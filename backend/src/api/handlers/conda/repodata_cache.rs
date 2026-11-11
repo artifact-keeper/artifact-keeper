@@ -49,9 +49,14 @@ const SUBDIR_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
 const SMALL_CACHE_MAX_ENTRIES: usize = 256;
 const SMALL_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
 
-/// The fingerprint of a hosted conda scope: its revision.
+/// The fingerprint of a hosted conda scope: its revision, and the
+/// scan-policy listing epoch of its repository (#4978 item 6,
+/// [`super::listing_policy_epoch`]): `None` when no scan policy applies, so
+/// the documents move with the revision alone; otherwise they are rendered
+/// again when the epoch moves, since a scan or a policy edit can block or
+/// release a package with no catalog write.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Revision(pub i64);
+pub(crate) struct Revision(pub i64, pub Option<u64>);
 
 impl Fingerprint for Revision {}
 
@@ -127,8 +132,24 @@ impl CachedRender for SubdirDocs {
     }
 }
 
+/// The CEP-16 shards of a hosted subdir a scan policy applies to, built from
+/// the policy-filtered listing (#4978 item 6): the stored shards carry no
+/// policy decision, so such a subdir serves these instead.
+pub(crate) struct WalkedShards {
+    pub index: Arc<Prepared>,
+    /// Shard bytes by address.
+    pub shards: std::collections::HashMap<Vec<u8>, Bytes>,
+}
+
+impl CachedRender for WalkedShards {
+    fn weight_bytes(&self) -> usize {
+        self.index.weight() + self.shards.values().map(Bytes::len).sum::<usize>()
+    }
+}
+
 type SubdirCache = RepoMetadataRevisionCache<Revision, SubdirDocs>;
 type DocCache = RepoMetadataRevisionCache<Revision, Prepared>;
+type WalkedShardCache = RepoMetadataRevisionCache<Revision, WalkedShards>;
 
 fn config(scope_kind: &'static str, max_entries: usize, max_bytes: usize) -> RevisionCacheConfig {
     RevisionCacheConfig {
@@ -159,6 +180,17 @@ pub(crate) fn shard_index_cache() -> &'static DocCache {
     CACHE.get_or_init(|| {
         DocCache::with_config(config(
             "shard_index",
+            SMALL_CACHE_MAX_ENTRIES,
+            SMALL_CACHE_MAX_BYTES,
+        ))
+    })
+}
+
+pub(crate) fn walked_shard_cache() -> &'static WalkedShardCache {
+    static CACHE: OnceLock<WalkedShardCache> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        WalkedShardCache::with_config(config(
+            "walked_shards",
             SMALL_CACHE_MAX_ENTRIES,
             SMALL_CACHE_MAX_BYTES,
         ))
@@ -338,12 +370,14 @@ pub(crate) async fn invalidate_local(repo_id: Uuid, subdirs: &[String]) {
     if subdirs.is_empty() {
         subdir_cache().invalidate_repo(repo_id).await;
         shard_index_cache().invalidate_repo(repo_id).await;
+        walked_shard_cache().invalidate_repo(repo_id).await;
         channel_cache().invalidate_repo(repo_id).await;
         return;
     }
     for subdir in subdirs {
         subdir_cache().invalidate_scope(repo_id, subdir).await;
         shard_index_cache().invalidate_scope(repo_id, subdir).await;
+        walked_shard_cache().invalidate_scope(repo_id, subdir).await;
     }
     channel_cache()
         .invalidate_scope(repo_id, CHANNEL_SCOPE)
@@ -374,8 +408,9 @@ pub(crate) async fn hosted_subdir_docs(
             // entry. Requests for made-up subdirs cannot evict real ones.
             return empty_subdir_docs(&subdir).map(Arc::new);
         }
+        let policy = super::listing_policy_epoch(&db, repo_id).await?;
         subdir_cache()
-            .get_or_render_scoped(repo_id, &subdir, Revision(state.revision), || {
+            .get_or_render_scoped(repo_id, &subdir, Revision(state.revision, policy), || {
                 regen_gate().run(render_subdir_docs(
                     db.clone(),
                     repo_id,
@@ -483,11 +518,15 @@ pub(crate) async fn hosted_shard_index(
     let subdir = subdir.to_string();
     bounded(async move {
         let state = shard_store::subdir_state(&db, repo_id, &subdir).await?;
+        if let Some(policy) = super::listing_policy_epoch(&db, repo_id).await? {
+            let walked = walked_shards(&db, repo_id, &subdir, state.revision, policy).await?;
+            return Ok(Some(walked.index.clone()));
+        }
         if !state.backfilled {
             return Ok(None);
         }
         shard_index_cache()
-            .get_or_render_scoped(repo_id, &subdir, Revision(state.revision), || async {
+            .get_or_render_scoped(repo_id, &subdir, Revision(state.revision, None), || async {
                 let shards = shard_store::stored_index(&db, repo_id, &subdir).await?;
                 let body =
                     super::serialize_msgpack_zst(&super::build_sharded_index(&subdir, &shards))?;
@@ -509,12 +548,49 @@ pub(crate) async fn hosted_shard(
     address: &[u8],
 ) -> Result<Option<Option<Vec<u8>>>, Response> {
     let state = shard_store::subdir_state(db, repo_id, subdir).await?;
+    if let Some(policy) = super::listing_policy_epoch(db, repo_id).await? {
+        let db = db.clone();
+        let subdir = subdir.to_string();
+        let walked =
+            bounded(
+                async move { walked_shards(&db, repo_id, &subdir, state.revision, policy).await },
+            )
+            .await?;
+        return Ok(Some(walked.shards.get(address).map(|b| b.to_vec())));
+    }
     if !state.backfilled {
         return Ok(None);
     }
     shard_store::stored_shard(db, repo_id, subdir, address)
         .await
         .map(Some)
+}
+
+/// The shards of hosted `(repo_id, subdir)` built from its policy-filtered
+/// listing ([`WalkedShards`]), kept under the revision and the policy epoch
+/// and rendered under the regeneration gate.
+async fn walked_shards(
+    db: &PgPool,
+    repo_id: Uuid,
+    subdir: &str,
+    revision: i64,
+    policy: u64,
+) -> Result<Arc<WalkedShards>, Response> {
+    walked_shard_cache()
+        .get_or_render_scoped(repo_id, subdir, Revision(revision, Some(policy)), || {
+            regen_gate().run(async {
+                let shards = super::hosted_shards(db, &[repo_id], subdir).await?;
+                let index = super::encode_hosted_shard_index(subdir, &shards)?;
+                Ok::<_, Response>(WalkedShards {
+                    index: Arc::new(Prepared::new(index)),
+                    shards: shards
+                        .into_values()
+                        .map(|shard| (super::shard_address(&shard).to_vec(), Bytes::from(shard)))
+                        .collect(),
+                })
+            })
+        })
+        .await
 }
 
 /// `channeldata.json` of hosted `repo_id` at its current revision.
@@ -525,13 +601,20 @@ pub(crate) async fn hosted_channeldata(
     let db = db.clone();
     bounded(async move {
         let state = shard_store::repo_state(&db, repo_id).await?;
+        let policy = super::listing_policy_epoch(&db, repo_id).await?;
         channel_cache()
-            .get_or_render_scoped(repo_id, CHANNEL_SCOPE, Revision(state.revision), || {
-                regen_gate().run(async {
-                    let body = super::render_hosted_channeldata(&db, repo_id, state.now).await?;
-                    Ok::<_, Response>(Prepared::new(body))
-                })
-            })
+            .get_or_render_scoped(
+                repo_id,
+                CHANNEL_SCOPE,
+                Revision(state.revision, policy),
+                || {
+                    regen_gate().run(async {
+                        let body =
+                            super::render_hosted_channeldata(&db, repo_id, state.now).await?;
+                        Ok::<_, Response>(Prepared::new(body))
+                    })
+                },
+            )
             .await
     })
     .await

@@ -891,7 +891,7 @@ pub(crate) async fn synthesized_index(
     .await
     .map_err(internal)?;
     repodata_cache::shard_index_cache()
-        .get_or_render_scoped(repo_id, subdir, Revision(revision), || async {
+        .get_or_render_scoped(repo_id, subdir, Revision(revision, None), || async {
             let shards = super::shard_store::stored_index(db, repo_id, subdir).await?;
             let body = super::serialize_msgpack_zst(&super::build_sharded_index(subdir, &shards))?;
             Ok::<_, Response>(Prepared::new(body))
