@@ -13,6 +13,19 @@ startup:
 `artifact_keeper_backend=debug,tower_http=debug,sqlx::query=info`). The audit
 stream (`AUDIT_STREAM`) is separate; see [audit-events.md](../audit-events.md).
 
+## Error responses and their level
+
+A request that ends in an error logs one `Request error` line with the error
+code, at a level that says whose problem it is: `INFO` for a client error
+(`4xx`), `WARN` for credential failures, a saturated database pool and a
+virtual repository answering `503` because its members' upstreams are down,
+and `ERROR` for a server fault. `tower_http` adds a `response failed` line at
+`ERROR` for a `5xx`, except for the deliberate ones logged below `ERROR` (the
+member outage `503`, a saturated pool's `503`, a quota `507`, a documented `501`): an upstream outage
+behind a virtual repository therefore no longer adds an `ERROR` line per client
+request (#5623, #5701). The member walk itself logs each member that could not
+answer at `WARN` (`virtual member could not answer, trying the next member`).
+
 ## OpenTelemetry export (`OTEL_EXPORTER_OTLP_ENDPOINT`)
 
 Setting `OTEL_EXPORTER_OTLP_ENDPOINT` exports spans over OTLP. Since 1.12.0

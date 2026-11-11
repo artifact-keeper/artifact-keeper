@@ -280,6 +280,16 @@ pub enum AppError {
     #[error("Service unavailable: {0}")]
     ServiceUnavailable(String),
 
+    /// A repository member could not answer (an upstream outage, #5504), so
+    /// a virtual repository's walk or merge answers `503` + `Retry-After`
+    /// instead of a `404` the client would cache. Same status, code and body
+    /// as [`Self::ServiceUnavailable`], but an EXPECTED outcome of an upstream
+    /// outage, not a server fault: logged at `warn` (#5623), so an outage does
+    /// not add an ERROR line per client request. The member walk already
+    /// logs each member that could not answer.
+    #[error("Service unavailable: {0}")]
+    MemberUnavailable(String),
+
     /// A scanner's backing engine/CLI is not present in this deployment, so the
     /// scan cannot run at all — distinct from the scan running and failing. The
     /// hardened runtime image routes container-image scans through the Harbor
@@ -457,7 +467,9 @@ impl AppError {
             Self::UpstreamAuth(_) => (StatusCode::BAD_GATEWAY, "UPSTREAM_AUTH_FAILED"),
             Self::OidcNoIdToken(_) => (StatusCode::BAD_GATEWAY, "OIDC_NO_ID_TOKEN"),
             Self::CodedBadGateway { code, .. } => (StatusCode::BAD_GATEWAY, code),
-            Self::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE"),
+            Self::ServiceUnavailable(_) | Self::MemberUnavailable(_) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE")
+            }
             Self::ScannerEngineUnavailable(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "SCANNER_ENGINE_UNAVAILABLE",
@@ -496,6 +508,9 @@ impl AppError {
             Self::Authentication(_) | Self::Unauthorized(_) | Self::Authorization(_) => {
                 tracing::Level::WARN
             }
+            // #5623: an upstream outage behind a virtual repository is an
+            // expected, retryable answer, not a fault of this server.
+            Self::MemberUnavailable(_) => tracing::Level::WARN,
             Self::QuotaExceeded(_) => tracing::Level::INFO,
             // A 5xx by status, but an intentional, documented gap: nothing
             // failed, so it must not read as a server fault in the logs.
@@ -558,6 +573,7 @@ impl AppError {
             | Self::UpstreamAuth(msg)
             | Self::OidcNoIdToken(msg)
             | Self::ServiceUnavailable(msg)
+            | Self::MemberUnavailable(msg)
             | Self::ScannerEngineUnavailable(msg)
             | Self::NotImplemented(msg) => msg.clone(),
             Self::CodedValidation { message, .. }
@@ -566,6 +582,23 @@ impl AppError {
             Self::Json(_) => "Invalid JSON".to_string(),
         }
     }
+}
+
+/// Response extension on a `5xx` that is an expected, deliberate answer
+/// rather than a server fault (#5623, #5701): the [`AppError`] behind it chose
+/// a log level below `error` (an upstream member outage, a quota refusal, a
+/// saturated connection pool, a documented `501`). The HTTP trace layer's
+/// classifier ([`crate::api::middleware::request_span::ServerErrorsExceptExpected`])
+/// reads it so the same response is not logged again as an ERROR
+/// `response failed` line.
+#[derive(Debug, Clone, Copy)]
+pub struct ExpectedOutcome;
+
+/// Whether a response of `status`, logged at `level`, is an expected `5xx`
+/// that gets [`ExpectedOutcome`]. Pure, so the rule is pinned without a
+/// subscriber.
+fn expected_server_status(status: StatusCode, level: tracing::Level) -> bool {
+    status.is_server_error() && level != tracing::Level::ERROR
 }
 
 impl IntoResponse for AppError {
@@ -595,7 +628,8 @@ impl IntoResponse for AppError {
             crate::storage::failure::record_failure(class);
         }
 
-        match self.log_level() {
+        let level = self.log_level();
+        match level {
             tracing::Level::ERROR => tracing::error!(error = %self, code = code, "Request error"),
             tracing::Level::WARN => tracing::warn!(error = %self, code = code, "Request error"),
             _ => tracing::info!(error = %self, code = code, "Request error"),
@@ -607,6 +641,9 @@ impl IntoResponse for AppError {
         }));
 
         let mut response = (status, body).into_response();
+        if expected_server_status(status, level) {
+            response.extensions_mut().insert(ExpectedOutcome);
+        }
         // Tell well-behaved clients to back off on capacity-shed responses so
         // they retry on a slower cadence and don't compound the saturation.
         if status == StatusCode::SERVICE_UNAVAILABLE {
@@ -1314,6 +1351,55 @@ mod tests {
             AppError::ServiceUnavailable("at capacity".into()).log_level(),
             tracing::Level::ERROR
         );
+    }
+
+    /// #5623: a member outage answers exactly what `ServiceUnavailable` does
+    /// (503, `SERVICE_UNAVAILABLE`, its message, `Retry-After`), logs at WARN,
+    /// and is marked [`ExpectedOutcome`] for the trace layer; a plain
+    /// `ServiceUnavailable` keeps ERROR and no marker.
+    #[test]
+    fn member_unavailable_is_a_warn_level_503_5623() {
+        let err = AppError::MemberUnavailable("member down".into());
+        assert_eq!(
+            err.status_and_code(),
+            (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE")
+        );
+        assert_eq!(err.user_message(), "member down");
+        assert_eq!(err.log_level(), tracing::Level::WARN);
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers()[header::RETRY_AFTER],
+            RETRY_AFTER_SECS_ON_503
+        );
+        assert!(response.extensions().get::<ExpectedOutcome>().is_some());
+
+        let plain = AppError::ServiceUnavailable("at capacity".into()).into_response();
+        assert!(plain.extensions().get::<ExpectedOutcome>().is_none());
+    }
+
+    /// Only a 5xx logged below ERROR is an expected outcome: a 4xx is never a
+    /// trace-layer failure to begin with, and an ERROR 5xx stays a failure.
+    #[test]
+    fn expected_server_status_rule_5623() {
+        use tracing::Level;
+        assert!(expected_server_status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Level::WARN
+        ));
+        assert!(expected_server_status(
+            StatusCode::INSUFFICIENT_STORAGE,
+            Level::INFO
+        ));
+        assert!(!expected_server_status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Level::ERROR
+        ));
+        assert!(!expected_server_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Level::ERROR
+        ));
+        assert!(!expected_server_status(StatusCode::NOT_FOUND, Level::INFO));
     }
 
     // -----------------------------------------------------------------------

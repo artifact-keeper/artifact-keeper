@@ -844,7 +844,7 @@ pub(crate) fn is_member_unavailable_response(response: &Response) -> bool {
 /// is unknowable, so the client is told to retry instead of being handed a
 /// `404` it would cache.
 pub fn member_unavailable_response() -> Response {
-    let mut response = crate::error::AppError::ServiceUnavailable(
+    let mut response = crate::error::AppError::MemberUnavailable(
         "A repository member is temporarily unavailable, retry shortly".to_string(),
     )
     .into_response();
