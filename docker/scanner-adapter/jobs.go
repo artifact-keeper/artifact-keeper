@@ -13,6 +13,9 @@ type JobStatus string
 const (
 	// StatusPending: accepted, not yet started.
 	StatusPending JobStatus = "Pending"
+	// StatusQueued: waiting for one of the adapter's MaxConcurrentScans scan
+	// slots (#5657). Reported to pollers in the X-Scan-Status header.
+	StatusQueued JobStatus = "Queued"
 	// StatusRunning: trivy is executing.
 	StatusRunning JobStatus = "Running"
 	// StatusSucceeded: a report is available.
@@ -70,12 +73,19 @@ func (s *JobStore) Create() (*Job, error) {
 	return job, nil
 }
 
-// Get returns the job for id and whether it exists.
+// Get returns a snapshot of the job for id and whether it exists. It is a
+// copy taken under the lock: the scan goroutine keeps updating the stored
+// job, and handing out the shared pointer let the report handler read Status
+// while Fail/Succeed wrote it (a data race go test -race reports).
 func (s *JobStore) Get(id string) (*Job, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	job, ok := s.jobs[id]
-	return job, ok
+	if !ok {
+		return nil, false
+	}
+	cp := *job
+	return &cp, true
 }
 
 // setStatus transitions a job's status (no-op if the id is gone).
@@ -86,6 +96,9 @@ func (s *JobStore) setStatus(id string, status JobStatus) {
 		job.Status = status
 	}
 }
+
+// Queued marks a job as waiting for a scan slot.
+func (s *JobStore) Queued(id string) { s.setStatus(id, StatusQueued) }
 
 // Running marks a job as executing.
 func (s *JobStore) Running(id string) { s.setStatus(id, StatusRunning) }

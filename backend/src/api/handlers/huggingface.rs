@@ -18,10 +18,10 @@
 //! `"namespace/name"` inside the handler). See `router()` below.
 
 use axum::body::Body;
-use axum::extract::{Path, State};
-use axum::http::header::{
-    CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_RANGE, RANGE,
-};
+use axum::extract::{Path, RawQuery, State};
+#[cfg(test)]
+use axum::http::header::CONTENT_LENGTH;
+use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE, ETAG};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -34,6 +34,7 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
+use crate::api::handlers::proxy_helpers::{apply_range_to_streamed_serve, effective_range};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::services::proxy_service::UPSTREAM_COMMIT_HEADER;
@@ -52,10 +53,12 @@ const MAX_MODEL_ID_LEN: usize = 255;
 const MAX_REVISION_LEN: usize = 255;
 
 /// Maximum artifact path length. The `path` and `storage_key` columns are
-/// VARCHAR(2048). The storage key adds a `huggingface/` prefix (12 chars),
-/// so the artifact path must stay within 2036 to keep the storage key under
-/// the column limit.
-const MAX_PATH_LEN: usize = 2036;
+/// VARCHAR(2048). On a shared cloud namespace the storage key is repo-scoped
+/// (#5662) and prefixes the path with `huggingface/{repository_id}/`: 12
+/// chars for `huggingface/`, 36 for the UUID and 1 for its `/`, 49 in all.
+/// The artifact path must stay within 2048 - 49 = 1999 to keep the storage
+/// key under the column limit (the flat `huggingface/{path}` key is shorter).
+const MAX_PATH_LEN: usize = 1999;
 
 /// Total deadline for the best-effort model-info fallback in
 /// [`fetch_upstream_commit_sha`] (#2915).
@@ -196,6 +199,116 @@ fn local_repo_commit_sha(model_id: &str, revision: &str) -> String {
     digest[..40].to_string()
 }
 
+/// `true` for a value `huggingface_hub` treats as an already-resolved commit:
+/// exactly 40 lowercase hex characters (its `REGEX_COMMIT_HASH`).
+fn is_commit_hash(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Pick which stored revision of a hosted model a request means (#5280).
+///
+/// `revisions` are the distinct `version`s the repository holds for the model,
+/// newest upload first. `requested` is the revision segment of the request, or
+/// `None` for the revision-less model-info route.
+///
+///   * A revision the repository holds by that literal name wins, so a branch
+///     or tag that happens to be spelled as 40 hex characters still means itself.
+///   * Otherwise a 40-hex value is matched against [`local_repo_commit_sha`] of
+///     each held revision. This is the round trip `snapshot_download` makes: it
+///     reads `sha` from model info and then lists the tree and requests every
+///     file at `/resolve/<sha>/<file>`, so the synthetic commit has to lead back
+///     to the revision it was derived from or every file 404s.
+///   * No revision means the default branch, `main`, as on the Hub; a model
+///     that was never published to `main` falls back to its newest revision so
+///     `model_info(repo_id)` still describes something real.
+///
+/// `None` means the revision does not exist for this model.
+fn pick_local_revision(
+    model_id: &str,
+    revisions: &[String],
+    requested: Option<&str>,
+) -> Option<String> {
+    match requested {
+        Some(requested) => {
+            if revisions.iter().any(|r| r == requested) {
+                return Some(requested.to_string());
+            }
+            if !is_commit_hash(requested) {
+                return None;
+            }
+            revisions
+                .iter()
+                .find(|r| local_repo_commit_sha(model_id, r) == requested)
+                .cloned()
+        }
+        None => revisions
+            .iter()
+            .find(|r| r.as_str() == "main")
+            .or_else(|| revisions.first())
+            .cloned(),
+    }
+}
+
+/// Distinct revisions held for `model_id` in a repository, newest upload first.
+async fn local_model_revisions(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    model_id: &str,
+) -> Result<Vec<String>, Response> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT version FROM artifacts \
+         WHERE repository_id = $1 \
+           AND is_deleted = false \
+           AND LOWER(name) = LOWER($2) \
+           AND version IS NOT NULL \
+         GROUP BY version \
+         ORDER BY MAX(created_at) DESC, version",
+    )
+    .bind(repository_id)
+    .bind(model_id)
+    .fetch_all(db)
+    .await
+    .map_err(super::db_err)
+}
+
+/// Format a timestamp the way the Hub does and `huggingface_hub`'s
+/// `parse_datetime` requires: `%Y-%m-%dT%H:%M:%S.%fZ`.
+fn hub_timestamp(ts: chrono::DateTime<chrono::Utc>) -> String {
+    ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// The path of a stored file relative to its model revision, the shape the Hub
+/// reports as `siblings[].rfilename` and tree `path`.
+///
+/// Stored paths are `{model_id}/{revision}/{file}`. The prefix is stripped with
+/// the row's own `name` and `version` so a request that spells the model ID in
+/// another case (model info matches it case-insensitively) still gets the
+/// relative path.
+fn relative_model_path<'a>(path: &'a str, name: &str, version: &str) -> &'a str {
+    path.strip_prefix(name)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .and_then(|rest| rest.strip_prefix(version))
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(path)
+}
+
+/// 404 for a revision this repository does not hold, with the
+/// `X-Error-Code: RevisionNotFound` header the Hub sends, which
+/// `huggingface_hub` turns into `RevisionNotFoundError`.
+fn revision_not_found(model_id: &str, revision: &str) -> Response {
+    let mut resp = (
+        StatusCode::NOT_FOUND,
+        format!("Revision not found: {model_id}@{revision}"),
+    )
+        .into_response();
+    resp.headers_mut()
+        .insert("x-error-code", HeaderValue::from_static("RevisionNotFound"));
+    resp
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -264,6 +377,95 @@ async fn resolve_huggingface_repo(db: &PgPool, repo_key: &str) -> Result<RepoInf
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["huggingface"], "a Hugging Face").await
 }
 
+// ---------------------------------------------------------------------------
+// Upstream refusals (#5323)
+// ---------------------------------------------------------------------------
+
+/// The response headers `huggingface_hub` reads to pick its exception
+/// (`hf_raise_for_status`): the code first, then the message.
+const HUB_ERROR_CODE_HEADER: &str = "x-error-code";
+const HUB_ERROR_MESSAGE_HEADER: &str = "x-error-message";
+
+/// The `X-Error-Code` and message a Hugging Face client gets for an upstream
+/// `status` (`401`/`403`) that named `upstream_code` (#5323).
+///
+/// The shared proxy mapping turns every upstream refusal into an opaque 502,
+/// which `huggingface_hub` retries five times as a server error. The Hub's own
+/// answer is a client error it raises at once, so this mirrors it: the status
+/// stays the upstream's, and the code is the upstream's when it gave one. A
+/// `401` without a code is how the Hub answers a missing or private repository
+/// to an unauthenticated request (and how `huggingface_hub` reads it), so it is
+/// named `RepoNotFound`; a `403` without one keeps no code.
+///
+/// The message is written here and names the Remote's upstream credential,
+/// never the credential itself or anything the upstream said.
+fn hub_refusal_reply(
+    status: StatusCode,
+    upstream_code: Option<&'static str>,
+    repo_key: &str,
+) -> (Option<&'static str>, String) {
+    let fix = format!(
+        "An administrator can set the Remote's upstream credential with \
+         PUT /api/v1/repositories/{repo_key}/upstream-auth."
+    );
+    let code = upstream_code.or((status == StatusCode::UNAUTHORIZED).then_some("RepoNotFound"));
+    let message = match code {
+        Some("GatedRepo") => format!(
+            "This model is gated on the upstream Hub, and the upstream credential of Remote \
+             '{repo_key}' is missing or has not been granted access to it. {fix}"
+        ),
+        Some("RepoNotFound") => format!(
+            "The upstream Hub has no such repository, or it is private and the upstream \
+             credential of Remote '{repo_key}' is missing or lacks access to it. {fix}"
+        ),
+        Some("RevisionNotFound") => "The upstream Hub has no such revision.".to_string(),
+        Some("EntryNotFound") => "The upstream Hub has no such file.".to_string(),
+        _ => format!(
+            "The upstream Hub refused the upstream credential of Remote '{repo_key}' for \
+             this model. {fix}"
+        ),
+    };
+    (code, message)
+}
+
+/// Turn a Remote's proxy error `response` that came from an upstream
+/// `401`/`403` into the Hub-shaped refusal [`hub_refusal_reply`] describes
+/// (#5323). Any other response (a 404, a 5xx folded to 503, a policy refusal,
+/// a Virtual's answer) is returned as is.
+///
+/// A pure mapping on purpose: the proxy fetch futures sit at the compiler's
+/// layout query-depth limit, so this is applied with `map_err` rather than as
+/// another async layer.
+fn hub_upstream_refusal(repo: &RepoInfo, response: Response) -> Response {
+    if proxy_helpers::classify_remote_or_virtual(&repo.repo_type)
+        != proxy_helpers::RemoteOrVirtualAction::Remote
+    {
+        return response;
+    }
+    let Some(status) = proxy_helpers::upstream_refusal_status(&response) else {
+        return response;
+    };
+    let upstream_code = proxy_helpers::upstream_hub_error_code(&response);
+    let (code, message) = hub_refusal_reply(status, upstream_code, &repo.key);
+    let mut reply = (
+        status,
+        axum::Json(serde_json::json!({ "error": message.as_str() })),
+    )
+        .into_response();
+    if let Some(code) = code {
+        reply
+            .headers_mut()
+            .insert(HUB_ERROR_CODE_HEADER, HeaderValue::from_static(code));
+    }
+    if let Ok(value) = HeaderValue::from_str(&message) {
+        reply.headers_mut().insert(HUB_ERROR_MESSAGE_HEADER, value);
+    }
+    reply
+        .extensions_mut()
+        .extend(response.into_parts().0.extensions);
+    reply
+}
+
 /// Extract a filename from request headers.
 ///
 /// Prefers the `X-Filename` header; falls back to `Content-Disposition`
@@ -296,48 +498,62 @@ async fn list_models(
 ) -> Result<Response, Response> {
     let repo = resolve_huggingface_repo(&state.db, &repo_key).await?;
 
-    let artifacts = sqlx::query!(
-        r#"
-        SELECT DISTINCT ON (LOWER(name)) name, version,
-               am.metadata as "metadata?"
-        FROM artifacts a
-        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1
-          AND a.is_deleted = false
-        ORDER BY LOWER(name), a.created_at DESC
-        "#,
-        repo.id
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT DISTINCT ON (LOWER(a.name)) a.name, a.created_at, am.metadata \
+         FROM artifacts a \
+         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+         WHERE a.repository_id = $1 \
+           AND a.is_deleted = false \
+         ORDER BY LOWER(a.name), a.created_at DESC",
     )
+    .bind(repo.id)
     .fetch_all(&state.db)
     .await
     .map_err(super::db_err)?;
 
-    let models: Vec<serde_json::Value> = artifacts
+    let models = rows
         .iter()
-        .map(|a| {
-            let model_id = a.name.clone();
-            let pipeline_tag = a
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("pipeline_tag"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            serde_json::json!({
-                "modelId": model_id,
-                "lastModified": a.version.clone().unwrap_or_default(),
-                "pipeline_tag": pipeline_tag,
-                "tags": [],
-            })
+        .map(|row| {
+            Ok(list_models_entry(
+                &row.try_get::<String, _>("name").map_err(super::db_err)?,
+                row.try_get("created_at").map_err(super::db_err)?,
+                row.try_get::<Option<serde_json::Value>, _>("metadata")
+                    .map_err(super::db_err)?
+                    .as_ref(),
+            ))
         })
-        .collect();
+        .collect::<Result<Vec<_>, Response>>()?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_string(&models).unwrap()))
         .unwrap())
+}
+
+/// One `list_models` entry. `id` is required by `huggingface_hub`'s
+/// `ModelInfo`, which `HfApi.list_models` builds from every entry, and
+/// `lastModified` must be a Hub timestamp, not a revision name (#5280).
+fn list_models_entry(
+    model_id: &str,
+    last_modified: chrono::DateTime<chrono::Utc>,
+    metadata: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut json = serde_json::json!({
+        "id": model_id,
+        "modelId": model_id,
+        "lastModified": hub_timestamp(last_modified),
+        "tags": [],
+    });
+    if let Some(tag) = metadata
+        .and_then(|m| m.get("pipeline_tag"))
+        .and_then(|v| v.as_str())
+        .filter(|t| !t.is_empty())
+    {
+        json["pipeline_tag"] = tag.into();
+    }
+    json
 }
 
 // ---------------------------------------------------------------------------
@@ -408,63 +624,127 @@ async fn model_info_impl(
         }
     };
 
-    let siblings = sqlx::query!(
-        r#"
-        SELECT path, size_bytes
-        FROM artifacts
-        WHERE repository_id = $1
-          AND is_deleted = false
-          AND LOWER(name) = LOWER($2)
-        ORDER BY path
-        "#,
-        repo.id,
-        model_id
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(super::db_err)?;
+    // Which stored revision this request means: a branch/tag by name, the
+    // synthetic commit `sha` this route itself handed out, or (no revision)
+    // `main` (#5280). A revision the repository does not hold is the Hub's
+    // RevisionNotFound, except on a Remote repository holding promoted copies
+    // of some revisions, where upstream may still have it.
+    let revisions = local_model_revisions(&state.db, repo.id, &model_id).await?;
+    let Some(effective) = pick_local_revision(&model_id, &revisions, revision.as_deref()) else {
+        if let Some(resp) = proxy_model_info(&state, &repo, &model_id, revision.as_deref()).await? {
+            return Ok(resp);
+        }
+        return Err(revision_not_found(
+            &model_id,
+            revision.as_deref().unwrap_or("main"),
+        ));
+    };
 
-    let files: Vec<serde_json::Value> = siblings
-        .iter()
-        .map(|s| {
-            serde_json::json!({
-                "rfilename": s.path,
-                "size": s.size_bytes,
-            })
-        })
-        .collect();
-
+    let files = hosted_revision_files(&state.db, repo.id, &model_id, &effective).await?;
     let pipeline_tag = artifact
         .metadata
         .as_ref()
         .and_then(|m| m.get("pipeline_tag"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+        .and_then(|v| v.as_str());
 
-    // `sha` must be the SAME value the resolve route reports in
-    // `X-Repo-Commit` for this `(model_id, revision)`, or `snapshot_download`
-    // computes its snapshot directory from one value and files the downloaded
-    // blobs under the other (#2915 - see `local_repo_commit_sha`). It used to
-    // be this artifact's `checksum_sha256`, which is per-FILE and 64 hex
-    // characters: it disagreed with every sibling in the same revision and was
-    // never a commit identifier in the first place. Per-file content identity
-    // is still exposed - as the resolve ETag, where `huggingface_hub` looks for
-    // it.
-    let commit_revision = revision
-        .as_deref()
-        .or(artifact.version.as_deref())
-        .unwrap_or("main");
-    let json = serde_json::json!({
+    Ok(super::json_response(&hosted_model_info_json(
+        &model_id,
+        &effective,
+        &files,
+        pipeline_tag,
+    )))
+}
+
+/// One stored file of a hosted model revision.
+struct HostedFile {
+    /// Path relative to the model revision (`config.json`, `onnx/model.onnx`).
+    rfilename: String,
+    size_bytes: i64,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Every live file of `model_id` at `revision` in a repository, by path.
+async fn hosted_revision_files(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    model_id: &str,
+    revision: &str,
+) -> Result<Vec<HostedFile>, Response> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT path, name, version, size_bytes, created_at \
+         FROM artifacts \
+         WHERE repository_id = $1 \
+           AND is_deleted = false \
+           AND LOWER(name) = LOWER($2) \
+           AND version = $3 \
+         ORDER BY path",
+    )
+    .bind(repository_id)
+    .bind(model_id)
+    .bind(revision)
+    .fetch_all(db)
+    .await
+    .map_err(super::db_err)?;
+
+    rows.iter()
+        .map(|row| {
+            let path: String = row.try_get("path").map_err(super::db_err)?;
+            let name: String = row.try_get("name").map_err(super::db_err)?;
+            let version: String = row.try_get("version").map_err(super::db_err)?;
+            Ok(HostedFile {
+                rfilename: relative_model_path(&path, &name, &version).to_string(),
+                size_bytes: row.try_get("size_bytes").map_err(super::db_err)?,
+                created_at: row.try_get("created_at").map_err(super::db_err)?,
+            })
+        })
+        .collect()
+}
+
+/// The model-info document for a hosted model revision, in the shape the Hub
+/// serves and `huggingface_hub`'s `ModelInfo` parses (#5280).
+///
+///   * `id` is required: `ModelInfo.__init__` does `kwargs.pop("id")`, so a
+///     document without it fails `model_info()` and `snapshot_download` with a
+///     `KeyError`. `modelId` is the legacy alias the Hub still sends.
+///   * `siblings[].rfilename` is the path inside the repository
+///     (`config.json`), never the stored `{model}/{revision}/{file}` key: the
+///     client requests `/resolve/<sha>/<rfilename>` for each sibling.
+///   * `sha` is the same value the resolve route reports in `X-Repo-Commit` for
+///     this revision, or `snapshot_download` computes its snapshot directory
+///     from one value and files the downloaded blobs under the other (#2915,
+///     see [`local_repo_commit_sha`]).
+///   * `lastModified` / `createdAt` are timestamps in the Hub's
+///     `%Y-%m-%dT%H:%M:%S.%fZ` form, which `parse_datetime` insists on.
+fn hosted_model_info_json(
+    model_id: &str,
+    revision: &str,
+    files: &[HostedFile],
+    pipeline_tag: Option<&str>,
+) -> serde_json::Value {
+    let siblings: Vec<serde_json::Value> = files
+        .iter()
+        .map(|f| serde_json::json!({ "rfilename": f.rfilename, "size": f.size_bytes }))
+        .collect();
+    let mut json = serde_json::json!({
+        "id": model_id,
         "modelId": model_id,
-        "sha": local_repo_commit_sha(&model_id, commit_revision),
-        "lastModified": artifact.version.clone().unwrap_or_default(),
-        "pipeline_tag": pipeline_tag,
+        "sha": local_repo_commit_sha(model_id, revision),
+        "disabled": false,
+        "gated": false,
         "tags": [],
-        "siblings": files,
+        "siblings": siblings,
     });
-
-    Ok(super::json_response(&json))
+    if let Some(last) = files.iter().map(|f| f.created_at).max() {
+        json["lastModified"] = hub_timestamp(last).into();
+    }
+    if let Some(first) = files.iter().map(|f| f.created_at).min() {
+        json["createdAt"] = hub_timestamp(first).into();
+    }
+    if let Some(tag) = pipeline_tag.filter(|t| !t.is_empty()) {
+        json["pipeline_tag"] = tag.into();
+    }
+    json
 }
 
 /// Proxy the upstream Hugging Face model-info JSON for a Remote repo.
@@ -531,22 +811,336 @@ async fn proxy_model_info(
 /// Same contract as [`proxy_model_info`]: `Ok(None)` for a non-Remote repo so
 /// the caller keeps its existing behaviour, `Err` for a real upstream failure.
 ///
-/// Only the first page is proxied. The Hub paginates large trees with a `Link:
-/// rel="next"` header, which `proxy_fetch_capped` does not follow, so a model
-/// with more entries than one page holds is reported short here. `hf download`
-/// does not use this endpoint (it lists files from model-info `siblings`), so
-/// that limitation is not on the download path.
+/// # Query and pagination (#5321)
+///
+/// `snapshot_download` (`huggingface_hub` 1.x and 2.x) builds the snapshot
+/// from `tree/<commit>?recursive=true`, not from model-info `siblings`.
+/// Without the query the Hub lists only the top level, so every file in a
+/// subdirectory was silently left out of the snapshot. The allow-listed query
+/// ([`TreeQuery`]) is forwarded in one canonical spelling and is part of the
+/// fetch path, so it is also part of the proxy-cache key and of the upstream
+/// filter subject: each distinct listing is cached on its own.
+///
+/// The Hub pages trees (1000 entries, 50 with `expand`) and says where the
+/// next page is only in a `Link: <...cursor=...>; rel="next"` header. The proxy
+/// cache stores bodies, not that header, so the pages are followed here and
+/// returned as one array, each page cached under its own `cursor` key. A page
+/// shorter than the Hub's page size is the last one, which is every page of
+/// almost every model, so the common case is one cached fetch and works with
+/// the upstream unreachable. Only a full page costs an uncached fetch of the
+/// same URL to read its `Link` header; that fetch's body is the one served, so
+/// a page and the cursor after it always come from the same response. If that
+/// fetch fails the request fails: serving a short listing as complete is the
+/// bug this fixes. Bounded by [`MAX_TREE_PAGES`] and [`MAX_TREE_LISTING_BYTES`].
+///
+/// Following server-side rather than passing a rewritten `Link` through means
+/// no public base URL has to be reconstructed behind reverse proxies, and any
+/// client gets the full listing whether it follows `Link` or not.
 async fn proxy_model_tree(
     state: &SharedState,
     repo: &RepoInfo,
     model_id: &str,
     revision: &str,
+    query: &TreeQuery,
 ) -> Result<Option<Response>, Response> {
-    let upstream_path = format!(
+    let Some((upstream_url, proxy)) = remote_upstream(state, repo) else {
+        return Ok(None);
+    };
+
+    let page_size = query.hub_page_size();
+    let mut cursor = query.cursor.clone();
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    let mut total_bytes = 0usize;
+    for page in 0..MAX_TREE_PAGES {
+        let upstream_path = tree_upstream_path(model_id, revision, query, cursor.as_deref());
+        // The real format reaches the cache classifier, which (with #5283)
+        // keeps a listing at a commit sha, page by page, as immutable.
+        let (bytes, _content_type) = proxy_helpers::proxy_fetch_capped_with_format(
+            proxy,
+            repo.id,
+            &repo.key,
+            upstream_url,
+            &upstream_path,
+            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            crate::models::repository::RepositoryFormat::Huggingface,
+        )
+        .await?;
+        let items = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(serde_json::Value::Array(items)) => items,
+            // Not a listing: hand it back as before rather than fail a
+            // passthrough that works today.
+            _ if page == 0 => return Ok(Some(tree_json_response(strip_xet_metadata(bytes)))),
+            _ => {
+                return Err(tree_bad_gateway(
+                    "an upstream tree page is not a JSON array",
+                ))
+            }
+        };
+        if items.len() < page_size {
+            total_bytes += bytes.len();
+            if total_bytes > MAX_TREE_LISTING_BYTES {
+                return Err(tree_bad_gateway("the upstream tree listing is too large"));
+            }
+            entries.extend(items);
+            return Ok(Some(tree_listing_response(entries)));
+        }
+
+        // A full page: only its `Link` header says whether another follows.
+        let direct = proxy_helpers::proxy_fetch_uncached_with_link(
+            proxy,
+            repo.id,
+            &repo.key,
+            upstream_url,
+            &upstream_path,
+        )
+        .await?;
+        let next = next_tree_page(direct.link.as_deref());
+        let decoded = match crate::util::content_coding::strip_content_coding(
+            &direct.content,
+            direct.content_encoding.as_deref(),
+        ) {
+            Ok(crate::util::content_coding::Decoded::Bytes(body)) => body,
+            _ => {
+                return Err(tree_bad_gateway(
+                    "an upstream tree page could not be decoded",
+                ))
+            }
+        };
+        let Ok(serde_json::Value::Array(items)) = serde_json::from_slice(&decoded) else {
+            return Err(tree_bad_gateway(
+                "an upstream tree page is not a JSON array",
+            ));
+        };
+        total_bytes += decoded.len();
+        if total_bytes > MAX_TREE_LISTING_BYTES {
+            return Err(tree_bad_gateway("the upstream tree listing is too large"));
+        }
+        entries.extend(items);
+        match next {
+            NextTreePage::Last => return Ok(Some(tree_listing_response(entries))),
+            NextTreePage::Cursor(next) if cursor.as_deref() != Some(next.as_str()) => {
+                cursor = Some(next);
+            }
+            NextTreePage::Cursor(_) => {
+                return Err(tree_bad_gateway("the upstream tree cursor did not advance"));
+            }
+            NextTreePage::Unusable => {
+                return Err(tree_bad_gateway(
+                    "the upstream next-page link has no cursor",
+                ));
+            }
+        }
+    }
+    Err(tree_bad_gateway(
+        "the upstream tree listing has too many pages",
+    ))
+}
+
+/// The upstream URL and proxy of a Remote repository that has both wired up,
+/// or `None` for any other repository.
+fn remote_upstream<'a>(
+    state: &'a SharedState,
+    repo: &'a RepoInfo,
+) -> Option<(&'a str, &'a crate::services::proxy_service::ProxyService)> {
+    if proxy_helpers::classify_remote_or_virtual(&repo.repo_type)
+        != proxy_helpers::RemoteOrVirtualAction::Remote
+    {
+        return None;
+    }
+    Some((
+        repo.upstream_url.as_deref()?,
+        state.proxy_service.as_deref()?,
+    ))
+}
+
+/// Entries per tree page on the Hub, and with `expand=true` (as documented by
+/// `huggingface_hub`'s `list_repo_tree`). A page with fewer entries is the
+/// last one, so no `Link` lookup is needed for it.
+const HUB_TREE_PAGE_ENTRIES: usize = 1000;
+const HUB_TREE_EXPAND_PAGE_ENTRIES: usize = 50;
+
+/// Upper bounds on one followed Remote tree listing (#5321): pages fetched,
+/// and the JSON bytes held to concatenate them. 100 pages is 100,000 entries
+/// without `expand`; past either bound the request fails rather than return
+/// a listing that looks complete and is not.
+const MAX_TREE_PAGES: usize = 100;
+const MAX_TREE_LISTING_BYTES: usize = 32 * 1024 * 1024;
+
+/// Longest `cursor` forwarded, from the client or from a `Link` header. Hub
+/// cursors are short opaque tokens (about 100 characters); the bound keeps the
+/// cursor-bearing proxy-cache key inside its 1 KiB storage-key limit.
+const MAX_TREE_CURSOR_LEN: usize = 256;
+
+/// The tree query parameters this proxy understands (#5321). Everything else
+/// in the client's query is dropped, so it never reaches the upstream or the
+/// cache key. `limit` is dropped too: pages are followed to the end here, so a
+/// client page size would only multiply upstream requests.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct TreeQuery {
+    recursive: bool,
+    expand: bool,
+    cursor: Option<String>,
+}
+
+impl TreeQuery {
+    fn hub_page_size(&self) -> usize {
+        if self.expand {
+            HUB_TREE_EXPAND_PAGE_ENTRIES
+        } else {
+            HUB_TREE_PAGE_ENTRIES
+        }
+    }
+}
+
+/// Parse a Hub boolean query value. `huggingface_hub` sends `true`/`false`
+/// (httpx spelling of Python booleans); `True`/`1`/`0` are accepted as well.
+fn parse_tree_flag(name: &str, value: &str) -> Result<bool, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" | "" => Ok(false),
+        _ => Err(format!(
+            "Invalid value for '{name}': expected true or false"
+        )),
+    }
+}
+
+/// Parse the raw tree query string into the allow-listed [`TreeQuery`].
+fn parse_tree_query(raw: Option<&str>) -> Result<TreeQuery, String> {
+    let mut query = TreeQuery::default();
+    for (key, value) in url::form_urlencoded::parse(raw.unwrap_or("").as_bytes()) {
+        match key.as_ref() {
+            "recursive" => query.recursive = parse_tree_flag("recursive", &value)?,
+            "expand" => query.expand = parse_tree_flag("expand", &value)?,
+            "cursor" if value.is_empty() => query.cursor = None,
+            "cursor" if value.len() > MAX_TREE_CURSOR_LEN || value.contains('\0') => {
+                return Err("Invalid 'cursor'".to_string());
+            }
+            "cursor" => query.cursor = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    Ok(query)
+}
+
+/// The upstream tree path for one page, with the query in a single canonical
+/// spelling: parameters in a fixed order, `false` flags left out (the Hub's
+/// default), values form-encoded so a cursor's `/`, `+` or `=` cannot leave
+/// the query. `?recursive=true&expand=false` and `?recursive=true` are the
+/// same request and share one cache entry.
+fn tree_upstream_path(
+    model_id: &str,
+    revision: &str,
+    query: &TreeQuery,
+    cursor: Option<&str>,
+) -> String {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    if query.recursive {
+        serializer.append_pair("recursive", "true");
+    }
+    if query.expand {
+        serializer.append_pair("expand", "true");
+    }
+    if let Some(cursor) = cursor {
+        serializer.append_pair("cursor", cursor);
+    }
+    let encoded = serializer.finish();
+    let base = format!(
         "api/models/{model_id}/tree/{}",
         encode_upstream_revision(revision)
     );
-    proxy_hf_metadata_json(state, repo, &upstream_path).await
+    if encoded.is_empty() {
+        base
+    } else {
+        format!("{base}?{encoded}")
+    }
+}
+
+/// What a tree page's `Link` header says about the page after it.
+#[derive(Debug, PartialEq, Eq)]
+enum NextTreePage {
+    /// No `rel="next"` target: this was the last page.
+    Last,
+    /// The next page's `cursor`.
+    Cursor(String),
+    /// A `rel="next"` target without a usable `cursor`. Treated as an error,
+    /// never as the last page, so a listing is not cut short silently.
+    Unusable,
+}
+
+/// Read the `rel="next"` target of an RFC 8288 `Link` header. Only its
+/// `cursor` is taken: the next request is rebuilt by [`tree_upstream_path`],
+/// so the upstream cannot point this proxy at another path or host.
+fn next_tree_page(link: Option<&str>) -> NextTreePage {
+    let Some(link) = link else {
+        return NextTreePage::Last;
+    };
+    match link_next_target(link) {
+        None => NextTreePage::Last,
+        Some(target) => target
+            .split('#')
+            .next()
+            .and_then(|t| t.split_once('?'))
+            .and_then(|(_, query)| {
+                url::form_urlencoded::parse(query.as_bytes())
+                    .find(|(key, _)| key == "cursor")
+                    .map(|(_, value)| value.into_owned())
+            })
+            .filter(|cursor| !cursor.is_empty() && cursor.len() <= MAX_TREE_CURSOR_LEN)
+            .map_or(NextTreePage::Unusable, NextTreePage::Cursor),
+    }
+}
+
+/// The URI-reference of the first `rel="next"` link in a `Link` header.
+fn link_next_target(link: &str) -> Option<&str> {
+    let mut rest = link;
+    while let Some(start) = rest.find('<') {
+        let after = &rest[start + 1..];
+        let end = after.find('>')?;
+        let target = &after[..end];
+        let tail = &after[end + 1..];
+        let params = &tail[..tail.find('<').unwrap_or(tail.len())];
+        let is_next = params.split(';').any(|param| {
+            let Some((key, value)) = param.split_once('=') else {
+                return false;
+            };
+            key.trim().eq_ignore_ascii_case("rel")
+                && value
+                    .trim()
+                    .trim_end_matches(',')
+                    .trim()
+                    .trim_matches('"')
+                    .split_whitespace()
+                    .any(|rel| rel.eq_ignore_ascii_case("next"))
+        });
+        if is_next {
+            return Some(target);
+        }
+        rest = tail;
+    }
+    None
+}
+
+fn tree_json_response(body: Bytes) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// The concatenated pages, Xet fields removed as for any proxied metadata.
+fn tree_listing_response(entries: Vec<serde_json::Value>) -> Response {
+    let mut value = serde_json::Value::Array(entries);
+    remove_xet_keys(&mut value);
+    tree_json_response(Bytes::from(serde_json::to_vec(&value).unwrap_or_default()))
+}
+
+fn tree_bad_gateway(reason: &str) -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        format!("Hugging Face tree listing failed: {reason}"),
+    )
+        .into_response()
 }
 
 /// Object keys removed from proxied Hugging Face metadata documents (#3334).
@@ -609,9 +1203,10 @@ fn strip_xet_metadata(bytes: Bytes) -> Bytes {
     }
 }
 
-/// Shared body of [`proxy_model_info`] and [`proxy_model_tree`]: fetch a
-/// buffered JSON metadata document from a Remote repo's upstream and hand it
-/// back with Xet fields removed by [`strip_xet_metadata`].
+/// Body of [`proxy_model_info`]: fetch a buffered JSON metadata document from
+/// a Remote repo's upstream and hand it back with Xet fields removed by
+/// [`strip_xet_metadata`]. [`proxy_model_tree`] runs the same guards and the
+/// same capped fetch once per page (#5321).
 ///
 /// Keeping the Remote/upstream/proxy-wired guards and the capped fetch in one
 /// place is what makes the two endpoints propagate upstream failures
@@ -634,15 +1229,19 @@ async fn proxy_hf_metadata_json(
         return Ok(None);
     };
 
-    let (bytes, _content_type) = proxy_helpers::proxy_fetch_capped(
+    // The real format reaches the cache classifier (#5283): model info and
+    // a tree at a commit sha are immutable, branch and tag forms are not.
+    let (bytes, _content_type) = proxy_helpers::proxy_fetch_capped_with_format(
         proxy,
         repo.id,
         &repo.key,
         upstream_url,
         upstream_path,
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        crate::models::repository::RepositoryFormat::Huggingface,
     )
-    .await?;
+    .await
+    .map_err(|resp| hub_upstream_refusal(repo, resp))?;
 
     Ok(Some(
         Response::builder()
@@ -702,13 +1301,14 @@ async fn fetch_upstream_commit_sha(
         "api/models/{model_id}/revision/{}",
         encode_upstream_revision(revision)
     );
-    let fetch = proxy_helpers::proxy_fetch_capped(
+    let fetch = proxy_helpers::proxy_fetch_capped_with_format(
         proxy,
         repo.id,
         &repo.key,
         upstream_url,
         &upstream_path,
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        crate::models::repository::RepositoryFormat::Huggingface,
     );
 
     // Own deadline, not the shared client's: see `COMMIT_SHA_FALLBACK_TIMEOUT`.
@@ -953,83 +1553,30 @@ async fn download_file_namespaced(
     .await
 }
 
-/// The `Range` to honour for this request, if any.
+/// The stored file at `artifact_path`, with what the resolve route serves it by.
 ///
-/// `Range` is defined for GET only (RFC 9110 §14.2), so a HEAD ignores it and
-/// keeps reporting the whole file. `If-Range` keeps it only for the current
-/// strong ETag; an older ETag or a date gets the whole file, which is the safe
-/// answer for a client resuming a file that may have changed (§13.1.5).
-fn effective_range<'a>(
-    headers: &'a HeaderMap,
-    etag: Option<&str>,
-    is_head: bool,
-) -> Option<&'a str> {
-    if is_head {
-        return None;
-    }
-    if let Some(validator) = headers.get(IF_RANGE) {
-        let current = etag.filter(|e| !e.starts_with("W/"));
-        if validator.to_str().ok() != current || current.is_none() {
-            return None;
-        }
-    }
-    headers.get(RANGE).and_then(|v| v.to_str().ok())
-}
-
-/// Apply the client's `Range` to a Remote or Virtual serve, which arrives from
-/// the shared streaming builder as a complete `200` (#5145).
-///
-/// The window is cut from the object's stream by
-/// [`ranged_stream_response`](crate::api::handlers::repositories::ranged_stream_response),
-/// as the OCI blob route does for its proxied bytes. `Range` is never forwarded
-/// upstream, so a cold serve still fills the cache with the whole file.
-///
-/// Left as it is: anything but a `200` (a presigned redirect's target answers
-/// `Range` itself), a content-coded body (a client's offsets describe the
-/// decoded file) and a body of unknown length.
-#[allow(clippy::result_large_err)]
-fn apply_range_to_streamed_serve(
-    resp: Response,
-    headers: &HeaderMap,
-    is_head: bool,
-) -> Result<Response, Response> {
-    use futures::StreamExt;
-
-    let total = resp
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-    let Some(total) = total.filter(|_| {
-        resp.status() == StatusCode::OK && !resp.headers().contains_key(CONTENT_ENCODING)
-    }) else {
-        return Ok(resp);
-    };
-
-    let etag = resp.headers().get(ETAG).and_then(|v| v.to_str().ok());
-    let range = effective_range(headers, etag, is_head);
-    let (mut parts, body) = resp.into_parts();
-    let stream = body
-        .into_data_stream()
-        .map(|chunk| chunk.map_err(|e| crate::error::AppError::BadGateway(e.to_string())))
-        .boxed();
-    let ranged = crate::api::handlers::repositories::ranged_stream_response(
-        range,
-        total,
-        stream,
-        Vec::new(),
+/// Runtime query rather than `sqlx::query!` so `checksum_sha256` can be read
+/// alongside the storage key in a single round trip; this is the same
+/// runtime-query + `try_get` shape
+/// `proxy_helpers::find_artifact_by_name_lowercase` uses. The checksum feeds
+/// the resolve ETag (#2915).
+async fn find_stored_file(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    artifact_path: &str,
+) -> Result<Option<sqlx::postgres::PgRow>, Response> {
+    sqlx::query(
+        "SELECT id, storage_key, size_bytes, checksum_sha256 FROM artifacts \
+         WHERE repository_id = $1 \
+           AND is_deleted = false \
+           AND path = $2 \
+         LIMIT 1",
     )
-    .map_err(|e| e.into_response())?;
-
-    let (ranged_parts, ranged_body) = ranged.into_parts();
-    if ranged_parts.status == StatusCode::RANGE_NOT_SATISFIABLE {
-        // No representation is served, so none of its headers apply.
-        parts.headers.clear();
-    }
-    parts.status = ranged_parts.status;
-    parts.headers.remove(CONTENT_LENGTH);
-    parts.headers.extend(ranged_parts.headers);
-    Ok(Response::from_parts(parts, ranged_body))
+    .bind(repository_id)
+    .bind(artifact_path)
+    .fetch_optional(db)
+    .await
+    .map_err(super::db_err)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1047,31 +1594,42 @@ async fn download_file_impl(
     validate_model_coordinates(&model_id, Some(&revision))?;
 
     let filename = filename.trim_start_matches('/');
-    let artifact_path = format!("{}/{}/{}", model_id, revision, filename);
+    let mut artifact_path = format!("{}/{}/{}", model_id, revision, filename);
 
     // GHSA-6wjw-gcvx-3q58: same reject-at-ingest rule as the upload path, so
     // read and write can never diverge on what they accept (#2915).
     crate::services::upload_service::validate_artifact_path(&artifact_path)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
 
-    // Runtime query rather than `sqlx::query!` so `checksum_sha256` can be read
-    // alongside the storage key in a single round trip; this is the same
-    // runtime-query + `try_get` shape
-    // `proxy_helpers::find_artifact_by_name_lowercase` uses. The checksum feeds
-    // the resolve ETag below (#2915).
     use sqlx::Row;
-    let artifact = sqlx::query(
-        "SELECT id, storage_key, size_bytes, checksum_sha256 FROM artifacts \
-         WHERE repository_id = $1 \
-           AND is_deleted = false \
-           AND path = $2 \
-         LIMIT 1",
-    )
-    .bind(repo.id)
-    .bind(&artifact_path)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(super::db_err)?;
+    let mut artifact = find_stored_file(&state.db, repo.id, &artifact_path).await?;
+
+    // `snapshot_download` (and `hf_hub_download` once a ref is cached) asks for
+    // every file at the commit model info reported, `/resolve/<sha>/<file>`.
+    // For a hosted model that `sha` is synthetic, so map it back to the
+    // revision it was derived from (#5280). Only a 40-hex revision that no
+    // stored path matched takes this lookup, and only an exact synthetic match
+    // rewrites it, so a Remote repository's real upstream commits fall through
+    // to the proxy unchanged. A Virtual repository serves no model info, so it
+    // never hands out a synthetic commit to map.
+    let mut revision = revision;
+    if artifact.is_none()
+        && is_commit_hash(&revision)
+        && proxy_helpers::classify_remote_or_virtual(&repo.repo_type)
+            != proxy_helpers::RemoteOrVirtualAction::Virtual
+    {
+        let revisions = local_model_revisions(&state.db, repo.id, &model_id).await?;
+        if let Some(local) = pick_local_revision(&model_id, &revisions, Some(&revision))
+            .filter(|local| *local != revision)
+        {
+            let local_path = format!("{model_id}/{local}/{filename}");
+            artifact = find_stored_file(&state.db, repo.id, &local_path).await?;
+            if artifact.is_some() {
+                revision = local;
+                artifact_path = local_path;
+            }
+        }
+    }
 
     let Some(artifact) = artifact else {
         // The revision is re-encoded here: axum handed us the decoded value, and
@@ -1096,7 +1654,8 @@ async fn download_file_impl(
                 suppress_upstream_proxy: false,
             },
         )
-        .await?
+        .await
+        .map_err(|resp| hub_upstream_refusal(&repo, resp))?
         {
             // Remote serves normally arrive with upstream's own ETag and
             // `X-Repo-Commit` already forwarded by the streaming response
@@ -1190,7 +1749,7 @@ async fn upload_file(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, model_id, revision)): Path<(String, String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, Response> {
     upload_file_impl(state, auth, repo_key, model_id, revision, headers, body).await
 }
@@ -1200,7 +1759,7 @@ async fn upload_file_namespaced(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, namespace, name, revision)): Path<(String, String, String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, Response> {
     upload_file_impl(
         state,
@@ -1221,17 +1780,13 @@ async fn upload_file_impl(
     model_id: String,
     revision: String,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "huggingface", "write:artifacts")?.user_id;
     let repo = resolve_huggingface_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
-
-    if body.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Empty file body").into_response());
-    }
 
     // Length ceilings (`name` is VARCHAR(512), `version` is VARCHAR(255)) plus
     // the traversal/NUL rejections, from the one helper the read paths also use
@@ -1262,10 +1817,45 @@ async fn upload_file_impl(
             .into_response());
     }
 
-    // Compute SHA256
-    let mut hasher = Sha256::new();
-    hasher.update(&body);
-    let computed_sha256 = format!("{:x}", hasher.finalize());
+    // #5291: a declared body over `MAX_UPLOAD_SIZE` is refused before any of
+    // it is read. The stager below enforces the same cap on the bytes actually
+    // received, which covers a chunked body or a wrong header.
+    let max = state.config.max_upload_size_bytes;
+    if max != 0 && super::upload_body::declared_content_length(&headers).is_some_and(|n| n > max) {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("Upload exceeds the maximum allowed size of {max} bytes"),
+        )
+            .into_response());
+    }
+
+    // A published file is immutable, so a re-publish to a taken path is
+    // refused before its body is received rather than after (#5291). The
+    // authoritative check (which also sweeps a soft-deleted row) still runs
+    // below, after staging, where it always ran. A request that declares an
+    // empty body skips this probe so it keeps answering 400.
+    if super::upload_body::declared_content_length(&headers) != Some(0) {
+        reject_if_artifact_path_taken(&state.db, repo.id, &artifact_path).await?;
+    }
+
+    // #5291: stream the body to a bounded staging area (local scratch, or the
+    // repository's own backend when it streams natively), computing SHA-256
+    // as it arrives, instead of holding the whole file in memory. The stager
+    // refuses with 413 once `MAX_UPLOAD_SIZE` is crossed, and the staged copy
+    // is removed when `staged` drops, on every early return below.
+    let (staged, digests) = super::repositories::GenericStagedBody::stage_for_repo(
+        &state,
+        &repo,
+        body.into_data_stream(),
+    )
+    .await?;
+
+    if staged.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Empty file body").into_response());
+    }
+
+    let computed_sha256 = digests.sha256.clone();
+    let size_bytes = staged.size_bytes();
 
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
@@ -1275,10 +1865,27 @@ async fn upload_file_impl(
     )
     .await?;
 
-    let storage_key = format!("huggingface/{}/{}/{}", model_id, revision, filename);
-    proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, body.clone()).await?;
-
-    let size_bytes = body.len() as i64;
+    // Same quota preflight and cross-repository write guard as the buffered
+    // `put_artifact_bytes` this replaces, then the staged bytes are streamed
+    // (or copied server-side) to the final key and the staging copy released.
+    // Repo-scoped on a shared cloud namespace (#5662), so two repositories
+    // holding the same model file do not collide on one key; reads go
+    // through the row's storage_key, so legacy flat-key rows keep serving.
+    let storage_key = crate::storage::StorageKeyScheme::from_env().write_key(
+        &repo.storage_backend,
+        "huggingface",
+        repo.id,
+        &format!("{}/{}/{}", model_id, revision, filename),
+    );
+    proxy_helpers::put_staged_body(
+        &state,
+        &repo,
+        super::publish_quota::PublishAt::StorageKey(&storage_key),
+        &storage_key,
+        staged,
+        &digests,
+    )
+    .await?;
 
     let metadata = serde_json::json!({
         "model_id": model_id,
@@ -1326,6 +1933,7 @@ async fn upload_file_impl(
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         "huggingface",
         &model_id,
@@ -1367,6 +1975,30 @@ async fn upload_file_impl(
         .unwrap())
 }
 
+/// Refuse with the upload route's 409 when a live artifact already sits at
+/// `artifact_path`. Read-only: unlike
+/// [`proxy_helpers::ensure_unique_artifact_path`] it never sweeps a
+/// soft-deleted row, so it can run before the body has been received (#5291).
+#[allow(clippy::result_large_err)]
+async fn reject_if_artifact_path_taken(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    artifact_path: &str,
+) -> Result<(), Response> {
+    let existing: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+    )
+    .bind(repo_id)
+    .bind(artifact_path)
+    .fetch_optional(db)
+    .await
+    .map_err(super::db_err)?;
+    match existing {
+        Some(_) => Err((StatusCode::CONFLICT, "File already exists at this path").into_response()),
+        None => Ok(()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GET /huggingface/{repo_key}/api/models/{model_id}/tree/{revision} — List files
 // ---------------------------------------------------------------------------
@@ -1374,15 +2006,24 @@ async fn upload_file_impl(
 async fn list_files(
     State(state): State<SharedState>,
     Path((repo_key, model_id, revision)): Path<(String, String, String)>,
+    RawQuery(query): RawQuery,
 ) -> Result<Response, Response> {
-    list_files_impl(state, repo_key, model_id, revision).await
+    list_files_impl(state, repo_key, model_id, revision, query).await
 }
 
 async fn list_files_namespaced(
     State(state): State<SharedState>,
     Path((repo_key, namespace, name, revision)): Path<(String, String, String, String)>,
+    RawQuery(query): RawQuery,
 ) -> Result<Response, Response> {
-    list_files_impl(state, repo_key, format!("{namespace}/{name}"), revision).await
+    list_files_impl(
+        state,
+        repo_key,
+        format!("{namespace}/{name}"),
+        revision,
+        query,
+    )
+    .await
 }
 
 async fn list_files_impl(
@@ -1390,9 +2031,20 @@ async fn list_files_impl(
     repo_key: String,
     model_id: String,
     revision: String,
+    query: Option<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_huggingface_repo(&state.db, &repo_key).await?;
     validate_model_coordinates(&model_id, Some(&revision))?;
+    let query = parse_tree_query(query.as_deref())
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg).into_response())?;
+
+    // `snapshot_download` lists the tree at the commit model info reported, so
+    // a hosted model's synthetic `sha` must lead back to its revision here as
+    // it does on the resolve route (#5280). A revision the repository does
+    // not hold is looked up literally, as before.
+    let revisions = local_model_revisions(&state.db, repo.id, &model_id).await?;
+    let local_revision = pick_local_revision(&model_id, &revisions, Some(&revision))
+        .unwrap_or_else(|| revision.clone());
 
     // Two prefixes, deliberately: the LIKE pattern is escaped so `%`/`_`/`\` in
     // a model ID or revision cannot widen the match, while the prefix stripped
@@ -1402,8 +2054,8 @@ async fn list_files_impl(
     // `strip_prefix` could not match - so `unwrap_or` fell through and the
     // endpoint reported every entry under its full stored path instead of the
     // path relative to the revision.
-    let like_prefix = super::escape_path_prefix(&[&model_id, &revision]);
-    let path_prefix = format!("{}/{}/", model_id, revision);
+    let like_prefix = super::escape_path_prefix(&[&model_id, &local_revision]);
+    let path_prefix = format!("{}/{}/", model_id, local_revision);
 
     let artifacts = sqlx::query!(
         r#"
@@ -1427,7 +2079,7 @@ async fn list_files_impl(
     // artifacts that were promoted into a Remote repo authoritative, exactly as
     // `model_info_impl` does.
     if artifacts.is_empty() {
-        if let Some(resp) = proxy_model_tree(&state, &repo, &model_id, &revision).await? {
+        if let Some(resp) = proxy_model_tree(&state, &repo, &model_id, &revision, &query).await? {
             return Ok(resp);
         }
     }
@@ -1449,12 +2101,56 @@ async fn list_files_impl(
             })
         })
         .collect();
+    let files = shape_local_tree(files, query.recursive, &model_id, &revision);
 
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_string(&files).unwrap()))
         .unwrap())
+}
+
+/// Give a hosted listing the Hub's `recursive` semantics (#5321).
+///
+/// `files` is every file of the revision, nested ones included, in path order.
+/// With `recursive=true` that is the answer: the files `snapshot_download`
+/// needs. Without it the Hub lists only the top level, a subdirectory standing
+/// for its contents as one `"type": "directory"` entry, which is what
+/// `list_repo_tree(recursive=False)` turns into a `RepoFolder`. A hosted
+/// repository has no git trees, so the directory `oid` is derived from the
+/// coordinates, stable as [`local_repo_commit_sha`] is.
+fn shape_local_tree(
+    files: Vec<serde_json::Value>,
+    recursive: bool,
+    model_id: &str,
+    revision: &str,
+) -> Vec<serde_json::Value> {
+    if recursive {
+        return files;
+    }
+    let mut seen_dirs = std::collections::HashSet::new();
+    let mut shaped = Vec::with_capacity(files.len());
+    for file in files {
+        let dir = file["path"]
+            .as_str()
+            .and_then(|path| path.split_once('/'))
+            .map(|(dir, _)| dir.to_string());
+        match dir {
+            None => shaped.push(file),
+            Some(dir) => {
+                if seen_dirs.insert(dir.clone()) {
+                    let oid = local_repo_commit_sha(model_id, &format!("{revision}\n{dir}/"));
+                    shaped.push(serde_json::json!({
+                        "type": "directory",
+                        "oid": oid,
+                        "size": 0,
+                        "path": dir,
+                    }));
+                }
+            }
+        }
+    }
+    shaped
 }
 
 #[cfg(ak_test_shard = "handlers-1")]
@@ -1662,18 +2358,44 @@ mod tests {
         );
     }
 
+    /// The longest key the upload writes, the repo-scoped cloud key
+    /// (`huggingface/{repository_id}/` + path, #5662).
+    fn longest_storage_key(path: &str) -> String {
+        crate::storage::StorageKeyScheme::RepoScoped.write_key(
+            "s3",
+            "huggingface",
+            uuid::Uuid::new_v4(),
+            path,
+        )
+    }
+
     #[test]
     fn test_long_model_id_storage_key_fits_in_db() {
-        // Storage key adds "huggingface/" prefix (12 chars).
+        // The repo-scoped storage key adds "huggingface/{uuid}/" (49 chars).
         let model_id = "a".repeat(MAX_MODEL_ID_LEN);
         let revision = "main";
         let filename = "model.safetensors";
-        let key = format!("huggingface/{}/{}/{}", model_id, revision, filename);
+        let key = longest_storage_key(&format!("{}/{}/{}", model_id, revision, filename));
         assert!(
             key.len() <= 2048,
             "storage_key length {} exceeds VARCHAR(2048)",
             key.len()
         );
+    }
+
+    /// #5662: a path of exactly MAX_PATH_LEN still fits VARCHAR(2048) under
+    /// the repo-scoped cloud key, and the cap is not looser than that.
+    #[test]
+    fn test_max_path_len_storage_key_fits_in_db_5662() {
+        let key = longest_storage_key(&"p".repeat(MAX_PATH_LEN));
+        assert_eq!(key.len(), 2048);
+        let flat = crate::storage::StorageKeyScheme::Flat.write_key(
+            "s3",
+            "huggingface",
+            uuid::Uuid::new_v4(),
+            &"p".repeat(MAX_PATH_LEN),
+        );
+        assert!(flat.len() <= 2048);
     }
 
     #[test]
@@ -1689,10 +2411,7 @@ mod tests {
         assert_eq!(model_id.len(), 120);
         let path = format!("{}/{}/{}", model_id, "main", "weights.safetensors");
         assert!(path.len() <= MAX_PATH_LEN);
-        let key = format!(
-            "huggingface/{}/{}/{}",
-            model_id, "main", "weights.safetensors"
-        );
+        let key = longest_storage_key(&path);
         assert!(key.len() <= 2048);
     }
 
@@ -1802,6 +2521,301 @@ mod tests {
             status
         );
         f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #5291: hosted uploads stream to storage instead of being buffered.
+    // -----------------------------------------------------------------------
+
+    /// Small `MAX_UPLOAD_SIZE` the #5291 size tests run against.
+    const TEST_MAX_UPLOAD: u64 = 64;
+
+    /// A fixture whose state carries `TEST_MAX_UPLOAD` as its upload cap.
+    async fn small_limit_fixture() -> Option<tdh::Fixture> {
+        let mut f = tdh::Fixture::setup("local", "huggingface").await?;
+        f.state = tdh::build_state_with(f.pool.clone(), f.storage_dir.to_str().unwrap(), |cfg| {
+            cfg.max_upload_size_bytes = TEST_MAX_UPLOAD
+        });
+        Some(f)
+    }
+
+    fn upload_request(
+        repo_key: &str,
+        model: &str,
+        filename: &str,
+        body: Body,
+    ) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{repo_key}/api/models/{model}/upload/main"))
+            .header("x-filename", filename)
+            .body(body)
+            .unwrap()
+    }
+
+    async fn artifact_count(f: &tdh::Fixture) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+            .bind(f.repo_id)
+            .fetch_one(&f.pool)
+            .await
+            .expect("count artifacts")
+    }
+
+    /// The fixture repository's storage backend, resolved from its stored
+    /// row as the upload handler resolves it.
+    async fn fixture_storage(
+        f: &tdh::Fixture,
+    ) -> std::sync::Arc<dyn crate::storage::StorageBackend> {
+        let repo = resolve_huggingface_repo(&f.state.db, &f.repo_key)
+            .await
+            .expect("repo");
+        f.state
+            .storage_for_repo(&repo.storage_location())
+            .expect("storage")
+    }
+
+    /// Upload staging files left under the fixture's staging root. Skipped
+    /// (empty) when the staging root is overridden by the environment, since
+    /// that directory is shared with every other test.
+    fn leftover_staging_files(f: &tdh::Fixture) -> Vec<String> {
+        if std::env::var_os("AK_UPLOAD_STAGING_DIR").is_some()
+            || std::env::var_os("AK_INCUS_UPLOAD_TMP_DIR").is_some()
+        {
+            return Vec::new();
+        }
+        let root = crate::api::handlers::incus::staging_root(f.storage_dir.to_str().unwrap());
+        std::fs::read_dir(root)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| crate::api::handlers::incus::is_staging_file(n))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// #5662: the same model file uploads into two Hugging Face repositories
+    /// on a shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_model_file_uploads_to_two_cloud_repositories_5662() {
+        let file = b"{\"model_type\":\"scoped-5662\"}";
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "huggingface",
+            key_prefix: "huggingface",
+            router: super::router,
+            publish: &|key| {
+                vec![upload_request(
+                    key,
+                    "scoped5662-model",
+                    "config.json",
+                    Body::from(&file[..]),
+                )]
+            },
+            download: &|key| tdh::get(format!("/{key}/scoped5662-model/resolve/main/config.json")),
+            expected: file,
+        })
+        .await;
+    }
+
+    /// A body over `MAX_UPLOAD_SIZE`, sent with no `Content-Length` and in
+    /// several chunks, is cut off while streaming with 413: no artifact row,
+    /// no stored object and no staging file is left behind.
+    #[tokio::test]
+    async fn upload_over_max_upload_size_streamed_is_413_5291() {
+        let Some(f) = small_limit_fixture().await else {
+            return;
+        };
+        let chunks: Vec<Result<Bytes, std::io::Error>> = (0..5)
+            .map(|_| Ok(Bytes::from(vec![b'a'; TEST_MAX_UPLOAD as usize / 4])))
+            .collect();
+        let req = upload_request(
+            &f.repo_key,
+            "big-model",
+            "weights.bin",
+            Body::from_stream(futures::stream::iter(chunks)),
+        );
+        let (status, body) = tdh::send(f.router_with_auth(super::router()), req).await;
+        let count = artifact_count(&f).await;
+        let stored = fixture_storage(&f)
+            .await
+            .exists("huggingface/big-model/main/weights.bin")
+            .await
+            .unwrap_or(false);
+        let leftovers = leftover_staging_files(&f);
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "got {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains(&TEST_MAX_UPLOAD.to_string()),
+            "the 413 names the configured limit"
+        );
+        assert_eq!(count, 0, "a refused upload records no artifact row");
+        assert!(!stored, "a refused upload stores no object");
+        assert!(leftovers.is_empty(), "staging files leaked: {leftovers:?}");
+    }
+
+    /// A declared `Content-Length` over `MAX_UPLOAD_SIZE` is refused up front.
+    #[tokio::test]
+    async fn upload_declared_length_over_max_upload_size_is_413_5291() {
+        let Some(f) = small_limit_fixture().await else {
+            return;
+        };
+        let content = vec![b'a'; TEST_MAX_UPLOAD as usize + 1];
+        let mut req = upload_request(
+            &f.repo_key,
+            "big-model",
+            "weights.bin",
+            Body::from(content.clone()),
+        );
+        req.headers_mut().insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&content.len().to_string()).unwrap(),
+        );
+        let (status, _) = tdh::send(f.router_with_auth(super::router()), req).await;
+        let count = artifact_count(&f).await;
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(count, 0);
+    }
+
+    /// A body of exactly `MAX_UPLOAD_SIZE` is accepted, and an empty body is
+    /// still a 400.
+    #[tokio::test]
+    async fn upload_at_max_upload_size_is_stored_and_empty_is_400_5291() {
+        let Some(f) = small_limit_fixture().await else {
+            return;
+        };
+        let req = upload_request(
+            &f.repo_key,
+            "edge-model",
+            "exact.bin",
+            Body::from(vec![b'z'; TEST_MAX_UPLOAD as usize]),
+        );
+        let (exact, _) = tdh::send(f.router_with_auth(super::router()), req).await;
+        let req = upload_request(&f.repo_key, "edge-model", "empty.bin", Body::empty());
+        let (empty, empty_body) = tdh::send(f.router_with_auth(super::router()), req).await;
+        let count = artifact_count(&f).await;
+        f.teardown().await;
+
+        assert_eq!(exact, StatusCode::OK);
+        assert_eq!(empty, StatusCode::BAD_REQUEST);
+        assert_eq!(&empty_body[..], b"Empty file body");
+        assert_eq!(count, 1);
+    }
+
+    /// A multi-chunk upload is stored byte for byte, and the sha256 and size
+    /// in the response and on the artifact row are those of the bytes sent.
+    #[tokio::test]
+    async fn upload_streams_body_and_records_its_sha256_5291() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        // ~1.5 MiB in uneven chunks, so the staging and storage copies both
+        // span several reads.
+        let content: Vec<u8> = (0..(3 * 512 * 1024 + 17))
+            .map(|i: u32| (i % 251) as u8)
+            .collect();
+        let chunks: Vec<Result<Bytes, std::io::Error>> = content
+            .chunks(100_003)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+        let req = upload_request(
+            &f.repo_key,
+            "acme/streamed",
+            "model.gguf",
+            Body::from_stream(futures::stream::iter(chunks)),
+        );
+        let (status, body) = tdh::send(f.router_with_auth(super::router()), req).await;
+        let stored = fixture_storage(&f)
+            .await
+            .get("huggingface/acme/streamed/main/model.gguf")
+            .await;
+        let row: Option<(i64, String)> = sqlx::query_as(
+            "SELECT size_bytes, checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(f.repo_id)
+        .bind("acme/streamed/main/model.gguf")
+        .fetch_optional(&f.pool)
+        .await
+        .expect("artifact row");
+        let leftovers = leftover_staging_files(&f);
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "upload failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let want_sha = format!("{:x}", Sha256::digest(&content));
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+        assert_eq!(json["message"], "File uploaded successfully");
+        assert_eq!(json["path"], "acme/streamed/main/model.gguf");
+        assert_eq!(json["sha256"], want_sha.as_str());
+        assert_eq!(json["size"], content.len() as i64);
+        let stored = stored.expect("stored object");
+        assert!(stored.as_ref() == content.as_slice(), "stored bytes differ");
+        assert_eq!(row, Some((content.len() as i64, want_sha)));
+        assert!(leftovers.is_empty(), "staging files leaked: {leftovers:?}");
+    }
+
+    /// A published file is immutable: a second upload to the same path is a
+    /// 409, whether or not the bytes differ, and the first file's bytes stay.
+    #[tokio::test]
+    async fn upload_republish_to_taken_path_is_409_5291() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let send = |body: &'static [u8]| {
+            let req = upload_request(&f.repo_key, "frozen", "config.json", Body::from(body));
+            tdh::send(f.router_with_auth(super::router()), req)
+        };
+        let (first, _) = send(b"{\"v\":1}").await;
+        let (different, different_body) = send(b"{\"v\":2}").await;
+        let (same, _) = send(b"{\"v\":1}").await;
+        let stored = fixture_storage(&f)
+            .await
+            .get("huggingface/frozen/main/config.json")
+            .await;
+        let count = artifact_count(&f).await;
+        f.teardown().await;
+
+        assert_eq!(first, StatusCode::OK);
+        assert_eq!(different, StatusCode::CONFLICT);
+        assert_eq!(&different_body[..], b"File already exists at this path");
+        assert_eq!(same, StatusCode::CONFLICT);
+        assert_eq!(stored.expect("stored").as_ref(), b"{\"v\":1}");
+        assert_eq!(count, 1);
+    }
+
+    /// #5291 ratchet: the upload handlers take the request body as a stream,
+    /// never as a buffered `Bytes` extractor.
+    #[test]
+    fn upload_handlers_take_a_streamed_body_5291() {
+        let source = include_str!("huggingface.rs");
+        for name in ["upload_file", "upload_file_namespaced", "upload_file_impl"] {
+            let start = source
+                .find(&format!("async fn {name}("))
+                .unwrap_or_else(|| panic!("{name} not found"));
+            let signature = &source[start..];
+            let signature = &signature[..signature.find(") -> Result").expect("signature end")];
+            assert!(
+                signature.contains("body: Body,"),
+                "{name} must take the body as axum::body::Body"
+            );
+            assert!(
+                !signature.contains("Bytes"),
+                "{name} must not buffer the upload body as Bytes"
+            );
+        }
     }
 
     /// #4725: a HuggingFace file upload to a hosted repository must queue a
@@ -2533,6 +3547,243 @@ mod tests {
         );
     }
 
+    /// #5323: what a Hugging Face client is told for each upstream refusal.
+    /// `huggingface_hub` raises `GatedRepoError` for `X-Error-Code: GatedRepo`
+    /// with 401 or 403 and `RepositoryNotFoundError` for `RepoNotFound`.
+    #[test]
+    fn test_hub_refusal_reply_mirrors_the_hub_5323() {
+        let reply = |status, code| hub_refusal_reply(status, code, "hf-remote");
+
+        let (code, message) = reply(StatusCode::UNAUTHORIZED, Some("GatedRepo"));
+        assert_eq!(code, Some("GatedRepo"));
+        assert!(message.contains("gated"), "{message}");
+        assert!(
+            message.contains("PUT /api/v1/repositories/hf-remote/upstream-auth"),
+            "{message}"
+        );
+        assert_eq!(
+            reply(StatusCode::FORBIDDEN, Some("GatedRepo")).0,
+            Some("GatedRepo")
+        );
+
+        // A 401 without a code is the Hub's answer for a missing or private
+        // repository; a 403 without one keeps no code.
+        assert_eq!(
+            reply(StatusCode::UNAUTHORIZED, None).0,
+            Some("RepoNotFound")
+        );
+        assert_eq!(
+            reply(StatusCode::UNAUTHORIZED, Some("RepoNotFound")).0,
+            Some("RepoNotFound")
+        );
+        let (code, message) = reply(StatusCode::FORBIDDEN, None);
+        assert_eq!(code, None);
+        assert!(message.contains("upstream-auth"), "{message}");
+        assert_eq!(
+            reply(StatusCode::FORBIDDEN, Some("EntryNotFound")).0,
+            Some("EntryNotFound")
+        );
+    }
+
+    /// Mount the Hub's refusal of `model` on both resolve and model-info: the
+    /// status, the Hub's `X-Error-Message`, its `X-Error-Code` when `code` is
+    /// set, and (when `challenge`) the `WWW-Authenticate: Bearer
+    /// realm="Authentication required"` huggingface.co sends with a 401.
+    async fn mount_hub_refusal(
+        server: &wiremock::MockServer,
+        model: &str,
+        status: u16,
+        code: Option<&str>,
+        challenge: bool,
+    ) {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        for upstream_path in [
+            format!("/{model}/resolve/main/config.json"),
+            format!("/api/models/{model}/revision/main"),
+        ] {
+            let mut template = ResponseTemplate::new(status)
+                .insert_header("x-error-message", "upstream-said-this")
+                .set_body_string("upstream-said-this");
+            if let Some(code) = code {
+                template = template.insert_header("x-error-code", code);
+            }
+            if challenge {
+                template = template.insert_header(
+                    "www-authenticate",
+                    "Bearer realm=\"Authentication required\", charset=\"UTF-8\"",
+                );
+            }
+            Mock::given(method("GET"))
+                .and(wm_path(upstream_path))
+                .respond_with(template)
+                .mount(server)
+                .await;
+        }
+    }
+
+    /// #5323: an upstream 401/403 from the Hub reaches the client as the same
+    /// 401/403 with an `X-Error-Code` huggingface_hub recognises, on resolve and
+    /// on model-info, never as a 5xx it would retry (nor the 400 the Hub's
+    /// non-URL Bearer realm used to produce). The Hub's own message is not
+    /// echoed.
+    #[tokio::test]
+    async fn test_huggingface_upstream_refusal_is_a_hub_client_error_5323() {
+        use wiremock::MockServer;
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // (model, upstream status, upstream code, challenge, client code)
+        let cases: [(&str, u16, Option<&str>, bool, &str); 4] = [
+            ("org/gated-401", 401, Some("GatedRepo"), true, "GatedRepo"),
+            ("org/gated-403", 403, Some("GatedRepo"), false, "GatedRepo"),
+            (
+                "org/missing-401",
+                401,
+                Some("RepoNotFound"),
+                false,
+                "RepoNotFound",
+            ),
+            ("org/private-401", 401, None, true, "RepoNotFound"),
+        ];
+        for (model, status, code, challenge, _) in cases {
+            mount_hub_refusal(&server, model, status, code, challenge).await;
+        }
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let mut seen = Vec::new();
+        for (model, status, _, _, client_code) in cases {
+            for uri in [
+                format!("/{}/{model}/resolve/main/config.json", f.repo_key),
+                format!("/{}/api/models/{model}/revision/main", f.repo_key),
+            ] {
+                let (got, body, headers) =
+                    tdh::send_with_headers(app.clone(), tdh::get(uri.clone())).await;
+                seen.push((uri, status, got, body, headers, client_code));
+            }
+        }
+
+        f.teardown().await;
+
+        for (uri, status, got, body, headers, client_code) in seen {
+            assert_eq!(got.as_u16(), status, "{uri}: the upstream refusal's status");
+            assert_eq!(
+                headers.get("x-error-code").and_then(|v| v.to_str().ok()),
+                Some(client_code),
+                "{uri}"
+            );
+            let message = headers
+                .get("x-error-message")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            assert!(message.contains("upstream-auth"), "{uri}: {message}");
+            let body = String::from_utf8_lossy(&body);
+            assert!(!body.contains("upstream-said-this"), "{uri}: {body}");
+            assert!(!message.contains("upstream-said-this"), "{uri}: {message}");
+        }
+    }
+
+    /// #5323: a gated model refused without an upstream credential downloads
+    /// once one is set (the refusal was not cached), and a credential the Hub
+    /// has not granted access gets the Hub's 403 `GatedRepo`, without the
+    /// credential appearing anywhere in the response.
+    #[tokio::test]
+    async fn test_huggingface_gated_model_with_upstream_auth_5323() {
+        use wiremock::matchers::{header, method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // `save_upstream_auth` encrypts via `encryption_key()`.
+        if std::env::var("JWT_SECRET").is_err() && std::env::var("SSO_ENCRYPTION_KEY").is_err() {
+            return;
+        }
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let token = "hf_upstream_secret_5323";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/org/gated/resolve/main/config.json"))
+            .and(header("authorization", format!("Bearer {token}").as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"{\"gated\": true}".to_vec()))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_hub_refusal(&server, "org/gated", 401, Some("GatedRepo"), true).await;
+        Mock::given(method("GET"))
+            .and(wm_path("/org/not-granted/resolve/main/config.json"))
+            .and(header("authorization", format!("Bearer {token}").as_str()))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .insert_header("x-error-code", "GatedRepo")
+                    .insert_header("x-error-message", "upstream-said-this"),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let gated = format!("/{}/org/gated/resolve/main/config.json", f.repo_key);
+
+        let (before, _, before_headers) =
+            tdh::send_with_headers(app.clone(), tdh::get(gated.clone())).await;
+
+        let creds = crate::services::upstream_auth::build_credentials_json(
+            &crate::services::upstream_auth::UpstreamAuthType::Bearer {
+                token: token.to_string(),
+            },
+        );
+        crate::services::upstream_auth::save_upstream_auth(&f.pool, f.repo_id, "bearer", &creds)
+            .await
+            .expect("save upstream auth");
+
+        let (after, after_body, _) = tdh::send_with_headers(app.clone(), tdh::get(gated)).await;
+        let (refused, refused_body, refused_headers) = tdh::send_with_headers(
+            app,
+            tdh::get(format!(
+                "/{}/org/not-granted/resolve/main/config.json",
+                f.repo_key
+            )),
+        )
+        .await;
+
+        f.teardown().await;
+
+        assert_eq!(before, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            before_headers
+                .get("x-error-code")
+                .and_then(|v| v.to_str().ok()),
+            Some("GatedRepo")
+        );
+        assert_eq!(
+            after,
+            StatusCode::OK,
+            "with upstream-auth set the gated model must download, so the earlier \
+             401 must not have been cached"
+        );
+        assert_eq!(&after_body[..], b"{\"gated\": true}");
+        assert_eq!(refused, StatusCode::FORBIDDEN);
+        assert_eq!(
+            refused_headers
+                .get("x-error-code")
+                .and_then(|v| v.to_str().ok()),
+            Some("GatedRepo")
+        );
+        let leaked = refused_headers
+            .values()
+            .any(|v| v.to_str().is_ok_and(|v| v.contains(token)))
+            || String::from_utf8_lossy(&refused_body).contains(token);
+        assert!(
+            !leaked,
+            "the upstream credential must never reach the client"
+        );
+    }
+
     #[tokio::test]
     async fn test_huggingface_model_info_cached_model_skips_upstream_proxy() {
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2766,6 +4017,78 @@ mod tests {
             "a HEAD probe must transfer no bytes, got {}",
             collected.len()
         );
+    }
+
+    /// #5283: a file fetched by commit sha is immutable and is served from the
+    /// cache without contacting the Hub again, even with the repository's
+    /// mutable-path TTL set to expire at once; the same file fetched by
+    /// branch is revalidated. Before, every Remote download reached the cache
+    /// classifier as `Generic`, which has no arm, so both were revalidated.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    async fn test_huggingface_commit_pinned_resolve_is_never_revalidated() {
+        use tower::ServiceExt;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let sha = "1110a243c5cd318b8688b1e73b6ba0b9c7d6f6cf";
+        let model = "sentence-transformers/all-MiniLM-L6-v2";
+        let server = MockServer::start().await;
+        for (rev, hits) in [(sha, 1), ("main", 2)] {
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/{model}/resolve/{rev}/model.safetensors")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("etag", "\"weights\"")
+                        .insert_header("x-repo-commit", sha)
+                        .set_body_bytes(b"weights".to_vec()),
+                )
+                .expect(hits)
+                .mount(&server)
+                .await;
+        }
+        // Every mutable path expires the moment it is cached.
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'cache_ttl_secs', '0')",
+        )
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .expect("set cache_ttl_secs");
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        for rev in [sha, "main"] {
+            for _ in 0..2 {
+                let req = axum::http::Request::builder()
+                    .uri(format!(
+                        "/{}/{model}/resolve/{rev}/model.safetensors",
+                        f.repo_key
+                    ))
+                    .body(Body::empty())
+                    .expect("build request");
+                let resp = app
+                    .clone()
+                    .oneshot(req)
+                    .await
+                    .expect("resolve must respond");
+                assert_eq!(resp.status(), StatusCode::OK, "{rev}");
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .expect("collect body");
+                assert_eq!(&body[..], b"weights", "{rev}");
+            }
+        }
+
+        f.teardown().await;
+        // `expect(..)` is checked when the server drops: one upstream request
+        // for the sha path, two for the branch path.
+        server.verify().await;
     }
 
     /// `X-Repo-Commit` comes from the resolve response's OWN header when upstream
@@ -3391,6 +4714,413 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // #5321: tree query (`recursive`, `expand`, `cursor`) and pagination.
+    // `snapshot_download` lists `tree/<commit>?recursive=true`; the Remote
+    // proxy used to drop the query, so files in subdirectories went missing.
+    // -----------------------------------------------------------------------
+
+    const TREE_MODEL: &str = "acme-lab/tiny-st";
+    const TREE_SHA: &str = "099a800f0123456789abcdef0123456789abcdef";
+
+    fn tree_entry(path: &str) -> serde_json::Value {
+        serde_json::json!({"type": "file", "oid": "abc", "size": 1, "path": path})
+    }
+
+    fn tree_upstream_mock(query: &[(&str, &str)], missing: &[&str]) -> wiremock::MockBuilder {
+        use wiremock::matchers::{method, path as wm_path, query_param, query_param_is_missing};
+        let mut mock = wiremock::Mock::given(method("GET"))
+            .and(wm_path(format!("/api/models/{TREE_MODEL}/tree/{TREE_SHA}")));
+        for (key, value) in query {
+            mock = mock.and(query_param(*key, *value));
+        }
+        for key in missing {
+            mock = mock.and(query_param_is_missing(*key));
+        }
+        mock
+    }
+
+    async fn tree_get(
+        app: &Router,
+        repo_key: &str,
+        query: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let (status, body) = tdh::send(
+            app.clone(),
+            tdh::get(format!(
+                "/{repo_key}/api/models/{TREE_MODEL}/tree/{TREE_SHA}{query}"
+            )),
+        )
+        .await;
+        let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    fn tree_paths(json: &serde_json::Value) -> Vec<&str> {
+        json.as_array()
+            .expect("tree must be a JSON array")
+            .iter()
+            .map(|e| e["path"].as_str().unwrap())
+            .collect()
+    }
+
+    /// The walkthrough's F2: the upstream lists `1_Pooling/config.json` only
+    /// when asked for `recursive=true`. The recursive and the plain listing are
+    /// two cache entries (one upstream request each), and the
+    /// `huggingface_hub` spelling `recursive=true&expand=false` shares the
+    /// entry of `recursive=true`.
+    #[tokio::test]
+    async fn remote_tree_forwards_recursive_and_caches_each_query_5321() {
+        use wiremock::{MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        tree_upstream_mock(&[("recursive", "true")], &["expand", "cursor"])
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                tree_entry("config.json"),
+                {"type": "directory", "oid": "d1", "size": 0, "path": "1_Pooling"},
+                tree_entry("1_Pooling/config.json"),
+            ])))
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        tree_upstream_mock(&[], &["recursive", "expand", "cursor"])
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                tree_entry("config.json"),
+                {"type": "directory", "oid": "d1", "size": 0, "path": "1_Pooling"},
+            ])))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let mut results = Vec::new();
+        for query in [
+            "?recursive=true&expand=false",
+            "?recursive=true",
+            "",
+            "?recursive=false",
+        ] {
+            results.push((query, tree_get(&app, &f.repo_key, query).await));
+        }
+        f.teardown().await;
+        server.verify().await;
+
+        for (query, (status, json)) in &results {
+            assert_eq!(*status, StatusCode::OK, "{query}");
+            let paths = tree_paths(json);
+            assert_eq!(
+                paths.contains(&"1_Pooling/config.json"),
+                query.contains("recursive=true"),
+                "{query}: {paths:?}"
+            );
+        }
+    }
+
+    /// `expand` and `cursor` reach the upstream too, the cursor form-encoded
+    /// so its `/` and `=` stay inside the query; unknown parameters and
+    /// `limit` do not.
+    #[tokio::test]
+    async fn remote_tree_forwards_expand_and_cursor_only_5321() {
+        use wiremock::{MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        tree_upstream_mock(
+            &[
+                ("recursive", "true"),
+                ("expand", "true"),
+                ("cursor", "abc/def=="),
+            ],
+            &["limit", "foo"],
+        )
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!([tree_entry("onnx/model.onnx")])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, json) = tree_get(
+            &app,
+            &f.repo_key,
+            "?foo=bar&cursor=abc%2Fdef%3D%3D&limit=5&expand=True&recursive=1",
+        )
+        .await;
+        let (bad_status, _) = tree_get(&app, &f.repo_key, "?recursive=maybe").await;
+        f.teardown().await;
+        server.verify().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(tree_paths(&json), ["onnx/model.onnx"]);
+        assert_eq!(bad_status, StatusCode::BAD_REQUEST);
+    }
+
+    fn full_tree_page() -> serde_json::Value {
+        serde_json::Value::Array(
+            (0..HUB_TREE_PAGE_ENTRIES)
+                .map(|i| tree_entry(&format!("shards/part-{i:04}.bin")))
+                .collect(),
+        )
+    }
+
+    /// A full page is followed through its `Link: rel="next"` cursor and the
+    /// pages come back as one array. The full page is read twice (the cached
+    /// fetch, then the uncached one that carries `Link`), the short last page
+    /// once.
+    #[tokio::test]
+    async fn remote_tree_follows_link_pages_5321() {
+        use wiremock::{MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let next = format!(
+            "<{}/api/models/{TREE_MODEL}/tree/{TREE_SHA}?recursive=true&expand=false&cursor=p%2F2%3D>; rel=\"next\"",
+            server.uri()
+        );
+        tree_upstream_mock(&[("recursive", "true")], &["cursor"])
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("link", next.as_str())
+                    .set_body_json(full_tree_page()),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        tree_upstream_mock(&[("recursive", "true"), ("cursor", "p/2=")], &[])
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                tree_entry("1_Pooling/config.json"),
+                tree_entry("zz-last.json"),
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, json) = tree_get(&app, &f.repo_key, "?recursive=true").await;
+        f.teardown().await;
+        server.verify().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let paths = tree_paths(&json);
+        assert_eq!(paths.len(), HUB_TREE_PAGE_ENTRIES + 2);
+        assert_eq!(paths[0], "shards/part-0000.bin");
+        assert_eq!(paths[HUB_TREE_PAGE_ENTRIES], "1_Pooling/config.json");
+        assert_eq!(*paths.last().unwrap(), "zz-last.json");
+    }
+
+    /// A full page whose `Link` cannot be read fails the request instead of
+    /// being served as the whole listing.
+    #[tokio::test]
+    async fn remote_tree_full_page_without_link_lookup_fails_closed_5321() {
+        use wiremock::{MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        tree_upstream_mock(&[("recursive", "true")], &["cursor"])
+            .respond_with(ResponseTemplate::new(200).set_body_json(full_tree_page()))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        tree_upstream_mock(&[("recursive", "true")], &["cursor"])
+            .respond_with(ResponseTemplate::new(500))
+            .with_priority(2)
+            .expect(1..)
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, _) = tree_get(&app, &f.repo_key, "?recursive=true").await;
+        f.teardown().await;
+        server.verify().await;
+
+        assert!(
+            status.is_server_error(),
+            "a listing that may continue must not be served as complete: {status}"
+        );
+    }
+
+    /// Hosted listings honour `recursive` as the Hub does: every file with it,
+    /// the top level plus one directory entry per subdirectory without it.
+    #[tokio::test]
+    async fn hosted_tree_honours_recursive_5321() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        for file in ["1_Pooling/config.json", "config.json", "onnx/a/model.onnx"] {
+            tdh::seed_artifact(
+                &f.state,
+                &f.pool,
+                &repo,
+                &format!("huggingface/{TREE_MODEL}/main/{file}"),
+                &format!("{TREE_MODEL}/main/{file}"),
+                TREE_MODEL,
+                "main",
+                "application/octet-stream",
+                bytes::Bytes::from_static(b"x"),
+                f.user_id,
+            )
+            .await;
+        }
+        let app = f.router_anon(super::router());
+        let get = |query: &'static str| {
+            tdh::send(
+                app.clone(),
+                tdh::get(format!(
+                    "/{}/api/models/{TREE_MODEL}/tree/main{query}",
+                    f.repo_key
+                )),
+            )
+        };
+        let (rec_status, rec_body) = get("?recursive=true").await;
+        let (top_status, top_body) = get("").await;
+        f.teardown().await;
+
+        assert_eq!(rec_status, StatusCode::OK);
+        let rec: serde_json::Value = serde_json::from_slice(&rec_body).unwrap();
+        assert_eq!(
+            tree_paths(&rec),
+            ["1_Pooling/config.json", "config.json", "onnx/a/model.onnx"]
+        );
+        assert!(rec.as_array().unwrap().iter().all(|e| e["type"] == "file"));
+
+        assert_eq!(top_status, StatusCode::OK);
+        let top: serde_json::Value = serde_json::from_slice(&top_body).unwrap();
+        assert_eq!(tree_paths(&top), ["1_Pooling", "config.json", "onnx"]);
+        let types: Vec<&str> = top
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, ["directory", "file", "directory"]);
+        assert_eq!(top[0]["oid"].as_str().unwrap().len(), 40);
+    }
+
+    #[test]
+    fn parse_tree_query_keeps_only_the_allow_list_5321() {
+        assert_eq!(parse_tree_query(None).unwrap(), TreeQuery::default());
+        let q = parse_tree_query(Some(
+            "recursive=True&expand=false&cursor=a%2Bb%2Fc%3D&limit=3&path=..%2Fx",
+        ))
+        .unwrap();
+        assert_eq!(
+            q,
+            TreeQuery {
+                recursive: true,
+                expand: false,
+                cursor: Some("a+b/c=".to_string()),
+            }
+        );
+        assert!(
+            parse_tree_query(Some("recursive=1&expand=1"))
+                .unwrap()
+                .expand
+        );
+        assert_eq!(parse_tree_query(Some("cursor=")).unwrap().cursor, None);
+        assert!(parse_tree_query(Some("recursive=yes")).is_err());
+        assert!(parse_tree_query(Some("expand=2")).is_err());
+        let long = format!("cursor={}", "a".repeat(MAX_TREE_CURSOR_LEN + 1));
+        assert!(parse_tree_query(Some(&long)).is_err());
+    }
+
+    #[test]
+    fn tree_upstream_path_is_canonical_and_encoded_5321() {
+        let plain = TreeQuery::default();
+        assert_eq!(
+            tree_upstream_path("org/name", "main", &plain, None),
+            "api/models/org/name/tree/main"
+        );
+        let rec = TreeQuery {
+            recursive: true,
+            ..TreeQuery::default()
+        };
+        assert_eq!(
+            tree_upstream_path("org/name", "refs/pr/1", &rec, None),
+            "api/models/org/name/tree/refs%2Fpr%2F1?recursive=true"
+        );
+        let all = TreeQuery {
+            recursive: true,
+            expand: true,
+            cursor: Some("ignored".to_string()),
+        };
+        let path = tree_upstream_path("gpt2", TREE_SHA, &all, Some("a+b/c= d"));
+        assert_eq!(
+            path,
+            format!(
+                "api/models/gpt2/tree/{TREE_SHA}?recursive=true&expand=true&cursor=a%2Bb%2Fc%3D+d"
+            )
+        );
+        // Every page path passes the proxy's fetch-path check: no `/` or `#`
+        // in the query.
+        crate::services::proxy_service::check_upstream_fetch_path(&path).unwrap();
+    }
+
+    #[test]
+    fn next_tree_page_reads_only_the_next_cursor_5321() {
+        assert_eq!(next_tree_page(None), NextTreePage::Last);
+        assert_eq!(
+            next_tree_page(Some("<https://hub/x?cursor=a>; rel=\"prev\"")),
+            NextTreePage::Last
+        );
+        assert_eq!(
+            next_tree_page(Some(
+                "<https://huggingface.co/api/models/m/tree/main?recursive=true&expand=false&cursor=eyJ%2FIjoxfQ%3D%3D>; rel=\"next\""
+            )),
+            NextTreePage::Cursor("eyJ/IjoxfQ==".to_string())
+        );
+        assert_eq!(
+            next_tree_page(Some(
+                "<https://hub/x?cursor=p1>; rel=\"prev\", </x?cursor=n,2>; rel=next"
+            )),
+            NextTreePage::Cursor("n,2".to_string())
+        );
+        assert_eq!(
+            next_tree_page(Some("<https://hub/x?recursive=true>; rel=\"next\"")),
+            NextTreePage::Unusable
+        );
+    }
+
+    #[test]
+    fn shape_local_tree_folds_subdirectories_unless_recursive_5321() {
+        let files: Vec<serde_json::Value> = ["a/b/c.bin", "a/d.bin", "e.json"]
+            .into_iter()
+            .map(tree_entry)
+            .collect();
+        assert_eq!(shape_local_tree(files.clone(), true, "m", "main"), files);
+        let top = shape_local_tree(files, false, "m", "main");
+        assert_eq!(
+            tree_paths(&serde_json::Value::Array(top.clone())),
+            ["a", "e.json"]
+        );
+        assert_eq!(top[0]["type"], "directory");
+        assert_eq!(top[0]["size"], 0);
+        assert_eq!(
+            top[0]["oid"],
+            shape_local_tree(vec![tree_entry("a/x")], false, "m", "main")[0]["oid"],
+            "a directory's oid is stable for the coordinates"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Xet field stripping in proxied metadata (#3334)
     // -----------------------------------------------------------------------
 
@@ -3500,6 +5230,320 @@ mod tests {
 
         assert_eq!(json[0]["type"], "file");
         assert_eq!(json[0]["path"], "config.json");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #5280: `snapshot_download` against a hosted repository.
+// ---------------------------------------------------------------------------
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod hosted_snapshot_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    fn at(minute: u32) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc
+            .with_ymd_and_hms(2026, 11, 4, 12, minute, 0)
+            .unwrap()
+    }
+
+    fn file(rfilename: &str, minute: u32) -> HostedFile {
+        HostedFile {
+            rfilename: rfilename.to_string(),
+            size_bytes: 7,
+            created_at: at(minute),
+        }
+    }
+
+    #[test]
+    fn commit_hash_is_exactly_40_lowercase_hex() {
+        assert!(is_commit_hash(&"a1".repeat(20)));
+        assert!(!is_commit_hash(&"A1".repeat(20)));
+        assert!(!is_commit_hash(&"a1".repeat(32)));
+        assert!(!is_commit_hash("main"));
+        assert!(!is_commit_hash(&"g1".repeat(20)));
+    }
+
+    #[test]
+    fn pick_local_revision_maps_names_commits_and_the_default_branch() {
+        let model = "acme/tiny";
+        let held = vec!["v1".to_string(), "main".to_string()];
+
+        // A held branch or tag means itself.
+        assert_eq!(
+            pick_local_revision(model, &held, Some("v1")).as_deref(),
+            Some("v1")
+        );
+        // The synthetic commit model info reported leads back to its revision.
+        let v1_sha = local_repo_commit_sha(model, "v1");
+        assert_eq!(
+            pick_local_revision(model, &held, Some(&v1_sha)).as_deref(),
+            Some("v1")
+        );
+        let main_sha = local_repo_commit_sha(model, "main");
+        assert_eq!(
+            pick_local_revision(model, &held, Some(&main_sha)).as_deref(),
+            Some("main")
+        );
+        // No revision means `main`, even when it is not the newest upload.
+        assert_eq!(
+            pick_local_revision(model, &held, None).as_deref(),
+            Some("main")
+        );
+        // Without a `main`, the newest revision.
+        assert_eq!(
+            pick_local_revision(model, &["v2".to_string(), "v1".to_string()], None).as_deref(),
+            Some("v2")
+        );
+        // Unknown names and commits are not found; another model's commit is
+        // not this model's.
+        assert_eq!(pick_local_revision(model, &held, Some("v9")), None);
+        assert_eq!(
+            pick_local_revision(model, &held, Some(&"0".repeat(40))),
+            None
+        );
+        let other = local_repo_commit_sha("acme/other", "v1");
+        assert_eq!(pick_local_revision(model, &held, Some(&other)), None);
+        assert_eq!(pick_local_revision(model, &[], None), None);
+        // A branch literally named like a commit still means itself.
+        let hexy = "c".repeat(40);
+        assert_eq!(
+            pick_local_revision(model, std::slice::from_ref(&hexy), Some(&hexy)).as_deref(),
+            Some(hexy.as_str())
+        );
+    }
+
+    #[test]
+    fn relative_model_path_strips_the_rows_own_prefix() {
+        assert_eq!(
+            relative_model_path("acme/tiny/v1/onnx/model.onnx", "acme/tiny", "v1"),
+            "onnx/model.onnx"
+        );
+        assert_eq!(
+            relative_model_path("gpt2/main/config.json", "gpt2", "main"),
+            "config.json"
+        );
+        // A path outside the expected layout is reported as stored.
+        assert_eq!(
+            relative_model_path("elsewhere/config.json", "gpt2", "main"),
+            "elsewhere/config.json"
+        );
+        assert_eq!(
+            relative_model_path("gpt2/mainx", "gpt2", "main"),
+            "gpt2/mainx"
+        );
+    }
+
+    /// The document `huggingface_hub.ModelInfo(**json)` parses: `id` present,
+    /// `rfilename` relative to the repo, `sha` the 40-hex commit the resolve
+    /// route reports, timestamps in `%Y-%m-%dT%H:%M:%S.%fZ`.
+    #[test]
+    fn hosted_model_info_matches_the_hub_shape() {
+        let files = [file("config.json", 1), file("onnx/model.onnx", 3)];
+        let json = hosted_model_info_json("acme/tiny", "v1", &files, Some("text-classification"));
+
+        assert_eq!(json["id"], "acme/tiny");
+        assert_eq!(json["modelId"], "acme/tiny");
+        assert_eq!(json["sha"], local_repo_commit_sha("acme/tiny", "v1"));
+        assert_eq!(json["siblings"][0]["rfilename"], "config.json");
+        assert_eq!(json["siblings"][1]["rfilename"], "onnx/model.onnx");
+        assert_eq!(json["siblings"][1]["size"], 7);
+        assert_eq!(json["lastModified"], "2026-11-04T12:03:00.000Z");
+        assert_eq!(json["createdAt"], "2026-11-04T12:01:00.000Z");
+        assert_eq!(json["pipeline_tag"], "text-classification");
+        assert_eq!(json["gated"], false);
+        for key in ["lastModified", "createdAt"] {
+            chrono::NaiveDateTime::parse_from_str(
+                json[key].as_str().unwrap(),
+                "%Y-%m-%dT%H:%M:%S%.fZ",
+            )
+            .unwrap_or_else(|e| panic!("{key} must parse as a Hub timestamp: {e}"));
+        }
+
+        let bare = hosted_model_info_json("gpt2", "main", &[], None);
+        assert!(bare.get("pipeline_tag").is_none());
+        assert!(bare.get("lastModified").is_none());
+        assert_eq!(bare["siblings"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn list_models_entry_carries_id_and_a_timestamp() {
+        let meta = serde_json::json!({"pipeline_tag": "fill-mask"});
+        let json = list_models_entry("acme/tiny", at(5), Some(&meta));
+        assert_eq!(json["id"], "acme/tiny");
+        assert_eq!(json["modelId"], "acme/tiny");
+        assert_eq!(json["lastModified"], "2026-11-04T12:05:00.000Z");
+        assert_eq!(json["pipeline_tag"], "fill-mask");
+        assert!(list_models_entry("gpt2", at(0), None)
+            .get("pipeline_tag")
+            .is_none());
+    }
+
+    #[test]
+    fn revision_not_found_carries_the_hub_error_code() {
+        let resp = revision_not_found("acme/tiny", "v9");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.headers()["x-error-code"], "RevisionNotFound");
+    }
+
+    async fn upload(fx: &tdh::Fixture, model: &str, revision: &str, filename: &str, body: &str) {
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/api/models/{model}/upload/{revision}",
+                fx.repo_key
+            ))
+            .header("x-filename", filename)
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, resp) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "upload {filename} failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+    }
+
+    async fn get_json(fx: &tdh::Fixture, uri: String) -> (StatusCode, serde_json::Value) {
+        let (status, body) = tdh::send(fx.router_anon(super::router()), tdh::get(uri)).await;
+        let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    fn sha256_hex(body: &str) -> String {
+        format!("{:x}", Sha256::digest(body.as_bytes()))
+    }
+
+    /// The request sequence `snapshot_download(repo_id, revision="v1")` makes,
+    /// against a model published with the hosted upload route: model info at
+    /// the revision, the tree at the `sha` it returned, then a HEAD and a GET
+    /// of every file at `/resolve/<sha>/<rfilename>`.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    async fn snapshot_download_sequence_resolves_the_synthetic_commit() {
+        let Some(fx) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let model = "acme/tiny-model";
+        let files = [
+            ("config.json", "{\"hidden_size\": 8}"),
+            ("onnx/model.onnx", "onnx-bytes"),
+        ];
+        for (name, body) in files {
+            upload(&fx, model, "v1", name, body).await;
+        }
+        upload(&fx, model, "main", "README.md", "# tiny").await;
+
+        let (status, info) = get_json(
+            &fx,
+            format!("/{}/api/models/{model}/revision/v1", fx.repo_key),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(info["id"], model);
+        let sha = info["sha"].as_str().expect("sha").to_string();
+        assert_eq!(sha, local_repo_commit_sha(model, "v1"));
+        let rfilenames: Vec<&str> = info["siblings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["rfilename"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            rfilenames,
+            ["config.json", "onnx/model.onnx"],
+            "siblings must be this revision's files, relative to the repo"
+        );
+
+        let (status, tree) = get_json(
+            &fx,
+            format!(
+                "/{}/api/models/{model}/tree/{sha}?recursive=true",
+                fx.repo_key
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let paths: Vec<&str> = tree
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, ["config.json", "onnx/model.onnx"]);
+        assert_eq!(tree[0]["type"], "file");
+
+        for (name, body) in files {
+            let uri = format!("/{}/{model}/resolve/{sha}/{name}", fx.repo_key);
+            let head = axum::http::Request::builder()
+                .method("HEAD")
+                .uri(&uri)
+                .body(Body::empty())
+                .unwrap();
+            let (status, _, headers) =
+                tdh::send_with_headers(fx.router_anon(super::router()), head).await;
+            assert_eq!(status, StatusCode::OK, "HEAD {uri}");
+            assert_eq!(headers[UPSTREAM_COMMIT_HEADER], sha.as_str());
+            assert_eq!(
+                headers[ETAG].to_str().unwrap(),
+                format!("\"{}\"", sha256_hex(body))
+            );
+            assert_eq!(headers[CONTENT_LENGTH], body.len().to_string().as_str());
+
+            let (status, got, headers) =
+                tdh::send_with_headers(fx.router_anon(super::router()), tdh::get(uri.clone()))
+                    .await;
+            assert_eq!(status, StatusCode::OK, "GET {uri}");
+            assert_eq!(&got[..], body.as_bytes());
+            assert_eq!(headers[UPSTREAM_COMMIT_HEADER], sha.as_str());
+        }
+
+        // `main` gets its own commit and only its own files; a revision-less
+        // model info is `main`, as on the Hub.
+        let main_sha = local_repo_commit_sha(model, "main");
+        let (status, info) = get_json(&fx, format!("/{}/api/models/{model}", fx.repo_key)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(info["sha"], main_sha.as_str());
+        assert_eq!(
+            info["siblings"],
+            serde_json::json!([{"rfilename": "README.md", "size": 6}])
+        );
+        let (status, got) = tdh::send(
+            fx.router_anon(super::router()),
+            tdh::get(format!(
+                "/{}/{model}/resolve/{main_sha}/README.md",
+                fx.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&got[..], b"# tiny");
+
+        // v1's commit does not serve main's file, and an unknown revision is
+        // the Hub's RevisionNotFound.
+        let (status, _) = tdh::send(
+            fx.router_anon(super::router()),
+            tdh::get(format!("/{}/{model}/resolve/{sha}/README.md", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, headers) = tdh::send_with_headers(
+            fx.router_anon(super::router()),
+            tdh::get(format!("/{}/api/models/{model}/revision/v9", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(headers["x-error-code"], "RevisionNotFound");
+
+        let (status, listed) = get_json(&fx, format!("/{}/api/models", fx.repo_key)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed[0]["id"], model);
+
+        fx.teardown().await;
     }
 }
 
@@ -4007,5 +6051,123 @@ mod range_tests {
         assert!(window.2.contains_key("x-repo-commit"));
         assert_eq!(past_end.0, StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(header(&past_end.2, CONTENT_RANGE), Some("bytes */1000"));
+    }
+}
+
+/// #5322: `hf_hub_download` sends `HEAD` then `GET` on `/resolve/...`. On a
+/// cold Remote the HEAD used to start a full upstream GET whose body the HEAD
+/// response dropped, so nothing was cached and the GET downloaded the file
+/// again. The counting upstream in [`tdh::mount_head_and_get_once`] fails the
+/// test on any second body fetch, and on a HEAD that is not sent upstream as
+/// a HEAD.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod cold_head_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::header::{CONTENT_LENGTH, ETAG};
+    use axum::http::{HeaderMap, StatusCode};
+
+    const MODEL: &str = "acme/tiny-st";
+    const FILE_PATH: &str = "/acme/tiny-st/resolve/main/model.safetensors";
+    const COMMIT: &str = "ba316f07c0a4d8b1e5f3a6c2d9e7b4a1f0c3d5e6";
+    const ETAG_VALUE: &str = "\"ba316f07e6a1\"";
+
+    fn payload() -> Vec<u8> {
+        (0..4096u32).map(|i| (i % 253) as u8).collect()
+    }
+
+    fn header<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
+        headers.get(name).and_then(|v| v.to_str().ok())
+    }
+
+    /// Mount the counting resolve upstream and drive HEAD, GET, GET through
+    /// `repo_key`'s resolve route, asserting the answers `huggingface_hub`
+    /// needs. The mock's `expect(1)`s are verified when `server` drops.
+    async fn assert_head_then_gets_fetch_once(
+        state: crate::api::SharedState,
+        cache_dir: &std::path::Path,
+        server: wiremock::MockServer,
+        repo_key: &str,
+    ) {
+        let data = payload();
+        tdh::mount_head_and_get_once(
+            &server,
+            FILE_PATH,
+            &[("etag", ETAG_VALUE), ("x-repo-commit", COMMIT)],
+            &data,
+        )
+        .await;
+        let uri = format!("/{repo_key}/{MODEL}/resolve/main/model.safetensors");
+        let [head, cold, warm] = tdh::cold_head_then_two_gets(
+            || tdh::router_anon(super::router(), state.clone()),
+            &uri,
+            cache_dir,
+            data.len() as u64,
+        )
+        .await;
+
+        assert_eq!(head.0, StatusCode::OK, "cold HEAD");
+        assert!(head.1.is_empty(), "a HEAD transfers no bytes");
+        assert_eq!(header(&head.2, ETAG.as_str()), Some(ETAG_VALUE));
+        let size = data.len().to_string();
+        assert_eq!(
+            header(&head.2, CONTENT_LENGTH.as_str()),
+            Some(size.as_str()),
+            "the cold HEAD advertises the size the GET will send"
+        );
+        assert_eq!(header(&head.2, "x-repo-commit"), Some(COMMIT));
+
+        for (label, served) in [("cold GET", &cold), ("warm GET", &warm)] {
+            assert_eq!(served.0, StatusCode::OK, "{label}");
+            assert_eq!(&served.1[..], &data[..], "{label} body");
+            assert_eq!(
+                header(&served.2, ETAG.as_str()),
+                Some(ETAG_VALUE),
+                "{label}"
+            );
+            assert_eq!(header(&served.2, "x-repo-commit"), Some(COMMIT), "{label}");
+        }
+        // Verifies one upstream HEAD and one upstream GET across all three.
+        tdh::drop_mock_server(server).await;
+    }
+
+    #[tokio::test]
+    async fn remote_cold_head_then_get_downloads_the_body_once_5322() {
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = wiremock::MockServer::start().await;
+        let (state, cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let repo_key = f.repo_key.clone();
+        assert_head_then_gets_fetch_once(state, cache.path(), server, &repo_key).await;
+        f.teardown().await;
+    }
+
+    /// The Virtual resolver's Remote-member fetch takes the same HEAD path.
+    #[tokio::test]
+    async fn virtual_remote_member_cold_head_downloads_the_body_once_5322() {
+        let Some(f) = tdh::Fixture::setup("virtual", "huggingface").await else {
+            return;
+        };
+        let server = wiremock::MockServer::start().await;
+        let (member_id, _member_key, member_dir) =
+            tdh::create_repo(&f.pool, "remote", "huggingface").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(server.uri())
+            .bind(member_id)
+            .execute(&f.pool)
+            .await
+            .expect("point the member at the mock upstream");
+        tdh::link_virtual_member(&f.pool, f.repo_id, member_id, 1).await;
+        tdh::publish_repo(&f.pool, member_id).await;
+        let cache = tempfile::tempdir().expect("tempdir");
+        let cache_root = cache.path().to_str().expect("utf-8 cache path");
+        let proxy = tdh::build_proxy_service_with_fs(f.pool.clone(), cache_root);
+        let state = tdh::build_state_with_proxy(f.pool.clone(), cache_root, proxy);
+
+        let repo_key = f.repo_key.clone();
+        assert_head_then_gets_fetch_once(state, cache.path(), server, &repo_key).await;
+        tdh::cleanup_member_repo(&f.pool, member_id, &member_dir).await;
+        f.teardown().await;
     }
 }

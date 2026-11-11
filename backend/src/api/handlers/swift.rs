@@ -746,6 +746,7 @@ async fn download_archive(
                         upstream_url,
                         &upstream_path,
                         "application/octet-stream",
+                        ctx.is_head,
                     )
                     .await?;
                     // #3649: count the proxied serve. The streaming helper answers a warm
@@ -990,10 +991,7 @@ async fn fetch_manifest(
                 .storage_for_repo(&owner_location)
                 .map_err(|e| e.into_response())?;
             let zip_bytes = storage.get(&storage_key).await.map_err(|e| {
-                swift_error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    crate::api::handlers::storage_err_message(&e),
-                )
+                crate::api::handlers::storage_err_response(&e, swift_error_response)
             })?;
             // #2561: permit-scoped decode, fast-fail 503 on saturation.
             crate::util::bounded_archive::with_ingest_extraction(|| {
@@ -1318,8 +1316,16 @@ async fn publish_release(
     // the object the repository's backend already staged (#4990). The checksum
     // is over the ARCHIVE, not the multipart envelope -- SwiftPM verifies the
     // source archive's checksum, and this same value is what the release-metadata
-    // `checksum` and the download `Digest` header report (#3595).
-    let storage_key = format!("swift/{}/{}/{}/{}.zip", scope, name, version, name);
+    // `checksum` and the download `Digest` header report (#3595). The key is
+    // repo-scoped on a shared cloud namespace (#5662), so two registries
+    // holding the same release do not collide on one key; reads go through
+    // the row's storage_key, so legacy flat-key rows keep serving.
+    let storage_key = crate::storage::StorageKeyScheme::from_env().write_key(
+        &repo.storage_backend,
+        "swift",
+        repo.id,
+        &format!("{}/{}/{}/{}.zip", scope, name, version, name),
+    );
     let put = proxy_helpers::put_staged_body(
         &state,
         &repo,
@@ -1442,6 +1448,7 @@ async fn publish_release(
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         "swift",
         &package_id,
@@ -2076,6 +2083,84 @@ mod tests {
         assert!(manifest.contains("swift-tools-version:5.9"));
         assert!((manifest.len() as u64) <= MAX_MANIFEST_BYTES);
     }
+
+    /// #5685: the `Package.swift` fetch of a release with no cached manifest
+    /// (a legacy upload, #1100) reads the source archive from storage
+    /// (`fetch_manifest`'s `storage.get`). Against a store that is down it
+    /// answers `503` with `Retry-After`, against one that is full `507`
+    /// without it, both in the SE-0292 problem+json envelope with the fixed
+    /// message as `detail` and no backend text. It answered a hard-coded 500.
+    #[tokio::test]
+    async fn manifest_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "swift").await else {
+            return;
+        };
+        // A release row with no `artifact_metadata` (so no cached manifest):
+        // the manifest route falls back to reading the archive bytes.
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 id, repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, $5, 1, $6, 'application/zip', $3, $7)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(fx.repo_id)
+        .bind("outscope.outpkg/1.0.0.zip")
+        .bind("outscope.outpkg")
+        .bind("1.0.0")
+        .bind("seed-outscope.outpkg-5685")
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed legacy release artifact row");
+
+        for (message, want, detail) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&fx.pool, &fx.state, fx.repo_id, &message).await;
+            let app = tdh::router_with_auth(
+                super::router(),
+                state,
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let (status, body, headers) = tdh::send_with_headers(
+                app,
+                tdh::get(format!(
+                    "/{}/outscope/outpkg/1.0.0/Package.swift",
+                    fx.repo_key
+                )),
+            )
+            .await;
+            assert_eq!(status, want, "{}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want == StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            assert_eq!(
+                headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                Some("application/problem+json"),
+                "the swift problem envelope is kept"
+            );
+            let problem: serde_json::Value =
+                serde_json::from_slice(&body).expect("problem+json body");
+            assert_eq!(problem["detail"], detail);
+            tdh::assert_no_storage_backend_text("swift Package.swift", &body);
+        }
+        fx.teardown().await;
+    }
 }
 
 #[cfg(ak_test_shard = "handlers-2")]
@@ -2459,6 +2544,28 @@ mod multipart_publish_tests {
             .header("content-type", content_type)
             .body(Body::from(body))
             .expect("build PUT request")
+    }
+
+    /// #5662: the same release publishes into two Swift registries on a
+    /// shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_release_publishes_to_two_cloud_registries_5662() {
+        let archive = source_archive();
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "swift",
+            key_prefix: "swift",
+            router: super::router,
+            publish: &|key| {
+                vec![publish_request(
+                    format!("/{key}/shared/SharedPackage/1.0.0"),
+                    &format!("multipart/form-data; boundary={}", BOUNDARY),
+                    publish_envelope(&[("source-archive", "application/zip", &archive)]),
+                )]
+            },
+            download: &|key| tdh::get(format!("/{key}/shared/SharedPackage/1.0.0.zip")),
+            expected: &archive,
+        })
+        .await;
     }
 
     #[tokio::test]

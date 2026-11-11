@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#4832]
----
-- **Concurrent uploads to one artifact path now agree on a single winner** (#4832). An upload to a path that already holds a live artifact at the same version is refused with 409 `CONFLICT` ("Artifact version already exists and is immutable") unless the repository has versioning enabled. That check ran before the bytes were stored and outside the transaction that writes the artifact row, so several `PUT /api/v1/repositories/{key}/artifacts/{path}` requests racing to one free path could all pass it: each was answered 201, and the last to commit silently replaced the content the others had been acknowledged for. The same rule is now part of the row write itself, for direct uploads and for chunked-upload completion: exactly one of the racing uploads is answered 201 and keeps its bytes, and every other one gets the documented 409. A deleted artifact can still be replaced, and a versioning-enabled Generic or Mlmodel repository still appends a revision. The 409 is now listed in the OpenAPI description of the PUT.

@@ -13,7 +13,8 @@ use uuid::Uuid;
 use crate::api::extractors::Json as BodyJson;
 use crate::api::handlers::artifacts::check_artifact_visibility;
 use crate::api::handlers::repositories::{
-    require_repo_action, require_repo_admin, require_repo_write_access, require_visible,
+    hide_write_denial_from_non_readers, require_repo_action, require_repo_admin,
+    require_repo_write_access, require_visible,
 };
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -283,10 +284,11 @@ pub struct ListScansQuery {
 ///
 /// Kept in sync with the constraint by hand — the constraint is the authority
 /// and is re-stated in whichever migration last touched it (`022`, `032`,
-/// `034`, `060`, and `220` for `external`). Used only to reject a typo'd
-/// filter: an unknown value must be a `400`, because an unfiltered response to
-/// a misspelled engine name reads as "no scans from that engine", which is the
-/// wrong direction for a security view (#3410).
+/// `034`, `060`, `220` for `external`, `327` for `mcp_lint`, `331` for
+/// `model`). Used only to reject a typo'd filter: an unknown value must be a
+/// `400`, because an unfiltered response to a misspelled engine name reads as
+/// "no scans from that engine", which is the wrong direction for a security
+/// view (#3410).
 pub(crate) const KNOWN_SCAN_TYPES: &[&str] = &[
     "dependency",
     "image",
@@ -297,6 +299,8 @@ pub(crate) const KNOWN_SCAN_TYPES: &[&str] = &[
     "openscap",
     "incus",
     EXTERNAL_SCAN_TYPE,
+    crate::services::mcp_lint::MCP_LINT_SCAN_TYPE,
+    crate::services::model_file_scanner::MODEL_SCAN_TYPE,
 ];
 
 /// Canonical severity vocabulary for the findings filter, matching
@@ -309,10 +313,16 @@ pub(crate) const KNOWN_SEVERITIES: &[&str] = &["critical", "high", "medium", "lo
 /// [`crate::models::security::FindingClass::as_str`].
 pub(crate) const KNOWN_FINDING_CLASSES: &[&str] = &["vulnerability", "malicious", "policy"];
 
-/// Longest accepted value for the free-text findings filters (`source`,
-/// `cve_id`). Both columns are `VARCHAR(100)`, so anything longer cannot match
-/// a stored row and is rejected rather than run as a guaranteed-empty query.
+/// Longest accepted `cve_id` findings filter. This bounds the query, not the
+/// column: `scan_findings.cve_id` is `VARCHAR(30)`, so a value between 31 and
+/// 100 characters runs as a guaranteed-empty query, and anything longer is
+/// rejected up front.
 const FINDING_FILTER_MAX_LEN: usize = 100;
+
+/// Longest accepted `source` findings filter. `scan_findings.source` is `TEXT`
+/// since migration 339 (#5534), so this bounds the query, not the column: it
+/// is well above any scanner name a finding carries.
+const FINDING_SOURCE_FILTER_MAX_LEN: usize = 1024;
 
 /// Validate an optional filter against a closed vocabulary (#3410).
 ///
@@ -340,14 +350,18 @@ fn validate_enum_filter<'a>(
 /// carries whichever scanner name an engine (or an external submitter) wrote —
 /// so these are bounded rather than enumerated: a blank or over-long value is
 /// rejected, anything else is matched exactly.
-fn validate_text_filter<'a>(value: Option<&'a String>, field: &str) -> Result<Option<&'a str>> {
+fn validate_text_filter<'a>(
+    value: Option<&'a String>,
+    field: &str,
+    max_len: usize,
+) -> Result<Option<&'a str>> {
     match value {
         None => Ok(None),
         Some(v) if v.trim().is_empty() => Err(AppError::Validation(format!(
             "Invalid {field}: must not be blank"
         ))),
-        Some(v) if v.len() > FINDING_FILTER_MAX_LEN => Err(AppError::Validation(format!(
-            "Invalid {field}: must be at most {FINDING_FILTER_MAX_LEN} characters"
+        Some(v) if v.len() > max_len => Err(AppError::Validation(format!(
+            "Invalid {field}: must be at most {max_len} characters"
         ))),
         Some(v) => Ok(Some(v.as_str())),
     }
@@ -756,8 +770,12 @@ impl ListFindingsQuery {
     ) -> Result<crate::services::scan_result_service::FindingListFilter<'_>> {
         Ok(crate::services::scan_result_service::FindingListFilter {
             severity: validate_enum_filter(self.severity.as_ref(), KNOWN_SEVERITIES, "severity")?,
-            source: validate_text_filter(self.source.as_ref(), "source")?,
-            cve_id: validate_text_filter(self.cve_id.as_ref(), "cve_id")?,
+            source: validate_text_filter(
+                self.source.as_ref(),
+                "source",
+                FINDING_SOURCE_FILTER_MAX_LEN,
+            )?,
+            cve_id: validate_text_filter(self.cve_id.as_ref(), "cve_id", FINDING_FILTER_MAX_LEN)?,
             finding_class: validate_enum_filter(
                 self.finding_class.as_ref(),
                 KNOWN_FINDING_CLASSES,
@@ -1594,21 +1612,21 @@ async fn list_scans(
     }
 
     let filters = query.validated_filters()?;
-    let svc = ScanResultService::new(state.db.clone());
     let page = query.page.unwrap_or(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = (page - 1) * per_page;
 
-    let (scans, total) = svc
-        .list_scans(
-            query.repository_id,
-            query.artifact_id,
-            query.status.as_deref(),
-            filters.scan_type,
-            offset,
-            per_page,
-        )
-        .await?;
+    let (scans, total) = list_scans_served(
+        &state,
+        auth.as_ref(),
+        query.repository_id,
+        query.artifact_id,
+        query.status.as_deref(),
+        filters.scan_type,
+        offset,
+        per_page,
+    )
+    .await?;
 
     // #2471: fold redundant per-artifact `not_applicable` rows into a single
     // muted summary row before returning. `total` is left as the raw DB row
@@ -1641,7 +1659,7 @@ async fn get_scan(
     let s = svc.get_scan(id).await?;
 
     // Cross-repo authorization (#2439): see `scan_visible_to`.
-    let s = scan_visible_to(&state.db, &auth, s, None).await?;
+    let s = scan_visible_to(&state, &auth, s, None).await?;
 
     let mut items = enrich_scans(&state.db, vec![s]).await?;
     Ok(Json(items.remove(0)))
@@ -1660,29 +1678,29 @@ async fn get_scan(
 /// caller gets their copy (#5153). The no-access 404 body is normalized to the one
 /// an absent id produces, so this is not an existence oracle.
 async fn scan_visible_to(
-    db: &PgPool,
+    state: &SharedState,
     auth: &AuthExtension,
     scan: ScanResult,
     artifact_id: Option<Uuid>,
 ) -> Result<ScanResult> {
     let caller = Some(auth.clone());
-    let svc = ScanResultService::new(db.clone());
+    let svc = ScanResultService::new(state.db.clone());
     if let Some(artifact_id) = artifact_id {
         let row = svc
             .scan_for_artifact(scan.id, artifact_id)
             .await?
             .ok_or_else(|| AppError::NotFound(SCAN_NOT_FOUND_MSG.to_string()))?;
-        check_artifact_visibility(&caller, row.artifact_id, db, "read")
+        scan_artifact_readable(state, &caller, row.artifact_id)
             .await
             .map_err(unify_scan_not_found)?;
         return Ok(row);
     }
-    let refusal = match check_artifact_visibility(&caller, scan.artifact_id, db, "read").await {
+    let refusal = match scan_artifact_readable(state, &caller, scan.artifact_id).await {
         Ok(_) => return Ok(scan),
         Err(refusal) => refusal,
     };
     for copy in svc.copies_of_scan(scan.id).await? {
-        if check_artifact_visibility(&caller, copy.artifact_id, db, "read")
+        if scan_artifact_readable(state, &caller, copy.artifact_id)
             .await
             .is_ok()
         {
@@ -1690,6 +1708,66 @@ async fn scan_visible_to(
         }
     }
     Err(unify_scan_not_found(refusal))
+}
+
+/// The read gate on a scan's artifact: [`check_artifact_visibility`], plus
+/// the MCP serve decision (#5253), so the scan of an MCP server version
+/// readers are not served is missing for a caller who does not hold the
+/// registry.
+async fn scan_artifact_readable(
+    state: &SharedState,
+    caller: &Option<AuthExtension>,
+    artifact_id: Uuid,
+) -> Result<()> {
+    check_artifact_visibility(caller, artifact_id, &state.db, "read").await?;
+    crate::api::handlers::artifacts::require_mcp_servable(state, caller, artifact_id).await
+}
+
+/// One page of scan rows for a listing, and their total, as `auth` may see
+/// them (#5253): the scans of an MCP server version the caller is not served
+/// are left out in SQL (an artifact-scoped listing of such a version is
+/// empty, as for a missing artifact), so `total` counts only what is listed.
+#[allow(clippy::too_many_arguments)]
+async fn list_scans_served(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repository_id: Option<Uuid>,
+    artifact_id: Option<Uuid>,
+    status: Option<&str>,
+    scan_type: Option<&str>,
+    offset: i64,
+    limit: i64,
+) -> Result<(Vec<ScanResult>, i64)> {
+    if let Some(artifact_id) = artifact_id {
+        if !crate::api::handlers::artifacts::mcp_servable(state, auth, artifact_id).await? {
+            return Ok((Vec::new(), 0));
+        }
+    }
+    let svc = ScanResultService::new(state.db.clone());
+    let served_only = match repository_id {
+        Some(repo) => {
+            crate::api::handlers::search::mcp_served_only_fresh(state, auth, Some(&[repo])).await?
+        }
+        None => None,
+    };
+    match served_only {
+        Some(served_only) => {
+            svc.list_scans_served_only(
+                repository_id,
+                artifact_id,
+                status,
+                scan_type,
+                &served_only,
+                offset,
+                limit,
+            )
+            .await
+        }
+        None => {
+            svc.list_scans(repository_id, artifact_id, status, scan_type, offset, limit)
+                .await
+        }
+    }
 }
 
 #[utoipa::path(
@@ -1723,7 +1801,7 @@ async fn list_findings(
     let scan = svc.get_scan(scan_id).await?;
 
     // Cross-repo authorization (#2439): see `scan_visible_to`.
-    let scan = scan_visible_to(&state.db, &auth, scan, query.artifact_id).await?;
+    let scan = scan_visible_to(&state, &auth, scan, query.artifact_id).await?;
 
     let filters = query.validated_filters()?;
     let page = query.page.unwrap_or(1);
@@ -2527,7 +2605,10 @@ async fn update_repo_security(
     // repository administration, not artifact publishing. Same admin tier and
     // fail-closed gate as the configuration subresources fixed in #2745
     // (#2603 sibling, #2750).
-    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    // #5645: refused to a caller who cannot read the repository (a
+    // publish-only or delete-only grantee), it is the unknown-key 404.
+    let admin = require_repo_admin(&auth, repo.id, &state.permission_service).await;
+    hide_write_denial_from_non_readers(admin, &auth, &repo, &repo_service).await?;
     let svc = ScanConfigService::new(state.db.clone());
     // #3645: the previous row is read in the same transaction as the write,
     // so the audited "before" is exactly what this write replaced. #4363: the
@@ -2646,6 +2727,7 @@ fn scan_config_change_audit(
                 allow_public_with_upstream_credentials: None,
                 upstream_auth_change: None,
                 age_gate_change: None,
+                upstream_mode_change: None,
             }),
     )
 }
@@ -2674,24 +2756,25 @@ async fn list_artifact_scans(
 ) -> Result<Json<ScanListResponse>> {
     // Cross-repo authorization (#2439): apply the canonical artifact-visibility
     // gate (existence-hiding 404) before listing any scan for this artifact.
-    check_artifact_visibility(&Some(auth), artifact_id, &state.db, "read").await?;
+    let auth = Some(auth);
+    check_artifact_visibility(&auth, artifact_id, &state.db, "read").await?;
 
     let filters = query.validated_filters()?;
-    let svc = ScanResultService::new(state.db.clone());
     let page = query.page.unwrap_or(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = (page - 1) * per_page;
 
-    let (scans, total) = svc
-        .list_scans(
-            None,
-            Some(artifact_id),
-            query.status.as_deref(),
-            filters.scan_type,
-            offset,
-            per_page,
-        )
-        .await?;
+    let (scans, total) = list_scans_served(
+        &state,
+        auth.as_ref(),
+        None,
+        Some(artifact_id),
+        query.status.as_deref(),
+        filters.scan_type,
+        offset,
+        per_page,
+    )
+    .await?;
 
     // #2471: fold redundant per-artifact `not_applicable` rows into a single
     // muted summary row before returning. `total` is left as the raw DB row
@@ -2729,25 +2812,26 @@ async fn list_repo_scans(
     // to avoid leaking a private repo's scan list to a non-member.
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
-    require_visible(&repo, &Some(auth), &repo_service).await?;
+    let auth = Some(auth);
+    require_visible(&repo, &auth, &repo_service).await?;
     let repo = repo.id;
 
     let filters = query.validated_filters()?;
-    let svc = ScanResultService::new(state.db.clone());
     let page = query.page.unwrap_or(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = (page - 1) * per_page;
 
-    let (scans, total) = svc
-        .list_scans(
-            Some(repo),
-            None,
-            query.status.as_deref(),
-            filters.scan_type,
-            offset,
-            per_page,
-        )
-        .await?;
+    let (scans, total) = list_scans_served(
+        &state,
+        auth.as_ref(),
+        Some(repo),
+        None,
+        query.status.as_deref(),
+        filters.scan_type,
+        offset,
+        per_page,
+    )
+    .await?;
 
     // #2471: fold redundant per-artifact `not_applicable` rows into a single
     // muted summary row before returning. `total` is left as the raw DB row
@@ -3521,6 +3605,14 @@ fn rescan_inconclusive_response(
             code: "RESCAN_SCAN_FAILED".to_string(),
             message: "The scan failed. The stored verdict is unchanged.".to_string(),
         },
+        // #5628: no retry can succeed, so no `Retry-After` either (below).
+        ProxyScanInconclusive::RequestPinned => ErrorResponse {
+            code: "RESCAN_REQUEST_PINNED".to_string(),
+            message: "This verdict was graded against the release or coordinate the \
+                      request named; a rescan cannot re-grade it. Pull the package \
+                      through the proxy to re-grade it. The stored verdict is unchanged."
+                .to_string(),
+        },
         ProxyScanInconclusive::BudgetExceeded => {
             // The ACTUAL budget this request ran under, which is derived from
             // the configured global request timeout (#3455 review, F2) -- not
@@ -3539,6 +3631,8 @@ fn rescan_inconclusive_response(
     };
     let mut resp = (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(error)).into_response();
 
+    let retry_after =
+        retry_after.filter(|_| !matches!(reason, ProxyScanInconclusive::RequestPinned));
     if let Some(remaining) = retry_after {
         let secs = retry_after_delay_seconds(remaining);
         let value = axum::http::HeaderValue::from_str(&secs.to_string())
@@ -3597,10 +3691,16 @@ pub struct ProxyRescanResponse {
             `NO_SCANNER_CONFIGURED` (no scanner is configured for this instance), \
             `RESCAN_SCAN_FAILED` (the scan ran and errored, cataloged nothing \
             gradeable in an object it could not pin, or cataloged fewer \
-            components than a stored vulnerable verdict was graded on), or \
+            components than a stored vulnerable verdict was graded on), \
+            `RESCAN_REQUEST_PINNED` (the stored vulnerable verdict was graded \
+            against the release or coordinate the request named -- a `.deb`, \
+            `.rpm` or `.apk` of a release, a Go, Composer or Conan coordinate -- \
+            and the rescan, which cannot name it, did not find the package at \
+            least as severe; a rescan cannot re-grade it, so pull the package \
+            through the proxy to re-grade it; never carries `Retry-After`), or \
             `RESCAN_BUDGET_EXCEEDED` (the scan did not finish inside its budget). \
-            `Retry-After` is set only when cooldown time actually remains. \
-            The stored verdict is unchanged in every case.", body = crate::api::openapi::ErrorResponse),
+            `Retry-After` is set only when cooldown time actually remains and a \
+            retry can succeed. The stored verdict is unchanged in every case.", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -3622,7 +3722,10 @@ async fn rescan_proxy_cached_path(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
-    require_repo_action(&auth, repo.id, "write", &state.permission_service).await?;
+    // #5645: refused to a caller who cannot read the repository (a
+    // publish-only or delete-only grantee), it is the unknown-key 404.
+    let write = require_repo_action(&auth, repo.id, "write", &state.permission_service).await;
+    hide_write_denial_from_non_readers(write, &auth, &repo, &repo_service).await?;
 
     let path = body.path.trim().to_string();
     if path.is_empty() {
@@ -3715,9 +3818,10 @@ async fn rescan_proxy_cached_path(
     let budget = crate::services::scanner_service::proxy_rescan_budget(
         state.config.global_request_timeout_secs,
     );
-    // A `clean` result does not replace a stored `vulnerable` verdict graded
-    // on more components than this rescan cataloged (see
-    // `rescan_may_replace_stored_verdict`); that is inconclusive too.
+    // A rescan does not overrule a stored blocking verdict it graded less of
+    // (a `clean` on fewer components, or a request-pinned verdict it did not
+    // find at least as severe, #5628; see `rescan_replacement`); that is
+    // inconclusive too.
     let verdict = match crate::api::handlers::proxy_helpers::proxy_rescan_and_record(
         &state, repo.id, &digest, &synthetic, &bytes, &mode, budget,
     )
@@ -3737,7 +3841,9 @@ async fn rescan_proxy_cached_path(
                 // pre-#3455 window (#3455 review, F5): the common case here
                 // is a misconfigured scanner erroring instantly, and a full
                 // 120s lockout per attempt makes that debug loop 4x worse.
-                ProxyScanInconclusive::ScanFailed => {
+                // A scan that ran but cannot overrule a request-pinned verdict
+                // (#5628) spent the same scanner time as a failed one.
+                ProxyScanInconclusive::ScanFailed | ProxyScanInconclusive::RequestPinned => {
                     shorten_rescan_slot(repo.id, PROXY_RESCAN_FAILURE_COOLDOWN)
                 }
                 // By definition consumed (up to) the whole budget: the claim
@@ -6194,6 +6300,265 @@ mod tests {
         assert_eq!(body["code"], serde_json::json!("RESCAN_SCAN_FAILED"));
         assert_eq!(status_b, axum::http::StatusCode::OK);
         assert_eq!(stored_b, PROXY_STATE_CLEAN);
+    }
+
+    /// #5628: a Debian or RPM Remote holds a `vulnerable` verdict graded as
+    /// the package of a release (`rpm|…|rhel:9`, `debian|…|debian:12`). A
+    /// rescan cannot pin the release, so the engine catalogs the package's
+    /// own header (one component, as many as the stored verdict) and, with no
+    /// release feed to match it against, finds nothing. That `clean` must not
+    /// replace the verdict: the rescan is inconclusive (503
+    /// `RESCAN_REQUEST_PINNED`, with no `Retry-After`, since no retry can
+    /// succeed), the stored verdict and its pin stand, and a fail_closed pull
+    /// of the pinned package is still refused (403).
+    #[tokio::test]
+    async fn rescan_without_the_release_pin_keeps_a_vulnerable_os_package_verdict_5628() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+        use crate::services::scanner_service::{
+            ComponentEcosystem, ExpectedComponent, OsPackageContext, OsRelease,
+        };
+
+        let pool = match tdh::try_pool().await {
+            Some(pool) => pool,
+            None if std::env::var_os("CI").is_some() => {
+                panic!("this CI regression requires Postgres; refusing to skip it")
+            }
+            None => return,
+        };
+        let cases = [
+            (
+                "rpm",
+                ComponentEcosystem::Rpm,
+                "9/BaseOS/x86_64/os/Packages/o/openssl-libs-3.0.7-17.el9_2.x86_64.rpm",
+                "openssl-libs-3.0.7-17.el9_2.x86_64.rpm",
+                "openssl-libs",
+                "1:3.0.7-17.el9_2",
+                ("rhel", "9"),
+            ),
+            (
+                "debian",
+                ComponentEcosystem::Debian,
+                "pool/main/o/openssl/openssl_3.0.11-1~deb12u2_amd64.deb",
+                "openssl_3.0.11-1~deb12u2_amd64.deb",
+                "openssl",
+                "3.0.11-1~deb12u2",
+                ("debian", "12"),
+            ),
+        ];
+        let mut outcomes = Vec::new();
+        for (format, ecosystem, path, filename, name, version, (id, release)) in cases {
+            let fx = ProxyScanFixture::with_format(pool.clone(), format).await;
+            let pin = ExpectedComponent::os_package(
+                ecosystem,
+                name,
+                version,
+                OsPackageContext {
+                    release: OsRelease::new(id, release).expect("a release with a feed"),
+                    arch: "x86_64".to_string(),
+                    source: None,
+                },
+            )
+            .expect("an OS package pin");
+            let content = bytes::Bytes::from(format!("{format} package {}", Uuid::new_v4()));
+            let digest = seed_cached_verdict_3396(
+                &fx,
+                path,
+                &content,
+                None,
+                PROXY_STATE_VULNERABLE,
+                Some(1),
+                Some(&pin.pin_identity()),
+            )
+            .await;
+            // Cataloged as itself, nothing found: what the engine reports for
+            // a lone package with no release to grade it against.
+            let scanner = std::sync::Arc::new(VersionedCveScanner::new(
+                Some("grype-test"),
+                MockCveRescan::Cataloged("openssl", "3.0.7"),
+            ))
+                as std::sync::Arc<dyn crate::services::scanner_service::Scanner>;
+            let state = scanner_state_with(&fx, vec![scanner], path, content.clone(), |_| {}).await;
+
+            let resp = call_rescan(state.clone(), &fx, path)
+                .await
+                .expect("a rescan answers with a built response");
+            let status = resp.status();
+            let retry_after = resp.headers().get(axum::http::header::RETRY_AFTER).cloned();
+            let body = json_body(resp).await;
+            let stored = crate::services::proxy_scan_service::ProxyScanService::new(pool.clone())
+                .lookup_verdict_with_pin(
+                    &digest,
+                    crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE,
+                )
+                .await
+                .expect("read the stored verdict")
+                .expect("a stored verdict");
+            let pull = gate_pull_3396(
+                &state,
+                &fx,
+                filename,
+                None,
+                &digest,
+                &content,
+                crate::services::proxy_scan_service::ProxyScanAction::FailClosed,
+                crate::api::handlers::proxy_helpers::ProxyScanIdentity::Established(pin.clone()),
+            )
+            .await;
+
+            release_rescan_slot(fx.repo_id);
+            fx.cleanup(&[digest]).await;
+            outcomes.push((
+                format,
+                status,
+                retry_after,
+                body,
+                stored,
+                pin.pin_identity(),
+                pull,
+            ));
+        }
+
+        for (format, status, retry_after, body, (row, stored_pin, cataloged), pin, pull) in outcomes
+        {
+            assert_eq!(
+                status,
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "{format}: an unpinned clean rescan must be inconclusive: {body}"
+            );
+            assert_eq!(
+                body["code"],
+                serde_json::json!("RESCAN_REQUEST_PINNED"),
+                "{format}"
+            );
+            assert_eq!(
+                retry_after, None,
+                "{format}: a retry cannot succeed, so none is advertised"
+            );
+            assert_eq!(
+                (row.verdict.as_str(), stored_pin.as_deref(), cataloged),
+                (PROXY_STATE_VULNERABLE, Some(pin.as_str()), Some(1)),
+                "{format}: the stored verdict and its pin must stand"
+            );
+            assert_eq!(pull, "403", "{format}: the pinned pull is still refused");
+        }
+    }
+
+    /// #5628 review: an unpinned rescan that finds a release-pinned `critical`
+    /// package vulnerable at a LOWER severity (`high`) must not replace it
+    /// either. Recorded, it would have dropped the pin and the severity, and
+    /// an opted-in severity threshold above `high` would then serve the
+    /// package. It is inconclusive (503 `RESCAN_REQUEST_PINNED`), and the
+    /// `critical` verdict and its pin stand. A rescan that finds the package
+    /// at least as severe (stored `high`, rescan `high`) is recorded, under
+    /// the stored pin.
+    #[tokio::test]
+    async fn rescan_at_a_lower_severity_keeps_a_release_pinned_verdict_and_its_pin_5628() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+        use crate::services::scanner_service::{
+            ComponentEcosystem, ExpectedComponent, OsPackageContext, OsRelease,
+        };
+
+        let pool = match tdh::try_pool().await {
+            Some(pool) => pool,
+            None if std::env::var_os("CI").is_some() => {
+                panic!("this CI regression requires Postgres; refusing to skip it")
+            }
+            None => return,
+        };
+        let fx = ProxyScanFixture::with_format(pool.clone(), "rpm").await;
+        let pin = ExpectedComponent::os_package(
+            ComponentEcosystem::Rpm,
+            "openssl-libs",
+            "1:3.0.7-17.el9_2",
+            OsPackageContext {
+                release: OsRelease::new("rhel", "9").expect("a release with a feed"),
+                arch: "x86_64".to_string(),
+                source: None,
+            },
+        )
+        .expect("an OS package pin")
+        .pin_identity();
+        let pss = crate::services::proxy_scan_service::ProxyScanService::new(pool.clone());
+        let mut digests = Vec::new();
+        let mut outcomes = Vec::new();
+        for (n, stored_severity) in ["critical", "high"].into_iter().enumerate() {
+            let path = format!("Packages/o/openssl-libs-3.0.7-17.el9_2.{n}.x86_64.rpm");
+            let content = bytes::Bytes::from(format!("rpm package {}", Uuid::new_v4()));
+            let digest = seed_cached_verdict_3396(
+                &fx,
+                &path,
+                &content,
+                None,
+                PROXY_STATE_VULNERABLE,
+                Some(1),
+                Some(&pin),
+            )
+            .await;
+            sqlx::query(
+                "UPDATE proxy_scan_results SET max_severity = $2 WHERE checksum_sha256 = $1",
+            )
+            .bind(&digest)
+            .bind(stored_severity)
+            .execute(&pool)
+            .await
+            .expect("set the stored severity");
+            // One `High` finding, cataloged as itself.
+            let scanner = std::sync::Arc::new(VersionedCveScanner::new(
+                Some("grype-test"),
+                MockCveRescan::CatalogedVulnerable("openssl-libs", "3.0.7"),
+            ))
+                as std::sync::Arc<dyn crate::services::scanner_service::Scanner>;
+            let state =
+                scanner_state_with(&fx, vec![scanner], &path, content.clone(), |_| {}).await;
+            let resp = call_rescan(state, &fx, &path)
+                .await
+                .expect("a rescan answers with a built response");
+            let status = resp.status();
+            let body = json_body(resp).await;
+            let (row, stored_pin, _) = pss
+                .lookup_verdict_with_pin(
+                    &digest,
+                    crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE,
+                )
+                .await
+                .expect("read the stored verdict")
+                .expect("a stored verdict");
+            release_rescan_slot(fx.repo_id);
+            outcomes.push((stored_severity, status, body, row, stored_pin));
+            digests.push(digest);
+        }
+        fx.cleanup(&digests).await;
+
+        let (_, status, body, row, stored_pin) = &outcomes[0];
+        assert_eq!(
+            *status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{body}"
+        );
+        assert_eq!(body["code"], serde_json::json!("RESCAN_REQUEST_PINNED"));
+        assert_eq!(
+            (
+                row.verdict.as_str(),
+                row.max_severity.as_deref(),
+                stored_pin.as_deref()
+            ),
+            (PROXY_STATE_VULNERABLE, Some("critical"), Some(pin.as_str())),
+            "a lower-severity rescan must keep the critical verdict and its pin"
+        );
+
+        let (_, status, body, row, stored_pin) = &outcomes[1];
+        assert_eq!(*status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(
+            (
+                row.verdict.as_str(),
+                row.max_severity.as_deref(),
+                stored_pin.as_deref()
+            ),
+            (PROXY_STATE_VULNERABLE, Some("high"), Some(pin.as_str())),
+            "an at-least-as-severe rescan is recorded under the stored pin"
+        );
     }
 
     /// A CVE-authoritative scanner that does not apply to the rescanned
@@ -11471,8 +11836,23 @@ mod tests {
         };
         assert!(
             matches!(q.validated_filters(), Err(AppError::Validation(_))),
-            "cve_id is VARCHAR(100): a longer value cannot match a stored row"
+            "cve_id is VARCHAR(30): a longer value cannot match a stored row"
         );
+        // #5534: `source` is TEXT, so a scanner name past the old 100-char
+        // column bound is filterable; only an unbounded query is refused.
+        let long_source = ListFindingsQuery {
+            source: Some("s".repeat(300)),
+            ..Default::default()
+        };
+        assert!(long_source.validated_filters().is_ok());
+        let q = ListFindingsQuery {
+            source: Some("s".repeat(FINDING_SOURCE_FILTER_MAX_LEN + 1)),
+            ..Default::default()
+        };
+        assert!(matches!(
+            q.validated_filters(),
+            Err(AppError::Validation(_))
+        ));
         let ok = ListFindingsQuery {
             source: Some("grype".to_string()),
             cve_id: Some("CVE-2024-3094".to_string()),

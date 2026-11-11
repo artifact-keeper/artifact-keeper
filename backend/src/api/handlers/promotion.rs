@@ -1029,6 +1029,37 @@ pub(super) async fn carry_scan_state_to_promoted(
 /// `origin` is the SOURCE artifact's recorded origin (#4152), looked up by
 /// each caller so it can apply its own error shape; passing it explicitly
 /// stops the `artifacts_origin_fill` trigger relabelling the copy `hosted`.
+/// Why [`insert_promoted_artifact_row`] stored nothing.
+#[derive(Debug)]
+enum PromotedInsertError {
+    Db(sqlx::Error),
+    /// The copy is an MCP server version whose name is a case-only twin of
+    /// one the target registry recorded (#5435): the stored spelling.
+    NameCaseConflict(String),
+}
+
+impl From<sqlx::Error> for PromotedInsertError {
+    fn from(e: sqlx::Error) -> Self {
+        Self::Db(e)
+    }
+}
+
+impl PromotedInsertError {
+    /// The `409 mcp_name_case_conflict` a promotion answers, with the
+    /// publish route's wording.
+    fn name_case_conflict(name: &str, existing: String) -> AppError {
+        let e = crate::formats::mcp::McpError::NameCaseConflict {
+            name: name.to_string(),
+            existing,
+        };
+        AppError::CodedConflict {
+            code: e.code(),
+            message: e.detail(),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn insert_promoted_artifact_row(
     db: &sqlx::PgPool,
     new_artifact_id: Uuid,
@@ -1037,10 +1068,23 @@ async fn insert_promoted_artifact_row(
     uploaded_by: Uuid,
     origin: Option<serde_json::Value>,
     oci_image: Option<&crate::services::oci_promotion::PreparedOciImage>,
-) -> std::result::Result<(), sqlx::Error> {
+    mcp_server_name: Option<&str>,
+) -> std::result::Result<(), PromotedInsertError> {
     // The row, its metadata and (for a Docker/OCI manifest) the rows that make
     // the image pullable commit together (#4578).
     let mut tx = db.begin().await?;
+    // #5435: an MCP server version copied into a hosted registry obeys the
+    // publish rule against case-only name twins (#5434), under the same
+    // lowercased-name lock, so a look-alike cannot reach a Local registry
+    // by way of a Staging one. A name the target already recorded never
+    // conflicts with itself.
+    if let Some(name) = mcp_server_name {
+        if let Some(existing) =
+            super::mcp::locked_case_twin_of(&mut tx, target_repo_id, name).await?
+        {
+            return Err(PromotedInsertError::NameCaseConflict(existing));
+        }
+    }
     // NO-SCAN-ON-UPLOAD: promotion copies an existing artifact whose own scans
     // gated the promotion; it is not an upload (#4166 scope). Those scans and the
     // acknowledgements on them travel with the copy (#5153,
@@ -1094,7 +1138,7 @@ async fn insert_promoted_artifact_row(
             .register_in_tx(&mut tx, target_repo_id, uploaded_by)
             .await?;
     }
-    tx.commit().await
+    Ok(tx.commit().await?)
 }
 
 /// One row of the promotion audit trail. A struct rather than a parameter list
@@ -1448,6 +1492,21 @@ pub async fn promote_artifact(
     )
     .await?;
 
+    if crate::services::mcp_write::copy_reuses_recorded_version(
+        &state.db,
+        &target_repo.format,
+        target_repo.id,
+        &artifact.path,
+        &artifact.name,
+        artifact.version.as_deref(),
+    )
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?
+    {
+        return Err(AppError::Conflict(
+            crate::services::mcp_write::COPY_REUSES_VERSION.to_string(),
+        ));
+    }
     super::cleanup_soft_deleted_artifact(&state.db, target_repo.id, &artifact.path).await;
 
     // Carry the SOURCE artifact's origin onto the copy (#4152). Without an
@@ -1461,6 +1520,9 @@ pub async fn promote_artifact(
         .await
         .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?;
 
+    let mcp_server_name =
+        crate::services::mcp_write::copy_is_mcp_server_json(&target_repo.format, &artifact.path)
+            .then_some(artifact.name.as_str());
     insert_promoted_artifact_row(
         &state.db,
         new_artifact_id,
@@ -1469,17 +1531,20 @@ pub async fn promote_artifact(
         auth.user_id,
         source_origin,
         oci_image.as_ref(),
+        mcp_server_name,
     )
     .await
-    .map_err(|e: sqlx::Error| {
-        if e.to_string().contains("duplicate key") {
+    .map_err(|e| match e {
+        PromotedInsertError::NameCaseConflict(existing) => {
+            PromotedInsertError::name_case_conflict(&artifact.name, existing)
+        }
+        PromotedInsertError::Db(e) if e.to_string().contains("duplicate key") => {
             AppError::Conflict(format!(
                 "Artifact already exists in target repository: {}",
                 artifact.path
             ))
-        } else {
-            AppError::Database(e.to_string())
         }
+        PromotedInsertError::Db(e) => AppError::Database(e.to_string()),
     })?;
 
     let promotion_id = Uuid::new_v4();
@@ -1906,6 +1971,26 @@ pub async fn promote_artifacts_bulk(
         };
 
         let new_artifact_id = Uuid::new_v4();
+        // A recorded MCP server version is write-once (#5253): refused
+        // before the trashed row at the target path is cleared.
+        let reused = crate::services::mcp_write::copy_reuses_recorded_version(
+            &state.db,
+            &target_repo.format,
+            target_repo.id,
+            &artifact.path,
+            &artifact.name,
+            artifact.version.as_deref(),
+        )
+        .await;
+        if !matches!(reused, Ok(false)) {
+            failed += 1;
+            let msg = match reused {
+                Ok(_) => crate::services::mcp_write::COPY_REUSES_VERSION.to_string(),
+                Err(e) => crate::api::handlers::db_err_message(&e).to_string(),
+            };
+            results.push(failed_response(source_display, target_display, msg));
+            continue;
+        }
         super::cleanup_soft_deleted_artifact(&state.db, target_repo.id, &artifact.path).await;
         // Same origin carry-over as the single-promote path (#4152): the
         // copy records where the SOURCE artifact's bytes came from, not a
@@ -1924,6 +2009,11 @@ pub async fn promote_artifacts_bulk(
                 }
             };
 
+        let mcp_server_name = crate::services::mcp_write::copy_is_mcp_server_json(
+            &target_repo.format,
+            &artifact.path,
+        )
+        .then_some(artifact.name.as_str());
         let insert_result = insert_promoted_artifact_row(
             &state.db,
             new_artifact_id,
@@ -1932,15 +2022,20 @@ pub async fn promote_artifacts_bulk(
             auth.user_id,
             source_origin,
             oci_image.as_ref(),
+            mcp_server_name,
         )
         .await;
 
         if let Err(e) = insert_result {
             failed += 1;
-            let msg = if e.to_string().contains("duplicate key") {
-                "Artifact already exists in target".to_string()
-            } else {
-                crate::api::handlers::db_err_message(&e).to_string()
+            let msg = match e {
+                PromotedInsertError::NameCaseConflict(existing) => {
+                    PromotedInsertError::name_case_conflict(&artifact.name, existing).to_string()
+                }
+                PromotedInsertError::Db(e) if e.to_string().contains("duplicate key") => {
+                    "Artifact already exists in target".to_string()
+                }
+                PromotedInsertError::Db(e) => crate::api::handlers::db_err_message(&e).to_string(),
             };
             results.push(failed_response(source_display, target_display, msg));
             continue;
@@ -2205,6 +2300,7 @@ pub async fn promotion_history(
         LEFT JOIN users u ON u.id = ph.promoted_by
         WHERE (ph.source_repo_id = $1 OR ph.target_repo_id = $1)
           AND ($4::TEXT IS NULL OR ph.status = $4)
+          AND ($5::UUID IS NULL OR ph.artifact_id = $5)
         ORDER BY ph.created_at DESC
         LIMIT $2 OFFSET $3
         "#,
@@ -2213,6 +2309,7 @@ pub async fn promotion_history(
     .bind(per_page as i64)
     .bind(offset)
     .bind(status_filter)
+    .bind(query.artifact_id)
     .fetch_all(&state.db)
     .await
     .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?;
@@ -2220,10 +2317,12 @@ pub async fn promotion_history(
     let total: i64 = sqlx::query_scalar(
         r#"SELECT COUNT(*)::BIGINT FROM promotion_history
            WHERE (source_repo_id = $1 OR target_repo_id = $1)
-             AND ($2::TEXT IS NULL OR status = $2)"#,
+             AND ($2::TEXT IS NULL OR status = $2)
+             AND ($3::UUID IS NULL OR artifact_id = $3)"#,
     )
     .bind(repo.id)
     .bind(status_filter)
+    .bind(query.artifact_id)
     .fetch_one(&state.db)
     .await
     .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?;
@@ -2668,6 +2767,162 @@ fn build_rejection_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #5435: a promotion into an MCP registry refuses a case-only twin of
+    /// a recorded server name (`409 mcp_name_case_conflict`, nothing
+    /// stored), as publish does; the recorded spelling itself still
+    /// promotes. A peer replication stores the twin and reports it.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)] // a bounded read of a small test body
+    async fn mcp_case_only_twins_promotion_refused_replication_reported_5435() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (target, target_key, dir) = tdh::create_repo(&pool, "local", "mcp").await;
+        let (user, _) = tdh::create_user(&pool).await;
+        sqlx::query(
+            "INSERT INTO mcp_version_tombstones (repository_id, name, version) \
+             VALUES ($1, 'io.acme/tool', '1.0.0')",
+        )
+        .bind(target)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let copy = |name: &str, version: &str| crate::models::artifact::Artifact {
+            id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            path: crate::formats::mcp::storage_path(name, version),
+            name: name.to_string(),
+            version: Some(version.to_string()),
+            size_bytes: 2,
+            checksum_sha256: "a".repeat(64),
+            checksum_md5: None,
+            checksum_sha1: None,
+            content_type: "application/json".into(),
+            storage_key: format!("mcp/{name}/{version}/x.json"),
+            is_deleted: false,
+            uploaded_by: None,
+            quarantine_status: None,
+            quarantine_until: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let stored = |name: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM artifacts WHERE repository_id = $1 AND name = $2",
+                )
+                .bind(target)
+                .bind(name)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let twin = copy("io.Acme/tool", "2.0.0");
+        let err = insert_promoted_artifact_row(
+            &pool,
+            Uuid::new_v4(),
+            target,
+            &twin,
+            user,
+            None,
+            None,
+            Some(twin.name.as_str()),
+        )
+        .await
+        .expect_err("a case-only twin is refused");
+        let PromotedInsertError::NameCaseConflict(existing) = err else {
+            panic!("expected the case conflict, got {err:?}");
+        };
+        assert_eq!(existing, "io.acme/tool");
+        assert_eq!(stored("io.Acme/tool").await, 0, "nothing stored");
+        let resp = PromotedInsertError::name_case_conflict(&twin.name, existing).into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["code"], "mcp_name_case_conflict", "{body}");
+        assert!(
+            body["message"].as_str().unwrap().contains("io.acme/tool"),
+            "{body}"
+        );
+
+        // The recorded spelling promotes a new version.
+        let same = copy("io.acme/tool", "2.0.0");
+        insert_promoted_artifact_row(
+            &pool,
+            Uuid::new_v4(),
+            target,
+            &same,
+            user,
+            None,
+            None,
+            Some(same.name.as_str()),
+        )
+        .await
+        .expect("the recorded spelling is not a twin of itself");
+        assert_eq!(stored("io.acme/tool").await, 1);
+
+        // Replication: the twin is stored as sent, then reported.
+        let replicated = copy("IO.ACME/tool", "3.0.0");
+        insert_promoted_artifact_row(
+            &pool,
+            replicated.id,
+            target,
+            &replicated,
+            user,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("a replication path stores the twin");
+        let twins = crate::api::handlers::repositories::audit_replicated_case_twin(
+            &pool,
+            target,
+            &target_key,
+            user,
+            replicated.id,
+            &replicated.name,
+            "3.0.0",
+        )
+        .await;
+        assert_eq!(twins, ["io.acme/tool"]);
+        assert!(
+            crate::api::handlers::repositories::audit_replicated_case_twin(
+                &pool,
+                target,
+                &target_key,
+                user,
+                same.id,
+                "io.other/tool",
+                "1.0.0",
+            )
+            .await
+            .is_empty()
+        );
+
+        sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(target)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(target)
+            .execute(&pool)
+            .await
+            .unwrap();
+        tdh::cleanup_user(&pool, user).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     // -----------------------------------------------------------------------
     // ensure_promotion_authorized (admin-only gate on /promote routes)
@@ -6762,6 +7017,80 @@ mod tests {
             let (status, json) = f.history(&f.staging.1, admin).await;
             assert_eq!(status, StatusCode::OK, "{json}");
             assert_eq!(keys(&json), (f.staging.1.clone(), f.release.1.clone()));
+            f.teardown().await;
+        }
+
+        /// #5209: `artifact_id` filters both the page and `pagination.total`.
+        #[tokio::test]
+        async fn history_filters_by_artifact_id() {
+            let Some(f) = HistoryFixture::setup().await else {
+                return;
+            };
+            let first: Uuid =
+                sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1")
+                    .bind(f.staging.0)
+                    .fetch_one(&f.pool)
+                    .await
+                    .expect("fixture artifact");
+            let second: Uuid = sqlx::query_scalar(
+                "INSERT INTO artifacts (repository_id, path, name, size_bytes, \
+                 checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, 'app/2.0/app.bin', 'app', 1, repeat('1', 64), \
+                         'application/octet-stream', 'ph-5209') RETURNING id",
+            )
+            .bind(f.staging.0)
+            .fetch_one(&f.pool)
+            .await
+            .expect("seed second artifact");
+            sqlx::query(
+                "INSERT INTO promotion_history \
+                 (artifact_id, source_repo_id, target_repo_id, status, rejection_reason) \
+                 VALUES ($1, $2, $3, 'rejected', 'no')",
+            )
+            .bind(second)
+            .bind(f.staging.0)
+            .bind(f.release.0)
+            .execute(&f.pool)
+            .await
+            .expect("seed second history row");
+            let admin = AuthExtension {
+                is_admin: true,
+                ..f.member()
+            };
+            let get = |query: String| {
+                let admin = admin.clone();
+                let key = f.staging.1.clone();
+                let f = &f;
+                async move {
+                    f.read(&key, &format!("promotion-history{query}"), admin)
+                        .await
+                }
+            };
+
+            let (status, json) = get(String::new()).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(json["pagination"]["total"], 2, "unfiltered: {json}");
+
+            for artifact in [first, second] {
+                let (status, json) = get(format!("?artifact_id={artifact}")).await;
+                assert_eq!(status, StatusCode::OK, "{json}");
+                assert_eq!(json["pagination"]["total"], 1, "{artifact}: {json}");
+                let items = json["items"].as_array().expect("items");
+                assert_eq!(items.len(), 1, "{artifact}: {json}");
+                assert_eq!(items[0]["artifact_id"], artifact.to_string(), "{json}");
+            }
+
+            // No artifact has this id: empty page, zero total.
+            let (status, json) = get(format!("?artifact_id={}", Uuid::nil())).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(json["pagination"]["total"], 0, "{json}");
+            assert_eq!(json["items"].as_array().map(Vec::len), Some(0), "{json}");
+
+            // Combined with status, both filters apply.
+            let (_, json) = get(format!("?artifact_id={second}&status=promoted")).await;
+            assert_eq!(json["pagination"]["total"], 0, "{json}");
+            let (_, json) = get(format!("?artifact_id={second}&status=rejected")).await;
+            assert_eq!(json["pagination"]["total"], 1, "{json}");
             f.teardown().await;
         }
 

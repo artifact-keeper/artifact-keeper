@@ -55,23 +55,77 @@ use tracing::{field::Empty, Instrument, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::services::proxy_service::redact_url_for_diagnostics;
+use crate::services::upstream_fetch_audit::{PendingFetch, UpstreamAuditTarget};
 
 /// Send `request` to an upstream inside a `CLIENT` span, injecting its trace
 /// context. Returns exactly what `RequestBuilder::send` would, so each caller
 /// keeps its own error mapping.
-pub(crate) async fn send_upstream(
+///
+/// A plain `fn` returning [`send_upstream_audited`]'s future, not an `async fn`
+/// wrapping it: handler futures that reach an upstream call (the NuGet,
+/// conda, sbt and VS Code member walks) already sit at the compiler's layout
+/// query-depth limit, and one more wrapper level pushed them over (#5286).
+pub(crate) fn send_upstream(
     request: reqwest::RequestBuilder,
+) -> impl std::future::Future<Output = reqwest::Result<reqwest::Response>> + Send {
+    send_upstream_audited(request, None, true)
+}
+
+/// [`send_upstream`] from a client that may not follow the environment
+/// proxy: `env_proxy` is false for a per-repository `direct`/`explicit`
+/// client, whose requests the environment-proxy recheck must not judge
+/// (see [`send_upstream_audited`]).
+pub(crate) fn send_upstream_for(
+    request: reqwest::RequestBuilder,
+    env_proxy: bool,
+) -> impl std::future::Future<Output = reqwest::Result<reqwest::Response>> + Send {
+    send_upstream_audited(request, None, env_proxy)
+}
+
+/// [`send_upstream`] that also records the request as an `UPSTREAM_FETCHED`
+/// audit row when `audit` is given (#5286). A request that fails to build is
+/// never sent and never recorded. The row is written off the request path
+/// (see [`crate::services::upstream_fetch_audit`]).
+///
+/// `env_proxy_recheck` is whether the sending client follows the environment
+/// proxy (the shared upstream client): its plain-HTTP requests are then
+/// rechecked before each send (#5459). A per-repository `direct` or
+/// `explicit` client is not routed by the environment proxy and passes
+/// `false`.
+pub(crate) async fn send_upstream_audited(
+    request: reqwest::RequestBuilder,
+    audit: Option<UpstreamAuditTarget>,
+    env_proxy_recheck: bool,
 ) -> reqwest::Result<reqwest::Response> {
     let (client, built) = request.build_split();
     let mut request = built?;
     let had_auth = request.headers().contains_key(AUTHORIZATION);
     let span = upstream_client_span(request.method(), request.url());
     inject_trace_context(&span, request.headers_mut());
+    // A plain-HTTP request the environment proxy carries may ride a pooled
+    // connection that never passes the connect-time check again (#5459).
+    let recheck = if env_proxy_recheck {
+        crate::services::env_proxy_guard::check_upstream_request(request.url())
+            .instrument(span.clone())
+            .await
+    } else {
+        Ok(())
+    };
+    if let Err(err) = recheck {
+        record_transport_error(&span, &err);
+        return Err(err);
+    }
+    let pending = audit.map(|target| PendingFetch::start(target, &request, had_auth));
 
     let result = client.execute(request).instrument(span.clone()).await;
     match &result {
         Ok(response) => record_response_status(&span, response.status(), had_auth),
         Err(err) => record_transport_error(&span, err),
+    }
+    if let Some(pending) = pending {
+        // Boxed so the audit bookkeeping adds one opaque level, not its own
+        // depth, to every caller's future (see `send_upstream`).
+        Box::pin(pending.finish(&result)).await;
     }
     result
 }
@@ -125,7 +179,7 @@ fn status_is_error(status: StatusCode, had_auth: bool) -> bool {
 
 /// Low-cardinality `error.type` for a request that produced no response: the
 /// first matching reqwest error class, in this order, else `_OTHER`.
-fn transport_error_type(err: &reqwest::Error) -> &'static str {
+pub(crate) fn transport_error_type(err: &reqwest::Error) -> &'static str {
     type Class = (fn(&reqwest::Error) -> bool, &'static str);
     const CLASSES: [Class; 7] = [
         (reqwest::Error::is_timeout, "timeout"),

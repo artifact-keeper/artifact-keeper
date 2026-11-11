@@ -961,6 +961,242 @@ pub fn if_none_match_matches(header: &str, etag: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Remote repositories: documents proxied from another Artifact Keeper (#5289)
+// ---------------------------------------------------------------------------
+
+/// Whether `s` is a SHA-256 in hex (either case).
+pub fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The proxy-cache path a Remote keeps an archive under:
+/// `{name}/{version}/{sha256}/{name}-{version}.zip`, lowercase digest.
+///
+/// It names the digest the upstream index lists, so the entry is
+/// content-addressed and the cache classifier keeps it as immutable. The
+/// hosted artifact path (`{name}/{version}/{name}-{version}.zip`, three
+/// segments) is deliberately a different shape: it stays out of the
+/// immutable arm, so the delete and re-publish rules of hosted repositories
+/// are unchanged.
+pub fn remote_cache_path(name: &str, version: &str, sha256: &str) -> String {
+    format!(
+        "{name}/{version}/{}/{}",
+        sha256.to_ascii_lowercase(),
+        archive_filename(name, version)
+    )
+}
+
+/// Whether an upstream archive `url` is the canonical download URL of
+/// `name` `version` on an Artifact Keeper: an `http(s)` URL whose path ends
+/// with `/{name}/{version}/{name}-{version}.zip`.
+///
+/// The host is not compared. The upstream builds its URLs from its own
+/// external URL, which need not be the URL this instance reaches it at, and
+/// the Remote always downloads from its own `upstream_url` anyway, gated on
+/// the listed `sha256`. A URL with another path (a foreign host's own
+/// layout, a relative path) names bytes this instance cannot fetch through
+/// its upstream, so its entry is not proxied.
+fn is_canonical_archive_url(url: &str, name: &str, version: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    matches!(parsed.scheme(), "http" | "https")
+        && parsed
+            .path()
+            .ends_with(&format!("/{}", artifact_path(name, version)))
+}
+
+/// The archive one upstream entry points at, when this instance can proxy
+/// it: valid coordinates, a SHA-256, and a canonical archive URL.
+fn proxiable_archive<'a>(
+    name: &str,
+    version: &str,
+    url: Option<&'a str>,
+    sha256: Option<&'a str>,
+) -> Option<&'a str> {
+    validate_coordinates(name, version, &archive_filename(name, version)).ok()?;
+    let sha256 = sha256.filter(|s| is_sha256_hex(s))?;
+    url.filter(|u| is_canonical_archive_url(u, name, version))?;
+    Some(sha256)
+}
+
+fn str_field<'a>(obj: &'a Value, key: &str) -> Option<&'a str> {
+    obj.get(key).and_then(Value::as_str)
+}
+
+/// Rewrite one upstream `plugins[]` entry for this instance, or `None` when
+/// it cannot be proxied (not an `archive` source, invalid coordinates, no
+/// SHA-256, or a non-canonical URL).
+fn rewrite_marketplace_entry(mut entry: Value, ctx: &IndexContext) -> Option<Value> {
+    let name = str_field(&entry, "name")?.to_string();
+    let version = str_field(&entry, "version")?.to_string();
+    let source = entry.get("source")?;
+    if str_field(source, "source") != Some("archive") {
+        return None;
+    }
+    proxiable_archive(
+        &name,
+        &version,
+        str_field(source, "url"),
+        str_field(source, "sha256"),
+    )?;
+    let obj = entry.as_object_mut()?;
+    if let Some(Value::Object(source)) = obj.get_mut("source") {
+        source.insert("url".into(), json!(ctx.download_url(&name, &version)));
+    }
+    if let Some(Value::Object(meta)) = obj.get_mut("metadata") {
+        if meta.contains_key("versions_url") {
+            meta.insert("versions_url".into(), json!(ctx.versions_url(&name)));
+        }
+    }
+    Some(entry)
+}
+
+/// Turn a marketplace document fetched from an upstream Artifact Keeper
+/// (any of the five variants) into the document this Remote serves.
+///
+/// Every archive `url` and `versions_url` is rebuilt to point at this
+/// instance's routes for this repository (keeping a `/t/{token}/` prefix
+/// when `ctx` carries one), and each `sha256` is kept exactly as the
+/// upstream listed it, so a client verifies the same bytes on every
+/// instance. The marketplace `name`, `owner.url`, `metadata.repository` and
+/// `metadata.plugin_count` describe this repository; the `description` is the
+/// Remote's own when it has one, the upstream's otherwise. Entries this
+/// instance cannot proxy (see [`rewrite_marketplace_entry`]) are dropped.
+/// Every other field, and the upstream order of `plugins`, is kept.
+pub fn rewrite_proxied_marketplace(
+    doc: Value,
+    ctx: &IndexContext,
+) -> std::result::Result<Value, String> {
+    let Value::Object(mut doc) = doc else {
+        return Err("the upstream marketplace document is not a JSON object".into());
+    };
+    let Some(Value::Array(plugins)) = doc.remove("plugins") else {
+        return Err("the upstream marketplace document has no plugins array".into());
+    };
+    let plugins: Vec<Value> = plugins
+        .into_iter()
+        .filter_map(|entry| rewrite_marketplace_entry(entry, ctx))
+        .collect();
+    doc.insert(
+        "name".into(),
+        json!(sanitize_marketplace_name(&ctx.repo_key)),
+    );
+    if let Some(description) = ctx.description.as_ref().filter(|d| !d.trim().is_empty()) {
+        doc.insert("description".into(), json!(description));
+    }
+    if let Some(Value::Object(owner)) = doc.get_mut("owner") {
+        owner.insert("url".into(), json!(ctx.origin));
+    }
+    if let Some(Value::Object(meta)) = doc.get_mut("metadata") {
+        meta.insert("repository".into(), json!(ctx.repo_key));
+        meta.insert("plugin_count".into(), json!(plugins.len()));
+    }
+    doc.insert("plugins".into(), Value::Array(plugins));
+    Ok(Value::Object(doc))
+}
+
+/// The proxiable `versions[]` entries of an upstream `{name}/index.json`.
+fn proxiable_versions<'a>(
+    doc: &'a Value,
+    name: &'a str,
+) -> impl Iterator<Item = (&'a Value, &'a str, &'a str)> + 'a {
+    doc.get("versions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(move |entry| {
+            let version = str_field(entry, "version")?;
+            let sha256 = proxiable_archive(
+                name,
+                version,
+                str_field(entry, "url"),
+                str_field(entry, "sha256"),
+            )?;
+            Some((entry, version, sha256))
+        })
+}
+
+fn check_versions_index(doc: &Value, name: &str) -> std::result::Result<(), String> {
+    if !doc.is_object() {
+        return Err("the upstream versions index is not a JSON object".into());
+    }
+    if str_field(doc, "name") != Some(name) {
+        return Err(format!(
+            "the upstream versions index does not describe plugin {name:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Turn an upstream `{name}/index.json` into the one this Remote serves:
+/// each version's `url` points at this instance (token prefix kept), each
+/// `sha256` is the upstream's, and a version this instance cannot proxy is
+/// dropped. `latest` stays the upstream's when that version is still listed
+/// and is otherwise the highest SemVer version kept. `Ok(None)` when no
+/// version is left (the route answers `404`, as for a hosted plugin with no
+/// servable version); `Err` when the body is not an index of `name`.
+pub fn rewrite_proxied_versions_index(
+    doc: Value,
+    name: &str,
+    ctx: &IndexContext,
+) -> std::result::Result<Option<Value>, String> {
+    check_versions_index(&doc, name)?;
+    let mut kept: Vec<Value> = Vec::new();
+    for (entry, version, _) in proxiable_versions(&doc, name) {
+        let mut entry = entry.clone();
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("url".into(), json!(ctx.download_url(name, version)));
+        }
+        kept.push(entry);
+    }
+    let versions: Vec<&str> = kept
+        .iter()
+        .filter_map(|e| str_field(e, "version"))
+        .collect();
+    let Some(highest) = versions
+        .iter()
+        .copied()
+        .max_by(|a, b| compare_versions(a, b))
+    else {
+        return Ok(None);
+    };
+    let latest = str_field(&doc, "latest")
+        .filter(|l| versions.contains(l))
+        .unwrap_or(highest)
+        .to_string();
+    let Value::Object(mut out) = doc else {
+        unreachable!("checked above");
+    };
+    out.insert("latest".into(), json!(latest));
+    out.insert("versions".into(), Value::Array(kept));
+    Ok(Some(Value::Object(out)))
+}
+
+/// What an upstream `{name}/index.json` says about one archive: the SHA-256
+/// a Remote checks the downloaded bytes against before caching or serving
+/// them, and the size, when listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxiedArchive {
+    /// Lowercase hex.
+    pub sha256: String,
+    pub size_bytes: Option<u64>,
+}
+
+/// The [`ProxiedArchive`] of `name` `version` in an upstream index, under the
+/// same rules [`rewrite_proxied_versions_index`] lists a version by, so a
+/// version the served index leaves out is not downloadable either.
+pub fn proxied_archive(doc: &Value, name: &str, version: &str) -> Option<ProxiedArchive> {
+    check_versions_index(doc, name).ok()?;
+    proxiable_versions(doc, name)
+        .find(|(_, v, _)| *v == version)
+        .map(|(entry, _, sha256)| ProxiedArchive {
+            sha256: sha256.to_ascii_lowercase(),
+            size_bytes: entry.get("size_bytes").and_then(Value::as_u64),
+        })
+}
+
+// ---------------------------------------------------------------------------
 // FormatHandler
 // ---------------------------------------------------------------------------
 
@@ -1667,5 +1903,282 @@ mod tests {
             ("a".into(), "1.0.0".into(), "a-1.0.0.zip".into())
         );
         assert!(split_artifact_path("a/1.0.0").is_err());
+    }
+
+    // ---- Remote: proxied documents (#5289) --------------------------------
+
+    fn sha(n: u8) -> String {
+        format!("{n:02x}").repeat(32)
+    }
+
+    /// A version as a central AK lists it, with a real-shaped sha256.
+    fn central(name: &str, v: &str, harnesses: &[&str], n: u8) -> IndexedVersion {
+        IndexedVersion {
+            sha256: sha(n),
+            ..version(name, v, harnesses, n as u32)
+        }
+    }
+
+    /// The central instance the documents are generated on.
+    fn upstream_ctx(token: Option<&str>) -> IndexContext {
+        IndexContext {
+            repo_key: "central".into(),
+            description: Some("Central plugins".into()),
+            origin: "https://central.example.com".into(),
+            token: token.map(str::to_string),
+        }
+    }
+
+    /// The Remote on this instance.
+    fn remote_ctx(token: Option<&str>) -> IndexContext {
+        IndexContext {
+            repo_key: "plugins-remote".into(),
+            description: None,
+            origin: "https://site.example.org".into(),
+            token: token.map(str::to_string),
+        }
+    }
+
+    fn central_versions() -> Vec<IndexedVersion> {
+        vec![
+            central("deploy-tools", "1.0.0", &["claude"], 1),
+            central("deploy-tools", "1.2.0", &["claude", "standard"], 2),
+            central("multi", "3.0.0", &["claude", "cursor", "codex"], 3),
+            central("std-tools", "0.1.0", &["standard"], 4),
+        ]
+    }
+
+    /// Every document variant, from a plain and from a token upstream, served
+    /// through a plain and a token Remote: each archive URL and versions_url
+    /// is this instance's, each sha256 is the upstream's, and every other
+    /// field is kept.
+    #[test]
+    fn proxied_marketplace_rewrites_urls_and_keeps_sha256_5289() {
+        let versions = central_versions();
+        for up_token in [None, Some("up-secret")] {
+            for local_token in [None, Some("local/tok")] {
+                let up = upstream_ctx(up_token);
+                let local = remote_ctx(local_token);
+                for kind in Marketplace::ALL {
+                    let upstream = build_marketplace(kind, &up, &versions);
+                    let doc = rewrite_proxied_marketplace(upstream.clone(), &local).unwrap();
+                    let label = format!("{} {up_token:?} {local_token:?}", kind.file_name());
+                    assert_eq!(doc["name"], "plugins-remote", "{label}");
+                    assert_eq!(doc["owner"]["url"], "https://site.example.org");
+                    assert_eq!(doc["owner"]["name"], OWNER_NAME);
+                    assert_eq!(doc["description"], "Central plugins");
+                    assert_eq!(doc["metadata"]["repository"], "plugins-remote");
+                    assert_eq!(
+                        doc["metadata"]["generated_at"],
+                        upstream["metadata"]["generated_at"]
+                    );
+                    assert_eq!(doc.get("$schema"), upstream.get("$schema"), "{label}");
+                    let up_plugins = upstream["plugins"].as_array().unwrap();
+                    let plugins = doc["plugins"].as_array().unwrap();
+                    assert_eq!(plugins.len(), up_plugins.len(), "{label}");
+                    assert_eq!(doc["metadata"]["plugin_count"], json!(plugins.len()));
+                    for (entry, up_entry) in plugins.iter().zip(up_plugins) {
+                        let name = entry["name"].as_str().unwrap();
+                        let v = entry["version"].as_str().unwrap();
+                        assert_eq!(entry["source"]["url"], local.download_url(name, v));
+                        assert_eq!(entry["source"]["sha256"], up_entry["source"]["sha256"]);
+                        assert_eq!(entry["metadata"]["versions_url"], local.versions_url(name));
+                        assert_eq!(
+                            entry["metadata"]["harnesses"],
+                            up_entry["metadata"]["harnesses"]
+                        );
+                        assert_eq!(entry["description"], up_entry["description"]);
+                        let url = entry["source"]["url"].as_str().unwrap();
+                        assert!(!url.contains("central"), "{url}");
+                        assert!(!url.contains("up-secret"), "{url}");
+                        assert_eq!(url.contains("/t/local%2Ftok/"), local_token.is_some());
+                    }
+                }
+            }
+        }
+    }
+
+    /// The Remote's own description wins over the upstream's when it has one.
+    #[test]
+    fn proxied_marketplace_prefers_the_remote_description_5289() {
+        let upstream =
+            build_marketplace(Marketplace::All, &upstream_ctx(None), &central_versions());
+        let mut local = remote_ctx(None);
+        local.description = Some("Site mirror".into());
+        let doc = rewrite_proxied_marketplace(upstream.clone(), &local).unwrap();
+        assert_eq!(doc["description"], "Site mirror");
+        local.description = Some("  ".into());
+        let doc = rewrite_proxied_marketplace(upstream, &local).unwrap();
+        assert_eq!(doc["description"], "Central plugins");
+    }
+
+    /// Foreign and unproxiable entries are pinned: an archive URL on another
+    /// host with the canonical path is proxied (the Remote fetches from its
+    /// own upstream, gated on the sha256); a URL with another path, a
+    /// non-archive source, a missing or malformed sha256, invalid coordinates
+    /// or a non-http URL is dropped.
+    #[test]
+    fn proxied_marketplace_drops_entries_it_cannot_proxy_5289() {
+        let entry = |name: &str, version: &str, source: Value| json!({"name": name, "version": version, "source": source, "metadata": {}});
+        let archive =
+            |url: &str, sha256: Value| json!({"source": "archive", "url": url, "sha256": sha256});
+        let good = "https://elsewhere.example.net/agentplugins/x/p/1.0.0/p-1.0.0.zip";
+        let upstream = json!({
+            "name": "central",
+            "owner": {"name": OWNER_NAME, "url": "https://central.example.com"},
+            "metadata": {"repository": "central", "plugin_count": 9},
+            "plugins": [
+                entry("p", "1.0.0", archive(good, json!(sha(1)))),
+                entry("p", "1.0.0", archive(good, json!(sha(1).to_uppercase()))),
+                entry("q", "1.0.0", archive("https://cdn.example.net/q.zip", json!(sha(2)))),
+                entry("q", "1.0.0", archive("/agentplugins/x/q/1.0.0/q-1.0.0.zip", json!(sha(2)))),
+                entry("q", "1.0.0", archive("ftp://h/agentplugins/x/q/1.0.0/q-1.0.0.zip", json!(sha(2)))),
+                entry("q", "1.0.0", json!({"source": "github", "repo": "o/q"})),
+                entry("q", "1.0.0", json!("./plugins/q")),
+                entry("q", "1.0.0", archive("https://h/q/1.0.0/q-1.0.0.zip", json!("abc"))),
+                entry("q", "1.0.0", archive("https://h/q/1.0.0/q-1.0.0.zip", Value::Null)),
+                entry("Q", "1.0.0", archive("https://h/Q/1.0.0/Q-1.0.0.zip", json!(sha(2)))),
+                entry("q", "1.0", archive("https://h/q/1.0/q-1.0.zip", json!(sha(2)))),
+                json!({"name": "q"}),
+                json!("not an object"),
+            ],
+        });
+        let local = remote_ctx(None);
+        let doc = rewrite_proxied_marketplace(upstream, &local).unwrap();
+        let plugins = doc["plugins"].as_array().unwrap();
+        assert_eq!(plugins.len(), 2, "{doc:#}");
+        assert_eq!(
+            plugins[0]["source"]["url"],
+            local.download_url("p", "1.0.0")
+        );
+        assert_eq!(plugins[0]["source"]["sha256"], sha(1));
+        assert_eq!(plugins[1]["source"]["sha256"], sha(1).to_uppercase());
+        assert_eq!(doc["metadata"]["plugin_count"], 2);
+        // An entry without `metadata.versions_url` does not gain one.
+        assert!(plugins[0]["metadata"].get("versions_url").is_none());
+    }
+
+    #[test]
+    fn proxied_marketplace_refuses_a_body_that_is_not_one_5289() {
+        let local = remote_ctx(None);
+        for bad in [
+            json!([]),
+            json!("x"),
+            json!({"name": "c"}),
+            json!({"plugins": {}}),
+        ] {
+            assert!(
+                rewrite_proxied_marketplace(bad.clone(), &local).is_err(),
+                "{bad}"
+            );
+        }
+        let empty = rewrite_proxied_marketplace(json!({"plugins": []}), &local).unwrap();
+        assert_eq!(empty["plugins"], json!([]));
+        assert_eq!(empty["name"], "plugins-remote");
+    }
+
+    /// `{name}/index.json` through a plain and a token Remote, from a plain
+    /// and a token upstream.
+    #[test]
+    fn proxied_versions_index_rewrites_urls_and_keeps_sha256_5289() {
+        let versions = central_versions();
+        for up_token in [None, Some("up")] {
+            for local_token in [None, Some("tok")] {
+                let up = upstream_ctx(up_token);
+                let local = remote_ctx(local_token);
+                let upstream = build_versions_index("deploy-tools", &up, &versions).unwrap();
+                let doc = rewrite_proxied_versions_index(upstream.clone(), "deploy-tools", &local)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(doc["name"], "deploy-tools");
+                assert_eq!(doc["latest"], "1.2.0");
+                let entries = doc["versions"].as_array().unwrap();
+                assert_eq!(entries.len(), 2);
+                for (entry, up_entry) in
+                    entries.iter().zip(upstream["versions"].as_array().unwrap())
+                {
+                    let v = entry["version"].as_str().unwrap();
+                    assert_eq!(entry["url"], local.download_url("deploy-tools", v));
+                    assert_eq!(entry["sha256"], up_entry["sha256"]);
+                    assert_eq!(entry["size_bytes"], up_entry["size_bytes"]);
+                    assert_eq!(entry["harnesses"], up_entry["harnesses"]);
+                }
+                let archive = proxied_archive(&upstream, "deploy-tools", "1.0.0").unwrap();
+                assert_eq!(archive.sha256, sha(1));
+                assert_eq!(archive.size_bytes, Some(10));
+                assert!(proxied_archive(&upstream, "deploy-tools", "9.0.0").is_none());
+                assert!(proxied_archive(&upstream, "other", "1.0.0").is_none());
+            }
+        }
+    }
+
+    /// A dropped latest falls back to the highest kept version; nothing kept
+    /// is `None`; a body that is not an index of the plugin is an error.
+    #[test]
+    fn proxied_versions_index_edge_cases_5289() {
+        let local = remote_ctx(None);
+        let url = |v: &str| format!("https://c/agentplugins/k/p/{v}/p-{v}.zip");
+        let doc = json!({
+            "name": "p",
+            "latest": "3.0.0",
+            "versions": [
+                {"version": "3.0.0", "sha256": "bad", "url": url("3.0.0")},
+                {"version": "2.0.0-rc.1", "sha256": sha(2), "url": url("2.0.0-rc.1")},
+                {"version": "1.0.0", "sha256": sha(1).to_uppercase(), "url": url("1.0.0"), "size_bytes": 5},
+                {"version": "0.9.0", "sha256": sha(9), "url": "https://c/other.zip"},
+            ],
+        });
+        let out = rewrite_proxied_versions_index(doc.clone(), "p", &local)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out["latest"], "2.0.0-rc.1");
+        let kept: Vec<&str> = out["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["version"].as_str().unwrap())
+            .collect();
+        assert_eq!(kept, vec!["2.0.0-rc.1", "1.0.0"]);
+        // The expected digest is lowercased for the comparison; the listed
+        // value is served unchanged.
+        assert_eq!(out["versions"][1]["sha256"], sha(1).to_uppercase());
+        assert_eq!(
+            proxied_archive(&doc, "p", "1.0.0"),
+            Some(ProxiedArchive {
+                sha256: sha(1),
+                size_bytes: Some(5)
+            })
+        );
+        assert!(proxied_archive(&doc, "p", "3.0.0").is_none());
+        assert!(proxied_archive(&doc, "p", "0.9.0").is_none());
+
+        let none = json!({"name": "p", "latest": "1.0.0", "versions": []});
+        assert_eq!(
+            rewrite_proxied_versions_index(none, "p", &local).unwrap(),
+            None
+        );
+        for bad in [
+            json!([]),
+            json!({"name": "q", "versions": []}),
+            json!({"versions": []}),
+        ] {
+            assert!(
+                rewrite_proxied_versions_index(bad.clone(), "p", &local).is_err(),
+                "{bad}"
+            );
+            assert!(proxied_archive(&bad, "p", "1.0.0").is_none());
+        }
+    }
+
+    #[test]
+    fn remote_cache_path_is_content_addressed_5289() {
+        assert_eq!(
+            remote_cache_path("p", "1.0.0", &sha(10).to_uppercase()),
+            format!("p/1.0.0/{}/p-1.0.0.zip", sha(10))
+        );
+        assert!(is_sha256_hex(&sha(1)));
+        assert!(is_sha256_hex(&sha(1).to_uppercase()));
+        assert!(!is_sha256_hex(&sha(1)[..63]));
+        assert!(!is_sha256_hex(&format!("{}g", &sha(1)[..63])));
     }
 }

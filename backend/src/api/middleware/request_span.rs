@@ -73,6 +73,10 @@ struct RequestAttributes {
     /// per-request `Request completed` log line (#4674). A log field only:
     /// never a span attribute or metric label.
     user: RefCell<Option<String>>,
+    /// The id of the API token the request authenticated with, when it did
+    /// (#4987): for audit attribution (`PROXY_SCAN_BLOCKED`), never a span
+    /// attribute, log field or metric label.
+    api_token_id: Cell<Option<uuid::Uuid>>,
 }
 
 tokio::task_local! {
@@ -122,6 +126,24 @@ pub fn record_user(username: &str) {
 pub fn recorded_user() -> Option<String> {
     REQUEST_ATTRIBUTES
         .try_with(|attrs| attrs.user.borrow().clone())
+        .ok()
+        .flatten()
+}
+
+/// Record the id of the API token this request authenticated with (#4987).
+/// Called by `AuthService::validate_api_token` once a token has verified, so
+/// every surface that accepts an API token (Bearer, `X-API-Key`, Basic
+/// password, the OCI credential check) records it the same way; the last
+/// call wins. A no-op outside a request scope.
+pub fn record_api_token(token_id: uuid::Uuid) {
+    let _ = REQUEST_ATTRIBUTES.try_with(|attrs| attrs.api_token_id.set(Some(token_id)));
+}
+
+/// The API token id recorded by [`record_api_token`] for the request in
+/// flight, if any.
+pub fn recorded_api_token() -> Option<uuid::Uuid> {
+    REQUEST_ATTRIBUTES
+        .try_with(|attrs| attrs.api_token_id.get())
         .ok()
         .flatten()
 }
@@ -180,6 +202,58 @@ impl<B: HttpBody> OnResponse<B> for RecordResponseOnSpan {
         record_http_response(span, response);
         self.inner.on_response(response, latency, span);
     }
+}
+
+/// The `TraceLayer` classifier (#5623, #5701): `tower_http`'s
+/// [`ServerErrorsAsFailures`](tower_http::classify::ServerErrorsAsFailures),
+/// except that a `5xx` carrying [`crate::error::ExpectedOutcome`] is not a
+/// failure. Such a response is a deliberate answer (a virtual repository
+/// whose members are down answering `503` + `Retry-After`, a `507` quota
+/// refusal) that the error path has already logged at the level it chose, so
+/// the trace layer must not log it a second time as an ERROR
+/// `response failed` line. The span still records the `5xx` status
+/// ([`RecordResponseOnSpan`]), and every other `5xx` is a failure as before.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ServerErrorsExceptExpected;
+
+impl tower_http::classify::ClassifyResponse for ServerErrorsExceptExpected {
+    type FailureClass = tower_http::classify::ServerErrorsFailureClass;
+    type ClassifyEos = tower_http::classify::NeverClassifyEos<Self::FailureClass>;
+
+    fn classify_response<B>(
+        self,
+        res: &Response<B>,
+    ) -> tower_http::classify::ClassifiedResponse<Self::FailureClass, Self::ClassifyEos> {
+        if res
+            .extensions()
+            .get::<crate::error::ExpectedOutcome>()
+            .is_some()
+        {
+            return tower_http::classify::ClassifiedResponse::Ready(Ok(()));
+        }
+        tower_http::classify::ServerErrorsAsFailures::new().classify_response(res)
+    }
+
+    fn classify_error<E>(self, error: &E) -> Self::FailureClass
+    where
+        E: std::fmt::Display + 'static,
+    {
+        tower_http::classify::ServerErrorsAsFailures::new().classify_error(error)
+    }
+}
+
+/// The HTTP `TraceLayer` the server mounts, classified by
+/// [`ServerErrorsExceptExpected`].
+pub type HttpTraceLayer = tower_http::trace::TraceLayer<
+    tower_http::classify::SharedClassifier<ServerErrorsExceptExpected>,
+>;
+
+/// A new [`HttpTraceLayer`]; `main.rs` adds its span builder and
+/// [`RecordResponseOnSpan`].
+pub fn http_trace_layer() -> HttpTraceLayer {
+    tower_http::trace::TraceLayer::new(tower_http::classify::SharedClassifier::new(
+        ServerErrorsExceptExpected,
+    ))
 }
 
 #[cfg(ak_test_shard = "services-2")]
@@ -415,5 +489,90 @@ mod tests {
         });
         assert_eq!(rec.get(REPOSITORY_KEY_FIELD), None);
         assert_eq!(rec.get(CACHE_OUTCOME_FIELD), None);
+    }
+
+    /// The levels of every event emitted while `f` runs.
+    fn event_levels<R>(f: impl FnOnce() -> R) -> (R, Vec<tracing::Level>) {
+        use std::sync::{Arc, Mutex};
+        struct Levels(Arc<Mutex<Vec<tracing::Level>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Levels {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0.lock().unwrap().push(*event.metadata().level());
+            }
+        }
+        let levels = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Levels(levels.clone()));
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let levels = levels.lock().unwrap().clone();
+        (out, levels)
+    }
+
+    /// One request through the server's trace layer to a handler answering
+    /// `answer`: the status and the levels of every event it logged.
+    fn traced(answer: fn() -> axum::response::Response) -> (StatusCode, Vec<tracing::Level>) {
+        use axum::{routing::get, Router};
+        use tower::ServiceExt;
+        event_levels(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let app = Router::new()
+                    .route("/x", get(move || async move { answer() }))
+                    .layer(http_trace_layer());
+                let request = axum::http::Request::builder()
+                    .uri("/x")
+                    .body(Body::empty())
+                    .unwrap();
+                app.oneshot(request).await.unwrap().status()
+            })
+        })
+    }
+
+    /// #5623: a virtual repository's member-outage `503` is logged once, at
+    /// WARN, and the trace layer does not log it again as an ERROR. Fails on
+    /// `main`: the error path logged ERROR `Request error` and the trace
+    /// layer ERROR `response failed`, per client request.
+    #[test]
+    fn a_member_outage_503_logs_no_error_5623() {
+        let (status, levels) =
+            traced(crate::api::handlers::proxy_helpers::member_unavailable_response);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !levels.contains(&tracing::Level::ERROR),
+            "no ERROR line for an expected 503: {levels:?}"
+        );
+        assert!(levels.contains(&tracing::Level::WARN), "{levels:?}");
+    }
+
+    /// #5701: a quota refusal (`507`) is an expected answer too; an
+    /// unexpected `500` still logs ERROR from both the error path and the
+    /// trace layer.
+    #[test]
+    fn only_unexpected_server_errors_log_error_5701() {
+        use axum::response::IntoResponse;
+        let (quota, quota_levels) =
+            traced(|| crate::error::AppError::QuotaExceeded("over quota".into()).into_response());
+        assert_eq!(quota, StatusCode::INSUFFICIENT_STORAGE);
+        assert!(
+            !quota_levels.contains(&tracing::Level::ERROR),
+            "{quota_levels:?}"
+        );
+
+        let (internal, internal_levels) =
+            traced(|| crate::error::AppError::Internal("boom".into()).into_response());
+        assert_eq!(internal, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            internal_levels
+                .iter()
+                .filter(|l| **l == tracing::Level::ERROR)
+                .count(),
+            2,
+            "a server fault: `Request error` and `response failed`: {internal_levels:?}"
+        );
     }
 }

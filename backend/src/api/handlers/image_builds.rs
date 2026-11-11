@@ -27,7 +27,8 @@ use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::handlers::repositories::{
-    require_repo_action, require_repo_write_access, require_visible,
+    hide_write_denial_from_non_readers, require_repo_action, require_repo_write_access,
+    require_visible,
 };
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -333,8 +334,13 @@ async fn authorize_build(
     auth.require_scope("write:artifacts")?;
     let repo_service = RepositoryService::new(state.db.clone());
     require_repo_write_access(auth, repo, &repo_service).await?;
-    require_may_build(auth, settings)?;
-    require_repo_action(auth, repo.id, "write", &state.permission_service).await
+    // #5645: either refusal, to a caller who cannot read the repository (a
+    // publish-only or delete-only grantee), is the unknown-key 404.
+    let gate = match require_may_build(auth, settings) {
+        Ok(()) => require_repo_action(auth, repo.id, "write", &state.permission_service).await,
+        Err(e) => Err(e),
+    };
+    hide_write_denial_from_non_readers(gate, auth, repo, &repo_service).await
 }
 
 fn require_buildable(repo: &Repository) -> Result<()> {
@@ -570,7 +576,7 @@ async fn digest_belongs_to_image(
 /// catalog row with those bytes (migrated data before the backfill records
 /// it). Used for the children an index lists, which are read only when this
 /// repository holds them.
-async fn manifest_recorded_in_repository(
+pub(crate) async fn manifest_recorded_in_repository(
     db: &sqlx::PgPool,
     repo_id: Uuid,
     digest: &str,
@@ -598,7 +604,7 @@ async fn manifest_recorded_in_repository(
 /// manifest can name any digest, and on storage shared by several
 /// repositories the object of a blob recorded only for another repository is
 /// readable by its digest key.
-async fn blob_recorded_in_repository(
+pub(crate) async fn blob_recorded_in_repository(
     db: &sqlx::PgPool,
     repo_id: Uuid,
     digest: &str,

@@ -121,6 +121,7 @@ pub fn create_router(state: SharedState) -> Router {
         .nest("/cocoapods", handlers::cocoapods::router())
         .nest("/hex", handlers::hex::router())
         .nest("/huggingface", handlers::huggingface::router())
+        .nest(handlers::mcp::MOUNT_PREFIX, handlers::mcp::router())
         .nest("/jetbrains", handlers::jetbrains::router())
         .nest("/agentplugins", handlers::agent_plugins::router())
         .nest("/chef", handlers::chef::router())
@@ -221,6 +222,12 @@ pub fn create_router(state: SharedState) -> Router {
     let token_exchange_rate_limit_state =
         build_token_exchange_rate_limit_state(&login_rate_limit_state, &state.config);
     crate::services::ldap_basic_auth::install_rate_limit(token_exchange_rate_limit_state.clone());
+    // HTTP Basic `username:password` on the format routes and the management
+    // API (#5485): failed verifications are budgeted per (username, IP), and
+    // the timing pad draws on the login endpoint's per-IP failure budget.
+    crate::api::middleware::rate_limit::install_basic_password_budget(
+        build_basic_password_rate_limit_state(&login_rate_limit_state, &state.config),
+    );
 
     let mut router = router
         // API v1 routes
@@ -253,6 +260,10 @@ pub fn create_router(state: SharedState) -> Router {
             "/v2",
             handlers::oci_v2::router(Some(token_exchange_rate_limit_state)),
         )
+        // #5253: the MCP registry's credential exchange (`/mcp/{repo}/v0/auth/*`);
+        // the OIDC assertion in the body is the credential, so it sits outside
+        // the repository visibility middleware.
+        .merge(handlers::mcp_edges::public_router())
         // All native-protocol format handler routes (repo visibility enforced)
         .merge(format_routes);
 
@@ -648,12 +659,31 @@ fn build_token_exchange_rate_limit_state(
     login: &LoginRateLimitState,
     config: &crate::config::Config,
 ) -> LoginRateLimitState {
+    let mut state = login_state_with_own_bucket(login, config, "token");
+    // Its own once-per-window audit memory (#4677), so a `/v2/token` refusal
+    // is not swallowed by a login refusal from the same address.
+    state.audit = login
+        .audit
+        .as_ref()
+        .map(|audit| Arc::new(audit.for_another_surface()));
+    state
+}
+
+/// `login` with its per-(username, IP) bucket replaced by a fresh one named
+/// `name`, holding [`TOKEN_EXCHANGE_PER_WINDOW_ENV`] units per
+/// `rate_limit_login_window_secs`, with its expired entries swept every
+/// minute. The global backstop and the per-IP failed-login budget stay shared.
+fn login_state_with_own_bucket(
+    login: &LoginRateLimitState,
+    config: &crate::config::Config,
+    name: &'static str,
+) -> LoginRateLimitState {
     let limiter = Arc::new(
         RateLimiter::new(
             token_exchange_per_window(std::env::var(TOKEN_EXCHANGE_PER_WINDOW_ENV).ok().as_deref()),
             config.rate_limit_login_window_secs,
         )
-        .named("token"),
+        .named(name),
     );
     {
         let cleanup = Arc::clone(&limiter);
@@ -667,12 +697,28 @@ fn build_token_exchange_rate_limit_state(
     }
     let mut state = login.clone();
     state.inner.limiter = limiter;
-    // Its own once-per-window audit memory (#4677), so a `/v2/token` refusal
-    // is not swallowed by a login refusal from the same address.
-    state.audit = login
-        .audit
-        .as_ref()
-        .map(|audit| Arc::new(audit.for_another_surface()));
+    state
+}
+
+/// The Basic-password budget (#5485, see
+/// `rate_limit::BasicPasswordBudget`): the login state with its
+/// per-(username, IP) bucket swapped for one that counts only FAILED Basic
+/// password verifications, sized like the `/v2/token` bucket
+/// ([`TOKEN_EXCHANGE_PER_WINDOW_ENV`]) over `rate_limit_login_window_secs`.
+///
+/// A separate bucket, not the login one: package managers retry a rejected
+/// credential many times per build, and ten failures per fifteen minutes would
+/// keep a user who fixed a stale password in `.netrc` locked out of the web
+/// login too. The per-IP failed-login budget that gates the timing pad stays
+/// SHARED with `/api/v1/auth/login` and `/v2/token`.
+fn build_basic_password_rate_limit_state(
+    login: &LoginRateLimitState,
+    config: &crate::config::Config,
+) -> LoginRateLimitState {
+    let mut state = login_state_with_own_bucket(login, config, "basic_password");
+    // Refusals here are not login-endpoint refusals; they are counted in
+    // `ak_rate_limit_rejections_total{limiter="basic_password"}` instead.
+    state.audit = None;
     state
 }
 
@@ -954,6 +1000,16 @@ fn api_v1_routes(
         .nest(
             "/auth",
             handlers::auth::login_router().layer(middleware::from_fn_with_state(
+                login_rate_limit_state.clone(),
+                login_rate_limit_middleware,
+            )),
+        )
+        // LDAP password login (#5485): the same login limiter as /auth/login
+        // (per-(username, IP) bucket, global backstop, per-IP failed-login
+        // budget), so a guess against either spends the other's budget.
+        .nest(
+            "/auth/sso",
+            handlers::sso::ldap_login_router().layer(middleware::from_fn_with_state(
                 login_rate_limit_state,
                 login_rate_limit_middleware,
             )),
@@ -1112,6 +1168,13 @@ fn api_v1_routes(
                 // Precomputed RPM repodata (#4544):
                 // POST /repositories/{key}/rpm/repodata/rebuild.
                 .merge(handlers::rpm::repo_router())
+                // Remote MCP registries (#5253): upstream catalog, approval
+                // queue, pins, bulk approval, sync:
+                // /repositories/{key}/mcp/{catalog,sync}[/...].
+                .merge(handlers::mcp_remote::repo_router())
+                // MCP server health roll-up (#5253):
+                // GET /repositories/{key}/mcp/servers/{name}/versions/{v}/health.
+                .merge(handlers::mcp_health::repo_router())
                 // `GET /repositories/{key}/download/{path}` is NOT merged
                 // here: it is nested separately below with its own
                 // authentication layer (#4654).
@@ -1405,6 +1468,11 @@ fn api_v1_routes(
             .nest("/monitoring", handlers::monitoring::router())
             .nest("/sso", handlers::sso_admin::router())
             .nest("/ci-oidc", handlers::ci_auth_admin::router())
+            // #5253: MCP namespace proofs (admin-initiated DNS/HTTP checks).
+            .nest(
+                "/mcp/namespace-proofs",
+                handlers::mcp_namespace_proofs::router(),
+            )
             .nest("/smtp", handlers::smtp::router())
             // Maintenance banner CRUD (#2155); the public read is `/banners`.
             .nest("/banners", handlers::banners::admin_router())
@@ -1415,6 +1483,8 @@ fn api_v1_routes(
             // `/quality/checks` (auth-only, 400s without artifact_id) is the
             // separate #2334 contract and is unchanged.
             .nest("/quality-checks", handlers::quality_gates::admin_router())
+            // Config-as-code export / plan / apply (#5292).
+            .nest("/config", handlers::admin_config::router())
             .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
             .layer(middleware::from_fn_with_state(
                 auth_service.clone(),
@@ -1532,6 +1602,24 @@ fn api_v1_routes(
         .nest(
             "/quality",
             handlers::quality_gates::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
+        // MCP approval-queue count across the Remote MCP repositories the
+        // caller can read (#5253): GET /mcp/pending-summary.
+        .nest(
+            "/mcp",
+            handlers::mcp_remote::summary_router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
+        // MCP introspection worker API (#5253): claim/complete jobs with an
+        // `mcp:introspect` token. The worker is a separate process.
+        .nest(
+            "/mcp/introspection",
+            handlers::mcp_capabilities::worker_router().layer(middleware::from_fn_with_state(
                 auth_service.clone(),
                 auth_middleware,
             )),
@@ -1807,6 +1895,54 @@ mod tests {
             incus_count >= 2,
             "expected handlers::incus::router() to be referenced at least \
              twice (once for /incus, once for /lxc); found {incus_count}"
+        );
+    }
+
+    /// #5485: `POST /api/v1/auth/sso/ldap/:id/login` verifies a directory
+    /// password, so it sits behind the same per-(username, IP) login limiter
+    /// as `/api/v1/auth/login`. Before the fix it had only the API-wide
+    /// limiter, and the eleventh guess in a window still reached the
+    /// directory. Driven through the production router.
+    #[tokio::test]
+    async fn ldap_login_is_behind_the_login_rate_limiter_5485() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool, "/tmp/ldap-login-limiter-5485");
+        let per_window = state.config.rate_limit_login_per_window;
+        assert!(state.config.rate_limit_enabled && per_window > 0);
+        let app = super::create_router(state);
+        // An unknown provider: the handler answers 404 before any bind, so
+        // the test needs no directory.
+        let uri = format!("/api/v1/auth/sso/ldap/{}/login", uuid::Uuid::new_v4());
+        let username = format!("ldap-5485-{}", uuid::Uuid::new_v4().simple());
+        let attempt = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri(uri.as_str())
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "203.0.113.55")
+                .body(Body::from(format!(
+                    r#"{{"username":"{username}","password":"guess"}}"#
+                )))
+                .unwrap()
+        };
+
+        for n in 0..per_window {
+            let (status, _) = tdh::send(app.clone(), attempt()).await;
+            assert_ne!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "attempt {n} is inside the login budget"
+            );
+        }
+        let (status, _) = tdh::send(app.clone(), attempt()).await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the LDAP login must be refused once the per-(username, IP) login budget is spent"
         );
     }
 

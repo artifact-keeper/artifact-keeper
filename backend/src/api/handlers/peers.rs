@@ -110,7 +110,20 @@ fn parse_replication_mode(s: &str) -> Option<ReplicationMode> {
 pub struct AssignRepoRequest {
     pub repository_id: Uuid,
     pub sync_enabled: Option<bool>,
+    /// `push` (the default) or `mirror`, which both send each new artifact
+    /// to the peer as it is uploaded, or `none` (assigned, not replicated).
+    /// `pull` is refused with 400: it is not implemented and never created a
+    /// sync task (#5293).
     pub replication_mode: Option<String>,
+    /// Cron expression (UTC; 5-field, or 6/7 with seconds/year) for a
+    /// `mirror` subscription's whole-repository pass (#5342). Each time it is
+    /// due the sync worker queues every artifact the peer has no task for
+    /// (the work of `POST /{id}/repositories/{repo_id}/sync`) and sets
+    /// `last_replicated_at`; a subscription that has never completed a pass
+    /// runs one on the first check. Ignored for `push` and `none`. An invalid
+    /// expression is refused with 400. Scheduled passes do not run while
+    /// upstream jobs are paused (#5288).
+    #[schema(example = "0 */6 * * *")]
     pub replication_schedule: Option<String>,
     /// Optional JSONB filter constraining which artifacts in the repository
     /// get replicated. Shape: `{"include_patterns": ["^v\\d+\\."], "exclude_patterns": [".*-SNAPSHOT$"]}`.
@@ -130,12 +143,25 @@ pub struct SubscriptionResponse {
     pub replication_schedule: Option<String>,
     #[schema(value_type = Object)]
     pub replication_filter: Option<serde_json::Value>,
+    /// When the last whole-repository pass (a scheduled `mirror` pass or a
+    /// `sync` call) queued its tasks; `null` if none has run (#5342).
     pub last_replicated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// `active` when the subscription is enabled and its mode is replicated
+    /// (`push` or `mirror`); `inactive` otherwise, including a `pull`
+    /// subscription stored before `pull` was refused, which never replicated
+    /// anything (#5293).
+    #[schema(example = "active")]
+    pub effective: String,
 }
 
 impl From<crate::models::peer_instance::PeerRepoSubscription> for SubscriptionResponse {
     fn from(s: crate::models::peer_instance::PeerRepoSubscription) -> Self {
+        let effective = crate::services::peer_instance_service::subscription_effective_state(
+            s.sync_enabled,
+            s.replication_mode.as_deref(),
+        )
+        .to_string();
         Self {
             id: s.id,
             peer_instance_id: s.peer_instance_id,
@@ -146,6 +172,7 @@ impl From<crate::models::peer_instance::PeerRepoSubscription> for SubscriptionRe
             replication_filter: s.replication_filter,
             last_replicated_at: s.last_replicated_at,
             created_at: s.created_at,
+            effective,
         }
     }
 }
@@ -258,8 +285,19 @@ fn parse_status(s: &str) -> Option<InstanceStatus> {
 )]
 pub async fn list_peers(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ListPeersQuery>,
 ) -> Result<Json<PeerInstanceListResponse>> {
+    // A peer's heartbeat probe (`sync_worker::probe_peer`) lists this route
+    // with the API key it was registered with and needs only a 2xx, so a
+    // signed-in non-admin keeps the `200`, but with no peer in it: peer
+    // names, endpoints, regions and cache figures are administrator data.
+    if !auth.is_admin {
+        return Ok(Json(PeerInstanceListResponse {
+            items: Vec::new(),
+            total: 0,
+        }));
+    }
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = ((page - 1) * per_page) as i64;
@@ -390,8 +428,10 @@ pub async fn register_peer(
 )]
 pub async fn get_peer(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PeerInstanceResponse>> {
+    auth.require_admin()?;
     let service = PeerInstanceService::new(state.db.clone());
     let instance = service.get_by_id(id).await?;
 
@@ -524,9 +564,11 @@ pub async fn trigger_sync(
 )]
 pub async fn get_sync_tasks(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Query(query): Query<ListPeersQuery>,
 ) -> Result<Json<Vec<SyncTaskResponse>>> {
+    auth.require_admin()?;
     let limit = query.per_page.unwrap_or(50) as i64;
     let service = PeerInstanceService::new(state.db.clone());
     let tasks = service.get_pending_sync_tasks(id, limit).await?;
@@ -567,8 +609,10 @@ pub async fn get_sync_tasks(
 )]
 pub async fn get_assigned_repos(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<SubscriptionResponse>>> {
+    auth.require_admin()?;
     let service = PeerInstanceService::new(state.db.clone());
     let items = service
         .list_subscriptions(id)
@@ -591,7 +635,7 @@ pub async fn get_assigned_repos(
     request_body = AssignRepoRequest,
     responses(
         (status = 200, description = "Repository assigned successfully"),
-        (status = 400, description = "Invalid replication_mode"),
+        (status = 400, description = "Invalid replication_mode, `pull` (not implemented), or a replication_schedule that is not a valid cron expression"),
         (status = 404, description = "Peer instance or repository not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -604,14 +648,15 @@ pub async fn assign_repo(
     Json(payload): Json<AssignRepoRequest>,
 ) -> Result<()> {
     auth.require_admin()?;
-    // An omitted `replication_mode` is valid and falls back to the column
-    // default (`pull`) in the service layer. A *present but unrecognized* value
-    // is a client error and must surface as 400, not be silently dropped (which
-    // previously produced a NULL insert and an opaque 500 DATABASE_ERROR).
+    // An omitted `replication_mode` is valid and falls back to `push` in the
+    // service layer, which also refuses `pull` (#5293). A *present but
+    // unrecognized* value is a client error and must surface as 400, not be
+    // silently dropped (which previously produced a NULL insert and an opaque
+    // 500 DATABASE_ERROR).
     let replication_mode = match payload.replication_mode.as_deref() {
         Some(s) => Some(parse_replication_mode(s).ok_or_else(|| {
             crate::error::AppError::Validation(format!(
-                "invalid replication_mode '{}' (expected one of: push, pull, mirror, none)",
+                "invalid replication_mode '{}' (expected one of: push, mirror, none)",
                 s
             ))
         })?),
@@ -656,8 +701,10 @@ pub async fn assign_repo(
 )]
 pub async fn get_subscription(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path((id, repo_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<SubscriptionResponse>> {
+    auth.require_admin()?;
     let service = PeerInstanceService::new(state.db.clone());
     let sub = service.get_subscription(id, repo_id).await?;
     Ok(Json(sub.into()))
@@ -666,9 +713,11 @@ pub async fn get_subscription(
 /// Trigger an immediate sync for a single (peer, repo) subscription.
 ///
 /// Queues one `sync_task` per artifact in the repository at priority 100
-/// without waiting for the next cron tick. Idempotent: if tasks are already
-/// pending for the same artifacts, the unique constraint
-/// `(peer_instance_id, artifact_id, task_type)` skips duplicates.
+/// without waiting for a `mirror` subscription's `replication_schedule`, and
+/// sets `last_replicated_at`, so the schedule next fires at its first
+/// occurrence after this call (#5342). Idempotent: an artifact that already
+/// has a task for this peer (pending or completed) is skipped through the
+/// unique constraint `(peer_instance_id, artifact_id, task_type)`.
 #[utoipa::path(
     post,
     path = "/{id}/repositories/{repo_id}/sync",
@@ -1514,6 +1563,7 @@ mod tests {
             replication_filter: Some(filter.clone()),
             last_replicated_at: None,
             created_at: chrono::Utc::now(),
+            effective: "active".to_string(),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["replication_filter"], filter);
@@ -1535,10 +1585,39 @@ mod tests {
             replication_filter: None,
             last_replicated_at: None,
             created_at: chrono::Utc::now(),
+            effective: "active".to_string(),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json.get("replication_filter").is_some());
         assert!(json["replication_filter"].is_null());
+    }
+
+    /// #5293: a `pull` subscription stored before `pull` was refused is
+    /// listed as `inactive`, so the list says it never replicates.
+    #[test]
+    fn test_subscription_response_reports_effective_state() {
+        let row = |mode: &str, enabled: bool| crate::models::peer_instance::PeerRepoSubscription {
+            id: Uuid::nil(),
+            peer_instance_id: Uuid::nil(),
+            repository_id: Uuid::nil(),
+            sync_enabled: enabled,
+            replication_mode: Some(mode.to_string()),
+            replication_schedule: None,
+            replication_filter: None,
+            last_replicated_at: None,
+            created_at: chrono::Utc::now(),
+        };
+        for (mode, enabled, expected) in [
+            ("push", true, "active"),
+            ("mirror", true, "active"),
+            ("pull", true, "inactive"),
+            ("none", true, "inactive"),
+            ("push", false, "inactive"),
+        ] {
+            let json =
+                serde_json::to_value(SubscriptionResponse::from(row(mode, enabled))).unwrap();
+            assert_eq!(json["effective"], expected, "{mode} enabled={enabled}");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1750,5 +1829,107 @@ mod tests {
         assert!(resp.replication_filter.is_none());
         assert!(resp.last_replicated_at.is_none());
         assert!(!resp.sync_enabled);
+    }
+
+    // -----------------------------------------------------------------------
+    // Read authorization: peer, subscription, sync-task, label, connection,
+    // chunk and transfer reads are administrator data. Mounted as in
+    // production (`routes.rs`), every read is refused to a signed-in
+    // non-admin, except the peer listing, which a peer's heartbeat probe
+    // calls with its registered key: that stays `200` but lists no peer.
+    // -----------------------------------------------------------------------
+    mod read_authz {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::auth::AuthExtension;
+        use axum::http::StatusCode;
+        use axum::Router;
+        use uuid::Uuid;
+
+        fn app(state: crate::api::SharedState, auth: AuthExtension) -> Router {
+            let router = super::super::router()
+                .merge(crate::api::handlers::peer_instance_labels::peer_labels_router())
+                .nest("/:id/transfer", crate::api::handlers::transfer::router())
+                .nest(
+                    "/:id/connections",
+                    crate::api::handlers::peer::peer_router(),
+                )
+                .nest("/:id/chunks", crate::api::handlers::peer::chunk_router());
+            tdh::router_with_auth_ext(router, state, auth)
+        }
+
+        #[tokio::test]
+        async fn peer_and_transfer_reads_require_an_admin() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = tdh::build_state(pool.clone(), "/tmp/ph-peers-read-authz");
+            let peer = tdh::register_test_peer(&pool, "authz-read", "reads").await;
+            let other = Uuid::new_v4();
+            let user = tdh::make_auth(Uuid::new_v4(), "low.priv");
+            let service_account = AuthExtension {
+                is_service_account: true,
+                is_api_token: true,
+                ..tdh::make_auth(Uuid::new_v4(), "peer.key")
+            };
+            let mut admin = tdh::make_auth(Uuid::new_v4(), "fed.admin");
+            admin.is_admin = true;
+
+            let reads = [
+                format!("/{peer}"),
+                format!("/{peer}/sync/tasks"),
+                format!("/{peer}/repositories"),
+                format!("/{peer}/repositories/{other}"),
+                format!("/{peer}/labels"),
+                format!("/{peer}/connections"),
+                format!("/{peer}/connections/discover"),
+                format!("/{peer}/chunks/{other}"),
+                format!("/{peer}/chunks/{other}/peers"),
+                format!("/{peer}/chunks/{other}/scored-peers"),
+                format!("/{peer}/transfer/{other}"),
+                format!("/{peer}/transfer/{other}/chunks"),
+            ];
+            let mut refused = Vec::new();
+            let mut admin_blocked = Vec::new();
+            for uri in &reads {
+                for caller in [&user, &service_account] {
+                    let (s, _) =
+                        tdh::send(app(state.clone(), caller.clone()), tdh::get(uri.clone())).await;
+                    refused.push((uri.clone(), caller.username.clone(), s));
+                }
+                let (s, _) =
+                    tdh::send(app(state.clone(), admin.clone()), tdh::get(uri.clone())).await;
+                if s == StatusCode::FORBIDDEN {
+                    admin_blocked.push(uri.clone());
+                }
+            }
+            let mut listings = Vec::new();
+            for caller in [&user, &service_account, &admin] {
+                let (s, b) =
+                    tdh::send(app(state.clone(), caller.clone()), tdh::get("/".into())).await;
+                let v: serde_json::Value = serde_json::from_slice(&b).unwrap_or_default();
+                let named = v["items"]
+                    .as_array()
+                    .map(|items| items.iter().any(|i| i["id"] == peer.to_string()))
+                    .unwrap_or(false);
+                listings.push((caller.username.clone(), s, v["total"].clone(), named));
+            }
+
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+                .bind(peer)
+                .execute(&pool)
+                .await;
+
+            for (uri, who, s) in &refused {
+                assert_eq!(*s, StatusCode::FORBIDDEN, "{who} GET {uri}");
+            }
+            assert!(admin_blocked.is_empty(), "admin refused: {admin_blocked:?}");
+            for (who, s, total, named) in &listings[..2] {
+                assert_eq!(*s, StatusCode::OK, "{who} keeps the heartbeat 200");
+                assert_eq!(*total, serde_json::json!(0), "{who} sees no peer");
+                assert!(!named, "{who} sees no peer");
+            }
+            assert_eq!(listings[2].1, StatusCode::OK);
+            assert!(listings[2].3, "an admin lists the peer");
+        }
     }
 }

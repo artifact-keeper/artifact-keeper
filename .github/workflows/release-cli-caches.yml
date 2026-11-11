@@ -108,14 +108,19 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            features: vendored-openssl,jemalloc
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
+            features: vendored-openssl,jemalloc
           - target: x86_64-apple-darwin
             os: macos-latest
+            features: vendored-openssl
           - target: aarch64-apple-darwin
             os: macos-latest
+            features: vendored-openssl
           - target: x86_64-pc-windows-gnu
             os: ubuntu-latest
+            features: vendored-openssl
 
     steps:
       # No `ref:`, deliberately: this is the commit the dispatch started on.
@@ -162,9 +167,18 @@ jobs:
       # No "Set version from tag" step: the workspace crates are not saved, and
       # the cache key normalises their versions, so the version main's tip
       # carries makes no difference to what the tag restores.
+      #
+      # jemalloc's page size is fixed at compile time. Match release.yml's
+      # aarch64 leg, which is cross-compiled on a 4 KiB-page runner (#5130).
+      - name: Build jemalloc for 64 KiB pages on arm64
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          echo "JEMALLOC_SYS_WITH_LG_PAGE=16" >> "$GITHUB_ENV"
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
       - name: Build
         env:
           SQLX_OFFLINE: true
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
-        run: cargo auditable build --release --target ${{ matrix.target }} --features vendored-openssl
+        run: cargo auditable build --release --target ${{ matrix.target }} --features ${{ matrix.features }}

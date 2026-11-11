@@ -28,7 +28,7 @@ use crate::services::package_service::PackageService;
 use crate::services::repository_service::RepositoryService;
 use crate::services::upload_service::{self, UploadError, UploadService};
 
-mod format_finalize;
+pub(crate) mod format_finalize;
 use format_finalize::{FinalizeInput, FinalizeSource};
 
 // ---------------------------------------------------------------------------
@@ -268,8 +268,15 @@ async fn create_session(
     // without ever having been fetched from it. Checked after the
     // authorization gates and before any session row exists.
     proxy_helpers::reject_write_if_not_hosted(repo_record.repo_type.as_str())?;
+    // #5253: an MCP registry publishes through its own route only.
+    super::repositories::reject_generic_write_to_mcp(&repo_record.format, &auth, &headers)?;
 
-    let is_replication = super::is_replication_request(&headers);
+    // #5455: the session is a replication session only for an authenticated
+    // peer. The header alone is client-set: a forged one opens an ordinary
+    // session (quota applies, no caller-supplied metadata, no cleanup of
+    // other sessions) and records `is_replication = false`, so the commit
+    // cannot inherit an exemption from it either.
+    let is_replication = super::trusted_peer_replication(&auth, &headers);
     if req.skip_if_present && !is_replication {
         let declared = super::artifact_presence::DeclaredUpload {
             path: &req.artifact_path,
@@ -289,7 +296,7 @@ async fn create_session(
             return Ok((StatusCode::OK, Json(present)).into_response());
         }
     }
-    let replication_metadata = replication_session_metadata_from_request(&headers, &req);
+    let replication_metadata = replication_session_metadata_from_request(is_replication, &req);
 
     if is_replication {
         cleanup_stale_replication_upload_sessions(&state, repo.0, &req.artifact_path).await;
@@ -302,13 +309,9 @@ async fn create_session(
     // and drive one DB row per chunk. Skipped for peer replication so artifacts
     // that legitimately predate a quota change can still replicate; the
     // `max_upload_size` cap inside `create_session` still applies in that case.
-    // Only a TRUSTED replication session (admin or service account) is
-    // exempt: the replication header alone is client-set.
-    if !super::repositories::replication_exemption_trusted(
-        is_replication,
-        auth.is_admin,
-        auth.is_service_account,
-    ) {
+    // Only a TRUSTED replication session (an authenticated peer,
+    // `trusted_peer_replication`) is exempt: the header alone is client-set.
+    if !is_replication {
         let denied_by = state
             .create_repository_service()
             .quota_preflight(repo_id, req.total_size)
@@ -576,10 +579,12 @@ async fn session_status_response(
     tag = "uploads",
     params(
         ("session_id" = Uuid, Path, description = "Upload session ID"),
+        ("If-Match" = Option<String>, Header, description = "Commit only if the live artifact at the session's path has one of these entity tags (its quoted SHA-256, the `ETag` a download or upload answers with), or `*` for any live artifact. A match lets the completion replace that artifact (#4989)"),
+        ("If-None-Match" = Option<String>, Header, description = "`*`: commit only if no live artifact holds the session's path (#4989)"),
         ("Prefer" = Option<String>, Header, description = "`respond-async` (RFC 7240): answer 202 once the completion lease is held and commit in the background; poll `GET /api/v1/uploads/{session_id}` until `status` is `completed` (with `artifact_id`), `failed` (with `error`), or back to `in_progress` (a retryable failure: repeat this request)"),
     ),
     responses(
-        (status = 200, description = "Upload finalized, artifact created. In a format repository (Maven, Gradle, npm, PyPI, RPM, Incus, Debian) the artifact is named, versioned and indexed as the format's own upload route indexes it (#1846)", body = CompleteResponse),
+        (status = 200, description = "Upload finalized, artifact created. In a format repository (Maven, Gradle, npm, PyPI, RPM, Incus, Debian, Alpine) the artifact is named, versioned and indexed as the format's own upload route indexes it (#1846)", body = CompleteResponse),
         (status = 202, description = "`Prefer: respond-async` was sent: the completion lease is held and the commit runs in the background. `Location` is the session status to poll", body = SessionStatusResponse),
         (status = 400, description = "Incomplete chunks or invalid state, or the session's repository is virtual (the session is failed), or the format's own upload route would refuse the package: a `package.json`, wheel `METADATA` or Debian control file that names another package or version than the path (the session is failed, nothing is stored)", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Session not found", body = crate::api::openapi::ErrorResponse),
@@ -592,6 +597,8 @@ async fn session_status_response(
             The body is `{\"code\": \"CONFLICT\", \"message\": \"Artifact version already exists and is immutable\"}`; no bytes are written and the session stays open, \
             so this request can be repeated once the occupying artifact is deleted.", body = crate::api::openapi::ErrorResponse),
         (status = 410, description = "Session expired, or created by an earlier server version and not resumable; start a new session", body = crate::api::openapi::ErrorResponse),
+        (status = 412, description = "An `If-Match` or `If-None-Match` sent on this request does not hold against the live artifact at the session's path (`code: PRECONDITION_FAILED`, #4989), the same rule as the whole-body `PUT` (#4186). \
+            Evaluated before the chunks are assembled and again, with the artifact row locked, when the artifact commits. Nothing is written and the session stays open, so the completion can be retried. A malformed header is a 400.", body = crate::api::openapi::ErrorResponse),
         (status = 503, description = "Staging storage or database temporarily unavailable, or storage garbage collection is removing identical content at this moment (#4980); the session is left completable, retry (honour Retry-After)", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
@@ -736,6 +743,40 @@ async fn complete_session_commit(
         return Err(e.into_response());
     }
 
+    // #4989: the `If-Match` / `If-None-Match` preconditions of the completing
+    // request, honoured as the whole-body PUT honours them (#4186). Completion
+    // is the write, so the headers go on `PUT .../complete`. A malformed
+    // header is a 400 and a precondition that does not hold a 412; both
+    // release the lease and leave the session completable, so the client can
+    // re-read the artifact and retry with the right tag without re-uploading
+    // its chunks.
+    let precondition = match super::repositories::parse_write_precondition(headers) {
+        Ok(precondition) => precondition,
+        Err(e) => {
+            UploadService::release_commit_lease(&state.db, &session).await;
+            return Err(e.into_response());
+        }
+    };
+    if let Some(precondition) = &precondition {
+        match crate::services::artifact_service::current_live_checksum(
+            &state.db,
+            session.repository_id,
+            &session.artifact_path,
+        )
+        .await
+        {
+            Ok(current) if precondition.holds(current.as_deref()) => {}
+            Ok(_) => {
+                UploadService::release_commit_lease(&state.db, &session).await;
+                return Err(precondition_failed(&session.artifact_path));
+            }
+            Err(e) => {
+                UploadService::release_commit_lease(&state.db, &session).await;
+                return Err(e.into_response());
+            }
+        }
+    }
+
     // Resolve the *repo-scoped* storage backend and use a content-addressable
     // key, matching how non-chunked uploads work (issue #1168 part 3).
     //
@@ -799,17 +840,34 @@ async fn complete_session_commit(
     // here becomes a legal write the moment the occupying artifact is
     // deleted, so the client can retry this session instead of re-uploading
     // every chunk.
-    // Only a TRUSTED replication session (admin or service account) may
+    // Only a TRUSTED replication session (an authenticated peer, #5455) may
     // bring its own metadata instead of the server deriving it from the
-    // bytes: the replication header is client-set.
-    let replication_trusted = super::repositories::replication_exemption_trusted(
+    // bytes: the replication header is client-set. Re-decided here for the
+    // committing principal, not inherited from the session alone.
+    let replication_trusted = super::trusted_peer_replication_marked(
+        auth,
         is_replication_request || session.is_replication,
-        auth.is_admin,
-        auth.is_service_account,
     );
+    // #5455: the create-time MCP refusal, re-applied to the committing
+    // principal with the same decision, so no session (whoever opened it)
+    // commits a server.json into an MCP registry outside the publish route
+    // unless an authenticated peer replicates it. Terminal, like the
+    // hosted-only gate above.
+    if let Err(rejection) =
+        super::repositories::reject_generic_write_to_mcp_marked(&repo.format, replication_trusted)
+    {
+        UploadService::fail_committing(&state.db, &session, MCP_SESSION_ERROR).await;
+        return Err(rejection);
+    }
+    // #5455: the source row's metadata a session carries is honoured only
+    // for the commit decision above, not the create-time one. A session an
+    // administrator opened and a narrower token completes, or one opened
+    // with the header by a non-administrator before the upgrade, commits
+    // with server-derived metadata only.
+    let session = without_untrusted_replication_metadata(session, replication_trusted);
     let replicated_metadata = replication_trusted && session.artifact_metadata_format.is_some();
     // #1846: a format with a native upload route (Maven, npm, PyPI, RPM,
-    // Incus, Debian) gets the coordinates that route writes, derived from the
+    // Incus, Debian, Alpine) gets the coordinates that route writes, derived from the
     // path before the bytes are read so the immutability gate below checks
     // the very `version` the row is written with. A trusted replication
     // session brings the source row's own metadata instead.
@@ -885,17 +943,36 @@ async fn complete_session_commit(
         }
     }
     if !identical_replay && !mutable_replication {
-        if let Err(e) = crate::services::artifact_service::enforce_path_immutability(
+        // #4989: a matched `If-Match` is a compare-and-swap on the live
+        // artifact, so it lifts the live-overwrite 409 exactly as on the
+        // whole-body PUT; the release-immutability backstop still applies.
+        if let Err(e) = crate::services::artifact_service::enforce_path_immutability_with(
             &state.db,
             session.repository_id,
             Some(&repo),
             &session.artifact_path,
             derived_version.as_deref(),
             &session.checksum_sha256,
+            precondition.as_ref().is_some_and(
+                crate::services::artifact_service::WritePrecondition::replaces_current,
+            ),
         )
         .await
         {
             UploadService::release_commit_lease(&state.db, &session).await;
+            // A writer that committed since the check above is what refused
+            // this one: answer 412, not the gate's 409 (as `preflight_upload`).
+            if let (crate::error::AppError::Conflict(_), Some(precondition)) = (&e, &precondition) {
+                let current = crate::services::artifact_service::current_live_checksum(
+                    &state.db,
+                    session.repository_id,
+                    &session.artifact_path,
+                )
+                .await;
+                if matches!(current, Ok(current) if !precondition.holds(current.as_deref())) {
+                    return Err(precondition_failed(&session.artifact_path));
+                }
+            }
             return Err(e.into_response());
         }
     }
@@ -1084,6 +1161,14 @@ async fn complete_session_commit(
     // Clean up the local scratch copy now that the bytes are in final storage.
     drop(assembled);
 
+    // #5254: a format whose native route stores a package under the identity
+    // its bytes declare (an Alpine `.PKGINFO`) is stored under that identity
+    // here too: row, catalog entry and response.
+    let native_target = match (native_target, staged_native.as_ref()) {
+        (Some(target), Some(staged)) => Some(format_finalize::resolved_target(target, staged)),
+        (target, _) => target,
+    };
+
     // Create artifact record. A natively finalized format is named the way
     // its native route names it (Maven artifactId, npm package, normalized
     // PyPI project, RPM name, incus product, debian package), which is what
@@ -1110,8 +1195,14 @@ async fn complete_session_commit(
     // path so the artifact remains retrievable with correct coordinates. Generic
     // repositories keep their existing behaviour (version may be NULL).
     // `derived_version` was computed above, before the immutability gate, so
-    // the value checked there is exactly the value written here.
-    let artifact_version = derived_version.as_deref();
+    // the value checked there is the value written here, except for a package
+    // whose own declared version differs from its file name's (#5254): the
+    // atomic upsert below still refuses a live row at that version, and the
+    // gate's release backstop already refused any change of bytes at the path.
+    let artifact_version = match &native_target {
+        Some(target) => Some(target.version.as_str()),
+        None => derived_version.as_deref(),
+    };
 
     // #2516 S2: atomic quota admission for the chunked path, in the same
     // transaction as the artifact INSERT. The session-create quota check is
@@ -1206,40 +1297,86 @@ async fn complete_session_commit(
     // both passed it and the later upsert silently replaced the earlier one.
     // A live row at the same version is now left untouched (no row returned)
     // and this completion is refused with the gate's own 409.
-    let inserted_artifact_id = sqlx::query_scalar::<_, Uuid>(
-        r#"
-        INSERT INTO artifacts (repository_id, path, name, version, size_bytes,
-                               checksum_sha256, content_type, storage_key, uploaded_by)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        ON CONFLICT (repository_id, path) DO UPDATE SET
-            name = $3, version = $4, size_bytes = $5, checksum_sha256 = $6,
-            content_type = $7, storage_key = $8, uploaded_by = $9,
-            updated_at = NOW(), is_deleted = false
-        WHERE artifacts.is_deleted
-            OR $10
-            OR artifacts.version IS DISTINCT FROM EXCLUDED.version
-            OR ($11 AND LOWER(artifacts.checksum_sha256) = LOWER(EXCLUDED.checksum_sha256))
-            OR $12
-        RETURNING id
-        "#,
-    )
-    .bind(session.repository_id)
-    .bind(&session.artifact_path)
-    .bind(artifact_name)
-    .bind(artifact_version)
-    .bind(session.total_size)
-    .bind(&session.checksum_sha256)
-    .bind(content_type)
-    .bind(&storage_key)
-    .bind(user_id)
-    .bind(crate::services::artifact_service::versioning_applies(
+    //
+    // #4989: a conditional completion re-evaluates its precondition here
+    // with the target row locked, as `upload_content_conditional` does for
+    // the whole-body PUT, so of two conditional writers racing on one ETag
+    // exactly one commits and the other gets 412. When no live row existed,
+    // the upsert must not touch one that a concurrent writer committed in
+    // the meantime; the second pass evaluates the precondition against it.
+    let versioning_active = crate::services::artifact_service::versioning_applies(
         &repo.format,
         repo.versioning_enabled,
-    ))
-    .bind(identical_replay)
-    .bind(mutable_replication)
-    .fetch_optional(&mut *tx)
-    .await;
+    );
+    let mut attempt = 0;
+    let (inserted_artifact_id, replaced) = loop {
+        attempt += 1;
+        let gate = match &precondition {
+            Some(precondition) => {
+                match locked_precondition_gate(&mut tx, &session, precondition).await {
+                    Ok(Some(gate)) => gate,
+                    Ok(None) => {
+                        drop(tx);
+                        if !content_exists {
+                            state
+                                .create_artifact_service(storage.clone())
+                                .journal_unreferenced_upload_object(
+                                    session.repository_id,
+                                    &storage_key,
+                                )
+                                .await;
+                        }
+                        UploadService::release_commit_lease(&state.db, &session).await;
+                        return Err(precondition_failed(&session.artifact_path));
+                    }
+                    Err(e) => {
+                        drop(tx);
+                        return Err(release_after_precommit_failure(&state.db, &session, e).await);
+                    }
+                }
+            }
+            None => LockedPreconditionGate::default(),
+        };
+        let inserted = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            INSERT INTO artifacts (repository_id, path, name, version, size_bytes,
+                                   checksum_sha256, content_type, storage_key, uploaded_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (repository_id, path) DO UPDATE SET
+                name = $3, version = $4, size_bytes = $5, checksum_sha256 = $6,
+                content_type = $7, storage_key = $8, uploaded_by = $9,
+                updated_at = NOW(), is_deleted = false
+            WHERE (artifacts.is_deleted
+                OR $10
+                OR artifacts.version IS DISTINCT FROM EXCLUDED.version
+                OR ($11 AND LOWER(artifacts.checksum_sha256) = LOWER(EXCLUDED.checksum_sha256))
+                OR $12
+                OR $13)
+              AND (NOT $14 OR artifacts.is_deleted)
+            RETURNING id
+            "#,
+        )
+        .bind(session.repository_id)
+        .bind(&session.artifact_path)
+        .bind(artifact_name)
+        .bind(artifact_version)
+        .bind(session.total_size)
+        .bind(&session.checksum_sha256)
+        .bind(content_type)
+        .bind(&storage_key)
+        .bind(user_id)
+        .bind(versioning_active)
+        .bind(identical_replay)
+        .bind(mutable_replication)
+        .bind(gate.replaces_current)
+        .bind(gate.expect_absent)
+        .fetch_optional(&mut *tx)
+        .await;
+        match inserted {
+            Ok(None) if gate.expect_absent && attempt == 1 => continue,
+            other => break (other, gate.replaced_key),
+        }
+    };
     let artifact_id: Uuid = match inserted_artifact_id {
         Ok(Some(id)) => id,
         Ok(None) => {
@@ -1266,6 +1403,19 @@ async fn complete_session_commit(
             return Err(release_after_precommit_failure(&state.db, &session, e).await);
         }
     };
+    // #4989: an `If-Match` replace on a repository without revision history
+    // leaves the old object with no row; storage GC's candidate sweep
+    // re-checks every reference before deleting it (as on the whole-body PUT).
+    if let Some(old_key) = replaced.filter(|key| !versioning_active && *key != storage_key) {
+        if let Err(e) = crate::services::artifact_service::record_replaced_object_gc_candidate(
+            &mut tx, &repo, &old_key,
+        )
+        .await
+        {
+            drop(tx);
+            return Err(release_after_precommit_failure(&state.db, &session, e).await);
+        }
+    }
     // #5002: write the format metadata in the same transaction as the
     // artifact row. The native finalize's document (or the client's, for a
     // non-native format) used to be written after the commit; a crash in
@@ -1276,7 +1426,7 @@ async fn complete_session_commit(
             match format_finalize::metadata_document(
                 staged,
                 target,
-                &session,
+                &(&session).into(),
                 rpm_upload_metadata.as_ref(),
             ) {
                 Ok(document) => document,
@@ -1463,7 +1613,7 @@ async fn complete_session_commit(
     if let (Some(staged), Some(target)) = (staged_native, &native_target) {
         let recorded = format_finalize::record(
             state,
-            &session,
+            &(&session).into(),
             artifact_id,
             target,
             staged,
@@ -1537,6 +1687,14 @@ async fn complete_session_commit(
     state
         .event_bus
         .emit_artifact_uploaded(artifact_id, session.repository_id, Some(user_id));
+    // #5455: a replicated MCP server.json leaves the publish audit row.
+    super::repositories::audit_generic_mcp_publish(
+        &state.db,
+        &repo,
+        user_id,
+        artifact_id,
+        &session.artifact_path,
+    );
 
     // Terminal transition, token-guarded. A lost lease here means the commit
     // took longer than the 6h staleness window and a newer complete request
@@ -1683,6 +1841,53 @@ async fn finish_stale_label_index_replication(
         checksum_sha256,
     })
     .into_response())
+}
+
+/// The 412 a chunked completion whose `If-Match` / `If-None-Match` does not
+/// hold is answered with (#4989): the whole-body PUT's `PRECONDITION_FAILED`.
+fn precondition_failed(path: &str) -> Response {
+    crate::services::artifact_service::WritePrecondition::failed(path).into_response()
+}
+
+/// How a conditional completion's upsert may treat the row at its path
+/// (#4989), decided with that row locked.
+#[derive(Default)]
+struct LockedPreconditionGate {
+    /// A matched `If-Match` names the live row: the upsert may replace it.
+    replaces_current: bool,
+    /// No live row held the path: the upsert must not touch one a concurrent
+    /// writer committed since.
+    expect_absent: bool,
+    /// The storage key of the live row a matched `If-Match` replaces.
+    replaced_key: Option<String>,
+}
+
+/// Lock the row at the session's path and evaluate `precondition` against it
+/// (#4989). `Ok(None)` when the precondition does not hold.
+async fn locked_precondition_gate(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session: &upload_service::UploadSession,
+    precondition: &crate::services::artifact_service::WritePrecondition,
+) -> crate::error::Result<Option<LockedPreconditionGate>> {
+    let row = sqlx::query_as::<_, (String, String, bool)>(
+        "SELECT checksum_sha256, storage_key, is_deleted FROM artifacts \
+         WHERE repository_id = $1 AND path = $2 FOR UPDATE",
+    )
+    .bind(session.repository_id)
+    .bind(&session.artifact_path)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+    let live = row.filter(|(_, _, deleted)| !deleted);
+    if !precondition.holds(live.as_ref().map(|(checksum, _, _)| checksum.trim())) {
+        return Ok(None);
+    }
+    let replaces_current = live.is_some() && precondition.replaces_current();
+    Ok(Some(LockedPreconditionGate {
+        replaces_current,
+        expect_absent: live.is_none(),
+        replaced_key: live.filter(|_| replaces_current).map(|(_, key, _)| key),
+    }))
 }
 
 /// Whether a live artifact at `(repository_id, path)` already holds exactly
@@ -1920,6 +2125,11 @@ fn reject_session_if_promotion_only(promotion_only: bool, is_admin: bool) -> Opt
 /// repository is not hosted (#4420).
 const NOT_HOSTED_SESSION_ERROR: &str =
     "repository does not accept direct uploads (remote or virtual repository)";
+
+/// `upload_sessions.error_message` for a completion refused because the
+/// repository is an MCP registry and the committer is not an authenticated
+/// peer replicating into it (#5455).
+const MCP_SESSION_ERROR: &str = super::repositories::MCP_GENERIC_WRITE_REFUSED;
 
 /// Extract a simple artifact name from its path (last path component without extension).
 /// Read the leading bytes of an uploaded `.rpm` that hold its lead,
@@ -2175,6 +2385,26 @@ fn maven_grouped_name_for_format(
     }
 }
 
+/// Drop the caller-supplied replication fields (artifact metadata and its
+/// properties, package description and metadata) from `session` unless the
+/// commit is a trusted peer replication (#5455). Every later read of those
+/// fields in the commit (the metadata document, the rpm repodata and pacman
+/// file-list subsets, the catalog entry) then sees only what a trusted peer
+/// sent.
+fn without_untrusted_replication_metadata(
+    mut session: upload_service::UploadSession,
+    replication_trusted: bool,
+) -> upload_service::UploadSession {
+    if !replication_trusted {
+        session.artifact_metadata_format = None;
+        session.artifact_metadata = None;
+        session.artifact_metadata_properties = None;
+        session.package_description = None;
+        session.package_metadata = None;
+    }
+    session
+}
+
 fn completed_package_description(session: &upload_service::UploadSession) -> Option<&str> {
     session.package_description.as_deref().or_else(|| {
         if !replicated_maven_artifact_is_pom(session) {
@@ -2352,11 +2582,11 @@ struct ReplicationSessionMetadata<'a> {
     package_metadata: Option<&'a serde_json::Value>,
 }
 
-fn replication_session_metadata_from_request<'a>(
-    headers: &HeaderMap,
-    req: &'a CreateSessionRequest,
-) -> ReplicationSessionMetadata<'a> {
-    if !super::is_replication_request(headers) {
+fn replication_session_metadata_from_request(
+    trusted_replication: bool,
+    req: &CreateSessionRequest,
+) -> ReplicationSessionMetadata<'_> {
+    if !trusted_replication {
         return ReplicationSessionMetadata {
             artifact_metadata_format: None,
             artifact_metadata: None,
@@ -3148,21 +3378,11 @@ mod tests {
         }
     }
 
-    fn headers_with_replication(value: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-artifact-keeper-replication",
-            axum::http::HeaderValue::from_str(value).unwrap(),
-        );
-        headers
-    }
-
     #[test]
     fn test_replication_session_metadata_keeps_fields_for_peer_request() {
         let req = request_with_replication_metadata();
-        let headers = headers_with_replication("true");
 
-        let metadata = replication_session_metadata_from_request(&headers, &req);
+        let metadata = replication_session_metadata_from_request(true, &req);
 
         assert_eq!(metadata.artifact_metadata_format, Some("debian"));
         assert_eq!(
@@ -3186,9 +3406,8 @@ mod tests {
     #[test]
     fn test_replication_session_metadata_drops_fields_without_peer_marker() {
         let req = request_with_replication_metadata();
-        let headers = HeaderMap::new();
 
-        let metadata = replication_session_metadata_from_request(&headers, &req);
+        let metadata = replication_session_metadata_from_request(false, &req);
 
         assert!(metadata.artifact_metadata_format.is_none());
         assert!(metadata.artifact_metadata.is_none());
@@ -4294,9 +4513,10 @@ mod tests {
         create_body: serde_json::Value,
         payload: &[u8],
     ) -> Uuid {
+        // A peer replicates under an administrator's token (#5455).
         complete_replication_upload_as(
             f,
-            || tdh::make_auth(f.user_id, &f.username),
+            || tdh::admin_auth(f.user_id, &f.username),
             create_body,
             payload,
         )
@@ -4369,7 +4589,28 @@ mod tests {
         let Some(f) = tdh::Fixture::setup("local", "generic").await else {
             return;
         };
+        let peer = tdh::admin_auth(f.user_id, &f.username);
+        replication_session_retry_case(f, peer, true).await;
+    }
 
+    /// #5455: the replication header from a caller that is not an
+    /// authenticated peer (a service account with `write`, or a plain
+    /// writer) opens an ordinary session. It neither removes another
+    /// session's in-flight replication upload nor records the new session as
+    /// a replication one, so the commit cannot inherit an exemption.
+    #[tokio::test]
+    async fn forged_replication_session_is_an_ordinary_session_5455() {
+        for service_account in [true, false] {
+            let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+                return;
+            };
+            let mut writer = tdh::make_auth(f.user_id, &f.username);
+            writer.is_service_account = service_account;
+            replication_session_retry_case(f, writer, false).await;
+        }
+    }
+
+    async fn replication_session_retry_case(f: tdh::Fixture, auth: AuthExtension, peer: bool) {
         let artifact_path = "torch/2.0.0/torch-2.0.0-cp311-cp311-win_amd64.whl";
         let stale_session_id = Uuid::new_v4();
         let stale_temp = f
@@ -4414,7 +4655,6 @@ mod tests {
         .await
         .expect("insert stale chunk row");
 
-        let auth = tdh::make_auth(f.user_id, &f.username);
         let app = upload_router_with_auth(f.state.clone(), auth);
         let req = create_replication_session_req(&serde_json::json!({
             "repository_key": f.repo_key,
@@ -4436,32 +4676,59 @@ mod tests {
             String::from_utf8_lossy(&body)
         );
 
-        assert_eq!(
-            upload_session_row_counts(&f.pool, stale_session_id).await,
-            (0, 0),
-            "retrying peer replication must remove stale upload session/chunk rows"
-        );
-        assert!(
-            !stale_temp.exists(),
-            "retry cleanup should remove the stale replication temp file"
-        );
+        let stale_rows = upload_session_row_counts(&f.pool, stale_session_id).await;
+        let stale_temp_survived = stale_temp.exists();
 
         let create_resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let new_session_id: Uuid =
             serde_json::from_value(create_resp["session_id"].clone()).expect("session_id");
-        let is_replication: bool =
-            sqlx::query_scalar("SELECT is_replication FROM upload_sessions WHERE id = $1")
-                .bind(new_session_id)
-                .fetch_one(&f.pool)
-                .await
-                .expect("query new upload session");
-        assert!(
-            is_replication,
-            "new peer-created upload session must be marked as replication"
-        );
+        let (is_replication, metadata_format): (bool, Option<String>) = sqlx::query_as(
+            "SELECT is_replication, artifact_metadata_format FROM upload_sessions WHERE id = $1",
+        )
+        .bind(new_session_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("query new upload session");
 
         cleanup_created_session(&f.pool, &body).await;
+        let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
+            .bind(stale_session_id)
+            .execute(&f.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+            .bind(stale_session_id)
+            .execute(&f.pool)
+            .await;
+        let _ = tokio::fs::remove_file(&stale_temp).await;
         f.teardown().await;
+
+        if peer {
+            assert_eq!(
+                stale_rows,
+                (0, 0),
+                "retrying peer replication must remove stale upload session/chunk rows"
+            );
+            assert!(
+                !stale_temp_survived,
+                "retry cleanup should remove the stale replication temp file"
+            );
+        } else {
+            assert_eq!(
+                stale_rows,
+                (1, 1),
+                "a forged replication header must not remove another session"
+            );
+            assert!(stale_temp_survived, "nor its staged bytes");
+        }
+        assert_eq!(
+            is_replication, peer,
+            "only a peer-created upload session is marked as replication"
+        );
+        assert_eq!(
+            metadata_format.is_some(),
+            peer,
+            "only a peer session keeps caller-supplied metadata"
+        );
     }
 
     #[tokio::test]
@@ -4525,9 +4792,11 @@ mod tests {
             "checksum_sha256": "deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
         }));
         let (status, _body) = tdh::send(app, req).await;
+        // #5458: the non-member cannot read this private repository, so the
+        // denial is the unknown-key 404, not a 403 that confirms the key.
         assert_eq!(
             status,
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
             "non-member on a ruled repo must be denied"
         );
         // No session must have been created for this repo.
@@ -5291,6 +5560,152 @@ mod tests {
 
         cleanup_staged_session(&f, first_session, &first_temp).await;
         cleanup_staged_session(&f, second_session, &second_temp).await;
+        f.teardown().await;
+    }
+
+    /// `PUT /api/v1/uploads/{id}/complete` with `If-Match` / `If-None-Match`.
+    fn conditional_complete_req(
+        session_id: Uuid,
+        header: &'static str,
+        value: &str,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut req = complete_req(session_id);
+        req.headers_mut().insert(
+            header,
+            axum::http::HeaderValue::from_str(value).expect("header value"),
+        );
+        req
+    }
+
+    async fn live_checksum_at(f: &tdh::Fixture, path: &str) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(f.repo_id)
+        .bind(path)
+        .fetch_optional(&f.pool)
+        .await
+        .expect("read live artifact")
+    }
+
+    /// #4989: chunked completion ignored `If-Match` / `If-None-Match`, so a
+    /// client's compare-and-swap through the chunked flow was a blind write:
+    /// `If-Match` on a free path committed, `If-None-Match: *` on an occupied
+    /// one answered the immutability 409 instead of 412, and a matched
+    /// `If-Match` could not replace the artifact it named. The completion now
+    /// applies the whole-body `PUT`'s rule (#4186): 412 `PRECONDITION_FAILED`
+    /// on a mismatch with nothing written and the session left completable,
+    /// a matched `If-Match` replaces the live artifact, and a malformed
+    /// header is a 400.
+    #[tokio::test]
+    async fn complete_honours_if_match_and_if_none_match_4989() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let original: &[u8] = b"chunked precondition original 4989";
+        let replacement: &[u8] = b"chunked precondition REPLACEMENT 4989";
+        let path = "cas4989/target.bin";
+        let free = "cas4989/free.bin";
+        let send = |req| {
+            let app =
+                upload_router_with_auth(f.state.clone(), tdh::make_auth(f.user_id, &f.username));
+            tdh::send(app, req)
+        };
+        let mut staged = Vec::new();
+
+        // If-Match on a path no artifact holds: 412, nothing committed.
+        let (session, temp) = stage_completable_session_at(&f, original, free).await;
+        let (status, body) = send(conditional_complete_req(session, "if-match", "*")).await;
+        assert_eq!(
+            status,
+            StatusCode::PRECONDITION_FAILED,
+            "If-Match * on a free path: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON error body");
+        assert_eq!(json["code"], "PRECONDITION_FAILED");
+        assert_eq!(live_checksum_at(&f, free).await, None, "nothing committed");
+        assert_completion_is_retryable(&f, session, &temp).await;
+        // The same session commits once its precondition holds.
+        let (status, _) = send(conditional_complete_req(session, "if-none-match", "*")).await;
+        assert_eq!(status, StatusCode::OK, "If-None-Match * on a free path");
+        staged.push((session, temp));
+
+        // Occupy `path` unconditionally.
+        let (session, temp) = stage_completable_session_at(&f, original, path).await;
+        let (status, _) = send(complete_req(session)).await;
+        assert_eq!(status, StatusCode::OK, "first completion takes the path");
+        staged.push((session, temp));
+        let original_etag = format!("\"{}\"", sha256_hex(original));
+
+        let (session, temp) = stage_completable_session_at(&f, replacement, path).await;
+        for (header, value, want) in [
+            ("if-none-match", "*", StatusCode::PRECONDITION_FAILED),
+            (
+                "if-match",
+                "\"0000000000000000000000000000000000000000000000000000000000000000\"",
+                StatusCode::PRECONDITION_FAILED,
+            ),
+            ("if-match", "not-an-entity-tag", StatusCode::BAD_REQUEST),
+        ] {
+            let (status, body) = send(conditional_complete_req(session, header, value)).await;
+            assert_eq!(
+                status,
+                want,
+                "{header}: {value}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(
+                live_checksum_at(&f, path).await.as_deref(),
+                Some(sha256_hex(original).as_str()),
+                "{header}: {value} must leave the original in place"
+            );
+            assert_completion_is_retryable(&f, session, &temp).await;
+        }
+
+        // A matched If-Match is a compare-and-swap: it replaces the original.
+        let (status, body) = send(conditional_complete_req(
+            session,
+            "if-match",
+            &original_etag,
+        ))
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "matched If-Match: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            live_checksum_at(&f, path).await.as_deref(),
+            Some(sha256_hex(replacement).as_str()),
+            "the matched If-Match replaced the artifact it named"
+        );
+        // The replaced object has no row left: it is a storage GC candidate.
+        let original_key =
+            crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+                &sha256_hex(original),
+            );
+        let candidates: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_gc_candidates \
+             WHERE storage_key = $1 AND source_repository_id = $2",
+        )
+        .bind(&original_key)
+        .bind(f.repo_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("count GC candidates");
+        assert_eq!(candidates, 1, "the replaced object is journalled for GC");
+        staged.push((session, temp));
+
+        let _ = sqlx::query("DELETE FROM oci_gc_candidates WHERE source_repository_id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await;
+        for (session, temp) in &staged {
+            cleanup_staged_session(&f, *session, temp).await;
+        }
         f.teardown().await;
     }
 
@@ -6578,6 +6993,76 @@ mod tests {
         );
     }
 
+    /// #5455: a session a peer opened with the source row's metadata, then
+    /// completed by a narrower (non-administrator) token, commits with no
+    /// caller-supplied artifact metadata, properties or package fields.
+    #[tokio::test]
+    async fn non_peer_commit_drops_session_replication_metadata_5455() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let payload: &[u8] = b"forged-metadata-bytes-5455";
+        let artifact_path = "pool/main/f/forged/forged_1_amd64.deb";
+        let calls = std::cell::Cell::new(0);
+        complete_replication_upload_as(
+            &f,
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() < 3 {
+                    tdh::admin_auth(f.user_id, &f.username)
+                } else {
+                    let mut narrower = tdh::make_auth(f.user_id, &f.username);
+                    narrower.is_service_account = true;
+                    narrower
+                }
+            },
+            serde_json::json!({
+                "repository_key": f.repo_key,
+                "artifact_path": artifact_path,
+                "artifact_name": "forged",
+                "artifact_version": "1",
+                "artifact_metadata_format": "debian",
+                "artifact_metadata": {"format": "debian", "architecture": "amd64"},
+                "artifact_metadata_properties": {"source": "forged"},
+                "package_description": "forged description",
+                "package_metadata": {"format": "debian"},
+                "total_size": payload.len() as i64,
+                "checksum_sha256": sha256_hex(payload),
+                "chunk_size": 1024 * 1024_i64,
+            }),
+            payload,
+        )
+        .await;
+        assert_eq!(
+            calls.get(),
+            3,
+            "create and chunk as the peer, complete as the narrower token"
+        );
+        let forged: Option<String> = sqlx::query_scalar(
+            "SELECT am.format FROM artifact_metadata am JOIN artifacts a ON a.id = am.artifact_id \
+             WHERE a.repository_id = $1 AND a.path = $2 AND am.format = 'debian'",
+        )
+        .bind(f.repo_id)
+        .bind(artifact_path)
+        .fetch_optional(&f.pool)
+        .await
+        .unwrap();
+        let description: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT description FROM packages WHERE repository_id = $1 AND description = 'forged description'",
+        )
+        .bind(f.repo_id)
+        .fetch_optional(&f.pool)
+        .await
+        .unwrap();
+        f.teardown().await;
+
+        assert!(
+            forged.is_none(),
+            "the session's debian document must not be written"
+        );
+        assert!(description.is_none(), "nor its package description");
+    }
+
     #[tokio::test]
     async fn complete_materializes_replication_metadata() {
         let Some(f) = tdh::Fixture::setup("local", "generic").await else {
@@ -7154,6 +7639,16 @@ mod tests {
             StatusCode::PAYLOAD_TOO_LARGE,
             "an untrusted replication header must not skip the create-time quota check"
         );
+        // #5455: nor a service account's.
+        let mut service_account = user.clone();
+        service_account.is_service_account = true;
+        let (status, _) =
+            create_session_as(&f, &service_account, "quota/sa.bin", payload, true).await;
+        assert_eq!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a service account's replication header must not skip the quota"
+        );
         let admin = tdh::admin_auth(f.user_id, &f.username);
         let (status, _) = create_session_as(&f, &admin, "quota/peer.bin", payload, true).await;
         assert_eq!(
@@ -7249,5 +7744,162 @@ mod tests {
         crate::services::quarantine_service::invalidate_config_cache(f.repo_id);
         f.teardown().await;
         assert_eq!(held.as_deref(), Some("quarantined"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #5455: the replication header is not a peer identity (chunked path)
+    // -----------------------------------------------------------------------
+
+    fn mcp_server_json(name: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({"name": name, "version": "1.0.0"})).unwrap()
+    }
+
+    async fn repo_row_counts(f: &tdh::Fixture) -> (i64, i64) {
+        sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM artifacts WHERE repository_id = $1), \
+                    (SELECT COUNT(*) FROM upload_sessions WHERE repository_id = $1)",
+        )
+        .bind(f.repo_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap()
+    }
+
+    /// A service account with `write` on an MCP registry cannot open a
+    /// one-chunk session for a server.json in a namespace it holds no grant
+    /// for, with or without the replication header: the same `400` either
+    /// way, and no session or artifact row exists afterwards (so nothing can
+    /// be served).
+    #[tokio::test]
+    async fn forged_header_one_chunk_mcp_session_is_refused_5455_db() {
+        let Some(f) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let mut service_account = tdh::make_auth(f.user_id, &f.username);
+        service_account.is_service_account = true;
+        let doc = mcp_server_json("io.modelcontextprotocol/squat");
+        let path = "servers/io.modelcontextprotocol/squat/1.0.0/server.json";
+        let mut statuses = Vec::new();
+        for replication in [false, true] {
+            statuses.push(create_session_as(&f, &service_account, path, &doc, replication).await);
+        }
+        let counts = repo_row_counts(&f).await;
+        f.teardown().await;
+
+        for (status, session) in &statuses {
+            assert_eq!(*status, StatusCode::BAD_REQUEST);
+            assert!(session.is_none());
+        }
+        assert_eq!(counts, (0, 0), "nothing stored, nothing to serve");
+    }
+
+    /// The peer (an administrator's token with the header) still replicates
+    /// a server.json through the chunked flow, and the commit records the
+    /// `MCP_SERVER_PUBLISHED` audit row with the peer as its actor.
+    #[tokio::test]
+    async fn peer_one_chunk_mcp_replication_lands_and_is_audited_5455_db() {
+        let Some(f) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let peer = tdh::admin_auth(f.user_id, &f.username);
+        let path = "servers/com.peer/echo/1.0.0/server.json";
+        let (status, body) = f
+            .chunked_upload_as(
+                peer,
+                path,
+                &mcp_server_json("com.peer/echo"),
+                serde_json::json!({}),
+                true,
+            )
+            .await;
+        let artifact: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2")
+                .bind(f.repo_id)
+                .bind(path)
+                .fetch_optional(&f.pool)
+                .await
+                .unwrap();
+        let audit = match artifact {
+            Some(id) => Some(tdh::audit_row_eventually(&f.pool, id, "MCP_SERVER_PUBLISHED").await),
+            None => None,
+        };
+        let _ = sqlx::query("DELETE FROM mcp_version_tombstones WHERE repository_id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await;
+        let user_id = f.user_id;
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let audit = audit.expect("the replicated server.json row");
+        assert_eq!(
+            audit.user_id,
+            Some(user_id),
+            "a non-null authenticated actor"
+        );
+        assert_eq!(audit.details["server"], "com.peer/echo");
+        assert_eq!(audit.details["version"], "1.0.0");
+    }
+
+    /// The commit re-decides peer identity for the committing principal: a
+    /// session a peer opened (marked `is_replication`) and that a non-peer
+    /// completes, even with the header, is refused for an MCP registry and
+    /// stores nothing.
+    #[tokio::test]
+    async fn commit_rechecks_peer_identity_for_mcp_5455_db() {
+        let Some(f) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let peer = tdh::admin_auth(f.user_id, &f.username);
+        let doc = mcp_server_json("com.peer/late");
+        let path = "servers/com.peer/late/1.0.0/server.json";
+        let (status, session) = create_session_as(&f, &peer, path, &doc, true).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let session: Uuid = session.unwrap().parse().unwrap();
+        let chunk = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/{session}"))
+            .header(
+                "content-range",
+                format!("bytes 0-{}/{}", doc.len() - 1, doc.len()),
+            )
+            .body(axum::body::Body::from(doc.clone()))
+            .unwrap();
+        let (status, _) = tdh::send(
+            upload_router_with_auth(f.state.clone(), peer.clone()),
+            chunk,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let mut service_account = tdh::make_auth(f.user_id, &f.username);
+        service_account.is_service_account = true;
+        let mut complete = complete_req(session);
+        complete.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let (status, body) = tdh::send(
+            upload_router_with_auth(f.state.clone(), service_account),
+            complete,
+        )
+        .await;
+        let (artifacts, _) = repo_row_counts(&f).await;
+        let error: Option<String> =
+            sqlx::query_scalar("SELECT error_message FROM upload_sessions WHERE id = $1")
+                .bind(session)
+                .fetch_optional(&f.pool)
+                .await
+                .unwrap()
+                .flatten();
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(artifacts, 0, "the refused commit stored nothing");
+        assert_eq!(error.as_deref(), Some(MCP_SESSION_ERROR));
     }
 }

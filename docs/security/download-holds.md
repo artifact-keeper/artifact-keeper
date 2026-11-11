@@ -17,6 +17,7 @@ repository-scoped token is refused), and enumerate every repository.
 | Held with no recorded source, and no scan policy refuses it | `409` |
 | Rejected during review | `403` |
 | Not held, but a scan policy refuses it | `403` |
+| MCP server version whose server.json, or a package it pins, is held | `404` on the `/mcp/{repo}/v0.1` surface for every caller; the reason is in the problem+json body only for callers who hold the repository. The generic artifact routes (listing, metadata, revision history, download, by id) treat such a version as missing for a caller who does not hold the repository (left out of listings, plain `404`); a holder keeps access and the server.json's own `409`/`403`. `/api/v1/packages` shows such a caller the server's newest servable version, or no row (holders see the stored row with `metadata.servable: false`). See [`docs/mcp-registry.md`](../mcp-registry.md#what-a-client-sees). |
 
 Before 1.12.0 a scan-policy hold answered `409`, like any other hold. A
 client that retried on `409` waiting for a release now gets `403` for a
@@ -27,6 +28,24 @@ rescan that clears the findings, an acknowledgement (see
 ("Artifact download is blocked by the repository's scan policy"); it names no
 policy or finding. A Maven checksum (`.sha1`, `.md5`, `.sha256`, `.sha512`)
 of a refused artifact answers `404`.
+
+## Turning on the upload-time quarantine period
+
+A repository's quarantine period is set with `quarantine_enabled` and
+`quarantine_duration_minutes` (minutes, non-negative). Both
+`POST /api/v1/repositories` and `PATCH /api/v1/repositories/{key}` accept
+them, so a repository created with `quarantine_enabled: true` holds its very
+first upload; the create response, like `GET`, reports the stored values.
+Enabling it on a Virtual repository is refused with `400` on both: a virtual
+has no content of its own, so set it on the member repositories. Before the
+fix for #5324, create accepted the two fields and stored neither, leaving the
+repository unheld until a `PATCH`.
+
+Create also refuses (`400`, naming the field) the update-only settings it
+does not apply, rather than ignoring them: a non-empty
+`release_repository_key`, `curation_enabled: true`, and any
+`curation_default_action` other than `allow`. Set those with `PATCH` after
+creating the repository.
 
 ## Where a hold came from
 
@@ -44,6 +63,59 @@ A release clears the source. The gate never trusts the free-text
 `quarantine_reason`. A hold with no source answers `403` exactly when a scan
 policy refuses the artifact right now (the same evaluation the gate's policy
 half runs), so no backfill is needed for the status codes to be right.
+
+## OCI images: holds follow the digest
+
+An OCI manifest can have several `artifacts` rows in one repository: one per
+tag (`v2/<name>/manifests/<tag>`) and a digest row
+(`v2/<name>/manifests/sha256:<hex>`, written by an MCP pin, a push by digest
+or a Remote pull). Since #5457 every read of a manifest (the native pull and
+HEAD, hosted and through a Virtual, the MCP backing gate, the generic
+`/download` and `/general` routes, hosted and through a Virtual (#5619), and
+the tree content read) checks every live row of the
+digest in that repository, whatever the image name. If any row is held or
+rejected, every reference to the digest is refused.
+
+When a push moves a tag whose row is held (a rejection, a permanent
+quarantine, or a timed hold that has not expired) to another image, the hold
+moves to the old digest's digest row. That row is created if needed, and
+revived if it was deleted. When it already has a hold, it keeps whichever of
+the two is stronger: rejected, then a permanent quarantine, then a release,
+then a timed hold. The tag row starts clean for the new image, which gets its
+own upload hold if the repository has one. A moved scan-policy hold is
+recorded as `admin`. The digest row has no scan of its own, so acknowledging
+findings cannot release it, and an administrator releases it instead.
+
+A hold that an administrator or the scanner decides on a tag row binds to the
+digest the row named when the hold was decided (#5646). When a push moves the
+tag to another image before the hold is written, the hold goes to the old
+digest's digest row instead (created if needed), and the new image is not
+changed. The quarantine and reject actions then answer with
+`held_artifact_id`, `held_digest` and `moved_to_digest`. They also accept an
+optional `expected_digest` (`sha256:<hex>`) naming the image the operator saw,
+so a tag that moved before the request was sent is handled the same way. When
+the old digest has no row left (it was deleted by digest), they answer `409`
+and change nothing. A scan verdict on the old image that would hold it is
+recorded as `admin`, like a moved hold.
+
+What this means for operators:
+
+- Releasing or rejecting acts on one row. To serve a held image again, release
+  every held row of the digest (its tag rows and its digest row). There is no
+  "release this digest everywhere" action yet. While any row of the digest is
+  still held, the image stays refused.
+- A rejected image whose tag moved away keeps a live digest row, so it is
+  retained (and listed) until an administrator deletes it.
+- Only manifests are gated. Layers and other blobs are content-addressed and
+  shared between images, so a client that already knows a blob digest can
+  still fetch it (as since #2912).
+- Replacing a held tag with a fixed image works with a plain `docker push`
+  (#5606). A caller who may push to the repository (write permission, and a
+  token with `write:artifacts`) is answered the held manifest's and blobs'
+  headers on `HEAD`, which docker checks before it uploads. The answer has no
+  body. `GET` of the held bytes stays refused for every caller, pull-only
+  callers are refused `HEAD` too, and the held image stays refused by digest
+  after the push.
 
 ## Queues
 
@@ -71,7 +143,11 @@ half runs), so no backfill is needed for the status codes to be right.
   the queue pages by cursor rather than by page number: pass `next_cursor`
   back as `cursor` until it is `null`. Each page evaluates a bounded number
   of hosted artifacts (`evaluated` in the response) and may hold fewer than
-  `per_page` items while still returning a cursor.
+  `per_page` items while still returning a cursor. The proxy half resumes
+  after the last cached path a page examined (by repository key, path and
+  digest), so a path that drops out of the queue between two pages does not
+  make the next page skip one. A cursor written by an earlier release is
+  refused with `400`; start the listing again.
 
 ## Acknowledging a finding
 

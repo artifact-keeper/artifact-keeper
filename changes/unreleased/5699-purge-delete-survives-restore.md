@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#5699]
+---
+- **A purged artifact no longer stays on push peers when another artifact at the same path is restored or re-uploaded** ([#5699]). When an artifact was purged from the trash, its queued peer delete could be cancelled by a later artifact at the same path: a restore cancelled it outright, and the sync worker cancelled it as soon as a push for the new artifact was queued, on the assumption that the push replaces the peer's copy. It does not: the peer refuses a push onto a path it still holds with `409` (`Artifact version already exists and is immutable`), so the hub served the new artifact while the peer kept serving the purged bytes indefinitely. A restore now cancels only the restored artifact's own deletes. The purged artifact's delete stays queued, and the sync worker holds a push until every undelivered delete of another artifact at the same repository and path has reached the peer, so the peer first removes the old copy and then receives the new one.

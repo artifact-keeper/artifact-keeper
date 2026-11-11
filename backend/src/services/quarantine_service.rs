@@ -592,6 +592,47 @@ pub async fn transition(
     Ok(())
 }
 
+/// The admin rejection of [`transition`], bound to the bytes the
+/// administrator saw (#5646), as [`quarantine_now_bound`] is: when an OCI tag
+/// moved to another image before the write, the old image's row is rejected
+/// (it must itself be quarantined, as for any rejection), never the new one.
+pub async fn reject_bound(
+    db: &PgPool,
+    artifact_id: Uuid,
+    reason: Option<&str>,
+    expected_digest: Option<&str>,
+) -> Result<HoldOutcome> {
+    let seen = hold_binding(db, artifact_id, expected_digest).await?;
+    let not_quarantined = || {
+        AppError::Conflict(
+            "Artifact is not in quarantined state; transition not allowed".to_string(),
+        )
+    };
+    bound_hold_write(
+        db,
+        artifact_id,
+        seen,
+        "rejected",
+        not_quarantined,
+        |id, seen| async move {
+            sqlx::query(
+                "UPDATE artifacts SET quarantine_status = 'rejected', quarantine_until = NULL, \
+             quarantine_reason = COALESCE($2, quarantine_reason) \
+             WHERE id = $1 AND quarantine_status = 'quarantined' \
+               AND ($3::text IS NULL OR checksum_sha256 = $3::bpchar)",
+            )
+            .bind(id)
+            .bind(reason)
+            .bind(seen)
+            .execute(db)
+            .await
+            .map(|r| r.rows_affected())
+            .map_err(|e| AppError::Database(e.to_string()))
+        },
+    )
+    .await
+}
+
 /// Release a scan-policy hold whose policy no longer refuses the artifact (#5153).
 ///
 /// A hold with `quarantine_source = 'scan_policy'` exists only because of the
@@ -606,13 +647,29 @@ pub async fn release_cleared_scan_policy_hold(
     actor: Option<Uuid>,
     released_by: &str,
 ) -> Result<bool> {
+    release_cleared_scan_policy_hold_bound(db, artifact_id, actor, released_by, None).await
+}
+
+/// [`release_cleared_scan_policy_hold`] only while the row still holds the
+/// bytes `seen` (sha256 hex) the policy was evaluated on (#5646), so a rescan
+/// of an OCI image whose tag moved meanwhile cannot release the new image's
+/// hold. `None` releases unbound.
+pub async fn release_cleared_scan_policy_hold_bound(
+    db: &PgPool,
+    artifact_id: Uuid,
+    actor: Option<Uuid>,
+    released_by: &str,
+    seen: Option<&str>,
+) -> Result<bool> {
     let released = sqlx::query(
         "UPDATE artifacts SET quarantine_status = 'released', quarantine_until = NULL, \
              quarantine_reason = NULL, quarantine_source = NULL \
          WHERE id = $1 AND quarantine_status = 'quarantined' \
-           AND quarantine_until IS NULL AND quarantine_source = 'scan_policy'",
+           AND quarantine_until IS NULL AND quarantine_source = 'scan_policy' \
+           AND ($2::text IS NULL OR checksum_sha256 = $2::bpchar)",
     )
     .bind(artifact_id)
+    .bind(seen)
     .execute(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?
@@ -660,37 +717,179 @@ pub async fn quarantine_now(
     artifact_id: Uuid,
     reason: Option<String>,
 ) -> Result<&'static str> {
+    Ok(quarantine_now_bound(db, artifact_id, reason, None)
+        .await?
+        .status)
+}
+
+/// What an administrator's hold did (#5646): the status written and, when
+/// the OCI tag it named moved to another image before the hold landed, the
+/// row of the old digest that took the hold instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoldOutcome {
+    pub status: &'static str,
+    pub moved: Option<MovedHold>,
+}
+
+/// The hold landed on the image the tag named when it was read, not on the
+/// one it names now (#5646).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MovedHold {
+    /// The row of `held_digest` that carries the hold.
+    pub artifact_id: Uuid,
+    pub held_digest: String,
+    /// The digest the tag names now; it is not held by this action.
+    pub moved_to: String,
+}
+
+/// The sha256 hex a hold on `artifact_id` binds to (#5646): the operator's
+/// `expected_digest` (`sha256:<hex>`) when given, else the checksum of a live
+/// OCI manifest row as read now. `None` (no binding) for any other row.
+async fn hold_binding(
+    db: &PgPool,
+    artifact_id: Uuid,
+    expected_digest: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(expected) = expected_digest {
+        let hex = expected
+            .strip_prefix("sha256:")
+            .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| {
+                AppError::Validation(
+                    "expected_digest must be a sha256 digest (sha256:<64 hex>)".to_string(),
+                )
+            })?;
+        return Ok(Some(hex.to_ascii_lowercase()));
+    }
+    crate::services::oci_manifests::manifest_checksum(db, artifact_id)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+}
+
+/// Run a hold write `write(row_id, seen)` bound to the bytes `seen` (#5646).
+/// The write must match its row only while the row still holds `seen`. When
+/// it matched nothing because an OCI tag moved, it is run once more against a
+/// row of the old digest ([`hold_target`]), and the outcome says so. A write
+/// that matched nothing for any other reason answers `refused`.
+///
+/// [`hold_target`]: crate::services::oci_manifests::hold_target
+async fn bound_hold_write<F, Fut>(
+    db: &PgPool,
+    artifact_id: Uuid,
+    seen: Option<String>,
+    status: &'static str,
+    refused: impl Fn() -> AppError,
+    write: F,
+) -> Result<HoldOutcome>
+where
+    F: Fn(Uuid, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<u64>>,
+{
+    if write(artifact_id, seen.clone()).await? > 0 {
+        return Ok(HoldOutcome {
+            status,
+            moved: None,
+        });
+    }
+    let Some(seen) = seen else {
+        return Err(refused());
+    };
+    use crate::services::oci_manifests::{hold_target, HoldTarget};
+    match hold_target(db, artifact_id, &seen)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+    {
+        HoldTarget::Same => Err(refused()),
+        HoldTarget::Gone {
+            held_digest,
+            moved_to,
+        } => Err(AppError::Conflict(format!(
+            "The tag moved to {moved_to} before the hold was applied, and {held_digest} has \
+             no row left to hold; nothing was changed"
+        ))),
+        HoldTarget::Moved {
+            artifact_id: target,
+            held_digest,
+            moved_to,
+        } => {
+            if write(target, Some(seen)).await? == 0 {
+                return Err(refused());
+            }
+            tracing::warn!(
+                %artifact_id,
+                held_artifact_id = %target,
+                %held_digest,
+                %moved_to,
+                status,
+                "OCI tag moved before the hold was applied; held the digest it named when read"
+            );
+            Ok(HoldOutcome {
+                status,
+                moved: Some(MovedHold {
+                    artifact_id: target,
+                    held_digest,
+                    moved_to,
+                }),
+            })
+        }
+    }
+}
+
+/// [`quarantine_now`] bound to the bytes the administrator saw (#5646):
+/// `expected_digest`, or for an OCI manifest row the digest it names when
+/// read. When an OCI tag moved to another image before the write, the old
+/// image is quarantined (through a row of its digest) and the new one is
+/// left alone; [`HoldOutcome::moved`] names both digests.
+pub async fn quarantine_now_bound(
+    db: &PgPool,
+    artifact_id: Uuid,
+    reason: Option<String>,
+    expected_digest: Option<&str>,
+) -> Result<HoldOutcome> {
     let Some((status, _until, _reason)) = fetch_quarantine_fields(db, artifact_id).await? else {
         return Err(AppError::NotFound(format!(
             "Artifact {artifact_id} not found"
         )));
     };
-    if !admin_quarantine_allowed(status.as_deref()) {
-        return Err(AppError::Conflict(
+    let rejected = || {
+        AppError::Conflict(
             "Artifact was rejected during security review; cannot re-quarantine".to_string(),
-        ));
+        )
+    };
+    if !admin_quarantine_allowed(status.as_deref()) {
+        return Err(rejected());
     }
     let reason = reason.unwrap_or_else(|| "Quarantined by administrator".to_string());
+    let seen = hold_binding(db, artifact_id, expected_digest).await?;
     // Re-check `rejected` in the statement as well: the read above and this write
     // are not atomic, so a concurrent admin reject must not be downgraded.
-    let result = sqlx::query(
-        "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL, \
-         quarantine_reason = $2, quarantine_source = 'admin' \
-         WHERE id = $1 AND is_deleted = false \
-           AND quarantine_status IS DISTINCT FROM 'rejected'",
+    bound_hold_write(
+        db,
+        artifact_id,
+        seen,
+        "quarantined",
+        rejected,
+        |id, seen| {
+            let reason = reason.clone();
+            async move {
+                sqlx::query(
+                "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL, \
+                 quarantine_reason = $2, quarantine_source = 'admin' \
+                 WHERE id = $1 AND is_deleted = false \
+                   AND quarantine_status IS DISTINCT FROM 'rejected' \
+                   AND ($3::text IS NULL OR checksum_sha256 = $3::bpchar)",
+            )
+            .bind(id)
+            .bind(reason)
+            .bind(seen)
+            .execute(db)
+            .await
+            .map(|r| r.rows_affected())
+            .map_err(|e| AppError::Database(e.to_string()))
+            }
+        },
     )
-    .bind(artifact_id)
-    .bind(reason)
-    .execute(db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-
-    if result.rows_affected() == 0 {
-        return Err(AppError::Conflict(
-            "Artifact was rejected during security review; cannot re-quarantine".to_string(),
-        ));
-    }
-    Ok("quarantined")
 }
 
 /// Fetch the raw `(quarantine_status, quarantine_until, quarantine_reason)`
@@ -861,6 +1060,72 @@ pub async fn enforce_download_gate(db: &PgPool, artifact_id: Uuid) -> Result<()>
     // Scan-policy gate. No-op (allowed) when no enabled policy matches the repo.
     enforce_scan_policy_gate(db, artifact_id, repository_id).await
 }
+
+/// One row [`enforce_download_gate_rows`] decides, with the quarantine fields
+/// the caller's lookup already selected.
+#[derive(Debug, Clone, Copy)]
+pub struct GateRow<'a> {
+    pub artifact_id: Uuid,
+    /// The artifact's owning repository.
+    pub repository_id: Uuid,
+    pub quarantine_status: Option<&'a str>,
+    pub quarantine_until: Option<DateTime<Utc>>,
+}
+
+/// [`enforce_download_gate`] over several rows that hold the same bytes (the
+/// aliases of one OCI manifest digest, #5457): every row must pass, and the
+/// first refusal is returned with the row it came from. No rows passes, as an
+/// absent artifact does.
+///
+/// Same decision and order as the per-row gate, from the fields in hand: the
+/// quarantine half of every row first (no statement unless one is held), then
+/// the scan-policy half, evaluated only when an enabled policy applies to the
+/// row's repository (one statement per repository).
+pub async fn enforce_download_gate_rows(
+    db: &PgPool,
+    rows: &[GateRow<'_>],
+) -> std::result::Result<(), (Uuid, AppError)> {
+    let now = Utc::now();
+    for row in rows {
+        if let Err(e) = check_download_allowed(row.quarantine_status, row.quarantine_until, now) {
+            let e = refine_hold_refusal(db, row.artifact_id, row.repository_id, e).await;
+            return Err((row.artifact_id, e));
+        }
+    }
+    let mut applies: std::collections::HashMap<Uuid, bool> = std::collections::HashMap::new();
+    for row in rows {
+        let policy_applies = match applies.get(&row.repository_id) {
+            Some(v) => *v,
+            None => {
+                let v = scan_policy_applies(db, row.repository_id)
+                    .await
+                    .map_err(|e| (row.artifact_id, e))?;
+                applies.insert(row.repository_id, v);
+                v
+            }
+        };
+        if policy_applies {
+            enforce_scan_policy_gate(db, row.artifact_id, row.repository_id)
+                .await
+                .map_err(|e| (row.artifact_id, e))?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether any enabled scan policy (repository-specific or global) applies to
+/// `repository_id`: the predicate `PolicyService::evaluate_artifact` loads its
+/// policies with.
+async fn scan_policy_applies(db: &PgPool, repository_id: Uuid) -> Result<bool> {
+    sqlx::query_scalar(SCAN_POLICY_APPLIES_SQL)
+        .bind(repository_id)
+        .fetch_one(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+}
+
+const SCAN_POLICY_APPLIES_SQL: &str = "SELECT EXISTS (SELECT 1 FROM scan_policies \
+      WHERE is_enabled AND (repository_id = $1 OR repository_id IS NULL))";
 
 /// Turn the quarantine 409 of an active hold into the scan-policy 403 when
 /// the hold is a scan-policy hold (#4510). Any other refusal is returned
@@ -1040,6 +1305,41 @@ fn listing_policy_presence_cache() -> &'static moka::future::Cache<Uuid, bool> {
 pub fn invalidate_listing_decisions() {
     listing_decision_cache().invalidate_all();
     listing_policy_presence_cache().invalidate_all();
+    LISTING_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Bumped by every [`invalidate_listing_decisions`].
+static LISTING_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether an enabled scan policy applies to `repository_id`, cached for
+/// [`LISTING_POLICY_PRESENCE_TTL`] when `cached`.
+async fn listing_policy_applies(db: &PgPool, repository_id: Uuid, cached: bool) -> Result<bool> {
+    let presence = listing_policy_presence_cache();
+    if cached {
+        if let Some(v) = presence.get(&repository_id).await {
+            return Ok(v);
+        }
+    }
+    let v = scan_policy_applies(db, repository_id).await?;
+    presence.insert(repository_id, v).await;
+    Ok(v)
+}
+
+/// The epoch a generated index of `repository_id` that went through
+/// [`listing_refusals`] stays valid for, for a cache keyed on the index's
+/// catalog revision (conda's revision cache, #4978 item 6): `None` when no
+/// enabled scan policy applies to the repository, so its listing decisions
+/// are the quarantine fields alone and move with the catalog; otherwise a
+/// value that changes every [`LISTING_DECISION_TTL`] and on every
+/// [`invalidate_listing_decisions`] in this process, because a scan or a
+/// policy edit can move a decision with no catalog write.
+pub async fn listing_policy_epoch(db: &PgPool, repository_id: Uuid) -> Result<Option<u64>> {
+    if !listing_policy_applies(db, repository_id, true).await? {
+        return Ok(None);
+    }
+    let window = Utc::now().timestamp().max(0) as u64 / LISTING_DECISION_TTL.as_secs();
+    let generation = LISTING_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
+    Ok(Some((generation << 32) | (window & 0xffff_ffff)))
 }
 
 /// The artifacts of `candidates` that the download gate would refuse, so a
@@ -1067,6 +1367,28 @@ pub async fn listing_refusals(
     repository_id: Uuid,
     candidates: &[ListingCandidate<'_>],
 ) -> Result<std::collections::HashSet<Uuid>> {
+    listing_refusals_with(db, repository_id, candidates, true).await
+}
+
+/// [`listing_refusals`] without its caches: every candidate's scan-policy
+/// decision is evaluated now. For a listing that is itself the serve surface
+/// (the MCP registry lists whole server.json documents, #5253), where a
+/// decision a minute behind a scan that just completed would hand out a
+/// refused recipe.
+pub async fn listing_refusals_fresh(
+    db: &PgPool,
+    repository_id: Uuid,
+    candidates: &[ListingCandidate<'_>],
+) -> Result<std::collections::HashSet<Uuid>> {
+    listing_refusals_with(db, repository_id, candidates, false).await
+}
+
+async fn listing_refusals_with(
+    db: &PgPool,
+    repository_id: Uuid,
+    candidates: &[ListingCandidate<'_>],
+    cached: bool,
+) -> Result<std::collections::HashSet<Uuid>> {
     use futures::StreamExt;
     let now = Utc::now();
     let mut refused = std::collections::HashSet::new();
@@ -1082,22 +1404,7 @@ pub async fn listing_refusals(
         return Ok(refused);
     }
 
-    let presence = listing_policy_presence_cache();
-    let policy_applies = match presence.get(&repository_id).await {
-        Some(v) => v,
-        None => {
-            let v: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM scan_policies \
-                  WHERE is_enabled AND (repository_id = $1 OR repository_id IS NULL))",
-            )
-            .bind(repository_id)
-            .fetch_one(db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-            presence.insert(repository_id, v).await;
-            v
-        }
-    };
+    let policy_applies = listing_policy_applies(db, repository_id, cached).await?;
     if !policy_applies {
         return Ok(refused);
     }
@@ -1108,8 +1415,10 @@ pub async fn listing_refusals(
         .map(|artifact_id| {
             let policy = &policy;
             async move {
-                if let Some(blocked) = decisions.get(&(repository_id, artifact_id)).await {
-                    return (artifact_id, blocked);
+                if cached {
+                    if let Some(blocked) = decisions.get(&(repository_id, artifact_id)).await {
+                        return (artifact_id, blocked);
+                    }
                 }
                 let blocked = match policy.evaluate_artifact(artifact_id, repository_id).await {
                     Ok(result) => !result.allowed,
@@ -1151,6 +1460,88 @@ pub fn validate_duration(minutes: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- the laws proved in formal/ArtifactKeeper/Quarantine/DownloadGate.lean --
+
+    mod download_gate_props {
+        use super::super::{admin_quarantine_allowed, check_download_allowed};
+        use chrono::{DateTime, TimeZone, Utc};
+        use proptest::prelude::*;
+
+        fn at(secs: i64) -> DateTime<Utc> {
+            Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap()
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(2000))]
+
+            /// `rejected_never_downloads`.
+            #[test]
+            fn a_rejection_never_downloads(
+                until in proptest::option::of(-1000i64..1000),
+                now in -1000i64..1000,
+            ) {
+                prop_assert!(check_download_allowed(Some("rejected"), until.map(at), at(now)).is_err());
+            }
+
+            /// `permanent_hold_never_lapses`.
+            #[test]
+            fn a_hold_with_no_expiry_never_lapses(now in -1000i64..1000) {
+                prop_assert!(check_download_allowed(Some("quarantined"), None, at(now)).is_err());
+            }
+
+            /// `timed_hold_blocks_until_expiry`.
+            #[test]
+            fn a_timed_hold_blocks_for_exactly_its_window(
+                until in -1000i64..1000,
+                now in -1000i64..1000,
+            ) {
+                let blocked =
+                    check_download_allowed(Some("quarantined"), Some(at(until)), at(now)).is_err();
+                prop_assert_eq!(blocked, now < until);
+            }
+
+            /// `lapsed_hold_stays_lapsed`.
+            #[test]
+            fn a_lapsed_hold_stays_lapsed(
+                until in -1000i64..1000,
+                now in -1000i64..1000,
+                later in 0i64..1000,
+            ) {
+                if check_download_allowed(Some("quarantined"), Some(at(until)), at(now)).is_ok() {
+                    prop_assert!(check_download_allowed(
+                        Some("quarantined"),
+                        Some(at(until)),
+                        at(now + later)
+                    )
+                    .is_ok());
+                }
+            }
+        }
+
+        /// `admin_quarantine_refused_on_rejection` and the statuses the gate
+        /// has no arm for (`unrecognised_status_downloads`): every other value
+        /// the column's CHECK constraint allows is downloadable and may be
+        /// quarantined by an administrator.
+        #[test]
+        fn statuses_without_an_arm_download_and_only_a_rejection_refuses_quarantine_now() {
+            assert!(!admin_quarantine_allowed(Some("rejected")));
+            for status in [
+                None,
+                Some("released"),
+                Some("clean"),
+                Some("unscanned"),
+                Some("flagged"),
+            ] {
+                assert!(
+                    check_download_allowed(status, None, at(0)).is_ok(),
+                    "{status:?}"
+                );
+                assert!(admin_quarantine_allowed(status), "{status:?}");
+            }
+            assert!(admin_quarantine_allowed(Some("quarantined")));
+        }
+    }
     use chrono::Utc;
 
     // -----------------------------------------------------------------------
@@ -2334,6 +2725,10 @@ mod listing_refusals_4288_tests {
         let cached = listing_refusals(&fx.pool, fx.repo_id, &candidates(None))
             .await
             .expect("cached");
+        // The uncached variant (#5253) sees the change at once.
+        let fresh = listing_refusals_fresh(&fx.pool, fx.repo_id, &candidates(None))
+            .await
+            .expect("fresh");
         invalidate_listing_decisions();
         let after = listing_refusals(&fx.pool, fx.repo_id, &candidates(None))
             .await
@@ -2351,6 +2746,103 @@ mod listing_refusals_4288_tests {
             "block_unscanned refuses the unscanned and the (unscanned) held package"
         );
         assert_eq!(cached, with_policy);
+        assert!(
+            fresh.is_empty(),
+            "the fresh variant ignores the cached decisions"
+        );
         assert!(after.is_empty(), "no policy, no hold: everything listed");
+    }
+
+    /// #4987: a scan reaching a terminal state and a label write drop the
+    /// cached listing decisions, so a listing follows them at once instead of
+    /// within the 60 s TTL.
+    #[tokio::test]
+    async fn a_completed_scan_and_a_label_write_invalidate_the_listing() {
+        use crate::services::scan_result_service::ScanResultService;
+        let Some(fx) = Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let scanned = seed(&fx, "linux-64/scanned-1.0-0.conda").await;
+        let labelled = seed(&fx, "linux-64/labelled-1.0-0.conda").await;
+        let scans = ScanResultService::new(fx.pool.clone());
+        let running = scans
+            .create_scan_result(scanned, fx.repo_id, "dependency")
+            .await
+            .expect("running scan");
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', true, false, true)",
+        )
+        .bind(format!("listing-4987-{}", fx.repo_id))
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("policy");
+        let candidates = [scanned, labelled].map(|artifact_id| ListingCandidate {
+            artifact_id,
+            quarantine_status: None,
+            quarantine_until: None,
+        });
+        invalidate_listing_decisions();
+        let before = listing_refusals(&fx.pool, fx.repo_id, &candidates)
+            .await
+            .expect("before");
+        scans
+            .complete_scan(
+                running.id,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some("test-4987"),
+                Utc::now(),
+                "complete",
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("complete scan");
+        let after_scan = listing_refusals(&fx.pool, fx.repo_id, &candidates)
+            .await
+            .expect("after scan");
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        let cached = listing_refusals(&fx.pool, fx.repo_id, &candidates)
+            .await
+            .expect("cached");
+        crate::services::artifact_label_service::ArtifactLabelService::new(fx.pool.clone())
+            .add_label(labelled, "team", "build")
+            .await
+            .expect("label");
+        let after_label = listing_refusals(&fx.pool, fx.repo_id, &candidates)
+            .await
+            .expect("after label");
+        let _ = sqlx::query("DELETE FROM scan_results WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            before,
+            [scanned, labelled].into_iter().collect(),
+            "both unscanned"
+        );
+        assert_eq!(
+            after_scan,
+            [labelled].into_iter().collect(),
+            "the completed scan is seen at once"
+        );
+        assert_eq!(
+            cached, after_scan,
+            "a direct policy delete is not seen while cached"
+        );
+        assert!(after_label.is_empty(), "the label write dropped the cache");
     }
 }

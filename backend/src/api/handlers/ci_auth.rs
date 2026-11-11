@@ -151,12 +151,31 @@ pub async fn exchange_ci_token(
 
     let req = parse_optional_body(&body)?;
 
+    let (user, tokens, _claims) = exchange_assertion(&state, jwt, req.provider_id).await?;
+
+    Ok(Json(CiTokenResponse {
+        access_token: tokens.access_token,
+        token_type: "Bearer".to_string(),
+        expires_in: tokens.expires_in,
+        username: user.username,
+    }))
+}
+
+/// The whole exchange of one CI assertion: provider by `iss` (or the
+/// explicit `provider_id`), signature/audience/issuer validation, mapping,
+/// service account, mint. Returns the verified claims too, for callers that
+/// record them (the MCP registry's `/auth/github-oidc` bridge, #5253).
+pub(crate) async fn exchange_assertion(
+    state: &SharedState,
+    jwt: &str,
+    provider_id: Option<Uuid>,
+) -> Result<(User, AccessToken, serde_json::Value)> {
     let svc = CiOidcService::new(state.db.clone());
 
     // 1. Pick the provider from the assertion's own `iss` claim, or from the
     //    explicit `provider_id` override when one was sent (#3548).
     let provider = svc
-        .resolve_provider_for_assertion(jwt, req.provider_id)
+        .resolve_provider_for_assertion(jwt, provider_id)
         .await
         .inspect_err(|e| record_ci_auth_failure(e, AuthFailureReason::InvalidToken))?;
 
@@ -168,16 +187,21 @@ pub async fn exchange_ci_token(
 
     // 3-5. Resolve the mapping, its service account, and mint. A verified
     // assertion refused here is refused by policy (no mapping matches).
-    let (user, tokens) = exchange_validated_claims(&state, &svc, &provider, &claims)
+    let (user, tokens) = exchange_validated_claims(state, &svc, &provider, &claims)
         .await
         .inspect_err(|e| record_ci_auth_failure(e, AuthFailureReason::Scope))?;
-
-    Ok(Json(CiTokenResponse {
-        access_token: tokens.access_token,
-        token_type: "Bearer".to_string(),
-        expires_in: tokens.expires_in,
-        username: user.username,
-    }))
+    // #5253: the claims of this session, for namespace grants that
+    // interpolate them (`io.github.{repository_owner}/*`). Best-effort: a
+    // session without a record matches no interpolated grant (fail closed).
+    crate::services::mcp_namespaces::record_ci_session(
+        &state.db,
+        &tokens.access_token,
+        user.id,
+        &claims,
+        tokens.expires_in,
+    )
+    .await;
+    Ok((user, tokens, claims))
 }
 
 /// Count a rejected CI assertion in `ak_auth_failures_total` (#4676): only
@@ -901,6 +925,7 @@ mod tests {
             groups: vec!["ci".to_string()],
             required_admin_group: None,
             auto_create_users: true,
+            provider_id: None,
         };
         let remaining = |token: &str| {
             let claims = auth_service

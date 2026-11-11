@@ -552,8 +552,9 @@ async fn index_yaml(
             }
         }
 
-        // A member that failed is a 502 above (#4192), unless the virtual
-        // allows partial merges: then the index is marked as such.
+        // An unavailable member is left out and the index marked partial
+        // (#5621); a member whose index does not parse is a 502 above unless
+        // the virtual allows partial merges (#4192).
         return remote_indexes
             .partial
             .apply(build_index_response(all_charts, None));
@@ -721,6 +722,7 @@ async fn fetch_chart_via_index(
         &fetch_url,
         &cache_path,
         RepositoryFormat::Helm,
+        ctx.is_head,
     )
     .await?;
     // #3446: count the proxied chart (or its `.prov`). `cache_path` is the
@@ -1088,12 +1090,21 @@ async fn upload_chart(
     // retry cannot collide with a half-finished predecessor in
     // `ensure_unique_artifact_path` and get a 409 it can never clear. An
     // orphaned object left in storage by an interrupted upload is overwritten
-    // by that retry -- the storage key is fully determined by chart name and
-    // version.
+    // by that retry -- the storage key is fully determined by the repository,
+    // chart name and version.
 
     // Stream the staged archive into the repo's StorageBackend, from local
     // scratch or by copying the object the backend already staged (#4990).
-    let storage_key = format!("helm/{}/{}/{}", chart_name, chart_version, filename);
+    // Repo-scoped on a shared cloud namespace (#5662), so two repositories
+    // holding the same chart version do not collide on one key; reads go
+    // through the row's storage_key, so legacy flat-key rows keep serving.
+    let key_scheme = crate::storage::StorageKeyScheme::from_env();
+    let storage_key = key_scheme.write_key(
+        &repo.storage_backend,
+        "helm",
+        repo.id,
+        &format!("{}/{}/{}", chart_name, chart_version, filename),
+    );
     let put = proxy_helpers::put_staged_body(
         &state,
         &repo,
@@ -1112,7 +1123,13 @@ async fn upload_chart(
     // through to a `{"saved":true}` reply while the prov is on the floor, and
     // must never leave behind a chart that advertises provenance it cannot
     // serve.
-    let prov_storage_key = format!("helm/{}/{}/{}", chart_name, chart_version, prov_filename);
+    // Repo-scoped beside its chart (#5662).
+    let prov_storage_key = key_scheme.write_key(
+        &repo.storage_backend,
+        "helm",
+        repo.id,
+        &format!("{}/{}/{}", chart_name, chart_version, prov_filename),
+    );
     let prov_put = match staged_prov {
         Some((prov, prov_digests)) => Some(
             proxy_helpers::put_staged_body(
@@ -1236,6 +1253,7 @@ async fn upload_chart(
     crate::services::package_service::register_published_package_with_metadata(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         chart_name,
         chart_version,
@@ -2484,6 +2502,35 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         tdh::send(app, req).await
     }
 
+    /// #5662: the same signed chart version (chart and `.prov`) uploads into
+    /// two Helm repositories on a shared cloud namespace (on main the second
+    /// answered 409).
+    #[tokio::test]
+    async fn same_chart_version_uploads_to_two_cloud_repositories_5662() {
+        let tgz = signed_chart_tgz();
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "helm",
+            key_prefix: "helm",
+            router: super::router,
+            publish: &|key| {
+                vec![tdh::post(
+                    format!("/{key}/api/charts"),
+                    "multipart/form-data; boundary=BOUNDARY",
+                    multipart_body(
+                        "BOUNDARY",
+                        &[
+                            ("chart", "provchart-0.1.0.tgz", &tgz),
+                            ("prov", "provchart-0.1.0.tgz.prov", REAL_PROV),
+                        ],
+                    ),
+                )]
+            },
+            download: &|key| tdh::get(format!("/{key}/charts/provchart-0.1.0.tgz")),
+            expected: &tgz,
+        })
+        .await;
+    }
+
     // -----------------------------------------------------------------------
     // cm-push default URL shape (#2941)
     // -----------------------------------------------------------------------
@@ -3218,6 +3265,88 @@ entries:
         assert!(index.entries.contains_key("trust-manager"));
     }
 
+    /// #5277: charts.rancher.io lists local subcharts (`repository: file://...`)
+    /// with no dependency `version`, which Helm accepts. The whole Remote index
+    /// answered 502 because of them, so every chart in the repository was
+    /// unreachable, including charts with no such dependency.
+    #[tokio::test]
+    async fn test_remote_index_yaml_with_versionless_dependency_5277() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let upstream = r#"apiVersion: v1
+generated: "2025-06-01T00:00:00Z"
+entries:
+  epinio:
+    - apiVersion: v2
+      appVersion: v1.10.0
+      created: "2024-06-01T00:00:00Z"
+      dependencies:
+        - condition: global.dex.enabled
+          name: dex
+          repository: file://./charts/dex
+          tags:
+            - dex
+      digest: bbbb2222
+      name: epinio
+      urls:
+        - assets/epinio/epinio-103.0.2+up1.10.0.tgz
+      version: 103.0.2+up1.10.0
+    - name: epinio
+      digest: broken-entry-without-version
+  rancher-backup:
+    - apiVersion: v2
+      created: "2024-06-01T00:00:00Z"
+      digest: cccc3333
+      name: rancher-backup
+      urls:
+        - assets/rancher-backup/rancher-backup-105.0.0+up6.0.0.tgz
+      version: 105.0.0+up6.0.0
+"#;
+
+        let Some(f) = tdh::Fixture::setup("remote", "helm").await else {
+            return;
+        };
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .and(path("/index.yaml"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(upstream.as_bytes()))
+            .mount(&server)
+            .await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(app, tdh::get(format!("/{}/index.yaml", f.repo_key))).await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a dependency without `version` is valid Helm and must not 502 the index: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let index = parse_index(&body);
+        assert_eq!(index.entries["rancher-backup"].len(), 1);
+        let epinio = &index.entries["epinio"];
+        assert_eq!(
+            epinio.len(),
+            1,
+            "the unreadable entry is skipped, the valid one is served"
+        );
+        let dep = &epinio[0].chart.dependencies.as_ref().unwrap()[0];
+        assert_eq!(dep.name, "dex");
+        assert_eq!(dep.version, None);
+
+        let served: serde_yaml::Value = serde_yaml::from_slice(&body).unwrap();
+        assert!(
+            served["entries"]["epinio"][0]["dependencies"][0]
+                .get("version")
+                .is_none(),
+            "the proxied index must not invent a dependency version"
+        );
+    }
+
     /// The two upstream failures an operator actually hits: the upstream is
     /// down (5xx), and the upstream URL is wrong so `index.yaml` 404s — the
     /// more common misconfiguration of the two. Neither may answer 200 with an
@@ -3373,9 +3502,9 @@ entries:
 
     /// #3448: an upstream index is parsed as ONE document, so a single
     /// non-conforming entry must not take the whole repository's discovery with
-    /// it. `urls`, `created`, `digest` and `generated` default; `name` and
-    /// `version` remain required because there is nothing to advertise without
-    /// them.
+    /// it. `urls`, `created`, `digest` and `generated` default; an entry
+    /// without `name` or `version` has nothing to advertise and is skipped
+    /// (see `test_upstream_index_entry_without_a_name_is_skipped`).
     #[test]
     fn test_upstream_index_entry_missing_optional_fields_still_parses() {
         let yaml = r#"apiVersion: v1
@@ -3400,18 +3529,31 @@ entries:
         );
     }
 
+    /// An entry with no chart name cannot be advertised, so it is dropped;
+    /// like Helm's index loader, the rest of the index is still served
+    /// (#5277) instead of the whole document failing.
     #[test]
-    fn test_upstream_index_entry_without_a_name_is_still_rejected() {
+    fn test_upstream_index_entry_without_a_name_is_skipped() {
         let yaml = r#"apiVersion: v1
 entries:
   nameless:
     - apiVersion: v2
       version: 1.0.0
+  named:
+    - apiVersion: v2
+      name: named
+      version: 1.0.0
 "#;
-        assert!(
-            serde_yaml::from_str::<HelmIndex>(yaml).is_err(),
-            "an entry with no chart name cannot be advertised and must stay a parse error"
+        let index: HelmIndex =
+            serde_yaml::from_str(yaml).expect("one unusable entry must not fail the index");
+        let mut out: Vec<(ChartYaml, String, String, String)> = Vec::new();
+        merge_upstream_index_entries("helm-remote", index, &mut out);
+        assert_eq!(
+            out.len(),
+            1,
+            "only the named entry is advertised, got {out:?}"
         );
+        assert_eq!(out[0].1, "charts/named-1.0.0.tgz");
     }
 
     /// #3448: the proxied index rebuilds every URL from a third party's
@@ -4539,12 +4681,13 @@ mod virtual_member_authz_tests {
     }
 }
 
-/// #4192 / #4508: a Remote member of a virtual Helm repository whose
-/// `index.yaml` cannot be fetched or parsed, or that does not answer within
-/// the member deadline, fails the merged index loudly (502 naming the member)
-/// instead of serving an index that silently lacks the member. A member that
-/// answers 404 publishes nothing and is not a failure; a virtual that opted
-/// into partial merges serves the rest, marked partial and uncacheable.
+/// #4192 / #4508 / #5621: a Remote member of a virtual Helm repository whose
+/// `index.yaml` does not parse fails the merged index loudly (502 naming the
+/// member) unless the virtual opted into partial merges. A member that is
+/// unavailable (5xx, the member deadline) is left out and the index served
+/// marked partial and uncacheable, or a 503 with `Retry-After` when no member
+/// answered. A member that answers 404 or another permanent 4xx publishes
+/// nothing and is not a failure.
 #[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod virtual_member_failure_tests {
@@ -4649,42 +4792,125 @@ mod virtual_member_failure_tests {
         upstream(ResponseTemplate::new(200).set_body_string(GOOD_INDEX)).await
     }
 
-    /// #4192: a member answering 500 or a document that does not parse fails
-    /// the merged index with 502 naming that member, by default.
-    #[tokio::test]
-    async fn failed_member_fails_the_merged_index_by_default_4192() {
-        let Some(pool) = tdh::try_pool().await else {
-            return;
-        };
-        for bad in [
-            ResponseTemplate::new(500),
-            ResponseTemplate::new(200).set_body_string("entries: [this is: not an index"),
-        ] {
-            let good = good_upstream().await;
-            let bad = upstream(bad).await;
-            let rig = Rig::new(pool.clone(), &[good.uri(), bad.uri()]).await;
-            let (status, body, _) = rig.index().await;
-            let bad_key = rig.member_keys[1].clone();
-            rig.cleanup().await;
-
-            let body = String::from_utf8_lossy(&body);
-            assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-            assert!(
-                body.contains(&bad_key),
-                "the 502 must name the member: {body}"
-            );
-        }
+    fn unparseable() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_string("entries: [this is: not an index")
     }
 
-    /// #4192: with `virtual_metadata_partial` the healthy members are served,
-    /// the missing member is named, and the response is not cacheable.
+    fn assert_partial(headers: &HeaderMap, missing: &str) {
+        assert_eq!(
+            headers
+                .get("x-ak-partial-members")
+                .and_then(|v| v.to_str().ok()),
+            Some(missing)
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        assert!(headers.get(axum::http::header::WARNING).is_some());
+        assert!(headers.get(axum::http::header::ETAG).is_none());
+    }
+
+    /// #4192: a member whose document does not parse fails the merged index
+    /// with 502 naming that member, by default. (Before #5621 a member
+    /// answering 500 did too; it is now left out, see below.)
     #[tokio::test]
-    async fn failed_member_is_served_partial_when_the_virtual_allows_it_4192() {
+    async fn unparseable_member_fails_the_merged_index_by_default_4192() {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
         let good = good_upstream().await;
-        let bad = upstream(ResponseTemplate::new(500)).await;
+        let bad = upstream(unparseable()).await;
+        let rig = Rig::new(pool, &[good.uri(), bad.uri()]).await;
+        let (status, body, _) = rig.index().await;
+        let bad_key = rig.member_keys[1].clone();
+        rig.cleanup().await;
+
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(
+            body.contains(&bad_key),
+            "the 502 must name the member: {body}"
+        );
+    }
+
+    /// #5621: a member answering 503 in front of a healthy one is left out:
+    /// the healthy member's charts are served, marked partial and
+    /// uncacheable, without `virtual_metadata_partial`.
+    #[tokio::test]
+    async fn unavailable_member_is_left_out_and_marked_partial_5621() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let bad = upstream(ResponseTemplate::new(503)).await;
+        let good = good_upstream().await;
+        let rig = Rig::new(pool, &[bad.uri(), good.uri()]).await;
+        let (status, body, headers) = rig.index().await;
+        let bad_key = rig.member_keys[0].clone();
+        rig.cleanup().await;
+
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("alpha"), "{body}");
+        assert_partial(&headers, &bad_key);
+    }
+
+    /// #5621: a member answering a permanent 401/403/451 is a miss, as in the
+    /// artifact walk (#5504): the healthy member is served complete.
+    #[tokio::test]
+    async fn permanently_refusing_member_is_a_miss_5621() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        for code in [401, 403, 451] {
+            let refusing = upstream(ResponseTemplate::new(code)).await;
+            let good = good_upstream().await;
+            let rig = Rig::new(pool.clone(), &[refusing.uri(), good.uri()]).await;
+            let (status, body, headers) = rig.index().await;
+            rig.cleanup().await;
+
+            let body = String::from_utf8_lossy(&body);
+            assert_eq!(status, StatusCode::OK, "{code}: {body}");
+            assert!(body.contains("alpha"), "{code}: {body}");
+            assert!(
+                headers.get("x-ak-partial-members").is_none(),
+                "{code}: a permanent answer is not a partial merge"
+            );
+        }
+    }
+
+    /// #5621: with no member able to answer, the index is a retryable 503
+    /// with `Retry-After`, never a 502 or an empty index.
+    #[tokio::test]
+    async fn only_unavailable_members_answer_503_5621() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let bad = upstream(ResponseTemplate::new(503)).await;
+        let rig = Rig::new(pool, &[bad.uri()]).await;
+        let (status, body, headers) = rig.index().await;
+        rig.cleanup().await;
+
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(
+            headers.get(axum::http::header::RETRY_AFTER).is_some(),
+            "the 503 must carry Retry-After"
+        );
+    }
+
+    /// #4192: with `virtual_metadata_partial` a member whose document does
+    /// not parse is left out: the healthy members are served, the missing
+    /// member is named, and the response is not cacheable.
+    #[tokio::test]
+    async fn unparseable_member_is_served_partial_when_the_virtual_allows_it_4192() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let good = good_upstream().await;
+        let bad = upstream(unparseable()).await;
         let rig = Rig::new(pool, &[good.uri(), bad.uri()]).await;
         rig.allow_partial().await;
         let (status, body, headers) = rig.index().await;
@@ -4694,19 +4920,7 @@ mod virtual_member_failure_tests {
         let body = String::from_utf8_lossy(&body);
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body.contains("alpha"), "{body}");
-        assert_eq!(
-            headers
-                .get("x-ak-partial-members")
-                .and_then(|v| v.to_str().ok()),
-            Some(bad_key.as_str())
-        );
-        assert_eq!(
-            headers
-                .get(axum::http::header::CACHE_CONTROL)
-                .and_then(|v| v.to_str().ok()),
-            Some("no-store")
-        );
-        assert!(headers.get(axum::http::header::WARNING).is_some());
+        assert_partial(&headers, &bad_key);
     }
 
     /// #4192: a member that answers 404 publishes no index; that is not a
@@ -4728,39 +4942,69 @@ mod virtual_member_failure_tests {
         assert!(headers.get("x-ak-partial-members").is_none());
     }
 
-    /// #4508: a member that does not answer within the member deadline fails
-    /// the merged index with 502 naming it, promptly, instead of holding the
-    /// request for the upstream's full timeout (which outlasts a reverse
-    /// proxy's and turns into a 504).
+    /// #4508 / #5621: a member that does not answer within the member
+    /// deadline is left out promptly, instead of holding the request for the
+    /// upstream's full timeout (which outlasts a reverse proxy's and turns
+    /// into a 504); the healthy member is served, marked partial.
     #[tokio::test]
-    async fn stalled_member_fails_within_the_deadline_4508() {
+    async fn stalled_member_is_left_out_within_the_deadline_5621() {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
         let good = good_upstream().await;
-        let stalled = upstream(
-            ResponseTemplate::new(200)
-                .set_body_string(GOOD_INDEX)
-                .set_delay(std::time::Duration::from_secs(5)),
-        )
-        .await;
+        let stalled = tdh::SilentUpstream::start().await;
         let rig = Rig::new(pool, &[good.uri(), stalled.uri()]).await;
         let started = std::time::Instant::now();
-        let (status, body, _) = crate::api::handlers::proxy_helpers::with_virtual_member_deadline(
-            std::time::Duration::from_millis(300),
-            rig.index(),
-        )
-        .await;
+        let (status, body, headers) =
+            crate::api::handlers::proxy_helpers::with_virtual_member_deadline(
+                // #5823: generous, so the healthy member (an immediate local
+                // answer) is always inside it; the stalled member never answers.
+                std::time::Duration::from_secs(5),
+                rig.index(),
+            )
+            .await;
         let elapsed = started.elapsed();
         let stalled_key = rig.member_keys[1].clone();
         rig.cleanup().await;
 
         let body = String::from_utf8_lossy(&body);
-        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-        assert!(body.contains(&stalled_key), "{body}");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("alpha"), "{body}");
+        assert_partial(&headers, &stalled_key);
         assert!(
-            elapsed < std::time::Duration::from_secs(3),
+            elapsed < std::time::Duration::from_secs(15),
             "the deadline must bound the wait: took {elapsed:?}"
         );
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod hosted_serve_verification_4989_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// #4989 (#4323 remainder): the hosted Helm chart download
+    /// (`serve_local_artifact`) verifies the stored bytes against the row. A corrupt object is the 502 `STORED_OBJECT_INTEGRITY` with none of
+    /// its bytes, not a 200 under the checksum it was uploaded with.
+    #[tokio::test]
+    async fn hosted_download_refuses_a_corrupt_object_4989() {
+        let Some(fx) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        tdh::seed_corrupt_artifact(
+            &fx,
+            "v4989-0.1.0.tgz",
+            "v4989",
+            "0.1.0",
+            "application/gzip",
+            b"stored bytes 4989",
+            b"stored bytes 498X",
+        )
+        .await;
+        let key = fx.repo_key.clone();
+        let send = |req| tdh::send(fx.router_with_auth(super::router()), req);
+        let (get_0, body_0) = send(tdh::get(format!("/{key}/charts/v4989-0.1.0.tgz"))).await;
+        fx.teardown().await;
+        tdh::assert_integrity_refusal(get_0, &body_0, b"stored bytes 498X");
     }
 }

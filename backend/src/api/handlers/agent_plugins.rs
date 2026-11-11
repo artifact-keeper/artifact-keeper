@@ -15,10 +15,14 @@
 //!   GET  /agentplugins/t/{token}/{repo}/...                           - Every read route above,
 //!                                                                       token in the path (D8)
 //!
-//! Repositories are hosted only (D3). The documents are built from the
-//! database on every request (D7), so a delete or a quarantine hold is
-//! reflected immediately; they carry an `ETag` and answer `If-None-Match`
-//! with `304`. Protocol reference: `docs/agent-plugins.md`.
+//! A hosted repository builds the documents from the database on every
+//! request (D7), so a delete or a quarantine hold is reflected immediately;
+//! they carry an `ETag` and answer `If-None-Match` with `304`. A Remote
+//! repository (#5289) proxies another Artifact Keeper's hosted repository:
+//! its documents are fetched through the proxy service and rewritten to point
+//! at this instance (the upstream `sha256` is kept), and its archives are
+//! fetched, checked against that `sha256`, and cached. Virtual repositories
+//! are not supported yet. Protocol reference: `docs/agent-plugins.md`.
 
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -92,12 +96,14 @@ fn token_router() -> Router<SharedState> {
 // Repository resolution and shared helpers
 // ---------------------------------------------------------------------------
 
+/// Virtual Agent Plugins repositories have no merge rule yet (#5289 phase 2).
 #[allow(clippy::result_large_err)]
-fn reject_if_not_hosted(repo: &RepoInfo) -> Result<(), Response> {
-    if repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual {
+fn reject_if_virtual(repo: &RepoInfo) -> Result<(), Response> {
+    if repo.repo_type == RepositoryType::Virtual {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Agent Plugins repositories are hosted-only; this repository is not hosted",
+            "Agent Plugins virtual repositories are not supported yet; use a hosted or \
+             remote repository",
         )
             .into_response());
     }
@@ -107,8 +113,12 @@ fn reject_if_not_hosted(repo: &RepoInfo) -> Result<(), Response> {
 async fn resolve_agentplugins_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
     let repo =
         proxy_helpers::resolve_repo_by_key(db, repo_key, &[FORMAT_KEY], "an Agent Plugins").await?;
-    reject_if_not_hosted(&repo)?;
+    reject_if_virtual(&repo)?;
     Ok(repo)
+}
+
+fn is_remote(repo: &RepoInfo) -> bool {
+    repo.repo_type == RepositoryType::Remote
 }
 
 /// A token route must have authenticated through its path token. The
@@ -317,6 +327,11 @@ async fn serve_document(req: ReadRequest, repo_key: String, document: String) ->
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    if is_remote(&repo) {
+        return remote::serve_document(req, repo, kind)
+            .await
+            .unwrap_or_else(|resp| resp);
+    }
     let versions = match servable_versions(&req.state.db, repo.id).await {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -331,6 +346,11 @@ async fn serve_versions_index(req: ReadRequest, repo_key: String, name: String) 
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    if is_remote(&repo) {
+        return remote::serve_versions_index(req, repo, name)
+            .await
+            .unwrap_or_else(|resp| resp);
+    }
     let versions = match servable_versions(&req.state.db, repo.id).await {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -433,6 +453,9 @@ async fn serve_download(
     if ap::validate_coordinates(&name, &version, &file).is_err() {
         return Err(not_found("Plugin archive"));
     }
+    if is_remote(&repo) {
+        return remote::serve_download(&state, &method, &repo, (&name, &version), &ctx).await;
+    }
     let path = ap::artifact_path(&name, &version);
     let artifact = archive_rows(&state.db, repo.id, Some(&path))
         .await?
@@ -467,13 +490,7 @@ async fn serve_download(
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
     Ok(response.body(Body::from_stream(stream)).unwrap())
 }
@@ -499,6 +516,236 @@ async fn download_with_token(
 }
 
 // ---------------------------------------------------------------------------
+// Remote repositories (#5289)
+// ---------------------------------------------------------------------------
+
+/// A Remote repository proxying another Artifact Keeper's hosted Agent
+/// Plugins repository: `upstream_url` is `https://central/agentplugins/<key>`
+/// (or the `/agentplugins/t/<token>/<key>` form), and every fetch goes
+/// through the proxy service, so the upstream credentials, the upstream
+/// filter, the origin policy and the proxy cache all apply as for any other
+/// Remote.
+///
+/// Documents are fetched as mutable proxy entries and rewritten by
+/// [`ap::rewrite_proxied_marketplace`] / [`ap::rewrite_proxied_versions_index`].
+/// An archive is fetched only for a version the upstream `{name}/index.json`
+/// lists, and the bytes must hash to the `sha256` listed there: a body that
+/// does not is never cached and the download answers `502`.
+mod remote {
+    use super::*;
+    use crate::models::repository::RepositoryFormat;
+    use crate::services::proxy_service::ProxyService;
+
+    /// Largest archive a Remote proxies: Claude Code itself refuses archives
+    /// over 256 MiB. The archive is buffered (it is checked before any byte
+    /// is served), under the shared proxy metadata byte budget.
+    pub(super) const REMOTE_ARCHIVE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+    fn bad_gateway(message: impl Into<String>) -> Response {
+        (StatusCode::BAD_GATEWAY, message.into()).into_response()
+    }
+
+    /// The proxy service and the upstream URL of a Remote.
+    #[allow(clippy::result_large_err)]
+    fn upstream<'a>(
+        state: &'a SharedState,
+        repo: &'a RepoInfo,
+    ) -> Result<(&'a ProxyService, &'a str), Response> {
+        let proxy = state.proxy_service.as_deref().ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The proxy service is not available",
+            )
+                .into_response()
+        })?;
+        let upstream_url = repo
+            .upstream_url
+            .as_deref()
+            .filter(|u| !u.trim().is_empty())
+            .ok_or_else(|| bad_gateway("This remote repository has no upstream URL"))?;
+        Ok((proxy, upstream_url))
+    }
+
+    /// Whether a proxied body carries a content coding this handler would
+    /// have to undo before reading it.
+    fn is_coded(content_encoding: Option<&str>) -> bool {
+        content_encoding.is_some_and(|e| !e.trim().eq_ignore_ascii_case("identity"))
+    }
+
+    /// Fetch an upstream document (`path` relative to `upstream_url`) through
+    /// the proxy cache, as a mutable entry, and parse it.
+    async fn fetch_json(
+        state: &SharedState,
+        repo: &RepoInfo,
+        path: &str,
+    ) -> Result<serde_json::Value, Response> {
+        let (proxy, upstream_url) = upstream(state, repo)?;
+        let max = proxy_helpers::DEFAULT_METADATA_MAX_BYTES;
+        let _budget = proxy_helpers::proxy_metadata_budget().reserve(max).await;
+        let body = proxy_helpers::proxy_fetch_capped_encoded_with_format(
+            proxy,
+            repo.id,
+            &repo.key,
+            upstream_url,
+            path,
+            max,
+            RepositoryFormat::AgentPlugins,
+        )
+        .await?;
+        if is_coded(body.content_encoding.as_deref()) {
+            return Err(bad_gateway(format!(
+                "The upstream {path} arrived content coded; expected identity"
+            )));
+        }
+        serde_json::from_slice(&body.content)
+            .map_err(|e| bad_gateway(format!("The upstream {path} is not JSON: {e}")))
+    }
+
+    pub(super) async fn serve_document(
+        req: ReadRequest,
+        repo: RepoInfo,
+        kind: Marketplace,
+    ) -> Result<Response, Response> {
+        let upstream_doc = fetch_json(&req.state, &repo, kind.file_name()).await?;
+        let description = repo_description(&req.state.db, repo.id).await;
+        let ctx = index_context(&req.base_url, &repo.key, description, req.token);
+        let doc = ap::rewrite_proxied_marketplace(upstream_doc, &ctx).map_err(bad_gateway)?;
+        Ok(json_document(&req.headers, &doc))
+    }
+
+    pub(super) async fn serve_versions_index(
+        req: ReadRequest,
+        repo: RepoInfo,
+        name: String,
+    ) -> Result<Response, Response> {
+        if ap::validate_slug(&name).is_err() {
+            return Err(not_found("Plugin"));
+        }
+        let upstream_doc = fetch_json(&req.state, &repo, &format!("{name}/index.json")).await?;
+        let ctx = index_context(&req.base_url, &repo.key, None, req.token);
+        match ap::rewrite_proxied_versions_index(upstream_doc, &name, &ctx).map_err(bad_gateway)? {
+            Some(doc) => Ok(json_document(&req.headers, &doc)),
+            None => Err(not_found("Plugin")),
+        }
+    }
+
+    /// Whether `content` is the archive whose SHA-256 is `expected`
+    /// (lowercase hex). Hashed off the async runtime.
+    pub(super) async fn archive_matches(
+        content: bytes::Bytes,
+        content_encoding: Option<String>,
+        expected: String,
+    ) -> bool {
+        if is_coded(content_encoding.as_deref()) {
+            return false;
+        }
+        tokio::task::spawn_blocking(move || {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(&content)) == expected
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// The byte cap of one archive fetch: the size the upstream index lists,
+    /// or [`REMOTE_ARCHIVE_MAX_BYTES`] when it lists none.
+    #[allow(clippy::result_large_err)]
+    pub(super) fn archive_cap(size_bytes: Option<u64>) -> Result<usize, Response> {
+        match size_bytes {
+            None => Ok(REMOTE_ARCHIVE_MAX_BYTES),
+            Some(size) if size <= REMOTE_ARCHIVE_MAX_BYTES as u64 => Ok((size as usize).max(1)),
+            Some(size) => Err(bad_gateway(format!(
+                "The upstream archive is {size} bytes, over the {REMOTE_ARCHIVE_MAX_BYTES} \
+                 bytes a remote repository proxies"
+            ))),
+        }
+    }
+
+    pub(super) async fn serve_download(
+        state: &SharedState,
+        method: &Method,
+        repo: &RepoInfo,
+        (name, version): (&str, &str),
+        ctx: &DownloadContext,
+    ) -> Result<Response, Response> {
+        // The expected digest comes from the upstream's own index of the
+        // plugin (a mutable proxy entry, shared with the index route).
+        let index = fetch_json(state, repo, &format!("{name}/index.json")).await?;
+        let archive = ap::proxied_archive(&index, name, version)
+            .ok_or_else(|| not_found("Plugin archive"))?;
+        let cap = archive_cap(archive.size_bytes)?;
+        let builder = |len: usize| {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/zip")
+                .header(
+                    CONTENT_DISPOSITION,
+                    format!(
+                        "attachment; filename=\"{}\"",
+                        ap::archive_filename(name, version)
+                    ),
+                )
+                .header(CONTENT_LENGTH, len.to_string())
+                .header("X-Checksum-Sha256", &archive.sha256)
+                .header(ETAG, format!("\"{}\"", archive.sha256))
+        };
+        if *method == Method::HEAD {
+            if let Some(size) = archive.size_bytes {
+                return Ok(builder(size as usize).body(Body::empty()).unwrap());
+            }
+        }
+
+        let (proxy, upstream_url) = upstream(state, repo)?;
+        let fetch_path = ap::artifact_path(name, version);
+        let cache_path = ap::remote_cache_path(name, version, &archive.sha256);
+        let expected = archive.sha256.clone();
+        let check = move |content: bytes::Bytes,
+                          encoding: Option<String>|
+              -> futures::future::BoxFuture<'static, bool> {
+            Box::pin(archive_matches(content, encoding, expected.clone()))
+        };
+        let _budget = proxy_helpers::proxy_metadata_budget().reserve(cap).await;
+        let body = proxy_helpers::proxy_fetch_capped_with_cache_key_encoded_format(
+            proxy,
+            repo.id,
+            &repo.key,
+            upstream_url,
+            &fetch_path,
+            &cache_path,
+            cap,
+            RepositoryFormat::AgentPlugins,
+            &check,
+        )
+        .await?;
+        // The check kept a mismatching body out of the cache; it is returned
+        // anyway, and never served.
+        if !archive_matches(
+            body.content.clone(),
+            body.content_encoding.clone(),
+            archive.sha256.clone(),
+        )
+        .await
+        {
+            tracing::warn!(
+                repo = %repo.key,
+                plugin = name,
+                version,
+                "upstream agent plugin archive does not match the sha256 its index lists; refusing it"
+            );
+            return Err(bad_gateway(
+                "The upstream archive does not match the sha256 its index lists",
+            ));
+        }
+        let response = builder(body.content.len());
+        if *method == Method::HEAD {
+            return Ok(response.body(Body::empty()).unwrap());
+        }
+        proxy_helpers::record_proxy_download(state, repo.id, &repo.key, &cache_path, ctx).await;
+        Ok(response.body(Body::from(body.content)).unwrap())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PUT the zip (publish)
 // ---------------------------------------------------------------------------
 
@@ -518,6 +765,37 @@ async fn discard_unreferenced_object(state: &SharedState, repo: &RepoInfo, stora
             let _ = storage.delete(storage_key).await;
         }
     }
+}
+
+/// The storage key a published archive is written to:
+/// `agentplugins/{repository_id}/{sha256}/{name}/{version}/{name}-{version}.zip`
+/// on a shared cloud namespace (S3/GCS/Azure), the repo-scoped shape of the
+/// #2624 scheme npm (#4293) and Conan (#4694) use.
+///
+/// The content-only `agentplugins/{sha256}/...` key every repository used to
+/// share made a second repository publishing byte-identical archives (a
+/// staging and a production repository on one bucket) fail the
+/// cross-repository write guard with 409 "already owned by another
+/// repository" (#5267). The SHA-256 stays inside the per-repository prefix,
+/// so a losing concurrent publish of different bytes to the same version
+/// still writes its own object and never overwrites the winner's.
+/// Filesystem backends (one directory per repository) and
+/// `STORAGE_KEY_SCHEME=flat` keep `agentplugins/{sha256}/...`. Existing
+/// objects are untouched: downloads resolve the object through the
+/// `storage_key` its artifact row recorded.
+fn plugin_storage_key(
+    scheme: crate::storage::StorageKeyScheme,
+    storage_backend: &str,
+    repo_id: Uuid,
+    sha256: &str,
+    artifact_path: &str,
+) -> String {
+    scheme.write_key(
+        storage_backend,
+        FORMAT_KEY,
+        repo_id,
+        &format!("{sha256}/{artifact_path}"),
+    )
 }
 
 /// Read the optional `X-Checksum-Sha256` header, lowercased.
@@ -668,9 +946,16 @@ async fn publish_plugin(
         other => other.into_response(),
     })?;
 
-    // Content-addressed key: a concurrent publish of different bytes to the
+    // Repo-scoped on a shared cloud namespace (#5267) and content-addressed
+    // inside that prefix, so a concurrent publish of different bytes to the
     // same version cannot overwrite the object the winning row points at.
-    let storage_key = format!("{FORMAT_KEY}/{}/{artifact_path}", digests.sha256);
+    let storage_key = plugin_storage_key(
+        crate::storage::StorageKeyScheme::from_env(),
+        &repo.storage_backend,
+        repo.id,
+        &digests.sha256,
+        &artifact_path,
+    );
     proxy_helpers::put_staged_body(
         &state,
         &repo,
@@ -746,6 +1031,7 @@ async fn publish_plugin(
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         FORMAT_KEY,
         &name,
@@ -789,13 +1075,18 @@ mod tests {
     const STANDARD: &[u8] =
         br#"{"$schema":"https://agent-plugins.org/schemas/plugin-1.0.0.json","name":"std-tools","version":"0.1.0","description":"Standard skills"}"#;
 
+    /// A Claude Code plugin zip. Every call returns distinct bytes (a nonce
+    /// in the command body), so tests running in parallel against one
+    /// database never publish identical archives; a test that needs the same
+    /// bytes twice clones the result (#5267).
     fn claude_zip(name: &str, version: &str) -> Vec<u8> {
+        let nonce = format!("# deploy {}", Uuid::new_v4());
         let manifest = format!(
             r#"{{"name":"{name}","version":"{version}","description":"Deploy commands","author":{{"name":"Example Team"}},"license":"MIT","keywords":["deploy"]}}"#
         );
         test_zip(&[
             (".claude-plugin/plugin.json", manifest.as_bytes()),
-            ("commands/deploy.md", b"# deploy"),
+            ("commands/deploy.md", nonce.as_bytes()),
             ("skills/deploy/SKILL.md", b"# skill"),
             ("hooks/hooks.json", b"{}"),
         ])
@@ -860,6 +1151,26 @@ mod tests {
         let resp = require_token_caller(&None).unwrap_err();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert!(require_token_caller(&Some(tdh::make_auth(Uuid::nil(), "u"))).is_ok());
+    }
+
+    #[test]
+    fn plugin_storage_key_is_repo_scoped_on_shared_namespaces_5267() {
+        use crate::storage::StorageKeyScheme::{Flat, RepoScoped};
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let path = "p/1.0.0/p-1.0.0.zip";
+        let key = |scheme, backend, repo| plugin_storage_key(scheme, backend, repo, "abc", path);
+        assert_eq!(
+            key(RepoScoped, "s3", a),
+            format!("agentplugins/{a}/abc/p/1.0.0/p-1.0.0.zip")
+        );
+        assert_ne!(key(RepoScoped, "gcs", a), key(RepoScoped, "gcs", b));
+        for (scheme, backend) in [(RepoScoped, "filesystem"), (Flat, "s3"), (Flat, "azure")] {
+            assert_eq!(
+                key(scheme, backend, a),
+                "agentplugins/abc/p/1.0.0/p-1.0.0.zip",
+                "{scheme:?} on {backend}"
+            );
+        }
     }
 
     #[test]
@@ -965,6 +1276,109 @@ mod tests {
         assert_eq!(meta["sha256"], sha);
         let catalog = catalog.expect("catalog row");
         assert_eq!(catalog.version, "1.2.0");
+    }
+
+    /// Downloads of a published archive are the count the Packages API
+    /// reports for that version and its package (#5260): the agent-plugins
+    /// route records the same `download_statistics` rows as every other
+    /// hosted serve, and the catalog count reads them from there.
+    #[tokio::test]
+    async fn downloads_show_in_package_counts_5260() {
+        let Some(fx) = tdh::Fixture::setup("local", "agentplugins").await else {
+            return;
+        };
+        let zip_bytes = claude_zip("counted", "1.0.0");
+        let sha = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(&zip_bytes))
+        };
+        let (status, body) = publish(&fx, "counted", "1.0.0", zip_bytes).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM artifacts WHERE repository_id = $1 AND checksum_sha256 = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(&sha)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("published artifact");
+        let package_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM packages WHERE repository_id = $1 AND name = $2")
+                .bind(fx.repo_id)
+                .bind("counted")
+                .fetch_one(&fx.pool)
+                .await
+                .expect("published package");
+
+        let app = tdh::router_with_auth(
+            Router::new()
+                .nest("/agentplugins", super::router())
+                .nest("/packages", crate::api::handlers::packages::router()),
+            fx.state.clone(),
+            tdh::make_auth(fx.user_id, &fx.username),
+        );
+        for _ in 0..3 {
+            let (dl_status, _) = tdh::send(
+                app.clone(),
+                tdh::get(format!(
+                    "/agentplugins/{}/counted/1.0.0/counted-1.0.0.zip",
+                    fx.repo_key
+                )),
+            )
+            .await;
+            assert_eq!(dl_status, StatusCode::OK);
+        }
+        assert_eq!(
+            tdh::download_count_eventually(&fx.pool, artifact_id, 3).await,
+            3
+        );
+
+        let (detail_status, detail_body) =
+            tdh::send(app.clone(), tdh::get(format!("/packages/{package_id}"))).await;
+        let (versions_status, versions_body) = tdh::send(
+            app.clone(),
+            tdh::get(format!("/packages/{package_id}/versions")),
+        )
+        .await;
+        let (list_status, list_body) = tdh::send(
+            app,
+            tdh::get(format!("/packages?repository_key={}", fx.repo_key)),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            detail_status,
+            StatusCode::OK,
+            "detail: {}",
+            String::from_utf8_lossy(&detail_body)
+        );
+        assert_eq!(
+            versions_status,
+            StatusCode::OK,
+            "versions: {}",
+            String::from_utf8_lossy(&versions_body)
+        );
+        assert_eq!(
+            list_status,
+            StatusCode::OK,
+            "list: {}",
+            String::from_utf8_lossy(&list_body)
+        );
+        let detail: Value = serde_json::from_slice(&detail_body).expect("detail json");
+        let versions: Value = serde_json::from_slice(&versions_body).expect("versions json");
+        let list: Value = serde_json::from_slice(&list_body).expect("list json");
+        assert_eq!(detail["download_count"], 3);
+        assert_eq!(versions["versions"][0]["version"], "1.0.0");
+        assert_eq!(versions["versions"][0]["download_count"], 3);
+        let listed = list["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| item["name"] == "counted")
+            .expect("counted package listed");
+        assert_eq!(listed["download_count"], 3);
     }
 
     /// Every class of refused publish is a 400 and stores nothing.
@@ -1218,7 +1632,9 @@ mod tests {
 
     /// The production composition: the router nested at `/agentplugins`
     /// under `repo_visibility_middleware`, so path tokens are really
-    /// validated.
+    /// validated, with the global `security_headers_middleware` outermost as
+    /// `main.rs` applies it to the whole app, so the headers asserted are
+    /// the ones a client receives (#5259).
     fn full_stack(state: &crate::api::SharedState) -> Router {
         use crate::api::middleware::auth::{repo_visibility_middleware, RepoVisibilityState};
         let vis = RepoVisibilityState {
@@ -1236,6 +1652,9 @@ mod tests {
             .layer(axum::middleware::from_fn_with_state(
                 vis,
                 repo_visibility_middleware,
+            ))
+            .layer(axum::middleware::from_fn(
+                crate::api::middleware::security_headers::security_headers_middleware,
             ))
             .with_state(state.clone())
     }
@@ -1347,6 +1766,9 @@ mod tests {
 
         assert_eq!(ok, StatusCode::OK);
         assert_eq!(headers[CACHE_CONTROL], "private, no-store");
+        // Through the global security-headers layer the route's stricter
+        // policy must survive, not be replaced by the default (#5259).
+        assert_eq!(headers["x-frame-options"], "DENY", "global layer ran");
         assert_eq!(headers["referrer-policy"], "no-referrer");
         let doc: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
@@ -1587,10 +2009,11 @@ mod tests {
         assert!(kept, "a referenced object is kept");
     }
 
-    /// Non-hosted repositories are refused on every route (D3).
+    /// Virtual repositories are refused on every route until their merge rule
+    /// exists (#5289 phase 2); a Remote refuses a publish with 405.
     #[tokio::test]
-    async fn non_hosted_repositories_are_refused_5251() {
-        let Some(fx) = tdh::Fixture::setup("remote", "agentplugins").await else {
+    async fn virtual_repositories_are_refused_and_remotes_are_read_only_5289() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "agentplugins").await else {
             return;
         };
         let key = fx.repo_key.clone();
@@ -1613,6 +2036,298 @@ mod tests {
             "{statuses:?}"
         );
         assert_eq!(put, StatusCode::BAD_REQUEST);
+
+        let Some(fx) = tdh::Fixture::setup("remote", "agentplugins").await else {
+            return;
+        };
+        let (put, body) = publish(&fx, "p", "1.0.0", claude_zip("p", "1.0.0")).await;
+        fx.teardown().await;
+        assert_eq!(put, StatusCode::METHOD_NOT_ALLOWED, "{body}");
+    }
+
+    // ---- Remote repositories (#5289) --------------------------------------
+
+    /// The upstream ("central") repository key in the wiremock layout.
+    const CENTRAL: &str = "central";
+
+    /// One version as the central AK lists it.
+    fn central_version(name: &str, version: &str, zip: &[u8]) -> IndexedVersion {
+        use sha2::{Digest, Sha256};
+        IndexedVersion {
+            name: name.into(),
+            version: version.into(),
+            sha256: format!("{:x}", Sha256::digest(zip)),
+            size_bytes: zip.len() as i64,
+            published_at: chrono::Utc::now(),
+            metadata: PluginMetadata {
+                name: name.into(),
+                version: version.into(),
+                harnesses: vec!["claude".into()],
+                description: Some("Deploy commands".into()),
+                ..PluginMetadata::default()
+            },
+        }
+    }
+
+    /// A wiremock "central AK" serving the documents its hosted repository
+    /// would generate for `versions` (built with the real generator, with the
+    /// central instance's own external URL, which is not the URL the Remote
+    /// reaches it at). The archives are mounted by each test.
+    async fn central_ak(
+        versions: &[IndexedVersion],
+    ) -> (wiremock::MockServer, tdh::SsrfTestAllowlistGuard) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let (server, guard) = tdh::non_loopback_mock_server().await;
+        let ctx = IndexContext {
+            repo_key: CENTRAL.into(),
+            description: Some("Central plugins".into()),
+            origin: "https://central.example.com".into(),
+            token: None,
+        };
+        for kind in Marketplace::ALL {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/agentplugins/{CENTRAL}/{}",
+                    kind.file_name()
+                )))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(ap::build_marketplace(kind, &ctx, versions)),
+                )
+                .mount(&server)
+                .await;
+        }
+        let names: std::collections::BTreeSet<&str> =
+            versions.iter().map(|v| v.name.as_str()).collect();
+        for name in names {
+            Mock::given(method("GET"))
+                .and(path(format!("/agentplugins/{CENTRAL}/{name}/index.json")))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(
+                        ap::build_versions_index(name, &ctx, versions).expect("index"),
+                    ),
+                )
+                .mount(&server)
+                .await;
+        }
+        (server, guard)
+    }
+
+    /// Mount the archive of `name` `version` on the central AK, answering
+    /// `body`, expected exactly `times` times.
+    async fn mount_archive(
+        server: &wiremock::MockServer,
+        name: &str,
+        version: &str,
+        body: Vec<u8>,
+        times: u64,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/agentplugins/{CENTRAL}/{}",
+                ap::artifact_path(name, version)
+            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/zip")
+                    .set_body_bytes(body),
+            )
+            .expect(times)
+            .mount(server)
+            .await;
+    }
+
+    /// Point the fixture Remote at the central AK and wire the proxy service
+    /// in. The fixture is set up BEFORE the mock server, so a run without a
+    /// database returns before any `expect` is mounted.
+    async fn wire_remote(
+        fx: &tdh::Fixture,
+        server: &wiremock::MockServer,
+    ) -> (SharedState, tempfile::TempDir) {
+        let upstream = format!("{}/agentplugins/{CENTRAL}", server.uri());
+        tdh::rewire_remote_proxy(fx, &upstream).await
+    }
+
+    /// The Remote serves the central marketplace with every archive URL and
+    /// `versions_url` pointing at itself, the upstream `sha256` unchanged, and
+    /// its own marketplace name; `{name}/index.json` likewise.
+    #[tokio::test]
+    async fn remote_documents_point_at_the_remote_and_keep_sha256_5289() {
+        let zip = claude_zip("deploy-tools", "1.2.0");
+        let versions = vec![central_version("deploy-tools", "1.2.0", &zip)];
+        let Some(fx) = tdh::Fixture::setup("remote", "agentplugins").await else {
+            return;
+        };
+        let (server, _guard) = central_ak(&versions).await;
+        let (state, _dir) = wire_remote(&fx, &server).await;
+        let key = fx.repo_key.clone();
+        let app = || tdh::router_anon(super::router(), state.clone());
+        let (status, doc) = get_json(app(), format!("/{key}/claude-marketplace.json")).await;
+        let (unified_status, unified) = get_json(app(), format!("/{key}/marketplace.json")).await;
+        let (idx_status, idx) = get_json(app(), format!("/{key}/deploy-tools/index.json")).await;
+        let (bad_slug, _) = get_json(app(), format!("/{key}/Bad_Slug/index.json")).await;
+        fx.teardown().await;
+
+        let base = format!("http://localhost/agentplugins/{key}");
+        let archive_url = format!("{base}/deploy-tools/1.2.0/deploy-tools-1.2.0.zip");
+        assert_eq!(status, StatusCode::OK, "{doc}");
+        assert_eq!(doc["name"], ap::sanitize_marketplace_name(&key));
+        assert_eq!(doc["metadata"]["repository"], key);
+        assert_eq!(doc["owner"]["url"], "http://localhost");
+        assert_eq!(doc["description"], "Central plugins");
+        let entry = &doc["plugins"][0];
+        assert_eq!(entry["source"]["source"], "archive");
+        assert_eq!(entry["source"]["url"], archive_url);
+        assert_eq!(entry["source"]["sha256"], versions[0].sha256);
+        assert_eq!(
+            entry["metadata"]["versions_url"],
+            format!("{base}/deploy-tools/index.json")
+        );
+        assert_eq!(unified_status, StatusCode::OK);
+        assert_eq!(unified["$schema"], ap::UNIFIED_SCHEMA);
+        assert_eq!(unified["plugins"][0]["source"]["url"], archive_url);
+
+        assert_eq!(idx_status, StatusCode::OK, "{idx}");
+        assert_eq!(idx["latest"], "1.2.0");
+        assert_eq!(idx["versions"][0]["url"], archive_url);
+        assert_eq!(idx["versions"][0]["sha256"], versions[0].sha256);
+        assert_eq!(bad_slug, StatusCode::NOT_FOUND);
+    }
+
+    /// An archive is fetched once and served from the proxy cache after that
+    /// (the second download makes no upstream request), with the hosted
+    /// download headers; HEAD is answered from the index.
+    #[tokio::test]
+    async fn remote_archive_is_verified_and_cached_5289() {
+        let zip = claude_zip("deploy-tools", "1.2.0");
+        let versions = vec![central_version("deploy-tools", "1.2.0", &zip)];
+        let Some(fx) = tdh::Fixture::setup("remote", "agentplugins").await else {
+            return;
+        };
+        let (server, _guard) = central_ak(&versions).await;
+        mount_archive(&server, "deploy-tools", "1.2.0", zip.clone(), 1).await;
+        let (state, _dir) = wire_remote(&fx, &server).await;
+        let uri = format!("/{}/deploy-tools/1.2.0/deploy-tools-1.2.0.zip", fx.repo_key);
+        let app = || tdh::router_anon(super::router(), state.clone());
+        let first = tdh::send_with_headers(app(), tdh::get(uri.clone())).await;
+        let second = tdh::send_with_headers(app(), tdh::get(uri.clone())).await;
+        let head = tdh::send_with_headers(app(), tdh::head(uri.clone())).await;
+        let (missing, _) = tdh::send(
+            app(),
+            tdh::get(format!(
+                "/{}/deploy-tools/9.9.9/deploy-tools-9.9.9.zip",
+                fx.repo_key
+            )),
+        )
+        .await;
+        fx.teardown().await;
+        server.verify().await;
+
+        let sha = versions[0].sha256.as_str();
+        for (status, body, headers) in [&first, &second] {
+            assert_eq!(*status, StatusCode::OK, "{}", String::from_utf8_lossy(body));
+            assert_eq!(&body[..], &zip[..]);
+            assert_eq!(headers[CONTENT_TYPE], "application/zip");
+            assert_eq!(headers["x-checksum-sha256"], sha);
+            assert_eq!(headers[ETAG], format!("\"{sha}\"").as_str());
+            assert_eq!(headers[CONTENT_LENGTH], zip.len().to_string().as_str());
+        }
+        assert_eq!(head.0, StatusCode::OK);
+        assert!(head.1.is_empty());
+        assert_eq!(head.2[CONTENT_LENGTH], zip.len().to_string().as_str());
+        assert_eq!(missing, StatusCode::NOT_FOUND);
+    }
+
+    /// Upstream bytes that do not hash to the `sha256` the upstream index
+    /// lists are refused with 502 and never cached: the second download asks
+    /// the upstream again (`expect(2)`).
+    #[tokio::test]
+    async fn remote_tampered_archive_is_refused_and_not_cached_5289() {
+        let zip = claude_zip("deploy-tools", "1.2.0");
+        let tampered = claude_zip("deploy-tools", "1.2.0");
+        assert_ne!(zip, tampered);
+        let versions = vec![central_version("deploy-tools", "1.2.0", &zip)];
+        let Some(fx) = tdh::Fixture::setup("remote", "agentplugins").await else {
+            return;
+        };
+        let (server, _guard) = central_ak(&versions).await;
+        mount_archive(&server, "deploy-tools", "1.2.0", tampered, 2).await;
+        let (state, _dir) = wire_remote(&fx, &server).await;
+        let uri = format!("/{}/deploy-tools/1.2.0/deploy-tools-1.2.0.zip", fx.repo_key);
+        let app = || tdh::router_anon(super::router(), state.clone());
+        let (first, first_body) = tdh::send(app(), tdh::get(uri.clone())).await;
+        let (second, _) = tdh::send(app(), tdh::get(uri.clone())).await;
+        fx.teardown().await;
+        server.verify().await;
+        assert_eq!(
+            first,
+            StatusCode::BAD_GATEWAY,
+            "{}",
+            String::from_utf8_lossy(&first_body)
+        );
+        assert_eq!(second, StatusCode::BAD_GATEWAY);
+    }
+
+    /// Creating an Agent Plugins Remote through the API succeeds; a Virtual
+    /// is still refused (#5289 phase 2).
+    #[tokio::test]
+    async fn create_agentplugins_remote_succeeds_and_virtual_is_refused_5289() {
+        use crate::api::handlers::repositories::create_repository;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tdh::build_state(pool.clone(), dir.path().to_str().unwrap());
+        let admin = tdh::admin_auth(user_id, &username);
+        let request = |repo_type: &str, key: &str| {
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "key": key,
+                    "name": key,
+                    "format": "agentplugins",
+                    "repo_type": repo_type,
+                    "upstream_url": "https://central.example.com/agentplugins/plugins",
+                }))
+                .unwrap(),
+            )
+        };
+        let remote_key = format!("ap-remote-{}", Uuid::new_v4().simple());
+        let remote = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            request("remote", &remote_key),
+        )
+        .await;
+        let virtual_key = format!("ap-virtual-{}", Uuid::new_v4().simple());
+        let refused = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            request("virtual", &virtual_key),
+        )
+        .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = ANY($1)")
+            .bind(vec![remote_key.clone(), virtual_key.clone()])
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+
+        let remote = remote.expect("an agentplugins remote is created").0;
+        assert_eq!(remote.key, remote_key);
+        assert_eq!(remote.repo_type, "remote");
+        match refused {
+            Err(crate::error::AppError::Validation(msg)) => {
+                assert!(msg.contains("phase 2"), "{msg}")
+            }
+            Err(other) => panic!("expected a validation error, got {other:?}"),
+            Ok(_) => panic!("a virtual agentplugins repository must be refused"),
+        }
     }
 
     /// The archive is streamed by the handler even when the storage backend
@@ -1623,14 +2338,7 @@ mod tests {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
-        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "local", "agentplugins").await;
-        sqlx::query(
-            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
-        )
-        .bind(repo_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+        let (repo_id, repo_key, dir) = cloud_repo(&pool).await;
         let (user_id, username) = tdh::create_user(&pool).await;
         tdh::grant_repo_access(&pool, repo_id, user_id).await;
         let (state, _mem) = tdh::build_state_with_presigning_cloud(pool.clone(), "s3");
@@ -1664,5 +2372,142 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(&body[..], &zip[..]);
         }
+    }
+
+    /// A hosted Agent Plugins repository on the `s3` backend; every such
+    /// repository shares the one in-memory bucket of a cloud test state.
+    async fn cloud_repo(pool: &PgPool) -> (Uuid, String, std::path::PathBuf) {
+        let (repo_id, repo_key, dir) = tdh::create_repo(pool, "local", "agentplugins").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        (repo_id, repo_key, dir)
+    }
+
+    /// Two repositories on one shared bucket (staging and production)
+    /// publishing byte-identical archives both succeed and each keeps its
+    /// own object: the content-addressed key is scoped per repository, so
+    /// the cross-repository write guard no longer answers the second 409
+    /// (#5267).
+    #[tokio::test]
+    async fn identical_archives_publish_to_two_repositories_5267() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (staging, staging_key, staging_dir) = cloud_repo(&pool).await;
+        let (prod, prod_key, prod_dir) = cloud_repo(&pool).await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, staging, user_id).await;
+        tdh::grant_repo_access(&pool, prod, user_id).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let app = tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+        let zip = claude_zip("p", "1.0.0");
+        let uri = |key: &str| format!("/{key}/p/1.0.0/p-1.0.0.zip");
+        let mut puts = Vec::new();
+        let mut downloads = Vec::new();
+        for key in [&staging_key, &prod_key] {
+            let put = tdh::put(uri(key), Bytes::from(zip.clone()));
+            puts.push(tdh::send(app.clone(), put).await);
+        }
+        for key in [&staging_key, &prod_key] {
+            downloads.push(tdh::send(app.clone(), tdh::get(uri(key))).await);
+        }
+        let key_of = |repo: Uuid| {
+            sqlx::query_scalar::<_, String>(
+                "SELECT storage_key FROM artifacts WHERE repository_id = $1",
+            )
+            .bind(repo)
+            .fetch_one(&pool)
+        };
+        let (staging_obj, prod_obj) = (key_of(staging).await, key_of(prod).await);
+        let stored = mem.objects.lock().unwrap().len();
+        // The user goes with the last repository, once no row references it.
+        tdh::cleanup(&pool, staging, Uuid::nil()).await;
+        tdh::cleanup(&pool, prod, user_id).await;
+        let _ = std::fs::remove_dir_all(staging_dir);
+        let _ = std::fs::remove_dir_all(prod_dir);
+
+        for (status, body) in puts {
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "{}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        for (status, body) in downloads {
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(&body[..], &zip[..]);
+        }
+        let (staging_obj, prod_obj) = (staging_obj.unwrap(), prod_obj.unwrap());
+        assert_ne!(staging_obj, prod_obj, "each repository owns its own object");
+        assert!(staging_obj.starts_with(&format!("agentplugins/{staging}/")));
+        assert!(prod_obj.starts_with(&format!("agentplugins/{prod}/")));
+        assert_eq!(stored, 2, "two physical objects in the shared bucket");
+    }
+
+    /// #5685: `serve_download`'s `get_stream` answered a hard-coded 500 on
+    /// any storage failure. A store that is down now answers `503` with
+    /// `Retry-After`, one that is full `507` without it, and neither body
+    /// carries the backend's text.
+    #[tokio::test]
+    async fn download_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        let Some(fx) = tdh::Fixture::setup("local", "agentplugins").await else {
+            return;
+        };
+        let (status, body) = publish(
+            &fx,
+            "outage-tools",
+            "1.0.0",
+            claude_zip("outage-tools", "1.0.0"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "publish while storage works: {body}"
+        );
+
+        for (message, want, want_body) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&fx.pool, &fx.state, fx.repo_id, &message).await;
+            let app = tdh::router_with_auth(
+                super::router(),
+                state,
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let (status, body, headers) = tdh::send_with_headers(
+                app,
+                tdh::get(format!(
+                    "/{}/outage-tools/1.0.0/outage-tools-1.0.0.zip",
+                    fx.repo_key
+                )),
+            )
+            .await;
+            assert_eq!(status, want, "GET: {}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want == StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            assert_eq!(&body[..], want_body.as_bytes());
+            tdh::assert_no_storage_backend_text("agentplugins download", &body);
+        }
+        fx.teardown().await;
     }
 }

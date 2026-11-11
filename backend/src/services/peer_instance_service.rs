@@ -19,6 +19,206 @@ const PUSH_MIRROR_SUBSCRIPTIONS_SQL: &str = r#"
       AND prs.replication_mode::text IN ('push', 'mirror')
     "#;
 
+/// A restore supersedes the delete task that took the artifact out of the
+/// trash. Unlike [`REARM_SUPERSEDED_PUSH_SQL`], this does not wait for a
+/// checksum or timestamp change: the peer may have applied the delete before
+/// the restore reached this instance, so a finished push must go out again.
+const QUEUE_RESTORED_PUSH_SQL: &str = r#"
+    INSERT INTO sync_tasks (peer_instance_id, artifact_id, priority, task_type)
+    VALUES ($1, $2, 0, 'push')
+    ON CONFLICT (peer_instance_id, artifact_id, task_type)
+    DO UPDATE SET
+        status = 'pending',
+        priority = GREATEST(sync_tasks.priority, 0),
+        retry_count = 0,
+        error_message = NULL,
+        started_at = NULL,
+        completed_at = NULL,
+        claimed_by = NULL,
+        claim_token = NULL,
+        claim_expires_at = NULL
+    -- An in-flight push is left alone: it is already delivering the artifact.
+    -- Known gap: if a delete for the same peer is also in flight, the push and
+    -- the delete race and their order on the peer is not guaranteed. That
+    -- needs three overlapping operations (in-flight push, in-flight delete and
+    -- the restore), so it is not handled here.
+    WHERE sync_tasks.status <> 'in_progress'
+    "#;
+
+/// Cancel the delete tasks a restore supersedes, for the peers `$2` the
+/// restore re-pushes to. A delete for any other peer stays: it may have been
+/// queued because the peer dropped out of a sync policy's scope (the same
+/// `(peer, artifact, 'delete')` row as the trash delete), or its subscription
+/// was disabled or removed, and that peer gets no push to replace it. A worker
+/// that already claimed a delete is left alone: its push is queued as well and
+/// delivered after the in-flight delete finishes.
+///
+/// Only the restored artifact's own deletes (`artifact_id = $1`) are
+/// superseded (#5699). A delete left by a purged artifact that held the same
+/// path (`artifact_id` NULL, addressed by key and path, #5624) is a different
+/// artifact's delete and stays queued: the peer still holds the purged bytes
+/// there, and a peer refuses a push onto a live path with `409` (immutable),
+/// so the push cannot replace them. The sync worker sends that delete first
+/// and holds the push until it is delivered.
+const CANCEL_SUPERSEDED_DELETE_TASKS_SQL: &str = r#"
+    UPDATE sync_tasks
+    SET status = 'cancelled',
+        completed_at = NOW(),
+        error_message = 'superseded by artifact restore'
+    WHERE peer_instance_id = ANY($2)
+      AND task_type = 'delete'
+      AND status IN ('pending', 'failed')
+      AND artifact_id = $1
+    "#;
+
+/// Fill in the peer address of the delete tasks already queued for the
+/// artifacts `$1` of repository `$2` (key `$3`) that do not carry one yet (a
+/// task queued before migration 340, or by an older replica), so they still
+/// reach the peer once the row is gone (#5624). Scoped by peer so the
+/// `(peer_instance_id, artifact_id, task_type)` index serves it.
+const ADDRESS_QUEUED_DELETE_TASKS_SQL: &str = r#"
+    UPDATE sync_tasks st
+    SET target_repository_id = $2,
+        target_repository_key = $3,
+        target_path = a.path
+    FROM artifacts a
+    WHERE st.peer_instance_id = ANY(SELECT id FROM peer_instances WHERE is_local = false)
+      AND st.artifact_id = ANY($1)
+      AND st.task_type = 'delete'
+      AND st.target_path IS NULL
+      AND a.id = st.artifact_id
+    "#;
+
+/// Queue an addressed delete for every artifact `$1` of repository `$2` (key
+/// `$3`) to every push/mirror subscriber, before the rows are hard-deleted
+/// (#5624). A finished delete of a trashed artifact is kept (the peer already
+/// removed it); any other delete that is not in flight is re-armed.
+const QUEUE_REMOVAL_DELETE_TASKS_SQL: &str = r#"
+    INSERT INTO sync_tasks (
+        peer_instance_id, artifact_id, task_type, status, priority,
+        target_repository_id, target_repository_key, target_path
+    )
+    SELECT prs.peer_instance_id, a.id, 'delete', 'pending', 0, $2, $3, a.path
+    FROM artifacts a
+    JOIN peer_repo_subscriptions prs ON prs.repository_id = a.repository_id
+    JOIN peer_instances pi ON pi.id = prs.peer_instance_id
+    WHERE a.id = ANY($1)
+      AND a.repository_id = $2
+      AND pi.is_local = false
+      AND prs.sync_enabled = true
+      AND prs.replication_mode::text IN ('push', 'mirror')
+    ON CONFLICT (peer_instance_id, artifact_id, task_type) DO UPDATE SET
+        status = 'pending',
+        retry_count = 0,
+        error_message = NULL,
+        started_at = NULL,
+        completed_at = NULL,
+        claimed_by = NULL,
+        claim_token = NULL,
+        claim_expires_at = NULL,
+        target_repository_id = EXCLUDED.target_repository_id,
+        target_repository_key = EXCLUDED.target_repository_key,
+        target_path = EXCLUDED.target_path
+    WHERE sync_tasks.status <> 'in_progress'
+      AND (
+          sync_tasks.status <> 'completed'
+          OR EXISTS (
+              SELECT 1 FROM artifacts x
+              WHERE x.id = sync_tasks.artifact_id AND x.is_deleted = false
+          )
+      )
+    "#;
+
+/// Queue one pending sync task per artifact of repository `$2` for peer `$1`,
+/// skipping every artifact that already has a push task for that peer (the
+/// unique `(peer_instance_id, artifact_id, task_type)`), and return how many
+/// were queued. The work of a whole-repository pass: the run-now route and the
+/// scheduled `mirror` job (#5342) share it.
+const QUEUE_REPOSITORY_SYNC_TASKS_SQL: &str = r#"
+    WITH inserted AS (
+        INSERT INTO sync_tasks (peer_instance_id, artifact_id, priority)
+        SELECT $1, a.id, 100
+        FROM artifacts a
+        WHERE a.repository_id = $2
+        ON CONFLICT (peer_instance_id, artifact_id, task_type) DO NOTHING
+        RETURNING id
+    )
+    SELECT COUNT(*)::bigint FROM inserted
+    "#;
+
+/// Where a `mirror` subscription's `replication_schedule` stands at a given
+/// instant (#5342).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorScheduleState {
+    /// No schedule: the subscription gets upload-time tasks only.
+    Unscheduled,
+    /// The stored expression does not parse as cron.
+    Invalid,
+    /// The first occurrence after the last pass is still in the future.
+    NotDue,
+    /// Never replicated, or an occurrence has passed since the last pass.
+    Due,
+}
+
+/// Whether a scheduled `mirror` pass is due at `now` (#5342). The schedule is
+/// standard 5-field cron (or 6/7 fields with seconds / year), in UTC. It is
+/// due when the subscription has never completed a pass, or when the first
+/// occurrence after `last_replicated_at` is at or before `now`; a run of
+/// missed occurrences (downtime, the upstream-jobs switch) is one pass, not
+/// a backlog.
+pub fn mirror_schedule_state(
+    schedule: Option<&str>,
+    last_replicated_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> MirrorScheduleState {
+    let Some(expr) = schedule.map(str::trim).filter(|s| !s.is_empty()) else {
+        return MirrorScheduleState::Unscheduled;
+    };
+    let Some(cron) = parse_replication_schedule(expr) else {
+        return MirrorScheduleState::Invalid;
+    };
+    let Some(last) = last_replicated_at else {
+        return MirrorScheduleState::Due;
+    };
+    match cron.after(&last).next() {
+        Some(next) if next <= now => MirrorScheduleState::Due,
+        _ => MirrorScheduleState::NotDue,
+    }
+}
+
+fn parse_replication_schedule(expr: &str) -> Option<cron::Schedule> {
+    crate::services::scheduler_service::parse_cron_schedule(
+        &crate::services::scheduler_service::normalize_cron_expression(expr),
+    )
+}
+
+/// Refuse a `replication_schedule` that is not valid cron (#5342): it would
+/// be stored and never fire.
+fn validate_replication_schedule(schedule: Option<&str>) -> Result<()> {
+    match schedule.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(expr) if parse_replication_schedule(expr).is_none() => {
+            Err(AppError::Validation(format!(
+                "invalid replication_schedule '{expr}': expected a cron expression such as \
+                 '0 */6 * * *' (UTC)"
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Totals of one [`PeerInstanceService::run_due_mirror_passes`] tick.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MirrorPassSummary {
+    /// Subscriptions whose schedule was due.
+    pub due: usize,
+    /// Passes that completed (and advanced `last_replicated_at`).
+    pub passes: usize,
+    /// Sync tasks those passes queued.
+    pub tasks_queued: i64,
+    /// Subscriptions (or peers) whose pass failed; retried next tick.
+    pub failed: usize,
+}
+
 pub struct PublishedArtifact<'a> {
     pub id: Uuid,
     pub repository_id: Uuid,
@@ -135,6 +335,119 @@ pub enum ReplicationMode {
     Pull,
     Mirror,
     None,
+}
+
+/// Message of the 400 a `pull` subscription or sync policy is refused with
+/// (#5293).
+pub const PULL_REPLICATION_NOT_IMPLEMENTED: &str =
+    "pull replication is not implemented: no sync task is ever created for a `pull` \
+     subscription. Subscribe this repository to the receiving peer on the instance that \
+     holds it, with `push` or `mirror` (each new artifact is sent as it is uploaded; \
+     POST /api/v1/peers/{id}/repositories/{repo_id}/sync sends the whole repository)";
+
+impl ReplicationMode {
+    /// The mode a subscription gets when the caller names none (#5293). It was
+    /// `pull`, which no task producer ever selects, so an omitted mode created a
+    /// subscription that silently never moved a byte; sync policies already
+    /// defaulted to `push`.
+    pub const DEFAULT: ReplicationMode = ReplicationMode::Push;
+
+    /// The mode as stored in the `replication_mode` enum.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReplicationMode::Push => "push",
+            ReplicationMode::Pull => "pull",
+            ReplicationMode::Mirror => "mirror",
+            ReplicationMode::None => "none",
+        }
+    }
+
+    /// Whether anything ever creates sync tasks for a subscription in this
+    /// mode: `push` and `mirror` both get one per new artifact from the upload
+    /// hook (`PUSH_MIRROR_SUBSCRIPTIONS_SQL`), and a `mirror` subscription with
+    /// a `replication_schedule` also gets a whole-repository pass each time it
+    /// is due (`run_due_mirror_passes`, #5342). `none` is the explicit
+    /// "subscribed, do not replicate" mode, and `pull` has no producer at all.
+    pub fn produces_sync_tasks(self) -> bool {
+        matches!(self, ReplicationMode::Push | ReplicationMode::Mirror)
+    }
+
+    /// The mode to store for a subscription request: an omitted mode is
+    /// [`Self::DEFAULT`], and `pull` is refused with
+    /// [`PULL_REPLICATION_NOT_IMPLEMENTED`] instead of being stored as a
+    /// subscription that never replicates (#5293).
+    pub fn for_new_subscription(mode: Option<ReplicationMode>) -> Result<ReplicationMode> {
+        match mode.unwrap_or(Self::DEFAULT) {
+            ReplicationMode::Pull => Err(AppError::Validation(
+                PULL_REPLICATION_NOT_IMPLEMENTED.to_string(),
+            )),
+            other => Ok(other),
+        }
+    }
+}
+
+/// Whether a stored subscription is actually replicated, as reported in the
+/// subscription API's `effective` field (#5293): `active` when it is enabled
+/// and its mode has a task producer, `inactive` otherwise. A `pull` row
+/// written before `pull` was refused reports `inactive`.
+pub fn subscription_effective_state(
+    sync_enabled: bool,
+    replication_mode: Option<&str>,
+) -> &'static str {
+    let replicates = matches!(replication_mode, Some("push") | Some("mirror"));
+    if sync_enabled && replicates {
+        "active"
+    } else {
+        "inactive"
+    }
+}
+
+/// Name, once per boot, every peer subscription and sync policy that still
+/// uses `pull` (#5293). Those rows were accepted before `pull` was refused and
+/// have never replicated anything; they are left unchanged so the operator
+/// can pick `push` or `mirror` deliberately. Returns the
+/// `(kind, description)` pairs it warned about.
+pub async fn warn_inactive_pull_replication(db: &PgPool) -> Vec<(String, String)> {
+    let subscriptions: Vec<(String, String)> = sqlx::query_as(
+        "SELECT p.name, r.key \
+         FROM peer_repo_subscriptions s \
+         JOIN peer_instances p ON p.id = s.peer_instance_id \
+         JOIN repositories r ON r.id = s.repository_id \
+         WHERE s.replication_mode::text = 'pull' \
+         ORDER BY p.name, r.key",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let policies: Vec<(String,)> = sqlx::query_as(
+        "SELECT name FROM sync_policies WHERE replication_mode = 'pull' ORDER BY name",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    let mut warned = Vec::new();
+    for (peer, repo) in subscriptions {
+        tracing::warn!(
+            peer = %peer,
+            repository = %repo,
+            "peer subscription uses replication_mode 'pull', which is not implemented: it has \
+             never replicated anything (#5293). Re-subscribe with `push` or `mirror` \
+             (POST /api/v1/peers/{{id}}/repositories); the stored row has been left unchanged."
+        );
+        warned.push(("subscription".to_string(), format!("{peer}/{repo}")));
+    }
+    for (policy,) in policies {
+        tracing::warn!(
+            policy = %policy,
+            "sync policy uses replication_mode 'pull', which is not implemented: the \
+             subscriptions it creates never replicate anything (#5293). Change it to `push` \
+             or `mirror` (PUT /api/v1/sync-policies/{{id}}); the stored policy has been left \
+             unchanged."
+        );
+        warned.push(("policy".to_string(), policy));
+    }
+    warned
 }
 
 /// A repository with a mirror replication policy.
@@ -589,8 +902,10 @@ impl PeerInstanceService {
         // `peer_repo_subscriptions.replication_mode` is NOT NULL. A caller that
         // omits the mode must not produce a constraint violation surfaced as an
         // opaque 500 -- fall back to the same default the column declares
-        // (`'pull'`).
-        let replication_mode = replication_mode.unwrap_or(ReplicationMode::Pull);
+        // (`'push'` since #5293). `pull` is refused here, at the one writer of
+        // a hand-made subscription, rather than stored and never acted on.
+        let replication_mode = ReplicationMode::for_new_subscription(replication_mode)?;
+        validate_replication_schedule(replication_schedule.as_deref())?;
         sqlx::query!(
             r#"
             INSERT INTO peer_repo_subscriptions
@@ -648,8 +963,9 @@ impl PeerInstanceService {
     }
 
     /// Queue sync tasks for every artifact in a subscribed repository.
-    /// Used by the "run now" endpoint to bypass the polled schedule and
-    /// kick a sync immediately. Returns the number of tasks queued.
+    /// Used by the "run now" endpoint to kick a whole-repository pass
+    /// immediately instead of waiting for a `mirror` subscription's schedule.
+    /// Returns the number of tasks queued.
     pub async fn run_subscription_now(
         &self,
         peer_instance_id: Uuid,
@@ -660,31 +976,16 @@ impl PeerInstanceService {
             .get_subscription(peer_instance_id, repository_id)
             .await?;
 
-        // INSERT one sync_task per artifact in the repo. The unique constraint
-        // (peer_instance_id, artifact_id, task_type) ensures we don't duplicate
-        // pending tasks already queued for the same artifact.
-        let inserted: i64 = sqlx::query_scalar(
-            r#"
-            WITH inserted AS (
-                INSERT INTO sync_tasks (peer_instance_id, artifact_id, priority)
-                SELECT $1, a.id, 100
-                FROM artifacts a
-                WHERE a.repository_id = $2
-                ON CONFLICT (peer_instance_id, artifact_id, task_type) DO NOTHING
-                RETURNING id
-            )
-            SELECT COUNT(*)::bigint FROM inserted
-            "#,
-        )
-        .bind(peer_instance_id)
-        .bind(repository_id)
-        .fetch_one(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        let inserted: i64 = sqlx::query_scalar(QUEUE_REPOSITORY_SYNC_TASKS_SQL)
+            .bind(peer_instance_id)
+            .bind(repository_id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
-        // Reset last_replicated_at so the mirror scheduler doesn't think this
-        // run satisfies the cron schedule; we still want the next cron tick to
-        // re-evaluate.
+        // A run-now pass is a completed whole-repository pass: stamping it
+        // means a `mirror` schedule next fires at its first occurrence after
+        // this run rather than repeating the same work (#5342).
         let _ = sqlx::query!(
             "UPDATE peer_repo_subscriptions SET last_replicated_at = NOW() WHERE peer_instance_id = $1 AND repository_id = $2",
             peer_instance_id,
@@ -695,6 +996,123 @@ impl PeerInstanceService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(inserted)
+    }
+
+    /// One scheduled pass of a `mirror` subscription (#5342): queue the
+    /// repository's artifacts the peer has no task for (the work of
+    /// [`Self::run_subscription_now`]) and stamp `last_replicated_at = now`.
+    ///
+    /// Both happen in one transaction, so `last_replicated_at` advances only
+    /// when the pass completes: a failed insert leaves the stamp where it was
+    /// and the schedule is still due on the next tick. The stamp is written
+    /// first and only if it still equals `expected_last` (what the caller
+    /// read when it decided the pass was due), which holds the row until
+    /// commit; a replica or run-now that got there first makes this return
+    /// `Ok(None)` without queueing anything. `Ok(Some(n))` is a completed
+    /// pass that queued `n` tasks.
+    pub async fn run_mirror_pass(
+        &self,
+        peer_instance_id: Uuid,
+        repository_id: Uuid,
+        expected_last: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Result<Option<i64>> {
+        let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
+        let mut tx = self.db.begin().await.map_err(db_err)?;
+        let claimed = sqlx::query(
+            r#"
+            UPDATE peer_repo_subscriptions
+            SET last_replicated_at = $3
+            WHERE peer_instance_id = $1
+              AND repository_id = $2
+              AND sync_enabled = true
+              AND replication_mode::text = 'mirror'
+              AND last_replicated_at IS NOT DISTINCT FROM $4
+            "#,
+        )
+        .bind(peer_instance_id)
+        .bind(repository_id)
+        .bind(now)
+        .bind(expected_last)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        if claimed == 0 {
+            return Ok(None);
+        }
+        let queued: i64 = sqlx::query_scalar(QUEUE_REPOSITORY_SYNC_TASKS_SQL)
+            .bind(peer_instance_id)
+            .bind(repository_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(Some(queued))
+    }
+
+    /// The scheduled `mirror` job (#5342): for every enabled `mirror`
+    /// subscription with a `replication_schedule` that is due at `now`, run
+    /// one [`Self::run_mirror_pass`]. A failure on one subscription is logged
+    /// and counted; the others still run.
+    pub async fn run_due_mirror_passes(&self, now: DateTime<Utc>) -> Result<MirrorPassSummary> {
+        let peers: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT DISTINCT peer_instance_id FROM peer_repo_subscriptions \
+             WHERE sync_enabled = true AND replication_mode::text = 'mirror' \
+               AND replication_schedule IS NOT NULL",
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let mut summary = MirrorPassSummary::default();
+        for peer_id in peers {
+            let repos = match self.get_repos_for_mirror_sync(peer_id).await {
+                Ok(repos) => repos,
+                Err(e) => {
+                    tracing::warn!(peer = %peer_id, "mirror schedule: listing subscriptions failed: {e}");
+                    summary.failed += 1;
+                    continue;
+                }
+            };
+            for repo in repos {
+                match mirror_schedule_state(repo.schedule.as_deref(), repo.last_replicated_at, now)
+                {
+                    MirrorScheduleState::Due => {}
+                    MirrorScheduleState::Invalid => {
+                        tracing::warn!(
+                            peer = %peer_id,
+                            repository = %repo.repo_id,
+                            schedule = repo.schedule.as_deref().unwrap_or_default(),
+                            "mirror subscription has an invalid replication_schedule; no \
+                             scheduled pass runs until it is corrected"
+                        );
+                        continue;
+                    }
+                    MirrorScheduleState::Unscheduled | MirrorScheduleState::NotDue => continue,
+                }
+                summary.due += 1;
+                match self
+                    .run_mirror_pass(peer_id, repo.repo_id, repo.last_replicated_at, now)
+                    .await
+                {
+                    Ok(Some(queued)) => {
+                        summary.passes += 1;
+                        summary.tasks_queued += queued;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            peer = %peer_id,
+                            repository = %repo.repo_id,
+                            "scheduled mirror pass failed, retried on the next tick: {e}"
+                        );
+                        summary.failed += 1;
+                    }
+                }
+            }
+        }
+        Ok(summary)
     }
 
     /// Remove repository subscription from peer instance
@@ -797,19 +1215,51 @@ impl PeerInstanceService {
         Ok(id)
     }
 
-    pub async fn queue_push_sync_tasks(&self, artifact: &PublishedArtifact<'_>) -> usize {
+    /// The peers an upload-time push of `artifact` should go to: every enabled
+    /// push/mirror subscription whose policy filter still accepts it.
+    async fn push_sync_peers<'e, E>(
+        executor: E,
+        artifact: &PublishedArtifact<'_>,
+    ) -> std::result::Result<Vec<Uuid>, sqlx::Error>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
         #[derive(sqlx::FromRow)]
         struct SubWithFilter {
             peer_instance_id: Uuid,
             artifact_filter: Option<serde_json::Value>,
         }
 
-        let subscriptions: Vec<SubWithFilter> = match sqlx::query_as(PUSH_MIRROR_SUBSCRIPTIONS_SQL)
+        let subscriptions: Vec<SubWithFilter> = sqlx::query_as(PUSH_MIRROR_SUBSCRIPTIONS_SQL)
             .bind(artifact.repository_id)
-            .fetch_all(&self.db)
-            .await
-        {
-            Ok(subs) => subs,
+            .fetch_all(executor)
+            .await?;
+
+        Ok(subscriptions
+            .into_iter()
+            .filter_map(|sub| {
+                let filter: crate::services::sync_policy_service::ArtifactFilter = sub
+                    .artifact_filter
+                    .as_ref()
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+
+                if !filter.matches(artifact.path, artifact.size_bytes, artifact.created_at) {
+                    tracing::debug!(
+                        "Artifact {} filtered out for peer {} by policy artifact_filter",
+                        artifact.id,
+                        sub.peer_instance_id,
+                    );
+                    return None;
+                }
+                Some(sub.peer_instance_id)
+            })
+            .collect())
+    }
+
+    pub async fn queue_push_sync_tasks(&self, artifact: &PublishedArtifact<'_>) -> usize {
+        let peers = match Self::push_sync_peers(&self.db, artifact).await {
+            Ok(peers) => peers,
             Err(e) => {
                 tracing::warn!(
                     "Failed to query peer subscriptions for repo {} artifact {}: {}",
@@ -822,30 +1272,12 @@ impl PeerInstanceService {
         };
 
         let mut queued = 0usize;
-        for sub in &subscriptions {
-            let filter: crate::services::sync_policy_service::ArtifactFilter = sub
-                .artifact_filter
-                .as_ref()
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-
-            if !filter.matches(artifact.path, artifact.size_bytes, artifact.created_at) {
-                tracing::debug!(
-                    "Artifact {} filtered out for peer {} by policy artifact_filter",
-                    artifact.id,
-                    sub.peer_instance_id,
-                );
-                continue;
-            }
-
-            match self
-                .queue_sync_task(sub.peer_instance_id, artifact.id, 0)
-                .await
-            {
+        for peer_id in peers {
+            match self.queue_sync_task(peer_id, artifact.id, 0).await {
                 Ok(_) => queued += 1,
                 Err(e) => tracing::warn!(
                     "Failed to queue sync task for peer {} artifact {}: {}",
-                    sub.peer_instance_id,
+                    peer_id,
                     artifact.id,
                     e
                 ),
@@ -859,6 +1291,85 @@ impl PeerInstanceService {
             );
         }
         queued
+    }
+
+    /// Replicate a just-restored artifact: queue a push to every eligible
+    /// peer, forcing a finished push back to `pending`, and cancel those
+    /// peers' delete tasks the restore supersedes (#5505). Deletes for peers
+    /// outside the push set still run.
+    ///
+    /// Runs on the caller's connection so the restore and its replication side
+    /// effects commit together: a crash cannot leave the restored artifact live
+    /// with a pending delete that still takes it off a peer.
+    pub async fn queue_restored_artifact_sync_tasks(
+        conn: &mut sqlx::PgConnection,
+        artifact: &PublishedArtifact<'_>,
+    ) -> Result<usize> {
+        let peers = Self::push_sync_peers(&mut *conn, artifact)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        sqlx::query(CANCEL_SUPERSEDED_DELETE_TASKS_SQL)
+            .bind(artifact.id)
+            .bind(&peers)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let mut queued = 0usize;
+        for peer_id in peers {
+            let result = sqlx::query(QUEUE_RESTORED_PUSH_SQL)
+                .bind(peer_id)
+                .bind(artifact.id)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            if result.rows_affected() == 1 {
+                queued += 1;
+            }
+        }
+        if queued > 0 {
+            tracing::info!(
+                "Queued restore pushes for artifact {} to {} peer(s)",
+                artifact.id,
+                queued
+            );
+        }
+        Ok(queued)
+    }
+
+    /// Make sure the peers lose `artifact_ids` (rows of repository
+    /// `repository_id`, addressed on the peers as `repository_key`) when the
+    /// caller hard-deletes them in the same transaction (#5624): queue an
+    /// addressed delete per push/mirror subscriber, and address the deletes
+    /// already queued for other peers (a policy-scoped delete, say). The
+    /// tasks outlive the rows (`ON DELETE SET NULL`), so the sync worker
+    /// delivers them after the rows are gone. Returns the tasks queued or
+    /// re-armed.
+    pub async fn queue_deletes_before_removal(
+        conn: &mut sqlx::PgConnection,
+        repository_id: Uuid,
+        repository_key: &str,
+        artifact_ids: &[Uuid],
+    ) -> Result<u64> {
+        if artifact_ids.is_empty() {
+            return Ok(0);
+        }
+        sqlx::query(ADDRESS_QUEUED_DELETE_TASKS_SQL)
+            .bind(artifact_ids)
+            .bind(repository_id)
+            .bind(repository_key)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let queued = sqlx::query(QUEUE_REMOVAL_DELETE_TASKS_SQL)
+            .bind(artifact_ids)
+            .bind(repository_id)
+            .bind(repository_key)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .rows_affected();
+        Ok(queued)
     }
 
     /// Put a finished push task back to `pending` when the artifact it
@@ -892,7 +1403,7 @@ impl PeerInstanceService {
             SyncTask,
             r#"
             SELECT
-                st.id, st.peer_instance_id, st.artifact_id,
+                st.id, st.peer_instance_id, st.artifact_id as "artifact_id!",
                 st.status as "status: SyncStatus",
                 st.priority, st.bytes_transferred, st.error_message,
                 st.started_at, st.completed_at, st.created_at,
@@ -1380,7 +1891,7 @@ mod tests {
         for (mode, enabled) in [
             (ReplicationMode::Push, true),
             (ReplicationMode::Mirror, true),
-            (ReplicationMode::Pull, true),
+            (ReplicationMode::None, true),
             (ReplicationMode::Push, false),
         ] {
             let peer_id = register_test_peer(&svc, &Uuid::new_v4()).await;
@@ -1389,6 +1900,10 @@ mod tests {
                 .unwrap();
             peers.push(peer_id);
         }
+        // A `pull` row stored before `pull` was refused (#5293) gets no task.
+        let legacy_pull_peer = register_test_peer(&svc, &Uuid::new_v4()).await;
+        insert_legacy_pull_subscription(&pool, legacy_pull_peer, repo_id).await;
+        peers.push(legacy_pull_peer);
 
         let path = "pkg/1.0.0/pkg-1.0.0.tgz";
         let artifact_id = insert_test_artifact(&pool, repo_id, path).await;
@@ -1473,6 +1988,166 @@ mod tests {
             .ok();
     }
 
+    /// Store a `pull` subscription directly, as one written before `pull`
+    /// was refused at the API (#5293) would be.
+    async fn insert_legacy_pull_subscription(pool: &sqlx::PgPool, peer_id: Uuid, repo_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO peer_repo_subscriptions \
+                 (peer_instance_id, repository_id, sync_enabled, replication_mode) \
+             VALUES ($1, $2, true, 'pull')",
+        )
+        .bind(peer_id)
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// #5293: every mode a new subscription can be created with has a task
+    /// producer, except `none`, the explicit "do not replicate" mode. `pull`
+    /// had none and is refused; an omitted mode is `push`.
+    #[test]
+    fn every_accepted_subscription_mode_replicates_or_is_none() {
+        for mode in [
+            ReplicationMode::Push,
+            ReplicationMode::Pull,
+            ReplicationMode::Mirror,
+            ReplicationMode::None,
+        ] {
+            match ReplicationMode::for_new_subscription(Some(mode)) {
+                Ok(stored) => {
+                    assert_eq!(stored, mode);
+                    assert!(
+                        mode.produces_sync_tasks() || mode == ReplicationMode::None,
+                        "{mode:?} is accepted but nothing creates sync tasks for it"
+                    );
+                }
+                Err(AppError::Validation(msg)) => {
+                    assert_eq!(mode, ReplicationMode::Pull);
+                    assert_eq!(msg, PULL_REPLICATION_NOT_IMPLEMENTED);
+                }
+                Err(other) => panic!("{mode:?}: unexpected error {other:?}"),
+            }
+        }
+        assert_eq!(
+            ReplicationMode::for_new_subscription(None).unwrap(),
+            ReplicationMode::Push
+        );
+        assert_eq!(ReplicationMode::DEFAULT, ReplicationMode::Push);
+        // The producers' SQL selects exactly the modes `produces_sync_tasks`
+        // names, so the two cannot drift apart unnoticed.
+        let produced: Vec<&str> = [
+            ReplicationMode::Push,
+            ReplicationMode::Pull,
+            ReplicationMode::Mirror,
+            ReplicationMode::None,
+        ]
+        .into_iter()
+        .filter(|m| m.produces_sync_tasks())
+        .map(ReplicationMode::as_str)
+        .collect();
+        assert_eq!(produced, ["push", "mirror"]);
+        assert!(PUSH_MIRROR_SUBSCRIPTIONS_SQL.contains("IN ('push', 'mirror')"));
+    }
+
+    #[test]
+    fn subscription_effective_state_reports_rows_that_never_replicate() {
+        assert_eq!(subscription_effective_state(true, Some("push")), "active");
+        assert_eq!(subscription_effective_state(true, Some("mirror")), "active");
+        assert_eq!(subscription_effective_state(true, Some("pull")), "inactive");
+        assert_eq!(subscription_effective_state(true, Some("none")), "inactive");
+        assert_eq!(
+            subscription_effective_state(false, Some("push")),
+            "inactive"
+        );
+        assert_eq!(subscription_effective_state(true, None), "inactive");
+    }
+
+    /// DB-backed (#5293): `pull` is refused before anything is written, the
+    /// column default is `push`, and a legacy `pull` row gets no task from
+    /// either producer and is named by the boot-time warning.
+    #[tokio::test]
+    async fn pull_subscriptions_are_refused_and_legacy_rows_are_reported() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4();
+        let svc = PeerInstanceService::new(pool.clone());
+        let peer_id = register_test_peer(&svc, &suffix).await;
+        let repo_id = insert_test_repo(&pool, &suffix).await;
+
+        let err = svc
+            .assign_repository(
+                peer_id,
+                repo_id,
+                true,
+                Some(ReplicationMode::Pull),
+                None,
+                None,
+            )
+            .await
+            .expect_err("pull must be refused");
+        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+        assert!(matches!(
+            svc.get_subscription(peer_id, repo_id).await,
+            Err(AppError::NotFound(_))
+        ));
+
+        // The column default agrees with the API default (migration 330).
+        sqlx::query(
+            "INSERT INTO peer_repo_subscriptions (peer_instance_id, repository_id) VALUES ($1, $2)",
+        )
+        .bind(peer_id)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let sub = svc.get_subscription(peer_id, repo_id).await.unwrap();
+        assert_eq!(sub.replication_mode.as_deref(), Some("push"));
+        sqlx::query("DELETE FROM peer_repo_subscriptions WHERE peer_instance_id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        insert_legacy_pull_subscription(&pool, peer_id, repo_id).await;
+        assert!(svc
+            .get_repos_for_push_sync(peer_id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(svc
+            .get_repos_for_mirror_sync(peer_id)
+            .await
+            .unwrap()
+            .is_empty());
+        let sub = svc.get_subscription(peer_id, repo_id).await.unwrap();
+        assert_eq!(
+            subscription_effective_state(sub.sync_enabled, sub.replication_mode.as_deref()),
+            "inactive"
+        );
+        let peer_name: String = sqlx::query_scalar("SELECT name FROM peer_instances WHERE id = $1")
+            .bind(peer_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let repo_key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let warned = warn_inactive_pull_replication(&pool).await;
+        assert!(
+            warned.contains(&(
+                "subscription".to_string(),
+                format!("{peer_name}/{repo_key}")
+            )),
+            "{warned:?}"
+        );
+
+        cleanup_assign(&pool, peer_id, repo_id).await;
+    }
+
     async fn cleanup_assign(pool: &sqlx::PgPool, peer_id: Uuid, repo_id: Uuid) {
         // peer_repo_subscriptions cascades from both peer and repo deletes.
         sqlx::query("DELETE FROM peer_instances WHERE id = $1")
@@ -1489,11 +2164,12 @@ mod tests {
 
     /// DB-backed regression for the 1.2.2 federation fix: assigning a valid
     /// repository to a peer with NO `replication_mode` supplied must succeed
-    /// (defaulting to `pull`) and persist a subscription. Previously this wrote
-    /// a NULL into the NOT NULL `replication_mode` column and surfaced as an
-    /// opaque 500 DATABASE_ERROR for every such call.
+    /// and persist a subscription. Previously this wrote a NULL into the NOT
+    /// NULL `replication_mode` column and surfaced as an opaque 500
+    /// DATABASE_ERROR for every such call. The default is `push` since #5293:
+    /// it was `pull`, which never replicated anything.
     #[tokio::test]
-    async fn assign_repository_without_mode_defaults_to_pull_and_persists() {
+    async fn assign_repository_without_mode_defaults_to_push_and_persists() {
         let Some(pool) = test_pool().await else {
             return;
         };
@@ -1507,10 +2183,14 @@ mod tests {
             .await
             .expect("assignment without replication_mode must succeed");
 
-        // Persisted with the column default.
+        // Persisted with the default, a mode that replicates.
         let sub = svc.get_subscription(peer_id, repo_id).await.unwrap();
         assert_eq!(sub.repository_id, repo_id);
-        assert_eq!(sub.replication_mode.as_deref(), Some("pull"));
+        assert_eq!(sub.replication_mode.as_deref(), Some("push"));
+        assert_eq!(
+            subscription_effective_state(sub.sync_enabled, sub.replication_mode.as_deref()),
+            "active"
+        );
         assert!(sub.sync_enabled);
 
         // Idempotent upsert: a second assign with an explicit mode updates,
@@ -1588,7 +2268,7 @@ mod tests {
                 peer_id,
                 bogus_repo,
                 true,
-                Some(ReplicationMode::Pull),
+                Some(ReplicationMode::Push),
                 None,
                 None,
             )
@@ -1626,7 +2306,7 @@ mod tests {
             peer_id,
             enabled_repo,
             true,
-            Some(ReplicationMode::Pull),
+            Some(ReplicationMode::Push),
             None,
             None,
         )
@@ -1636,7 +2316,7 @@ mod tests {
             peer_id,
             disabled_repo,
             false,
-            Some(ReplicationMode::Pull),
+            Some(ReplicationMode::Push),
             None,
             None,
         )
@@ -2218,6 +2898,88 @@ mod tests {
             last_replicated_at: Some(Utc::now()),
         };
         assert!(repo.schedule.is_some());
+    }
+
+    fn at(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// #5342: when a scheduled `mirror` pass is due.
+    #[test]
+    fn mirror_schedule_state_follows_the_cron_after_the_last_pass() {
+        use MirrorScheduleState::*;
+        let last = Some(at("2026-01-01T03:00:00Z"));
+        let cases = [
+            (None, last, "2026-01-05T00:00:00Z", Unscheduled),
+            (Some("  "), last, "2026-01-05T00:00:00Z", Unscheduled),
+            (Some("not cron"), last, "2026-01-05T00:00:00Z", Invalid),
+            // Never replicated: due at once.
+            (Some("0 3 * * *"), None, "2026-01-01T00:00:00Z", Due),
+            (Some("0 3 * * *"), last, "2026-01-02T02:59:59Z", NotDue),
+            (Some("0 3 * * *"), last, "2026-01-02T03:00:00Z", Due),
+            // Several missed occurrences are one pass, still due.
+            (Some("0 3 * * *"), last, "2026-01-09T12:00:00Z", Due),
+            // 6-field (with seconds) is accepted as-is.
+            (Some("0 0 */6 * * *"), last, "2026-01-01T05:59:59Z", NotDue),
+            (Some("0 0 */6 * * *"), last, "2026-01-01T06:00:00Z", Due),
+        ];
+        for (schedule, last, now, want) in cases {
+            assert_eq!(
+                mirror_schedule_state(schedule, last, at(now)),
+                want,
+                "{schedule:?} last={last:?} now={now}"
+            );
+        }
+    }
+
+    #[test]
+    fn replication_schedule_validation_refuses_only_bad_cron() {
+        assert!(validate_replication_schedule(None).is_ok());
+        assert!(validate_replication_schedule(Some("")).is_ok());
+        assert!(validate_replication_schedule(Some("0 */6 * * *")).is_ok());
+        assert!(validate_replication_schedule(Some("0 0 3 * * *")).is_ok());
+        let err = validate_replication_schedule(Some("every day")).unwrap_err();
+        assert!(
+            matches!(&err, AppError::Validation(m) if m.contains("every day")),
+            "{err:?}"
+        );
+    }
+
+    /// DB-backed (#5342): an invalid cron is refused before anything is
+    /// written instead of being stored and never firing.
+    #[tokio::test]
+    async fn assign_repository_refuses_an_invalid_replication_schedule() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4();
+        let svc = PeerInstanceService::new(pool.clone());
+        let peer_id = register_test_peer(&svc, &suffix).await;
+        let repo_id = insert_test_repo(&pool, &suffix).await;
+        let err = svc
+            .assign_repository(
+                peer_id,
+                repo_id,
+                true,
+                Some(ReplicationMode::Mirror),
+                Some("61 * * * *".to_string()),
+                None,
+            )
+            .await
+            .expect_err("invalid cron must be refused");
+        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+        assert!(matches!(
+            svc.get_subscription(peer_id, repo_id).await,
+            Err(AppError::NotFound(_))
+        ));
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
     }
 
     async fn completed_push_fixture(

@@ -104,6 +104,10 @@ pub(crate) const ALLOWED_SCOPES: &[&str] = &[
     // publish packages must not thereby be able to write the verdicts the
     // download gate, the promotion gate and the repository score read.
     "write:findings",
+    // #5253: the MCP introspection worker's credential (claim jobs, post
+    // results). Dedicated so no other token can feed observed capability
+    // snapshots, and admin-only to mint.
+    "mcp:introspect",
     "admin",
     "*",
 ];
@@ -162,6 +166,7 @@ pub(crate) const ADMIN_ONLY_SCOPES: &[&str] = &[
     "trigger:sync",
     "write:users",
     "write:findings",
+    "mcp:introspect",
 ];
 
 /// Enforce that a non-admin caller may not grant any admin-class scope
@@ -472,8 +477,7 @@ impl TokenService {
         match auth_service.validate_api_token(token).await {
             Ok(validation) => {
                 // Get token details
-                if token.len() >= 8 {
-                    let prefix = &token[..8];
+                if let Some(prefix) = AuthService::api_token_prefix(token) {
                     if let Ok(Some(token_info)) = sqlx::query!(
                         "SELECT scopes, expires_at FROM api_tokens WHERE token_prefix = $1",
                         prefix
@@ -523,11 +527,11 @@ impl TokenService {
     /// # Returns
     /// * `Ok(bool)` - Whether the token has the scope
     pub async fn has_scope(&self, token: &str, required_scope: &str) -> Result<bool> {
-        if token.len() < 8 {
+        // `None` for a short token and for one whose byte 8 is inside a
+        // multibyte character (#5525); `&token[..8]` panicked on the latter.
+        let Some(prefix) = AuthService::api_token_prefix(token) else {
             return Err(AppError::Authentication("Invalid token format".to_string()));
-        }
-
-        let prefix = &token[..8];
+        };
         let token_info = sqlx::query!(
             "SELECT scopes FROM api_tokens WHERE token_prefix = $1",
             prefix

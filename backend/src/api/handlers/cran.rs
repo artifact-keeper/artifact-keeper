@@ -393,7 +393,15 @@ async fn upload_package(
     )
     .await?;
 
-    let storage_key = format!("cran/{}/{}/{}", pkg_name, pkg_version, filename);
+    // Repo-scoped on a shared cloud namespace (#5662), so two repositories
+    // holding the same version do not collide on one key; reads go through
+    // the row's storage_key, so legacy flat-key rows keep serving.
+    let storage_key = crate::storage::StorageKeyScheme::from_env().write_key(
+        &repo.storage_backend,
+        "cran",
+        repo.id,
+        &format!("{}/{}/{}", pkg_name, pkg_version, filename),
+    );
     proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, body.clone()).await?;
 
     let pkg_metadata = serde_json::json!({
@@ -437,6 +445,7 @@ async fn upload_package(
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         "cran",
         &pkg_name,
@@ -1362,6 +1371,27 @@ mod tests {
         );
     }
 
+    /// #5662: the same source package uploads into two CRAN repositories on
+    /// a shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_package_uploads_to_two_cloud_repositories_5662() {
+        const TARBALL: &[u8] = b"one source package two mirrors carry (#5662)";
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "cran",
+            key_prefix: "cran",
+            router: super::router,
+            publish: &|key| {
+                vec![tdh::put(
+                    format!("/{key}/src/contrib/sharedpkg_1.0.0.tar.gz"),
+                    Bytes::from_static(TARBALL),
+                )]
+            },
+            download: &|key| tdh::get(format!("/{key}/src/contrib/sharedpkg_1.0.0.tar.gz")),
+            expected: TARBALL,
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn test_cran_upload_conflict_returns_409() {
         let Some(f) = tdh::Fixture::setup("local", "cran").await else {
@@ -1812,5 +1842,48 @@ License: MIT + file LICENSE
             merged.contains("Version: 1.0\n\nPackage: ggplot2\n"),
             "local and upstream records must be separated: {merged}"
         );
+    }
+
+    /// #5322: CRAN's Remote download shares `try_remote_or_virtual_download`
+    /// with Hugging Face, so a cold `HEAD` of a source package is answered by
+    /// an upstream HEAD and the package body leaves the upstream once across
+    /// HEAD, GET and a warm GET (the counting mock's `expect(1)`s).
+    #[tokio::test]
+    async fn test_cran_remote_cold_head_downloads_the_package_once_5322() {
+        let Some(f) = tdh::Fixture::setup("remote", "cran").await else {
+            return;
+        };
+        let server = wiremock::MockServer::start().await;
+        let package: Vec<u8> = (0..2048u32).map(|i| (i % 241) as u8).collect();
+        tdh::mount_head_and_get_once(
+            &server,
+            "/src/contrib/dplyr_1.1.0.tar.gz",
+            &[("etag", "\"dplyr-1.1.0\"")],
+            &package,
+        )
+        .await;
+        let (state, cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let uri = format!("/{}/src/contrib/dplyr_1.1.0.tar.gz", f.repo_key);
+        let [head, cold, warm] = tdh::cold_head_then_two_gets(
+            || tdh::router_anon(super::router(), state.clone()),
+            &uri,
+            cache.path(),
+            package.len() as u64,
+        )
+        .await;
+        f.teardown().await;
+
+        assert_eq!(head.0, StatusCode::OK);
+        assert!(head.1.is_empty());
+        let size = package.len().to_string();
+        assert_eq!(
+            head.2.get("content-length").and_then(|v| v.to_str().ok()),
+            Some(size.as_str())
+        );
+        assert_eq!(cold.0, StatusCode::OK);
+        assert_eq!(&cold.1[..], &package[..]);
+        assert_eq!(warm.0, StatusCode::OK);
+        assert_eq!(&warm.1[..], &package[..]);
+        tdh::drop_mock_server(server).await;
     }
 }

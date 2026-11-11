@@ -435,6 +435,43 @@ pub struct ProxyBlockedEntry {
     pub proxy_scan_action: String,
 }
 
+/// Where a keyset-paged blocked-proxy listing resumes (#4987): the
+/// `(repository key, path, digest)` of the last candidate a page examined,
+/// in the listing's own order. The digest makes the key unique.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyBlockedKey {
+    pub repository_key: String,
+    pub path: String,
+    pub checksum_sha256: String,
+}
+
+impl ProxyBlockedKey {
+    fn of(entry: &ProxyBlockedEntry) -> Self {
+        Self {
+            repository_key: entry.repository_key.clone(),
+            path: entry.path.clone(),
+            checksum_sha256: entry.checksum_sha256.clone(),
+        }
+    }
+}
+
+/// One keyset page of [`ScanResultService::list_blocked_proxy_entries_page`].
+#[derive(Debug, Clone, Default)]
+pub struct ProxyBlockedPage {
+    pub entries: Vec<ProxyBlockedEntry>,
+    /// Where the next page resumes; `None` once the candidates are exhausted.
+    pub resume_after: Option<ProxyBlockedKey>,
+}
+
+/// Candidates one keyset read fetches (#4987).
+const PROXY_BLOCKED_PAGE_BATCH: i64 = 500;
+
+/// Candidates one keyset page examines at most before it returns short with
+/// a resume key (#4987), so a page over many vulnerable verdicts the gate
+/// does not refuse (record-only repositories, sub-threshold severities) stays
+/// bounded.
+const PROXY_BLOCKED_PAGE_EXAMINE_BUDGET: usize = 5_000;
+
 /// Upper bound on the candidate rows one blocked-proxy listing reads. The
 /// candidates are vulnerable verdicts on cached paths, a small set in
 /// practice; the cap only bounds a pathological instance, and is logged.
@@ -1571,6 +1608,7 @@ impl ScanResultService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
+        scan_completed();
         Ok(new_scan)
     }
 
@@ -1881,6 +1919,7 @@ impl ScanResultService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
+        scan_completed();
         Ok(updated)
     }
 
@@ -1952,6 +1991,7 @@ impl ScanResultService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        scan_completed();
         Ok(())
     }
 
@@ -1984,7 +2024,46 @@ impl ScanResultService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        scan_completed();
         Ok(())
+    }
+
+    /// Fail `scan_id` with `error` only if it is still `running`, and return
+    /// the checksum of the bytes it was prepared for (`Some(None)` when the
+    /// row carries none), or `None` when the row is already terminal or gone
+    /// (#5830).
+    ///
+    /// Used for a trigger's pre-allocated rows once the scan has returned:
+    /// a row the scan finished is left alone, and one it never reached ends
+    /// `failed` with its inventory `failed`, as a scanner that errored does,
+    /// instead of sitting `running` until the stuck-scan janitor reaps it.
+    /// `started_at` is kept, so the row still says when the scan was queued.
+    pub async fn fail_scan_if_running(
+        &self,
+        scan_id: Uuid,
+        error: &str,
+    ) -> Result<Option<Option<String>>> {
+        // Runtime query (not `query!`) so the `.sqlx/` offline cache needs
+        // no new entry, as in `cleanup_stuck_scans_with_limit`.
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            r#"
+            UPDATE scan_results
+            SET status = 'failed', error_message = $2, completed_at = NOW(),
+                inventory_status = 'failed'
+            WHERE id = $1 AND status = 'running'
+            RETURNING checksum_sha256::text
+            "#,
+        )
+        .bind(scan_id)
+        .bind(error)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        if row.is_some() {
+            scan_completed();
+        }
+        Ok(row.map(|(checksum,)| checksum))
     }
 
     /// Mark a scan as `not_applicable` (#1470): the scanner does not apply to
@@ -2016,6 +2095,7 @@ impl ScanResultService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        scan_completed();
         Ok(())
     }
 
@@ -2056,6 +2136,7 @@ impl ScanResultService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        scan_completed();
         Ok(result)
     }
 
@@ -2143,6 +2224,62 @@ impl ScanResultService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        Ok((results, total))
+    }
+
+    /// [`Self::list_scans`] showing a scan of one of `served_only.repos` (MCP
+    /// registries the caller does not hold, #5253) only when its artifact is
+    /// in `served_only.served`, so the scans of a version the caller is not
+    /// served, and of a row the served set does not name, are left out in
+    /// SQL (fail closed) and `total` and the page count only the rest.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_scans_served_only(
+        &self,
+        repository_id: Option<Uuid>,
+        artifact_id: Option<Uuid>,
+        status: Option<&str>,
+        scan_type: Option<&str>,
+        served_only: &crate::services::search_service::McpServedOnly,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<ScanResult>, i64)> {
+        const FILTER: &str = "($1::uuid IS NULL OR repository_id = $1) \
+              AND ($2::uuid IS NULL OR artifact_id = $2) \
+              AND ($3::text IS NULL OR status = $3) \
+              AND ($4::text IS NULL OR scan_type = $4) \
+              AND (repository_id <> ALL($5) OR artifact_id = ANY($6))";
+        let page_sql = format!(
+            "SELECT id, artifact_id, repository_id, scan_type, status, \
+                    findings_count, critical_count, high_count, medium_count, low_count, \
+                    info_count, scanner_version, error_message, started_at, completed_at, \
+                    created_at, is_reused, source_scan_id, scan_completeness, \
+                    scan_completeness_reason, vuln_db_version, vuln_db_published_at \
+             FROM scan_results WHERE {FILTER} \
+             ORDER BY created_at DESC LIMIT $7 OFFSET $8"
+        );
+        let results = sqlx::query_as::<_, ScanResult>(sqlx::AssertSqlSafe(page_sql))
+            .bind(repository_id)
+            .bind(artifact_id)
+            .bind(status)
+            .bind(scan_type)
+            .bind(&served_only.repos)
+            .bind(&served_only.served)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let count_sql = format!("SELECT COUNT(*) FROM scan_results WHERE {FILTER}");
+        let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(count_sql))
+            .bind(repository_id)
+            .bind(artifact_id)
+            .bind(status)
+            .bind(scan_type)
+            .bind(&served_only.repos)
+            .bind(&served_only.served)
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
         Ok((results, total))
     }
 
@@ -3228,7 +3365,9 @@ impl ScanResultService {
         &self,
         repository_key: Option<&str>,
     ) -> Result<Vec<ProxyBlockedEntry>> {
-        let mut rows = self.cached_vulnerable_proxy_entries(repository_key).await?;
+        let mut rows = self
+            .cached_vulnerable_proxy_entries(repository_key, None, PROXY_BLOCKED_CANDIDATE_CAP)
+            .await?;
         rows.retain(|r| {
             proxy_gate_refuses(
                 &r.repository_format,
@@ -3241,6 +3380,59 @@ impl ScanResultService {
         Ok(rows)
     }
 
+    /// One keyset page of [`Self::list_blocked_proxy_entries`] (#4987): up to
+    /// `limit` refused entries after `after`, in the same order. Reads the
+    /// candidates from the resume key on in batches, so a page costs what it
+    /// examines, not a read of the whole list; a page examines at most
+    /// [`PROXY_BLOCKED_PAGE_EXAMINE_BUDGET`] candidates and may come back short
+    /// with a resume key. Rows that appear or disappear between pages never
+    /// shift the next page, as an offset would.
+    pub async fn list_blocked_proxy_entries_page(
+        &self,
+        repository_key: Option<&str>,
+        after: Option<&ProxyBlockedKey>,
+        limit: usize,
+    ) -> Result<ProxyBlockedPage> {
+        let limit = limit.max(1);
+        let mut page = ProxyBlockedPage::default();
+        let mut cursor = after.cloned();
+        let mut examined = 0usize;
+        loop {
+            let batch = self
+                .cached_vulnerable_proxy_entries(
+                    repository_key,
+                    cursor.as_ref(),
+                    PROXY_BLOCKED_PAGE_BATCH,
+                )
+                .await?;
+            let exhausted = (batch.len() as i64) < PROXY_BLOCKED_PAGE_BATCH;
+            for entry in batch {
+                examined += 1;
+                cursor = Some(ProxyBlockedKey::of(&entry));
+                if proxy_gate_refuses(
+                    &entry.repository_format,
+                    entry.block_on_policy_violation,
+                    &entry.severity_threshold,
+                    &entry.proxy_scan_action,
+                    entry.max_severity.as_deref(),
+                ) {
+                    page.entries.push(entry);
+                    if page.entries.len() >= limit {
+                        page.resume_after = cursor;
+                        return Ok(page);
+                    }
+                }
+            }
+            if exhausted {
+                return Ok(page);
+            }
+            if examined >= PROXY_BLOCKED_PAGE_EXAMINE_BUDGET {
+                page.resume_after = cursor;
+                return Ok(page);
+            }
+        }
+    }
+
     /// Every proxied path a repository's proxy scan gate would refuse if it
     /// enforced (#5232): [`Self::list_blocked_proxy_entries`] over the same
     /// candidates, filtered with [`proxy_gate_would_refuse`].
@@ -3248,7 +3440,9 @@ impl ScanResultService {
         &self,
         repository_key: Option<&str>,
     ) -> Result<Vec<ProxyBlockedEntry>> {
-        let mut rows = self.cached_vulnerable_proxy_entries(repository_key).await?;
+        let mut rows = self
+            .cached_vulnerable_proxy_entries(repository_key, None, PROXY_BLOCKED_CANDIDATE_CAP)
+            .await?;
         rows.retain(|r| {
             proxy_gate_would_refuse(
                 &r.repository_format,
@@ -3327,10 +3521,13 @@ impl ScanResultService {
     }
 
     /// Fresh `vulnerable` verdicts on cached paths of scanning repositories,
-    /// ordered by repository key then path, before any gate decides.
+    /// ordered by repository key, path and digest, before any gate decides:
+    /// at most `limit`, after `after` when given (#4987).
     async fn cached_vulnerable_proxy_entries(
         &self,
         repository_key: Option<&str>,
+        after: Option<&ProxyBlockedKey>,
+        limit: i64,
     ) -> Result<Vec<ProxyBlockedEntry>> {
         let rows: Vec<ProxyBlockedEntry> = sqlx::query_as(
             r#"
@@ -3362,18 +3559,23 @@ impl ScanResultService {
             WHERE sc.scan_on_proxy
               AND r.repo_type IN ('remote', 'virtual')
               AND ($3::text IS NULL OR r.key = $3)
-            ORDER BY r.key, cached.path
+              AND ($5::text IS NULL
+                   OR (r.key, cached.path, psr.checksum_sha256) > ($5, $6, $7))
+            ORDER BY r.key, cached.path, psr.checksum_sha256
             LIMIT $4
             "#,
         )
         .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
         .bind(crate::services::scanner_service::DEDUP_TTL_DAYS)
         .bind(repository_key)
-        .bind(PROXY_BLOCKED_CANDIDATE_CAP)
+        .bind(limit)
+        .bind(after.map(|k| k.repository_key.as_str()))
+        .bind(after.map(|k| k.path.as_str()))
+        .bind(after.map(|k| k.checksum_sha256.as_str()))
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-        if rows.len() as i64 >= PROXY_BLOCKED_CANDIDATE_CAP {
+        if after.is_none() && rows.len() as i64 >= PROXY_BLOCKED_CANDIDATE_CAP {
             tracing::warn!(
                 cap = PROXY_BLOCKED_CANDIDATE_CAP,
                 "blocked proxy listing reached its candidate cap; later repositories are not listed"
@@ -3383,11 +3585,83 @@ impl ScanResultService {
     }
 }
 
+/// A scan reached a terminal state (completed, reused, failed, not
+/// applicable), which can move a scan policy's decision on its artifact
+/// (`block_unscanned`, `block_on_fail`, the severity thresholds): drop the
+/// generated listings' cached decisions so they follow it at once instead of
+/// within their TTL (#4987). Process-local; another replica's caches expire
+/// on their TTL.
+fn scan_completed() {
+    crate::services::quarantine_service::invalidate_listing_decisions();
+}
+
+/// Longest `scan_findings.cve_id` the column holds, in characters
+/// (`VARCHAR(30)`, migration 022). It is the one scanner-supplied text column
+/// migration 339 did not widen to `TEXT` (#5534): a partial index sits on it,
+/// and widening would rebuild that index under an exclusive lock.
+pub(crate) const SCAN_FINDING_CVE_ID_MAX_CHARS: usize = 30;
+
+/// Why `findings` cannot be stored, naming the finding and the column, or
+/// `None` when every row fits the `scan_findings` schema (#5534).
+///
+/// The findings go in as ONE statement, so a single value the column rejects
+/// fails the whole batch, and PostgreSQL's error names neither the row nor
+/// (for an over-long value) the column. This check runs first and says which.
+/// It refuses rather than truncates or drops: storing a finding other than
+/// the one the scanner reported, or completing a scan without it, would hand
+/// every gate that reads the scan a verdict nobody issued.
+///
+/// Covers what the schema still refuses: a NUL byte in any text column
+/// (PostgreSQL cannot store one in `TEXT`) and an over-long `cve_id`.
+fn unstorable_finding(findings: &[RawFinding]) -> Option<String> {
+    let total = findings.len();
+    findings.iter().enumerate().find_map(|(index, f)| {
+        let text_columns = [
+            ("title", Some(f.title.as_str())),
+            ("description", f.description.as_deref()),
+            ("cve_id", f.cve_id.as_deref()),
+            ("affected_component", f.affected_component.as_deref()),
+            ("affected_version", f.affected_version.as_deref()),
+            ("fixed_version", f.fixed_version.as_deref()),
+            ("source", f.source.as_deref()),
+            ("source_url", f.source_url.as_deref()),
+        ];
+        let problem = text_columns.iter().find_map(|(column, value)| {
+            let value = (*value)?;
+            if value.contains('\0') {
+                return Some(format!("`{column}` contains a NUL byte"));
+            }
+            let chars = value.chars().count();
+            (*column == "cve_id" && chars > SCAN_FINDING_CVE_ID_MAX_CHARS).then(|| {
+                format!(
+                    "`cve_id` is {chars} characters, longer than the \
+                     {SCAN_FINDING_CVE_ID_MAX_CHARS} the column holds"
+                )
+            })
+        })?;
+        let label: String = f
+            .cve_id
+            .as_deref()
+            .unwrap_or(&f.title)
+            .chars()
+            .take(80)
+            .collect();
+        Some(format!(
+            "finding {} of {total} ({label:?}) cannot be stored: {problem}",
+            index + 1
+        ))
+    })
+}
+
 /// The single-statement UNNEST insert behind
 /// [`ScanResultService::create_findings`], generic over the executor so
 /// [`ScanResultService::create_completed_scan_with_findings`] can run it
 /// inside the transaction that wrote the scan row (#4667).
-async fn insert_findings<'e, E>(
+///
+/// #5534: a batch the schema would refuse is answered with a `Validation`
+/// error naming the finding and the column (see [`unstorable_finding`]), and
+/// any other database error says how many findings for which scan it lost.
+pub(crate) async fn insert_findings<'e, E>(
     executor: E,
     scan_result_id: Uuid,
     artifact_id: Uuid,
@@ -3398,6 +3672,9 @@ where
 {
     if findings.is_empty() {
         return Ok(());
+    }
+    if let Some(problem) = unstorable_finding(findings) {
+        return Err(AppError::Validation(problem));
     }
 
     let severities: Vec<String> = findings
@@ -3461,7 +3738,12 @@ where
     )
     .execute(executor)
     .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    .map_err(|e| {
+        AppError::Database(format!(
+            "storing {} findings for scan {scan_result_id}: {e}",
+            findings.len()
+        ))
+    })?;
 
     Ok(())
 }
@@ -4132,6 +4414,69 @@ mod tests {
         };
         assert_eq!(finding.severity, Severity::Info);
         assert!(finding.description.is_none());
+    }
+
+    // =======================================================================
+    // unstorable_finding (#5534)
+    // =======================================================================
+
+    fn storable_finding(cve: &str) -> RawFinding {
+        RawFinding {
+            severity: Severity::High,
+            title: format!("{cve} in libexpat"),
+            description: None,
+            cve_id: Some(cve.to_string()),
+            affected_component: Some("libexpat".to_string()),
+            affected_version: Some("2.5.0".to_string()),
+            fixed_version: Some("2.6.0".to_string()),
+            source: Some("trivy".to_string()),
+            source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
+        }
+    }
+
+    /// Lengths the 022 schema refused are storable now that the columns are
+    /// `TEXT` (339): nothing is refused, so nothing would be truncated.
+    #[test]
+    fn test_unstorable_finding_accepts_long_text_columns() {
+        let mut long = storable_finding("CVE-2024-5534");
+        long.title = "t".repeat(2000);
+        long.affected_component = Some("c".repeat(600));
+        long.affected_version = Some("a".repeat(300));
+        long.fixed_version = Some("f".repeat(300));
+        long.source = Some("s".repeat(300));
+        long.source_url = Some("u".repeat(1000));
+        long.cve_id = Some("C".repeat(SCAN_FINDING_CVE_ID_MAX_CHARS));
+        assert_eq!(unstorable_finding(&[storable_finding("CVE-1"), long]), None);
+        assert_eq!(unstorable_finding(&[]), None);
+    }
+
+    #[test]
+    fn test_unstorable_finding_names_the_finding_and_column() {
+        let mut overlong = storable_finding(&"X".repeat(SCAN_FINDING_CVE_ID_MAX_CHARS + 1));
+        overlong.title = "ignored".to_string();
+        let message = unstorable_finding(&[storable_finding("CVE-1"), overlong])
+            .expect("a cve_id past VARCHAR(30) is refused");
+        assert!(message.starts_with("finding 2 of 2 (\"XXXX"), "{message}");
+        assert!(
+            message.contains("`cve_id` is 31 characters, longer than the 30"),
+            "{message}"
+        );
+
+        // Characters, not bytes: the column is VARCHAR(30) characters.
+        let wide = storable_finding(&"é".repeat(SCAN_FINDING_CVE_ID_MAX_CHARS));
+        assert_eq!(unstorable_finding(&[wide]), None);
+
+        // A NUL in any text column, labelled by title when there is no id.
+        let mut nul = storable_finding("CVE-2");
+        nul.cve_id = None;
+        nul.fixed_version = Some("1.0\u{0}".to_string());
+        let message = unstorable_finding(&[nul]).expect("a NUL is refused");
+        assert_eq!(
+            message,
+            "finding 1 of 1 (\"CVE-2 in libexpat\") cannot be stored: \
+             `fixed_version` contains a NUL byte"
+        );
     }
 
     // =======================================================================

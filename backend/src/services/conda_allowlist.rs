@@ -430,12 +430,15 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     let (mut pi, mut ti) = (0usize, 0usize);
     let mut star: Option<(usize, usize)> = None;
     while ti < t.len() {
-        if pi < p.len() && (p[pi] == b'?' || p[pi] == t[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < p.len() && p[pi] == b'*' {
+        // `*` first: tested after the literal comparison, a `*` in the
+        // pattern facing a literal `*` in the name was consumed as an
+        // ordinary character and stopped being a wildcard.
+        if pi < p.len() && p[pi] == b'*' {
             star = Some((pi, ti));
             pi += 1;
+        } else if pi < p.len() && (p[pi] == b'?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
         } else if let Some((sp, st)) = star {
             pi = sp + 1;
             ti = st + 1;
@@ -902,5 +905,96 @@ mod tests {
         assert!(!broken_opt_out.applies_to_hosted());
         let broken = compile_for_enforcement(id, "{not json").expect("enforced");
         assert!(broken.applies_to_hosted(), "fail closed on every member");
+    }
+
+    // -- property tests ---------------------------------------------------------
+
+    mod props {
+        use super::super::{glob_match, split_conda_filename};
+        use crate::formats::conda_native::CondaNativeHandler;
+        use proptest::prelude::*;
+        use rattler_conda_types::package::CondaArchiveIdentifier;
+
+        /// The same pattern as an anchored regex.
+        fn oracle(pattern: &str) -> regex::Regex {
+            let body: String = pattern
+                .chars()
+                .map(|c| match c {
+                    '*' => ".*".to_string(),
+                    '?' => ".".to_string(),
+                    c => regex::escape(&c.to_string()),
+                })
+                .collect();
+            regex::Regex::new(&format!("^(?s:{body})$")).expect("oracle regex compiles")
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(4000))]
+
+            /// The matcher agrees with a regex on ASCII names, including a
+            /// name that itself contains `*` or `?`.
+            #[test]
+            fn glob_match_agrees_with_the_regex_oracle(
+                pattern in "[ab*?.-]{0,8}",
+                text in "[ab*?.-]{0,10}",
+            ) {
+                prop_assert_eq!(
+                    glob_match(&pattern, &text),
+                    oracle(&pattern).is_match(&text),
+                    "pattern {:?} on {:?}", pattern, text
+                );
+            }
+
+            /// The allowlist, the upload validator and rattler read the same
+            /// name and version out of a package filename. The allowlist is
+            /// the stricter one: it also refuses an empty name, version or
+            /// build, which the other two accept.
+            #[test]
+            fn filename_parsers_agree(
+                stem in "[a-c0-1._-]{0,12}",
+                extension in prop_oneof![
+                    Just(".conda"),
+                    Just(".tar.bz2"),
+                    Just(""),
+                    Just(".zip"),
+                    Just(".CONDA"),
+                ],
+            ) {
+                let filename = format!("{stem}{extension}");
+                let reference = CondaArchiveIdentifier::try_from_filename(&filename);
+                let upload = CondaNativeHandler::parse_package_filename(&filename).ok();
+                let allowlist = split_conda_filename(&filename);
+
+                // The upload validator is the reference, field for field.
+                prop_assert_eq!(
+                    upload.clone(),
+                    reference.as_ref().map(|r| (
+                        r.identifier.name.clone(),
+                        r.identifier.version.clone(),
+                        r.identifier.build_string.clone(),
+                    )),
+                    "upload validator vs rattler on {:?}", filename
+                );
+
+                // The allowlist reads the same name and version whenever it
+                // reads any, and declines exactly when a part is empty.
+                match (&allowlist, &upload) {
+                    (Some((name, version)), Some((n, v, _))) => {
+                        prop_assert_eq!(*name, n.as_str());
+                        prop_assert_eq!(*version, v.as_str());
+                    }
+                    (None, Some((n, v, b))) => {
+                        prop_assert!(
+                            n.is_empty() || v.is_empty() || b.is_empty(),
+                            "allowlist declined {:?} though every part is present", filename
+                        );
+                    }
+                    (None, None) => {}
+                    (Some(_), None) => {
+                        prop_assert!(false, "allowlist read {:?}, which is not a package filename", filename);
+                    }
+                }
+            }
+        }
     }
 }

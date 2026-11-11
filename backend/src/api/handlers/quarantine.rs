@@ -62,12 +62,24 @@ pub struct QuarantineStatusResponse {
 pub struct QuarantineNowRequest {
     /// Reason shown to developers whose downloads are blocked.
     pub reason: Option<String>,
+    /// OCI images (#5646): the manifest digest (`sha256:<hex>`) the hold is
+    /// meant for. When the tag row now names another image, that digest is
+    /// held instead and the response names both. Defaults to the digest the
+    /// row names when the request is handled.
+    #[serde(default)]
+    pub expected_digest: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RejectRequest {
     /// Optional reason for rejection.
     pub reason: Option<String>,
+    /// OCI images (#5646): the manifest digest (`sha256:<hex>`) the hold is
+    /// meant for. When the tag row now names another image, that digest is
+    /// held instead and the response names both. Defaults to the digest the
+    /// row names when the request is handled.
+    #[serde(default)]
+    pub expected_digest: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -90,6 +102,39 @@ pub struct QuarantineActionResponse {
     pub artifact_id: Uuid,
     pub new_status: String,
     pub message: String,
+    /// Set when an OCI tag moved to another image before the hold landed
+    /// (#5646): the row of the old digest that took the hold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub held_artifact_id: Option<Uuid>,
+    /// The digest the hold was applied to (the one the tag named when read).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub held_digest: Option<String>,
+    /// The digest the tag names now. It is not held by this action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moved_to_digest: Option<String>,
+}
+
+impl QuarantineActionResponse {
+    /// The answer for an action on `artifact_id` that wrote `new_status`;
+    /// `message` is replaced when the hold followed a moved tag (#5646).
+    fn new(artifact_id: Uuid, outcome: quarantine_service::HoldOutcome, message: String) -> Self {
+        let moved = outcome.moved;
+        Self {
+            artifact_id,
+            new_status: outcome.status.to_string(),
+            message: match &moved {
+                Some(m) => format!(
+                    "The tag moved to {} before the action landed; {} (the image it named \
+                     when read) is now {}. The new image was not changed",
+                    m.moved_to, m.held_digest, outcome.status
+                ),
+                None => message,
+            },
+            held_artifact_id: moved.as_ref().map(|m| m.artifact_id),
+            held_digest: moved.as_ref().map(|m| m.held_digest.clone()),
+            moved_to_digest: moved.map(|m| m.moved_to),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +190,11 @@ pub async fn get_quarantine_status(
         "Artifact not found",
     )
     .await?;
+    // #5253: an MCP server version readers are not served is missing for a
+    // caller who does not hold the registry. A holder (the reason gate below)
+    // passes, as on the registry surface.
+    let caller = Some(auth_ext.clone());
+    crate::api::handlers::artifacts::require_mcp_servable(&state, &caller, artifact_id).await?;
 
     let now = chrono::Utc::now();
     let is_blocked = quarantine_service::check_download_allowed(
@@ -173,20 +223,8 @@ pub async fn get_quarantine_status(
     // field was handed to any authenticated caller on any repository. The
     // comment is why the gate survived review; the predicate is now spelled out
     // instead of delegated to a name that means something else.
-    let repo_service =
-        crate::services::repository_service::RepositoryService::new(state.db.clone());
-    let holds_repository = auth_ext.can_access_repo(row.repository_id)
-        && (auth_ext.is_admin
-            || repo_service
-                .user_can_access_repo(
-                    row.repository_id,
-                    auth_ext.user_id,
-                    // CONTENT (#3331): the reason is the policy name, finding
-                    // counts and admin incident notes behind the hold — private
-                    // security detail, so `read` and not merely a grant.
-                    crate::services::repository_service::RepoAccess::READ,
-                )
-                .await?);
+    let holds_repository =
+        caller_passes_reason_gate(&state.db, &auth_ext, row.repository_id).await?;
     let quarantine_reason = if holds_repository {
         row.quarantine_reason
     } else {
@@ -200,6 +238,34 @@ pub async fn get_quarantine_status(
         quarantine_reason,
         is_blocked,
     }))
+}
+
+/// The REASON gate: whether `auth_ext` genuinely HOLDS repository
+/// `repo_id` (`in_scope AND (is_admin OR grants)`), the `is_public` arm of the
+/// visibility predicate deliberately dropped. Shared by the quarantine status
+/// endpoint (the hold reason) and the MCP registry surface (#5253: why a
+/// server version is held), so both disclose to exactly the same callers.
+pub(crate) async fn caller_passes_reason_gate(
+    db: &sqlx::PgPool,
+    auth_ext: &AuthExtension,
+    repo_id: Uuid,
+) -> Result<bool> {
+    if !auth_ext.can_access_repo(repo_id) {
+        return Ok(false);
+    }
+    if auth_ext.is_admin {
+        return Ok(true);
+    }
+    crate::services::repository_service::RepositoryService::new(db.clone())
+        .user_can_access_repo(
+            repo_id,
+            auth_ext.user_id,
+            // CONTENT (#3331): the reason is the policy name, finding counts
+            // and admin incident notes behind the hold — private security
+            // detail, so `read` and not merely a grant.
+            crate::services::repository_service::RepoAccess::READ,
+        )
+        .await
 }
 
 /// Quarantine an artifact immediately (admin only)
@@ -238,14 +304,20 @@ pub async fn quarantine_artifact(
     // express that on axum 0.7 — its `FromRequest` impl maps every rejection,
     // including a wrong content-type and invalid JSON, to `None` — so parse the
     // raw bytes instead (#2912).
-    let reason = if body.is_empty() {
-        None
+    let (reason, expected_digest) = if body.is_empty() {
+        (None, None)
     } else {
-        serde_json::from_slice::<QuarantineNowRequest>(&body)
-            .map_err(|e| AppError::Validation(format!("Invalid request body: {e}")))?
-            .reason
+        let req = serde_json::from_slice::<QuarantineNowRequest>(&body)
+            .map_err(|e| AppError::Validation(format!("Invalid request body: {e}")))?;
+        (req.reason, req.expected_digest)
     };
-    let new_status = quarantine_service::quarantine_now(&state.db, artifact_id, reason).await?;
+    let outcome = quarantine_service::quarantine_now_bound(
+        &state.db,
+        artifact_id,
+        reason,
+        expected_digest.as_deref(),
+    )
+    .await?;
 
     tracing::info!(
         artifact_id = %artifact_id,
@@ -259,11 +331,11 @@ pub async fn quarantine_artifact(
         Some(auth.username),
     );
 
-    Ok(Json(QuarantineActionResponse {
+    Ok(Json(QuarantineActionResponse::new(
         artifact_id,
-        new_status: new_status.to_string(),
-        message: "Artifact quarantined".to_string(),
-    }))
+        outcome,
+        "Artifact quarantined".to_string(),
+    )))
 }
 
 /// Release an artifact from quarantine (admin only)
@@ -331,11 +403,14 @@ pub async fn release_artifact(
         Some(auth.username),
     );
 
-    Ok(Json(QuarantineActionResponse {
+    Ok(Json(QuarantineActionResponse::new(
         artifact_id,
-        new_status: "released".to_string(),
-        message: "Artifact released from quarantine".to_string(),
-    }))
+        quarantine_service::HoldOutcome {
+            status: "released",
+            moved: None,
+        },
+        "Artifact released from quarantine".to_string(),
+    )))
 }
 
 /// Release a held proxied (proxy-cache) artifact from quarantine (admin only)
@@ -457,11 +532,11 @@ pub async fn reject_artifact(
     // Persist the admin's rejection reason rather than only logging it, so the
     // stored reason describes the rejection instead of whatever the preceding
     // quarantine recorded (#2912).
-    quarantine_service::transition(
+    let outcome = quarantine_service::reject_bound(
         &state.db,
         artifact_id,
-        quarantine_service::QuarantineState::Rejected,
         req.reason.as_deref(),
+        req.expected_digest.as_deref(),
     )
     .await?;
 
@@ -477,6 +552,11 @@ pub async fn reject_artifact(
             "artifact_id": artifact_id,
             "previous_status": previous_status,
             "reason": req.reason,
+            // #5646: the tag moved before the rejection landed; the old
+            // image's row was rejected instead.
+            "held_artifact_id": outcome.moved.as_ref().map(|m| m.artifact_id),
+            "held_digest": outcome.moved.as_ref().map(|m| m.held_digest.clone()),
+            "moved_to_digest": outcome.moved.as_ref().map(|m| m.moved_to.clone()),
         })),
     )
     .await;
@@ -495,11 +575,11 @@ pub async fn reject_artifact(
         Some(auth.username),
     );
 
-    Ok(Json(QuarantineActionResponse {
+    Ok(Json(QuarantineActionResponse::new(
         artifact_id,
-        new_status: "rejected".to_string(),
-        message: format!("Artifact rejected: {}", reason),
-    }))
+        outcome,
+        format!("Artifact rejected: {}", reason),
+    )))
 }
 
 #[cfg(ak_test_shard = "handlers-2")]
@@ -1263,6 +1343,48 @@ mod tests {
 
         fx.teardown().await;
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #5253: the reason-gate predicate the quarantine status endpoint and
+    /// the MCP registry surface share: admin and grant holder pass, a caller
+    /// who can see the repository only because it is public does not, and a
+    /// token scoped to another repository does not.
+    #[tokio::test]
+    async fn reason_gate_predicate_admits_only_repository_holders_5253() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let member = tdh::make_auth(fx.user_id, &fx.username);
+        assert!(caller_passes_reason_gate(&fx.pool, &member, fx.repo_id)
+            .await
+            .unwrap());
+        let (other, other_name) = tdh::create_user(&fx.pool).await;
+        assert!(caller_passes_reason_gate(
+            &fx.pool,
+            &tdh::admin_auth(other, &other_name),
+            fx.repo_id
+        )
+        .await
+        .unwrap());
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        assert!(!caller_passes_reason_gate(
+            &fx.pool,
+            &tdh::make_auth(other, &other_name),
+            fx.repo_id
+        )
+        .await
+        .unwrap());
+        let scoped = AuthExtension {
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![
+                Uuid::new_v4(),
+            ]),
+            ..member
+        };
+        assert!(!caller_passes_reason_gate(&fx.pool, &scoped, fx.repo_id)
+            .await
+            .unwrap());
+        tdh::cleanup_user(&fx.pool, other).await;
+        fx.teardown().await;
     }
 }
 

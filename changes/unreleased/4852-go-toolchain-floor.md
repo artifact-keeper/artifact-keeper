@@ -1,5 +1,0 @@
----
-section: Security
-issues: [#4852]
----
-- **The Go toolchain floor for every binary Artifact Keeper builds with Go moves to go1.27.3, and the scanner adapter's bundled trivy is rebuilt on go1.27.3, published as scanner adapter 1.6.0** (#4852). This fixes CVE-2026-111943 (HIGH, Go stdlib). `GO_MIN_PATCH` was 1.27.2 in the backend, the Alpine backend and the scanner adapter, and the adapter's bundled trivy was built on stdlib v1.27.2. The floor is raised in all three Dockerfiles at once rather than one image at a time, because the stdlib is a property of the compiler, not of the image that happened to be reported first; the watch that found it only named the adapter. A new `scripts/ci/check-go-floor-agreement.sh` now fails any PR that leaves the floors disagreeing, so the class cannot come back one image at a time. The bundled trivy moves from `ghcr.io/artifact-keeper/trivy:0.76.0-r1` to `0.76.0-r2`, the same upstream Trivy v0.76.0 rebuilt on go1.27.3 (artifact-keeper/trivy#19); the trivy release is unchanged, so a self-run trivy server stays on 0.76.0.

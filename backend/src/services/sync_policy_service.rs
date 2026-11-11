@@ -264,6 +264,36 @@ pub struct MatchedPeer {
     pub region: Option<String>,
 }
 
+/// The manual (`policy_id IS NULL`) subscriptions of repository `$1`, with
+/// whether each one replicates to its peer now (enabled, push or mirror).
+const MANUAL_SUBSCRIPTIONS_SQL: &str = r#"
+    SELECT prs.peer_instance_id,
+           (prs.sync_enabled AND prs.replication_mode::text IN ('push', 'mirror')) AS replicates
+    FROM peer_repo_subscriptions prs
+    JOIN peer_instances pi ON pi.id = prs.peer_instance_id
+    WHERE prs.repository_id = $1
+      AND prs.policy_id IS NULL
+      AND pi.is_local = false
+    "#;
+
+/// The peers that should hold an artifact once manual subscriptions are taken
+/// into account (#5625): a peer with a manual subscription to the artifact's
+/// repository is decided by that subscription alone (kept when it
+/// replicates, dropped from the policy result when it is disabled or pull),
+/// every other peer by the policies.
+fn merge_manual_subscriptions(policy_peers: Vec<Uuid>, manual: &[(Uuid, bool)]) -> Vec<Uuid> {
+    let mut desired: Vec<Uuid> = policy_peers
+        .into_iter()
+        .filter(|peer| !manual.iter().any(|(manual_peer, _)| manual_peer == peer))
+        .collect();
+    for (peer, replicates) in manual {
+        if *replicates && !desired.contains(peer) {
+            desired.push(*peer);
+        }
+    }
+    desired
+}
+
 fn default_true() -> bool {
     true
 }
@@ -274,6 +304,23 @@ fn default_replication_mode() -> String {
 
 fn default_precedence() -> i32 {
     100
+}
+
+/// Refuse a sync policy `replication_mode` that would produce subscriptions
+/// the sync worker never acts on, or that the `replication_mode` enum cannot
+/// hold (#5293). Before this the column took any string: `pull` produced
+/// subscriptions that never replicated, and a typo only failed later, at
+/// evaluation, when the value was cast to the enum.
+fn validate_replication_mode(mode: &str) -> Result<()> {
+    match mode {
+        "push" | "mirror" | "none" => Ok(()),
+        "pull" => Err(AppError::Validation(
+            crate::services::peer_instance_service::PULL_REPLICATION_NOT_IMPLEMENTED.to_string(),
+        )),
+        other => Err(AppError::Validation(format!(
+            "invalid replication_mode '{other}' (expected one of: push, mirror, none)"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +362,7 @@ impl SyncPolicyService {
                 "Policy name cannot be empty".to_string(),
             ));
         }
+        validate_replication_mode(&req.replication_mode)?;
 
         let repo_selector_json = serde_json::to_value(&req.repo_selector)
             .map_err(|e| AppError::Validation(format!("Invalid repo_selector: {e}")))?;
@@ -403,6 +451,9 @@ impl SyncPolicyService {
         id: Uuid,
         req: UpdateSyncPolicyRequest,
     ) -> Result<SyncPolicy> {
+        if let Some(mode) = req.replication_mode.as_deref() {
+            validate_replication_mode(mode)?;
+        }
         // Fetch existing policy first
         let existing = self.get_policy(id).await?;
 
@@ -860,6 +911,26 @@ impl SyncPolicyService {
             }
         }
 
+        // 5b. A manual subscription (`POST /peers/{id}/repositories`) governs
+        // its (peer, repository) pair: policies never manage that pair (they
+        // insert with ON CONFLICT DO NOTHING), and upload replicates to it
+        // without a policy filter. So a label change neither adds nor removes
+        // such a peer by policy (#5625): an enabled push/mirror subscription
+        // keeps (or gets) the artifact, and a disabled or pull one is left
+        // alone. Without this, every manually subscribed peer that held the
+        // artifact got a delete on the first label write.
+        let manual_subscriptions: Vec<(Uuid, bool)> = sqlx::query_as(MANUAL_SUBSCRIPTIONS_SQL)
+            .bind(artifact.repository_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let desired_peers = merge_manual_subscriptions(desired_peers, &manual_subscriptions);
+        let governed_by_manual = |peer_id: &Uuid| {
+            manual_subscriptions
+                .iter()
+                .any(|(manual_peer, _)| manual_peer == peer_id)
+        };
+
         // 6. Find peers that previously completed a push for this artifact
         let synced_peers: Vec<Uuid> = sqlx::query_scalar(
             r#"
@@ -899,6 +970,10 @@ impl SyncPolicyService {
                 DO UPDATE SET
                     status = 'pending',
                     priority = GREATEST(sync_tasks.priority, 0),
+                    retry_count = 0,
+                    error_message = NULL,
+                    started_at = NULL,
+                    completed_at = NULL,
                     claimed_by = NULL,
                     claim_token = NULL,
                     claim_expires_at = NULL
@@ -913,7 +988,7 @@ impl SyncPolicyService {
 
         // 8. Queue delete tasks for peers that shouldn't have it but do
         for peer_id in &synced_peers {
-            if desired_peers.contains(peer_id) {
+            if desired_peers.contains(peer_id) || governed_by_manual(peer_id) {
                 continue;
             }
             // Cancel any pending push for this peer+artifact
@@ -929,18 +1004,31 @@ impl SyncPolicyService {
             .execute(&self.db)
             .await;
 
-            // Queue delete
+            // Queue delete, addressed so it survives a purge of the row (#5624)
             let _ = sqlx::query(
                 r#"
-                INSERT INTO sync_tasks (peer_instance_id, artifact_id, priority, task_type)
-                VALUES ($1, $2, 0, 'delete')
+                INSERT INTO sync_tasks (
+                    peer_instance_id, artifact_id, priority, task_type,
+                    target_repository_id, target_repository_key, target_path
+                )
+                SELECT $1, a.id, 0, 'delete', r.id, r.key, a.path
+                FROM artifacts a
+                JOIN repositories r ON r.id = a.repository_id
+                WHERE a.id = $2
                 ON CONFLICT (peer_instance_id, artifact_id, task_type)
                 DO UPDATE SET
                     status = 'pending',
                     priority = GREATEST(sync_tasks.priority, 0),
+                    retry_count = 0,
+                    error_message = NULL,
+                    started_at = NULL,
+                    completed_at = NULL,
                     claimed_by = NULL,
                     claim_token = NULL,
-                    claim_expires_at = NULL
+                    claim_expires_at = NULL,
+                    target_repository_id = EXCLUDED.target_repository_id,
+                    target_repository_key = EXCLUDED.target_repository_key,
+                    target_path = EXCLUDED.target_path
                 WHERE sync_tasks.status != 'in_progress'
                 "#,
             )
@@ -1325,10 +1413,6 @@ mod tests {
 
     fn compute_subscription_count(repo_count: usize, peer_count: usize) -> usize {
         repo_count * peer_count
-    }
-
-    fn validate_replication_mode(mode: &str) -> bool {
-        matches!(mode, "push" | "pull" | "mirror")
     }
 
     // -----------------------------------------------------------------------
@@ -2162,17 +2246,34 @@ mod tests {
 
     #[test]
     fn test_validate_replication_mode_valid() {
-        assert!(validate_replication_mode("push"));
-        assert!(validate_replication_mode("pull"));
-        assert!(validate_replication_mode("mirror"));
+        assert!(validate_replication_mode("push").is_ok());
+        assert!(validate_replication_mode("mirror").is_ok());
+        assert!(validate_replication_mode("none").is_ok());
+    }
+
+    #[test]
+    fn test_validate_replication_mode_refuses_pull_with_its_own_message() {
+        // #5293: `pull` has no task producer; a policy using it created
+        // subscriptions that never replicated anything.
+        match validate_replication_mode("pull") {
+            Err(AppError::Validation(msg)) => {
+                assert!(msg.contains("pull replication is not implemented"), "{msg}");
+                assert!(msg.contains("push") && msg.contains("mirror"), "{msg}");
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+        match validate_replication_mode("sync") {
+            Err(AppError::Validation(msg)) => assert!(msg.contains("expected one of"), "{msg}"),
+            other => panic!("expected a validation error, got {other:?}"),
+        }
     }
 
     #[test]
     fn test_validate_replication_mode_invalid() {
-        assert!(!validate_replication_mode("sync"));
-        assert!(!validate_replication_mode(""));
-        assert!(!validate_replication_mode("Push"));
-        assert!(!validate_replication_mode("MIRROR"));
+        assert!(validate_replication_mode("sync").is_err());
+        assert!(validate_replication_mode("").is_err());
+        assert!(validate_replication_mode("Push").is_err());
+        assert!(validate_replication_mode("MIRROR").is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -3250,16 +3351,16 @@ mod tests {
     #[test]
     fn test_validate_replication_mode_case_sensitivity() {
         // Only lowercase variants are valid
-        assert!(!validate_replication_mode("Push"));
-        assert!(!validate_replication_mode("PULL"));
-        assert!(!validate_replication_mode("Mirror"));
+        assert!(validate_replication_mode("Push").is_err());
+        assert!(validate_replication_mode("PULL").is_err());
+        assert!(validate_replication_mode("Mirror").is_err());
     }
 
     #[test]
     fn test_validate_replication_mode_whitespace() {
-        assert!(!validate_replication_mode(" push"));
-        assert!(!validate_replication_mode("push "));
-        assert!(!validate_replication_mode(" push "));
+        assert!(validate_replication_mode(" push").is_err());
+        assert!(validate_replication_mode("push ").is_err());
+        assert!(validate_replication_mode(" push ").is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -4878,5 +4979,82 @@ mod tests {
     fn test_artifact_filter_matches_with_tags_no_requirements_empty_tags() {
         let f = ArtifactFilter::default();
         assert!(f.matches_with_tags("path/file.jar", 100, recent_time(), &[]));
+    }
+
+    #[test]
+    fn merge_manual_subscriptions_lets_the_subscription_decide_5625() {
+        let (policy_only, manual_on, manual_off, manual_new) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let merged = merge_manual_subscriptions(
+            vec![policy_only, manual_on, manual_off],
+            &[(manual_on, true), (manual_off, false), (manual_new, true)],
+        );
+        assert_eq!(merged, vec![policy_only, manual_on, manual_new]);
+        assert!(merge_manual_subscriptions(Vec::new(), &[]).is_empty());
+    }
+
+    /// #5625: `evaluate_for_artifact` (run on every label write) decided the
+    /// peers from sync policies only, so a peer subscribed by hand
+    /// (`POST /peers/{id}/repositories`) that held the artifact got a delete
+    /// whenever no policy wanted it, and the old delete row a restore had
+    /// cancelled came back as `pending` with its stale message. A manual
+    /// subscription now decides its pair: enabled or disabled, its peer gets
+    /// no delete. The policy-managed peer is the control: it still loses the
+    /// artifact, through a delete row reset to a clean first attempt.
+    #[tokio::test]
+    async fn label_evaluation_keeps_manually_subscribed_peers_5625() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (repo_id, _, _) = tdh::create_repo(&pool, "local", "generic").await;
+        let artifact_id = crate::api::handlers::proxy_helpers::insert_artifact(
+            &pool,
+            crate::api::handlers::proxy_helpers::NewArtifact {
+                repository_id: repo_id,
+                path: "lab/lab1.bin",
+                name: "lab1.bin",
+                version: "1.0.0",
+                size_bytes: 3,
+                checksum_sha256: "label-5625",
+                content_type: "application/octet-stream",
+                storage_key: &format!("label-5625/{}", Uuid::new_v4()),
+                uploaded_by: user_id,
+            },
+        )
+        .await
+        .expect("insert artifact");
+        crate::services::artifact_label_service::ArtifactLabelService::new(pool.clone())
+            .add_label(artifact_id, "stage", "qa")
+            .await
+            .expect("label");
+        let f = tdh::setup_manual_peer_fixture(
+            pool,
+            user_id,
+            repo_id,
+            artifact_id,
+            &[(true, true), (false, true), (true, false)],
+        )
+        .await;
+
+        let result = SyncPolicyService::new(f.pool.clone())
+            .evaluate_for_artifact(artifact_id)
+            .await;
+        let states = f.task_states().await;
+        f.teardown().await;
+        tdh::cleanup(&f.pool, f.repo_id, f.user_id).await;
+
+        result.expect("evaluate");
+        assert_eq!(
+            states,
+            tdh::expected_after_label_write_5625(),
+            "manual subscriptions (enabled, disabled) keep the artifact and their \
+             cancelled delete; only the policy-managed peer gets a fresh delete"
+        );
     }
 }

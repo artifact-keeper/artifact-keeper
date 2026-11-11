@@ -741,7 +741,7 @@ pub struct SignArtifactResponse {
         (status = 200, description = "Artifact signed; attestation recorded", body = SignArtifactResponse),
         (status = 403, description = "Admin privilege required", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Artifact not found or not eligible for signing", body = crate::api::openapi::ErrorResponse),
-        (status = 409, description = "Repository has no active signing key/config", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "Repository cannot sign artifacts: no signing config, no active key, or sign_packages disabled", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -775,18 +775,27 @@ async fn sign_artifact(
     let location = crate::storage::StorageLocation { backend, path };
     let storage = state.storage_for_repo(&location)?;
     let content = storage.get(&storage_key).await.map_err(|e| {
-        AppError::NotFound(format!("Artifact content unavailable for signing: {e}"))
+        // An outage or full store keeps its own status (#5649); any other
+        // failure is "not available", without the storage error's text,
+        // which names keys and backends and can carry the class marker.
+        if e.storage_failure().is_some() {
+            return e;
+        }
+        tracing::warn!(error = %e, storage_key = %storage_key, "artifact content unavailable for signing");
+        AppError::NotFound("Artifact content unavailable for signing".to_string())
     })?;
 
-    let signed = signing_service(&state)
+    let svc = signing_service(&state);
+    let Some(signed) = svc
         .sign_artifact_content(repository_id, artifact_id, &content, Some(auth.user_id))
         .await?
-        .ok_or_else(|| {
-            AppError::Conflict(
-                "Repository has no active signing key or signing config; configure one before signing artifacts"
-                    .to_string(),
-            )
-        })?;
+    else {
+        // Name the missing setting rather than a generic "no key or config" (#5208).
+        return Err(AppError::Conflict(
+            svc.content_signing_unavailable_reason(repository_id)
+                .await?,
+        ));
+    };
 
     Ok(Json(SignArtifactResponse {
         artifact_id,

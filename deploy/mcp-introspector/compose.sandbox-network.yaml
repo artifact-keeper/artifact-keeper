@@ -1,0 +1,62 @@
+# Reference AK forwarder for ak-mcp-introspector sandbox guests (#5253, #5447).
+# docs/security/mcp-sandbox.md, "Option A". Run as the worker's rootless user
+# (`podman-compose -f compose.sandbox-network.yaml up -d`, or
+# `docker compose` on a host dedicated to the worker).
+#
+# There is no shared guest network. For every npm or PyPI guest the worker
+# creates an internal network of its own (`<engine> network create
+# --internal ak-mcp-sbx-<job>-<random>`), has this forwarder join it under
+# the AK hostname (`<engine> network connect --alias <AK host> <net>
+# ak-gateway`, the host of the job's `akBaseUrl`), reads this forwarder's
+# address on it and starts the guest there with `--add-host <AK host>:<that
+# address>` (so the guest needs no DNS), and removes it after the run. The guest's only peer is the forwarder, so it cannot reach another guest; if
+# the network cannot be created or the forwarder cannot join it, the guest
+# is not started. OCI guests run with `--network=none`.
+#
+# The forwarder answers on the AK hostname and forwards raw TCP to the real
+# AK, so TLS and the certificate stay end to end. It must not look the AK
+# hostname up itself: on a guest network that name is its own alias, so it
+# would forward to itself. It reaches AK as `ak-upstream`, an /etc/hosts
+# entry for AK's address.
+#
+# Replace 203.0.113.10 below with the address AK's public host name (the
+# host of the backend's public base URL, which every job carries as
+# `akBaseUrl`) resolves to: the ingress or load balancer. The container
+# name is what AK_MCP_SANDBOX_GATEWAY names (default `ak-gateway`).
+name: ak-mcp-sandbox
+
+services:
+  ak-gateway:
+    container_name: ak-gateway
+    # Pin by digest in production (mirror it through an AK OCI repository).
+    image: docker.io/library/nginx:1.27-alpine
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE, SETUID, SETGID, CHOWN]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - ./nginx-ak-gateway.conf:/etc/nginx/nginx.conf:ro
+    # Only its way out. Guest networks are attached by the worker, one per
+    # guest, for the length of a run.
+    networks:
+      egress: {}
+    # The forwarder joins every live guest network, so it must never route
+    # between them. A new network namespace inherits the host's setting,
+    # and on a Docker host (or one with a VPN or router role) that is 1:
+    # set it off here rather than rely on a default.
+    sysctls:
+      net.ipv4.ip_forward: "0"
+      net.ipv6.conf.all.forwarding: "0"
+    # The upstream nginx-ak-gateway.conf forwards to. Not the AK hostname.
+    extra_hosts:
+      - "ak-upstream:203.0.113.10"
+    restart: unless-stopped
+
+networks:
+  # The forwarder's way out, to AK only (restrict it at the host firewall).
+  # No guest ever joins it.
+  egress:
+    name: ak-mcp-sandbox-egress

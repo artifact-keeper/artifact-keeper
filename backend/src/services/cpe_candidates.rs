@@ -586,9 +586,15 @@ fn candidate_matches_node(candidate: &CpeCandidate, node: &NvdCpeMatch) -> bool 
     true
 }
 
-/// Compare two dotted versions segment-wise, numerically where both
-/// segments are numeric (`1.10.0` > `1.9.0`), lexicographically otherwise.
-/// Missing trailing segments read as `0`, so `1.3` == `1.3.0`.
+/// Compare two dotted versions segment-wise in natural order: each segment's
+/// leading digits by value (`1.10.0` > `1.9.0`, `1.0.9a` < `1.0.10`), then
+/// the rest of the segment lexically. Missing trailing segments read as `0`,
+/// so `1.3` == `1.3.0`.
+///
+/// The segment comparator is [`compare_natural_segment`], a total order. The
+/// earlier "numeric when both parse, lexical otherwise" rule had a cycle
+/// (`2 < 10` by value, `10 < 1a` and `1a < 2` lexically), which put a
+/// version on the wrong side of a range bound.
 ///
 /// This is not a full semver/pre-release implementation — NVD version
 /// bounds on C-library releases are dotted numerics in practice, and the
@@ -602,10 +608,7 @@ pub(crate) fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     for i in 0..sa.len().max(sb.len()) {
         let x = sa.get(i).copied().unwrap_or("0");
         let y = sb.get(i).copied().unwrap_or("0");
-        let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
-            (Ok(nx), Ok(ny)) => nx.cmp(&ny),
-            _ => x.cmp(y),
-        };
+        let ord = crate::services::version_order::compare_natural_segment(x, y);
         if ord != std::cmp::Ordering::Equal {
             return ord;
         }
@@ -1170,5 +1173,27 @@ mod tests {
             a.windows(2).all(|w| w[0].confidence >= w[1].confidence),
             "best-first order: {a:?}"
         );
+    }
+
+    // -- compare_versions is a total order --------------------------------------
+
+    crate::testing::props::total_order_proptest!(
+        compare_versions_is_a_total_order,
+        compare_versions
+    );
+
+    /// The cycles the property test found in the old "numeric when both
+    /// parse, lexical otherwise" rule.
+    #[test]
+    fn compare_versions_orders_mixed_segments_by_their_leading_digits() {
+        use std::cmp::Ordering::Less;
+        assert_eq!(compare_versions("2", "10"), Less);
+        assert_eq!(compare_versions("1a", "2"), Less);
+        assert_eq!(compare_versions("1a", "10"), Less);
+        assert_eq!(compare_versions("1.0.9a", "1.0.10"), Less);
+        // A digit run too long for u64 still compares by value.
+        assert_eq!(compare_versions("3", "100"), Less);
+        assert_eq!(compare_versions("100", "20000000000000000000"), Less);
+        assert_eq!(compare_versions("3", "20000000000000000000"), Less);
     }
 }

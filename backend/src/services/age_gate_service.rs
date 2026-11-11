@@ -1765,7 +1765,7 @@ impl AgeGateService {
         ))
     }
 
-    async fn get_review(
+    pub(crate) async fn get_review(
         &self,
         repository_id: Uuid,
         package_name: &str,
@@ -2662,6 +2662,90 @@ mod tests {
             require_may_relax_review(ActorTier::Repository, true),
             Err(AppError::Authorization(_))
         ));
+    }
+
+    // -- the laws proved in formal/ArtifactKeeper/AgeGate, on the real functions --
+
+    /// `AgeGate/PolicyRelaxation.lean`, `allowed_run_never_relaxes`: however
+    /// many individually allowed changes are applied to an enabled gate, it
+    /// stays enabled, in the same mode, with a minimum age that never drops.
+    mod policy_relaxation_props {
+        use super::super::{AgeGateMode, AgeGatePolicy};
+        use proptest::prelude::*;
+
+        fn any_policy() -> impl Strategy<Value = AgeGatePolicy> {
+            (any::<bool>(), 0i32..60, any::<bool>()).prop_map(
+                |(enabled, min_age_days, first_seen)| AgeGatePolicy {
+                    enabled,
+                    min_age_days,
+                    mode: if first_seen {
+                        AgeGateMode::FirstSeen
+                    } else {
+                        AgeGateMode::UpstreamPublishTime
+                    },
+                },
+            )
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(4000))]
+
+            #[test]
+            fn a_run_of_allowed_changes_never_relaxes_an_enabled_gate(
+                start in any_policy(),
+                proposals in proptest::collection::vec(any_policy(), 0..10),
+            ) {
+                let start = AgeGatePolicy { enabled: true, ..start };
+                let mut current = start;
+                for next in proposals {
+                    if !current.is_relaxed_by(next) {
+                        current = next;
+                    }
+                }
+                prop_assert!(current.enabled);
+                prop_assert_eq!(current.mode, start.mode);
+                prop_assert!(current.min_age_days >= start.min_age_days);
+            }
+        }
+    }
+
+    /// `AgeGate/CheckDecision.lean`, `serves_iff`: over every review row and
+    /// both sides of the threshold, a version is served exactly when it is
+    /// not rejected and either meets the threshold or carries a manual
+    /// approval the current policy still honours.
+    #[test]
+    fn a_version_is_served_exactly_when_the_model_says_so() {
+        use ReviewIdentityMatch::{Differs, Legacy, Matches};
+        let serves = |action: AgeGateCheckAction| {
+            matches!(
+                action,
+                AgeGateCheckAction::Allow
+                    | AgeGateCheckAction::AllowAndAutoApprovePending
+                    | AgeGateCheckAction::AllowAlreadyApproved
+            )
+        };
+        let mut rows: Vec<Option<ReviewPolicyView>> = vec![None];
+        for status in ["pending", "approved", "rejected", "some_future_status"] {
+            for is_automatic in [false, true] {
+                for identity in [Matches, Differs, Legacy] {
+                    rows.push(Some(view(status, is_automatic, identity)));
+                }
+            }
+        }
+        for row in &rows {
+            for meets in [false, true] {
+                let rejected = row.as_ref().is_some_and(|r| r.status == "rejected");
+                let honoured_manual_approval = row.as_ref().is_some_and(|r| {
+                    r.status == "approved" && !r.is_automatic && r.identity != Differs
+                });
+                let expected = !rejected && (meets || honoured_manual_approval);
+                assert_eq!(
+                    serves(decide_age_gate_check(row.as_ref(), meets)),
+                    expected,
+                    "row {row:?}, meets_threshold {meets}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5102,6 +5186,49 @@ mod tests {
             status(legacy_after_switch).await,
             "pending",
             "legacy rows are not swept under first_seen"
+        );
+    }
+
+    // -- property test: the version comparator is a total order ---------------
+
+    crate::testing::props::total_order_proptest!(
+        version_compare_is_a_total_order,
+        |a: &str, b: &str| version_compare(a, b).cmp(&0)
+    );
+
+    /// The comparator orders valid SemVer versions exactly as npm's `semver`
+    /// does (reference fixture, `scripts/reference/gen_npm_fixture.js`).
+    #[test]
+    fn version_compare_agrees_with_npm_semver() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../test_fixtures/reference/npm.json")).unwrap();
+        let versions: Vec<(String, u64)> = fixture["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["valid"].as_bool().unwrap())
+            .map(|r| {
+                (
+                    r["version"].as_str().unwrap().to_string(),
+                    r["rank"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert!(versions.len() > 200, "fixture loaded");
+        let mut wrong = Vec::new();
+        for (i, (a, ra)) in versions.iter().enumerate() {
+            for (b, rb) in versions.iter().skip(i + 1) {
+                let got = version_compare(a, b).cmp(&0);
+                if got != ra.cmp(rb) {
+                    wrong.push(format!("{a:?} vs {b:?}: {got:?}, semver {:?}", ra.cmp(rb)));
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} disagreements:\n{}",
+            wrong.len(),
+            wrong[..wrong.len().min(10)].join("\n")
         );
     }
 }

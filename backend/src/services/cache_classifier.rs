@@ -322,10 +322,74 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
         // hashes).
         RepositoryFormat::Bazel => classify_bazel(&lower),
 
+        // MCP registry API (#5253): a Remote MCP registry's sync reads the
+        // upstream listing and per-server version lists, which change with
+        // every publish and status flip, so they always revalidate. One exact
+        // version document is stable but not immutable (an upstream
+        // administrator may edit it; the sync detects that as content drift),
+        // so it gets a longer, finite lifetime.
+        RepositoryFormat::Mcp => classify_mcp(&lower),
+
+        // Agent Plugins Remote (#5289): an archive is cached under
+        // `{name}/{version}/{sha256}/{name}-{version}.zip`, the digest the
+        // upstream index lists, so it is content-addressed. The marketplace
+        // documents and `{name}/index.json` gain versions over time.
+        RepositoryFormat::AgentPlugins => classify_agent_plugins(&lower),
+
+        // Hugging Face Hub (#5283): a file or metadata document addressed by
+        // a 40-hex commit sha (`{id}/resolve/<sha>/...`, the shape
+        // `snapshot_download` fetches every file with) can never change;
+        // branch, tag and `refs/pr/N` paths and plain model info are
+        // pointers the Hub moves.
+        RepositoryFormat::Huggingface => match classify_huggingface(&lower) {
+            HfPath::CommitPinned => Mutability::Immutable,
+            HfPath::Pointer | HfPath::Unknown => Mutability::mutable_default(),
+        },
+
         // Everything else: conservative default. Revalidate rather than risk
         // serving a stale index forever.
         _ => Mutability::mutable_default(),
     }
+}
+
+/// [`classify`] for a path in a repository's own stored layout (#5626).
+///
+/// [`classify`] keys on the upstream URL shapes the proxy cache stores under.
+/// The hosted npm and cargo publish routes store a release under
+/// `<name>/<version>/<file>` instead (npm `<pkg>/<ver>/<pkg>-<ver>.tgz`,
+/// scoped `@scope/<pkg>/<ver>/<pkg>-<ver>.tgz`; cargo
+/// `<crate>/<ver>/<crate>-<ver>.crate`), which carries neither npm's `/-/`
+/// segment nor cargo's `crates/` one, so [`classify`] alone calls a hosted
+/// release mutable. This also recognises those stored shapes as immutable.
+pub fn classify_stored(format: &RepositoryFormat, path: &str) -> Mutability {
+    let classified = classify(format, path);
+    if classified.is_immutable() {
+        return classified;
+    }
+    let stored_release = match format {
+        RepositoryFormat::Npm
+        | RepositoryFormat::Yarn
+        | RepositoryFormat::Pnpm
+        | RepositoryFormat::Bower => crate::formats::npm::tarball_url_path_from_stored(path)
+            .is_some_and(|url| classify(format, &url).is_immutable()),
+        RepositoryFormat::Cargo => is_stored_cargo_crate(&path.to_ascii_lowercase()),
+        _ => false,
+    };
+    if stored_release {
+        Mutability::Immutable
+    } else {
+        classified
+    }
+}
+
+/// Whether a (lower-cased) path is a hosted cargo release as the cargo
+/// publish route stores it: `<crate>/<ver>/<crate>-<ver>.crate`.
+fn is_stored_cargo_crate(lower: &str) -> bool {
+    let parts: Vec<&str> = lower.trim_start_matches('/').split('/').collect();
+    let [name, version, file] = parts[..] else {
+        return false;
+    };
+    !name.is_empty() && !version.is_empty() && file == format!("{name}-{version}.crate")
 }
 
 /// Whether `path` is a *known* mutable index / pointer file for `format` — i.e.
@@ -387,6 +451,13 @@ pub fn is_explicitly_mutable_index(format: &RepositoryFormat, path: &str) -> boo
         // label move. It is the only mutable coordinate in a protobuf module;
         // commits and their bundles remain release-immutable.
         RepositoryFormat::Protobuf => lower == "_labels" || lower.ends_with("/_labels"),
+
+        // #5283: only the Hub's recognised pointer shapes (branch/tag
+        // resolve paths, model info, non-sha tree listings) are mutable
+        // indexes. A hosted coordinate (`{id}/{revision}/{file}`) is not one
+        // of them and stays a release coordinate, so a re-publish of the
+        // same file still answers 409.
+        RepositoryFormat::Huggingface => classify_huggingface(&lower) == HfPath::Pointer,
 
         // Default-format families (Generic, Nuget, Composer, Go,
         // Helm, ...) have no in-place index files at artifact coordinates:
@@ -620,14 +691,30 @@ fn classify_oci(lower: &str) -> Mutability {
 /// for a canonical `vMAJOR.MINOR.PATCH[-pre][+build]` version (pseudo-versions
 /// and `+incompatible` included). `@v/list`, `@latest` and a query such as
 /// `@v/master.info` or `@v/v1.2.info` stay mutable.
+///
+/// The checksum database the Go handler caches under `sumdb/<host>/...`
+/// (#5344): see [`classify_go_sumdb`].
 fn classify_go(lower: &str) -> Mutability {
+    if let Some(rest) = lower.strip_prefix("sumdb/") {
+        return classify_go_sumdb(rest);
+    }
     let version = lower.rsplit_once("/@v/").and_then(|(_, leaf)| {
         [".info", ".mod", ".zip"]
             .iter()
             .find_map(|ext| leaf.strip_suffix(ext))
     });
-    let canonical = version
-        .and_then(|v| v.strip_prefix('v'))
+    if version.is_some_and(is_canonical_go_version) {
+        Mutability::Immutable
+    } else {
+        Mutability::mutable_default()
+    }
+}
+
+/// A canonical Go version, `vMAJOR.MINOR.PATCH[-pre][+build]` with no leading
+/// zeros (pseudo-versions and `+incompatible` included).
+fn is_canonical_go_version(version: &str) -> bool {
+    version
+        .strip_prefix('v')
         .and_then(|v| v.split(['-', '+']).next())
         .is_some_and(|core| {
             let parts: Vec<&str> = core.split('.').collect();
@@ -637,8 +724,23 @@ fn classify_go(lower: &str) -> Mutability {
                         && p.bytes().all(|b| b.is_ascii_digit())
                         && (p.len() == 1 || !p.starts_with('0'))
                 })
-        });
-    if canonical {
+        })
+}
+
+/// The Go checksum database (`<host>/<path>` after `sumdb/`, #5344). A tile
+/// (`tile/H/L/NNN`, and a partial `tile/H/L/NNN.p/W`, which names exactly
+/// `W` hashes) is fixed by its coordinates, and the record a lookup of a
+/// canonical `module@version` returns never changes: only the signed tree
+/// head it carries ages, and the toolchain accepts an older head that is
+/// consistent with the one it knows. The signed tree head `latest` moves
+/// with every append and stays mutable, as does anything unrecognised.
+fn classify_go_sumdb(rest: &str) -> Mutability {
+    let path = rest.split_once('/').map_or("", |(_, path)| path);
+    let pinned_lookup = path
+        .strip_prefix("lookup/")
+        .and_then(|lookup| lookup.rsplit_once('@'))
+        .is_some_and(|(module, version)| !module.is_empty() && is_canonical_go_version(version));
+    if path.starts_with("tile/") || pinned_lookup {
         Mutability::Immutable
     } else {
         Mutability::mutable_default()
@@ -788,6 +890,143 @@ fn classify_bazel(lower: &str) -> Mutability {
         Mutability::Immutable
     } else {
         Mutability::mutable_default()
+    }
+}
+
+/// TTL of one exact upstream MCP server version document.
+pub const MCP_VERSION_DOCUMENT_TTL_SECS: i64 = 3600;
+
+/// MCP registry API paths (`v0.1/...` or `v0/...`, query included).
+fn classify_mcp(lower: &str) -> Mutability {
+    let path = lower.split('?').next().unwrap_or(lower);
+    let rest = path
+        .strip_prefix("v0.1/")
+        .or_else(|| path.strip_prefix("v0/"));
+    let Some(rest) = rest else {
+        return Mutability::mutable_default();
+    };
+    let always_revalidate = Mutability::Mutable {
+        default_ttl_secs: 0,
+    };
+    let Some(tail) = rest.strip_prefix("servers/") else {
+        // `servers` (the listing) and anything unrecognised.
+        return always_revalidate;
+    };
+    match tail.rsplit_once("/versions/") {
+        Some((_, version))
+            if !version.is_empty() && version != "latest" && !version.contains('/') =>
+        {
+            Mutability::Mutable {
+                default_ttl_secs: MCP_VERSION_DOCUMENT_TTL_SECS,
+            }
+        }
+        _ => always_revalidate,
+    }
+}
+
+/// Agent Plugins (#5289): only a Remote's content-addressed archive cache
+/// path, `{name}/{version}/{sha256}/{name}-{version}.zip`, is immutable.
+/// The hosted artifact path (`{name}/{version}/{name}-{version}.zip`, three
+/// segments) is NOT: `classify` also drives the hosted delete guard, and a
+/// hosted plugin version stays deletable through the REST artifact delete.
+/// Documents (`marketplace.json`, `claude-marketplace.json`, ...,
+/// `{name}/index.json`) are mutable.
+fn classify_agent_plugins(lower: &str) -> Mutability {
+    let parts: Vec<&str> = lower.split('/').collect();
+    let content_addressed = match parts.as_slice() {
+        [name, version, digest, file] => {
+            !name.is_empty()
+                && !version.is_empty()
+                && digest.len() == 64
+                && digest.bytes().all(|b| b.is_ascii_hexdigit())
+                && *file == format!("{name}-{version}.zip")
+        }
+        _ => false,
+    };
+    if content_addressed {
+        Mutability::Immutable
+    } else {
+        Mutability::mutable_default()
+    }
+}
+
+/// What a Hugging Face Hub path addresses (#5283).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HfPath {
+    /// Content pinned by a 40-hex commit sha.
+    CommitPinned,
+    /// A recognised Hub path the Hub rewrites in place: a branch, tag or
+    /// `refs/pr/N` revision, or model info without a revision.
+    Pointer,
+    /// Not a Hub API path shape.
+    Unknown,
+}
+
+/// A Hub commit sha: exactly 40 lowercase hex characters (the path is already
+/// lowercased). A branch whose name is 40 hex characters is treated as a
+/// commit, as `huggingface_hub` does.
+fn is_hf_commit_sha(segment: &str) -> bool {
+    segment.len() == 40 && segment.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Classify a Hugging Face Hub path, as the handler requests it upstream
+/// (`api/handlers/huggingface.rs`):
+///
+/// * `{id}/resolve/{rev}/{file...}`: a file download;
+/// * `api/models/{id}`: model info at the default branch;
+/// * `api/models/{id}/revision/{rev}`: model info at a revision;
+/// * `api/models/{id}/tree/{rev}[/{dir...}]`: a file listing.
+///
+/// `{id}` is one segment (`gpt2`) or two (`org/name`), so a path can parse
+/// both ways (a model literally named `resolve`). Every parse that fits is
+/// considered and the path is commit-pinned only when all of them are: the
+/// safe direction, since a mutable path cached as immutable would be served
+/// stale forever.
+fn classify_huggingface(lower: &str) -> HfPath {
+    // A tree listing carries its query (`?recursive=true&cursor=...`, #5321).
+    // The listing at a commit is as fixed as the commit, page by page, so the
+    // query does not change the verdict; it only must not be read as part of
+    // the revision segment.
+    let lower = lower.split_once('?').map_or(lower, |(path, _)| path);
+    let segments: Vec<&str> = lower.split('/').collect();
+    if segments.iter().any(|s| s.is_empty()) {
+        return HfPath::Unknown;
+    }
+    let mut verdicts = Vec::new();
+    if let ["api", "models", rest @ ..] = segments.as_slice() {
+        for id_len in [1, 2] {
+            if rest.len() < id_len {
+                continue;
+            }
+            match &rest[id_len..] {
+                [] => verdicts.push(HfPath::Pointer),
+                ["revision", rev] => verdicts.push(hf_revision_verdict(rev)),
+                ["tree", rev, ..] => verdicts.push(hf_revision_verdict(rev)),
+                _ => {}
+            }
+        }
+    }
+    // Considered for `api/models/...` paths too: a model id may begin with
+    // `api/models`, and every fitting parse must agree.
+    for id_len in [1, 2] {
+        if let ["resolve", rev, _file, ..] = segments.get(id_len..).unwrap_or(&[]) {
+            verdicts.push(hf_revision_verdict(rev));
+        }
+    }
+    if verdicts.is_empty() {
+        HfPath::Unknown
+    } else if verdicts.iter().all(|v| *v == HfPath::CommitPinned) {
+        HfPath::CommitPinned
+    } else {
+        HfPath::Pointer
+    }
+}
+
+fn hf_revision_verdict(rev: &str) -> HfPath {
+    if is_hf_commit_sha(rev) {
+        HfPath::CommitPinned
+    } else {
+        HfPath::Pointer
     }
 }
 
@@ -1054,6 +1293,28 @@ mod tests {
         }
     }
 
+    /// #5253: MCP registry paths are never immutable; the listing and version
+    /// lists always revalidate, one exact version document lives an hour.
+    #[test]
+    fn mcp_registry_paths_classify() {
+        use RepositoryFormat::Mcp;
+        let ttl = |p: &str| match classify(&Mcp, p) {
+            Mutability::Mutable { default_ttl_secs } => default_ttl_secs,
+            Mutability::Immutable => panic!("{p} must not be immutable"),
+        };
+        assert_eq!(ttl("v0.1/servers?limit=100&cursor=abc"), 0);
+        assert_eq!(ttl("v0.1/servers"), 0);
+        assert_eq!(ttl("v0/servers/com.acme%2Fx/versions"), 0);
+        assert_eq!(ttl("v0.1/servers/com.acme%2Fx/versions/latest"), 0);
+        assert_eq!(
+            ttl("v0.1/servers/com.acme%2Fx/versions/1.0.0"),
+            MCP_VERSION_DOCUMENT_TTL_SECS
+        );
+        assert_eq!(ttl("v0.1/ping"), 0);
+        assert_eq!(ttl("other/path"), MUTABLE_DEFAULT_TTL_SECS);
+        assert!(!is_explicitly_mutable_index(&Mcp, "v0.1/servers"));
+    }
+
     /// `(format, path, expected_immutable)` rows straight from the §2.1 table.
     fn classify_cases() -> Vec<(RepositoryFormat, &'static str, bool)> {
         use RepositoryFormat::*;
@@ -1282,6 +1543,19 @@ mod tests {
             (Go, "github.com/foo/bar/@v/v2.0.0+incompatible.zip", true),
             (Go, "github.com/!burnt!sushi/toml/@v/v1.3.2.zip", true),
             (Go, "github.com/foo/bar/@v/list", false),
+            // Go checksum database under the Go repository (#5344): tiles and
+            // a lookup of a canonical version are pinned, the signed tree head
+            // moves.
+            (Go, "sumdb/sum.golang.org/tile/8/0/000", true),
+            (Go, "sumdb/sum.golang.org/tile/8/1/x001/234.p/17", true),
+            (Go, "sumdb/sum.golang.org/tile/8/data/x123/456", true),
+            (Go, "sumdb/sum.golang.org/lookup/golang.org/x/text@v0.14.0", true),
+            (Go, "sumdb/sum.golang.org/lookup/github.com/!azure/sdk@v1.2.3-!r!c1", true),
+            (Go, "sumdb/sum.golang.org/latest", false),
+            (Go, "sumdb/sum.golang.org/lookup/golang.org/x/text@master", false),
+            (Go, "sumdb/sum.golang.org/lookup/golang.org/x/text", false),
+            (Go, "sumdb/sum.golang.org/supported", false),
+            (Go, "sumdb/sum.golang.org", false),
             (Go, "github.com/foo/bar/@latest", false),
             (Go, "github.com/foo/bar/@v/master.info", false),
             (Go, "github.com/foo/bar/@v/v1.2.info", false),
@@ -1295,6 +1569,33 @@ mod tests {
             (Bazel, "modules/rules_cc/0.1.1/source.json", true),
             (Bazel, "modules/rules_cc/0.1.1/patches/fix.patch", true),
             (Bazel, "modules/rules_cc", false),
+            // Agent Plugins Remote (#5289): the content-addressed archive
+            // cache path is immutable; the hosted artifact path, the documents
+            // and a malformed digest segment are not.
+            (
+                AgentPlugins,
+                "deploy-tools/1.2.0/6bfa000000000000000000000000000000000000000000000000000000000000/deploy-tools-1.2.0.zip",
+                true,
+            ),
+            (
+                AgentPlugins,
+                "deploy-tools/2.0.0-rc.1/6BFA000000000000000000000000000000000000000000000000000000000000/deploy-tools-2.0.0-rc.1.zip",
+                true,
+            ),
+            (AgentPlugins, "deploy-tools/1.2.0/deploy-tools-1.2.0.zip", false),
+            (
+                AgentPlugins,
+                "deploy-tools/1.2.0/6bfa00000000000000000000000000000000000000000000000000000000000/deploy-tools-1.2.0.zip",
+                false,
+            ),
+            (
+                AgentPlugins,
+                "deploy-tools/1.2.0/6bfa000000000000000000000000000000000000000000000000000000000000/other-1.2.0.zip",
+                false,
+            ),
+            (AgentPlugins, "marketplace.json", false),
+            (AgentPlugins, "claude-marketplace.json", false),
+            (AgentPlugins, "deploy-tools/index.json", false),
         ]
     }
 
@@ -1490,6 +1791,114 @@ mod tests {
         // An unrecognized Maven leaf must NOT be misclassified immutable.
         assert!(!classify(&RepositoryFormat::Maven, "com/example/app/").is_immutable());
         assert!(!classify(&RepositoryFormat::Cargo, "weird/index/path").is_immutable());
+    }
+
+    const HF_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// #5283: `(path, expected)` for every row of the issue's table, with one-
+    /// and two-segment model ids and the `refs%2Fpr%2F1` encoding.
+    fn huggingface_cases() -> Vec<(String, HfPath)> {
+        let mut cases = Vec::new();
+        for id in ["gpt2", "sentence-transformers/all-MiniLM-L6-v2"] {
+            let pinned = [
+                format!("{id}/resolve/{HF_SHA}/model.safetensors"),
+                format!("{id}/resolve/{HF_SHA}/onnx/model.onnx"),
+                format!("api/models/{id}/revision/{HF_SHA}"),
+                format!("api/models/{id}/tree/{HF_SHA}"),
+                format!("api/models/{id}/tree/{HF_SHA}/onnx"),
+                format!("api/models/{id}/tree/{HF_SHA}?recursive=true&expand=false"),
+                format!("api/models/{id}/tree/{HF_SHA}?cursor=abc%2Fdef%3D%3D&recursive=true"),
+            ];
+            let pointers = [
+                format!("{id}/resolve/main/config.json"),
+                format!("{id}/resolve/v1.0/config.json"),
+                format!("{id}/resolve/refs%2Fpr%2F1/config.json"),
+                format!("api/models/{id}"),
+                format!("api/models/{id}/revision/main"),
+                format!("api/models/{id}/revision/refs%2Fpr%2F1"),
+                format!("api/models/{id}/tree/main"),
+                format!("api/models/{id}/tree/main/onnx"),
+                format!("api/models/{id}/tree/main?recursive=true"),
+                // 39 and 41 hex characters are not a commit.
+                format!("{id}/resolve/{}/config.json", &HF_SHA[..39]),
+                format!("{id}/resolve/{HF_SHA}0/config.json"),
+            ];
+            cases.extend(pinned.into_iter().map(|p| (p, HfPath::CommitPinned)));
+            cases.extend(pointers.into_iter().map(|p| (p, HfPath::Pointer)));
+        }
+        for unknown in [
+            "",
+            "gpt2",
+            "gpt2/resolve",
+            &format!("gpt2/resolve/{HF_SHA}"),
+            "api/models",
+            "api/models/org/name/commits/main",
+            &format!("api/datasets/org/name/revision/{HF_SHA}"),
+            // The hosted artifact layout, `{id}/{revision}/{file}`.
+            "org/name/main/config.json",
+            &format!("org/name/{HF_SHA}/config.json"),
+            "org//resolve/main/config.json",
+        ] {
+            cases.push((unknown.to_string(), HfPath::Unknown));
+        }
+        cases
+    }
+
+    #[test]
+    fn huggingface_paths_classify_per_the_table() {
+        let format = RepositoryFormat::Huggingface;
+        for (path, expected) in huggingface_cases() {
+            assert_eq!(
+                classify_huggingface(&path.to_ascii_lowercase()),
+                expected,
+                "{path}"
+            );
+            let m = classify(&format, &path);
+            assert_eq!(
+                m.is_immutable(),
+                expected == HfPath::CommitPinned,
+                "{path}: {m:?}"
+            );
+            if !m.is_immutable() {
+                assert_eq!(m, Mutability::mutable_default(), "{path}");
+            }
+            // `is_explicitly_mutable_index` agrees with `classify` on every
+            // recognised path and leaves unrecognised (hosted) ones protected.
+            assert_eq!(
+                is_explicitly_mutable_index(&format, &path),
+                expected == HfPath::Pointer,
+                "{path}"
+            );
+        }
+        // Case-insensitive like every other arm: the path is lowercased.
+        assert!(classify(
+            &format,
+            &format!("Org/Name/resolve/{}/f.bin", HF_SHA.to_uppercase())
+        )
+        .is_immutable());
+        assert!(classify(&format, &format!("/gpt2/resolve/{HF_SHA}/f.bin")).is_immutable());
+    }
+
+    /// A model id may be one or two segments, so a model named `resolve`
+    /// makes a path parse two ways. It is commit-pinned only if every parse
+    /// says so.
+    #[test]
+    fn huggingface_ambiguous_parse_is_pinned_only_when_every_parse_is() {
+        // `a` at revision `resolve`, or `a/resolve` at the sha.
+        assert_eq!(
+            classify_huggingface(&format!("a/resolve/resolve/{HF_SHA}/f")),
+            HfPath::Pointer
+        );
+        // Only one parse fits (`a` at the sha; `a/resolve` has no `resolve`
+        // segment after it), so the sha decides.
+        assert_eq!(
+            classify_huggingface(&format!("a/resolve/{HF_SHA}/resolve/main/f")),
+            HfPath::CommitPinned
+        );
+        assert_eq!(
+            classify_huggingface(&format!("api/models/resolve/{HF_SHA}/f")),
+            HfPath::CommitPinned
+        );
     }
 
     #[test]
@@ -1790,5 +2199,45 @@ mod tests {
             "docker-compose.test.yml NEG_TTL_SECONDS must equal \
              cache_classifier::NEGATIVE_CACHE_TTL_SECS"
         );
+    }
+
+    /// #5626: the hosted npm and cargo publish routes store a release under
+    /// `<name>/<version>/<file>`; that stored shape is a release, while the
+    /// packument, the sparse index and look-alike paths stay mutable.
+    #[test]
+    fn classify_stored_recognises_hosted_npm_and_cargo_releases_5626() {
+        let immutable = [
+            (RepositoryFormat::Npm, "lodash/4.17.21/lodash-4.17.21.tgz"),
+            (RepositoryFormat::Npm, "@acme/widget/1.0.0/widget-1.0.0.tgz"),
+            (RepositoryFormat::Npm, "lodash/-/lodash-4.17.21.tgz"),
+            (RepositoryFormat::Yarn, "left-pad/1.3.0/left-pad-1.3.0.tgz"),
+            (RepositoryFormat::Cargo, "serde/1.0.0/serde-1.0.0.crate"),
+            (RepositoryFormat::Cargo, "/Serde/1.0.0/serde-1.0.0.crate"),
+            (RepositoryFormat::Cargo, "crates/serde/serde-1.0.0.crate"),
+        ];
+        for (format, path) in immutable {
+            assert!(
+                classify_stored(&format, path).is_immutable(),
+                "{format:?} {path} is a release"
+            );
+        }
+        let mutable = [
+            (RepositoryFormat::Npm, "lodash"),
+            (RepositoryFormat::Npm, "lodash/4.17.21/other-4.17.21.tgz"),
+            (RepositoryFormat::Npm, "lodash/4.17.21/lodash-4.17.22.tgz"),
+            (RepositoryFormat::Cargo, "config.json"),
+            (RepositoryFormat::Cargo, "se/rd/serde"),
+            (RepositoryFormat::Cargo, "serde/1.0.0/other-1.0.0.crate"),
+            (RepositoryFormat::Cargo, "serde/serde-1.0.0.crate"),
+            (RepositoryFormat::Generic, "serde/1.0.0/serde-1.0.0.crate"),
+        ];
+        for (format, path) in mutable {
+            assert!(
+                !classify_stored(&format, path).is_immutable(),
+                "{format:?} {path} is not a release"
+            );
+        }
+        // Anything `classify` already calls a release stays one.
+        assert!(classify_stored(&RepositoryFormat::Maven, "a/b/1.0/b-1.0.jar").is_immutable());
     }
 }

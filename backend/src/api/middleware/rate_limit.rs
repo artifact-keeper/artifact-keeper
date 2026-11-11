@@ -1381,6 +1381,141 @@ pub(crate) fn resolve_client_ip_addr(
     None
 }
 
+// ---------------------------------------------------------------------------
+// HTTP Basic username:password budget (#5485)
+// ---------------------------------------------------------------------------
+
+/// The limiter state behind [`basic_password_budget`], installed once by
+/// `create_router`. `None` (unit tests, hand-built routers) leaves Basic
+/// password verification unmetered, which is how it always behaved.
+static BASIC_PASSWORD_BUDGET: std::sync::OnceLock<std::sync::RwLock<Option<LoginRateLimitState>>> =
+    std::sync::OnceLock::new();
+
+fn basic_password_budget_cell() -> &'static std::sync::RwLock<Option<LoginRateLimitState>> {
+    BASIC_PASSWORD_BUDGET.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Install the Basic-password budget. Safe to call repeatedly; the latest
+/// router's state wins (tests build routers repeatedly in one process).
+pub fn install_basic_password_budget(state: LoginRateLimitState) {
+    if let Ok(mut slot) = basic_password_budget_cell().write() {
+        *slot = Some(state);
+    }
+}
+
+fn installed_basic_password_budget() -> Option<LoginRateLimitState> {
+    basic_password_budget_cell()
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
+
+/// The login budget of one HTTP Basic `username:password` verification on
+/// the format routes and the management API (#5485).
+///
+/// Those surfaces verify a password on every Basic request and had no login
+/// budget: an anonymous caller could guess one account's password at the
+/// speed of the auth-concurrency cap, and sweep usernames with the bcrypt
+/// timing pad paid on every guess. They now follow the login endpoint's rules,
+/// counting only *failed* verifications, because package managers send the
+/// correct password on every request and must never be throttled for it:
+///
+/// * a per-`(username, IP)` bucket of failed verifications; once it is spent
+///   the next attempt for that pair is refused with 429 before any bcrypt,
+///   whether or not the username exists (the refusal is the same for both);
+/// * the per-IP failed-login budget shared with `POST /api/v1/auth/login`
+///   and `/v2/token` ([`LoginRateLimitState::failed_by_ip`]), which gates the
+///   bcrypt timing pad exactly as it does there: within it an unknown or
+///   federated username pays the same dummy-hash bcrypt as a wrong password,
+///   past it the hashless arms answer unpadded instead of buying the caller
+///   more bcrypt work. A Basic failure spends the login pad budget too.
+///
+/// Rate-limit exemptions (usernames, trusted CIDRs) and the master switch
+/// apply as on the other login limiters.
+#[derive(Debug)]
+pub(crate) enum BasicPasswordBudget {
+    /// No budget applies (no limiter installed, limiting disabled, or an
+    /// exempt caller): verify and pad as before.
+    Unmetered,
+    /// Verify, charging a failure to the two keys.
+    Metered {
+        state: LoginRateLimitState,
+        pair_key: String,
+        failed_ip_key: String,
+        pad_within_budget: bool,
+    },
+    /// The pair's failure budget is spent: refuse without verifying.
+    /// Carries `Retry-After` seconds.
+    Refused(u64),
+}
+
+impl BasicPasswordBudget {
+    /// Whether the bcrypt timing pad should run for this attempt.
+    pub(crate) fn pad_allowed(&self) -> bool {
+        match self {
+            Self::Unmetered => true,
+            Self::Metered {
+                pad_within_budget, ..
+            } => *pad_within_budget,
+            Self::Refused(_) => false,
+        }
+    }
+
+    /// Charge one failed verification to the pair and to the source IP.
+    pub(crate) async fn record_failure(&self) {
+        if let Self::Metered {
+            state,
+            pair_key,
+            failed_ip_key,
+            ..
+        } = self
+        {
+            state.inner.limiter.record_attempt(pair_key).await;
+            if state.failed_by_ip.max_requests > 0 {
+                state.failed_by_ip.record_attempt(failed_ip_key).await;
+            }
+        }
+    }
+}
+
+/// Read the Basic-password budget for `username` from the request's client
+/// IP. See [`BasicPasswordBudget`].
+pub(crate) async fn basic_password_budget(username: &str) -> BasicPasswordBudget {
+    let Some(state) = installed_basic_password_budget() else {
+        return BasicPasswordBudget::Unmetered;
+    };
+    if !rate_limiting_active(state.inner.enabled)
+        || state.inner.exemptions.usernames.contains(username)
+    {
+        return BasicPasswordBudget::Unmetered;
+    }
+    let client_ip = super::client_ip::current_client_ip();
+    if client_ip.is_some_and(|ip| state.inner.exemptions.is_trusted_cidr(ip)) {
+        return BasicPasswordBudget::Unmetered;
+    }
+    let ip_key = client_ip
+        .map(|ip| format!("ip:{ip}"))
+        .unwrap_or_else(|| "ip:unknown".to_string());
+    let pair_key = login_rate_limit_key(username, &ip_key);
+    if let Err(retry_after) = state.inner.limiter.peek_rate_limit(&pair_key).await {
+        crate::services::metrics_service::record_rate_limit_rejection(state.inner.limiter.name());
+        return BasicPasswordBudget::Refused(retry_after);
+    }
+    let failed_ip_key = login_failed_ip_key(&ip_key);
+    let pad_within_budget = state.failed_by_ip.max_requests == 0
+        || state
+            .failed_by_ip
+            .peek_rate_limit(&failed_ip_key)
+            .await
+            .is_ok();
+    BasicPasswordBudget::Metered {
+        state,
+        pair_key,
+        failed_ip_key,
+        pad_within_budget,
+    }
+}
+
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(ak_test_shard = "services-2")]

@@ -103,7 +103,7 @@ Consequences that shape the design:
 |---|---|---|
 | D1 | Format key `agentplugins`, enum `RepositoryFormat::AgentPlugins`, Postgres enum value `agentplugins`, label "Agent Plugins", web group "Extensions" | Matches JFrog's package type for migration parity; sits with VS Code and JetBrains in the UI |
 | D2 | Route prefix `/agentplugins/{repo_key}/...`; handler `backend/src/api/handlers/agent_plugins.rs`; pure logic in `backend/src/formats/agent_plugins.rs` | Repo convention; pure module keeps the coverage gate satisfiable |
-| D3 | Hosted (local) repositories only. Repository creation with `remote` or `virtual` is refused with 400; every handler also refuses non-hosted repos | Same as JFrog; nothing upstream to proxy today |
+| D3 | Hosted (local) repositories only. Repository creation with `remote` or `virtual` is refused with 400; every handler also refuses non-hosted repos | Same as JFrog; nothing upstream to proxy today. Amended by #5289: a Remote may proxy another Artifact Keeper's hosted repository (its documents are the upstream protocol); Virtual stays refused until its merge rule lands |
 | D4 | Path is authoritative: `{name}/{version}/{name}-{version}.zip`. Slug `^[a-z0-9][a-z0-9-]*$`, max 64. Version strict SemVer 2.0 | JFrog layout; SemVer needed for `latest`; the slug is the intersection of Claude, Cursor, agent-plugins.org and JFrog rules |
 | D5 | A manifest `name`, when present, must equal the slug; a manifest `version`, when present, must equal the path version; otherwise 400 with an explanatory message | Prevents Claude Code's version precedence from freezing updates; keeps indexes unambiguous |
 | D6 | Versions are immutable: re-publishing an existing version is 409. Removal goes through the existing REST artifact delete, and indexes reflect it immediately | Every hosted AK format behaves this way; "immutability and provenance" without an overwrite permission |
@@ -172,6 +172,15 @@ as `jetbrains.rs::upload_plugin` does. The structural gates in
 `proxy_helpers.rs` (scan-on-upload coverage, quota admission) scan every
 handler source, so the insert must sit in the function that calls those
 helpers.
+
+The object key is content-addressed inside the repository-scoped prefix of
+the #2624 scheme: `agentplugins/{repository_id}/{sha256}/{name}/{version}/{name}-{version}.zip`
+on a shared cloud namespace, `agentplugins/{sha256}/...` on a filesystem
+backend or under `STORAGE_KEY_SCHEME=flat`. The repository segment lets two
+repositories on one bucket hold byte-identical archives without tripping the
+cross-repository write guard (#5267); the hash keeps a losing concurrent
+publish of different bytes from overwriting the winner's object. Downloads
+read the key the artifact row recorded, never a recomputed one.
 
 ## 5. Harness compatibility and index membership
 

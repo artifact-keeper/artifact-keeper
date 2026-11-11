@@ -113,22 +113,36 @@ pub(super) fn channeldata_candidates() -> Vec<(String, FileCodec)> {
 pub(super) struct MemberFailure {
     /// The member repository's key.
     pub member: String,
-    /// Stable, low-cardinality class for the failure metric: `fetch`, `cap`,
-    /// `decode` or `parse`.
+    /// Stable, low-cardinality class for the failure metric: `fetch`,
+    /// `timeout` (the virtual member deadline), `cap`, `decode` or `parse`.
     pub kind: &'static str,
     /// What went wrong, phrased for an operator reading a 502 body.
     pub reason: String,
 }
 
-/// What a virtual merge does when a member fails.
+impl MemberFailure {
+    /// Whether the member could not answer (`fetch`: an upstream 5xx or a
+    /// transport failure; `timeout`: the member deadline), as opposed to
+    /// answering with a document this merge cannot use (`cap`, `decode`,
+    /// `parse`). An unavailable member is stepped past under either policy
+    /// (#5621); an unusable document is strict unless the virtual opted in
+    /// (#4192).
+    pub(super) fn is_unavailable(&self) -> bool {
+        matches!(self.kind, "fetch" | "timeout")
+    }
+}
+
+/// What a virtual merge does when a member's document cannot be used (cap,
+/// decode, parse). A member that is unavailable (upstream 5xx, transport
+/// failure, the member deadline) is left out and the merge marked partial
+/// under either policy (#5621).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FailurePolicy {
-    /// Any member failure fails the request with 502 naming the member. The
-    /// default: a merged index that silently lacks a member makes the client
-    /// conclude those packages do not exist, or resolve a name present in
-    /// two members to the lower-priority one.
+    /// An unusable member document fails the request with 502 naming the
+    /// member. The default: the member answered, and will answer the same
+    /// way again, so a merge without it is not a transient degradation.
     Strict,
-    /// Serve the merge of the members that succeeded, marked partial and
+    /// Serve the merge of the other members, marked partial and
     /// uncacheable. Opt-in per virtual repository.
     AllowPartial,
 }
@@ -168,8 +182,9 @@ pub(super) fn count_allowlist_drops(virtual_repo_key: &str, member: &str, droppe
 
 /// Count every member failure (both policies) and turn the outcome into the
 /// response the policy calls for. `Ok(None)`: no failures, serve as usual.
-/// `Ok(Some(members))`: degraded, serve with the partial marking.
-/// `Err(502)`: strict and something failed.
+/// `Ok(Some(members))`: degraded, serve with the partial marking (an
+/// unavailable member, #5621, or any failure under `AllowPartial`).
+/// `Err(502)`: strict and a member's document could not be used.
 pub(super) fn apply_failure_policy(
     policy: FailurePolicy,
     virtual_repo_key: &str,
@@ -179,6 +194,58 @@ pub(super) fn apply_failure_policy(
     if failed.is_empty() {
         return Ok(None);
     }
+    count_failures(virtual_repo_key, document, failed, Some(policy));
+    match policy {
+        FailurePolicy::Strict if failed.iter().any(|f| !f.is_unavailable()) => Err(bad_gateway(
+            virtual_repo_key,
+            document,
+            failed.iter().filter(|f| !f.is_unavailable()),
+        )),
+        FailurePolicy::Strict | FailurePolicy::AllowPartial => Ok(Some(
+            failed
+                .iter()
+                .map(|f| f.member.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        )),
+    }
+}
+
+/// The 502 for a member that could not produce one object the virtual's
+/// merged index lists (a CEP-16 shard): not a merge, so no partial answer
+/// exists, whatever the failure was.
+pub(super) fn member_object_failure(
+    virtual_repo_key: &str,
+    document: &str,
+    failure: MemberFailure,
+) -> Response {
+    let failed = [failure];
+    count_failures(virtual_repo_key, document, &failed, None);
+    bad_gateway(virtual_repo_key, document, failed.iter())
+}
+
+fn bad_gateway<'a>(
+    virtual_repo_key: &str,
+    document: &str,
+    failed: impl Iterator<Item = &'a MemberFailure>,
+) -> Response {
+    let detail = failed
+        .map(|f| format!("member '{}' failed: {}", f.member, f.reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    (
+        StatusCode::BAD_GATEWAY,
+        format!("Virtual conda channel '{virtual_repo_key}' cannot serve {document}: {detail}"),
+    )
+        .into_response()
+}
+
+fn count_failures(
+    virtual_repo_key: &str,
+    document: &str,
+    failed: &[MemberFailure],
+    policy: Option<FailurePolicy>,
+) {
     for f in failed {
         metrics::counter!(
             "ak_virtual_member_metadata_failures_total",
@@ -196,29 +263,6 @@ pub(super) fn apply_failure_policy(
             ?policy,
             "conda virtual member could not contribute to the merged document"
         );
-    }
-    match policy {
-        FailurePolicy::Strict => {
-            let detail = failed
-                .iter()
-                .map(|f| format!("member '{}' failed: {}", f.member, f.reason))
-                .collect::<Vec<_>>()
-                .join("; ");
-            Err((
-                StatusCode::BAD_GATEWAY,
-                format!(
-                    "Virtual conda channel '{virtual_repo_key}' cannot serve {document}: {detail}"
-                ),
-            )
-                .into_response())
-        }
-        FailurePolicy::AllowPartial => Ok(Some(
-            failed
-                .iter()
-                .map(|f| f.member.as_str())
-                .collect::<Vec<_>>()
-                .join(","),
-        )),
     }
 }
 
@@ -365,6 +409,16 @@ fn candidate_is_absent(response: &Response, codec: FileCodec) -> bool {
 /// to the next when the upstream does not publish the current one (404, or a
 /// 401/403 for a compressed candidate; see [`candidate_is_absent`]).
 ///
+/// The `bool` is whether the member published the document: `false` for the
+/// empty stand-in of a member that answered 404 for every candidate, or a
+/// permanent 4xx (401/403/451) for the last one (#5621, read as a miss the
+/// way the artifact walk reads it, #5504).
+///
+/// The upstream fetches are bounded by the virtual member deadline
+/// ([`proxy_helpers::VIRTUAL_MEMBER_METADATA_TIMEOUT_ENV`], #4508), across
+/// every candidate together, so a member whose upstream is down costs the
+/// deadline, not the upstream client's own timeout (#5621).
+///
 /// The fetch buffer and the decoded document are covered by the merge's own
 /// budget reservation (#4608) and tracked in `account`: the buffer until it is
 /// decoded, the document until the merge ends. Members are fetched one at a
@@ -376,7 +430,7 @@ pub(super) async fn fetch_member_document(
     limits: MemberLimits,
     missing_is_empty: bool,
     account: &mut super::merge_gate::MergeAccount,
-) -> Result<MemberDocument, MemberFailure> {
+) -> Result<(MemberDocument, bool), MemberFailure> {
     let fail = |kind: &'static str, reason: String| MemberFailure {
         member: member.key.clone(),
         kind,
@@ -389,18 +443,32 @@ pub(super) async fn fetch_member_document(
         ));
     };
     let mut last_status = None;
+    // A candidate answered a permanent non-404 refusal (#5621).
+    let mut refused = false;
+    let deadline = proxy_helpers::virtual_member_metadata_timeout();
+    let give_up_at = tokio::time::Instant::now() + deadline;
     for (path, codec) in candidates {
         let permit = account.fetch_permit();
-        let fetched = proxy_helpers::proxy_fetch_capped_with_encoding_reserved(
-            proxy,
-            member.id,
-            &member.key,
-            upstream_url,
-            path,
-            limits.fetched,
-            permit,
+        let Ok(fetched) = tokio::time::timeout_at(
+            give_up_at,
+            proxy_helpers::proxy_fetch_capped_with_encoding_reserved(
+                proxy,
+                member.id,
+                &member.key,
+                upstream_url,
+                path,
+                limits.fetched,
+                permit,
+            ),
         )
-        .await;
+        .await
+        else {
+            proxy_helpers::record_virtual_member_deadline_miss(&member.key, path, deadline);
+            return Err(fail(
+                "timeout",
+                proxy_helpers::virtual_member_deadline_reason(path, deadline),
+            ));
+        };
         match fetched {
             Ok(proxy_helpers::CappedMetadataGet::Buffered {
                 content,
@@ -452,11 +520,14 @@ pub(super) async fn fetch_member_document(
                         path: path.clone(),
                         checksum,
                     });
-                return Ok(MemberDocument {
-                    member: member.key.clone(),
-                    json,
-                    validator,
-                });
+                return Ok((
+                    MemberDocument {
+                        member: member.key.clone(),
+                        json,
+                        validator,
+                    },
+                    true,
+                ));
             }
             Ok(proxy_helpers::CappedMetadataGet::OverCap) => {
                 return Err(fail(
@@ -473,15 +544,34 @@ pub(super) async fn fetch_member_document(
                 );
                 continue;
             }
-            Err(response) => {
+            // A transient failure (#5504): the member may publish the
+            // document, so the merge goes on without it, marked partial.
+            Err(response) if proxy_helpers::is_member_unavailable_response(&response) => {
                 return Err(fail(
                     "fetch",
                     format!("{path}: upstream fetch failed with {}", response.status()),
                 ));
             }
+            // A permanent answer (a 401/403 for the plain document, a 451,
+            // ...; #5621): the member will not publish this candidate to us.
+            // Read as a miss, like a 404, the way the artifact walk reads it.
+            Err(response) => {
+                tracing::info!(
+                    member = %member.key,
+                    path = %path,
+                    status = %proxy_helpers::upstream_refusal_status(&response)
+                        .unwrap_or(response.status()),
+                    "conda virtual member refused the document permanently"
+                );
+                refused = true;
+                last_status = Some(
+                    proxy_helpers::upstream_refusal_status(&response).unwrap_or(response.status()),
+                );
+                continue;
+            }
         }
     }
-    if missing_is_empty && last_status == Some(StatusCode::NOT_FOUND) {
+    if missing_is_empty && (refused || last_status == Some(StatusCode::NOT_FOUND)) {
         // Every candidate answered 404: the upstream does not publish this
         // document at all (conda-forge has no `unknown/`, most channels lack
         // most platforms, many publish no channeldata.json). A conda client
@@ -493,11 +583,7 @@ pub(super) async fn fetch_member_document(
             "conda virtual member's upstream does not publish this document; it contributes \
              no entries"
         );
-        return Ok(MemberDocument {
-            member: member.key.clone(),
-            json: b"{}".to_vec(),
-            validator: None,
-        });
+        return Ok((empty_member_document(member), false));
     }
     Err(fail(
         "fetch",
@@ -508,9 +594,20 @@ pub(super) async fn fetch_member_document(
     ))
 }
 
+/// The stand-in document of a member that publishes nothing: no entries, and
+/// no validator, so a merge built with it is not kept.
+fn empty_member_document(member: &Repository) -> MemberDocument {
+    MemberDocument {
+        member: member.key.clone(),
+        json: b"{}".to_vec(),
+        validator: None,
+    }
+}
+
 /// Fetch every remote member in `members` (already in priority order),
 /// sequentially. Successful documents and failures are returned separately,
-/// each in member order.
+/// each in member order, with whether any member actually published its
+/// document (see [`fetch_member_document`]).
 pub(super) async fn fetch_remote_members(
     proxy: Option<&ProxyService>,
     members: &[Repository],
@@ -518,9 +615,10 @@ pub(super) async fn fetch_remote_members(
     limits: MemberLimits,
     missing_is_empty: bool,
     account: &mut super::merge_gate::MergeAccount,
-) -> (Vec<MemberDocument>, Vec<MemberFailure>) {
+) -> (Vec<MemberDocument>, Vec<MemberFailure>, bool) {
     let mut documents = Vec::new();
     let mut failures = Vec::new();
+    let mut published = false;
     for member in members
         .iter()
         .filter(|m| m.repo_type == RepositoryType::Remote)
@@ -536,11 +634,31 @@ pub(super) async fn fetch_remote_members(
         match fetch_member_document(proxy, member, candidates, limits, missing_is_empty, account)
             .await
         {
-            Ok(doc) => documents.push(doc),
+            Ok((doc, member_published)) => {
+                published |= member_published;
+                documents.push(doc);
+            }
             Err(failure) => failures.push(failure),
         }
     }
-    (documents, failures)
+    (documents, failures, published)
+}
+
+/// The answer of a virtual merge in which no member contributed (no hosted
+/// member, no remote member that published the document) and a member was
+/// unavailable (#5621): a retryable `503` with `Retry-After`, never an empty
+/// document the client would take as the channel having no packages. `None`
+/// when the merge should go ahead.
+pub(super) fn nothing_contributed(
+    hosted_members: usize,
+    remote_published: bool,
+    failed: &[MemberFailure],
+) -> Option<Response> {
+    (hosted_members == 0
+        && !remote_published
+        && failed.iter().any(MemberFailure::is_unavailable)
+        && failed.iter().all(MemberFailure::is_unavailable))
+    .then(proxy_helpers::member_unavailable_response)
 }
 
 // ---------------------------------------------------------------------------

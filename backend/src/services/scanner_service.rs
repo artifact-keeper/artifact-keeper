@@ -860,7 +860,7 @@ impl ScanReferenceResolution {
 ///     marker `docker buildx` stamps onto attestation children),
 ///   * `annotations["vnd.docker.reference.type"]` is `attestation-manifest`,
 ///   * `artifactType` contains `in-toto` (SLSA/provenance attestations).
-fn is_excluded_index_child(child: &serde_json::Value) -> bool {
+pub(crate) fn is_excluded_index_child(child: &serde_json::Value) -> bool {
     let platform = child.get("platform");
     let os = platform
         .and_then(|p| p.get("os"))
@@ -1486,6 +1486,48 @@ pub(crate) mod test_scan_job_suffix {
 
     pub(super) fn get() -> Option<String> {
         FIXED.with(|f| f.borrow().clone())
+    }
+}
+
+/// Test-only sync points for the two pieces of work a cancelled scan leaves
+/// running after its future is dropped: the blocking archive extractor and
+/// the guard's workspace-removal thread (#5348). A test arms them on its own
+/// thread before polling the scan; the next [`ScanWorkspace::extract_archive`]
+/// and the next armed [`WorkspaceGuard`] drop on that thread take the sender
+/// and drop it when their work has returned, which resolves the receiver.
+/// Not compiled outside tests.
+#[cfg(test)]
+pub(crate) mod test_blocking_exit {
+    use std::cell::RefCell;
+    use tokio::sync::oneshot;
+
+    thread_local! {
+        static EXTRACTION: RefCell<Option<oneshot::Sender<()>>> = const { RefCell::new(None) };
+        static CLEANUP: RefCell<Option<oneshot::Sender<()>>> = const { RefCell::new(None) };
+    }
+
+    /// Resolves once the next blocking extraction started on this thread has
+    /// returned, however it ended.
+    pub(crate) fn on_extraction_exit() -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        EXTRACTION.with(|s| *s.borrow_mut() = Some(tx));
+        rx
+    }
+
+    /// Resolves once the removal started by the next armed guard dropped on
+    /// this thread has finished.
+    pub(crate) fn on_cleanup_exit() -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        CLEANUP.with(|s| *s.borrow_mut() = Some(tx));
+        rx
+    }
+
+    pub(super) fn take_extraction() -> Option<oneshot::Sender<()>> {
+        EXTRACTION.with(|s| s.borrow_mut().take())
+    }
+
+    pub(super) fn take_cleanup() -> Option<oneshot::Sender<()>> {
+        CLEANUP.with(|s| s.borrow_mut().take())
     }
 }
 
@@ -2363,9 +2405,16 @@ impl ScanWorkspace {
                 return Ok(());
             };
 
-        tokio::task::spawn_blocking(move || extract_archive_blocking(kind, &src, &dst, &cancel))
-            .await
-            .map_err(|e| AppError::Internal(format!("Extraction task panicked: {}", e)))?
+        #[cfg(test)]
+        let exit_signal = test_blocking_exit::take_extraction();
+        tokio::task::spawn_blocking(move || {
+            let result = extract_archive_blocking(kind, &src, &dst, &cancel);
+            #[cfg(test)]
+            drop(exit_signal);
+            result
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("Extraction task panicked: {}", e)))?
     }
 }
 
@@ -2498,17 +2547,27 @@ impl Drop for WorkspaceGuard {
         // during an unwind aborts the process). One thread per cancelled
         // scan, bounded in practice by the extraction concurrency limit; if
         // the OS refuses it, remove inline rather than not at all.
+        #[cfg(test)]
+        let done_signal = std::sync::Arc::new(test_blocking_exit::take_cleanup());
         let spawned = {
             let path = path.clone();
             let sidecars = sidecars.clone();
+            #[cfg(test)]
+            let done_signal = std::sync::Arc::clone(&done_signal);
             std::thread::Builder::new()
                 .name("scan-ws-cleanup".to_string())
-                .spawn(move || remove_workspace_blocking(&path, &sidecars))
+                .spawn(move || {
+                    remove_workspace_blocking(&path, &sidecars);
+                    #[cfg(test)]
+                    drop(done_signal);
+                })
                 .is_ok()
         };
         if !spawned {
             remove_workspace_blocking(&path, &sidecars);
         }
+        #[cfg(test)]
+        drop(done_signal);
     }
 }
 
@@ -2770,16 +2829,90 @@ pub(crate) fn dpkg_status_pin(name: &str, version: &str, os: &OsPackageContext) 
     stanza
 }
 
-/// The one-record `lib/apk/db/installed` for an Alpine package pin (#4113):
-/// `P` (pkgname), `V` (pkgver), `A` (arch) and `o` (origin) from the
-/// package's own `.PKGINFO`.
+/// The `lib/apk/db/installed` for an Alpine package pin (#4113): `P`
+/// (pkgname), `V` (pkgver), `A` (arch) and `o` (origin) from the package's
+/// own `.PKGINFO`.
+///
+/// A subpackage (`libcurl`, origin `curl`) gets a second record for its
+/// origin at the same version (#5236; every package an APKBUILD builds shares
+/// its `pkgver-pkgrel`). The engine matches the distribution feed through the
+/// `o:` origin, but its NVD CPE search for the origin only rewrites the
+/// subpackage's own generated CPE (`libcurl:libcurl` becomes `curl:curl`),
+/// which misses a product NVD files under another vendor (`haxx:curl`):
+/// measured on grype 0.121.3, `libcurl 8.14.1-r4` matched 0 advisories and
+/// `curl` 40. Cataloged as itself, the origin gets the CPEs the engine's
+/// dictionary knows for it. What the engine reports for that synthetic
+/// record is attributed back to the served package by
+/// [`fold_apk_origin_record`].
 pub(crate) fn apk_installed_pin(name: &str, version: &str, os: &OsPackageContext) -> String {
-    let mut record = format!("P:{name}\nV:{version}\nA:{}\n", os.arch);
-    if let Some(origin) = os.source.as_deref() {
-        record.push_str(&format!("o:{origin}\n"));
+    let record = |pkgname: &str| {
+        let mut record = format!("P:{pkgname}\nV:{version}\nA:{}\n", os.arch);
+        if let Some(origin) = os.source.as_deref() {
+            record.push_str(&format!("o:{origin}\n"));
+        }
+        record.push('\n');
+        record
+    };
+    let mut db = record(name);
+    if let Some(origin) = apk_synthetic_origin(name, os) {
+        db.push_str(&record(origin));
     }
-    record.push('\n');
-    record
+    db
+}
+
+/// The origin [`apk_installed_pin`] writes a second record for (#5236): the
+/// pin's source package, when it names a package other than the pin itself.
+fn apk_synthetic_origin<'a>(name: &str, os: &'a OsPackageContext) -> Option<&'a str> {
+    os.source
+        .as_deref()
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty() && *origin != name.trim())
+}
+
+/// Attribute what a scanner reported for the synthetic origin record of an
+/// Alpine subpackage pin (#5236, see [`apk_installed_pin`]) to the package
+/// being graded.
+///
+/// The bytes being scanned are the subpackage, so a finding against the
+/// origin record is a finding against the subpackage: it is renamed, and the
+/// callers' per-pin dedup then collapses it with the same advisory matched
+/// through the origin's distribution feed. The record is dropped from the
+/// inventory and the catalog, so the SBOM lists no component the package
+/// does not ship and the verdict records the components it graded as before.
+/// A no-op for every other pin.
+pub(crate) fn fold_apk_origin_record(output: &mut ScanOutput, pin: Option<&ExpectedComponent>) {
+    let Some(pin) = pin.filter(|p| p.ecosystem == ComponentEcosystem::Alpine) else {
+        return;
+    };
+    let Some(origin) = pin
+        .os
+        .as_ref()
+        .and_then(|os| apk_synthetic_origin(&pin.name, os))
+    else {
+        return;
+    };
+    let version = pin.version.trim();
+    let is_origin = |name: &str, v: Option<&str>| {
+        name.trim() == origin && v.is_none_or(|v| v.trim() == version)
+    };
+    for finding in &mut output.findings {
+        let Some(component) = finding.affected_component.as_deref() else {
+            continue;
+        };
+        if !is_origin(component, finding.affected_version.as_deref()) {
+            continue;
+        }
+        if let Some(advisory) = finding.title.strip_suffix(&format!(" in {origin}")) {
+            finding.title = format!("{advisory} in {}", pin.name);
+        }
+        finding.affected_component = Some(pin.name.clone());
+    }
+    output
+        .packages
+        .retain(|p| !is_origin(&p.name, p.version.as_deref()));
+    if let Some(cataloged) = output.cataloged.as_mut() {
+        cataloged.retain(|c| !is_origin(&c.name, Some(&c.version)));
+    }
 }
 
 /// The `package-lock.json` (lockfileVersion 3) body that pins exactly one
@@ -3592,6 +3725,22 @@ pub(crate) fn maven_archive_claim(
     let Ok(text) = String::from_utf8(body) else {
         return MavenArchiveClaim::Unreadable;
     };
+    match parse_pom_properties(&text) {
+        Some((group_id, artifact_id, version)) => MavenArchiveClaim::Declares {
+            group_id,
+            artifact_id,
+            version,
+        },
+        None => MavenArchiveClaim::Unreadable,
+    }
+}
+
+/// The `(groupId, artifactId, version)` a Maven `pom.properties` declares, or
+/// `None` unless all three are present and non-empty. Comment lines (`#`,
+/// `!`) are skipped and either `=` or `:` separates key from value, as in a
+/// Java properties file. The values are returned as written; callers that
+/// interpolate them anywhere validate them first.
+pub(crate) fn parse_pom_properties(text: &str) -> Option<(String, String, String)> {
     let (mut g, mut a, mut v) = (None, None, None);
     for line in text.lines() {
         let line = line.trim();
@@ -3610,16 +3759,10 @@ pub(crate) fn maven_archive_claim(
         }
     }
     match (g, a, v) {
-        (Some(group_id), Some(artifact_id), Some(version))
-            if !group_id.is_empty() && !artifact_id.is_empty() && !version.is_empty() =>
-        {
-            MavenArchiveClaim::Declares {
-                group_id,
-                artifact_id,
-                version,
-            }
+        (Some(g), Some(a), Some(v)) if !g.is_empty() && !a.is_empty() && !v.is_empty() => {
+            Some((g, a, v))
         }
-        _ => MavenArchiveClaim::Unreadable,
+        _ => None,
     }
 }
 
@@ -5034,6 +5177,11 @@ pub struct ScanTarget<'a> {
     /// `false` (hosted upload scans, inline file formats, unit tests) keeps
     /// prior behavior exactly.
     pub require_nonempty_catalog: bool,
+    /// The owning repository's format (`repositories.format`, e.g.
+    /// `huggingface`), when the caller knows it. Hosted upload scans set it;
+    /// `None` (inline proxy scans, unit tests) makes format-gated scanners
+    /// such as the model-file scanner (#5285) not applicable.
+    pub repository_format: Option<&'a str>,
 }
 
 /// The package ecosystem an [`ExpectedComponent`] belongs to. Selects both the
@@ -8401,6 +8549,12 @@ impl DependencyScanner {
         }
 
         let name = artifact.name.to_lowercase();
+        // #5666: a JVM archive is binary, so the UTF-8 gate below sent it home
+        // with nothing -- a Spring Boot fat jar bundling 141 libraries was
+        // queried for none of them and graded 0 findings.
+        if Self::is_jvm_artifact(artifact) {
+            return Self::jvm_archive_dependencies(artifact, content);
+        }
         let content_str = match std::str::from_utf8(content) {
             Ok(s) => s,
             Err(_) => return vec![], // binary artifact, skip manifest parsing
@@ -8427,6 +8581,49 @@ impl DependencyScanner {
             // Try to infer from path patterns
             Self::infer_dependencies(artifact, content_str)
         }
+    }
+
+    fn is_jvm_artifact(artifact: &Artifact) -> bool {
+        [&artifact.name, &artifact.path].iter().any(|n| {
+            let n = n.to_ascii_lowercase();
+            n.ends_with(".jar") || n.ends_with(".war") || n.ends_with(".ear")
+        })
+    }
+
+    /// The libraries a JVM archive bundles (#5666), as Maven dependencies at
+    /// the versions their own `pom.properties` declare: those stored in the
+    /// archive (a shaded jar) and in the jars nested one level inside it (a
+    /// Spring Boot fat jar's `BOOT-INF/lib/`, a war's `WEB-INF/lib/`). The
+    /// archive's own coordinate is left out -- a package is not one of its
+    /// own dependencies; the orchestrator's pin queries it as `Own` (#4669).
+    fn jvm_archive_dependencies(artifact: &Artifact, content: &Bytes) -> Vec<Dependency> {
+        let file = artifact
+            .path
+            .rsplit('/')
+            .next()
+            .filter(|f| !f.is_empty())
+            .unwrap_or(&artifact.name);
+        let segments: Vec<&str> = artifact.path.split('/').collect();
+        let is_own = |c: &crate::services::trivy_fs_scanner::MavenCoordinate| {
+            let stem = format!("{}-{}", c.artifact_id, c.version);
+            let named = file
+                .strip_prefix(stem.as_str())
+                .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('-'));
+            // Maven layout: <group path>/<artifactId>/<version>/<file>.
+            let laid_out = segments.len() >= 3
+                && segments[segments.len() - 3] == c.artifact_id
+                && segments[segments.len() - 2] == c.version;
+            named || laid_out
+        };
+        crate::services::trivy_fs_scanner::maven_coordinates_in_archive(content)
+            .into_iter()
+            .filter(|c| !is_own(c))
+            .map(|c| Dependency {
+                name: format!("{}:{}", c.group_id, c.artifact_id),
+                version: Some(c.version),
+                ecosystem: "Maven".to_string(),
+            })
+            .collect()
     }
 
     fn parse_npm(content: &str) -> Vec<Dependency> {
@@ -8725,7 +8922,20 @@ impl DependencyScanner {
         content: &Bytes,
         pin: Option<&ExpectedComponent>,
     ) -> Result<ScanOutput> {
-        let declared = Self::extract_dependencies(artifact, metadata, content);
+        // A JVM archive's bundled libraries are read by inflating its nested
+        // jars (#5666), which is too much CPU for an async worker on a large
+        // fat jar.
+        let declared = if Self::is_jvm_artifact(artifact) {
+            let (artifact, content) = (artifact.clone(), content.clone());
+            tokio::task::spawn_blocking(move || Self::jvm_archive_dependencies(&artifact, &content))
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("Bundled-library walk of a JVM archive failed: {}", e);
+                    Vec::new()
+                })
+        } else {
+            Self::extract_dependencies(artifact, metadata, content)
+        };
 
         // The native libraries compiled INTO this artifact (#4043). A conda
         // package or a wheel declares none of them -- `extract_dependencies`
@@ -9114,7 +9324,13 @@ mod construction {
             // wheel contains libwebp 1.3.2" into a CVE finding (#4043).
             let dep_scanner: Arc<dyn Scanner> =
                 Arc::new(DependencyScanner::new(advisory_client).with_db(db.clone()));
-            let mut scanners: Vec<Arc<dyn Scanner>> = vec![dep_scanner];
+            // #5285: the model-file scanner is in-process and needs no engine,
+            // so it is always registered; it applies only to model files in
+            // huggingface and mlmodel repositories.
+            let mut scanners: Vec<Arc<dyn Scanner>> = vec![
+                dep_scanner,
+                Arc::new(crate::services::model_file_scanner::ModelFileScanner::new()),
+            ];
             let incus_capability = IncusScannerCapability::from_config(incus_scanner_enabled);
 
             // Container *image* scanner: Harbor scanner-adapter (#2088). Registered
@@ -9370,8 +9586,70 @@ impl ScannerService {
         force: bool,
         bypass_dedup: bool,
     ) -> Result<()> {
-        self.scan_artifact_inner(artifact_id, force, bypass_dedup, Some(prepared))
-            .await
+        // #5830: the trigger handler already returned these ids, and the
+        // scan runs detached, so whatever it returns nobody reads. Keep the
+        // ids to fail every row it did not finish, with the reason, instead
+        // of leaving them `running` until the stuck-scan janitor reaps them.
+        let prepared_ids: Vec<(String, Uuid)> = prepared
+            .iter()
+            .map(|(scan_type, id)| (scan_type.clone(), *id))
+            .collect();
+        let result = self
+            .scan_artifact_inner(artifact_id, force, bypass_dedup, Some(prepared))
+            .await;
+        self.fail_unfinished_prepared_scans(artifact_id, prepared_ids, result.as_ref().err())
+            .await;
+        result
+    }
+
+    /// Fail each of a trigger's pre-allocated `prepared` rows the scan left
+    /// `running` (#5830).
+    ///
+    /// A scan returns before its scanners reach their rows when the artifact
+    /// is gone, its bytes cannot be read, or a database call fails before or
+    /// between scanners. Each such row ends `failed` with that error, and the
+    /// artifact gets the same fail-closed treatment as a scanner that errored
+    /// ([`Self::flag_after_failed_scan`]). A row the scan finished is not
+    /// touched (the update is guarded on `running`), and a scan that returned
+    /// `Ok` with a row still `running` names that too rather than leaving it.
+    /// Best-effort: an error here is logged, and the janitor stays the
+    /// backstop.
+    async fn fail_unfinished_prepared_scans(
+        &self,
+        artifact_id: Uuid,
+        mut prepared: Vec<(String, Uuid)>,
+        error: Option<&AppError>,
+    ) {
+        prepared.sort();
+        let mut scanned: Option<String> = None;
+        let mut failed_any = false;
+        for (scan_type, scan_id) in prepared {
+            let reason = match error {
+                Some(e) => format!("scan stopped before the {scan_type} scanner finished: {e}"),
+                None => format!("scan finished without running the {scan_type} scanner"),
+            };
+            match self
+                .scan_result_service
+                .fail_scan_if_running(scan_id, &reason)
+                .await
+            {
+                Ok(Some(checksum)) => {
+                    warn!("Scan {} of artifact {}: {}", scan_id, artifact_id, reason);
+                    failed_any = true;
+                    scanned = scanned.or(checksum);
+                }
+                Ok(None) => {}
+                Err(e) => error!(
+                    "Failed to fail unfinished scan {} of artifact {}: {}",
+                    scan_id, artifact_id, e
+                ),
+            }
+        }
+        // The hold binds to the bytes the rows were prepared for.
+        if failed_any {
+            self.flag_after_failed_scan(artifact_id, scanned.as_deref())
+                .await;
+        }
     }
 
     /// Run the leaf scanners over raw in-memory bytes with NO `artifacts` row
@@ -9445,6 +9723,7 @@ impl ScannerService {
             manifest_body: None,
             expected_component: expected,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
         run_inline_proxy_scanners_target(&self.scanners, &target, content).await
     }
@@ -9473,6 +9752,7 @@ impl ScannerService {
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: true,
+            repository_format: None,
         };
         run_inline_proxy_scanners_target(&self.scanners, &target, content).await
     }
@@ -9717,6 +9997,8 @@ impl ScannerService {
             // `None` for every format that is not pinned.
             expected_component: upload_pin.as_ref(),
             require_nonempty_catalog: false,
+            // #5285: the model-file scanner applies by repository format.
+            repository_format: Some(repository_format.as_str()),
         };
         let mut catalog_set = CatalogSetTally::default();
         let expects_catalog = upload_expects_catalog(
@@ -9932,7 +10214,11 @@ impl ScannerService {
                     // is a pure re-derivation from existing rows, so it is cheap and
                     // idempotent (#2912).
                     if let Err(e) = self
-                        .update_quarantine_status(artifact_id, source_scan.findings_count)
+                        .update_quarantine_status_of(
+                            artifact_id,
+                            Some(&artifact.checksum_sha256),
+                            source_scan.findings_count,
+                        )
                         .await
                     {
                         warn!(
@@ -9982,8 +10268,12 @@ impl ScannerService {
                         );
                         catalog_set.record_reused(&reused.scan_completeness);
                         // Update quarantine status based on copied findings
-                        self.update_quarantine_status(artifact_id, reused.findings_count)
-                            .await?;
+                        self.update_quarantine_status_of(
+                            artifact_id,
+                            Some(&artifact.checksum_sha256),
+                            reused.findings_count,
+                        )
+                        .await?;
                         continue;
                     }
                     Err(e) => {
@@ -10227,10 +10517,34 @@ impl ScannerService {
                         None => scanner.vuln_db().await,
                     };
 
-                    // Persist findings
-                    self.scan_result_service
+                    // Persist findings. #5534: a batch that cannot be stored
+                    // fails THIS scan, named, and the set moves on to the next
+                    // scanner. It is not completed without the findings it
+                    // lost (that would be a cleaner verdict than the scanner
+                    // gave), and `?` here used to abandon the row `running`
+                    // and skip every later scanner.
+                    if let Err(e) = self
+                        .scan_result_service
                         .create_findings(scan_result.id, artifact_id, &findings)
+                        .await
+                    {
+                        let reason = format!(
+                            "{} reported {} findings that could not be stored: {e}",
+                            scanner.name(),
+                            findings.len()
+                        );
+                        error!("Scan of artifact {}: {}", artifact_id, reason);
+                        self.record_failed_scan(
+                            artifact_id,
+                            &artifact.checksum_sha256,
+                            scan_result.id,
+                            scanner.as_ref(),
+                            &reason,
+                            started_at,
+                        )
                         .await?;
+                        continue;
+                    }
 
                     // Persist the package inventory (#903). Failures here
                     // are logged but do not fail the scan: the inventory is
@@ -10409,7 +10723,12 @@ impl ScannerService {
                     );
 
                     // Update quarantine status
-                    self.update_quarantine_status(artifact_id, total).await?;
+                    self.update_quarantine_status_of(
+                        artifact_id,
+                        Some(&artifact.checksum_sha256),
+                        total,
+                    )
+                    .await?;
                 }
                 Err(AppError::ScannerEngineUnavailable(reason)) => {
                     // #2059 dropped the trivy CLI from the runtime image (image
@@ -10451,71 +10770,15 @@ impl ScannerService {
                         artifact_id,
                         e
                     );
-                    // Best-effort version probe even on failure: lets ops
-                    // distinguish "scanner crashed mid-scan" from "scanner
-                    // binary missing". `None` is acceptable for the latter.
-                    let scanner_version = scanner.version().await;
-                    self.scan_result_service
-                        .fail_scan(
-                            scan_result.id,
-                            &e.to_string(),
-                            scanner_version.as_deref(),
-                            started_at,
-                        )
-                        .await?;
-
-                    // #1188-R3: the inventory_status column documents
-                    // `'failed'` as "scan itself failed", kept distinct from
-                    // `'partial'` so dashboards can split "scanner crashed"
-                    // from "scanner ran but inventory broken". fail_scan
-                    // above only touches `status`; reflect the crash state
-                    // in `inventory_status` too so the column is actually
-                    // populated by every path the CHECK constraint allows.
-                    // Non-fatal: the scan_result row is already in the
-                    // failed state and the security score still recomputes
-                    // correctly; we log on failure so the gap is grep-able.
-                    if let Err(set_err) = self
-                        .scan_result_service
-                        .set_inventory_status(
-                            scan_result.id,
-                            crate::services::scan_result_service::InventoryStatus::Failed,
-                        )
-                        .await
-                    {
-                        error!(
-                            "Failed to set inventory_status='failed' on scan {}: {}",
-                            scan_result.id, set_err
-                        );
-                    }
-
-                    // Mark as flagged on failure (conservative), but never
-                    // downgrade an artifact that is already in a blocking or
-                    // admin-controlled quarantine-workflow state. A scanner
-                    // that fails AFTER another scanner quarantined the same
-                    // artifact (policy violation, or admin action) must not
-                    // silently un-block it by stomping the status back to
-                    // 'flagged'. Only flag from a non-blocking state.
-                    if let Err(e) = sqlx::query!(
-                        "UPDATE artifacts SET quarantine_status = 'flagged' \
-                         WHERE id = $1 \
-                           AND (quarantine_status IS NULL \
-                                OR quarantine_status IN ('clean', 'flagged', 'unscanned'))",
+                    self.record_failed_scan(
                         artifact_id,
+                        &artifact.checksum_sha256,
+                        scan_result.id,
+                        scanner.as_ref(),
+                        &e.to_string(),
+                        started_at,
                     )
-                    .execute(&self.db)
-                    .await
-                    {
-                        tracing::error!(
-                            artifact_id = %artifact_id,
-                            error = %e,
-                            "Failed to set flagged status after scan failure"
-                        );
-                    }
-
-                    // 'flagged' is downloadable, so a `block_on_fail` policy has to
-                    // be applied here — this path never reaches
-                    // update_quarantine_status (#2912).
-                    self.enforce_policy_after_failed_scan(artifact_id).await;
+                    .await?;
                 }
             }
         }
@@ -11152,6 +11415,102 @@ impl ScannerService {
         Ok(())
     }
 
+    /// Record one scanner's run as failed, fail-closed: the scan row goes
+    /// `failed` with `reason`, its inventory `failed`, the artifact `flagged`
+    /// unless it is already in a blocking state, and `block_on_fail` policies
+    /// are applied (#2912).
+    ///
+    /// Shared by a scanner that errored and, since #5534, by one whose
+    /// findings could not be stored: either way no verdict was recorded, and
+    /// leaving the row `running` for the janitor would also have skipped every
+    /// scanner after it in the set.
+    async fn record_failed_scan(
+        &self,
+        artifact_id: Uuid,
+        scanned: &str,
+        scan_result_id: Uuid,
+        scanner: &dyn Scanner,
+        reason: &str,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        // Best-effort version probe even on failure: lets ops
+        // distinguish "scanner crashed mid-scan" from "scanner
+        // binary missing". `None` is acceptable for the latter.
+        let scanner_version = scanner.version().await;
+        self.scan_result_service
+            .fail_scan(
+                scan_result_id,
+                reason,
+                scanner_version.as_deref(),
+                started_at,
+            )
+            .await?;
+
+        // #1188-R3: the inventory_status column documents
+        // `'failed'` as "scan itself failed", kept distinct from
+        // `'partial'` so dashboards can split "scanner crashed"
+        // from "scanner ran but inventory broken". fail_scan
+        // above only touches `status`; reflect the crash state
+        // in `inventory_status` too so the column is actually
+        // populated by every path the CHECK constraint allows.
+        // Non-fatal: the scan_result row is already in the
+        // failed state and the security score still recomputes
+        // correctly; we log on failure so the gap is grep-able.
+        if let Err(set_err) = self
+            .scan_result_service
+            .set_inventory_status(
+                scan_result_id,
+                crate::services::scan_result_service::InventoryStatus::Failed,
+            )
+            .await
+        {
+            error!(
+                "Failed to set inventory_status='failed' on scan {}: {}",
+                scan_result_id, set_err
+            );
+        }
+
+        self.flag_after_failed_scan(artifact_id, Some(scanned))
+            .await;
+        Ok(())
+    }
+
+    /// The artifact side of a failed scan: `flagged` unless it is already in
+    /// a blocking state, then `block_on_fail` policies (#2912) bound to
+    /// `scanned`, the bytes the scan was for (the hold is unbound when that
+    /// is unknown, as [`Self::scan_hold_row`] does for `None`).
+    async fn flag_after_failed_scan(&self, artifact_id: Uuid, scanned: Option<&str>) {
+        // Mark as flagged on failure (conservative), but never
+        // downgrade an artifact that is already in a blocking or
+        // admin-controlled quarantine-workflow state. A scanner
+        // that fails AFTER another scanner quarantined the same
+        // artifact (policy violation, or admin action) must not
+        // silently un-block it by stomping the status back to
+        // 'flagged'. Only flag from a non-blocking state.
+        if let Err(e) = sqlx::query!(
+            "UPDATE artifacts SET quarantine_status = 'flagged' \
+             WHERE id = $1 \
+               AND (quarantine_status IS NULL \
+                    OR quarantine_status IN ('clean', 'flagged', 'unscanned'))",
+            artifact_id,
+        )
+        .execute(&self.db)
+        .await
+        {
+            tracing::error!(
+                artifact_id = %artifact_id,
+                error = %e,
+                "Failed to set flagged status after scan failure"
+            );
+        }
+
+        // 'flagged' is downloadable, so a `block_on_fail` policy has to
+        // be applied here — this path never reaches
+        // update_quarantine_status (#2912).
+        self.enforce_policy_after_failed_scan(artifact_id, scanned)
+            .await;
+    }
+
     /// Apply scan policies after a scan *failed* (#2912).
     ///
     /// The failure arm marks the artifact `flagged`, which
@@ -11163,7 +11522,11 @@ impl ScannerService {
     /// Escalate-only: on a violation the artifact becomes a permanent quarantine;
     /// a clean evaluation leaves the `flagged` status the caller just set, so this
     /// can never downgrade. Guarded against `rejected`, and fails open on error.
-    async fn enforce_policy_after_failed_scan(&self, artifact_id: Uuid) {
+    ///
+    /// The hold binds to the bytes the scan read (`scanned`, #5646): when an
+    /// OCI tag moved to another image during the scan, the old image's row is
+    /// held, not the new one.
+    async fn enforce_policy_after_failed_scan(&self, artifact_id: Uuid, scanned: Option<&str>) {
         let repository_id: Option<Uuid> =
             match sqlx::query_scalar("SELECT repository_id FROM artifacts WHERE id = $1")
                 .bind(artifact_id)
@@ -11207,16 +11570,31 @@ impl ScannerService {
             violations = %reason,
             "Quarantining artifact after failed scan due to scan policy violation"
         );
+        let (row_id, bind) = match self.scan_hold_row(artifact_id, scanned).await {
+            Ok(Some(target)) => target,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::error!(
+                    artifact_id = %artifact_id,
+                    error = %e,
+                    "Failed to resolve the scanned image's row; not quarantining"
+                );
+                return;
+            }
+        };
         if let Err(e) = sqlx::query(
             "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL, \
              quarantine_reason = $2, \
              quarantine_source = CASE WHEN quarantine_status = 'quarantined' \
                                            AND quarantine_until IS NULL \
-                                      THEN quarantine_source ELSE 'scan_policy' END \
-             WHERE id = $1 AND quarantine_status IS DISTINCT FROM 'rejected'",
+                                      THEN quarantine_source ELSE $4 END \
+             WHERE id = $1 AND quarantine_status IS DISTINCT FROM 'rejected' \
+               AND ($3::text IS NULL OR checksum_sha256 = $3::bpchar)",
         )
-        .bind(artifact_id)
+        .bind(row_id)
         .bind(&reason)
+        .bind(bind.as_deref())
+        .bind(scan_hold_source(artifact_id, row_id))
         .execute(&self.db)
         .await
         {
@@ -11238,7 +11616,91 @@ impl ScannerService {
     /// and clears the quarantine_until timestamp. Uses a conditional UPDATE
     /// (`WHERE quarantine_status = 'quarantined'`) to prevent a clean scan
     /// from overwriting a rejection set by an admin or another scanner.
+    #[cfg(test)]
     async fn update_quarantine_status(&self, artifact_id: Uuid, findings_count: i32) -> Result<()> {
+        self.update_quarantine_status_of(artifact_id, None, findings_count)
+            .await
+    }
+
+    /// The row a hold decided by a scan of `artifact_id` lands on, and the
+    /// checksum the write binds to (#5646). `scanned` is the sha256 hex of
+    /// the bytes the scan read. For an OCI manifest row whose tag moved to
+    /// another image meanwhile, that is a row of the scanned digest
+    /// ([`oci_manifests::hold_target`]); `None` when the scanned digest has
+    /// no row left, so nothing is written. Any other row is written as before,
+    /// unbound.
+    ///
+    /// [`oci_manifests::hold_target`]: crate::services::oci_manifests::hold_target
+    async fn scan_hold_row(
+        &self,
+        artifact_id: Uuid,
+        scanned: Option<&str>,
+    ) -> Result<Option<(Uuid, Option<String>)>> {
+        use crate::services::oci_manifests::{hold_target, manifest_checksum, HoldTarget};
+        let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
+        let Some(scanned) = scanned else {
+            return Ok(Some((artifact_id, None)));
+        };
+        if manifest_checksum(&self.db, artifact_id)
+            .await
+            .map_err(db_err)?
+            .is_none()
+        {
+            return Ok(Some((artifact_id, None)));
+        }
+        let bind = Some(scanned.trim().to_ascii_lowercase());
+        Ok(
+            match hold_target(&self.db, artifact_id, scanned.trim())
+                .await
+                .map_err(db_err)?
+            {
+                HoldTarget::Same => Some((artifact_id, bind)),
+                HoldTarget::Moved {
+                    artifact_id: target,
+                    held_digest,
+                    moved_to,
+                } => {
+                    tracing::info!(
+                        %artifact_id,
+                        held_artifact_id = %target,
+                        %held_digest,
+                        %moved_to,
+                        "OCI tag moved during the scan; its verdict applies to the scanned digest"
+                    );
+                    Some((target, bind))
+                }
+                HoldTarget::Gone {
+                    held_digest,
+                    moved_to,
+                } => {
+                    tracing::info!(
+                        %artifact_id,
+                        %held_digest,
+                        %moved_to,
+                        "OCI tag moved during the scan and the scanned digest has no row left; \
+                         verdict not applied"
+                    );
+                    None
+                }
+            },
+        )
+    }
+
+    /// [`Self::update_quarantine_status`] for the bytes `scanned` (sha256
+    /// hex) the scan read (#5646): see [`Self::scan_hold_row`]. The policy is
+    /// evaluated on `artifact_id`, whose scan results these are; the state
+    /// read and written is that of the row the verdict lands on.
+    async fn update_quarantine_status_of(
+        &self,
+        scanned_artifact_id: Uuid,
+        scanned: Option<&str>,
+        findings_count: i32,
+    ) -> Result<()> {
+        let Some((artifact_id, bind)) = self.scan_hold_row(scanned_artifact_id, scanned).await?
+        else {
+            return Ok(());
+        };
+        let hold_source = scan_hold_source(scanned_artifact_id, artifact_id);
         // Read the quarantine state and the owning repository in one round trip:
         // whether the artifact is in quarantine-period mode, whether that
         // quarantine is a timed hold (upload/age-gate, non-NULL quarantine_until)
@@ -11264,7 +11726,10 @@ impl ScannerService {
         let policy_result = match repository_id {
             Some(repository_id) => {
                 let svc = crate::services::policy_service::PolicyService::new(self.db.clone());
-                match svc.evaluate_artifact(artifact_id, repository_id).await {
+                match svc
+                    .evaluate_artifact(scanned_artifact_id, repository_id)
+                    .await
+                {
                     Ok(r) => Some(r),
                     Err(e) => {
                         tracing::warn!(
@@ -11294,11 +11759,12 @@ impl ScannerService {
         if matches!(current_status.as_deref(), Some("quarantined"))
             && !has_timed_hold
             && policy_result.as_ref().is_some_and(|p| p.allowed)
-            && crate::services::quarantine_service::release_cleared_scan_policy_hold(
+            && crate::services::quarantine_service::release_cleared_scan_policy_hold_bound(
                 &self.db,
                 artifact_id,
                 None,
                 "scan",
+                bind.as_deref(),
             )
             .await?
         {
@@ -11320,7 +11786,7 @@ impl ScannerService {
             );
         }
 
-        if decision.clear_until {
+        let written = if decision.clear_until {
             // Guard on BOTH halves of the predicate that selected this branch: the
             // artifact must still be quarantined AND still carry a timed hold.
             // Re-checking only the status would let this write land on an admin
@@ -11332,14 +11798,17 @@ impl ScannerService {
                 "UPDATE artifacts SET quarantine_status = $2, quarantine_until = NULL, \
                        quarantine_reason = CASE WHEN $2 = 'released' THEN NULL \
                                                 ELSE COALESCE($3, quarantine_reason) END, \
-                       quarantine_source = CASE WHEN $2 = 'quarantined' THEN 'scan_policy' \
+                       quarantine_source = CASE WHEN $2 = 'quarantined' THEN $5 \
                                                 ELSE quarantine_source END \
                  WHERE id = $1 AND quarantine_status = 'quarantined' \
-                       AND quarantine_until IS NOT NULL",
+                       AND quarantine_until IS NOT NULL \
+                       AND ($4::text IS NULL OR checksum_sha256 = $4::bpchar)",
             )
             .bind(artifact_id)
             .bind(&decision.status)
             .bind(&decision.reason)
+            .bind(bind.as_deref())
+            .bind(hold_source)
             .execute(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -11351,6 +11820,7 @@ impl ScannerService {
                     "Quarantine transition skipped: artifact is no longer under a timed hold"
                 );
             }
+            result.rows_affected()
         } else {
             // Deliberate change from the unguarded pre-enforcement UPDATE: a
             // completing scan must never downgrade a concurrently set admin
@@ -11359,19 +11829,54 @@ impl ScannerService {
                 "UPDATE artifacts SET quarantine_status = $2, \
                        quarantine_until = CASE WHEN $2 = 'quarantined' THEN NULL ELSE quarantine_until END, \
                        quarantine_reason = $3, \
-                       quarantine_source = CASE WHEN $2 = 'quarantined' THEN 'scan_policy' \
+                       quarantine_source = CASE WHEN $2 = 'quarantined' THEN $5 \
                                                 ELSE quarantine_source END \
                  WHERE id = $1 AND quarantine_status IS DISTINCT FROM 'quarantined' \
-                       AND quarantine_status IS DISTINCT FROM 'rejected'",
+                       AND quarantine_status IS DISTINCT FROM 'rejected' \
+                       AND ($4::text IS NULL OR checksum_sha256 = $4::bpchar)",
             )
             .bind(artifact_id)
             .bind(&decision.status)
             .bind(&decision.reason)
+            .bind(bind.as_deref())
+            .bind(hold_source)
             .execute(&self.db)
             .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .rows_affected()
+        };
+        // #5646: the tag moved between the row was resolved and the write,
+        // which the checksum binding then refused: decide again for the row of
+        // the scanned digest (once: that row's checksum never changes).
+        if written == 0
+            && bind.is_some()
+            && artifact_id == scanned_artifact_id
+            && crate::services::oci_manifests::manifest_checksum(&self.db, artifact_id)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .is_some_and(|now| Some(now.to_ascii_lowercase()) != bind)
+        {
+            return Box::pin(self.update_quarantine_status_of(
+                scanned_artifact_id,
+                scanned,
+                findings_count,
+            ))
+            .await;
         }
         Ok(())
+    }
+}
+
+/// The `quarantine_source` a scan's hold records on `row_id` (#5646): the
+/// scan-policy origin on the scanned row itself; `admin` on a row of the
+/// scanned digest that took the verdict after a tag move, as a carried hold
+/// is recorded (#5457): that row has no scan of its own, so an acknowledgement
+/// release would otherwise lift it with the findings still open.
+fn scan_hold_source(scanned_artifact_id: Uuid, row_id: Uuid) -> &'static str {
+    if scanned_artifact_id == row_id {
+        "scan_policy"
+    } else {
+        "admin"
     }
 }
 
@@ -11930,6 +12435,7 @@ mod tests {
             manifest_body: Some(&manifest),
             expected_component: None,
             require_nonempty_catalog: true,
+            repository_format: None,
         };
 
         for (mode, trivy_url, trivy_adapter_url) in [
@@ -11992,6 +12498,7 @@ mod tests {
             manifest_body: Some(&manifest),
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
 
         for (mode, trivy_url, trivy_adapter_url) in [
@@ -12855,6 +13362,11 @@ mod tests {
         test_scan_job_suffix::fix("cancelled-job");
         let path = ScanWorkspace::job_workspace_dir(base.to_str().unwrap(), None, &artifact);
 
+        // Armed before the first poll, so the extraction and the guard drop
+        // below (both on this thread) pick them up.
+        let extraction_exited = test_blocking_exit::on_extraction_exit();
+        let cleanup_finished = test_blocking_exit::on_cleanup_exit();
+
         let mut prepare = Box::pin(ScanWorkspace::prepare_pinned(
             base.to_str().unwrap(),
             None,
@@ -12876,14 +13388,39 @@ mod tests {
         }
         drop(prepare);
 
-        // Long enough for the blocking extractor to unpack the remaining
-        // ~19,900 entries if nothing stopped it.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // #5348: wait for the two things the dropped future leaves running
+        // rather than sleeping a fixed interval. The blocking extractor keeps
+        // going until it sees the flag (or, if cancellation were broken,
+        // until it has unpacked every remaining entry), and the guard removes
+        // the tree on its own thread. Once both have returned nothing else
+        // writes under `path`. The deadlines are generous bounds for a loaded
+        // runner, not expected durations: a timeout here is a hang, not a
+        // slow pass.
+        tokio::time::timeout(Duration::from_secs(120), extraction_exited)
+            .await
+            .expect("the blocking extractor never returned after cancellation")
+            .ok();
+        tokio::time::timeout(Duration::from_secs(120), cleanup_finished)
+            .await
+            .expect("the guard's workspace removal never finished")
+            .ok();
+
+        // The extractor checks the flag once per entry and the removal does
+        // not synchronise with it, so the documented bound is one entry
+        // landing after the removal (see `remove_workspace_blocking`). An
+        // extractor that ignored the flag leaves the remaining ~19,900.
+        let left = count_files(&path);
         assert!(
-            !path.exists(),
-            "a cancelled extraction must not rebuild the workspace: {} files left at {}",
-            count_files(&path),
+            left <= 1,
+            "a cancelled extraction must not rebuild the workspace: {left} files left at {}",
             path.display()
+        );
+        // And nothing is still writing: the count does not grow afterwards.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            count_files(&path),
+            left,
+            "the workspace changed after the extractor and its removal had both returned"
         );
     }
 
@@ -13163,6 +13700,92 @@ mod tests {
         .execute(&fx.pool)
         .await
         .expect("insert artifact");
+    }
+
+    /// #5646: a scan of an OCI image whose tag moved to another image while
+    /// the scan ran lands its verdict on the scanned digest, never on the tag
+    /// row that now names the new image. The tag row already names D2; the
+    /// scan read D1, whose only record is the registry's manifest row, so its
+    /// digest-path row is created and held (recorded `admin`, as a carried
+    /// hold is). The control scan of D2 itself holds the tag row.
+    #[tokio::test]
+    async fn scan_verdict_after_a_tag_move_holds_the_scanned_digest_5646() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let (d1, d2) = (fresh_checksum(), fresh_checksum());
+        let tag_row = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, checksum_sha256, \
+                                    content_type, storage_key) \
+             VALUES ($1, $2, 'app:1.0', 'v2/app/manifests/1.0', 10, $3, \
+                     'application/vnd.oci.image.manifest.v1+json', $4)",
+        )
+        .bind(tag_row)
+        .bind(fx.repo_id)
+        .bind(&d2)
+        .bind(format!("oci-manifests/sha256:{d2}"))
+        .execute(&fx.pool)
+        .await
+        .expect("insert tag row");
+        sqlx::query(
+            "INSERT INTO oci_manifests (repository_id, digest, content_type, size_bytes) \
+             VALUES ($1, $2, 'application/vnd.oci.image.manifest.v1+json', 10)",
+        )
+        .bind(fx.repo_id)
+        .bind(format!("sha256:{d1}"))
+        .execute(&fx.pool)
+        .await
+        .expect("record D1");
+        seed_completed_scan_with_high_finding(&fx.pool, tag_row, fx.repo_id).await;
+        seed_enabled_policy(&fx.pool, fx.repo_id, "gate-5646").await;
+
+        let scanner = scanner_for_fixture(&fx);
+        scanner
+            .update_quarantine_status_of(tag_row, Some(&d1), 1)
+            .await
+            .expect("verdict for D1");
+        let hold = |path: String| {
+            let pool = fx.pool.clone();
+            let repo = fx.repo_id;
+            async move {
+                sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                    "SELECT quarantine_status, quarantine_source FROM artifacts \
+                     WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+                )
+                .bind(repo)
+                .bind(path)
+                .fetch_optional(&pool)
+                .await
+                .expect("read hold")
+            }
+        };
+        let tag_after_d1 = hold("v2/app/manifests/1.0".into()).await;
+        let d1_row = hold(format!("v2/app/manifests/sha256:{d1}")).await;
+
+        scanner
+            .update_quarantine_status_of(tag_row, Some(&d2), 1)
+            .await
+            .expect("verdict for D2");
+        let tag_after_d2 = hold("v2/app/manifests/1.0".into()).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            tag_after_d1,
+            Some((None, None)),
+            "D1's verdict must not hold the tag row, which names D2"
+        );
+        assert_eq!(
+            d1_row,
+            Some((Some("quarantined".into()), Some("admin".into()))),
+            "D1's verdict holds D1's digest row"
+        );
+        assert_eq!(
+            tag_after_d2,
+            Some((Some("quarantined".into()), Some("scan_policy".into()))),
+            "control: D2's own verdict holds the tag row"
+        );
     }
 
     /// The regression test for the headline bug (#2912): an enabled scan policy
@@ -14328,6 +14951,7 @@ mod tests {
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
         assert!(oci_target_is_scannable_image(&target));
     }
@@ -14348,6 +14972,7 @@ mod tests {
             manifest_body: Some(HELM_OCI_MANIFEST_BODY),
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
         assert!(!oci_target_is_scannable_image(&target));
     }
@@ -17140,9 +17765,156 @@ mod tests {
             .unwrap();
         assert_eq!(
             installed,
-            "P:libcrypto3\nV:3.1.4-r0\nA:x86_64\no:openssl\n\n"
+            "P:libcrypto3\nV:3.1.4-r0\nA:x86_64\no:openssl\n\n\
+             P:openssl\nV:3.1.4-r0\nA:x86_64\no:openssl\n\n",
+            "a subpackage is written with its origin's record too (#5236)"
         );
         assert!(!ws.join(DPKG_STATUS_PATH).exists());
+    }
+
+    /// #5236: an Alpine subpackage's synthetic installed db carries a second
+    /// record for its origin at the same version, so the engine catalogs the
+    /// origin as itself and searches the CPEs it knows for it (`haxx:curl`
+    /// for `curl`; `libcurl` alone generated only `libcurl:libcurl`). A
+    /// package that is its own origin, or names none, gets one record.
+    #[test]
+    fn apk_installed_pin_adds_the_origin_record_for_a_subpackage_5236() {
+        let ctx = |source: Option<&str>| os_context("alpine", "3.22", "x86_64", source);
+        assert_eq!(
+            apk_installed_pin("libcurl", "8.14.1-r4", &ctx(Some("curl"))),
+            "P:libcurl\nV:8.14.1-r4\nA:x86_64\no:curl\n\n\
+             P:curl\nV:8.14.1-r4\nA:x86_64\no:curl\n\n"
+        );
+        assert_eq!(
+            apk_installed_pin("curl", "8.14.1-r4", &ctx(Some("curl"))),
+            "P:curl\nV:8.14.1-r4\nA:x86_64\no:curl\n\n"
+        );
+        assert_eq!(
+            apk_installed_pin("busybox", "1.36.1-r15", &ctx(None)),
+            "P:busybox\nV:1.36.1-r15\nA:x86_64\n\n"
+        );
+        assert_eq!(
+            apk_installed_pin("busybox", "1.36.1-r15", &ctx(Some(" "))),
+            "P:busybox\nV:1.36.1-r15\nA:x86_64\no: \n\n",
+            "a blank origin names no second package"
+        );
+    }
+
+    /// #5236: what a scanner reports for the synthetic origin record is the
+    /// subpackage's. Its findings are renamed to the served package (so the
+    /// per-pin dedup collapses an advisory matched both through the origin's
+    /// feed and on the record), and the record leaves the inventory and the
+    /// catalog. Other components, and every non-Alpine pin, are untouched.
+    #[test]
+    fn fold_apk_origin_record_attributes_the_origin_record_to_the_subpackage_5236() {
+        let finding = |component: &str, version: &str, cve: &str| RawFinding {
+            severity: Severity::Critical,
+            title: format!("{cve} in {component}"),
+            description: None,
+            cve_id: Some(cve.to_string()),
+            affected_component: Some(component.to_string()),
+            affected_version: Some(version.to_string()),
+            fixed_version: None,
+            source: Some("grype".to_string()),
+            source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
+        };
+        let package = |name: &str, version: &str| RawPackage {
+            name: name.to_string(),
+            version: Some(version.to_string()),
+            purl: None,
+            license: None,
+            source_target: None,
+        };
+        let cataloged = |name: &str, version: &str| CatalogedComponent {
+            name: name.to_string(),
+            version: version.to_string(),
+        };
+        let output = || ScanOutput {
+            findings: vec![
+                finding("libcurl", "8.14.1-r4", "CVE-2025-0001"),
+                finding("curl", "8.14.1-r4", "CVE-2025-0001"),
+                finding("curl", "8.14.1-r4", "CVE-2025-0002"),
+                finding("curl", "7.0.0-r0", "CVE-2025-0003"),
+            ],
+            packages: vec![
+                package("libcurl", "8.14.1-r4"),
+                package("curl", "8.14.1-r4"),
+                package("alpine-baselayout", "3.7.0-r0"),
+            ],
+            scan_completeness: ScanCompleteness::Complete,
+            cataloged: Some(vec![
+                cataloged("libcurl", "8.14.1-r4"),
+                cataloged("curl", "8.14.1-r4"),
+            ]),
+            vuln_db: None,
+        };
+        let pin = ExpectedComponent::os_package(
+            ComponentEcosystem::Alpine,
+            "libcurl",
+            "8.14.1-r4",
+            os_context("alpine", "3.22", "x86_64", Some("curl")),
+        )
+        .unwrap();
+
+        let mut folded = output();
+        fold_apk_origin_record(&mut folded, Some(&pin));
+        let named: Vec<(&str, &str)> = folded
+            .findings
+            .iter()
+            .map(|f| (f.affected_component.as_deref().unwrap(), f.title.as_str()))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                ("libcurl", "CVE-2025-0001 in libcurl"),
+                ("libcurl", "CVE-2025-0001 in libcurl"),
+                ("libcurl", "CVE-2025-0002 in libcurl"),
+                // Another version of the origin is not the synthetic record.
+                ("curl", "CVE-2025-0003 in curl"),
+            ]
+        );
+        assert_eq!(
+            folded
+                .packages
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["libcurl", "alpine-baselayout"]
+        );
+        assert_eq!(
+            folded.cataloged,
+            Some(vec![cataloged("libcurl", "8.14.1-r4")])
+        );
+        // The pin's dedup then counts the doubly matched advisory once.
+        let deduped = dedupe_findings(folded.findings, Some(ComponentEcosystem::Alpine));
+        assert_eq!(deduped.len(), 3, "{deduped:?}");
+
+        // No-ops: a package that is its own origin, a Debian pin, no pin.
+        let own = ExpectedComponent::os_package(
+            ComponentEcosystem::Alpine,
+            "curl",
+            "8.14.1-r4",
+            os_context("alpine", "3.22", "x86_64", Some("curl")),
+        )
+        .unwrap();
+        let deb = ExpectedComponent::os_package(
+            ComponentEcosystem::Debian,
+            "libcurl4",
+            "8.14.1-r4",
+            os_context("debian", "12", "amd64", Some("curl")),
+        )
+        .unwrap();
+        for pin in [Some(&own), Some(&deb), None] {
+            let mut untouched = output();
+            fold_apk_origin_record(&mut untouched, pin);
+            assert_eq!(
+                format!("{:?}", untouched.findings),
+                format!("{:?}", output().findings)
+            );
+            assert_eq!(untouched.packages, output().packages);
+            assert_eq!(untouched.cataloged, output().cataloged);
+        }
     }
 
     /// An OS package pin with no release would catalog the package and grade
@@ -19750,6 +20522,64 @@ tonic-build = "0.12"
             );
         }
 
+        /// #5666 end to end: a fat jar bundling a vulnerable library is
+        /// queried for it and produces the finding, where it used to send the
+        /// feed nothing and report 0.
+        #[tokio::test]
+        async fn test_scan_of_fat_jar_grades_bundled_library() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{ "vulns": [{
+                        "id": "GHSA-jfh8-c2jp-5v3q",
+                        "summary": "Remote code injection in Log4j",
+                        "aliases": ["CVE-2021-44228"],
+                        "database_specific": { "severity": "CRITICAL" },
+                        "affected": [{ "ranges": [{ "events": [{ "fixed": "2.15.0" }] }] }]
+                    }]}]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )));
+            let fat = zip_owned(vec![
+                pom_properties_entry("com.example", "app", "1.0.0"),
+                (
+                    "BOOT-INF/lib/log4j-core-2.14.1.jar".into(),
+                    zip_owned(vec![pom_properties_entry(
+                        "org.apache.logging.log4j",
+                        "log4j-core",
+                        "2.14.1",
+                    )]),
+                ),
+            ]);
+            let artifact = make_artifact(
+                "app-1.0.0.jar",
+                "com/example/app/1.0.0/app-1.0.0.jar",
+                Some("1.0.0"),
+            );
+            let out = scanner
+                .scan(&artifact, None, &Bytes::from(fat))
+                .await
+                .expect("scan");
+
+            assert_eq!(out.findings.len(), 1, "{:?}", out.findings);
+            assert_eq!(
+                out.findings[0].affected_component.as_deref(),
+                Some("org.apache.logging.log4j:log4j-core")
+            );
+            assert!(out
+                .packages
+                .iter()
+                .any(|p| p.name == "org.apache.logging.log4j:log4j-core"
+                    && p.version.as_deref() == Some("2.14.1")));
+        }
+
         // -------------------------------------------------------------------
         // Attribution
         // -------------------------------------------------------------------
@@ -19836,6 +20666,7 @@ tonic-build = "0.12"
                 manifest_body: None,
                 expected_component: Some(&pin),
                 require_nonempty_catalog: false,
+                repository_format: None,
             };
 
             let out = scanner
@@ -19930,6 +20761,7 @@ tonic-build = "0.12"
                 manifest_body: None,
                 expected_component: Some(&pin),
                 require_nonempty_catalog: false,
+                repository_format: None,
             };
             let out = scanner
                 .scan_target(&target, None, &content)
@@ -22911,6 +23743,111 @@ tonic-build = "0.12"
         let deps = DependencyScanner::extract_dependencies(&artifact, None, &content);
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].ecosystem, "NuGet");
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_dependencies - JVM archives (#5666)
+    // -----------------------------------------------------------------------
+
+    fn pom_properties_entry(group: &str, artifact: &str, version: &str) -> (String, Vec<u8>) {
+        (
+            format!("META-INF/maven/{group}/{artifact}/pom.properties"),
+            format!(
+                "#Generated by Maven\ngroupId={group}\nartifactId={artifact}\nversion={version}\n"
+            )
+            .into_bytes(),
+        )
+    }
+
+    fn zip_owned(entries: Vec<(String, Vec<u8>)>) -> Vec<u8> {
+        let refs: Vec<(&str, Vec<u8>)> = entries
+            .iter()
+            .map(|(p, b)| (p.as_str(), b.clone()))
+            .collect();
+        build_zip(&refs)
+    }
+
+    /// #5666: a Spring Boot fat jar is binary, so the dependency scanner
+    /// returned no dependencies for it and graded 0 findings however many
+    /// vulnerable libraries it bundled. The libraries under `BOOT-INF/lib/`
+    /// are now queried at the versions their own `pom.properties` declare;
+    /// the application's own coordinate is not one of them.
+    #[test]
+    fn test_extract_dependencies_fat_jar_bundled_libraries() {
+        let lib = |g: &str, a: &str, v: &str| zip_owned(vec![pom_properties_entry(g, a, v)]);
+        let fat = zip_owned(vec![
+            pom_properties_entry("com.example", "app", "1.0.0"),
+            (
+                "BOOT-INF/classes/application.properties".into(),
+                b"x=1".to_vec(),
+            ),
+            (
+                "BOOT-INF/lib/jackson-databind-2.9.10.jar".into(),
+                lib("com.fasterxml.jackson.core", "jackson-databind", "2.9.10"),
+            ),
+            (
+                "BOOT-INF/lib/log4j-core-2.14.1.jar".into(),
+                lib("org.apache.logging.log4j", "log4j-core", "2.14.1"),
+            ),
+            (
+                "BOOT-INF/lib/commons-collections-3.2.1.jar".into(),
+                lib("commons-collections", "commons-collections", "3.2.1"),
+            ),
+        ]);
+        let artifact = make_artifact(
+            "app-1.0.0.jar",
+            "com/example/app/1.0.0/app-1.0.0.jar",
+            Some("1.0.0"),
+        );
+        let mut deps: Vec<(String, Option<String>, String)> =
+            DependencyScanner::extract_dependencies(&artifact, None, &Bytes::from(fat))
+                .into_iter()
+                .map(|d| (d.name, d.version, d.ecosystem))
+                .collect();
+        deps.sort();
+        let want = |n: &str, v: &str| (n.to_string(), Some(v.to_string()), "Maven".to_string());
+        assert_eq!(
+            deps,
+            vec![
+                want("com.fasterxml.jackson.core:jackson-databind", "2.9.10"),
+                want("commons-collections:commons-collections", "3.2.1"),
+                want("org.apache.logging.log4j:log4j-core", "2.14.1"),
+            ]
+        );
+    }
+
+    /// #5666: a shaded jar carries the `pom.properties` of what it bundles
+    /// beside its own; a war bundles under `WEB-INF/lib/`. A renamed archive
+    /// outside a Maven layout keeps its own coordinate out by file name, and
+    /// a jar that is not a zip yields nothing rather than an error.
+    #[test]
+    fn test_extract_dependencies_shaded_jar_war_and_garbage() {
+        let shaded = zip_owned(vec![
+            pom_properties_entry("org.example", "tool", "2.1"),
+            pom_properties_entry("com.google.guava", "guava", "20.0"),
+        ]);
+        let artifact = make_artifact("tool-2.1-all.jar", "uploads/tool-2.1-all.jar", None);
+        let deps = DependencyScanner::extract_dependencies(&artifact, None, &Bytes::from(shaded));
+        assert_eq!(deps.len(), 1, "{deps:?}");
+        assert_eq!(deps[0].name, "com.google.guava:guava");
+        assert_eq!(deps[0].version.as_deref(), Some("20.0"));
+
+        let war = zip_owned(vec![(
+            "WEB-INF/lib/snakeyaml-1.26.jar".into(),
+            zip_owned(vec![pom_properties_entry("org.yaml", "snakeyaml", "1.26")]),
+        )]);
+        let artifact = make_artifact("site.WAR", "site.WAR", None);
+        let deps = DependencyScanner::extract_dependencies(&artifact, None, &Bytes::from(war));
+        assert_eq!(deps.len(), 1, "{deps:?}");
+        assert_eq!(deps[0].name, "org.yaml:snakeyaml");
+
+        let artifact = make_artifact("broken.jar", "broken.jar", None);
+        assert!(DependencyScanner::extract_dependencies(
+            &artifact,
+            None,
+            &Bytes::from_static(b"not a zip")
+        )
+        .is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -27055,6 +27992,7 @@ tonic-build = "0.12"
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         }
     }
 
@@ -27106,6 +28044,7 @@ tonic-build = "0.12"
             manifest_body: None,
             expected_component: Some(expected),
             require_nonempty_catalog: false,
+            repository_format: None,
         }
     }
 
@@ -27543,6 +28482,7 @@ tonic-build = "0.12"
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: true,
+            repository_format: None,
         }
     }
 
@@ -28420,6 +29360,7 @@ tonic-build = "0.12"
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
 
         assert!(scanner.is_applicable_for_target(&target));
@@ -28446,6 +29387,7 @@ tonic-build = "0.12"
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
 
         assert!(scanner.is_applicable_for_target(&target));
@@ -29735,6 +30677,148 @@ tonic-build = "0.12"
         fx.teardown().await;
     }
 
+    /// A `ScannerService` over the fixture with one never-applicable scanner,
+    /// for the #5830 early-return tests: they return before any scanner runs.
+    fn early_return_scanner(fx: &crate::api::handlers::test_db_helpers::Fixture) -> ScannerService {
+        ScannerService {
+            db: fx.pool.clone(),
+            scanners: vec![Arc::new(NeverApplicableScanner)],
+            scan_result_service: Arc::new(ScanResultService::new(fx.pool.clone())),
+            scan_config_service: Arc::new(ScanConfigService::new(fx.pool.clone())),
+            storage: fx.state.storage.clone(),
+            storage_registry: fx.state.storage_registry.clone(),
+            storage_base_path: fx.storage_dir.to_string_lossy().into_owned(),
+            scan_workspace_path: fx
+                .storage_dir
+                .join("scan-workspace")
+                .to_string_lossy()
+                .into_owned(),
+            dependency_track: None,
+        }
+    }
+
+    async fn scan_row_state(
+        pool: &PgPool,
+        scan_id: Uuid,
+    ) -> (String, Option<String>, bool, String) {
+        sqlx::query_as(
+            "SELECT status, error_message, completed_at IS NOT NULL, inventory_status \
+             FROM scan_results WHERE id = $1",
+        )
+        .bind(scan_id)
+        .fetch_one(pool)
+        .await
+        .expect("read scan row")
+    }
+
+    /// #5830: a manual scan whose blob is gone from storage returns before any
+    /// scanner runs. Its pre-allocated rows must end `failed` with the storage
+    /// error at once, not stay `running` until the stuck-scan janitor; a row
+    /// already terminal is left alone, and the artifact is flagged as for any
+    /// failed scan.
+    #[tokio::test]
+    async fn test_scan_with_prepared_fails_rows_when_blob_is_missing() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        // No blob is written under this key.
+        let artifact_id = insert_minimal_artifact(&fx.pool, fx.repo_id, &fresh_checksum()).await;
+        let scanner = early_return_scanner(&fx);
+        let grype = scanner
+            .scan_result_service
+            .create_scan_result(artifact_id, fx.repo_id, "grype")
+            .await
+            .expect("pre-allocate running scan");
+        let finished = scanner
+            .scan_result_service
+            .create_scan_result(artifact_id, fx.repo_id, "openscap")
+            .await
+            .expect("pre-allocate second scan");
+        sqlx::query(
+            "UPDATE scan_results SET status = 'completed', completed_at = NOW() WHERE id = $1",
+        )
+        .bind(finished.id)
+        .execute(&fx.pool)
+        .await
+        .expect("complete second scan");
+
+        let mut prepared = HashMap::new();
+        prepared.insert("grype".to_string(), grype.id);
+        prepared.insert("openscap".to_string(), finished.id);
+        let err = scanner
+            .scan_artifact_with_prepared(artifact_id, prepared, true, true)
+            .await
+            .expect_err("a missing blob fails the scan");
+
+        let (status, message, completed, inventory) = scan_row_state(&fx.pool, grype.id).await;
+        assert_eq!(status, "failed", "the row must not be left running");
+        assert!(completed, "a failed row is terminal");
+        assert_eq!(inventory, "failed");
+        assert_eq!(
+            message.as_deref(),
+            Some(format!("scan stopped before the grype scanner finished: {err}").as_str()),
+            "error_message carries the real error"
+        );
+
+        let (status, message, _, _) = scan_row_state(&fx.pool, finished.id).await;
+        assert_eq!(status, "completed", "a finished row is not touched");
+        assert_eq!(message, None);
+
+        let quarantine: Option<String> =
+            sqlx::query_scalar("SELECT quarantine_status FROM artifacts WHERE id = $1")
+                .bind(artifact_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("read artifact");
+        assert_eq!(
+            quarantine.as_deref(),
+            Some("flagged"),
+            "fail-closed as a scanner error"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    /// #5830: the artifact was deleted between the trigger and the task, so
+    /// the scan returns `NotFound` before loading anything. The prepared row
+    /// ends `failed` with that reason.
+    #[tokio::test]
+    async fn test_scan_with_prepared_fails_rows_when_artifact_was_deleted() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = insert_minimal_artifact(&fx.pool, fx.repo_id, &fresh_checksum()).await;
+        let scanner = early_return_scanner(&fx);
+        let row = scanner
+            .scan_result_service
+            .create_scan_result(artifact_id, fx.repo_id, "grype")
+            .await
+            .expect("pre-allocate running scan");
+        soft_delete_artifact(&fx.pool, artifact_id).await;
+
+        let mut prepared = HashMap::new();
+        prepared.insert("grype".to_string(), row.id);
+        let err = scanner
+            .scan_artifact_with_prepared(artifact_id, prepared, true, true)
+            .await
+            .expect_err("a deleted artifact fails the scan");
+        assert!(matches!(err, AppError::NotFound(_)), "{err}");
+
+        let (status, message, completed, _) = scan_row_state(&fx.pool, row.id).await;
+        assert_eq!(status, "failed");
+        assert!(completed);
+        assert_eq!(
+            message.as_deref(),
+            Some(format!("scan stopped before the grype scanner finished: {err}").as_str())
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
     #[tokio::test]
     async fn test_scan_artifact_inner_supplies_repository_context_to_scanners() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -30960,6 +32044,110 @@ tonic-build = "0.12"
             assert!(cves.contains(&"CVE-2024-0002".to_string()));
 
             finish(fx).await;
+        }
+
+        /// #5534: an image scan whose advisory lists several fixed versions in
+        /// one string. `affected_version`, `fixed_version` and `source` were
+        /// `VARCHAR(100)` (022), so the one batched findings insert was refused
+        /// and the scan lost all of its findings. Every finding must persist,
+        /// byte for byte, and the scan must complete with its real counts.
+        #[tokio::test]
+        async fn test_image_scan_stores_findings_with_long_version_and_source_strings() {
+            let long_fixed = (0..30)
+                .map(|i| format!("1.{i}.9"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let long_fixed = format!("{long_fixed}{}", "9".repeat(300 - long_fixed.len()));
+            let long_affected = format!(">= 0.1, < {}", "7".repeat(290));
+            let long_source = format!("scanner-adapter/trivy:{}", "d".repeat(278));
+            assert_eq!(long_fixed.len(), 300);
+            assert_eq!(long_affected.len(), 300);
+            assert_eq!(long_source.len(), 300);
+            let mut long = cve_finding(Severity::Critical, "CVE-2024-5534", "libexpat");
+            long.affected_version = Some(long_affected.clone());
+            long.fixed_version = Some(long_fixed.clone());
+            long.source = Some(long_source.clone());
+            let mut findings = two_cve_findings();
+            findings.push(long);
+
+            let Some((fx, artifact_id)) = setup_and_scan(
+                "image-long-versions",
+                vec![FakeScanner::completed("image", findings, Vec::new())],
+                None,
+            )
+            .await
+            else {
+                return;
+            };
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "image").await;
+            let scan_id = latest_scan_id(&fx.pool, artifact_id, "image").await;
+            let stored: Vec<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT affected_version, fixed_version, source FROM scan_findings \
+                 WHERE scan_result_id = $1 AND cve_id = 'CVE-2024-5534'",
+            )
+            .bind(scan_id)
+            .fetch_all(&fx.pool)
+            .await
+            .expect("read the long finding back");
+            let stored_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM scan_findings WHERE scan_result_id = $1")
+                    .bind(scan_id)
+                    .fetch_one(&fx.pool)
+                    .await
+                    .expect("count findings");
+            finish(fx).await;
+
+            assert_eq!(
+                row.status, "completed",
+                "a long version string must not fail the scan: {:?}",
+                row.error_message
+            );
+            assert_eq!(row.findings_count, 3);
+            assert_eq!(row.critical_count, 2);
+            assert_eq!(row.high_count, 1);
+            assert_eq!(stored_count, 3, "every finding of the scan must persist");
+            assert_eq!(
+                stored,
+                vec![(Some(long_affected), Some(long_fixed), Some(long_source))],
+                "the long values are stored whole, never truncated"
+            );
+        }
+
+        /// #5534: a finding the schema still cannot hold (here a `cve_id` past
+        /// `VARCHAR(30)`) fails ITS scan, fail-closed, with an error that names
+        /// the finding and the column, and the scanners after it in the set
+        /// still run. The findings insert's `?` used to abandon the row
+        /// `running` and skip every later scanner.
+        #[tokio::test]
+        async fn test_unstorable_finding_fails_its_scan_by_name_and_set_continues() {
+            let overlong_id = format!("VENDOR-ADVISORY-{}", "1".repeat(30));
+            let image = FakeScanner::completed(
+                "image",
+                vec![cve_finding(Severity::High, &overlong_id, "zlib")],
+                Vec::new(),
+            );
+            let Some((fx, artifact_id)) =
+                setup_and_scan("image-unstorable", vec![image, grype_completed()], None).await
+            else {
+                return;
+            };
+
+            let image_row = latest_scan_row(&fx.pool, artifact_id, "image").await;
+            let grype_row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            finish(fx).await;
+
+            assert_failed_closed(&image_row, "finding 1 of 1");
+            let message = image_row.error_message.unwrap_or_default();
+            assert!(
+                message.contains("`cve_id` is 46 characters") && message.contains(&overlong_id),
+                "the error must name the column and the finding, got: {message}"
+            );
+            assert_eq!(
+                grype_row.status, "completed",
+                "the next scanner in the set must still run"
+            );
+            assert_eq!(grype_row.findings_count, 2);
         }
 
         /// egress-restricted (SECURITY-CRITICAL): scanner cannot reach its vuln

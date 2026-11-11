@@ -92,7 +92,8 @@ use serde_json::json;
 use crate::api::extractors::request_base_url_from_request;
 use crate::api::middleware::auth::{
     extract_ticket_from_query, extract_visibility_token, extracted_basic_credentials,
-    is_browser_request, service_unavailable_response, try_resolve_auth_outcome, AuthOutcome,
+    is_browser_request, record_basic_refusal, service_unavailable_response,
+    try_resolve_auth_outcome_deferring_audit, AuthOutcome,
 };
 use crate::api::middleware::oci_errors::{is_oci_v2_path, oci_unauthorized_response};
 use crate::services::auth_service::AuthService;
@@ -303,6 +304,7 @@ fn defers_to_package_route(path: &str) -> bool {
         "/cocoapods",
         "/hex",
         "/huggingface",
+        "/mcp",
         "/jetbrains",
         "/agentplugins",
         "/chef",
@@ -382,7 +384,17 @@ pub async fn guest_access_guard(
     // `optional_auth_middleware` / `admin_middleware` re-resolve with
     // `allow_basic_api_token=false` and still refuse an API token as the Basic
     // password on the management API.
-    let outcome = try_resolve_auth_outcome(&state.auth_service, extracted, true).await;
+    // The `LOGIN_FAILED` row of a refused Basic password (#5653) is written
+    // below by whichever layer answers: here, unless the request is deferred
+    // to the package route, whose middleware re-resolves and records it.
+    let mut refused = None;
+    let outcome = try_resolve_auth_outcome_deferring_audit(
+        &state.auth_service,
+        extracted,
+        true,
+        &mut refused,
+    )
+    .await;
     // Browser-originated requests get the popup-free 401 variant so the web
     // UI can show its login / OIDC screen instead of the native Basic dialog
     // (#2936 / #3082). Classified from request headers only (Fetch Metadata /
@@ -405,6 +417,7 @@ pub async fn guest_access_guard(
     {
         return next.run(request).await;
     }
+    record_basic_refusal(&state.auth_service, refused, None).await;
     match guard_short_circuit(&outcome, for_browser, oci_base_url.as_deref()) {
         Some(response) => response,
         None => next.run(request).await,

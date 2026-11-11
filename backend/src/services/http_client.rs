@@ -11,6 +11,8 @@ use reqwest::tls::Certificate;
 use reqwest::ClientBuilder;
 use std::time::Duration;
 
+use crate::services::env_proxy_guard::EnvProxyGuard;
+
 /// Maximum number of redirects we will follow even if every hop passes
 /// the SSRF check. Matches reqwest's historical default and prevents
 /// loops or pathological chains from tying up workers.
@@ -68,10 +70,42 @@ fn log_proxy_env() {
                 no_proxy = ?no,
                 "HTTP proxy configuration detected"
             );
+            warn_on_env_proxy_posture(
+                crate::services::env_proxy_guard::upstream_env_proxy_mode(),
+                crate::api::validation::upstream_allow_private_ips_enabled(),
+            );
         } else {
             tracing::debug!("No HTTP proxy environment variables set");
         }
     });
+}
+
+/// Startup note on how the guarded clients use a detected environment proxy
+/// (#5459). Returns the message for tests.
+fn warn_on_env_proxy_posture(
+    mode: crate::services::env_proxy_guard::UpstreamEnvProxyMode,
+    upstream_allow_private_ips: bool,
+) -> Option<&'static str> {
+    use crate::services::env_proxy_guard::UpstreamEnvProxyMode;
+    match mode {
+        UpstreamEnvProxyMode::Ignore => {
+            tracing::info!(
+                "AK_UPSTREAM_ENV_PROXY=ignore: Remote and other upstream fetches connect \
+                 directly; webhook, SSO and internal-service requests still use the proxy"
+            );
+            None
+        }
+        UpstreamEnvProxyMode::Check if !upstream_allow_private_ips => {
+            const MSG: &str = "Outbound requests go through the environment proxy. Each \
+                 destination is resolved and checked here first, but the proxy resolves it \
+                 again on its own: give the proxy a destination policy that refuses loopback, \
+                 link-local, metadata and internal ranges, or set AK_UPSTREAM_ENV_PROXY=ignore \
+                 to keep upstream fetches off the proxy";
+            tracing::warn!(target: "security", "{MSG}");
+            Some(MSG)
+        }
+        UpstreamEnvProxyMode::Check => None,
+    }
 }
 
 /// Return a [`ClientBuilder`] pre-loaded with custom CA certificates when
@@ -81,12 +115,51 @@ fn log_proxy_env() {
 /// certificates. This is required for HTTPS connections to internal services
 /// (Artifactory, Nexus, remote repositories) that use certificates signed by
 /// a private CA.
+///
+/// Under an environment proxy the destination of every proxied request is
+/// checked first, or the proxy is not used at all with
+/// `AK_UPSTREAM_ENV_PROXY=ignore` (#5459, see
+/// [`crate::services::env_proxy_guard`]). A caller's later `.no_proxy()`
+/// removes the routing but keeps the destination-check connector layer, so
+/// the fail-closed checks continue for any destination the environment
+/// proxy would have carried; a caller with its own routing should start from
+/// [`base_client_builder_without_env_proxy`] instead.
 pub fn base_client_builder() -> ClientBuilder {
+    use crate::services::env_proxy_guard::{upstream_env_proxy_mode, UpstreamEnvProxyMode};
+    let guard = match upstream_env_proxy_mode() {
+        UpstreamEnvProxyMode::Check => Some(EnvProxyGuard::from_env(
+            crate::api::validation::OutboundUrlContext::Upstream,
+        )),
+        UpstreamEnvProxyMode::Ignore => None,
+    };
+    upstream_client_builder(guard)
+}
+
+/// [`base_client_builder`] that never uses the environment proxy, for a
+/// caller that sets its own routing (a per-repository `direct` or
+/// `explicit` egress proxy).
+pub fn base_client_builder_without_env_proxy() -> ClientBuilder {
+    upstream_client_builder(None)
+}
+
+/// [`base_client_builder`] with the environment proxy behind `guard`, or
+/// none at all.
+pub(crate) fn upstream_client_builder(guard: Option<EnvProxyGuard>) -> ClientBuilder {
     log_proxy_env();
 
-    let builder = plain_client_builder()
-        .redirect(ssrf_redirect_policy())
-        .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver())
+    let builder = plain_client_builder().redirect(ssrf_redirect_policy(guard.clone()));
+    let builder = match guard {
+        Some(guard) => with_guarded_env_proxy(
+            builder,
+            &guard,
+            crate::services::ssrf_dns::ssrf_guard_resolver,
+        ),
+        // No proxy is dialed, so nothing may be exempted from the guard.
+        None => builder.no_proxy().dns_resolver(
+            crate::services::ssrf_dns::ssrf_guard_resolver_exempting(Default::default()),
+        ),
+    };
+    let builder = builder
         // This crate's own `Cargo.toml` requests only `["json", "stream",
         // "form"]`, but Cargo unifies features for a single resolved
         // `reqwest` version across the whole build: the `opensearch` crate
@@ -162,9 +235,15 @@ pub fn base_client_builder() -> ClientBuilder {
 pub fn internal_service_client_builder() -> ClientBuilder {
     log_proxy_env();
 
-    let builder = plain_client_builder()
-        .redirect(ssrf_internal_redirect_policy())
-        .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver_internal());
+    let guard =
+        EnvProxyGuard::from_env(crate::api::validation::OutboundUrlContext::TrustedInternal);
+    let builder =
+        plain_client_builder().redirect(ssrf_internal_redirect_policy(Some(guard.clone())));
+    let builder = with_guarded_env_proxy(
+        builder,
+        &guard,
+        crate::services::ssrf_dns::ssrf_guard_resolver_internal,
+    );
 
     apply_custom_ca_cert(builder)
 }
@@ -182,9 +261,17 @@ pub fn internal_service_client_builder() -> ClientBuilder {
 pub fn webhook_client_builder() -> ClientBuilder {
     log_proxy_env();
 
-    let builder = plain_client_builder()
-        .redirect(ssrf_webhook_redirect_policy())
-        .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver_webhook());
+    let guard = EnvProxyGuard::from_env(crate::api::validation::OutboundUrlContext::Webhook);
+    let builder =
+        plain_client_builder().redirect(ssrf_webhook_redirect_policy(Some(guard.clone())));
+    let builder = without_idle_plain_http_proxy_connections(
+        with_guarded_env_proxy(
+            builder,
+            &guard,
+            crate::services::ssrf_dns::ssrf_guard_resolver_webhook,
+        ),
+        &guard,
+    );
 
     apply_custom_ca_cert(builder)
 }
@@ -214,15 +301,42 @@ pub fn webhook_client() -> reqwest::Client {
 /// Requests carry `User-Agent: artifact-keeper/<version>`
 /// ([`SSO_USER_AGENT`]): web application firewalls in front of identity
 /// providers commonly refuse requests without one (#5036).
+///
+/// Every request is bounded by [`SSO_CONNECT_TIMEOUT`] and
+/// [`SSO_REQUEST_TIMEOUT`] (#5485). Without them a stalled identity provider
+/// (accepting the TCP connection and then never answering) held each SSO
+/// login, callback and token exchange open until the global request timeout,
+/// and a burst of logins tied up that many connections and tasks. A
+/// per-request `RequestBuilder::timeout` still overrides the total for the
+/// callers that want a tighter bound.
 pub fn sso_client_builder() -> ClientBuilder {
     log_proxy_env();
 
-    let builder = plain_client_builder()
-        .redirect(ssrf_sso_redirect_policy())
-        .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver_sso());
+    let guard = EnvProxyGuard::from_env(crate::api::validation::OutboundUrlContext::SsoDiscovery);
+    let builder = plain_client_builder().redirect(ssrf_sso_redirect_policy(Some(guard.clone())));
+    let builder = without_idle_plain_http_proxy_connections(
+        with_guarded_env_proxy(
+            builder,
+            &guard,
+            crate::services::ssrf_dns::ssrf_guard_resolver_sso,
+        ),
+        &guard,
+    );
 
     apply_custom_ca_cert(builder)
+        .connect_timeout(SSO_CONNECT_TIMEOUT)
+        .timeout(SSO_REQUEST_TIMEOUT)
 }
+
+/// Connect timeout of the SSO/OIDC-fetch client (#5485); the same 10 s the
+/// large-object and proxy clients use.
+pub const SSO_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Total per-request timeout of the SSO/OIDC-fetch client (#5485): connect,
+/// headers and body of one discovery, token, JWKS or userinfo call. Identity
+/// providers answer these in well under a second; 30 s leaves room for a slow
+/// one while staying far below the global request timeout.
+pub const SSO_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The `User-Agent` the SSO/OIDC-fetch client sends (#5036).
 pub const SSO_USER_AGENT: &str = DEFAULT_USER_AGENT;
@@ -265,7 +379,7 @@ pub async fn read_json_capped<T: serde::de::DeserializeOwned>(
 
 /// The body-reading half of [`read_json_capped`]: the response bytes, or an
 /// error once they would exceed `max_bytes`.
-async fn read_body_capped(
+pub(crate) async fn read_body_capped(
     mut response: reqwest::Response,
     max_bytes: usize,
 ) -> std::result::Result<Vec<u8>, String> {
@@ -500,13 +614,44 @@ pub fn proxy_client() -> reqwest::Client {
         .expect("failed to build remote-instance proxy HTTP client")
 }
 
+/// Route `builder` through the environment proxy behind `guard`, checking
+/// each new connection's destination (#5459), with the trust class's SSRF
+/// resolver for direct connections and the proxy's own name.
+fn with_guarded_env_proxy(
+    builder: ClientBuilder,
+    guard: &EnvProxyGuard,
+    resolver: fn() -> std::sync::Arc<dyn reqwest::dns::Resolve>,
+) -> ClientBuilder {
+    builder
+        .proxy(guard.reqwest_proxy())
+        .connector_layer(guard.layer())
+        .dns_resolver(resolver())
+}
+
+/// Keep no idle connections when plain-HTTP requests are forward-proxied:
+/// such a connection is pooled per destination and reused without passing
+/// the connector layer's check again. For the low-volume webhook and SSO
+/// clients, whose requests do not go through the upstream send path's
+/// per-request check (#5459).
+fn without_idle_plain_http_proxy_connections(
+    builder: ClientBuilder,
+    guard: &EnvProxyGuard,
+) -> ClientBuilder {
+    if guard.proxies_plain_http() {
+        builder.pool_max_idle_per_host(0)
+    } else {
+        builder
+    }
+}
+
 /// Redirect policy that re-runs the SSRF allow-list on every hop. An
 /// upstream returning `302 Location: http://[::ffff:127.0.0.1]/` would
 /// otherwise defeat the entry-point validator. Caps at
 /// [`MAX_REDIRECTS`] hops so a redirect loop cannot tie up a worker.
-fn ssrf_redirect_policy() -> Policy {
+fn ssrf_redirect_policy(guard: Option<EnvProxyGuard>) -> Policy {
     ssrf_redirect_policy_with(
         crate::api::validation::is_blocked_url,
+        guard,
         "http-client redirect",
         "upstream",
     )
@@ -517,9 +662,10 @@ fn ssrf_redirect_policy() -> Policy {
 /// trusted-internal block-list so a redirect to a private address is allowed
 /// while a redirect that pivots to a cloud-metadata / loopback / link-local
 /// target is still refused.
-fn ssrf_internal_redirect_policy() -> Policy {
+fn ssrf_internal_redirect_policy(guard: Option<EnvProxyGuard>) -> Policy {
     ssrf_redirect_policy_with(
         crate::api::validation::is_blocked_url_internal,
+        guard,
         "internal-service redirect",
         "internal",
     )
@@ -530,9 +676,10 @@ fn ssrf_internal_redirect_policy() -> Policy {
 /// a redirect hop honors `WEBHOOK_ALLOW_PRIVATE_IPS` /
 /// `AK_SSRF_ALLOW_PRIVATE_CIDRS` while metadata / loopback / link-local
 /// pivots are still refused.
-fn ssrf_webhook_redirect_policy() -> Policy {
+fn ssrf_webhook_redirect_policy(guard: Option<EnvProxyGuard>) -> Policy {
     ssrf_redirect_policy_with(
         crate::api::validation::is_blocked_url_webhook,
+        guard,
         "webhook redirect",
         "webhook",
     )
@@ -543,9 +690,10 @@ fn ssrf_webhook_redirect_policy() -> Policy {
 /// redirect hop honors `SSO_ALLOW_PRIVATE_IPS` /
 /// `AK_SSRF_ALLOW_PRIVATE_CIDRS` while metadata / loopback / link-local
 /// pivots are still refused.
-fn ssrf_sso_redirect_policy() -> Policy {
+fn ssrf_sso_redirect_policy(guard: Option<EnvProxyGuard>) -> Policy {
     ssrf_redirect_policy_with(
         crate::api::validation::is_blocked_url_sso,
+        guard,
         "sso redirect",
         "sso",
     )
@@ -554,13 +702,23 @@ fn ssrf_sso_redirect_policy() -> Policy {
 /// Shared redirect-policy body: re-run `is_blocked` on every hop and refuse
 /// the request if it returns a block reason, capping at [`MAX_REDIRECTS`].
 /// The `is_blocked` fn selects the trust class (upstream vs trusted-internal).
+/// A hop the environment proxy behind `guard` would carry is checked in the
+/// guard's trust class with a lookup failure refused, since the proxy
+/// resolves the host on its own (#5459).
 fn ssrf_redirect_policy_with(
     is_blocked: fn(&reqwest::Url) -> Option<crate::api::validation::BlockReason>,
+    guard: Option<EnvProxyGuard>,
     context_label: &'static str,
     surface: &'static str,
 ) -> Policy {
     Policy::custom(move |attempt| {
-        if let Some(reason) = is_blocked(attempt.url()) {
+        let blocked = match &guard {
+            Some(g) if g.proxies(attempt.url()) => {
+                crate::api::validation::is_blocked_url_fail_closed(attempt.url(), g.ctx())
+            }
+            _ => is_blocked(attempt.url()),
+        };
+        if let Some(reason) = blocked {
             tracing::warn!(
                 target: "security",
                 redirect_url = %attempt.url(),
@@ -592,6 +750,7 @@ mod tests {
     use super::{
         base_client_builder, default_client, internal_service_client_builder,
         large_object_client_builder, sso_client_builder, webhook_client_builder,
+        SSO_CONNECT_TIMEOUT, SSO_REQUEST_TIMEOUT,
     };
     use std::io::Write;
     use std::time::Duration;
@@ -858,7 +1017,7 @@ mod tests {
         });
 
         let client = loopback_client_from(reqwest::Client::builder().redirect(
-            super::ssrf_redirect_policy_with(|_| None, "test redirect", "upstream"),
+            super::ssrf_redirect_policy_with(|_| None, None, "test redirect", "upstream"),
         ));
         let response = client
             .get(format!("http://127.0.0.1:{entry_port}/start"))
@@ -996,6 +1155,24 @@ mod tests {
             accept_result.is_err(),
             "internal client must never connect to a loopback listener: {accept_result:?}"
         );
+    }
+
+    /// #5485: the SSO client carries both a connect and a total timeout, so
+    /// a stalled identity provider cannot pin a login until the global
+    /// request timeout. `ClientBuilder`'s `Debug` lists only the timeouts that
+    /// were set, which is what this reads.
+    #[test]
+    fn test_sso_client_builder_sets_connect_and_request_timeouts_5485() {
+        let debug = format!("{:?}", sso_client_builder());
+        assert!(
+            debug.contains(&format!("connect_timeout: {SSO_CONNECT_TIMEOUT:?}")),
+            "SSO client has no connect timeout: {debug}"
+        );
+        assert!(
+            debug.contains(&format!(" timeout: {SSO_REQUEST_TIMEOUT:?}")),
+            "SSO client has no request timeout: {debug}"
+        );
+        assert!(SSO_CONNECT_TIMEOUT <= SSO_REQUEST_TIMEOUT);
     }
 
     #[test]
@@ -1326,6 +1503,711 @@ mod tests {
             "the request through an unexempted loopback proxy must fail at the \
              resolver instead of connecting"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // #5459: a proxied destination gets the same address check as a direct one
+    // -------------------------------------------------------------------
+
+    use crate::api::validation::{BlockReason, OutboundUrlContext};
+    use crate::services::env_proxy_guard::{EnvProxyGuard, Lookup};
+
+    /// The six case variants of the proxy variables, each with the schemes
+    /// `reqwest` routes through it.
+    const PROXY_VAR_SCHEMES_5459: [(&str, &[&str]); 6] = [
+        ("HTTP_PROXY", &["http"]),
+        ("http_proxy", &["http"]),
+        ("HTTPS_PROXY", &["https"]),
+        ("https_proxy", &["https"]),
+        ("ALL_PROXY", &["http", "https"]),
+        ("all_proxy", &["http", "https"]),
+    ];
+
+    /// Every variable the environment proxy matcher and the upstream mode
+    /// read, plus a mixed-case spelling the matcher must ignore.
+    const ENV_PROXY_VARS_5459: [&str; 11] = [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        "REQUEST_METHOD",
+        "Http_Proxy",
+        "AK_UPSTREAM_ENV_PROXY",
+    ];
+
+    /// Run `build` with only `vars` set among [`ENV_PROXY_VARS_5459`], under
+    /// [`PROXY_ENV_LOCK`], and restore the previous values. The matcher and
+    /// the resolver's exempt set are read when a builder or guard is
+    /// constructed, so `build` must construct it.
+    fn with_env_proxy_5459<R>(vars: &[(&str, &str)], build: impl FnOnce() -> R) -> R {
+        let _guard = PROXY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous: Vec<(&str, Option<String>)> = ENV_PROXY_VARS_5459
+            .iter()
+            .map(|v| (*v, std::env::var(v).ok()))
+            .collect();
+        for v in ENV_PROXY_VARS_5459 {
+            std::env::remove_var(v);
+        }
+        for (k, v) in vars {
+            std::env::set_var(k, v);
+        }
+        let out = build();
+        for (k, v) in previous {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        out
+    }
+
+    /// A pinned resolver: `rebound.example` answers loopback,
+    /// `unresolvable.example` fails, `empty.example` answers nothing, every
+    /// other name a public address.
+    fn pinned_lookup_5459() -> Lookup {
+        std::sync::Arc::new(|host: String| {
+            Box::pin(async move {
+                match host.as_str() {
+                    "rebound.example" => Ok(vec!["127.0.0.1".parse().unwrap()]),
+                    "unresolvable.example" => Err(std::io::Error::other("SERVFAIL")),
+                    "empty.example" => Ok(vec![]),
+                    _ => Ok(vec!["93.184.216.34".parse().unwrap()]),
+                }
+            })
+        })
+    }
+
+    /// A resolver that answers public until `rebound` is set, then loopback:
+    /// a TTL-0 rebinding after the first fetch.
+    fn flipping_lookup_5459(rebound: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Lookup {
+        std::sync::Arc::new(move |_host: String| {
+            let rebound = rebound.load(std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(vec![if rebound {
+                    "127.0.0.1"
+                } else {
+                    "93.184.216.34"
+                }
+                .parse()
+                .unwrap()])
+            })
+        })
+    }
+
+    fn guard_5459(vars: &[(&str, &str)], lookup: Lookup) -> EnvProxyGuard {
+        with_env_proxy_5459(vars, || {
+            EnvProxyGuard::with_lookup(OutboundUrlContext::Upstream, lookup)
+        })
+    }
+
+    fn url_5459(url: &str) -> reqwest::Url {
+        reqwest::Url::parse(url).unwrap()
+    }
+
+    /// Every case variant proxies exactly the schemes `reqwest` proxies for
+    /// it, and the proxy URL handed to `reqwest` keeps its credentials.
+    #[test]
+    fn test_every_proxy_variable_case_routes_like_reqwest_5459() {
+        let proxy = "http://user:p%40ss@proxy.example:3128";
+        for (var, schemes) in PROXY_VAR_SCHEMES_5459 {
+            let guard = guard_5459(&[(var, proxy)], pinned_lookup_5459());
+            for scheme in ["http", "https"] {
+                assert_eq!(
+                    guard.proxies(&url_5459(&format!("{scheme}://public.example/"))),
+                    schemes.contains(&scheme),
+                    "{var}: {scheme}"
+                );
+            }
+            assert_eq!(
+                guard.proxies_plain_http(),
+                schemes.contains(&"http"),
+                "{var}"
+            );
+            let matcher = with_env_proxy_5459(&[(var, proxy)], || {
+                hyper_util::client::proxy::matcher::Matcher::from_system()
+            });
+            let dst: http::Uri = format!("{}://public.example/", schemes[0]).parse().unwrap();
+            let url = crate::services::env_proxy_guard::intercept_proxy_url(
+                &matcher.intercept(&dst).expect("intercepted"),
+            );
+            assert_eq!(
+                (url.host_str(), url.port(), url.username(), url.password()),
+                (Some("proxy.example"), Some(3128), "user", Some("p%40ss")),
+                "{var}"
+            );
+        }
+    }
+
+    /// `NO_PROXY` (either case) sends a destination direct, where the SSRF
+    /// resolver checks it; a mixed-case variable, an empty upper-case one in
+    /// front of a lower-case one, and a CGI environment configure no proxy,
+    /// exactly as for `reqwest`'s own environment proxy.
+    #[test]
+    fn test_env_proxy_routing_matches_reqwest_semantics_5459() {
+        for no in ["NO_PROXY", "no_proxy"] {
+            let guard = guard_5459(
+                &[
+                    ("HTTP_PROXY", "http://proxy.example:3128"),
+                    (no, "rebound.example,10.0.0.0/8"),
+                ],
+                pinned_lookup_5459(),
+            );
+            assert!(!guard.proxies(&url_5459("http://rebound.example/")), "{no}");
+            assert!(!guard.proxies(&url_5459("http://10.1.2.3/")), "{no}");
+            assert!(guard.proxies(&url_5459("http://public.example/")), "{no}");
+        }
+        for vars in [
+            &[("Http_Proxy", "http://proxy.example:3128")][..],
+            &[
+                ("HTTP_PROXY", ""),
+                ("http_proxy", "http://proxy.example:3128"),
+            ][..],
+            &[
+                ("HTTP_PROXY", "http://proxy.example:3128"),
+                ("REQUEST_METHOD", "GET"),
+            ][..],
+        ] {
+            let guard = guard_5459(vars, pinned_lookup_5459());
+            assert!(
+                !guard.proxies(&url_5459("http://rebound.example/")),
+                "{vars:?}"
+            );
+            assert!(!guard.proxies_plain_http(), "{vars:?}");
+        }
+    }
+
+    /// A `NO_PROXY` suffix that would also cover a probe host (`.invalid`)
+    /// must not switch the checks off while real hosts are still proxied.
+    #[test]
+    fn test_no_proxy_suffix_does_not_disable_the_guard_5459() {
+        for no in [".invalid", "invalid", "localhost,.local,.invalid"] {
+            let guard = guard_5459(
+                &[("HTTP_PROXY", "http://corp:3128"), ("NO_PROXY", no)],
+                pinned_lookup_5459(),
+            );
+            assert!(guard.proxies(&url_5459("http://public.example/")), "{no}");
+            assert!(!guard.proxies(&url_5459("http://x.invalid/")), "{no}");
+            assert!(guard.proxies_plain_http(), "{no}");
+        }
+    }
+
+    /// The destination check: names and literals the policy refuses, a name
+    /// resolving to loopback, and a name that does not resolve (or resolves
+    /// to nothing) are refused; a public name or literal passes.
+    #[tokio::test]
+    async fn test_proxied_destination_check_fails_closed_5459() {
+        let guard = guard_5459(
+            &[("HTTP_PROXY", "http://proxy.example:3128")],
+            pinned_lookup_5459(),
+        );
+        for (host, refused) in [
+            ("public.example", None),
+            ("93.184.216.34", None),
+            ("rebound.example", Some("ip")),
+            ("127.0.0.1", Some("ip")),
+            ("[::1]", Some("ip")),
+            ("localhost", Some("hostname")),
+            ("unresolvable.example", Some("unresolved")),
+            ("empty.example", Some("unresolved")),
+        ] {
+            let got = guard.check(host).await.err();
+            assert_eq!(
+                got.as_ref().map(BlockReason::metric_label),
+                refused,
+                "{host}: {got:?}"
+            );
+        }
+    }
+
+    /// A `Basic` value decodes back to the credentials it carries.
+    #[test]
+    fn test_decode_basic_auth_5459() {
+        use crate::services::env_proxy_guard::decode_basic_auth;
+        let value = reqwest::header::HeaderValue::from_static("Basic dXNlcjpwOnNz");
+        assert_eq!(
+            decode_basic_auth(&value),
+            Some(("user".to_string(), "p:ss".to_string()))
+        );
+        for bad in ["Bearer dXNlcjpw", "Basic !!", "Basic dXNlcg=="] {
+            let value = reqwest::header::HeaderValue::from_static(bad);
+            assert_eq!(decode_basic_auth(&value), None, "{bad}");
+        }
+    }
+
+    /// The connector request's `Debug` form names its destination; anything
+    /// else reads as unreadable (and is refused by the layer).
+    #[test]
+    fn test_destination_from_connector_request_5459() {
+        use crate::services::env_proxy_guard::destination_from_connector_request as parse;
+        let uri = parse("Unnameable(http://public.example:8080/)").expect("parsed");
+        assert_eq!(
+            (uri.host(), uri.port_u16()),
+            (Some("public.example"), Some(8080))
+        );
+        assert!(parse("Unnameable(https://[::1]:443/)").is_some());
+        for bad in [
+            "Other(http://a/)",
+            "Unnameable(/relative)",
+            "Unnameable(http://a/",
+        ] {
+            assert!(parse(bad).is_none(), "{bad}");
+        }
+    }
+
+    /// `AK_UPSTREAM_ENV_PROXY`: `check` by default and for anything
+    /// unrecognised, `ignore` in either case.
+    #[test]
+    fn test_upstream_env_proxy_mode_5459() {
+        use crate::services::env_proxy_guard::{upstream_env_proxy_mode, UpstreamEnvProxyMode};
+        for (value, mode) in [
+            (None, UpstreamEnvProxyMode::Check),
+            (Some("check"), UpstreamEnvProxyMode::Check),
+            (Some(" IGNORE "), UpstreamEnvProxyMode::Ignore),
+            (Some("off"), UpstreamEnvProxyMode::Check),
+        ] {
+            let vars: Vec<(&str, &str)> = value
+                .map(|v| ("AK_UPSTREAM_ENV_PROXY", v))
+                .into_iter()
+                .collect();
+            assert_eq!(
+                with_env_proxy_5459(&vars, upstream_env_proxy_mode),
+                mode,
+                "{value:?}"
+            );
+        }
+    }
+
+    /// The startup warning fires when guarded clients inherit the proxy with
+    /// private upstreams disallowed, and names both remedies.
+    #[test]
+    fn test_env_proxy_startup_warning_5459() {
+        use crate::services::env_proxy_guard::UpstreamEnvProxyMode;
+        let msg =
+            super::warn_on_env_proxy_posture(UpstreamEnvProxyMode::Check, false).expect("warning");
+        assert!(msg.contains("destination policy"), "{msg}");
+        assert!(msg.contains("AK_UPSTREAM_ENV_PROXY=ignore"), "{msg}");
+        assert_eq!(
+            super::warn_on_env_proxy_posture(UpstreamEnvProxyMode::Check, true),
+            None
+        );
+        assert_eq!(
+            super::warn_on_env_proxy_posture(UpstreamEnvProxyMode::Ignore, false),
+            None
+        );
+    }
+
+    /// A local stand-in for the operator's proxy. The URL is an IP literal,
+    /// so no exempt-set entry is involved.
+    async fn proxy_listener_5459() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy listener");
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        (listener, url)
+    }
+
+    /// The first line of the next request the proxy listener receives, or
+    /// `None` when no connection arrives within `wait`. `respond` is written
+    /// back before the connection closes.
+    async fn next_proxy_request_5459(
+        listener: &tokio::net::TcpListener,
+        wait: Duration,
+        respond: &[u8],
+    ) -> Option<String> {
+        let (mut sock, _) = tokio::time::timeout(wait, listener.accept())
+            .await
+            .ok()?
+            .ok()?;
+        let mut buf = vec![0u8; 4096];
+        let n = sock.read(&mut buf).await.unwrap_or(0);
+        let _ = sock.write_all(respond).await;
+        let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+        Some(head.lines().next().unwrap_or_default().to_string())
+    }
+
+    /// `(connection number, request line)` of every request a test proxy saw.
+    type SeenRequests5459 = std::sync::Arc<std::sync::Mutex<Vec<(usize, String)>>>;
+
+    /// A keep-alive proxy: serves every request on every connection with a
+    /// small 200, recording `(connection number, request line)`.
+    fn keep_alive_proxy_5459(
+        listener: tokio::net::TcpListener,
+    ) -> (SeenRequests5459, tokio::task::JoinHandle<()>) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&seen);
+        let task = tokio::spawn(async move {
+            let mut conn = 0;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                conn += 1;
+                let log = std::sync::Arc::clone(&log);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    loop {
+                        let Ok(n) = sock.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        let line = head.lines().next().unwrap_or_default().to_string();
+                        log.lock().unwrap().push((conn, line));
+                        if sock
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (seen, task)
+    }
+
+    fn assert_ssrf_refusal_5459(result: reqwest::Result<reqwest::Response>, what: &str) {
+        let err = result.expect_err(what);
+        assert!(
+            crate::services::ssrf_refusal::is_ssrf_refusal_error(&err),
+            "{what}: expected an SSRF refusal, got {err:?}"
+        );
+    }
+
+    fn build_5459(builder: reqwest::ClientBuilder) -> reqwest::Client {
+        builder
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("build client")
+    }
+
+    /// The release-gate case: with each case variant of the proxy variables
+    /// pointing at a live proxy, the production upstream client refuses a
+    /// loopback destination (literal and host name) before anything reaches
+    /// the proxy, for plain HTTP (absolute-form request) and HTTPS
+    /// (`CONNECT`) alike. Before #5459 every one of these went to the proxy.
+    #[tokio::test]
+    async fn test_upstream_client_refuses_loopback_through_every_env_proxy_5459() {
+        for (var, schemes) in PROXY_VAR_SCHEMES_5459 {
+            let (listener, proxy_url) = proxy_listener_5459().await;
+            let client = with_env_proxy_5459(&[(var, proxy_url.as_str())], || {
+                build_5459(base_client_builder())
+            });
+            for scheme in schemes {
+                for host in ["127.0.0.1", "localhost", "[::1]"] {
+                    let dest = format!("{scheme}://{host}:9/simple/");
+                    assert_ssrf_refusal_5459(
+                        client.get(&dest).send().await,
+                        &format!("{var}: {dest}"),
+                    );
+                    let reached =
+                        next_proxy_request_5459(&listener, Duration::from_millis(200), b"").await;
+                    assert_eq!(reached, None, "{var}: {dest} reached the proxy");
+                }
+            }
+        }
+    }
+
+    /// The live form of the `.invalid` case: with `NO_PROXY` naming that
+    /// suffix, a loopback destination is still refused before the proxy.
+    #[tokio::test]
+    async fn test_no_proxy_invalid_suffix_still_refuses_loopback_5459() {
+        let (listener, proxy_url) = proxy_listener_5459().await;
+        let client = with_env_proxy_5459(
+            &[
+                ("HTTP_PROXY", proxy_url.as_str()),
+                ("NO_PROXY", "localhost,.local,.invalid"),
+            ],
+            || build_5459(base_client_builder()),
+        );
+        for dest in ["http://127.0.0.1:9/pkg", "http://[::1]:9/pkg"] {
+            assert_ssrf_refusal_5459(client.get(dest).send().await, dest);
+            let reached = next_proxy_request_5459(&listener, Duration::from_millis(200), b"").await;
+            assert_eq!(reached, None, "{dest} reached the proxy");
+        }
+    }
+
+    /// The production upstream builder with a pinned resolver behind its
+    /// destination check: a host name resolving to loopback, and one that
+    /// does not resolve, are refused before the proxy is contacted; a public
+    /// one still goes through it, as an absolute-form `GET` for `http://` and
+    /// as `CONNECT` for `https://` (the evidence split of #5459: only the
+    /// former delivers a response body to this client).
+    #[tokio::test]
+    async fn test_proxied_hostname_resolving_to_loopback_is_refused_5459() {
+        for (var, schemes) in PROXY_VAR_SCHEMES_5459 {
+            let (listener, proxy_url) = proxy_listener_5459().await;
+            let client = with_env_proxy_5459(&[(var, proxy_url.as_str())], || {
+                build_5459(super::upstream_client_builder(Some(
+                    EnvProxyGuard::with_lookup(OutboundUrlContext::Upstream, pinned_lookup_5459()),
+                )))
+            });
+            for scheme in schemes {
+                for host in ["rebound.example", "unresolvable.example"] {
+                    assert_ssrf_refusal_5459(
+                        client
+                            .get(format!("{scheme}://{host}/simple/"))
+                            .send()
+                            .await,
+                        &format!("{var}: {scheme}://{host}"),
+                    );
+                    let reached =
+                        next_proxy_request_5459(&listener, Duration::from_millis(200), b"").await;
+                    assert_eq!(reached, None, "{var}: {scheme}://{host} reached the proxy");
+                }
+
+                let request = {
+                    let client = client.clone();
+                    let url = format!("{scheme}://public.example/simple/");
+                    tokio::spawn(async move { client.get(url).send().await.is_ok() })
+                };
+                let line = next_proxy_request_5459(
+                    &listener,
+                    Duration::from_secs(5),
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap_or_else(|| panic!("{var}: {scheme}: public host never reached the proxy"));
+                let expected = match *scheme {
+                    "http" => "GET http://public.example/simple/ HTTP/1.1",
+                    _ => "CONNECT public.example:443 HTTP/1.1",
+                };
+                assert_eq!(line, expected, "{var}: {scheme}");
+                let _ = tokio::time::timeout(Duration::from_secs(5), request).await;
+            }
+        }
+    }
+
+    /// Installs a guard for the upstream send path's per-request check and
+    /// removes it again when dropped, so the test need not keep the proxy
+    /// variables set (outside [`PROXY_ENV_LOCK`]) while it sends.
+    struct UpstreamGuardOverride5459;
+
+    impl UpstreamGuardOverride5459 {
+        fn install(guard: EnvProxyGuard) -> Self {
+            *crate::services::env_proxy_guard::TEST_UPSTREAM_GUARD
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(guard);
+            Self
+        }
+    }
+
+    impl Drop for UpstreamGuardOverride5459 {
+        fn drop(&mut self) {
+            *crate::services::env_proxy_guard::TEST_UPSTREAM_GUARD
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+    }
+
+    /// The keep-alive bypass: the first plain-HTTP fetch of a host goes
+    /// through the proxy on a pooled connection, then its DNS answer turns
+    /// to loopback. The upstream send path refuses the next request before
+    /// it goes out; a request sent around that path rides the pooled
+    /// connection unchecked, which is why the per-request check is needed.
+    #[tokio::test]
+    async fn test_reused_proxy_connection_is_rechecked_per_request_5459() {
+        let rebound = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (listener, proxy_url) = proxy_listener_5459().await;
+        let guard = guard_5459(
+            &[("HTTP_PROXY", proxy_url.as_str())],
+            flipping_lookup_5459(std::sync::Arc::clone(&rebound)),
+        );
+        let _override = UpstreamGuardOverride5459::install(guard.clone());
+        let client = with_env_proxy_5459(&[("HTTP_PROXY", proxy_url.as_str())], || {
+            build_5459(super::upstream_client_builder(Some(guard)))
+        });
+        let (seen, proxy) = keep_alive_proxy_5459(listener);
+        let send = |path: &str| {
+            crate::services::upstream_tracing::send_upstream(
+                client.get(format!("http://flip.example/{path}")),
+            )
+        };
+
+        let first = send("first").await.expect("first fetch through the proxy");
+        assert_eq!(first.text().await.unwrap(), "ok");
+
+        rebound.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_ssrf_refusal_5459(send("second").await, "rebound host on the send path");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![(1, "GET http://flip.example/first HTTP/1.1".to_string())],
+            "the refused request must not reach the proxy"
+        );
+
+        // Control: around the send path the pooled connection carries it.
+        let around = client.get("http://flip.example/around").send().await;
+        assert!(around.is_ok(), "{around:?}");
+        assert_eq!(
+            seen.lock().unwrap().last().cloned(),
+            Some((1, "GET http://flip.example/around HTTP/1.1".to_string())),
+            "the control must ride the same pooled connection"
+        );
+        proxy.abort();
+    }
+
+    /// The per-request recheck judges only a client that follows the
+    /// environment proxy: a per-repository `direct`/`explicit` client's
+    /// request (`env_proxy: false`) goes out even for a host the backend
+    /// cannot resolve, while the same request from the shared client is
+    /// refused.
+    #[tokio::test]
+    async fn test_recheck_skips_clients_off_the_env_proxy_5459() {
+        let _override = UpstreamGuardOverride5459::install(guard_5459(
+            &[("HTTP_PROXY", "http://proxy.example:3128")],
+            pinned_lookup_5459(),
+        ));
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        // The per-repository client's own routing reaches the upstream.
+        let client = loopback_client_from(
+            reqwest::Client::builder().resolve("unresolvable.example", *server.address()),
+        );
+        let url = format!(
+            "http://unresolvable.example:{}/pkg",
+            server.address().port()
+        );
+        let send = |env_proxy| {
+            crate::services::upstream_tracing::send_upstream_for(client.get(&url), env_proxy)
+        };
+        let direct = send(false)
+            .await
+            .expect("an explicit/direct client is not rechecked");
+        assert_eq!(direct.status(), reqwest::StatusCode::OK);
+        assert_ssrf_refusal_5459(send(true).await, "the shared client is rechecked");
+    }
+
+    /// The webhook and SSO clients, which do not use the upstream send path,
+    /// keep no idle plain-HTTP proxy connection: each request opens (and is
+    /// checked on) its own connection.
+    #[tokio::test]
+    async fn test_webhook_and_sso_clients_do_not_reuse_plain_http_proxy_connections_5459() {
+        for (name, builder) in [
+            (
+                "webhook",
+                webhook_client_builder as fn() -> reqwest::ClientBuilder,
+            ),
+            ("sso", sso_client_builder),
+        ] {
+            let (listener, proxy_url) = proxy_listener_5459().await;
+            let client = with_env_proxy_5459(&[("HTTP_PROXY", proxy_url.as_str())], || {
+                build_5459(builder())
+            });
+            let (seen, proxy) = keep_alive_proxy_5459(listener);
+            for _ in 0..2 {
+                let resp = client.get("http://93.184.216.34/hook").send().await;
+                assert!(resp.is_ok(), "{name}: {resp:?}");
+                let _ = resp.unwrap().bytes().await;
+            }
+            let conns: Vec<usize> = seen.lock().unwrap().iter().map(|(c, _)| *c).collect();
+            assert_eq!(conns, vec![1, 2], "{name}");
+            proxy.abort();
+        }
+    }
+
+    /// A redirect answered through the environment proxy is checked like a
+    /// direct one, and a hop the proxy would carry is refused when its host
+    /// does not resolve here; neither hop is sent to the proxy.
+    #[tokio::test]
+    async fn test_proxied_redirect_to_loopback_or_unresolvable_is_refused_5459() {
+        for location in [
+            "http://127.0.0.1:9/latest/meta-data/",
+            "http://ak-redirect-target.invalid/",
+        ] {
+            let (listener, proxy_url) = proxy_listener_5459().await;
+            let client = with_env_proxy_5459(&[("HTTP_PROXY", proxy_url.as_str())], || {
+                build_5459(base_client_builder())
+            });
+            let request =
+                tokio::spawn(async move { client.get("http://93.184.216.34/pkg").send().await });
+            let respond = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+            );
+            let line =
+                next_proxy_request_5459(&listener, Duration::from_secs(5), respond.as_bytes())
+                    .await
+                    .expect("the public destination reaches the proxy");
+            assert_eq!(line, "GET http://93.184.216.34/pkg HTTP/1.1");
+            let result = tokio::time::timeout(Duration::from_secs(10), request)
+                .await
+                .expect("request finishes")
+                .expect("request task");
+            assert_ssrf_refusal_5459(result, location);
+            let reached = next_proxy_request_5459(&listener, Duration::from_millis(200), b"").await;
+            assert_eq!(
+                reached, None,
+                "{location}: the refused hop reached the proxy"
+            );
+        }
+    }
+
+    /// `NO_PROXY`, a mixed-case variable and `AK_UPSTREAM_ENV_PROXY=ignore`
+    /// leave a destination direct, where the SSRF resolver refuses a
+    /// loopback host name; the proxy is never contacted.
+    #[tokio::test]
+    async fn test_direct_destinations_under_an_env_proxy_stay_guarded_5459() {
+        for vars in [
+            &[("HTTP_PROXY", "PROXY"), ("NO_PROXY", "localhost")][..],
+            &[("http_proxy", "PROXY"), ("no_proxy", "localhost")][..],
+            &[("Http_Proxy", "PROXY")][..],
+            &[("HTTP_PROXY", "PROXY"), ("AK_UPSTREAM_ENV_PROXY", "ignore")][..],
+        ] {
+            let (listener, proxy_url) = proxy_listener_5459().await;
+            let vars: Vec<(&str, &str)> = vars
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        *k,
+                        if *v == "PROXY" {
+                            proxy_url.as_str()
+                        } else {
+                            *v
+                        },
+                    )
+                })
+                .collect();
+            let client = with_env_proxy_5459(&vars, || build_5459(base_client_builder()));
+            assert_ssrf_refusal_5459(
+                client.get("http://localhost:9/").send().await,
+                &format!("{vars:?}"),
+            );
+            let reached = next_proxy_request_5459(&listener, Duration::from_millis(200), b"").await;
+            assert_eq!(reached, None, "{vars:?}: reached the proxy");
+        }
+    }
+
+    /// With `AK_UPSTREAM_ENV_PROXY=ignore` an allowed destination also goes
+    /// direct, not to the proxy.
+    #[tokio::test]
+    async fn test_ignore_mode_never_uses_the_env_proxy_5459() {
+        let (listener, proxy_url) = proxy_listener_5459().await;
+        let client = with_env_proxy_5459(
+            &[
+                ("HTTP_PROXY", proxy_url.as_str()),
+                ("AK_UPSTREAM_ENV_PROXY", "ignore"),
+            ],
+            || {
+                base_client_builder()
+                    .timeout(Duration::from_millis(500))
+                    .build()
+                    .unwrap()
+            },
+        );
+        // TEST-NET-1: unroutable, so the direct attempt just times out.
+        let _ = client.get("http://192.0.2.1/pkg").send().await;
+        let reached = next_proxy_request_5459(&listener, Duration::from_millis(200), b"").await;
+        assert_eq!(reached, None, "ignore mode reached the proxy");
     }
 
     // -------------------------------------------------------------------

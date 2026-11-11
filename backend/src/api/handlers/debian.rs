@@ -63,7 +63,7 @@ use crate::services::signing_service::{
 };
 use crate::storage::StorageBackend;
 
-const DEBIAN_BINARY_CONTENT_TYPE: &str = "application/vnd.debian.binary-package";
+pub(crate) const DEBIAN_BINARY_CONTENT_TYPE: &str = "application/vnd.debian.binary-package";
 
 // ---------------------------------------------------------------------------
 // Router
@@ -1850,16 +1850,59 @@ fn packages_index_distribution(cache_path: &str, component: &str) -> Option<Stri
     (!distribution.is_empty()).then(|| distribution.to_string())
 }
 
+/// A cached Packages index to look a pool file up in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexCandidate {
+    /// Where it is cached.
+    cache_path: String,
+    /// The path it is decoded as (its compression suffix).
+    name: String,
+    /// The SHA-256 the suite's `Release` names it by (#5695). When set, the
+    /// cached bytes are read only if they hash to it.
+    sha256: Option<String>,
+    /// The release that same `Release` names (#5695): read from the text the
+    /// digest was checked against, never re-read after the check.
+    release: Option<crate::services::scanner_service::OsRelease>,
+}
+
+/// What a cached Packages index records for a pool file.
+struct PoolIndexEntry {
+    /// The file's SHA-256.
+    sha256: String,
+    /// The index's distribution.
+    distribution: String,
+    /// The release of the `Release` the index was checked against.
+    release: Option<crate::services::scanner_service::OsRelease>,
+}
+
+impl IndexCandidate {
+    /// An index trusted as cached (the client-path Tier B resolver).
+    fn unchecked(cache_path: String) -> Self {
+        Self {
+            name: cache_path.clone(),
+            cache_path,
+            sha256: None,
+            release: None,
+        }
+    }
+}
+
 /// The cached Packages index, at `cache_path` and decoded as `name` says, that
 /// lists `artifact_path`: its SHA-256 for the file and its distribution.
 async fn pool_entry_in_indexes(
     proxy: &ProxyService,
     repo_key: &str,
     (component, artifact_path): (&str, &str),
-    indexes: impl IntoIterator<Item = (String, String)>,
+    indexes: impl IntoIterator<Item = IndexCandidate>,
     ignore_expiry: bool,
-) -> crate::error::Result<Option<(String, String)>> {
-    for (cache_path, name) in indexes {
+) -> crate::error::Result<Option<PoolIndexEntry>> {
+    for IndexCandidate {
+        cache_path,
+        name,
+        sha256,
+        release,
+    } in indexes
+    {
         let cached = if ignore_expiry {
             proxy
                 .get_cached_artifact_by_path_ignoring_expiry(repo_key, &cache_path)
@@ -1872,10 +1915,14 @@ async fn pool_entry_in_indexes(
         let Ok(Some(proxy_helpers::CachedBody { content: bytes, .. })) = cached else {
             continue;
         };
-        // A `by-hash/` entry says what it must hash to.
-        if by_hash_sha256(&cache_path).is_some_and(|want| {
-            crate::services::storage_service::StorageService::calculate_hash(&bytes) != want
-        }) {
+        // A `by-hash/` entry says what it must hash to, and so does an index
+        // the suite's `Release` names (#5695): bytes that are not the ones
+        // named decide nothing, however they got into the cache.
+        let actual = crate::services::storage_service::StorageService::calculate_hash(&bytes);
+        let mismatch = |want: &str| !actual.eq_ignore_ascii_case(want);
+        if by_hash_sha256(&cache_path).is_some_and(mismatch)
+            || sha256.as_deref().is_some_and(mismatch)
+        {
             continue;
         }
         // #2561: permit-scoped decode on this serve path (each cached index
@@ -1888,10 +1935,14 @@ async fn pool_entry_in_indexes(
             continue;
         };
         let map = crate::formats::debian::parse_packages_index(&text);
-        if let Some(sha) = resolve_pool_deb_checksum(&map, artifact_path) {
+        if let Some(sha256) = resolve_pool_deb_checksum(&map, artifact_path) {
             let distribution =
                 packages_index_distribution(&cache_path, component).unwrap_or_default();
-            return Ok(Some((sha, distribution)));
+            return Ok(Some(PoolIndexEntry {
+                sha256,
+                distribution,
+                release,
+            }));
         }
     }
     Ok(None)
@@ -1914,8 +1965,12 @@ async fn resolve_pool_index_entry(
         .await
         .into_iter()
         .filter(|path| is_matching_packages_index(path, component, &arch))
-        .map(|path| (path.clone(), path));
-    pool_entry_in_indexes(proxy, repo_key, (component, artifact_path), indexes, false).await
+        .map(IndexCandidate::unchecked);
+    Ok(
+        pool_entry_in_indexes(proxy, repo_key, (component, artifact_path), indexes, false)
+            .await?
+            .map(|entry| (entry.sha256, entry.distribution)),
+    )
 }
 
 /// The architecture a pool file's name names.
@@ -2003,14 +2058,17 @@ fn release_packages_indexes(
 /// Fetch the one index a pull needs of those a suite's `Release` names: the
 /// first architecture's, smallest encoding first, by hash when the archive
 /// serves it that way. `None` unless the bytes are the ones the `Release`
-/// names. Cached like a client's fetch, so this happens once per index.
+/// names. Cached like a client's fetch, so this happens once per index, but
+/// only once verified (#5695): bytes the `Release` does not name are never
+/// committed to the proxy cache, and a cached copy that no longer matches is
+/// evicted and fetched again.
 async fn fetch_named_packages_index(
     proxy: &ProxyService,
     repo: &crate::models::repository::Repository,
     suite_dir: &str,
     release_text: &str,
     named: &[NamedPackagesIndex],
-) -> Option<(String, String)> {
+) -> Option<IndexCandidate> {
     let dir = &named.first()?.dir;
     let index = [".xz", ".gz", ""].iter().find_map(|encoding| {
         let path = format!("{dir}/Packages{encoding}");
@@ -2024,12 +2082,35 @@ async fn fetch_named_packages_index(
     } else {
         format!("{suite_dir}/{}", index.path)
     };
-    let (bytes, _) = proxy
-        .fetch_artifact_capped(repo, &cache_path, proxy_helpers::LARGE_METADATA_MAX_BYTES)
+    let want = index.sha256.clone();
+    let check: Box<crate::services::proxy_service::CachedBodyCheck> =
+        Box::new(move |bytes: Bytes, _encoding: Option<String>| {
+            let matches = crate::services::storage_service::StorageService::calculate_hash(&bytes)
+                .eq_ignore_ascii_case(&want);
+            Box::pin(async move { matches })
+        });
+    let body = proxy
+        .fetch_artifact_with_cache_path_capped_checked(
+            repo,
+            &cache_path,
+            &cache_path,
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            &*check,
+        )
         .await
         .ok()?;
-    let actual = crate::services::storage_service::StorageService::calculate_hash(&bytes);
-    (actual == index.sha256).then(|| (cache_path, index.path.clone()))
+    // A fresh body that fails the check is returned uncached: still refuse it.
+    let actual = crate::services::storage_service::StorageService::calculate_hash(&body.content);
+    actual
+        .eq_ignore_ascii_case(&index.sha256)
+        .then(|| IndexCandidate {
+            cache_path,
+            name: index.path.clone(),
+            sha256: Some(index.sha256.clone()),
+            release: crate::api::handlers::proxy_scan_archive::os_release_from_apt_release(
+                release_text,
+            ),
+        })
 }
 
 /// [`is_matching_packages_index`], with an `_all` file in any architecture's.
@@ -2050,13 +2131,15 @@ fn is_gated_packages_index(cache_path: &str, component: &str, arch: &str) -> boo
 /// lists it is still right about it). A client whose lists are current fetches
 /// no index at all, so a suite whose `Release` is cached and whose index is not
 /// has the index the `Release` names fetched, verified against that `Release`.
+/// The file's SHA-256 and the release named by the very `Release` text its
+/// index was checked against (#5695).
 async fn resolve_gated_pool_index_entry(
     db: &PgPool,
     proxy: &ProxyService,
     (repo_id, repo_key, upstream_url): (uuid::Uuid, &str, &str),
     component: &str,
     artifact_path: &str,
-) -> crate::error::Result<Option<(String, String)>> {
+) -> crate::error::Result<Option<(String, Option<crate::services::scanner_service::OsRelease>)>> {
     let Some(arch) = pool_file_arch(artifact_path) else {
         return Ok(None);
     };
@@ -2065,37 +2148,51 @@ async fn resolve_gated_pool_index_entry(
     let cached_paths = cached_dists_paths(db, proxy, repo_id, repo_key).await;
     let cached_set: std::collections::HashSet<&str> =
         cached_paths.iter().map(String::as_str).collect();
-    let mut indexes: Vec<(String, String)> = cached_paths
+    let mut releases = HashMap::new();
+    let mut indexes: Vec<IndexCandidate> = Vec::new();
+    for path in cached_paths
         .iter()
         .filter(|path| is_gated_packages_index(path, component, &arch))
-        .map(|path| (path.clone(), path.clone()))
-        .collect();
+    {
+        if let Some(index) =
+            release_checked_index(proxy, repo_key, component, path, &mut releases).await
+        {
+            indexes.push(index);
+        }
+    }
     let mut without_an_index = Vec::new();
     for dir in cached_suite_dirs(&cached_paths) {
         let Some(text) = cached_apt_release_text(proxy, repo_key, dir).await else {
             continue;
         };
         let named = release_packages_indexes(&text, component, &arch);
-        let by_hash: Vec<(String, String)> = named
+        let suite_release =
+            crate::api::handlers::proxy_scan_archive::os_release_from_apt_release(&text);
+        let by_hash: Vec<IndexCandidate> = named
             .iter()
-            .map(|index| (index.by_hash_path(dir), index.path.clone()))
-            .filter(|(path, _)| cached_set.contains(path.as_str()))
+            .map(|index| IndexCandidate {
+                cache_path: index.by_hash_path(dir),
+                name: index.path.clone(),
+                sha256: Some(index.sha256.clone()),
+                release: suite_release.clone(),
+            })
+            .filter(|index| cached_set.contains(index.cache_path.as_str()))
             .collect();
         let suite_prefix = format!("{dir}/");
         // Worth a fetch only if listing the file would name a release: a
         // derivative's `Release` names none the scanner grades.
-        let names_a_release =
-            crate::api::handlers::proxy_scan_archive::os_release_from_apt_release(&text).is_some();
-        if names_a_release
+        if suite_release.is_some()
             && by_hash.is_empty()
-            && !indexes.iter().any(|(p, _)| p.starts_with(&suite_prefix))
+            && !indexes
+                .iter()
+                .any(|index| index.cache_path.starts_with(&suite_prefix))
         {
             without_an_index.push((dir, text, named));
         }
         indexes.extend(by_hash);
     }
     if let Some(entry) = pool_entry_in_indexes(proxy, repo_key, target, indexes, true).await? {
-        return Ok(Some(entry));
+        return Ok(Some((entry.sha256, entry.release)));
     }
     let repo = proxy_helpers::build_remote_repo_with_format(
         repo_id,
@@ -2108,10 +2205,75 @@ async fn resolve_gated_pool_index_entry(
             continue;
         };
         if let Some(entry) = pool_entry_in_indexes(proxy, repo_key, target, [index], true).await? {
-            return Ok(Some(entry));
+            return Ok(Some((entry.sha256, entry.release)));
         }
     }
     Ok(None)
+}
+
+/// A suite `Release`'s SHA256 table (path -> (digest, size)) and the release
+/// it names, both read from one cached `Release` text.
+type CheckedRelease = (
+    HashMap<String, (String, u64)>,
+    Option<crate::services::scanner_service::OsRelease>,
+);
+
+/// A cached `Packages` index at `cache_path` as the gate may read it (#5695):
+/// held to the digest its own suite's cached `Release` names it by, so bytes
+/// cached before they were checked, or an index a later `Release` no longer
+/// names, never decide a pull, and carrying the release that same `Release`
+/// text names. `None` when that `Release` carries no SHA256 table (every
+/// Debian and Ubuntu `Release` does), a table that does not name the index,
+/// or one that names other bytes than those cached. A suite whose `Release`
+/// is not cached has nothing to check the index against, and the index names
+/// no release for the file.
+async fn release_checked_index(
+    proxy: &ProxyService,
+    repo_key: &str,
+    component: &str,
+    cache_path: &str,
+    releases: &mut HashMap<String, Option<CheckedRelease>>,
+) -> Option<IndexCandidate> {
+    let unchecked = IndexCandidate::unchecked(cache_path.to_string());
+    let Some(distribution) = packages_index_distribution(cache_path, component) else {
+        return Some(unchecked);
+    };
+    let dir = format!("dists/{distribution}");
+    if !releases.contains_key(&dir) {
+        let release = cached_apt_release_text(proxy, repo_key, &dir)
+            .await
+            .map(|text| {
+                (
+                    crate::formats::debian::parse_release_checksums(&text),
+                    crate::api::handlers::proxy_scan_archive::os_release_from_apt_release(&text),
+                )
+            });
+        releases.insert(dir.clone(), release);
+    }
+    let Some((table, release)) = releases.get(&dir).and_then(Option::as_ref) else {
+        return Some(unchecked);
+    };
+    let release_relative = cache_path.strip_prefix(&format!("{dir}/"))?;
+    // An empty table names nothing, so nothing here is vouched for.
+    let (sha256, _) = table.get(release_relative)?;
+    // Checked here as well as when it is read, so a suite whose only cached
+    // index is not the one named counts as having none, and has the named
+    // one fetched (which evicts the stale copy).
+    let cached = proxy
+        .get_cached_artifact_by_path_ignoring_expiry(repo_key, cache_path)
+        .await
+        .ok()
+        .flatten()?;
+    if !crate::services::storage_service::StorageService::calculate_hash(&cached.content)
+        .eq_ignore_ascii_case(sha256)
+    {
+        return None;
+    }
+    Some(IndexCandidate {
+        sha256: Some(sha256.clone()),
+        release: release.clone(),
+        ..unchecked
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3143,6 +3305,7 @@ async fn dists_proxy_catchall(
             &upstream_path,
             DEBIAN_BINARY_CONTENT_TYPE,
             RepositoryFormat::Debian,
+            ctx.is_head,
         )
         .await?;
         // #3446: count the proxied package. `upstream_path` is also the
@@ -3690,6 +3853,7 @@ async fn flat_remote(
                 &path,
                 expected,
                 RepositoryFormat::Debian,
+                ctx.is_head,
             )
             .await?;
             proxy_helpers::record_proxy_download(state, repo.id, repo_key, &path, ctx).await;
@@ -3960,6 +4124,7 @@ async fn pool_download(
                         &upstream_path,
                         expected_checksum,
                         RepositoryFormat::Debian,
+                        ctx.is_head,
                     )
                     .await?;
                     // #3446: count the proxied `.deb`. `upstream_path` is also
@@ -3996,13 +4161,13 @@ async fn pool_download(
                 // #3178: authorize the member set against the CALLER before any
                 // format-specific filtering, so a member this caller could not
                 // read directly can never reach the byte resolver.
-                let members = proxy_helpers::authorize_virtual_members(
+                let members = proxy_helpers::try_authorize_virtual_members(
                     &state.db,
                     auth.as_ref(),
                     repo.id,
                     members,
                 )
-                .await;
+                .await?;
                 let mut allowed_members = Vec::with_capacity(members.len());
                 for member in members {
                     match remote_member_upstream(&member) {
@@ -4065,33 +4230,87 @@ async fn pool_download(
         .await
         .map_err(|e| e.into_response())?;
 
-    let stream = storage
-        .get_stream(&artifact.storage_key)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
+    let filename = path.rsplit('/').next().unwrap_or(&path);
+    let route = DebPackageRoute::Pool {
+        component: &component,
+        path: &path,
+    };
+    // #5076: a row a scanning Remote holds goes through the scan gate,
+    // graded as the proxied file would be. Pool metadata (`.dsc`, ...) is
+    // not gated there either.
+    let proxy_helpers::StoredRowBody { body: stream, scan } =
+        if deb_serve_key(&route.upstream_path()).scannable {
+            let release = stored_deb_release(&state, &repo, route).await?;
+            proxy_helpers::open_stored_row(
+                &state,
+                storage.as_ref(),
+                &proxy_helpers::StoredRow {
+                    repo: &repo,
+                    filename,
+                    storage_key: &artifact.storage_key,
+                    size_bytes: artifact.size_bytes,
+                },
+                DebPackage {
+                    release,
+                    expected_sha256: None,
+                },
             )
-                .into_response()
-        })?;
+            .await?
+        } else {
+            proxy_helpers::StoredRowBody {
+                body: storage
+                    .get_stream(&artifact.storage_key)
+                    .await
+                    .map_err(|e| crate::api::handlers::storage_err_plain(&e))?,
+                scan: None,
+            }
+        };
 
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
-    let filename = path.rsplit('/').next().unwrap_or(&path);
+    Ok(proxy_helpers::StoredRowBody::stamp(
+        scan,
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, DEBIAN_BINARY_CONTENT_TYPE)
+            .header(
+                "Content-Disposition",
+                format!("attachment; filename=\"{}\"", filename),
+            )
+            .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
+            .header("X-Checksum-SHA256", &artifact.checksum_sha256)
+            .body(Body::from_stream(stream))
+            .unwrap(),
+    ))
+}
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, DEBIAN_BINARY_CONTENT_TYPE)
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
-        .header("X-Checksum-SHA256", &artifact.checksum_sha256)
-        .body(Body::from_stream(stream))
-        .unwrap())
+/// The release a stored package row of `repo` is graded under (#5076): the
+/// one the proxied file would be graded under ([`deb_member_digest_and_release`])
+/// when the repository is a Remote that scans on proxy and can reach its
+/// upstream, else `None` (the version's own marker, else inconclusive, as for
+/// a proxied file whose suite names no release). Only looked up for a
+/// repository that gates its rows, so a hosted pull does no extra work.
+async fn stored_deb_release(
+    state: &SharedState,
+    repo: &RepoInfo,
+    route: DebPackageRoute<'_>,
+) -> Result<Option<crate::services::scanner_service::OsRelease>, Response> {
+    if proxy_helpers::stored_row_scan_policy(state, repo)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let (Some(upstream_url), Some(proxy)) =
+        (repo.upstream_url.as_deref(), state.proxy_service.as_deref())
+    else {
+        return Ok(None);
+    };
+    let (_, release) =
+        deb_member_digest_and_release(state, proxy, (repo.id, &repo.key, upstream_url), route)
+            .await?;
+    Ok(release)
 }
 
 // ---------------------------------------------------------------------------
@@ -4321,11 +4540,7 @@ async fn deb_member_digest_and_release(
             .await
             .map_err(IntoResponse::into_response)?
             {
-                Some((sha, distribution)) => {
-                    let release =
-                        cached_apt_release(proxy, repo_key, &format!("dists/{distribution}")).await;
-                    (Some(sha), release)
-                }
+                Some((sha, release)) => (Some(sha), release),
                 None => (None, None),
             }
         }
@@ -4913,10 +5128,17 @@ async fn read_deb_head_from_storage(
 ) -> Result<Vec<u8>, String> {
     let invalid = |msg: &str| format!("Invalid Debian package metadata: {msg}");
     let read = |offset: u64, length: usize| storage.get_range(storage_key, offset, length);
+    // The reason lands in the admin backfill response and its audit row, so it
+    // names the failure's class in fixed words and logs the raw error, which
+    // quotes the object store and carries the storage-class marker (#5685).
+    let unreadable = |e: crate::error::AppError| {
+        format!(
+            "could not read stored .deb: {}",
+            crate::api::handlers::storage_err_message(&e)
+        )
+    };
 
-    let magic = read(0, 8)
-        .await
-        .map_err(|e| format!("could not read stored .deb: {e}"))?;
+    let magic = read(0, 8).await.map_err(unreadable)?;
     if magic.as_ref() != b"!<arch>\n" {
         return Err(invalid("not an ar archive"));
     }
@@ -4926,7 +5148,7 @@ async fn read_deb_head_from_storage(
         let header = match read(offset, 60).await {
             Ok(header) if header.len() == 60 => header,
             Ok(_) => break,
-            Err(e) => return Err(format!("could not read stored .deb: {e}")),
+            Err(e) => return Err(unreadable(e)),
         };
         let name = std::str::from_utf8(&header[..16])
             .unwrap_or("")
@@ -4946,9 +5168,7 @@ async fn read_deb_head_from_storage(
                 .ok_or_else(|| invalid("ar member offset overflow"))?;
             let body_len =
                 usize::try_from(size).map_err(|_| invalid("control.tar member is too large"))?;
-            let body = read(body_offset, body_len)
-                .await
-                .map_err(|e| format!("could not read stored .deb: {e}"))?;
+            let body = read(body_offset, body_len).await.map_err(unreadable)?;
             if body.len() != body_len {
                 return Err(invalid("truncated ar member"));
             }
@@ -6957,6 +7177,66 @@ mod tests {
     async fn signed_release_cache_miss_on_unknown_key_is_not_an_eviction() {
         let (state, _dir) = cache_test_state(604_800);
         assert!(signed_release_cache_get(&state, "absent").await.is_none());
+    }
+
+    /// #5685: `pool_download`'s `get_stream` answered a hard-coded 500 on any
+    /// storage failure. A store that is down now answers `503` with
+    /// `Retry-After`, one that is full `507` without it, and neither body
+    /// carries the backend's text.
+    #[tokio::test]
+    async fn pool_download_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let path = "pool/main/o/outage5685/outage5685_1.0_amd64.deb";
+        let repo = fx.repo_info("local", None);
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            path,
+            path,
+            "outage5685",
+            "1.0",
+            DEBIAN_BINARY_CONTENT_TYPE,
+            Bytes::from_static(b"!<arch>\n5685"),
+            fx.user_id,
+        )
+        .await;
+
+        for (message, want, want_body) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&fx.pool, &fx.state, fx.repo_id, &message).await;
+            let app = tdh::router_with_auth(
+                super::router(),
+                state,
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let (status, body, headers) =
+                tdh::send_with_headers(app, tdh::get(format!("/{}/{path}", fx.repo_key))).await;
+            assert_eq!(status, want, "GET: {}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want == StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            assert_eq!(&body[..], want_body.as_bytes());
+            tdh::assert_no_storage_backend_text("debian pool download", &body);
+        }
+        fx.teardown().await;
     }
 }
 
@@ -10028,6 +10308,22 @@ mod scan_on_proxy_4111 {
 
     archive_scan_suite!(case);
 
+    /// #5076: a row the scanning Remote holds itself is served through the
+    /// gate, as the proxied file is. Fails on `main`: the row streamed
+    /// ungated (200, no `X-AK-Scan`) under every policy.
+    #[tokio::test]
+    async fn a_stored_row_of_a_scanning_remote_is_gated_5076() {
+        crate::api::handlers::proxy_scan_archive::test_support::stored_row_is_gated(
+            case,
+            crate::api::handlers::proxy_scan_archive::test_support::StoredRowSeed {
+                path: format!("{POOL}/{FILE}"),
+                name: "libdtf".to_string(),
+                version: "1.0-1+deb12u1".to_string(),
+            },
+        )
+        .await;
+    }
+
     /// A vendor layout keeping the binaries under `dists/` (#3596).
     fn dists_case(_mock: &str) -> ArchiveCase {
         let path = format!("dists/bookworm/main/binary-amd64/{FILE}");
@@ -10179,10 +10475,11 @@ mod scan_on_proxy_4111 {
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/dists/bookworm/Release"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
-                "Origin: Debian\nLabel: Debian\nSuite: stable\nVersion: 12.7\n\
-                 Codename: bookworm\nComponents: main\nArchitectures: amd64\n",
-            ))
+            // #5695: the Release names the index by its SHA-256.
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(plain_release(packages_listing(&rig).as_bytes())),
+            )
             .mount(&rig.server)
             .await;
         let _ = tdh::send_with_headers(
@@ -10208,8 +10505,7 @@ mod scan_on_proxy_4111 {
     }
 
     /// The release a pool package is graded against comes from the `Release`
-    /// of the suite whose cached index lists it: with none cached, or none
-    /// listing it, from nothing.
+    /// of the suite whose cached index lists it: with none cached, from nothing.
     #[tokio::test]
     async fn the_release_comes_from_the_remotes_cached_release() {
         let Some(rig) = Rig::new(case, Some("fail_closed")).await else {
@@ -10232,10 +10528,11 @@ mod scan_on_proxy_4111 {
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/dists/bookworm/Release"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
-                "Origin: Debian\nLabel: Debian\nSuite: stable\nVersion: 12.7\n\
-                 Codename: bookworm\nComponents: main\nArchitectures: amd64\n",
-            ))
+            // #5695: the Release names the index by its SHA-256.
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(plain_release(packages_listing(&rig).as_bytes())),
+            )
             .mount(&rig.server)
             .await;
         let _ = tdh::send_with_headers(
@@ -10243,15 +10540,9 @@ mod scan_on_proxy_4111 {
             tdh::get(format!("/{}/dists/bookworm/Release", rig.fx.repo_key)),
         )
         .await;
-        let (_, release) = deb_member_digest_and_release(
-            &rig.state,
-            &proxy,
-            (rig.fx.repo_id, &rig.fx.repo_key, &rig.server.uri()),
-            route,
-        )
-        .await
-        .expect("lookup");
-        assert_eq!(release, None, "nothing says the file is this suite's");
+        // A `Release` alone now has the index it names fetched (#5170, see
+        // `an_index_no_client_fetched_is_read_from_what_the_release_names_5170`);
+        // here a client fetches it.
         let listing = packages_listing(&rig);
         pull_through(
             &rig,
@@ -11023,6 +11314,261 @@ mod scan_on_proxy_4111 {
             member_release(&rig, route).await,
             (Some(rig.digest()), Some("debian:12".to_string()))
         );
+        rig.teardown().await;
+    }
+    // #5695: a suite without `Acquire-By-Hash` keeps its index under its own
+    // name, which carries no digest of its own: only the suite's `Release`
+    // says what it must hash to, and the gate holds it to that before the
+    // bytes are cached or decide a pull.
+
+    const PLAIN_INDEX: &str = "dists/bookworm/main/binary-amd64/Packages";
+
+    /// A `Release` for `dists/bookworm` (no `Acquire-By-Hash`) naming `index`
+    /// as `main/binary-amd64/Packages`.
+    fn plain_release(index: &[u8]) -> String {
+        format!(
+            "{}SHA256:\n {} {} main/binary-amd64/Packages\n",
+            BOOKWORM_RELEASE.replace("Acquire-By-Hash: yes\n", ""),
+            crate::services::storage_service::StorageService::calculate_hash(index),
+            index.len()
+        )
+    }
+
+    /// The upstream serves `served` as the suite's index while its `Release`
+    /// (cached, as a client's `apt-get update` leaves it) names `named`. No
+    /// client fetches the index, so the gate fetches the one the `Release`
+    /// names.
+    async fn plain_suite(rig: &Rig, named: &[u8], served: Vec<u8>) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/{PLAIN_INDEX}")))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(served))
+            .mount(&rig.server)
+            .await;
+        pull_through(
+            rig,
+            "dists/bookworm/Release",
+            plain_release(named).into_bytes(),
+        )
+        .await;
+    }
+
+    async fn cached_plain_index(rig: &Rig) -> Option<Bytes> {
+        let proxy = rig.state.proxy_service.clone().expect("proxy");
+        proxy
+            .get_cached_artifact_by_path_ignoring_expiry(&rig.fx.repo_key, PLAIN_INDEX)
+            .await
+            .expect("read")
+            .map(|body| body.content)
+    }
+
+    async fn plain_index_fetches(rig: &Rig) -> usize {
+        rig.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == format!("/{PLAIN_INDEX}"))
+            .count()
+    }
+
+    /// The reproduction: an upstream index that is not the one its `Release`
+    /// names is refused on the first pull AND never cached, so no later pull
+    /// grades on it. Before the fix the first pull was 423 and every later
+    /// one 200, graded on the cached forgery.
+    #[tokio::test]
+    async fn a_tampered_index_is_never_cached_and_every_pull_stays_locked_5695() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_closed")).await else {
+            return;
+        };
+        let listing = packages_listing(&rig);
+        let forged = listing.replace("Package: libdtf", "Package: libdtf\nX: y");
+        plain_suite(&rig, listing.as_bytes(), forged.into_bytes()).await;
+        seed_graded_on(&rig, "1.0-1", "debian:12", "clean").await;
+        for pull in ["first", "second", "third"] {
+            let (status, _, _) = rig.pull_remote().await;
+            assert_eq!(status, StatusCode::LOCKED, "{pull} pull");
+            assert_eq!(
+                cached_plain_index(&rig).await,
+                None,
+                "{pull} pull: the rejected index is not cached"
+            );
+        }
+        assert!(plain_index_fetches(&rig).await >= 1, "the gate fetched it");
+        let route = DebPackageRoute::Pool {
+            component: "main",
+            path: "d/dtf/libdtf_1.0-1_amd64.deb",
+        };
+        assert_eq!(member_release(&rig, route).await, (None, None));
+        rig.teardown().await;
+    }
+
+    /// The same under fail-open: every pull is served pending, never from the
+    /// verdict graded on the release the forged index would have named.
+    #[tokio::test]
+    async fn a_tampered_index_never_names_the_release_under_fail_open_5695() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_open")).await else {
+            return;
+        };
+        let listing = packages_listing(&rig);
+        let forged = listing.replace("Package: libdtf", "Package: libdtf\nX: y");
+        plain_suite(&rig, listing.as_bytes(), forged.into_bytes()).await;
+        seed_graded_on(&rig, "1.0-1", "debian:12", "clean").await;
+        for pull in ["first", "second", "third"] {
+            let (status, _, headers) = rig.pull_remote().await;
+            assert_eq!(status, StatusCode::OK, "{pull} pull");
+            assert_eq!(
+                ts::scan_header(&headers).as_deref(),
+                Some("pending"),
+                "{pull} pull"
+            );
+            assert_eq!(cached_plain_index(&rig).await, None, "{pull} pull");
+        }
+        rig.teardown().await;
+    }
+
+    /// Bytes a client's fetch left in the cache before Tier A evicted them
+    /// (or before any check existed) decide nothing either: a cached index
+    /// is read only if its suite's `Release` names its digest.
+    #[tokio::test]
+    async fn a_cached_index_its_release_does_not_name_decides_nothing_5695() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_closed")).await else {
+            return;
+        };
+        let listing = packages_listing(&rig);
+        let forged = listing.replace("Package: libdtf", "Package: libdtf\nX: y");
+        // The forgery is cached first (no `Release` to check it against yet),
+        // then the suite's `Release` naming the genuine index arrives.
+        pull_through(&rig, PLAIN_INDEX, forged.clone().into_bytes()).await;
+        assert_eq!(
+            cached_plain_index(&rig).await.as_deref(),
+            Some(forged.as_bytes())
+        );
+        pull_through(
+            &rig,
+            "dists/bookworm/Release",
+            plain_release(listing.as_bytes()).into_bytes(),
+        )
+        .await;
+        seed_graded_on(&rig, "1.0-1", "debian:12", "clean").await;
+        let route = DebPackageRoute::Pool {
+            component: "main",
+            path: "d/dtf/libdtf_1.0-1_amd64.deb",
+        };
+        assert_eq!(member_release(&rig, route).await, (None, None));
+        let (status, _, _) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::LOCKED);
+        rig.teardown().await;
+    }
+
+    /// Control: the index the `Release` names is fetched once, cached, and
+    /// names the suite the package is graded on (fail-open, so the stored
+    /// verdict decides without a live scanner).
+    #[tokio::test]
+    async fn a_matching_index_is_cached_and_decides_the_pull_5695() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_open")).await else {
+            return;
+        };
+        let listing = packages_listing(&rig);
+        plain_suite(&rig, listing.as_bytes(), listing.clone().into_bytes()).await;
+        seed_graded_on(&rig, "1.0-1", "debian:12", "clean").await;
+        for pull in ["first", "second"] {
+            let (status, _, headers) = rig.pull_remote().await;
+            assert_eq!(status, StatusCode::OK, "{pull} pull");
+            assert_eq!(
+                ts::scan_header(&headers).as_deref(),
+                Some("clean"),
+                "{pull}"
+            );
+        }
+        assert_eq!(
+            cached_plain_index(&rig).await.as_deref(),
+            Some(listing.as_bytes())
+        );
+        assert_eq!(
+            plain_index_fetches(&rig).await,
+            1,
+            "fetched once, then cached"
+        );
+        rig.teardown().await;
+    }
+
+    /// A cached index is held to the `Release` cached now, not the one it was
+    /// verified against: once the suite's `InRelease` names another index the
+    /// old one decides nothing, and the stale copy is evicted when the gate
+    /// fetches the index named now.
+    #[tokio::test]
+    async fn a_cached_index_is_re_verified_when_the_release_changes_5695() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_open")).await else {
+            return;
+        };
+        let listing = packages_listing(&rig);
+        plain_suite(&rig, listing.as_bytes(), listing.clone().into_bytes()).await;
+        seed_graded_on(&rig, "1.0-1", "debian:12", "clean").await;
+        let (status, _, headers) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            ts::scan_header(&headers).as_deref(),
+            Some("clean"),
+            "graded on the verified index"
+        );
+        assert!(cached_plain_index(&rig).await.is_some());
+
+        // The suite moves on: its `InRelease` (read before `Release`) names
+        // an index the upstream does not (yet) serve.
+        let newer = format!("{listing}Package: other\nFilename: pool/main/o/other/o_1_amd64.deb\n");
+        pull_through(
+            &rig,
+            "dists/bookworm/InRelease",
+            plain_release(newer.as_bytes()).into_bytes(),
+        )
+        .await;
+        let route = DebPackageRoute::Pool {
+            component: "main",
+            path: "d/dtf/libdtf_1.0-1_amd64.deb",
+        };
+        assert_eq!(member_release(&rig, route).await, (None, None));
+        let (status, _, headers) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            ts::scan_header(&headers).as_deref(),
+            Some("pending"),
+            "the old index no longer decides"
+        );
+        assert_eq!(
+            cached_plain_index(&rig).await,
+            None,
+            "the index the Release no longer names is evicted, not refilled"
+        );
+        rig.teardown().await;
+    }
+    /// A `Release` with no SHA256 table vouches for no index (every Debian
+    /// and Ubuntu `Release` carries one), so a cached index under it names no
+    /// release for the file and the verdict graded on Debian 12 is not used.
+    #[tokio::test]
+    async fn a_release_without_a_sha256_table_names_nothing_5695() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_open")).await else {
+            return;
+        };
+        pull_through(
+            &rig,
+            "dists/bookworm/Release",
+            BOOKWORM_RELEASE
+                .replace("Acquire-By-Hash: yes\n", "")
+                .into_bytes(),
+        )
+        .await;
+        let listing = packages_listing(&rig);
+        pull_through(&rig, PLAIN_INDEX, listing.into_bytes()).await;
+        assert!(cached_plain_index(&rig).await.is_some());
+        seed_graded_on(&rig, "1.0-1", "debian:12", "clean").await;
+        let route = DebPackageRoute::Pool {
+            component: "main",
+            path: "d/dtf/libdtf_1.0-1_amd64.deb",
+        };
+        assert_eq!(member_release(&rig, route).await, (None, None));
+        let (status, _, headers) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ts::scan_header(&headers).as_deref(), Some("pending"));
         rig.teardown().await;
     }
 }

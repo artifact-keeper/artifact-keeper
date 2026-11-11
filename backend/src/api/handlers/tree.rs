@@ -291,10 +291,23 @@ pub async fn get_tree(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    // MCP serve decision (#5253): a caller who does not hold an MCP registry
+    // sees only the paths of the server versions it is served now, exactly
+    // as the generic artifact listing does. A held, refused, resolving,
+    // unresolvable, draft or soft-deleted version contributes no node, and a
+    // folder that held versions alone fill is left out. Other formats pass.
+    let mut gate = crate::api::handlers::mcp::GenericArtifactGate::new(&state, auth.as_ref());
+    let mut visible_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        if gate.visible_listed(repo_id, &row.path).await {
+            visible_rows.push(row);
+        }
+    }
+
     // Group by next path segment at current depth
     let mut folders: BTreeMap<String, FolderEntry> = BTreeMap::new();
 
-    for row in &rows {
+    for row in &visible_rows {
         let parts: Vec<&str> = row.path.split('/').collect();
         if parts.len() <= prefix_depth {
             continue;
@@ -380,24 +393,27 @@ pub async fn get_content(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Query(params): Query<ContentQuery>,
-) -> Result<impl IntoResponse> {
+    base: crate::api::extractors::RequestBaseUrl,
+) -> Result<axum::response::Response> {
     // Verify repository exists and check visibility
     let repo_row: Option<(
         Uuid,
         crate::models::repository::RepositoryVisibility,
         String,
         String,
+        String,
     )> = sqlx::query_as(
-        "SELECT id, visibility, storage_backend, storage_path FROM repositories WHERE key = $1 AND key NOT LIKE '~deleting~%'",
+        "SELECT id, visibility, storage_backend, storage_path, format::text FROM repositories WHERE key = $1 AND key NOT LIKE '~deleting~%'",
     )
     .bind(&params.repository_key)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let (repo_id, visibility, storage_backend, storage_path) = repo_row.ok_or_else(|| {
-        AppError::NotFound(format!("Repository '{}' not found", params.repository_key))
-    })?;
+    let (repo_id, visibility, storage_backend, storage_path, format) =
+        repo_row.ok_or_else(|| {
+            AppError::NotFound(format!("Repository '{}' not found", params.repository_key))
+        })?;
 
     // Per-repo read authorization (#1803). These routes bypass
     // repo_visibility_middleware, so enforce admin / public+token-scope /
@@ -427,14 +443,44 @@ pub async fn get_content(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound(format!("Artifact '{}' not found", params.path)))?;
 
+    // MCP serve decision (#5253): a server version a reader is not served
+    // now (draft, held, refused, resolving, unresolvable, soft-deleted, or
+    // matched by a deny list) is the same 404 as a path that does not exist,
+    // decided before any byte is read. A holder reads every stored version.
+    if !crate::api::handlers::mcp::GenericArtifactGate::new(&state, auth.as_ref())
+        .visible(repo_id, &params.path)
+        .await
+    {
+        return Err(AppError::NotFound(format!(
+            "Artifact '{}' not found",
+            params.path
+        )));
+    }
+    // #5452: an MCP server version's content is its served (pinned)
+    // document, as the registry serves it, never the stored submission.
+    if format == "mcp" {
+        if let Some(doc) =
+            crate::api::handlers::mcp::served_server_json(&state.db, artifact.id, base.as_str())
+                .await?
+        {
+            return Ok(crate::api::handlers::repositories::mcp_server_json_response(&doc, false));
+        }
+    }
+
     // Fetch content from storage
     let location = crate::storage::StorageLocation {
         backend: storage_backend,
         path: storage_path,
     };
     let storage = state.storage_for_repo(&location)?;
-    // Check quarantine status before serving
-    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id).await?;
+    // Check quarantine status before serving; an OCI manifest is gated with
+    // every alias of its digest (#5457).
+    crate::services::oci_manifests::enforce_path_download_gate(
+        &state.db,
+        artifact.id,
+        &params.path,
+    )
+    .await?;
 
     let content = storage.get(&artifact.storage_key).await?;
 
@@ -462,10 +508,33 @@ pub async fn get_content(
                 header::HeaderName::from_static("x-content-size"),
                 artifact.size_bytes.to_string(),
             ),
-            (header::CACHE_CONTROL, "public, max-age=3600".to_string()),
+            (
+                header::CACHE_CONTROL,
+                content_cache_control(&format, visibility).to_string(),
+            ),
         ],
         body,
-    ))
+    )
+        .into_response())
+}
+
+/// The `Cache-Control` of a `/tree/content` answer. Only a public
+/// repository's bytes may sit in a shared cache. An MCP registry's never do:
+/// whether a server version is served is decided per caller and can change
+/// on the next read (a hold, a deny-list entry), so a cached copy would
+/// outlive the decision. Any other repository's bytes stay in the caller's
+/// own cache only.
+fn content_cache_control(
+    format: &str,
+    visibility: crate::models::repository::RepositoryVisibility,
+) -> &'static str {
+    if format == "mcp" {
+        "no-store"
+    } else if visibility == crate::models::repository::RepositoryVisibility::Public {
+        "public, max-age=3600"
+    } else {
+        "private, max-age=3600"
+    }
 }
 
 #[derive(OpenApi)]

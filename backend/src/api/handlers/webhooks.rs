@@ -168,15 +168,17 @@ pub fn webhook_within_token_scope(token_scope: &AccessScope, repository_id: Opti
 /// # What this gate fronts (#3715, #3901)
 ///
 /// The `TENANT-GATE-ONLY` justification this gate used to carry argued in
-/// MANAGEMENT terms, but no management verb reaches here any more:
-/// `create_webhook` goes through `enforce_admin_audited`, and delete /
+/// MANAGEMENT terms, but no management verb relies on it for its decision any
+/// more: `create_webhook` goes through `enforce_admin_audited`, and delete /
 /// enable / disable / test / rotate-secret / redeliver each call
-/// `auth.require_admin()` first. The only two callers left are pure READS --
-/// [`get_webhook`] and [`list_deliveries`] -- which return a private
+/// `auth.require_admin()` first. The two READ callers are
+/// [`get_webhook`] and [`list_deliveries`], which return a private
 /// repository's webhook `url`, `headers`, `secret_digest` and delivery
 /// history. (The raw secret is not among them: it is returned once at create
-/// and is unrecoverable afterwards, so what a bad decision here leaks is
-/// secret METADATA, not the signing key.)
+/// or rotation and is unrecoverable afterwards, so what a bad decision here
+/// leaks is secret METADATA, not the signing key.) `rotate_webhook_secret` also
+/// passes through here after its admin check, for the token-scope term alone,
+/// because it hands back the raw secret (#5235).
 ///
 /// #3901 settled the policy question #3708 left open: the by-id read must
 /// require the same READ-carrying access as [`list_webhooks`], so this gate
@@ -454,18 +456,37 @@ pub struct WebhookSecretCreatedResponse {
 
 /// Response returned by the rotate-secret endpoint.
 ///
-/// GHSA-qcmj: the raw signing secret is intentionally NOT returned here. A
-/// rotation only reports success and non-reversible metadata (the display
-/// `secret_digest` and the previous-secret expiry); the new raw secret is
-/// retained only in encrypted form and delivered/consumed out-of-band, so it
-/// cannot be disclosed via this response body or logs.
-#[derive(Debug, Serialize, ToSchema)]
+/// #5235: this is the one place the new secret is ever returned, because a
+/// receiver cannot verify after the overlap ends without it. GHSA-qcmj's threat
+/// was a NON-ADMIN obtaining a key to forge deliveries, so what keeps this safe
+/// is the gate in [`rotate_webhook_secret`], not the absence of the field. The
+/// value is never stored in the clear, and no read route returns it.
+///
+/// `Debug` is written by hand so that logging this struct cannot print it.
+#[derive(Serialize, ToSchema)]
 pub struct RotateWebhookSecretResponse {
     pub id: Uuid,
+    /// Raw signing secret produced by this rotation. Shown exactly once: record
+    /// it now, because the server retains only the encrypted form and a digest.
+    pub secret: String,
     /// Short, non-reversible identifier for the newly active signing secret.
     pub secret_digest: String,
     /// When the previously active secret stops being accepted.
     pub previous_secret_expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl std::fmt::Debug for RotateWebhookSecretResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RotateWebhookSecretResponse")
+            .field("id", &self.id)
+            .field("secret", &"<redacted>")
+            .field("secret_digest", &self.secret_digest)
+            .field(
+                "previous_secret_expires_at",
+                &self.previous_secret_expires_at,
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1630,13 +1651,16 @@ fn rotation_guard_allows(
 ///
 /// Generates a new raw secret, encrypts it, moves the existing
 /// `secret_encrypted` into `secret_previous_encrypted`, and stamps an
-/// expiry 24 hours in the future. GHSA-qcmj: the new raw secret is NOT
-/// returned in the response body — only success and non-reversible
-/// metadata (`secret_digest`, previous-secret expiry). The new secret is
-/// retained encrypted at rest and consumed out-of-band. The HMAC signing
-/// path (added in a later ticket)
-/// signs deliveries with both secrets while the previous one is within
-/// its expiry window so consumers can rotate without dropped events.
+/// expiry 24 hours in the future. The new raw secret is returned in this
+/// response, once, with `Cache-Control: no-store` (#5235); it is the same
+/// contract `create_webhook` has, and no later call can return it. The HMAC
+/// signing path signs deliveries with both secrets while the previous one is
+/// within its expiry window so consumers can rotate without dropped events.
+///
+/// Authorization (GHSA-qcmj, #5235): the caller must be an effective admin,
+/// which an admin-owned token without the `admin` scope is not (GHSA-vvc3), and
+/// the webhook must be within the presenting token's repository scope, so a
+/// credential gets a secret only for a webhook it can read.
 ///
 /// If a previous-secret window is still active when the rotate request
 /// arrives, the request is REJECTED with HTTP 409 Conflict. This prevents
@@ -1653,8 +1677,9 @@ fn rotation_guard_allows(
         ("id" = Uuid, Path, description = "Webhook ID")
     ),
     responses(
-        (status = 200, description = "Secret rotated. Body reports success and metadata only; the raw secret is not returned.", body = RotateWebhookSecretResponse),
-        (status = 404, description = "Webhook not found"),
+        (status = 200, description = "Secret rotated. Body includes the new raw secret exactly once, with `Cache-Control: no-store`; no later call returns it.", body = RotateWebhookSecretResponse),
+        (status = 403, description = "Caller is not an admin, or its token lacks the `admin` scope"),
+        (status = 404, description = "Webhook not found, or outside the token's repository scope"),
         (status = 409, description = "A previous rotation overlap window is still active"),
         (status = 500, description = "Encryption key not configured")
     ),
@@ -1670,6 +1695,10 @@ pub async fn rotate_webhook_secret(
     // GHSA-qcmj: rotating the signing secret is a management action -> admin
     // only (scope-aware via GHSA-vvc3), matching `create_webhook`.
     auth.require_admin()?;
+    // #5235: the response holds the new secret, so the token's repository scope
+    // binds too. An out-of-scope webhook takes the read gate's 404 and is not
+    // rotated.
+    authorize_webhook_access(&state, &auth, id).await?;
 
     let new_secret = webhook_secret_crypto::generate_secret();
     let new_encrypted = webhook_secret_crypto::encrypt_secret(&new_secret).map_err(|e| {
@@ -1761,15 +1790,18 @@ pub async fn rotate_webhook_secret(
     )
     .await;
 
-    // GHSA-qcmj: return success + non-reversible metadata only. The raw
-    // `new_secret` is never echoed in the response body; it is stored
-    // encrypted and delivered out-of-band.
-    Ok(Json(RotateWebhookSecretResponse {
-        id,
-        secret_digest: new_digest,
-        previous_secret_expires_at: previous_expires_at,
-    })
-    .into_response())
+    // #5235: the only time the new secret leaves the server. Never cached, and
+    // never passed to the audit entry above or to a log line.
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(RotateWebhookSecretResponse {
+            id,
+            secret: new_secret,
+            secret_digest: new_digest,
+            previous_secret_expires_at: previous_expires_at,
+        }),
+    )
+        .into_response())
 }
 
 /// Background-task entry point: clear expired previous-secret material so
@@ -2023,12 +2055,11 @@ fn build_delivery_request_headers(inputs: &DeliveryHeaderInputs<'_>) -> Vec<(Str
         );
         out.push(("X-ArtifactKeeper-Signature".into(), sig_header));
     }
+    // The legacy header carries no timestamp, so it signs the body alone
+    // (#5234); the timestamped form lives only in the `v1=` token above.
     if let Some(current) = inputs.secrets.first() {
-        let legacy_sig = crate::services::webhook_signing::compute_v1_signature(
-            current,
-            inputs.unix_secs,
-            inputs.body_bytes,
-        );
+        let legacy_sig =
+            crate::services::webhook_signing::compute_legacy_signature(current, inputs.body_bytes);
         out.push((
             "X-Webhook-Signature".into(),
             format!("sha256={}", legacy_sig),
@@ -2210,41 +2241,113 @@ const WEBHOOK_RETRY_CLAIM_TTL_SECS: f64 = 120.0;
 /// `claim_token` in the same statement, so concurrent replicas drain disjoint
 /// deliveries. A row whose previous claim expired (owner crashed mid-send) is
 /// claimable again once `next_retry_at` keeps it due.
+///
+/// The batch is filled round-robin across webhooks (#5661): each due row is
+/// ranked within its own webhook by `next_retry_at`, and the batch takes every
+/// webhook's first due row before any webhook's second, so one endpoint's
+/// backlog cannot push other endpoints' deliveries out of the batch. Ties
+/// within a rank go to first attempts, then to the oldest due row. Rows come
+/// back in `next_retry_at` order, so per-webhook order is preserved.
 async fn claim_due_webhook_deliveries(
     db: &sqlx::PgPool,
     limit: i64,
     claimed_by: &str,
     claim_ttl_secs: f64,
 ) -> std::result::Result<Vec<Claimed<RetryDeliveryRow>>, String> {
+    claim_due_webhook_deliveries_of(db, limit, claimed_by, claim_ttl_secs, None).await
+}
+
+/// [`claim_due_webhook_deliveries`] restricted to the given webhooks'
+/// deliveries, for tests that must claim their own fixture rows from a shared
+/// database whatever other tests have queued there (#5825): the fair batch
+/// can hold 50 other webhooks' rows ahead of them on every pass. Among the
+/// given webhooks the batch is filled with the same round-robin ranking.
+#[cfg(test)]
+async fn claim_due_webhook_deliveries_for_webhooks(
+    db: &sqlx::PgPool,
+    webhook_ids: &[Uuid],
+    limit: i64,
+    claimed_by: &str,
+    claim_ttl_secs: f64,
+) -> std::result::Result<Vec<Claimed<RetryDeliveryRow>>, String> {
+    claim_due_webhook_deliveries_of(
+        db,
+        limit,
+        claimed_by,
+        claim_ttl_secs,
+        Some(webhook_ids.to_vec()),
+    )
+    .await
+}
+
+/// The claim query. `only_webhooks` is `None` on every production path; the
+/// same statement, ranking and locking serve the test-only restricted form.
+async fn claim_due_webhook_deliveries_of(
+    db: &sqlx::PgPool,
+    limit: i64,
+    claimed_by: &str,
+    claim_ttl_secs: f64,
+    only_webhooks: Option<Vec<Uuid>>,
+) -> std::result::Result<Vec<Claimed<RetryDeliveryRow>>, String> {
     use sqlx::Row;
 
+    // `FOR UPDATE` cannot share a query level with a window function, so the
+    // ranking runs unlocked in `ranked` and `candidate` re-checks the due
+    // predicate while locking (a row claimed concurrently is skipped).
     let raw_rows = sqlx::query(
         r#"
-        WITH candidate AS (
-            SELECT id
+        WITH ranked AS (
+            SELECT id,
+                   attempts,
+                   next_retry_at,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY webhook_id ORDER BY next_retry_at ASC, id ASC
+                   ) AS webhook_rank
             FROM webhook_deliveries
             WHERE success = false
               AND next_retry_at IS NOT NULL
               AND next_retry_at <= NOW()
               AND attempts < max_attempts
               AND (claim_expires_at IS NULL OR claim_expires_at <= NOW())
-            ORDER BY next_retry_at ASC
+              AND ($4::uuid[] IS NULL OR webhook_id = ANY($4))
+        ),
+        fair AS (
+            SELECT id
+            FROM ranked
+            ORDER BY webhook_rank ASC, (attempts = 0) DESC, next_retry_at ASC, id ASC
             LIMIT $1
+        ),
+        candidate AS (
+            SELECT id
+            FROM webhook_deliveries
+            WHERE id IN (SELECT id FROM fair)
+              AND success = false
+              AND next_retry_at IS NOT NULL
+              AND next_retry_at <= NOW()
+              AND attempts < max_attempts
+              AND (claim_expires_at IS NULL OR claim_expires_at <= NOW())
             FOR UPDATE SKIP LOCKED
+        ),
+        claimed AS (
+            UPDATE webhook_deliveries d
+            SET claimed_by = $2,
+                claim_token = gen_random_uuid(),
+                claim_expires_at = NOW() + make_interval(secs => $3)
+            FROM candidate
+            WHERE d.id = candidate.id
+            RETURNING d.id, d.webhook_id, d.event, d.payload, d.attempts, d.max_attempts,
+                      d.claim_token, d.claimed_by, d.claim_expires_at, d.next_retry_at
         )
-        UPDATE webhook_deliveries d
-        SET claimed_by = $2,
-            claim_token = gen_random_uuid(),
-            claim_expires_at = NOW() + make_interval(secs => $3)
-        FROM candidate
-        WHERE d.id = candidate.id
-        RETURNING d.id, d.webhook_id, d.event, d.payload, d.attempts, d.max_attempts,
-                  d.claim_token, d.claimed_by, d.claim_expires_at
+        SELECT id, webhook_id, event, payload, attempts, max_attempts,
+               claim_token, claimed_by, claim_expires_at
+        FROM claimed
+        ORDER BY next_retry_at ASC, id ASC
         "#,
     )
     .bind(limit)
     .bind(claimed_by)
     .bind(claim_ttl_secs)
+    .bind(only_webhooks)
     .fetch_all(db)
     .await
     .map_err(|e| format!("Failed to claim retry queue: {}", e))?;
@@ -2341,14 +2444,35 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
     deliver_claimed_webhook_batch(db, &rows).await
 }
 
+/// Upper bound on webhooks whose claimed deliveries are sent concurrently in
+/// one retry pass (#5661). Each webhook's deliveries are sent one at a time,
+/// in claim order, so this also caps in-flight sends at one per endpoint.
+const WEBHOOK_DELIVERY_CONCURRENCY: usize = 8;
+
+/// What happened to one claimed delivery in a retry pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryStep {
+    /// Not sent: dead-lettered without an attempt, or the claim was lost.
+    Skipped,
+    /// Sent and accepted by the receiver.
+    Delivered,
+    /// Sent and failed (transport error, timeout, or non-2xx status).
+    Failed,
+}
+
 /// Send each claimed delivery and record the outcome. Split from
 /// [`process_webhook_retries`] so a test can drive the real send path for
 /// exactly the rows it claimed, without draining other due deliveries.
+///
+/// Deliveries are grouped by webhook. Webhooks are served concurrently (up to
+/// [`WEBHOOK_DELIVERY_CONCURRENCY`]); each webhook's own deliveries are sent
+/// in order, one at a time. A slow or dead receiver therefore holds up only
+/// its own deliveries, not other webhooks' (#5661).
 async fn deliver_claimed_webhook_batch(
     db: &sqlx::PgPool,
     rows: &[Claimed<RetryDeliveryRow>],
 ) -> std::result::Result<(), String> {
-    use sqlx::Row;
+    use futures::StreamExt;
 
     if rows.is_empty() {
         return Ok(());
@@ -2363,227 +2487,331 @@ async fn deliver_claimed_webhook_batch(
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
-    for delivery in rows {
-        // Look up the webhook URL and headers. Signing-secret material is
-        // loaded separately via `load_active_secrets` so the retry path can
-        // use the AES-GCM-decrypted secrets directly for HMAC. The legacy
-        // bcrypt `secret_hash` cannot sign (irreversible) and is therefore
-        // not read here.
-        let webhook_row =
-            sqlx::query("SELECT url, headers FROM webhooks WHERE id = $1 AND is_enabled = true")
-                .bind(delivery.webhook_id)
-                .fetch_optional(db)
-                .await
-                .map_err(|e| format!("Failed to fetch webhook: {}", e))?;
-
-        let webhook_row = match webhook_row {
-            Some(w) => w,
-            None => {
-                // Webhook deleted or disabled: mark delivery as dead letter
-                dead_letter_claimed_delivery(db, delivery).await;
-                continue;
-            }
-        };
-
-        let url: String = webhook_row.get("url");
-        let headers: Option<serde_json::Value> = webhook_row.get("headers");
-
-        // Validate URL before delivery (SSRF prevention)
-        if validate_webhook_url(&url).is_err() {
-            dead_letter_claimed_delivery(db, delivery).await;
-            tracing::warn!(
-                "Webhook URL failed validation during retry, delivery {} dead-lettered",
-                delivery.id
-            );
-            continue;
+    // A hand-driven FuturesUnordered rather than `stream.map(..).buffer_unordered`:
+    // the closure form trips rustc's higher-ranked `Send` inference when the
+    // worker future is spawned (scheduler_service).
+    let mut pending = group_deliveries_by_webhook(rows).into_iter();
+    let mut in_flight = futures::stream::FuturesUnordered::new();
+    for lane in pending.by_ref().take(WEBHOOK_DELIVERY_CONCURRENCY) {
+        in_flight.push(deliver_webhook_lane(db, &client, lane));
+    }
+    let mut first_error = None;
+    while let Some(result) = in_flight.next().await {
+        if let Err(e) = result {
+            first_error.get_or_insert(e);
         }
-
-        // Serialize once so the bytes we sign are exactly the bytes we POST.
-        let body_bytes = match serde_json::to_vec(&delivery.payload) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(
-                    delivery_id = %delivery.id,
-                    error = %e,
-                    "Failed to serialize webhook payload; dead-lettering"
-                );
-                dead_letter_claimed_delivery(db, delivery).await;
-                continue;
-            }
-        };
-
-        // Look up the pinned event_schema_version for this webhook so
-        // the header is correct even when the delivery row was enqueued
-        // before E4 landed. Cheap; one row, one column.
-        let event_version: String =
-            sqlx::query_scalar("SELECT event_schema_version FROM webhooks WHERE id = $1")
-                .bind(delivery.webhook_id)
-                .fetch_optional(db)
-                .await
-                .map_err(|e| format!("load event_schema_version: {}", e))?
-                .unwrap_or_else(|| "2026-04-01".to_string());
-
-        let unix_secs = chrono::Utc::now().timestamp();
-        let signing = load_delivery_signing(db, delivery.webhook_id).await;
-        let secret_refs = signing.secret_refs();
-
-        let header_inputs = DeliveryHeaderInputs {
-            delivery_id: delivery.id,
-            webhook_id: delivery.webhook_id,
-            event: &delivery.event,
-            event_version: &event_version,
-            retry_attempt: Some(delivery.attempts + 1),
-            custom_headers: headers.as_ref(),
-            secrets: &secret_refs,
-            v2_keys: &signing.v2_keys,
-            unix_secs,
-            body_bytes: &body_bytes,
-        };
-        // Re-assert ownership immediately before the side effect: earlier
-        // items in this batch may have taken long enough (30s timeout each)
-        // that this row's claim lapsed and another replica took it over. The
-        // new owner will POST it; sending here too would duplicate it.
-        if !extend_webhook_delivery_claim(db, delivery, WEBHOOK_RETRY_CLAIM_TTL_SECS).await {
-            tracing::info!(
-                delivery_id = %delivery.id,
-                "Webhook retry claim lost before send; skipping (new owner will deliver)"
-            );
-            continue;
+        if let Some(lane) = pending.next() {
+            in_flight.push(deliver_webhook_lane(db, &client, lane));
         }
-
-        let mut request = client.post(&url);
-        for (name, value) in build_delivery_request_headers(&header_inputs) {
-            request = request.header(name, value);
-        }
-
-        let (success, response_status, response_body) = match request.body(body_bytes).send().await
-        {
-            Ok(response) => {
-                let status = response.status().as_u16() as i32;
-                let body = response.text().await.ok();
-                (
-                    is_webhook_delivery_success(status as u16),
-                    Some(status),
-                    body,
-                )
-            }
-            Err(e) => (false, None, Some(e.to_string())),
-        };
-
-        let new_attempts = delivery.attempts + 1;
-        let outcome = determine_retry_outcome(success, delivery.attempts, delivery.max_attempts);
-
-        if outcome == RetryOutcome::Success {
-            // Delivery succeeded
-            let _ = sqlx::query(
-                r#"
-                UPDATE webhook_deliveries
-                SET success = true,
-                    response_status = $2,
-                    response_body = $3,
-                    attempts = $4,
-                    delivered_at = NOW(),
-                    next_retry_at = NULL,
-                    claimed_by = NULL,
-                    claim_token = NULL,
-                    claim_expires_at = NULL
-                WHERE id = $1
-                  AND claim_token = $5
-                "#,
-            )
-            .bind(delivery.id)
-            .bind(response_status)
-            .bind(&response_body)
-            .bind(new_attempts)
-            .bind(delivery.claim_token())
-            .execute(db)
-            .await;
-        } else if outcome == RetryOutcome::DeadLetter {
-            // Max attempts exhausted: dead letter. Token-guarded so a stale
-            // owner cannot dead-letter (and auto-disable the webhook for) a
-            // delivery that a new owner is still driving.
-            let dead_lettered = sqlx::query(
-                r#"
-                UPDATE webhook_deliveries
-                SET response_status = $2,
-                    response_body = $3,
-                    attempts = $4,
-                    next_retry_at = NULL,
-                    claimed_by = NULL,
-                    claim_token = NULL,
-                    claim_expires_at = NULL
-                WHERE id = $1
-                  AND claim_token = $5
-                "#,
-            )
-            .bind(delivery.id)
-            .bind(response_status)
-            .bind(&response_body)
-            .bind(new_attempts)
-            .bind(delivery.claim_token())
-            .execute(db)
-            .await;
-
-            let owns_dead_letter =
-                matches!(dead_lettered, Ok(ref result) if result.rows_affected() == 1);
-            if owns_dead_letter {
-                tracing::info!(
-                    "Webhook delivery {} exhausted {} attempts, dead-lettered",
-                    delivery.id,
-                    new_attempts
-                );
-
-                // Auto-disable + notifier. Failures here are logged but do
-                // not retry the (already dead-lettered) delivery.
-                if let Err(e) =
-                    crate::services::webhook_notifier::auto_disable_webhook_for_dead_letter(
-                        db,
-                        delivery.webhook_id,
-                        delivery.id,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        delivery_id = %delivery.id,
-                        webhook_id = %delivery.webhook_id,
-                        error = %e,
-                        "auto-disable on dead-letter failed"
-                    );
-                }
-
-                crate::services::metrics_service::record_webhook_dead_letter(&delivery.event);
-            }
-        } else if let RetryOutcome::Retry { delay_secs } = outcome {
-            // Schedule next retry, releasing the claim so any replica can
-            // pick the delivery up once the backoff elapses.
-            let _ = sqlx::query(
-                r#"
-                UPDATE webhook_deliveries
-                SET response_status = $2,
-                    response_body = $3,
-                    attempts = $4,
-                    next_retry_at = NOW() + ($5 || ' seconds')::interval,
-                    claimed_by = NULL,
-                    claim_token = NULL,
-                    claim_expires_at = NULL
-                WHERE id = $1
-                  AND claim_token = $6
-                "#,
-            )
-            .bind(delivery.id)
-            .bind(response_status)
-            .bind(&response_body)
-            .bind(new_attempts)
-            .bind(delay_secs.to_string())
-            .bind(delivery.claim_token())
-            .execute(db)
-            .await;
-        }
-
-        crate::services::metrics_service::record_webhook_delivery(&delivery.event, success);
     }
 
+    first_error.map_or(Ok(()), Err)
+}
+
+/// Group claimed deliveries by webhook, keeping claim order within each group
+/// and ordering groups by their first delivery.
+fn group_deliveries_by_webhook(
+    rows: &[Claimed<RetryDeliveryRow>],
+) -> Vec<Vec<&Claimed<RetryDeliveryRow>>> {
+    let mut lanes: Vec<Vec<&Claimed<RetryDeliveryRow>>> = Vec::new();
+    let mut index: std::collections::HashMap<Uuid, usize> = std::collections::HashMap::new();
+    for row in rows {
+        let slot = *index.entry(row.webhook_id).or_insert_with(|| {
+            lanes.push(Vec::new());
+            lanes.len() - 1
+        });
+        lanes[slot].push(row);
+    }
+    lanes
+}
+
+/// Send one webhook's claimed deliveries in order. After a failed send the
+/// endpoint is treated as unavailable for the rest of this pass: its remaining
+/// deliveries are released unattempted (attempts and `next_retry_at`
+/// unchanged), so they are retried on the next pass instead of each waiting
+/// out another timeout now.
+async fn deliver_webhook_lane(
+    db: &sqlx::PgPool,
+    client: &reqwest::Client,
+    lane: Vec<&Claimed<RetryDeliveryRow>>,
+) -> std::result::Result<(), String> {
+    for (i, delivery) in lane.iter().enumerate() {
+        let step = match deliver_one_claimed_webhook(db, client, delivery).await {
+            Ok(step) => step,
+            Err(e) => {
+                release_unattempted_claims(db, &lane[i..]).await;
+                return Err(e);
+            }
+        };
+        if step == DeliveryStep::Failed {
+            let rest = &lane[i + 1..];
+            if !rest.is_empty() {
+                tracing::debug!(
+                    webhook_id = %delivery.webhook_id,
+                    deferred = rest.len(),
+                    "Webhook delivery failed; deferring the endpoint's other due deliveries to the next pass"
+                );
+                release_unattempted_claims(db, rest).await;
+            }
+            break;
+        }
+    }
     Ok(())
+}
+
+/// Drop this owner's claim on deliveries it will not send in this pass,
+/// without recording an attempt. Token-guarded per row.
+async fn release_unattempted_claims(db: &sqlx::PgPool, deliveries: &[&Claimed<RetryDeliveryRow>]) {
+    if deliveries.is_empty() {
+        return;
+    }
+    let ids: Vec<Uuid> = deliveries.iter().map(|d| d.id).collect();
+    let tokens: Vec<Uuid> = deliveries.iter().map(|d| d.claim_token()).collect();
+    if let Err(e) = sqlx::query(
+        "UPDATE webhook_deliveries d \
+         SET claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL \
+         FROM UNNEST($1::uuid[], $2::uuid[]) AS c(id, token) \
+         WHERE d.id = c.id AND d.claim_token = c.token",
+    )
+    .bind(&ids)
+    .bind(&tokens)
+    .execute(db)
+    .await
+    {
+        // The claims still expire on their own after the claim TTL.
+        tracing::warn!(error = %e, "Failed to release deferred webhook delivery claims");
+    }
+}
+
+/// Send one claimed delivery and record its outcome.
+async fn deliver_one_claimed_webhook(
+    db: &sqlx::PgPool,
+    client: &reqwest::Client,
+    delivery: &Claimed<RetryDeliveryRow>,
+) -> std::result::Result<DeliveryStep, String> {
+    use sqlx::Row;
+
+    // Look up the webhook URL and headers. Signing-secret material is
+    // loaded separately via `load_active_secrets` so the retry path can
+    // use the AES-GCM-decrypted secrets directly for HMAC. The legacy
+    // bcrypt `secret_hash` cannot sign (irreversible) and is therefore
+    // not read here.
+    let webhook_row =
+        sqlx::query("SELECT url, headers FROM webhooks WHERE id = $1 AND is_enabled = true")
+            .bind(delivery.webhook_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| format!("Failed to fetch webhook: {}", e))?;
+
+    let webhook_row = match webhook_row {
+        Some(w) => w,
+        None => {
+            // Webhook deleted or disabled: mark delivery as dead letter
+            dead_letter_claimed_delivery(db, delivery).await;
+            return Ok(DeliveryStep::Skipped);
+        }
+    };
+
+    let url: String = webhook_row.get("url");
+    let headers: Option<serde_json::Value> = webhook_row.get("headers");
+
+    // Validate URL before delivery (SSRF prevention)
+    if validate_webhook_url(&url).is_err() {
+        dead_letter_claimed_delivery(db, delivery).await;
+        tracing::warn!(
+            "Webhook URL failed validation during retry, delivery {} dead-lettered",
+            delivery.id
+        );
+        return Ok(DeliveryStep::Skipped);
+    }
+
+    // Serialize once so the bytes we sign are exactly the bytes we POST.
+    let body_bytes = match serde_json::to_vec(&delivery.payload) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                delivery_id = %delivery.id,
+                error = %e,
+                "Failed to serialize webhook payload; dead-lettering"
+            );
+            dead_letter_claimed_delivery(db, delivery).await;
+            return Ok(DeliveryStep::Skipped);
+        }
+    };
+
+    // Look up the pinned event_schema_version for this webhook so
+    // the header is correct even when the delivery row was enqueued
+    // before E4 landed. Cheap; one row, one column.
+    let event_version: String =
+        sqlx::query_scalar("SELECT event_schema_version FROM webhooks WHERE id = $1")
+            .bind(delivery.webhook_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| format!("load event_schema_version: {}", e))?
+            .unwrap_or_else(|| "2026-04-01".to_string());
+
+    let unix_secs = chrono::Utc::now().timestamp();
+    let signing = load_delivery_signing(db, delivery.webhook_id).await;
+    let secret_refs = signing.secret_refs();
+
+    let header_inputs = DeliveryHeaderInputs {
+        delivery_id: delivery.id,
+        webhook_id: delivery.webhook_id,
+        event: &delivery.event,
+        event_version: &event_version,
+        retry_attempt: Some(delivery.attempts + 1),
+        custom_headers: headers.as_ref(),
+        secrets: &secret_refs,
+        v2_keys: &signing.v2_keys,
+        unix_secs,
+        body_bytes: &body_bytes,
+    };
+    // Re-assert ownership immediately before the side effect: earlier
+    // items in this batch may have taken long enough (30s timeout each)
+    // that this row's claim lapsed and another replica took it over. The
+    // new owner will POST it; sending here too would duplicate it.
+    if !extend_webhook_delivery_claim(db, delivery, WEBHOOK_RETRY_CLAIM_TTL_SECS).await {
+        tracing::info!(
+            delivery_id = %delivery.id,
+            "Webhook retry claim lost before send; skipping (new owner will deliver)"
+        );
+        return Ok(DeliveryStep::Skipped);
+    }
+
+    let mut request = client.post(&url);
+    for (name, value) in build_delivery_request_headers(&header_inputs) {
+        request = request.header(name, value);
+    }
+
+    let (success, response_status, response_body) = match request.body(body_bytes).send().await {
+        Ok(response) => {
+            let status = response.status().as_u16() as i32;
+            let body = response.text().await.ok();
+            (
+                is_webhook_delivery_success(status as u16),
+                Some(status),
+                body,
+            )
+        }
+        Err(e) => (false, None, Some(e.to_string())),
+    };
+
+    let new_attempts = delivery.attempts + 1;
+    let outcome = determine_retry_outcome(success, delivery.attempts, delivery.max_attempts);
+
+    if outcome == RetryOutcome::Success {
+        // Delivery succeeded
+        let _ = sqlx::query(
+            r#"
+            UPDATE webhook_deliveries
+            SET success = true,
+                response_status = $2,
+                response_body = $3,
+                attempts = $4,
+                delivered_at = NOW(),
+                next_retry_at = NULL,
+                claimed_by = NULL,
+                claim_token = NULL,
+                claim_expires_at = NULL
+            WHERE id = $1
+              AND claim_token = $5
+            "#,
+        )
+        .bind(delivery.id)
+        .bind(response_status)
+        .bind(&response_body)
+        .bind(new_attempts)
+        .bind(delivery.claim_token())
+        .execute(db)
+        .await;
+    } else if outcome == RetryOutcome::DeadLetter {
+        // Max attempts exhausted: dead letter. Token-guarded so a stale
+        // owner cannot dead-letter (and auto-disable the webhook for) a
+        // delivery that a new owner is still driving.
+        let dead_lettered = sqlx::query(
+            r#"
+            UPDATE webhook_deliveries
+            SET response_status = $2,
+                response_body = $3,
+                attempts = $4,
+                next_retry_at = NULL,
+                claimed_by = NULL,
+                claim_token = NULL,
+                claim_expires_at = NULL
+            WHERE id = $1
+              AND claim_token = $5
+            "#,
+        )
+        .bind(delivery.id)
+        .bind(response_status)
+        .bind(&response_body)
+        .bind(new_attempts)
+        .bind(delivery.claim_token())
+        .execute(db)
+        .await;
+
+        let owns_dead_letter =
+            matches!(dead_lettered, Ok(ref result) if result.rows_affected() == 1);
+        if owns_dead_letter {
+            tracing::info!(
+                "Webhook delivery {} exhausted {} attempts, dead-lettered",
+                delivery.id,
+                new_attempts
+            );
+
+            // Auto-disable + notifier. Failures here are logged but do
+            // not retry the (already dead-lettered) delivery.
+            if let Err(e) = crate::services::webhook_notifier::auto_disable_webhook_for_dead_letter(
+                db,
+                delivery.webhook_id,
+                delivery.id,
+            )
+            .await
+            {
+                tracing::warn!(
+                    delivery_id = %delivery.id,
+                    webhook_id = %delivery.webhook_id,
+                    error = %e,
+                    "auto-disable on dead-letter failed"
+                );
+            }
+
+            crate::services::metrics_service::record_webhook_dead_letter(&delivery.event);
+        }
+    } else if let RetryOutcome::Retry { delay_secs } = outcome {
+        // Schedule next retry, releasing the claim so any replica can
+        // pick the delivery up once the backoff elapses.
+        let _ = sqlx::query(
+            r#"
+            UPDATE webhook_deliveries
+            SET response_status = $2,
+                response_body = $3,
+                attempts = $4,
+                next_retry_at = NOW() + ($5 || ' seconds')::interval,
+                claimed_by = NULL,
+                claim_token = NULL,
+                claim_expires_at = NULL
+            WHERE id = $1
+              AND claim_token = $6
+            "#,
+        )
+        .bind(delivery.id)
+        .bind(response_status)
+        .bind(&response_body)
+        .bind(new_attempts)
+        .bind(delay_secs.to_string())
+        .bind(delivery.claim_token())
+        .execute(db)
+        .await;
+    }
+
+    crate::services::metrics_service::record_webhook_delivery(&delivery.event, success);
+
+    Ok(if success {
+        DeliveryStep::Delivered
+    } else {
+        DeliveryStep::Failed
+    })
 }
 
 #[derive(OpenApi)]
@@ -3689,16 +3917,21 @@ mod tests {
         let mut inputs = sample_inputs(&secret_refs, body);
         inputs.unix_secs = unix_secs;
         let h = build_delivery_request_headers(&inputs);
-        // The legacy header is HMAC over body alone (no timestamp prefix).
+        // The legacy header is HMAC over body alone (no timestamp prefix),
+        // so a receiver holding only this header can verify it (#5234).
+        // Literal computed out-of-band:
+        // printf '%s' 'hello world' | openssl dgst -sha256 -hmac whsec_test
         let legacy = header(&h, "X-Webhook-Signature").unwrap();
-        let expected_legacy = format!(
-            "sha256={}",
-            crate::services::webhook_signing::compute_v1_signature(secret, unix_secs, body)
+        assert_eq!(
+            legacy,
+            "sha256=a3ea78f3992b9c14cb5f03dfc734e3ac8846b716e277bb2b1826079fdceec34a"
         );
-        assert_eq!(legacy, expected_legacy);
-        // The v2 header includes the same hex token.
+        // The v1= token is still over "<t>.<body>", so it differs from the
+        // legacy value.
         let v2 = header(&h, "X-ArtifactKeeper-Signature").unwrap();
-        assert!(v2.contains(&legacy[7..]));
+        let v1 = crate::services::webhook_signing::compute_v1_signature(secret, unix_secs, body);
+        assert_eq!(v2, format!("t={unix_secs},v1={v1}"));
+        assert!(!v2.contains(&legacy[7..]));
     }
 
     #[test]
@@ -3732,8 +3965,10 @@ mod tests {
     /// #921 regression pin: the complete header set a `signing_mode = hmac`
     /// webhook sends, byte for byte, as it was before asymmetric signing
     /// existed. The expected values are literals (HMAC-SHA256 computed
-    /// out-of-band over `"1700000000.<body>"`), not re-derived through the
-    /// code under test, so any drift in names, order, or token layout fails.
+    /// out-of-band: `v1=` over `"1700000000.<body>"`, the legacy
+    /// `X-Webhook-Signature` over `<body>` alone since #5234), not
+    /// re-derived through the code under test, so any drift in names,
+    /// order, or token layout fails.
     #[test]
     fn delivery_headers_hmac_mode_are_byte_identical_to_pre_v2_wire() {
         let secret_refs = ["whsec_current", "whsec_previous"];
@@ -3744,6 +3979,7 @@ mod tests {
         let h = build_delivery_request_headers(&inputs);
         let cur = "e63b1d3ddaa5c2696fc1f76f142509e122f6baa6c55fd010482b060a858f7017";
         let prev = "725598b0de63a47dc2a201da3fa6ac232f9d56ffa4ee9f9fb86ad5a1df0d6926";
+        let legacy = "4586d3971c966d41554b224a7fe762e2638266efe34320caebe19967f969c776";
         let nil = "00000000-0000-0000-0000-000000000000";
         let expected: Vec<(String, String)> = [
             ("Content-Type", "application/json".to_string()),
@@ -3759,7 +3995,7 @@ mod tests {
                 "X-ArtifactKeeper-Signature",
                 format!("t=1700000000,v1={cur},v1={prev}"),
             ),
-            ("X-Webhook-Signature", format!("sha256={cur}")),
+            ("X-Webhook-Signature", format!("sha256={legacy}")),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
@@ -5059,32 +5295,284 @@ mod tests {
         }
 
         // ===================================================================
-        // rotate_webhook_secret — secret non-disclosure (GHSA-qcmj)
+        // rotate_webhook_secret — one-time secret disclosure (#5235)
         // ===================================================================
 
-        /// The rotate-secret response body must not carry the raw signing
-        /// secret. This is a pure serialization guard (no DB): before the fix
-        /// the response embedded the raw `secret`; after it, only the
-        /// non-reversible `secret_digest` and expiry metadata are present.
+        /// A webhook that already has a signing secret, so a rotation opens
+        /// the overlap window and a second rotation answers 409.
+        async fn insert_signed_webhook(pool: &PgPool, repository_id: Option<Uuid>) -> Uuid {
+            super::set_test_secret_key();
+            let id = insert_webhook(pool, None, repository_id).await;
+            sqlx::query(
+                "UPDATE webhooks SET secret_encrypted = $2, secret_digest = 'whsec_...init' \
+                 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(super::encrypt_test_secret("whsec_initial"))
+            .execute(pool)
+            .await
+            .expect("set initial secret");
+            id
+        }
+
+        async fn stored_digest(pool: &PgPool, id: Uuid) -> String {
+            sqlx::query_scalar("SELECT secret_digest FROM webhooks WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("read digest")
+        }
+
+        /// POST rotate-secret through the real route and the layers that wrap
+        /// every response in production that could touch this one: the security
+        /// headers and the request trace.
+        #[allow(clippy::disallowed_methods)]
+        // streaming-invariant: test exempt — a small JSON body is not an
+        // artifact path (#1608).
+        async fn rotate_via_router(
+            state: crate::api::SharedState,
+            auth: AuthExtension,
+            id: Uuid,
+        ) -> (axum::http::StatusCode, axum::http::HeaderMap, String) {
+            use tower::ServiceExt;
+            let app = router()
+                .layer(axum::middleware::from_fn(
+                    crate::api::middleware::security_headers::security_headers_middleware,
+                ))
+                .layer(tower_http::trace::TraceLayer::new_for_http().on_response(
+                    crate::api::middleware::request_span::RecordResponseOnSpan::default(),
+                ))
+                .layer(axum::Extension(auth))
+                .with_state(state);
+            let response = app
+                .oneshot(
+                    axum::http::Request::post(format!("/{id}/rotate-secret"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let (parts, body) = response.into_parts();
+            let bytes = axum::body::to_bytes(body, 64 * 1024).await.unwrap();
+            (
+                parts.status,
+                parts.headers,
+                String::from_utf8(bytes.to_vec()).unwrap(),
+            )
+        }
+
+        #[derive(Clone, Default)]
+        struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for LogCapture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+            type Writer = LogCapture;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        /// #5235: a rotation hands the admin the new secret, once. The value
+        /// must be the one deliveries now sign with, must not be cacheable, and
+        /// must not reach a later read, the 409 of a repeat rotation, the audit
+        /// row or any log line, at the most verbose log level.
+        #[tokio::test]
+        async fn rotate_secret_returns_the_new_secret_once_and_nowhere_else() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let admin = create_user(&pool, true).await;
+            let state = tdh::build_state(pool.clone(), "/tmp");
+            let wh = insert_signed_webhook(&pool, None).await;
+
+            let logs = LogCapture::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(logs.clone())
+                .finish();
+            let log_guard = tracing::subscriber::set_default(subscriber);
+            let (status, headers, body) =
+                rotate_via_router(state.clone(), auth_for(admin, true), wh).await;
+            let row = tdh::audit_row_eventually(&pool, wh, "WEBHOOK_SECRET_ROTATED").await;
+            drop(log_guard);
+
+            assert_eq!(status, axum::http::StatusCode::OK, "body: {body}");
+            assert_eq!(
+                headers
+                    .get(axum::http::header::CACHE_CONTROL)
+                    .map(|v| v.to_str().unwrap()),
+                Some("no-store"),
+                "a response holding a signing secret must not be cached"
+            );
+
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let secret = json["secret"]
+                .as_str()
+                .expect("rotate response must carry the new secret")
+                .to_string();
+            assert!(secret.starts_with(webhook_secret_crypto::SECRET_PREFIX));
+
+            // It is the secret deliveries now sign with, not merely a string
+            // that looks like one, and the digest identifies it.
+            let stored: Vec<u8> =
+                sqlx::query_scalar("SELECT secret_encrypted FROM webhooks WHERE id = $1")
+                    .bind(wh)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                webhook_secret_crypto::decrypt_secret(&stored).unwrap(),
+                secret
+            );
+            assert_eq!(
+                json["secret_digest"].as_str(),
+                Some(webhook_secret_crypto::digest_for_display(&secret).as_str())
+            );
+
+            // No later read returns it.
+            let read = get_webhook(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(admin, true)),
+                axum::extract::Path(wh),
+            )
+            .await
+            .expect("get webhook")
+            .0;
+            let read = serde_json::to_string(&read).unwrap();
+            assert!(read.contains("secret_digest"), "read: {read}");
+            assert!(!read.contains(&secret), "GET returned the secret");
+
+            let list = list_webhooks(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(admin, true)),
+                axum::extract::Query(ListWebhooksQuery {
+                    repository_id: None,
+                    enabled: None,
+                    page: None,
+                    per_page: Some(1000),
+                }),
+            )
+            .await
+            .expect("list webhooks")
+            .0;
+            assert!(!serde_json::to_string(&list).unwrap().contains(&secret));
+
+            // Rotating again inside the window neither replays the secret nor
+            // changes the one just handed out.
+            let (again, _, again_body) =
+                rotate_via_router(state.clone(), auth_for(admin, true), wh).await;
+            assert_eq!(again, axum::http::StatusCode::CONFLICT);
+            assert!(!again_body.contains(&secret), "409 replayed the secret");
+            let stored: Vec<u8> =
+                sqlx::query_scalar("SELECT secret_encrypted FROM webhooks WHERE id = $1")
+                    .bind(wh)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                webhook_secret_crypto::decrypt_secret(&stored).unwrap(),
+                secret
+            );
+
+            // The audit row records the fact, not the value.
+            assert_eq!(row.details["secret_rotated"], true);
+            let details = row.details.to_string();
+            assert!(!details.contains(&secret), "audit recorded: {details}");
+            assert!(!details.contains("secret_digest"), "audit: {details}");
+
+            // Prove the capture saw the request, then that it never saw the
+            // secret: not in a span, an event, or a logged SQL statement.
+            let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                logged.contains("UPDATE webhooks"),
+                "capture saw nothing, so its silence proves nothing"
+            );
+            assert!(!logged.contains(&secret), "the secret reached a log line");
+
+            sqlx::query("DELETE FROM webhooks WHERE id = $1")
+                .bind(wh)
+                .execute(&pool)
+                .await
+                .ok();
+            cleanup(&pool, &[], &[admin]).await;
+        }
+
+        /// #5235: rotation takes the read gate's token-scope check. A webhook
+        /// outside the token's repository scope answers 404 and is not rotated;
+        /// inside it, the token behaves as an admin.
+        #[tokio::test]
+        async fn rotate_secret_is_confined_to_the_token_repository_scope() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let admin = create_user(&pool, true).await;
+            let in_scope_repo = create_repo(&pool).await;
+            let other_repo = create_repo(&pool).await;
+            let state = tdh::build_state(pool.clone(), "/tmp");
+            let global_wh = insert_signed_webhook(&pool, None).await;
+            let other_wh = insert_signed_webhook(&pool, Some(other_repo)).await;
+            let in_scope_wh = insert_signed_webhook(&pool, Some(in_scope_repo)).await;
+            let restricted = || AuthExtension {
+                is_api_token: true,
+                allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![
+                    in_scope_repo,
+                ]),
+                ..auth_for(admin, true)
+            };
+
+            for wh in [global_wh, other_wh] {
+                let before = stored_digest(&pool, wh).await;
+                let (status, _, body) = rotate_via_router(state.clone(), restricted(), wh).await;
+                assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "body: {body}");
+                assert!(!body.contains("whsec_"), "body: {body}");
+                assert_eq!(
+                    stored_digest(&pool, wh).await,
+                    before,
+                    "an out-of-scope rotation must not change the secret"
+                );
+            }
+
+            let (status, _, body) =
+                rotate_via_router(state.clone(), restricted(), in_scope_wh).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "body: {body}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(json["secret"].is_string(), "body: {body}");
+
+            for wh in [global_wh, other_wh, in_scope_wh] {
+                sqlx::query("DELETE FROM webhooks WHERE id = $1")
+                    .bind(wh)
+                    .execute(&pool)
+                    .await
+                    .ok();
+            }
+            cleanup(&pool, &[in_scope_repo, other_repo], &[admin]).await;
+        }
+
+        /// The derived `Debug` would print the raw secret into any log line
+        /// that formats this response.
         #[test]
-        fn rotate_response_omits_raw_secret() {
+        fn rotate_response_debug_redacts_the_secret() {
             let resp = RotateWebhookSecretResponse {
                 id: Uuid::new_v4(),
-                secret_digest: "whsec_pub_abcdef".to_string(),
+                secret: "whsec_must_not_be_logged".to_string(),
+                secret_digest: "whsec_...gged".to_string(),
                 previous_secret_expires_at: chrono::Utc::now(),
             };
-            let v = serde_json::to_value(&resp).expect("serialize rotate response");
-            let obj = v.as_object().expect("rotate response is a JSON object");
-            assert!(
-                !obj.contains_key("secret"),
-                "rotate response must not carry the raw signing secret, got: {v}"
-            );
-            // The non-reversible digest is still surfaced so callers can
-            // identify the newly active secret.
-            assert!(
-                obj.contains_key("secret_digest"),
-                "rotate response should still expose the display digest"
-            );
+            let printed = format!("{resp:?}");
+            assert!(!printed.contains("must_not_be_logged"), "{printed}");
+            assert!(printed.contains("whsec_...gged"), "{printed}");
+            // The field is still on the wire: it is the point of the response.
+            let v = serde_json::to_value(&resp).unwrap();
+            assert_eq!(v["secret"], "whsec_must_not_be_logged");
         }
 
         // ===================================================================
@@ -6239,13 +6727,14 @@ mod tests {
             let inputs = super::sample_inputs(&refs, body);
             let h = build_delivery_request_headers(&inputs);
             let cur = "e63b1d3ddaa5c2696fc1f76f142509e122f6baa6c55fd010482b060a858f7017";
+            let legacy = "4586d3971c966d41554b224a7fe762e2638266efe34320caebe19967f969c776";
             assert_eq!(
                 super::header(&h, "X-ArtifactKeeper-Signature"),
                 Some(format!("t=1700000000,v1={cur}").as_str())
             );
             assert_eq!(
                 super::header(&h, "X-Webhook-Signature"),
-                Some(format!("sha256={cur}").as_str())
+                Some(format!("sha256={legacy}").as_str())
             );
         }
 
@@ -6418,13 +6907,28 @@ mod tests {
             claimed_by: &str,
             claim_ttl_secs: f64,
         ) -> Claimed<RetryDeliveryRow> {
+            // Scoped to the fixture's own webhook (#5825): the fair claim
+            // takes every webhook's first due row before any second, so with
+            // 50 or more other webhooks' rows due on the shared database the
+            // instance-wide batch can skip the fixture on every pass.
+            let webhook_id: Uuid =
+                sqlx::query_scalar("SELECT webhook_id FROM webhook_deliveries WHERE id = $1")
+                    .bind(fixture_delivery_id)
+                    .fetch_one(pool)
+                    .await
+                    .expect("fixture delivery webhook");
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(750);
 
             loop {
-                let mut claimed =
-                    claim_due_webhook_deliveries(pool, 50, claimed_by, claim_ttl_secs)
-                        .await
-                        .expect("claim ok");
+                let mut claimed = claim_due_webhook_deliveries_for_webhooks(
+                    pool,
+                    &[webhook_id],
+                    50,
+                    claimed_by,
+                    claim_ttl_secs,
+                )
+                .await
+                .expect("claim ok");
 
                 let fixture_index = claimed
                     .iter()
@@ -6613,6 +7117,285 @@ mod tests {
             );
 
             cleanup_claim_test(&pool, webhook_id).await;
+        }
+
+        // -------------------------------------------------------------------
+        // Per-endpoint fairness (#5661, #5195)
+        // -------------------------------------------------------------------
+
+        async fn insert_url_webhook(pool: &sqlx::PgPool, url: &str) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO webhooks (id, name, url, events, is_enabled) \
+                 VALUES ($1, $2, $3, ARRAY['artifact.created'], true)",
+            )
+            .bind(id)
+            .bind(format!("wh-fair-{}", &id.to_string()[..8]))
+            .bind(url)
+            .execute(pool)
+            .await
+            .expect("insert webhook");
+            id
+        }
+
+        /// Insert `count` due deliveries for one webhook, `age_secs` overdue,
+        /// each one second apart so their order is well defined.
+        async fn insert_due_deliveries(
+            pool: &sqlx::PgPool,
+            webhook_id: Uuid,
+            count: i32,
+            age_secs: i32,
+        ) -> Vec<Uuid> {
+            sqlx::query_scalar(
+                "INSERT INTO webhook_deliveries \
+                     (webhook_id, event, payload, success, attempts, max_attempts, next_retry_at) \
+                 SELECT $1, 'artifact.created', '{}'::jsonb, false, 1, 5, \
+                        NOW() - make_interval(secs => ($3 - g)::double precision) \
+                 FROM generate_series(1, $2) AS g \
+                 ORDER BY g \
+                 RETURNING id",
+            )
+            .bind(webhook_id)
+            .bind(count)
+            .bind(age_secs)
+            .fetch_all(pool)
+            .await
+            .expect("insert due deliveries")
+        }
+
+        /// Claim until every fixture row is held by `claimed_by`, releasing
+        /// rows that belong to other tests. Returned in claim order.
+        async fn claim_fixture_deliveries(
+            pool: &sqlx::PgPool,
+            fixture_ids: &[Uuid],
+            claimed_by: &str,
+        ) -> Vec<Claimed<RetryDeliveryRow>> {
+            // Restricted to the fixtures' webhooks (#5825), as in
+            // `claim_fixture_delivery`.
+            let webhook_ids: Vec<Uuid> = sqlx::query_scalar(
+                "SELECT DISTINCT webhook_id FROM webhook_deliveries WHERE id = ANY($1)",
+            )
+            .bind(fixture_ids)
+            .fetch_all(pool)
+            .await
+            .expect("fixture delivery webhooks");
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut held: Vec<Claimed<RetryDeliveryRow>> = Vec::new();
+            while held.len() < fixture_ids.len() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "only {} of {} fixture deliveries were claimed",
+                    held.len(),
+                    fixture_ids.len()
+                );
+                let claimed = claim_due_webhook_deliveries_for_webhooks(
+                    pool,
+                    &webhook_ids,
+                    50,
+                    claimed_by,
+                    120.0,
+                )
+                .await
+                .expect("claim ok");
+                for delivery in claimed {
+                    if fixture_ids.contains(&delivery.id) {
+                        held.push(delivery);
+                    } else {
+                        release_test_claim(pool, &delivery).await;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            held
+        }
+
+        /// One webhook with a deep backlog of older due retries must not push
+        /// another webhook's due delivery out of the batch: the claim is
+        /// round-robin across webhooks, not the N oldest rows overall.
+        #[tokio::test]
+        async fn claim_is_round_robin_across_webhooks_not_oldest_first() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let dead = insert_url_webhook(&pool, "http://198.51.100.7/dead").await;
+            let healthy = insert_url_webhook(&pool, "http://198.51.100.7/live").await;
+            // 200 rows, all hours older than the healthy row: on an
+            // oldest-first claim of 50 they fill every slot, even if another
+            // test is holding up to 50 of them at the same moment.
+            insert_due_deliveries(&pool, dead, 200, 7200).await;
+            let healthy_row = insert_due_delivery(&pool, healthy).await;
+
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(750);
+            let mut dead_claimed = 0usize;
+            let mut healthy_claimed = false;
+            while !healthy_claimed && tokio::time::Instant::now() < deadline {
+                // Restricted to this test's two webhooks (#5825): the
+                // round-robin ranking among them is what is under test, and
+                // other tests' due rows on the shared database must not fill
+                // the batch.
+                let claimed = claim_due_webhook_deliveries_for_webhooks(
+                    &pool,
+                    &[dead, healthy],
+                    50,
+                    "fairness-test",
+                    60.0,
+                )
+                .await
+                .expect("claim ok");
+                for delivery in &claimed {
+                    if delivery.id == healthy_row {
+                        healthy_claimed = true;
+                    } else if delivery.webhook_id == dead {
+                        dead_claimed += 1;
+                    }
+                    release_test_claim(&pool, delivery).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+
+            cleanup_claim_test(&pool, dead).await;
+            cleanup_claim_test(&pool, healthy).await;
+
+            assert!(
+                healthy_claimed,
+                "the healthy webhook's due delivery must be claimed despite the other \
+                 webhook's backlog of older retries"
+            );
+            assert!(
+                dead_claimed > 0,
+                "the backlogged webhook still gets the remaining batch slots"
+            );
+        }
+
+        /// A receiver that never answers must not hold up another webhook's
+        /// deliveries claimed in the same batch. The dead endpoint's rows are
+        /// first in the batch; the healthy endpoint's rows must still be
+        /// delivered well inside one 30 s send timeout.
+        #[tokio::test]
+        async fn dead_receiver_does_not_hold_up_healthy_webhook_deliveries() {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, ResponseTemplate};
+
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+            Mock::given(method("POST"))
+                .and(path("/dead"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(120)),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/live"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+
+            let dead = insert_url_webhook(&pool, &format!("{}/dead", server.uri())).await;
+            let healthy = insert_url_webhook(&pool, &format!("{}/live", server.uri())).await;
+            let dead_rows = insert_due_deliveries(&pool, dead, 3, 7200).await;
+            let healthy_rows = insert_due_deliveries(&pool, healthy, 3, 60).await;
+
+            let mut fixture: Vec<Uuid> = dead_rows.clone();
+            fixture.extend(&healthy_rows);
+            let mut claimed = claim_fixture_deliveries(&pool, &fixture, "dead-receiver-test").await;
+            // Dead endpoint's rows first, as an oldest-first batch orders them.
+            claimed.sort_by_key(|d| !dead_rows.contains(&d.id));
+
+            let batch_pool = pool.clone();
+            let batch =
+                tokio::spawn(
+                    async move { deliver_claimed_webhook_batch(&batch_pool, &claimed).await },
+                );
+
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut delivered = 0i64;
+            while tokio::time::Instant::now() < deadline {
+                delivered = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM webhook_deliveries \
+                     WHERE webhook_id = $1 AND success = true",
+                )
+                .bind(healthy)
+                .fetch_one(&pool)
+                .await
+                .expect("count delivered");
+                if delivered == healthy_rows.len() as i64 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            batch.abort();
+
+            cleanup_claim_test(&pool, dead).await;
+            cleanup_claim_test(&pool, healthy).await;
+
+            assert_eq!(
+                delivered,
+                healthy_rows.len() as i64,
+                "the healthy webhook's deliveries must complete while the dead receiver hangs"
+            );
+        }
+
+        /// After one failed send to an endpoint, its other deliveries in the
+        /// same pass are released unattempted (attempts and next_retry_at
+        /// unchanged) rather than each being sent to a receiver that just
+        /// failed. The failed row itself follows normal backoff.
+        #[tokio::test]
+        async fn failed_send_defers_rest_of_that_webhooks_batch() {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, ResponseTemplate};
+
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+            Mock::given(method("POST"))
+                .and(path("/fail"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&server)
+                .await;
+
+            let webhook = insert_url_webhook(&pool, &format!("{}/fail", server.uri())).await;
+            let rows = insert_due_deliveries(&pool, webhook, 3, 600).await;
+            let claimed = claim_fixture_deliveries(&pool, &rows, "defer-test").await;
+
+            deliver_claimed_webhook_batch(&pool, &claimed)
+                .await
+                .expect("deliver claimed batch");
+
+            let received = server.received_requests().await.expect("recording on");
+            let states: Vec<(Uuid, i32, bool, bool)> = sqlx::query_as(
+                "SELECT id, attempts, claim_token IS NULL, next_retry_at > NOW() \
+                 FROM webhook_deliveries WHERE webhook_id = $1 ORDER BY next_retry_at",
+            )
+            .bind(webhook)
+            .fetch_all(&pool)
+            .await
+            .expect("delivery states");
+            cleanup_claim_test(&pool, webhook).await;
+
+            assert_eq!(received.len(), 1, "one send to a failing endpoint per pass");
+            let attempted: Vec<_> = states.iter().filter(|s| s.1 == 2).collect();
+            assert_eq!(
+                attempted.len(),
+                1,
+                "exactly one row was attempted: {states:?}"
+            );
+            assert_eq!(
+                attempted[0].0, rows[0],
+                "the oldest due row is attempted first"
+            );
+            assert!(
+                attempted[0].3,
+                "the failed row is rescheduled into the future"
+            );
+            for s in states.iter().filter(|s| s.0 != rows[0]) {
+                assert_eq!(s.1, 1, "deferred rows keep their attempt count: {s:?}");
+                assert!(s.2, "deferred rows are released for the next pass: {s:?}");
+                assert!(!s.3, "deferred rows stay due: {s:?}");
+            }
         }
     }
 }

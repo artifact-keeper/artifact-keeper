@@ -11,8 +11,8 @@ artifact is still cached and downloadable.
 
 | Class | Examples | Default lifetime | On expiry |
 | --- | --- | --- | --- |
-| **Mutable** | npm packument, PyPI simple index, `maven-metadata.xml`, OCI tag, Go `@v/list`, Cargo sparse index, conda `repodata.json`, RPM `repomd.xml` | 300 s (5 min) | revalidated against upstream, then refilled |
-| **Immutable** | npm tarball (`…/-/<pkg>-<ver>.tgz`), wheel/sdist, `.jar`, `.crate`, OCI digest blob, RPM package | 315360000 s (~10 years) | never expires, never revalidated |
+| **Mutable** | npm packument, PyPI simple index, `maven-metadata.xml`, OCI tag, Go `@v/list`, Cargo sparse index, conda `repodata.json`, RPM `repomd.xml`, Hugging Face `resolve/main/...` and model info at a branch, Go checksum database tree head (`sumdb/<host>/latest`) | 300 s (5 min) | revalidated against upstream, then refilled |
+| **Immutable** | npm tarball (`…/-/<pkg>-<ver>.tgz`), wheel/sdist, `.jar`, `.crate`, OCI digest blob, RPM package, Hugging Face file or model info at a 40-hex commit sha (`<model>/resolve/<sha>/...`), Go checksum database tiles and `lookup/<module>@<version>` | 315360000 s (~10 years) | never expires, never revalidated |
 
 Classification is by **path shape**, not by format alone — see
 `backend/src/services/cache_classifier.rs`. The bias is deliberate: a mutable
@@ -125,6 +125,74 @@ Details that make `keep` safe:
 tier as the cache TTL and repository delete/update: it needs the
 `write:repositories` scope and `admin` on the repository for non-administrators.
 
+## Cache-only (offline) mode (`upstream_mode`, #5282)
+
+A Remote that was seeded while connected and then cut off can be declared
+**cache-only**. It then serves what it holds and never contacts its upstream:
+
+```bash
+# Take the Remote offline: serve the cache, never contact upstream.
+curl -X PUT "$AK/api/v1/repositories/<key>/upstream-mode" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"upstream_mode":"cache_only"}'
+
+# Read it back. `effective_upstream_mode` is `cache_only` whenever the
+# instance-wide PROXY_UPSTREAM_MODE=cache_only override is set.
+curl "$AK/api/v1/repositories/<key>/upstream-mode" \
+  -H "Authorization: Bearer $TOKEN"
+
+# Back online: the next read of an expired entry revalidates as usual.
+curl -X PUT "$AK/api/v1/repositories/<key>/upstream-mode" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"upstream_mode":"online"}'
+```
+
+| Value | Behaviour |
+| --- | --- |
+| `online` *(default)* | Normal pull-through proxying, revalidation and stale-if-error. |
+| `cache_only` | No upstream contact. Every cached entry is served, fresh or stale. A miss is `404`. |
+
+In `cache_only`:
+
+- **Nothing leaves the process.** The mode is checked by the same gate as the
+  upstream filter, which every proxy fetch, the stale revalidation probe, the
+  npm `/-/` passthroughs and `npm audit`, the curation upstream sync and the
+  `test-upstream` probe pass through. A miss therefore answers at once, even
+  when the upstream address drops packets.
+- **Stale entries are served, not revalidated.** An expired mutable entry
+  (`maven-metadata.xml`, a packument, an index) is served as it is, with no
+  grace window, and is marked with `Warning: 110` and `X-AK-Stale-Since` like a
+  stale-if-error serve. It does not count toward
+  `ak_proxy_stale_if_error_responses_total` or `last_stale_served_at`: the
+  upstream was not tried.
+- **A miss names the mode.** The `404` reason is
+  `not in cache; repository '<key>' is cache-only`, so "not seeded" is
+  distinguishable from "excluded by the upstream filter". A miss writes no
+  negative-cache marker; a marker written while online still answers `404`
+  until it lapses. Each miss counts as
+  `ak_proxy_cache_lookups_total{result="cache_only_miss"}`.
+- **Virtual repositories skip the member.** A cache-only member that does not
+  hold the path is skipped without contact, so the next member answers with no
+  wait.
+- **Switching back takes effect at once** on the replica that served the `PUT`
+  and on the others through the cache-invalidation channel (at most 30 s if
+  that notification is lost); no restart.
+
+The setting is Remote-only (`400` on other types), needs the
+`write:repositories` scope and `admin` on the repository, and each change is
+recorded as `REPOSITORY_UPDATED` with `upstream_mode_change`
+`{previous_upstream_mode, upstream_mode}`. Setting `PROXY_UPSTREAM_MODE=cache_only`
+in the environment puts every Remote in cache-only mode at once (read at
+startup).
+
+### How it differs from an exclude-everything upstream filter
+
+An upstream filter with `exclude_patterns: [".*"]` also stops upstream contact,
+but it is a security control, not an offline mode: an expired entry for a
+refused path is refused with `404` instead of served (so a seeded index file
+disappears once its TTL passes), and the `404` gives the filter's reason. Use
+`upstream_mode` for "disconnected now", and the filter for "never fetch this".
+
 ## The yank asymmetry
 
 Combining the two lifetimes produces a symptom that looks like a cache bug but
@@ -180,6 +248,8 @@ above (#4640).
 
 ## See also
 
+- [cache-seed.md](cache-seed.md) — fill a Remote's cache from a list of paths
+  ahead of time, with a per-path inventory (#5284).
 - `backend/src/services/cache_classifier.rs` — classification rules and TTL
   constants (`MUTABLE_DEFAULT_TTL_SECS`, `NEGATIVE_CACHE_TTL_SECS`,
   `STALE_IF_ERROR_GRACE_SECS`, `STALE_IF_ERROR_GRACE_MAX_SECS`,
@@ -187,6 +257,8 @@ above (#4640).
 - `backend/src/services/upstream_not_found_policy.rs` — the
   `on_upstream_not_found` policy shared by the proxy and the npm packument
   cache (#4640).
+- `backend/src/services/upstream_mode.rs` — the `upstream_mode`
+  (online / cache-only) setting and its gate (#5282).
 - `backend/src/services/proxy_service.rs` — revalidation, stale-if-error and
   negative caching on the buffered and streaming paths.
 - Cache-correctness invariants: #1611, #3749 (410 negative-cached like 404).

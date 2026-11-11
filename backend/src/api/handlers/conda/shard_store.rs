@@ -6,13 +6,16 @@
 //! catalog triggers put every `(repository, subdir, name)` a write touches
 //! into `conda_shard_dirty` in the writer's own transaction, whichever code
 //! path writes (an upload here, a generic delete, a scanner verdict, the
-//! quarantine console). This module turns dirty keys back into shards:
+//! quarantine console). Marks are append-only (#4978): each is a new row
+//! with its own sequence value, so writers never lock a shared key and two
+//! writers marking the same names in different orders cannot deadlock.
+//! This module turns dirty keys back into shards:
 //!
 //! * [`materialise`] rebuilds the dirty keys of a repository (or one subdir
 //!   of it) in bounded batches, each batch one transaction under a
 //!   per-repository advisory lock: it reads only the rows of the dirty names,
 //!   rewrites only the shards whose bytes changed, deletes the marks it saw
-//!   (a mark set again meanwhile survives), bumps the revision of every
+//!   (a mark added meanwhile survives), bumps the revision of every
 //!   subdir it touched and announces the change on the conda invalidation
 //!   channel. The conda write paths call it right after their write; every
 //!   reader calls it, through [`subdir_state`], before it serves, so nothing
@@ -96,14 +99,45 @@ fn db_unavailable(context: &str, e: impl std::fmt::Display) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
 }
 
-/// Rebuild what is dirty in `(repo_id, subdir)` and return its state.
-pub(crate) async fn subdir_state(
+/// Longest a reader waits for a rebuild of its repository that another
+/// session is running before it answers 503 (#4978 item 5).
+const READER_WAIT: Duration = Duration::from_secs(10);
+/// First and longest pause between a waiting reader's looks at the state.
+const READER_POLL_MIN: Duration = Duration::from_millis(10);
+const READER_POLL_MAX: Duration = Duration::from_millis(200);
+/// Stripes of the per-process reader turn ([`reader_turn`]).
+const READER_TURN_STRIPES: usize = 64;
+
+/// The turn a reader of `repo_id` takes before it rebuilds dirty keys
+/// (#4978 item 5): one reader per repository (stripe) per process rebuilds,
+/// the others wait here holding no database connection, then find the state
+/// clean. Across processes the rebuild lock is only ever TRIED by a reader,
+/// so a reader never holds a pooled connection while it waits for a rebuild
+/// another session runs either.
+fn reader_turn(repo_id: Uuid) -> &'static tokio::sync::Mutex<()> {
+    static TURNS: std::sync::OnceLock<Vec<tokio::sync::Mutex<()>>> = std::sync::OnceLock::new();
+    let turns = TURNS.get_or_init(|| {
+        (0..READER_TURN_STRIPES)
+            .map(|_| tokio::sync::Mutex::new(()))
+            .collect()
+    });
+    let stripe = repo_id.as_u128() as usize % READER_TURN_STRIPES;
+    &turns[stripe]
+}
+
+/// One look at a scope's state: `(revision, dirty, expired, backfilled,
+/// now)`.
+type StateRow = (i64, bool, bool, bool, DateTime<Utc>);
+
+/// Read the state of `(repo_id, subdir)`, or of the whole repository when
+/// `subdir` is `None` (the sum of its subdir revisions).
+async fn read_state(
     db: &PgPool,
     repo_id: Uuid,
-    subdir: &str,
-) -> Result<SubdirState, Response> {
-    for _ in 0..MAX_READ_PASSES {
-        let row = sqlx::query(
+    subdir: Option<&str>,
+) -> Result<StateRow, Response> {
+    let row = match subdir {
+        Some(subdir) => sqlx::query(
             "SELECT \
                COALESCE((SELECT revision FROM conda_subdir_revisions \
                           WHERE repository_id = $1 AND subdir = $2), 0) AS revision, \
@@ -116,35 +150,8 @@ pub(crate) async fn subdir_state(
                NOW() AS now",
         )
         .bind(repo_id)
-        .bind(subdir)
-        .fetch_one(db)
-        .await
-        .map_err(|e| db_unavailable("reading subdir state", e))?;
-        let dirty: bool = row.get("dirty");
-        let expired: bool = row.get("expired");
-        if !dirty && !expired {
-            return Ok(SubdirState {
-                revision: row.get("revision"),
-                backfilled: row.get("backfilled"),
-                now: row.get("now"),
-            });
-        }
-        if expired {
-            mark_lapsed_holds(db, repo_id)
-                .await
-                .map_err(|e| db_unavailable("marking lapsed holds", e))?;
-        }
-        materialise(db, repo_id, Some(subdir))
-            .await
-            .map_err(|e| db_unavailable("rebuilding shards", e))?;
-    }
-    Err(busy())
-}
-
-/// Rebuild everything dirty in `repo_id` and return its state.
-pub(crate) async fn repo_state(db: &PgPool, repo_id: Uuid) -> Result<RepoState, Response> {
-    for _ in 0..MAX_READ_PASSES {
-        let row = sqlx::query(
+        .bind(subdir),
+        None => sqlx::query(
             "SELECT \
                COALESCE((SELECT SUM(revision) FROM conda_subdir_revisions \
                           WHERE repository_id = $1), 0)::BIGINT AS revision, \
@@ -155,29 +162,101 @@ pub(crate) async fn repo_state(db: &PgPool, repo_id: Uuid) -> Result<RepoState, 
                           WHERE repository_id = $1), true) AS backfilled, \
                NOW() AS now",
         )
-        .bind(repo_id)
-        .fetch_one(db)
-        .await
-        .map_err(|e| db_unavailable("reading repository state", e))?;
-        let dirty: bool = row.get("dirty");
-        let expired: bool = row.get("expired");
+        .bind(repo_id),
+    }
+    .fetch_one(db)
+    .await
+    .map_err(|e| db_unavailable("reading conda channel state", e))?;
+    Ok((
+        row.get("revision"),
+        row.get("dirty"),
+        row.get("expired"),
+        row.get("backfilled"),
+        row.get("now"),
+    ))
+}
+
+/// Rebuild what is dirty in the scope (`subdir`, or the whole repository)
+/// and return its clean state: `(revision, backfilled, now)`.
+///
+/// A reader holds a pooled connection only for its own statements, never
+/// while it waits for a rebuild (#4978 item 5): it waits for its turn in this
+/// process ([`reader_turn`]) with no connection, and it only TRIES the
+/// repository's rebuild lock, so when another session holds it the reader
+/// gives the connection back, pauses and looks again. It answers 503 after
+/// [`READER_WAIT`] or [`MAX_READ_PASSES`] rebuilds of its own.
+async fn clean_state(
+    db: &PgPool,
+    repo_id: Uuid,
+    subdir: Option<&str>,
+) -> Result<(i64, bool, DateTime<Utc>), Response> {
+    let deadline = tokio::time::Instant::now() + READER_WAIT;
+    let mut passes = 0;
+    let mut pause = READER_POLL_MIN;
+    loop {
+        let (revision, dirty, expired, backfilled, now) = read_state(db, repo_id, subdir).await?;
         if !dirty && !expired {
-            return Ok(RepoState {
-                revision: row.get("revision"),
-                backfilled: row.get("backfilled"),
-                now: row.get("now"),
-            });
+            return Ok((revision, backfilled, now));
         }
+        let Ok(turn) = tokio::time::timeout_at(deadline, reader_turn(repo_id).lock()).await else {
+            return Err(busy());
+        };
+        // Another reader of this process may have rebuilt it meanwhile.
+        let (revision, dirty, expired, backfilled, now) = read_state(db, repo_id, subdir).await?;
+        if !dirty && !expired {
+            return Ok((revision, backfilled, now));
+        }
+        let mut done = true;
         if expired {
-            mark_lapsed_holds(db, repo_id)
+            done = mark_lapsed_holds(db, repo_id, false)
                 .await
                 .map_err(|e| db_unavailable("marking lapsed holds", e))?;
         }
-        materialise(db, repo_id, None)
-            .await
-            .map_err(|e| db_unavailable("rebuilding shards", e))?;
+        if done {
+            done = materialise_with(db, repo_id, subdir, false)
+                .await
+                .map_err(|e| db_unavailable("rebuilding shards", e))?
+                .is_some();
+        }
+        drop(turn);
+        if done {
+            passes += 1;
+            if passes >= MAX_READ_PASSES {
+                return Err(busy());
+            }
+            continue;
+        }
+        // Another session holds the rebuild lock: look again shortly.
+        if tokio::time::Instant::now() + pause > deadline {
+            return Err(busy());
+        }
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(READER_POLL_MAX);
     }
-    Err(busy())
+}
+
+/// Rebuild what is dirty in `(repo_id, subdir)` and return its state.
+pub(crate) async fn subdir_state(
+    db: &PgPool,
+    repo_id: Uuid,
+    subdir: &str,
+) -> Result<SubdirState, Response> {
+    let (revision, backfilled, now) = clean_state(db, repo_id, Some(subdir)).await?;
+    Ok(SubdirState {
+        revision,
+        backfilled,
+        now,
+    })
+}
+
+/// Rebuild everything dirty in `repo_id` and return its state.
+pub(crate) async fn repo_state(db: &PgPool, repo_id: Uuid) -> Result<RepoState, Response> {
+    let (revision, backfilled, now) = clean_state(db, repo_id, None).await?;
+    Ok(RepoState {
+        revision,
+        backfilled,
+        now,
+    })
 }
 
 fn busy() -> Response {
@@ -217,10 +296,14 @@ async fn try_lock_repo(tx: &mut Transaction<'_, Postgres>, repo_id: Uuid) -> sql
 }
 
 /// Mark the rows whose hold lapsed since the last check, and record the next
-/// pending expiry.
-async fn mark_lapsed_holds(db: &PgPool, repo_id: Uuid) -> sqlx::Result<()> {
+/// pending expiry. With `wait` false, `Ok(false)` when another session holds
+/// the repository's rebuild lock (nothing is done).
+async fn mark_lapsed_holds(db: &PgPool, repo_id: Uuid, wait: bool) -> sqlx::Result<bool> {
     let mut tx = db.begin().await?;
-    lock_repo(&mut tx, repo_id).await?;
+    if !take_lock(&mut tx, repo_id, wait).await? {
+        tx.rollback().await?;
+        return Ok(false);
+    }
     let since: Option<DateTime<Utc>> = sqlx::query_scalar(
         "SELECT next_hold_expiry FROM conda_channel_state \
           WHERE repository_id = $1 AND next_hold_expiry <= NOW()",
@@ -243,7 +326,22 @@ async fn mark_lapsed_holds(db: &PgPool, repo_id: Uuid) -> sqlx::Result<()> {
         .await?;
         refresh_next_hold_expiry(&mut tx, repo_id).await?;
     }
-    tx.commit().await
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// [`lock_repo`] when `wait`, else [`try_lock_repo`].
+async fn take_lock(
+    tx: &mut Transaction<'_, Postgres>,
+    repo_id: Uuid,
+    wait: bool,
+) -> sqlx::Result<bool> {
+    if wait {
+        lock_repo(tx, repo_id).await?;
+        Ok(true)
+    } else {
+        try_lock_repo(tx, repo_id).await
+    }
 }
 
 /// Store the earliest pending hold expiry of `repo_id`.
@@ -279,14 +377,39 @@ pub(crate) async fn materialise(
     repo_id: Uuid,
     subdir: Option<&str>,
 ) -> sqlx::Result<usize> {
+    Ok(materialise_with(db, repo_id, subdir, true)
+        .await?
+        .unwrap_or_default())
+}
+
+/// [`materialise`]; with `wait` false the rebuild lock is only tried, and
+/// `Ok(None)` means another session held it before anything was rebuilt (a
+/// batch already rebuilt is kept and its count returned).
+async fn materialise_with(
+    db: &PgPool,
+    repo_id: Uuid,
+    subdir: Option<&str>,
+    wait: bool,
+) -> sqlx::Result<Option<usize>> {
     let mut total = 0;
+    let mut batches = 0;
     loop {
         let mut tx = db.begin().await?;
-        lock_repo(&mut tx, repo_id).await?;
+        if !take_lock(&mut tx, repo_id, wait).await? {
+            tx.rollback().await?;
+            return Ok((batches > 0).then_some(total));
+        }
+        // Every mark of the first `MATERIALISE_BATCH_KEYS` keys: marks are
+        // append-only (#4978), so a key can carry several.
         let dirty: Vec<DirtyKey> = sqlx::query_as(
-            "SELECT subdir, package_name, mark FROM conda_shard_dirty \
-              WHERE repository_id = $1 AND ($2::TEXT IS NULL OR subdir = $2) \
-              ORDER BY subdir, package_name LIMIT $3",
+            "SELECT d.subdir, d.package_name, d.mark FROM conda_shard_dirty d \
+               JOIN (SELECT subdir, package_name FROM conda_shard_dirty \
+                      WHERE repository_id = $1 AND ($2::TEXT IS NULL OR subdir = $2) \
+                      GROUP BY subdir, package_name \
+                      ORDER BY subdir, package_name LIMIT $3) k \
+                 USING (subdir, package_name) \
+              WHERE d.repository_id = $1 \
+              ORDER BY d.subdir, d.package_name, d.mark",
         )
         .bind(repo_id)
         .bind(subdir)
@@ -295,9 +418,10 @@ pub(crate) async fn materialise(
         .await?;
         if dirty.is_empty() {
             tx.commit().await?;
-            return Ok(total);
+            return Ok(Some(total));
         }
         total += dirty.len();
+        batches += 1;
         rebuild_keys(&mut tx, repo_id, &dirty).await?;
         tx.commit().await?;
     }
@@ -316,7 +440,7 @@ async fn rebuild_keys(
         .await?;
     let names: Vec<String> = keys
         .iter()
-        .map(|(_, name, _)| name.to_lowercase())
+        .map(|(_, name, _)| name.clone())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -403,25 +527,53 @@ async fn rebuild_keys(
     Ok(())
 }
 
-/// Live rows (any visibility) of `repo_id` whose name is one of `names`
-/// (lower-cased), newest first.
+/// Live rows (any visibility) of `repo_id` that can belong to the shard of
+/// one of the package names `names` (as the keys spell them), newest first.
+///
+/// A row belongs to the shard its METADATA name names
+/// ([`super::group_artifacts_by_name`]), which is not always its
+/// `artifacts.name` (#4978 item 3): the upload route writes them equal, but
+/// any other writer may not. So a row is read when either its row name
+/// matches case-insensitively (the `LOWER(name)` index) or its metadata
+/// `name` is exactly one of `names` (the metadata GIN index, `@>`).
 async fn rows_for_names(
     tx: &mut Transaction<'_, Postgres>,
     repo_id: Uuid,
     names: &[String],
 ) -> sqlx::Result<Vec<CondaArtifactRow>> {
+    let lowered: Vec<String> = names
+        .iter()
+        .map(|n| n.to_lowercase())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let by_metadata: Vec<serde_json::Value> = names
+        .iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|n| serde_json::json!({ "name": n }))
+        .collect();
     sqlx::query_as::<_, CondaArtifactRow>(
         "SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256, \
                 a.storage_key, am.metadata, a.quarantine_status, a.quarantine_until, \
                 a.created_at \
            FROM artifacts a \
            LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
-          WHERE a.repository_id = $1 AND a.is_deleted = false \
-            AND LOWER(a.name) = ANY($2) \
+          WHERE a.id IN ( \
+                  SELECT n.id FROM artifacts n \
+                   WHERE n.repository_id = $1 AND n.is_deleted = false \
+                     AND LOWER(n.name) = ANY($2) \
+                  UNION \
+                  SELECT m.artifact_id \
+                    FROM UNNEST($3::JSONB[]) AS q(doc) \
+                    JOIN artifact_metadata m ON m.metadata @> q.doc \
+                    JOIN artifacts r ON r.id = m.artifact_id \
+                   WHERE r.repository_id = $1 AND r.is_deleted = false) \
           ORDER BY a.created_at DESC",
     )
     .bind(repo_id)
-    .bind(names)
+    .bind(&lowered)
+    .bind(&by_metadata)
     .fetch_all(&mut **tx)
     .await
 }
@@ -765,14 +917,13 @@ pub(crate) async fn member_rows_for_names(
     names: &[String],
     now: DateTime<Utc>,
 ) -> Result<Vec<Vec<CondaArtifact>>, Response> {
-    let lowered: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
     let mut out = Vec::with_capacity(repo_ids.len());
     for repo_id in repo_ids {
         let mut tx = db
             .begin()
             .await
             .map_err(|e| db_unavailable("reading member rows", e))?;
-        let rows = rows_for_names(&mut tx, *repo_id, &lowered)
+        let rows = rows_for_names(&mut tx, *repo_id, names)
             .await
             .map_err(|e| db_unavailable("reading member rows", e))?;
         tx.commit()
@@ -784,6 +935,39 @@ pub(crate) async fn member_rows_for_names(
                 .map(row_to_artifact)
                 .collect(),
         );
+    }
+    Ok(out)
+}
+
+/// The revision of each hosted repository of `repo_ids` (the sum of its
+/// subdir revisions), in order, after every dirty key of it was rebuilt: the
+/// fingerprint the virtual dependency-confusion guard keeps its owned-name
+/// set under (#4978 item 1). One statement for all of them; a repository
+/// with dirty keys is rebuilt first ([`repo_state`]).
+pub(crate) async fn member_revisions(
+    db: &PgPool,
+    repo_ids: &[Uuid],
+) -> Result<Vec<(Uuid, i64)>, Response> {
+    let rows: Vec<(Uuid, i64, bool)> = sqlx::query_as(
+        "SELECT m.id, \
+                COALESCE((SELECT SUM(r.revision) FROM conda_subdir_revisions r \
+                           WHERE r.repository_id = m.id), 0)::BIGINT, \
+                EXISTS (SELECT 1 FROM conda_shard_dirty d WHERE d.repository_id = m.id) \
+           FROM UNNEST($1::UUID[]) WITH ORDINALITY AS m(id, ord) \
+          ORDER BY m.ord",
+    )
+    .bind(repo_ids)
+    .fetch_all(db)
+    .await
+    .map_err(|e| db_unavailable("reading member revisions", e))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (id, revision, dirty) in rows {
+        let revision = if dirty {
+            repo_state(db, id).await?.revision
+        } else {
+            revision
+        };
+        out.push((id, revision));
     }
     Ok(out)
 }

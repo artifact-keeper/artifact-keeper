@@ -1,0 +1,38 @@
+# ak-mcp-introspector with the sandbox, as the dedicated rootless user
+# (#5253, docs/security/mcp-sandbox.md "Option A"). The worker drives that
+# user's rootless Podman directly: no engine socket, no root.
+[Unit]
+Description=Artifact Keeper MCP introspection worker (sandboxed)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ak-sbx
+Group=ak-sbx
+EnvironmentFile=/etc/ak-mcp-introspector.env
+# The token is never in the environment: systemd opens the root-only file
+# and hands it over as standard input, which the worker reads once
+# (`--token-file -`). Nothing the ak-sbx user can open holds it, and the
+# worker makes itself non-dumpable, so a guest that escapes gVisor as
+# ak-sbx cannot read it from /proc/<pid>/environ or memory (#5390).
+StandardInput=file:/etc/ak-mcp-introspector/token
+StandardOutput=journal
+StandardError=journal
+ExecStart=/usr/local/bin/ak-mcp-introspector run --sandbox --poll-secs 30 --token-file -
+Restart=on-failure
+RestartSec=30
+# The worker itself needs no privileges; Podman's rootless helpers
+# (newuidmap/newgidmap) are setuid and need the default NoNewPrivileges=no.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ak-sbx/.local/share/containers /run/user
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=false
+RestrictSUIDSGID=false
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

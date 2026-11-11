@@ -1,0 +1,78 @@
+# The worker (#5253). Build an image holding the ak-mcp-introspector binary
+# (`cargo build --release --bin ak-mcp-introspector`), kubectl and jq, and
+# create the launcher ConfigMap from k8s-launcher.sh:
+#   kubectl -n ak-mcp-introspector create configmap ak-mcp-sandbox-launcher \
+#     --from-file=k8s-launcher.sh \
+#     --from-file=job.json=../sandbox-check/job.example.json
+# and the token Secret (a service-account API token with exactly
+# mcp:introspect):
+#   kubectl -n ak-mcp-introspector create secret generic ak-mcp-introspector \
+#     --from-literal=token=<token>
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ak-mcp-introspector
+  namespace: ak-mcp-introspector
+spec:
+  # Jobs run one at a time per worker; scale out with more replicas.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ak-mcp-introspector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ak-mcp-introspector
+    spec:
+      serviceAccountName: ak-mcp-introspector
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: worker
+          image: registry.example.com/ak-mcp-introspector:REPLACE_ME
+          # The token is read from the mounted Secret file, not the
+          # environment (#5390).
+          args: ["run", "--sandbox", "--poll-secs", "30",
+                 "--token-file", "/var/run/ak-mcp-introspector/token"]
+          env:
+            - name: AK_URL
+              value: https://ak.example.com
+            - name: AK_MCP_INTROSPECTOR_ID
+              valueFrom:
+                fieldRef: {fieldPath: metadata.name}
+            - name: AK_MCP_SANDBOX_COMMAND
+              value: /opt/ak/k8s-launcher.sh
+            # Guests get no DNS: the launcher maps this host to this address
+            # in each guest pod's /etc/hosts. The host of AK_URL, and the
+            # address in networkpolicy.yaml.
+            - name: AK_MCP_SANDBOX_AK_HOST
+              value: ak.example.com
+            - name: AK_MCP_SANDBOX_AK_IP
+              value: 203.0.113.10
+            - name: AK_MCP_SANDBOX_NODE_IMAGE
+              value: ak.example.com/docker-local/library/node@sha256:REPLACE_ME
+            - name: AK_MCP_SANDBOX_PYTHON_IMAGE
+              value: ak.example.com/docker-local/astral-sh/uv@sha256:REPLACE_ME
+          volumeMounts:
+            - {name: launcher, mountPath: /opt/ak, readOnly: true}
+            - {name: token, mountPath: /var/run/ak-mcp-introspector, readOnly: true}
+          resources:
+            limits: {memory: 256Mi, cpu: 500m}
+            requests: {memory: 64Mi, cpu: 50m}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+      volumes:
+        - name: token
+          secret:
+            secretName: ak-mcp-introspector
+            defaultMode: 0440
+        - name: launcher
+          configMap:
+            name: ak-mcp-sandbox-launcher
+            defaultMode: 0555

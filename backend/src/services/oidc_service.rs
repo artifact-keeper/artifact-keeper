@@ -968,6 +968,7 @@ mod tests {
             sso_disable_admin_break_glass: false,
             oidc_silent_sso_enabled: true,
             device_auth: Default::default(),
+            proxy_upstream: Default::default(),
             totp_policy: None,
             api_token_expiry_policy: None,
             metrics_port: None,
@@ -1033,6 +1034,7 @@ mod tests {
             proxy_singleflight_lock_wait_timeout_secs: 65,
             proxy_stale_if_error_grace_secs:
                 crate::services::cache_classifier::STALE_IF_ERROR_GRACE_SECS,
+            audit_upstream_fetches: Default::default(),
             oci_virtual_negative_cache_ttl_ms:
                 crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
             npm_virtual_negative_cache_ttl_ms:
@@ -1057,6 +1059,7 @@ mod tests {
             npm_attestation_negative_cache_enabled: true,
             npm_attestation_negative_cache_ttl_secs: 86_400,
             npm_upstream_feed_enabled: false,
+            upstream_jobs_paused: false,
             npm_upstream_feed_url: crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
                 .into(),
             scan_token_ttl_seconds: 300,
@@ -1144,6 +1147,7 @@ mod tests {
             sso_disable_admin_break_glass: false,
             oidc_silent_sso_enabled: true,
             device_auth: Default::default(),
+            proxy_upstream: Default::default(),
             totp_policy: None,
             api_token_expiry_policy: None,
             metrics_port: None,
@@ -1209,6 +1213,7 @@ mod tests {
             proxy_singleflight_lock_wait_timeout_secs: 65,
             proxy_stale_if_error_grace_secs:
                 crate::services::cache_classifier::STALE_IF_ERROR_GRACE_SECS,
+            audit_upstream_fetches: Default::default(),
             oci_virtual_negative_cache_ttl_ms:
                 crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
             npm_virtual_negative_cache_ttl_ms:
@@ -1233,6 +1238,7 @@ mod tests {
             npm_attestation_negative_cache_enabled: true,
             npm_attestation_negative_cache_ttl_secs: 86_400,
             npm_upstream_feed_enabled: false,
+            upstream_jobs_paused: false,
             npm_upstream_feed_url: crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
                 .into(),
             scan_token_ttl_seconds: 300,

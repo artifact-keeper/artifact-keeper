@@ -140,8 +140,10 @@ async fn init_transfer(
 )]
 async fn get_chunk_manifest(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path((_peer_id, session_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<ChunkManifestResponse>> {
+    auth.require_admin()?;
     let service = TransferService::new(state.db.clone());
     let chunks = service.get_chunk_manifest(session_id).await?;
 
@@ -178,8 +180,10 @@ async fn get_chunk_manifest(
 )]
 async fn get_session(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path((_peer_id, session_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<TransferSessionResponse>> {
+    auth.require_admin()?;
     let service = TransferService::new(state.db.clone());
     let session = service.get_session(session_id).await?;
 

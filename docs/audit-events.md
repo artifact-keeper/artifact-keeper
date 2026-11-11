@@ -117,7 +117,7 @@ the remaining actions is an incremental follow-up.
 
 | Actions | `details` shape |
 | --- | --- |
-| `REPOSITORY_CREATED` / `_UPDATED` / `_DELETED` | `RepositoryDetails` (`actor_id`, `key`, `is_public`, structured format/policy fields; `upstream_change` / `upstream_auth_change` on credential changes, secrets never carried; on `_UPDATED`, `project_change` `{previous_project_id, project_id}` when the project assignment changed, `project_id: null` for a cleared assignment, #4026; an age-gate policy change adds `age_gate_change`: the replaced policy, `actor_tier`, and `relaxed`) |
+| `REPOSITORY_CREATED` / `_UPDATED` / `_DELETED` | `RepositoryDetails` (`actor_id`, `key`, `is_public`, structured format/policy fields; `upstream_change` / `upstream_auth_change` on credential changes, secrets never carried; on `_UPDATED`, `project_change` `{previous_project_id, project_id}` when the project assignment changed, `project_id: null` for a cleared assignment, #4026; an age-gate policy change adds `age_gate_change`: the replaced policy, `actor_tier`, and `relaxed`; a `PUT .../upstream-mode` adds `upstream_mode_change` `{previous_upstream_mode, upstream_mode}`, #5282) |
 | `AGE_GATE_LOCK_SET` / `AGE_GATE_LOCK_RELEASED` | `lock` (`policy` / `review`), `actor_tier`, `repository_key`, and the policy (`age_gate_*`) or review (`review_id`, `package`, `version`, `status`) at that moment. A release is always a relaxation. |
 | `ROLE_ASSIGNED` / `_REVOKED`, `REPOSITORY_PERMISSION_CHANGED` | `PermissionDetails` (`actor_id`, `role_id`, `grantee_id`, `repository_id?`) |
 | `API_TOKEN_CREATED` / `_REVOKED` | `TokenDetails` (`token_id`, `token_name?`, `surface`, `expires_at?`, `policy_applied?`) |
@@ -163,11 +163,18 @@ such as `credential_replaced` or `secret_rotated`.
 | `WEBHOOK_SECRET_ROTATED` | `webhook` | `name`, `url`, `events`, `repository_id`, `secret_rotated: true`, `previous_secret_expires_at` |
 | `SYNC_POLICY_CREATED` / `_DELETED` | `sync_policy` | `name`, `policy` (the policy without timestamps) |
 | `SYNC_POLICY_UPDATED` | `sync_policy` | `name`, `changed_fields`, `before`, `after` (written by update and by enable / disable) |
+| `GROUP_CREATED` / `GROUP_DELETED` | `group` (`resource_name`: the group name); `POST` / `DELETE /api/v1/groups[/{id}]` (#5653) | `group_id`, `name`; on create `description`; on delete `external_source` and `member_count` (the memberships that cascaded) |
+| `GROUP_UPDATED` | `group`; `PUT /api/v1/groups/{id}` | `group_id`, `before` and `after` (`name`, `description`) |
+| `GROUP_MEMBERS_ADDED` / `GROUP_MEMBERS_REMOVED` | `group`; `POST` / `DELETE /api/v1/groups/{id}/members`. One row per request that changed a membership; none when every listed user already was (or was not) a member. A group grants its members its permission rules, so this is a privilege change | `group_id`, `group_name`, `user_ids` (only the users whose membership changed), `count` |
+| `CONFIG_IMPORTED` | `setting` (`resource_name: config_document`); one summary row per `POST /api/v1/admin/config/import?mode=apply` (#5292), on top of the per-repository rows each write records | `schema_version`, `completed`, `error` (null on success), `planned_create`, `planned_update` (keys), `unchanged` and `not_in_document` (counts), `created`, `updated`, `members_updated` (keys actually written), `prune` |
+| `SETTING_CHANGED` (system settings) | `setting` (`resource_name`: the key); one row per field a `POST /api/v1/admin/settings` changes (#5652), none for a field sent unchanged. See [operations/system-settings.md](operations/system-settings.md) | `key`, `old_value`, `new_value` (strings), `setting`, `from`, `to` (numbers) |
 
 A webhook `url` is recorded as scheme, host, port and path: userinfo, query
 string and fragment are dropped because receivers often carry a token there.
 `PROMOTION_REFUSED` and `PROMOTION_APPROVAL_DENIED` export with outcome
-`denied`; the others export as `success`.
+`denied`; a `CONFIG_IMPORTED` row for an apply that failed part way exports
+with outcome `failure`; the others export as `success`. `CONFIG_IMPORTED`
+never carries a value from the import's `secrets` map.
 
 ## Conda channel and environment actions
 
@@ -190,11 +197,12 @@ come from the CEP-26 filename and are `null` when it does not parse).
 
 ## Detection events
 
-Two actions close detection gaps found by the 1.11.0 red team (#4677).
+These actions close detection gaps found by the 1.11.0 red team (#4677) and the 1.12.0 candidate swarm (#5653).
 
 | Action | Resource | Fires when | `details` |
 | --- | --- | --- | --- |
 | `LOGIN_RATE_LIMITED` | `user` (no id) | A login limiter refuses `POST /api/v1/auth/login` or an OCI credential exchange on `/v2/token` with 429. At most one row per source IP per limiter window; see below. Outcome `denied`. | `AuthDetails`: `username` (the attempted name, as `LOGIN_FAILED` records it; never the password), `path`, `method`, and `reason`, the limiter: `login_per_account` (the per-username-and-IP bucket) or `login_global_backstop`. |
+| `LOGIN_FAILED` (HTTP Basic) | `user` (no id) | A local password sent as HTTP Basic credentials (package clients, `curl -u`, the `/api/v1` API) is refused (#5653). Written by the layer that answers the request: the guest-access guard when it refuses a request itself (the management API, `/v2`), the route's middleware otherwise. When the LDAP Basic passthrough tries the credentials next and refuses them, its own row (`provider: ldap`) stands for the request; when the shared login limiter stops the passthrough, this row is written with `reason: ldap_passthrough_rate_limited`. At most one row per (username, source IP) per minute per replica, so a client retrying a stale password does not write one row per request; `suppressed_since_last_row` counts the refusals folded since the pair's previous row. A full memory (10,000 pairs) forgets the pair recorded longest ago, never a new one. Outcome `failure`. | `AuthDetails`: `username` (the attempted name; never the password), `reason` (`invalid_password`, `unknown_or_inactive_user`, `federated_account`, `no_password_hash`, `account_locked`, `ldap_passthrough_rate_limited`), `auth_method: basic`, `suppressed_since_last_row`. The passthrough's own rows gained the reasons `not_directory_account`, `no_directory_provider` and `directory_sync_refused`, so every refusal it answers has a row. |
 | `EXTERNAL_FINDINGS_INGESTED` | `artifact` | An admin (or a token with `write:findings`) ingests an external scanner's findings (`POST /api/v1/security/findings/external`). This is the write that classes a `MAL-*` advisory `malicious`/Critical. Outcome `success`. | `artifact_id`, `repository_id`, `scan_id`, `scanner`, `scanner_version`, `findings_ingested`, `severity_counts` (`critical` .. `info`), `class_counts` (`vulnerability`, `malicious`, `policy`), `malicious_ids` (the `MAL-*` ids, at most 50) and `malicious_ids_truncated`, and the repository `score` and `grade` after the ingest. |
 
 `LOGIN_RATE_LIMITED` rows carry the verified client IP in `source_ip` /
@@ -211,11 +219,38 @@ Each ingest also logs an `INFO` line on the `security` target
 (`external findings ingested`) with the artifact, scan, scanner, acting user,
 finding and malicious counts and the new score.
 
+### MCP registry
+
+| Action | Resource | Fires when | `details` |
+| --- | --- | --- | --- |
+| `MCP_PACKAGE_PINNED` | `artifact` (the server.json version) | A publish to an MCP registry resolved one `packages[]` entry to an artifact or image digest in a backing repository (#5253). One row per entry. Outcome `success`. | `repository`, `server`, `version`, `index`, `registry_type`, `submitted` (`identifier`, `version`), `resolved_repository`, `digest` (OCI) or `sha256`, `warnings` (e.g. `oci_tag_digest_mismatch`). |
+| `MCP_PIN_DRIFT_DETECTED` | `artifact` (the server.json version that pinned the tag) | An OCI tag that a published server version pinned moved to another digest, by a push or an upstream refresh (#5253). The version keeps serving the pinned digest; nothing is unpublished. Outcome `success`. | `backing_repository_id`, `name`, `tag`, `previous_digest`, `pinned_digest`, `observed_digest`, `mcp_server`, `mcp_version`. |
+| `MCP_SERVER_DOWNLOAD_REFUSED` | `artifact` (the server.json version) | The `/mcp/{repo}/v0.1` surface refused to hand a held server version to a client (#5253). Sampled: at most one row per (version, caller) per minute per replica. Outcome `denied`. | `repository`, `repository_id`, `server`, `version`, `hold_class` (`quarantine`, `scan_policy`, `backing`, `age_gate`, `unresolvable`, `resolving`, `curation`, `content_drift`, `unavailable`), `reason_disclosed` (whether the caller got the reason body), `anonymous`. |
+| `MCP_SERVER_PUBLISHED` | `artifact` or `repository` | A server version was published to a hosted MCP registry, or ingested from upstream into a Remote one. (#5253). Outcome `success`. | `repository`, `server`, `version`, `repository_id`, `packages`, `remotes`, `pinned` (count), `resolving` (indexes of packages still being filled; the version answers `202`). |
+| `MCP_SERVER_STATUS_CHANGED` | `artifact` or `repository` | A server version's registry status (active, deprecated, deleted) changed. (#5253). Outcome `success`. | `repository`, `server`, `version`, `from`, `to`, `status_message`. One row per version a status `PATCH` changed. |
+| `MCP_SERVER_APPROVED` | `repository` (the Remote MCP registry) | A Remote MCP registry approved a server name (or a name@version pin) for serving. (#5253). Outcome `success`. | `repository`, `repository_id`, `server`, `version` (a `name@version` pin; `null` for a name), `review_id` (the curation row), `reason` (`auto_approve_namespace` for an approval made by the sync), `pattern` (a bulk approval). Actor: the approving user; none for an automatic approval. |
+| `MCP_SERVER_REJECTED` | `repository` (the Remote MCP registry) | A Remote MCP registry blocked a server name (or a name@version pin). (#5253). Outcome `denied`. | `repository`, `repository_id`, `server`, `version` (`null` for a name), `review_id`, `reason`. Actor: the blocking user. |
+| `MCP_SERVER_REOPENED` | `repository` (the Remote MCP registry) | An MCP approval was revoked back to review (an admin reopened it, or content drift re-queued it). (#5253). Outcome `success`. | `repository`, `repository_id`, `server`, `version` (`null` for a name), `review_id`, `reason` (`content_drift` when the sync re-queued a served version; otherwise the administrator's). |
+| `MCP_SERVER_CONTENT_DRIFT` | `repository` (the Remote MCP registry) | An upstream entry changed content under an already ingested name@version. (#5253). Outcome `success`. | `repository`, `repository_id`, `server`, `version`, `review_id` (the version's curation row, now `review`), `stored_sha256`, `upstream_sha256`, `was_approved` (whether the version was being served). No actor (the sync). |
+| `MCP_NAME_CASE_TWIN_REPLICATED` | `artifact` (the replicated server.json) | A peer replication stored an MCP server name that differs only in letter case from a name the registry already recorded (#5435). The write is not refused (a mirror follows its source); this row reports the twin. Outcome `success`. | `repository`, `repository_id`, `server`, `version`, `twins` (the other recorded spellings, at most 20). The replicating peer is the actor. |
+| `MCP_GATE_UNAVAILABLE` | `repository` (the MCP registry read) | An MCP serve gate could not be evaluated and the surface answered 503 (fail closed). (#5253). Outcome `failure`. | `repository_id`, `surface` (`detail` or `listing`), and for a detail read `repository`, `server`, `version`. Sampled: at most one row per version (or listing repository) per minute per replica. |
+| `MCP_CAPABILITIES_INGESTED` | `artifact` | A capability snapshot (tools/resources/prompts) was recorded for a server version: declared at publish, reported by CI or a gateway, or observed by the introspection worker. Actor: the reporter (none for declarations and worker results). (#5253). Outcome `success`. | `repository`, `server`, `version`, `snapshot_id`, `source`, `provenance`, `origin`, `outcome`, `auth_state`, `content_hash`, `tools`, `resources`, `prompts` (counts). |
+| `MCP_TOOLS_DRIFT` | `artifact` | A new successful capability snapshot differs from the previous successful one of the same source for the same server version; a `tool_drift` finding was recorded. (#5253). Outcome `success`. | The `MCP_CAPABILITIES_INGESTED` fields plus `previous_snapshot_id`, `previous_hash`, `scan_id`, `severity`, `summary`, `destructive_added`. |
+| `MCP_NAMESPACE_GRANTED` | `repository` (the rule's target id) | A permission rule write added `conditions.mcp_namespaces` patterns (create, or an update that added patterns). One row per write, listing the added patterns. The condition is accepted only on an MCP repository target. (#5253). Outcome `success`. | `rule_id`, `principal_type`, `principal_id`, `target_type`, `target_id`, `actions`, `patterns` (added). |
+| `MCP_NAMESPACE_REVOKED` | `repository` (the rule's target id) | A permission rule write removed `conditions.mcp_namespaces` patterns (delete, or an update that removed patterns). (#5253). Outcome `success`. | `rule_id`, `principal_type`, `principal_id`, `target_type`, `target_id`, `actions`, `patterns` (removed). |
+| `MCP_NAMESPACE_PROOF_VERIFIED` | `setting` (the proof id; `resource_name` the namespace) | An administrator-initiated DNS/HTTP namespace proof check found the challenge value. (#5253). Outcome `success`. | `proof_id`, `namespace`, `domain`, `method` (`dns`, `http`), `error` (null). |
+| `MCP_NAMESPACE_PROOF_FAILED` | `setting` (the proof id; `resource_name` the namespace) | An administrator-initiated DNS/HTTP namespace proof check did not find the challenge value, or the fetch was refused or failed. (#5253). Outcome `failure`. | `proof_id`, `namespace`, `domain`, `method`, `error` (why). |
+| `MCP_SERVER_EDITED` | `artifact` or `repository` | An administrator replaced a server version's document (PUT admin edit). (#5253). Outcome `success`. | `repository`, `server`, `version`, `previous_sha256`, `sha256`, `packages_changed`, `resolving`. |
+| `MCP_SERVER_DELETED` | `artifact` or `repository` | A server version was soft-deleted (DELETE), leaving a tombstone. (#5253). Outcome `success`. | `repository`, `server`, `version`, `from` (previous status), `status_message`. |
+| `MCP_SERVER_PURGED` | `artifact` (the server.json) | An instance administrator purged a soft-deleted server version (`POST .../versions/{version}/purge`): its server.json and bundles went to the trash, releasing what it pinned; the tombstone stays. (#5368). Outcome `success`. | `repository`, `repository_id`, `server`, `version`, `released_digests` (each `repository_id`, `image`, `digest`, `still_pinned` when another live version pins it too), `pins`, `trashed` (artifact paths). |
+| `MCP_MIRROR_SYNCED` | `repository` (the Remote MCP registry) | A Remote MCP registry finished an upstream sync run. (#5253). Outcome `success`. | `repository`, `repository_id`, `mode` (`allowlist` or `mirror`), `upstream` (the Remote's upstream URL with any userinfo credentials stripped), `updated_since` (the watermark the run started from), `summary` (`pages`, `entries`, `namesNew`, `autoApproved`, `flagged`, `ingested`, `unchanged`, `statusChanged`, `drifted`, `invalid`, `unresolved`, `reResolved`, `backfilledNames`, `complete`, `errors`). No actor. |
+| `MCP_BUNDLE_SIGNATURE_REJECTED` | `artifact` or `repository` | An MCPB bundle upload was refused for its signature: it did not verify, or `mcp_require_bundle_signature` is on and the bundle is unsigned or signed by a signer not on `MCP_TRUSTED_BUNDLE_SIGNERS`. (#5253). Outcome `denied`. | `repository`, `server`, `version`, `file`, `file_sha256`, `signature` (`state`: `valid`, `self_signed`, `unsigned` or `invalid`; `reason`, `signer`, `fingerprint`, ...), `require_signature`, `error` (`mcp_bundle_signature_invalid`, `mcp_bundle_unsigned` or `mcp_bundle_signer_untrusted`). Resource type `repository` (no artifact is stored). |
+
 ### Proxy scan refusals
 
 | Action | Resource | Fires when | `details` |
 | --- | --- | --- | --- |
-| `PROXY_SCAN_BLOCKED` | `repository` (the repository the pull was made through) | The scan-on-proxy gate refuses a proxied download with `403 scan_blocked` (#4777). Outcome `denied`. | `repository`, `repository_id`, `path` (the file the 403 names), `checksum_sha256`, `verdict`, `max_severity`, `findings_count`, `scanned_at` (of the verdict), `principal` (the username, `null` for an anonymous pull), `anonymous`, `attempts`, `aggregated`, `window_seconds`. |
+| `PROXY_SCAN_BLOCKED` | `repository` (the repository the pull was made through) | The scan-on-proxy gate refuses a proxied download with `403 scan_blocked` (#4777), or a serve path refuses one from a stored verdict outside the gate: a conda `.sigs` sidecar of a blocked package, the NuGet digest-pinned row repair, an OCI blob of a blocked image (#4987). Outcome `denied`. | `repository`, `repository_id`, `path` (the file the 403 names; `<image>@<digest>` for an OCI blob), `checksum_sha256`, `verdict`, `max_severity`, `findings_count`, `scanned_at` (of the verdict), `principal` (the username, `null` for an anonymous pull), `api_token_id` (the API token the pull authenticated with, else `null`), `anonymous`, `attempts`, `aggregated`, `window_seconds`. |
 
 The row's `user_id` is the authenticated principal (`null` for an anonymous
 pull) and `ip_address` the verified client IP, as for `LOGIN_FAILED`. A client
@@ -225,12 +260,55 @@ each replica: the first refusal writes a row at once with `attempts: 1`, and
 the repeats inside the window write one summary row when it closes, with
 `attempts` set to their count and `aggregated: true`. A retry loop therefore
 writes at most two rows a minute per replica. An anonymous principal is keyed
-by its client IP. The row does not carry the API token id; the principal is
-the token's user.
+by its client IP, and two API tokens of one user are separate principals.
+`api_token_id` is set when the pull authenticated with an API token (Bearer,
+`X-API-Key`, or the token as a Basic password); a session, a password login
+or a token exchanged for a registry bearer leaves it `null`.
+
+Each replica runs at most 4 of these writes at once, so many distinct callers
+refused together cannot take the connection pool their pulls need. Up to
+10,000 more wait their turn; past that an entry is dropped and the drop is
+logged (`PROXY_SCAN_BLOCKED audit backlog is full`). The 403 is never
+delayed.
 
 To answer "who asked for this blocked package", filter the audit log on
 `PROXY_SCAN_BLOCKED` and the repository, and match `checksum_sha256` against
 `GET /api/v1/security/proxy-blocked`.
+
+### Proxy cache seeds
+
+| Action | Resource | Fires when | `details` |
+| --- | --- | --- | --- |
+| `CACHE_SEEDED` | `repository` (the Remote that was seeded) | A proxy-cache seed job (`POST /api/v1/repositories/{key}/cache/seed`, #5284) completed. One row per job. Outcome `success`. | `repository`, `repository_id`, `job_id`, `kind`, `cached`, `already_cached`, `refused`, `failed`, `cached_bytes`. |
+
+The row's `user_id` is the user who started the seed. The per-path inventory
+stays on the job (`GET .../cache/seed/{job_id}`), not in the audit row.
+
+### Upstream contact
+
+| Action | Resource | Fires when | `details` |
+| --- | --- | --- | --- |
+| `UPSTREAM_FETCHED` | `repository` (the Remote the request was made for) | The proxy sends a request to an upstream (#5286): a cache-miss fetch, a revalidation, an OCI bearer-token exchange or its retry. One row per request actually sent; a cache hit sends nothing and writes nothing, neither does a miss a cache-only Remote (#5282) or the upstream filter refuses, and a single-flight fill writes one row however many clients wait on it. Off by default; see below. Outcome `failure` for `not_found`, `error` and `timeout`, else `success`. | `repository`, `repository_id`, `caller` (`proxy`, `revalidate`, `oci_token`), `method`, `host`, `port`, `path` (the URL path only: never userinfo, query string or fragment), `redirected_to_host` (the host the request ended on when a redirect left the requested one, else `null`), `conditional` (sent with `If-None-Match` / `If-Modified-Since`), `status` (`null` when no response arrived), `result` (`ok`, `not_modified`, `not_found`, `auth_challenge`, `error`, `timeout`), `error_type` (the transport error class: `timeout`, `connect`, `redirect`, `body`, `request`, `_OTHER`), `bytes` (the body length the upstream announced in `Content-Length`; `0` for a `HEAD` or `304`, `null` for a chunked body), `duration_ms` (to response headers), `principal` (the username of the client request that caused it, `null` when anonymous or outside a request). |
+
+`AUDIT_UPSTREAM_FETCHES` selects what is written: `off` (the default, no rows
+and no bookkeeping), `errors` (only `not_found`, `error` and `timeout`) or
+`all` (every request; what an air-gapped deployment sets, so the seed
+window's upstream traffic can be listed and the absence of any after the cut
+shown from the audit log). `auth_challenge` is the `401` an OCI registry
+answers an anonymous first request with; the token exchange and retry that
+follow are rows of their own.
+
+The row is written off the request path by a bounded background task, so it
+adds no latency and a failed insert never fails the request (it is logged at
+`WARN`). When the writer pool is saturated the insert runs inline instead of
+being dropped. The row's `user_id`, `ip_address` and correlation id are those
+of the client request that caused the upstream request, when there was one.
+
+Not yet recorded: upstream requests made outside the proxy service (the
+`test-upstream` probe, curation sync, the popularity source, the npm change
+feed and the npm `/-/` and audit passthroughs, the Go sumdb pass-through of
+a Hosted repository, the AWS token exchange). A Go Remote's checksum database
+fetches go through the proxy service and are recorded (#5344).
 
 ## Compatibility policy
 

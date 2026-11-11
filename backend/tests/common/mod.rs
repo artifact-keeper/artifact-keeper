@@ -11,6 +11,7 @@
 pub mod ci_oidc_issuer;
 pub mod conda_support;
 pub mod fixtures;
+pub mod mcp_support;
 pub mod sso_support;
 pub mod upstream_mock;
 

@@ -125,9 +125,10 @@ async fn trigger_peer_policy_evaluation(db: &sqlx::PgPool, peer_id: Uuid) {
 )]
 async fn list_labels(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PeerLabelsListResponse>> {
+    auth.require_admin()?;
     let peer_service = PeerInstanceService::new(state.db.clone());
     let _peer = peer_service.get_by_id(id).await?;
 

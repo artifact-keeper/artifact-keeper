@@ -1,0 +1,223 @@
+name: MCP Sandbox
+
+# A real sandboxed MCP probe under gVisor (#5253). `ak-mcp-introspector
+# sandbox-probe` starts a guest with the OCI runner and `--runtime=runsc`,
+# speaks MCP over its stdio and lists its tools; this job passes only when
+# that guest answered from inside gVisor and its container was removed. It
+# also checks that the runner refuses to start a guest without a sandbox
+# runtime (none, or runc), that an internal
+# guest network has no way out, that a guest on its own network reaches the
+# forwarder but not another guest (#5447), and that the reference
+# deployment files (deploy/mcp-introspector) parse.
+# docs/security/mcp-sandbox.md, "Continuous integration".
+#
+# Not covered here (deployment checks, see that page): npm and PyPI guests,
+# which install from a running Artifact Keeper, and the Kubernetes launcher.
+
+on:
+  pull_request:
+    paths:
+      - 'backend/src/bin/mcp_introspector/**'
+      - 'backend/tests/fixtures/mcp_sandbox/**'
+      - 'deploy/mcp-introspector/**'
+      - '.github/workflows/mcp-sandbox.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'backend/src/bin/mcp_introspector/**'
+      - 'backend/tests/fixtures/mcp_sandbox/**'
+      - 'deploy/mcp-introspector/**'
+      - '.github/workflows/mcp-sandbox.yml'
+  schedule:
+    # Weekly, Tuesdays 05:00 UTC: gVisor and the runner image move.
+    - cron: '0 5 * * 2'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Not cancelled in progress: the job pushes to a throwaway local registry,
+# and `image_publishing_workflows_never_cancel_in_progress` (config.rs)
+# treats every `docker push` workflow as a publisher.
+concurrency:
+  group: mcp-sandbox-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sandboxed-probe:
+    name: 🧪 MCP sandboxed probe (gVisor)
+    runs-on: ubuntu-24.04
+    # A cold build of the backend crate's dependency graph plus the bin.
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_NET_RETRY: "10"
+      SQLX_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate the reference deployment files
+        run: |
+          docker compose -f deploy/mcp-introspector/compose.sandbox-network.yaml config --quiet
+          python3 - <<'PY'
+          import glob, yaml
+          for f in sorted(glob.glob('deploy/mcp-introspector/k8s/*.yaml')):
+              docs = [d for d in yaml.safe_load_all(open(f)) if d]
+              assert docs and all('kind' in d and 'apiVersion' in d for d in docs), f
+              print('ok', f, [d['kind'] for d in docs])
+          PY
+          sh -n deploy/mcp-introspector/k8s/k8s-launcher.sh
+          sh -n backend/tests/fixtures/mcp_sandbox/echo-mcp-server.sh
+
+      - name: Install gVisor (runsc) and register it with Docker
+        run: |
+          set -eux
+          curl -fsSL https://gvisor.dev/archive.key \
+            | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
+            | sudo tee /etc/apt/sources.list.d/gvisor.list
+          sudo apt-get update
+          sudo apt-get install -y runsc protobuf-compiler
+          sudo runsc install
+          sudo systemctl restart docker
+          docker info --format '{{json .Runtimes}}' | grep -q runsc
+          # gVisor answers with its own kernel, not the runner's.
+          guest="$(docker run --rm --runtime=runsc docker.io/library/alpine:3.20 uname -r)"
+          test "$guest" != "$(uname -r)"
+
+      - uses: dtolnay/rust-toolchain@1.98.0
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: v2-rust
+          shared-key: mcp-introspector
+          save-if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
+
+      - name: Build ak-mcp-introspector
+        run: cargo build --bin ak-mcp-introspector
+
+      - name: Publish the guest image to a stand-in OCI registry
+        id: guest
+        run: |
+          set -eux
+          docker run -d --name ak-sbx-registry -p 127.0.0.1:5000:5000 docker.io/library/registry:2.8.3
+          docker build -t localhost:5000/ak/sandbox-echo:1 \
+            -f deploy/mcp-introspector/sandbox-check/Dockerfile \
+            backend/tests/fixtures/mcp_sandbox
+          docker push localhost:5000/ak/sandbox-echo:1
+          ref="$(docker inspect --format '{{index .RepoDigests 0}}' localhost:5000/ak/sandbox-echo:1)"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          jq -n --arg ref "$ref" '{jobId: "ci", akBaseUrl: "http://localhost:5000",
+            target: {type: "package", index: 0, registryType: "oci",
+                     package: {registryType: "oci", identifier: $ref, transport: {type: "stdio"}}}}' \
+            > "$RUNNER_TEMP/job.json"
+          cat "$RUNNER_TEMP/job.json"
+
+      - name: Sandboxed probe under gVisor
+        env:
+          AK_MCP_SANDBOX_ENGINE: docker
+          AK_MCP_SANDBOX_RUNTIME: runsc
+        run: |
+          set -eu
+          ./target/debug/ak-mcp-introspector sandbox-probe "$RUNNER_TEMP/job.json" | tee "$RUNNER_TEMP/out.json"
+          jq -e '.outcome == "ok"' "$RUNNER_TEMP/out.json"
+          jq -e '.tools | map(.name) | index("echo") != null' "$RUNNER_TEMP/out.json"
+          jq -e '.details.runner == "oci"' "$RUNNER_TEMP/out.json"
+          kernel="$(jq -r '.tools[] | select(.name == "echo") | .description' "$RUNNER_TEMP/out.json")"
+          echo "guest reported: $kernel; runner kernel: $(uname -sr)"
+          test "$kernel" != "kernel: $(uname -sr)"
+          # The guest container is removed after the run, not only its client.
+          test -z "$(docker ps -aq --filter label=com.artifactkeeper.mcp-sandbox)"
+
+      - name: No sandbox runtime, no guest
+        env:
+          AK_MCP_SANDBOX_ENGINE: docker
+          AK_MCP_SANDBOX_RUNTIME: ""
+        run: |
+          set -u
+          if ./target/debug/ak-mcp-introspector sandbox-probe "$RUNNER_TEMP/job.json" > "$RUNNER_TEMP/plain.json"; then
+            echo "a probe without a sandbox runtime must be refused"; exit 1
+          fi
+          cat "$RUNNER_TEMP/plain.json"
+          jq -e '.outcome == "unsupported"' "$RUNNER_TEMP/plain.json"
+          test -z "$(docker ps -aq --filter label=com.artifactkeeper.mcp-sandbox)"
+
+      - name: A plain runtime (runc) is not a sandbox runtime
+        env:
+          AK_MCP_SANDBOX_ENGINE: docker
+          AK_MCP_SANDBOX_RUNTIME: runc
+        run: |
+          set -u
+          if ./target/debug/ak-mcp-introspector sandbox-probe "$RUNNER_TEMP/job.json" > "$RUNNER_TEMP/runc.json"; then
+            echo "a probe with runc must be refused"; exit 1
+          fi
+          cat "$RUNNER_TEMP/runc.json"
+          jq -e '.outcome == "unsupported"' "$RUNNER_TEMP/runc.json"
+          test -z "$(docker ps -aq --filter label=com.artifactkeeper.mcp-sandbox)"
+
+      - name: An internal sandbox network has no way out
+        run: |
+          set -u
+          docker network create --internal ak-mcp-sandbox-ci
+          if docker run --rm --runtime=runsc --network=ak-mcp-sandbox-ci \
+              docker.io/library/alpine:3.20 wget -q -T 5 -O /dev/null http://example.com; then
+            echo "a guest on the internal network reached the internet"; exit 1
+          fi
+          docker network rm ak-mcp-sandbox-ci
+
+      - name: Guests cannot reach each other, only the forwarder (#5447)
+        run: |
+          set -u
+          ENGINE=docker RUNTIME=runsc sh deploy/mcp-introspector/sandbox-check/guest-isolation-check.sh
+          # The policy-removed control: with the attacker on the victim's
+          # network (the old shared bridge), the same check must fail, and
+          # fail because the victim was reached, not because the check
+          # could not run (a pull failure or a missing runtime).
+          if SHARED=1 ENGINE=docker RUNTIME=runsc sh deploy/mcp-introspector/sandbox-check/guest-isolation-check.sh \
+              > "$RUNNER_TEMP/shared.txt" 2>&1; then
+            cat "$RUNNER_TEMP/shared.txt"
+            echo "the isolation check passed on a shared network"; exit 1
+          fi
+          cat "$RUNNER_TEMP/shared.txt"
+          grep -q '^FAIL attacker -> second guest' "$RUNNER_TEMP/shared.txt"
+          grep -q '^FAIL victim recorded 2 connection(s)' "$RUNNER_TEMP/shared.txt"
+
+      - name: The worker gives an npm guest its own network, with the forwarder only (#5447)
+        env:
+          AK_MCP_SANDBOX_ENGINE: docker
+          AK_MCP_SANDBOX_RUNTIME: runsc
+        run: |
+          set -eu
+          # A stand-in forwarder that records connections: the guest's npx
+          # reaches it under the AK hostname, fails TLS and exits, so the
+          # outcome is needs_config. What is checked is the engine commands
+          # the worker ran (create, connect --alias, run, then cleanup),
+          # against the real Docker CLI.
+          docker network create ak-mcp-sandbox-egress-ci
+          docker run -d --name ak-gateway --network=ak-mcp-sandbox-egress-ci \
+            --sysctl net.ipv4.ip_forward=0 \
+            docker.io/library/alpine:3.20 nc -lk -p 443 -e sh -c 'echo connection >&2'
+          printf '%s' '{"jobId": "npm-ci", "akBaseUrl": "https://ak.example.com", "target": {"type": "package", "registryType": "npm", "package": {"registryType": "npm", "identifier": "@acme/weather", "version": "1.0.0", "registryBaseUrl": "https://ak.example.com/npm/npm", "transport": {"type": "stdio"}}}}' \
+            > "$RUNNER_TEMP/npm-job.json"
+          ./target/debug/ak-mcp-introspector sandbox-probe "$RUNNER_TEMP/npm-job.json" > "$RUNNER_TEMP/npm.json" || true
+          cat "$RUNNER_TEMP/npm.json"
+          jq -e '.outcome == "needs_config"' "$RUNNER_TEMP/npm.json"
+          docker logs ak-gateway 2>&1 | grep -q '^connection$'
+          test -z "$(docker ps -aq --filter label=com.artifactkeeper.mcp-sandbox)"
+          test -z "$(docker network ls -q --filter label=com.artifactkeeper.mcp-sandbox)"
+          test "$(docker inspect ak-gateway --format '{{len .NetworkSettings.Networks}}')" = 1
+          docker rm -f ak-gateway
+          docker network rm ak-mcp-sandbox-egress-ci
+
+      - name: The retired shared network stops the worker (#5447)
+        env:
+          AK_MCP_SANDBOX_ENGINE: docker
+          AK_MCP_SANDBOX_RUNTIME: runsc
+          AK_MCP_SANDBOX_NETWORK: ak-mcp-sandbox
+        run: |
+          set -u
+          if ./target/debug/ak-mcp-introspector sandbox-probe "$RUNNER_TEMP/job.json" 2> "$RUNNER_TEMP/retired.txt"; then
+            echo "a retired AK_MCP_SANDBOX_NETWORK must be refused"; exit 1
+          fi
+          cat "$RUNNER_TEMP/retired.txt"
+          grep -q 'AK_MCP_SANDBOX_NETWORK=ak-mcp-sandbox is no longer supported' "$RUNNER_TEMP/retired.txt"

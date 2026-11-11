@@ -21,7 +21,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
@@ -31,7 +32,9 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::access_scope::AccessScope;
 use crate::services::opensearch_service::ArtifactDocument;
-use crate::services::search_service::{SearchFacets, SearchQuery, SearchResult, SearchService};
+use crate::services::search_service::{
+    McpServedOnly, SearchFacets, SearchQuery, SearchResult, SearchService,
+};
 
 // ---------------------------------------------------------------------------
 // Admin Router
@@ -175,6 +178,7 @@ const OPENSEARCH_QUICK_SEARCH_TIMEOUT: Duration = Duration::from_secs(3);
 async fn retain_live_visible_hits(
     db: &PgPool,
     scope: &AccessScope,
+    hidden: Option<&McpServedOnly>,
     hits: Vec<ArtifactDocument>,
 ) -> Result<Vec<SearchResultItem>> {
     if hits.is_empty() {
@@ -198,10 +202,13 @@ async fn retain_live_visible_hits(
           AND a.is_deleted = false
           AND r.key NOT LIKE '~deleting~%'
           AND ($2::uuid[] IS NULL OR r.id = ANY($2))
+          AND ($3::uuid[] IS NULL OR r.id <> ALL($3) OR a.id = ANY($4))
         "#,
     )
     .bind(&ids)
     .bind(scope.as_allowed_repo_ids())
+    .bind(McpServedOnly::repos_bind(hidden))
+    .bind(McpServedOnly::served_bind(hidden))
     .fetch_all(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
@@ -219,6 +226,203 @@ async fn retain_live_visible_hits(
             Some(build_search_result_item_from_doc(d, status, until))
         })
         .collect())
+}
+
+/// The MCP registries in `scope` (`None`: every repository) that `auth`
+/// does not hold, with the artifacts of theirs search may show it (#5253):
+/// the stored documents and bundles of the server versions the listing
+/// decision serves to readers
+/// ([`super::mcp::GenericArtifactGate::visible_listed`]). Search items,
+/// totals, facets, suggestions, trending and recent show an artifact of such
+/// a registry only when it is served, so a version that is not served, a
+/// row added since the served set was computed and a row past its cap are
+/// all hidden (fail closed). `None` when there is no such registry (none in
+/// scope, or the caller holds every one).
+///
+/// Whether the caller holds a registry is decided per request; the reader
+/// served set is the same for every caller who does not, so it is shared
+/// across requests ([`reader_served`], #5397).
+pub(crate) async fn mcp_served_only(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    scope: Option<&[Uuid]>,
+) -> Result<Option<McpServedOnly>> {
+    served_only(state, auth, scope, true).await
+}
+
+/// [`mcp_served_only`] with each registry's reader served set computed for
+/// this request ([`compute_reader_served`]) instead of shared for
+/// [`MCP_SEARCH_SERVED_TTL`]: for the generic routes that evaluate the
+/// listing decision afresh on every request (the security scan listings).
+pub(crate) async fn mcp_served_only_fresh(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    scope: Option<&[Uuid]>,
+) -> Result<Option<McpServedOnly>> {
+    served_only(state, auth, scope, false).await
+}
+
+async fn served_only(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    scope: Option<&[Uuid]>,
+    shared: bool,
+) -> Result<Option<McpServedOnly>> {
+    let repos: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM repositories WHERE format = 'mcp' \
+         AND ($1::uuid[] IS NULL OR id = ANY($1))",
+    )
+    .bind(scope)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    if repos.is_empty() {
+        return Ok(None);
+    }
+    let mut gate = super::mcp::GenericArtifactGate::new(state, auth);
+    let mut out = McpServedOnly::default();
+    for repo_id in repos {
+        if gate.holds_all(&[repo_id]).await {
+            continue;
+        }
+        if shared {
+            out.served
+                .extend(reader_served(state, repo_id).await.iter().copied());
+        } else {
+            out.served
+                .extend(compute_reader_served(state, repo_id, MCP_SEARCH_SERVED_ROW_CAP).await);
+        }
+        out.repos.push(repo_id);
+    }
+    Ok((!out.repos.is_empty()).then_some(out))
+}
+
+/// How long one registry's reader served set ([`reader_served`]) is reused
+/// across search requests (#5397). A hold, release or status change reaches
+/// search within this window; a newly stored row is hidden until the set is
+/// recomputed. The `/v0.1` listings and the generic artifact routes do not
+/// use it.
+pub(crate) const MCP_SEARCH_SERVED_TTL: Duration = Duration::from_secs(5);
+
+/// How many artifact rows of one registry the reader served set holds (on
+/// top of the listing decision's cap of
+/// [`super::mcp::GENERIC_LISTING_VERSION_CAP`] versions). Rows past it, by
+/// path, are hidden from readers in search (fail closed).
+pub(crate) const MCP_SEARCH_SERVED_ROW_CAP: i64 = 2 * super::mcp::GENERIC_LISTING_VERSION_CAP;
+
+/// Entries the slot map holds before idle, expired ones are dropped.
+const MCP_SEARCH_SERVED_SLOTS: usize = 1_024;
+
+type ServedSlot = Arc<tokio::sync::Mutex<Option<(Instant, Arc<Vec<Uuid>>)>>>;
+
+fn served_slots() -> &'static std::sync::Mutex<HashMap<Uuid, ServedSlot>> {
+    static SLOTS: OnceLock<std::sync::Mutex<HashMap<Uuid, ServedSlot>>> = OnceLock::new();
+    SLOTS.get_or_init(Default::default)
+}
+
+/// The artifacts of MCP registry `repo_id` served to a reader (a caller who
+/// does not hold it), shared by every search request on this replica for
+/// [`MCP_SEARCH_SERVED_TTL`] from when its computation began. It is the
+/// reader audience only (computed without the caller's credentials), so no
+/// holder decision is ever cached or handed to another caller. Concurrent
+/// misses for one registry wait for a single computation.
+async fn reader_served(state: &SharedState, repo_id: Uuid) -> Arc<Vec<Uuid>> {
+    let slot = {
+        let mut slots = served_slots().lock().unwrap_or_else(|e| e.into_inner());
+        if slots.len() >= MCP_SEARCH_SERVED_SLOTS {
+            slots.retain(|_, s| {
+                Arc::strong_count(s) > 1
+                    || s.try_lock().is_ok_and(|g| {
+                        g.as_ref()
+                            .is_some_and(|(at, _)| at.elapsed() < MCP_SEARCH_SERVED_TTL)
+                    })
+            });
+        }
+        slots.entry(repo_id).or_default().clone()
+    };
+    let mut cached = slot.lock().await;
+    if let Some((at, served)) = cached.as_ref() {
+        if at.elapsed() < MCP_SEARCH_SERVED_TTL {
+            return served.clone();
+        }
+    }
+    let started = Instant::now();
+    let served = Arc::new(compute_reader_served(state, repo_id, MCP_SEARCH_SERVED_ROW_CAP).await);
+    *cached = Some((started, served.clone()));
+    served
+}
+
+#[cfg(test)]
+fn served_computes() -> &'static std::sync::Mutex<HashMap<Uuid, usize>> {
+    static COUNTS: OnceLock<std::sync::Mutex<HashMap<Uuid, usize>>> = OnceLock::new();
+    COUNTS.get_or_init(Default::default)
+}
+
+/// How many times the reader served set of `repo_id` has been computed.
+#[cfg(test)]
+pub(crate) fn reader_served_computations(repo_id: Uuid) -> usize {
+    served_computes()
+        .lock()
+        .unwrap()
+        .get(&repo_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// [`reader_served`] uncached: the listing decision for readers over the
+/// registry's versions, then at most `row_cap` of the artifact rows those
+/// versions own. An error, an unresolvable registry or a row past the cap
+/// leaves rows out (hidden).
+pub(crate) async fn compute_reader_served(
+    state: &SharedState,
+    repo_id: Uuid,
+    row_cap: i64,
+) -> Vec<Uuid> {
+    #[cfg(test)]
+    {
+        *served_computes()
+            .lock()
+            .unwrap()
+            .entry(repo_id)
+            .or_default() += 1;
+    }
+    let versions = super::mcp::GenericArtifactGate::new(state, None)
+        .reader_listed_versions(repo_id)
+        .await;
+    if versions.is_empty() {
+        return Vec::new();
+    }
+    // `servers/{name}/{version}/server.json` and
+    // `servers/{name}/{version}/bundles/...`, matched on `{name}/{version}`
+    // in SQL and re-checked with `owning_version` below.
+    let owners: Vec<String> = versions.iter().map(|(n, v)| format!("{n}/{v}")).collect();
+    let rows: Vec<(Uuid, String)> = match sqlx::query_as(
+        "SELECT a.id, a.path FROM artifacts a \
+         WHERE a.repository_id = $1 AND a.is_deleted = false \
+           AND left(a.path, 8) = 'servers/' \
+           AND (CASE WHEN right(a.path, 12) = '/server.json' \
+                       THEN substr(a.path, 9, length(a.path) - 20) \
+                     WHEN strpos(substr(a.path, 9), '/bundles/') > 0 \
+                       THEN left(substr(a.path, 9), strpos(substr(a.path, 9), '/bundles/') - 1) \
+                END) = ANY($2) \
+         ORDER BY a.path LIMIT $3",
+    )
+    .bind(repo_id)
+    .bind(&owners)
+    .bind(row_cap)
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+    rows.into_iter()
+        .filter(|(_, path)| {
+            super::mcp::owning_version(path)
+                .is_some_and(|(n, v)| versions.contains(&(n.to_string(), v.to_string())))
+        })
+        .map(|(id, _)| id)
+        .collect()
 }
 
 /// `quarantine_status` / `quarantine_until` are the raw `artifacts` columns,
@@ -564,6 +768,7 @@ pub async fn quick_search(
     }
 
     let scope = resolve_accessible_repos(&state.db, &auth).await?;
+    let hidden = mcp_served_only(&state, auth.as_ref(), scope.as_allowed_repo_ids()).await?;
 
     // Prefer OpenSearch when configured: it gives typo tolerance and relevance
     // ranking the PostgreSQL tsquery path cannot (#3670). The caller's scope is
@@ -590,7 +795,9 @@ pub async fn quick_search(
                 // database failure, not a search-cluster failure, so it
                 // propagates rather than falling back — the PostgreSQL path
                 // would fail the same way.
-                let results = retain_live_visible_hits(&state.db, &scope, found.hits).await?;
+                let results =
+                    retain_live_visible_hits(&state.db, &scope, hidden.as_ref(), found.hits)
+                        .await?;
                 return Ok(Json(QuickSearchResponse { results }));
             }
             Ok(Err(e)) => {
@@ -620,8 +827,10 @@ pub async fn quick_search(
         limit: Some(limit),
         public_only: false,
         accessible_repo_ids,
+        mcp_served_only: hidden,
         sort_by: None,
         sort_order: None,
+        ..Default::default()
     };
 
     let service = SearchService::new(state.db.clone());
@@ -680,11 +889,14 @@ pub async fn advanced_search(
     Extension(auth): Extension<Option<AuthExtension>>,
     Query(params): Query<AdvancedSearchQuery>,
 ) -> Result<Json<AdvancedSearchResponse>> {
+    let filters = advanced_field_filters(&params)?;
+
     // per_page=0 is an explicit request for zero results: return an empty
     // page with the right total so paginated UIs still render counts.
     if matches!(params.per_page, Some(0)) {
         let accessible_repo_ids: Option<Vec<Uuid>> =
             resolve_accessible_repos(&state.db, &auth).await?.into();
+        let hidden = mcp_served_only(&state, auth.as_ref(), accessible_repo_ids.as_deref()).await?;
         let count_query = SearchQuery {
             q: params.query.clone(),
             format: params.format.clone(),
@@ -693,8 +905,10 @@ pub async fn advanced_search(
             limit: Some(1),
             public_only: false,
             accessible_repo_ids: accessible_repo_ids.clone(),
+            mcp_served_only: hidden,
             sort_by: None,
             sort_order: None,
+            ..filters
         };
         let service = SearchService::new(state.db.clone());
         let response = service.search(count_query).await?;
@@ -718,6 +932,7 @@ pub async fn advanced_search(
 
     let accessible_repo_ids: Option<Vec<Uuid>> =
         resolve_accessible_repos(&state.db, &auth).await?.into();
+    let hidden = mcp_served_only(&state, auth.as_ref(), accessible_repo_ids.as_deref()).await?;
 
     let search_query = SearchQuery {
         q: params.query.clone(),
@@ -727,8 +942,10 @@ pub async fn advanced_search(
         limit: Some(per_page as i64),
         public_only: false,
         accessible_repo_ids,
+        mcp_served_only: hidden,
         sort_by: params.sort_by.clone(),
         sort_order: params.sort_order.clone(),
+        ..filters
     };
 
     let service = SearchService::new(state.db.clone());
@@ -755,6 +972,39 @@ pub async fn advanced_search(
         },
         facets,
     }))
+}
+
+/// The field filters of `GET /search/advanced` (#5200) as the base of its
+/// [`SearchQuery`], so the items and the total both honour them.
+fn advanced_field_filters(params: &AdvancedSearchQuery) -> Result<SearchQuery> {
+    Ok(SearchQuery {
+        repository_key: params.repository_key.clone(),
+        path: params.path.clone(),
+        version: params.version.clone(),
+        min_size: params.min_size,
+        max_size: params.max_size,
+        created_after: parse_search_instant("created_after", params.created_after.as_deref())?,
+        created_before: parse_search_instant("created_before", params.created_before.as_deref())?,
+        ..Default::default()
+    })
+}
+
+/// Parse a `created_after` / `created_before` value: an RFC 3339 timestamp,
+/// or a `YYYY-MM-DD` date meaning midnight UTC. Anything else is a 400 rather
+/// than a silently ignored filter.
+fn parse_search_instant(field: &str, value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if let Ok(instant) = DateTime::parse_from_rfc3339(value) {
+        return Ok(Some(instant.with_timezone(&Utc)));
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        return Ok(Some(date.and_time(chrono::NaiveTime::MIN).and_utc()));
+    }
+    Err(AppError::Validation(format!(
+        "{field} must be an RFC 3339 timestamp or a YYYY-MM-DD date"
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -840,14 +1090,23 @@ pub async fn checksum_search(
           AND r.key NOT LIKE '~deleting~%'
           AND {col} = $1
           AND ($2::uuid[] IS NULL OR r.id = ANY($2))
+          AND ($3::uuid[] IS NULL OR r.id <> ALL($3) OR a.id = ANY($4))
         ORDER BY a.created_at DESC
         "#,
         col = checksum_column,
     );
+    let hidden = mcp_served_only(
+        &state,
+        auth.as_ref(),
+        accessible_repo_ids.as_allowed_repo_ids(),
+    )
+    .await?;
 
     let rows: Vec<ChecksumRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
         .bind(&checksum)
         .bind(accessible_repo_ids.as_allowed_repo_ids())
+        .bind(McpServedOnly::repos_bind(hidden.as_ref()))
+        .bind(McpServedOnly::served_bind(hidden.as_ref()))
         .fetch_all(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -928,10 +1187,17 @@ pub async fn suggest(
     let limit = clamp_positive_limit(params.limit, 10, 1, 50);
 
     let scope = resolve_accessible_repos(&state.db, &auth).await?;
+    let hidden = mcp_served_only(&state, auth.as_ref(), scope.as_allowed_repo_ids()).await?;
 
     let service = SearchService::new(state.db.clone());
     let suggestions = service
-        .suggest(&params.prefix, limit, scope.as_allowed_repo_ids(), false)
+        .suggest(
+            &params.prefix,
+            limit,
+            scope.as_allowed_repo_ids(),
+            false,
+            hidden.as_ref(),
+        )
         .await?;
 
     Ok(Json(SuggestResponse { suggestions }))
@@ -969,10 +1235,17 @@ pub async fn trending(
     let limit = clamp_positive_limit(params.limit, 20, 1, 100);
 
     let scope = resolve_accessible_repos(&state.db, &auth).await?;
+    let hidden = mcp_served_only(&state, auth.as_ref(), scope.as_allowed_repo_ids()).await?;
 
     let service = SearchService::new(state.db.clone());
     let results = service
-        .trending(days, limit, false, scope.as_allowed_repo_ids())
+        .trending(
+            days,
+            limit,
+            false,
+            scope.as_allowed_repo_ids(),
+            hidden.as_ref(),
+        )
         .await?;
 
     let items = results.into_iter().map(build_search_result_item).collect();
@@ -1012,10 +1285,11 @@ pub async fn recent(
     let limit = clamp_positive_limit(params.limit, 20, 1, 100);
 
     let scope = resolve_accessible_repos(&state.db, &auth).await?;
+    let hidden = mcp_served_only(&state, auth.as_ref(), scope.as_allowed_repo_ids()).await?;
 
     let service = SearchService::new(state.db.clone());
     let results = service
-        .recent(limit, false, scope.as_allowed_repo_ids())
+        .recent(limit, false, scope.as_allowed_repo_ids(), hidden.as_ref())
         .await?;
 
     let items = results.into_iter().map(build_search_result_item).collect();
@@ -3453,5 +3727,267 @@ mod opensearch_quick_search_db_tests {
                 "{backend}: the reason must never be exposed on search"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #5200: /search/advanced applies every documented field filter
+// ---------------------------------------------------------------------------
+
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod advanced_field_filter_db_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Two repositories the non-admin caller can read, `sa` and `sb`, and a
+    /// third, `sc`, it holds no grant on. Every artifact's name is
+    /// `<needle>-<label>`, so `name=<needle>-*` alone selects exactly this
+    /// fixture and each test only adds the filter under test.
+    ///
+    /// | label | repo | path                | version | size | created_at |
+    /// |-------|------|---------------------|---------|------|------------|
+    /// | a1    | sa   | `<needle>/lib/a1`   | 1.0.0   | 5    | 2024-01-10 |
+    /// | a2    | sa   | `<needle>/docs/a2`  | 2.0.0   | 50   | 2024-06-10 |
+    /// | b1    | sb   | `<needle>/lib/b1`   | 1.0.0   | 5    | 2025-01-10 |
+    /// | c1    | sc   | `<needle>/lib/c1`   | 2.0.0   | 50   | 2024-06-10 |
+    struct Fixture {
+        pool: PgPool,
+        state: SharedState,
+        user_id: Uuid,
+        username: String,
+        needle: String,
+        repos: Vec<(Uuid, String, std::path::PathBuf)>,
+    }
+
+    impl Fixture {
+        async fn setup() -> Option<Self> {
+            let pool = tdh::try_pool().await?;
+            let (user_id, username) = tdh::create_user(&pool).await;
+            let mut repos = Vec::new();
+            for _ in 0..3 {
+                repos.push(tdh::create_repo(&pool, "local", "generic").await);
+            }
+            tdh::grant_repo_access(&pool, repos[0].0, user_id).await;
+            tdh::grant_repo_access(&pool, repos[1].0, user_id).await;
+            let needle = format!("adv5200{}", Uuid::new_v4().simple());
+            let rows = [
+                ("a1", 0, "lib", "1.0.0", 5_i64, "2024-01-10T12:00:00Z"),
+                ("a2", 0, "docs", "2.0.0", 50, "2024-06-10T12:00:00Z"),
+                ("b1", 1, "lib", "1.0.0", 5, "2025-01-10T12:00:00Z"),
+                ("c1", 2, "lib", "2.0.0", 50, "2024-06-10T12:00:00Z"),
+            ];
+            for (label, repo, dir, version, size, created) in rows {
+                sqlx::query(
+                    "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                     checksum_sha256, content_type, storage_key, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, 'application/octet-stream', $7, \
+                     $8::timestamptz)",
+                )
+                .bind(repos[repo].0)
+                .bind(format!("{needle}/{dir}/{label}"))
+                .bind(format!("{needle}-{label}"))
+                .bind(version)
+                .bind(size)
+                .bind("0".repeat(64))
+                .bind(format!("generic/{}", Uuid::new_v4()))
+                .bind(created)
+                .execute(&pool)
+                .await
+                .expect("seed artifact");
+            }
+            let state = tdh::build_state(pool.clone(), repos[0].2.to_string_lossy().as_ref());
+            Some(Self {
+                pool,
+                state,
+                user_id,
+                username,
+                needle,
+                repos,
+            })
+        }
+
+        fn key(&self, repo: usize) -> &str {
+            &self.repos[repo].1
+        }
+
+        /// `GET /advanced?name=<needle>-*&<extra>` as the non-admin caller:
+        /// the status, the sorted labels of the items, and `pagination.total`.
+        async fn search(&self, extra: &str) -> (axum::http::StatusCode, Vec<String>, i64) {
+            let auth = tdh::make_auth(self.user_id, &self.username);
+            let app = tdh::router_with_auth(router(), self.state.clone(), auth);
+            let page = if extra.contains("per_page=") {
+                ""
+            } else {
+                "per_page=50&"
+            };
+            let uri = format!("/advanced?name={}-*&{page}{extra}", self.needle);
+            let (status, body) = tdh::send(app, tdh::get(uri)).await;
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
+            let prefix = format!("{}-", self.needle);
+            let mut labels: Vec<String> = json["items"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|i| i["name"].as_str())
+                        .map(|n| n.trim_start_matches(&prefix).to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            labels.sort();
+            let total = json["pagination"]["total"].as_i64().unwrap_or(-1);
+            (status, labels, total)
+        }
+
+        /// Run `extra` and tear the fixture down before returning, so a failed
+        /// assertion never leaks it.
+        async fn search_once(self, extra: &str) -> (axum::http::StatusCode, Vec<String>, i64) {
+            let out = self.search(extra).await;
+            self.teardown().await;
+            out
+        }
+
+        async fn teardown(self) {
+            for (id, _, dir) in &self.repos {
+                tdh::cleanup_member_repo(&self.pool, *id, dir).await;
+            }
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(self.user_id)
+                .execute(&self.pool)
+                .await;
+        }
+    }
+
+    fn assert_hits(got: (axum::http::StatusCode, Vec<String>, i64), want: &[&str], what: &str) {
+        let (status, labels, total) = got;
+        assert_eq!(status, axum::http::StatusCode::OK, "{what}: status");
+        assert_eq!(labels, want, "{what}: items");
+        assert_eq!(total, want.len() as i64, "{what}: pagination.total");
+    }
+
+    /// Control: with no field filter the caller sees everything it can read,
+    /// and never `sc`. Every other test narrows this set.
+    #[tokio::test]
+    async fn advanced_search_without_field_filters_returns_all_readable_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        assert_hits(fx.search_once("").await, &["a1", "a2", "b1"], "no filter");
+    }
+
+    /// The #5200 reproduction: `repository_key=sa` returned `sb`'s artifact
+    /// too.
+    #[tokio::test]
+    async fn advanced_search_filters_by_repository_key_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        let extra = format!("repository_key={}", fx.key(0));
+        assert_hits(
+            fx.search_once(&extra).await,
+            &["a1", "a2"],
+            "repository_key",
+        );
+    }
+
+    /// Naming a repository the caller cannot read must not widen its scope.
+    #[tokio::test]
+    async fn advanced_search_repository_key_respects_permissions_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        let extra = format!("repository_key={}", fx.key(2));
+        assert_hits(
+            fx.search_once(&extra).await,
+            &[],
+            "unreadable repository_key",
+        );
+    }
+
+    /// `path` is a literal prefix: a leading `/` is ignored and `_` is not a
+    /// wildcard.
+    #[tokio::test]
+    async fn advanced_search_filters_by_path_prefix_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        let lib = fx.search(&format!("path={}/lib/", fx.needle)).await;
+        let slash = fx.search(&format!("path=/{}/docs", fx.needle)).await;
+        let literal = fx.search(&format!("path={}/l_b", fx.needle)).await;
+        fx.teardown().await;
+        assert_hits(lib, &["a1", "b1"], "path prefix");
+        assert_hits(slash, &["a2"], "path with a leading slash");
+        assert_hits(literal, &[], "path `_` is literal");
+    }
+
+    #[tokio::test]
+    async fn advanced_search_filters_by_version_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        assert_hits(fx.search_once("version=2.0.0").await, &["a2"], "version");
+    }
+
+    /// Both bounds are inclusive.
+    #[tokio::test]
+    async fn advanced_search_filters_by_size_bounds_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        let min = fx.search("min_size=50").await;
+        let max = fx.search("max_size=5").await;
+        let between = fx.search("min_size=6&max_size=49").await;
+        fx.teardown().await;
+        assert_hits(min, &["a2"], "min_size");
+        assert_hits(max, &["a1", "b1"], "max_size");
+        assert_hits(between, &[], "min_size and max_size");
+    }
+
+    /// A bare date means midnight UTC; an RFC 3339 timestamp is exact.
+    #[tokio::test]
+    async fn advanced_search_filters_by_created_dates_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        let after = fx.search("created_after=2024-03-01").await;
+        let before = fx.search("created_before=2024-03-01T00:00:00Z").await;
+        let range = fx
+            .search("created_after=2024-06-10T11:59:59Z&created_before=2024-12-31")
+            .await;
+        fx.teardown().await;
+        assert_hits(after, &["a2", "b1"], "created_after");
+        assert_hits(before, &["a1"], "created_before");
+        assert_hits(range, &["a2"], "created_after and created_before");
+    }
+
+    /// An unparseable date is refused, not silently dropped.
+    #[tokio::test]
+    async fn advanced_search_rejects_an_invalid_date_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        let (status, _, _) = fx.search_once("created_after=yesterday").await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// The `per_page=0` count-only path honours the filters too, and they
+    /// combine with each other.
+    #[tokio::test]
+    async fn advanced_search_count_only_and_combined_filters_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        let count_only = fx
+            .search(&format!("repository_key={}&per_page=0", fx.key(0)))
+            .await;
+        let combined = fx
+            .search(&format!("repository_key={}&version=1.0.0", fx.key(0)))
+            .await;
+        fx.teardown().await;
+        assert_eq!(count_only.0, axum::http::StatusCode::OK);
+        assert_eq!(count_only.2, 2, "per_page=0 total must honour the filter");
+        assert_hits(combined, &["a1"], "repository_key and version");
     }
 }

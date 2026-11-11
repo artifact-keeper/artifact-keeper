@@ -24,16 +24,19 @@ const STREAM_CHUNK_SIZE: usize = 256 * 1024;
 async fn sync_parent_directory(path: &Path, key: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         let dir = fs::File::open(parent).await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to open parent directory of '{}' for sync: {}",
-                key, e
-            ))
+            crate::storage::failure::io_storage_error(
+                &e,
+                format!(
+                    "Failed to open parent directory of '{}' for sync: {}",
+                    key, e
+                ),
+            )
         })?;
         dir.sync_all().await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to sync parent directory of '{}': {}",
-                key, e
-            ))
+            crate::storage::failure::io_storage_error(
+                &e,
+                format!("Failed to sync parent directory of '{}': {}", key, e),
+            )
         })?;
     }
     Ok(())
@@ -307,7 +310,10 @@ impl StorageBackend for FilesystemStorage {
             if e.kind() == std::io::ErrorKind::NotFound {
                 AppError::NotFound(format!("Storage key not found: {}", key))
             } else {
-                AppError::Storage(format!("Failed to read {}: {}", key, e))
+                crate::storage::failure::io_storage_error(
+                    &e,
+                    format!("Failed to read {}: {}", key, e),
+                )
             }
         })?;
         Ok(Bytes::from(content))
@@ -329,7 +335,10 @@ impl StorageBackend for FilesystemStorage {
             if e.kind() == std::io::ErrorKind::NotFound {
                 AppError::NotFound(format!("Storage key not found: {}", key))
             } else {
-                AppError::Storage(format!("Failed to delete {}: {}", key, e))
+                crate::storage::failure::io_storage_error(
+                    &e,
+                    format!("Failed to delete {}: {}", key, e),
+                )
             }
         })?;
         Ok(())
@@ -349,7 +358,10 @@ impl StorageBackend for FilesystemStorage {
             return Err(if e.kind() == std::io::ErrorKind::NotFound {
                 AppError::NotFound(format!("Storage key not found: {}", source))
             } else {
-                AppError::Storage(format!("Failed to copy {} to {}: {}", source, dest, e))
+                crate::storage::failure::io_storage_error(
+                    &e,
+                    format!("Failed to copy {} to {}: {}", source, dest, e),
+                )
             });
         }
 
@@ -357,27 +369,27 @@ impl StorageBackend for FilesystemStorage {
             Ok(file) => file,
             Err(e) => {
                 remove_temp_file_best_effort(&temp_path, "filesystem copy temp open failed").await;
-                return Err(AppError::Storage(format!(
-                    "Failed to open copied temp file for {}: {}",
-                    dest, e
-                )));
+                return Err(crate::storage::failure::io_storage_error(
+                    &e,
+                    format!("Failed to open copied temp file for {}: {}", dest, e),
+                ));
             }
         };
         if let Err(e) = file.sync_all().await {
             remove_temp_file_best_effort(&temp_path, "filesystem copy temp sync failed").await;
-            return Err(AppError::Storage(format!(
-                "Failed to sync copied temp file for {}: {}",
-                dest, e
-            )));
+            return Err(crate::storage::failure::io_storage_error(
+                &e,
+                format!("Failed to sync copied temp file for {}: {}", dest, e),
+            ));
         }
         drop(file);
 
         if let Err(e) = fs::rename(&temp_path, &dest_path).await {
             remove_temp_file_best_effort(&temp_path, "filesystem copy temp promote failed").await;
-            return Err(AppError::Storage(format!(
-                "Failed to promote copied temp file to {}: {}",
-                dest, e
-            )));
+            return Err(crate::storage::failure::io_storage_error(
+                &e,
+                format!("Failed to promote copied temp file to {}: {}", dest, e),
+            ));
         }
         sync_parent_directory(&dest_path, dest).await?;
         Ok(())
@@ -435,10 +447,10 @@ impl StorageBackend for FilesystemStorage {
                 "Storage key not found: {}",
                 key
             ))),
-            Err(e) => Err(AppError::Storage(format!(
-                "Failed to read metadata of {}: {}",
-                key, e
-            ))),
+            Err(e) => Err(crate::storage::failure::io_storage_error(
+                &e,
+                format!("Failed to read metadata of {}: {}", key, e),
+            )),
         }
     }
 
@@ -460,10 +472,10 @@ impl StorageBackend for FilesystemStorage {
 
         if let Err(e) = fs::copy(path, &temp_path).await {
             remove_temp_file_best_effort(&temp_path, "filesystem put_file copy failed").await;
-            return Err(AppError::Storage(format!(
-                "Failed to copy file to {}: {}",
-                key, e
-            )));
+            return Err(crate::storage::failure::io_storage_error(
+                &e,
+                format!("Failed to copy file to {}: {}", key, e),
+            ));
         }
 
         let file = match fs::OpenOptions::new().read(true).open(&temp_path).await {
@@ -471,28 +483,28 @@ impl StorageBackend for FilesystemStorage {
             Err(e) => {
                 remove_temp_file_best_effort(&temp_path, "filesystem put_file temp open failed")
                     .await;
-                return Err(AppError::Storage(format!(
-                    "Failed to open copied temp file for {}: {}",
-                    key, e
-                )));
+                return Err(crate::storage::failure::io_storage_error(
+                    &e,
+                    format!("Failed to open copied temp file for {}: {}", key, e),
+                ));
             }
         };
         if let Err(e) = file.sync_all().await {
             remove_temp_file_best_effort(&temp_path, "filesystem put_file temp sync failed").await;
-            return Err(AppError::Storage(format!(
-                "Failed to sync copied temp file for {}: {}",
-                key, e
-            )));
+            return Err(crate::storage::failure::io_storage_error(
+                &e,
+                format!("Failed to sync copied temp file for {}: {}", key, e),
+            ));
         }
         drop(file);
 
         if let Err(e) = fs::rename(&temp_path, &dest).await {
             remove_temp_file_best_effort(&temp_path, "filesystem put_file temp promote failed")
                 .await;
-            return Err(AppError::Storage(format!(
-                "Failed to promote copied temp file to {}: {}",
-                key, e
-            )));
+            return Err(crate::storage::failure::io_storage_error(
+                &e,
+                format!("Failed to promote copied temp file to {}: {}", key, e),
+            ));
         }
         sync_parent_directory(&dest, key).await?;
         Ok(())
@@ -511,7 +523,10 @@ impl StorageBackend for FilesystemStorage {
             if e.kind() == std::io::ErrorKind::NotFound {
                 AppError::NotFound(format!("Storage key not found: {}", key))
             } else {
-                AppError::Storage(format!("Failed to open {}: {}", key, e))
+                crate::storage::failure::io_storage_error(
+                    &e,
+                    format!("Failed to open {}: {}", key, e),
+                )
             }
         })?;
 
@@ -519,8 +534,11 @@ impl StorageBackend for FilesystemStorage {
         let stream = ReaderStream::with_capacity(reader, STREAM_CHUNK_SIZE);
 
         // Map tokio io errors to our Result type
-        let mapped = stream
-            .map(|result| result.map_err(|e| AppError::Storage(format!("Read error: {}", e))));
+        let mapped = stream.map(|result| {
+            result.map_err(|e| {
+                crate::storage::failure::io_storage_error(&e, format!("Read error: {}", e))
+            })
+        });
 
         Ok(Box::pin(mapped))
     }
@@ -536,23 +554,28 @@ impl StorageBackend for FilesystemStorage {
             if e.kind() == std::io::ErrorKind::NotFound {
                 AppError::NotFound(format!("Storage key not found: {}", key))
             } else {
-                AppError::Storage(format!("Failed to open {}: {}", key, e))
+                crate::storage::failure::io_storage_error(
+                    &e,
+                    format!("Failed to open {}: {}", key, e),
+                )
             }
         })?;
 
-        file.seek(SeekFrom::Start(offset))
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to seek {}: {}", key, e)))?;
+        file.seek(SeekFrom::Start(offset)).await.map_err(|e| {
+            crate::storage::failure::io_storage_error(&e, format!("Failed to seek {}: {}", key, e))
+        })?;
 
         let mut remaining = length;
         let mut out = Vec::with_capacity(length);
 
         while remaining > 0 {
             let mut buf = vec![0u8; remaining.min(STREAM_CHUNK_SIZE)];
-            let read = file
-                .read(&mut buf)
-                .await
-                .map_err(|e| AppError::Storage(format!("Failed to read {}: {}", key, e)))?;
+            let read = file.read(&mut buf).await.map_err(|e| {
+                crate::storage::failure::io_storage_error(
+                    &e,
+                    format!("Failed to read {}: {}", key, e),
+                )
+            })?;
             if read == 0 {
                 break;
             }
@@ -578,9 +601,12 @@ impl StorageBackend for FilesystemStorage {
         // Write to a temp file in the same directory so rename is atomic
         // (same filesystem guarantees atomic rename on POSIX).
         let temp_path = temp_path_for_dest(&dest, key, Uuid::new_v4())?;
-        let mut file = fs::File::create(&temp_path)
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to create temp file: {}", e)))?;
+        let mut file = fs::File::create(&temp_path).await.map_err(|e| {
+            crate::storage::failure::io_storage_error(
+                &e,
+                format!("Failed to create temp file: {}", e),
+            )
+        })?;
 
         let mut hasher = Sha256::new();
         let mut total: u64 = 0;
@@ -594,7 +620,10 @@ impl StorageBackend for FilesystemStorage {
                     if let Err(e) = file.write_all(&data).await {
                         remove_temp_file_best_effort(&temp_path, "filesystem stream write failed")
                             .await;
-                        return Err(AppError::Storage(format!("Write error: {}", e)));
+                        return Err(crate::storage::failure::io_storage_error(
+                            &e,
+                            format!("Write error: {}", e),
+                        ));
                     }
                 }
                 Err(e) => {
@@ -611,18 +640,27 @@ impl StorageBackend for FilesystemStorage {
         // length of the full stream.
         if let Err(e) = file.flush().await {
             remove_temp_file_best_effort(&temp_path, "filesystem stream flush failed").await;
-            return Err(AppError::Storage(format!("Write error: {}", e)));
+            return Err(crate::storage::failure::io_storage_error(
+                &e,
+                format!("Write error: {}", e),
+            ));
         }
         if let Err(e) = file.sync_all().await {
             remove_temp_file_best_effort(&temp_path, "filesystem stream sync failed").await;
-            return Err(AppError::Storage(format!("Sync error: {}", e)));
+            return Err(crate::storage::failure::io_storage_error(
+                &e,
+                format!("Sync error: {}", e),
+            ));
         }
         drop(file);
 
         // Atomic rename
         if let Err(e) = fs::rename(&temp_path, &dest).await {
             remove_temp_file_best_effort(&temp_path, "filesystem stream promote failed").await;
-            return Err(AppError::Storage(format!("Rename error: {}", e)));
+            return Err(crate::storage::failure::io_storage_error(
+                &e,
+                format!("Rename error: {}", e),
+            ));
         }
         sync_parent_directory(&dest, key).await?;
 

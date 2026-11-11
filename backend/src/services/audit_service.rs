@@ -260,6 +260,14 @@ pub enum AuditAction {
     /// per minute so a CI loop retrying a blocked pull writes at most two
     /// rows a minute per replica; see [`record_proxy_scan_blocked`].
     ProxyScanBlocked,
+    /// A proxy-cache seed job of a Remote repository finished (#5284): one
+    /// summary row per job with its inventory counts.
+    CacheSeeded,
+    /// The proxy sent a request to an upstream (#5286): one row per request
+    /// actually sent, never for a cache hit. Off unless
+    /// `AUDIT_UPSTREAM_FETCHES` is `errors` or `all`; see
+    /// [`crate::services::upstream_fetch_audit`].
+    UpstreamFetched,
     /// An administrator accepted a finding: a decision about an advisory in a
     /// component of specific bytes (#5153).
     FindingAcknowledged,
@@ -273,6 +281,73 @@ pub enum AuditAction {
     FindingAcknowledgementNotCarried,
     /// An acknowledgement reached its expiry and stopped applying.
     FindingAcknowledgementExpired,
+    /// An MCP server publish pinned one `packages[]` entry to an artifact or
+    /// image digest in a backing repository (#5253). One row per entry.
+    McpPackagePinned,
+    /// An OCI tag an MCP server version pinned moved to another digest. The
+    /// version keeps serving the pinned digest (#5253).
+    McpPinDriftDetected,
+    /// The MCP registry API refused to hand a held server version to a
+    /// client (#5253). Sampled per (version, caller) per minute.
+    McpServerDownloadRefused,
+    /// A server version was published to a hosted MCP registry, or ingested from upstream into a Remote one. (#5253).
+    McpServerPublished,
+    /// A server version's registry status (active, deprecated, deleted) changed. (#5253).
+    McpServerStatusChanged,
+    /// A Remote MCP registry approved a server name (or a name@version pin) for serving. (#5253).
+    McpServerApproved,
+    /// A Remote MCP registry blocked a server name (or a name@version pin). (#5253).
+    McpServerRejected,
+    /// An MCP approval was revoked back to review (an admin reopened it, or content drift re-queued it). (#5253).
+    McpServerReopened,
+    /// An upstream entry changed content under an already ingested name@version. (#5253).
+    McpServerContentDrift,
+    /// A peer replication stored an MCP server name that differs only in letter case from a name the registry already recorded. (#5435).
+    McpNameCaseTwinReplicated,
+    /// An MCP serve gate could not be evaluated and the surface answered 503 (fail closed). (#5253).
+    McpGateUnavailable,
+    /// A capability snapshot (tools/resources/prompts) was recorded for a server version. (#5253).
+    McpCapabilitiesIngested,
+    /// A new capability snapshot differs from the previous one for the same server version. (#5253).
+    McpToolsDrift,
+    /// A namespace-conditioned MCP publish grant was created or widened. (#5253).
+    McpNamespaceGranted,
+    /// A namespace-conditioned MCP publish grant was removed or narrowed. (#5253).
+    McpNamespaceRevoked,
+    /// An admin-initiated DNS/HTTP namespace proof verified. (#5253).
+    McpNamespaceProofVerified,
+    /// An admin-initiated DNS/HTTP namespace proof did not verify. (#5253).
+    McpNamespaceProofFailed,
+    /// An administrator replaced a server version's document (PUT admin edit). (#5253).
+    McpServerEdited,
+    /// A server version was soft-deleted (DELETE), leaving a tombstone. (#5253).
+    McpServerDeleted,
+    /// An administrator purged a deleted server version: its server.json and
+    /// bundles went to the trash, releasing its pins; the tombstone stays. (#5368).
+    McpServerPurged,
+    /// A Remote MCP registry finished an upstream sync run. (#5253).
+    McpMirrorSynced,
+    /// An MCPB bundle's signature did not verify and the upload was refused. (#5253).
+    McpBundleSignatureRejected,
+    /// An administrator applied a config-as-code document (#5292). One
+    /// summary row per `mode=apply`; each write it made also records its own
+    /// per-repository row.
+    ConfigImported,
+    // Group administration (#5653). Appended at the END of the enum. A group
+    // grants its members every permission rule held by the group, so its
+    // membership is a privilege change and is audited like a role grant.
+    /// A group was created.
+    GroupCreated,
+    /// A group's name or description changed.
+    GroupUpdated,
+    /// A group was deleted (its memberships and grants cascade).
+    GroupDeleted,
+    /// Users were added to a group. One row per request, listing the users
+    /// whose membership was new.
+    GroupMembersAdded,
+    /// Users were removed from a group. One row per request, listing the
+    /// users whose membership existed.
+    GroupMembersRemoved,
 }
 
 impl AuditAction {
@@ -386,6 +461,36 @@ impl AuditAction {
             AuditAction::DeviceAuthorizationExpired => "DEVICE_AUTHORIZATION_EXPIRED",
             AuditAction::DebianBackfillRun => "DEBIAN_BACKFILL_RUN",
             AuditAction::ProxyScanBlocked => "PROXY_SCAN_BLOCKED",
+            AuditAction::McpPackagePinned => "MCP_PACKAGE_PINNED",
+            AuditAction::McpPinDriftDetected => "MCP_PIN_DRIFT_DETECTED",
+            AuditAction::McpServerDownloadRefused => "MCP_SERVER_DOWNLOAD_REFUSED",
+            AuditAction::McpServerPublished => "MCP_SERVER_PUBLISHED",
+            AuditAction::McpServerStatusChanged => "MCP_SERVER_STATUS_CHANGED",
+            AuditAction::McpServerApproved => "MCP_SERVER_APPROVED",
+            AuditAction::McpServerRejected => "MCP_SERVER_REJECTED",
+            AuditAction::McpServerReopened => "MCP_SERVER_REOPENED",
+            AuditAction::McpServerContentDrift => "MCP_SERVER_CONTENT_DRIFT",
+            AuditAction::McpNameCaseTwinReplicated => "MCP_NAME_CASE_TWIN_REPLICATED",
+            AuditAction::McpGateUnavailable => "MCP_GATE_UNAVAILABLE",
+            AuditAction::McpCapabilitiesIngested => "MCP_CAPABILITIES_INGESTED",
+            AuditAction::McpToolsDrift => "MCP_TOOLS_DRIFT",
+            AuditAction::McpNamespaceGranted => "MCP_NAMESPACE_GRANTED",
+            AuditAction::McpNamespaceRevoked => "MCP_NAMESPACE_REVOKED",
+            AuditAction::McpNamespaceProofVerified => "MCP_NAMESPACE_PROOF_VERIFIED",
+            AuditAction::McpNamespaceProofFailed => "MCP_NAMESPACE_PROOF_FAILED",
+            AuditAction::McpServerEdited => "MCP_SERVER_EDITED",
+            AuditAction::McpServerDeleted => "MCP_SERVER_DELETED",
+            AuditAction::McpServerPurged => "MCP_SERVER_PURGED",
+            AuditAction::McpMirrorSynced => "MCP_MIRROR_SYNCED",
+            AuditAction::McpBundleSignatureRejected => "MCP_BUNDLE_SIGNATURE_REJECTED",
+            AuditAction::CacheSeeded => "CACHE_SEEDED",
+            AuditAction::UpstreamFetched => "UPSTREAM_FETCHED",
+            AuditAction::ConfigImported => "CONFIG_IMPORTED",
+            AuditAction::GroupCreated => "GROUP_CREATED",
+            AuditAction::GroupUpdated => "GROUP_UPDATED",
+            AuditAction::GroupDeleted => "GROUP_DELETED",
+            AuditAction::GroupMembersAdded => "GROUP_MEMBERS_ADDED",
+            AuditAction::GroupMembersRemoved => "GROUP_MEMBERS_REMOVED",
         }
     }
 }
@@ -412,6 +517,8 @@ pub enum ResourceType {
     SyncPolicy,
     /// A stored environment (ingested lockfile graph, #4054 / #4709).
     Environment,
+    /// A user group (#5653).
+    Group,
 }
 
 impl ResourceType {
@@ -434,6 +541,7 @@ impl ResourceType {
             ResourceType::Webhook => "webhook",
             ResourceType::SyncPolicy => "sync_policy",
             ResourceType::Environment => "environment",
+            ResourceType::Group => "group",
         }
     }
 }
@@ -1439,6 +1547,19 @@ pub const PROXY_SCAN_BLOCK_WINDOW: std::time::Duration = std::time::Duration::fr
 /// is not aggregated.
 const PROXY_SCAN_BLOCK_MAX_KEYS: usize = 10_000;
 
+/// `PROXY_SCAN_BLOCKED` writes that may run at once on this replica (#4987).
+/// Each write holds a pool connection for two statements (the context read
+/// and the insert); repeats from one caller are coalesced by the aggregator,
+/// but many distinct callers each start a write, and without a bound a burst
+/// of them could take the pool the pulls themselves need.
+const PROXY_SCAN_BLOCK_WRITE_CONCURRENCY: usize = 4;
+
+/// `PROXY_SCAN_BLOCKED` writes that may be pending (waiting for a permit or
+/// running) on this replica (#4987). Past it a row is dropped and the drop
+/// is logged, so a flood of distinct callers cannot grow the backlog without
+/// bound either. The 403 itself is never affected.
+const PROXY_SCAN_BLOCK_WRITE_BACKLOG: usize = 10_000;
+
 /// What one refused pull should write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlockAdmission {
@@ -1526,6 +1647,67 @@ impl BlockAggregator {
     }
 }
 
+fn block_write_permits() -> &'static tokio::sync::Semaphore {
+    static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| tokio::sync::Semaphore::new(PROXY_SCAN_BLOCK_WRITE_CONCURRENCY))
+}
+
+static BLOCK_WRITES_PENDING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static BLOCK_WRITES_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Run `write` once a permit of `permits` is free, unless `pending` already
+/// counts `backlog` writes, in which case `write` is dropped and `false` is
+/// returned. `pending` counts the writes waiting for a permit and the ones
+/// running.
+async fn bounded_write<F: std::future::Future<Output = ()>>(
+    permits: &tokio::sync::Semaphore,
+    pending: &std::sync::atomic::AtomicUsize,
+    backlog: usize,
+    write: F,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    if pending.fetch_add(1, Ordering::AcqRel) >= backlog {
+        pending.fetch_sub(1, Ordering::AcqRel);
+        return false;
+    }
+    let permit = permits.acquire().await.ok();
+    write.await;
+    drop(permit);
+    pending.fetch_sub(1, Ordering::AcqRel);
+    true
+}
+
+/// [`write_proxy_scan_blocked`] under the replica's write limit
+/// ([`PROXY_SCAN_BLOCK_WRITE_CONCURRENCY`], [`PROXY_SCAN_BLOCK_WRITE_BACKLOG`]).
+async fn write_proxy_scan_blocked_bounded(
+    db: &PgPool,
+    event: &ProxyScanBlockEvent,
+    principal: &BlockPrincipal,
+    attempts: u64,
+    aggregated: bool,
+) {
+    let written = bounded_write(
+        block_write_permits(),
+        &BLOCK_WRITES_PENDING,
+        PROXY_SCAN_BLOCK_WRITE_BACKLOG,
+        write_proxy_scan_blocked(db, event, principal, attempts, aggregated),
+    )
+    .await;
+    if !written {
+        let dropped = BLOCK_WRITES_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        // Logged at 1, 2, 4, 8, ... drops so a flood does not flood the log.
+        if dropped.is_power_of_two() {
+            tracing::warn!(
+                repository_id = %event.repository_id, digest = %event.checksum_sha256,
+                attempts, dropped_total = dropped,
+                backlog = PROXY_SCAN_BLOCK_WRITE_BACKLOG,
+                "PROXY_SCAN_BLOCKED audit backlog is full; dropping the entry"
+            );
+        }
+    }
+}
+
 fn block_aggregator() -> &'static std::sync::Mutex<BlockAggregator> {
     static AGG: std::sync::OnceLock<std::sync::Mutex<BlockAggregator>> = std::sync::OnceLock::new();
     AGG.get_or_init(Default::default)
@@ -1544,28 +1726,39 @@ pub struct ProxyScanBlockEvent {
 /// username the auth middleware recorded (`None` for an anonymous pull) and
 /// the authorization-grade client IP. Captured before any detached task,
 /// which would not inherit the request's task-locals.
+///
+/// Shared with the `UPSTREAM_FETCHED` recorder (#5286), which attributes an
+/// upstream request to the client request that caused it the same way.
 #[derive(Debug, Clone)]
-struct BlockPrincipal {
-    username: Option<String>,
-    ip: Option<IpAddr>,
-    correlation_id: Option<String>,
+pub(crate) struct BlockPrincipal {
+    pub(crate) username: Option<String>,
+    /// The API token the request authenticated with (#4987); `None` for a
+    /// session, Basic password, anonymous or other non-token principal.
+    pub(crate) api_token_id: Option<Uuid>,
+    pub(crate) ip: Option<IpAddr>,
+    pub(crate) correlation_id: Option<String>,
 }
 
 impl BlockPrincipal {
-    fn current() -> Self {
+    pub(crate) fn current() -> Self {
         Self {
             username: crate::api::middleware::request_span::recorded_user(),
+            api_token_id: crate::api::middleware::request_span::recorded_api_token(),
             ip: crate::api::middleware::client_ip::current_verified_client_ip(),
             correlation_id: crate::api::middleware::tracing::current_correlation_id()
                 .map(crate::api::middleware::tracing::CorrelationId::into_string),
         }
     }
 
-    /// The aggregation key's principal: the username, or for an anonymous
+    /// The aggregation key's principal: the username (and the API token, so
+    /// two tokens of one user are told apart, #4987), or for an anonymous
     /// pull the client address (one CI runner's loop is one key).
     fn key(&self) -> String {
         match (&self.username, self.ip) {
-            (Some(u), _) => format!("user:{u}"),
+            (Some(u), _) => match self.api_token_id {
+                Some(token) => format!("user:{u}:token:{token}"),
+                None => format!("user:{u}"),
+            },
             (None, Some(ip)) => format!("anonymous:{ip}"),
             (None, None) => "anonymous".to_string(),
         }
@@ -1603,9 +1796,10 @@ pub fn record_proxy_scan_blocked(db: &PgPool, event: ProxyScanBlockEvent) {
         BlockAdmission::Write { closed_repeats } => {
             tokio::spawn(async move {
                 if closed_repeats > 0 {
-                    write_proxy_scan_blocked(&db, &event, &principal, closed_repeats, true).await;
+                    write_proxy_scan_blocked_bounded(&db, &event, &principal, closed_repeats, true)
+                        .await;
                 }
-                write_proxy_scan_blocked(&db, &event, &principal, 1, false).await;
+                write_proxy_scan_blocked_bounded(&db, &event, &principal, 1, false).await;
             });
         }
         BlockAdmission::Suppress {
@@ -1624,7 +1818,7 @@ pub fn record_proxy_scan_blocked(db: &PgPool, event: ProxyScanBlockEvent) {
                     Err(poisoned) => poisoned.into_inner().take_suppressed(&key, started),
                 };
                 if repeats > 0 {
-                    write_proxy_scan_blocked(&db, &event, &principal, repeats, true).await;
+                    write_proxy_scan_blocked_bounded(&db, &event, &principal, repeats, true).await;
                 }
             });
         }
@@ -1686,6 +1880,7 @@ async fn write_proxy_scan_blocked(
         "findings_count": ctx.findings_count,
         "scanned_at": ctx.scanned_at,
         "principal": principal.username,
+        "api_token_id": principal.api_token_id,
         "anonymous": principal.username.is_none(),
         "attempts": attempts,
         "aggregated": aggregated,
@@ -1826,6 +2021,7 @@ mod proxy_scan_blocked_4777_tests {
     fn principal_key_prefers_the_username_then_the_address() {
         let p = |u: Option<&str>, ip: Option<&str>| BlockPrincipal {
             username: u.map(str::to_string),
+            api_token_id: None,
             ip: ip.map(|s| s.parse().unwrap()),
             correlation_id: None,
         };
@@ -1834,10 +2030,270 @@ mod proxy_scan_blocked_4777_tests {
         assert_eq!(p(None, None).key(), "anonymous");
     }
 
+    /// #4987: two API tokens of one user are separate keys, so the summary
+    /// row of one never absorbs the other's refusals.
+    #[test]
+    fn principal_key_tells_two_tokens_of_one_user_apart() {
+        let token = |id: Option<Uuid>| BlockPrincipal {
+            username: Some("ci".to_string()),
+            api_token_id: id,
+            ip: None,
+            correlation_id: None,
+        };
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        assert_ne!(token(Some(a)).key(), token(Some(b)).key());
+        assert_ne!(token(Some(a)).key(), token(None).key());
+        assert_eq!(token(None).key(), "user:ci");
+    }
+
+    /// #4987: the principal reads the token id the auth path recorded on the
+    /// request.
+    #[tokio::test]
+    async fn principal_carries_the_recorded_api_token() {
+        use crate::api::middleware::request_span as rs;
+        let id = Uuid::new_v4();
+        let p = rs::with_request_span(tracing::Span::none(), async {
+            rs::record_user("ci");
+            rs::record_api_token(id);
+            BlockPrincipal::current()
+        })
+        .await;
+        assert_eq!(p.username.as_deref(), Some("ci"));
+        assert_eq!(p.api_token_id, Some(id));
+    }
+
+    /// #4987: refused-pull audit writes run at most `permits` at a time, and
+    /// past the backlog a write is dropped instead of queued.
+    #[tokio::test]
+    async fn bounded_write_caps_concurrency_and_backlog() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let permits = Arc::new(tokio::sync::Semaphore::new(2));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..20 {
+            let (permits, pending, running, peak) = (
+                permits.clone(),
+                pending.clone(),
+                running.clone(),
+                peak.clone(),
+            );
+            tasks.push(tokio::spawn(async move {
+                bounded_write(&permits, &pending, 100, async {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    running.fetch_sub(1, Ordering::SeqCst);
+                })
+                .await
+            }));
+        }
+        for t in tasks {
+            assert!(t.await.unwrap(), "under the backlog every write runs");
+        }
+        assert!(peak.load(Ordering::SeqCst) <= 2, "peak {peak:?}");
+        assert_eq!(pending.load(Ordering::SeqCst), 0);
+
+        // A full backlog drops the write without running it.
+        let closed = tokio::sync::Semaphore::new(0);
+        let full = AtomicUsize::new(3);
+        let ran = AtomicUsize::new(0);
+        let written = bounded_write(&closed, &full, 3, async {
+            ran.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert!(!written);
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            full.load(Ordering::SeqCst),
+            3,
+            "a dropped write is not counted"
+        );
+    }
+
+    /// #4987: the row names the API token the refused pull authenticated with.
+    #[tokio::test]
+    async fn the_audit_row_records_the_api_token_id() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let token = Uuid::new_v4();
+        let event = ProxyScanBlockEvent {
+            repository_id: repo_id,
+            path: "left-pad-1.0.0.tgz".to_string(),
+            checksum_sha256: format!("{:064x}", Uuid::new_v4().as_u128()),
+        };
+        let principal = |api_token_id| BlockPrincipal {
+            username: None,
+            api_token_id,
+            ip: None,
+            correlation_id: None,
+        };
+        write_proxy_scan_blocked(&pool, &event, &principal(Some(token)), 1, false).await;
+        let with_token = tdh::audit_row_eventually(&pool, repo_id, "PROXY_SCAN_BLOCKED").await;
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        write_proxy_scan_blocked(&pool, &event, &principal(None), 1, false).await;
+        let without = tdh::audit_row_eventually(&pool, repo_id, "PROXY_SCAN_BLOCKED").await;
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert_eq!(with_token.details["api_token_id"], token.to_string());
+        assert!(without.details["api_token_id"].is_null());
+    }
+
     #[test]
     fn action_string_is_stable() {
         assert_eq!(AuditAction::ProxyScanBlocked.as_str(), "PROXY_SCAN_BLOCKED");
         assert!(AuditAction::ProxyScanBlocked.as_str().len() <= 100);
+        assert_eq!(AuditAction::UpstreamFetched.as_str(), "UPSTREAM_FETCHED");
+        assert_eq!(AuditAction::ConfigImported.as_str(), "CONFIG_IMPORTED");
+        assert_eq!(AuditAction::GroupCreated.as_str(), "GROUP_CREATED");
+        assert_eq!(AuditAction::GroupUpdated.as_str(), "GROUP_UPDATED");
+        assert_eq!(AuditAction::GroupDeleted.as_str(), "GROUP_DELETED");
+        assert_eq!(
+            AuditAction::GroupMembersAdded.as_str(),
+            "GROUP_MEMBERS_ADDED"
+        );
+        assert_eq!(
+            AuditAction::GroupMembersRemoved.as_str(),
+            "GROUP_MEMBERS_REMOVED"
+        );
+    }
+
+    /// #5253: the MCP registry vocabulary is a published contract
+    /// (`docs/audit-events.md`).
+    #[test]
+    fn mcp_action_names_and_outcomes() {
+        use crate::services::audit_export::Outcome;
+        for (action, name, outcome) in [
+            (
+                AuditAction::McpPackagePinned,
+                "MCP_PACKAGE_PINNED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpPinDriftDetected,
+                "MCP_PIN_DRIFT_DETECTED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerDownloadRefused,
+                "MCP_SERVER_DOWNLOAD_REFUSED",
+                Outcome::Denied,
+            ),
+            (
+                AuditAction::McpServerPublished,
+                "MCP_SERVER_PUBLISHED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerStatusChanged,
+                "MCP_SERVER_STATUS_CHANGED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerApproved,
+                "MCP_SERVER_APPROVED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerRejected,
+                "MCP_SERVER_REJECTED",
+                Outcome::Denied,
+            ),
+            (
+                AuditAction::McpServerReopened,
+                "MCP_SERVER_REOPENED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerContentDrift,
+                "MCP_SERVER_CONTENT_DRIFT",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpGateUnavailable,
+                "MCP_GATE_UNAVAILABLE",
+                Outcome::Failure,
+            ),
+            (
+                AuditAction::McpNameCaseTwinReplicated,
+                "MCP_NAME_CASE_TWIN_REPLICATED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpCapabilitiesIngested,
+                "MCP_CAPABILITIES_INGESTED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpToolsDrift,
+                "MCP_TOOLS_DRIFT",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpNamespaceGranted,
+                "MCP_NAMESPACE_GRANTED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpNamespaceRevoked,
+                "MCP_NAMESPACE_REVOKED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpNamespaceProofVerified,
+                "MCP_NAMESPACE_PROOF_VERIFIED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpNamespaceProofFailed,
+                "MCP_NAMESPACE_PROOF_FAILED",
+                Outcome::Failure,
+            ),
+            (
+                AuditAction::McpServerEdited,
+                "MCP_SERVER_EDITED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerDeleted,
+                "MCP_SERVER_DELETED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerPurged,
+                "MCP_SERVER_PURGED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpMirrorSynced,
+                "MCP_MIRROR_SYNCED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpBundleSignatureRejected,
+                "MCP_BUNDLE_SIGNATURE_REJECTED",
+                Outcome::Denied,
+            ),
+        ] {
+            assert_eq!(action.as_str(), name);
+            assert_eq!(action.outcome(), outcome);
+        }
     }
 }
 
@@ -2022,6 +2478,7 @@ mod tests {
         assert_eq!(ResourceType::Webhook.as_str(), "webhook");
         assert_eq!(ResourceType::SyncPolicy.as_str(), "sync_policy");
         assert_eq!(ResourceType::Environment.as_str(), "environment");
+        assert_eq!(ResourceType::Group.as_str(), "group");
     }
 
     /// #4710: the core privileged-action vocabulary. The names are a published
@@ -2061,6 +2518,7 @@ mod tests {
                 "QUARANTINE_RELEASED",
                 Outcome::Success,
             ),
+            (AuditAction::CacheSeeded, "CACHE_SEEDED", Outcome::Success),
             (
                 AuditAction::QuarantineRejected,
                 "QUARANTINE_REJECTED",

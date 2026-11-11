@@ -25,6 +25,32 @@ type Config struct {
 	// SkipDBUpdate passes --skip-db-update so an air-gapped / pre-seeded cache
 	// is used verbatim instead of contacting the trivy DB registry.
 	SkipDBUpdate bool
+	// Offline (SCANNER_OFFLINE) is the single air-gap switch (#5287). It
+	// implies SkipDBUpdate, adds --skip-java-db-update to every scan, and
+	// suppresses the startup DB download. (--offline-scan, no API lookups
+	// during analysis, is on for every scan since #5666; see noLookupArgs.) The vulnerability DB then comes only
+	// from what is already in CacheDir or from PUT /api/v1/vulndb. Default
+	// false: connected installs behave exactly as before.
+	Offline bool
+	// DBSchemaVersion (SCANNER_TRIVY_DB_SCHEMA_VERSION) is the trivy DB schema
+	// version an imported DB must carry in its metadata.json `Version`. trivy
+	// does not report the schema it expects (`trivy version` prints the
+	// metadata of the DB it has, not the one it wants), so this is configured.
+	// It is the major tag of the DB artifact (ghcr.io/aquasecurity/trivy-db:2)
+	// and has been 2 since trivy 0.23. Default 2.
+	DBSchemaVersion int
+	// AdapterToken (SCANNER_ADAPTER_TOKEN) is the shared bearer token required
+	// on the vulnerability-DB routes (GET/PUT /api/v1/vulndb). Empty (default)
+	// disables both routes (403): a route that replaces the DB every scan is
+	// matched against is never served unauthenticated.
+	AdapterToken string
+	// VulnDBMaxUploadBytes (SCANNER_VULNDB_MAX_UPLOAD_BYTES) caps the
+	// compressed db.tar.gz body of PUT /api/v1/vulndb. Default 2 GiB.
+	VulnDBMaxUploadBytes int64
+	// VulnDBMaxExtractedBytes (SCANNER_VULNDB_MAX_EXTRACTED_BYTES) caps the
+	// total uncompressed size of the imported files (gzip-bomb bound).
+	// Default 8 GiB.
+	VulnDBMaxExtractedBytes int64
 	// DBRepository overrides the OCI repository trivy pulls its vulnerability DB
 	// from (--db-repository). Empty means trivy's built-in default
 	// (mirror.gcr.io/aquasecurity/trivy-db), which is an anonymous, shared,
@@ -52,6 +78,14 @@ type Config struct {
 	// POST /api/v1/filesystem/scan. The body is an UNCOMPRESSED tar, so this
 	// also bounds the extracted tree (no decompression amplification).
 	FsMaxUploadBytes int64
+	// MaxConcurrentScans (SCANNER_MAX_CONCURRENT_SCANS) bounds how many trivy
+	// scans (image and filesystem together) run at once in this adapter
+	// (#5657). Further jobs wait, reported as Queued on the report route,
+	// instead of all starting at once: every trivy run holds its own copy of
+	// the vulnerability DB and the analysed layers in memory, and only one
+	// image scan at a time can use the on-disk analysis cache. Default 4; 0
+	// removes the bound.
+	MaxConcurrentScans int
 	// JobTTL is how long a finished job (report or error) is retained before the
 	// sweeper evicts it.
 	JobTTL time.Duration
@@ -95,7 +129,7 @@ type Config struct {
 
 // LoadConfig reads the SCANNER_* environment variables, applying defaults.
 func LoadConfig() *Config {
-	return &Config{
+	cfg := &Config{
 		Addr:         getenv("SCANNER_ADAPTER_ADDR", ":8080"),
 		TrivyPath:    getenv("SCANNER_TRIVY_PATH", "trivy"),
 		CacheDir:     getenv("SCANNER_TRIVY_CACHE_DIR", "/home/scanner/.cache/trivy"),
@@ -115,12 +149,28 @@ func LoadConfig() *Config {
 		FsScanTimeout:       getenvDuration("SCANNER_FS_SCAN_TIMEOUT", 10*time.Minute),
 		FsMaxUploadBytes:    getenvInt64("SCANNER_FS_MAX_UPLOAD_BYTES", 64*1024*1024*1024),
 		JobTTL:              getenvDuration("SCANNER_JOB_TTL", 30*time.Minute),
+		MaxConcurrentScans:  getenvIntNonNeg("SCANNER_MAX_CONCURRENT_SCANS", 4),
 		LogLevel:            getenv("SCANNER_LOG_LEVEL", "info"),
 		ScannerVersion:      os.Getenv("SCANNER_SCANNER_VERSION"),
 		TrivyServer:         strings.TrimRight(strings.TrimSpace(os.Getenv("SCANNER_TRIVY_SERVER")), "/"),
 		CachePartition:      strings.TrimSpace(os.Getenv("SCANNER_TRIVY_CACHE_PARTITION")),
 		TrivyServerInsecure: getenvBool("SCANNER_TRIVY_SERVER_INSECURE", false),
+		Offline:             getenvBool("SCANNER_OFFLINE", false),
+		DBSchemaVersion:     getenvIntNonNeg("SCANNER_TRIVY_DB_SCHEMA_VERSION", 2),
+		AdapterToken:        strings.TrimSpace(os.Getenv("SCANNER_ADAPTER_TOKEN")),
+
+		VulnDBMaxUploadBytes:    getenvInt64("SCANNER_VULNDB_MAX_UPLOAD_BYTES", 2*1024*1024*1024),
+		VulnDBMaxExtractedBytes: getenvInt64("SCANNER_VULNDB_MAX_EXTRACTED_BYTES", 8*1024*1024*1024),
 	}
+	if cfg.DBSchemaVersion < 1 {
+		cfg.DBSchemaVersion = 2
+	}
+	// Offline overrides an explicit SCANNER_TRIVY_SKIP_DB_UPDATE=false: one
+	// switch, no combination that still reaches out.
+	if cfg.Offline {
+		cfg.SkipDBUpdate = true
+	}
+	return cfg
 }
 
 func getenv(key, def string) string {
