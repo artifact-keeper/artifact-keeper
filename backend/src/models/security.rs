@@ -866,24 +866,17 @@ pub struct VulnDbProvenance {
     pub published_at: Option<DateTime<Utc>>,
 }
 
-/// Longest `vuln_db_version` the column accepts (`VARCHAR(100)`).
-pub const VULN_DB_VERSION_MAX_LEN: usize = 100;
-
 impl VulnDbProvenance {
-    /// Build a provenance record, returning `None` for an empty identity and
-    /// truncating (on a char boundary) to the column width so an unexpected
-    /// scanner string can never fail the `complete_scan` write.
+    /// Build a provenance record, returning `None` for an empty identity.
+    ///
+    /// The identity is stored whole. `vuln_db_version` is `TEXT` since #5564,
+    /// so an unexpectedly long scanner string can neither fail the
+    /// `complete_scan` write nor be silently truncated into a different
+    /// database identity.
     pub fn new(version: impl Into<String>, published_at: Option<DateTime<Utc>>) -> Option<Self> {
-        let mut version: String = version.into().trim().to_string();
+        let version: String = version.into().trim().to_string();
         if version.is_empty() {
             return None;
-        }
-        if version.len() > VULN_DB_VERSION_MAX_LEN {
-            let mut cut = VULN_DB_VERSION_MAX_LEN;
-            while !version.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            version.truncate(cut);
         }
         Some(Self {
             version,
@@ -1407,19 +1400,16 @@ mod tests {
     }
 
     #[test]
-    fn vuln_db_provenance_rejects_empty_and_fits_the_column() {
+    fn vuln_db_provenance_rejects_empty_and_keeps_the_whole_identity() {
         assert_eq!(VulnDbProvenance::new("   ", None), None);
         let p = VulnDbProvenance::new(" trivy-db-v2 ", None).unwrap();
         assert_eq!(p.version, "trivy-db-v2");
 
-        let long = "x".repeat(VULN_DB_VERSION_MAX_LEN + 20);
-        let p = VulnDbProvenance::new(long, None).unwrap();
-        assert_eq!(p.version.len(), VULN_DB_VERSION_MAX_LEN);
-
-        // Truncation lands on a char boundary, never mid-codepoint.
-        let multibyte = format!("{}é", "a".repeat(VULN_DB_VERSION_MAX_LEN - 1));
-        let p = VulnDbProvenance::new(multibyte, None).unwrap();
-        assert_eq!(p.version, "a".repeat(VULN_DB_VERSION_MAX_LEN - 1));
+        // #5564: the column is TEXT, so a long scanner-supplied identity is
+        // stored whole rather than truncated into a different database name.
+        let long = format!("grype-db-v6.1.10+{}", "x".repeat(300));
+        let p = VulnDbProvenance::new(long.clone(), None).unwrap();
+        assert_eq!(p.version, long);
     }
 
     // -----------------------------------------------------------------------
