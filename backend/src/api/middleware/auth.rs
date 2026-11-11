@@ -530,6 +530,22 @@ pub async fn require_auth_with_bearer_fallback(
                 .body(axum::body::Body::from("Invalid credentials"))
                 .unwrap()
         })?;
+    // #5484: as on the other format-route password paths, an account with
+    // TOTP enrolled must present an API token, not its password.
+    if let Some(refusal) = format_route_password_refusal(&user) {
+        tracing::info!(
+            target: "security",
+            username = %user.username,
+            reason = refusal.as_str(),
+            "password authentication refused; the account needs an API token"
+        );
+        record_auth_failure(AuthFailureSurface::Basic, AuthFailureReason::Scope);
+        return Err(Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("WWW-Authenticate", format!("Basic realm=\"{}\"", realm))
+            .body(axum::body::Body::from("Invalid credentials"))
+            .unwrap());
+    }
     Ok(user.id)
 }
 
@@ -1444,7 +1460,11 @@ async fn resolve_basic_pair(
     }
 
     match verify_basic_password(auth_service, username, password).await {
-        BasicPasswordOutcome::Verified(user) => AuthOutcome::Resolved(AuthExtension::from(*user)),
+        // #5484: a verified password is admitted only when it is all this
+        // surface may ask of the account.
+        BasicPasswordOutcome::Verified(user) => {
+            password_outcome(auth_service, *user, allow_basic_api_token, failure).await
+        }
         BasicPasswordOutcome::RateLimited(retry_after) => AuthOutcome::RateLimited(retry_after),
         BasicPasswordOutcome::Overloaded => AuthOutcome::Overloaded,
         BasicPasswordOutcome::Rejected { metric } => {
@@ -1519,6 +1539,65 @@ pub(crate) async fn verify_basic_password(
             }
         }
     }
+}
+
+/// Admit a password-verified `user` only when a password is all this surface
+/// may ask of them (#5484).
+///
+/// HTTP Basic `username:password` (and its base64-in-Bearer form) used to
+/// resolve straight to the account, so a stolen password reached
+/// `POST /api/v1/auth/tokens` and minted a non-expiring API token for an
+/// account with TOTP enrolled, and a local account kept working where SSO
+/// had disabled local login.
+///
+/// * Management API (`allow_basic_api_token = false`): every policy
+///   `POST /api/v1/auth/login` applies after the password
+///   ([`AuthService::password_only_refusal`]).
+/// * Format and registry routes (`true`): an account with TOTP enrolled is
+///   refused, as `/v2/token` already refuses it, since a package client
+///   cannot answer a TOTP challenge. The user-and-API-token form is the way
+///   in for such an account.
+///
+/// A refused account gets the same 401 as a wrong password.
+pub(crate) async fn password_outcome(
+    auth_service: &AuthService,
+    user: User,
+    allow_basic_api_token: bool,
+    failure: &mut Option<AuthFailureLabels>,
+) -> AuthOutcome {
+    let refusal = if allow_basic_api_token {
+        Ok(format_route_password_refusal(&user))
+    } else {
+        auth_service.password_only_refusal(&user).await
+    };
+    match refusal {
+        Ok(None) => AuthOutcome::Resolved(AuthExtension::from(user)),
+        Ok(Some(refusal)) => {
+            tracing::info!(
+                target: "security",
+                username = %user.username,
+                reason = refusal.as_str(),
+                "password authentication refused; the account needs an API token"
+            );
+            *failure = Some((AuthFailureSurface::Basic, AuthFailureReason::Scope));
+            AuthOutcome::InvalidCredential
+        }
+        // The policy lookups are DB reads: an outage is a retryable 503.
+        Err(ref e) if e.is_db_unavailable() => AuthOutcome::Overloaded,
+        Err(e) => {
+            tracing::error!(error = %e, "password-only policy lookup failed; refusing");
+            AuthOutcome::Overloaded
+        }
+    }
+}
+
+/// The #5484 policy for a password on the format and registry routes: an
+/// account with TOTP enrolled must use an API token instead.
+pub(crate) fn format_route_password_refusal(
+    user: &User,
+) -> Option<crate::services::auth_service::PasswordOnlyRefusal> {
+    user.totp_enabled
+        .then_some(crate::services::auth_service::PasswordOnlyRefusal::SecondFactorRequired)
 }
 
 /// Extract the value of a `ticket` query parameter from a URI's query string.
@@ -3941,6 +4020,84 @@ mod tests {
         let ext = AuthExtension::from(user);
         assert_eq!(ext.iat_ms, None);
         assert_eq!(ext.caller_iat_ms(), None);
+    }
+
+    fn password_only_test_user(totp_enabled: bool) -> User {
+        use crate::models::user::AuthProvider;
+        let now = chrono::Utc::now();
+        User {
+            id: Uuid::new_v4(),
+            username: "pw-5484".to_string(),
+            email: "pw-5484@example.com".to_string(),
+            password_hash: None,
+            auth_provider: AuthProvider::Local,
+            external_id: None,
+            display_name: None,
+            is_active: true,
+            is_admin: false,
+            is_service_account: false,
+            must_change_password: false,
+            totp_secret: None,
+            totp_enabled,
+            totp_backup_codes: None,
+            totp_verified_at: None,
+            failed_login_attempts: 0,
+            locked_until: None,
+            last_failed_login_at: None,
+            password_changed_at: now,
+            last_login_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// #5484: the management-API gate reads the TOTP policy and the enabled
+    /// SSO providers. If the database cannot answer, the password is neither
+    /// admitted nor refused: it is a retryable 503 (`Overloaded`).
+    #[tokio::test]
+    async fn password_outcome_is_overloaded_when_the_policy_lookup_fails_5484() {
+        let svc = make_test_auth_service();
+        let mut failure = None;
+        let outcome =
+            password_outcome(&svc, password_only_test_user(false), false, &mut failure).await;
+        assert!(matches!(outcome, AuthOutcome::Overloaded), "{outcome:?}");
+        assert!(failure.is_none());
+    }
+
+    /// #5484: on the format routes the gate needs no lookup. A TOTP account's
+    /// password is refused and labelled; any other password is admitted.
+    #[tokio::test]
+    async fn password_outcome_on_format_routes_needs_no_lookup_5484() {
+        let svc = make_test_auth_service();
+        let mut failure = None;
+        let refused_outcome =
+            password_outcome(&svc, password_only_test_user(true), true, &mut failure).await;
+        assert!(
+            matches!(refused_outcome, AuthOutcome::InvalidCredential),
+            "{refused_outcome:?}"
+        );
+        assert_eq!(
+            failure,
+            Some((AuthFailureSurface::Basic, AuthFailureReason::Scope))
+        );
+        let mut failure = None;
+        let admitted =
+            password_outcome(&svc, password_only_test_user(false), true, &mut failure).await;
+        assert!(matches!(admitted, AuthOutcome::Resolved(_)), "{admitted:?}");
+        assert!(failure.is_none());
+    }
+
+    #[test]
+    fn password_only_refusal_reasons_are_stable_5484() {
+        use crate::services::auth_service::PasswordOnlyRefusal;
+        assert_eq!(
+            PasswordOnlyRefusal::SecondFactorRequired.as_str(),
+            "second_factor_required"
+        );
+        assert_eq!(
+            PasswordOnlyRefusal::SsoRequired.as_str(),
+            "local_login_disabled_sso"
+        );
     }
 
     #[test]
@@ -6944,6 +7101,12 @@ mod tests {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
+        // A local password on the management API now also passes the
+        // SSO-only and TOTP policy gates (#5484), which read whole-database
+        // state; hold their test locks so a peer test's enabled SSO provider
+        // or TOTP policy cannot flip this baseline mid-test.
+        let _sso = tdh::sso_provider_serial_lock().await;
+        let _totp = tdh::totp_policy_serial_lock().await;
         // Local user with a real bcrypt password: the token fallback must not
         // regress ordinary username/password Basic auth.
         let user_id = Uuid::new_v4();
@@ -12256,6 +12419,12 @@ mod tests {
             let Some(pool) = tdh::try_pool().await else {
                 return;
             };
+            // A local password on the management API now also passes the
+            // SSO-only and TOTP policy gates (#5484), which read whole-database
+            // state; hold their test locks so a peer test's enabled SSO provider
+            // or TOTP policy cannot flip this baseline mid-test.
+            let _sso = tdh::sso_provider_serial_lock().await;
+            let _totp = tdh::totp_policy_serial_lock().await;
             let (user_id, username) = local_user(&pool).await;
             let svc = Arc::new(service(&pool));
 
@@ -12832,6 +13001,327 @@ mod tests {
             assert_eq!(password_cost, 1);
             assert!(matches!(wrong_outcome, AuthOutcome::InvalidCredential));
             assert_eq!(wrong_cost, 1);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // #5484: a password alone must not sign in, on the management API, an
+    // account that `POST /api/v1/auth/login` would have sent to a TOTP
+    // challenge or to SSO. Every test drives the full router with the request
+    // shape from the issue: `curl -u victim:pw -X POST /api/v1/auth/tokens`.
+    // -----------------------------------------------------------------------
+    mod password_only_5484 {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::{Method, StatusCode};
+        use base64::Engine as _;
+        use sqlx::PgPool;
+        use uuid::Uuid;
+
+        const PASSWORD: &str = "Victim-Pa55word!";
+
+        /// A local account with `PASSWORD`, optionally admin and/or with TOTP
+        /// enrolled.
+        async fn seed_local_user(pool: &PgPool, is_admin: bool, totp: bool) -> (Uuid, String) {
+            let id = Uuid::new_v4();
+            let username = format!("ph-5484-{}", id.simple());
+            let hash = crate::services::auth_service::AuthService::hash_password(PASSWORD)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO users (id, username, email, password_hash, auth_provider, \
+                 is_admin, is_active, must_change_password, totp_enabled, totp_secret) \
+                 VALUES ($1, $2, $3, $4, 'local', $5, true, false, $6, $7)",
+            )
+            .bind(id)
+            .bind(&username)
+            .bind(format!("{username}@test.local"))
+            .bind(&hash)
+            .bind(is_admin)
+            .bind(totp)
+            .bind(totp.then_some("JBSWY3DPEHPK3PXP"))
+            .execute(pool)
+            .await
+            .expect("seed user");
+            (id, username)
+        }
+
+        async fn cleanup(pool: &PgPool, id: Uuid) {
+            let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+
+        async fn tokens_of(pool: &PgPool, id: Uuid) -> i64 {
+            sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens WHERE user_id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+
+        fn basic(username: &str) -> String {
+            let pair = format!("{username}:{PASSWORD}");
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(pair)
+            )
+        }
+
+        /// `curl -u <user>:<pw> -X POST /api/v1/auth/tokens -d '{...}'`.
+        async fn mint_with_password(state: &crate::api::SharedState, username: &str) -> StatusCode {
+            let req = axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/auth/tokens")
+                .header("Authorization", basic(username))
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"name":"x","scopes":["write:artifacts"]}"#,
+                ))
+                .unwrap();
+            tdh::send(crate::api::routes::create_router(state.clone()), req)
+                .await
+                .0
+        }
+
+        fn state(
+            pool: &PgPool,
+            mutate: impl FnOnce(&mut crate::config::Config),
+        ) -> crate::api::SharedState {
+            let dir = std::env::temp_dir().join(format!("ph-5484-{}", Uuid::new_v4()));
+            tdh::build_state_with(pool.clone(), dir.to_string_lossy().as_ref(), mutate)
+        }
+
+        /// The reporter's case: a TOTP-enrolled user's password used to mint a
+        /// non-expiring API token over Basic. The same request for an account
+        /// without TOTP still works, so the refusal is the TOTP gate.
+        #[tokio::test]
+        async fn basic_password_cannot_mint_an_api_token_for_a_totp_account() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            // The control / refusal must not flip on an SSO provider another
+            // test enabled meanwhile.
+            let _guard = tdh::sso_provider_serial_lock().await;
+            // Nor on a TOTP or token-expiry policy another test set.
+            let _totp = tdh::totp_policy_serial_lock().await;
+            let _token = tdh::token_policy_serial_lock().await;
+            let state = state(&pool, |_| {});
+            let (victim, victim_name) = seed_local_user(&pool, false, true).await;
+            let (plain, plain_name) = seed_local_user(&pool, false, false).await;
+
+            let refused = mint_with_password(&state, &victim_name).await;
+            let minted_for_victim = tokens_of(&pool, victim).await;
+            let control = mint_with_password(&state, &plain_name).await;
+            cleanup(&pool, victim).await;
+            cleanup(&pool, plain).await;
+
+            assert_eq!(refused, StatusCode::UNAUTHORIZED);
+            assert_eq!(minted_for_victim, 0, "no token minted for the TOTP account");
+            assert_eq!(control, StatusCode::OK, "the request shape itself works");
+        }
+
+        /// `curl -u admin:pw /api/v1/admin/...` for a TOTP-enrolled admin.
+        #[tokio::test]
+        async fn basic_password_is_refused_on_admin_routes_for_a_totp_admin() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = state(&pool, |_| {});
+            let (admin, admin_name) = seed_local_user(&pool, true, true).await;
+            let req = axum::http::Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/admin/backups")
+                .header("Authorization", basic(&admin_name))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let (status, _) =
+                tdh::send(crate::api::routes::create_router(state.clone()), req).await;
+            let mint = mint_with_password(&state, &admin_name).await;
+            let minted = tokens_of(&pool, admin).await;
+            cleanup(&pool, admin).await;
+
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "admin route");
+            assert_eq!(mint, StatusCode::UNAUTHORIZED, "token mint");
+            assert_eq!(minted, 0);
+        }
+
+        /// The TOTP enforcement policy (#2805) sends a covered account that
+        /// has not enrolled to enrolment at `/auth/login`; Basic must not skip
+        /// that step either.
+        #[tokio::test]
+        async fn basic_password_is_refused_when_the_policy_requires_enrolment() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            // The control / refusal must not flip on an SSO provider another
+            // test enabled meanwhile.
+            let _guard = tdh::sso_provider_serial_lock().await;
+            // Nor on a TOTP or token-expiry policy another test set.
+            let _totp = tdh::totp_policy_serial_lock().await;
+            let _token = tdh::token_policy_serial_lock().await;
+            let state = state(&pool, |c| {
+                c.totp_policy = Some(crate::services::totp_policy::TotpPolicy::RequiredForAll);
+            });
+            let (user, name) = seed_local_user(&pool, false, false).await;
+            let status = mint_with_password(&state, &name).await;
+            let minted = tokens_of(&pool, user).await;
+            cleanup(&pool, user).await;
+
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(minted, 0);
+        }
+
+        /// With an SSO provider enabled, `/auth/login` answers a non-admin
+        /// local account with "Local login is disabled when SSO is
+        /// configured"; Basic used to serve it anyway. The verified-admin
+        /// break-glass (#443) is kept, exactly as at `/auth/login`.
+        #[tokio::test]
+        async fn basic_password_honours_the_sso_only_local_login_policy() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let _guard = tdh::sso_provider_serial_lock().await;
+            // Nor on a TOTP or token-expiry policy another test set.
+            let _totp = tdh::totp_policy_serial_lock().await;
+            let _token = tdh::token_policy_serial_lock().await;
+            let state = state(&pool, |_| {});
+            let provider = format!("ph-5484-ldap-{}", Uuid::new_v4().simple());
+            sqlx::query(
+                "INSERT INTO ldap_configs (name, server_url, user_base_dn, is_enabled) \
+                 VALUES ($1, 'ldap://test.invalid', 'dc=test', true)",
+            )
+            .bind(&provider)
+            .execute(&pool)
+            .await
+            .expect("seed enabled LDAP provider");
+            let (user, name) = seed_local_user(&pool, false, false).await;
+            let (admin, admin_name) = seed_local_user(&pool, true, false).await;
+
+            let refused = mint_with_password(&state, &name).await;
+            let minted = tokens_of(&pool, user).await;
+            let break_glass = mint_with_password(&state, &admin_name).await;
+            cleanup(&pool, user).await;
+            cleanup(&pool, admin).await;
+            let _ = sqlx::query("DELETE FROM ldap_configs WHERE name = $1")
+                .bind(&provider)
+                .execute(&pool)
+                .await;
+
+            assert_eq!(refused, StatusCode::UNAUTHORIZED, "non-admin under SSO");
+            assert_eq!(minted, 0);
+            assert_eq!(break_glass, StatusCode::OK, "verified-admin break-glass");
+        }
+
+        /// On the format and registry routes (`allow_basic_api_token = true`)
+        /// a TOTP-enrolled account's password is refused as `/v2/token`
+        /// refuses it, in both the Basic and the base64-in-Bearer form. The
+        /// user-and-API-token form still works for that account, and a
+        /// password still works for an account without TOTP.
+        #[tokio::test]
+        async fn format_route_password_is_refused_for_a_totp_account() {
+            use super::super::{try_resolve_auth_outcome, AuthOutcome, ExtractedToken};
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = state(&pool, |_| {});
+            let svc = crate::services::auth_service::AuthService::new(
+                pool.clone(),
+                std::sync::Arc::new(state.config.clone()),
+            );
+            let (victim, victim_name) = seed_local_user(&pool, false, true).await;
+            let (plain, plain_name) = seed_local_user(&pool, false, false).await;
+            let (api_token, _) = svc
+                .generate_api_token(victim, "ph-5484", vec!["read:artifacts".into()], None)
+                .await
+                .expect("mint API token");
+            let enc = |user: &str, secret: &str| {
+                base64::engine::general_purpose::STANDARD.encode(format!("{user}:{secret}"))
+            };
+            let resolve = |cred: String, bearer: bool| {
+                let svc = &svc;
+                async move {
+                    let extracted = if bearer {
+                        ExtractedToken::Bearer(&cred)
+                    } else {
+                        ExtractedToken::Basic(&cred)
+                    };
+                    try_resolve_auth_outcome(svc, extracted, true).await
+                }
+            };
+
+            let basic_victim = resolve(enc(&victim_name, PASSWORD), false).await;
+            let bearer_victim = resolve(enc(&victim_name, PASSWORD), true).await;
+            let token_victim = resolve(enc(&victim_name, &api_token), false).await;
+            let basic_plain = resolve(enc(&plain_name, PASSWORD), false).await;
+            let bearer_plain = resolve(enc(&plain_name, PASSWORD), true).await;
+            cleanup(&pool, victim).await;
+            cleanup(&pool, plain).await;
+
+            assert!(
+                matches!(basic_victim, AuthOutcome::InvalidCredential),
+                "Basic password, TOTP account: {basic_victim:?}"
+            );
+            assert!(
+                matches!(bearer_victim, AuthOutcome::InvalidCredential),
+                "base64 Bearer password, TOTP account: {bearer_victim:?}"
+            );
+            assert!(
+                matches!(&token_victim, AuthOutcome::Resolved(ext) if ext.user_id == victim),
+                "user:<api_token>, TOTP account: {token_victim:?}"
+            );
+            assert!(
+                matches!(&basic_plain, AuthOutcome::Resolved(ext) if ext.user_id == plain),
+                "Basic password, no TOTP: {basic_plain:?}"
+            );
+            assert!(
+                matches!(&bearer_plain, AuthOutcome::Resolved(ext) if ext.user_id == plain),
+                "base64 Bearer password, no TOTP: {bearer_plain:?}"
+            );
+        }
+
+        /// `require_auth_with_bearer_fallback` (npm, cargo, goproxy handlers)
+        /// verifies a base64 `user:pass` Bearer itself; it applies the same
+        /// format-route refusal.
+        #[tokio::test]
+        async fn bearer_fallback_refuses_a_totp_accounts_password() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = state(&pool, |_| {});
+            let (victim, victim_name) = seed_local_user(&pool, false, true).await;
+            let (plain, plain_name) = seed_local_user(&pool, false, false).await;
+            let call = |user: String| {
+                let pool = pool.clone();
+                let config = state.config.clone();
+                async move {
+                    let mut headers = axum::http::HeaderMap::new();
+                    let cred = base64::engine::general_purpose::STANDARD
+                        .encode(format!("{user}:{PASSWORD}"));
+                    headers.insert(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {cred}").parse().unwrap(),
+                    );
+                    super::super::require_auth_with_bearer_fallback(
+                        None, &headers, &pool, &config, "npm",
+                    )
+                    .await
+                }
+            };
+            let refused = call(victim_name).await;
+            let allowed = call(plain_name).await;
+            cleanup(&pool, victim).await;
+            cleanup(&pool, plain).await;
+
+            assert_eq!(
+                refused.err().map(|r| r.status()),
+                Some(StatusCode::UNAUTHORIZED)
+            );
+            assert_eq!(allowed.ok(), Some(plain));
         }
     }
 }

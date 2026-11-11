@@ -1642,3 +1642,91 @@ async fn test_saml_disabled_provider_cannot_log_in() {
 
     delete_saml_provider(&pool, provider_id).await;
 }
+
+/// #5484: a SAML user who enrolled TOTP in Artifact Keeper used to get a
+/// session from the ACS with no second factor. Now the ACS sets no cookies
+/// and its exchange code answers with the TOTP challenge and no session. The
+/// first ACS, before enrolment, is the control.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+#[allow(clippy::disallowed_methods)] // streaming-invariant: test exempt — buffering a small JSON body in a test assertion is not an artifact path (#1608)
+async fn test_saml_acs_challenges_a_totp_enrolled_user_5484() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let provider_id = create_saml_provider(&pool, SamlProviderOpts::default()).await;
+    let name_id = format!("saml-5484-{}", Uuid::new_v4().as_simple());
+
+    let mut outcomes = Vec::new();
+    for enrolled in [false, true] {
+        if enrolled {
+            sqlx::query(
+                "UPDATE users SET totp_enabled = true, totp_secret = 'JBSWY3DPEHPK3PXP' \
+                 WHERE external_id = $1 AND auth_provider = 'saml'",
+            )
+            .bind(&name_id)
+            .execute(&pool)
+            .await
+            .expect("enrol totp");
+        }
+        let request_id = seed_session(&pool, provider_id).await;
+        let resp = post_acs(
+            build_state(pool.clone()),
+            provider_id,
+            &happy_spec(&request_id, &name_id).signed_b64(),
+        )
+        .await;
+        let status = resp.status();
+        let cookies = resp.headers().get_all("set-cookie").iter().count();
+        let location = resp.headers()["location"].to_str().unwrap().to_string();
+        let code = location
+            .strip_prefix("/callback?code=")
+            .map(|c| urlencoding::decode(c).unwrap().into_owned())
+            .expect("exchange code on the frontend redirect");
+        let ex = sso_app(build_state(pool.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/exchange")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({ "code": code }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("exchange oneshot");
+        let ex_status = ex.status();
+        let ex_cookies = ex.headers().get_all("set-cookie").iter().count();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(ex.into_body(), 64 * 1024)
+                .await
+                .expect("body"),
+        )
+        .expect("json");
+        outcomes.push((status, cookies, ex_status, ex_cookies, body));
+    }
+    let user_id = get_saml_user(&pool, &name_id).await.map(|u| u.0);
+    delete_saml_user(&pool, &name_id).await;
+    delete_saml_provider(&pool, provider_id).await;
+
+    let (status, cookies, ex_status, ex_cookies, body) = &outcomes[0];
+    assert_eq!(*status, StatusCode::TEMPORARY_REDIRECT, "control");
+    assert!(*cookies > 0, "control: the ACS sets session cookies");
+    assert_eq!(*ex_status, StatusCode::OK);
+    assert!(*ex_cookies > 0);
+    assert!(body.get("totp_required").is_none(), "{body}");
+
+    let (status, cookies, ex_status, ex_cookies, body) = &outcomes[1];
+    assert_eq!(*status, StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(*cookies, 0, "no session cookies before the second factor");
+    assert_eq!(*ex_status, StatusCode::OK, "{body}");
+    assert_eq!(*ex_cookies, 0);
+    assert_eq!(body["totp_required"], true, "{body}");
+    assert_eq!(body["access_token"], "", "{body}");
+    let claims = artifact_keeper_backend::services::auth_service::AuthService::new(
+        pool.clone(),
+        std::sync::Arc::new(common::sso_support::test_config()),
+    )
+    .validate_totp_pending_token(body["totp_token"].as_str().expect("totp_token"))
+    .expect("a TOTP pending token for /auth/totp/verify");
+    assert_eq!(Some(claims.sub), user_id);
+}

@@ -1426,6 +1426,81 @@ impl From<AppError> for LoginFailure {
     }
 }
 
+/// Outcome of the local-login policy decision in [`local_login_gate`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LocalLoginGate {
+    /// Local login may proceed.
+    Allow,
+    /// Local login is rejected because SSO is enforced for this user.
+    RejectSso,
+}
+
+/// Decide whether a *verified* local credential may complete login.
+///
+/// Evaluated AFTER `AuthService::authenticate` succeeds, so `user_is_admin`
+/// is a proven property of the caller, not a claim from the request. When any
+/// SSO provider is enabled (issue #213) non-admin local login stays disabled,
+/// but a verified admin retains a break-glass recovery path by default so a
+/// misconfigured SSO provider can be repaired in-band (issue #443). The
+/// legacy `ALLOW_LOCAL_ADMIN_LOGIN` flag (`allow_local_admin_login`) is kept
+/// as a back-compat input; it only ever applied to the admin account and must
+/// never broaden access for non-admin users.
+///
+/// A deployment that wants strict "SSO-only, no exceptions" enforcement can
+/// opt in via `SSO_DISABLE_ADMIN_BREAK_GLASS` (`disable_admin_break_glass`,
+/// #2018): when set, even the verified-admin break-glass is rejected while SSO
+/// is enabled. The flag defaults to `false`, so the historical break-glass
+/// behaviour is unchanged for existing deployments.
+pub(crate) fn local_login_gate(
+    sso_enabled: bool,
+    user_is_admin: bool,
+    allow_local_admin_login: bool,
+    disable_admin_break_glass: bool,
+) -> LocalLoginGate {
+    match (
+        sso_enabled,
+        user_is_admin,
+        allow_local_admin_login,
+        disable_admin_break_glass,
+    ) {
+        // No SSO providers enabled: local login is unchanged for everyone.
+        (false, _, _, _) => LocalLoginGate::Allow,
+        // Opt-in strict SSO-only (#2018): the admin break-glass is disabled,
+        // so even a verified admin must use SSO. This is the stricter posture
+        // and takes precedence over the legacy allow-local-admin flag.
+        (true, true, _, true) => LocalLoginGate::RejectSso,
+        // Verified-admin break-glass (default; supersedes the legacy flag,
+        // which only ever allowed the admin account).
+        (true, true, _, false) => LocalLoginGate::Allow,
+        // Non-admins must use SSO; neither flag ever broadens them.
+        (true, false, _, _) => LocalLoginGate::RejectSso,
+    }
+}
+
+/// Why a verified password alone may not establish a principal (#5484).
+///
+/// `POST /api/v1/auth/login` turns either case into the next step of an
+/// interactive login (a TOTP challenge or enrolment ticket, or "use SSO").
+/// The password-only surfaces that cannot run that step (HTTP Basic on the
+/// management API, LDAP login) must refuse instead of skipping it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordOnlyRefusal {
+    /// The account has TOTP enrolled, or the TOTP policy requires it to enrol.
+    SecondFactorRequired,
+    /// Local login is disabled for this account because SSO is configured.
+    SsoRequired,
+}
+
+impl PasswordOnlyRefusal {
+    /// Stable identifier for logs and audit details.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SecondFactorRequired => "second_factor_required",
+            Self::SsoRequired => "local_login_disabled_sso",
+        }
+    }
+}
+
 /// Authentication service
 pub struct AuthService {
     db: PgPool,
@@ -1444,6 +1519,62 @@ pub struct AuthService {
 }
 
 impl AuthService {
+    /// Whether `user`, whose password has just been verified, may be signed
+    /// in on a surface that has nothing but that password (#5484).
+    ///
+    /// Applies the two policies `POST /api/v1/auth/login` enforces after the
+    /// password check: the TOTP gate ([`totp_policy::totp_login_requirement`],
+    /// which covers an enrolled account and one the enforcement policy
+    /// requires to enrol) and, for local accounts, the SSO-only local-login
+    /// gate ([`local_login_gate`]). `Ok(None)` means the password suffices.
+    ///
+    /// The enrolled-TOTP case answers without a query; the policy and the
+    /// SSO lookups are one primary-key read and one small table scan.
+    ///
+    /// [`totp_policy::totp_login_requirement`]: crate::services::totp_policy::totp_login_requirement
+    pub async fn password_only_refusal(&self, user: &User) -> Result<Option<PasswordOnlyRefusal>> {
+        use crate::services::totp_policy;
+
+        let subject = totp_policy::TotpSubject {
+            auth_provider: user.auth_provider,
+            is_admin: user.is_admin,
+            is_service_account: user.is_service_account,
+            totp_enabled: user.totp_enabled,
+        };
+        let policy = if user.totp_enabled {
+            // An enrolled account is challenged whatever the policy says.
+            totp_policy::TotpPolicy::Disabled
+        } else {
+            totp_policy::effective_policy(&self.db, self.config.totp_policy)
+                .await
+                .0
+        };
+        if totp_policy::totp_login_requirement(policy, subject)
+            != totp_policy::TotpLoginRequirement::NotRequired
+        {
+            return Ok(Some(PasswordOnlyRefusal::SecondFactorRequired));
+        }
+
+        if user.auth_provider == AuthProvider::Local {
+            let sso_enabled =
+                !crate::services::auth_config_service::AuthConfigService::list_enabled_providers(
+                    &self.db,
+                )
+                .await?
+                .is_empty();
+            if local_login_gate(
+                sso_enabled,
+                user.is_admin,
+                self.config.allow_local_admin_login,
+                self.config.sso_disable_admin_break_glass,
+            ) == LocalLoginGate::RejectSso
+            {
+                return Ok(Some(PasswordOnlyRefusal::SsoRequired));
+            }
+        }
+        Ok(None)
+    }
+
     /// Create a new authentication service
     pub fn new(db: PgPool, config: Arc<Config>) -> Self {
         let secret = config.jwt_secret.clone();

@@ -4069,4 +4069,130 @@ pub(crate) mod tests {
         let (auth_status, _) = client_visible(authenticate_wrong_password().await).await;
         assert_ne!(status, auth_status);
     }
+
+    /// #5484: `POST /api/v1/auth/sso/ldap/{id}/login` with only the directory
+    /// password used to issue tokens and session cookies to an LDAP user who
+    /// had enrolled TOTP. It now answers like `POST /auth/login`: a TOTP
+    /// challenge with no session. The same login for an account without TOTP
+    /// still gets its tokens. (On main this test lives in
+    /// `services::ldap_basic_auth`, which release/1.11.x does not have.)
+    #[tokio::test]
+    async fn test_ldap_login_challenges_a_totp_enrolled_user_5484() {
+        use crate::api::handlers::test_db_helpers;
+        use crate::services::auth_config_service::{AuthConfigService, CreateLdapConfigRequest};
+        use axum::http::{Request, StatusCode};
+        const BASE: &str = "dc=example,dc=com";
+
+        if std::env::var("SSO_ENCRYPTION_KEY").is_err() && std::env::var("JWT_SECRET").is_err() {
+            return;
+        }
+        let Some(pool) = test_db_helpers::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-5484-ldap-{}", uuid::Uuid::new_v4()));
+        let state = test_db_helpers::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+
+        for totp in [true, false] {
+            let suffix = uuid::Uuid::new_v4().simple().to_string();
+            let username = format!("ldaptotp{suffix}");
+            let dn = format!("uid={username},ou=people,{BASE}");
+            let port = spawn_mock_directory(MockDirectory {
+                service_dn: MOCK_SERVICE_DN.to_string(),
+                entry: Some((
+                    dn.clone(),
+                    username.clone(),
+                    format!("{username}@example.com"),
+                )),
+                user_bind_rc: 0,
+                ops: OpsLog::default(),
+            })
+            .await;
+            let provider_id = AuthConfigService::create_ldap(
+                &pool,
+                CreateLdapConfigRequest {
+                    name: format!("totp-{suffix}"),
+                    server_url: format!("ldap://127.0.0.1:{port}"),
+                    bind_dn: Some(MOCK_SERVICE_DN.into()),
+                    bind_password: Some("svc-secret".into()),
+                    user_base_dn: BASE.into(),
+                    user_filter: Some("(uid={0})".into()),
+                    group_base_dn: None,
+                    group_filter: None,
+                    email_attribute: None,
+                    display_name_attribute: None,
+                    username_attribute: None,
+                    groups_attribute: None,
+                    admin_group_dn: None,
+                    use_starttls: None,
+                    insecure_skip_verify: None,
+                    ca_certificate: None,
+                    is_enabled: Some(true),
+                    priority: Some(0),
+                },
+            )
+            .await
+            .expect("create provider")
+            .id;
+            // Pin the provider on the account, the production steady state
+            // (`auth_provider_id` is the #5483 binding on release/1.11.x).
+            sqlx::query(
+                "INSERT INTO users (id, username, email, auth_provider, external_id, is_active, \
+                 is_admin, ldap_provider_id, auth_provider_id, totp_enabled, totp_secret) \
+                 VALUES ($1, $2, $3, 'ldap'::auth_provider, $4, true, false, $5, $5, $6, $7)",
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(&username)
+            .bind(format!("{username}@example.com"))
+            .bind(&dn)
+            .bind(provider_id)
+            .bind(totp)
+            .bind(totp.then_some("JBSWY3DPEHPK3PXP"))
+            .execute(&pool)
+            .await
+            .expect("insert known user");
+
+            let (status, bytes, headers) = test_db_helpers::send_with_headers(
+                crate::api::handlers::sso::ldap_login_router().with_state(state.clone()),
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/ldap/{provider_id}/login"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "username": username,
+                            "password": "directory-password",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await;
+            let cookies = headers.get_all("set-cookie").iter().count();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let _ = sqlx::query("DELETE FROM users WHERE username = $1")
+                .bind(&username)
+                .execute(&pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM ldap_configs WHERE id = $1")
+                .bind(provider_id)
+                .execute(&pool)
+                .await;
+
+            assert_eq!(status, StatusCode::OK, "totp={totp}: {body}");
+            if totp {
+                assert_eq!(body["totp_required"], true, "{body}");
+                assert!(body["totp_token"].as_str().is_some_and(|t| !t.is_empty()));
+                assert_eq!(
+                    body["access_token"], "",
+                    "no session before the second factor"
+                );
+                assert_eq!(body["refresh_token"], "");
+                assert_eq!(cookies, 0, "no session cookies before the second factor");
+            } else {
+                assert!(body["totp_required"].is_null(), "{body}");
+                assert!(body["access_token"].as_str().is_some_and(|t| !t.is_empty()));
+                assert!(cookies > 0);
+            }
+        }
+    }
 }
