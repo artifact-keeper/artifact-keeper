@@ -44,6 +44,63 @@ pub struct FederatedCredentials {
     /// (issue #2057, honours the OIDC "Auto Create Users" switch). Providers
     /// without an explicit toggle (LDAP/SAML) pass `true` to preserve behaviour.
     pub auto_create_users: bool,
+    /// The provider configuration (`oidc_configs` / `saml_configs` /
+    /// `ldap_configs` id) the login came through (#5483). The account is
+    /// matched on `(auth_provider, auth_provider_id, external_id)`, so the
+    /// same subject at another provider of the same type is another account.
+    /// `None` keeps the type-wide match, for CI service accounts, whose
+    /// `external_id` already names their provider.
+    pub provider_id: Option<Uuid>,
+}
+
+/// Audit `reason` for a federated sign-in refused because the account
+/// predates provider binding and its provider is not known (#5483).
+pub const FEDERATED_ACCOUNT_UNLINKED: &str = "federated_account_unlinked";
+
+/// Which account a federated sign-in resolves to (#5483).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FederatedAccountMatch {
+    /// The account bound to this provider (or, with no provider, the
+    /// type-wide match).
+    Existing(Uuid),
+    /// Only an account whose provider is unknown has this subject: it may
+    /// belong to another provider of the same type, so it is not claimed and
+    /// no second account is created beside it.
+    Unlinked(Uuid),
+    /// No account has this subject at this provider.
+    New,
+}
+
+/// Pick the account for a federated sign-in from the accounts that carry its
+/// `(auth_provider, external_id)`, given as `(user id, auth_provider_id)`.
+fn match_federated_account(
+    candidates: &[(Uuid, Option<Uuid>)],
+    provider_id: Option<Uuid>,
+) -> FederatedAccountMatch {
+    let Some(provider_id) = provider_id else {
+        return candidates
+            .first()
+            .map_or(FederatedAccountMatch::New, |(id, _)| {
+                FederatedAccountMatch::Existing(*id)
+            });
+    };
+    if let Some((id, _)) = candidates.iter().find(|(_, p)| *p == Some(provider_id)) {
+        return FederatedAccountMatch::Existing(*id);
+    }
+    match candidates.iter().find(|(_, p)| p.is_none()) {
+        Some((id, _)) => FederatedAccountMatch::Unlinked(*id),
+        None => FederatedAccountMatch::New,
+    }
+}
+
+/// The 403 for [`FederatedAccountMatch::Unlinked`].
+fn federated_account_unlinked_error() -> AppError {
+    AppError::Authorization(
+        "This account was created before sign-ins were bound to a single identity \
+         provider, and more than one provider of this type could have created it. \
+         Ask an administrator to link the account to its identity provider."
+            .to_string(),
+    )
 }
 
 /// Decide whether a federated login is allowed to proceed given the provider's
@@ -3681,33 +3738,37 @@ impl AuthService {
             credentials.required_admin_group.as_deref(),
         );
 
-        // Check if user exists by external_id
-        let existing_user = sqlx::query_as!(
-            User,
-            r#"
-            SELECT
-                id, username, email, password_hash, display_name,
-                auth_provider as "auth_provider: AuthProvider",
-                external_id, is_admin, is_active, is_service_account, must_change_password,
-                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
-                failed_login_attempts, locked_until, last_failed_login_at,
-                password_changed_at, last_login_at, created_at, updated_at
-            FROM users
-            WHERE external_id = $1 AND auth_provider = $2
-            "#,
-            credentials.external_id,
-            provider as AuthProvider
+        // Find the account by subject, then by the provider it is bound to
+        // (#5483): the same subject at another provider of this type is a
+        // different account. Runtime query: `auth_provider_id` is not part of
+        // the `.sqlx` cache.
+        let candidates: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+            "SELECT id, auth_provider_id FROM users \
+             WHERE external_id = $1 AND auth_provider = $2 \
+             ORDER BY created_at, id",
         )
-        .fetch_optional(&self.db)
+        .bind(&credentials.external_id)
+        .bind(provider)
+        .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let existing_user = match match_federated_account(&candidates, credentials.provider_id) {
+            FederatedAccountMatch::Existing(id) => Some(id),
+            FederatedAccountMatch::New => None,
+            FederatedAccountMatch::Unlinked(user_id) => {
+                self.audit_unlinked_federated_account(provider, credentials, user_id)
+                    .await;
+                return Err(federated_account_unlinked_error());
+            }
+        };
 
         // #2057: honour the provider's "Auto Create Users" switch. A brand-new
         // federated principal may only be provisioned when auto-create is on;
         // otherwise the login is rejected rather than silently creating a user.
         guard_federated_provisioning(existing_user.is_some(), credentials.auto_create_users)?;
 
-        let user = if let Some(existing) = existing_user {
+        let user = if let Some(existing_id) = existing_user {
             // Update existing user with latest information from provider.
             //
             // A CI service account keeps its `is_active` (#4031): it is
@@ -3742,7 +3803,7 @@ impl AuthService {
                     password_changed_at, last_login_at, created_at, updated_at
                 "#,
             )
-            .bind(existing.id)
+            .bind(existing_id)
             .bind(&credentials.username)
             .bind(&credentials.email)
             .bind(credentials.display_name.as_deref())
@@ -3751,30 +3812,33 @@ impl AuthService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?
         } else {
-            // Create new user from federated credentials
-            sqlx::query_as!(
-                User,
+            // Create new user from federated credentials, bound to the
+            // provider it came through (#5483). Runtime query for the same
+            // `.sqlx` reason as the UPDATE above.
+            sqlx::query_as::<_, User>(
                 r#"
                 INSERT INTO users (
                     username, email, display_name, auth_provider,
-                    external_id, is_admin, is_active, is_service_account, must_change_password
+                    external_id, is_admin, is_active, is_service_account, must_change_password,
+                    auth_provider_id
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, true, false, false)
+                VALUES ($1, $2, $3, $4, $5, $6, true, false, false, $7)
                 RETURNING
                     id, username, email, password_hash, display_name,
-                    auth_provider as "auth_provider: AuthProvider",
+                    auth_provider,
                     external_id, is_admin, is_active, is_service_account, must_change_password,
                     totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                     failed_login_attempts, locked_until, last_failed_login_at,
                     password_changed_at, last_login_at, created_at, updated_at
                 "#,
-                credentials.username,
-                credentials.email,
-                credentials.display_name,
-                provider as AuthProvider,
-                credentials.external_id,
-                role_mapping.is_admin.unwrap_or(false)
             )
+            .bind(&credentials.username)
+            .bind(&credentials.email)
+            .bind(credentials.display_name.as_deref())
+            .bind(provider)
+            .bind(&credentials.external_id)
+            .bind(role_mapping.is_admin.unwrap_or(false))
+            .bind(credentials.provider_id)
             .fetch_one(&self.db)
             .await
             .map_err(|e| {
@@ -3797,6 +3861,40 @@ impl AuthService {
         self.apply_role_mapping(user.id, &role_mapping).await?;
 
         Ok(user)
+    }
+
+    /// Record a federated sign-in refused because the only account with its
+    /// subject is not bound to a provider (#5483), naming the account and
+    /// the provider the sign-in came through so an administrator can link it.
+    async fn audit_unlinked_federated_account(
+        &self,
+        provider: AuthProvider,
+        credentials: &FederatedCredentials,
+        user_id: Uuid,
+    ) {
+        use crate::services::audit_service::{
+            audit_fire_and_forget, federated_login_details, AuditAction, AuditEntry, ResourceType,
+        };
+        tracing::warn!(
+            user_id = %user_id,
+            provider = ?provider,
+            provider_id = ?credentials.provider_id,
+            "Refused a federated sign-in: the account is not linked to an identity provider (#5483)"
+        );
+        let provider_label = format!("{provider:?}").to_ascii_lowercase();
+        let entry = AuditEntry::new(AuditAction::LoginFailed, ResourceType::User)
+            .resource(user_id)
+            .actor_name(credentials.username.clone())
+            .details(federated_login_details(
+                &provider_label,
+                serde_json::json!({
+                    "username": credentials.username,
+                    "reason": FEDERATED_ACCOUNT_UNLINKED,
+                    "provider_id": credentials.provider_id,
+                }),
+            ))
+            .with_request_client_ip();
+        audit_fire_and_forget(self.db.clone(), entry).await;
     }
 
     /// Deactivate users who no longer exist in the federated provider.
@@ -5547,6 +5645,7 @@ mod tests {
             groups: vec!["devs".to_string(), "admin".to_string()],
             required_admin_group: None,
             auto_create_users: true,
+            provider_id: None,
         };
         let debug = format!("{:?}", creds);
         assert!(debug.contains("feduser"));
@@ -7554,6 +7653,7 @@ mod tests {
             groups: vec!["ci".to_string()],
             required_admin_group: None,
             auto_create_users: true,
+            provider_id: None,
         };
         let expected_scope = Some(vec![Uuid::new_v4(), Uuid::new_v4()]);
 
@@ -7625,6 +7725,7 @@ mod tests {
             groups: Vec::new(),
             required_admin_group: None,
             auto_create_users: true,
+            provider_id: None,
         };
 
         let result = service
@@ -7674,6 +7775,7 @@ mod tests {
             groups: vec!["ci".to_string()],
             required_admin_group: None,
             auto_create_users: true,
+            provider_id: None,
         };
 
         let (user, tokens) = service
@@ -7697,6 +7799,359 @@ mod tests {
         let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user.id)
             .execute(&pool)
             .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #5483: federated accounts are bound to the provider that created them.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn match_federated_account_binds_to_the_provider_5483() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let (user_a, user_b, legacy) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        use FederatedAccountMatch::*;
+
+        assert_eq!(match_federated_account(&[], Some(a)), New);
+        assert_eq!(
+            match_federated_account(&[(user_a, Some(a))], Some(a)),
+            Existing(user_a)
+        );
+        // The same subject at another provider of the type is not this account.
+        assert_eq!(match_federated_account(&[(user_a, Some(a))], Some(b)), New);
+        assert_eq!(
+            match_federated_account(&[(user_a, Some(a)), (user_b, Some(b))], Some(b)),
+            Existing(user_b)
+        );
+        // An unattributed account is never claimed, nor duplicated.
+        assert_eq!(
+            match_federated_account(&[(legacy, None)], Some(a)),
+            Unlinked(legacy)
+        );
+        assert_eq!(
+            match_federated_account(&[(legacy, None), (user_a, Some(a))], Some(a)),
+            Existing(user_a)
+        );
+        // No provider (CI service accounts): the type-wide match, unchanged.
+        assert_eq!(
+            match_federated_account(&[(legacy, None)], None),
+            Existing(legacy)
+        );
+        assert_eq!(match_federated_account(&[], None), New);
+    }
+
+    fn fed_creds_5483(sub: &str, username: &str, provider_id: Uuid) -> FederatedCredentials {
+        FederatedCredentials {
+            external_id: sub.to_string(),
+            username: username.to_string(),
+            email: format!("{username}@test.local"),
+            display_name: None,
+            groups: Vec::new(),
+            required_admin_group: None,
+            auto_create_users: true,
+            provider_id: Some(provider_id),
+        }
+    }
+
+    async fn delete_users_by_external_id_5483(pool: &sqlx::PgPool, external_id: &str) {
+        for sql in [
+            "DELETE FROM refresh_token_jti WHERE user_id IN \
+             (SELECT id FROM users WHERE external_id = $1)",
+            "DELETE FROM user_roles WHERE user_id IN \
+             (SELECT id FROM users WHERE external_id = $1)",
+        ] {
+            let _ = sqlx::query(sql).bind(external_id).execute(pool).await;
+        }
+        let _ = sqlx::query("DELETE FROM users WHERE external_id = $1")
+            .bind(external_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// Two providers of one type that issue the same subject (two GitLab
+    /// instances numbering users from one, the default `emailAddress`
+    /// NameID, the same DN in two directories): the second provider's user
+    /// gets its own account and the first provider's account is left alone.
+    /// Covers OIDC, SAML and LDAP.
+    #[tokio::test]
+    async fn test_same_subject_at_two_providers_is_two_accounts_5483() {
+        let Some(pool) = crate::testing::try_pool_with(4).await else {
+            return;
+        };
+        let service = AuthService::new(pool.clone(), make_test_config());
+        for kind in [AuthProvider::Oidc, AuthProvider::Saml, AuthProvider::Ldap] {
+            let (provider_a, provider_b) = (Uuid::new_v4(), Uuid::new_v4());
+            let suffix = &Uuid::new_v4().simple().to_string()[..12];
+            let sub = format!("5483-sub-{suffix}");
+
+            let victim = service
+                .sync_federated_user(
+                    kind,
+                    &fed_creds_5483(&sub, &format!("victim_{suffix}"), provider_a),
+                )
+                .await
+                .expect("first provider provisions its user");
+            sqlx::query("UPDATE users SET is_admin = true WHERE id = $1")
+                .bind(victim.id)
+                .execute(&pool)
+                .await
+                .expect("make the victim an admin");
+
+            let other = service
+                .sync_federated_user(
+                    kind,
+                    &fed_creds_5483(&sub, &format!("intruder_{suffix}"), provider_b),
+                )
+                .await
+                .expect("second provider provisions its own user");
+            assert_ne!(
+                other.id, victim.id,
+                "{kind:?}: same subject at another provider took over"
+            );
+            assert!(
+                !other.is_admin,
+                "{kind:?}: the new account must not inherit is_admin"
+            );
+
+            let (username, email, bound): (String, String, Option<Uuid>) =
+                sqlx::query_as("SELECT username, email, auth_provider_id FROM users WHERE id = $1")
+                    .bind(victim.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read victim");
+            assert_eq!(username, format!("victim_{suffix}"), "{kind:?}");
+            assert_eq!(email, format!("victim_{suffix}@test.local"), "{kind:?}");
+            assert_eq!(bound, Some(provider_a), "{kind:?}");
+
+            // Each provider keeps resolving to its own account.
+            let again = service
+                .sync_federated_user(
+                    kind,
+                    &fed_creds_5483(&sub, &format!("victim_{suffix}"), provider_a),
+                )
+                .await
+                .expect("first provider signs in again");
+            assert_eq!(again.id, victim.id, "{kind:?}");
+            let again_b = service
+                .sync_federated_user(
+                    kind,
+                    &fed_creds_5483(&sub, &format!("intruder_{suffix}"), provider_b),
+                )
+                .await
+                .expect("second provider signs in again");
+            assert_eq!(again_b.id, other.id, "{kind:?}");
+
+            delete_users_by_external_id_5483(&pool, &sub).await;
+        }
+    }
+
+    /// An account from before provider binding, when the upgrade could not
+    /// tell which provider created it: refused (403, audited), neither
+    /// claimed nor duplicated, until an administrator links it.
+    #[tokio::test]
+    async fn test_unlinked_federated_account_is_refused_until_linked_5483() {
+        let Some(pool) = crate::testing::try_pool_with(4).await else {
+            return;
+        };
+        let service = AuthService::new(pool.clone(), make_test_config());
+        let provider = Uuid::new_v4();
+        let suffix = &Uuid::new_v4().simple().to_string()[..12];
+        let sub = format!("5483-legacy-{suffix}");
+        let username = format!("legacy_{suffix}");
+        let legacy_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO users (username, email, auth_provider, external_id, is_admin) \
+             VALUES ($1, $2, 'saml', $3, true) RETURNING id",
+        )
+        .bind(&username)
+        .bind(format!("{username}@test.local"))
+        .bind(&sub)
+        .fetch_one(&pool)
+        .await
+        .expect("seed an unattributed SAML account");
+
+        let mut creds = fed_creds_5483(&sub, &format!("claimant_{suffix}"), provider);
+        creds.email = format!("claimant_{suffix}@test.local");
+        let err = service
+            .authenticate_federated(AuthProvider::Saml, creds.clone())
+            .await
+            .expect_err("an unattributed account must not be signed in to");
+        assert!(
+            matches!(&err, AppError::Authorization(m) if m.contains("link the account")),
+            "{err:?}"
+        );
+
+        let rows: Vec<(Uuid, String, Option<Uuid>)> = sqlx::query_as(
+            "SELECT id, username, auth_provider_id FROM users WHERE external_id = $1",
+        )
+        .bind(&sub)
+        .fetch_all(&pool)
+        .await
+        .expect("read accounts");
+        assert_eq!(
+            rows,
+            vec![(legacy_id, username.clone(), None)],
+            "the legacy account must be untouched and no second account created"
+        );
+
+        let mut audited = false;
+        for _ in 0..100 {
+            audited = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM audit_log \
+                 WHERE action = 'LOGIN_FAILED' AND resource_id = $1 \
+                   AND details->>'reason' = $2 AND details->>'provider' = 'saml')",
+            )
+            .bind(legacy_id)
+            .bind(FEDERATED_ACCOUNT_UNLINKED)
+            .fetch_one(&pool)
+            .await
+            .expect("read audit");
+            if audited {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(audited, "the refusal must leave a LOGIN_FAILED audit row");
+
+        // The administrator's relink from the upgrade notes.
+        sqlx::query("UPDATE users SET auth_provider_id = $1 WHERE id = $2")
+            .bind(provider)
+            .bind(legacy_id)
+            .execute(&pool)
+            .await
+            .expect("relink");
+        let (user, _) = service
+            .authenticate_federated(AuthProvider::Saml, creds)
+            .await
+            .expect("a linked account signs in");
+        assert_eq!(user.id, legacy_id);
+
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(legacy_id)
+            .execute(&pool)
+            .await;
+        delete_users_by_external_id_5483(&pool, &sub).await;
+    }
+
+    const PROVIDER_ID_MIGRATION: &str =
+        include_str!("../../migrations/350_users_auth_provider_id.sql");
+
+    /// Migration 350 against a private copy of the tables it reads (a
+    /// schema first on `search_path`, rolled back), so the provider counts
+    /// are this test's alone: attribution only where certain, and a second
+    /// run changes nothing.
+    #[tokio::test]
+    async fn test_provider_id_migration_backfill_is_conservative_and_idempotent_5483() {
+        let Some(pool) = crate::testing::try_pool_with(4).await else {
+            return;
+        };
+        let mut tx = pool.begin().await.expect("begin");
+        sqlx::raw_sql(
+            "CREATE SCHEMA m5483; SET LOCAL search_path = m5483, public; \
+             CREATE TABLE m5483.oidc_configs (id UUID PRIMARY KEY); \
+             CREATE TABLE m5483.saml_configs (id UUID PRIMARY KEY); \
+             CREATE TABLE m5483.ldap_configs (id UUID PRIMARY KEY); \
+             CREATE TABLE m5483.users (id UUID PRIMARY KEY, \
+                 auth_provider public.auth_provider NOT NULL, external_id TEXT, \
+                 ldap_provider_id UUID);",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("private tables");
+
+        let (oidc, saml_1, saml_2, ldap_1, ldap_2) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        for (sql, id) in [
+            ("INSERT INTO m5483.oidc_configs (id) VALUES ($1)", oidc),
+            ("INSERT INTO m5483.saml_configs (id) VALUES ($1)", saml_1),
+            ("INSERT INTO m5483.saml_configs (id) VALUES ($1)", saml_2),
+            ("INSERT INTO m5483.ldap_configs (id) VALUES ($1)", ldap_1),
+            ("INSERT INTO m5483.ldap_configs (id) VALUES ($1)", ldap_2),
+        ] {
+            sqlx::query(sql)
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .expect("seed provider");
+        }
+        // (user, auth_provider, external_id, ldap_provider_id, expected)
+        type Case<'a> = (Uuid, &'a str, Option<&'a str>, Option<Uuid>, Option<Uuid>);
+        let cases: Vec<Case> = vec![
+            // The only OIDC provider: attributed to it.
+            (Uuid::new_v4(), "oidc", Some("sub-1"), None, Some(oidc)),
+            // Two SAML providers: ambiguous, left unbound.
+            (Uuid::new_v4(), "saml", Some("ceo@corp.example"), None, None),
+            // LDAP with a recorded provider: that provider.
+            (
+                Uuid::new_v4(),
+                "ldap",
+                Some("uid=a"),
+                Some(ldap_2),
+                Some(ldap_2),
+            ),
+            // LDAP without one, two providers: unbound.
+            (Uuid::new_v4(), "ldap", Some("uid=b"), None, None),
+            // Local and CI accounts are never touched.
+            (Uuid::new_v4(), "local", None, None, None),
+            (Uuid::new_v4(), "ci", Some("ci:p:m"), None, None),
+        ];
+        for (id, kind, external_id, ldap_provider_id, _) in &cases {
+            sqlx::query(
+                "INSERT INTO m5483.users (id, auth_provider, external_id, ldap_provider_id) \
+                 VALUES ($1, $2::text::public.auth_provider, $3, $4)",
+            )
+            .bind(id)
+            .bind(kind)
+            .bind(external_id)
+            .bind(ldap_provider_id)
+            .execute(&mut *tx)
+            .await
+            .expect("seed user");
+        }
+
+        async fn read(conn: &mut sqlx::PgConnection, ids: &[Uuid]) -> Vec<Option<Uuid>> {
+            let mut out = Vec::new();
+            for id in ids {
+                let bound: Option<Uuid> =
+                    sqlx::query_scalar("SELECT auth_provider_id FROM m5483.users WHERE id = $1")
+                        .bind(id)
+                        .fetch_one(&mut *conn)
+                        .await
+                        .expect("read backfill");
+                out.push(bound);
+            }
+            out
+        }
+        let ids: Vec<Uuid> = cases.iter().map(|c| c.0).collect();
+        let expected: Vec<Option<Uuid>> = cases.iter().map(|c| c.4).collect();
+
+        sqlx::raw_sql(PROVIDER_ID_MIGRATION)
+            .execute(&mut *tx)
+            .await
+            .expect("migration 350 applies");
+        assert_eq!(read(&mut tx, &ids).await, expected);
+
+        // A rerun (or a boot that finds it half-applied) changes nothing,
+        // and never overwrites an administrator's link.
+        let relinked = cases[1].0;
+        sqlx::query("UPDATE m5483.users SET auth_provider_id = $1 WHERE id = $2")
+            .bind(saml_2)
+            .bind(relinked)
+            .execute(&mut *tx)
+            .await
+            .expect("admin relink");
+        sqlx::raw_sql(PROVIDER_ID_MIGRATION)
+            .execute(&mut *tx)
+            .await
+            .expect("migration 350 reapplies");
+        let mut expected_after = expected.clone();
+        expected_after[1] = Some(saml_2);
+        assert_eq!(read(&mut tx, &ids).await, expected_after);
+
+        tx.rollback().await.expect("rollback");
     }
 
     // -----------------------------------------------------------------------
