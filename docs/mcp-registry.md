@@ -2799,15 +2799,16 @@ the lists. `401`/`403` -> `auth_required`; `429` -> `rate_limited` with
 list methods: `tools/call`, `resources/read` and `prompts/get` are refused in
 code. Server-to-client requests over stdio are answered "method not found".
 
-Response and session integrity. Every response is matched to the one
-outstanding request; a violation ends the probe `refused`, is not retried, and
+Response and session integrity. Every response, on every transport (stdio
+sandbox guests included, #5636), is matched to the one outstanding request;
+a violation ends the probe `refused` at once, is not retried, and
 nothing the server sent in that probe (capabilities, `serverInfo`,
 `instructions`, list items) is reported. `details.protocolViolation`:
 
 | Code | Cause |
 |---|---|
 | `response_id_mismatch` | A response (JSON body or SSE event) whose `id` is absent, `null` or not the outstanding request's; the type counts (`1` and `"1"` differ). A non-2xx body read as the request's JSON-RPC error (a modern error code, which steers the fallback) may carry `"id": null` or none, but not another request's `id`; any other non-2xx body is an HTTP-level error whose `id` is not looked at (only its status is used). |
-| `duplicate_response` | A response to a request already answered, or a second response for the same `id` in the same read of an SSE stream. The stream is not read past the first response, so a duplicate sent later is never seen and never accepted. |
+| `duplicate_response` | A response to a request already answered, or a second response for the same `id` in the same read of an SSE stream. The stream is not read past the first response, so a duplicate sent later is never seen and never accepted. Over stdio a duplicate is seen when the next request reads it; one sent after the last request is never read. |
 | `unexpected_batch` | A JSON-RPC batch carrying a response (the worker never sends a batch). A batch of only notifications or server requests is skipped. |
 | `session_id_changed` | After `initialize` established an `Mcp-Session-Id`, a response carried a different one. The worker never switches sessions. |
 | `session_id_invalid` | `initialize` assigned an `Mcp-Session-Id` that is not 1 to 256 visible ASCII characters. |
