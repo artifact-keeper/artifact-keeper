@@ -1023,6 +1023,21 @@ fn ip_is_private(ip: IpAddr) -> bool {
 
 /// `remote_url_shape` and URL-borne `secret_literal` for one remote URL.
 pub fn lint_remote_url(path: &str, raw: &str, ctx: DocContext, out: &mut Vec<LintFinding>) {
+    lint_url(path, raw, ctx, UrlRole::Remote, out);
+}
+
+/// Which rules [`lint_url`] applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UrlRole {
+    /// A remote: every rule.
+    Remote,
+    /// A package's `transport.url`: the server the client launches itself,
+    /// so plain http, localhost, private addresses and ports are the norm;
+    /// only the credential and user-info rules apply.
+    PackageTransport,
+}
+
+fn lint_url(path: &str, raw: &str, ctx: DocContext, role: UrlRole, out: &mut Vec<LintFinding>) {
     let shape = |action, msg: String, out: &mut Vec<LintFinding>| {
         out.push(LintFinding::new(
             LintRule::RemoteUrlShape,
@@ -1036,7 +1051,7 @@ pub fn lint_remote_url(path: &str, raw: &str, ctx: DocContext, out: &mut Vec<Lin
         .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or(""))
         .unwrap_or("");
     let host_part = authority.rsplit('@').next().unwrap_or("");
-    if host_part.contains('{') {
+    if role == UrlRole::Remote && host_part.contains('{') {
         shape(
             LintAction::Review,
             "a template variable in the host lets the client point the server anywhere".into(),
@@ -1072,6 +1087,9 @@ pub fn lint_remote_url(path: &str, raw: &str, ctx: DocContext, out: &mut Vec<Lin
                 format!("query parameter \"{}\" carries a credential", excerpt(&k)),
             ));
         }
+    }
+    if role == UrlRole::PackageTransport {
+        return;
     }
     if url.scheme() == "http" {
         shape(
@@ -1148,6 +1166,32 @@ fn lint_url_template(
                 i.message()
             ),
         )),
+    }
+}
+
+/// [`lint_url`] on a transport URL template and on every URL the
+/// publisher's own values expand it to (#5547): a template such as
+/// `{base}/sse` has no authority of its own, so only its expansions (a
+/// `default` of `https://user:pass@host`) show what a client connects to.
+/// A finding on an expansion says so.
+fn lint_url_and_expansions(
+    path: &str,
+    raw: &str,
+    expansions: &[String],
+    ctx: DocContext,
+    role: UrlRole,
+    out: &mut Vec<LintFinding>,
+) {
+    lint_url(path, raw, ctx, role, out);
+    for expansion in expansions.iter().filter(|e| e.as_str() != raw) {
+        let mut found = Vec::new();
+        lint_url(path, expansion, ctx, role, &mut found);
+        // The expansion is not quoted: it may carry the very credential
+        // the finding is about.
+        out.extend(found.into_iter().map(|mut f| {
+            f.message = format!("{} once expanded with the publisher's values", f.message);
+            f
+        }));
     }
 }
 
@@ -1236,6 +1280,16 @@ pub fn lint_server_document(server: &Value, ctx: DocContext) -> Vec<LintFinding>
     for (i, pkg) in arr_at(server, "packages").iter().enumerate() {
         lint_package(&format!("packages[{i}]"), pkg, &mut out);
         if let Ok(p) = serde_json::from_value::<fmt::Package>(pkg.clone()) {
+            if let Some(u) = p.transport.url.as_deref() {
+                lint_url_and_expansions(
+                    &format!("packages[{i}].transport.url"),
+                    u,
+                    &fmt::package_url_expansions(&p),
+                    ctx,
+                    UrlRole::PackageTransport,
+                    &mut out,
+                );
+            }
             lint_url_template(
                 &format!("packages[{i}].transport.url"),
                 |m| fmt::package_url_issue(&p, m),
@@ -1245,10 +1299,22 @@ pub fn lint_server_document(server: &Value, ctx: DocContext) -> Vec<LintFinding>
     }
     for (i, remote) in arr_at(server, "remotes").iter().enumerate() {
         let path = format!("remotes[{i}]");
+        let parsed = serde_json::from_value::<fmt::Transport>(remote.clone()).ok();
         if let Some(u) = str_at(remote, "url") {
-            lint_remote_url(&format!("{path}.url"), u, ctx, &mut out);
+            let expansions = parsed
+                .as_ref()
+                .map(fmt::remote_url_expansions)
+                .unwrap_or_default();
+            lint_url_and_expansions(
+                &format!("{path}.url"),
+                u,
+                &expansions,
+                ctx,
+                UrlRole::Remote,
+                &mut out,
+            );
         }
-        if let Ok(r) = serde_json::from_value::<fmt::Transport>(remote.clone()) {
+        if let Some(r) = parsed {
             lint_url_template(
                 &format!("{path}.url"),
                 |m| fmt::remote_url_issue(&r, m),
@@ -2651,6 +2717,124 @@ mod tests {
                 "variables": {"a": {"choices": many}, "b": {"choices": many}}}]}),
             "remotes[0].url"
         ));
+    }
+
+    /// #5547: the per-URL rules run on every expansion of a URL template
+    /// with the publisher's values, and on a package's `transport.url`
+    /// (there only the credential and user-info rules: a locally launched
+    /// server on `http://localhost:<port>` is the norm).
+    #[test]
+    fn url_rules_cover_template_expansions_and_package_transport_urls_5547() {
+        let lint = |doc: Value, public: bool| {
+            lint_server_document(
+                &server(doc),
+                DocContext {
+                    public_repo: public,
+                },
+            )
+        };
+        // A password in a variable default: the template has no `://`, so
+        // only the expansion shows it.
+        let f = lint(
+            json!({"remotes": [{"type": "sse", "url": "{base}/sse",
+                "variables": {"base": {"default": "https://trusted:hunter2@evil.test"}}}]}),
+            false,
+        );
+        assert!(
+            has(
+                &f,
+                LintRule::SecretLiteral,
+                LintAction::Block,
+                "remotes[0].url"
+            ),
+            "{f:?}"
+        );
+        assert!(
+            f.iter().all(|x| !x.message.contains("hunter2")),
+            "a finding never quotes the credential: {f:?}"
+        );
+        // User-info, a credential query parameter and a private address
+        // reached through `choices` / `placeholder` / a later variable.
+        let f = lint(
+            json!({"remotes": [{"type": "streamable-http", "url": "https://{host}/mcp{q}",
+                "variables": {"host": {"choices": ["mcp.acme.test", "10.0.0.7"]},
+                              "q": {"placeholder": "?api_key=sk_live_abcdefghijklmnop"}}}]}),
+            false,
+        );
+        assert!(
+            has(
+                &f,
+                LintRule::SecretLiteral,
+                LintAction::Block,
+                "remotes[0].url"
+            ),
+            "{f:?}"
+        );
+        let f = lint(
+            json!({"remotes": [{"type": "sse", "url": "{base}/sse",
+                "variables": {"base": {"choices": ["https://mcp.acme.test", "https://ops@mcp.acme.test"]}}}]}),
+            false,
+        );
+        assert!(
+            has(
+                &f,
+                LintRule::RemoteUrlShape,
+                LintAction::Review,
+                "remotes[0].url"
+            ),
+            "{f:?}"
+        );
+        assert!(f
+            .iter()
+            .any(|x| x.message.contains("user-info") && x.message.contains("publisher's values")));
+        // A clean expansion adds nothing.
+        assert!(lint(
+            json!({"remotes": [{"type": "sse", "url": "{base}/sse",
+                "variables": {"base": {"default": "https://mcp.acme.test"}}}]}),
+            true,
+        )
+        .is_empty());
+        // Package transport URLs: credentials, literal or expanded, are
+        // flagged; localhost and plain http are not.
+        let f = lint(
+            json!({"packages": [pkg(json!({
+                "transport": {"type": "streamable-http", "url": "http://admin:s3cret@localhost:8080/mcp"}}))]}),
+            true,
+        );
+        assert!(
+            has(
+                &f,
+                LintRule::SecretLiteral,
+                LintAction::Block,
+                "packages[0].transport.url"
+            ),
+            "{f:?}"
+        );
+        let f = lint(
+            json!({"packages": [pkg(json!({
+                "transport": {"type": "sse", "url": "{baseUrl}/sse"},
+                "environmentVariables": [{"name": "baseUrl", "default": "https://u:p@evil.test"}]}))]}),
+            false,
+        );
+        assert!(
+            has(
+                &f,
+                LintRule::SecretLiteral,
+                LintAction::Block,
+                "packages[0].transport.url"
+            ),
+            "{f:?}"
+        );
+        let f = lint(
+            json!({"packages": [pkg(json!({
+                "transport": {"type": "streamable-http", "url": "http://localhost:{port}/mcp"},
+                "packageArguments": [{"type": "named", "name": "--port", "valueHint": "port", "default": "8080"}]}))]}),
+            true,
+        );
+        assert!(
+            !f.iter().any(|x| x.path == "packages[0].transport.url"),
+            "{f:?}"
+        );
     }
 
     #[test]
