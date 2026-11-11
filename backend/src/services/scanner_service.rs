@@ -3725,6 +3725,22 @@ pub(crate) fn maven_archive_claim(
     let Ok(text) = String::from_utf8(body) else {
         return MavenArchiveClaim::Unreadable;
     };
+    match parse_pom_properties(&text) {
+        Some((group_id, artifact_id, version)) => MavenArchiveClaim::Declares {
+            group_id,
+            artifact_id,
+            version,
+        },
+        None => MavenArchiveClaim::Unreadable,
+    }
+}
+
+/// The `(groupId, artifactId, version)` a Maven `pom.properties` declares, or
+/// `None` unless all three are present and non-empty. Comment lines (`#`,
+/// `!`) are skipped and either `=` or `:` separates key from value, as in a
+/// Java properties file. The values are returned as written; callers that
+/// interpolate them anywhere validate them first.
+pub(crate) fn parse_pom_properties(text: &str) -> Option<(String, String, String)> {
     let (mut g, mut a, mut v) = (None, None, None);
     for line in text.lines() {
         let line = line.trim();
@@ -3743,16 +3759,10 @@ pub(crate) fn maven_archive_claim(
         }
     }
     match (g, a, v) {
-        (Some(group_id), Some(artifact_id), Some(version))
-            if !group_id.is_empty() && !artifact_id.is_empty() && !version.is_empty() =>
-        {
-            MavenArchiveClaim::Declares {
-                group_id,
-                artifact_id,
-                version,
-            }
+        (Some(g), Some(a), Some(v)) if !g.is_empty() && !a.is_empty() && !v.is_empty() => {
+            Some((g, a, v))
         }
-        _ => MavenArchiveClaim::Unreadable,
+        _ => None,
     }
 }
 
@@ -8539,6 +8549,12 @@ impl DependencyScanner {
         }
 
         let name = artifact.name.to_lowercase();
+        // #5666: a JVM archive is binary, so the UTF-8 gate below sent it home
+        // with nothing -- a Spring Boot fat jar bundling 141 libraries was
+        // queried for none of them and graded 0 findings.
+        if Self::is_jvm_artifact(artifact) {
+            return Self::jvm_archive_dependencies(artifact, content);
+        }
         let content_str = match std::str::from_utf8(content) {
             Ok(s) => s,
             Err(_) => return vec![], // binary artifact, skip manifest parsing
@@ -8565,6 +8581,49 @@ impl DependencyScanner {
             // Try to infer from path patterns
             Self::infer_dependencies(artifact, content_str)
         }
+    }
+
+    fn is_jvm_artifact(artifact: &Artifact) -> bool {
+        [&artifact.name, &artifact.path].iter().any(|n| {
+            let n = n.to_ascii_lowercase();
+            n.ends_with(".jar") || n.ends_with(".war") || n.ends_with(".ear")
+        })
+    }
+
+    /// The libraries a JVM archive bundles (#5666), as Maven dependencies at
+    /// the versions their own `pom.properties` declare: those stored in the
+    /// archive (a shaded jar) and in the jars nested one level inside it (a
+    /// Spring Boot fat jar's `BOOT-INF/lib/`, a war's `WEB-INF/lib/`). The
+    /// archive's own coordinate is left out -- a package is not one of its
+    /// own dependencies; the orchestrator's pin queries it as `Own` (#4669).
+    fn jvm_archive_dependencies(artifact: &Artifact, content: &Bytes) -> Vec<Dependency> {
+        let file = artifact
+            .path
+            .rsplit('/')
+            .next()
+            .filter(|f| !f.is_empty())
+            .unwrap_or(&artifact.name);
+        let segments: Vec<&str> = artifact.path.split('/').collect();
+        let is_own = |c: &crate::services::trivy_fs_scanner::MavenCoordinate| {
+            let stem = format!("{}-{}", c.artifact_id, c.version);
+            let named = file
+                .strip_prefix(stem.as_str())
+                .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('-'));
+            // Maven layout: <group path>/<artifactId>/<version>/<file>.
+            let laid_out = segments.len() >= 3
+                && segments[segments.len() - 3] == c.artifact_id
+                && segments[segments.len() - 2] == c.version;
+            named || laid_out
+        };
+        crate::services::trivy_fs_scanner::maven_coordinates_in_archive(content)
+            .into_iter()
+            .filter(|c| !is_own(c))
+            .map(|c| Dependency {
+                name: format!("{}:{}", c.group_id, c.artifact_id),
+                version: Some(c.version),
+                ecosystem: "Maven".to_string(),
+            })
+            .collect()
     }
 
     fn parse_npm(content: &str) -> Vec<Dependency> {
@@ -8863,7 +8922,20 @@ impl DependencyScanner {
         content: &Bytes,
         pin: Option<&ExpectedComponent>,
     ) -> Result<ScanOutput> {
-        let declared = Self::extract_dependencies(artifact, metadata, content);
+        // A JVM archive's bundled libraries are read by inflating its nested
+        // jars (#5666), which is too much CPU for an async worker on a large
+        // fat jar.
+        let declared = if Self::is_jvm_artifact(artifact) {
+            let (artifact, content) = (artifact.clone(), content.clone());
+            tokio::task::spawn_blocking(move || Self::jvm_archive_dependencies(&artifact, &content))
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("Bundled-library walk of a JVM archive failed: {}", e);
+                    Vec::new()
+                })
+        } else {
+            Self::extract_dependencies(artifact, metadata, content)
+        };
 
         // The native libraries compiled INTO this artifact (#4043). A conda
         // package or a wheel declares none of them -- `extract_dependencies`
@@ -20379,6 +20451,64 @@ tonic-build = "0.12"
             );
         }
 
+        /// #5666 end to end: a fat jar bundling a vulnerable library is
+        /// queried for it and produces the finding, where it used to send the
+        /// feed nothing and report 0.
+        #[tokio::test]
+        async fn test_scan_of_fat_jar_grades_bundled_library() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{ "vulns": [{
+                        "id": "GHSA-jfh8-c2jp-5v3q",
+                        "summary": "Remote code injection in Log4j",
+                        "aliases": ["CVE-2021-44228"],
+                        "database_specific": { "severity": "CRITICAL" },
+                        "affected": [{ "ranges": [{ "events": [{ "fixed": "2.15.0" }] }] }]
+                    }]}]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )));
+            let fat = zip_owned(vec![
+                pom_properties_entry("com.example", "app", "1.0.0"),
+                (
+                    "BOOT-INF/lib/log4j-core-2.14.1.jar".into(),
+                    zip_owned(vec![pom_properties_entry(
+                        "org.apache.logging.log4j",
+                        "log4j-core",
+                        "2.14.1",
+                    )]),
+                ),
+            ]);
+            let artifact = make_artifact(
+                "app-1.0.0.jar",
+                "com/example/app/1.0.0/app-1.0.0.jar",
+                Some("1.0.0"),
+            );
+            let out = scanner
+                .scan(&artifact, None, &Bytes::from(fat))
+                .await
+                .expect("scan");
+
+            assert_eq!(out.findings.len(), 1, "{:?}", out.findings);
+            assert_eq!(
+                out.findings[0].affected_component.as_deref(),
+                Some("org.apache.logging.log4j:log4j-core")
+            );
+            assert!(out
+                .packages
+                .iter()
+                .any(|p| p.name == "org.apache.logging.log4j:log4j-core"
+                    && p.version.as_deref() == Some("2.14.1")));
+        }
+
         // -------------------------------------------------------------------
         // Attribution
         // -------------------------------------------------------------------
@@ -23542,6 +23672,111 @@ tonic-build = "0.12"
         let deps = DependencyScanner::extract_dependencies(&artifact, None, &content);
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].ecosystem, "NuGet");
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_dependencies - JVM archives (#5666)
+    // -----------------------------------------------------------------------
+
+    fn pom_properties_entry(group: &str, artifact: &str, version: &str) -> (String, Vec<u8>) {
+        (
+            format!("META-INF/maven/{group}/{artifact}/pom.properties"),
+            format!(
+                "#Generated by Maven\ngroupId={group}\nartifactId={artifact}\nversion={version}\n"
+            )
+            .into_bytes(),
+        )
+    }
+
+    fn zip_owned(entries: Vec<(String, Vec<u8>)>) -> Vec<u8> {
+        let refs: Vec<(&str, Vec<u8>)> = entries
+            .iter()
+            .map(|(p, b)| (p.as_str(), b.clone()))
+            .collect();
+        build_zip(&refs)
+    }
+
+    /// #5666: a Spring Boot fat jar is binary, so the dependency scanner
+    /// returned no dependencies for it and graded 0 findings however many
+    /// vulnerable libraries it bundled. The libraries under `BOOT-INF/lib/`
+    /// are now queried at the versions their own `pom.properties` declare;
+    /// the application's own coordinate is not one of them.
+    #[test]
+    fn test_extract_dependencies_fat_jar_bundled_libraries() {
+        let lib = |g: &str, a: &str, v: &str| zip_owned(vec![pom_properties_entry(g, a, v)]);
+        let fat = zip_owned(vec![
+            pom_properties_entry("com.example", "app", "1.0.0"),
+            (
+                "BOOT-INF/classes/application.properties".into(),
+                b"x=1".to_vec(),
+            ),
+            (
+                "BOOT-INF/lib/jackson-databind-2.9.10.jar".into(),
+                lib("com.fasterxml.jackson.core", "jackson-databind", "2.9.10"),
+            ),
+            (
+                "BOOT-INF/lib/log4j-core-2.14.1.jar".into(),
+                lib("org.apache.logging.log4j", "log4j-core", "2.14.1"),
+            ),
+            (
+                "BOOT-INF/lib/commons-collections-3.2.1.jar".into(),
+                lib("commons-collections", "commons-collections", "3.2.1"),
+            ),
+        ]);
+        let artifact = make_artifact(
+            "app-1.0.0.jar",
+            "com/example/app/1.0.0/app-1.0.0.jar",
+            Some("1.0.0"),
+        );
+        let mut deps: Vec<(String, Option<String>, String)> =
+            DependencyScanner::extract_dependencies(&artifact, None, &Bytes::from(fat))
+                .into_iter()
+                .map(|d| (d.name, d.version, d.ecosystem))
+                .collect();
+        deps.sort();
+        let want = |n: &str, v: &str| (n.to_string(), Some(v.to_string()), "Maven".to_string());
+        assert_eq!(
+            deps,
+            vec![
+                want("com.fasterxml.jackson.core:jackson-databind", "2.9.10"),
+                want("commons-collections:commons-collections", "3.2.1"),
+                want("org.apache.logging.log4j:log4j-core", "2.14.1"),
+            ]
+        );
+    }
+
+    /// #5666: a shaded jar carries the `pom.properties` of what it bundles
+    /// beside its own; a war bundles under `WEB-INF/lib/`. A renamed archive
+    /// outside a Maven layout keeps its own coordinate out by file name, and
+    /// a jar that is not a zip yields nothing rather than an error.
+    #[test]
+    fn test_extract_dependencies_shaded_jar_war_and_garbage() {
+        let shaded = zip_owned(vec![
+            pom_properties_entry("org.example", "tool", "2.1"),
+            pom_properties_entry("com.google.guava", "guava", "20.0"),
+        ]);
+        let artifact = make_artifact("tool-2.1-all.jar", "uploads/tool-2.1-all.jar", None);
+        let deps = DependencyScanner::extract_dependencies(&artifact, None, &Bytes::from(shaded));
+        assert_eq!(deps.len(), 1, "{deps:?}");
+        assert_eq!(deps[0].name, "com.google.guava:guava");
+        assert_eq!(deps[0].version.as_deref(), Some("20.0"));
+
+        let war = zip_owned(vec![(
+            "WEB-INF/lib/snakeyaml-1.26.jar".into(),
+            zip_owned(vec![pom_properties_entry("org.yaml", "snakeyaml", "1.26")]),
+        )]);
+        let artifact = make_artifact("site.WAR", "site.WAR", None);
+        let deps = DependencyScanner::extract_dependencies(&artifact, None, &Bytes::from(war));
+        assert_eq!(deps.len(), 1, "{deps:?}");
+        assert_eq!(deps[0].name, "org.yaml:snakeyaml");
+
+        let artifact = make_artifact("broken.jar", "broken.jar", None);
+        assert!(DependencyScanner::extract_dependencies(
+            &artifact,
+            None,
+            &Bytes::from_static(b"not a zip")
+        )
+        .is_empty());
     }
 
     // -----------------------------------------------------------------------
