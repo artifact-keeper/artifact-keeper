@@ -6695,10 +6695,13 @@ mod tests {
         let stale = claim_all(&f, 5, 5, "worker-dead", -1.0).await;
         assert_eq!(stale.len(), 1);
 
-        let recovered = recover_expired_sync_task_claims(&f.pool)
+        // The recovery is instance-wide: its count includes expired claims
+        // other tests leave on the shared database, and a concurrent test's
+        // recovery may take this row first. Assert on this task's row only
+        // (#5818).
+        recover_expired_sync_task_claims(&f.pool)
             .await
             .expect("recovery query ok");
-        assert_eq!(recovered, 1, "expired claim must be recovered");
 
         let (status, token): (String, Option<Uuid>) =
             sqlx::query_as("SELECT status::TEXT, claim_token FROM sync_tasks WHERE id = $1")
@@ -6759,10 +6762,11 @@ mod tests {
             .await
             .expect("seed active transfer counter");
 
-        let recovered = recover_expired_sync_task_claims(&f.pool)
+        // Instance-wide, like the test above: the row and its peer's counter
+        // are what this test owns, not the returned count (#5818).
+        recover_expired_sync_task_claims(&f.pool)
             .await
             .expect("recovery query ok");
-        assert_eq!(recovered, 1, "legacy in_progress task must recover");
 
         let (status, token, claim_expires_at, active_transfers): (
             String,
