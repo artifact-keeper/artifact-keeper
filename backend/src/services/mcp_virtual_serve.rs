@@ -32,10 +32,19 @@
 //! would: PyPI curation, and an age gate's answer that a Remote's upstream
 //! does not host the version.
 //!
-//! Known caveat (#5536): per-caller member visibility is not modelled
-//! either. The route drops the members a caller cannot read, so for such a
-//! caller a member the model ranks below the pinned one can serve the
-//! coordinate while the pin stands.
+//! Per-caller member visibility (#5536). The route drops the members a
+//! caller cannot read, so for a caller who can read the Virtual but not the
+//! winning member, the next member that holds or proxies the coordinate
+//! serves it. The model therefore also records the members after the
+//! winner that would serve ([`ServeModel::later`]), and when the winning
+//! member is not readable by everyone who can read the Virtual
+//! ([`member_covers_virtual`]), any of them counts as shadowing
+//! ([`hidden_member_shadow`]). The format guards are not per caller (npm
+//! and Cargo ownership is decided over every member), so a Remote the guard
+//! withholds stays withheld for every caller. PyPI needs no extra rule: every
+//! hosted file of the version is already part of the pin and every Remote
+//! with an upstream already shadows it, so a caller who cannot read a member
+//! is served fewer pinned files, never other bytes.
 //!
 //! [`fetch_virtual_expansion`]: crate::api::handlers::proxy_helpers::fetch_virtual_expansion
 //! [`npm_virtual_eligible_members`]: crate::api::handlers::npm::npm_virtual_eligible_members
@@ -80,6 +89,27 @@ pub struct ServeModel {
     pub remotes: Vec<(Uuid, String)>,
     /// The key of the first hosted member holding the coordinate.
     pub first_holder: Option<String>,
+    /// npm, NuGet, Cargo: the members after the winner, in walk order, that
+    /// would serve the coordinate to a caller who cannot read the members
+    /// before them (a hosted member holding it, or a Remote member the
+    /// format's guard keeps, with an upstream): `(id, key)` (#5536).
+    pub later: Vec<(Uuid, String)>,
+}
+
+impl Winner {
+    /// The serving member's id: a hosted member's rows all live in it.
+    fn member_id(&self) -> Option<Uuid> {
+        match self {
+            Winner::Hosted { rows, .. } => rows.first().map(|r| r.repository_id),
+            Winner::Remote { id, .. } => Some(*id),
+        }
+    }
+
+    fn key(&self) -> &str {
+        match self {
+            Winner::Hosted { key, .. } | Winner::Remote { key, .. } => key,
+        }
+    }
 }
 
 fn walk_err(_: axum::response::Response) -> McpError {
@@ -330,6 +360,7 @@ pub async fn serve_model(
                 .collect(),
             files,
             winner: None,
+            later: Vec::new(),
         });
     }
     let rows = repo_rows(db, &ids, registry_type, identifier, version).await?;
@@ -343,6 +374,7 @@ pub async fn serve_model(
         })
         .map(|r| key_of(r.repository_id));
     let mut winner = None;
+    let mut later = Vec::new();
     for m in guarded_members(
         db,
         virtual_id,
@@ -353,27 +385,28 @@ pub async fn serve_model(
     )
     .await?
     {
-        if m.repo_type == RepositoryType::Remote {
-            if serves_upstream(&m) {
-                winner = Some(Winner::Remote {
-                    id: m.id,
-                    key: m.key.clone(),
-                });
-                break;
-            }
-            continue;
-        }
-        let held: Vec<HostedRow> = rows
-            .iter()
-            .filter(|r| r.repository_id == m.id)
-            .cloned()
-            .collect();
-        if !held.is_empty() {
-            winner = Some(Winner::Hosted {
+        let serving = if m.repo_type == RepositoryType::Remote {
+            serves_upstream(&m).then(|| Winner::Remote {
+                id: m.id,
+                key: m.key.clone(),
+            })
+        } else {
+            let held: Vec<HostedRow> = rows
+                .iter()
+                .filter(|r| r.repository_id == m.id)
+                .cloned()
+                .collect();
+            (!held.is_empty()).then(|| Winner::Hosted {
                 key: m.key.clone(),
                 rows: held,
-            });
-            break;
+            })
+        };
+        // The walk goes on past the winner: a caller who cannot read it is
+        // served by the next member that serves (#5536).
+        match serving {
+            Some(w) if winner.is_none() => winner = Some(w),
+            Some(_) => later.push((m.id, m.key.clone())),
+            None => {}
         }
     }
     Ok(ServeModel {
@@ -381,7 +414,121 @@ pub async fn serve_model(
         files: Vec::new(),
         remotes: Vec::new(),
         first_holder,
+        later,
     })
+}
+
+/// Whether every principal that can read Virtual `virtual_id` can also read
+/// its member `member_id` (#5536). Decided conservatively, so that `false`
+/// is the answer whenever coverage cannot be shown:
+///
+/// * a public member covers any Virtual; a public Virtual (or one with an
+///   anonymous rule) is covered only by a public member;
+/// * otherwise every active, non-administrator user who may be a reader of
+///   the Virtual (any user when it is `internal`; otherwise one holding a
+///   role carrying `read` or `admin` on it or instance-wide, or named by a
+///   `permissions` rule on it or its project carrying `read` or `admin`,
+///   whatever the rule's conditions) must certainly read the member: through a role carrying
+///   `admin`, an unconditioned rule on the member (or its project) carrying
+///   `read` or `admin`, or, when no rule on the member names the user, a
+///   role carrying `read` or `admin`. These are the arms of the read action
+///   gate the Virtual walk applies to each member
+///   (`try_authorize_virtual_members`), each taken only where it grants for
+///   every request; a rule with conditions (a CIDR or MCP namespace list)
+///   is never relied on.
+///
+/// Instance administrators read every repository and are left out.
+pub async fn member_covers_virtual(
+    db: &PgPool,
+    virtual_id: Uuid,
+    member_id: Uuid,
+) -> Result<bool, McpError> {
+    const NAMES_USER: &str = "((p.principal_type IN ('user', 'service_account') \
+         AND p.principal_id = u.id) \
+        OR (p.principal_type = 'group' AND p.principal_id IN \
+            (SELECT g.group_id FROM user_group_members g WHERE g.user_id = u.id)))";
+    let on = |r: &str| {
+        format!(
+            "((p.target_type = 'repository' AND p.target_id = {r}.id) \
+              OR (p.target_type = 'project' AND p.target_id = {r}.project_id))"
+        )
+    };
+    let (on_v, on_m) = (on("v"), on("m"));
+    let role_on = |repo: &str, perms: &str| {
+        format!(
+            "EXISTS (SELECT 1 FROM role_assignments ra JOIN roles r ON r.id = ra.role_id \
+             WHERE ra.user_id = u.id AND (ra.repository_id = {repo}.id OR ra.repository_id IS NULL) \
+               AND ({perms}))"
+        )
+    };
+    const READS: &str = "'read' = ANY(r.permissions) OR 'admin' = ANY(r.permissions)";
+    let admin_role = role_on("m", "'admin' = ANY(r.permissions)");
+    let read_role_m = role_on("m", READS);
+    let read_role_v = role_on("v", READS);
+    let sql = format!(
+        "SELECT CASE \
+           WHEN m.visibility = 'public' THEN true \
+           WHEN v.visibility = 'public' THEN false \
+           WHEN EXISTS (SELECT 1 FROM permissions p \
+                        WHERE p.principal_type = 'anonymous' AND {on_v}) THEN false \
+           ELSE NOT EXISTS ( \
+             SELECT 1 FROM users u \
+             WHERE u.is_active AND NOT u.is_admin \
+               AND (v.visibility = 'internal' \
+                    OR {read_role_v} \
+                    OR EXISTS (SELECT 1 FROM permissions p WHERE {on_v} AND {NAMES_USER} \
+                               AND ('read' = ANY(p.actions) OR 'admin' = ANY(p.actions)))) \
+               AND NOT ({admin_role} \
+                    OR EXISTS (SELECT 1 FROM permissions p WHERE {on_m} AND {NAMES_USER} \
+                               AND ('read' = ANY(p.actions) OR 'admin' = ANY(p.actions)) \
+                               AND p.conditions = '{{}}'::jsonb) \
+                    OR (NOT EXISTS (SELECT 1 FROM permissions p WHERE {on_m} AND {NAMES_USER}) \
+                        AND {read_role_m}))) \
+         END \
+         FROM repositories v, repositories m WHERE v.id = $1 AND m.id = $2"
+    );
+    let covers: Option<bool> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(virtual_id)
+        .bind(member_id)
+        .fetch_optional(db)
+        .await
+        .map_err(db_err)?;
+    Ok(covers.unwrap_or(false))
+}
+
+/// Why a reader of Virtual `virtual_id` who cannot read the winning member
+/// would be served other bytes (#5536): `Some` when a member after the
+/// winner serves the coordinate ([`ServeModel::later`]) and the winner is
+/// not readable by everyone who can read the Virtual
+/// ([`member_covers_virtual`]). `covers` memoises the coverage answers.
+/// `None` for PyPI (see the module docs) and when nothing serves.
+pub async fn hidden_member_shadow(
+    db: &PgPool,
+    virtual_id: Uuid,
+    model: &ServeModel,
+    covers: &mut std::collections::HashMap<(Uuid, Uuid), bool>,
+) -> Result<Option<String>, McpError> {
+    let (Some(winner), Some((_, next))) = (&model.winner, model.later.first()) else {
+        return Ok(None);
+    };
+    let Some(member) = winner.member_id() else {
+        return Ok(None);
+    };
+    let covered = match covers.get(&(virtual_id, member)) {
+        Some(c) => *c,
+        None => {
+            let c = member_covers_virtual(db, virtual_id, member).await?;
+            covers.insert((virtual_id, member), c);
+            c
+        }
+    };
+    Ok((!covered).then(|| {
+        format!(
+            "member '{}' is not readable by every reader of the Virtual, and member '{next}' \
+             serves this version to a reader who cannot read it",
+            winner.key()
+        )
+    }))
 }
 
 /// Why the advertised Virtual URL would not deliver a pin, as the one line a
