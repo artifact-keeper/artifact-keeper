@@ -53,12 +53,13 @@ const QUEUE_RESTORED_PUSH_SQL: &str = r#"
 /// that already claimed a delete is left alone: its push is queued as well and
 /// delivered after the in-flight delete finishes.
 ///
-/// A delete is matched by its artifact, or by its address when its artifact
-/// row is gone (#5624): a purged artifact that held the restored one's path
-/// left a delete addressed to the key of repository `$3` and path `$4`, and
-/// the push queued here replaces the peer's copy anyway. Matched by key, not
-/// repository id: the peer addresses repositories by key, and a repository
-/// deleted and re-created under the same key has a new id.
+/// Only the restored artifact's own deletes (`artifact_id = $1`) are
+/// superseded (#5699). A delete left by a purged artifact that held the same
+/// path (`artifact_id` NULL, addressed by key and path, #5624) is a different
+/// artifact's delete and stays queued: the peer still holds the purged bytes
+/// there, and a peer refuses a push onto a live path with `409` (immutable),
+/// so the push cannot replace them. The sync worker sends that delete first
+/// and holds the push until it is delivered.
 const CANCEL_SUPERSEDED_DELETE_TASKS_SQL: &str = r#"
     UPDATE sync_tasks
     SET status = 'cancelled',
@@ -67,14 +68,7 @@ const CANCEL_SUPERSEDED_DELETE_TASKS_SQL: &str = r#"
     WHERE peer_instance_id = ANY($2)
       AND task_type = 'delete'
       AND status IN ('pending', 'failed')
-      AND (
-          artifact_id = $1
-          OR (
-              artifact_id IS NULL
-              AND target_repository_key = (SELECT key FROM repositories WHERE id = $3)
-              AND target_path = $4
-          )
-      )
+      AND artifact_id = $1
     "#;
 
 /// Fill in the peer address of the delete tasks already queued for the
@@ -1317,8 +1311,6 @@ impl PeerInstanceService {
         sqlx::query(CANCEL_SUPERSEDED_DELETE_TASKS_SQL)
             .bind(artifact.id)
             .bind(&peers)
-            .bind(artifact.repository_id)
-            .bind(artifact.path)
             .execute(&mut *conn)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
