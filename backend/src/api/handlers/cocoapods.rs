@@ -367,13 +367,10 @@ async fn get_podspec(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let content = storage.get(&podspec_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            crate::api::handlers::storage_err_message(&e),
-        )
-            .into_response()
-    })?;
+    let content = storage
+        .get(&podspec_key)
+        .await
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -656,13 +653,10 @@ async fn push_pod(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body.clone()).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            crate::api::handlers::storage_err_message(&e),
-        )
-            .into_response()
-    })?;
+    storage
+        .put(&storage_key, body.clone())
+        .await
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     // Also store the podspec JSON separately for direct retrieval
     let podspec_key = build_cocoapods_podspec_key(pod_name, pod_version);
@@ -672,13 +666,7 @@ async fn push_pod(
     storage
         .put(&podspec_key, Bytes::from(podspec_json))
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     // Build metadata JSON
     let pod_metadata = build_cocoapods_metadata(&podspec, &filename);
@@ -2186,6 +2174,93 @@ mod db_cov_tests {
             vec!["Repl4725/1.0.0/Repl4725-1.0.0.tar.gz".to_string()],
             "only the client push queues a push task; the replicated one must not"
         );
+    }
+
+    /// #5685: `push_pod`'s `storage.put` and `get_podspec`'s storage fallback
+    /// answered a hard-coded 500 on any storage failure. A store that is down
+    /// now answers `503` with `Retry-After`, one that is full `507` without
+    /// it, and neither body carries the backend's text.
+    #[tokio::test]
+    async fn push_and_podspec_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "cocoapods").await else {
+            return;
+        };
+        // Pod storage keys are not repository-scoped, and on the shared
+        // (s3) namespace the cross-repo write guard refuses a key another
+        // repository owns, so both pods carry this fixture's id.
+        let seeded = format!("Seeded{}", fx.repo_id.simple());
+        let outage = format!("Outage{}", fx.repo_id.simple());
+        push_pod(&fx, &seeded, "1.0.0").await;
+        // `get_podspec` answers from metadata when it has the podspec; drop it
+        // so the route falls back to the storage read under test.
+        sqlx::query(
+            "UPDATE artifact_metadata SET metadata = metadata - 'podspec' \
+             WHERE artifact_id IN (SELECT id FROM artifacts WHERE repository_id = $1)",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("strip podspec metadata");
+
+        for (message, want, want_body) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&fx.pool, &fx.state, fx.repo_id, &message).await;
+            let app = tdh::router_with_auth(
+                super::router(),
+                state.clone(),
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/{}/pods", fx.repo_key))
+                .body(axum::body::Body::from(pod_archive(&outage, "1.0.0")))
+                .unwrap();
+            let (status, body, headers) = tdh::send_with_headers(app, req).await;
+            assert_eq!(status, want, "push: {}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want == StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            assert_eq!(&body[..], want_body.as_bytes());
+            tdh::assert_no_storage_backend_text("cocoapods push", &body);
+
+            let app = tdh::router_with_auth(
+                super::router(),
+                state.clone(),
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let (status, body, headers) = tdh::send_with_headers(
+                app,
+                tdh::get(format!(
+                    "/{}/Specs/{seeded}/1.0.0/{seeded}.podspec.json",
+                    fx.repo_key
+                )),
+            )
+            .await;
+            assert_eq!(status, want, "podspec: {}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want == StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            assert_eq!(&body[..], want_body.as_bytes());
+            tdh::assert_no_storage_backend_text("cocoapods podspec", &body);
+        }
+        fx.teardown().await;
     }
 }
 

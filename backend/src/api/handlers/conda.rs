@@ -7044,10 +7044,7 @@ async fn download_package(
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
-        .map_err(|e| {
-            tracing::error!("Storage error reading conda package: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-        })?;
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
@@ -8940,13 +8937,10 @@ async fn store_attestation(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let mut stream = storage.get_stream(&storage_key).await.map_err(|e| {
-        tracing::error!(
-            "Storage error reading conda package for attestation verification: {}",
-            e
-        );
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
+    let mut stream = storage
+        .get_stream(&storage_key)
+        .await
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
     let mut artifact_digest = Sha256::new();
     {
         use futures::StreamExt;
@@ -15243,6 +15237,68 @@ mod tests {
         };
 
         assertions.await;
+        fx.teardown().await;
+    }
+
+    /// #5685: the download of a hosted package (`download_package`'s
+    /// `get_stream`) against a store that is down answers `503` with
+    /// `Retry-After`, and against one that is full `507` without it, with no
+    /// backend text in the body. It answered a hard-coded `500`.
+    #[tokio::test]
+    async fn package_download_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+        let filename = "outage5685-1.0-0.tar.bz2";
+        let path = format!("noarch/{filename}");
+        let storage_key = format!("conda/{}/{}", fx.repo_id, path);
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &storage_key,
+            &path,
+            "outage5685",
+            "1.0",
+            "application/x-tar",
+            Bytes::from_static(b"fake-conda-package-bytes-5685"),
+            fx.user_id,
+        )
+        .await;
+
+        for (message, want) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&fx.pool, &fx.state, fx.repo_id, &message).await;
+            let app = tdh::router_with_auth(
+                super::router(),
+                state,
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let (status, body, headers) = tdh::send_with_headers(
+                app,
+                tdh::get(format!("/{}/noarch/{filename}", fx.repo_key)),
+            )
+            .await;
+            assert_eq!(status, want, "{}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want == StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            tdh::assert_no_storage_backend_text("conda package GET", &body);
+        }
         fx.teardown().await;
     }
 

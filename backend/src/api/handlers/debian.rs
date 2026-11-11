@@ -4233,13 +4233,7 @@ async fn pool_download(
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
@@ -5074,10 +5068,17 @@ async fn read_deb_head_from_storage(
 ) -> Result<Vec<u8>, String> {
     let invalid = |msg: &str| format!("Invalid Debian package metadata: {msg}");
     let read = |offset: u64, length: usize| storage.get_range(storage_key, offset, length);
+    // The reason lands in the admin backfill response and its audit row, so it
+    // names the failure's class in fixed words and logs the raw error, which
+    // quotes the object store and carries the storage-class marker (#5685).
+    let unreadable = |e: crate::error::AppError| {
+        format!(
+            "could not read stored .deb: {}",
+            crate::api::handlers::storage_err_message(&e)
+        )
+    };
 
-    let magic = read(0, 8)
-        .await
-        .map_err(|e| format!("could not read stored .deb: {e}"))?;
+    let magic = read(0, 8).await.map_err(unreadable)?;
     if magic.as_ref() != b"!<arch>\n" {
         return Err(invalid("not an ar archive"));
     }
@@ -5087,7 +5088,7 @@ async fn read_deb_head_from_storage(
         let header = match read(offset, 60).await {
             Ok(header) if header.len() == 60 => header,
             Ok(_) => break,
-            Err(e) => return Err(format!("could not read stored .deb: {e}")),
+            Err(e) => return Err(unreadable(e)),
         };
         let name = std::str::from_utf8(&header[..16])
             .unwrap_or("")
@@ -5107,9 +5108,7 @@ async fn read_deb_head_from_storage(
                 .ok_or_else(|| invalid("ar member offset overflow"))?;
             let body_len =
                 usize::try_from(size).map_err(|_| invalid("control.tar member is too large"))?;
-            let body = read(body_offset, body_len)
-                .await
-                .map_err(|e| format!("could not read stored .deb: {e}"))?;
+            let body = read(body_offset, body_len).await.map_err(unreadable)?;
             if body.len() != body_len {
                 return Err(invalid("truncated ar member"));
             }
@@ -7118,6 +7117,66 @@ mod tests {
     async fn signed_release_cache_miss_on_unknown_key_is_not_an_eviction() {
         let (state, _dir) = cache_test_state(604_800);
         assert!(signed_release_cache_get(&state, "absent").await.is_none());
+    }
+
+    /// #5685: `pool_download`'s `get_stream` answered a hard-coded 500 on any
+    /// storage failure. A store that is down now answers `503` with
+    /// `Retry-After`, one that is full `507` without it, and neither body
+    /// carries the backend's text.
+    #[tokio::test]
+    async fn pool_download_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let path = "pool/main/o/outage5685/outage5685_1.0_amd64.deb";
+        let repo = fx.repo_info("local", None);
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            path,
+            path,
+            "outage5685",
+            "1.0",
+            DEBIAN_BINARY_CONTENT_TYPE,
+            Bytes::from_static(b"!<arch>\n5685"),
+            fx.user_id,
+        )
+        .await;
+
+        for (message, want, want_body) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&fx.pool, &fx.state, fx.repo_id, &message).await;
+            let app = tdh::router_with_auth(
+                super::router(),
+                state,
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let (status, body, headers) =
+                tdh::send_with_headers(app, tdh::get(format!("/{}/{path}", fx.repo_key))).await;
+            assert_eq!(status, want, "GET: {}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want == StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            assert_eq!(&body[..], want_body.as_bytes());
+            tdh::assert_no_storage_backend_text("debian pool download", &body);
+        }
+        fx.teardown().await;
     }
 }
 

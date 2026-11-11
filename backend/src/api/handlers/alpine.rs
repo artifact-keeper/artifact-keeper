@@ -1530,11 +1530,7 @@ async fn download_package(
                     return Ok(response);
                 }
             }
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response())
+            Err(crate::api::handlers::storage_err_plain(&e))
         }
     }
 }
@@ -1982,13 +1978,7 @@ async fn store_apk(
     storage
         .put(&storage_key, content.clone())
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     let size_bytes = content.len() as i64;
 
@@ -4473,6 +4463,85 @@ mod tests {
             vec!["v3.21/main/aarch64/repl-apk-1.0-r0.apk".to_string()],
             "only the client upload queues a push task; the replicated one must not"
         );
+    }
+
+    /// #5685: `store_apk`'s `storage.put` and `download_package`'s
+    /// `get_stream` answered a hard-coded 500 on any storage failure. A store
+    /// that is down now answers `503` with `Retry-After`, one that is full
+    /// `507` without it, and neither body carries the backend's text.
+    #[tokio::test]
+    async fn apk_put_and_get_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
+            return;
+        };
+        let published = format!("/{}/v3.21/main/aarch64/dtf-marker-1.0-r0.apk", fx.repo_key);
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(published.clone(), bytes::Bytes::from_static(MARKER_APK)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CREATED,
+            "publish while storage works: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        for (message, want, want_body) in [
+            (
+                tdh::minio_unreachable_error(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                axum::http::StatusCode::INSUFFICIENT_STORAGE,
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&fx.pool, &fx.state, fx.repo_id, &message).await;
+            let app = tdh::router_with_auth(
+                super::router(),
+                state.clone(),
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let (status, body, headers) = tdh::send_with_headers(
+                app,
+                tdh::put(
+                    format!("/{}/v3.21/main/aarch64/outage5685-1.0-r0.apk", fx.repo_key),
+                    bytes::Bytes::from_static(MARKER_APK),
+                ),
+            )
+            .await;
+            assert_eq!(status, want, "PUT: {}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want == axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            assert_eq!(&body[..], want_body.as_bytes());
+            tdh::assert_no_storage_backend_text("alpine PUT", &body);
+
+            let app = tdh::router_with_auth(
+                super::router(),
+                state.clone(),
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let (status, body, headers) =
+                tdh::send_with_headers(app, tdh::get(published.clone())).await;
+            assert_eq!(status, want, "GET: {}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want == axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            assert_eq!(&body[..], want_body.as_bytes());
+            tdh::assert_no_storage_backend_text("alpine GET", &body);
+        }
+        fx.teardown().await;
     }
 }
 

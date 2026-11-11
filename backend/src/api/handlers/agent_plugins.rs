@@ -490,13 +490,7 @@ async fn serve_download(
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
     Ok(response.body(Body::from_stream(stream)).unwrap())
 }
@@ -2453,5 +2447,66 @@ mod tests {
         assert!(staging_obj.starts_with(&format!("agentplugins/{staging}/")));
         assert!(prod_obj.starts_with(&format!("agentplugins/{prod}/")));
         assert_eq!(stored, 2, "two physical objects in the shared bucket");
+    }
+
+    /// #5685: `serve_download`'s `get_stream` answered a hard-coded 500 on
+    /// any storage failure. A store that is down now answers `503` with
+    /// `Retry-After`, one that is full `507` without it, and neither body
+    /// carries the backend's text.
+    #[tokio::test]
+    async fn download_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        let Some(fx) = tdh::Fixture::setup("local", "agentplugins").await else {
+            return;
+        };
+        let (status, body) = publish(
+            &fx,
+            "outage-tools",
+            "1.0.0",
+            claude_zip("outage-tools", "1.0.0"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "publish while storage works: {body}"
+        );
+
+        for (message, want, want_body) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&fx.pool, &fx.state, fx.repo_id, &message).await;
+            let app = tdh::router_with_auth(
+                super::router(),
+                state,
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let (status, body, headers) = tdh::send_with_headers(
+                app,
+                tdh::get(format!(
+                    "/{}/outage-tools/1.0.0/outage-tools-1.0.0.zip",
+                    fx.repo_key
+                )),
+            )
+            .await;
+            assert_eq!(status, want, "GET: {}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want == StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            assert_eq!(&body[..], want_body.as_bytes());
+            tdh::assert_no_storage_backend_text("agentplugins download", &body);
+        }
+        fx.teardown().await;
     }
 }

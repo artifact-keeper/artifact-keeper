@@ -8384,13 +8384,8 @@ pub async fn put_artifact_stream(
     // and backends and must not reach the client (#3718).
     let result = storage.put_stream(storage_key, stream).await.map_err(|e| {
         // #4609: a full disk is 507 + Retry-After, not an opaque 500.
-        super::upload_body::storage_failure_response(&e).unwrap_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })
+        super::upload_body::storage_failure_response(&e)
+            .unwrap_or_else(|| crate::api::handlers::storage_err_plain(&e))
     })?;
     Ok(result)
     // `staged` drops here -> scratch file removed.
@@ -8422,13 +8417,8 @@ pub(crate) async fn put_staged_body(
         .write(storage.as_ref(), storage_key)
         .await
         .map_err(|e| {
-            super::upload_body::storage_failure_response(&e).unwrap_or_else(|| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    crate::api::handlers::storage_err_message(&e),
-                )
-                    .into_response()
-            })
+            super::upload_body::storage_failure_response(&e)
+                .unwrap_or_else(|| crate::api::handlers::storage_err_plain(&e))
         })?;
     staged.discard().await;
     Ok(crate::storage::PutStreamResult {
@@ -9229,14 +9219,11 @@ pub(crate) async fn gate_stored_content<
         .map(Some)
 }
 
-/// The `500` a format route answers when a stored row cannot be read, as the
-/// routes built it before #4514.
+/// What a format route answers when a stored row cannot be read: the routes'
+/// plain-text body from before #4514, with `503` / `507` for a store that is
+/// down or full (#5685) instead of a flat `500`.
 fn stored_row_storage_error(e: crate::error::AppError) -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        crate::api::handlers::storage_err_message(&e),
-    )
-        .into_response()
+    crate::api::handlers::storage_err_plain(&e)
 }
 
 /// The scan policy and format a stored row is gated under (#4514).

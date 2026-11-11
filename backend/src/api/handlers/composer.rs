@@ -2110,13 +2110,10 @@ async fn upload(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body.clone()).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            crate::api::handlers::storage_err_message(&e),
-        )
-            .into_response()
-    })?;
+    storage
+        .put(&storage_key, body.clone())
+        .await
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     let size_bytes = body.len() as i64;
 
@@ -4239,6 +4236,58 @@ mod upload_db_tests {
             vec![format!("{name}/1.2.3/{sha}.zip")],
             "only the client publish queues a push task; the replicated one must not"
         );
+    }
+
+    /// #5685: `upload`'s `storage.put` answered a hard-coded 500 on any
+    /// storage failure. A store that is down now answers `503` with
+    /// `Retry-After`, one that is full `507` without it, and neither body
+    /// carries the backend's text.
+    #[tokio::test]
+    async fn upload_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        use axum::http::StatusCode;
+
+        let Some(f) = tdh::Fixture::setup("local", "composer").await else {
+            return;
+        };
+        // The storage key is not repository-scoped, and on the shared (s3)
+        // namespace the cross-repo write guard refuses a key another
+        // repository owns, so the package name carries this fixture's id.
+        let name = format!("outage5685/p{}", f.repo_id.simple());
+
+        for (message, want, want_body) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&f.pool, &f.state, f.repo_id, &message).await;
+            let app = tdh::router_with_auth(
+                super::router(),
+                state,
+                tdh::make_auth(f.user_id, &f.username),
+            );
+            let req = put_composer(
+                format!("/{}/api/packages", f.repo_key),
+                build_composer_zip(&name, "1.0.0", "storage outage (#5685)"),
+            );
+            let (status, body, headers) = tdh::send_with_headers(app, req).await;
+            assert_eq!(status, want, "upload: {}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want == StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            assert_eq!(&body[..], want_body.as_bytes());
+            tdh::assert_no_storage_backend_text("composer upload", &body);
+        }
+        f.teardown().await;
     }
 }
 

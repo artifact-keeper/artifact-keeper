@@ -4246,11 +4246,7 @@ async fn flatcontainer_download(
                 };
 
                 let Some((upstream_url, proxy)) = remote_proxy else {
-                    return Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        crate::api::handlers::storage_err_message(&missing),
-                    )
-                        .into_response());
+                    return Err(crate::api::handlers::storage_err_plain(&missing));
                 };
 
                 let sub_path =
@@ -4434,11 +4430,7 @@ async fn flatcontainer_download(
                 }
             }
             Err(e) => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    crate::api::handlers::storage_err_message(&e),
-                )
-                    .into_response());
+                return Err(crate::api::handlers::storage_err_plain(&e));
             }
         };
 
@@ -5033,13 +5025,7 @@ async fn v2_download(
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
     crate::services::artifact_service::record_download(&state.db, artifact.id, ctx).await;
     use futures::StreamExt as _;
     let filename = build_nupkg_filename(&id_lower, version);
@@ -7474,6 +7460,65 @@ mod read_db_tests {
             "search must surface the package description; body={json}"
         );
 
+        f.teardown().await;
+    }
+
+    /// #5685: the download of a pushed package whose store is down answers
+    /// `503` with `Retry-After`, and one whose store is full `507` without
+    /// it, on both the V3 flat container (`flatcontainer_download`'s
+    /// `get_stream` error arm) and the V2 package route (`v2_download`), with
+    /// the fixed message and no backend text or storage-class marker. Both
+    /// answered a hard-coded 500.
+    #[tokio::test]
+    async fn download_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        push_pkg(&f, &f.repo_key, "Qa.Outage5685", "1.0.0", "storage outage").await;
+
+        for (message, want, expected) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&f.pool, &f.state, f.repo_id, &message).await;
+            for (label, uri) in [
+                (
+                    "V3 flatcontainer",
+                    format!(
+                        "/{}/v3/flatcontainer/qa.outage5685/1.0.0/qa.outage5685.1.0.0.nupkg",
+                        f.repo_key
+                    ),
+                ),
+                (
+                    "V2 package",
+                    format!("/{}/v2/package/Qa.Outage5685/1.0.0", f.repo_key),
+                ),
+            ] {
+                let app = tdh::router_with_auth(
+                    super::router(),
+                    state.clone(),
+                    tdh::make_auth(f.user_id, &f.username),
+                );
+                let (status, body, headers) = tdh::send_with_headers(app, tdh::get(uri)).await;
+                assert_eq!(status, want, "{label}: {}", String::from_utf8_lossy(&body));
+                assert_eq!(
+                    headers.contains_key(axum::http::header::RETRY_AFTER),
+                    want == StatusCode::SERVICE_UNAVAILABLE,
+                    "{label}: Retry-After only on the 503"
+                );
+                tdh::assert_no_storage_backend_text(&format!("nuget {label}"), &body);
+                assert_eq!(&body[..], expected.as_bytes(), "{label}: fixed message");
+            }
+        }
         f.teardown().await;
     }
 

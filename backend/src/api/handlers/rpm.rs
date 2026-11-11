@@ -347,11 +347,7 @@ async fn serve_stored_publication_blob(
                 .unwrap(),
         )),
         Err(crate::error::AppError::NotFound(_)) => Ok(None),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            crate::api::handlers::storage_err_message(&e),
-        )
-            .into_response()),
+        Err(e) => Err(crate::api::handlers::storage_err_plain(&e)),
     }
 }
 
@@ -656,13 +652,10 @@ async fn serve_version_package(
 
     // Cache into the immutable frozen store, then stream the verified bytes.
     let size = bytes.len() as i64;
-    storage.put(&cache_key, bytes.clone()).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            crate::api::handlers::storage_err_message(&e),
-        )
-            .into_response()
-    })?;
+    storage
+        .put(&cache_key, bytes.clone())
+        .await
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     Ok(build_rpm_package_response(
         Body::from(bytes),
@@ -1247,11 +1240,7 @@ async fn stored_repodata_response(
             };
             Ok(repodata_bytes_response(file, bytes))
         }
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            crate::api::handlers::storage_err_message(&e),
-        )
-            .into_response()),
+        Err(e) => Err(crate::api::handlers::storage_err_plain(&e)),
     }
 }
 
@@ -2976,13 +2965,7 @@ async fn upstream_proxy(
         let stream = storage
             .get_stream(&artifact.storage_key)
             .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    crate::api::handlers::storage_err_message(&e),
-                )
-                    .into_response()
-            })?;
+            .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
         return Ok(build_rpm_package_response(
             Body::from_stream(stream),
@@ -3318,13 +3301,7 @@ async fn download_package(
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
@@ -5523,6 +5500,62 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(&body[..], b"rpm-bytes");
+        f.teardown().await;
+    }
+
+    /// #5685: the download of a hosted package (`download_package`'s
+    /// `get_stream`) against a store that is down answers `503` with
+    /// `Retry-After`, and against one that is full `507` without it, with no
+    /// backend text in the body. It answered a hard-coded `500`.
+    #[tokio::test]
+    async fn package_download_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "rpm/outage5685/1.0/outage5685-1.0-1.x86_64.rpm",
+            "outage5685/1.0/outage5685-1.0-1.x86_64.rpm",
+            "outage5685",
+            "1.0",
+            "application/x-rpm",
+            bytes::Bytes::from_static(b"rpm-bytes-5685"),
+            f.user_id,
+        )
+        .await;
+
+        for (message, want) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&f.pool, &f.state, f.repo_id, &message).await;
+            let app = tdh::router_anon(super::router(), state);
+            let (status, body, headers) = tdh::send_with_headers(
+                app,
+                tdh::get(format!(
+                    "/{}/packages/outage5685-1.0-1.x86_64.rpm",
+                    f.repo_key
+                )),
+            )
+            .await;
+            assert_eq!(status, want, "{}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want == StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            tdh::assert_no_storage_backend_text("rpm package GET", &body);
+        }
         f.teardown().await;
     }
 

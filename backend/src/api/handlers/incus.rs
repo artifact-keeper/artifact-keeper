@@ -1080,11 +1080,7 @@ async fn download_image(
         if msg.to_lowercase().contains("not found") {
             (StatusCode::NOT_FOUND, "Image file not found").into_response()
         } else {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&msg),
-            )
-                .into_response()
+            crate::api::handlers::storage_err_plain(&msg)
         }
     })?;
 
@@ -2656,20 +2652,39 @@ async fn put_staged_upload_to_storage(
     committed: u64,
     final_path: Option<&Path>,
 ) -> Result<(), String> {
+    // The returned string is recorded as the session's `finalize_error`, which
+    // `GET /incus/{repo}/uploads/{id}` hands back to the client, so it carries
+    // fixed wording only (#5685): the raw errors name storage keys, staging
+    // paths and the object store's own XML, and a classified one carries the
+    // storage-class marker token. They are logged here instead.
     let storage = state
         .storage_for_repo(&repo.storage_location())
-        .map_err(|e| format!("storage backend resolution failed: {e}"))?;
+        .map_err(|e| finalize_storage_error("Could not resolve the storage backend", &e))?;
 
     let stream = open_finalize_stream(sealed_path, committed, final_path)
         .await
-        .map_err(|e| format!("reopen staged data for streaming put: {e}"))?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Incus finalize: reopening staged data failed");
+            "Failed to reopen the staged upload".to_string()
+        })?;
 
     storage
         .put_stream(storage_key, stream)
         .await
-        .map_err(|e| format!("storage put_stream failed: {e}"))?;
+        .map_err(|e| finalize_storage_error("Could not write the image to storage", &e))?;
 
     Ok(())
+}
+
+/// The `finalize_error` for a failed storage step of a background finalize
+/// (#5685): the step, then the fixed message for the failure's class
+/// ([`crate::api::handlers::storage_err_message`], which logs the raw error),
+/// so a poller can tell a store that is down or full from any other failure.
+fn finalize_storage_error(step: &str, e: &dyn Display) -> String {
+    if let Some(class) = crate::storage::StorageFailure::from_message(&e.to_string()) {
+        crate::storage::failure::record_failure(class);
+    }
+    format!("{step}: {}", crate::api::handlers::storage_err_message(e))
 }
 
 /// Owned inputs for the background finalize task. Everything is owned (no
@@ -4767,6 +4782,140 @@ mod streaming_pipeline_regression_tests {
             }
         }
         panic!("finalize did not reach a terminal status in time");
+    }
+
+    /// #5685: the download of a stored image (`download_image`'s
+    /// `get_stream`) whose store is down answers `503` with `Retry-After`,
+    /// and one whose store is full `507` without it, with the fixed message
+    /// and no backend text or storage-class marker; it answered a hard-coded
+    /// 500. And a monolithic PUT accepted with `202` whose background
+    /// finalize then fails its `put_stream` against the unreachable store
+    /// records a `finalize_error` (served by `GET /uploads/{id}`) that names
+    /// the step and the fixed message, never the backend's text or the
+    /// marker token (`finalize_storage_error`).
+    #[tokio::test]
+    async fn download_and_finalize_map_storage_outage_and_full_without_echoing_the_error_5685() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let payload: Vec<u8> = (0u32..4096).map(|i| (i % 251) as u8).collect();
+        let stored_uri = format!("/{}/images/ubuntu/5685/incus.tar.xz", f.repo_key);
+
+        // Publish while storage works.
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(&stored_uri)
+            .body(Body::from(payload.clone()))
+            .expect("build PUT request");
+        let (status, body) = tdh::send(f.router_with_auth(router()), req).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let session_id: Uuid = serde_json::from_slice::<serde_json::Value>(&body)
+            .expect("parse upload response")["session_id"]
+            .as_str()
+            .expect("response has session_id")
+            .parse()
+            .expect("session_id is a UUID");
+        let progress = await_finalize(&f, session_id).await;
+        assert_eq!(progress["status"].as_str(), Some("completed"), "{progress}");
+
+        for (message, want, expected) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&f.pool, &f.state, f.repo_id, &message).await;
+            let app = tdh::router_with_auth(
+                router(),
+                state.clone(),
+                tdh::make_auth(f.user_id, &f.username),
+            );
+            let (status, body, headers) =
+                tdh::send_with_headers(app, tdh::get(stored_uri.clone())).await;
+            assert_eq!(
+                status,
+                want,
+                "GET image: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(
+                headers.contains_key(header::RETRY_AFTER),
+                want == StatusCode::SERVICE_UNAVAILABLE,
+                "GET image: Retry-After only on the 503"
+            );
+            tdh::assert_no_storage_backend_text("incus GET image", &body);
+            assert_eq!(&body[..], expected.as_bytes(), "GET image: fixed message");
+
+            if want != StatusCode::SERVICE_UNAVAILABLE {
+                continue;
+            }
+
+            // A new image accepted with 202 whose background push then
+            // meets the unreachable store.
+            let app = tdh::router_with_auth(
+                router(),
+                state.clone(),
+                tdh::make_auth(f.user_id, &f.username),
+            );
+            let req = axum::http::Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/{}/images/ubuntu/5685-outage/incus.tar.xz",
+                    f.repo_key
+                ))
+                .body(Body::from(payload.clone()))
+                .expect("build PUT request");
+            let (status, body) = tdh::send(app, req).await;
+            assert_eq!(
+                status,
+                StatusCode::ACCEPTED,
+                "{}",
+                String::from_utf8_lossy(&body)
+            );
+            let failed_session: Uuid = serde_json::from_slice::<serde_json::Value>(&body)
+                .expect("parse upload response")["session_id"]
+                .as_str()
+                .expect("response has session_id")
+                .parse()
+                .expect("session_id is a UUID");
+            let progress = await_finalize(&f, failed_session).await;
+            assert_eq!(progress["status"].as_str(), Some("failed"), "{progress}");
+
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri(format!("/{}/uploads/{}", f.repo_key, failed_session))
+                .body(Body::empty())
+                .expect("build progress GET");
+            let (status, body) = tdh::send(f.router_with_auth(router()), req).await;
+            assert_eq!(status, StatusCode::OK);
+            tdh::assert_no_storage_backend_text("incus GET upload progress", &body);
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).expect("parse progress JSON");
+            assert_eq!(
+                json["finalize_error"].as_str(),
+                Some(
+                    format!(
+                        "Could not write the image to storage: {}",
+                        crate::error::STORAGE_UNAVAILABLE_MESSAGE
+                    )
+                    .as_str()
+                ),
+                "{json}"
+            );
+        }
+        f.teardown().await;
     }
 
     /// PUT a monolithic image, then GET it back. Exercises `upload_image`'s

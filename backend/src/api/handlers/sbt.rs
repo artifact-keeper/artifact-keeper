@@ -462,13 +462,7 @@ async fn download_by_path(
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
@@ -585,13 +579,10 @@ async fn upload_artifact(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body.clone()).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            crate::api::handlers::storage_err_message(&e),
-        )
-            .into_response()
-    })?;
+    storage
+        .put(&storage_key, body.clone())
+        .await
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     // The Ivy module coordinate, captured before `path_info`'s fields move
     // into the metadata JSON below (#3659).
@@ -1149,6 +1140,87 @@ mod tests {
         assert_eq!(metadata["artifact"], "config-1.4.2");
         assert_eq!(metadata["ext"], "jar");
         assert_eq!(metadata["is_ivy_descriptor"], false);
+    }
+
+    /// #5685: an Ivy PUT (`upload_artifact`'s `storage.put`) against a store
+    /// that is down answers `503` with `Retry-After`, and against one that is
+    /// full `507` without it; the GET of a published file
+    /// (`download_by_path`'s `get_stream`) answers the outage `503`. Neither
+    /// body echoes the backend error. Both sites answered a hard-coded `500`.
+    #[tokio::test]
+    async fn ivy_put_and_get_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::{header::RETRY_AFTER, StatusCode};
+
+        let Some(fx) = tdh::Fixture::setup("local", "sbt").await else {
+            return;
+        };
+        let published = "com.example/served5685_2.13/1.0.0/jars/served5685_2.13-1.0.0.jar";
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                format!("/{}/{published}", fx.repo_key),
+                bytes::Bytes::from_static(b"jar-bytes-5685"),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "publish while storage works: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        for (message, want) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&fx.pool, &fx.state, fx.repo_id, &message).await;
+            let app = tdh::router_with_auth(
+                super::router(),
+                state.clone(),
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let (status, body, headers) = tdh::send_with_headers(
+                app,
+                tdh::put(
+                    format!(
+                        "/{}/com.example/outage5685_2.13/1.0.0/jars/outage5685_2.13-1.0.0.jar",
+                        fx.repo_key
+                    ),
+                    bytes::Bytes::from_static(b"jar-bytes-outage"),
+                ),
+            )
+            .await;
+            assert_eq!(status, want, "PUT: {}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(RETRY_AFTER),
+                want == StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            tdh::assert_no_storage_backend_text("sbt PUT", &body);
+
+            if want == StatusCode::SERVICE_UNAVAILABLE {
+                let app = tdh::router_with_auth(
+                    super::router(),
+                    state.clone(),
+                    tdh::make_auth(fx.user_id, &fx.username),
+                );
+                let (status, body, headers) =
+                    tdh::send_with_headers(app, tdh::get(format!("/{}/{published}", fx.repo_key)))
+                        .await;
+                assert_eq!(status, want, "GET: {}", String::from_utf8_lossy(&body));
+                assert!(headers.contains_key(RETRY_AFTER));
+                tdh::assert_no_storage_backend_text("sbt GET", &body);
+            }
+        }
+        fx.teardown().await;
     }
 }
 

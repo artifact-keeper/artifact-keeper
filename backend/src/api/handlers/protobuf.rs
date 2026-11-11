@@ -394,8 +394,11 @@ pub(crate) fn connect_error(status: StatusCode, code: &str, message: &str) -> Re
     // The database sites pass `db_status(&e)` with `internal`; a 503 there
     // (saturated pool, unreachable database) is Connect's retryable
     // `unavailable`, the code Connect itself maps HTTP 503 to (#4765).
+    // A full store (507, #5685) is Connect's `resource_exhausted`.
     let code = if status == StatusCode::SERVICE_UNAVAILABLE && code == "internal" {
         "unavailable"
+    } else if status == StatusCode::INSUFFICIENT_STORAGE && code == "internal" {
+        "resource_exhausted"
     } else {
         code
     };
@@ -821,11 +824,9 @@ async fn save_label_index(
         &checksum_sha256,
     );
     storage.put(&storage_key, bytes).await.map_err(|e| {
-        connect_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            crate::api::handlers::storage_err_message(&e),
-        )
+        crate::api::handlers::storage_err_response(&e, |status, message| {
+            connect_error(status, "internal", message)
+        })
     })?;
 
     // NO-SCAN-ON-UPLOAD: the `_labels` index is a registry-generated JSON
@@ -1366,11 +1367,9 @@ async fn upload(
             .storage_for_repo(&repo.storage_location())
             .map_err(|e| e.into_response())?;
         storage.put(&storage_key, bundle_bytes).await.map_err(|e| {
-            connect_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                crate::api::handlers::storage_err_message(&e),
-            )
+            crate::api::handlers::storage_err_response(&e, |status, message| {
+                connect_error(status, "internal", message)
+            })
         })?;
 
         super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
@@ -1710,11 +1709,9 @@ async fn download(
             .storage_for_repo(&repo.storage_location())
             .map_err(|e| e.into_response())?;
         let bundle_data = storage.get(&storage_key).await.map_err(|e| {
-            connect_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                crate::api::handlers::storage_err_message(&e),
-            )
+            crate::api::handlers::storage_err_response(&e, |status, message| {
+                connect_error(status, "internal", message)
+            })
         })?;
 
         // #2561: permit-scoped decode, fast-fail 503 on saturation.
@@ -3121,6 +3118,133 @@ mod tests {
             "the client push queues the commit and the label index; \
              the replicated push must not queue another task"
         );
+    }
+
+    /// #5685: against a store that is down, a `buf push` of a new commit
+    /// (`upload`'s bundle `storage.put`), a label move on a stored commit
+    /// (`save_label_index`'s `storage.put`, reached through the idempotent
+    /// re-push with `labelRefs`) and a `Download` of a stored commit
+    /// (`download`'s `storage.get`) answer `503` + `Retry-After` with Connect
+    /// code `unavailable`; against one that is full, `507` without it and
+    /// code `resource_exhausted`. The message is the fixed one, with no
+    /// backend text or storage-class marker. All three answered a hard-coded
+    /// 500 `internal`.
+    #[tokio::test]
+    async fn upload_labels_and_download_map_storage_outage_and_full_without_echoing_the_error_5685()
+    {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use base64::Engine;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let upload_body = |proto: &[u8], labels: serde_json::Value| {
+            let body = serde_json::json!({
+                "contents": [{
+                    "moduleRef": { "owner": "acme", "module": "outage5685" },
+                    "files": [{
+                        "path": "acme/outage5685/v1/o.proto",
+                        "content": base64::engine::general_purpose::STANDARD.encode(proto),
+                    }],
+                    "labelRefs": labels,
+                }],
+            });
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap())
+        };
+        let upload_uri = format!(
+            "/{}/buf.registry.module.v1beta1.UploadService/Upload",
+            fx.repo_key
+        );
+        let download_uri = format!(
+            "/{}/buf.registry.module.v1beta1.DownloadService/Download",
+            fx.repo_key
+        );
+        let stored: &[u8] = b"syntax = \"proto3\";\n// stored 5685\n";
+
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                upload_uri.clone(),
+                "application/json",
+                upload_body(stored, serde_json::json!([])),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "push while storage works: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        for (message, want, code, expected) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                "resource_exhausted",
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&fx.pool, &fx.state, fx.repo_id, &message).await;
+            let download_body = serde_json::json!({
+                "values": [{ "resourceRef": { "owner": "acme", "module": "outage5685" } }],
+            });
+            let requests = [
+                (
+                    "Upload (new commit)",
+                    tdh::post(
+                        upload_uri.clone(),
+                        "application/json",
+                        upload_body(
+                            b"syntax = \"proto3\";\n// never stored 5685\n",
+                            serde_json::json!([]),
+                        ),
+                    ),
+                ),
+                (
+                    "Upload (label move)",
+                    tdh::post(
+                        upload_uri.clone(),
+                        "application/json",
+                        upload_body(stored, serde_json::json!([{ "name": "release" }])),
+                    ),
+                ),
+                (
+                    "Download",
+                    tdh::post(
+                        download_uri.clone(),
+                        "application/json",
+                        bytes::Bytes::from(serde_json::to_vec(&download_body).unwrap()),
+                    ),
+                ),
+            ];
+            for (label, req) in requests {
+                let app = tdh::router_with_auth(
+                    super::router(),
+                    state.clone(),
+                    tdh::make_auth(fx.user_id, &fx.username),
+                );
+                let (status, body, headers) = tdh::send_with_headers(app, req).await;
+                assert_eq!(status, want, "{label}: {}", String::from_utf8_lossy(&body));
+                assert_eq!(
+                    headers.contains_key(axum::http::header::RETRY_AFTER),
+                    want == StatusCode::SERVICE_UNAVAILABLE,
+                    "{label}: Retry-After only on the 503"
+                );
+                tdh::assert_no_storage_backend_text(&format!("protobuf {label}"), &body);
+                let json: serde_json::Value =
+                    serde_json::from_slice(&body).expect("Connect error envelope is JSON");
+                assert_eq!(json["code"], code, "{label}: Connect code");
+                assert_eq!(json["message"], expected, "{label}: fixed message");
+            }
+        }
+        fx.teardown().await;
     }
 
     /// #4916: every label move stores a new content-addressed JSON document.
