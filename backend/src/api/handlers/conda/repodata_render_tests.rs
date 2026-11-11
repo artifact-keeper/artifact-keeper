@@ -442,7 +442,7 @@ async fn bz2_is_rendered_on_first_request_and_kept_for_the_revision_4882() {
         .unwrap()
         .revision;
     let kept = repodata_cache::subdir_cache()
-        .lookup_scoped(fx.repo_id, "noarch", &Revision(revision))
+        .lookup_scoped(fx.repo_id, "noarch", &Revision(revision, None))
         .await
         .expect("the revision is kept");
     assert!(
@@ -507,7 +507,7 @@ async fn a_never_named_subdir_is_served_without_a_render_4176() {
         .sum();
     assert_eq!(renders, 0, "no render for a subdir no row names");
     assert!(repodata_cache::subdir_cache()
-        .lookup_scoped(fx.repo_id, "osx-arm64", &Revision(0))
+        .lookup_scoped(fx.repo_id, "osx-arm64", &Revision(0, None))
         .await
         .is_none());
 }

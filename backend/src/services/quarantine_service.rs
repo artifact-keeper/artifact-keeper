@@ -1305,6 +1305,41 @@ fn listing_policy_presence_cache() -> &'static moka::future::Cache<Uuid, bool> {
 pub fn invalidate_listing_decisions() {
     listing_decision_cache().invalidate_all();
     listing_policy_presence_cache().invalidate_all();
+    LISTING_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Bumped by every [`invalidate_listing_decisions`].
+static LISTING_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether an enabled scan policy applies to `repository_id`, cached for
+/// [`LISTING_POLICY_PRESENCE_TTL`] when `cached`.
+async fn listing_policy_applies(db: &PgPool, repository_id: Uuid, cached: bool) -> Result<bool> {
+    let presence = listing_policy_presence_cache();
+    if cached {
+        if let Some(v) = presence.get(&repository_id).await {
+            return Ok(v);
+        }
+    }
+    let v = scan_policy_applies(db, repository_id).await?;
+    presence.insert(repository_id, v).await;
+    Ok(v)
+}
+
+/// The epoch a generated index of `repository_id` that went through
+/// [`listing_refusals`] stays valid for, for a cache keyed on the index's
+/// catalog revision (conda's revision cache, #4978 item 6): `None` when no
+/// enabled scan policy applies to the repository, so its listing decisions
+/// are the quarantine fields alone and move with the catalog; otherwise a
+/// value that changes every [`LISTING_DECISION_TTL`] and on every
+/// [`invalidate_listing_decisions`] in this process, because a scan or a
+/// policy edit can move a decision with no catalog write.
+pub async fn listing_policy_epoch(db: &PgPool, repository_id: Uuid) -> Result<Option<u64>> {
+    if !listing_policy_applies(db, repository_id, true).await? {
+        return Ok(None);
+    }
+    let window = Utc::now().timestamp().max(0) as u64 / LISTING_DECISION_TTL.as_secs();
+    let generation = LISTING_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
+    Ok(Some((generation << 32) | (window & 0xffff_ffff)))
 }
 
 /// The artifacts of `candidates` that the download gate would refuse, so a
@@ -1369,20 +1404,7 @@ async fn listing_refusals_with(
         return Ok(refused);
     }
 
-    let presence = listing_policy_presence_cache();
-    let known = if cached {
-        presence.get(&repository_id).await
-    } else {
-        None
-    };
-    let policy_applies = match known {
-        Some(v) => v,
-        None => {
-            let v = scan_policy_applies(db, repository_id).await?;
-            presence.insert(repository_id, v).await;
-            v
-        }
-    };
+    let policy_applies = listing_policy_applies(db, repository_id, cached).await?;
     if !policy_applies {
         return Ok(refused);
     }

@@ -1143,6 +1143,63 @@ fn is_withdrawn(
     .is_err()
 }
 
+/// The rows of `ids`, visible by their quarantine fields, that a scan policy
+/// on `repo_id` blocks (#4288 item 1, #4978 item 6): the download gate
+/// answers 403 for them, so no generated index lists them.
+/// [`quarantine_service::listing_refusals`] decides, cached; a repository no
+/// enabled policy applies to costs one cached lookup. The quarantine half is
+/// already decided by the caller at the database instant, so it is not
+/// decided again here at the application's.
+///
+/// [`quarantine_service::listing_refusals`]: crate::services::quarantine_service::listing_refusals
+async fn policy_refused(
+    db: &sqlx::PgPool,
+    repo_id: uuid::Uuid,
+    ids: &[uuid::Uuid],
+) -> Result<HashSet<uuid::Uuid>, Response> {
+    if ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let candidates: Vec<crate::services::quarantine_service::ListingCandidate<'_>> = ids
+        .iter()
+        .map(|id| crate::services::quarantine_service::ListingCandidate {
+            artifact_id: *id,
+            quarantine_status: None,
+            quarantine_until: None,
+        })
+        .collect();
+    crate::services::quarantine_service::listing_refusals(db, repo_id, &candidates)
+        .await
+        .map_err(|e| {
+            tracing::error!(repo_id = %repo_id, error = %e, "conda listing: scan policy lookup failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        })
+}
+
+/// [`quarantine_service::listing_policy_epoch`] of `repo_id`: `None` when no
+/// scan policy applies to it, else the epoch its listings are cached under.
+///
+/// [`quarantine_service::listing_policy_epoch`]: crate::services::quarantine_service::listing_policy_epoch
+pub(crate) async fn listing_policy_epoch(
+    db: &sqlx::PgPool,
+    repo_id: uuid::Uuid,
+) -> Result<Option<u64>, Response> {
+    crate::services::quarantine_service::listing_policy_epoch(db, repo_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(repo_id = %repo_id, error = %e, "conda listing: scan policy lookup failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        })
+}
+
+/// Add a member's [`listing_policy_epoch`] to a merge key.
+fn policy_epoch_part(key: &mut merge_gate::MergeKeyBuilder, epoch: Option<u64>) {
+    match epoch {
+        Some(epoch) => key.part(b"policy").part(&epoch.to_le_bytes()),
+        None => key.part(b"no-policy"),
+    };
+}
+
 async fn list_conda_artifacts(
     db: &sqlx::PgPool,
     repo_id: uuid::Uuid,
@@ -1181,9 +1238,16 @@ async fn list_conda_artifacts_at(
     // bz2/zst/sig encodings, JLAP, CEP-16 shards, run_exports, channeldata)
     // is built from THIS listing, so the withdrawal filter lives here and
     // only here — one predicate, no per-endpoint copies to drift.
-    Ok(rows
+    let rows: Vec<CondaArtifactRow> = rows
         .into_iter()
         .filter(|r| !is_withdrawn(r.quarantine_status.as_deref(), r.quarantine_until, now))
+        .collect();
+    // #4288 item 1 / #4978 item 6: and nothing a scan policy blocks.
+    let ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.id).collect();
+    let refused = policy_refused(db, repo_id, &ids).await?;
+    Ok(rows
+        .into_iter()
+        .filter(|r| !refused.contains(&r.id))
         .map(|r| CondaArtifact {
             id: r.id,
             path: r.path,
@@ -3830,7 +3894,7 @@ struct MergedShardIndex {
     /// Remote names the allowlist left out; `None` when none is enforced.
     allowlist_dropped: Option<usize>,
     /// Names a hosted member owns, lower-cased.
-    owned: HashSet<String>,
+    owned: std::sync::Arc<HashSet<String>>,
     allowlist: Option<std::sync::Arc<crate::services::conda_allowlist::CompiledAllowlist>>,
 }
 
@@ -4341,7 +4405,10 @@ async fn hosted_member_revisions(
     let mut now = chrono::Utc::now();
     for id in ids {
         let state = shard_store::subdir_state(db, *id, subdir).await?;
-        if !state.backfilled {
+        // Stored shards carry no scan-policy decision (#4978 item 6): a
+        // member a policy applies to is merged from its rows, through the
+        // listing that leaves policy-blocked packages out.
+        if !state.backfilled || listing_policy_epoch(db, *id).await?.is_some() {
             return Ok(None);
         }
         now = state.now;
@@ -5431,30 +5498,98 @@ fn conda_name_from_filename(filename: &str) -> Option<&str> {
 /// impostor. Every non-deleted row counts, including withdrawn ones, because a
 /// withdrawn internal package must not hand its name to the upstream either.
 /// Fails closed: a database error is a 500, never an unguarded merge.
+///
+/// The set is kept per virtual under its hosted members' revisions (#4978
+/// item 1), so a virtual request (a shard GET included) reads one row per
+/// hosted member instead of every row of every hosted member. Every write
+/// that can move the set marks a key of its member dirty in the writer's own
+/// transaction (a row with no subdir marks the `''` key), and the member's
+/// revision moves when that key is rebuilt, which [`shard_store::member_revisions`]
+/// does before it answers. A member the catalog triggers do not cover (not a
+/// hosted conda repository) keeps the per-request read.
 async fn virtual_hosted_owned_names(
     db: &sqlx::PgPool,
     virtual_repo_id: uuid::Uuid,
-) -> Result<std::collections::HashSet<String>, Response> {
+) -> Result<std::sync::Arc<std::collections::HashSet<String>>, Response> {
     // UNFILTERED-ENFORCEMENT (#3323): this walk decides name ownership (a
     // shadowing guard), not a response body; narrowing it by caller visibility
     // would let a caller who cannot read the hosted member be offered the
     // upstream impostor.
     let members = proxy_helpers::fetch_virtual_members(db, virtual_repo_id).await?;
-    let hosted_ids: Vec<uuid::Uuid> = members
+    let hosted: Vec<&crate::models::repository::Repository> = members
         .iter()
         .filter(|m| m.repo_type != RepositoryType::Remote)
-        .map(|m| m.id)
         .collect();
-    if hosted_ids.is_empty() {
+    if hosted.is_empty() {
         return Ok(Default::default());
     }
+    let hosted_ids: Vec<uuid::Uuid> = hosted.iter().map(|m| m.id).collect();
+    let tracked = hosted.iter().all(|m| {
+        matches!(
+            m.format,
+            RepositoryFormat::Conda | RepositoryFormat::CondaNative
+        ) && matches!(m.repo_type, RepositoryType::Local | RepositoryType::Staging)
+    });
+    if !tracked {
+        return query_hosted_owned_names(db, virtual_repo_id, &hosted_ids)
+            .await
+            .map(std::sync::Arc::new);
+    }
+    let revisions = shard_store::member_revisions(db, &hosted_ids).await?;
+    let cache = owned_names_cache();
+    if let Some(kept) = cache.get(&virtual_repo_id).await {
+        if kept.0 == revisions {
+            return Ok(kept.1.clone());
+        }
+    }
+    // Read after the revisions: a write that commits in between is at most
+    // already in the set, and it moves a revision for the next request.
+    let names =
+        std::sync::Arc::new(query_hosted_owned_names(db, virtual_repo_id, &hosted_ids).await?);
+    cache
+        .insert(
+            virtual_repo_id,
+            std::sync::Arc::new((revisions, names.clone())),
+        )
+        .await;
+    Ok(names)
+}
+
+/// Owned-name sets kept per virtual, with the hosted member revisions they
+/// were read at ([`virtual_hosted_owned_names`]).
+type OwnedNames = (
+    Vec<(uuid::Uuid, i64)>,
+    std::sync::Arc<std::collections::HashSet<String>>,
+);
+
+fn owned_names_cache() -> &'static moka::future::Cache<uuid::Uuid, std::sync::Arc<OwnedNames>> {
+    static CACHE: std::sync::OnceLock<moka::future::Cache<uuid::Uuid, std::sync::Arc<OwnedNames>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        moka::future::Cache::builder()
+            // Weighed by names held; a large hosted channel owns tens of
+            // thousands of names.
+            .weigher(|_, v: &std::sync::Arc<OwnedNames>| {
+                u32::try_from(v.1.len().max(1)).unwrap_or(u32::MAX)
+            })
+            .max_capacity(2_000_000)
+            .build()
+    })
+}
+
+/// [`virtual_hosted_owned_names`]' read of the hosted members' rows.
+async fn query_hosted_owned_names(
+    db: &sqlx::PgPool,
+    virtual_repo_id: uuid::Uuid,
+    hosted_ids: &[uuid::Uuid],
+) -> Result<std::collections::HashSet<String>, Response> {
     let names: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT LOWER(COALESCE(am.metadata->>'name', a.name)) \
          FROM artifacts a \
          LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
          WHERE a.repository_id = ANY($1) AND a.is_deleted = false",
     )
-    .bind(&hosted_ids)
+    .bind(hosted_ids)
     .fetch_all(db)
     .await
     .map_err(|e| {
@@ -5588,7 +5723,7 @@ struct VirtualMergeInputs {
     /// Caller-authorized members, in priority order (#3323).
     members: Vec<crate::models::repository::Repository>,
     /// Names hosted members own (the dependency-confusion guard).
-    owned: std::collections::HashSet<String>,
+    owned: std::sync::Arc<std::collections::HashSet<String>>,
     allowlist: Option<std::sync::Arc<crate::services::conda_allowlist::CompiledAllowlist>>,
     key: merge_gate::MergeKeyBuilder,
 }
@@ -5826,9 +5961,12 @@ where
     let mut hosted_now = chrono::Utc::now();
     key.part(&(hosted_members.len() as u64).to_le_bytes());
     for (id, _) in &hosted_members {
-        let state = shard_store::subdir_state(&state.db, *id, subdir).await?;
-        hosted_now = state.now;
-        key.part(id.as_bytes()).part(&state.revision.to_le_bytes());
+        let member_state = shard_store::subdir_state(&state.db, *id, subdir).await?;
+        hosted_now = member_state.now;
+        key.part(id.as_bytes())
+            .part(&member_state.revision.to_le_bytes());
+        // #4978 item 6: a scan-policy decision moves with no revision.
+        policy_epoch_part(&mut key, listing_policy_epoch(&state.db, *id).await?);
     }
 
     let db = state.db.clone();
@@ -6085,9 +6223,12 @@ async fn build_virtual_channeldata(
     let mut hosted_now = chrono::Utc::now();
     key.part(&(hosted_members.len() as u64).to_le_bytes());
     for (id, _) in &hosted_members {
-        let state = shard_store::repo_state(&state.db, *id).await?;
-        hosted_now = state.now;
-        key.part(id.as_bytes()).part(&state.revision.to_le_bytes());
+        let member_state = shard_store::repo_state(&state.db, *id).await?;
+        hosted_now = member_state.now;
+        key.part(id.as_bytes())
+            .part(&member_state.revision.to_le_bytes());
+        // #4978 item 6: a scan-policy decision moves with no revision.
+        policy_epoch_part(&mut key, listing_policy_epoch(&state.db, *id).await?);
     }
 
     let db = state.db.clone();
