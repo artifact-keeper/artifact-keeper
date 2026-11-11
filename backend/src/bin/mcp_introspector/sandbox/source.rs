@@ -43,10 +43,9 @@ use super::SandboxError;
 
 /// The longest `registryBaseUrl` considered.
 pub const MAX_URL: usize = 2048;
-/// The longest package name and version considered.
+/// The longest package name considered (versions: `MAX_EXACT_VERSION_LEN`).
 pub const MAX_NPM_NAME: usize = 214;
 pub const MAX_PYPI_NAME: usize = 200;
-pub const MAX_VERSION: usize = 256;
 
 /// `npx`/`npm` long options (without `--`; compared in lower case, `_` read
 /// as `-`) that name a registry. `--@<scope>:registry` counts too. Refused
@@ -105,25 +104,9 @@ const CREDENTIAL_SUFFIXES: &[&[&str]] = &[
 static NPM_NAME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?i:@[a-z0-9~-][a-z0-9._~-]*/)?(?i:[a-z0-9~-][a-z0-9._~-]*)$").expect("regex")
 });
-/// SemVer 2.0.0, exactly one version, without build metadata (registry
-/// versions carry none, and npm reads `1.2.3+x.tgz` as a file).
-static SEMVER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$",
-    )
-    .expect("regex")
-});
 /// A PEP 508 project name.
 static PYPI_NAME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?i:[a-z0-9]|[a-z0-9][a-z0-9._-]*[a-z0-9])$").expect("regex"));
-/// A PEP 440 version (the `packaging` grammar), exactly one version.
-static PEP440: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"^(?i:v?([0-9]+!)?[0-9]+(\.[0-9]+)*([-_.]?(a|b|c|rc|alpha|beta|pre|preview)[-_.]?[0-9]*)?((-[0-9]+)|([-_.]?(post|rev|r)[-_.]?[0-9]*))?([-_.]?dev[-_.]?[0-9]*)?(\+[a-z0-9]+([-_.][a-z0-9]+)*)?)$",
-    )
-    .expect("regex")
-});
-
 fn invalid(field: &str, m: &str) -> SandboxError {
     SandboxError::Invalid(format!("{field}: {m}"))
 }
@@ -275,20 +258,8 @@ pub fn check_coordinates(
     let Some(v) = version.filter(|v| !v.is_empty()) else {
         return Ok(());
     };
-    let (version_ok, what) = match kind {
-        "npm" => (
-            SEMVER.is_match(v),
-            "an exact SemVer version without build metadata",
-        ),
-        _ => (PEP440.is_match(v), "an exact PEP 440 version"),
-    };
-    // npm takes a spec ending in `.tgz`/`.tar`/`.tar.gz` as a file to open.
-    let lower = v.to_ascii_lowercase();
-    let archive = [".tgz", ".tar", ".tar.gz"]
-        .iter()
-        .any(|x| lower.ends_with(x));
-    let version_ok = version_ok && v.len() <= MAX_VERSION && !archive;
-    if !version_ok {
+    // The rule publish applies (#5549), so the two cannot drift.
+    if let Err(what) = artifact_keeper_backend::formats::mcp::exact_package_version(kind, v) {
         return Err(invalid(
             "package version",
             &format!("not {what}; a range, tag, URL, path or alias is not allowed"),
@@ -764,6 +735,7 @@ mod tests {
         // Length limits: at the limit renders, one over is refused.
         let npm_at = "a".repeat(MAX_NPM_NAME);
         let pypi_at = "a".repeat(MAX_PYPI_NAME);
+        const MAX_VERSION: usize = artifact_keeper_backend::formats::mcp::MAX_EXACT_VERSION_LEN;
         let semver_at = format!("1.0.0-{}", "a".repeat(MAX_VERSION - 6));
         let pep_at = format!("1.0+{}", "a".repeat(MAX_VERSION - 4));
         for (k, ok, over) in [
