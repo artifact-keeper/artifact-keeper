@@ -4113,6 +4113,154 @@ pub fn npm_tarball(name: &str, version: &str) -> Vec<u8> {
     gz.finish().unwrap()
 }
 
+/// Peers for the #5625 tests around `artifact_id` of `repo_id` (labelled
+/// `stage=qa` by the caller): one peer per `(sync_enabled, manual)` entry,
+/// each subscribed to the repository (by hand, or by the policy) and holding
+/// the artifact (a completed push) plus an old delete a restore cancelled. The
+/// policy is scoped to all the peers and replicates only `stage=prod`.
+pub struct ManualPeerFixture {
+    pub pool: PgPool,
+    pub user_id: Uuid,
+    pub repo_id: Uuid,
+    pub artifact_id: Uuid,
+    pub policy_id: Uuid,
+    pub peers: Vec<Uuid>,
+}
+
+pub async fn setup_manual_peer_fixture(
+    pool: PgPool,
+    user_id: Uuid,
+    repo_id: Uuid,
+    artifact_id: Uuid,
+    subscriptions: &[(bool, bool)],
+) -> ManualPeerFixture {
+    let tag = Uuid::new_v4().simple().to_string();
+    let mut peers = Vec::new();
+    for _ in subscriptions {
+        peers.push(register_test_peer(&pool, "label-5625", &tag).await);
+    }
+    let policy_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO sync_policies \
+             (name, repo_selector, peer_selector, artifact_filter, precedence) \
+         VALUES ($1, $2, $3, $4, 0) RETURNING id",
+    )
+    .bind(format!("label-5625-{tag}"))
+    .bind(serde_json::json!({ "match_repos": [repo_id] }))
+    .bind(serde_json::json!({ "match_peers": peers }))
+    .bind(serde_json::json!({ "match_tags": { "stage": "prod" } }))
+    .fetch_one(&pool)
+    .await
+    .expect("policy");
+    for (peer, (enabled, manual)) in peers.iter().zip(subscriptions) {
+        sqlx::query(
+            "INSERT INTO peer_repo_subscriptions \
+                 (peer_instance_id, repository_id, sync_enabled, replication_mode, policy_id) \
+             VALUES ($1, $2, $3, 'push', $4)",
+        )
+        .bind(peer)
+        .bind(repo_id)
+        .bind(enabled)
+        .bind(if *manual { None } else { Some(policy_id) })
+        .execute(&pool)
+        .await
+        .expect("subscribe");
+        sqlx::query(
+            "INSERT INTO sync_tasks (peer_instance_id, artifact_id, task_type, status, completed_at) \
+             VALUES ($1, $2, 'push', 'completed', NOW()), \
+                    ($1, $2, 'delete', 'cancelled', NOW()) \
+             ON CONFLICT (peer_instance_id, artifact_id, task_type) DO UPDATE SET \
+                 status = EXCLUDED.status, completed_at = EXCLUDED.completed_at",
+        )
+        .bind(peer)
+        .bind(artifact_id)
+        .execute(&pool)
+        .await
+        .expect("replicated, with an old cancelled delete");
+        sqlx::query(
+            "UPDATE sync_tasks SET error_message = 'superseded by artifact restore', \
+                 retry_count = 2 \
+             WHERE peer_instance_id = $1 AND task_type = 'delete'",
+        )
+        .bind(peer)
+        .execute(&pool)
+        .await
+        .expect("stale cancelled delete");
+    }
+    ManualPeerFixture {
+        pool,
+        user_id,
+        repo_id,
+        artifact_id,
+        policy_id,
+        peers,
+    }
+}
+
+impl ManualPeerFixture {
+    /// Per peer: `(push status, delete status, delete error, delete retries)`.
+    pub async fn task_states(&self) -> Vec<(String, String, Option<String>, i32)> {
+        let mut states = Vec::new();
+        for peer in &self.peers {
+            let push: String = sqlx::query_scalar(
+                "SELECT status::TEXT FROM sync_tasks \
+                 WHERE peer_instance_id = $1 AND artifact_id = $2 AND task_type = 'push'",
+            )
+            .bind(peer)
+            .bind(self.artifact_id)
+            .fetch_one(&self.pool)
+            .await
+            .expect("push row");
+            let (delete, error, retries): (String, Option<String>, i32) = sqlx::query_as(
+                "SELECT status::TEXT, error_message, retry_count FROM sync_tasks \
+                 WHERE peer_instance_id = $1 AND artifact_id = $2 AND task_type = 'delete'",
+            )
+            .bind(peer)
+            .bind(self.artifact_id)
+            .fetch_one(&self.pool)
+            .await
+            .expect("delete row");
+            states.push((push, delete, error, retries));
+        }
+        states
+    }
+
+    pub async fn teardown(&self) {
+        let _ = sqlx::query("DELETE FROM sync_tasks WHERE peer_instance_id = ANY($1)")
+            .bind(&self.peers)
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM peer_repo_subscriptions WHERE peer_instance_id = ANY($1)")
+            .bind(&self.peers)
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM sync_policies WHERE id = $1")
+            .bind(self.policy_id)
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = ANY($1)")
+            .bind(&self.peers)
+            .execute(&self.pool)
+            .await;
+    }
+}
+
+/// The expected task states after a label write that leaves the artifact
+/// outside the policy (`stage=qa`, policy wants `stage=prod`), for peers
+/// subscribed (manual enabled, manual disabled, policy-managed).
+pub fn expected_after_label_write_5625() -> Vec<(String, String, Option<String>, i32)> {
+    let kept = (
+        "completed".to_string(),
+        "cancelled".to_string(),
+        Some("superseded by artifact restore".to_string()),
+        2,
+    );
+    vec![
+        kept.clone(),
+        kept,
+        ("completed".to_string(), "pending".to_string(), None, 0),
+    ]
+}
+
 // In a `#[cfg(test)]` module (this whole file is test-only anyway) so the
 // #1315 token-mint surface gate, which skips test modules, does not count the
 // API-token mint below as a production endpoint.
