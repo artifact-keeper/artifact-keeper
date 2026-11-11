@@ -38,7 +38,7 @@ pub const SECRET_EGRESS_PROXY: &str = "egress_proxy";
 const IMMUTABLE_FIELDS: [&str; 3] = ["format", "format_key", "repo_type"];
 
 /// Fields `apply` writes through `PATCH /api/v1/repositories/{key}`.
-const PATCH_FIELDS: [&str; 12] = [
+const PATCH_FIELDS: [&str; 13] = [
     "name",
     "description",
     "visibility",
@@ -51,6 +51,7 @@ const PATCH_FIELDS: [&str; 12] = [
     "custom_user_agent",
     "curation_enabled",
     "curation_default_action",
+    "curation_source_repository_key",
 ];
 
 /// Placeholder for a credential the export never carries. The import takes
@@ -124,6 +125,10 @@ pub struct ConfigRepository {
     pub curation_enabled: bool,
     #[serde(default = "default_curation_action")]
     pub curation_default_action: String,
+    /// Staging repositories: the key of the Remote the curation sync ingests
+    /// from (#5207). Absent means no source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curation_source_repository_key: Option<String>,
     /// Virtual repositories: member keys in resolution order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<ConfigVirtualMember>,
@@ -494,6 +499,14 @@ pub fn plan(
                 changes
             }
         };
+        if let Some(source) = &desired.curation_source_repository_key {
+            if !doc_keys.contains(source.as_str()) && !target_keys.contains(source) {
+                out.errors.push(format!(
+                    "repository {}: curation source {source} is neither in the document nor on the target",
+                    desired.key
+                ));
+            }
+        }
         for member in &desired.members {
             if !doc_keys.contains(member.key.as_str()) && !target_keys.contains(&member.key) {
                 out.errors.push(format!(
@@ -522,13 +535,21 @@ pub fn plan(
     out
 }
 
-/// The order `apply` visits repositories: every non-virtual repository, then
+/// The order `apply` visits repositories: every other repository, then the
+/// ones that name a curation source (#5207, the source must exist first), then
 /// the virtual ones (whose members must exist first), each by key.
 pub fn apply_order(doc: &ConfigDocument) -> Vec<&ConfigRepository> {
+    let rank = |r: &ConfigRepository| {
+        if r.repo_type == "virtual" {
+            2
+        } else if r.curation_source_repository_key.is_some() {
+            1
+        } else {
+            0
+        }
+    };
     let mut ordered: Vec<&ConfigRepository> = doc.repositories.iter().collect();
-    ordered.sort_by(|a, b| {
-        (a.repo_type == "virtual", &a.key).cmp(&(b.repo_type == "virtual", &b.key))
-    });
+    ordered.sort_by(|a, b| (rank(a), &a.key).cmp(&(rank(b), &b.key)));
     ordered
 }
 
@@ -657,6 +678,14 @@ pub fn patch_body(
             "curation_default_action".into(),
             desired.curation_default_action.clone().into(),
         );
+    }
+    if changed("curation_source_repository_key") {
+        // `""` removes the link (#5207).
+        let source = desired
+            .curation_source_repository_key
+            .clone()
+            .unwrap_or_default();
+        map.insert("curation_source_repository_key".into(), source.into());
     }
     for (field, value) in [
         ("promotion_only", desired.promotion_only),
@@ -1008,6 +1037,55 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// #5207: the curation source round-trips through the document. It is
+    /// written by `PATCH` (removed with `""`), a staging repository that names
+    /// one is applied after its source, and a source that is neither in the
+    /// document nor on the target fails the plan.
+    #[test]
+    fn curation_source_is_planned_patched_and_ordered_after_its_source() {
+        let mut staging: ConfigRepository = serde_json::from_value(serde_json::json!({
+            "key": "a-staging", "name": "a-staging", "format": "npm",
+            "repo_type": "staging", "visibility": "private",
+            "curation_enabled": true,
+            "curation_source_repository_key": "z-remote",
+        }))
+        .expect("staging fixture");
+        let mut current = staging.clone();
+        current.curation_source_repository_key = None;
+        let changes: BTreeSet<String> = changed_fields(&staging, &current).into_iter().collect();
+        assert_eq!(changes, keys(&["curation_source_repository_key"]));
+        let patch = patch_body(&staging, &changes, &BTreeMap::new())
+            .unwrap()
+            .expect("a PATCH");
+        assert_eq!(patch["curation_source_repository_key"], "z-remote");
+        let cleared = patch_body(&current, &changes, &BTreeMap::new())
+            .unwrap()
+            .expect("a PATCH");
+        assert_eq!(cleared["curation_source_repository_key"], "");
+
+        let d = doc(vec![staging.clone(), remote("z-remote"), remote("b")]);
+        let order: Vec<&str> = apply_order(&d).iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(order, ["b", "z-remote", "a-staging"]);
+        let p = plan(&d, &BTreeMap::new(), &BTreeSet::new(), &BTreeMap::new());
+        assert!(p.errors.is_empty(), "{:?}", p.errors);
+
+        staging.curation_source_repository_key = Some("missing".into());
+        let p = plan(
+            &doc(vec![staging]),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        assert!(
+            p.errors
+                .iter()
+                .any(|e| e.contains("curation source missing")),
+            "{:?}",
+            p.errors
+        );
+        assert!(!p.applicable);
     }
 
     #[test]

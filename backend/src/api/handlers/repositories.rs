@@ -1271,6 +1271,14 @@ pub struct CreateRepositoryRequest {
     /// `PUT /api/v1/repositories/{key}/release-target`. A non-empty value is
     /// refused with 400 rather than ignored.
     pub release_repository_key: Option<String>,
+    /// Staging repositories only: the key of the Remote repository this
+    /// staging repository's curation sync ingests from (#5207). It must be a
+    /// Remote of the same format (or the same package family: `pypi`, `poetry`
+    /// and `jupyter`; `npm`, `yarn` and `pnpm`) that the caller can read, and
+    /// the format must have a curation sync (rpm, debian, the PyPI and npm
+    /// families). Omit or send `""` for none. Read back as
+    /// `curation_source_repo_id`.
+    pub curation_source_repository_key: Option<String>,
     /// Not settable on create (#5324): enable curation with
     /// `PATCH /api/v1/repositories/{key}` after creating the repository.
     /// `true` is refused with 400 rather than ignored; `false` (the default)
@@ -1484,6 +1492,12 @@ pub struct UpdateRepositoryRequest {
     /// Pass an empty string to remove the link.
     /// Stored in `repository_config` under `release_repository_id`.
     pub release_repository_key: Option<String>,
+    /// Link this staging repository to the Remote repository its curation
+    /// sync ingests from (#5207), by key. Same rules as on create: a Remote of
+    /// the same format or package family, readable by the caller, in a format
+    /// that has a curation sync. Pass an empty string to remove the link;
+    /// omit to leave it unchanged. Stored in `curation_source_repo_id`.
+    pub curation_source_repository_key: Option<String>,
     /// Update the custom User-Agent for outbound HTTP requests to the upstream.
     /// Only valid for remote repositories. Pass an empty string to remove.
     /// Max 256 characters. Stored in `repository_config` under `custom_user_agent`.
@@ -1825,6 +1839,11 @@ pub struct RepositoryResponse {
     pub curation_enabled: bool,
     /// Stance applied when no curation rule matches: `allow` or `review`.
     pub curation_default_action: String,
+    /// Staging repositories: the Remote repository the curation sync ingests
+    /// from (#5207), set with `curation_source_repository_key`. Omitted when
+    /// none is linked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub curation_source_repo_id: Option<Uuid>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -2285,6 +2304,7 @@ fn repo_to_response(
         debian: None,
         curation_enabled: repo.curation_enabled,
         curation_default_action: repo.curation_default_action,
+        curation_source_repo_id: repo.curation_source_repo_id,
         created_at: repo.created_at,
         updated_at: repo.updated_at,
     }
@@ -4716,6 +4736,16 @@ pub async fn create_repository(
     // #5402: the Remote's upstream mode and egress proxy, validated before
     // the row exists and stored right after it, before anything else.
     let born_remote = born_remote_settings(&payload, &repo_type)?;
+    // #5207: the staging repository's curation source, resolved and checked
+    // before the row exists.
+    let curation_source = resolve_curation_source(
+        &service,
+        &auth,
+        &repo_type,
+        &format,
+        payload.curation_source_repository_key.as_deref(),
+    )
+    .await?;
 
     if let Some(ref ua) = payload.custom_user_agent {
         if repo_type != RepositoryType::Remote {
@@ -5019,6 +5049,8 @@ pub async fn create_repository(
     // Quarantine period and `virtual_metadata_partial` (#5324), validated
     // above; the same writes as `update_repository`.
     shared_config.persist(&state.db, repo.id).await?;
+    let mut repo = repo;
+    persist_curation_source(&state.db, &mut repo, curation_source).await?;
 
     if let Some(ref index_url) = payload.index_upstream_url {
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
@@ -6060,6 +6092,110 @@ fn refuse_update_only_fields_on_create(payload: &CreateRepositoryRequest) -> Res
     )))
 }
 
+/// Whether `source` may be the curation source of a staging repository of
+/// `staging_format` (#5207). Pure. The sync joins the source's
+/// `upstream_url`, so only a Remote has anything to ingest; the formats must
+/// match or share a package family, because the proxy enqueues on-demand
+/// rows under the family label and the sync walks the source as the staging
+/// repository's own format.
+pub(crate) fn validate_curation_source_link(
+    staging_type: &RepositoryType,
+    staging_format: &RepositoryFormat,
+    source: &crate::models::repository::Repository,
+) -> Result<()> {
+    if *staging_type != RepositoryType::Staging {
+        return Err(AppError::Validation(
+            "curation_source_repository_key is only valid for staging repositories".to_string(),
+        ));
+    }
+    let staging_key = staging_format.as_key();
+    if !crate::services::scheduler_service::curation_sync_supported(staging_key) {
+        return Err(AppError::Validation(format!(
+            "curation sync is not available for {staging_key} repositories (supported: \
+             rpm, debian, pypi, poetry, jupyter, npm, yarn, pnpm)"
+        )));
+    }
+    if source.repo_type != RepositoryType::Remote {
+        return Err(AppError::Validation(format!(
+            "Curation source '{}' must be a remote repository",
+            source.key
+        )));
+    }
+    let family = crate::services::scheduler_service::ondemand_curation_family;
+    let source_key = source.format.as_key();
+    let compatible = staging_key == source_key
+        || family(staging_key).is_some_and(|f| family(source_key) == Some(f));
+    if !compatible {
+        return Err(AppError::Validation(format!(
+            "Format mismatch: staging repository is {staging_key}, curation source '{}' is \
+             {source_key}",
+            source.key
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve a request's `curation_source_repository_key` (#5207): `None` when
+/// the field is absent, `Some(None)` for `""` (no source), `Some(Some(id))`
+/// for a valid source. A repository the caller cannot read answers exactly
+/// like one that does not exist, so the field cannot probe for private keys.
+async fn resolve_curation_source(
+    service: &RepositoryService,
+    auth: &AuthExtension,
+    staging_type: &RepositoryType,
+    staging_format: &RepositoryFormat,
+    requested: Option<&str>,
+) -> Result<Option<Option<Uuid>>> {
+    let source_key = match requested {
+        None => return Ok(None),
+        Some("") => return Ok(Some(None)),
+        Some(key) => key,
+    };
+    let not_found = || {
+        AppError::Validation(format!(
+            "Curation source repository '{source_key}' not found"
+        ))
+    };
+    let source = match service.get_by_key(source_key).await {
+        Ok(source) => source,
+        Err(AppError::NotFound(_)) => return Err(not_found()),
+        Err(e) => return Err(e),
+    };
+    match require_visible(&source, &Some(auth.clone()), service).await {
+        Ok(()) => {}
+        Err(AppError::NotFound(_)) => return Err(not_found()),
+        Err(e) => return Err(e),
+    }
+    validate_curation_source_link(staging_type, staging_format, &source)?;
+    Ok(Some(Some(source.id)))
+}
+
+/// Store a resolved curation source (#5207). The column has no API write
+/// besides this one; the sync and the proxy's on-demand ingest read it.
+async fn persist_curation_source(
+    db: &sqlx::PgPool,
+    repo: &mut crate::models::repository::Repository,
+    source: Option<Option<Uuid>>,
+) -> Result<()> {
+    let Some(source) = source else {
+        return Ok(());
+    };
+    sqlx::query(
+        "UPDATE repositories SET curation_source_repo_id = $2, updated_at = NOW() WHERE id = $1",
+    )
+    .bind(repo.id)
+    .bind(source)
+    .execute(db)
+    .await
+    .map_err(|e| {
+        // The migration-247 layout guard fires on this column.
+        let message = e.to_string();
+        crate::services::rpm_layout::database_error(&message).unwrap_or(AppError::Database(message))
+    })?;
+    repo.curation_source_repo_id = source;
+    Ok(())
+}
+
 /// Reject the `PATCH /repositories/{key}` fields that do not apply to this
 /// repository, or carry a bad value, before anything is written (#5201).
 /// The update handler used to check them one by one after the repository row
@@ -6352,6 +6488,15 @@ pub async fn update_repository(
             Some(Some(release_repo.id))
         }
     };
+    // #5207: resolved before the first write, stored after the main update.
+    let curation_source = resolve_curation_source(
+        &service,
+        &auth,
+        &existing.repo_type,
+        &existing.format,
+        payload.curation_source_repository_key.as_deref(),
+    )
+    .await?;
     // Debian remote proxy filter (#2460). Three-way semantics:
     //   * field omitted (`None`)      -> leave the stored config unchanged
     //   * field `null` (`Some(None)`) -> clear it (revert to full-proxy)
@@ -6492,6 +6637,8 @@ pub async fn update_repository(
     // Every field below was validated before the first write (#5201), so
     // nothing past this point answers 4xx. Shared with create (#5324).
     shared_config.persist(&state.db, repo.id).await?;
+    let mut repo = repo;
+    persist_curation_source(&state.db, &mut repo, curation_source).await?;
 
     // Release repository linking for staging repos (resolved above).
     match release_link {
@@ -19503,6 +19650,7 @@ mod tests {
             debian: None,
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            curation_source_repo_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -19565,6 +19713,7 @@ mod tests {
             debian: None,
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            curation_source_repo_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -21014,6 +21163,7 @@ mod tests {
             debian: None,
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            curation_source_repo_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -36734,6 +36884,7 @@ mod tests {
             debian: None,
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            curation_source_repo_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -38196,6 +38347,172 @@ mod tests {
         assert_eq!(reader_virtual.0, StatusCode::OK, "{reader_virtual:?}");
         assert_eq!(reader_local.0, StatusCode::BAD_REQUEST, "{reader_local:?}");
         assert_eq!(owner_virtual.0, StatusCode::OK, "{owner_virtual:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // #5207: the staging repository's curation source is settable on create
+    // and update, and validated.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_curation_source_link_cases() {
+        let source = |repo_type: RepositoryType, format: RepositoryFormat| {
+            let mut repo = sample_repo();
+            repo.key = "src".to_string();
+            repo.repo_type = repo_type;
+            repo.format = format;
+            repo
+        };
+        let check = |staging_type: RepositoryType,
+                     staging_format: RepositoryFormat,
+                     source: &crate::models::repository::Repository| {
+            validate_curation_source_link(&staging_type, &staging_format, source)
+        };
+        use RepositoryFormat::{Debian, Maven, Npm, Poetry, Pypi, Rpm, Yarn};
+        use RepositoryType::{Local, Remote, Staging, Virtual};
+        // Accepted: same format, or the same on-demand family.
+        for (staging, src) in [(Rpm, Rpm), (Debian, Debian), (Poetry, Pypi), (Yarn, Npm)] {
+            let result = check(Staging, staging.clone(), &source(Remote, src.clone()));
+            assert!(result.is_ok(), "{staging:?} <- {src:?}: {result:?}");
+        }
+        let refused = [
+            // Only a staging repository has a curation source.
+            (Local, Rpm, source(Remote, Rpm), "only valid for staging"),
+            // The source must be a Remote: the sync reads its upstream URL.
+            (Staging, Rpm, source(Local, Rpm), "must be a remote"),
+            (Staging, Npm, source(Virtual, Npm), "must be a remote"),
+            (Staging, Rpm, source(Remote, Debian), "Format mismatch"),
+            (Staging, Pypi, source(Remote, Npm), "Format mismatch"),
+            // No curation sync exists for the format.
+            (
+                Staging,
+                Maven,
+                source(Remote, Maven),
+                "not available for maven",
+            ),
+        ];
+        for (staging_type, staging_format, src, want) in refused {
+            match check(staging_type.clone(), staging_format.clone(), &src) {
+                Err(AppError::Validation(msg)) => assert!(msg.contains(want), "{msg}"),
+                other => panic!("{staging_type:?}/{staging_format:?}: {other:?}"),
+            }
+        }
+    }
+
+    /// Create and PATCH set, read back and clear the source; a missing, an
+    /// unreadable and an incompatible source are refused with 400, the
+    /// unreadable one exactly like the missing one, and leave it unchanged.
+    #[tokio::test]
+    async fn test_curation_source_set_on_create_and_update_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin, admin_name) = tdh::create_user(&pool).await;
+        let (owner, owner_name) = tdh::create_user(&pool).await;
+        let (remote_id, remote_key, storage_dir) = tdh::create_repo(&pool, "remote", "rpm").await;
+        let (deb_id, deb_key, _) = tdh::create_repo(&pool, "remote", "debian").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let stored = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<Uuid>>(
+                    "SELECT curation_source_repo_id FROM repositories WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("read curation source")
+            }
+        };
+
+        let staging_key = format!("s5207-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(admin, &admin_name))),
+            make_create_request(
+                &staging_key,
+                "staging",
+                "rpm",
+                serde_json::json!({
+                    "repo_type": "staging",
+                    "curation_source_repository_key": remote_key,
+                }),
+            ),
+        )
+        .await
+        .expect("create a staging repository with a curation source");
+        assert_eq!(created.curation_source_repo_id, Some(remote_id));
+        assert_eq!(stored(created.id).await, Some(remote_id));
+        tdh::grant_repo_role(&pool, created.id, owner, "repository-owner").await;
+
+        let patch = |auth: AuthExtension, body: serde_json::Value| {
+            update_repository(
+                State(state.clone()),
+                Extension(Some(auth)),
+                Path(staging_key.clone()),
+                Json(serde_json::from_value(body).expect("update payload")),
+            )
+        };
+        // The repository owner cannot read the private debian Remote: refused
+        // with the same message as a key that names nothing.
+        let refusals = [
+            (admin_auth(admin, &admin_name), "no-such-remote".to_string()),
+            (tdh::make_auth(owner, &owner_name), remote_key.clone()),
+            (admin_auth(admin, &admin_name), deb_key.clone()),
+        ];
+        sqlx::query("UPDATE repositories SET visibility = 'private' WHERE id = $1")
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .expect("make the remote private");
+        let mut messages = Vec::new();
+        for (auth, key) in refusals {
+            let body = serde_json::json!({ "curation_source_repository_key": key });
+            match patch(auth, body).await {
+                Err(AppError::Validation(msg)) => messages.push(msg),
+                other => panic!("source {key}: expected 400, got {other:?}"),
+            }
+            assert_eq!(stored(created.id).await, Some(remote_id), "{key}");
+        }
+        assert_eq!(
+            messages[0].replace("no-such-remote", &remote_key),
+            messages[1],
+            "an unreadable source must answer like a missing one"
+        );
+        assert!(messages[2].contains("Format mismatch"), "{}", messages[2]);
+
+        let Json(cleared) = patch(
+            admin_auth(admin, &admin_name),
+            serde_json::json!({ "curation_source_repository_key": "" }),
+        )
+        .await
+        .expect("clear the curation source");
+        assert_eq!(cleared.curation_source_repo_id, None);
+        assert_eq!(stored(created.id).await, None);
+        let Json(relinked) = patch(
+            admin_auth(admin, &admin_name),
+            serde_json::json!({ "curation_source_repository_key": remote_key }),
+        )
+        .await
+        .expect("link the curation source");
+        assert_eq!(relinked.curation_source_repo_id, Some(remote_id));
+        // Omitting the field leaves the link alone.
+        let Json(untouched) = patch(
+            admin_auth(admin, &admin_name),
+            serde_json::json!({ "name": "renamed" }),
+        )
+        .await
+        .expect("unrelated update");
+        assert_eq!(untouched.curation_source_repo_id, Some(remote_id));
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![created.id, remote_id, deb_id])
+            .execute(&pool)
+            .await;
+        for user in [admin, owner] {
+            tdh::cleanup_user(&pool, user).await;
+        }
     }
 }
 
