@@ -1244,9 +1244,9 @@ pub struct CreateRepositoryRequest {
     /// Stored in `repository_config` under `quarantine_duration_minutes`.
     pub quarantine_duration_minutes: Option<i64>,
     /// Virtual repositories only: serve a partial metadata merge instead of
-    /// a 502 when a member fails (#4192); see
-    /// `UpdateRepositoryRequest.virtual_metadata_partial`. Refused (400) on
-    /// any other repository type.
+    /// a 502 when a member answers with a metadata document that cannot be
+    /// read (#4192); see `UpdateRepositoryRequest.virtual_metadata_partial`.
+    /// Refused (400) on any other repository type.
     pub virtual_metadata_partial: Option<bool>,
     /// Remote repositories only: the upstream mode the repository is born
     /// with (#5402), `online` (the default) or `cache_only`. The same value
@@ -1502,13 +1502,19 @@ pub struct UpdateRepositoryRequest {
     /// Only valid for remote repositories. Pass an empty string to remove.
     /// Max 256 characters. Stored in `repository_config` under `custom_user_agent`.
     pub custom_user_agent: Option<String>,
-    /// Virtual repositories only: when a member's metadata cannot be fetched
-    /// or parsed, serve the merge of the members that succeeded (marked with
+    /// Virtual repositories only: when a member answers with a metadata
+    /// document that cannot be parsed (or, for conda, decoded or held under
+    /// the member ceiling), serve the merge of the other members (marked with
     /// `X-AK-Partial-Members` and `Cache-Control: no-store`) instead of
     /// failing with 502. Defaults to `false` (strict). Honoured by every
     /// virtual metadata merge: conda channels and the merged indexes of Helm,
-    /// CRAN, Hex and Bazel virtuals (#4192). Stored in `repository_config`
-    /// under `virtual_metadata_partial`.
+    /// CRAN, Hex, Puppet and Bazel virtuals (#4192). A member that is
+    /// unavailable (upstream 5xx, transport failure, the member deadline) is
+    /// left out and the merge marked partial whatever this is set to, or a
+    /// 503 with `Retry-After` when no member answered; a member answering a
+    /// permanent 4xx contributes nothing (#5621). Stored in
+    /// `repository_config` under `virtual_metadata_partial`; read back in
+    /// `RepositoryResponse.virtual_metadata_partial`.
     pub virtual_metadata_partial: Option<bool>,
     /// Assign this repository to a project (#2472), or take it out of one
     /// (#4026). Three-way semantics via `Option<Option<Uuid>>`: omit the field
@@ -1755,6 +1761,14 @@ pub struct RepositoryResponse {
     /// `repository_config` (#1770 B). `None` when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quarantine_duration_minutes: Option<i64>,
+    /// Virtual repositories only (#5621): whether the virtual serves a
+    /// partial metadata merge, instead of a 502, when a member answers with
+    /// a document that cannot be read (#4192); see
+    /// `UpdateRepositoryRequest.virtual_metadata_partial`. Always present on
+    /// a virtual repository (`false` when never set), omitted on every
+    /// other type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub virtual_metadata_partial: Option<bool>,
     /// Custom User-Agent used for outbound HTTP requests to the upstream,
     /// read back from `repository_config`. `None` when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2285,6 +2299,7 @@ fn repo_to_response(
         // db-less, mirroring `upstream_auth_*` above (#1770 B).
         quarantine_enabled: None,
         quarantine_duration_minutes: None,
+        virtual_metadata_partial: None,
         custom_user_agent: None,
         apt_origin: None,
         apt_label: None,
@@ -2342,6 +2357,21 @@ async fn with_quarantine_settings(
     }
     response.quarantine_enabled = enabled;
     response.quarantine_duration_minutes = duration;
+    response
+}
+
+/// Populate `RepositoryResponse.virtual_metadata_partial` (#5621): the stored
+/// opt-in on a virtual repository, read exactly as the merges read it, so
+/// `false` when unset; left `None` on every other type.
+async fn with_virtual_metadata_partial(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    mut response: RepositoryResponse,
+) -> RepositoryResponse {
+    if response.repo_type == RepositoryType::Virtual.as_str() {
+        response.virtual_metadata_partial =
+            Some(proxy_helpers::virtual_metadata_partial_allowed(db, repo_id).await);
+    }
     response
 }
 
@@ -4614,6 +4644,27 @@ pub async fn list_repositories(
         }
     }
 
+    // #5621: the virtuals' partial-merge opt-in, batched like the rows above.
+    let mut partial_opt_in: std::collections::HashMap<Uuid, bool> =
+        std::collections::HashMap::new();
+    if !repo_ids.is_empty() {
+        for (id, value) in sqlx::query_as::<_, (Uuid, Option<String>)>(
+            "SELECT repository_id, value FROM repository_config \
+             WHERE repository_id = ANY($1) AND key = $2",
+        )
+        .bind(&repo_ids)
+        .bind(proxy_helpers::VIRTUAL_METADATA_PARTIAL_CONFIG_KEY)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        {
+            partial_opt_in.insert(
+                id,
+                proxy_helpers::virtual_metadata_partial_opted_in(value.as_deref()),
+            );
+        }
+    }
+
     let depth_settings = rpm_layout::settings(&state.db, &repo_ids).await?;
     let mut repodata_modes = rpm_repodata_builder::modes(&state.db, &repo_ids).await?;
     let items: Vec<RepositoryResponse> = repos
@@ -4632,6 +4683,10 @@ pub async fn list_repositories(
                 resp.repodata_depth_editable = editable;
             }
             resp.repodata_mode = repodata_modes.remove(&resp.id);
+            if resp.repo_type == RepositoryType::Virtual.as_str() {
+                resp.virtual_metadata_partial =
+                    Some(partial_opt_in.get(&resp.id).copied().unwrap_or(false));
+            }
             resp
         })
         .collect();
@@ -5276,7 +5331,8 @@ pub async fn create_repository(
     let response = repo_to_display_response(repo, storage);
     // Echo the stored quarantine settings (#5324), read back exactly as GET
     // and PATCH do.
-    let mut response = with_quarantine_settings(&state.db, repo_id, response).await;
+    let response = with_quarantine_settings(&state.db, repo_id, response).await;
+    let mut response = with_virtual_metadata_partial(&state.db, repo_id, response).await;
     if let Some(ref at) = payload.upstream_auth_type {
         response.upstream_auth_type = Some(at.clone());
         response.upstream_auth_configured = true;
@@ -5372,6 +5428,7 @@ pub async fn get_repository(
     response.upstream_auth_configured = auth_type.is_some();
     response.upstream_auth_type = auth_type;
     let response = with_quarantine_settings(&state.db, repo_id, response).await;
+    let response = with_virtual_metadata_partial(&state.db, repo_id, response).await;
     let response = with_custom_user_agent(&state.db, repo_id, response).await;
     let response = if is_apt_hosted {
         with_apt_settings(&state.db, repo_id, response).await
@@ -6761,7 +6818,8 @@ pub async fn update_repository(
     let is_apt_hosted =
         repo.repo_type.is_hosted() && matches!(repo.format, RepositoryFormat::Debian);
     let response = repo_to_display_response(repo, storage_used);
-    let mut response = with_quarantine_settings(&state.db, repo_id, response).await;
+    let response = with_quarantine_settings(&state.db, repo_id, response).await;
+    let mut response = with_virtual_metadata_partial(&state.db, repo_id, response).await;
     if let Some(ref ua) = payload.custom_user_agent {
         response.custom_user_agent = if ua.is_empty() {
             None
@@ -19834,6 +19892,7 @@ mod tests {
             allow_public_with_upstream_credentials: false,
             quarantine_enabled: None,
             quarantine_duration_minutes: None,
+            virtual_metadata_partial: None,
             custom_user_agent: None,
             project_id: None,
             apt_origin: None,
@@ -19897,6 +19956,7 @@ mod tests {
             allow_public_with_upstream_credentials: false,
             quarantine_enabled: None,
             quarantine_duration_minutes: None,
+            virtual_metadata_partial: None,
             custom_user_agent: None,
             project_id: None,
             apt_origin: None,
@@ -21347,6 +21407,7 @@ mod tests {
             allow_public_with_upstream_credentials: false,
             quarantine_enabled: Some(true),
             quarantine_duration_minutes: Some(525600),
+            virtual_metadata_partial: None,
             custom_user_agent: None,
             project_id: None,
             apt_origin: None,
@@ -36337,6 +36398,102 @@ mod tests {
         assert_eq!(local_value, None);
     }
 
+    /// DB-backed (#5621): `virtual_metadata_partial` set through PUT reads
+    /// back through GET, the listing and the update's own echo; a virtual
+    /// that never set it reads `false`, and a non-virtual omits the field.
+    #[tokio::test]
+    async fn test_virtual_metadata_partial_reads_back_5621_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, Query, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (local_id, local_key, storage_dir) = tdh::create_repo(&pool, "local", "helm").await;
+        let (virtual_id, virtual_key, _vdir) = tdh::create_repo(&pool, "virtual", "helm").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let admin = || Extension(Some(admin_auth(user_id, &username)));
+        let read = |key: String| {
+            let state = state.clone();
+            let auth = admin();
+            async move {
+                get_repository(State(state), auth, Path(key))
+                    .await
+                    .expect("GET repository")
+                    .0
+                    .virtual_metadata_partial
+            }
+        };
+        let listed = |key: String| {
+            let state = state.clone();
+            let auth = admin();
+            async move {
+                let query = ListRepositoriesQuery {
+                    page: Some(1),
+                    per_page: Some(100),
+                    format: None,
+                    repo_type: None,
+                    q: Some(key.clone()),
+                    project: None,
+                };
+                list_repositories(State(state), auth, Query(query))
+                    .await
+                    .expect("list repositories")
+                    .0
+                    .items
+                    .into_iter()
+                    .find(|r| r.key == key)
+                    .expect("the repository is listed")
+                    .virtual_metadata_partial
+            }
+        };
+
+        let unset = read(virtual_key.clone()).await;
+        let local = read(local_key.clone()).await;
+        let local_json = serde_json::to_string(
+            &get_repository(State(state.clone()), admin(), Path(local_key.clone()))
+                .await
+                .expect("GET local")
+                .0,
+        )
+        .expect("serialize");
+        let Json(echo) = update_repository(
+            State(state.clone()),
+            admin(),
+            Path(virtual_key.clone()),
+            Json(
+                serde_json::from_str::<UpdateRepositoryRequest>(
+                    r#"{"virtual_metadata_partial":true}"#,
+                )
+                .expect("update payload"),
+            ),
+        )
+        .await
+        .expect("a virtual repository accepts virtual_metadata_partial");
+        let after = read(virtual_key.clone()).await;
+        let in_list = listed(virtual_key.clone()).await;
+        let local_in_list = listed(local_key.clone()).await;
+
+        tdh::cleanup(&pool, virtual_id, user_id).await;
+        tdh::cleanup(&pool, local_id, user_id).await;
+
+        assert_eq!(
+            unset,
+            Some(false),
+            "a virtual that never set it reads false"
+        );
+        assert_eq!(echo.virtual_metadata_partial, Some(true), "PUT echoes it");
+        assert_eq!(after, Some(true), "GET reads back what PUT stored");
+        assert_eq!(in_list, Some(true), "the listing reports it too");
+        assert_eq!(local, None);
+        assert_eq!(local_in_list, None);
+        assert!(
+            !local_json.contains("virtual_metadata_partial"),
+            "omitted on a non-virtual repository: {local_json}"
+        );
+    }
+
     /// DB-backed: the hosted types are untouched — enabling quarantine on a
     /// Local and on a Staging repository still stores the setting and echoes it
     /// back.
@@ -37068,6 +37225,7 @@ mod tests {
             allow_public_with_upstream_credentials: false,
             quarantine_enabled: None,
             quarantine_duration_minutes: None,
+            virtual_metadata_partial: None,
             custom_user_agent: None,
             project_id: None,
             apt_origin: None,

@@ -1292,6 +1292,29 @@ pub async fn proxy_fetch_capped_budgeted(
     Ok((content, content_type, permit))
 }
 
+/// [`proxy_fetch_capped_budgeted`] that also reports the #4581 stale marker
+/// (the instant the body's freshness lapsed when it is served under the
+/// `stale-if-error` grace) in place of the `Content-Type`, for a handler that
+/// builds its own response from the bytes and must still mark it stale with
+/// [`apply_stale_markers`] (#5616).
+pub async fn proxy_fetch_capped_budgeted_stale(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+    format: RepositoryFormat,
+) -> Result<(Bytes, Option<DateTime<Utc>>, OwnedSemaphorePermit), Response> {
+    let permit = proxy_metadata_budget().reserve(max).await;
+    let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
+    let body = proxy_service
+        .fetch_artifact_capped_with_encoding(&repo, path, max)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, path, e))?;
+    Ok((body.content, body.stale_since, permit))
+}
+
 /// POST a JSON metadata request without using the proxy cache, while reserving
 /// the caller-declared whole-request working set against the shared
 /// buffered-metadata budget. Protocols such as the VS Code gallery key
@@ -4506,11 +4529,11 @@ pub async fn within_virtual_member_deadline<F: std::future::Future>(
         .map_err(|_| deadline)
 }
 
-/// [`proxy_fetch_capped_budgeted`] for one virtual member's metadata, bounded
-/// by the member deadline (#4508). The budget reservation is waited for
-/// first and only the upstream fetch is timed, so a saturated buffered-metadata
-/// budget is never reported as the member being down. `Err` carries the
-/// deadline the fetch missed.
+/// [`proxy_fetch_capped_budgeted_stale`] for one virtual member's metadata,
+/// bounded by the member deadline (#4508). The budget reservation is waited
+/// for first and only the upstream fetch is timed, so a saturated
+/// buffered-metadata budget is never reported as the member being down.
+/// `Err` carries the deadline the fetch missed.
 pub async fn member_metadata_fetch_capped_budgeted(
     proxy_service: &ProxyService,
     repo_id: Uuid,
@@ -4519,14 +4542,18 @@ pub async fn member_metadata_fetch_capped_budgeted(
     path: &str,
     max: usize,
     format: RepositoryFormat,
-) -> Result<Result<(Bytes, Option<String>, OwnedSemaphorePermit), Response>, std::time::Duration> {
+) -> Result<
+    Result<(Bytes, Option<DateTime<Utc>>, OwnedSemaphorePermit), Response>,
+    std::time::Duration,
+> {
     let permit = proxy_metadata_budget().reserve(max).await;
     let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
-    let fetched =
-        within_virtual_member_deadline(proxy_service.fetch_artifact_capped(&repo, path, max))
-            .await?;
+    let fetched = within_virtual_member_deadline(
+        proxy_service.fetch_artifact_capped_with_encoding(&repo, path, max),
+    )
+    .await?;
     Ok(fetched
-        .map(|(content, content_type)| (content, content_type, permit))
+        .map(|body| (body.content, body.stale_since, permit))
         .map_err(|e| map_proxy_error(repo_key, path, e)))
 }
 
@@ -4539,14 +4566,14 @@ pub fn virtual_member_deadline_reason(path: &str, deadline: std::time::Duration)
     )
 }
 
-/// The 502 a virtual metadata request answers when `member` misses the
-/// member deadline (#4508): fail promptly and name the member, instead of
-/// holding the request for the upstream's own timeout.
-pub fn virtual_member_deadline_response(
+/// Count and log `member` missing the member deadline (#4508) on `path`.
+/// Shared by [`virtual_member_deadline_response`] and the merges that step
+/// past such a member instead of failing (#5621).
+pub fn record_virtual_member_deadline_miss(
     member: &str,
     path: &str,
     deadline: std::time::Duration,
-) -> Response {
+) {
     metrics::counter!(
         "ak_virtual_member_metadata_timeouts_total",
         "member" => member.to_string(),
@@ -4558,6 +4585,17 @@ pub fn virtual_member_deadline_response(
         deadline_secs = deadline.as_secs_f64(),
         "virtual member did not answer a metadata fetch within the member deadline"
     );
+}
+
+/// The 502 a virtual metadata request answers when `member` misses the
+/// member deadline (#4508): fail promptly and name the member, instead of
+/// holding the request for the upstream's own timeout.
+pub fn virtual_member_deadline_response(
+    member: &str,
+    path: &str,
+    deadline: std::time::Duration,
+) -> Response {
+    record_virtual_member_deadline_miss(member, path, deadline);
     (
         StatusCode::BAD_GATEWAY,
         format!(
@@ -4569,9 +4607,18 @@ pub fn virtual_member_deadline_response(
 }
 
 /// `repository_config` key on a VIRTUAL repository that opts it into degraded
-/// metadata merges (#4192): `true` serves the merge of the members that
-/// succeeded, marked partial and uncacheable. Absent or anything else:
-/// strict, i.e. any member failure fails the request with 502. Shared by
+/// metadata merges when a member's document cannot be READ (#4192, #5621):
+/// `true` serves the merge of the other members, marked partial and
+/// uncacheable, when a member answered with a document that does not parse
+/// (or, for conda, does not decode or exceeds the member ceiling). Absent or
+/// anything else: strict, i.e. such a member fails the request with 502.
+///
+/// A member that is UNAVAILABLE (an upstream 5xx, a transport failure or
+/// timeout, the member deadline) is stepped past regardless of this key
+/// (#5621): the merge of the members that answered is served marked
+/// partial, or a `503` with `Retry-After` when no member contributed. A
+/// member answering a permanent 4xx (404, 401, 403, 451, ...) is a miss and
+/// contributes nothing, as in the artifact walk (#5504). Shared by
 /// [`collect_virtual_metadata`] and the conda virtual merge.
 pub const VIRTUAL_METADATA_PARTIAL_CONFIG_KEY: &str = "virtual_metadata_partial";
 
@@ -4636,6 +4683,16 @@ pub struct VirtualMemberFailure {
     pub reason: String,
 }
 
+impl VirtualMemberFailure {
+    /// Whether the member could not answer (`fetch`, `timeout`), as opposed
+    /// to answering with a document that does not parse (#5621). An
+    /// unavailable member is stepped past and the merge served partial; a
+    /// `parse` failure is strict unless the virtual opted in (#4192).
+    pub fn is_unavailable(&self) -> bool {
+        self.kind != "parse"
+    }
+}
+
 /// The members a merged metadata document left out, when the virtual opted
 /// into partial merges (#4192). Empty for a complete merge.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -4643,6 +4700,12 @@ pub struct VirtualMemberFailure {
 pub struct PartialMerge(Option<String>);
 
 impl PartialMerge {
+    /// A merge that left out `members` (none: a complete merge).
+    pub fn of_members<'a>(members: impl IntoIterator<Item = &'a str>) -> Self {
+        let missing = members.into_iter().collect::<Vec<_>>().join(",");
+        Self((!missing.is_empty()).then_some(missing))
+    }
+
     /// The comma-separated member keys left out, if any.
     pub fn missing(&self) -> Option<&str> {
         self.0.as_deref()
@@ -4674,14 +4737,17 @@ pub struct VirtualMetadata<T> {
 }
 
 /// Count every member failure and turn the outcome into what the virtual's
-/// policy calls for (#4192): nothing missing, a partial merge naming the
-/// members (opted in), or the strict 502 naming each member and its cause.
+/// policy calls for (#4192, #5621): nothing missing; a partial merge naming
+/// the members; the strict 502 naming each member and its cause when a
+/// member's document did not parse and the virtual did not opt in; or the
+/// retryable 503 when nothing `contributed` and a member was unavailable.
 async fn apply_virtual_member_failures(
     db: &PgPool,
     virtual_repo_id: Uuid,
     format: &str,
     path: &str,
     failed: &[VirtualMemberFailure],
+    contributed: bool,
 ) -> Result<PartialMerge, Response> {
     if failed.is_empty() {
         return Ok(PartialMerge::default());
@@ -4713,25 +4779,30 @@ async fn apply_virtual_member_failures(
             "virtual member could not contribute to the merged metadata document"
         );
     }
-    if allow_partial {
-        return Ok(PartialMerge(Some(
-            failed
-                .iter()
-                .map(|f| f.member.as_str())
-                .collect::<Vec<_>>()
-                .join(","),
-        )));
+    // A member whose document does not parse is strict unless the virtual
+    // opted in (#4192): it answered, and will answer the same way again.
+    if !allow_partial && failed.iter().any(|f| !f.is_unavailable()) {
+        let detail = failed
+            .iter()
+            .filter(|f| !f.is_unavailable())
+            .map(|f| format!("member '{}' failed: {}", f.member, f.reason))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Virtual repository '{virtual_key}' cannot serve {path}: {detail}"),
+        )
+            .into_response());
     }
-    let detail = failed
-        .iter()
-        .map(|f| format!("member '{}' failed: {}", f.member, f.reason))
-        .collect::<Vec<_>>()
-        .join("; ");
-    Err((
-        StatusCode::BAD_GATEWAY,
-        format!("Virtual repository '{virtual_key}' cannot serve {path}: {detail}"),
-    )
-        .into_response())
+    // Nothing to serve and a member that could not answer (#5621): "no such
+    // document" is unknowable, so the client is told to retry, as the
+    // artifact walk does (#5504), never handed an empty index it would cache.
+    if !contributed && failed.iter().any(VirtualMemberFailure::is_unavailable) {
+        return Err(member_unavailable_response());
+    }
+    Ok(PartialMerge::of_members(
+        failed.iter().map(|f| f.member.as_str()),
+    ))
 }
 
 /// Collect metadata from ALL remote members of a virtual repository.
@@ -4742,16 +4813,23 @@ async fn apply_virtual_member_failures(
 /// must be combined (cran PACKAGES, helm index, hex names/versions, bazel
 /// module metadata).
 ///
-/// A member that fails to fetch or whose document does not extract fails the
-/// merge loudly (#4192): by default the request is a 502 naming each failed
-/// member and the cause, because a merged index that silently lacks a member
-/// makes the client conclude its packages do not exist (or resolve a name
-/// present in two members to the lower-priority one). A virtual that opted in
-/// through [`VIRTUAL_METADATA_PARTIAL_CONFIG_KEY`] gets the merge of the
-/// members that succeeded and a [`PartialMerge`] the caller marks on its
-/// response. Either way each failure counts in
-/// `ak_virtual_member_metadata_failures_total`. A member that answers 404
-/// publishes no such document: it contributes nothing and is not a failure.
+/// Member outcomes (#4192, #5621), each failure counted in
+/// `ak_virtual_member_metadata_failures_total`:
+/// - A member that answers 404 or any other permanent 4xx (401, 403, 451,
+///   as [`crate::services::proxy_service::classify_member_fetch_failure`]
+///   reads it, #5504) publishes no document for this caller: it contributes
+///   nothing and is not a failure.
+/// - A member that is unavailable (an upstream 5xx, a transport failure or
+///   timeout, the member deadline) is stepped past: the merge of the members
+///   that answered is served with a [`PartialMerge`] the caller marks on its
+///   response, so it is never cached as the complete index. When no member
+///   contributed (no Remote document and no hosted member) the request is a
+///   `503` with `Retry-After` instead of an empty index.
+/// - A member whose document does not extract fails the merge loudly with a
+///   502 naming it, unless the virtual opted in through
+///   [`VIRTUAL_METADATA_PARTIAL_CONFIG_KEY`]; then it is left out like an
+///   unavailable member.
+///
 /// Members the caller may not read are not members here at all (#3323).
 ///
 /// Deliberately DROPS the upstream `Content-Encoding` (#3260): every `extract`
@@ -4837,13 +4915,24 @@ where
                         ),
                     ),
                 },
-                // The member publishes no such document: nothing to merge,
-                // and nothing missing from the merge either.
-                Err(response) if response.status() == StatusCode::NOT_FOUND => None,
-                Err(response) => fail(
+                // A transient failure (#5504): the member may publish the
+                // document, so the merge is partial without it.
+                Err(response) if is_member_unavailable_response(&response) => fail(
                     "fetch",
                     format!("{path}: upstream fetch failed with {}", response.status()),
                 ),
+                // A 404 or other permanent answer (401/403/451, #5621): the
+                // member publishes no such document for us, so there is
+                // nothing to merge and nothing missing from the merge.
+                Err(response) => {
+                    tracing::debug!(
+                        member = %member.key,
+                        path = %path,
+                        status = %response.status(),
+                        "virtual member has no document to contribute (permanent answer)"
+                    );
+                    None
+                }
             }
         }))
         .await;
@@ -4855,7 +4944,15 @@ where
         }
     }
 
-    let partial = apply_virtual_member_failures(db, virtual_repo_id, format, path, &failed).await?;
+    // A hosted member always answers (with whatever it holds), so with one in
+    // the set the caller has something to serve.
+    let contributed = !documents.is_empty()
+        || members
+            .iter()
+            .any(|m| m.repo_type != RepositoryType::Remote);
+    let partial =
+        apply_virtual_member_failures(db, virtual_repo_id, format, path, &failed, contributed)
+            .await?;
     Ok(VirtualMetadata { documents, partial })
 }
 
