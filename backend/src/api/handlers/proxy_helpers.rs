@@ -11277,6 +11277,46 @@ pub(crate) fn stored_verdict_blocks_under_gate(
     }
 }
 
+/// Audit and count a pull refused on a stored `vulnerable` verdict by a serve
+/// path outside [`gate_proxy_scan_serve`] (#4987): a conda `.sigs` sidecar
+/// following its package, NuGet's digest-pinned row repair, an OCI blob
+/// re-block. The same `PROXY_SCAN_BLOCKED` row (aggregated per window) and
+/// `ak_proxy_scan_verdicts_total{verdict="vulnerable",action="blocked"}`
+/// count the gate writes for its own 403, so a refusal is visible the same
+/// way whichever path made it. `path` is the file the 403 names; `digest` the
+/// verdict's digest (bare hex, a `sha256:` prefix is dropped). Must be called
+/// on the request's own task (see [`record_proxy_scan_blocked`]).
+///
+/// [`record_proxy_scan_blocked`]: crate::services::audit_service::record_proxy_scan_blocked
+pub(crate) fn note_stored_verdict_block(
+    db: &PgPool,
+    repository_id: Uuid,
+    path: &str,
+    digest: &str,
+) {
+    crate::services::metrics_service::record_proxy_scan_verdict("vulnerable", "blocked");
+    crate::services::audit_service::record_proxy_scan_blocked(
+        db,
+        crate::services::audit_service::ProxyScanBlockEvent {
+            repository_id,
+            path: path.to_string(),
+            checksum_sha256: digest.strip_prefix("sha256:").unwrap_or(digest).to_string(),
+        },
+    );
+}
+
+/// [`scan_blocked_response`] for `filename`, after
+/// [`note_stored_verdict_block`] (#4987).
+pub(crate) fn audited_scan_blocked_response(
+    db: &PgPool,
+    repository_id: Uuid,
+    filename: &str,
+    digest: &str,
+) -> Response {
+    note_stored_verdict_block(db, repository_id, filename, digest);
+    scan_blocked_response(filename)
+}
+
 /// Whether a STORED `vulnerable` verdict for `digest` refuses a pull under
 /// `severity_gate` (#4102), without fetching or scanning anything: for a
 /// serve path whose bytes are already pinned to a known digest (NuGet's

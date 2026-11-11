@@ -9625,9 +9625,10 @@ async fn proxy_sidecar(
 /// refuses under record-only), the sidecar is refused with the package's
 /// `scan_blocked` body. With no cached package or no verdict yet there is
 /// nothing to follow, and the sidecar is served; the package download itself
-/// is gated.
+/// is gated. A refusal is audited and counted as the gate's own is (#4987).
 async fn sidecar_blocked_by_package_verdict(
     state: &SharedState,
+    repo_id: uuid::Uuid,
     repo_key: &str,
     policy: Option<proxy_helpers::MemberScanPolicy>,
     subdir: &str,
@@ -9659,7 +9660,12 @@ async fn sidecar_blocked_by_package_verdict(
         digest = %cached.checksum_sha256,
         "refusing a conda attestation sidecar: its package has a blocking scan verdict"
     );
-    Some(proxy_helpers::scan_blocked_response(filename))
+    Some(proxy_helpers::audited_scan_blocked_response(
+        &state.db,
+        repo_id,
+        filename,
+        &cached.checksum_sha256,
+    ))
 }
 
 /// `GET /conda/{repo}/{subdir}/{file}.sigs[.<sha256>]` (CEP-50).
@@ -9684,9 +9690,10 @@ async fn serve_sidecar(
     if repo.repo_type == RepositoryType::Remote {
         // #4585: the sidecar follows its package's verdict.
         let policy = proxy_helpers::remote_scan_policy(&state.db, repo.id).await?;
-        if let Some(blocked) =
-            sidecar_blocked_by_package_verdict(state, &repo.key, policy, subdir, filename, &request)
-                .await
+        if let Some(blocked) = sidecar_blocked_by_package_verdict(
+            state, repo.id, &repo.key, policy, subdir, filename, &request,
+        )
+        .await
         {
             return Err(blocked);
         }
@@ -9724,6 +9731,7 @@ async fn serve_sidecar(
                 }
                 if let Some(blocked) = sidecar_blocked_by_package_verdict(
                     state,
+                    member.id,
                     &member.key,
                     policy,
                     subdir,
@@ -25129,6 +25137,45 @@ mod scan_on_proxy_tests {
         assert_eq!(clean_sigs, StatusCode::OK);
         assert_eq!(&clean_sigs_body[..], b"[]");
         assert_eq!(recorded_sigs, StatusCode::OK);
+    }
+
+    /// #4987: a sidecar refused on its package's verdict leaves the same
+    /// `PROXY_SCAN_BLOCKED` row the gate writes for the package itself,
+    /// naming the sidecar and the package's digest. The package is cached
+    /// under record-only first, so the only refusal is the sidecar's.
+    #[tokio::test]
+    async fn remote_sigs_sidecar_refusal_is_audited_4987() {
+        let vuln = "certifi-2022.12.7-pyhd8ed1ab_0.conda";
+        let vuln_bytes = conda_v2("certifi", "2022.12.7");
+        let server = MockServer::start().await;
+        mount_package(&server, vuln, &vuln_bytes).await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/noarch/{vuln}.sigs")))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+            .mount(&server)
+            .await;
+        let Some(rig) = RemoteRig::new(&server.uri(), None).await else {
+            return;
+        };
+        let digest = digest_of(&vuln_bytes);
+        seed_verdict(&rig.fx.pool, &digest, Some("high")).await;
+        configure_scan(&rig.fx.pool, rig.fx.repo_id, "record_only", Some("high")).await;
+        let (pkg, _, _) = rig.get(&format!("noarch/{vuln}")).await;
+        configure_scan(&rig.fx.pool, rig.fx.repo_id, "fail_open", Some("high")).await;
+        let (sigs, sigs_body, sigs_headers) = rig.get(&format!("noarch/{vuln}.sigs")).await;
+        let row =
+            tdh::audit_row_eventually(&rig.fx.pool, rig.fx.repo_id, "PROXY_SCAN_BLOCKED").await;
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(rig.fx.repo_id)
+            .execute(&rig.fx.pool)
+            .await;
+        rig.teardown(std::slice::from_ref(&digest)).await;
+
+        assert_eq!(pkg, StatusCode::OK, "record-only serves the package");
+        assert_scan_blocked(sigs, &sigs_body, &sigs_headers, &format!("{vuln}.sigs"));
+        assert_eq!(row.details["path"], format!("{vuln}.sigs"));
+        assert_eq!(row.details["checksum_sha256"], digest);
+        assert_eq!(row.details["attempts"], 1);
     }
 
     /// The `/t/<token>/` forms (conda's `.condarc` layout and rattler's) run

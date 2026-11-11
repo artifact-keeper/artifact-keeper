@@ -2804,9 +2804,33 @@ async fn download(
             // The fallible form (#4308): a failed authorization query is a
             // retryable 503, never an empty member set that answers the
             // definitive 404 Gradle caches as "this checksum does not exist".
-            let members =
-                proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id)
-                    .await?;
+            let all_members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+            // #4987: the dependency-confusion guard of the artifact walk
+            // (`serve_artifact`): when a hosted member owns this G:A:V, no
+            // Remote member answers for it, so a remote cannot hand out a
+            // checksum for a coordinate published locally. It sees every
+            // member, narrowed by the caller or not (UNFILTERED-ENFORCEMENT).
+            let local_owns = match MavenHandler::parse_coordinates(base_path) {
+                Ok(coords) => {
+                    proxy_helpers::virtual_non_remote_owns_maven_gav_in(
+                        &state.db,
+                        repo.id,
+                        &all_members,
+                        &coords.group_id,
+                        &coords.artifact_id,
+                        &coords.version,
+                    )
+                    .await?
+                }
+                Err(_) => false,
+            };
+            let members = proxy_helpers::try_authorize_virtual_members(
+                &state.db,
+                auth.as_ref(),
+                repo.id,
+                all_members,
+            )
+            .await?;
             // #4702: a Remote member whose age gate withholds the version is
             // skipped; if no other member answers, its 451 is the answer.
             let mut age_refusal: Option<Response> = None;
@@ -2820,6 +2844,9 @@ async fn download(
             let mut member_failed = false;
             for member in &members {
                 if member.repo_type == RepositoryType::Remote {
+                    if local_owns {
+                        continue;
+                    }
                     if let Some(refusal) = maven_member_age_gate(&state, member, &path).await? {
                         keep_maven_age_refusal(&mut age_refusal, refusal);
                         continue;
@@ -16556,6 +16583,50 @@ mod scan_on_proxy_tests {
         tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
         tdh::cleanup_member_repo(&fx.pool, hosted_id, &hosted_dir).await;
         fx.teardown().await;
+    }
+
+    /// #4987: the checksum walk takes the artifact walk's local-owns-G:A:V
+    /// guard. A Remote member ahead of the hosted member that owns the G:A:V
+    /// is never asked for the checksum, so it cannot hand out a digest for a
+    /// coordinate published locally; the hosted member's checksum answers.
+    /// A G:A:V no hosted member owns still resolves through the Remote.
+    #[tokio::test]
+    async fn virtual_checksum_of_a_locally_owned_gav_skips_remote_members() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "maven").await else {
+            return;
+        };
+        let other = "com/acme/widget/2.0/widget-2.0.jar";
+        let forged = b"0123456789abcdef0123456789abcdef01234567".to_vec();
+        let state = virtual_state(&fx);
+        let remote = MockServer::start().await;
+        mount(&remote, &format!("{JAR}.sha1"), forged.clone(), 0).await;
+        mount(&remote, &format!("{other}.sha1"), forged.clone(), 1).await;
+        let (remote_id, _, remote_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "maven", &remote.uri(), 1).await;
+        let hosted_bytes = b"hosted-jar-4987".to_vec();
+        let (hosted_id, hosted_dir, _row) =
+            attach_hosted_member(&fx, &state, JAR, &hosted_bytes, 2).await;
+
+        let (owned, owned_body, _) = pull(&state, &fx.repo_key, &format!("{JAR}.sha1")).await;
+        let (unowned, unowned_body, _) = pull(&state, &fx.repo_key, &format!("{other}.sha1")).await;
+
+        remote.verify().await;
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, hosted_id, &hosted_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(owned, StatusCode::OK);
+        assert_eq!(
+            String::from_utf8_lossy(&owned_body),
+            compute_checksum(&hosted_bytes, ChecksumType::Sha1),
+            "the hosted member's checksum, not the remote's"
+        );
+        assert_eq!(unowned, StatusCode::OK);
+        assert_eq!(
+            &unowned_body[..],
+            &forged[..],
+            "no local owner: the remote answers"
+        );
     }
 
     /// A scanning member that misses (upstream 404) or refuses its body as

@@ -2752,4 +2752,97 @@ mod listing_refusals_4288_tests {
         );
         assert!(after.is_empty(), "no policy, no hold: everything listed");
     }
+
+    /// #4987: a scan reaching a terminal state and a label write drop the
+    /// cached listing decisions, so a listing follows them at once instead of
+    /// within the 60 s TTL.
+    #[tokio::test]
+    async fn a_completed_scan_and_a_label_write_invalidate_the_listing() {
+        use crate::services::scan_result_service::ScanResultService;
+        let Some(fx) = Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let scanned = seed(&fx, "linux-64/scanned-1.0-0.conda").await;
+        let labelled = seed(&fx, "linux-64/labelled-1.0-0.conda").await;
+        let scans = ScanResultService::new(fx.pool.clone());
+        let running = scans
+            .create_scan_result(scanned, fx.repo_id, "dependency")
+            .await
+            .expect("running scan");
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', true, false, true)",
+        )
+        .bind(format!("listing-4987-{}", fx.repo_id))
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("policy");
+        let candidates = [scanned, labelled].map(|artifact_id| ListingCandidate {
+            artifact_id,
+            quarantine_status: None,
+            quarantine_until: None,
+        });
+        invalidate_listing_decisions();
+        let before = listing_refusals(&fx.pool, fx.repo_id, &candidates)
+            .await
+            .expect("before");
+        scans
+            .complete_scan(
+                running.id,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some("test-4987"),
+                Utc::now(),
+                "complete",
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("complete scan");
+        let after_scan = listing_refusals(&fx.pool, fx.repo_id, &candidates)
+            .await
+            .expect("after scan");
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        let cached = listing_refusals(&fx.pool, fx.repo_id, &candidates)
+            .await
+            .expect("cached");
+        crate::services::artifact_label_service::ArtifactLabelService::new(fx.pool.clone())
+            .add_label(labelled, "team", "build")
+            .await
+            .expect("label");
+        let after_label = listing_refusals(&fx.pool, fx.repo_id, &candidates)
+            .await
+            .expect("after label");
+        let _ = sqlx::query("DELETE FROM scan_results WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            before,
+            [scanned, labelled].into_iter().collect(),
+            "both unscanned"
+        );
+        assert_eq!(
+            after_scan,
+            [labelled].into_iter().collect(),
+            "the completed scan is seen at once"
+        );
+        assert_eq!(
+            cached, after_scan,
+            "a direct policy delete is not seen while cached"
+        );
+        assert!(after_label.is_empty(), "the label write dropped the cache");
+    }
 }

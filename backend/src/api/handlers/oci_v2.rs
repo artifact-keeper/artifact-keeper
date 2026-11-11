@@ -6408,6 +6408,13 @@ async fn enforce_blob_scan_reblock(
                 "blocking blob pull: every image in scope that references this blob is \
                  blocked by scan policy"
             );
+            // #4987: audited and counted as the manifest gate's refusal is.
+            proxy_helpers::note_stored_verdict_block(
+                &state.db,
+                repo.id,
+                &format!("{}@{}", repo.image, lookup_digest),
+                lookup_digest,
+            );
             return Err(oci_error(
                 StatusCode::FORBIDDEN,
                 "DENIED",
@@ -38287,10 +38294,33 @@ mod proxy_scan_block_tests {
         let clean_cfg_status = get_blob(clean_config.clone()).await;
         let clean_layer_status = get_blob(clean_layer.clone()).await;
 
+        // #4987: each refused blob leaves a PROXY_SCAN_BLOCKED row naming it,
+        // as the manifest gate's refusal does; a served blob leaves none.
+        let audited =
+            tdh::audit_count_eventually(&fx.pool, fx.repo_id, "PROXY_SCAN_BLOCKED", 2).await;
+        let mut audited_paths: Vec<String> = sqlx::query_scalar(
+            "SELECT details->>'path' FROM audit_log \
+              WHERE resource_id = $1 AND action = 'PROXY_SCAN_BLOCKED'",
+        )
+        .bind(fx.repo_id)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("audit paths");
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+
         for d in [&vuln_digest, &clean_digest] {
             cleanup_proxy_scan_row(&fx.pool, d.strip_prefix("sha256:").unwrap()).await;
         }
         fx.teardown().await;
+
+        assert_eq!(audited, 2, "one row per refused blob");
+        audited_paths.sort();
+        let mut want = vec![format!("app@{vuln_config}"), format!("app@{vuln_layer}")];
+        want.sort();
+        assert_eq!(audited_paths, want);
 
         assert_eq!(
             vuln_cfg_status,

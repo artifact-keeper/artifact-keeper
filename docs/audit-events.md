@@ -250,7 +250,7 @@ finding and malicious counts and the new score.
 
 | Action | Resource | Fires when | `details` |
 | --- | --- | --- | --- |
-| `PROXY_SCAN_BLOCKED` | `repository` (the repository the pull was made through) | The scan-on-proxy gate refuses a proxied download with `403 scan_blocked` (#4777). Outcome `denied`. | `repository`, `repository_id`, `path` (the file the 403 names), `checksum_sha256`, `verdict`, `max_severity`, `findings_count`, `scanned_at` (of the verdict), `principal` (the username, `null` for an anonymous pull), `anonymous`, `attempts`, `aggregated`, `window_seconds`. |
+| `PROXY_SCAN_BLOCKED` | `repository` (the repository the pull was made through) | The scan-on-proxy gate refuses a proxied download with `403 scan_blocked` (#4777), or a serve path refuses one from a stored verdict outside the gate: a conda `.sigs` sidecar of a blocked package, the NuGet digest-pinned row repair, an OCI blob of a blocked image (#4987). Outcome `denied`. | `repository`, `repository_id`, `path` (the file the 403 names; `<image>@<digest>` for an OCI blob), `checksum_sha256`, `verdict`, `max_severity`, `findings_count`, `scanned_at` (of the verdict), `principal` (the username, `null` for an anonymous pull), `api_token_id` (the API token the pull authenticated with, else `null`), `anonymous`, `attempts`, `aggregated`, `window_seconds`. |
 
 The row's `user_id` is the authenticated principal (`null` for an anonymous
 pull) and `ip_address` the verified client IP, as for `LOGIN_FAILED`. A client
@@ -260,8 +260,16 @@ each replica: the first refusal writes a row at once with `attempts: 1`, and
 the repeats inside the window write one summary row when it closes, with
 `attempts` set to their count and `aggregated: true`. A retry loop therefore
 writes at most two rows a minute per replica. An anonymous principal is keyed
-by its client IP. The row does not carry the API token id; the principal is
-the token's user.
+by its client IP, and two API tokens of one user are separate principals.
+`api_token_id` is set when the pull authenticated with an API token (Bearer,
+`X-API-Key`, or the token as a Basic password); a session, a password login
+or a token exchanged for a registry bearer leaves it `null`.
+
+Each replica runs at most 4 of these writes at once, so many distinct callers
+refused together cannot take the connection pool their pulls need. Up to
+10,000 more wait their turn; past that an entry is dropped and the drop is
+logged (`PROXY_SCAN_BLOCKED audit backlog is full`). The 403 is never
+delayed.
 
 To answer "who asked for this blocked package", filter the audit log on
 `PROXY_SCAN_BLOCKED` and the repository, and match `checksum_sha256` against

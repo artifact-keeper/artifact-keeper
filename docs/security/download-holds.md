@@ -143,7 +143,11 @@ What this means for operators:
   the queue pages by cursor rather than by page number: pass `next_cursor`
   back as `cursor` until it is `null`. Each page evaluates a bounded number
   of hosted artifacts (`evaluated` in the response) and may hold fewer than
-  `per_page` items while still returning a cursor.
+  `per_page` items while still returning a cursor. The proxy half resumes
+  after the last cached path a page examined (by repository key, path and
+  digest), so a path that drops out of the queue between two pages does not
+  make the next page skip one. A cursor written by an earlier release is
+  refused with `400`; start the listing again.
 
 ## Acknowledging a finding
 
