@@ -627,6 +627,14 @@ pub struct RestoreResponse {
     /// `manifest` (the archive's own checksum -- detects corruption, not
     /// tampering), or `waived` (`allow_unverified_archive` was set).
     pub integrity_anchor: String,
+    /// `completed` when nothing is missing, `partial` when `errors` names
+    /// something the restore could not bring back (#5654). Clients must read
+    /// this, not just the HTTP code.
+    pub status: String,
+    /// Categories of data the archive does not carry, so this restore did not
+    /// restore them (#5654): e.g. `webhook_deliveries`, `package_metadata`.
+    /// See `docs/operations/backup-and-restore.md`.
+    pub excluded: Vec<String>,
 }
 
 /// Restore from backup
@@ -640,7 +648,11 @@ pub struct RestoreResponse {
     ),
     request_body = RestoreRequest,
     responses(
-        (status = 200, description = "Backup restored", body = RestoreResponse),
+        (status = 200, description = "Restore ran; `status` is `completed` only when nothing \
+                                      is missing, `partial` when `errors` names what did not \
+                                      come back (e.g. artifact or blob bytes the archive lacks, \
+                                      or the images of an archive from before 1.12.0)",
+         body = RestoreResponse),
         (status = 400, description = "Archive integrity could not be established, or an \
                                       unsupported option was supplied"),
         (status = 404, description = "Backup not found"),
@@ -683,6 +695,8 @@ pub async fn restore_backup(
         artifacts_restored: result.artifacts_restored,
         errors: result.errors,
         integrity_anchor: result.integrity_anchor.to_string(),
+        status: result.status.to_string(),
+        excluded: result.excluded,
     }))
 }
 
@@ -4837,8 +4851,14 @@ mod tests {
             artifacts_restored: 42,
             errors: vec![],
             integrity_anchor: "recorded".to_string(),
+            status: "completed".to_string(),
+            excluded: vec!["oci_images".to_string()],
         };
         let json = serde_json::to_value(&resp).unwrap();
+        // #5654: the restore states whether anything is missing and what the
+        // archive never carried.
+        assert_eq!(json["status"], "completed");
+        assert_eq!(json["excluded"][0], "oci_images");
         assert_eq!(json["tables_restored"].as_array().unwrap().len(), 2);
         assert_eq!(json["artifacts_restored"], 42);
         assert!(json["errors"].as_array().unwrap().is_empty());
