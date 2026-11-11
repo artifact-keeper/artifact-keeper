@@ -11131,6 +11131,9 @@ pub async fn get_artifact_metadata(
         let db = state.db.clone();
         let path_clone = path.clone();
         let state_clone = state.clone();
+        // #4989: a HEAD never polls the member's body, so it reads nothing to
+        // verify, as on the download route's Virtual arm.
+        let verify_member = !dl_ctx.is_head;
         let result = proxy_helpers::resolve_virtual_download_from_members(
             members,
             proxy_for_virtual,
@@ -11141,22 +11144,37 @@ pub async fn get_artifact_metadata(
                 let state = state_clone.clone();
                 let p = path_clone.clone();
                 async move {
-                    proxy_helpers::local_fetch_by_path(&db, &state, member_id, &location, &p).await
+                    proxy_helpers::local_fetch_by_path_verifying(
+                        &db,
+                        &state,
+                        member_id,
+                        &location,
+                        &p,
+                        verify_member,
+                    )
+                    .await
                 }
             },
         )
-        .await
-        .map_err(|resp| {
+        .await;
+        let result = match result {
+            Ok(result) => result,
+            // #4989: a member whose stored bytes failed verification is
+            // answered as such (502), as on the download route, not as a miss.
+            Err(resp) if crate::storage::verify::is_integrity_failure(&resp) => return Ok(resp),
             // #5504: a member that could not answer makes "not found"
             // unknowable; answer the retryable 503, not a cacheable 404.
-            if proxy_helpers::is_member_unavailable_response(&resp) {
-                AppError::MemberUnavailable(
+            Err(resp) if proxy_helpers::is_member_unavailable_response(&resp) => {
+                return Err(AppError::MemberUnavailable(
                     "A repository member is temporarily unavailable, retry shortly".to_string(),
-                )
-            } else {
-                AppError::NotFound("Artifact not found in any member repository".to_string())
+                ))
             }
-        })?;
+            Err(_) => {
+                return Err(AppError::NotFound(
+                    "Artifact not found in any member repository".to_string(),
+                ))
+            }
+        };
 
         // #2394: unlike the direct-row branch above (metadata JSON only,
         // intentionally unrecorded), this branch serves the member's BYTES —
@@ -11397,7 +11415,7 @@ pub async fn upload_artifact(
 /// (#4186). `Ok(None)` for an unconditional write. A header that is present
 /// but not a valid `*` / entity-tag list is a 400: ignoring it would turn the
 /// client's compare-and-swap into a blind overwrite.
-fn parse_write_precondition(
+pub(crate) fn parse_write_precondition(
     headers: &HeaderMap,
 ) -> Result<Option<crate::services::artifact_service::WritePrecondition>> {
     use crate::services::artifact_service::{EntityTagCondition, WritePrecondition};
@@ -43176,6 +43194,67 @@ mod conditional_put_and_serve_verification_tests {
         assert_eq!(candidate, 1, "the replaced object is handed to storage GC");
     }
 
+    /// #4989: replacing content whose object is already journalled (here by
+    /// an earlier replace of the same bytes) refreshes the candidate's
+    /// `recorded_at`, so the object gets a full grace window from this
+    /// replace. Keeping the older stamp made it collectable at once.
+    #[tokio::test]
+    async fn replace_refreshes_an_existing_gc_candidate_4989_db() {
+        let Some(mut fx) = Fx::setup().await else {
+            return;
+        };
+        let (repo_id, key) = fx.repo("local", "generic", false).await;
+        let v1_key = crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+            &sha(b"v1"),
+        );
+        let stamp = |pool: sqlx::PgPool, k: String| async move {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT recorded_at > NOW() - INTERVAL '1 minute' FROM oci_gc_candidates \
+                 WHERE source_repository_id = $1 AND storage_key = $2",
+            )
+            .bind(repo_id)
+            .bind(k)
+            .fetch_optional(&pool)
+            .await
+            .expect("candidate")
+        };
+
+        let (created, _, _) = fx.put(&key, "index.yaml", b"v1", &[]).await;
+        let (to_v2, _, _) = fx
+            .put(&key, "index.yaml", b"v2", &[("if-match", &quoted(b"v1"))])
+            .await;
+        // The v1 candidate has waited out most of its grace window.
+        sqlx::query(
+            "UPDATE oci_gc_candidates SET recorded_at = NOW() - INTERVAL '3 days' \
+             WHERE source_repository_id = $1 AND storage_key = $2",
+        )
+        .bind(repo_id)
+        .bind(&v1_key)
+        .execute(&fx.pool)
+        .await
+        .expect("age the candidate");
+        let aged = stamp(fx.pool.clone(), v1_key.clone()).await;
+        let (to_v1, _, _) = fx
+            .put(&key, "index.yaml", b"v1", &[("if-match", &quoted(b"v2"))])
+            .await;
+        let (to_v2_again, _, _) = fx
+            .put(&key, "index.yaml", b"v2", &[("if-match", &quoted(b"v1"))])
+            .await;
+        let refreshed = stamp(fx.pool.clone(), v1_key.clone()).await;
+        fx.teardown().await;
+
+        assert_eq!(created, StatusCode::CREATED);
+        assert_eq!(to_v2, StatusCode::CREATED);
+        assert_eq!(to_v1, StatusCode::CREATED);
+        assert_eq!(to_v2_again, StatusCode::CREATED);
+        assert_eq!(aged, Some(false), "the candidate was aged");
+        assert_eq!(
+            refreshed,
+            Some(true),
+            "the second replace of v1 must restart its grace window"
+        );
+    }
+
     /// #4186 acceptance: of several conditional PUTs against one ETag exactly
     /// one wins (2xx) and every other gets 412, and the stored bytes are the
     /// winner's. Same single-winner shape as #4832.
@@ -43549,6 +43628,49 @@ mod conditional_put_and_serve_verification_tests {
             "with the length the row records"
         );
         assert_eq!(get_status, StatusCode::BAD_GATEWAY, "GET still verifies");
+        assert_eq!(code_of(&get_body), "STORED_OBJECT_INTEGRITY");
+    }
+
+    /// #4989: the artifact route's Virtual arm (it serves the member's bytes)
+    /// answers a HEAD without reading or verifying the member, as the download
+    /// route does, and answers a GET of a corrupt member with the terminal
+    /// 502 instead of a 404 that says the artifact does not exist.
+    #[tokio::test]
+    async fn artifact_route_virtual_head_skips_and_get_reports_verification_4989_db() {
+        let Some(mut fx) = Fx::setup().await else {
+            return;
+        };
+        let (member_id, member_key) = fx.repo("local", "generic", false).await;
+        let (virtual_id, virtual_key) = fx.repo("virtual", "generic", false).await;
+        tdh::link_virtual_member(&fx.pool, virtual_id, member_id, 1).await;
+        let (created, _, _) = fx.put(&member_key, "hm/x.bin", b"meta member", &[]).await;
+        assert_eq!(created, StatusCode::CREATED);
+        fx.corrupt(member_id, "hm/x.bin", b"meta membeR").await;
+
+        let (head_status, head_body, _) = tdh::send_with_headers(
+            fx.router(),
+            tdh::head(format!("/{virtual_key}/artifacts/hm/x.bin")),
+        )
+        .await;
+        let (get_status, get_body, _) = tdh::send_with_headers(
+            fx.router(),
+            tdh::get(format!("/{virtual_key}/artifacts/hm/x.bin")),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            head_status,
+            StatusCode::OK,
+            "HEAD is answered without reading the member: {}",
+            String::from_utf8_lossy(&head_body)
+        );
+        assert_eq!(
+            get_status,
+            StatusCode::BAD_GATEWAY,
+            "{}",
+            String::from_utf8_lossy(&get_body)
+        );
         assert_eq!(code_of(&get_body), "STORED_OBJECT_INTEGRITY");
     }
 

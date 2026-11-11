@@ -4234,7 +4234,18 @@ async fn flatcontainer_download(
     let mut content_length = artifact.size_bytes;
     let body: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>> =
         match storage.get_stream(&artifact.storage_key).await {
-            Ok(stream) => stream,
+            // #4989: the stored object is verified against the row (#4323).
+            Ok(stream) => {
+                crate::storage::verify::verify_row_serve(
+                    stream,
+                    &artifact.checksum_sha256,
+                    &filename,
+                    artifact.size_bytes,
+                    ctx.is_head,
+                    || format!("{repo_key}/{package_id_lower}/{version}/{filename}"),
+                )
+                .await?
+            }
             Err(crate::error::AppError::NotFound(missing)) => {
                 let remote_proxy = if repo.repo_type == RepositoryType::Remote {
                     match (&repo.upstream_url, &state.proxy_service) {
@@ -4965,7 +4976,7 @@ async fn v2_download(
     let repo_ids: Vec<uuid::Uuid> = locations.iter().map(|(id, _)| *id).collect();
     let artifact = sqlx::query!(
         r#"
-        SELECT id, repository_id, storage_key, size_bytes
+        SELECT id, repository_id, storage_key, size_bytes, checksum_sha256
         FROM artifacts
         WHERE repository_id = ANY($1::uuid[])
           AND is_deleted = false
@@ -5024,13 +5035,23 @@ async fn v2_download(
     crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
         .await
         .map_err(|e| e.into_response())?;
+    let filename = build_nupkg_filename(&id_lower, version);
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
         .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
+    // #4989: the stored object is verified against the row (#4323).
+    let stream = crate::storage::verify::verify_row_serve(
+        stream,
+        &artifact.checksum_sha256,
+        &filename,
+        artifact.size_bytes,
+        ctx.is_head,
+        || format!("{}/{filename}", artifact.repository_id),
+    )
+    .await?;
     crate::services::artifact_service::record_download(&state.db, artifact.id, ctx).await;
     use futures::StreamExt as _;
-    let filename = build_nupkg_filename(&id_lower, version);
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/octet-stream")
@@ -13843,5 +13864,49 @@ mod duplicate_entry_tests {
         }
         let single = zip_with(&[("Demo.nuspec", &good), ("lib/a.dll", b"x")]);
         assert!(established(&check(&single).1));
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod hosted_serve_verification_4989_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+
+    /// #4989 (#4323 remainder): the hosted NuGet download, V3 flat container
+    /// and V2, verifies the stored bytes against the row. A corrupt object is the 502 `STORED_OBJECT_INTEGRITY` with none of
+    /// its bytes, not a 200 under the checksum it was uploaded with.
+    #[tokio::test]
+    async fn hosted_download_refuses_a_corrupt_object_4989() {
+        let Some(fx) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        tdh::seed_corrupt_artifact(
+            &fx,
+            "v4989/1.0.0/v4989.1.0.0.nupkg",
+            "v4989",
+            "1.0.0",
+            "application/octet-stream",
+            b"stored bytes 4989",
+            b"stored bytes 498X",
+        )
+        .await;
+        let key = fx.repo_key.clone();
+        let send = |req| tdh::send(fx.router_with_auth(super::router()), req);
+        let (get_0, body_0) = send(tdh::get(format!(
+            "/{key}/v3/flatcontainer/v4989/1.0.0/v4989.1.0.0.nupkg"
+        )))
+        .await;
+        let (head_0, _) = send(tdh::head(format!(
+            "/{key}/v3/flatcontainer/v4989/1.0.0/v4989.1.0.0.nupkg"
+        )))
+        .await;
+        let (get_1, body_1) = send(tdh::get(format!("/{key}/v2/package/v4989/1.0.0"))).await;
+        let (head_1, _) = send(tdh::head(format!("/{key}/v2/package/v4989/1.0.0"))).await;
+        fx.teardown().await;
+        tdh::assert_integrity_refusal(get_0, &body_0, b"stored bytes 498X");
+        assert_eq!(head_0, StatusCode::OK, "a HEAD reads and verifies nothing");
+        tdh::assert_integrity_refusal(get_1, &body_1, b"stored bytes 498X");
+        assert_eq!(head_1, StatusCode::OK, "a HEAD reads and verifies nothing");
     }
 }

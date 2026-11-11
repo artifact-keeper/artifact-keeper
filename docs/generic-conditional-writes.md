@@ -5,7 +5,12 @@ preconditions `If-Match` and `If-None-Match` (RFC 9110 section 13), so a tool
 that keeps an index document (`index.yaml`, a lock file, a manifest) in a
 generic repository can update it without losing a concurrent writer's change
 (#4186). The multipart upload routes (`POST .../artifacts/{path}` and
-`POST .../artifacts`) evaluate the same headers.
+`POST .../artifacts`) evaluate the same headers, and so does the completion
+of a chunked upload (`PUT /api/v1/uploads/{session_id}/complete`, #4989):
+send the headers on the completing request, which is the write. A chunked
+completion refused with 412 (or 400 for a malformed header) writes nothing
+and leaves the session open, so it can be completed again with the right tag
+without re-uploading its chunks.
 
 ## The ETag
 

@@ -4980,3 +4980,34 @@ mod virtual_member_failure_tests {
         );
     }
 }
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod hosted_serve_verification_4989_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// #4989 (#4323 remainder): the hosted Helm chart download
+    /// (`serve_local_artifact`) verifies the stored bytes against the row. A corrupt object is the 502 `STORED_OBJECT_INTEGRITY` with none of
+    /// its bytes, not a 200 under the checksum it was uploaded with.
+    #[tokio::test]
+    async fn hosted_download_refuses_a_corrupt_object_4989() {
+        let Some(fx) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        tdh::seed_corrupt_artifact(
+            &fx,
+            "v4989-0.1.0.tgz",
+            "v4989",
+            "0.1.0",
+            "application/gzip",
+            b"stored bytes 4989",
+            b"stored bytes 498X",
+        )
+        .await;
+        let key = fx.repo_key.clone();
+        let send = |req| tdh::send(fx.router_with_auth(super::router()), req);
+        let (get_0, body_0) = send(tdh::get(format!("/{key}/charts/v4989-0.1.0.tgz"))).await;
+        fx.teardown().await;
+        tdh::assert_integrity_refusal(get_0, &body_0, b"stored bytes 498X");
+    }
+}

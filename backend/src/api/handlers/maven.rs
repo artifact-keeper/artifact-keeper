@@ -535,7 +535,7 @@ async fn fetch_snapshot_artifact(
     // newest row (#5664).
     let rows = sqlx::query(
         r#"
-        SELECT id, storage_key, checksum_sha256, path
+        SELECT id, storage_key, checksum_sha256, path, size_bytes
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
@@ -567,6 +567,7 @@ async fn fetch_snapshot_artifact(
                 storage_key: row.get("storage_key"),
                 checksum_sha256: row.get("checksum_sha256"),
                 path,
+                size_bytes: row.get("size_bytes"),
             },
         ));
     }
@@ -578,6 +579,7 @@ struct ResolvedSnapshot {
     storage_key: String,
     checksum_sha256: String,
     path: String,
+    size_bytes: i64,
 }
 
 /// Collect all stored timestamped SNAPSHOT files in a specific version directory
@@ -695,6 +697,15 @@ async fn maven_local_fetch_snapshot(
         .get_stream(&resolved.storage_key)
         .await
         .map_err(map_storage_err)?;
+    // #4989: verified like the exact-path member serve (`local_fetch_by_path`).
+    let stream = crate::storage::verify::verify_stored_body(
+        stream,
+        &resolved.checksum_sha256,
+        &resolved.path,
+        resolved.size_bytes,
+        || resolved.path.clone(),
+    )
+    .await?;
 
     let ct = content_type_for_path(path).to_string();
     Ok(proxy_helpers::StreamingFetchResult {
@@ -4164,6 +4175,14 @@ async fn serve_artifact(
                         .get(&resolved.storage_key)
                         .await
                         .map_err(map_storage_err)?;
+                    // #4989: verified against the resolved row (#4323).
+                    crate::storage::verify::verify_stored_bytes(
+                        &content,
+                        &resolved.checksum_sha256,
+                        &resolved.path,
+                        resolved.size_bytes,
+                        || format!("{repo_key}/{}", resolved.path),
+                    )?;
 
                     let ct = content_type_for_path(path);
                     return Ok(Response::builder()
@@ -4629,6 +4648,16 @@ async fn serve_artifact(
         .get_stream(&artifact.storage_key)
         .await
         .map_err(map_storage_err)?;
+    // #4989: verify the stored bytes against the row (#4323).
+    let stream = crate::storage::verify::verify_row_serve(
+        stream,
+        &artifact.checksum_sha256,
+        &artifact.path,
+        artifact.size_bytes,
+        ctx.is_head,
+        || format!("{repo_key}/{}", artifact.path),
+    )
+    .await?;
 
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, ctx).await;
@@ -9618,7 +9647,8 @@ mod tests {
         .bind(repo_id)
         .bind(path)
         .bind(jar.len() as i64)
-        .bind("ab".repeat(32))
+        // The real digest: the serve verifies the bytes against it (#4989).
+        .bind(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&jar)))
         .bind(&flat_key)
         .bind(user_id)
         .execute(&pool)
@@ -9799,7 +9829,8 @@ mod tests {
         // Insert the artifact row at the timestamped path; this is what
         // `resolve_snapshot_artifact` looks up to map the -SNAPSHOT alias.
         let artifact_id_db = Uuid::new_v4();
-        let sha256 = "deadbeef".repeat(8); // 64 hex chars
+        // The real digest: the serve verifies the bytes against it (#4989).
+        let sha256 = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&jar_bytes));
         sqlx::query(
             r#"
             INSERT INTO artifacts
@@ -17936,5 +17967,45 @@ mod duplicate_entry_tests {
         }
         let single = zip_with(&[(entry, good), ("org/demo/A.class", b"x")]);
         assert!(established(&check(&single).1));
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod hosted_serve_verification_4989_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+
+    /// #4989 (#4323 remainder): the hosted Maven download verifies the stored bytes against the
+    /// row. A corrupt object is the 502 `STORED_OBJECT_INTEGRITY` with none of
+    /// its bytes, not a 200 under the checksum it was uploaded with.
+    #[tokio::test]
+    async fn hosted_download_refuses_a_corrupt_object_4989() {
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        tdh::seed_corrupt_artifact(
+            &fx,
+            "com/example/v4989/1.0/v4989-1.0.jar",
+            "v4989",
+            "1.0",
+            "application/java-archive",
+            b"stored bytes 4989",
+            b"stored bytes 498X",
+        )
+        .await;
+        let key = fx.repo_key.clone();
+        let send = |req| tdh::send(fx.router_with_auth(super::router()), req);
+        let (get_0, body_0) = send(tdh::get(format!(
+            "/{key}/com/example/v4989/1.0/v4989-1.0.jar"
+        )))
+        .await;
+        let (head_0, _) = send(tdh::head(format!(
+            "/{key}/com/example/v4989/1.0/v4989-1.0.jar"
+        )))
+        .await;
+        fx.teardown().await;
+        tdh::assert_integrity_refusal(get_0, &body_0, b"stored bytes 498X");
+        assert_eq!(head_0, StatusCode::OK, "a HEAD reads and verifies nothing");
     }
 }

@@ -9125,7 +9125,8 @@ pub async fn record_artifact_metadata(
 /// Serve an artifact from local storage with quarantine + statistics.
 ///
 /// Performs the standard hit-path tail used by every format download handler:
-/// quarantine check, storage load, download-statistics insert, and a 200
+/// quarantine check, storage load, verification against the row (#4989),
+/// download-statistics insert, and a 200
 /// response with the supplied content type and optional `Content-Disposition`.
 /// `artifact_id` is the row id for quarantine + statistics; `storage_key` is
 /// the raw key handed to the storage backend.
@@ -9150,6 +9151,7 @@ pub async fn serve_local_artifact(
         .get(storage_key)
         .await
         .map_err(|e| internal_error("Storage", e))?;
+    verify_served_row(&state.db, repo, artifact_id, &content).await?;
 
     crate::services::artifact_service::record_download(&state.db, artifact_id, ctx).await;
 
@@ -9159,6 +9161,33 @@ pub async fn serve_local_artifact(
         content_type,
         content_disposition_filename,
     ))
+}
+
+/// Verify the bytes [`serve_local_artifact`] read for `artifact_id` against
+/// the row's recorded SHA-256 (#4323, #4989): a mismatch is the `502`
+/// [`crate::storage::verify::integrity_failure_response`]. The bytes are
+/// already in memory, so a HEAD costs no extra read here.
+async fn verify_served_row(
+    db: &PgPool,
+    repo: &RepoInfo,
+    artifact_id: Uuid,
+    content: &Bytes,
+) -> Result<(), Response> {
+    if !crate::storage::verify::serve_verification_enabled() {
+        return Ok(());
+    }
+    let row: Option<(String, String, i64)> =
+        sqlx::query_as("SELECT checksum_sha256, path, size_bytes FROM artifacts WHERE id = $1")
+            .bind(artifact_id)
+            .fetch_optional(db)
+            .await
+            .map_err(map_db_err)?;
+    let Some((checksum, path, size_bytes)) = row else {
+        return Ok(());
+    };
+    crate::storage::verify::verify_stored_bytes(content, &checksum, &path, size_bytes, || {
+        format!("{}/{path}", repo.key)
+    })
 }
 
 /// [`serve_local_artifact`] for a package route of a format that enforces
@@ -9190,6 +9219,7 @@ pub(crate) async fn serve_local_artifact_gated<
         .get(storage_key)
         .await
         .map_err(|e| internal_error("Storage", e))?;
+    verify_served_row(&state.db, repo, artifact_id, &content).await?;
     let scan = gate_stored_content(state, repo, filename, &content, kind).await?;
 
     crate::services::artifact_service::record_download(&state.db, artifact_id, ctx).await;
