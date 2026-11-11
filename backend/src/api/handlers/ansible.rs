@@ -1812,7 +1812,15 @@ async fn upload_collection(
 
     // Stream the staged tarball into the repo's StorageBackend, from local
     // scratch or by copying the object the backend already staged (#4990).
-    let storage_key = format!("ansible/{}/{}/{}", full_name, collection_version, filename);
+    // The key is repo-scoped on a shared cloud namespace (#5662), so two
+    // repositories holding the same version do not collide on one key; reads
+    // go through the row's storage_key, so legacy flat-key rows keep serving.
+    let storage_key = crate::storage::StorageKeyScheme::from_env().write_key(
+        &repo.storage_backend,
+        "ansible",
+        repo.id,
+        &format!("{}/{}/{}", full_name, collection_version, filename),
+    );
     let put = proxy_helpers::put_staged_body(
         &state,
         &repo,
@@ -2854,6 +2862,30 @@ mod tests {
             f.state.clone(),
             tdh::make_auth(f.user_id, &f.username),
         )
+    }
+
+    /// #5662: the same collection version publishes into two Ansible
+    /// repositories on a shared cloud namespace (on main the second answered
+    /// 409).
+    #[tokio::test]
+    async fn same_collection_publishes_to_two_cloud_repositories_5662() {
+        const TARBALL: &[u8] = b"one collection two galaxies carry (#5662)";
+        let sha = format!("{:x}", Sha256::digest(TARBALL));
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "ansible",
+            key_prefix: "ansible",
+            router: super::router,
+            publish: &|key| {
+                vec![tdh::post(
+                    format!("/{key}/api/v3/artifacts/collections/"),
+                    "multipart/form-data; boundary=BOUNDARY",
+                    galaxy_cli_multipart("BOUNDARY", "shared-coll-1.0.0.tar.gz", TARBALL, &sha),
+                )]
+            },
+            download: &|key| tdh::get(format!("/{key}/download/shared-coll-1.0.0.tar.gz")),
+            expected: TARBALL,
+        })
+        .await;
     }
 
     async fn publish_fixture_collection(

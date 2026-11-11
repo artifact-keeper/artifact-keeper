@@ -1173,6 +1173,178 @@ fn build_cloud_state(
     (state, mem)
 }
 
+/// What one format's #5662 cloud-key regression test drives: how to publish
+/// the same object into a hosted repository and fetch it back, and the key
+/// prefix its objects are written under.
+pub struct CloudPublishCase<'a> {
+    /// `repository_format` enum value of the hosted repositories.
+    pub format: &'a str,
+    /// Storage-key prefix of the format's objects (`"chef"` for
+    /// `chef/{name}/...`); new objects on a cloud backend must land under
+    /// `{key_prefix}/{repository_id}/`.
+    pub key_prefix: &'a str,
+    /// The format's router (`super::router()`).
+    pub router: fn() -> Router<SharedState>,
+    /// The publish requests for one repository key, sent in order; each must
+    /// answer a 2xx.
+    pub publish: &'a dyn Fn(&str) -> Vec<Request<Body>>,
+    /// The download request for one repository key; it must answer 200 with
+    /// [`Self::expected`].
+    pub download: &'a dyn Fn(&str) -> Request<Body>,
+    /// The bytes the download serves.
+    pub expected: &'a [u8],
+}
+
+/// A hosted `format` repository on the in-memory `s3` backend of
+/// [`build_state_with_cloud`], with `user_id` granted developer access.
+pub async fn create_cloud_repo(
+    pool: &PgPool,
+    format: &str,
+    user_id: Uuid,
+) -> (Uuid, String, PathBuf) {
+    let (repo_id, repo_key, dir) = create_repo(pool, "local", format).await;
+    sqlx::query("UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1")
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("set cloud backend");
+    grant_repo_access(pool, repo_id, user_id).await;
+    (repo_id, repo_key, dir)
+}
+
+/// #5662: the same object publishes into two hosted repositories of one
+/// format on a shared cloud namespace, each repository serves its own copy
+/// from a `{key_prefix}/{repository_id}/...` key, nothing is written to the
+/// legacy flat key, and an object whose row records the legacy flat key (the
+/// layout before the fix) still serves. Before the fix the second
+/// repository's publish answered 409 "already owned by another repository;
+/// refusing cross-repository overwrite".
+///
+/// The legacy case is simulated on the first repository after both
+/// publishes: its scoped objects move to the flat key the row then records,
+/// exactly the shape a pre-fix publish left, and the download must still
+/// answer the same bytes.
+pub async fn assert_cloud_publish_is_repo_scoped(case: CloudPublishCase<'_>) {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let (user_id, username) = create_user(&pool).await;
+    let auth = make_auth(user_id, &username);
+    let (state, mem) = build_state_with_cloud(pool.clone(), "s3");
+    let app = || router_with_auth((case.router)(), state.clone(), auth.clone());
+    let mut repos = Vec::new();
+    for _ in 0..2 {
+        repos.push(create_cloud_repo(&pool, case.format, user_id).await);
+    }
+    let row_keys = |repo_id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT storage_key FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+            )
+            .bind(repo_id)
+            .fetch_all(&pool)
+            .await
+            .expect("row keys")
+        }
+    };
+
+    let mut outcomes = Vec::new();
+    for (repo_id, repo_key, _) in &repos {
+        let mut published = Vec::new();
+        for req in (case.publish)(repo_key) {
+            published.push(send(app(), req).await);
+        }
+        let fetched = send(app(), (case.download)(repo_key)).await;
+        outcomes.push((*repo_id, published, fetched, row_keys(*repo_id).await));
+    }
+    let objects: Vec<String> = mem.objects.lock().unwrap().keys().cloned().collect();
+
+    // Rewrite the first repository's objects to the legacy flat layout.
+    let (legacy_id, legacy_key, _) = &repos[0];
+    let scoped_prefix = format!("{}/{legacy_id}/", case.key_prefix);
+    for key in row_keys(*legacy_id).await {
+        let Some(rest) = key.strip_prefix(&scoped_prefix) else {
+            continue;
+        };
+        let flat = format!("{}/{rest}", case.key_prefix);
+        let bytes = mem.objects.lock().unwrap().remove(&key);
+        if let Some(bytes) = bytes {
+            mem.objects.lock().unwrap().insert(flat.clone(), bytes);
+        }
+        sqlx::query(
+            "UPDATE artifacts SET storage_key = $1 WHERE repository_id = $2 AND storage_key = $3",
+        )
+        .bind(&flat)
+        .bind(legacy_id)
+        .bind(&key)
+        .execute(&pool)
+        .await
+        .expect("move row to the legacy key");
+    }
+    let legacy_fetch = send(app(), (case.download)(legacy_key)).await;
+    let legacy_rows = row_keys(*legacy_id).await;
+
+    for (repo_id, _, dir) in &repos {
+        cleanup_member_repo(&pool, *repo_id, dir).await;
+    }
+    cleanup_user(&pool, user_id).await;
+
+    let format = case.format;
+    // The symptom first: on main the second repository's publish is the 409.
+    for (repo_id, published, fetched, _) in &outcomes {
+        for (status, body) in published {
+            assert!(
+                status.is_success(),
+                "{format}: publish into repository {repo_id} must be accepted, got {status}: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        assert_eq!(
+            fetched.0,
+            StatusCode::OK,
+            "{format}: download from {repo_id}: {}",
+            String::from_utf8_lossy(&fetched.1)
+        );
+        assert_eq!(
+            &fetched.1[..],
+            case.expected,
+            "{format}: bytes from {repo_id}"
+        );
+    }
+    for (repo_id, _, _, keys) in outcomes {
+        let scoped = format!("{}/{repo_id}/", case.key_prefix);
+        let own: Vec<&String> = keys.iter().filter(|k| k.starts_with(&scoped)).collect();
+        assert!(!own.is_empty(), "{format}: no row under {scoped}: {keys:?}");
+        for key in own {
+            assert!(objects.contains(key), "{format}: {key} must be written");
+        }
+    }
+    let ids: Vec<String> = repos.iter().map(|(id, _, _)| id.to_string()).collect();
+    for key in &objects {
+        if let Some(rest) = key.strip_prefix(&format!("{}/", case.key_prefix)) {
+            assert!(
+                ids.iter().any(|id| rest.starts_with(&format!("{id}/"))),
+                "{format}: {key} is not repository-scoped; nothing may be written to \
+                 the legacy flat key on a cloud backend"
+            );
+        }
+    }
+    assert!(
+        legacy_rows
+            .iter()
+            .any(|k| !k.contains(&legacy_id.to_string())),
+        "{format}: the fixture must have moved a row to the legacy key: {legacy_rows:?}"
+    );
+    assert_eq!(
+        legacy_fetch.0,
+        StatusCode::OK,
+        "{format}: an object on the legacy flat key must still download: {}",
+        String::from_utf8_lossy(&legacy_fetch.1)
+    );
+    assert_eq!(&legacy_fetch.1[..], case.expected, "{format}: legacy bytes");
+}
+
 pub async fn create_user(pool: &PgPool) -> (Uuid, String) {
     let id = Uuid::new_v4();
     let username = format!("ph-test-u-{}", id);

@@ -1316,8 +1316,16 @@ async fn publish_release(
     // the object the repository's backend already staged (#4990). The checksum
     // is over the ARCHIVE, not the multipart envelope -- SwiftPM verifies the
     // source archive's checksum, and this same value is what the release-metadata
-    // `checksum` and the download `Digest` header report (#3595).
-    let storage_key = format!("swift/{}/{}/{}/{}.zip", scope, name, version, name);
+    // `checksum` and the download `Digest` header report (#3595). The key is
+    // repo-scoped on a shared cloud namespace (#5662), so two registries
+    // holding the same release do not collide on one key; reads go through
+    // the row's storage_key, so legacy flat-key rows keep serving.
+    let storage_key = crate::storage::StorageKeyScheme::from_env().write_key(
+        &repo.storage_backend,
+        "swift",
+        repo.id,
+        &format!("{}/{}/{}/{}.zip", scope, name, version, name),
+    );
     let put = proxy_helpers::put_staged_body(
         &state,
         &repo,
@@ -2536,6 +2544,28 @@ mod multipart_publish_tests {
             .header("content-type", content_type)
             .body(Body::from(body))
             .expect("build PUT request")
+    }
+
+    /// #5662: the same release publishes into two Swift registries on a
+    /// shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_release_publishes_to_two_cloud_registries_5662() {
+        let archive = source_archive();
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "swift",
+            key_prefix: "swift",
+            router: super::router,
+            publish: &|key| {
+                vec![publish_request(
+                    format!("/{key}/shared/SharedPackage/1.0.0"),
+                    &format!("multipart/form-data; boundary={}", BOUNDARY),
+                    publish_envelope(&[("source-archive", "application/zip", &archive)]),
+                )]
+            },
+            download: &|key| tdh::get(format!("/{key}/shared/SharedPackage/1.0.0.zip")),
+            expected: &archive,
+        })
+        .await;
     }
 
     #[tokio::test]

@@ -393,7 +393,15 @@ async fn upload_package(
     )
     .await?;
 
-    let storage_key = format!("cran/{}/{}/{}", pkg_name, pkg_version, filename);
+    // Repo-scoped on a shared cloud namespace (#5662), so two repositories
+    // holding the same version do not collide on one key; reads go through
+    // the row's storage_key, so legacy flat-key rows keep serving.
+    let storage_key = crate::storage::StorageKeyScheme::from_env().write_key(
+        &repo.storage_backend,
+        "cran",
+        repo.id,
+        &format!("{}/{}/{}", pkg_name, pkg_version, filename),
+    );
     proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, body.clone()).await?;
 
     let pkg_metadata = serde_json::json!({
@@ -1361,6 +1369,27 @@ mod tests {
                 .versions,
             vec!["1.1.0".to_string()]
         );
+    }
+
+    /// #5662: the same source package uploads into two CRAN repositories on
+    /// a shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_package_uploads_to_two_cloud_repositories_5662() {
+        const TARBALL: &[u8] = b"one source package two mirrors carry (#5662)";
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "cran",
+            key_prefix: "cran",
+            router: super::router,
+            publish: &|key| {
+                vec![tdh::put(
+                    format!("/{key}/src/contrib/sharedpkg_1.0.0.tar.gz"),
+                    Bytes::from_static(TARBALL),
+                )]
+            },
+            download: &|key| tdh::get(format!("/{key}/src/contrib/sharedpkg_1.0.0.tar.gz")),
+            expected: TARBALL,
+        })
+        .await;
     }
 
     #[tokio::test]

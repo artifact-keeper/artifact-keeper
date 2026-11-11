@@ -939,7 +939,13 @@ async fn publish_package(
     )
     .await?;
 
-    let storage_key = build_hex_storage_key(&pkg_name, &pkg_version);
+    let storage_key = build_hex_storage_key(
+        crate::storage::StorageKeyScheme::from_env(),
+        &repo.storage_backend,
+        repo.id,
+        &pkg_name,
+        &pkg_version,
+    );
     proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, body.clone()).await?;
 
     let size_bytes = body.len() as i64;
@@ -1842,10 +1848,25 @@ fn build_hex_artifact_path(name: &str, version: &str) -> String {
     format!("{}/{}/{}", name, version, filename)
 }
 
-/// Build the storage key: `hex/{name}/{version}/{name}-{version}.tar`
-fn build_hex_storage_key(name: &str, version: &str) -> String {
+/// Build the storage key: `hex/{name}/{version}/{name}-{version}.tar`.
+///
+/// Repo-scoped on a shared cloud namespace (#5662), so two repositories
+/// holding the same package version do not collide on one key; reads go
+/// through the row's storage_key, so legacy flat-key rows keep serving.
+fn build_hex_storage_key(
+    scheme: crate::storage::StorageKeyScheme,
+    storage_backend: &str,
+    repo_id: Uuid,
+    name: &str,
+    version: &str,
+) -> String {
     let filename = build_hex_filename(name, version);
-    format!("hex/{}/{}/{}", name, version, filename)
+    scheme.write_key(
+        storage_backend,
+        "hex",
+        repo_id,
+        &format!("{}/{}/{}", name, version, filename),
+    )
 }
 
 /// Build a tarball download URL: `/hex/{repo_key}/tarballs/{name}-{version}.tar`
@@ -2786,24 +2807,55 @@ mod tests {
     // build_hex_storage_key
     // -----------------------------------------------------------------------
 
+    /// The key on a filesystem backend, which keeps the legacy flat layout.
+    fn fs_hex_storage_key(name: &str, version: &str) -> String {
+        build_hex_storage_key(
+            crate::storage::StorageKeyScheme::RepoScoped,
+            "filesystem",
+            Uuid::new_v4(),
+            name,
+            version,
+        )
+    }
+
     #[test]
     fn test_build_hex_storage_key() {
         assert_eq!(
-            build_hex_storage_key("jason", "1.4.0"),
+            fs_hex_storage_key("jason", "1.4.0"),
             "hex/jason/1.4.0/jason-1.4.0.tar"
         );
     }
 
     #[test]
     fn test_build_hex_storage_key_starts_with_hex() {
-        let key = build_hex_storage_key("plug", "2.0.0");
+        let key = fs_hex_storage_key("plug", "2.0.0");
         assert!(key.starts_with("hex/"));
     }
 
     #[test]
     fn test_build_hex_storage_key_contains_filename() {
-        let key = build_hex_storage_key("ecto", "3.11.0");
+        let key = fs_hex_storage_key("ecto", "3.11.0");
         assert!(key.ends_with("ecto-3.11.0.tar"));
+    }
+
+    #[test]
+    fn hex_storage_key_is_repo_scoped_on_cloud_5662() {
+        use crate::storage::StorageKeyScheme;
+        let repo_id = Uuid::new_v4();
+        let key =
+            |scheme, backend| build_hex_storage_key(scheme, backend, repo_id, "jason", "1.4.0");
+        for backend in ["s3", "gcs", "azure"] {
+            assert_eq!(
+                key(StorageKeyScheme::RepoScoped, backend),
+                format!("hex/{repo_id}/jason/1.4.0/jason-1.4.0.tar"),
+                "{backend}"
+            );
+            assert_eq!(
+                key(StorageKeyScheme::Flat, backend),
+                "hex/jason/1.4.0/jason-1.4.0.tar",
+                "{backend}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -3365,6 +3417,34 @@ mod tests {
             .body(axum::body::Body::from(tar_data))
             .unwrap();
         tdh::send(f.router_with_auth(super::router()), req).await
+    }
+
+    /// #5662: the same package version publishes into two Hex repositories on
+    /// a shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_package_publishes_to_two_cloud_repositories_5662() {
+        let metadata = r#"{<<"name">>, <<"shared5662">>}.
+{<<"version">>, <<"1.0.0">>}.
+"#;
+        let tar_data = build_tar(&[
+            ("CHECKSUM", REAL_CHECKSUM.as_bytes()),
+            ("metadata.config", metadata.as_bytes()),
+        ]);
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "hex",
+            key_prefix: "hex",
+            router: super::router,
+            publish: &|key| {
+                vec![tdh::post(
+                    format!("/{key}/publish"),
+                    "application/octet-stream",
+                    bytes::Bytes::from(tar_data.clone()),
+                )]
+            },
+            download: &|key| tdh::get(format!("/{key}/tarballs/shared5662-1.0.0.tar")),
+            expected: &tar_data,
+        })
+        .await;
     }
 
     /// #2561: an authenticated hex publish decodes the outer tarball through

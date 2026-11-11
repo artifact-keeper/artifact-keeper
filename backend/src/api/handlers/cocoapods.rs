@@ -362,8 +362,12 @@ async fn get_podspec(
             .unwrap());
     }
 
-    // Fall back to reading the podspec file from storage
-    let podspec_key = build_cocoapods_podspec_key(&path_info.name, &path_info.version);
+    // Fall back to reading the podspec file from storage. The sidecar sits
+    // next to the archive the row recorded (#5662): under the repo-scoped
+    // `cocoapods/{repository_id}/...` key for a pod pushed to a cloud backend
+    // since the fix, under the legacy flat key for one pushed before it.
+    let podspec_key = podspec_sidecar_key(&artifact.storage_key)
+        .unwrap_or_else(|| build_cocoapods_podspec_key(&path_info.name, &path_info.version));
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
@@ -646,8 +650,17 @@ async fn push_pod(
     .await?;
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
-    // Store the pod archive
-    let storage_key = build_cocoapods_storage_key(pod_name, pod_version);
+    // Store the pod archive. Repo-scoped on a shared cloud namespace (#5662),
+    // so two repositories holding the same pod version do not collide on one
+    // key; downloads go through the row's storage_key and the podspec sidecar
+    // is read next to it, so legacy flat-key pods keep serving.
+    let key_scheme = crate::storage::StorageKeyScheme::from_env();
+    let storage_key = key_scheme.write_key(
+        &repo.storage_backend,
+        COCOAPODS_KEY_PREFIX,
+        repo.id,
+        &cocoapods_archive_path(pod_name, pod_version),
+    );
     proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
         .await?;
     let storage = state
@@ -659,7 +672,12 @@ async fn push_pod(
         .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     // Also store the podspec JSON separately for direct retrieval
-    let podspec_key = build_cocoapods_podspec_key(pod_name, pod_version);
+    let podspec_key = key_scheme.write_key(
+        &repo.storage_backend,
+        COCOAPODS_KEY_PREFIX,
+        repo.id,
+        &cocoapods_podspec_path(pod_name, pod_version),
+    );
     let podspec_json = serde_json::to_vec(&podspec).unwrap_or_default();
     proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &podspec_key)
         .await?;
@@ -873,15 +891,45 @@ fn build_cocoapods_artifact_path(name: &str, version: &str) -> String {
     format!("{}/{}/{}", name, version, filename)
 }
 
-/// Build the storage key for a CocoaPods archive.
-fn build_cocoapods_storage_key(name: &str, version: &str) -> String {
-    let filename = build_cocoapods_filename(name, version);
-    format!("cocoapods/{}/{}/{}", name, version, filename)
+/// Storage-key prefix of CocoaPods objects.
+const COCOAPODS_KEY_PREFIX: &str = "cocoapods";
+
+/// A pod archive's path under [`COCOAPODS_KEY_PREFIX`]
+/// (`{name}/{version}/{name}-{version}.tar.gz`).
+fn cocoapods_archive_path(name: &str, version: &str) -> String {
+    format!(
+        "{}/{}/{}",
+        name,
+        version,
+        build_cocoapods_filename(name, version)
+    )
 }
 
-/// Build the storage key for a CocoaPods podspec JSON file.
+/// A podspec sidecar's path under [`COCOAPODS_KEY_PREFIX`]
+/// (`{name}/{version}/{name}.podspec.json`).
+fn cocoapods_podspec_path(name: &str, version: &str) -> String {
+    format!("{}/{}/{}.podspec.json", name, version, name)
+}
+
+/// The legacy flat storage key of a CocoaPods podspec JSON file.
 fn build_cocoapods_podspec_key(name: &str, version: &str) -> String {
-    format!("cocoapods/{}/{}/{}.podspec.json", name, version, name)
+    format!(
+        "{COCOAPODS_KEY_PREFIX}/{}",
+        cocoapods_podspec_path(name, version)
+    )
+}
+
+/// The podspec sidecar written next to the archive at `archive_key` (#5662):
+/// `{dir}/{name}.podspec.json` for an archive at
+/// `{..}/{name}/{version}/{name}-{version}.tar.gz`. It holds for the legacy
+/// flat key and the repo-scoped one alike, and it names the pod as it was
+/// pushed rather than as a case-folded request spelled it. `None` for a key
+/// of another shape.
+fn podspec_sidecar_key(archive_key: &str) -> Option<String> {
+    let (dir, _file) = archive_key.rsplit_once('/')?;
+    let (name_dir, _version) = dir.rsplit_once('/')?;
+    let name = name_dir.rsplit('/').next().filter(|n| !n.is_empty())?;
+    Some(format!("{dir}/{name}.podspec.json"))
 }
 
 /// Build the metadata JSON for a published pod.
@@ -1084,6 +1132,14 @@ mod tests {
     }
     use super::*;
     use crate::formats::cocoapods::PodSpec;
+
+    /// The legacy flat storage key of a CocoaPods archive.
+    fn build_cocoapods_storage_key(name: &str, version: &str) -> String {
+        format!(
+            "{COCOAPODS_KEY_PREFIX}/{}",
+            cocoapods_archive_path(name, version)
+        )
+    }
 
     // -----------------------------------------------------------------------
     // CDN routing
@@ -1350,6 +1406,64 @@ mod tests {
         assert_eq!(key.matches("SnapKit").count(), 2); // cocoapods/SnapKit/5.7.1/SnapKit.podspec.json
     }
 
+    /// #5662: on a shared cloud namespace both objects of a pod are written
+    /// under `cocoapods/{repository_id}/`; filesystem storage and the flat
+    /// scheme keep the legacy keys. The sidecar is found next to either.
+    #[test]
+    fn test_cocoapods_keys_are_repo_scoped_on_cloud_5662() {
+        use crate::storage::StorageKeyScheme;
+        let repo = uuid::Uuid::new_v4();
+        for backend in ["s3", "gcs", "azure"] {
+            let archive = StorageKeyScheme::RepoScoped.write_key(
+                backend,
+                COCOAPODS_KEY_PREFIX,
+                repo,
+                &cocoapods_archive_path("SnapKit", "5.7.1"),
+            );
+            assert_eq!(
+                archive,
+                format!("cocoapods/{repo}/SnapKit/5.7.1/SnapKit-5.7.1.tar.gz")
+            );
+            assert_eq!(
+                podspec_sidecar_key(&archive).as_deref(),
+                Some(format!("cocoapods/{repo}/SnapKit/5.7.1/SnapKit.podspec.json").as_str())
+            );
+            assert_eq!(
+                StorageKeyScheme::RepoScoped.write_key(
+                    backend,
+                    COCOAPODS_KEY_PREFIX,
+                    repo,
+                    &cocoapods_podspec_path("SnapKit", "5.7.1"),
+                ),
+                format!("cocoapods/{repo}/SnapKit/5.7.1/SnapKit.podspec.json")
+            );
+            assert_eq!(
+                StorageKeyScheme::Flat.write_key(
+                    backend,
+                    COCOAPODS_KEY_PREFIX,
+                    repo,
+                    &cocoapods_archive_path("SnapKit", "5.7.1"),
+                ),
+                build_cocoapods_storage_key("SnapKit", "5.7.1")
+            );
+        }
+        assert_eq!(
+            StorageKeyScheme::RepoScoped.write_key(
+                "filesystem",
+                COCOAPODS_KEY_PREFIX,
+                repo,
+                &cocoapods_archive_path("SnapKit", "5.7.1"),
+            ),
+            build_cocoapods_storage_key("SnapKit", "5.7.1")
+        );
+        assert_eq!(
+            podspec_sidecar_key(&build_cocoapods_storage_key("SnapKit", "5.7.1")).as_deref(),
+            Some(build_cocoapods_podspec_key("SnapKit", "5.7.1").as_str())
+        );
+        assert_eq!(podspec_sidecar_key("no-slash.tar.gz"), None);
+        assert_eq!(podspec_sidecar_key("/5.7.1/x.tar.gz"), None);
+    }
+
     // -----------------------------------------------------------------------
     // build_cocoapods_metadata
     // -----------------------------------------------------------------------
@@ -1524,6 +1638,120 @@ mod db_cov_tests {
             String::from_utf8_lossy(&body[..])
         );
         fx.teardown().await;
+    }
+
+    /// #5662: the same pod version pushes into two CocoaPods repositories on
+    /// a shared cloud namespace (on main the second push answered 409
+    /// "already owned by another repository; refusing cross-repository
+    /// overwrite"), each serves its own archive, and neither the archive nor
+    /// the podspec sidecar is written to the legacy flat key.
+    #[tokio::test]
+    async fn same_pod_pushes_to_two_cloud_repositories_5662() {
+        let archive = pod_archive("SharedPod5662", "1.0.0");
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "cocoapods",
+            key_prefix: "cocoapods",
+            router: super::router,
+            publish: &|key| {
+                vec![axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/{key}/pods"))
+                    .body(axum::body::Body::from(archive.clone()))
+                    .unwrap()]
+            },
+            download: &|key| tdh::get(format!("/{key}/pods/SharedPod5662-1.0.0.tar.gz")),
+            expected: &archive,
+        })
+        .await;
+    }
+
+    /// #5662: a podspec with no metadata copy is read from the sidecar next
+    /// to the archive its row recorded: the repo-scoped key for a pod pushed
+    /// to a cloud backend now, the legacy flat key for one pushed before.
+    #[tokio::test]
+    async fn podspec_sidecar_is_read_next_to_the_row_key_5662() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let auth = tdh::make_auth(user_id, &username);
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let (repo_id, repo_key, dir) = tdh::create_cloud_repo(&pool, "cocoapods", user_id).await;
+        let app = || tdh::router_with_auth(super::router(), state.clone(), auth.clone());
+        let spec_uri = format!("/{repo_key}/Specs/SideCar5662/2.0.0/SideCar5662.podspec.json");
+
+        let push = tdh::send(
+            app(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/{repo_key}/pods"))
+                .body(axum::body::Body::from(pod_archive("SideCar5662", "2.0.0")))
+                .unwrap(),
+        )
+        .await;
+        // Serve the spec from storage, not from the metadata copy.
+        sqlx::query(
+            "DELETE FROM artifact_metadata WHERE artifact_id IN \
+             (SELECT id FROM artifacts WHERE repository_id = $1)",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("drop the metadata copy");
+        let scoped = tdh::send(app(), tdh::get(spec_uri.clone())).await;
+
+        // The layout a pre-fix push left: archive and sidecar on flat keys.
+        let scoped_prefix = format!("cocoapods/{repo_id}/");
+        let moved: Vec<String> = {
+            let mut objects = mem.objects.lock().unwrap();
+            let keys: Vec<String> = objects
+                .keys()
+                .filter(|k| k.starts_with(&scoped_prefix))
+                .cloned()
+                .collect();
+            keys.into_iter()
+                .map(|key| {
+                    let flat = format!("cocoapods/{}", &key[scoped_prefix.len()..]);
+                    let bytes = objects.remove(&key).unwrap();
+                    objects.insert(flat.clone(), bytes);
+                    flat
+                })
+                .collect()
+        };
+        sqlx::query(
+            "UPDATE artifacts SET storage_key = replace(storage_key, $2, 'cocoapods/') \
+             WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .bind(&scoped_prefix)
+        .execute(&pool)
+        .await
+        .expect("move the row to the legacy key");
+        let legacy = tdh::send(app(), tdh::get(spec_uri)).await;
+
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert!(
+            push.0.is_success(),
+            "push: {}",
+            String::from_utf8_lossy(&push.1)
+        );
+        assert_eq!(
+            moved.len(),
+            2,
+            "archive and podspec sidecar are both written under {scoped_prefix}: {moved:?}"
+        );
+        for (what, (status, body)) in [("repo-scoped", scoped), ("legacy flat", legacy)] {
+            assert_eq!(
+                status,
+                axum::http::StatusCode::OK,
+                "{what} sidecar: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let spec: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(spec["name"], "SideCar5662", "{what} sidecar");
+        }
     }
 
     // Exercises the DB-query happy paths so the sweep's db_err/db_status
