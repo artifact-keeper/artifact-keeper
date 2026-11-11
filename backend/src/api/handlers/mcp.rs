@@ -138,7 +138,8 @@ pub async fn mcp_surface_guard(
     let retry_after = resp.headers().get(header::RETRY_AFTER).cloned();
     let mut out = ensure_problem(resp).await;
     if let Some(v) = retry_after {
-        out.headers_mut().entry(header::RETRY_AFTER).or_insert(v);
+        // The middleware's own value beats the re-rendered default.
+        out.headers_mut().insert(header::RETRY_AFTER, v);
     }
     let status = out.status();
     if read {
@@ -257,9 +258,21 @@ pub fn problem(status: u16, code: &str, detail: &str, extra: serde_json::Value) 
     refusal_bytes(status, serde_json::to_vec(&body).unwrap_or_default())
 }
 
+/// The `Retry-After` (seconds) a `503` of this surface carries when the
+/// refusal set none of its own (`mcp_gate_unavailable`, #5637), so a client
+/// backs off instead of retrying at once.
+pub const RETRY_AFTER_SECS: &str = "5";
+
 pub(crate) fn refusal_bytes(status: u16, body: Vec<u8>) -> Response {
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    with_refusal_headers((status, body).into_response())
+    let mut resp = with_refusal_headers((status, body).into_response());
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        resp.headers_mut().insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_static(RETRY_AFTER_SECS),
+        );
+    }
+    resp
 }
 
 /// The unknown-name answer, byte for byte the reader-only refusal.
@@ -8230,6 +8243,21 @@ mod tests {
                 "/mcp/r/v0.1/hidden",
                 get(|| async { StatusCode::NOT_FOUND }),
             )
+            .route(
+                "/mcp/r/v0.1/busy",
+                get(move || plain(StatusCode::SERVICE_UNAVAILABLE)),
+            )
+            .route(
+                "/mcp/r/v0.1/gate",
+                get(|| async {
+                    problem(
+                        503,
+                        "mcp_gate_unavailable",
+                        "gates could not be evaluated",
+                        serde_json::json!({}),
+                    )
+                }),
+            )
             .route("/npm/r/x", get(move || plain(StatusCode::UNAUTHORIZED)))
             .layer(axum::middleware::from_fn(mcp_surface_guard));
         let send = |uri: &str| {
@@ -8252,6 +8280,16 @@ mod tests {
         assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
         assert_refusal_headers(&h);
         assert_eq!(json(&b)["error"], "mcp_rate_limited");
+        assert_eq!(h[header::RETRY_AFTER], "7");
+        // #5637: the router's own 503 (`mcp_gate_unavailable`) carries a
+        // `Retry-After`; a middleware 503 keeps its own value.
+        let (s, b, h) = send("/mcp/r/v0.1/gate").await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json(&b)["error"], "mcp_gate_unavailable");
+        assert_eq!(h[header::RETRY_AFTER], RETRY_AFTER_SECS);
+        let (s, b, h) = send("/mcp/r/v0.1/busy").await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json(&b)["error"], "mcp_unavailable");
         assert_eq!(h[header::RETRY_AFTER], "7");
         let (_, _, h) = send("/npm/r/x").await;
         assert_eq!(h[header::CONTENT_TYPE], "text/plain; charset=utf-8");
