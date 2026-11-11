@@ -640,7 +640,7 @@ repository that scans on proxy:
 | --- | --- | --- |
 | `GET /api/v1/repositories/{key}/artifacts` | The files the proxy cache holds, rebuilt from the proxy-cache catalog: path, size, when it was cached, download count. Each item has a synthetic id and `analyzable: false`. | None. It serves no bytes and does not read verdicts, so a cached file is listed whatever its verdict. |
 | `GET /api/v1/repositories/{key}/artifacts/*path` | The metadata (JSON) of an `artifacts` row at that path; `404` when there is none. It never reads the proxy cache or the upstream. | None. It serves no bytes. |
-| `GET /api/v1/repositories/{key}/download/*path` | A file the cache or the upstream would supply: `403` `scan_on_proxy_route_required` (see [The generic download route](#the-generic-download-route)). An `artifacts` row: its bytes from storage. | Refuses proxied files; serves rows without a scan. |
+| `GET /api/v1/repositories/{key}/download/*path` | `403` `scan_on_proxy_route_required` (see [The generic download route](#the-generic-download-route)), for a file the cache or the upstream would supply and for an `artifacts` row alike (#5076). | Refuses proxied files and rows. |
 | The format route (`/go/{key}/...`, `/gems/{key}/...`, ...) | An `artifacts` row: its bytes from storage, through the gate. Otherwise the file through the gate. | Gates proxied files and rows. |
 
 The reasoning:
@@ -664,8 +664,11 @@ The reasoning:
   proxied file of that format is, so a row whose archive declares another
   package or version, cannot be read, or holds two entries at one path is
   withheld under `fail_closed` exactly as the proxied file would be. The
-  generic download route still serves a row without a scan. See
-  [Known gaps](#known-gaps).
+  package routes of Go, RubyGems, Composer, Pub, Conan, CocoaPods and Swift
+  (#4514) and of NuGet, Debian `pool/`, RPM and Alpine (#5076) do this; see
+  [Known gaps](#known-gaps) for the rest. The generic download route cannot
+  grade a row, so it refuses it with the same `403`
+  `scan_on_proxy_route_required` as a proxied file (#5076).
 
 For a Virtual repository, `GET .../artifacts/*path` serves a member's bytes
 through the member walk, so it takes the same refusal as the generic download
@@ -749,18 +752,21 @@ have no core proxy path to gate.
 - **Package rows in a Remote repository.** A Remote can hold `artifacts`
   rows of its own (from replication, from a publish into the remote, or
   recorded before proxied content stopped being stored as rows).
-  - Go, RubyGems, Composer, Pub, Conan, CocoaPods and Swift: the format
-    route serves such a row through the gate (see
-    [The artifacts routes](#the-artifacts-routes)).
-  - NuGet, Debian, RPM and Alpine, and the rows of the other enforced
-    formats: the format route still serves a row whose blob is present from
-    storage without the gate. For NuGet, if the blob has gone missing and
-    the row records a SHA-256, the re-fetched bytes are held to that digest
-    instead of being scanned, and a stored `vulnerable` verdict for that
-    digest refuses the pull (`403`); a row with no digest is re-fetched
-    through the gate.
-  - Every enforced format: the generic download route serves a row from
-    storage without the gate.
+  - Go, RubyGems, Composer, Pub, Conan, CocoaPods, Swift (#4514), NuGet,
+    Debian `pool/`, RPM and Alpine (#5076): the format route serves such a
+    row through the gate (see [The artifacts routes](#the-artifacts-routes)).
+    For NuGet, if the blob has gone missing and the row records a SHA-256,
+    the re-fetched bytes are held to that digest instead of being scanned,
+    and a stored `vulnerable` verdict for that digest refuses the pull
+    (`403`); a row with no digest is re-fetched through the gate.
+  - The other enforced formats: the format route still serves a row whose
+    blob is present from storage without the gate.
+  - Every enforced format: the generic download route refuses the row
+    (`403` `scan_on_proxy_route_required`, #5076).
+  - Through a Virtual, a Remote member's rows are never read like a hosted
+    member's: a Remote member is resolved through its proxy cache, and a
+    Remote with no `upstream_url` cannot exist (the `check_upstream_url`
+    constraint) and would be skipped by the member walk anyway (#5076).
 - **Conda packages graded on file contents.** A conda package the scanner
   catalogs nothing for is graded on its findings alone and recorded with
   `components_cataloged: 0` (#4594). A clean result there means the scanner

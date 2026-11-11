@@ -13560,7 +13560,7 @@ async fn generic_route_virtual_refusal(
         (status = 200, description = "Artifact binary content. A hosted artifact carries `ETag: \"<sha256>\"` (its recorded SHA-256, the value `If-Match` on the generic PUT compares against) and `X-Checksum-Sha256`.", content_type = "application/octet-stream",
             headers(("ETag" = String, description = "Strong entity tag: the quoted SHA-256 of the artifact"))),
         (status = 302, description = "Redirect to S3 presigned URL"),
-        (status = 403, description = "A proxied file of a scan-on-proxy enforced format, in a Remote or Virtual repository that scans on proxy: download it through the format's own route (`error: scan_on_proxy_route_required`)"),
+        (status = 403, description = "A proxied file of a scan-on-proxy enforced format, in a Remote or Virtual repository that scans on proxy, or an `artifacts` row such a Remote holds (#5076): download it through the format's own route (`error: scan_on_proxy_route_required`)"),
         (status = 404, description = "Artifact not found"),
         (status = 502, description = "The stored object no longer matches its recorded SHA-256 (`code: STORED_OBJECT_INTEGRITY`, #4323). Objects up to 4 MiB are checked before any byte is sent; a larger corrupted object is aborted before its last bytes instead. Set `DOWNLOAD_VERIFY_CHECKSUMS=false` to turn verification off.", body = crate::api::openapi::ErrorResponse),
         (status = 503, description = "The repository's scan-on-proxy configuration could not be read"),
@@ -13657,6 +13657,18 @@ pub async fn download_artifact(
                 &path,
             )
             .await?;
+            // #5076: a Remote that scans on proxy can hold rows of its own
+            // (replication, a publish into the remote). This route cannot
+            // grade them as their format route does, so, as for its Remote
+            // miss (#4442), such a row of an enforced format is served only
+            // through the format route. Before the presigned redirect and the
+            // storage read, so neither serves it.
+            if repo.repo_type == RepositoryType::Remote {
+                if let Some(refusal) = generic_route_remote_refusal(&state.db, &repo, &path).await?
+                {
+                    return Ok(refusal);
+                }
+            }
         }
     }
 
@@ -32744,6 +32756,62 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// #5076: a row an enforced-format Remote holds itself (replicated, or
+    /// published into the remote) is refused on the generic route once the
+    /// repository scans on proxy, on both mounts, as its Remote miss is
+    /// (#4442). Scanning off, it is served as before. Fails on `main`: the row
+    /// streamed from storage past the gate.
+    #[tokio::test]
+    async fn generic_route_refuses_a_stored_row_of_a_scanning_remote_5076() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        let path = "com/example/lib/1.0/lib-1.0.jar";
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("remote", None),
+            &format!("rows-5076/{}", Uuid::new_v4()),
+            path,
+            "lib",
+            "1.0",
+            "application/java-archive",
+            Bytes::from_static(b"replicated-jar-bytes"),
+            fx.user_id,
+        )
+        .await;
+        let uri = format!("/{}/download/{path}", fx.repo_key);
+
+        let (status, body) = tdh::send(
+            fx.router_with_auth(download_router()),
+            tdh::get(uri.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "scan off: the row is served");
+        assert_eq!(&body[..], b"replicated-jar-bytes");
+
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+        let (status, body) = tdh::send(fx.router_with_auth(download_router()), tdh::get(uri)).await;
+        let (general_status, general_body) = tdh::send(
+            fx.router_with_auth(crate::api::handlers::general::router()),
+            tdh::get(format!("/{}/{path}", fx.repo_key)),
+        )
+        .await;
+        let _ = sqlx::query("DELETE FROM scan_configs WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+        assert_scan_route_refusal_4442(status, &body, "lib-1.0.jar", "maven", "stored row");
+        assert_scan_route_refusal_4442(
+            general_status,
+            &general_body,
+            "lib-1.0.jar",
+            "maven",
+            "stored row on /general/",
+        );
+    }
+
     /// What #4442 must not change: an enforced format with scan-on-proxy off,
     /// and an `accepted` format with it on, still stream from the upstream.
     #[tokio::test]
@@ -32904,10 +32972,10 @@ mod tests {
     }
 
     /// A file stored in a scanning Remote repository itself (an `artifacts`
-    /// row) is still served from storage: the refusal sits on the proxy
-    /// fallback only, after the row lookup, and the upstream is not contacted.
+    /// row) is refused like a proxied file (#5076; #4442 served it from
+    /// storage without the gate), and the upstream is not contacted.
     #[tokio::test]
-    async fn generic_route_still_serves_a_stored_file_of_a_scanning_remote_4442() {
+    async fn generic_route_refuses_a_stored_file_of_a_scanning_remote_4442() {
         let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
             return;
         };
@@ -32935,8 +33003,7 @@ mod tests {
             tdh::get(format!("/{}/download/pkg/stored-1.0.0.tgz", fx.repo_key)),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-        assert_eq!(&body[..], stored);
+        assert_scan_route_refusal_4442(status, &body, "stored-1.0.0.tgz", "npm", "stored row");
         assert_eq!(upstream_requests_4442(&server).await, 0);
         fx.teardown().await;
     }

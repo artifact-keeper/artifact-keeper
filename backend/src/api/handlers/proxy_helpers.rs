@@ -9347,30 +9347,69 @@ pub(crate) async fn open_stored_row<K: crate::api::handlers::proxy_scan_archive:
     row: &StoredRow<'_>,
     kind: K,
 ) -> Result<StoredRowBody, Response> {
-    let stream = || async move {
-        storage
+    let Some(policy) = stored_row_scan_policy(state, row.repo).await? else {
+        let body = storage
             .get_stream(row.storage_key)
             .await
-            .map_err(stored_row_storage_error)
-    };
-    let Some(policy) = stored_row_scan_policy(state, row.repo).await? else {
-        let body = stream().await?;
+            .map_err(stored_row_storage_error)?;
         return Ok(StoredRowBody { body, scan: None });
     };
+    gate_row_under_policy(state, storage, &policy, row, &kind, None).await
+}
+
+/// [`open_stored_row`] for a format route that has already opened the row's
+/// stream itself, because it answers a storage error its own way (a Remote
+/// re-fetching a missing blob from upstream, a hosted repository retrying a
+/// missing blob) (#5076). `body` is that stream: returned untouched when the
+/// repository does not gate its rows, otherwise replaced by the gated bytes
+/// (or kept, `pending`, for a row over the scan cap under `fail_open`).
+pub(crate) async fn gate_opened_stored_row<
+    K: crate::api::handlers::proxy_scan_archive::ArchiveKind,
+>(
+    state: &crate::api::SharedState,
+    storage: &dyn crate::storage::StorageBackend,
+    row: &StoredRow<'_>,
+    kind: K,
+    body: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+) -> Result<StoredRowBody, Response> {
+    let Some(policy) = stored_row_scan_policy(state, row.repo).await? else {
+        return Ok(StoredRowBody { body, scan: None });
+    };
+    gate_row_under_policy(state, storage, &policy, row, &kind, Some(body)).await
+}
+
+/// The gated half of [`open_stored_row`] and [`gate_opened_stored_row`]: a
+/// row over the scan cap is inconclusive (`423` under `fail_closed`, streamed
+/// `pending` otherwise); any other row is read into memory and gated.
+async fn gate_row_under_policy<K: crate::api::handlers::proxy_scan_archive::ArchiveKind>(
+    state: &crate::api::SharedState,
+    storage: &dyn crate::storage::StorageBackend,
+    policy: &StoredRowPolicy,
+    row: &StoredRow<'_>,
+    kind: &K,
+    opened: Option<futures::stream::BoxStream<'static, crate::error::Result<Bytes>>>,
+) -> Result<StoredRowBody, Response> {
     if stored_row_over_cap(row.size_bytes) {
-        stored_row_over_cap_locks(&policy, row.repo, row.filename)?;
-        let body = stream().await?;
+        stored_row_over_cap_locks(policy, row.repo, row.filename)?;
+        let body = match opened {
+            Some(body) => body,
+            None => storage
+                .get_stream(row.storage_key)
+                .await
+                .map_err(stored_row_storage_error)?,
+        };
         crate::services::metrics_service::record_proxy_scan_verdict("inconclusive", "served");
         return Ok(StoredRowBody {
             body,
             scan: Some("pending"),
         });
     }
+    drop(opened);
     let bytes = storage
         .get(row.storage_key)
         .await
         .map_err(stored_row_storage_error)?;
-    let scan = gate_stored_bytes(state, &policy, row.repo, row.filename, &bytes, &kind).await?;
+    let scan = gate_stored_bytes(state, policy, row.repo, row.filename, &bytes, kind).await?;
     Ok(StoredRowBody {
         body: futures::stream::once(async move { Ok(bytes) }).boxed(),
         scan: Some(scan),

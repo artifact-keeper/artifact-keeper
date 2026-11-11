@@ -1576,6 +1576,29 @@ async fn download_package(
 
     match storage.get_stream(&artifact.storage_key).await {
         Ok(stream) => {
+            // #5076: a row a scanning Remote holds goes through the scan
+            // gate, graded as the proxied `.apk` would be.
+            let proxy_helpers::StoredRowBody { body: stream, scan } =
+                proxy_helpers::gate_opened_stored_row(
+                    &state,
+                    storage.as_ref(),
+                    &proxy_helpers::StoredRow {
+                        repo: &repo,
+                        filename: &filename,
+                        storage_key: &artifact.storage_key,
+                        size_bytes: artifact.size_bytes,
+                    },
+                    ApkPackage {
+                        arch: &arch,
+                        release:
+                            crate::api::handlers::proxy_scan_archive::alpine_release_from_branch(
+                                &branch,
+                            ),
+                    },
+                    stream,
+                )
+                .await?;
+
             // Record download
             crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
@@ -1586,6 +1609,7 @@ async fn download_package(
                 &filename,
                 &artifact.checksum_sha256,
             )
+            .map(|resp| proxy_helpers::StoredRowBody::stamp(scan, resp))
         }
         Err(crate::error::AppError::NotFound(_)) if repo.repo_type != RepositoryType::Remote => {
             // Hosted artifact: file absent from storage. Serialise concurrent
@@ -5320,6 +5344,22 @@ mod scan_on_proxy_4113 {
     }
 
     archive_scan_suite!(case);
+
+    /// #5076: a row the scanning Remote holds itself is served through the
+    /// gate, as the proxied file is. Fails on `main`: the row streamed
+    /// ungated (200, no `X-AK-Scan`) under every policy.
+    #[tokio::test]
+    async fn a_stored_row_of_a_scanning_remote_is_gated_5076() {
+        crate::api::handlers::proxy_scan_archive::test_support::stored_row_is_gated(
+            case,
+            crate::api::handlers::proxy_scan_archive::test_support::StoredRowSeed {
+                path: format!("{DIR}/{FILE}"),
+                name: "libdtf".to_string(),
+                version: "1.0-r0".to_string(),
+            },
+        )
+        .await;
+    }
 
     /// #4365 item 3: an ambiguous segment on a proxying repository is a 400
     /// before anything is fetched.
