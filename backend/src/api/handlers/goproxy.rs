@@ -1709,8 +1709,11 @@ async fn download_zip(
                 let db = state.db.clone();
                 let module_clone = module.to_string();
                 let version_clone = version.to_string();
+                // #5810: no member scans; the virtual's member-fallback policy.
+                let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
                 let result = proxy_helpers::resolve_virtual_download_from_members(
                     allowed,
+                    fallback,
                     state.proxy_service.as_deref(),
                     &upstream_path,
                     Some(ctx),

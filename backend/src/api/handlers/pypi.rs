@@ -3108,6 +3108,13 @@ async fn serve_file(
                 let guard =
                     PypiOwnershipGuard::resolve(&state.db, repo.id, &members, project.as_str())
                         .await?;
+                // #5810: the virtual's member-fallback policy. In strict mode
+                // a Remote member that could not answer ends the walk with
+                // the retryable 503 instead of letting a lower member serve.
+                let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
+                let strict_unavailable = |resp: &Response| {
+                    fallback.is_strict() && proxy_helpers::is_member_unavailable_response(resp)
+                };
 
                 for member in &members {
                     // #3404: apply the ownership guard BEFORE this member is
@@ -3296,6 +3303,11 @@ async fn serve_file(
                                         {
                                             return Err(resp);
                                         }
+                                        if strict_unavailable(&resp) {
+                                            return Err(
+                                                proxy_helpers::member_unavailable_response(),
+                                            );
+                                        }
                                         debug!(
                                             member_key = %member.key,
                                             status = %status,
@@ -3356,6 +3368,9 @@ async fn serve_file(
                             {
                                 Ok(result) => {
                                     return Ok(build_streaming_file_response(filename, result));
+                                }
+                                Err(e) if strict_unavailable(&e) => {
+                                    return Err(proxy_helpers::member_unavailable_response());
                                 }
                                 Err(e) => {
                                     debug!(

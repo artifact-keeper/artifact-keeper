@@ -3295,18 +3295,29 @@ pub(crate) struct MemberWalk<'p> {
     /// counts against it. The `upstream` closure records the member's own
     /// answer ([`MemberBreaker::record`]).
     pub(crate) breaker: Option<&'p MemberBreaker>,
+    /// The virtual's [`VirtualMemberFallback::Strict`] mode (#5810): the
+    /// first member in priority order that is
+    /// [`MemberResolveOutcome::Unavailable`] ends the walk with
+    /// `Some(Unavailable)` instead of letting a lower member serve.
+    pub(crate) strict: bool,
 }
 
 impl<'p> MemberWalk<'p> {
     /// The walk an artifact download through `proxy_service` makes:
     /// bounded by [`virtual_member_download_deadline`] (no deadline without
-    /// a proxy: no member can then reach an upstream).
-    pub(crate) fn download(proxy_service: Option<&'p ProxyService>, path: &'p str) -> Self {
+    /// a proxy: no member can then reach an upstream), under the virtual's
+    /// `fallback` policy.
+    pub(crate) fn download(
+        proxy_service: Option<&'p ProxyService>,
+        path: &'p str,
+        fallback: VirtualMemberFallback,
+    ) -> Self {
         Self {
             path,
             deadline: proxy_service
                 .and_then(|p| virtual_member_download_deadline(p.upstream_read_timeout())),
             breaker: proxy_service.map(ProxyService::member_breaker),
+            strict: fallback.is_strict(),
         }
     }
 }
@@ -3480,6 +3491,15 @@ pub fn record_virtual_member_download_deadline_miss(
 /// it never contacts an upstream. `None` waits for every member as long as
 /// its upstream client allows.
 ///
+/// Strict member fallback (#5810): with [`MemberWalk::strict`] set, the
+/// first member in priority order that is
+/// [`MemberResolveOutcome::Unavailable`] (a Pass-1 probe that could not
+/// answer, the confirmed top candidate, or a fan-out member, including one
+/// passed over by its deadline or an open breaker) ends the walk with
+/// `Some(Unavailable)` as soon as every member above it has missed: no lower
+/// member's copy is served, and the fan-out is not waited for. A miss is
+/// still a miss, and members ranked below the winner never matter.
+///
 /// Runs in an `INTERNAL` `resolve_virtual_members` span (#4455); each member's
 /// proxy fetch is a `proxy_fetch` child of it.
 #[tracing::instrument(
@@ -3516,10 +3536,17 @@ where
     // when nothing serves.
     let mut any_unavailable = false;
     for member in members {
-        let (class, hit) = probe(member).await;
+        let (mut class, hit) = probe(member).await;
         // A probe that could not answer is a definite non-winner here; it is
-        // remembered, not offered as the Pass-1 fallback winner.
+        // remembered, not offered as the Pass-1 fallback winner. In strict
+        // mode (#5810) it is terminal like a policy block: Pass 1 stops
+        // there, only the members above it can still win, and if none does
+        // the walk answers `Unavailable`.
         let hit = match hit {
+            Some(MemberResolveOutcome::Unavailable) if walk.strict => {
+                class = MemberCacheClass::DefiniteHit;
+                Some(MemberResolveOutcome::Unavailable)
+            }
             Some(MemberResolveOutcome::Unavailable) => {
                 any_unavailable = true;
                 None
@@ -3599,7 +3626,10 @@ where
     // first request for an artifact the top remote member holds costs exactly
     // one upstream request, not one per member.
     let first_outcome = bounded(&members[first]).await;
-    if !first_outcome.passes() {
+    // #5810: in strict mode an unavailable top candidate is the answer.
+    if !first_outcome.passes()
+        || (walk.strict && matches!(first_outcome, MemberResolveOutcome::Unavailable))
+    {
         return Some(first_outcome);
     }
     any_unavailable |= matches!(first_outcome, MemberResolveOutcome::Unavailable);
@@ -3643,6 +3673,12 @@ where
         while next < buffer.len() {
             match buffer[next] {
                 Some(MemberResolveOutcome::Miss) => next += 1,
+                // #5810: strict mode ends the walk at the first unavailable
+                // member in priority order, whatever the members below it
+                // answered.
+                Some(MemberResolveOutcome::Unavailable) if walk.strict => {
+                    return buffer[next].take();
+                }
                 Some(MemberResolveOutcome::Unavailable) => {
                     any_unavailable = true;
                     next += 1;
@@ -3925,7 +3961,9 @@ where
         // has no members", so the two stayed distinguishable (#3452).
         return Err(no_accessible_members_response());
     }
-    resolve_virtual_download_from_members(members, proxy_service, path, ctx, local_fetch).await
+    let fallback = virtual_member_fallback(db, virtual_repo_id).await;
+    resolve_virtual_download_from_members(members, fallback, proxy_service, path, ctx, local_fetch)
+        .await
 }
 
 /// Body of [`resolve_virtual_download`] operating over an already-fetched (and,
@@ -3944,8 +3982,14 @@ where
 /// helpers.
 ///
 /// `ctx`: see [`resolve_virtual_download`] (#3844).
+///
+/// `fallback` is the virtual's [`VirtualMemberFallback`] (#5810), read once
+/// per request by the caller ([`virtual_member_fallback`]) for the virtual
+/// the request addressed: with nested virtuals the outermost one's setting
+/// governs the whole walk.
 pub async fn resolve_virtual_download_from_members<F, Fut>(
     members: Vec<Repository>,
+    fallback: VirtualMemberFallback,
     proxy_service: Option<&ProxyService>,
     path: &str,
     ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
@@ -3957,6 +4001,7 @@ where
 {
     resolve_virtual_download_from_members_with_fetch_urls(
         members,
+        fallback,
         proxy_service,
         path,
         &std::collections::HashMap::new(),
@@ -3984,6 +4029,7 @@ where
 /// recorded (`ctx`, #3844) under the canonical `path`, the key its cache uses.
 pub async fn resolve_virtual_download_from_members_with_fetch_urls<F, Fut>(
     members: Vec<Repository>,
+    fallback: VirtualMemberFallback,
     proxy_service: Option<&ProxyService>,
     path: &str,
     member_fetch_urls: &std::collections::HashMap<Uuid, String>,
@@ -3996,6 +4042,7 @@ where
 {
     resolve_virtual_download_winner(
         members,
+        fallback,
         proxy_service,
         path,
         member_fetch_urls,
@@ -4011,6 +4058,7 @@ where
 /// only that member can vouch for.
 pub(crate) async fn resolve_virtual_download_from_members_with_origin<F, Fut>(
     members: Vec<Repository>,
+    fallback: VirtualMemberFallback,
     proxy_service: Option<&ProxyService>,
     path: &str,
     ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
@@ -4022,6 +4070,7 @@ where
 {
     resolve_virtual_download_winner(
         members,
+        fallback,
         proxy_service,
         path,
         &std::collections::HashMap::new(),
@@ -4033,6 +4082,7 @@ where
 
 async fn resolve_virtual_download_winner<F, Fut>(
     members: Vec<Repository>,
+    fallback: VirtualMemberFallback,
     proxy_service: Option<&ProxyService>,
     path: &str,
     member_fetch_urls: &std::collections::HashMap<Uuid, String>,
@@ -4155,8 +4205,9 @@ where
                 None => MemberResolveOutcome::Miss,
             }
         },
-        // #5810: a hung member is passed over after the download deadline.
-        MemberWalk::download(proxy_service, path),
+        // #5810: a hung member is passed over after the download deadline;
+        // in strict mode an unavailable member ends the walk.
+        MemberWalk::download(proxy_service, path, fallback),
     )
     .await;
 
@@ -4342,6 +4393,8 @@ where
     if members.is_empty() {
         return Err(no_accessible_members_response());
     }
+    // #5810: the virtual's member-fallback policy, read once for the walk.
+    let fallback = virtual_member_fallback(&state.db, virtual_repo_id).await;
 
     // Two-phase, priority-preserving resolution (#2069), streaming sibling of
     // [`resolve_virtual_download_from_members`]. Pass 1 (`probe`) classifies
@@ -4442,8 +4495,9 @@ where
                     None => MemberResolveOutcome::Miss,
                 }
             },
-            // #5810: a hung member is passed over after the download deadline.
-            MemberWalk::download(proxy_service, path),
+            // #5810: a hung member is passed over after the download deadline;
+            // in strict mode an unavailable member ends the walk.
+            MemberWalk::download(proxy_service, path, fallback),
         )
         .await;
 
@@ -4852,6 +4906,85 @@ pub async fn virtual_metadata_partial_allowed(db: &PgPool, virtual_repo_id: Uuid
         None
     });
     virtual_metadata_partial_opted_in(value.as_deref())
+}
+
+/// `repository_config` key holding a virtual repository's
+/// [`VirtualMemberFallback`] (#5810), stored as `available` or `strict`.
+pub const VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY: &str = "virtual_member_fallback";
+
+/// Whether an artifact download through a virtual repository may be served
+/// by a lower-priority member while a higher-priority Remote member is
+/// unavailable (#5810). Metadata merges have their own policy
+/// ([`VIRTUAL_METADATA_PARTIAL_CONFIG_KEY`]) and ignore this one.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum VirtualMemberFallback {
+    /// An unavailable member (an upstream `5xx`, a transport failure or
+    /// timeout, a missed download deadline, an open breaker) is passed over
+    /// and the next member in priority order serves. The default.
+    #[default]
+    Available,
+    /// An unavailable member is terminal: the download answers `503` with
+    /// `Retry-After` instead of serving a lower member's copy. A `404` or
+    /// another permanent `4xx` is still a miss and the walk goes on.
+    Strict,
+}
+
+impl VirtualMemberFallback {
+    /// Canonical spelling, as stored and on the wire.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Strict => "strict",
+        }
+    }
+
+    /// Parse a stored value. Anything but `strict` (case-insensitive) is
+    /// [`Self::Available`], the behaviour a virtual has when never set.
+    pub fn from_stored(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some(v) if v.eq_ignore_ascii_case("strict") => Self::Strict,
+            _ => Self::Available,
+        }
+    }
+
+    /// Whether an unavailable member ends the walk.
+    pub const fn is_strict(self) -> bool {
+        matches!(self, Self::Strict)
+    }
+}
+
+/// Read `virtual_repo_id`'s [`VirtualMemberFallback`] (#5810): one
+/// `repository_config` lookup, made once per download. A failed read is
+/// [`VirtualMemberFallback::Available`] with a `WARN`, the behaviour every
+/// virtual had before the setting existed.
+pub async fn virtual_member_fallback(db: &PgPool, virtual_repo_id: Uuid) -> VirtualMemberFallback {
+    let value: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+    )
+    .bind(virtual_repo_id)
+    .bind(VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY)
+    .fetch_optional(db)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(
+            error = %e,
+            virtual_repo_id = %virtual_repo_id,
+            "reading {VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY} failed; using available"
+        );
+        None
+    });
+    VirtualMemberFallback::from_stored(value.as_deref())
 }
 
 /// Mark a degraded merged response: name the missing members, forbid caching
@@ -12616,15 +12749,23 @@ fn combined_member_policy(
 /// [`member_unavailable_response`] (503) instead of a 404 (#5504);
 /// `unscanned_run` reports such a run as `Some(Err(_))` through
 /// [`unscanned_run_failure`].
+///
+/// Strict member fallback (#5810): once some member scans, the walk reads the
+/// virtual's [`VirtualMemberFallback`] (one query, only on this path) and
+/// hands it to every `unscanned_run` call, which must pass it to its
+/// resolver. Under [`VirtualMemberFallback::Strict`] an unavailable scanning
+/// member or run ends the walk with the 503. A caller that falls back to its
+/// own resolver on `None` reads the setting then, so each download reads it
+/// once.
 pub(crate) async fn walk_virtual_members_with_scan<U, UFut, S, SFut>(
     db: &PgPool,
     virtual_id: Uuid,
     members: Vec<Repository>,
-    unscanned_run: U,
+    mut unscanned_run: U,
     scanned: S,
 ) -> Option<Result<Response, Response>>
 where
-    U: FnMut(Vec<Repository>) -> UFut,
+    U: FnMut(Vec<Repository>, VirtualMemberFallback) -> UFut,
     UFut: Future<Output = Option<Result<Response, Response>>>,
     S: FnMut(Repository, MemberScanPolicy) -> SFut,
     SFut: Future<Output = Result<Response, Response>>,
@@ -12633,7 +12774,18 @@ where
         Ok(policies) => policies,
         Err(resp) => return Some(Err(resp)),
     };
-    walk_members_with_policies(members, policies, unscanned_run, scanned).await
+    if policies.iter().all(Option::is_none) {
+        return None;
+    }
+    let fallback = virtual_member_fallback(db, virtual_id).await;
+    walk_members_with_policies(
+        members,
+        policies,
+        fallback,
+        move |run| unscanned_run(run, fallback),
+        scanned,
+    )
+    .await
 }
 
 /// The scan-on-proxy policy a scanning Virtual member is served under: the
@@ -12650,6 +12802,7 @@ pub(crate) type MemberScanPolicy = (
 async fn walk_members_with_policies<U, UFut, S, SFut>(
     members: Vec<Repository>,
     policies: Vec<Option<MemberScanPolicy>>,
+    fallback: VirtualMemberFallback,
     mut unscanned_run: U,
     mut scanned: S,
 ) -> Option<Result<Response, Response>>
@@ -12662,7 +12815,7 @@ where
     if policies.iter().all(Option::is_none) {
         return None;
     }
-    let mut failures = MemberWalkFailures::default();
+    let mut failures = MemberWalkFailures::new(fallback);
     let mut unscanned = Vec::new();
     for (member, policy) in members.into_iter().zip(policies) {
         let Some(policy) = policy else {
@@ -12685,7 +12838,9 @@ where
                 return Some(Err(resp))
             }
             Err(resp) => {
-                failures.note(&resp);
+                if let Some(ended) = failures.note(&resp) {
+                    return Some(ended);
+                }
                 tracing::debug!(
                     member_key = %member_key, status = %resp.status(),
                     "scanned virtual member did not serve; trying next member"
@@ -12705,33 +12860,55 @@ where
 /// member could not answer. Shared by [`walk_virtual_members_with_scan`] and
 /// the formats that drive their own scan-aware loop (cargo, conda, VS Code),
 /// so they all end the same way: the walk's 503 when a member was
-/// unavailable and nothing served, the 404 miss otherwise.
+/// unavailable and nothing served, the 404 miss otherwise. Under
+/// [`VirtualMemberFallback::Strict`] (#5810) the first unavailable member or
+/// run ends the walk with that 503 at once.
 #[derive(Debug, Default)]
 pub(crate) struct MemberWalkFailures {
     unavailable: bool,
+    strict: bool,
 }
 
 impl MemberWalkFailures {
+    /// A walk under the virtual's `fallback` policy.
+    pub(crate) fn new(fallback: VirtualMemberFallback) -> Self {
+        Self {
+            unavailable: false,
+            strict: fallback.is_strict(),
+        }
+    }
+
     /// An unscanned run's answer ([`unscanned_run_failure`]'s shape): a
     /// served response or a policy block is returned to end the walk; a run
     /// in which a member could not answer is recorded and the walk goes on
-    /// (`None`), as for a miss.
+    /// (`None`), as for a miss, or, in strict mode, ends with the 503.
     pub(crate) fn run_answer(
         &mut self,
         answer: Option<Result<Response, Response>>,
     ) -> Option<Result<Response, Response>> {
         match answer {
-            Some(Err(resp)) if is_member_unavailable_response(&resp) => {
-                self.unavailable = true;
-                None
-            }
+            Some(Err(resp)) if is_member_unavailable_response(&resp) => self.unavailable(),
             other => other,
         }
     }
 
-    /// Record a scanning member's failure that did not end the walk.
-    pub(crate) fn note(&mut self, resp: &Response) {
-        self.unavailable |= is_member_unavailable_response(resp);
+    /// Record a scanning member's failure. `Some` is the walk's answer when
+    /// the failure ends it (an unavailable member in strict mode, #5810);
+    /// `None` moves on to the next member.
+    #[must_use]
+    pub(crate) fn note(&mut self, resp: &Response) -> Option<Result<Response, Response>> {
+        if is_member_unavailable_response(resp) {
+            self.unavailable()
+        } else {
+            None
+        }
+    }
+
+    /// A member (or run) could not answer: remembered for [`Self::finish`],
+    /// or the walk's 503 now in strict mode.
+    fn unavailable(&mut self) -> Option<Result<Response, Response>> {
+        self.unavailable = true;
+        self.strict.then(|| Err(member_unavailable_response()))
     }
 
     /// The walk's answer after its last run (`last`): that run's answer if
@@ -12775,6 +12952,7 @@ pub(crate) fn unscanned_run_failure(resp: Response) -> Option<Result<Response, R
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_unscanned_member_run<F, Fut>(
     run: Vec<Repository>,
+    fallback: VirtualMemberFallback,
     proxy: Option<&ProxyService>,
     path: &str,
     local_fetch: F,
@@ -12789,7 +12967,8 @@ where
     F: Fn(Uuid, StorageLocation) -> Fut,
     Fut: Future<Output = Result<StreamingFetchResult, Response>>,
 {
-    match resolve_virtual_download_from_members(run, proxy, path, ctx, local_fetch).await {
+    match resolve_virtual_download_from_members(run, fallback, proxy, path, ctx, local_fetch).await
+    {
         Ok(result) => {
             if let (Some(artifact_id), Some((db, ctx))) = (result.artifact_id, record) {
                 crate::services::artifact_service::record_download(db, artifact_id, ctx).await;
@@ -12868,7 +13047,14 @@ mod virtual_scan_walk_tests {
                 }
             }
         };
-        let result = walk_members_with_policies(members, policies, unscanned_run, scanned).await;
+        let result = walk_members_with_policies(
+            members,
+            policies,
+            VirtualMemberFallback::Available,
+            unscanned_run,
+            scanned,
+        )
+        .await;
         let log = log.into_inner().unwrap();
         (result, log)
     }
@@ -12927,15 +13113,99 @@ mod virtual_scan_walk_tests {
             let scanned = |_m: Repository, _p: MemberScanPolicy| async move {
                 Err(member_unavailable_response())
             };
-            let result = walk_members_with_policies(members, policies, unscanned_run, scanned)
-                .await
-                .expect("walked");
+            let result = walk_members_with_policies(
+                members,
+                policies,
+                VirtualMemberFallback::Available,
+                unscanned_run,
+                scanned,
+            )
+            .await
+            .expect("walked");
             if last_serves {
                 assert_eq!(body_of(result.expect("served")).await, "run2");
             } else {
                 let resp = result.expect_err("nothing served");
                 assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
             }
+        }
+    }
+
+    /// #5810: under the strict member fallback an unavailable unscanned run
+    /// or scanning member ends the walk with the 503 at once, so no lower
+    /// member is asked; a miss still moves on, and the default (`available`)
+    /// passes it over as #5504 does.
+    #[tokio::test]
+    async fn strict_fallback_ends_the_walk_at_an_unavailable_member_5810() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // (which member is unavailable, fallback) -> (status, members asked)
+        let cases = [
+            (
+                "run1",
+                VirtualMemberFallback::Strict,
+                StatusCode::SERVICE_UNAVAILABLE,
+                1,
+            ),
+            (
+                "scanning",
+                VirtualMemberFallback::Strict,
+                StatusCode::SERVICE_UNAVAILABLE,
+                2,
+            ),
+            ("run1", VirtualMemberFallback::Available, StatusCode::OK, 3),
+            (
+                "scanning",
+                VirtualMemberFallback::Available,
+                StatusCode::OK,
+                3,
+            ),
+            ("none", VirtualMemberFallback::Strict, StatusCode::OK, 3),
+        ];
+        for (down, fallback, expected, asked_expected) in cases {
+            let asked = AtomicUsize::new(0);
+            let members = vec![member("run1"), member("scanning"), member("run2")];
+            let policies = vec![None, SCAN, None];
+            let unscanned_run = |run: Vec<Repository>| {
+                asked.fetch_add(1, Ordering::SeqCst);
+                let first = run[0].key.clone();
+                async move {
+                    match first.as_str() {
+                        k if k == down => Some(Err(member_unavailable_response())),
+                        "run1" => None,
+                        _ => Some(Ok(ok_from(&first))),
+                    }
+                }
+            };
+            let scanned = |m: Repository, _p: MemberScanPolicy| {
+                asked.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if m.key == down {
+                        Err(member_unavailable_response())
+                    } else {
+                        Err(status(StatusCode::NOT_FOUND))
+                    }
+                }
+            };
+            let result =
+                walk_members_with_policies(members, policies, fallback, unscanned_run, scanned)
+                    .await
+                    .expect("walked");
+            let status = match &result {
+                Ok(resp) | Err(resp) => resp.status(),
+            };
+            assert_eq!(status, expected, "{down} unavailable, {fallback:?}");
+            if expected == StatusCode::SERVICE_UNAVAILABLE {
+                let resp = result.expect_err("strict 503");
+                assert!(
+                    resp.headers().contains_key(axum::http::header::RETRY_AFTER),
+                    "the retryable 503 carries Retry-After"
+                );
+            }
+            assert_eq!(
+                asked.load(Ordering::SeqCst),
+                asked_expected,
+                "{down} unavailable, {fallback:?}: members asked"
+            );
         }
     }
 
@@ -16162,6 +16432,7 @@ mod tests {
             path: "com/example/lib/1.0/lib-1.0.jar",
             deadline: Some(after),
             breaker: None,
+            strict: false,
         }
     }
 
@@ -16362,6 +16633,7 @@ mod tests {
                 path: "com/example/lib/1.0/lib-1.0.jar",
                 deadline: Some(DEADLINE_5810),
                 breaker: Some(breaker),
+                strict: false,
             },
         )
         .await;
@@ -16432,6 +16704,258 @@ mod tests {
         let (_, elapsed) = breaker_walk_5810(&members, &breaker, false, &dialled).await;
         assert_eq!(elapsed, std::time::Duration::ZERO);
         assert_eq!(dialled.load(Ordering::SeqCst), 2, "open again");
+    }
+
+    // ── #5810: strict member fallback in the two-phase walk ──
+
+    /// A download walk under the virtual's `fallback`, with the deadline.
+    fn fallback_5810(fallback: VirtualMemberFallback) -> MemberWalk<'static> {
+        MemberWalk {
+            strict: fallback.is_strict(),
+            ..deadline_5810(DEADLINE_5810)
+        }
+    }
+
+    fn unavailable_5810(
+        after: std::time::Duration,
+    ) -> Option<(std::time::Duration, MemberResolveOutcome<String, String>)> {
+        Some((after, MemberResolveOutcome::Unavailable))
+    }
+
+    /// #5810: strict mode. An unavailable top candidate (a `5xx` at once, or
+    /// a hung member at the deadline) is the walk's answer: `Unavailable`,
+    /// without waiting for the lower member, whose hit is never served.
+    /// `available` serves that hit.
+    #[tokio::test(start_paused = true)]
+    async fn two_phase_strict_unavailable_top_candidate_is_terminal_5810() {
+        let slow_ok = std::time::Duration::from_secs(5);
+        let members = members_5810(&["down", "ok"]);
+        let answer = |k: &str| match k {
+            "down" => unavailable_5810(std::time::Duration::ZERO),
+            _ => Some((slow_ok, MemberResolveOutcome::Hit("ok".to_string()))),
+        };
+        let (out, elapsed) = walk_5810(
+            &members,
+            answer,
+            fallback_5810(VirtualMemberFallback::Strict),
+        )
+        .await;
+        assert!(
+            matches!(out, Some(MemberResolveOutcome::Unavailable)),
+            "strict: the unavailable top member is terminal, got {out:?}"
+        );
+        assert_eq!(
+            elapsed,
+            std::time::Duration::ZERO,
+            "the lower member is not waited for"
+        );
+
+        let (out, elapsed) = walk_5810(
+            &members,
+            answer,
+            fallback_5810(VirtualMemberFallback::Available),
+        )
+        .await;
+        assert!(
+            matches!(out, Some(MemberResolveOutcome::Hit(ref v)) if v == "ok"),
+            "available: the lower member serves, got {out:?}"
+        );
+        assert_eq!(elapsed, slow_ok);
+
+        // A hung top member costs the deadline, then strict answers
+        // Unavailable rather than the lower hit.
+        let members = members_5810(&["hung", "ok"]);
+        let (out, elapsed) = walk_5810(
+            &members,
+            |k| if k == "ok" { hit_5810("ok") } else { None },
+            fallback_5810(VirtualMemberFallback::Strict),
+        )
+        .await;
+        assert!(
+            matches!(out, Some(MemberResolveOutcome::Unavailable)),
+            "{out:?}"
+        );
+        assert_eq!(elapsed, DEADLINE_5810);
+    }
+
+    /// #5810: strict mode. An unavailable member in the middle of the
+    /// fan-out ends the walk once the members above it have missed, even
+    /// though a lower member already hit; `available` serves that hit.
+    #[tokio::test(start_paused = true)]
+    async fn two_phase_strict_unavailable_fan_out_member_is_terminal_5810() {
+        let down_after = std::time::Duration::from_secs(5);
+        let members = members_5810(&["miss", "down", "fast"]);
+        let answer = |k: &str| match k {
+            "miss" => Some((std::time::Duration::ZERO, MemberResolveOutcome::Miss)),
+            "down" => unavailable_5810(down_after),
+            _ => hit_5810("fast"),
+        };
+        let (out, elapsed) = walk_5810(
+            &members,
+            answer,
+            fallback_5810(VirtualMemberFallback::Strict),
+        )
+        .await;
+        assert!(
+            matches!(out, Some(MemberResolveOutcome::Unavailable)),
+            "strict: the lower member's earlier hit is not served, got {out:?}"
+        );
+        assert_eq!(elapsed, down_after);
+
+        let (out, _) = walk_5810(
+            &members,
+            answer,
+            fallback_5810(VirtualMemberFallback::Available),
+        )
+        .await;
+        assert!(
+            matches!(out, Some(MemberResolveOutcome::Hit(ref v)) if v == "fast"),
+            "available: the lower member serves, got {out:?}"
+        );
+    }
+
+    /// #5810: strict mode only makes an UNAVAILABLE member terminal: a miss
+    /// above a hit moves on, and members below the winner never matter.
+    #[tokio::test(start_paused = true)]
+    async fn two_phase_strict_miss_is_not_terminal_5810() {
+        let members = members_5810(&["miss", "ok", "down"]);
+        let (out, _) = walk_5810(
+            &members,
+            |k| match k {
+                "miss" => Some((std::time::Duration::ZERO, MemberResolveOutcome::Miss)),
+                "ok" => hit_5810("ok"),
+                _ => unavailable_5810(std::time::Duration::ZERO),
+            },
+            fallback_5810(VirtualMemberFallback::Strict),
+        )
+        .await;
+        assert!(
+            matches!(out, Some(MemberResolveOutcome::Hit(ref v)) if v == "ok"),
+            "a miss is not terminal and a member below the winner is ignored: {out:?}"
+        );
+    }
+
+    /// #5810: a Pass-1 probe that could not answer is terminal in strict
+    /// mode too: a lower member's cache hit is not served, while a member
+    /// ranked above the unavailable one still wins. `available` serves the
+    /// lower cache hit.
+    #[tokio::test(start_paused = true)]
+    async fn two_phase_strict_unavailable_probe_is_terminal_5810() {
+        async fn walk(
+            members: &[Repository],
+            top_hits: bool,
+            fallback: VirtualMemberFallback,
+        ) -> Option<MemberResolveOutcome<String, String>> {
+            resolve_members_two_phase::<String, String, _, _, _, _>(
+                members,
+                |m| {
+                    let key = m.key.clone();
+                    async move {
+                        match key.as_str() {
+                            "top" => (MemberCacheClass::NeedsUpstream, None),
+                            "probe-down" => (
+                                MemberCacheClass::DefiniteMiss,
+                                Some(MemberResolveOutcome::Unavailable),
+                            ),
+                            _ => (
+                                MemberCacheClass::DefiniteHit,
+                                Some(MemberResolveOutcome::Hit(key)),
+                            ),
+                        }
+                    }
+                },
+                |m| {
+                    let key = m.key.clone();
+                    async move {
+                        if top_hits {
+                            MemberResolveOutcome::Hit(key)
+                        } else {
+                            MemberResolveOutcome::Miss
+                        }
+                    }
+                },
+                fallback_5810(fallback),
+            )
+            .await
+        }
+        let members = members_5810(&["top", "probe-down", "cached"]);
+        let out = walk(&members, false, VirtualMemberFallback::Strict).await;
+        assert!(
+            matches!(out, Some(MemberResolveOutcome::Unavailable)),
+            "strict: the lower cache hit is not served, got {out:?}"
+        );
+        let out = walk(&members, true, VirtualMemberFallback::Strict).await;
+        assert!(
+            matches!(out, Some(MemberResolveOutcome::Hit(ref v)) if v == "top"),
+            "a member above the unavailable one still wins, got {out:?}"
+        );
+        let out = walk(&members, false, VirtualMemberFallback::Available).await;
+        assert!(
+            matches!(out, Some(MemberResolveOutcome::Hit(ref v)) if v == "cached"),
+            "available: the lower cache hit serves, got {out:?}"
+        );
+    }
+
+    /// #5810: strict mode with an open breaker answers `Unavailable` at once,
+    /// without dialling the member or waiting for any deadline.
+    #[tokio::test(start_paused = true)]
+    async fn two_phase_strict_open_breaker_is_immediate_unavailable_5810() {
+        let breaker = MemberBreaker::new(1, std::time::Duration::from_secs(30));
+        let members = members_5810(&["down", "ok"]);
+        breaker.record(members[0].id, &members[0].key, true);
+        let dialled = std::sync::atomic::AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let out = resolve_members_two_phase::<String, String, _, _, _, _>(
+            &members,
+            |_m| async move { (MemberCacheClass::NeedsUpstream, None) },
+            |m| {
+                dialled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let key = m.key.clone();
+                async move { MemberResolveOutcome::Hit(key) }
+            },
+            MemberWalk {
+                breaker: Some(&breaker),
+                ..fallback_5810(VirtualMemberFallback::Strict)
+            },
+        )
+        .await;
+        assert!(
+            matches!(out, Some(MemberResolveOutcome::Unavailable)),
+            "{out:?}"
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+        assert_eq!(
+            dialled.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "neither the open member nor the lower one is dialled"
+        );
+    }
+
+    /// #5810: the stored `virtual_member_fallback` values. Only `strict`
+    /// (any case) is strict; unset, `available` or anything else is the
+    /// default. The wire form is lowercase.
+    #[test]
+    fn virtual_member_fallback_stored_values_5810() {
+        use VirtualMemberFallback::{Available, Strict};
+        assert_eq!(VirtualMemberFallback::from_stored(None), Available);
+        assert_eq!(
+            VirtualMemberFallback::from_stored(Some("available")),
+            Available
+        );
+        assert_eq!(VirtualMemberFallback::from_stored(Some(" Strict ")), Strict);
+        assert_eq!(VirtualMemberFallback::from_stored(Some("bogus")), Available);
+        for mode in [Available, Strict] {
+            assert_eq!(
+                VirtualMemberFallback::from_stored(Some(mode.as_str())),
+                mode
+            );
+            assert_eq!(
+                serde_json::to_value(mode).unwrap(),
+                serde_json::Value::String(mode.as_str().to_string())
+            );
+        }
+        assert!(serde_json::from_str::<VirtualMemberFallback>("\"STRICT\"").is_err());
+        assert_eq!(VirtualMemberFallback::default(), Available);
     }
 
     /// #5810: the deadline setting. Unset or garbage is the default, `0`
@@ -17628,6 +18152,7 @@ mod tests {
     async fn resolve_from_members_empty_is_404() {
         let res = resolve_virtual_download_from_members(
             Vec::new(),
+            VirtualMemberFallback::Available,
             None,
             "g/a/1.0/a-1.0.jar",
             None,
@@ -17642,6 +18167,7 @@ mod tests {
         let members = vec![test_local_member("maven-local")];
         let res = resolve_virtual_download_from_members(
             members,
+            VirtualMemberFallback::Available,
             None,
             "g/a/1.0/a-1.0.jar",
             None,
@@ -17664,6 +18190,7 @@ mod tests {
         ];
         let res = resolve_virtual_download_from_members(
             members,
+            VirtualMemberFallback::Available,
             None,
             "g/a/1.0/a-1.0.jar",
             None,
@@ -17687,6 +18214,7 @@ mod tests {
         let calls2 = calls.clone();
         let res = resolve_virtual_download_from_members(
             members,
+            VirtualMemberFallback::Available,
             None,
             "g/a/1.0/a-1.0.jar",
             None,
@@ -29585,6 +30113,7 @@ mod virtual_winner_recording_tests_3844 {
         let urls = std::collections::HashMap::from([(*member_id, fetch_url)]);
         let served = resolve_virtual_download_from_members_with_fetch_urls(
             members,
+            VirtualMemberFallback::Available,
             Some(&rig.proxy),
             &path,
             &urls,

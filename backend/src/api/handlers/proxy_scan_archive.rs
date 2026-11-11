@@ -317,9 +317,10 @@ where
     SFut: std::future::Future<Output = Result<Response, Response>>,
 {
     let runs = &runs;
-    let unscanned_run = |run: Vec<Repository>| async move {
+    let unscanned_run = |run: Vec<Repository>, fallback| async move {
         match proxy_helpers::resolve_virtual_download_from_members_with_fetch_urls(
             run,
+            fallback,
             Some(runs.proxy),
             runs.path,
             runs.member_fetch_urls,

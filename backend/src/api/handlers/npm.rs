@@ -5661,8 +5661,13 @@ async fn serve_tarball(
         // (no regression). The shared `resolve_virtual_download_from_members` is
         // deliberately left untouched so maven/hex and other formats are
         // unaffected.
+        // #5810: the virtual's member-fallback policy. In strict mode a
+        // scanning member that could not answer cuts the walk there: only the
+        // members ranked above it may still serve, else the answer is 503.
+        let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
+        let mut strict_cut = None;
         if let Some(proxy) = proxy_for_virtual {
-            for member in &members {
+            for (rank, member) in members.iter().enumerate() {
                 if member.repo_type != RepositoryType::Remote {
                     continue;
                 }
@@ -5714,6 +5719,12 @@ async fn serve_tarball(
                         {
                             return Err(resp);
                         }
+                        if fallback.is_strict()
+                            && proxy_helpers::is_member_unavailable_response(&resp)
+                        {
+                            strict_cut = Some(rank);
+                            break;
+                        }
                         debug!(
                             member_key = %member.key,
                             status = %status,
@@ -5724,6 +5735,10 @@ async fn serve_tarball(
                 }
             }
         }
+        let members = match strict_cut {
+            Some(cut) => members[..cut].to_vec(),
+            None => members,
+        };
 
         // #3785: a Remote member whose upstream publishes tarballs outside the
         // registry-standard `/-/` layout (GitHub Packages' `/download/…`) is
@@ -5740,6 +5755,7 @@ async fn serve_tarball(
                 .await;
         let result = proxy_helpers::resolve_virtual_download_from_members_with_fetch_urls(
             members,
+            fallback,
             proxy_for_virtual,
             &upstream_path,
             &member_fetch_urls,
@@ -5755,7 +5771,14 @@ async fn serve_tarball(
                 }
             },
         )
-        .await?;
+        .await
+        .map_err(|resp| match strict_cut {
+            // Nothing above the unavailable scanning member served (#5810).
+            Some(_) if !proxy_helpers::is_member_policy_block_response(&resp) => {
+                proxy_helpers::member_unavailable_response()
+            }
+            _ => resp,
+        })?;
 
         // Always serve npm virtual-repo tarballs as `application/gzip`,
         // overriding whatever content type the proxy-cache sidecar recorded
