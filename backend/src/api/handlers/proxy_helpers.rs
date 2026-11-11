@@ -5437,6 +5437,8 @@ pub(crate) async fn fetch_virtual_expansion(
     db: &PgPool,
     virtual_repo_id: Uuid,
 ) -> Result<VirtualMemberExpansion, Response> {
+    #[cfg(test)]
+    VIRTUAL_EXPANSIONS.with(|n| n.set(n.get() + 1));
     let expansion = expand_virtual_members(db, virtual_repo_id).await?;
     if expansion.cycle_edge_skipped {
         tracing::warn!(
@@ -5453,6 +5455,30 @@ pub(crate) async fn fetch_virtual_expansion(
         );
     }
     Ok(expansion)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Calls of [`fetch_virtual_expansion`] on this thread: a test on a
+    /// current-thread runtime counts how often one decision expands a
+    /// Virtual (#5537).
+    static VIRTUAL_EXPANSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times [`fetch_virtual_expansion`] ran on this thread.
+#[cfg(test)]
+pub(crate) fn virtual_expansion_count() -> usize {
+    VIRTUAL_EXPANSIONS.with(|n| n.get())
+}
+
+/// The ids of the non-Remote leaves of an expansion, in resolution order:
+/// the member set the shadowing guards look for an owner in.
+pub(crate) fn non_remote_leaf_ids(members: &[ExpandedMember]) -> Vec<Uuid> {
+    members
+        .iter()
+        .filter(|m| m.repo.repo_type != RepositoryType::Remote)
+        .map(|m| m.repo.id)
+        .collect()
 }
 
 /// Dense resolution rank of every leaf in an expansion, keyed by repository
@@ -7024,13 +7050,30 @@ pub async fn virtual_non_remote_owns_name_version(
     version: Option<&str>,
     format: &str,
 ) -> Result<bool, Response> {
-    let members = fetch_virtual_members(db, virtual_repo_id).await?;
-    let non_remote_ids: Vec<Uuid> = members
-        .iter()
-        .filter(|m| m.repo_type != RepositoryType::Remote)
-        .map(|m| m.id)
-        .collect();
+    let expansion = fetch_virtual_expansion(db, virtual_repo_id).await?;
+    non_remote_ids_own_name_version(
+        db,
+        virtual_repo_id,
+        &non_remote_leaf_ids(&expansion.members),
+        package_name,
+        version,
+        format,
+    )
+    .await
+}
 
+/// [`virtual_non_remote_owns_name_version`] over the non-Remote leaves of an
+/// expansion the caller already holds ([`non_remote_leaf_ids`]), so one
+/// decision expands the Virtual once (#5537).
+#[allow(clippy::result_large_err)]
+pub(crate) async fn non_remote_ids_own_name_version(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+    non_remote_ids: &[Uuid],
+    package_name: &str,
+    version: Option<&str>,
+    format: &str,
+) -> Result<bool, Response> {
     if non_remote_ids.is_empty() {
         return Ok(false);
     }
@@ -7045,7 +7088,7 @@ pub async fn virtual_non_remote_owns_name_version(
                AND LOWER(name) = LOWER($2) \
              LIMIT 1",
         )
-        .bind(&non_remote_ids)
+        .bind(non_remote_ids)
         .bind(package_name)
         .fetch_optional(db)
         .await
@@ -7065,7 +7108,7 @@ pub async fn virtual_non_remote_owns_name_version(
            AND LOWER(name) = LOWER($2) \
            AND version IS NOT NULL",
     )
-    .bind(&non_remote_ids)
+    .bind(non_remote_ids)
     .bind(package_name)
     .fetch_all(db)
     .await
@@ -7097,21 +7140,19 @@ pub async fn virtual_non_remote_owns_name_version(
 /// for the version it actually owns, so every upstream version the merged
 /// packument advertises stays downloadable.
 ///
+/// `non_remote_ids` are the Virtual's non-Remote leaves, from an expansion
+/// the caller already holds ([`non_remote_leaf_ids`]), so one decision
+/// expands the Virtual once (#5537).
+///
 /// Fails closed on DB error (matches [`virtual_non_remote_owns_name`]).
 #[allow(clippy::result_large_err)]
-pub async fn npm_virtual_owner_min_priority(
+pub(crate) async fn npm_virtual_owner_min_priority(
     db: &PgPool,
     virtual_repo_id: Uuid,
+    non_remote_ids: &[Uuid],
     package_name: &str,
     version: &str,
 ) -> Result<Option<i32>, Response> {
-    let members = fetch_virtual_members(db, virtual_repo_id).await?;
-    let non_remote_ids: Vec<Uuid> = members
-        .iter()
-        .filter(|m| m.repo_type != RepositoryType::Remote)
-        .map(|m| m.id)
-        .collect();
-
     if non_remote_ids.is_empty() {
         return Ok(None);
     }
@@ -7131,7 +7172,7 @@ pub async fn npm_virtual_owner_min_priority(
            AND LOWER(a.name) = LOWER($2) \
            AND a.version = $3",
     )
-    .bind(&non_remote_ids)
+    .bind(non_remote_ids)
     .bind(package_name)
     .bind(version)
     .bind(virtual_repo_id)
@@ -7165,13 +7206,29 @@ pub async fn virtual_non_remote_owns_name_exact_version(
     version: &str,
     format: &str,
 ) -> Result<bool, Response> {
-    let members = fetch_virtual_members(db, virtual_repo_id).await?;
-    let non_remote_ids: Vec<Uuid> = members
-        .iter()
-        .filter(|m| m.repo_type != RepositoryType::Remote)
-        .map(|m| m.id)
-        .collect();
+    let expansion = fetch_virtual_expansion(db, virtual_repo_id).await?;
+    non_remote_ids_own_name_exact_version(
+        db,
+        virtual_repo_id,
+        &non_remote_leaf_ids(&expansion.members),
+        package_name,
+        version,
+        format,
+    )
+    .await
+}
 
+/// [`virtual_non_remote_owns_name_exact_version`] over the non-Remote leaves
+/// of an expansion the caller already holds ([`non_remote_leaf_ids`], #5537).
+#[allow(clippy::result_large_err)]
+pub(crate) async fn non_remote_ids_own_name_exact_version(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+    non_remote_ids: &[Uuid],
+    package_name: &str,
+    version: &str,
+    format: &str,
+) -> Result<bool, Response> {
     if non_remote_ids.is_empty() {
         return Ok(false);
     }
@@ -7184,7 +7241,7 @@ pub async fn virtual_non_remote_owns_name_exact_version(
            AND version = $3 \
          LIMIT 1",
     )
-    .bind(&non_remote_ids)
+    .bind(non_remote_ids)
     .bind(package_name)
     .bind(version)
     .fetch_optional(db)
