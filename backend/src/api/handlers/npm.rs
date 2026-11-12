@@ -1049,11 +1049,27 @@ fn validate_package_name(name: &str) -> Result<(), Response> {
                 "Scoped package name must have exactly one '/'",
             ));
         }
+        // #5725: a scope or package part that is a dot segment (`@./x`,
+        // `@scope/.`, also reached as `%2e`) would yield a storage key the
+        // filesystem backend normalises onto another package's key.
+        if rest.split('/').any(crate::formats::npm::is_dot_segment) {
+            return Err(map_status(
+                StatusCode::BAD_REQUEST,
+                "Package name contains a '.' path segment",
+            ));
+        }
     }
     if name.starts_with('.') || name.starts_with('_') {
         return Err(map_status(
             StatusCode::BAD_REQUEST,
             "Package name cannot start with '.' or '_'",
+        ));
+    }
+    // #5725: npm refuses these names outright.
+    if crate::formats::npm::is_npm_blocked_name(name) {
+        return Err(map_status(
+            StatusCode::BAD_REQUEST,
+            "Package name is not allowed",
         ));
     }
     Ok(())
@@ -3506,21 +3522,17 @@ fn npm_name_shape(package_name: &str) -> NpmNameShape<'_> {
 
 /// Validate an npm scope literal (`@scope`) for the policy allow-list.
 ///
-/// npm scope names follow the same character rules as package names: ASCII
-/// lowercase letters, digits, `-`, `_` and `.`, not starting with `.` or `_`,
-/// and at most 214 characters. Callers normalise to lowercase before
-/// validating, so uppercase input is accepted but stored case-folded.
+/// Uses the scope rule of [`crate::formats::npm::is_valid_npm_name`], so every
+/// scope a valid name can carry can also be allow-listed (#5725): ASCII
+/// lowercase letters, digits, `-`, `_`, `.` and `~` (any of them may lead),
+/// never exactly `.` or `..`, and at most 214 characters. Callers normalise to
+/// lowercase before validating, so uppercase input is accepted but stored
+/// case-folded.
 pub(crate) fn is_valid_npm_scope(scope: &str) -> bool {
     let Some(rest) = scope.strip_prefix('@') else {
         return false;
     };
-    !rest.is_empty()
-        && rest.len() <= 214
-        && !rest.starts_with('.')
-        && !rest.starts_with('_')
-        && rest
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
+    rest.len() <= 214 && crate::formats::npm::is_valid_npm_scope_segment(rest)
 }
 
 /// Per-repository npm name-namespace policy (#2327).
@@ -8550,8 +8562,13 @@ mod tests {
         assert!(!is_valid_npm_scope("types"));
         assert!(!is_valid_npm_scope("@"));
         assert!(!is_valid_npm_scope("@Types")); // callers lowercase first
-        assert!(!is_valid_npm_scope("@.hidden"));
-        assert!(!is_valid_npm_scope("@_private"));
+                                                // #5725: npm allows a scope to start with `.`, `_`, `-` or `~`.
+        for scope in ["@.hidden", "@_private", "@-dash", "@~tilde"] {
+            assert!(is_valid_npm_scope(scope), "{scope}");
+        }
+        assert!(!is_valid_npm_scope("@."));
+        assert!(!is_valid_npm_scope("@.."));
+        assert!(!is_valid_npm_scope("@a b"));
         assert!(!is_valid_npm_scope("@sc/ope"));
         assert!(!is_valid_npm_scope(&format!("@{}", "a".repeat(215))));
     }
@@ -9708,6 +9725,17 @@ mod tests {
         crate::api::handlers::test_db_helpers::Fixture,
         Vec<crate::models::repository::Repository>,
     )> {
+        setup_ownership_rig_owning("fail-safe-pkg").await
+    }
+
+    /// [`setup_3955_ownership_rig`] with the hosted member owning
+    /// `package@1.0.0` instead of `fail-safe-pkg@1.0.0`.
+    async fn setup_ownership_rig_owning(
+        package: &str,
+    ) -> Option<(
+        crate::api::handlers::test_db_helpers::Fixture,
+        Vec<crate::models::repository::Repository>,
+    )> {
         use crate::api::handlers::test_db_helpers as tdh;
 
         let fx = tdh::Fixture::setup("virtual", "npm").await?;
@@ -9726,17 +9754,18 @@ mod tests {
             .expect("attach member");
         }
         let local_repo = tdh::make_repo_info(local_id, &local_key, &local_dir, "local", None);
-        let artifact_path = "fail-safe-pkg/1.0.0/fail-safe-pkg-1.0.0.tgz";
+        let basename = package.rsplit('/').next().unwrap_or(package);
+        let artifact_path = format!("{package}/1.0.0/{basename}-1.0.0.tgz");
         tdh::seed_artifact(
             &fx.state,
             &fx.pool,
             &local_repo,
             &format!("npm/{artifact_path}"),
-            artifact_path,
-            "fail-safe-pkg",
+            &artifact_path,
+            package,
             "1.0.0",
             "application/gzip",
-            Bytes::from_static(b"tgz:fail-safe-pkg-1.0.0"),
+            Bytes::from(format!("tgz:{package}-1.0.0")),
             fx.user_id,
         )
         .await;
@@ -9863,6 +9892,66 @@ mod tests {
                 matches!(invalid, NpmVirtualOwnership::NotOwned),
                 "an invalid npm name must skip the ownership check ({filename}), got {invalid:?}"
             );
+        }
+    }
+
+    /// #5725: a hosted `@_scope/x` (a name npm accepts) withholds the Remote
+    /// tarball. `is_valid_npm_name` used to reject a scope starting with `_`,
+    /// `.` or `~`, so the guard skipped the ownership check (`NotOwned`) and
+    /// the Remote member stayed eligible: it could shadow the hosted bytes.
+    /// Runs the same member filter and proxy decision `serve_tarball` does.
+    #[tokio::test]
+    async fn test_tarball_ownership_npm_scoped_shapes_withhold_proxy_5725() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        for package in ["@_scope/x", "@.scope/x", "@~scope/x", "@scope/_x"] {
+            let Some((fx, members)) = setup_ownership_rig_owning(package).await else {
+                return;
+            };
+            let expansion = proxy_helpers::fetch_virtual_expansion(&fx.pool, fx.repo_id)
+                .await
+                .expect("virtual expansion");
+            let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+            let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+            let basename = package.rsplit('/').next().unwrap();
+            let mut outcomes = Vec::new();
+            for filename in [format!("{basename}-1.0.0.tgz"), format!("{basename}.tgz")] {
+                let (ownership, eligible) = npm_virtual_eligible_members(
+                    &fx.pool,
+                    fx.repo_id,
+                    &expansion.members,
+                    members.clone(),
+                    package,
+                    &filename,
+                )
+                .await
+                .expect("eligible members");
+                let remote_eligible = eligible
+                    .iter()
+                    .any(|m| m.repo_type == RepositoryType::Remote);
+                let proxied =
+                    npm_virtual_resolver_proxy(ownership, &eligible, Some(proxy.as_ref()))
+                        .is_some();
+                outcomes.push((filename, ownership, remote_eligible && proxied));
+            }
+            fx.teardown().await;
+
+            assert!(
+                matches!(outcomes[0].1, NpmVirtualOwnership::OwnedAtPriority(1)),
+                "{package}: the hosted owner must be found, got {:?}",
+                outcomes[0].1
+            );
+            assert!(
+                matches!(outcomes[1].1, NpmVirtualOwnership::OwnedNameOnly),
+                "{package}: the name-only fail-safe must engage, got {:?}",
+                outcomes[1].1
+            );
+            for (filename, _, remote_can_serve) in &outcomes {
+                assert!(
+                    !remote_can_serve,
+                    "{package} ({filename}): no Remote member may serve the hosted tarball"
+                );
+            }
         }
     }
 
@@ -11406,6 +11495,93 @@ mod tests {
         assert!(validate_package_name(&name).is_ok());
     }
 
+    /// #5725: a scope or package part that is `.` or `..` would give a
+    /// storage key the filesystem backend normalises onto another package's
+    /// key, and npm refuses `node_modules` / `favicon.ico` outright.
+    #[test]
+    fn test_validate_npm_package_name_rejects_dot_segments_and_blocked_5725() {
+        for name in [
+            "@./x",
+            "@../x",
+            "@scope/.",
+            "@scope/..",
+            "@./.",
+            "node_modules",
+            "favicon.ico",
+            "Node_Modules",
+            "FAVICON.ICO",
+        ] {
+            assert!(validate_package_name(name).is_err(), "{name}");
+        }
+        for name in [
+            "@_s/x",
+            "@.s/x",
+            "@~s/x",
+            "@s/_x",
+            "@s/x.",
+            "@scope/node_modules",
+            "http",
+            "buffer",
+        ] {
+            assert!(validate_package_name(name).is_ok(), "{name}");
+        }
+    }
+
+    /// #5725: the dot-segment and blocked-name rejections hold on the real
+    /// routes, including the percent-encoded spellings the router decodes
+    /// into the path parameters. Validation runs before any database access,
+    /// so a lazily connecting pool is enough.
+    #[tokio::test]
+    async fn test_routes_reject_dot_segment_and_blocked_names_5725() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let dir = std::env::temp_dir().join(format!("ak-npm-5725-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let state = tdh::build_state(tdh::lazy_pool(), dir.to_str().unwrap());
+        let gets = [
+            "/npm/repo/@scope/%2e",
+            "/npm/repo/@scope/%2E",
+            "/npm/repo/@scope/%2e%2e",
+            "/npm/repo/@%2e/x",
+            "/npm/repo/@%2e%2e/x",
+            "/npm/repo/@scope%2f%2e",
+            "/npm/repo/@scope/%2e/1.0.0",
+            "/npm/repo/@scope/%2e/-/x-1.0.0.tgz",
+            "/npm/repo/@%2e/x/-/x-1.0.0.tgz",
+            "/npm/repo/node_modules",
+            "/npm/repo/favicon.ico",
+            "/npm/repo/NODE_MODULES/1.0.0",
+            "/npm/repo/node_modules/-/node_modules-1.0.0.tgz",
+        ];
+        let mut results = Vec::new();
+        for uri in gets {
+            let (status, _) = tdh::send(
+                tdh::router_anon(npm_mounted_router(), state.clone()),
+                tdh::get(uri.to_string()),
+            )
+            .await;
+            results.push((uri, status));
+        }
+        for uri in [
+            "/npm/repo/@scope/%2e",
+            "/npm/repo/@%2e/x",
+            "/npm/repo/node_modules",
+        ] {
+            let (status, _) = tdh::send(
+                tdh::router_anon(npm_mounted_router(), state.clone()),
+                tdh::put_json(uri.to_string(), Bytes::from_static(b"{}")),
+            )
+            .await;
+            results.push((uri, status));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let wrong: Vec<_> = results
+            .iter()
+            .filter(|(_, status)| *status != StatusCode::BAD_REQUEST)
+            .collect();
+        assert!(wrong.is_empty(), "every request must be a 400: {wrong:?}");
+    }
+
     #[tokio::test]
     async fn test_publish_unscoped_non_ascii_names_rejected() {
         for raw_name in ["nｕmpy", "n%EF%BD%95mpy"] {
@@ -12937,6 +13113,41 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn test_advertised_tarball_filename_npm_scoped_shapes_5725() {
+        let up = Some("https://npm.pkg.github.com");
+        for (name, expected) in [
+            ("@_scope/x", "x-1.2.3.tgz"),
+            ("@.scope/x", "x-1.2.3.tgz"),
+            ("@~scope/x", "x-1.2.3.tgz"),
+            ("@scope/_x", "_x-1.2.3.tgz"),
+        ] {
+            assert_eq!(
+                npm_advertised_tarball_filename(
+                    "https://npm.pkg.github.com/download/@scope/x/1.2.3/abc",
+                    name,
+                    "1.2.3",
+                    up
+                )
+                .as_deref(),
+                Some(expected),
+                "{name}"
+            );
+        }
+        for name in ["@./x", "@scope/.", "node_modules"] {
+            assert_eq!(
+                npm_advertised_tarball_filename(
+                    "https://npm.pkg.github.com/download/x/1.2.3/abc",
+                    name,
+                    "1.2.3",
+                    up
+                ),
+                None,
+                "{name}"
+            );
+        }
     }
 
     #[test]

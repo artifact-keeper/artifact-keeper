@@ -19,7 +19,7 @@ use crate::api::handlers::repositories::{
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
-use crate::models::security::ScanResult;
+use crate::models::security::{ScanResult, UncatalogedPolicy};
 use crate::services::audit_export::details as audit_details;
 use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 use crate::services::finding_acknowledgements::{
@@ -95,6 +95,15 @@ pub fn repo_security_router() -> Router<SharedState> {
             get(get_repo_security).put(update_repo_security),
         )
         .route("/:key/security/scans", get(list_repo_scans))
+        // #4994: the uncataloged policy and the artifacts behind `coverage`.
+        .route(
+            "/:key/security/uncataloged-policy",
+            axum::routing::put(set_uncataloged_policy),
+        )
+        .route(
+            "/:key/security/coverage/artifacts",
+            get(list_repo_coverage_artifacts),
+        )
         .route("/:key/security/proxy-scans", get(get_repo_proxy_scans))
         .route(
             "/:key/security/proxy-scans/rescan",
@@ -639,6 +648,7 @@ impl From<crate::models::security::ScanPolicy> for PolicyResponse {
             max_severity: p.max_severity,
             block_unscanned: p.block_unscanned,
             block_on_fail: p.block_on_fail,
+            block_uncataloged: p.block_uncataloged,
             is_enabled: p.is_enabled,
             min_staging_hours: p.min_staging_hours,
             max_artifact_age_days: p.max_artifact_age_days,
@@ -988,6 +998,12 @@ pub struct CreatePolicyRequest {
     #[serde(default = "default_block_unscanned")]
     pub block_unscanned: bool,
     pub block_on_fail: bool,
+    /// Refuse an artifact whose latest completed scan of some scanner
+    /// cataloged nothing (`scan_completeness = not_cataloged`): its zero
+    /// findings mean nothing was assessed, not clean (#4994). Default `false`.
+    #[serde(default)]
+    #[schema(default = false)]
+    pub block_uncataloged: bool,
     pub min_staging_hours: Option<i32>,
     pub max_artifact_age_days: Option<i32>,
     #[serde(default)]
@@ -1023,6 +1039,9 @@ pub struct UpdatePolicyRequest {
     pub block_unscanned: Option<bool>,
     #[serde(default)]
     pub block_on_fail: Option<bool>,
+    /// See [`CreatePolicyRequest::block_uncataloged`]; omitted leaves it as is.
+    #[serde(default)]
+    pub block_uncataloged: Option<bool>,
     #[serde(default)]
     pub is_enabled: Option<bool>,
     #[serde(default)]
@@ -1046,6 +1065,8 @@ pub struct PolicyResponse {
     pub max_severity: String,
     pub block_unscanned: bool,
     pub block_on_fail: bool,
+    /// Whether the policy refuses an artifact no scanner could catalog (#4994).
+    pub block_uncataloged: bool,
     pub is_enabled: bool,
     pub min_staging_hours: Option<i32>,
     pub max_artifact_age_days: Option<i32>,
@@ -1059,6 +1080,82 @@ pub struct PolicyResponse {
 pub struct RepoSecurityResponse {
     pub config: Option<ScanConfigResponse>,
     pub score: Option<ScoreResponse>,
+    /// What an artifact no scanner could catalog does to the grade status
+    /// (#4994): `fail` (default) or `warn`. Set with
+    /// `PUT /api/v1/repositories/{key}/security/uncataloged-policy`.
+    pub uncataloged_policy: UncatalogedPolicy,
+}
+
+/// Body of `PUT /api/v1/repositories/{key}/security/uncataloged-policy`.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct UncatalogedPolicyRequest {
+    /// `fail`: an artifact no scanner could catalog makes the repository
+    /// `incomplete` (or `unrated` when nothing else was assessed), as since
+    /// #4036. `warn`: it stays in `coverage.uncataloged` and
+    /// `has_uncataloged_scan` but counts as assessed, so a repository of
+    /// plain archives can be `rated`. There is no `ignore`.
+    pub uncataloged_policy: UncatalogedPolicy,
+}
+
+/// Response of `PUT /api/v1/repositories/{key}/security/uncataloged-policy`:
+/// the policy and the score recalculated under it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UncatalogedPolicyResponse {
+    pub uncataloged_policy: UncatalogedPolicy,
+    pub score: ScoreResponse,
+}
+
+/// Query of `GET /api/v1/repositories/{key}/security/coverage/artifacts`.
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct CoverageArtifactsQuery {
+    /// Comma-separated coverage statuses to list: `failed`, `uncataloged`,
+    /// `partial`, `cataloged`, `unscanned`. Default
+    /// `failed,uncataloged,partial`, the artifacts that keep the repository
+    /// from `rated`.
+    pub status: Option<String>,
+    /// Page size, default 100, at most 1000.
+    pub limit: Option<i64>,
+    /// Rows to skip, default 0.
+    pub offset: Option<i64>,
+}
+
+/// One artifact behind a repository's coverage counts (#4994).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CoverageArtifactResponse {
+    pub artifact_id: Uuid,
+    pub name: String,
+    pub version: Option<String>,
+    pub path: String,
+    pub coverage_status: crate::services::scan_result_service::CoverageStatus,
+    /// The latest scan of each scanner for the artifact.
+    pub scans: Vec<crate::services::scan_result_service::CoverageScan>,
+}
+
+/// Live count of the repository's artifacts in each coverage status.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CoverageStatusCounts {
+    pub failed: i64,
+    pub uncataloged: i64,
+    pub partial: i64,
+    pub cataloged: i64,
+    pub unscanned: i64,
+}
+
+/// Response of `GET /api/v1/repositories/{key}/security/coverage/artifacts`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CoverageArtifactsResponse {
+    pub repository_id: Uuid,
+    /// Computed now, from the same latest scans as the score's `coverage`;
+    /// `failed + uncataloged + partial + cataloged` is `coverage.scanned`
+    /// and adding `unscanned` gives `coverage.artifacts`, as of the next
+    /// recalculation.
+    pub counts: CoverageStatusCounts,
+    /// Artifacts matching `status` (all pages).
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+    pub items: Vec<CoverageArtifactResponse>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2401,12 +2498,13 @@ async fn create_policy(
     auth.require_admin()?;
     let svc = PolicyService::new(state.db.clone());
     let p = svc
-        .create_policy(
+        .create_policy_with_uncataloged(
             &body.name,
             body.repository_id,
             &body.max_severity,
             body.block_unscanned,
             body.block_on_fail,
+            body.block_uncataloged,
             body.min_staging_hours,
             body.max_artifact_age_days,
             body.require_signature,
@@ -2470,12 +2568,13 @@ async fn update_policy(
     // PUT is partial-update friendly: any field client omits is left at its
     // current DB value via COALESCE in the service layer. See #1374.
     let p = svc
-        .update_policy(
+        .update_policy_with_uncataloged(
             id,
             body.name.as_deref(),
             body.max_severity.as_deref(),
             body.block_unscanned,
             body.block_on_fail,
+            body.block_uncataloged,
             body.is_enabled,
             body.min_staging_hours,
             body.max_artifact_age_days,
@@ -2558,10 +2657,167 @@ async fn get_repo_security(
         Some(_) => config_svc.instance_locked(repo).await?,
         None => false,
     };
+    let uncataloged_policy = read_uncataloged_policy(&state.db, repo).await?;
 
     Ok(Json(RepoSecurityResponse {
         config: config.map(|c| ScanConfigResponse::from(c).with_lock(instance_locked)),
         score: score.map(ScoreResponse::from),
+        uncataloged_policy,
+    }))
+}
+
+/// A repository's `uncataloged_policy` (#4994).
+async fn read_uncataloged_policy(db: &PgPool, repository_id: Uuid) -> Result<UncatalogedPolicy> {
+    let value: Option<String> =
+        sqlx::query_scalar("SELECT uncataloged_policy FROM repositories WHERE id = $1")
+            .bind(repository_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(value
+        .as_deref()
+        .map(UncatalogedPolicy::from_db)
+        .unwrap_or_default())
+}
+
+#[utoipa::path(
+    put,
+    path = "/{key}/security/uncataloged-policy",
+    context_path = "/api/v1/repositories",
+    tag = "security",
+    params(
+        ("key" = String, Path, description = "Repository key")
+    ),
+    request_body = UncatalogedPolicyRequest,
+    responses(
+        (status = 200, description = "Policy set; the score is recalculated under it", body = UncatalogedPolicyResponse),
+        (status = 401, description = "Authentication required", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Instance administrator required, or the token lacks write:repositories", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
+        (status = 422, description = "uncataloged_policy is not fail or warn", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn set_uncataloged_policy(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(body): Json<UncatalogedPolicyRequest>,
+) -> Result<Json<UncatalogedPolicyResponse>> {
+    let auth =
+        auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
+    auth.require_scope("write:repositories")?;
+    // `warn` relaxes every quality gate and promotion rule that fails closed
+    // on the grade status (#4994), and those are instance-admin controls, so
+    // this is one too.
+    auth.require_admin()?;
+    let repo = RepositoryService::new(state.db.clone())
+        .get_by_key(&key)
+        .await?;
+    let previous: Option<String> = sqlx::query_scalar(
+        "WITH old AS (SELECT uncataloged_policy FROM repositories WHERE id = $1) \
+         UPDATE repositories SET uncataloged_policy = $2 WHERE id = $1 \
+         RETURNING (SELECT uncataloged_policy FROM old)",
+    )
+    .bind(repo.id)
+    .bind(body.uncataloged_policy.as_str())
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    let previous = previous
+        .as_deref()
+        .map(UncatalogedPolicy::from_db)
+        .unwrap_or_default();
+
+    if previous != body.uncataloged_policy {
+        let entry = AuditEntry::new(AuditAction::RepositoryUpdated, ResourceType::Repository)
+            .user(auth.user_id)
+            .resource(repo.id)
+            .actor_name(auth.username.clone())
+            .resource_name(repo.key.clone())
+            .details(serde_json::json!({
+                "key": repo.key,
+                "uncataloged_policy": body.uncataloged_policy.as_str(),
+                "previous_uncataloged_policy": previous.as_str(),
+            }));
+        if let Err(e) = AuditService::new(state.db.clone()).log(entry).await {
+            tracing::warn!(
+                repo = %repo.key, error = %e,
+                "failed to record the uncataloged-policy change audit entry"
+            );
+        }
+    }
+
+    // The gates read the stored status, so recalculate it under the new
+    // policy now rather than at the next scan.
+    let score = ScanResultService::new(state.db.clone())
+        .recalculate_score(repo.id)
+        .await?;
+    Ok(Json(UncatalogedPolicyResponse {
+        uncataloged_policy: body.uncataloged_policy,
+        score: ScoreResponse::from(score),
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/{key}/security/coverage/artifacts",
+    context_path = "/api/v1/repositories",
+    tag = "security",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        CoverageArtifactsQuery,
+    ),
+    responses(
+        (status = 200, description = "The artifacts behind the repository's coverage counts", body = CoverageArtifactsResponse),
+        (status = 400, description = "Unknown status in the filter", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Authentication required", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn list_repo_coverage_artifacts(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Query(query): Query<CoverageArtifactsQuery>,
+) -> Result<Json<CoverageArtifactsResponse>> {
+    use crate::services::scan_result_service::{list_coverage_artifacts, CoverageStatus};
+    let auth =
+        auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
+    let repo_service = RepositoryService::new(state.db.clone());
+    let repo = repo_service.get_by_key(&key).await?;
+    require_visible(&repo, &Some(auth), &repo_service).await?;
+
+    let statuses = CoverageStatus::parse_filter(query.status.as_deref())?;
+    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    let offset = query.offset.unwrap_or(0).max(0);
+    let listing = list_coverage_artifacts(&state.db, repo.id, &statuses, limit, offset).await?;
+    let count = |s: CoverageStatus| listing.counts.get(s.as_str()).copied().unwrap_or(0);
+    Ok(Json(CoverageArtifactsResponse {
+        repository_id: repo.id,
+        counts: CoverageStatusCounts {
+            failed: count(CoverageStatus::Failed),
+            uncataloged: count(CoverageStatus::Uncataloged),
+            partial: count(CoverageStatus::Partial),
+            cataloged: count(CoverageStatus::Cataloged),
+            unscanned: count(CoverageStatus::Unscanned),
+        },
+        total: listing.total,
+        limit,
+        offset,
+        items: listing
+            .items
+            .into_iter()
+            .map(|a| CoverageArtifactResponse {
+                artifact_id: a.artifact_id,
+                name: a.name,
+                version: a.version,
+                path: a.path,
+                coverage_status: a.coverage_status,
+                scans: a.scans,
+            })
+            .collect(),
     }))
 }
 
@@ -3897,6 +4153,8 @@ async fn rescan_proxy_cached_path(
         delete_policy,
         get_repo_security,
         update_repo_security,
+        set_uncataloged_policy,
+        list_repo_coverage_artifacts,
         list_artifact_scans,
         list_repo_scans,
         get_repo_proxy_scans,
@@ -3929,6 +4187,14 @@ async fn rescan_proxy_cached_path(
         UpdatePolicyRequest,
         PolicyResponse,
         RepoSecurityResponse,
+        UncatalogedPolicyRequest,
+        UncatalogedPolicyResponse,
+        UncatalogedPolicy,
+        CoverageArtifactsResponse,
+        CoverageArtifactResponse,
+        CoverageStatusCounts,
+        crate::services::scan_result_service::CoverageStatus,
+        crate::services::scan_result_service::CoverageScan,
         ScanConfigResponse,
         UpdateRepoSecurityRequest,
         crate::services::scan_config_service::UpsertScanConfigRequest,
@@ -7917,6 +8183,131 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #4994: only an instance administrator sets a repository's
+    /// uncataloged policy (`warn` relaxes every gate that fails closed on the
+    /// grade status); the write recalculates the score under it, and the
+    /// coverage listing names the artifact behind `coverage.uncataloged`.
+    #[tokio::test]
+    async fn uncataloged_policy_and_coverage_listing_db_4994() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_admin(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let artifact_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, checksum_sha256, \
+                content_type, storage_key) \
+             VALUES ($1, $2, 'docs.tar.gz', 'docs/docs.tar.gz', 1, repeat('a', 64), \
+                'application/gzip', 'docs/docs.tar.gz')",
+        )
+        .bind(artifact_id)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("artifact");
+        sqlx::query(
+            "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
+                completed_at, scan_completeness, scan_completeness_reason) \
+             VALUES ($1, $2, 'dependency', 'completed', NOW(), 'not_cataloged', 'no catalog')",
+        )
+        .bind(artifact_id)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("scan");
+
+        let body = || {
+            Json(UncatalogedPolicyRequest {
+                uncataloged_policy: UncatalogedPolicy::Warn,
+            })
+        };
+        // A repository administrator is not enough.
+        let denied = set_uncataloged_policy(
+            State(state.clone()),
+            Extension(Some(tdh::make_auth(user_id, &username))),
+            Path(key.clone()),
+            body(),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "{denied:?}"
+        );
+        let stored: String =
+            sqlx::query_scalar("SELECT uncataloged_policy FROM repositories WHERE id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, "fail", "the default, unchanged by a refused write");
+
+        let admin = tdh::admin_auth(Uuid::new_v4(), "root");
+        let ok = set_uncataloged_policy(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(key.clone()),
+            body(),
+        )
+        .await
+        .expect("instance admin sets warn")
+        .0;
+        assert_eq!(ok.uncataloged_policy, UncatalogedPolicy::Warn);
+        assert_eq!(ok.score.grade_status, "rated", "recalculated under warn");
+        assert!(ok.score.has_uncataloged_scan);
+        assert_eq!(ok.score.coverage.as_ref().map(|c| c.uncataloged), Some(1));
+
+        let got = get_repo_security(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(key.clone()),
+        )
+        .await
+        .expect("get")
+        .0;
+        assert_eq!(got.uncataloged_policy, UncatalogedPolicy::Warn);
+
+        let listing = list_repo_coverage_artifacts(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(key.clone()),
+            Query(CoverageArtifactsQuery::default()),
+        )
+        .await
+        .expect("list")
+        .0;
+        assert_eq!((listing.total, listing.counts.uncataloged), (1, 1));
+        assert_eq!(listing.items[0].artifact_id, artifact_id);
+        assert_eq!(
+            listing.items[0].scans[0].reason.as_deref(),
+            Some("no catalog")
+        );
+        let json = serde_json::to_value(&listing).unwrap();
+        assert_eq!(json["items"][0]["coverage_status"], "uncataloged");
+
+        let bad = list_repo_coverage_artifacts(
+            State(state.clone()),
+            Extension(Some(admin)),
+            Path(key.clone()),
+            Query(CoverageArtifactsQuery {
+                status: Some("ignore".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert!(matches!(bad, Err(AppError::Validation(_))), "{bad:?}");
+
+        let _ = sqlx::query("DELETE FROM repo_security_scores WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// GHSA-gvhj-8vg9-358g: a user holding `repository:admin` who presents an
     /// API token minted with only `read:artifacts` must NOT be able to change
     /// the repository's scan configuration. The four sibling
@@ -10187,6 +10578,7 @@ mod tests {
             max_severity: "critical".to_string(),
             block_unscanned: true,
             block_on_fail: true,
+            block_uncataloged: false,
             is_enabled: false,
             min_staging_hours: None,
             max_artifact_age_days: None,
@@ -10915,6 +11307,7 @@ mod tests {
         let resp = RepoSecurityResponse {
             config: None,
             score: None,
+            uncataloged_policy: UncatalogedPolicy::Fail,
         };
         assert!(resp.config.is_none());
         assert!(resp.score.is_none());
@@ -10955,6 +11348,7 @@ mod tests {
                 has_failed_scan: false,
                 has_uncataloged_scan: false,
             }),
+            uncataloged_policy: UncatalogedPolicy::Warn,
         };
         assert!(resp.config.is_some());
         assert!(resp.score.is_some());
@@ -11128,6 +11522,7 @@ mod tests {
             max_severity: "high".to_string(),
             block_unscanned: true,
             block_on_fail: false,
+            block_uncataloged: false,
             is_enabled: true,
             min_staging_hours: Some(12),
             max_artifact_age_days: None,
@@ -12373,6 +12768,93 @@ mod tests {
         assert_eq!(rows[1].2, 1);
         assert_eq!(rows[1].3, 1);
         assert_eq!(stored_findings, 3, "2 + 1 findings across both submissions");
+    }
+
+    /// #5564: an external verdict's `scanner_version` used to be written into
+    /// `scan_results.scanner_version VARCHAR(50)`, so a longer vendor build id
+    /// answered 500 `DATABASE_ERROR`. It is `TEXT` now and must be stored
+    /// whole. A finding the schema still refuses (an over-long `cve_id`)
+    /// stays a 400 `VALIDATION_ERROR`, not a 500, and writes no scan row.
+    #[tokio::test]
+    async fn test_ingest_external_findings_stores_long_scanner_version_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let app = tdh::router_with_auth_ext(
+            router(),
+            fx.state.clone(),
+            tdh::admin_auth(fx.user_id, &fx.username),
+        );
+        let post = |body: serde_json::Value| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/findings/external")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        let long_version = format!("acme-scanner-{}", "v".repeat(120));
+        let (status, body) = tdh::send(
+            app.clone(),
+            post(serde_json::json!({
+                "artifact_id": art,
+                "scanner": "acme",
+                "scanner_version": long_version.clone(),
+                "findings": [{
+                    "severity": "high",
+                    "title": "backdoor",
+                    "cve_id": "CVE-2024-3094",
+                }],
+            })),
+        )
+        .await;
+        let overlong_id = format!("VENDOR-ADVISORY-{}", "1".repeat(30));
+        let (bad_status, bad_body) = tdh::send(
+            app,
+            post(serde_json::json!({
+                "artifact_id": art,
+                "scanner": "acme",
+                "findings": [{
+                    "severity": "high",
+                    "title": "backdoor",
+                    "cve_id": overlong_id,
+                }],
+            })),
+        )
+        .await;
+        let stored: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status, scanner_version FROM scan_results WHERE artifact_id = $1",
+        )
+        .bind(art)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("read the ingested scan back");
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "a long scanner version must be accepted, got {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            stored.len(),
+            1,
+            "the refused submission must write no scan row"
+        );
+        assert_eq!(stored[0].0, "completed");
+        assert_eq!(stored[0].1.as_deref(), Some(long_version.as_str()));
+        assert_eq!(
+            bad_status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "an over-long cve_id stays a 400, got {}",
+            String::from_utf8_lossy(&bad_body)
+        );
+        assert!(String::from_utf8_lossy(&bad_body).contains("VALIDATION_ERROR"));
     }
 
     #[tokio::test]
