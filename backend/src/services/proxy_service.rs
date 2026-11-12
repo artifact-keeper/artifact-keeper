@@ -103,16 +103,20 @@ fn is_detached_fill_wait_error(err: &AppError) -> bool {
 /// the shared upstream client and for every per-Remote egress client, so a
 /// Remote with its own egress routing gets the same bounds.
 pub(crate) fn configure_upstream_client(
-    builder: reqwest::ClientBuilder,
+    builder: crate::services::http_client::ClientBuilder,
     timeouts: &crate::config::ProxyUpstreamSettings,
-) -> reqwest::ClientBuilder {
-    builder
-        .connect_timeout(timeouts.connect())
-        .read_timeout(timeouts.read())
-        .http2_keep_alive_interval(UPSTREAM_HTTP2_KEEP_ALIVE_INTERVAL)
-        .http2_keep_alive_timeout(UPSTREAM_HTTP2_KEEP_ALIVE_TIMEOUT)
-        .http2_keep_alive_while_idle(true)
-        .pool_idle_timeout(UPSTREAM_POOL_IDLE_TIMEOUT)
+) -> crate::services::http_client::ClientBuilder {
+    let connect = timeouts.connect();
+    let read = timeouts.read();
+    builder.configure(move |builder| {
+        builder
+            .connect_timeout(connect)
+            .read_timeout(read)
+            .http2_keep_alive_interval(UPSTREAM_HTTP2_KEEP_ALIVE_INTERVAL)
+            .http2_keep_alive_timeout(UPSTREAM_HTTP2_KEEP_ALIVE_TIMEOUT)
+            .http2_keep_alive_while_idle(true)
+            .pool_idle_timeout(UPSTREAM_POOL_IDLE_TIMEOUT)
+    })
 }
 
 /// The shared upstream HTTP client of a [`ProxyService`].
@@ -30951,3 +30955,4 @@ mod finish_fill_on_drop_5509 {
         assert_eq!(follower_of_a_dropped_leader(true).await, None);
     }
 }
+
