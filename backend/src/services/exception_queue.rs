@@ -1,5 +1,5 @@
 //! Package-exception queue reads and auto-filing for the non-age gates
-//! (migration 345).
+//! (migration 375).
 //!
 //! The age gate owns its own rows through `age_gate_service`, because its
 //! decisions are bound to an age-specific policy identity (mode + upstream
@@ -219,6 +219,30 @@ pub fn render_url_template(
         .replace("{version}", &enc(version))
 }
 
+/// Validate an operator template before it is stored. Every refused client is
+/// handed the rendered link, and the web UI renders it as a link, so it must be
+/// an absolute `http(s)` URL: no `javascript:` or relative target, and no
+/// whitespace or control characters that could not go into a header. Empty
+/// clears the setting and is always valid.
+pub fn validate_url_template(template: &str) -> Result<()> {
+    let t = template.trim();
+    if t.is_empty() {
+        return Ok(());
+    }
+    if t.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(AppError::Validation(
+            "exception_request_url must not contain whitespace or control characters".to_string(),
+        ));
+    }
+    let probe = render_url_template(t, "scan", "repo", "package", "1.0.0");
+    match url::Url::parse(&probe) {
+        Ok(u) if matches!(u.scheme(), "http" | "https") && u.host_str().is_some() => Ok(()),
+        _ => Err(AppError::Validation(
+            "exception_request_url must be an absolute http or https URL".to_string(),
+        )),
+    }
+}
+
 /// The link a refused client should be pointed at, or `None` when neither a
 /// template nor an external base URL is configured.
 ///
@@ -254,7 +278,13 @@ pub async fn exception_request_url(
     if let Some(t) = configured.as_ref().and_then(|v| v.as_str()) {
         let t = t.trim();
         if !t.is_empty() {
-            return Some(render_url_template(t, gate, repo, package, version));
+            // A value written straight to the table skips the settings API's check
+            if validate_url_template(t).is_ok() {
+                return Some(render_url_template(t, gate, repo, package, version));
+            }
+            tracing::warn!(
+                "{EXCEPTION_URL_SETTING_KEY} is not an absolute http(s) URL; using the built-in form"
+            );
         }
     }
 
@@ -318,6 +348,52 @@ pub fn validate_request(
     Ok(())
 }
 
+/// Most undecided requests one user may have open at once. Filing is open to
+/// every authenticated user and a request may name a coordinate no gate has
+/// refused, so without a bound one account could fill the reviewer queue.
+pub const MAX_OPEN_REQUESTS_PER_USER: i64 = 50;
+
+/// Refuse a new request when `user_id` already has
+/// [`MAX_OPEN_REQUESTS_PER_USER`] pending requests. Re-filing a coordinate the
+/// user already asked for does not count against them.
+pub async fn require_open_request_budget(
+    db: &PgPool,
+    user_id: Uuid,
+    coord: &ExceptionCoord,
+) -> Result<()> {
+    let (open, already_mine): (i64, bool) = sqlx::query_as(
+        r#"
+        SELECT
+            (SELECT COUNT(*) FROM (
+                SELECT 1 FROM age_gate_reviews
+                WHERE requested_by = $1 AND status = 'pending' AND justification IS NOT NULL
+                LIMIT $6
+            ) open_rows)::bigint,
+            EXISTS (
+                SELECT 1 FROM age_gate_reviews
+                WHERE requested_by = $1 AND gate = $2 AND repository_id = $3
+                  AND package_name = $4 AND package_version = $5
+            )
+        "#,
+    )
+    .bind(user_id)
+    .bind(coord.gate)
+    .bind(coord.repository_id)
+    .bind(&coord.package_name)
+    .bind(&coord.package_version)
+    .bind(MAX_OPEN_REQUESTS_PER_USER)
+    .fetch_one(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    if !already_mine && open >= MAX_OPEN_REQUESTS_PER_USER {
+        return Err(AppError::Conflict(format!(
+            "You already have {MAX_OPEN_REQUESTS_PER_USER} open exception requests; \
+             wait for a reviewer to decide some of them"
+        )));
+    }
+    Ok(())
+}
+
 /// File a human request against a coordinate, creating the row if the gate has
 /// not already refused this package.
 ///
@@ -351,8 +427,13 @@ pub async fn file_request(
         VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7)
         ON CONFLICT (gate, repository_id, package_name, package_version)
         DO UPDATE SET
-            justification = EXCLUDED.justification,
-            requested_by = EXCLUDED.requested_by,
+            -- An approved row keeps the justification and requester it was
+            -- granted on, so a later request cannot rewrite what the
+            -- reviewer and the audit trail saw
+            justification = CASE WHEN age_gate_reviews.status = 'approved'
+                THEN age_gate_reviews.justification ELSE EXCLUDED.justification END,
+            requested_by = CASE WHEN age_gate_reviews.status = 'approved'
+                THEN age_gate_reviews.requested_by ELSE EXCLUDED.requested_by END,
             last_requested_at = NOW()
         RETURNING id, (request_count = 1 AND reviewed_at IS NULL) AS is_new
         "#,
@@ -572,6 +653,122 @@ mod tests {
         assert!(out.contains("gate=scan"));
         assert!(out.contains("repo=npm-remote"));
         assert!(out.contains("v=1.0.0"));
+    }
+
+    #[test]
+    fn a_hostile_package_name_cannot_break_out_of_the_link() {
+        let out = render_url_template(
+            "https://ak.example/exceptions/request?package={package}&version={version}",
+            "curation",
+            "r",
+            "evil\r\nSet-Cookie: x=1&gate=age#",
+            "1.0.0\"><script>",
+        );
+        assert!(!out.contains('\r') && !out.contains('\n') && !out.contains('<'));
+        assert!(out.contains("package=evil%0D%0ASet-Cookie%3A%20x%3D1%26gate%3Dage%23"));
+        assert!(axum::http::HeaderValue::from_str(&out).is_ok());
+    }
+
+    #[test]
+    fn validate_url_template_accepts_only_absolute_http_urls() {
+        assert!(validate_url_template("").is_ok());
+        assert!(validate_url_template("https://jira.example/new?pkg={package}").is_ok());
+        assert!(validate_url_template("http://help.internal/{gate}/{package}").is_ok());
+        for bad in [
+            "javascript:alert(1)",
+            "data:text/html,hi",
+            "//evil.example/{package}",
+            "/exceptions/request",
+            "https://a.example/{package} x",
+            "https://a.example/\u{7}",
+        ] {
+            assert!(
+                validate_url_template(bad).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// The request surface is open to every signed-in user, so it is bounded per user,
+    /// and a request never rewrites the reason an approved row was granted on.
+    #[tokio::test]
+    async fn db_request_budget_and_approved_rows_keep_their_justification() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (other_id, _) = tdh::create_user(&pool).await;
+        let repo_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO repositories (id, key, name, format, repo_type, storage_path, upstream_url)
+               VALUES ($1, $2, $2, 'npm', 'remote', '/tmp/ph-exq-budget', 'https://registry.npmjs.org')"#,
+        )
+        .bind(repo_id)
+        .bind(format!("ph-exq-budget-{repo_id}"))
+        .execute(&pool)
+        .await
+        .expect("seed repo");
+        let at = |v: i64| ExceptionCoord {
+            gate: GATE_CURATION,
+            repository_id: repo_id,
+            package_name: "left-pad".to_string(),
+            package_version: format!("1.0.{v}"),
+            digest: None,
+        };
+
+        for v in 0..MAX_OPEN_REQUESTS_PER_USER {
+            require_open_request_budget(&pool, user_id, &at(v))
+                .await
+                .expect("under the cap");
+            file_request(&pool, None, &at(v), user_id, "need it")
+                .await
+                .expect("file");
+        }
+        assert!(matches!(
+            require_open_request_budget(&pool, user_id, &at(MAX_OPEN_REQUESTS_PER_USER)).await,
+            Err(AppError::Conflict(_))
+        ));
+        // Re-filing one of their own does not count, and another user is unaffected
+        require_open_request_budget(&pool, user_id, &at(0))
+            .await
+            .expect("re-filing an existing request is allowed");
+        require_open_request_budget(&pool, other_id, &at(MAX_OPEN_REQUESTS_PER_USER))
+            .await
+            .expect("the cap is per user");
+
+        let id = file_request(&pool, None, &at(0), user_id, "need it")
+            .await
+            .expect("file");
+        sqlx::query("UPDATE age_gate_reviews SET status = 'approved' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("approve");
+        file_request(&pool, None, &at(0), other_id, "rewritten")
+            .await
+            .expect("re-file");
+        let (why, by): (Option<String>, Option<Uuid>) = sqlx::query_as(
+            "SELECT justification, requested_by FROM age_gate_reviews WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("row");
+        assert_eq!(why.as_deref(), Some("need it"));
+        assert_eq!(by, Some(user_id));
+
+        let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, user_id).await;
+        tdh::cleanup_user(&pool, other_id).await;
     }
 
     #[test]

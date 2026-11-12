@@ -1522,7 +1522,7 @@ mod tests {
             sqlx::query_scalar("SELECT id FROM roles WHERE name = 'security-reviewer'")
                 .fetch_one(&pool)
                 .await
-                .expect("migration 345 seeds the security-reviewer role");
+                .expect("migration 375 seeds the security-reviewer role");
 
         // No assignment yet.
         assert!(!service

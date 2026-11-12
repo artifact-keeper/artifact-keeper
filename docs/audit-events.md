@@ -279,7 +279,7 @@ To answer "who asked for this blocked package", filter the audit log on
 
 | Action | Resource | Fires when | `details` |
 | --- | --- | --- | --- |
-| `EXCEPTION_REQUESTED` | `repository` | An authenticated user asks for a package exception with `POST /api/v1/exceptions/requests` (#5152). Outcome `success`. | `review_id` (the queue row, shared with the age-gate review routes), `gate` (`age`, `scan` or `curation`), `package`, `version`. The justification stays on the row, not in the audit record. |
+| `EXCEPTION_REQUESTED` | `repository` | An authenticated user asks for a package exception with `POST /api/v1/exceptions/requests` (#5152). Outcome `success`. | `review_id` (the queue row, shared with the age-gate review routes), `gate` (`age`, `scan` or `curation`), `package`, `version`, `justification`. The row keeps only the latest requester's justification, the audit record keeps each one. A user may have at most 50 undecided requests open (409 past that). |
 
 A reviewer's decision on any gate's row is recorded as `AGE_GATE_APPROVED`,
 `AGE_GATE_REJECTED` or `AGE_GATE_REOPENED` with the actor and the row's `gate`, and
