@@ -1,0 +1,30 @@
+# Closed type:bug issues that have no end-to-end proof in artifact-keeper-test, and why.
+# Read by `scripts/ci/check-e2e-proof.py milestone` (release-preflight.sh check 7).
+# Columns, tab-separated: issue, category, reason. Categories: test-only, build-ci,
+# deps, docs, internal-unreachable and race-window (both must name the covering test),
+# embargoed, not-planned. A row is a reviewed backfill decision; a new bug fix
+# normally declares its exemption on its PR instead (E2E-Exempt line + no-e2e-required).
+4814	test-only	Flaky unit test (proxy streaming cache-path key under parallel runs); the fix changes only the test, no product behaviour.
+4930	test-only	The openapi route-consistency test skipped parameter-first paths; the fix widens the test, the product was unchanged.
+5214	test-only	Flaky test: oci_auth_db_pool_exhausted_is_503_not_401_4750 failed connecting its pool on a loaded runner; test-only fix.
+5365	test-only	Flaky test: generic_put_wheel_matches_native_pypi_upload compared wall-clock upload times; test-only fix.
+5566	test-only	Integration test regression_2264_age_gate_config_admin_only expected 403 where #5538 correctly answers 404; the test was updated.
+5818	test-only	Flaky test: expired_sync_task_claims_recover_and_fence_stale_owner asserted a database-wide recovery count; test-only fix.
+5820	test-only	The streaming_invariant allowlist fell out of step after #5778 removed an npm buffer site; the fix edits the allowlist.
+5823	test-only	Flaky #5621 virtual member deadline tests (conda, helm, maven) answered 503 on a loaded runner; test-only fix.
+5825	test-only	Flaky webhook retry_claim_tests missed their fixture delivery when other due rows filled the fair claim batch; test-only fix.
+5835	test-only	Flaky test: environment_sbom_is_refused_past_the_response_ceiling set its ceiling one byte under a timestamped render.
+5877	test-only	Flaky test: the upstream_fetch_audit secret-leak check matched 'abc' inside a random repository UUID; test-only fix.
+5880	test-only	Flaky test: restore_after_purge (#5699) lost its trashed artifacts to a concurrent instance-wide storage GC test.
+5882	test-only	Flaky test: the device-flow per-user rate-limit test counted fire-and-forget audit rows after a fixed 300 ms sleep.
+5826	build-ci	build.rs rerun-if-changed=../.git/HEAD is missing in git worktrees, so the crate recompiles every build; no runtime effect.
+5847	build-ci	main did not compile (record_failed_scan call from #5684 lacked the argument #5833 added); compile fix, nothing to deploy.
+5107	deps	Security Audit failed on RUSTSEC-2026-0418 (libz-sys 1.1.23); the fix is a dependency bump verified by cargo audit.
+5162	deps	Security Audit failed on RUSTSEC-2026-0433/0424/0429 (pulldown-cmark, wasmtime, zip); dependency bumps verified by cargo audit.
+5555	deps	Security Audit failed on RUSTSEC-2026-0459 (libsqlite3-sys via sqlx-sqlite); dependency change verified by cargo audit.
+4980	race-window	An upload deduplicating against an object storage GC is collecting. The window is forced by artifact_service.rs tests buffered_upload_deduplicating_against_a_collected_object_keeps_it_4980 and streamed_upload_deduplicating_against_a_collected_object_keeps_it_4980 (and complete_waits_out_a_gc_delete_lease_then_refuses_retryably_4980 in upload.rs).
+5128	race-window	A concurrent dirty-mark fold applied after the repodata swap. Forced by rpm/precomputed_tests.rs rebuild_wait_ignores_a_mark_predating_the_build_5128 and rpm_repodata_builder/tests.rs fold_marks_drops_marks_predating_the_build_5128.
+5593	race-window	A tag move between the MCP backing gate's read and its FOR SHARE lock. Forced (pg_blocking_pids barrier) by mcp.rs held_backing_package_rereads_rows_moved_before_the_lock_5593.
+5646	race-window	A hold landing after a concurrent OCI tag move. Forced (the move's transaction held open, the hold observed blocked) by mcp.rs quarantine_landing_after_a_tag_move_holds_the_digest_it_read_5646, rejection_with_an_expected_digest_after_a_tag_move_rejects_it_5646, and scanner_service.rs scan_verdict_after_a_tag_move_holds_the_scanned_digest_5646.
+5714	internal-unreachable	cpe_candidates::compare_versions was not a total order; pure-function fix, covered by the cpe_candidates.rs unit test compare_versions_orders_mixed_segments_by_their_leading_digits.
+4731	not-planned	Closed as not planned (virtual storage total and read grants on the virtual); no fix shipped.
