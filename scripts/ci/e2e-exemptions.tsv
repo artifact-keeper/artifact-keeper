@@ -4,6 +4,10 @@
 # deps, docs, internal-unreachable and race-window (both must name the covering test),
 # embargoed, not-planned. A row is a reviewed backfill decision; a new bug fix
 # normally declares its exemption on its PR instead (E2E-Exempt line + no-e2e-required).
+# An optional fourth column is the scope: `issue` (default) exempts the issue; `facet`
+# records one facet of an issue that a tier otherwise covers end to end. A facet row is
+# a note: it never exempts the issue, which still needs a wired tier. An issue may have
+# several facet rows.
 4814	test-only	Flaky unit test (proxy streaming cache-path key under parallel runs); the fix changes only the test, no product behaviour.
 4930	test-only	The openapi route-consistency test skipped parameter-first paths; the fix widens the test, the product was unchanged.
 5214	test-only	Flaky test: oci_auth_db_pool_exhausted_is_503_not_401_4750 failed connecting its pool on a loaded runner; test-only fix.
@@ -28,3 +32,18 @@
 5646	race-window	A hold landing after a concurrent OCI tag move. Forced (the move's transaction held open, the hold observed blocked) by mcp.rs quarantine_landing_after_a_tag_move_holds_the_digest_it_read_5646, rejection_with_an_expected_digest_after_a_tag_move_rejects_it_5646, and scanner_service.rs scan_verdict_after_a_tag_move_holds_the_scanned_digest_5646.
 5714	internal-unreachable	cpe_candidates::compare_versions was not a total order; pure-function fix, covered by the cpe_candidates.rs unit test compare_versions_orders_mixed_segments_by_their_leading_digits.
 4731	not-planned	Closed as not planned (virtual storage total and read grants on the virtual); no fix shipped.
+5450	internal-unreachable	The fix is only in the ak-mcp-introspector worker binary, which no published image ships, so no deployed instance can be driven into it. Covered by protocol.rs wrong_id_discovery_fails_closed, wrong_id_or_duplicate_tools_list_fails_closed and batches_and_foreign_error_bodies_fail_closed, and http.rs wrong_id_and_duplicate_responses_over_http.
+5451	internal-unreachable	The fix is only in the ak-mcp-introspector worker binary, which no published image ships. Covered by http.rs session_id_outside_initialize_is_ignored, session_id_replacement_fails_closed, stable_session_is_used_after_initialize and session_never_follows_a_redirect.
+5636	internal-unreachable	The fix is only in the ak-mcp-introspector worker binary (stdio transport), which no published image ships. Covered by stdio.rs stdio_guest_protocol_violations_are_refused_5636.
+5675	internal-unreachable	Storage-error mapping, seed-pin context, backfill retry cap and LFS reclaim journalling need a failing storage or a crafted legacy row that no client can produce. Covered by services/mcp_remote.rs store_failure_maps_413_to_its_own_code_5675 and backfill_rotates_and_caps_failing_rows_5675, handlers/mcp_remote.rs seed_keeps_the_approved_context_on_a_store_error_5675, and handlers/mod.rs reclaiming_cleanup_journals_the_replaced_key_5675.
+5170	internal-unreachable	Item 3 only (signed .apk PKGINFO read through FormatHandler::parse_metadata); the Debian release-inference items are covered by a tier. Covered by formats/alpine.rs test_extract_pkginfo_reads_a_signed_apk_5170, test_extract_pkginfo_does_not_decode_the_data_segment_5170 and test_extract_pkginfo_bomb_behind_the_signature_is_bounded_5170.	facet
+5657	internal-unreachable	The adapter half only (trivy cache-lock queueing inside the scanner adapter); the backend's resubmit half is covered by a tier. Covered by the adapter's Go tests docker/scanner-adapter/scan_cache_test.go TestConcurrentImageScansDoNotFailOnTheCacheLock and TestScansBeyondTheLimitAreQueuedNotFailed.	facet
+5654	internal-unreachable	Partial-restore path: an archive whose rows have no bytes, or whose OCI manifest rows name a repository, cannot be produced by a client. Covered by backup_service.rs archive_rows_without_bytes_are_reported_missing_5654 and archive_with_oci_manifest_rows_names_the_repository_5654.	facet
+5654	internal-unreachable	Scans, SBOMs and findings in the backup contents. Covered by backup_service.rs full_backup_contents_capture_images_groups_webhooks_settings_and_scans_5654.	facet
+4985	internal-unreachable	objects_checked double-counted an object whose finding failed. Covered by storage_scrub_service.rs scrub_counts_an_object_once_when_its_finding_fails_4323.	facet
+4985	internal-unreachable	Stale scrub cursors left in bookkeeping. Covered by storage_scrub_service.rs scrub_prunes_orphaned_bookkeeping_4323.	facet
+5168	internal-unreachable	The GC lease after a failed storage delete. Covered by storage_gc_service.rs failed_delete_releases_its_lease_for_uploads_5168 and failed_delete_keeps_a_newer_claims_lease_5168.	facet
+5168	race-window	A Postgres deadlock answered as 503 with Retry-After. Forced by db.rs real_deadlock_answers_503_with_retry_after_5168; the mapping by error.rs test_deadlock_maps_to_503_with_retry_after_5168.	facet
+5168	internal-unreachable	Reindex of objects with a `.tmp.` infix; S3 has no atomic-write staging files, so no client can produce one there. Covered by storage_reindex_service.rs reindex_recovers_object_named_with_tmp_infix_5168 and filesystem.rs test_list_keys_skips_only_atomic_write_staging_files_5168.	facet
+5713	internal-unreachable	The sort-panic facet: an inconsistent comparator could panic sort_maven_versions on crafted version sets. Covered by the maven_version.rs property test sorting_never_panics_and_keeps_every_version (with ordering_is_a_total_order_on_conventional_versions), from #5720.	facet
+5167	race-window	The JLAP tail stepping back when two renders of one revision interleave. Forced by jlap_store.rs renders_of_one_revision_do_not_step_the_tail_back_5167.	facet
