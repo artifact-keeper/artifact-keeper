@@ -147,12 +147,26 @@ expect_pr "fix/* branch alone makes a bug PR" 1 "missing end-to-end proof" \
   '.pull_request.title = "refactor: z (#101)" | .pull_request.body = "Closes #101"' '.'
 expect_pr "type:bug issue alone makes a bug PR" 1 "missing end-to-end proof" \
   '.pull_request.title = "refactor: z" | .pull_request.head.ref = "x"' '.'
-expect_pr "bug PR, title type chore -> automatic exemption" 0 "title type 'chore' is exempt" \
+# Automatic exemptions (title type, confined diff) apply ONLY when no linked
+# issue is type:bug. Here the PR is a bug PR through its fix/* branch alone
+# (#101 is a feature), so they apply...
+expect_pr "fix/* branch, no type:bug issue, title type chore -> automatic exemption" 0 "title type 'chore' is exempt" \
+  '.pull_request.title = "chore(deps): bump x (#101)" | .pull_request.body = "Closes #101"' '.'
+expect_pr "fix title, no type:bug issue, diff only in docs and scripts -> automatic exemption" 0 "the diff touches only" \
+  '.pull_request.body = "Closes #101"' '.GET["repos/\(env.R)/pulls/1/files"] = [{filename: "docs/a.md"}, {filename: "scripts/ci/x.sh"}, {filename: "Cargo.lock"}]'
+expect_pr "no type:bug issue, diff in backend and docs -> not exempt" 1 "missing end-to-end proof" \
+  '.pull_request.body = "Closes #101"' '.GET["repos/\(env.R)/pulls/1/files"] = [{filename: "docs/a.md"}, {filename: "backend/src/x.rs"}]'
+# ...and with a type:bug issue they never do: the title-type loophole.
+expect_pr "type:bug issue + title type chore -> still needs a proof" 1 "missing end-to-end proof" \
   '.pull_request.title = "chore(deps): bump x (#100)"' '.'
-expect_pr "bug PR, diff only in docs and scripts -> automatic exemption" 0 "the diff touches only" \
-  '.' '.GET["repos/\(env.R)/pulls/1/files"] = [{filename: "docs/a.md"}, {filename: "scripts/ci/x.sh"}, {filename: "Cargo.lock"}]'
-expect_pr "bug PR, diff in backend and docs -> not exempt" 1 "missing end-to-end proof" \
-  '.' '.GET["repos/\(env.R)/pulls/1/files"] = [{filename: "docs/a.md"}, {filename: "backend/src/x.rs"}]'
+expect_pr "type:bug issue + diff only in docs and scripts -> still needs a proof" 1 "missing end-to-end proof" \
+  '.' '.GET["repos/\(env.R)/pulls/1/files"] = [{filename: "docs/a.md"}, {filename: "scripts/ci/x.sh"}]'
+# The #5713 shape: a type:bug issue closed by a test(...)-titled PR on a test/ branch.
+expect_pr "#5713/#5719 shape: type:bug issue closed by a test: PR -> needs a proof" 1 "do not exempt this PR" \
+  '.pull_request.title = "test(maven): pin the fixed metadata behaviour (#100)" | .pull_request.head.ref = "test/maven-x"' \
+  '.GET["repos/\(env.R)/pulls/1/files"] = [{filename: "backend/tests/maven_x.rs"}]'
+expect_pr "type:bug issue + test: title + explicit exemption -> PASS" 0 "exempt (test-only)" \
+  "$(body $'Closes #100\nE2E-Exempt: test-only: the fix is in the test harness, nothing ships') | .pull_request.title = \"test(x): y (#100)\" | .pull_request.labels = [{name: \"no-e2e-required\"}]" '.'
 
 echo
 echo "check-e2e-proof.py pr: test-PR proofs"
@@ -259,6 +273,10 @@ expect_pr "backport inherits the original PR's exemption" 0 "inherited from #50"
   '.pull_request.base.ref = "release/1.11.x"' "$(inherit_world 'Closes #100\nE2E-Exempt: build-ci: compile fix only, no runtime effect')"
 expect_pr "backport of an unexempt PR still needs a proof" 1 "missing end-to-end proof" \
   '.pull_request.base.ref = "release/1.11.x"' "$(inherit_world 'Closes #100')"
+expect_pr "backport of a test:-titled PR for a type:bug issue does not inherit the title" 1 "missing end-to-end proof" \
+  '.pull_request.base.ref = "release/1.11.x"' "$(inherit_world 'Closes #100') | .GET[\"repos/$R/commits/abcdef1234567/pulls\"][0].title = \"test(x): y (#100)\""
+expect_pr "backport, no type:bug issue, inherits the original's title exemption" 0 "inherited from #50 (cherry-picked abcdef12): title type 'test'" \
+  '.pull_request.base.ref = "release/1.11.x" | .pull_request.body = "Closes #101"' "$(inherit_world 'Closes #101') | .GET[\"repos/$R/commits/abcdef1234567/pulls\"][0].title = \"test(x): y (#101)\""
 expect_pr "the trailer is not honoured on main" 1 "missing end-to-end proof" \
   '.' "$(inherit_world 'Closes #100\nE2E-Exempt: build-ci: compile fix only, no runtime effect')"
 expect_pr "API failure is INFRA, not a verdict" 2 "INFRA" \
@@ -344,7 +362,12 @@ expect_ms "closing PR's E2E-Exempt with label -> READY" 0 "#302: deps" \
   "$(issue 203 "$BUG" "[$(cpr 302 'fix(deps): x' 'E2E-Exempt: deps: bump for RUSTSEC-2026-0001' '[{"name":"no-e2e-required"}]')]")"
 expect_ms "closing PR's E2E-Exempt without the label -> NOT READY" 1 "MISSING" \
   "$(issue 203 "$BUG" "[$(cpr 300 'fix(deps): x' 'E2E-Exempt: deps: bump for RUSTSEC-2026-0001' '[]')]")"
-expect_ms "closing PR whose diff is docs only -> READY" 0 "diff only in" "$(issue 204 "$BUG" "[$(cpr 301 'fix: x' '' '[]')]")"
+# Every milestone issue is type:bug, so neither a confined diff nor a non-fix
+# title on the closing PR exempts it.
+expect_ms "closing PR whose diff is docs only -> still MISSING" 1 "MISSING" "$(issue 204 "$BUG" "[$(cpr 301 'fix: x' '' '[]')]")"
+expect_ms "#5713/#5719 shape: closed by a test:-titled PR -> MISSING" 1 "MISSING" \
+  "$(issue 5713 "$BUG" "[$(cpr 5719 'test(maven): cover the metadata fix (#5713)' 'Closes #5713' '[]')]")"
+expect_ms "closed by a chore:-titled PR -> MISSING" 1 "MISSING" "$(issue 204 "$BUG" "[$(cpr 301 'chore: x' '' '[]')]")"
 expect_ms "suite named by the closing PR -> READY" 0 "suite tests/formats/test-x.sh" \
   "$(issue 205 "$BUG" "[$(cpr 300 'fix: x' 'E2E: suite tests/formats/test-x.sh' '[]')]")"
 expect_ms "not-planned issues are skipped" 0 "closed as not_planned" "$(issue 207 "$BUG" '[]' NOT_PLANNED)"

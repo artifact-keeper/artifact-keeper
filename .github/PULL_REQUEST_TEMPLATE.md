@@ -38,7 +38,8 @@ for bug fixes"):
 Flake fixes: the `ci` or `testing` label and
   Flake-Proof: <how reproduced>; <N> consecutive passes under <load>
 A PR into release/X.Y.x cites a test PR against artifact-keeper-test's
-release/X.Y.x. Titles of type test/ci/docs/chore/build are exempt.
+release/X.Y.x. Titles of type test/ci/docs/chore/build, or a diff only in
+docs/.github/scripts, are exempt ONLY when no linked issue is type:bug.
 -->
 
 ## Changelog

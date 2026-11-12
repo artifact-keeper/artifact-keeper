@@ -50,7 +50,10 @@ and code blocks)
   reason`; the public tier asserts a harmless facet until disclosure).
 
   Automatic exemptions: title type test/ci/docs/chore/build; a diff only in
-  docs, .github, scripts, changes, Cargo.lock or audit config. Flake fixes:
+  docs, .github, scripts, changes, Cargo.lock or audit config. Both apply
+  ONLY when no linked issue is type:bug: a type:bug issue needs a proof line
+  or an explicit exemption whatever the PR's title or diff (and so at the
+  release backstop, where every issue is type:bug, they never apply). Flake fixes:
   the ci or testing label plus `Flake-Proof: <how reproduced>; <N>
   consecutive passes under <load>`.
 
@@ -442,8 +445,10 @@ def check_suite(path, issues, ref, test_repo, v):
     return named
 
 
-def inherited_exemption(pr, repo):
-    """For a backport: the exemption of the main PR it was cherry-picked from."""
+def inherited_exemption(pr, repo, allow_automatic=True):
+    """For a backport: the exemption of the main PR it was cherry-picked from.
+    An automatic (title/paths) exemption is inherited only when the backport's
+    own linked issues are not type:bug, the same rule run_pr applies."""
     commits = gh_list(f"repos/{repo}/pulls/{pr['number']}/commits")
     shas = []
     for c in commits:
@@ -465,7 +470,7 @@ def inherited_exemption(pr, repo):
             ex = declared_exemption(o, body)
             if ex and ex[2] is None:
                 return f"inherited from #{o['number']} (cherry-picked {sha[:8]}): E2E-Exempt {ex[0]}"
-            auto = automatic_exemption(o, repo)
+            auto = automatic_exemption(o, repo) if allow_automatic else None
             if auto:
                 return f"inherited from #{o['number']} (cherry-picked {sha[:8]}): {auto}"
     return None
@@ -514,9 +519,19 @@ def run_pr(args):
         return finish(v, "not a bug PR (no type:bug issue, fix title or fix/* branch): no proof needed", 0)
     print("  bug PR: " + "; ".join(reasons))
 
-    auto = automatic_exemption(pr, repo)
-    if auto:
-        return finish(v, f"exempt automatically: {auto}", 0)
+    # A non-fix title type or a confined diff exempts a PR only when no linked
+    # issue is type:bug. A type:bug issue needs a proof line or an explicit
+    # exemption whatever the title says: otherwise `test: ...` or `chore: ...`
+    # on a real fix would walk past the check (#5713 was closed by #5719, a
+    # `test(...)` PR).
+    if bug_issues:
+        v.note(
+            "a type:bug issue is linked, so the title type and the diff's paths do not exempt this PR"
+        )
+    else:
+        auto = automatic_exemption(pr, repo)
+        if auto:
+            return finish(v, f"exempt automatically: {auto}", 0)
 
     targets = bug_issues or list(issues) or []
     all_labels = set(labels)
@@ -542,7 +557,7 @@ def run_pr(args):
         return finish(v, "the Flake-Proof line is not valid", 1)
 
     if base.startswith("release/"):
-        inh = inherited_exemption(pr, repo)
+        inh = inherited_exemption(pr, repo, allow_automatic=not bug_issues)
         if inh:
             return finish(v, f"exempt: {inh}", 0)
 
@@ -789,6 +804,9 @@ def run_milestone(args):
 
 
 def proof_for_issue(n, issue, ilabels, ledger, by_issue, fixes, gate, tree, repo):
+    # Every issue here is type:bug, so the closing PR's title type and diff
+    # paths never exempt it (the rule run_pr applies): a bug closed by a
+    # `test: ...` PR still needs a tier, a suite, or an explicit exemption.
     tiers = by_issue.get(n, [])
     wired = [t for t in tiers if t in gate]
     if wired:
@@ -806,8 +824,6 @@ def proof_for_issue(n, issue, ilabels, ledger, by_issue, fixes, gate, tree, repo
         ex = declared_exemption(pr_obj, body)
         if ex and ex[2] is None:
             return "exempt", f"#{pr['number']}: {ex[0]}: {ex[1][:70]}"
-        if title_type(pr["title"]) in AUTO_EXEMPT_TITLE_TYPES:
-            return "exempt", f"#{pr['number']}: title type {title_type(pr['title'])}"
         flake = FLAKE_RE.search(body)
         if flake and FLAKE_SHAPE_RE.match(flake.group(1)) and set(plabels + ilabels).intersection(FLAKE_LABELS):
             return "exempt", f"#{pr['number']}: flake fix"
@@ -822,13 +838,6 @@ def proof_for_issue(n, issue, ilabels, ledger, by_issue, fixes, gate, tree, repo
             mt = TIER_RE.match(text)
             if mt and mt.group(1) in gate and (n in covers_list(tree, mt.group(1)) or n in fixes.get(mt.group(1), set())):
                 return "covered", f"tier {mt.group(1)} ({gate[mt.group(1)]}, #{pr['number']})"
-    for pr in prs:
-        try:
-            files = [f["filename"] for f in gh_list(f"repos/{repo}/pulls/{pr['number']}/files")]
-        except NotFound:
-            continue
-        if paths_exempt(files):
-            return "exempt", f"#{pr['number']}: diff only in docs/.github/scripts/changes/lockfile"
     if tiers:
         return "UNWIRED", f"tier {', '.join(tiers)} COVERS it but is not in the release-gate matrix"
     if DEFER_LABEL in ilabels:

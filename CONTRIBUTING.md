@@ -228,7 +228,11 @@ tier asserts only a harmless facet).
 
 **Automatic exemptions:** title types `test`, `ci`, `docs`, `chore` and
 `build`, and diffs only in docs, `.github`, `scripts`, `changes`, `Cargo.lock`
-or audit config (`.cargo/audit.toml`, `.trivyignore`, `.vex/`).
+or audit config (`.cargo/audit.toml`, `.trivyignore`, `.vex/`). These apply
+**only when no linked issue is `type:bug`** (a PR that is a bug PR only through
+its `fix` title or `fix/*` branch). If the issue it closes is `type:bug`, the
+PR needs an `E2E:` line or an explicit `E2E-Exempt:` whatever its title or diff
+says, and the release backstop applies the same rule.
 
 **Flake fixes** carry the `ci` or `testing` label and a line
 `Flake-Proof: <how reproduced>; <N> consecutive passes under <load>`. File new
