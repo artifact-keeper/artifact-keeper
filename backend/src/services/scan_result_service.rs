@@ -75,11 +75,34 @@ pub(crate) fn stable_lock_key(scan_type: &str) -> i32 {
     hash as i32
 }
 
-/// Attempts [`ScanResultService::recalculate_score`] makes before it returns
-/// a serialization failure (#5006). An attempt that found the repository's
-/// lock busy also counts, so this also bounds how long one call waits behind
-/// other recalculations of the same repository.
+/// Attempts [`ScanResultService::recalculate_score`] makes, while it holds
+/// the repository's lock, before it returns a serialization failure (#5006).
+/// Waiting for the lock is not an attempt (#5891).
 const SCORE_RECALC_MAX_ATTEMPTS: u32 = 8;
+
+/// A pooled connection that holds (or may hold) a repository's session-level
+/// score lock (#5891). Dropped without [`Self::release`] (an error at unlock,
+/// a panic, or the caller's future cancelled mid-recalculation), it closes the
+/// connection instead of returning it to the pool, so the server releases the
+/// lock and no later recalculation of the repository waits on it forever.
+struct ScoreRecalcLock {
+    conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+}
+
+impl ScoreRecalcLock {
+    /// The lock is released; return the connection to the pool.
+    fn release(&mut self) {
+        self.conn.take();
+    }
+}
+
+impl Drop for ScoreRecalcLock {
+    fn drop(&mut self) {
+        if let Some(mut conn) = self.conn.take() {
+            conn.close_on_drop();
+        }
+    }
+}
 
 /// Advisory-lock key text serializing score recalculations per repository
 /// (#5006). Hashed server-side with `hashtextextended(..., 0)`; the
@@ -648,7 +671,7 @@ pub struct CoverageListing {
 /// The per-artifact classification of the coverage listing: every live
 /// artifact of repository `$1` with its status and latest scans. The window
 /// and the per-artifact rule are those of the coverage counts in
-/// `recalculate_score_once`.
+/// `recalculate_score_locked`.
 macro_rules! coverage_classified_cte {
     () => {
         r#"
@@ -3014,22 +3037,48 @@ impl ScanResultService {
     /// Recalculations of one repository are serialized (#5006). Every caller
     /// (scan completion, the delete refresher, triage changes, the ingest
     /// handler) goes through here, and two scans of one repository often
-    /// finish together. Each attempt runs under a per-repository
-    /// transaction-scoped advisory lock, and an attempt that hits a
-    /// serialization failure is retried, so the stored score always comes
-    /// from a snapshot that includes every recalculation committed before it.
-    /// Before #5006 the loser of such a race returned 40001, and the winner's
-    /// score, computed before the loser's scan had committed, stayed until
-    /// the next scan or delete in the repository.
+    /// finish together. A recalculation holds a per-repository advisory lock
+    /// while it reads and writes, and an attempt that hits a serialization
+    /// failure is retried under the same lock, so the stored score always
+    /// comes from a snapshot that includes every recalculation committed
+    /// before it. Before #5006 the loser of such a race returned 40001, and
+    /// the winner's score, computed before the loser's scan had committed,
+    /// stayed until the next scan or delete in the repository.
+    ///
+    /// The lock is taken on the connection (session level) before the
+    /// REPEATABLE READ transaction begins, so the snapshot is always taken
+    /// after the previous holder's commit, and waiters get the lock in the
+    /// order they asked for it. #5007 took a transaction-level lock instead,
+    /// which had to be the transaction's first statement and so came after
+    /// its snapshot: an attempt that found the lock busy had to roll back
+    /// and start over, it counted against the attempt cap, and the last
+    /// attempt computed from the stale snapshot and failed with 40001. A burst
+    /// of 6 or more recalculations of one repository answered 500 (#5891).
     pub async fn recalculate_score(&self, repository_id: Uuid) -> Result<RepoSecurityScore> {
+        let lock_key = score_recalc_lock_key(repository_id);
+        let mut guard = ScoreRecalcLock {
+            conn: Some(
+                self.db
+                    .acquire()
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?,
+            ),
+        };
+        let conn = guard.conn.as_mut().expect("set above");
+        // Autocommit statement: no transaction, so no snapshot is held while
+        // it waits.
+        sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+            .bind(&lock_key)
+            .execute(&mut **conn)
+            .await?;
+
         let mut attempt = 1;
-        loop {
-            let last = attempt >= SCORE_RECALC_MAX_ATTEMPTS;
-            match self.recalculate_score_once(repository_id, last).await {
-                Ok(Some(score)) => return Ok(score),
-                // Another recalculation held the lock; it has finished now.
-                Ok(None) => {}
-                Err(err) if !last && is_score_recalc_conflict(&err) => {
+        let result = loop {
+            match Self::recalculate_score_locked(conn, repository_id).await {
+                Ok(score) => break Ok(score),
+                Err(err)
+                    if attempt < SCORE_RECALC_MAX_ATTEMPTS && is_score_recalc_conflict(&err) =>
+                {
                     let jitter: f64 = rand::random();
                     let base_ms = 20 * u64::from(attempt);
                     let jitter_ms = (base_ms as f64 * jitter).round() as u64;
@@ -3040,23 +3089,40 @@ impl ScanResultService {
                         "security score recalculation hit a serialization conflict; retrying"
                     );
                 }
-                Err(err) => return Err(err),
+                Err(err) => break Err(err),
             }
             attempt += 1;
+        };
+
+        // A failed attempt's transaction is rolled back before this runs
+        // (sqlx flushes the queued ROLLBACK first).
+        match sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+            .bind(&lock_key)
+            .fetch_one(&mut **conn)
+            .await
+        {
+            // Released: the connection can go back to the pool.
+            Ok(true) => guard.release(),
+            // The guard closes the connection, which releases the lock.
+            Ok(false) => tracing::warn!(
+                %repository_id,
+                "security score lock was not held at unlock; closing the connection"
+            ),
+            Err(e) => tracing::warn!(
+                %repository_id,
+                error = %e,
+                "could not release the security score lock; closing the connection"
+            ),
         }
+        result
     }
 
-    /// One attempt of [`Self::recalculate_score`]. Returns `Ok(None)` when
-    /// another recalculation of the repository held the lock: this attempt
-    /// waited for it to finish and gave up its snapshot, which predates that
-    /// recalculation's commit, so the caller starts over with a fresh one.
-    /// With `wait_for_lock` the attempt waits for the lock and computes in
-    /// any case (the last attempt).
-    async fn recalculate_score_once(
-        &self,
+    /// One attempt of [`Self::recalculate_score`], run on `conn` while it
+    /// holds the repository's score lock.
+    async fn recalculate_score_locked(
+        conn: &mut sqlx::PgConnection,
         repository_id: Uuid,
-        wait_for_lock: bool,
-    ) -> Result<Option<RepoSecurityScore>> {
+    ) -> Result<RepoSecurityScore> {
         // Wrap the three sequential queries (counts, last_scan_at, upsert)
         // in a single REPEATABLE READ transaction so all three statements
         // observe the same snapshot. The default sqlx transaction is
@@ -3066,9 +3132,7 @@ impl ScanResultService {
         // #1059 was filed to close. REPEATABLE READ pins the snapshot at
         // the first statement and forces the whole tx to read from there.
         // Same race pattern as #1035 (copy_scan_results); see #1059.
-        let mut tx = self
-            .db
-            .begin()
+        let mut tx = sqlx::Connection::begin(conn)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
         // Use runtime sqlx::query (not the compile-checked macro): the
@@ -3078,34 +3142,6 @@ impl ScanResultService {
             .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
-
-        // #5006: serialize recalculations of this repository. Under
-        // REPEATABLE READ the snapshot is taken when the first statement
-        // starts, which is the lock statement itself, so an attempt that had
-        // to wait for the lock would read from before the holder's commit.
-        // Take the lock without waiting; when it is busy, wait for the holder
-        // to finish and start over with a fresh snapshot.
-        let lock_key = score_recalc_lock_key(repository_id);
-        if wait_for_lock {
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                .bind(&lock_key)
-                .execute(&mut *tx)
-                .await?;
-        } else {
-            let acquired: bool =
-                sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
-                    .bind(&lock_key)
-                    .fetch_one(&mut *tx)
-                    .await?;
-            if !acquired {
-                sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                    .bind(&lock_key)
-                    .execute(&mut *tx)
-                    .await?;
-                tx.rollback().await?;
-                return Ok(None);
-            }
-        }
 
         // #4338: the shared definition of open vulnerabilities by severity
         // (latest completed scan per (artifact, scan type), one per
@@ -3377,7 +3413,7 @@ impl ScanResultService {
         // failure is recognized and retried (#5006).
         tx.commit().await?;
 
-        Ok(Some(result))
+        Ok(result)
     }
 
     /// Get the current security score for a repository.
@@ -7427,6 +7463,126 @@ mod tests {
             assert!(r1.is_ok(), "first recalculation failed: {:?}", r1.err());
             assert!(r2.is_ok(), "second recalculation failed: {:?}", r2.err());
             cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #5891: a burst of scan completions in one repository, each followed
+        /// by its own recalculation, as concurrent external ingests do. Before
+        /// the fix an attempt that found the repository lock busy counted
+        /// against the 8-attempt cap, and the last attempt waited for the
+        /// lock inside its REPEATABLE READ snapshot, so with 6 or more at once
+        /// some recalculations returned 40001 (a 500 from the ingest) even
+        /// though the stored score ended up right. Every one must succeed, and
+        /// the stored score must count every scan.
+        #[tokio::test]
+        async fn a_burst_of_concurrent_recalculations_all_succeed_5891() {
+            const WIDTH: usize = 16;
+            const ROUNDS: usize = 3;
+            let Some(pool) = crate::testing::try_pool_with(WIDTH as u32 + 4).await else {
+                return;
+            };
+            for round in 0..ROUNDS {
+                let repo_id = insert_test_repo(&pool).await;
+                let mut artifacts = Vec::with_capacity(WIDTH);
+                for i in 0..WIDTH {
+                    let (aid, _) =
+                        insert_test_artifact(&pool, repo_id, &format!("burst-{round}-{i}")).await;
+                    artifacts.push(aid);
+                }
+                let start = std::sync::Arc::new(tokio::sync::Barrier::new(WIDTH));
+                let tasks: Vec<_> = artifacts
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, aid)| {
+                        let svc = ScanResultService::new(pool.clone());
+                        let start = start.clone();
+                        tokio::spawn(async move {
+                            let cve = format!("CVE-2026-5891{round}{i:02}");
+                            start.wait().await;
+                            seed_scan_4338(
+                                &svc,
+                                aid,
+                                repo_id,
+                                "grype",
+                                &[(Severity::High, Some(cve.as_str()), "t", "lib")],
+                            )
+                            .await;
+                            svc.recalculate_score(repo_id).await
+                        })
+                    })
+                    .collect();
+                let mut failures = Vec::new();
+                for (i, task) in tasks.into_iter().enumerate() {
+                    if let Err(e) = task.await.expect("join") {
+                        failures.push(format!("recalculation {i}: {e}"));
+                    }
+                }
+                assert!(
+                    failures.is_empty(),
+                    "round {round}: {} of {WIDTH} concurrent recalculations failed: {failures:#?}",
+                    failures.len()
+                );
+                let score = svc_score(&pool, repo_id).await;
+                assert_eq!(
+                    score.high_count, WIDTH as i32,
+                    "round {round}: every scan's finding is counted"
+                );
+                assert_eq!(
+                    score.coverage().expect("coverage written").scanned,
+                    WIDTH as i64,
+                    "round {round}: every artifact is scanned"
+                );
+                cleanup_repo(&pool, repo_id).await;
+            }
+        }
+
+        /// #5891: a recalculation cancelled while it holds the repository's
+        /// session-level lock (a client that disconnects mid-ingest) does not
+        /// leave the lock held: the next recalculation of the repository
+        /// completes.
+        #[tokio::test]
+        async fn a_cancelled_recalculation_does_not_keep_the_lock_5891() {
+            let Some(pool) = crate::testing::try_pool_with(6).await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            svc.recalculate_score(repo_id).await.expect("recalculate");
+
+            // Hold the score row so the recalculation stops at its upsert,
+            // with the lock held.
+            let mut blocker = pool.begin().await.expect("begin blocker");
+            let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *blocker)
+                .await
+                .expect("blocker pid");
+            sqlx::query("SELECT 1 FROM repo_security_scores WHERE repository_id = $1 FOR UPDATE")
+                .bind(repo_id)
+                .execute(&mut *blocker)
+                .await
+                .expect("lock score row");
+            let held = tokio::spawn({
+                let svc = ScanResultService::new(pool.clone());
+                async move { svc.recalculate_score(repo_id).await }
+            });
+            wait_for_blocked_backend_5006(&pool, &[blocker_pid], &[]).await;
+            held.abort();
+            let _ = held.await;
+            blocker.commit().await.expect("release score row");
+
+            let next =
+                tokio::time::timeout(Duration::from_secs(15), svc.recalculate_score(repo_id))
+                    .await
+                    .expect("the next recalculation must not wait on a cancelled one's lock");
+            next.expect("the next recalculation succeeds");
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        async fn svc_score(pool: &PgPool, repo_id: Uuid) -> RepoSecurityScore {
+            ScanResultService::new(pool.clone())
+                .get_score(repo_id)
+                .await
+                .expect("get")
+                .expect("score row")
         }
 
         /// #5006: a recalculation whose upsert loses to a concurrent write of
