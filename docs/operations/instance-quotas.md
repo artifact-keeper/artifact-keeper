@@ -117,10 +117,30 @@ Every refusal is a 4xx with the standard error object, plus extra fields:
 }
 ```
 
+A storage refusal while usage is still below the quota means that this
+upload does not fit in the space left. Smaller uploads still succeed. The
+message says so, and the body carries the upload's declared size:
+
+```json
+{
+  "code": "STORAGE_QUOTA_EXCEEDED",
+  "message": "This upload (512.0 MiB) would exceed the storage quota: 9.8 GiB of 10.0 GiB used, 256.0 MiB free. Smaller uploads still fit; delete artifacts or raise the quota to upload this one. Downloads are not affected.",
+  "scope": "instance",
+  "limit_bytes": 10737418240,
+  "used_bytes": 10468982784,
+  "content_length": 536870912
+}
+```
+
+The code and fields are the same in both cases. A client tells them apart
+with `used_bytes < limit_bytes`. Repository and project refusals follow the
+same rule ("This upload (...) would exceed the storage quota of repository
+'libs': ...").
+
 | Refusal | Status | `code` | Extra fields |
 |---|---|---|---|
-| Instance storage | 403 | `STORAGE_QUOTA_EXCEEDED` | `scope: "instance"`, `limit_bytes`, `used_bytes`, `help_url` |
-| Repository or project quota | 403 | `QUOTA_EXCEEDED` | `scope: "repository"` or `"project"`, `repository`, `project`, `limit_bytes`, `used_bytes` |
+| Instance storage | 403 | `STORAGE_QUOTA_EXCEEDED` | `scope: "instance"`, `limit_bytes`, `used_bytes`, `content_length` (when declared), `help_url` |
+| Repository or project quota | 403 | `QUOTA_EXCEEDED` | `scope: "repository"` or `"project"`, `repository`, `project`, `limit_bytes`, `used_bytes`, `content_length` (when declared) |
 | Transfer | 429 + `Retry-After` | `TRANSFER_QUOTA_EXCEEDED` | `limit_bytes` (the monthly quota), `used_bytes`, `period_end`, `retry_after_seconds`, `help_url` |
 | Upload size | 413 | `PAYLOAD_TOO_LARGE` | `limit_bytes`, `content_length` (when declared) |
 
