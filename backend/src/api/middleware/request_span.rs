@@ -137,6 +137,8 @@ pub fn recorded_user() -> Option<String> {
 /// call wins. A no-op outside a request scope.
 pub fn record_api_token(token_id: uuid::Uuid) {
     let _ = REQUEST_ATTRIBUTES.try_with(|attrs| attrs.api_token_id.set(Some(token_id)));
+    // The IAM shadow comparison decides with this token's ceiling (#4214).
+    crate::api::authz::shadow_marker::note_api_token(token_id);
 }
 
 /// The API token id recorded by [`record_api_token`] for the request in

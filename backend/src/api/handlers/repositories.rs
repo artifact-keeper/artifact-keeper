@@ -582,7 +582,12 @@ pub(crate) async fn require_visible(
     // that names no repository. Naming the key here made the two 404s
     // distinguishable, so a caller who may not read a repository could still
     // learn that it exists.
-    let not_found = || AppError::NotFound(REPOSITORY_NOT_FOUND.to_string());
+    // Every refusal below is hidden behind that 404; the marker lets the IAM
+    // shadow comparison tell it from a missing key (#4214).
+    let not_found = || {
+        crate::api::authz::shadow_marker::note_hidden_refusal();
+        AppError::NotFound(REPOSITORY_NOT_FOUND.to_string())
+    };
     match auth {
         Some(a) => {
             // Repository-scoped API tokens must still allow this repo.

@@ -105,6 +105,9 @@ pub struct AuthExtension {
 fn record_request_user(auth: Option<&AuthExtension>) {
     if let Some(ext) = auth {
         crate::api::middleware::request_span::record_user(&ext.username);
+        // The IAM shadow layer sits above this middleware and cannot read
+        // the request extension it inserts (#4214).
+        crate::api::authz::shadow_marker::note_principal(ext);
     }
 }
 
