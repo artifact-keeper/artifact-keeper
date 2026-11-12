@@ -23,8 +23,15 @@ as a clean response under its original digest (#3919, #4323).
   what it finds (see below). Blobs streamed from an upstream on a proxy miss
   are not checked.
 
-Not yet covered: the Maven, npm, PyPI, Cargo, NuGet and
-Helm hosted download handlers, which read storage through their own paths. Protobuf commit bundles are never
+- The hosted downloads of Maven (including a `-SNAPSHOT` alias), npm
+  tarballs, PyPI files, Cargo crates, NuGet packages (V3 flat container and
+  V2) and Helm charts, and every other format route that serves a hosted row
+  through the shared `serve_local_artifact` tail (#4989).
+- The artifact route `GET /api/v1/repositories/{key}/artifacts/{path}` of a
+  virtual repository, which serves the member's bytes. A corrupt member is the
+  final `502` there too, not a `404` (#4989).
+
+Protobuf commit bundles are never
 checked, because their recorded digest is a commit digest, not the digest of
 the stored bundle.
 
@@ -42,9 +49,12 @@ the stored bundle.
 - A range request for part of an object is not checked (a window cannot be
   checked against a whole-object digest); a range covering the whole object
   is.
-- A `HEAD` on the generic route, including one a virtual repository answers
-  from a hosted member there (#4989), or one the shared hosted fetch answers
-  from the artifact row, reads no body and is not checked.
+- A `HEAD` on the generic route or the artifact route, including one a
+  virtual repository answers from a hosted member there (#4989), on one of the
+  hosted format downloads above that stream, or one the shared hosted fetch
+  answers from the artifact row, reads no body and is not checked. Helm and
+  the other `serve_local_artifact` formats read the object for a `HEAD` too,
+  so they check it.
 
 ## Repair on a Remote OCI repository
 
@@ -89,7 +99,8 @@ answered `502`. The budget's metrics are in
 [load shedding](load-shedding.md#download-verification-memory-budget). A
 larger object streams with one chunk held back. Virtual-repository `HEAD`
 requests that a format route resolves through a member walk still read a
-small object to check it; on the generic route they read nothing.
+small object to check it; on the generic and artifact routes they read
+nothing.
 
 Each failure logs `stored object failed integrity verification on serve`
 at error level with the object, the expected and actual digest and length.

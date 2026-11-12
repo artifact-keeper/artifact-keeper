@@ -64,8 +64,10 @@ request starts another rebuild.
 stale or not. The CEP-16 shard index is never served stale.
 
 A merge in which a member failed is never kept, so it is never served stale.
-The member-failure policy (strict 502, or a partial document marked
-`no-store`) is applied to every response exactly as before.
+The member-failure policy (see [virtual metadata merges](../virtual-metadata-merges.md):
+an unavailable member left out and the document marked `no-store`, a 503
+when no member answered, a strict 502 for a member document that cannot be
+read) is applied to every response exactly as before.
 
 **A cap on concurrent merges.** At most `CONDA_VIRTUAL_MAX_CONCURRENT_MERGES`
 merges run at once across all virtual channels. A merge that cannot start within
@@ -135,7 +137,8 @@ Size the container from three parts:
 
 Then leave headroom for the allocator: freed merge memory is not always returned
 to the operating system at once, so the resident set after a burst sits above
-the steady baseline.
+the steady baseline. How glibc arenas and jemalloc's decay affect that is in
+[backend RSS and the memory allocator](backend-memory-allocator.md).
 
 ### How this adds up with the upload budget
 

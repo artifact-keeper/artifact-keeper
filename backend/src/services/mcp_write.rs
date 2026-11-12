@@ -48,12 +48,21 @@ pub async fn copy_reuses_recorded_version(
     name: &str,
     version: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
-    if target_format != &crate::models::repository::RepositoryFormat::Mcp
-        || !(path.starts_with("servers/") && path.ends_with("/server.json"))
-    {
+    if !copy_is_mcp_server_json(target_format, path) {
         return Ok(false);
     }
     version_tombstoned(db, target_repo_id, name, version.unwrap_or_default()).await
+}
+
+/// Whether a copy of `path` into a repository of `target_format` stores an
+/// MCP server version (its `server.json`), and so its server name.
+pub fn copy_is_mcp_server_json(
+    target_format: &crate::models::repository::RepositoryFormat,
+    path: &str,
+) -> bool {
+    target_format == &crate::models::repository::RepositoryFormat::Mcp
+        && path.starts_with("servers/")
+        && path.ends_with("/server.json")
 }
 
 /// The refusal text of [`copy_reuses_recorded_version`].
@@ -218,7 +227,7 @@ pub enum Actor {
 
 /// One write-side MCP audit row (fire-and-forget): `MCP_SERVER_PUBLISHED`,
 /// `MCP_SERVER_STATUS_CHANGED`, `MCP_SERVER_EDITED`, `MCP_SERVER_DELETED`,
-/// `MCP_BUNDLE_SIGNATURE_REJECTED`. `details` gains `repository`, `server`
+/// `MCP_SERVER_PURGED`, `MCP_BUNDLE_SIGNATURE_REJECTED`. `details` gains `repository`, `server`
 /// and `version`.
 #[allow(clippy::too_many_arguments)]
 pub fn audit(

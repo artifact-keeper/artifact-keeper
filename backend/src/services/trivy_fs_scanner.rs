@@ -93,28 +93,11 @@ impl TrivyFsScanner {
         server_url: Option<&str>,
     ) -> Result<(TrivyReport, String)> {
         let ws = workspace.to_string_lossy();
-        let mut args = vec!["filesystem"];
-        if let Some(url) = server_url {
-            args.push("--server");
-            args.push(url);
-        }
-        args.extend_from_slice(&[
-            "--format",
-            "json",
-            // #3296: the shared allowlist includes UNKNOWN so ungraded CVEs
-            // reach the report instead of being dropped at the CLI.
-            "--severity",
-            crate::services::scanner_service::TRIVY_FS_SEVERITY_LIST,
-            // #903: enumerate every package the scanner saw (not just
-            // CVE-bearing rows) so SBOM generation reflects the complete
-            // dependency tree. `convert_trivy_packages` reads from the
-            // `Packages` block this flag adds to the JSON report.
-            "--list-all-pkgs",
-            "--quiet",
-            "--timeout",
-            "5m",
-            &ws,
-        ]);
+        // #903: `--list-all-pkgs` enumerates every package the scanner saw
+        // (not just CVE-bearing rows) so SBOM generation reflects the
+        // complete dependency tree; `convert_trivy_packages` reads the
+        // `Packages` block it adds to the JSON report.
+        let args = trivy_filesystem_args(&ws, server_url, "5m", true);
 
         let mode_label = if server_url.is_some() {
             "server"
@@ -122,14 +105,7 @@ impl TrivyFsScanner {
             "standalone"
         };
 
-        let mut command = tokio::process::Command::new("trivy");
-        // `tokio::process::Command` defaults `kill_on_drop` to `false`. This
-        // scan runs inside the caller's inline-proxy-gate timeout, and when
-        // that timeout fires it drops this future -- without this, the trivy
-        // child is ORPHANED and keeps running to completion unsupervised.
-        // Same fix, same rationale, as the grype spawn (#3455).
-        command.kill_on_drop(true);
-        let output = command
+        let output = trivy_cli_command()
             .args(&args)
             .output()
             .await
@@ -224,6 +200,399 @@ fn workspace_known_targets(workspace: &Path) -> Vec<&'static str> {
     hits
 }
 
+/// Environment for every local `trivy` CLI run (#5666). Without it each run
+/// calls `check.trivy.dev` for a version check and sends an anonymous
+/// telemetry header set, whatever else the scan is told about the network.
+/// Environment rather than `--skip-version-check` / `--disable-telemetry`
+/// because the legacy CLI path runs whatever trivy the operator installed:
+/// a release older than those flags ignores an unknown `TRIVY_*` variable
+/// but rejects an unknown flag and would fail every scan.
+pub(crate) const TRIVY_CLI_NO_PHONE_HOME_ENV: &[(&str, &str)] = &[
+    ("TRIVY_SKIP_VERSION_CHECK", "true"),
+    ("TRIVY_DISABLE_TELEMETRY", "true"),
+];
+
+/// A `trivy` command with the #5666 environment applied and `kill_on_drop`
+/// set. `tokio::process::Command` defaults `kill_on_drop` to `false`; these
+/// scans run inside the caller's inline-proxy-gate timeout, and when that
+/// fires it drops the future -- without the flag the trivy child is
+/// ORPHANED and keeps running unsupervised (#3455, same as the grype spawn).
+pub(crate) fn trivy_cli_command() -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("trivy");
+    command.kill_on_drop(true);
+    command.envs(TRIVY_CLI_NO_PHONE_HOME_ENV.iter().copied());
+    command
+}
+
+/// Arguments for a local `trivy filesystem` scan of `target`, shared by this
+/// scanner and the Incus rootfs scanner.
+///
+/// `--offline-scan` is unconditional (#5666). Without it trivy's `pom.xml`
+/// parser fetches parent POMs and unpinned dependency versions from
+/// `repo.maven.apache.org` for every POM in the workspace -- every extracted
+/// jar carries one under `META-INF/maven/` -- so a scan failed outright on
+/// an air-gapped install, bypassed AK's own proxy, and disclosed the
+/// artifact's dependency coordinates to Maven Central. What the remote
+/// lookup recovered was the version a parent or BOM *manages*, not the one
+/// the archive bundles; the bundled versions are cataloged offline from the
+/// jars' own `pom.properties` ([`write_embedded_jar_inventory`]).
+pub(crate) fn trivy_filesystem_args<'a>(
+    target: &'a str,
+    server_url: Option<&'a str>,
+    timeout: &'a str,
+    list_all_pkgs: bool,
+) -> Vec<&'a str> {
+    let mut args = vec!["filesystem"];
+    if let Some(url) = server_url {
+        args.push("--server");
+        args.push(url);
+    }
+    args.extend_from_slice(&[
+        "--format",
+        "json",
+        // #3296: the shared allowlist includes UNKNOWN so ungraded CVEs
+        // reach the report instead of being dropped at the CLI.
+        "--severity",
+        crate::services::scanner_service::TRIVY_FS_SEVERITY_LIST,
+    ]);
+    if list_all_pkgs {
+        args.push("--list-all-pkgs");
+    }
+    args.extend_from_slice(&["--offline-scan", "--quiet", "--timeout", timeout, target]);
+    args
+}
+
+/// Workspace subdirectory holding the synthesized Maven inventory (#5666).
+/// Dot-prefixed and fixed, like the component-pin directory, so an archive
+/// entry cannot be mistaken for it: the walk that builds the inventory skips
+/// it, and a shipped file at the same path is overwritten.
+pub(crate) const JAR_INVENTORY_SUBDIR: &str = ".ak-scan-jar-inventory";
+
+/// The inventory POM's own coordinate. trivy reports it as the `root`
+/// package of the inventory target; it names nothing real, so it is removed
+/// from the report before conversion ([`strip_jar_inventory_root`]).
+const JAR_INVENTORY_ROOT_GROUP: &str = "artifact-keeper.scan";
+const JAR_INVENTORY_ROOT_ARTIFACT: &str = "embedded-jars";
+
+/// Bounds for the inventory walk. A fat jar bundles a few hundred libraries;
+/// the ceilings exist so a hostile archive cannot turn the walk into a
+/// resource sink, and hitting one only truncates the inventory.
+const JAR_INVENTORY_MAX_DEPTH: usize = 16;
+const JAR_INVENTORY_MAX_ARCHIVES: usize = 10_000;
+const JAR_INVENTORY_MAX_COORDINATES: usize = 10_000;
+/// Entries per archive whose names are examined.
+const JAR_INVENTORY_MAX_ENTRIES: usize = 1_000_000;
+/// A `pom.properties` is a few hundred bytes.
+const JAR_INVENTORY_POM_PROPERTIES_MAX_BYTES: u64 = 64 * 1024;
+/// A jar nested inside a jar on disk is read into memory, one level deep,
+/// when it is no larger than this; the total read that way is capped too.
+const JAR_INVENTORY_NESTED_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const JAR_INVENTORY_NESTED_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// One Maven coordinate read from a bundled `pom.properties`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct MavenCoordinate {
+    pub(crate) group_id: String,
+    pub(crate) artifact_id: String,
+    pub(crate) version: String,
+}
+
+/// Maven-legal identifier characters. Anything else -- including the XML
+/// metacharacters the inventory POM would otherwise have to escape, and a
+/// `${...}` property reference -- disqualifies the coordinate.
+fn is_maven_token(value: &str, extra: &[char]) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') || extra.contains(&c)
+        })
+}
+
+impl MavenCoordinate {
+    fn from_pom_properties(body: &[u8]) -> Option<Self> {
+        let text = std::str::from_utf8(body).ok()?;
+        let (group_id, artifact_id, version) =
+            crate::services::scanner_service::parse_pom_properties(text)?;
+        (is_maven_token(&group_id, &[])
+            && is_maven_token(&artifact_id, &[])
+            && is_maven_token(&version, &['+']))
+        .then_some(Self {
+            group_id,
+            artifact_id,
+            version,
+        })
+    }
+}
+
+/// Whether `name` is a `META-INF/maven/<groupId>/<artifactId>/pom.properties`
+/// path, the file Maven's archiver writes for each packaged project.
+fn is_pom_properties_path(name: &str) -> bool {
+    let parts: Vec<&str> = name.split('/').collect();
+    matches!(
+        parts.as_slice(),
+        ["META-INF", "maven", g, a, "pom.properties"] if !g.is_empty() && !a.is_empty()
+    )
+}
+
+fn is_jvm_archive_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".jar") || lower.ends_with(".war") || lower.ends_with(".ear")
+}
+
+/// Accumulates coordinates under the walk's ceilings.
+#[derive(Default)]
+struct JarInventory {
+    coordinates: std::collections::BTreeSet<MavenCoordinate>,
+    archives_seen: usize,
+    nested_bytes: u64,
+}
+
+impl JarInventory {
+    fn full(&self) -> bool {
+        self.coordinates.len() >= JAR_INVENTORY_MAX_COORDINATES
+    }
+
+    fn add(&mut self, body: &[u8]) {
+        if self.full() {
+            return;
+        }
+        if let Some(coordinate) = MavenCoordinate::from_pom_properties(body) {
+            self.coordinates.insert(coordinate);
+        }
+    }
+
+    /// Read every `pom.properties` in a JVM archive and, when `nested` is
+    /// set, in each JVM archive stored inside it. Unreadable archives and
+    /// entries are skipped: the inventory is best-effort.
+    fn read_archive<R: std::io::Read + std::io::Seek>(&mut self, reader: R, nested: bool) {
+        use std::io::Read as _;
+
+        if self.archives_seen >= JAR_INVENTORY_MAX_ARCHIVES {
+            return;
+        }
+        self.archives_seen += 1;
+        let Ok(mut archive) = zip::ZipArchive::new(reader) else {
+            return;
+        };
+        for i in 0..archive.len().min(JAR_INVENTORY_MAX_ENTRIES) {
+            if self.full() {
+                return;
+            }
+            // Match on the central-directory name before opening the entry,
+            // so unmatched entries are never inflated.
+            let Some(Ok(name)) = archive.name_for_index(i) else {
+                continue;
+            };
+            let is_props = is_pom_properties_path(&name);
+            let is_nested = nested && is_jvm_archive_name(&name);
+            if !is_props && !is_nested {
+                continue;
+            }
+            let Ok(entry) = archive.by_index(i) else {
+                continue;
+            };
+            if !entry.is_file() {
+                continue;
+            }
+            let cap = if is_props {
+                JAR_INVENTORY_POM_PROPERTIES_MAX_BYTES
+            } else {
+                JAR_INVENTORY_NESTED_MAX_BYTES
+                    .min(JAR_INVENTORY_NESTED_TOTAL_BYTES.saturating_sub(self.nested_bytes))
+            };
+            if entry.size() > cap {
+                continue;
+            }
+            let mut body = Vec::new();
+            if entry.take(cap + 1).read_to_end(&mut body).is_err() || body.len() as u64 > cap {
+                continue;
+            }
+            if is_props {
+                self.add(&body);
+            } else {
+                self.nested_bytes += body.len() as u64;
+                self.read_archive(std::io::Cursor::new(body), false);
+            }
+        }
+    }
+}
+
+/// The Maven coordinates a JVM archive held in memory carries (#5666): every
+/// `pom.properties` entry in it, and in each `.jar`/`.war`/`.ear` stored
+/// inside it one level down (a fat jar's `BOOT-INF/lib/`, a war's
+/// `WEB-INF/lib/`). Same validation and ceilings as the workspace walk; an
+/// unreadable archive yields nothing. Used by the dependency scanner, which
+/// sees the artifact's bytes rather than an extracted workspace.
+pub(crate) fn maven_coordinates_in_archive(content: &[u8]) -> Vec<MavenCoordinate> {
+    let mut inventory = JarInventory::default();
+    inventory.read_archive(std::io::Cursor::new(content), true);
+    inventory.coordinates.into_iter().collect()
+}
+
+/// Collect the Maven coordinates bundled under `root`: loose
+/// `META-INF/maven/*/*/pom.properties` files (an extracted archive) and the
+/// `pom.properties` entries of every `.jar`/`.war`/`.ear` on disk, plus the
+/// jars nested one level inside those (a fat jar the workspace could not
+/// extract). Symlinks are not followed.
+fn collect_embedded_maven_coordinates(root: &Path) -> Vec<MavenCoordinate> {
+    let mut inventory = JarInventory::default();
+    let walker = walkdir::WalkDir::new(root)
+        .max_depth(JAR_INVENTORY_MAX_DEPTH)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| e.depth() != 1 || e.file_name() != JAR_INVENTORY_SUBDIR)
+        .filter_map(|e| e.ok());
+    for entry in walker {
+        if inventory.full() {
+            break;
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(root)
+            .ok()
+            .and_then(|p| p.to_str())
+            .unwrap_or_default();
+        let name = entry.file_name().to_string_lossy();
+        if rel.ends_with("pom.properties")
+            && rel
+                .match_indices("META-INF/maven/")
+                .any(|(i, _)| is_pom_properties_path(&rel[i..]))
+        {
+            let mut body = Vec::new();
+            if std::fs::File::open(path)
+                .and_then(|f| {
+                    std::io::Read::read_to_end(
+                        &mut std::io::Read::take(f, JAR_INVENTORY_POM_PROPERTIES_MAX_BYTES + 1),
+                        &mut body,
+                    )
+                })
+                .is_ok()
+                && body.len() as u64 <= JAR_INVENTORY_POM_PROPERTIES_MAX_BYTES
+            {
+                inventory.add(&body);
+            }
+        } else if is_jvm_archive_name(&name) {
+            if let Ok(file) = std::fs::File::open(path) {
+                inventory.read_archive(std::io::BufReader::new(file), true);
+            }
+        }
+    }
+    inventory.coordinates.into_iter().collect()
+}
+
+/// The inventory POM: one `<dependency>` per bundled coordinate, each with a
+/// literal version, so trivy's `pom.xml` analyzer catalogs and grades them
+/// with no remote resolution at all. Every value has passed
+/// [`is_maven_token`], so nothing in it needs XML escaping.
+fn render_jar_inventory_pom(coordinates: &[MavenCoordinate]) -> String {
+    let mut pom = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!-- Synthesized by Artifact Keeper from the pom.properties of the \
+         archives bundled in this artifact (#5666). -->\n\
+         <project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  \
+         <modelVersion>4.0.0</modelVersion>\n  \
+         <groupId>{JAR_INVENTORY_ROOT_GROUP}</groupId>\n  \
+         <artifactId>{JAR_INVENTORY_ROOT_ARTIFACT}</artifactId>\n  \
+         <version>0</version>\n  <packaging>pom</packaging>\n  <dependencies>\n"
+    );
+    for c in coordinates {
+        pom.push_str(&format!(
+            "    <dependency><groupId>{}</groupId><artifactId>{}</artifactId>\
+             <version>{}</version></dependency>\n",
+            c.group_id, c.artifact_id, c.version
+        ));
+    }
+    pom.push_str("  </dependencies>\n</project>\n");
+    pom
+}
+
+/// Write `<workspace>/.ak-scan-jar-inventory/pom.xml` naming every Maven
+/// coordinate bundled in the workspace (#5666), and return how many it names
+/// (0 writes nothing).
+///
+/// `trivy filesystem` does not open `.jar` files at all -- its jar analyzer
+/// runs only for image and rootfs targets, and needs the Java DB there -- so
+/// a fat jar's `BOOT-INF/lib/*.jar` (or a war's `WEB-INF/lib/*.jar`) was
+/// never cataloged, and the only Java input trivy saw was the outer
+/// project's `pom.xml`, resolved against Maven Central. This file hands the
+/// bundled libraries to the analyzer trivy does run on a filesystem, with
+/// the versions the archive actually ships. Best-effort: a failure is
+/// logged and the scan proceeds as it did before.
+pub(crate) async fn write_embedded_jar_inventory(workspace: &Path) -> usize {
+    let root = workspace.to_path_buf();
+    let coordinates = match tokio::task::spawn_blocking(move || {
+        collect_embedded_maven_coordinates(&root)
+    })
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Embedded jar inventory walk failed: {}", e);
+            return 0;
+        }
+    };
+    if coordinates.is_empty() {
+        return 0;
+    }
+    let dir = workspace.join(JAR_INVENTORY_SUBDIR);
+    let pom = dir.join("pom.xml");
+    // A shipped entry at the inventory path (a file or link where the
+    // directory goes, a directory or link where the pom goes, a decoy pom) is
+    // removed, never written through or trusted.
+    if tokio::fs::symlink_metadata(&dir)
+        .await
+        .is_ok_and(|m| !m.is_dir())
+    {
+        let _ = tokio::fs::remove_file(&dir).await;
+    }
+    match tokio::fs::symlink_metadata(&pom).await {
+        Ok(m) if m.is_dir() => {
+            let _ = tokio::fs::remove_dir_all(&pom).await;
+        }
+        Ok(_) => {
+            let _ = tokio::fs::remove_file(&pom).await;
+        }
+        Err(_) => {}
+    }
+    let written = async {
+        tokio::fs::create_dir_all(&dir).await?;
+        tokio::fs::write(&pom, render_jar_inventory_pom(&coordinates)).await
+    }
+    .await;
+    match written {
+        Ok(()) => coordinates.len(),
+        Err(e) => {
+            warn!(
+                "Could not write the embedded jar inventory into {}: {}",
+                dir.display(),
+                e
+            );
+            0
+        }
+    }
+}
+
+/// Remove the inventory POM's own `root` package from the report: it names
+/// no real component, and leaving it would put a fabricated package in the
+/// SBOM inventory.
+fn strip_jar_inventory_root(report: &mut TrivyReport) {
+    let root = format!("{JAR_INVENTORY_ROOT_GROUP}:{JAR_INVENTORY_ROOT_ARTIFACT}");
+    for result in &mut report.results {
+        if !result.target.starts_with(JAR_INVENTORY_SUBDIR) {
+            continue;
+        }
+        if let Some(packages) = result.packages.as_mut() {
+            packages.retain(|p| p.name != root);
+        }
+        if let Some(vulns) = result.vulnerabilities.as_mut() {
+            vulns.retain(|v| v.pkg_name != root);
+        }
+    }
+}
+
 #[async_trait]
 impl Scanner for TrivyFsScanner {
     fn name(&self) -> &str {
@@ -309,6 +678,16 @@ impl TrivyFsScanner {
             ScanWorkspace::prepare_pinned(&self.scan_workspace, None, artifact, content, pin)
                 .await?;
 
+        // #5666: name the libraries bundled in any JVM archive in the
+        // workspace, so trivy grades them offline (it never opens a jar).
+        let bundled = write_embedded_jar_inventory(&workspace).await;
+        if bundled > 0 {
+            info!(
+                "Cataloged {} bundled Maven coordinates for {} from their pom.properties",
+                bundled, artifact.name
+            );
+        }
+
         // Run the scan engine: legacy CLI (server-then-standalone) or the
         // scanner-adapter upload path (#2363). Both yield (report, stderr);
         // errors flow through `fail_scan`, which preserves the
@@ -325,7 +704,7 @@ impl TrivyFsScanner {
                 .await
                 .map(|scan| (scan.report, scan.stderr, scan.vuln_db)),
         };
-        let (report, stderr, vuln_db) = match scan_result {
+        let (mut report, stderr, vuln_db) = match scan_result {
             Ok(out) => out,
             Err(e) => {
                 return Err(
@@ -333,6 +712,7 @@ impl TrivyFsScanner {
                 );
             }
         };
+        strip_jar_inventory_root(&mut report);
 
         // #1153: enumerate lockfile/manifest files in the workspace so the
         // partial-scan classifier can flag a target Trivy silently skipped.
@@ -348,6 +728,8 @@ impl TrivyFsScanner {
         );
         // #3014: the adapter's DB for this scan (None in CLI mode).
         output.vuln_db = vuln_db;
+        // #5236: an Alpine subpackage pin's synthetic origin record.
+        crate::services::scanner_service::fold_apk_origin_record(&mut output, pin);
 
         info!(
             "Trivy filesystem scan complete for {}: {} vulnerabilities, {} packages, completeness={}",
@@ -695,6 +1077,371 @@ mod tests {
             matches!(err, crate::error::AppError::ScannerEngineUnavailable(_)),
             "a down adapter must be ScannerEngineUnavailable, got {err:?}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // #5666: no Maven Central, no phone-home, bundled jars cataloged
+    // -------------------------------------------------------------------
+
+    fn zip_of(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (path, body) in entries {
+            zw.start_file(*path, SimpleFileOptions::default()).unwrap();
+            zw.write_all(body).unwrap();
+        }
+        zw.finish().unwrap().into_inner()
+    }
+
+    /// A library jar as Maven packages it: its own `pom.properties` and a
+    /// `pom.xml` whose parent only Maven Central could resolve.
+    fn library_jar(group: &str, artifact: &str, version: &str) -> Vec<u8> {
+        let base = format!("META-INF/maven/{group}/{artifact}");
+        zip_of(&[
+            (
+                &format!("{base}/pom.properties"),
+                format!("#Generated by Maven\ngroupId={group}\nartifactId={artifact}\nversion={version}\n")
+                    .into_bytes(),
+            ),
+            (
+                &format!("{base}/pom.xml"),
+                format!(
+                    "<project><parent><groupId>{group}</groupId><artifactId>parent</artifactId>\
+                     <version>{version}</version></parent><artifactId>{artifact}</artifactId></project>"
+                )
+                .into_bytes(),
+            ),
+            ("x/Lib.class", b"\xca\xfe\xba\xbe".to_vec()),
+        ])
+    }
+
+    /// A Spring Boot style fat jar bundling three vulnerable libraries under
+    /// `BOOT-INF/lib/`, with the outer project's POM inheriting from a
+    /// remote parent (what sent trivy to Maven Central in #5666).
+    fn fat_jar() -> Bytes {
+        Bytes::from(zip_of(&[
+            (
+                "META-INF/maven/com.example/fatapp/pom.properties",
+                b"groupId=com.example\nartifactId=fatapp\nversion=1.0.0\n".to_vec(),
+            ),
+            (
+                "META-INF/maven/com.example/fatapp/pom.xml",
+                b"<project><parent><groupId>org.springframework.boot</groupId>\
+                  <artifactId>spring-boot-starter-parent</artifactId><version>2.1.0.RELEASE</version>\
+                  </parent><artifactId>fatapp</artifactId></project>"
+                    .to_vec(),
+            ),
+            (
+                "BOOT-INF/lib/jackson-databind-2.9.10.jar",
+                library_jar("com.fasterxml.jackson.core", "jackson-databind", "2.9.10"),
+            ),
+            (
+                "BOOT-INF/lib/log4j-core-2.14.1.jar",
+                library_jar("org.apache.logging.log4j", "log4j-core", "2.14.1"),
+            ),
+            (
+                "BOOT-INF/lib/commons-collections-3.2.1.jar",
+                library_jar("commons-collections", "commons-collections", "3.2.1"),
+            ),
+        ]))
+    }
+
+    const BUNDLED: &[(&str, &str, &str)] = &[
+        ("com.fasterxml.jackson.core", "jackson-databind", "2.9.10"),
+        ("org.apache.logging.log4j", "log4j-core", "2.14.1"),
+        ("commons-collections", "commons-collections", "3.2.1"),
+    ];
+
+    fn assert_inventory_names_bundled(pom: &str) {
+        for (g, a, v) in BUNDLED {
+            let dep = format!(
+                "<dependency><groupId>{g}</groupId><artifactId>{a}</artifactId>\
+                 <version>{v}</version></dependency>"
+            );
+            assert!(
+                pom.contains(&dep),
+                "inventory must name {g}:{a}:{v}:\n{pom}"
+            );
+        }
+    }
+
+    /// #5666: every local trivy filesystem scan (this scanner and the Incus
+    /// rootfs scanner share the builder) runs with `--offline-scan`, so its
+    /// POM parser never fetches parents or versions from Maven Central.
+    #[test]
+    fn test_trivy_filesystem_args_are_offline() {
+        for (server, list_all) in [(None, true), (Some("http://trivy:4954"), false)] {
+            let args = trivy_filesystem_args("/ws", server, "5m", list_all);
+            assert!(
+                args.contains(&"--offline-scan"),
+                "trivy filesystem must never resolve POMs remotely: {args:?}"
+            );
+            assert_eq!(args.first(), Some(&"filesystem"));
+            assert_eq!(args.last(), Some(&"/ws"), "target stays last: {args:?}");
+            assert_eq!(args.contains(&"--list-all-pkgs"), list_all, "{args:?}");
+            assert_eq!(
+                args.windows(2)
+                    .any(|w| w == ["--server", "http://trivy:4954"]),
+                server.is_some(),
+                "{args:?}"
+            );
+            assert!(args.windows(2).any(|w| w == ["--timeout", "5m"]));
+        }
+    }
+
+    /// #5666: the trivy child gets the environment that switches off its
+    /// per-run version check and telemetry call to `check.trivy.dev`, and
+    /// keeps `kill_on_drop` (#3455).
+    #[test]
+    fn test_trivy_cli_command_disables_phone_home() {
+        let command = trivy_cli_command();
+        let envs: Vec<(String, Option<String>)> = command
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        for key in ["TRIVY_SKIP_VERSION_CHECK", "TRIVY_DISABLE_TELEMETRY"] {
+            assert!(
+                envs.contains(&(key.to_string(), Some("true".to_string()))),
+                "{key}=true missing from the trivy environment: {envs:?}"
+            );
+        }
+        assert_eq!(command.as_std().get_program(), "trivy");
+    }
+
+    /// #5666: a fat jar staged as the scan workspace stages it (archive +
+    /// extracted tree) yields an inventory naming each bundled library at
+    /// the version it ships, read from the nested jars' own
+    /// `pom.properties` -- no network involved.
+    #[tokio::test]
+    async fn test_jar_inventory_catalogs_fat_jar_bundled_libraries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let artifact = make_test_artifact(
+            "fatapp-1.0.0.jar",
+            "application/java-archive",
+            "maven/com/example/fatapp/1.0.0/fatapp-1.0.0.jar",
+        );
+        let ws = ScanWorkspace::prepare_pinned(
+            tmp.path().to_str().unwrap(),
+            None,
+            &artifact,
+            &fat_jar(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            ws.join("BOOT-INF/lib/log4j-core-2.14.1.jar").is_file(),
+            "the workspace extracts the fat jar"
+        );
+
+        // The outer project's own coordinate is named too.
+        assert_eq!(write_embedded_jar_inventory(&ws).await, BUNDLED.len() + 1);
+        let pom = std::fs::read_to_string(ws.join(JAR_INVENTORY_SUBDIR).join("pom.xml")).unwrap();
+        assert_inventory_names_bundled(&pom);
+        assert!(pom.contains("<artifactId>fatapp</artifactId><version>1.0.0</version>"));
+        assert!(!pom.contains("<parent>"), "nothing to resolve remotely");
+
+        // Idempotent: a second pass does not read its own output.
+        assert_eq!(write_embedded_jar_inventory(&ws).await, BUNDLED.len() + 1);
+    }
+
+    /// #5666: when the workspace could not extract the fat jar (extraction
+    /// budget, raw-file fallback) the nested jars are read from inside it.
+    #[tokio::test]
+    async fn test_jar_inventory_reads_jars_nested_in_an_unextracted_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("fatapp-1.0.0.jar"), fat_jar()).unwrap();
+        assert_eq!(
+            write_embedded_jar_inventory(tmp.path()).await,
+            BUNDLED.len() + 1
+        );
+        let pom =
+            std::fs::read_to_string(tmp.path().join(JAR_INVENTORY_SUBDIR).join("pom.xml")).unwrap();
+        assert_inventory_names_bundled(&pom);
+    }
+
+    /// Coordinates are interpolated into XML, so anything outside Maven's
+    /// identifier alphabet (markup, a `${...}` reference) is dropped, and a
+    /// workspace with no JVM archive gets no inventory at all.
+    #[tokio::test]
+    async fn test_jar_inventory_drops_hostile_coordinates() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("evil.jar"),
+            zip_of(&[
+                (
+                    "META-INF/maven/a/b/pom.properties",
+                    b"groupId=a</groupId><x>\nartifactId=b\nversion=1\n".to_vec(),
+                ),
+                (
+                    "META-INF/maven/c/d/pom.properties",
+                    b"groupId=c\nartifactId=d\nversion=${revision}\n".to_vec(),
+                ),
+                // Not at META-INF/maven/<g>/<a>/: ignored.
+                (
+                    "META-INF/maven/pom.properties",
+                    b"groupId=e\nartifactId=f\nversion=1\n".to_vec(),
+                ),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(write_embedded_jar_inventory(tmp.path()).await, 0);
+        assert!(!tmp.path().join(JAR_INVENTORY_SUBDIR).exists());
+
+        let plain = tempfile::tempdir().unwrap();
+        std::fs::write(plain.path().join("requirements.txt"), b"requests==2.28.0\n").unwrap();
+        assert_eq!(write_embedded_jar_inventory(plain.path()).await, 0);
+        assert!(!plain.path().join(JAR_INVENTORY_SUBDIR).exists());
+    }
+
+    /// A shipped entry at the inventory path cannot block it or redirect the
+    /// write: a directory where the pom goes is removed, and a symlink is
+    /// replaced rather than written through.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_jar_inventory_replaces_shipped_decoys() {
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("victim");
+        std::fs::write(&target, b"untouched").unwrap();
+        for decoy_is_dir in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("fatapp-1.0.0.jar"), fat_jar()).unwrap();
+            let pom = tmp.path().join(JAR_INVENTORY_SUBDIR).join("pom.xml");
+            std::fs::create_dir_all(pom.parent().unwrap()).unwrap();
+            if decoy_is_dir {
+                std::fs::create_dir_all(pom.join("blocker")).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&target, &pom).unwrap();
+            }
+            assert_eq!(
+                write_embedded_jar_inventory(tmp.path()).await,
+                BUNDLED.len() + 1
+            );
+            assert!(std::fs::symlink_metadata(&pom).unwrap().is_file());
+            assert_inventory_names_bundled(&std::fs::read_to_string(&pom).unwrap());
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn test_maven_coordinate_validation() {
+        let ok = MavenCoordinate::from_pom_properties(
+            b"#c\ngroupId = org.example\nartifactId: my_lib-x\nversion=1.0.0+build.1\n",
+        )
+        .expect("valid coordinate");
+        assert_eq!(ok.group_id, "org.example");
+        assert_eq!(ok.artifact_id, "my_lib-x");
+        assert_eq!(ok.version, "1.0.0+build.1");
+        assert!(MavenCoordinate::from_pom_properties(b"groupId=a\nartifactId=b\n").is_none());
+        assert!(
+            MavenCoordinate::from_pom_properties(b"groupId=a&b\nartifactId=b\nversion=1\n")
+                .is_none()
+        );
+        assert!(MavenCoordinate::from_pom_properties(&[0xff, 0xfe]).is_none());
+        assert!(is_pom_properties_path("META-INF/maven/g/a/pom.properties"));
+        assert!(!is_pom_properties_path("META-INF/maven/g/pom.properties"));
+        assert!(!is_pom_properties_path(
+            "x/META-INF/maven/g/a/pom.properties"
+        ));
+    }
+
+    /// The inventory's own root coordinate never reaches the package
+    /// inventory; the real packages in the same target do.
+    #[test]
+    fn test_strip_jar_inventory_root() {
+        let mut report: TrivyReport = serde_json::from_value(serde_json::json!({"Results": [
+            {"Target": ".ak-scan-jar-inventory/pom.xml", "Class": "lang-pkgs", "Type": "pom",
+             "Packages": [
+                {"Name": "artifact-keeper.scan:embedded-jars", "Version": "0"},
+                {"Name": "org.apache.logging.log4j:log4j-core", "Version": "2.14.1"}
+             ]},
+            {"Target": "pom.xml", "Class": "lang-pkgs", "Type": "pom",
+             "Packages": [{"Name": "artifact-keeper.scan:embedded-jars", "Version": "0"}]}
+        ]}))
+        .unwrap();
+        strip_jar_inventory_root(&mut report);
+        let names = |i: usize| -> Vec<String> {
+            report.results[i]
+                .packages
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|p| p.name.clone())
+                .collect()
+        };
+        assert_eq!(names(0), vec!["org.apache.logging.log4j:log4j-core"]);
+        // Only the inventory target is touched.
+        assert_eq!(names(1), vec!["artifact-keeper.scan:embedded-jars"]);
+    }
+
+    /// #5666 end to end in adapter mode: a fat jar's scan uploads the
+    /// inventory naming its bundled libraries (so the adapter's trivy grades
+    /// them without contacting Maven Central), and the inventory's root
+    /// coordinate is kept out of the package list the adapter reports back.
+    #[tokio::test]
+    async fn test_adapter_scan_of_fat_jar_uploads_bundled_inventory() {
+        let server = wiremock::MockServer::start().await;
+        crate::services::scanner_adapter_client::test_support::mount_fs_scan_success(
+            &server,
+            "fs-fat",
+            serde_json::json!({
+                "report": {"Results": [{
+                    "Target": ".ak-scan-jar-inventory/pom.xml",
+                    "Class": "lang-pkgs",
+                    "Type": "pom",
+                    "Packages": [
+                        {"Name": "artifact-keeper.scan:embedded-jars", "Version": "0"},
+                        {"Name": "org.apache.logging.log4j:log4j-core", "Version": "2.14.1"}
+                    ]
+                }]},
+                "stderr": ""
+            }),
+        )
+        .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = TrivyFsScanner::new_with_adapter(
+            server.uri(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        let artifact = make_test_artifact(
+            "fatapp-1.0.0.jar",
+            "application/java-archive",
+            "maven/com/example/fatapp/1.0.0/fatapp-1.0.0.jar",
+        );
+        let output = scanner
+            .scan(&artifact, None, &fat_jar())
+            .await
+            .expect("adapter-backed scan should complete");
+        let names: Vec<&str> = output.packages.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["org.apache.logging.log4j:log4j-core"]);
+
+        let upload = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.method == wiremock::http::Method::POST)
+            .expect("workspace upload");
+        let mut archive = tar::Archive::new(std::io::Cursor::new(upload.body));
+        let mut pom = None;
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap() == Path::new(JAR_INVENTORY_SUBDIR).join("pom.xml") {
+                let mut s = String::new();
+                std::io::Read::read_to_string(&mut entry, &mut s).unwrap();
+                pom = Some(s);
+            }
+        }
+        assert_inventory_names_bundled(&pom.expect("the upload must carry the jar inventory"));
     }
 
     /// `version()` exercises the TTL-backed cached probe path. We do not

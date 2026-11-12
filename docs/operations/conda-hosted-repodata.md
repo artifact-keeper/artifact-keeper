@@ -132,6 +132,21 @@ their write; any other writer leaves the rebuild to the next read, which
 always rebuilds what is dirty before it serves. A read therefore never sees a
 document older than the catalog.
 
+Each mark is a row of its own (#4978): writers append marks and never update
+one another's, so two writes that touch the same names in different orders
+cannot deadlock on them, and one write adds at most one mark per name. A row
+with no subdir (no metadata `subdir` and no `/` in its path) marks the key
+`('', name)`; no document serves it, but its rebuild moves the repository's
+revision. A row belongs to the shard its metadata `name` names, which the
+rebuild reads it under even when `artifacts.name` differs.
+
+A read that finds dirty names rebuilds them itself, one reader per repository
+per process at a time. While another session (a writer, another replica) holds
+the repository's rebuild lock, a reader does not wait on it with a database
+connection: it gives the connection back and looks again shortly, for up to
+10 s, then answers `503` with `Retry-After: 1`. So readers queued behind a
+rebuild cannot exhaust the connection pool.
+
 An upload hold that lapses changes what a channel lists with no write at all.
 The earliest pending `quarantine_until` of each channel is kept, and the
 first read after it rebuilds the names whose hold lapsed.
@@ -145,6 +160,33 @@ on every request. The channel is separate so that 1.11.x replicas, which do
 not listen on it, are not affected during a rolling upgrade: on the shared
 channel they would answer every unknown event with a conservative flush of
 their authorization caches.
+
+## Packages a scan policy blocks
+
+A package that an enabled scan policy blocks is refused by the download gate
+(`403`), and from 1.12.0 no hosted listing advertises it either (#4288,
+#4978): `repodata.json` and its encodings, `current_repodata.json`,
+`run_exports.json`, `channeldata.json`, the shard index and its shards, and
+the hosted half of a virtual channel's documents. Its filename joins
+`removed`, as a withdrawn package's does. The decisions are the cached
+listing decisions of the scan gate (one evaluation per package per minute;
+a repository no enabled policy applies to costs one cached lookup per render).
+
+A scan or a policy edit can move a decision with no catalog write, so the
+documents of a repository a policy applies to are kept under the revision
+and a one-minute policy epoch, and are rendered again when the epoch moves (or
+at once on the replica that saved a policy or acknowledgement). Such a
+repository's shards are built from its policy-filtered listing and kept the
+same way instead of being read from the stored shards, which carry no policy
+decision. Two limits follow from deciding outside the catalog:
+
+- a listing can be up to about two minutes behind a decision on other
+  replicas (the epoch plus the decision cache); the download gate is always
+  current;
+- the JLAP records the first render of a revision, so a client following the
+  JLAP keeps the older listing (blocked package included) until the subdir's
+  revision next moves, and then gets a patch; `repodata.json` itself is
+  current.
 
 ## Remote channels whose upstream has no shard index
 

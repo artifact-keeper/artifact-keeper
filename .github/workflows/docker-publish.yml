@@ -526,18 +526,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # amd64 on the self-hosted ak-docker-runners pool (the build runs
-          # in the pod's DinD daemon, whose storage is a hostPath on the
-          # runner host); arm64 stays on GitHub-hosted arm, which rocky
-          # cannot provide natively.
-          # cargo-build-jobs caps rustc parallelism inside the build (see
-          # docker/Dockerfile.backend): 8 on the pool, where cargo would
-          # otherwise see all 88 host CPUs; 4 on hosted arm64, its core count,
-          # which is what cargo used there before the cap existed.
+          # Both legs run on GitHub-hosted runners (#5411). amd64 ran on the
+          # self-hosted ak-docker-runners pool from #4206 until #5411, but
+          # that pool builds inside the dind sidecar, whose memory cgroup is
+          # capped at 16 GiB with no swap. Since the MCP Registry merge
+          # (#5257) the release-profile compile of the artifact-keeper-backend
+          # lib (one codegen unit) no longer fits. Measured on ubuntu-24.04 at
+          # 4 jobs (run 42089930178), that one rustc peaks at 14.6 GB RSS
+          # while the host also used up to 2.9 GiB of swap. On the pool the
+          # kernel's memcg OOM killer took dockerd (oom_score_adj 962, against
+          # buildkit's 0) and buildx failed with `error reading from server:
+          # EOF`. Fewer jobs do not help: the lib is a single rustc, and the
+          # pool died at 4 jobs too (run 42083110185). The hosted amd64 VM
+          # (4 vCPU, 16 GB plus a 3 GB swapfile, 145 GB disk) built the same
+          # image in 26 min, with 17m48s for the final crate.
+          #
+          # cargo-build-jobs is the CARGO_BUILD_JOBS build arg (see
+          # docker/Dockerfile.backend): 4 on both, each runner's core count.
+          # The job count does not change the output; the profile, LTO and
+          # codegen units are the same on both legs.
           - platform: linux/amd64
-            runner: ak-docker-runners
+            runner: ubuntu-24.04
             cache-tag: amd64
-            cargo-build-jobs: 8
+            cargo-build-jobs: 4
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
             cache-tag: arm64
@@ -576,11 +587,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
 
-      # No "free disk space" step: that reclaimed room on a stock hosted
-      # amd64 runner's ~14 GB root disk. The amd64 leg now builds in the
-      # ak-docker-runners pod's DinD daemon, whose /var/lib/docker is an
-      # overlay2 hostPath on the runner host, and the arm64 leg never needed
-      # it.
+      # No "free disk space" step. It was written for the ~14 GB root disk
+      # hosted runners used to have. The current ubuntu-24.04 image has a
+      # 145 GB root with 86 GB free before the build (run 42089930178), and
+      # the arm64 leg never needed it.
 
       - name: Build and push by digest
         id: build
@@ -618,10 +628,16 @@ jobs:
           no-cache-filters: rootfs-builder,grype-bin,buildkit-bin,grype-db-seed,runtime
           sbom: true
           provenance: mode=max
+          # #5130: glibc's malloc retains freed proxy-download buffers in
+          # per-thread arenas, so the published UBI image OOM'd at 4 GiB under
+          # Maven bursts. Passed explicitly as well as defaulted in
+          # docker/Dockerfile.backend: a published image must not silently
+          # fall back to the system allocator if that default is edited.
           build-args: |
             GIT_SHA=${{ github.sha }}
             APP_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
             CARGO_BUILD_JOBS=${{ matrix.cargo-build-jobs }}
+            CARGO_FEATURES=jemalloc
 
       - name: Export digest
         run: |

@@ -871,7 +871,7 @@ async fn list_sboms(
     // also enforces access (callers cannot list a repo's SBOMs without
     // having access to that repo).
     if let Some(artifact_id) = query.artifact_id {
-        ensure_artifact_repo_access(&state.db, &auth, artifact_id, SBOM_NOT_AVAILABLE_MSG).await?;
+        ensure_artifact_served(&state, &auth, artifact_id, SBOM_NOT_AVAILABLE_MSG).await?;
     }
     // #3174: this branch used to gate on `auth.can_access_repo(repo_id)` alone.
     // That is the caller's TOKEN SCOPE, not repository visibility: it resolves
@@ -1025,7 +1025,7 @@ async fn get_sbom_by_artifact(
     Path(artifact_id): Path<Uuid>,
     Query(query): Query<ListSbomsQuery>,
 ) -> Result<Json<SbomContentResponse>> {
-    ensure_artifact_repo_access(&state.db, &auth, artifact_id, SBOM_NOT_AVAILABLE_MSG).await?;
+    ensure_artifact_served(&state, &auth, artifact_id, SBOM_NOT_AVAILABLE_MSG).await?;
     let service = SbomService::new(state.db.clone());
     let format = query
         .format
@@ -1359,13 +1359,8 @@ async fn get_cve_history(
 
     match classify_cve_history_path(&id) {
         CveHistoryPath::Artifact(artifact_id) => {
-            ensure_artifact_repo_access(
-                &state.db,
-                &auth,
-                artifact_id,
-                CVE_HISTORY_NOT_AVAILABLE_MSG,
-            )
-            .await?;
+            ensure_artifact_served(&state, &auth, artifact_id, CVE_HISTORY_NOT_AVAILABLE_MSG)
+                .await?;
             let entries = service.get_cve_history(artifact_id).await?;
             Ok(Json(entries))
         }
@@ -1406,8 +1401,7 @@ async fn get_cve_history_by_artifact(
     Path(artifact_id): Path<Uuid>,
 ) -> Result<Json<Vec<crate::models::sbom::CveHistoryEntry>>> {
     let service = SbomService::new(state.db.clone());
-    ensure_artifact_repo_access(&state.db, &auth, artifact_id, CVE_HISTORY_NOT_AVAILABLE_MSG)
-        .await?;
+    ensure_artifact_served(&state, &auth, artifact_id, CVE_HISTORY_NOT_AVAILABLE_MSG).await?;
     let entries = service.get_cve_history(artifact_id).await?;
     Ok(Json(entries))
 }
@@ -2267,6 +2261,24 @@ async fn ensure_repo_visibility(
     require_repo_visibility(db, auth, repo, "Repository not found").await
 }
 
+/// [`ensure_artifact_repo_access`] for a read, plus the MCP serve decision
+/// (#5253): an MCP server version readers are not served answers
+/// `missing_msg`, as a missing artifact does, for a caller who does not hold
+/// the registry.
+async fn ensure_artifact_served(
+    state: &SharedState,
+    auth: &AuthExtension,
+    artifact_id: Uuid,
+    missing_msg: &'static str,
+) -> Result<()> {
+    ensure_artifact_repo_access(&state.db, auth, artifact_id, missing_msg).await?;
+    if crate::api::handlers::artifacts::mcp_servable(state, Some(auth), artifact_id).await? {
+        Ok(())
+    } else {
+        Err(AppError::NotFound(missing_msg.into()))
+    }
+}
+
 /// Resolve `artifact_id → (repository_id, visibility)` and apply
 /// [`require_repo_visibility`].
 ///
@@ -2679,7 +2691,16 @@ package:
         assert!(linux.len() < whole.len());
 
         // A ceiling between the one-platform and the whole-environment size.
-        let ceiling = whole.len() - 1;
+        // Each render stamps `Utc::now().to_rfc3339()`, whose fractional
+        // seconds vary in length, so a later render can be a few bytes shorter
+        // than `whole`. Take the midpoint of the gap rather than one byte
+        // under `whole`, so the timestamp jitter cannot cross it.
+        let gap = whole.len() - linux.len();
+        assert!(
+            gap > 256,
+            "the fixture's graphs differ by more than the jitter: {gap}"
+        );
+        let ceiling = linux.len() + gap / 2;
         let err = render_environment_sbom(
             "conda-lock.yml",
             &env,

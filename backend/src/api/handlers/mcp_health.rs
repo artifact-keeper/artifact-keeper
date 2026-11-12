@@ -157,7 +157,7 @@ async fn health_impl(
     }
     let ctx = GateCtx::of(state, false);
     Ok(Json(
-        mcp_health::server_health(ctx, repo_id, artifact_id, &stored).await?,
+        mcp_health::server_health(ctx, artifact_id, &stored).await?,
     ))
 }
 

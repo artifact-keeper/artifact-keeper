@@ -1937,7 +1937,8 @@ async fn serve_virtual_metadata(
     }
 
     let members =
-        proxy_helpers::authorize_virtual_members(&state.db, auth, virtual_repo.id, members).await;
+        proxy_helpers::try_authorize_virtual_members(&state.db, auth, virtual_repo.id, members)
+            .await?;
     // #3452: a fully-filtered member set must answer the SAME body the
     // genuinely-empty set above answers, or the pair is an existence oracle
     // over the private members this virtual aggregates.
@@ -2821,6 +2822,7 @@ async fn enforce_pypi_download_age_gate(
         &lkg_filename,
         &index_path,
         RepositoryFormat::Pypi,
+        ctx.is_some_and(|c| c.is_head),
     )
     .await?;
     // #3649: and so is the cold fetch that substituted it.
@@ -3022,6 +3024,7 @@ async fn serve_file(
                         filename,
                         &index_path,
                         RepositoryFormat::Pypi,
+                        ctx.is_head,
                     )
                     .await?;
 
@@ -3064,8 +3067,8 @@ async fn serve_file(
                 // is never leaked. Routes through the SAME helper the Maven
                 // download path uses.
                 let members =
-                    proxy_helpers::authorize_virtual_members(&state.db, auth, repo.id, members)
-                        .await;
+                    proxy_helpers::try_authorize_virtual_members(&state.db, auth, repo.id, members)
+                        .await?;
                 // #3452: a fully-filtered member set must answer the SAME body
                 // the genuinely-empty set above answers, or the pair is an
                 // existence oracle over the private members this virtual
@@ -3347,6 +3350,7 @@ async fn serve_file(
                                 filename,
                                 &member_index_path,
                                 member.format.clone(),
+                                ctx.is_head,
                             )
                             .await
                             {
@@ -3406,6 +3410,26 @@ async fn serve_file(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
+    // The row's own stored object, verified against the row (#4323, #4989).
+    let stored_row = || async {
+        let stream = storage
+            .get_stream(&artifact.storage_key)
+            .await
+            .map_err(map_storage_err)?;
+        crate::storage::verify::verify_row_serve(
+            stream,
+            &artifact.checksum_sha256,
+            &artifact.path,
+            artifact.size_bytes,
+            ctx.is_head,
+            || format!("{repo_key}/{}", artifact.path),
+        )
+        .await
+        .map(|s| {
+            s.map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
+                .boxed()
+        })
+    };
     let stream = if repo.repo_type == RepositoryType::Remote {
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
@@ -3443,26 +3467,19 @@ async fn serve_file(
                         filename,
                         &index_path,
                         RepositoryFormat::Pypi,
+                        // A body fetch even for a HEAD: this refetch is
+                        // written back to the stored object it replaces.
+                        false,
                     )
                     .await
                 },
             )
             .await?
         } else {
-            storage
-                .get_stream(&artifact.storage_key)
-                .await
-                .map_err(map_storage_err)?
-                .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
-                .boxed()
+            stored_row().await?
         }
     } else {
-        storage
-            .get_stream(&artifact.storage_key)
-            .await
-            .map_err(map_storage_err)?
-            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
-            .boxed()
+        stored_row().await?
     };
 
     // Record download statistics for locally-stored artifacts only.
@@ -4041,6 +4058,10 @@ async fn pypi_proxy_cache_redirect(
 /// (CUDA / ML packages routinely exceed 400 MiB) previously OOM-killed
 /// memory-constrained pods when several `pip install` runs downloaded
 /// concurrently through the buffered path.
+///
+/// `is_head` (#5343): the client sent `HEAD`, so a cache miss is answered from
+/// an upstream `HEAD` of the package file (the simple index is still resolved,
+/// to find it) instead of a body download the HEAD response would drop.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_from_pypi_remote_streaming(
     proxy: &crate::services::proxy_service::ProxyService,
@@ -4051,6 +4072,7 @@ async fn fetch_from_pypi_remote_streaming(
     filename: &str,
     index_path: &str,
     format: RepositoryFormat,
+    is_head: bool,
 ) -> Result<crate::services::proxy_service::StreamingFetchResult, Response> {
     let target = resolve_pypi_remote_fetch_target(
         proxy,
@@ -4075,6 +4097,7 @@ async fn fetch_from_pypi_remote_streaming(
         &target.cache_path,
         target.expected_sha256,
         format,
+        is_head,
     )
     .await
 }
@@ -4304,6 +4327,7 @@ impl proxy_helpers::ScannedProxyFile for PypiScannedFile<'_> {
             req.filename,
             self.index_path,
             RepositoryFormat::Pypi,
+            req.is_head(),
         )
         .await?;
         Ok(build_streaming_file_response(req.filename, result))
@@ -15103,6 +15127,7 @@ mod tests {
             "numpy-2.0.0-py3-none-any.whl",
             "simple",
             RepositoryFormat::Pypi,
+            false,
         )
         .await
         .expect("streaming fetch via fallback path must succeed");
@@ -15287,6 +15312,45 @@ mod tests {
             metadata,
             "served metadata must be the wheel's METADATA bytes"
         );
+    }
+
+    /// #5343: pip and uv may `HEAD` a wheel before they download it. A cold
+    /// `HEAD` of a Remote package file is answered from an upstream `HEAD` of
+    /// the file the simple index points at, so the wheel leaves the upstream
+    /// once across HEAD, GET and a warm GET, and the HEAD keeps the
+    /// attachment name.
+    #[tokio::test]
+    async fn test_remote_pypi_cold_head_downloads_the_wheel_once_5343() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        let wheel = "headprobe-2.0-py3-none-any.whl";
+        Mock::given(method("GET"))
+            .and(path("/simple/headprobe/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(pep658_index_html(wheel)))
+            .mount(&upstream)
+            .await;
+        let body: Vec<u8> = (0..4096u32).map(|i| (i % 233) as u8).collect();
+        let uri = format!("/{}/simple/headprobe/{wheel}", fx.repo_key);
+        let head = tdh::assert_cold_head_fetches_body_once(
+            fx,
+            upstream,
+            super::router,
+            true,
+            &format!("/packages/{wheel}"),
+            &uri,
+            &[("content-type", "application/octet-stream")],
+            &body,
+        )
+        .await;
+        let disposition =
+            tdh::header_str(&head, axum::http::header::CONTENT_DISPOSITION).unwrap_or_default();
+        assert!(disposition.contains(wheel), "{disposition}");
     }
 
     // -----------------------------------------------------------------------
@@ -24456,5 +24520,39 @@ mod age_gate_upstream_evidence_tests {
 
         assert!(filtered.contains("gated-1.0.0"), "{filtered}");
         assert!(!filtered.contains("gated-2.0.0"), "{filtered}");
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod hosted_serve_verification_4989_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+
+    /// #4989 (#4323 remainder): the hosted PyPI file download verifies the stored bytes against the
+    /// row. A corrupt object is the 502 `STORED_OBJECT_INTEGRITY` with none of
+    /// its bytes, not a 200 under the checksum it was uploaded with.
+    #[tokio::test]
+    async fn hosted_download_refuses_a_corrupt_object_4989() {
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        tdh::seed_corrupt_artifact(
+            &fx,
+            "v4989/1.0/v4989-1.0.tar.gz",
+            "v4989",
+            "1.0",
+            "application/gzip",
+            b"stored bytes 4989",
+            b"stored bytes 498X",
+        )
+        .await;
+        let key = fx.repo_key.clone();
+        let send = |req| tdh::send(fx.router_with_auth(super::router()), req);
+        let (get_0, body_0) = send(tdh::get(format!("/{key}/simple/v4989/v4989-1.0.tar.gz"))).await;
+        let (head_0, _) = send(tdh::head(format!("/{key}/simple/v4989/v4989-1.0.tar.gz"))).await;
+        fx.teardown().await;
+        tdh::assert_integrity_refusal(get_0, &body_0, b"stored bytes 498X");
+        assert_eq!(head_0, StatusCode::OK, "a HEAD reads and verifies nothing");
     }
 }

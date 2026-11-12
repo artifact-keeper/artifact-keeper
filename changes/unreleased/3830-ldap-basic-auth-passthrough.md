@@ -1,5 +1,0 @@
----
-section: Added
-issues: [#3830]
----
-- **Package-manager clients can authenticate with LDAP/AD credentials** (#3830). Format and repository-download endpoints now accept a directory username and password in the same `Basic` (`curl -u`) credential every package client already supports. The passthrough is opt-in through `LDAP_BASIC_AUTH_PASSTHROUGH=true` and runs only after local bcrypt login, a short-lived JWT in the password field, and an API token in the password field have all been tried, so existing `.npmrc`, `auth.json`, `nuget.config` and token-based setups are unchanged. Binds share the `/v2/token` per-`(username, IP)` budget, and a per-username cap stops binding after three distinct failed passwords so an Artifact Keeper client cannot walk an AD account into lockout. Successful and failed passthrough logins are audited. The success cache is keyed by a per-process HMAC of the credential, re-reads `users.is_active` on every hit, and expires after five minutes, so a changed AD password works immediately and its old value stops working within that window; deactivation clears both caches at once.

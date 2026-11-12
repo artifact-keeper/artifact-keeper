@@ -225,6 +225,7 @@ impl<K: ArchiveKind> proxy_helpers::ScannedProxyFile for ScannedArchive<'_, K> {
             req.source_path,
             req.cache_path,
             req.format.clone(),
+            req.is_head(),
         )
         .await?;
         proxy_helpers::stream_fetch_result(result, K::CONTENT_TYPE, self.disposition)
@@ -332,8 +333,7 @@ where
                 runs.default_content_type,
                 runs.disposition,
             )),
-            Err(resp) if proxy_helpers::is_member_policy_block_response(&resp) => Some(Err(resp)),
-            Err(_) => None,
+            Err(resp) => proxy_helpers::unscanned_run_failure(resp),
         }
     };
     proxy_helpers::walk_virtual_members_with_scan(
@@ -1459,6 +1459,116 @@ pub(crate) mod test_support {
         assert_eq!(status, StatusCode::OK, "virtual over an unscanned member");
         assert_eq!(scan_header(&headers), None);
         rig.teardown().await;
+    }
+
+    /// The `artifacts` row [`stored_row_is_gated`] seeds in the Remote: the
+    /// coordinate the format route looks the row up by.
+    pub(crate) struct StoredRowSeed {
+        pub path: String,
+        pub name: String,
+        pub version: String,
+    }
+
+    /// #5076: an `artifacts` row the scanning Remote holds itself (from
+    /// replication, or a publish into the remote) is served through the scan
+    /// gate exactly as the same file proxied would be: a vulnerable verdict
+    /// for its bytes is 403, fail-closed with no verdict is 423, fail-open
+    /// serves it `pending`, and with scan-on-proxy off it streams as before.
+    /// Every answer comes from the row: the upstream is never asked.
+    pub(crate) async fn stored_row_is_gated(case: CaseFn, seed: StoredRowSeed) {
+        let Some(rig) = Rig::new(case, Some("fail_open")).await else {
+            return;
+        };
+        let pool = rig.fx.pool.clone();
+        let repo = crate::api::handlers::proxy_helpers::resolve_repo_by_key(
+            &pool,
+            &rig.fx.repo_key,
+            &[rig.case.format],
+            "a",
+        )
+        .await
+        .unwrap_or_else(|_| panic!("resolve the {} remote", rig.case.format));
+        tdh::seed_artifact_with_checksum(
+            &rig.state,
+            &pool,
+            &repo,
+            &format!("rows-5076/{}", uuid::Uuid::new_v4()),
+            &seed.path,
+            &seed.name,
+            &seed.version,
+            "application/octet-stream",
+            Bytes::from(rig.case.body.clone()),
+            rig.fx.user_id,
+            &rig.digest(),
+        )
+        .await;
+        let set_action = |action: &'static str| {
+            let pool = pool.clone();
+            let repo_id = rig.fx.repo_id;
+            async move {
+                sqlx::query(
+                    "UPDATE scan_configs SET proxy_scan_action = $2 WHERE repository_id = $1",
+                )
+                .bind(repo_id)
+                .bind(action)
+                .execute(&pool)
+                .await
+                .expect("set proxy_scan_action");
+            }
+        };
+
+        rig.seed("vulnerable").await;
+        let (blocked, blocked_body, _) = rig.pull_remote().await;
+
+        tdh::drop_proxy_verdicts(&pool, &[rig.digest()]).await;
+        set_action("fail_closed").await;
+        let (locked, locked_body, _) = rig.pull_remote().await;
+
+        set_action("fail_open").await;
+        let (pending, pending_body, pending_headers) = rig.pull_remote().await;
+
+        rig.seed("vulnerable").await;
+        sqlx::query("DELETE FROM scan_configs WHERE repository_id = $1")
+            .bind(rig.fx.repo_id)
+            .execute(&pool)
+            .await
+            .expect("turn scan-on-proxy off");
+        let (off, off_body, off_headers) = rig.pull_remote().await;
+
+        let fetches = rig.package_fetches().await;
+        tdh::drop_proxy_verdicts(&pool, &[rig.digest()]).await;
+        let _ = sqlx::query(
+            "DELETE FROM audit_log WHERE action = 'PROXY_SCAN_BLOCKED' AND resource_id = $1",
+        )
+        .bind(rig.fx.repo_id)
+        .execute(&pool)
+        .await;
+        let body = rig.case.body.clone();
+        let file = rig.case.file.clone();
+        rig.teardown().await;
+
+        assert_eq!(
+            blocked,
+            StatusCode::FORBIDDEN,
+            "a vulnerable stored row is refused: {}",
+            String::from_utf8_lossy(&blocked_body)
+        );
+        assert_eq!(json(&blocked_body)["error"], "scan_blocked");
+        assert_eq!(json(&blocked_body)["file"], file.as_str());
+        assert_eq!(
+            locked,
+            StatusCode::LOCKED,
+            "fail-closed with no verdict withholds the row: {}",
+            String::from_utf8_lossy(&locked_body)
+        );
+        assert_eq!(json(&locked_body)["error"], "scan_pending");
+        assert_eq!(pending, StatusCode::OK);
+        assert_eq!(scan_header(&pending_headers).as_deref(), Some("pending"));
+        assert_eq!(&pending_body[..], &body[..]);
+        assert_eq!(off, StatusCode::OK, "scan-on-proxy off: served as before");
+        assert_eq!(scan_header(&off_headers), None);
+        assert_eq!(&off_body[..], &body[..]);
+        assert_eq!(fetches, 0, "every answer came from the stored row");
     }
 
     /// Through a Virtual whose Remote member scans: the member's verdict

@@ -50,11 +50,13 @@ pub async fn try_pool() -> Option<PgPool> {
 /// /128 is allowlisted for the lifetime of the guard.
 /// It is the same lock the outbound-policy unit tests take
 /// (`validation::OUTBOUND_POLICY_ENV_LOCK`), so the two never interleave.
-static SSRF_TEST_ENV_LOCK: &tokio::sync::Mutex<()> =
-    &crate::api::validation::OUTBOUND_POLICY_ENV_LOCK;
-
+///
+/// One guard per test: the lock is not re-entrant, so a second
+/// `non_loopback_mock_server()` (or `mock_upstream`) while the first guard is
+/// alive panics at once naming both call sites, instead of waiting on itself
+/// forever as it did before #5537.
 pub struct SsrfTestAllowlistGuard {
-    _lock: tokio::sync::MutexGuard<'static, ()>,
+    _lock: crate::api::validation::OutboundPolicyEnvLock,
     previous: Option<String>,
 }
 
@@ -67,10 +69,49 @@ impl Drop for SsrfTestAllowlistGuard {
     }
 }
 
+/// An upstream that accepts connections and never answers (#5823): the
+/// member a virtual-member-deadline test leaves out. Unlike a wiremock
+/// response with `set_delay`, it cannot answer late on a slow runner, so the
+/// test's outcome depends only on the deadline, never on timing. Dropping it
+/// closes the listener and every connection it holds.
+pub struct SilentUpstream {
+    uri: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl SilentUpstream {
+    /// Bind `127.0.0.1` on an ephemeral port.
+    pub async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the silent upstream");
+        let uri = format!("http://{}", listener.local_addr().expect("local addr"));
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        Self { uri, task }
+    }
+
+    /// `http://127.0.0.1:<port>`, like `MockServer::uri`.
+    pub fn uri(&self) -> String {
+        self.uri.clone()
+    }
+}
+
+impl Drop for SilentUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// Start wiremock on a non-loopback interface accepted by the upstream SSRF
 /// policy, returning a guard that restores the process environment on drop.
 pub async fn non_loopback_mock_server() -> (wiremock::MockServer, SsrfTestAllowlistGuard) {
-    let lock = SSRF_TEST_ENV_LOCK.lock().await;
+    let lock =
+        crate::api::validation::lock_outbound_policy_env("tdh::non_loopback_mock_server").await;
     let previous = std::env::var("AK_SSRF_ALLOW_PRIVATE_CIDRS").ok();
     let probe = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind route probe");
     probe.connect("8.8.8.8:80").expect("connect route probe");
@@ -296,7 +337,7 @@ pub async fn token_policy_serial_lock() -> TokenPolicySerialGuard {
 const HIDDEN_NAV_ITEMS_TEST_LOCK_KEY: i64 = 0x4e56_4574; // "NV" + issue #4574
 
 /// Cross-process serialization guard for the DB-backed tests that write the
-/// `ui.hidden_nav_items` row (#4574). It is ONE row in `system_settings`
+/// `ui.hidden_nav_items` row (#4574), or that compare it across reads (#5431). It is ONE row in `system_settings`
 /// shared by the whole database, so two tests writing it under `cargo
 /// nextest` process-per-test parallelism would read each other's values.
 /// Mirrors [`token_policy_serial_lock`].
@@ -310,6 +351,25 @@ pub struct HiddenNavItemsSerialGuard {
 pub async fn hidden_nav_items_serial_lock() -> HiddenNavItemsSerialGuard {
     HiddenNavItemsSerialGuard {
         _conn: serial_lock_session(HIDDEN_NAV_ITEMS_TEST_LOCK_KEY).await,
+    }
+}
+
+/// Advisory-lock key for [`admin_settings_serial_lock`] (#5652).
+const ADMIN_SETTINGS_TEST_LOCK_KEY: i64 = 0x4153_5652; // "AS" + issue #5652
+
+/// Cross-process serialization guard for the DB-backed tests that write the
+/// `POST /api/v1/admin/settings` rows (#5652): one row per key in
+/// `system_settings`, shared by the whole database. Mirrors
+/// [`hidden_nav_items_serial_lock`].
+pub struct AdminSettingsSerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the admin-settings test lock, blocking until it is free. Returns an
+/// inert guard when the database is unreachable, mirroring [`try_pool`].
+pub async fn admin_settings_serial_lock() -> AdminSettingsSerialGuard {
+    AdminSettingsSerialGuard {
+        _conn: serial_lock_session(ADMIN_SETTINGS_TEST_LOCK_KEY).await,
     }
 }
 
@@ -680,6 +740,7 @@ fn cfg(storage_path: &str) -> Config {
         sso_disable_admin_break_glass: false,
         oidc_silent_sso_enabled: true,
         device_auth: Default::default(),
+        proxy_upstream: Default::default(),
         totp_policy: None,
         api_token_expiry_policy: None,
         max_upload_size_bytes: 10_737_418_240,
@@ -972,6 +1033,127 @@ impl crate::storage::StorageBackend for FallbackProbeStorage {
     }
 }
 
+/// A cloud backend whose every read and write fails with one storage error:
+/// the stand-in for an object store that is down or out of space (#5649,
+/// #5650). `exists` answers "absent", so upload paths go on to write, which
+/// is where a stopped or full store refuses them.
+pub struct FailingStorage {
+    message: String,
+}
+
+impl FailingStorage {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    fn fail<T>(&self) -> crate::error::Result<T> {
+        Err(crate::error::AppError::Storage(self.message.clone()))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::storage::StorageBackend for FailingStorage {
+    async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+        self.fail()
+    }
+    async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+        self.fail()
+    }
+    async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+        Ok(false)
+    }
+    async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+        Ok(())
+    }
+    async fn copy(&self, _source: &str, _dest: &str) -> crate::error::Result<()> {
+        self.fail()
+    }
+    async fn put_stream(
+        &self,
+        _key: &str,
+        _stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+    ) -> crate::error::Result<crate::storage::PutStreamResult> {
+        self.fail()
+    }
+    fn supports_streamed_assembly(&self) -> bool {
+        true
+    }
+    async fn health_check(&self) -> crate::error::Result<()> {
+        self.fail()
+    }
+}
+
+/// `state` with its registry replaced by one whose `"s3"` backend is a
+/// [`FailingStorage`] failing with `message`, plus the repository moved onto
+/// it. Every request against `repo_id` then reaches the failing store.
+pub async fn route_repo_to_failing_storage(
+    pool: &PgPool,
+    state: &SharedState,
+    repo_id: Uuid,
+    message: &str,
+) -> SharedState {
+    sqlx::query("UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1")
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("move repository onto the failing backend");
+    let failing: Arc<dyn crate::storage::StorageBackend> = Arc::new(FailingStorage::new(message));
+    let mut backends: std::collections::HashMap<String, Arc<dyn crate::storage::StorageBackend>> =
+        std::collections::HashMap::new();
+    backends.insert("s3".to_string(), failing);
+    let mut next = (**state).clone();
+    next.storage_registry = Arc::new(crate::storage::StorageRegistry::new(
+        backends,
+        "s3".to_string(),
+    ));
+    Arc::new(next)
+}
+
+/// What MinIO answers a PUT into a bucket at its quota, as the S3 backend
+/// tags and renders it (#5650): the XML names the bucket and carries the
+/// request ids, none of which may reach a client.
+pub fn minio_quota_exceeded_error() -> String {
+    crate::storage::StorageFailure::Full.tag(
+        "S3 request failed. caused by: Client error with status 400 Bad Request: \
+         <?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>XMinioAdminBucketQuotaExceeded\
+         </Code><Message>Bucket quota exceeded</Message><BucketName>ak-quota-bucket-5650\
+         </BucketName><RequestId>187A0F1E2D3C4B5A</RequestId></Error>",
+    )
+}
+
+/// What the S3 backend reports once its retry budget runs out against a
+/// stopped MinIO (#5649).
+pub fn minio_unreachable_error() -> String {
+    crate::storage::StorageFailure::Unavailable.tag(
+        "S3 connection refused. caused by: Error performing PUT <url> in 10.4s, after 6 \
+         retries - HTTP error: error sending request: tcp connect error: connection refused",
+    )
+}
+
+/// Assert a response body carries none of the backend text in
+/// [`minio_quota_exceeded_error`] / [`minio_unreachable_error`].
+pub fn assert_no_storage_backend_text(label: &str, body: &[u8]) {
+    let body = String::from_utf8_lossy(body);
+    for needle in [
+        "XMinio",
+        "<Error>",
+        "<?xml",
+        "ak-quota-bucket-5650",
+        "187A0F1E2D3C4B5A",
+        "caused by",
+        "connection refused",
+        crate::storage::StorageFailure::Full.marker(),
+        crate::storage::StorageFailure::Unavailable.marker(),
+    ] {
+        assert!(
+            !body.contains(needle),
+            "{label}: response body must not carry backend text {needle:?}: {body}"
+        );
+    }
+}
+
 /// Like [`build_state`], but the registry carries an in-memory backend
 /// registered under `backend_name` (e.g. `"s3"`), simulating a shared cloud
 /// namespace. Returns the state plus the backing [`MemStorage`] so tests can
@@ -990,6 +1172,20 @@ pub fn build_state_with_presigning_cloud(
     backend_name: &str,
 ) -> (SharedState, Arc<MemStorage>) {
     build_cloud_state(pool, backend_name, /* presign = */ true)
+}
+
+/// Like [`build_state_with_cloud`], with `proxy` as the proxy service (an
+/// upstream sync, e.g. a Remote MCP registry's, on a shared cloud
+/// namespace; #5660).
+pub fn build_state_with_cloud_and_proxy(
+    pool: PgPool,
+    backend_name: &str,
+    proxy: Arc<crate::services::proxy_service::ProxyService>,
+) -> (SharedState, Arc<MemStorage>) {
+    let (state, mem) = build_cloud_state(pool, backend_name, false);
+    let mut state = Arc::try_unwrap(state).unwrap_or_else(|_| unreachable!("fresh state"));
+    state.set_proxy_service(proxy);
+    (Arc::new(state), mem)
 }
 
 fn build_cloud_state(
@@ -1013,6 +1209,178 @@ fn build_cloud_state(
     config.presigned_downloads_enabled = presign;
     let state = Arc::new(AppState::new(config, pool, storage, registry));
     (state, mem)
+}
+
+/// What one format's #5662 cloud-key regression test drives: how to publish
+/// the same object into a hosted repository and fetch it back, and the key
+/// prefix its objects are written under.
+pub struct CloudPublishCase<'a> {
+    /// `repository_format` enum value of the hosted repositories.
+    pub format: &'a str,
+    /// Storage-key prefix of the format's objects (`"chef"` for
+    /// `chef/{name}/...`); new objects on a cloud backend must land under
+    /// `{key_prefix}/{repository_id}/`.
+    pub key_prefix: &'a str,
+    /// The format's router (`super::router()`).
+    pub router: fn() -> Router<SharedState>,
+    /// The publish requests for one repository key, sent in order; each must
+    /// answer a 2xx.
+    pub publish: &'a dyn Fn(&str) -> Vec<Request<Body>>,
+    /// The download request for one repository key; it must answer 200 with
+    /// [`Self::expected`].
+    pub download: &'a dyn Fn(&str) -> Request<Body>,
+    /// The bytes the download serves.
+    pub expected: &'a [u8],
+}
+
+/// A hosted `format` repository on the in-memory `s3` backend of
+/// [`build_state_with_cloud`], with `user_id` granted developer access.
+pub async fn create_cloud_repo(
+    pool: &PgPool,
+    format: &str,
+    user_id: Uuid,
+) -> (Uuid, String, PathBuf) {
+    let (repo_id, repo_key, dir) = create_repo(pool, "local", format).await;
+    sqlx::query("UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1")
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("set cloud backend");
+    grant_repo_access(pool, repo_id, user_id).await;
+    (repo_id, repo_key, dir)
+}
+
+/// #5662: the same object publishes into two hosted repositories of one
+/// format on a shared cloud namespace, each repository serves its own copy
+/// from a `{key_prefix}/{repository_id}/...` key, nothing is written to the
+/// legacy flat key, and an object whose row records the legacy flat key (the
+/// layout before the fix) still serves. Before the fix the second
+/// repository's publish answered 409 "already owned by another repository;
+/// refusing cross-repository overwrite".
+///
+/// The legacy case is simulated on the first repository after both
+/// publishes: its scoped objects move to the flat key the row then records,
+/// exactly the shape a pre-fix publish left, and the download must still
+/// answer the same bytes.
+pub async fn assert_cloud_publish_is_repo_scoped(case: CloudPublishCase<'_>) {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let (user_id, username) = create_user(&pool).await;
+    let auth = make_auth(user_id, &username);
+    let (state, mem) = build_state_with_cloud(pool.clone(), "s3");
+    let app = || router_with_auth((case.router)(), state.clone(), auth.clone());
+    let mut repos = Vec::new();
+    for _ in 0..2 {
+        repos.push(create_cloud_repo(&pool, case.format, user_id).await);
+    }
+    let row_keys = |repo_id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT storage_key FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+            )
+            .bind(repo_id)
+            .fetch_all(&pool)
+            .await
+            .expect("row keys")
+        }
+    };
+
+    let mut outcomes = Vec::new();
+    for (repo_id, repo_key, _) in &repos {
+        let mut published = Vec::new();
+        for req in (case.publish)(repo_key) {
+            published.push(send(app(), req).await);
+        }
+        let fetched = send(app(), (case.download)(repo_key)).await;
+        outcomes.push((*repo_id, published, fetched, row_keys(*repo_id).await));
+    }
+    let objects: Vec<String> = mem.objects.lock().unwrap().keys().cloned().collect();
+
+    // Rewrite the first repository's objects to the legacy flat layout.
+    let (legacy_id, legacy_key, _) = &repos[0];
+    let scoped_prefix = format!("{}/{legacy_id}/", case.key_prefix);
+    for key in row_keys(*legacy_id).await {
+        let Some(rest) = key.strip_prefix(&scoped_prefix) else {
+            continue;
+        };
+        let flat = format!("{}/{rest}", case.key_prefix);
+        let bytes = mem.objects.lock().unwrap().remove(&key);
+        if let Some(bytes) = bytes {
+            mem.objects.lock().unwrap().insert(flat.clone(), bytes);
+        }
+        sqlx::query(
+            "UPDATE artifacts SET storage_key = $1 WHERE repository_id = $2 AND storage_key = $3",
+        )
+        .bind(&flat)
+        .bind(legacy_id)
+        .bind(&key)
+        .execute(&pool)
+        .await
+        .expect("move row to the legacy key");
+    }
+    let legacy_fetch = send(app(), (case.download)(legacy_key)).await;
+    let legacy_rows = row_keys(*legacy_id).await;
+
+    for (repo_id, _, dir) in &repos {
+        cleanup_member_repo(&pool, *repo_id, dir).await;
+    }
+    cleanup_user(&pool, user_id).await;
+
+    let format = case.format;
+    // The symptom first: on main the second repository's publish is the 409.
+    for (repo_id, published, fetched, _) in &outcomes {
+        for (status, body) in published {
+            assert!(
+                status.is_success(),
+                "{format}: publish into repository {repo_id} must be accepted, got {status}: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        assert_eq!(
+            fetched.0,
+            StatusCode::OK,
+            "{format}: download from {repo_id}: {}",
+            String::from_utf8_lossy(&fetched.1)
+        );
+        assert_eq!(
+            &fetched.1[..],
+            case.expected,
+            "{format}: bytes from {repo_id}"
+        );
+    }
+    for (repo_id, _, _, keys) in outcomes {
+        let scoped = format!("{}/{repo_id}/", case.key_prefix);
+        let own: Vec<&String> = keys.iter().filter(|k| k.starts_with(&scoped)).collect();
+        assert!(!own.is_empty(), "{format}: no row under {scoped}: {keys:?}");
+        for key in own {
+            assert!(objects.contains(key), "{format}: {key} must be written");
+        }
+    }
+    let ids: Vec<String> = repos.iter().map(|(id, _, _)| id.to_string()).collect();
+    for key in &objects {
+        if let Some(rest) = key.strip_prefix(&format!("{}/", case.key_prefix)) {
+            assert!(
+                ids.iter().any(|id| rest.starts_with(&format!("{id}/"))),
+                "{format}: {key} is not repository-scoped; nothing may be written to \
+                 the legacy flat key on a cloud backend"
+            );
+        }
+    }
+    assert!(
+        legacy_rows
+            .iter()
+            .any(|k| !k.contains(&legacy_id.to_string())),
+        "{format}: the fixture must have moved a row to the legacy key: {legacy_rows:?}"
+    );
+    assert_eq!(
+        legacy_fetch.0,
+        StatusCode::OK,
+        "{format}: an object on the legacy flat key must still download: {}",
+        String::from_utf8_lossy(&legacy_fetch.1)
+    );
+    assert_eq!(&legacy_fetch.1[..], case.expected, "{format}: legacy bytes");
 }
 
 pub async fn create_user(pool: &PgPool) -> (Uuid, String) {
@@ -1619,6 +1987,81 @@ pub async fn cold_head_then_two_gets(
     [head_answer, cold_get, warm_get]
 }
 
+/// #5343: the cold-`HEAD` contract for a format handler that streams a Remote
+/// download itself rather than through `try_remote_or_virtual_download`.
+///
+/// `server` must already carry the format's own upstream documents (an index,
+/// a packument, a checksum sidecar: whatever the handler resolves first),
+/// unconstrained. This mounts the counting pair for `upstream_path` (one
+/// `HEAD`, one body `GET`, see [`mount_head_and_get_once`]), points the
+/// fixture's Remote at `server`, and sends `HEAD uri`, `GET uri` and, once the
+/// cache has committed, `GET uri` again through `router` (with the fixture
+/// user's auth when `with_auth`).
+///
+/// Asserts the HEAD is a 200 with no body that advertises the GET's
+/// `Content-Length`, that both GETs serve `body`, and (the claim under test)
+/// that the upstream saw exactly one `HEAD` and one `GET` of the body.
+/// Returns the HEAD's headers for the format's own header assertions.
+#[allow(clippy::too_many_arguments)]
+pub async fn assert_cold_head_fetches_body_once(
+    fx: Fixture,
+    server: wiremock::MockServer,
+    router: fn() -> Router<SharedState>,
+    with_auth: bool,
+    upstream_path: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> axum::http::HeaderMap {
+    mount_head_and_get_once(&server, upstream_path, headers, body).await;
+    let (state, cache) = rewire_remote_proxy(&fx, &server.uri()).await;
+    let auth = make_auth(fx.user_id, &fx.username);
+    let app = || {
+        if with_auth {
+            router_with_auth(router(), state.clone(), auth.clone())
+        } else {
+            router_anon(router(), state.clone())
+        }
+    };
+    let [head_answer, cold, warm] =
+        cold_head_then_two_gets(app, uri, cache.path(), body.len() as u64).await;
+    fx.teardown().await;
+
+    assert_eq!(head_answer.0, StatusCode::OK, "HEAD {uri}");
+    assert!(head_answer.1.is_empty(), "HEAD {uri} must have no body");
+    let size = body.len().to_string();
+    assert_eq!(
+        head_answer
+            .2
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some(size.as_str()),
+        "HEAD {uri} must advertise the GET's Content-Length"
+    );
+    for (which, answer) in [("cold", &cold), ("warm", &warm)] {
+        assert_eq!(answer.0, StatusCode::OK, "{which} GET {uri}");
+        assert!(answer.1[..] == body[..], "{which} GET {uri} body");
+    }
+    // The upstream request log, for a readable failure: before #5343 a cold
+    // HEAD opened a body GET whose dropped stream cached nothing, so the
+    // upstream saw no HEAD and two GETs of the body.
+    let seen: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == upstream_path)
+        .map(|r| r.method.to_string())
+        .collect();
+    assert_eq!(
+        seen,
+        ["HEAD", "GET"],
+        "cold HEAD then GET of {uri} must reach the upstream as one HEAD and one body GET"
+    );
+    drop_mock_server(server).await;
+    head_answer.2
+}
+
 /// Floor for "this proxy-cache entry was written as IMMUTABLE".
 ///
 /// `Mutability::write_ttl_secs` stamps an immutable entry with ~10 years and a
@@ -2096,6 +2539,57 @@ pub async fn seed_artifact_with_checksum(
     )
     .await
     .expect("seed insert_artifact")
+}
+
+/// Seed a hosted artifact in `fx`'s repository whose row records the SHA-256
+/// (and length) of `recorded` while its stored object holds `stored`, for the
+/// serve-time verification tests (#4323, #4989). Give `stored` the length of
+/// `recorded` so only the digest differs.
+#[allow(clippy::too_many_arguments)]
+pub async fn seed_corrupt_artifact(
+    fx: &Fixture,
+    path: &str,
+    name: &str,
+    version: &str,
+    content_type: &str,
+    recorded: &[u8],
+    stored: &'static [u8],
+) -> Uuid {
+    use sha2::Digest as _;
+    assert_eq!(
+        recorded.len(),
+        stored.len(),
+        "only the digest should differ"
+    );
+    seed_artifact_with_checksum(
+        &fx.state,
+        &fx.pool,
+        &fx.repo_info("local", None),
+        &format!("corrupt-4989/{}", Uuid::new_v4()),
+        path,
+        name,
+        version,
+        content_type,
+        Bytes::from_static(stored),
+        fx.user_id,
+        &hex::encode(sha2::Sha256::digest(recorded)),
+    )
+    .await
+}
+
+/// Assert that a serve answered the stored-object integrity refusal: `502`
+/// with the `STORED_OBJECT_INTEGRITY` code and none of the object (#4323).
+pub fn assert_integrity_refusal(status: StatusCode, body: &[u8], stored: &[u8]) {
+    let text = String::from_utf8_lossy(body);
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{text}");
+    assert!(
+        text.contains(crate::storage::verify::STORED_OBJECT_INTEGRITY_CODE),
+        "{text}"
+    );
+    assert!(
+        !body.windows(stored.len()).any(|w| w == stored),
+        "the corrupt bytes must not be served: {text}"
+    );
 }
 
 /// Build a GET request with no body. Centralizes the
@@ -3361,6 +3855,64 @@ pub async fn create_remote_and_virtual(
     (remote_id, remote_key, virtual_id, virtual_key)
 }
 
+/// #5504 rig: a public Virtual of `format` over two public Remote members on
+/// one mock server. The higher-priority member's upstream answers `404` for
+/// everything (a genuine miss); the lower-priority one answers
+/// `broken_status` for everything. Lets a test pin how a walk reads "member A
+/// missed, member B failed" through the format's real router.
+pub struct MissAndBrokenVirtual {
+    pub virtual_key: String,
+    pub repo_ids: Vec<Uuid>,
+    /// Kept alive for the rig's lifetime; dropping it stops the upstream.
+    pub upstream: wiremock::MockServer,
+}
+
+impl MissAndBrokenVirtual {
+    pub async fn new(pool: &PgPool, format: &str, broken_status: u16) -> Self {
+        use wiremock::matchers::path_regex;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(path_regex("^/miss/"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        Mock::given(path_regex("^/broken/"))
+            .respond_with(ResponseTemplate::new(broken_status))
+            .mount(&upstream)
+            .await;
+        let (virtual_id, virtual_key, _) = create_repo(pool, "virtual", format).await;
+        publish_repo(pool, virtual_id).await;
+        let mut repo_ids = vec![virtual_id];
+        for (priority, prefix) in [(0, "miss"), (1, "broken")] {
+            let (id, _, _) = create_repo(pool, "remote", format).await;
+            sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+                .bind(format!("{}/{prefix}", upstream.uri()))
+                .bind(id)
+                .execute(pool)
+                .await
+                .expect("point remote upstream at mock");
+            publish_repo(pool, id).await;
+            link_virtual_member(pool, virtual_id, id, priority).await;
+            repo_ids.push(id);
+        }
+        Self {
+            virtual_key,
+            repo_ids,
+            upstream,
+        }
+    }
+
+    pub async fn cleanup(self, pool: &PgPool) {
+        for id in &self.repo_ids {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+    }
+}
+
 /// Decode a body coded with `encoding` — the inverse of [`code_bytes`], so a
 /// test can assert the client receives BYTES it can actually decode rather
 /// than only that a header is present.
@@ -3820,6 +4372,191 @@ pub fn npm_tarball(name: &str, version: &str) -> Vec<u8> {
     }
     gz.flush().unwrap();
     gz.finish().unwrap()
+}
+
+/// Peers for the #5625 tests around `artifact_id` of `repo_id` (labelled
+/// `stage=qa` by the caller): one peer per `(sync_enabled, manual)` entry,
+/// each subscribed to the repository (by hand, or by the policy) and holding
+/// the artifact (a completed push) plus an old delete a restore cancelled. The
+/// policy is scoped to all the peers and replicates only `stage=prod`.
+pub struct ManualPeerFixture {
+    pub pool: PgPool,
+    pub user_id: Uuid,
+    pub repo_id: Uuid,
+    pub artifact_id: Uuid,
+    pub policy_id: Uuid,
+    pub peers: Vec<Uuid>,
+}
+
+pub async fn setup_manual_peer_fixture(
+    pool: PgPool,
+    user_id: Uuid,
+    repo_id: Uuid,
+    artifact_id: Uuid,
+    subscriptions: &[(bool, bool)],
+) -> ManualPeerFixture {
+    let tag = Uuid::new_v4().simple().to_string();
+    let mut peers = Vec::new();
+    for _ in subscriptions {
+        peers.push(register_test_peer(&pool, "label-5625", &tag).await);
+    }
+    let policy_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO sync_policies \
+             (name, repo_selector, peer_selector, artifact_filter, precedence) \
+         VALUES ($1, $2, $3, $4, 0) RETURNING id",
+    )
+    .bind(format!("label-5625-{tag}"))
+    .bind(serde_json::json!({ "match_repos": [repo_id] }))
+    .bind(serde_json::json!({ "match_peers": peers }))
+    .bind(serde_json::json!({ "match_tags": { "stage": "prod" } }))
+    .fetch_one(&pool)
+    .await
+    .expect("policy");
+    for (peer, (enabled, manual)) in peers.iter().zip(subscriptions) {
+        sqlx::query(
+            "INSERT INTO peer_repo_subscriptions \
+                 (peer_instance_id, repository_id, sync_enabled, replication_mode, policy_id) \
+             VALUES ($1, $2, $3, 'push', $4)",
+        )
+        .bind(peer)
+        .bind(repo_id)
+        .bind(enabled)
+        .bind(if *manual { None } else { Some(policy_id) })
+        .execute(&pool)
+        .await
+        .expect("subscribe");
+        sqlx::query(
+            "INSERT INTO sync_tasks (peer_instance_id, artifact_id, task_type, status, completed_at) \
+             VALUES ($1, $2, 'push', 'completed', NOW()), \
+                    ($1, $2, 'delete', 'cancelled', NOW()) \
+             ON CONFLICT (peer_instance_id, artifact_id, task_type) DO UPDATE SET \
+                 status = EXCLUDED.status, completed_at = EXCLUDED.completed_at",
+        )
+        .bind(peer)
+        .bind(artifact_id)
+        .execute(&pool)
+        .await
+        .expect("replicated, with an old cancelled delete");
+        sqlx::query(
+            "UPDATE sync_tasks SET error_message = 'superseded by artifact restore', \
+                 retry_count = 2 \
+             WHERE peer_instance_id = $1 AND task_type = 'delete'",
+        )
+        .bind(peer)
+        .execute(&pool)
+        .await
+        .expect("stale cancelled delete");
+    }
+    ManualPeerFixture {
+        pool,
+        user_id,
+        repo_id,
+        artifact_id,
+        policy_id,
+        peers,
+    }
+}
+
+impl ManualPeerFixture {
+    /// Per peer: `(push status, delete status, delete error, delete retries)`.
+    pub async fn task_states(&self) -> Vec<(String, String, Option<String>, i32)> {
+        let mut states = Vec::new();
+        for peer in &self.peers {
+            let push: String = sqlx::query_scalar(
+                "SELECT status::TEXT FROM sync_tasks \
+                 WHERE peer_instance_id = $1 AND artifact_id = $2 AND task_type = 'push'",
+            )
+            .bind(peer)
+            .bind(self.artifact_id)
+            .fetch_one(&self.pool)
+            .await
+            .expect("push row");
+            let (delete, error, retries): (String, Option<String>, i32) = sqlx::query_as(
+                "SELECT status::TEXT, error_message, retry_count FROM sync_tasks \
+                 WHERE peer_instance_id = $1 AND artifact_id = $2 AND task_type = 'delete'",
+            )
+            .bind(peer)
+            .bind(self.artifact_id)
+            .fetch_one(&self.pool)
+            .await
+            .expect("delete row");
+            states.push((push, delete, error, retries));
+        }
+        states
+    }
+
+    pub async fn teardown(&self) {
+        let _ = sqlx::query("DELETE FROM sync_tasks WHERE peer_instance_id = ANY($1)")
+            .bind(&self.peers)
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM peer_repo_subscriptions WHERE peer_instance_id = ANY($1)")
+            .bind(&self.peers)
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM sync_policies WHERE id = $1")
+            .bind(self.policy_id)
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = ANY($1)")
+            .bind(&self.peers)
+            .execute(&self.pool)
+            .await;
+    }
+}
+
+/// The expected task states after a label write that leaves the artifact
+/// outside the policy (`stage=qa`, policy wants `stage=prod`), for peers
+/// subscribed (manual enabled, manual disabled, policy-managed).
+pub fn expected_after_label_write_5625() -> Vec<(String, String, Option<String>, i32)> {
+    let kept = (
+        "completed".to_string(),
+        "cancelled".to_string(),
+        Some("superseded by artifact restore".to_string()),
+        2,
+    );
+    vec![
+        kept.clone(),
+        kept,
+        ("completed".to_string(), "pending".to_string(), None, 0),
+    ]
+}
+
+/// Install an `INSERT OR UPDATE` row trigger on `artifacts`, fired at
+/// `timing` (`"BEFORE"` or `"AFTER"`), that runs the PL/pgSQL `body` for the
+/// row whose SHA-256 is `checksum_sha256` (#4892, #5399). A test uses it to
+/// park one publish inside its publishing transaction, while it holds the
+/// per-key publish lock, without delaying any other artifact. An `AFTER`
+/// trigger parks it with its row already in the unique index, so a competing
+/// insert of the same path waits for it instead of committing first. Returns
+/// the SQL that removes it again.
+pub async fn install_artifact_row_fault(
+    pool: &sqlx::PgPool,
+    suffix: &str,
+    checksum_sha256: &str,
+    timing: &str,
+    body: &str,
+) -> String {
+    let func = format!("ak_test_artifact_fault_{suffix}");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE OR REPLACE FUNCTION {func}() RETURNS trigger AS $$ \
+         BEGIN \
+           IF NEW.checksum_sha256 = '{checksum_sha256}' THEN {body} END IF; \
+           RETURN NEW; \
+         END; \
+         $$ LANGUAGE plpgsql"
+    )))
+    .execute(pool)
+    .await
+    .expect("create artifact fault function");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TRIGGER {func} {timing} INSERT OR UPDATE ON artifacts \
+         FOR EACH ROW EXECUTE FUNCTION {func}()"
+    )))
+    .execute(pool)
+    .await
+    .expect("create artifact fault trigger");
+    format!("DROP TRIGGER IF EXISTS {func} ON artifacts; DROP FUNCTION IF EXISTS {func}()")
 }
 
 // In a `#[cfg(test)]` module (this whole file is test-only anyway) so the

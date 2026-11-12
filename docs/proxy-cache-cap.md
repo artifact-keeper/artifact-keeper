@@ -26,7 +26,11 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" \
 ```
 
 Reading and changing the cap need the repository `admin` action, like the
-upstream filter and the cache TTL. The cap is stored per repository, so it
+upstream filter and the cache TTL. A caller who cannot read the repository
+gets `404 Repository not found`, the same answer as for a key that names no
+repository, on every method and whatever the repository's type (#5610); a
+caller who can read it but lacks `admin` gets `403`, and a key that is not a
+Remote gets `400`. The cap is stored per repository, so it
 applies on every replica; a change made on one replica reaches the others
 within 30 seconds.
 

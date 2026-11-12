@@ -1,5 +1,0 @@
----
-section: Changed
-issues: [#4990, #3916]
----
-- **A Maven deploy into an S3-, GCS- or Azure-backed repository streams to object storage instead of a local scratch file** (#4990, #3916). `PUT /maven/{key}/{path}` (jars, POMs, checksum sidecars, `maven-metadata.xml`) now stages its body on the repository's backend with bounded memory, computing SHA-256, SHA-1 and MD5 on the way, and copies it server-side to its Maven key inside the publish lock, as the generic upload routes have done since 1.11.0. A multi-GiB jar no longer needs local disk of its size on the replica that receives it, and a full or read-only `AK_UPLOAD_STAGING_DIR` no longer fails the deploy. Filesystem repositories keep the local spool. Whether uploads stage on the backend is now decided by the backend's native streaming capability rather than its name. An upload that wrote its content-addressed object but did not commit its row (a conditional upload that lost its compare-and-swap after writing, a quota denial) now hands that object to storage GC instead of leaving it with no record.

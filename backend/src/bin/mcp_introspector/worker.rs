@@ -11,10 +11,15 @@ use serde_json::{json, Value};
 
 use crate::http::{check_url, HttpTransport};
 use crate::protocol::{probe, ProbeReport};
-use crate::sandbox::{guest_spec, run_and_probe, Images, SandboxRunner};
+use crate::sandbox::{guest_spec, run_and_probe, Images, SandboxError, SandboxRunner};
 
-pub const MAX_ITEMS: usize = 1000;
-pub const MAX_BYTES: usize = 1024 * 1024;
+use artifact_keeper_backend::services::mcp_capabilities as caps;
+
+/// The backend's limits, so a result the backend would refuse is refused
+/// here, with the reason, instead of being posted, rejected, and left to
+/// expire as "claim lease expired".
+pub const MAX_ITEMS: usize = caps::MAX_ITEMS;
+pub const MAX_BYTES: usize = caps::INGEST_MAX_BYTES;
 /// The whole remote probe (all requests together).
 pub const REMOTE_BUDGET: Duration = Duration::from_secs(30);
 
@@ -98,10 +103,21 @@ impl Backend {
                 result,
             )
             .await?;
-        if status == 200 {
-            Ok(body)
-        } else {
-            Err(format!("complete refused ({status}): {body}"))
+        match status {
+            200 => Ok(body),
+            // A refused result names the field (#5466): say which, so a
+            // result that would be refused on every attempt is diagnosable.
+            400 => {
+                let (code, field) = (
+                    body["error"].as_str().unwrap_or(""),
+                    body["field"].as_str().unwrap_or(""),
+                );
+                tracing::warn!(job = %job_id, %code, %field, "introspection result refused");
+                Err(format!(
+                    "complete refused (400 {code}, field `{field}`): {body}"
+                ))
+            }
+            _ => Err(format!("complete refused ({status}): {body}")),
         }
     }
 
@@ -146,6 +162,46 @@ fn failed(outcome: &str, error: impl Into<String>) -> ProbeReport {
     }
 }
 
+/// `report` as the backend will accept it: an `ok` result whose lists or
+/// instructions break the backend's limits ([`caps::CapabilitySet::from_doc`],
+/// the same check the backend applies) becomes `refused` with the reason.
+pub fn within_backend_limits(report: ProbeReport) -> ProbeReport {
+    if report.outcome != "ok" {
+        return report;
+    }
+    let doc = json!({
+        "tools": report.tools, "resources": report.resources,
+        "prompts": report.prompts, "instructions": report.instructions,
+    });
+    match caps::CapabilitySet::from_doc(&doc) {
+        Ok(_) => report,
+        Err(e) => ProbeReport {
+            details: report.details,
+            ..failed("refused", format!("result over the backend's limits: {e}"))
+        },
+    }
+}
+
+/// A `complete` body the backend accepts: within its request body limit
+/// ([`MAX_BYTES`]), else the result is replaced by a `refused` one.
+pub fn within_body_limit(body: Value) -> Value {
+    let size = serde_json::to_vec(&body)
+        .map(|b| b.len())
+        .unwrap_or(usize::MAX);
+    if size <= MAX_BYTES {
+        return body;
+    }
+    let mut r = failed(
+        "refused",
+        format!("result is {size} bytes, over the backend's {MAX_BYTES} byte limit"),
+    )
+    .to_result_json();
+    for k in ["claimToken", "workerVersion"] {
+        r[k] = body[k].clone();
+    }
+    r
+}
+
 /// Probe one remote URL with the guard, the cap and the overall budget.
 pub async fn probe_remote(client: reqwest::Client, url: &str) -> ProbeReport {
     if let Err(e) = check_url(url) {
@@ -153,7 +209,7 @@ pub async fn probe_remote(client: reqwest::Client, url: &str) -> ProbeReport {
     }
     let mut t = HttpTransport::new(client, url, MAX_BYTES);
     match tokio::time::timeout(REMOTE_BUDGET, probe(&mut t, MAX_ITEMS)).await {
-        Ok(r) => r,
+        Ok(r) => within_backend_limits(r),
         Err(_) => failed("timeout", "probe exceeded 30 s"),
     }
 }
@@ -176,11 +232,18 @@ pub async fn sandbox_probe(
             r.details.insert("runner".into(), json!(runner.name()));
             r.details.insert("image".into(), json!(spec.image));
             r.details.insert("notes".into(), json!(spec.notes));
-            r
+            within_backend_limits(r)
         }
+        // The deployment, not the server: retried (`start_failed` is
+        // transient), never stored as the server's state.
+        Err(e @ SandboxError::Deployment(_)) => failed("start_failed", e.to_string()),
         Err(e) => failed("unsupported", e.to_string()),
     }
 }
+
+/// How often an idle worker removes guests and guest networks that leaked
+/// (a cleanup command failed or timed out), besides once at startup.
+pub const REAP_EVERY: Duration = Duration::from_secs(600);
 
 impl Worker {
     pub fn kinds(&self) -> Vec<&'static str> {
@@ -209,13 +272,13 @@ impl Worker {
             },
             _ => failed("unsupported", "unknown job kind"),
         };
-        let mut body = report.to_result_json();
+        let mut body = within_backend_limits(report).to_result_json();
         body["claimToken"] = job["claimToken"].clone();
         body["workerVersion"] = json!(format!(
             "ak-mcp-introspector/{}",
             artifact_keeper_backend::build_info::VERSION
         ));
-        body
+        within_body_limit(body)
     }
 
     /// Claim and run at most one job. `Ok(true)` when one ran.
@@ -235,11 +298,38 @@ impl Worker {
         Ok(true)
     }
 
+    /// Remove the guests and guest networks earlier runs of this worker left
+    /// behind. Run at startup and, while idle, every [`REAP_EVERY`]: jobs
+    /// run one at a time, so no guest of this worker is live then. The
+    /// number of guests removed.
+    pub async fn reap(&self) -> usize {
+        let Some(runner) = &self.runner else {
+            return 0;
+        };
+        match crate::sandbox::reap_leftovers(runner.as_ref()).await {
+            Ok(0) => 0,
+            Ok(n) => {
+                tracing::warn!(removed = n, "removed leftover sandbox guests");
+                n
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not check for leftover sandbox guests");
+                0
+            }
+        }
+    }
+
     pub async fn run_forever(&self, poll: Duration) {
+        let mut last_reap = std::time::Instant::now();
         loop {
             match self.once().await {
                 Ok(true) => continue,
-                Ok(false) => {}
+                Ok(false) => {
+                    if last_reap.elapsed() >= REAP_EVERY {
+                        self.reap().await;
+                        last_reap = std::time::Instant::now();
+                    }
+                }
                 Err(e) => tracing::warn!(error = %e, "introspection worker"),
             }
             tokio::time::sleep(poll).await;
@@ -329,7 +419,7 @@ mod tests {
         let r = w
             .run_job(
                 &json!({"kind": "sandbox_run", "jobId": "j", "akBaseUrl": "https://ak.test",
-                "target": {"package": {"registryType": "npm", "identifier": "x", "version": "1",
+                "target": {"package": {"registryType": "npm", "identifier": "x", "version": "1.0.0",
                 "registryBaseUrl": "https://registry.npmjs.org"}}}),
             )
             .await;
@@ -344,12 +434,71 @@ mod tests {
         let r = w
             .run_job(
                 &json!({"kind": "sandbox_run", "jobId": "j", "akBaseUrl": "https://ak.test",
-                "target": {"package": {"registryType": "npm", "identifier": "x", "version": "1",
+                "target": {"package": {"registryType": "npm", "identifier": "x", "version": "1.0.0",
                 "registryBaseUrl": "https://ak.test/npm/r"}}}),
             )
             .await;
         assert_eq!(r["outcome"], "start_failed");
         assert_eq!(r["details"]["runner"], "external");
+    }
+
+    /// #5447: a job the deployment cannot isolate (here an AK base URL that
+    /// is an IP address, which the forwarder cannot stand in for) is
+    /// `start_failed`, which the backend retries, not a terminal
+    /// `unsupported` stored as the server's state.
+    #[tokio::test]
+    async fn deployment_refusals_are_retryable() {
+        let w = worker(
+            "http://127.0.0.1:9",
+            Some(Box::new(crate::sandbox::OciRunner::default())),
+        );
+        let r = w
+            .run_job(
+                &json!({"kind": "sandbox_run", "jobId": "j", "akBaseUrl": "https://203.0.113.10",
+                "target": {"package": {"registryType": "npm", "identifier": "x", "version": "1.0.0",
+                "registryBaseUrl": "https://203.0.113.10/npm/r"}}}),
+            )
+            .await;
+        assert_eq!(r["outcome"], "start_failed", "{r}");
+        assert!(r["error"].as_str().unwrap().contains("IP address"), "{r}");
+    }
+
+    /// The periodic reap: nothing without a runner; with one, this worker's
+    /// leftover guests (by its owner label) are removed.
+    #[tokio::test]
+    async fn reap_removes_this_workers_leftovers() {
+        assert_eq!(worker("http://127.0.0.1:9", None).reap().await, 0);
+        let dir = std::env::temp_dir().join(format!("ak-reap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = dir.join("engine");
+        std::fs::write(
+            &engine,
+            "#!/bin/sh\ncase \"$1 $2\" in ps*) echo c1;; 'network ls') echo n1;; 'network rm') exit 1;; esac\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runner = crate::sandbox::OciRunner {
+            engine: engine.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        // A teardown command that fails is a warning, not an error.
+        assert_eq!(
+            worker("http://127.0.0.1:9", Some(Box::new(runner)))
+                .reap()
+                .await,
+            1
+        );
+        let broken = crate::sandbox::OciRunner {
+            engine: "/nonexistent/podman".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            worker("http://127.0.0.1:9", Some(Box::new(broken)))
+                .reap()
+                .await,
+            0
+        );
     }
 
     #[tokio::test]
@@ -390,5 +539,46 @@ mod tests {
         assert!(b.complete("j", &json!({})).await.is_err());
         let r = probe_remote(crate::http::guarded_client(), "http://169.254.169.254/").await;
         assert_eq!(r.outcome, "refused");
+    }
+
+    /// A result the backend would refuse is refused here with the reason
+    /// (the backend would answer 400/413 and the job would hang until its
+    /// lease expired).
+    #[test]
+    fn results_over_the_backend_limits_are_refused() {
+        let ok = |tools: Vec<Value>, instructions: Option<String>| ProbeReport {
+            outcome: "ok".into(),
+            auth_state: "none".into(),
+            tools,
+            instructions,
+            ..Default::default()
+        };
+        let fine = within_backend_limits(ok(vec![json!({"name": "t"})], Some("use it".into())));
+        assert_eq!(fine.outcome, "ok");
+        let long_name = within_backend_limits(ok(
+            vec![json!({"name": "n".repeat(caps::MAX_NAME_LEN + 1)})],
+            None,
+        ));
+        assert_eq!(long_name.outcome, "refused");
+        assert!(long_name.error.unwrap().contains("backend's limits"));
+        let long_instructions =
+            within_backend_limits(ok(vec![], Some("x".repeat(caps::MAX_INSTRUCTIONS_LEN + 1))));
+        assert_eq!(long_instructions.outcome, "refused");
+        assert!(long_instructions.error.unwrap().contains("instructions"));
+        let failed_stays = within_backend_limits(failed("timeout", "t"));
+        assert_eq!(failed_stays.outcome, "timeout");
+
+        // Within every per-item limit, over the request body limit.
+        let big: Vec<Value> = (0..900)
+            .map(|i| json!({"name": format!("t{i}"), "description": "d".repeat(2000)}))
+            .collect();
+        let mut body = within_backend_limits(ok(big, None)).to_result_json();
+        assert_eq!(body["outcome"], "ok");
+        body["claimToken"] = json!("ct");
+        let body = within_body_limit(body);
+        assert_eq!(body["outcome"], "refused");
+        assert_eq!(body["claimToken"], "ct");
+        assert!(body["error"].as_str().unwrap().contains("byte limit"));
+        assert!(serde_json::to_vec(&body).unwrap().len() < MAX_BYTES);
     }
 }

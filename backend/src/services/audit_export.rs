@@ -168,6 +168,11 @@ impl AuditAction {
             | AuditAction::DebianBackfillRun
             | AuditAction::CacheSeeded
             | AuditAction::ConfigImported
+            | AuditAction::GroupCreated
+            | AuditAction::GroupUpdated
+            | AuditAction::GroupDeleted
+            | AuditAction::GroupMembersAdded
+            | AuditAction::GroupMembersRemoved
             | AuditAction::RepositoryAllowlistChanged
             | AuditAction::QuarantineReleased
             | AuditAction::FindingAcknowledged
@@ -211,6 +216,7 @@ impl AuditAction {
             | AuditAction::McpServerApproved
             | AuditAction::McpServerReopened
             | AuditAction::McpServerContentDrift
+            | AuditAction::McpNameCaseTwinReplicated
             | AuditAction::McpCapabilitiesIngested
             | AuditAction::McpToolsDrift
             | AuditAction::McpNamespaceGranted
@@ -218,6 +224,7 @@ impl AuditAction {
             | AuditAction::McpNamespaceProofVerified
             | AuditAction::McpServerEdited
             | AuditAction::McpServerDeleted
+            | AuditAction::McpServerPurged
             | AuditAction::McpMirrorSynced => Outcome::Success,
             // #5286: the recorder overrides to `Failure` for a request that
             // failed (`not_found`, `error`, `timeout`).

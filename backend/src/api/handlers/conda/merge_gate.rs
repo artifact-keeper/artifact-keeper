@@ -836,10 +836,18 @@ impl MergeGate {
         }
         let gate = Arc::clone(self);
         let task_key = key.clone();
-        let task = tokio::spawn(async move {
+        let lead = async move {
             gate.lead(kind, task_key, budget_shape, merge, predecessor)
                 .await
-        });
+        };
+        // A test scopes the virtual member deadline to the request it drives
+        // (#5621); the merge runs on its own task, so carry the scope along.
+        #[cfg(test)]
+        let lead = crate::api::handlers::proxy_helpers::with_virtual_member_deadline(
+            crate::api::handlers::proxy_helpers::virtual_member_metadata_timeout(),
+            lead,
+        );
+        let task = tokio::spawn(lead);
         let shared = async move {
             task.await
                 .unwrap_or_else(|e| Err(SharedResponse::internal(e)))

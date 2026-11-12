@@ -25,6 +25,16 @@ type Scanner struct {
 	// renames), after the upload has been received and verified. See
 	// importVulnDB for why the whole invocation is covered.
 	dbMu sync.RWMutex
+	// imageCacheMu is held by the one image scan that uses trivy's on-disk
+	// analysis cache (<CacheDir>/fanal/fanal.db) at a time (#5657). trivy
+	// opens that BoltDB with an exclusive lock for the whole run and gives up
+	// after 5s ("cache may be in use by another process: timeout"), so a
+	// second concurrent image scan over the same CacheDir used to fail. An
+	// image scan that finds it taken runs with --cache-backend memory
+	// instead: same report, no cross-scan layer reuse, no lock. Filesystem
+	// scans already default to the memory backend, and client mode uses the
+	// trivy server's cache, so neither takes it.
+	imageCacheMu sync.Mutex
 }
 
 // NewScanner constructs a Scanner bound to cfg.
@@ -80,6 +90,7 @@ func (s *Scanner) buildArgs(imageRef string) []string {
 		args = append(args, "--insecure")
 	}
 	args = append(args, s.cfg.dbUpdateArgs()...)
+	args = append(args, noLookupArgs...)
 	if s.cfg.DBRepository != "" {
 		args = append(args, "--db-repository", s.cfg.DBRepository)
 	}
@@ -88,18 +99,35 @@ func (s *Scanner) buildArgs(imageRef string) []string {
 	return args
 }
 
-// dbUpdateArgs returns the DB-update and offline flags shared by image and
-// filesystem scans: --skip-db-update when DB updates are off (always in
-// offline mode), and in offline mode (#5287) --skip-java-db-update and
-// --offline-scan so no scan contacts a DB registry, the Java DB registry or
-// any other network API.
+// noLookupArgs are on every trivy invocation, connected or not (#5666):
+//
+//   - --offline-scan stops trivy's pom.xml parser from fetching parent POMs
+//     and unpinned dependency versions from repo.maven.apache.org. Every
+//     extracted jar carries a pom.xml under META-INF/maven/, so a filesystem
+//     scan failed on an air-gapped install (a 429 from Central failed one on
+//     a connected one), went around AK's own proxy, and disclosed the
+//     artifact's dependency coordinates to Maven Central. The versions it
+//     recovered were the ones a parent or BOM manages, not the ones bundled;
+//     the backend now hands the bundled versions over in the workspace
+//     (.ak-scan-jar-inventory/pom.xml, read from the jars' pom.properties).
+//   - --skip-version-check and --disable-telemetry together stop the per-run
+//     request to check.trivy.dev (either alone still sends it).
+//
+// The vulnerability and Java DB downloads are not affected; SCANNER_OFFLINE
+// governs those (dbUpdateArgs).
+var noLookupArgs = []string{"--offline-scan", "--skip-version-check", "--disable-telemetry"}
+
+// dbUpdateArgs returns the DB-update flags shared by image and filesystem
+// scans: --skip-db-update when DB updates are off (always in offline mode),
+// and in offline mode (#5287) --skip-java-db-update, so no scan contacts a
+// DB registry or the Java DB registry. Every scan adds noLookupArgs as well.
 func (c *Config) dbUpdateArgs() []string {
 	var args []string
 	if c.SkipDBUpdate || c.Offline {
 		args = append(args, "--skip-db-update")
 	}
 	if c.Offline {
-		args = append(args, "--skip-java-db-update", "--offline-scan")
+		args = append(args, "--skip-java-db-update")
 	}
 	return args
 }
@@ -252,7 +280,8 @@ func DBReady(cfg *Config) bool { return dbPresent(cfg.CacheDir) }
 // honouring cfg.DBRepository (--db-repository) so the DB can be pulled from an
 // AK-controlled mirror instead of the shared public mirror.gcr.io endpoint.
 func downloadDBArgs(cfg *Config) []string {
-	args := []string{"image", "--download-db-only", "--cache-dir", cfg.CacheDir}
+	args := []string{"image", "--download-db-only", "--cache-dir", cfg.CacheDir,
+		"--skip-version-check", "--disable-telemetry"}
 	if cfg.DBRepository != "" {
 		args = append(args, "--db-repository", cfg.DBRepository)
 	}
@@ -318,7 +347,6 @@ func (s *Scanner) Scan(ctx context.Context, req *ScanRequest) (*HarborScanReport
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.ScanTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, s.cfg.TrivyPath, s.buildArgs(imageRef)...)
 	// Inherit the adapter's environment; add a HOST-SCOPED registry credential
 	// for private pulls via a per-scan Docker config (DOCKER_CONFIG). The bearer
 	// is applied ONLY to the target registry host, so trivy's vuln-DB OCI pull
@@ -329,15 +357,26 @@ func (s *Scanner) Scan(ctx context.Context, req *ScanRequest) (*HarborScanReport
 		return nil, fmt.Errorf("prepare registry credential for %s: %w", imageRef, err)
 	}
 	defer cred.cleanup()
-	cmd.Env = append(cmd.Environ(), cred.env...)
 
-	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	localDB, err := s.runLocked(cmd)
+	// One image scan at a time owns the on-disk analysis cache; the rest use
+	// the memory backend rather than fail on its lock (#5657). Client mode
+	// caches on the trivy server and never opens the local one.
+	memoryCache := false
+	if s.cfg.TrivyServer == "" {
+		memoryCache = !s.imageCacheMu.TryLock()
+		if !memoryCache {
+			defer s.imageCacheMu.Unlock()
+		}
+	}
+	stdout, stderr, localDB, err := s.runImageScan(ctx, imageRef, cred.env, memoryCache)
+	if err != nil && !memoryCache && trivyCacheLocked(stderr) {
+		// The lock is held outside this process (another adapter replica or
+		// a trivy run sharing the cache volume): retry without the cache.
+		log.Printf("trivy analysis cache in %s is locked by another process; rescanning %s with the memory cache backend", s.cfg.CacheDir, imageRef)
+		stdout, stderr, localDB, err = s.runImageScan(ctx, imageRef, cred.env, true)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("trivy scan failed for %s: %v: %s", imageRef, err, strings.TrimSpace(stderr.String()))
+		return nil, fmt.Errorf("trivy scan failed for %s: %v: %s", imageRef, err, strings.TrimSpace(stderr))
 	}
 
 	// Exit-0 DB-failure detection: trivy can exit 0 with empty Results when its
@@ -346,12 +385,12 @@ func (s *Scanner) Scan(ctx context.Context, req *ScanRequest) (*HarborScanReport
 	// an error so the job fails closed (report 500) instead of reporting no
 	// findings. Gated on markers, not on empty Results (a distroless image can
 	// legitimately catalog 0 packages).
-	if trivyOutputIndicatesDBFailure(stderr.String()) {
-		return nil, fmt.Errorf("trivy scan for %s reported a vulnerability-DB failure: %s", imageRef, strings.TrimSpace(stderr.String()))
+	if trivyOutputIndicatesDBFailure(stderr) {
+		return nil, fmt.Errorf("trivy scan for %s reported a vulnerability-DB failure: %s", imageRef, strings.TrimSpace(stderr))
 	}
 
 	var trivyReport TrivyReport
-	if err := json.Unmarshal([]byte(stdout.String()), &trivyReport); err != nil {
+	if err := json.Unmarshal([]byte(stdout), &trivyReport); err != nil {
 		return nil, fmt.Errorf("failed to parse trivy output for %s: %w", imageRef, err)
 	}
 
@@ -363,6 +402,46 @@ func (s *Scanner) Scan(ctx context.Context, req *ScanRequest) (*HarborScanReport
 	report := mapTrivyToHarbor(&trivyReport, scanner)
 	report.VulnerabilityDB = db
 	return report, nil
+}
+
+// runImageScan runs one `trivy image` invocation for imageRef with the extra
+// credential env, on the on-disk analysis cache or, when memoryCache is set,
+// on trivy's memory cache backend. It returns stdout, stderr, the local DB
+// provenance (see runLocked) and the run error.
+func (s *Scanner) runImageScan(ctx context.Context, imageRef string, env []string, memoryCache bool) (string, string, *VulnDBInfo, error) {
+	args := s.buildArgs(imageRef)
+	if memoryCache {
+		args = withMemoryCache(args)
+	}
+	cmd := exec.CommandContext(ctx, s.cfg.TrivyPath, args...)
+	cmd.Env = append(cmd.Environ(), env...)
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	localDB, err := s.runLocked(cmd)
+	return stdout.String(), stderr.String(), localDB, err
+}
+
+// withMemoryCache inserts `--cache-backend memory` before the final
+// positional argument (the scan target) of a trivy argument list.
+func withMemoryCache(args []string) []string {
+	if len(args) == 0 {
+		return args
+	}
+	last := len(args) - 1
+	out := make([]string, 0, len(args)+2)
+	out = append(out, args[:last]...)
+	out = append(out, "--cache-backend", "memory")
+	return append(out, args[last])
+}
+
+// trivyCacheLockedMarker is what trivy prints when it cannot take the lock on
+// its on-disk analysis cache within its 5s timeout (pkg/cache/fs.go).
+const trivyCacheLockedMarker = "cache may be in use by another process"
+
+// trivyCacheLocked reports whether trivy stderr carries the cache-lock error.
+func trivyCacheLocked(stderr string) bool {
+	return strings.Contains(strings.ToLower(stderr), trivyCacheLockedMarker)
 }
 
 // vulnDBInfo returns the trivy DB provenance of a finished scan (#3014).
@@ -404,6 +483,7 @@ func (s *Scanner) buildFsArgs(dir string) []string {
 		"--quiet",
 	}
 	args = append(args, s.cfg.dbUpdateArgs()...)
+	args = append(args, noLookupArgs...)
 	args = append(args, s.cfg.clientArgs()...)
 	return append(args, dir)
 }

@@ -531,6 +531,31 @@ const ALLOWLIST: &[(&str, &str, &str, usize, &str)] = &[
         1,
         "GIN index on the PyPI trove-classifier array for XML-RPC browse (#3783)",
     ),
+    (
+        "339_scan_findings_text_columns.sql",
+        KIND_COLUMN_REWRITE,
+        "scan_findings",
+        6,
+        "six scanner text columns VARCHAR(n) -> TEXT so one long fixed-version \
+         string cannot fail a scan's whole findings batch (#5534). Binary \
+         coercible with no USING clause and no index on any of the six, so it \
+         is catalog-only on PG 16/18 (heap, TOAST and index relfilenodes \
+         unchanged, verified); the lock is taken with a 5s lock_timeout and \
+         retried. `cve_id` was left out because its partial index would be \
+         rebuilt",
+    ),
+    (
+        "342_scan_results_text_columns.sql",
+        KIND_COLUMN_REWRITE,
+        "scan_results",
+        2,
+        "scanner_version and vuln_db_version VARCHAR(n) -> TEXT so a long \
+         scanner-supplied provenance string cannot fail `complete_scan` and \
+         strand the scan `running` (#5564). Binary coercible with no USING \
+         clause and no index on either column, so it is catalog-only on PG \
+         16/18 (heap and TOAST relfilenodes unchanged, verified); the lock is \
+         taken with a 5s lock_timeout and retried",
+    ),
 ];
 
 /// Blank out `--` line comments, `/* … */` block comments and `'…'` string

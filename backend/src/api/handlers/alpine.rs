@@ -21,6 +21,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use futures::StreamExt as _;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::io::Read;
@@ -851,93 +852,44 @@ async fn apk_index(
             )
             .await?;
 
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(
-                    CONTENT_TYPE,
-                    content_type.unwrap_or_else(|| "application/gzip".to_string()),
-                )
-                .header(CONTENT_LENGTH, content.len().to_string())
-                .body(Body::from(content))
-                .unwrap());
+            return Ok(passthrough_apkindex_response(content, content_type));
         }
     }
 
-    // For virtual repos, try each remote member in priority order so that
-    // upstream-signed indexes are returned when available.
     if repo.repo_type == RepositoryType::Virtual {
-        let upstream_path = build_apk_index_upstream_path(&branch, &repository, &arch);
-        // Caller-authorized member walk (#3323): a private Remote member's
-        // upstream index — potentially fetched with that member's credentials —
-        // must not be proxied to a caller who cannot read the member.
-        let members =
-            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
-
-        for member in &members {
-            if member.repo_type != RepositoryType::Remote {
-                continue;
-            }
-            let Some(ref upstream_url) = member.upstream_url else {
-                continue;
-            };
-            let Some(ref proxy) = state.proxy_service else {
-                continue;
-            };
-
-            let result = proxy_helpers::proxy_fetch_capped(
-                proxy,
-                member.id,
-                &member.key,
-                upstream_url,
-                &upstream_path,
-                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-            )
-            .await;
-
-            match result {
-                Ok((content, content_type)) => {
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            CONTENT_TYPE,
-                            content_type.unwrap_or_else(|| "application/gzip".to_string()),
-                        )
-                        .header(CONTENT_LENGTH, content.len().to_string())
-                        .body(Body::from(content))
-                        .unwrap());
-                }
-                Err(_e) => {
-                    tracing::debug!(
-                        member_key = %member.key,
-                        "APKINDEX proxy fetch failed for virtual member, trying next"
-                    );
-                    continue;
-                }
-            }
-        }
+        return virtual_apk_index(&state, auth.as_ref(), &repo, &branch, &repository, &arch).await;
     }
 
-    // Hosted repos (and virtual fallback): generate APKINDEX from local artifacts.
-    // TODO: For virtual repos this fallback queries `repo.id` (the virtual repo itself),
-    // which won't find artifacts stored under hosted members. A follow-up should aggregate
-    // artifacts from all hosted members of the virtual repo.
+    // Hosted repos: generate APKINDEX from local artifacts.
     let mut artifacts =
         list_alpine_artifacts(&state.db, repo.id, &branch, &repository, &arch).await?;
 
-    backfill_apk_metadata(&state, &repo, &mut artifacts).await;
+    backfill_apk_metadata(&state, &repo.storage_location(), &mut artifacts).await;
 
     let apkindex_text = generate_apkindex_text(&artifacts, &arch);
+    signed_apkindex_response(&state, repo.id, &apkindex_text).await
+}
 
+/// Serve `apkindex_text` as an `APKINDEX.tar.gz`, signed with `sign_repo_id`'s
+/// key when that repository has one.
+async fn signed_apkindex_response(
+    state: &SharedState,
+    sign_repo_id: uuid::Uuid,
+    apkindex_text: &str,
+) -> Result<Response, Response> {
     // Build the index segment first: apk's signature covers these exact
     // compressed bytes, so they are signed and then served unchanged (#3021).
     let mtime = tar_mtime_now();
-    let index_segment = build_apkindex_segment(&apkindex_text, mtime)
+    let index_segment = build_apkindex_segment(apkindex_text, mtime)
         .map_err(|e| apkindex_build_error("the APKINDEX archive", e))?;
 
     // Sign the index segment if signing is configured for this repository.
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
-    let signature =
-        resolve_apkindex_signature(signing_svc.sign_apk_index(repo.id, &index_segment).await)?;
+    let signature = resolve_apkindex_signature(
+        signing_svc
+            .sign_apk_index(sign_repo_id, &index_segment)
+            .await,
+    )?;
 
     let signature_segment = signature
         .map(|sig| build_apk_signature_segment(&sig, mtime))
@@ -952,6 +904,175 @@ async fn apk_index(
         .header(CONTENT_LENGTH, tar_gz.len().to_string())
         .body(Body::from(tar_gz))
         .unwrap())
+}
+
+/// Serve a proxied upstream `APKINDEX.tar.gz` byte for byte, so the upstream
+/// signature still verifies.
+fn passthrough_apkindex_response(content: Bytes, content_type: Option<String>) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            CONTENT_TYPE,
+            content_type.unwrap_or_else(|| "application/gzip".to_string()),
+        )
+        .header(CONTENT_LENGTH, content.len().to_string())
+        .body(Body::from(content))
+        .unwrap()
+}
+
+/// Whether a Virtual member stores its own packages (and so contributes them to
+/// the merged index from the database rather than from an upstream).
+fn is_hosted_member(repo_type: &RepositoryType) -> bool {
+    matches!(repo_type, RepositoryType::Local | RepositoryType::Staging)
+}
+
+/// The APKINDEX of a Virtual repository (#5622).
+///
+/// Walks only the members the caller may read (#3323). With no hosted member
+/// the first Remote member whose upstream answers is passed through unchanged,
+/// so the upstream signature keeps verifying. With a hosted (Local/Staging)
+/// member the index is a merge, in member priority order, of every hosted
+/// member's packages and every answering Remote member's upstream entries,
+/// signed with the virtual repository's key.
+///
+/// A member that could not answer (an upstream 5xx, a transport failure; see
+/// [`proxy_helpers::is_member_unavailable_response`]) never turns into an empty
+/// `200`: when no member contributed and one was unavailable the answer is the
+/// retryable `503` of [`proxy_helpers::member_unavailable_response`] (#5504),
+/// since apk would otherwise cache an index that lists nothing. An empty index
+/// is served only when every member answered definitively.
+async fn virtual_apk_index(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    branch: &str,
+    repository: &str,
+    arch: &str,
+) -> Result<Response, Response> {
+    let upstream_path = build_apk_index_upstream_path(branch, repository, arch);
+    let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+    let merge = members.iter().any(|m| is_hosted_member(&m.repo_type));
+
+    let mut index = MergedApkIndex::default();
+    let mut member_unavailable = false;
+    for member in &members {
+        if is_hosted_member(&member.repo_type) {
+            let mut artifacts =
+                list_alpine_artifacts(&state.db, member.id, branch, repository, arch).await?;
+            backfill_apk_metadata(state, &member.storage_location(), &mut artifacts).await;
+            index.extend(&generate_apkindex_text(&artifacts, arch));
+            continue;
+        }
+        if member.repo_type != RepositoryType::Remote {
+            continue;
+        }
+        let (Some(upstream_url), Some(proxy)) = (&member.upstream_url, &state.proxy_service) else {
+            continue;
+        };
+        let fetched = proxy_helpers::proxy_fetch_capped(
+            proxy,
+            member.id,
+            &member.key,
+            upstream_url,
+            &upstream_path,
+            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        )
+        .await;
+        match fetched {
+            Ok((content, content_type)) if !merge => {
+                return Ok(passthrough_apkindex_response(content, content_type));
+            }
+            Ok((content, _)) => match apkindex_text_from_archive(&content) {
+                Some(text) => {
+                    index.extend(&text);
+                    index.contributed = true;
+                }
+                None => tracing::warn!(
+                    member_key = %member.key,
+                    "upstream APKINDEX of virtual member is unreadable, leaving it out of the merge"
+                ),
+            },
+            Err(response) => {
+                if proxy_helpers::is_member_unavailable_response(&response) {
+                    member_unavailable = true;
+                }
+                tracing::debug!(
+                    member_key = %member.key,
+                    status = %response.status(),
+                    "APKINDEX proxy fetch failed for virtual member, trying next"
+                );
+            }
+        }
+    }
+
+    if member_unavailable && !index.contributed {
+        return Err(proxy_helpers::member_unavailable_response());
+    }
+    signed_apkindex_response(state, repo.id, &index.text).await
+}
+
+/// Upper bound on the inflated size of an upstream `APKINDEX.tar.gz` read for a
+/// Virtual merge. The largest Alpine indexes (`community`, `testing`) inflate
+/// to a few tens of MB; the cap keeps a hostile upstream from exhausting memory.
+const APKINDEX_MAX_INFLATED_BYTES: u64 = 128 * 1024 * 1024;
+
+/// The `APKINDEX` text inside an `APKINDEX.tar.gz` (signed or not).
+///
+/// The archive is a run of gzip members (an optional cut signature tar followed
+/// by the index tar), read as one tar stream exactly as apk-tools does.
+fn apkindex_text_from_archive(data: &[u8]) -> Option<String> {
+    let inflated = Read::take(
+        flate2::read::MultiGzDecoder::new(data),
+        APKINDEX_MAX_INFLATED_BYTES,
+    );
+    let mut archive = tar::Archive::new(inflated);
+    for entry in archive.entries().ok()? {
+        let mut entry = entry.ok()?;
+        if entry.path().ok()?.as_os_str() == "APKINDEX" {
+            let mut text = String::new();
+            entry.read_to_string(&mut text).ok()?;
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// The merged text of a Virtual APKINDEX: one stanza per `(P:, V:)`, the
+/// highest-priority member's entry winning.
+#[derive(Default)]
+struct MergedApkIndex {
+    text: String,
+    seen: std::collections::HashSet<(String, String)>,
+    /// Whether any member contributed: a hosted member with an indexable
+    /// package or a Remote member whose upstream index was read.
+    contributed: bool,
+}
+
+impl MergedApkIndex {
+    /// Append the stanzas of `apkindex_text` not already present.
+    fn extend(&mut self, apkindex_text: &str) {
+        for stanza in apkindex_text.split("\n\n") {
+            let stanza = stanza.trim_matches('\n');
+            if stanza.is_empty() {
+                continue;
+            }
+            let field = |key: &str| {
+                stanza
+                    .lines()
+                    .find_map(|line| line.strip_prefix(key))
+                    .map(str::to_string)
+            };
+            let (Some(name), Some(version)) = (field("P:"), field("V:")) else {
+                continue;
+            };
+            if !self.seen.insert((name, version)) {
+                continue;
+            }
+            self.text.push_str(stanza);
+            self.text.push_str("\n\n");
+            self.contributed = true;
+        }
+    }
 }
 
 /// Whether an artifact already carries the apk-native checksum in its metadata.
@@ -1154,7 +1275,7 @@ async fn read_apk_backfill(
 /// cancelled request keeps the progress it made.
 async fn backfill_apk_metadata(
     state: &SharedState,
-    repo: &RepoInfo,
+    location: &crate::storage::StorageLocation,
     artifacts: &mut [AlpineArtifact],
 ) {
     let selected = select_apk_backfill(artifacts);
@@ -1162,7 +1283,7 @@ async fn backfill_apk_metadata(
         return;
     }
 
-    let storage = match state.storage_for_repo(&repo.storage_location()) {
+    let storage = match state.storage_for_repo(location) {
         Ok(storage) => storage,
         Err(e) => {
             tracing::warn!("Alpine index backfill: storage unavailable: {}", e);
@@ -1335,8 +1456,13 @@ async fn download_package(
         String,
         String,
     )>,
+    headers: HeaderMap,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
+    // rules_apko fetches an .apk's three sections as separate ranged GETs and
+    // checksums each; ignoring Range answered 200 and failed all three. A
+    // stored package carries no ETag, so an `If-Range` gets the whole file.
+    let range_header = proxy_helpers::effective_range(&headers, None, ctx.is_head);
     if !filename.ends_with(".apk") {
         return Err((StatusCode::BAD_REQUEST, "File must have .apk extension").into_response());
     }
@@ -1395,6 +1521,7 @@ async fn download_package(
                     &arch,
                     &filename,
                     &ctx,
+                    &headers,
                 )
                 .await?
                 {
@@ -1428,10 +1555,10 @@ async fn download_package(
                 )
                 .await?;
 
-                return proxy_helpers::stream_fetch_result(
-                    result,
-                    "application/vnd.alpine.package",
-                    None,
+                return proxy_helpers::apply_range_to_streamed_serve(
+                    proxy_helpers::stream_fetch_result(result, APK_CONTENT_TYPE, None)?,
+                    &headers,
+                    ctx.is_head,
                 );
             }
 
@@ -1449,20 +1576,40 @@ async fn download_package(
 
     match storage.get_stream(&artifact.storage_key).await {
         Ok(stream) => {
+            // #5076: a row a scanning Remote holds goes through the scan
+            // gate, graded as the proxied `.apk` would be.
+            let proxy_helpers::StoredRowBody { body: stream, scan } =
+                proxy_helpers::gate_opened_stored_row(
+                    &state,
+                    storage.as_ref(),
+                    &proxy_helpers::StoredRow {
+                        repo: &repo,
+                        filename: &filename,
+                        storage_key: &artifact.storage_key,
+                        size_bytes: artifact.size_bytes,
+                    },
+                    ApkPackage {
+                        arch: &arch,
+                        release:
+                            crate::api::handlers::proxy_scan_archive::alpine_release_from_branch(
+                                &branch,
+                            ),
+                    },
+                    stream,
+                )
+                .await?;
+
             // Record download
             crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/vnd.alpine.package")
-                .header(
-                    "Content-Disposition",
-                    format!("attachment; filename=\"{}\"", filename),
-                )
-                .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
-                .header("X-Checksum-SHA256", &artifact.checksum_sha256)
-                .body(Body::from_stream(stream))
-                .unwrap())
+            serve_ranged_apk(
+                range_header,
+                artifact.size_bytes.max(0) as u64,
+                stream,
+                &filename,
+                &artifact.checksum_sha256,
+            )
+            .map(|resp| proxy_helpers::StoredRowBody::stamp(scan, resp))
         }
         Err(crate::error::AppError::NotFound(_)) if repo.repo_type != RepositoryType::Remote => {
             // Hosted artifact: file absent from storage. Serialise concurrent
@@ -1478,17 +1625,14 @@ async fn download_package(
 
             crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/vnd.alpine.package")
-                .header(
-                    "Content-Disposition",
-                    format!("attachment; filename=\"{}\"", filename),
-                )
-                .header(CONTENT_LENGTH, content.len().to_string())
-                .header("X-Checksum-SHA256", &artifact.checksum_sha256)
-                .body(Body::from(content))
-                .unwrap())
+            let total = content.len() as u64;
+            serve_ranged_apk(
+                range_header,
+                total,
+                futures::stream::once(async move { Ok(content) }).boxed(),
+                &filename,
+                &artifact.checksum_sha256,
+            )
         }
         Err(e) => {
             // Storage retrieval failed. For remote repos, the DB record may
@@ -1523,19 +1667,48 @@ async fn download_package(
                     &arch,
                     &filename,
                     &ctx,
+                    &headers,
                 )
                 .await?
                 {
                     return Ok(response);
                 }
             }
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response())
+            Err(crate::api::handlers::storage_err_plain(&e))
         }
     }
+}
+
+/// Serve a stored `.apk` with a single `Range`, so all three local serve sites
+/// answer 206/416 identically.
+#[allow(clippy::result_large_err)]
+fn serve_ranged_apk(
+    range_header: Option<&str>,
+    total: u64,
+    body: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+    filename: &str,
+    checksum_sha256: &str,
+) -> Result<Response, Response> {
+    // X-Checksum-SHA256 covers the whole object, which is what a client
+    // assembling ranges verifies at the end, so keep it on a 206.
+    let base_headers = vec![
+        (CONTENT_TYPE, APK_CONTENT_TYPE.to_string()),
+        (
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", filename),
+        ),
+        (
+            axum::http::header::HeaderName::from_static("x-checksum-sha256"),
+            checksum_sha256.to_string(),
+        ),
+    ];
+    crate::api::handlers::repositories::ranged_stream_response(
+        range_header,
+        total,
+        body,
+        base_headers,
+    )
+    .map_err(|e| e.into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -1712,6 +1885,7 @@ async fn try_proxy_apk(
     arch: &str,
     filename: &str,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+    headers: &HeaderMap,
 ) -> Result<Option<Response>, Response> {
     let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
         (Some(u), Some(p)) => (u, p),
@@ -1721,13 +1895,15 @@ async fn try_proxy_apk(
     // #895: stream large .apk bodies (a few MiB to ~100 MiB for LLVM-class
     // packages). Default Content-Type matches the buffered handler's
     // prior fallback.
-    let response = proxy_helpers::proxy_fetch_streaming(
+    // The proxy still caches the whole object; the range applies only to what we
+    // serve. Forwarding it upstream would cache a partial under the full key.
+    let result = proxy_helpers::proxy_fetch_streaming_result(
         proxy,
         repo.id,
         repo_key,
         upstream_url,
         &upstream_path,
-        "application/octet-stream",
+        ctx.is_head,
     )
     .await?;
     // #3649: count the proxied serve. The streaming helper answers a warm
@@ -1738,7 +1914,11 @@ async fn try_proxy_apk(
     // lines up with the catalog row the artifact listing renders. `ctx` is
     // threaded in from `download_package` for exactly this call.
     proxy_helpers::record_proxy_download(state, repo.id, repo_key, &upstream_path, ctx).await;
-    Ok(Some(response))
+    // The proxied serve is a complete `200`; the shared helper cuts the
+    // client's window from it (#5554), and a cold fill the client stops
+    // reading at the window's end still completes (#5509).
+    let resp = proxy_helpers::stream_fetch_result(result, "application/octet-stream", None)?;
+    proxy_helpers::apply_range_to_streamed_serve(resp, headers, ctx.is_head).map(Some)
 }
 
 // ---------------------------------------------------------------------------
@@ -1942,13 +2122,7 @@ async fn store_apk(
     storage
         .put(&storage_key, content.clone())
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     let size_bytes = content.len() as i64;
 
@@ -2024,6 +2198,7 @@ async fn store_apk(
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         "alpine",
         &pkg_name,
@@ -2387,6 +2562,69 @@ mod tests {
 
     fn marker_apk_info() -> ApkPackageInfo {
         parse_apk_package(MARKER_APK).expect("marker .apk should parse")
+    }
+
+    /// The stored-bytes serve path must answer the same 206 the proxy path
+    /// does. An apk client that fetches an archive as three ranged spans hits
+    /// this arm for every span after the first, so a 200 here fails its
+    /// per-span checksum exactly as a cold 200 does.
+    #[test]
+    fn a_stored_apk_honours_range_and_keeps_the_whole_object_checksum() {
+        use futures::StreamExt as _;
+        let body =
+            || futures::stream::once(async { Ok(Bytes::from_static(b"0123456789")) }).boxed();
+
+        let partial = serve_ranged_apk(Some("bytes=2-5"), 10, body(), "pkg-1.0-r0.apk", "deadbeef")
+            .expect("ranged serve");
+        assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            partial
+                .headers()
+                .get(axum::http::header::CONTENT_RANGE)
+                .unwrap(),
+            "bytes 2-5/10"
+        );
+        assert_eq!(
+            partial
+                .headers()
+                .get(axum::http::header::CONTENT_LENGTH)
+                .unwrap(),
+            "4"
+        );
+        // The digest covers the whole object, which is what a client
+        // reassembling spans verifies at the end, so a 206 keeps it.
+        assert_eq!(
+            partial.headers().get("x-checksum-sha256").unwrap(),
+            "deadbeef"
+        );
+
+        let full =
+            serve_ranged_apk(None, 10, body(), "pkg-1.0-r0.apk", "deadbeef").expect("full serve");
+        assert_eq!(full.status(), StatusCode::OK);
+        assert_eq!(
+            full.headers()
+                .get(axum::http::header::ACCEPT_RANGES)
+                .unwrap(),
+            "bytes",
+            "a client that probes before ranging must see the capability"
+        );
+
+        let unsatisfiable = serve_ranged_apk(
+            Some("bytes=50-60"),
+            10,
+            body(),
+            "pkg-1.0-r0.apk",
+            "deadbeef",
+        )
+        .expect("unsatisfiable serve");
+        assert_eq!(unsatisfiable.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            unsatisfiable
+                .headers()
+                .get(axum::http::header::CONTENT_RANGE)
+                .unwrap(),
+            "bytes */10"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4371,6 +4609,85 @@ mod tests {
             "only the client upload queues a push task; the replicated one must not"
         );
     }
+
+    /// #5685: `store_apk`'s `storage.put` and `download_package`'s
+    /// `get_stream` answered a hard-coded 500 on any storage failure. A store
+    /// that is down now answers `503` with `Retry-After`, one that is full
+    /// `507` without it, and neither body carries the backend's text.
+    #[tokio::test]
+    async fn apk_put_and_get_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
+            return;
+        };
+        let published = format!("/{}/v3.21/main/aarch64/dtf-marker-1.0-r0.apk", fx.repo_key);
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(published.clone(), bytes::Bytes::from_static(MARKER_APK)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CREATED,
+            "publish while storage works: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        for (message, want, want_body) in [
+            (
+                tdh::minio_unreachable_error(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                axum::http::StatusCode::INSUFFICIENT_STORAGE,
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&fx.pool, &fx.state, fx.repo_id, &message).await;
+            let app = tdh::router_with_auth(
+                super::router(),
+                state.clone(),
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let (status, body, headers) = tdh::send_with_headers(
+                app,
+                tdh::put(
+                    format!("/{}/v3.21/main/aarch64/outage5685-1.0-r0.apk", fx.repo_key),
+                    bytes::Bytes::from_static(MARKER_APK),
+                ),
+            )
+            .await;
+            assert_eq!(status, want, "PUT: {}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want == axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            assert_eq!(&body[..], want_body.as_bytes());
+            tdh::assert_no_storage_backend_text("alpine PUT", &body);
+
+            let app = tdh::router_with_auth(
+                super::router(),
+                state.clone(),
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let (status, body, headers) =
+                tdh::send_with_headers(app, tdh::get(published.clone())).await;
+            assert_eq!(status, want, "GET: {}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want == axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            assert_eq!(&body[..], want_body.as_bytes());
+            tdh::assert_no_storage_backend_text("alpine GET", &body);
+        }
+        fx.teardown().await;
+    }
 }
 
 #[cfg(ak_test_shard = "handlers-1")]
@@ -4521,6 +4838,39 @@ mod db_cov_tests {
             &body[..],
             super::MARKER_APK,
             "the advertised .apk must serve the published package bytes"
+        );
+    }
+
+    /// A ranged GET of a hosted package answers `206` with exactly the window
+    /// asked for (#5478): an apk client that fetches the sections as spans
+    /// checksums each one, so a whole-file `200` fails every span.
+    #[tokio::test]
+    async fn test_hosted_apk_download_honours_range() {
+        let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
+            return;
+        };
+        let text = publish_marker_and_fetch_index(&fx).await;
+        let filename = format!(
+            "{}-{}.apk",
+            apkindex_field(&text, 'P'),
+            apkindex_field(&text, 'V')
+        );
+        let k = fx.repo_key.clone();
+        let mut req = tdh::get(format!("/{k}/v3.21/main/aarch64/{filename}"));
+        req.headers_mut().insert(
+            axum::http::header::RANGE,
+            axum::http::HeaderValue::from_static("bytes=0-9"),
+        );
+        let (status, body, headers) =
+            tdh::send_with_headers(fx.router_with_auth(super::router()), req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body[..], &super::MARKER_APK[..10]);
+        assert_eq!(
+            headers[axum::http::header::CONTENT_RANGE],
+            format!("bytes 0-9/{}", super::MARKER_APK.len()).as_str()
         );
     }
 
@@ -4995,6 +5345,22 @@ mod scan_on_proxy_4113 {
 
     archive_scan_suite!(case);
 
+    /// #5076: a row the scanning Remote holds itself is served through the
+    /// gate, as the proxied file is. Fails on `main`: the row streamed
+    /// ungated (200, no `X-AK-Scan`) under every policy.
+    #[tokio::test]
+    async fn a_stored_row_of_a_scanning_remote_is_gated_5076() {
+        crate::api::handlers::proxy_scan_archive::test_support::stored_row_is_gated(
+            case,
+            crate::api::handlers::proxy_scan_archive::test_support::StoredRowSeed {
+                path: format!("{DIR}/{FILE}"),
+                name: "libdtf".to_string(),
+                version: "1.0-r0".to_string(),
+            },
+        )
+        .await;
+    }
+
     /// #4365 item 3: an ambiguous segment on a proxying repository is a 400
     /// before anything is fetched.
     #[tokio::test]
@@ -5128,5 +5494,401 @@ mod serve_key_4365_tests {
             assert!(key.scannable, "{path}");
             assert_eq!(key.cache_key, path);
         }
+    }
+}
+
+/// A ranged `.apk` GET on a cold Remote cache fills the cache (#5509).
+///
+/// Served over a real socket, because the bug lives in hyper: it stops
+/// polling a body once `Content-Length` bytes are out, so a client window
+/// ending before EOF used to drop the tee into the proxy cache mid-object.
+/// An in-process `oneshot` reads the body to its end and cannot see that.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+// Test reads of small, bounded bodies (#1608 exempts test scaffolding).
+#[allow(clippy::disallowed_methods)]
+mod ranged_cold_fill_5509 {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::{header, StatusCode};
+
+    const PATH: &str = "v3.21/main/x86_64/pkg-1.0-r0.apk";
+    const ETAG: &str = "\"apk-v1\"";
+
+    /// Several tee chunks long, so the first window ends well before EOF.
+    fn payload() -> Vec<u8> {
+        (0..300 * 1024u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    async fn serve(app: axum::Router) -> (String, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+        });
+        (base, stop)
+    }
+
+    #[tokio::test]
+    async fn a_cold_ranged_get_fills_the_cache_5509() {
+        let Some(fx) = tdh::Fixture::setup("remote", "alpine").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        let data = payload();
+        let total = data.len();
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/{PATH}")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("etag", ETAG)
+                    .set_body_bytes(data.clone()),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let (state, cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let (base, stop) = serve(tdh::router_anon(super::router(), state)).await;
+        let url = format!("{base}/{}/{PATH}", fx.repo_key);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let get = |headers: &[(header::HeaderName, &str)]| {
+            let mut req = client.get(&url);
+            for (name, value) in headers {
+                req = req.header(name.clone(), *value);
+            }
+            req
+        };
+
+        // Cold: the first span only, as rules_apko asks for the signature.
+        let cold = get(&[(header::RANGE, "bytes=0-99")]).send().await.unwrap();
+        assert_eq!(cold.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            cold.headers()[header::CONTENT_RANGE],
+            format!("bytes 0-99/{total}").as_str()
+        );
+        assert_eq!(&cold.bytes().await.unwrap()[..], &data[..100]);
+
+        // The fill outlives the client's window and commits the whole object.
+        tdh::wait_for_cache_commit(cache.path(), total as u64).await;
+
+        let warm = get(&[(header::RANGE, "bytes=100-199")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(warm.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            warm.headers()[header::CONTENT_RANGE],
+            format!("bytes 100-199/{total}").as_str()
+        );
+        assert_eq!(&warm.bytes().await.unwrap()[..], &data[100..200]);
+
+        let whole = get(&[]).send().await.unwrap();
+        assert_eq!(whole.status(), StatusCode::OK);
+        assert_eq!(whole.headers()[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(&whole.bytes().await.unwrap()[..], &data[..]);
+
+        // `If-Range`: the current ETag keeps the range, a stale one gets all.
+        let current = get(&[(header::RANGE, "bytes=0-9"), (header::IF_RANGE, ETAG)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(current.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&current.bytes().await.unwrap()[..], &data[..10]);
+        let stale = get(&[(header::RANGE, "bytes=0-9"), (header::IF_RANGE, "\"old\"")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::OK);
+        assert_eq!(&stale.bytes().await.unwrap()[..], &data[..]);
+
+        // HEAD ignores `Range`: a 200 describing the whole file, no body.
+        let head = client
+            .head(&url)
+            .header(header::RANGE, "bytes=0-99")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(
+            head.headers()[header::CONTENT_LENGTH],
+            total.to_string().as_str()
+        );
+        assert!(head.headers().get(header::CONTENT_RANGE).is_none());
+        assert!(head.bytes().await.unwrap().is_empty());
+
+        // Past the end is a 416 naming the length.
+        let past_end = format!("bytes={total}-");
+        let past = get(&[(header::RANGE, past_end.as_str())])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(past.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            past.headers()[header::CONTENT_RANGE],
+            format!("bytes */{total}").as_str()
+        );
+
+        let requests = upstream.received_requests().await.unwrap_or_default();
+        let _ = stop.send(());
+        fx.teardown().await;
+        assert_eq!(requests.len(), 1, "every serve after the cold one is a hit");
+        assert!(
+            requests.iter().all(|r| !r.headers.contains_key("range")),
+            "Range must not reach the upstream, so the cache fills whole"
+        );
+    }
+}
+
+/// #5622: the APKINDEX of a Virtual merges its hosted (Local/Staging)
+/// members' packages with its Remote members' upstream entries, and a member
+/// outage never reads as an empty `200` index.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+// Test reads of small, bounded bodies (#1608 exempts test scaffolding).
+#[allow(clippy::disallowed_methods)]
+mod virtual_apkindex_5622 {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::{header, StatusCode};
+    use wiremock::matchers::path_regex;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const DIR: &str = "v3.21/main/aarch64";
+
+    /// An upstream `APKINDEX.tar.gz` listing one package, `upstream-pkg`.
+    fn upstream_index() -> Vec<u8> {
+        let text = "C:Q1upstreamchecksumAAAAAAAAAAAAAAAA=\nP:upstream-pkg\nV:2.0-r0\n\
+                    A:aarch64\nS:100\nI:200\nT:upstream package\nU:\nL:MIT\n\n";
+        super::build_apkindex_segment(text, 0).expect("build upstream index")
+    }
+
+    /// The `APKINDEX` text of a served `APKINDEX.tar.gz`.
+    fn index_text(body: &[u8]) -> String {
+        let gz = flate2::read::MultiGzDecoder::new(body);
+        let mut archive = tar::Archive::new(gz);
+        for entry in archive.entries().expect("tar entries") {
+            let mut entry = entry.expect("tar entry");
+            if entry.path().expect("path").ends_with("APKINDEX") {
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut entry, &mut text).expect("read APKINDEX");
+                return text;
+            }
+        }
+        panic!("APKINDEX entry missing from the served tarball");
+    }
+
+    /// One member of the rig's public Virtual, in priority order: a hosted
+    /// repository (holding the marker package or empty) or a Remote pointing
+    /// at an upstream URL.
+    enum Member {
+        Hosted { with_package: bool },
+        Remote(String),
+    }
+
+    struct Rig {
+        fx: tdh::Fixture,
+        state: crate::api::SharedState,
+        virtual_key: String,
+        repos: Vec<(uuid::Uuid, std::path::PathBuf)>,
+        scratch: std::path::PathBuf,
+    }
+
+    impl Rig {
+        async fn new(members: &[Member]) -> Option<Self> {
+            let fx = tdh::Fixture::setup("local", "alpine").await?;
+            let pool = fx.pool.clone();
+            let (virtual_id, virtual_key, dir_v) =
+                tdh::create_repo(&pool, "virtual", "alpine").await;
+            tdh::publish_repo(&pool, virtual_id).await;
+            let mut repos = vec![(virtual_id, dir_v)];
+            let scratch = std::env::temp_dir().join(format!("apk5622-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&scratch).expect("create scratch dir");
+            let proxy = tdh::build_proxy_service_with_fs(pool.clone(), scratch.to_str().unwrap());
+            let state = tdh::build_state_with_proxy(pool.clone(), scratch.to_str().unwrap(), proxy);
+            let mut fixture_linked = false;
+            for (priority, member) in members.iter().enumerate() {
+                let id = match member {
+                    // The first hosted member is the fixture's own repository,
+                    // so the fixture user can upload to it.
+                    Member::Hosted { with_package } if !fixture_linked => {
+                        fixture_linked = true;
+                        if *with_package {
+                            let (status, _) = tdh::send(
+                                fx.router_with_auth(super::router()),
+                                tdh::put(
+                                    format!("/{}/{DIR}/dtf-marker-1.0-r0.apk", fx.repo_key),
+                                    bytes::Bytes::from_static(super::MARKER_APK),
+                                ),
+                            )
+                            .await;
+                            assert_eq!(status, StatusCode::CREATED, "seed hosted package");
+                        }
+                        fx.repo_id
+                    }
+                    Member::Hosted { .. } => panic!("one hosted member per rig"),
+                    Member::Remote(upstream) => {
+                        let (id, _, dir) = tdh::create_repo(&pool, "remote", "alpine").await;
+                        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+                            .bind(upstream)
+                            .bind(id)
+                            .execute(&pool)
+                            .await
+                            .expect("point remote upstream at mock");
+                        repos.push((id, dir));
+                        id
+                    }
+                };
+                tdh::publish_repo(&pool, id).await;
+                tdh::link_virtual_member(&pool, virtual_id, id, priority as i32).await;
+            }
+            Some(Self {
+                fx,
+                state,
+                virtual_key,
+                repos,
+                scratch,
+            })
+        }
+
+        async fn get_index(&self) -> (StatusCode, bytes::Bytes, axum::http::HeaderMap) {
+            tdh::send_with_headers(
+                tdh::router_anon(super::router(), self.state.clone()),
+                tdh::get(format!("/{}/{DIR}/APKINDEX.tar.gz", self.virtual_key)),
+            )
+            .await
+        }
+
+        async fn teardown(self) {
+            for (id, dir) in &self.repos {
+                tdh::cleanup_member_repo(&self.fx.pool, *id, dir).await;
+            }
+            let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE member_repo_id = $1")
+                .bind(self.fx.repo_id)
+                .execute(&self.fx.pool)
+                .await;
+            self.fx.teardown().await;
+            let _ = std::fs::remove_dir_all(&self.scratch);
+        }
+    }
+
+    /// An upstream that serves `upstream_index()` under `/ok/`, a 503 under
+    /// `/down/` and a 404 under `/miss/`.
+    async fn upstream() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(path_regex("^/ok/.*APKINDEX\\.tar\\.gz$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(upstream_index()))
+            .mount(&server)
+            .await;
+        Mock::given(path_regex("^/down/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        Mock::given(path_regex("^/miss/"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// (a) A hosted member's package is listed in the Virtual's index.
+    #[tokio::test]
+    async fn test_virtual_apkindex_lists_hosted_member_packages_5622() {
+        let Some(rig) = Rig::new(&[Member::Hosted { with_package: true }]).await else {
+            return;
+        };
+        let (status, body, _) = rig.get_index().await;
+        rig.teardown().await;
+        assert_eq!(status, StatusCode::OK);
+        let text = index_text(&body);
+        assert!(
+            text.contains("P:dtf-marker\n"),
+            "the hosted member's package must be indexed: {text:?}"
+        );
+        assert!(text.contains(&format!("C:{}\n", super::MARKER_APK_APK_TOOLS_CHECKSUM)));
+    }
+
+    /// (b) Hosted + Remote: both members' packages are listed, and a Remote
+    /// member that is down does not hide the hosted packages.
+    #[tokio::test]
+    async fn test_virtual_apkindex_merges_hosted_and_remote_members_5622() {
+        let server = upstream().await;
+        for (remote, upstream_listed) in [("ok", true), ("down", false)] {
+            let Some(rig) = Rig::new(&[
+                Member::Hosted { with_package: true },
+                Member::Remote(format!("{}/{remote}", server.uri())),
+            ])
+            .await
+            else {
+                return;
+            };
+            let (status, body, _) = rig.get_index().await;
+            rig.teardown().await;
+            assert_eq!(status, StatusCode::OK, "remote {remote}");
+            let text = index_text(&body);
+            assert!(
+                text.contains("P:dtf-marker\n"),
+                "remote {remote}: hosted package missing: {text:?}"
+            );
+            assert_eq!(
+                text.contains("P:upstream-pkg\n"),
+                upstream_listed,
+                "remote {remote}: upstream package: {text:?}"
+            );
+        }
+    }
+
+    /// (c) Every member unavailable answers a retryable 503, never a `200`
+    /// with an empty index; members that all answer definitively keep the
+    /// empty index.
+    #[tokio::test]
+    async fn test_virtual_apkindex_member_outage_answers_503_not_empty_5622() {
+        let server = upstream().await;
+        let at = |prefix: &str| Member::Remote(format!("{}/{prefix}", server.uri()));
+        // Nothing listens on port 1: a transport failure, not an HTTP answer.
+        let refused = || Member::Remote("http://127.0.0.1:1".to_string());
+        for (case, members) in [
+            ("all remotes down", vec![at("down"), refused()]),
+            (
+                "empty hosted + remote down",
+                vec![
+                    Member::Hosted {
+                        with_package: false,
+                    },
+                    at("down"),
+                ],
+            ),
+        ] {
+            let Some(rig) = Rig::new(&members).await else {
+                return;
+            };
+            let (status, body, headers) = rig.get_index().await;
+            rig.teardown().await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{case}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert!(
+                headers.contains_key(header::RETRY_AFTER),
+                "{case}: the 503 must carry Retry-After"
+            );
+        }
+
+        let Some(rig) = Rig::new(&[at("miss"), at("miss")]).await else {
+            return;
+        };
+        let (status, body, _) = rig.get_index().await;
+        rig.teardown().await;
+        assert_eq!(status, StatusCode::OK, "all members answered 404");
+        assert_eq!(index_text(&body), "", "definitive misses: an empty index");
     }
 }

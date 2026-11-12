@@ -1082,6 +1082,15 @@ async fn authenticate_with_token(
                 .body(Body::from("Invalid token"))
                 .unwrap()
         })?;
+    // #5484: this is a password check for the user named "token"; an account
+    // with TOTP enrolled must present an API token instead.
+    if crate::api::middleware::auth::format_route_password_refusal(&user).is_some() {
+        return Err(Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("WWW-Authenticate", "Basic realm=\"conda\"")
+            .body(Body::from("Invalid token"))
+            .unwrap());
+    }
 
     Ok(user.id)
 }
@@ -1143,6 +1152,63 @@ fn is_withdrawn(
     .is_err()
 }
 
+/// The rows of `ids`, visible by their quarantine fields, that a scan policy
+/// on `repo_id` blocks (#4288 item 1, #4978 item 6): the download gate
+/// answers 403 for them, so no generated index lists them.
+/// [`quarantine_service::listing_refusals`] decides, cached; a repository no
+/// enabled policy applies to costs one cached lookup. The quarantine half is
+/// already decided by the caller at the database instant, so it is not
+/// decided again here at the application's.
+///
+/// [`quarantine_service::listing_refusals`]: crate::services::quarantine_service::listing_refusals
+async fn policy_refused(
+    db: &sqlx::PgPool,
+    repo_id: uuid::Uuid,
+    ids: &[uuid::Uuid],
+) -> Result<HashSet<uuid::Uuid>, Response> {
+    if ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let candidates: Vec<crate::services::quarantine_service::ListingCandidate<'_>> = ids
+        .iter()
+        .map(|id| crate::services::quarantine_service::ListingCandidate {
+            artifact_id: *id,
+            quarantine_status: None,
+            quarantine_until: None,
+        })
+        .collect();
+    crate::services::quarantine_service::listing_refusals(db, repo_id, &candidates)
+        .await
+        .map_err(|e| {
+            tracing::error!(repo_id = %repo_id, error = %e, "conda listing: scan policy lookup failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        })
+}
+
+/// [`quarantine_service::listing_policy_epoch`] of `repo_id`: `None` when no
+/// scan policy applies to it, else the epoch its listings are cached under.
+///
+/// [`quarantine_service::listing_policy_epoch`]: crate::services::quarantine_service::listing_policy_epoch
+pub(crate) async fn listing_policy_epoch(
+    db: &sqlx::PgPool,
+    repo_id: uuid::Uuid,
+) -> Result<Option<u64>, Response> {
+    crate::services::quarantine_service::listing_policy_epoch(db, repo_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(repo_id = %repo_id, error = %e, "conda listing: scan policy lookup failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        })
+}
+
+/// Add a member's [`listing_policy_epoch`] to a merge key.
+fn policy_epoch_part(key: &mut merge_gate::MergeKeyBuilder, epoch: Option<u64>) {
+    match epoch {
+        Some(epoch) => key.part(b"policy").part(&epoch.to_le_bytes()),
+        None => key.part(b"no-policy"),
+    };
+}
+
 async fn list_conda_artifacts(
     db: &sqlx::PgPool,
     repo_id: uuid::Uuid,
@@ -1181,9 +1247,16 @@ async fn list_conda_artifacts_at(
     // bz2/zst/sig encodings, JLAP, CEP-16 shards, run_exports, channeldata)
     // is built from THIS listing, so the withdrawal filter lives here and
     // only here — one predicate, no per-endpoint copies to drift.
-    Ok(rows
+    let rows: Vec<CondaArtifactRow> = rows
         .into_iter()
         .filter(|r| !is_withdrawn(r.quarantine_status.as_deref(), r.quarantine_until, now))
+        .collect();
+    // #4288 item 1 / #4978 item 6: and nothing a scan policy blocks.
+    let ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.id).collect();
+    let refused = policy_refused(db, repo_id, &ids).await?;
+    Ok(rows
+        .into_iter()
+        .filter(|r| !refused.contains(&r.id))
         .map(|r| CondaArtifact {
             id: r.id,
             path: r.path,
@@ -2254,6 +2327,7 @@ async fn proxy_plain_repodata_document(
         upstream_url,
         &upstream_path,
         RepodataEncoding::Json.content_type(),
+        ctx.is_head,
     )
     .await?;
     // #3649: count the proxied serve once the streaming helper resolves, on
@@ -2595,6 +2669,7 @@ async fn serve_repodata(
                                 upstream_url,
                                 &upstream_path,
                                 ct,
+                                ctx.is_head,
                             )
                             .await?;
                             // #3649: count the proxied serve. The streaming helper
@@ -3828,7 +3903,7 @@ struct MergedShardIndex {
     /// Remote names the allowlist left out; `None` when none is enforced.
     allowlist_dropped: Option<usize>,
     /// Names a hosted member owns, lower-cased.
-    owned: HashSet<String>,
+    owned: std::sync::Arc<HashSet<String>>,
     allowlist: Option<std::sync::Arc<crate::services::conda_allowlist::CompiledAllowlist>>,
 }
 
@@ -4204,6 +4279,14 @@ async fn build_virtual_shard_index(
                         member_not_allowed,
                     );
                 }
+                // No member to serve and one that could not answer (#5621).
+                if let Some(unavailable) = virtual_merge::nothing_contributed(
+                    hosted_ids.len(),
+                    !merged.remotes.is_empty(),
+                    &merged.failed,
+                ) {
+                    return Err(unavailable);
+                }
                 if dropped.owned > 0 {
                     tracing::info!(
                         virtual_repo = %virtual_repo_key,
@@ -4331,7 +4414,10 @@ async fn hosted_member_revisions(
     let mut now = chrono::Utc::now();
     for id in ids {
         let state = shard_store::subdir_state(db, *id, subdir).await?;
-        if !state.backfilled {
+        // Stored shards carry no scan-policy decision (#4978 item 6): a
+        // member a policy applies to is merged from its rows, through the
+        // listing that leaves policy-blocked packages out.
+        if !state.backfilled || listing_policy_epoch(db, *id).await?.is_some() {
             return Ok(None);
         }
         now = state.now;
@@ -4736,8 +4822,10 @@ async fn check_shard_record_names(
 ///   does not decode) is a 502 naming the member, never a 404 that would
 ///   tell the client the package does not exist.
 /// - Not listed because the policy refused it (hosted-owned name, allowlist):
-///   404, logged at `info`. Not listed and a member failed to merge: 502, the
-///   shard may be that member's. Otherwise: an unknown address, 404.
+///   404, logged at `info`. Not listed and a member failed to merge: 502
+///   when its index could not be used, 503 with `Retry-After` when it could
+///   not answer (#5621); the shard may be that member's. Otherwise: an
+///   unknown address, 404.
 async fn serve_virtual_shard(
     state: &SharedState,
     auth: Option<&AuthExtension>,
@@ -4779,13 +4867,16 @@ async fn serve_virtual_shard(
         }
         if !merged.failed.is_empty() {
             // The shard may be the failed member's; a 404 would tell the
-            // client the package does not exist.
+            // client the package does not exist. A member whose index could
+            // not be used is the strict 502; one that could not answer makes
+            // the answer a retryable 503 (#5621).
             virtual_merge::apply_failure_policy(
                 virtual_merge::FailurePolicy::Strict,
                 &repo.key,
                 &document,
                 &merged.failed,
             )?;
+            return Err(proxy_helpers::member_unavailable_response());
         }
         tracing::debug!(
             virtual_repo = %repo.key,
@@ -4816,18 +4907,15 @@ async fn serve_virtual_shard(
     };
     let member = &merged.remotes[position];
     let member_failure = |kind: &'static str, reason: String| {
-        virtual_merge::apply_failure_policy(
-            virtual_merge::FailurePolicy::Strict,
+        virtual_merge::member_object_failure(
             &repo.key,
             &document,
-            &[virtual_merge::MemberFailure {
+            virtual_merge::MemberFailure {
                 member: member.key.clone(),
                 kind,
                 reason,
-            }],
+            },
         )
-        .err()
-        .unwrap_or_else(|| virtual_merge::internal_error("strict policy served a failure"))
     };
     let Some(shards_base) = member.shards_base.as_ref() else {
         // A member whose shards are synthesised (#4178): the stored shard,
@@ -5424,30 +5512,98 @@ fn conda_name_from_filename(filename: &str) -> Option<&str> {
 /// impostor. Every non-deleted row counts, including withdrawn ones, because a
 /// withdrawn internal package must not hand its name to the upstream either.
 /// Fails closed: a database error is a 500, never an unguarded merge.
+///
+/// The set is kept per virtual under its hosted members' revisions (#4978
+/// item 1), so a virtual request (a shard GET included) reads one row per
+/// hosted member instead of every row of every hosted member. Every write
+/// that can move the set marks a key of its member dirty in the writer's own
+/// transaction (a row with no subdir marks the `''` key), and the member's
+/// revision moves when that key is rebuilt, which [`shard_store::member_revisions`]
+/// does before it answers. A member the catalog triggers do not cover (not a
+/// hosted conda repository) keeps the per-request read.
 async fn virtual_hosted_owned_names(
     db: &sqlx::PgPool,
     virtual_repo_id: uuid::Uuid,
-) -> Result<std::collections::HashSet<String>, Response> {
+) -> Result<std::sync::Arc<std::collections::HashSet<String>>, Response> {
     // UNFILTERED-ENFORCEMENT (#3323): this walk decides name ownership (a
     // shadowing guard), not a response body; narrowing it by caller visibility
     // would let a caller who cannot read the hosted member be offered the
     // upstream impostor.
     let members = proxy_helpers::fetch_virtual_members(db, virtual_repo_id).await?;
-    let hosted_ids: Vec<uuid::Uuid> = members
+    let hosted: Vec<&crate::models::repository::Repository> = members
         .iter()
         .filter(|m| m.repo_type != RepositoryType::Remote)
-        .map(|m| m.id)
         .collect();
-    if hosted_ids.is_empty() {
+    if hosted.is_empty() {
         return Ok(Default::default());
     }
+    let hosted_ids: Vec<uuid::Uuid> = hosted.iter().map(|m| m.id).collect();
+    let tracked = hosted.iter().all(|m| {
+        matches!(
+            m.format,
+            RepositoryFormat::Conda | RepositoryFormat::CondaNative
+        ) && matches!(m.repo_type, RepositoryType::Local | RepositoryType::Staging)
+    });
+    if !tracked {
+        return query_hosted_owned_names(db, virtual_repo_id, &hosted_ids)
+            .await
+            .map(std::sync::Arc::new);
+    }
+    let revisions = shard_store::member_revisions(db, &hosted_ids).await?;
+    let cache = owned_names_cache();
+    if let Some(kept) = cache.get(&virtual_repo_id).await {
+        if kept.0 == revisions {
+            return Ok(kept.1.clone());
+        }
+    }
+    // Read after the revisions: a write that commits in between is at most
+    // already in the set, and it moves a revision for the next request.
+    let names =
+        std::sync::Arc::new(query_hosted_owned_names(db, virtual_repo_id, &hosted_ids).await?);
+    cache
+        .insert(
+            virtual_repo_id,
+            std::sync::Arc::new((revisions, names.clone())),
+        )
+        .await;
+    Ok(names)
+}
+
+/// Owned-name sets kept per virtual, with the hosted member revisions they
+/// were read at ([`virtual_hosted_owned_names`]).
+type OwnedNames = (
+    Vec<(uuid::Uuid, i64)>,
+    std::sync::Arc<std::collections::HashSet<String>>,
+);
+
+fn owned_names_cache() -> &'static moka::future::Cache<uuid::Uuid, std::sync::Arc<OwnedNames>> {
+    static CACHE: std::sync::OnceLock<moka::future::Cache<uuid::Uuid, std::sync::Arc<OwnedNames>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        moka::future::Cache::builder()
+            // Weighed by names held; a large hosted channel owns tens of
+            // thousands of names.
+            .weigher(|_, v: &std::sync::Arc<OwnedNames>| {
+                u32::try_from(v.1.len().max(1)).unwrap_or(u32::MAX)
+            })
+            .max_capacity(2_000_000)
+            .build()
+    })
+}
+
+/// [`virtual_hosted_owned_names`]' read of the hosted members' rows.
+async fn query_hosted_owned_names(
+    db: &sqlx::PgPool,
+    virtual_repo_id: uuid::Uuid,
+    hosted_ids: &[uuid::Uuid],
+) -> Result<std::collections::HashSet<String>, Response> {
     let names: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT LOWER(COALESCE(am.metadata->>'name', a.name)) \
          FROM artifacts a \
          LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
          WHERE a.repository_id = ANY($1) AND a.is_deleted = false",
     )
-    .bind(&hosted_ids)
+    .bind(hosted_ids)
     .fetch_all(db)
     .await
     .map_err(|e| {
@@ -5581,7 +5737,7 @@ struct VirtualMergeInputs {
     /// Caller-authorized members, in priority order (#3323).
     members: Vec<crate::models::repository::Repository>,
     /// Names hosted members own (the dependency-confusion guard).
-    owned: std::collections::HashSet<String>,
+    owned: std::sync::Arc<std::collections::HashSet<String>>,
     allowlist: Option<std::sync::Arc<crate::services::conda_allowlist::CompiledAllowlist>>,
     key: merge_gate::MergeKeyBuilder,
 }
@@ -5819,9 +5975,12 @@ where
     let mut hosted_now = chrono::Utc::now();
     key.part(&(hosted_members.len() as u64).to_le_bytes());
     for (id, _) in &hosted_members {
-        let state = shard_store::subdir_state(&state.db, *id, subdir).await?;
-        hosted_now = state.now;
-        key.part(id.as_bytes()).part(&state.revision.to_le_bytes());
+        let member_state = shard_store::subdir_state(&state.db, *id, subdir).await?;
+        hosted_now = member_state.now;
+        key.part(id.as_bytes())
+            .part(&member_state.revision.to_le_bytes());
+        // #4978 item 6: a scan-policy decision moves with no revision.
+        policy_epoch_part(&mut key, listing_policy_epoch(&state.db, *id).await?);
     }
 
     let db = state.db.clone();
@@ -5868,7 +6027,7 @@ where
                         });
                     }
                 }
-                let (documents, mut failed) = virtual_merge::fetch_remote_members(
+                let (documents, mut failed, published) = virtual_merge::fetch_remote_members(
                     proxy.as_deref(),
                     &members,
                     &candidates,
@@ -5877,6 +6036,14 @@ where
                     &mut account,
                 )
                 .await;
+                // No member to serve and one that could not answer: 503, not
+                // an empty subdir (#5621). Not kept, so the next request
+                // merges again.
+                if let Some(unavailable) =
+                    virtual_merge::nothing_contributed(hosted_members.len(), published, &failed)
+                {
+                    return Err(unavailable);
+                }
                 let decoded_bytes: usize = documents.iter().map(|d| d.json.len()).sum();
                 account.track(merge_gate::merge_working_set(decoded_bytes, plain_json));
                 let all_validated = documents.iter().all(|d| d.validator.is_some());
@@ -6070,9 +6237,12 @@ async fn build_virtual_channeldata(
     let mut hosted_now = chrono::Utc::now();
     key.part(&(hosted_members.len() as u64).to_le_bytes());
     for (id, _) in &hosted_members {
-        let state = shard_store::repo_state(&state.db, *id).await?;
-        hosted_now = state.now;
-        key.part(id.as_bytes()).part(&state.revision.to_le_bytes());
+        let member_state = shard_store::repo_state(&state.db, *id).await?;
+        hosted_now = member_state.now;
+        key.part(id.as_bytes())
+            .part(&member_state.revision.to_le_bytes());
+        // #4978 item 6: a scan-policy decision moves with no revision.
+        policy_epoch_part(&mut key, listing_policy_epoch(&state.db, *id).await?);
     }
 
     let db = state.db.clone();
@@ -6135,7 +6305,7 @@ async fn build_virtual_channeldata(
                 // A member whose upstream publishes no channeldata.json (404)
                 // contributes no entries; only a real failure (5xx, timeout,
                 // cap, parse) fails the merge (#4601).
-                let (documents, mut failed) = virtual_merge::fetch_remote_members(
+                let (documents, mut failed, published) = virtual_merge::fetch_remote_members(
                     proxy.as_deref(),
                     &members,
                     &virtual_merge::channeldata_candidates(),
@@ -6144,6 +6314,12 @@ async fn build_virtual_channeldata(
                     &mut account,
                 )
                 .await;
+                // As for repodata (#5621): nothing to serve and a member down.
+                if let Some(unavailable) =
+                    virtual_merge::nothing_contributed(hosted_members.len(), published, &failed)
+                {
+                    return Err(unavailable);
+                }
                 let decoded_bytes: usize = documents.iter().map(|d| d.json.len()).sum();
                 account.track(merge_gate::merge_working_set(decoded_bytes, true));
                 let all_validated = documents.iter().all(|d| d.validator.is_some());
@@ -6204,9 +6380,10 @@ async fn build_virtual_channeldata(
         .map_err(merge_gate::SharedResponse::into_response)
 }
 
-/// Apply the virtual's member-failure policy (#4192) to a merge: `Ok(None)`
-/// when every member contributed, `Ok(Some(members))` for a degraded merge the
-/// virtual opted in to serving, or the strict 502.
+/// Apply the virtual's member-failure policy (#4192, #5621) to a merge:
+/// `Ok(None)` when every member contributed, `Ok(Some(members))` for a
+/// degraded merge (a member that could not answer, or one whose document
+/// could not be used when the virtual opted in), or the strict 502.
 async fn virtual_merge_failure_policy(
     db: &sqlx::PgPool,
     virtual_repo_id: uuid::Uuid,
@@ -6223,7 +6400,9 @@ async fn virtual_merge_failure_policy(
 }
 
 /// Serve a virtual merge under the repository's member-failure policy
-/// (#4192): strict by default (502 naming the failed members), or a degraded
+/// (#4192, #5621): a member that could not answer is left out and the
+/// document marked partial; a member whose document could not be used is
+/// strict by default (502 naming the failed members), or a degraded
 /// document marked partial and uncacheable when the virtual opts in through
 /// `repository_config` key [`proxy_helpers::VIRTUAL_METADATA_PARTIAL_CONFIG_KEY`].
 ///
@@ -6838,6 +7017,7 @@ async fn download_package(
                             conda_package_content_type(&filename),
                             Some(&filename),
                             crate::models::repository::RepositoryFormat::Conda,
+                            ctx.is_head,
                         )
                         .await?;
                     // #4579: a catalogued package is immutable and answers from
@@ -6919,13 +7099,13 @@ async fn download_package(
                 // empty one (#3452), as `resolve_virtual_download` does.
                 let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
                 let had_members = !members.is_empty();
-                let members = proxy_helpers::authorize_virtual_members(
+                let members = proxy_helpers::try_authorize_virtual_members(
                     &state.db,
                     auth.as_ref(),
                     repo.id,
                     members,
                 )
-                .await;
+                .await?;
                 if had_members && members.is_empty() {
                     return Err(proxy_helpers::no_accessible_members_response());
                 }
@@ -7046,10 +7226,7 @@ async fn download_package(
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
-        .map_err(|e| {
-            tracing::error!("Storage error reading conda package: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-        })?;
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
@@ -7213,6 +7390,7 @@ impl proxy_helpers::ScannedProxyFile for CondaScannedPackage<'_> {
             conda_package_content_type(req.filename),
             Some(req.filename),
             crate::models::repository::RepositoryFormat::Conda,
+            req.is_head(),
         )
         .await
     }
@@ -7292,6 +7470,7 @@ where
     if policies.iter().all(Option::is_none) {
         return None;
     }
+    let mut failures = proxy_helpers::MemberWalkFailures::default();
     let mut unscanned = Vec::new();
     for (member, policy) in members.iter().zip(policies) {
         let (Some(policy), Some(upstream_url)) = (policy, member.upstream_url.as_deref()) else {
@@ -7299,7 +7478,9 @@ where
             continue;
         };
         let run = std::mem::take(&mut unscanned);
-        if let Some(served) = resolve_unscanned_conda_run(proxy, run, target, local_fetch).await {
+        if let Some(served) =
+            failures.run_answer(resolve_unscanned_conda_run(proxy, run, target, local_fetch).await)
+        {
             return Some(served);
         }
         match serve_scanned_conda_package(
@@ -7320,6 +7501,7 @@ where
                 return Some(Err(resp))
             }
             Err(resp) => {
+                failures.note(&resp);
                 tracing::debug!(
                     member_key = %member.key, status = %resp.status(),
                     "scanned conda virtual member did not serve; trying next member"
@@ -7327,11 +7509,7 @@ where
             }
         }
     }
-    Some(
-        resolve_unscanned_conda_run(proxy, unscanned, target, local_fetch)
-            .await
-            .unwrap_or_else(|| Err(proxy_helpers::member_miss_response())),
-    )
+    Some(failures.finish(resolve_unscanned_conda_run(proxy, unscanned, target, local_fetch).await))
 }
 
 /// A run of non-scanning members inside the scanned walk, through the shared
@@ -7367,8 +7545,7 @@ where
             conda_package_content_type(target.filename),
             Some(target.filename),
         )),
-        Err(resp) if proxy_helpers::is_member_policy_block_response(&resp) => Some(Err(resp)),
-        Err(_) => None,
+        Err(resp) => proxy_helpers::unscanned_run_failure(resp),
     }
 }
 
@@ -8942,13 +9119,10 @@ async fn store_attestation(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let mut stream = storage.get_stream(&storage_key).await.map_err(|e| {
-        tracing::error!(
-            "Storage error reading conda package for attestation verification: {}",
-            e
-        );
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
+    let mut stream = storage
+        .get_stream(&storage_key)
+        .await
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
     let mut artifact_digest = Sha256::new();
     {
         use futures::StreamExt;
@@ -9465,9 +9639,10 @@ async fn proxy_sidecar(
 /// refuses under record-only), the sidecar is refused with the package's
 /// `scan_blocked` body. With no cached package or no verdict yet there is
 /// nothing to follow, and the sidecar is served; the package download itself
-/// is gated.
+/// is gated. A refusal is audited and counted as the gate's own is (#4987).
 async fn sidecar_blocked_by_package_verdict(
     state: &SharedState,
+    repo_id: uuid::Uuid,
     repo_key: &str,
     policy: Option<proxy_helpers::MemberScanPolicy>,
     subdir: &str,
@@ -9499,7 +9674,12 @@ async fn sidecar_blocked_by_package_verdict(
         digest = %cached.checksum_sha256,
         "refusing a conda attestation sidecar: its package has a blocking scan verdict"
     );
-    Some(proxy_helpers::scan_blocked_response(filename))
+    Some(proxy_helpers::audited_scan_blocked_response(
+        &state.db,
+        repo_id,
+        filename,
+        &cached.checksum_sha256,
+    ))
 }
 
 /// `GET /conda/{repo}/{subdir}/{file}.sigs[.<sha256>]` (CEP-50).
@@ -9524,9 +9704,10 @@ async fn serve_sidecar(
     if repo.repo_type == RepositoryType::Remote {
         // #4585: the sidecar follows its package's verdict.
         let policy = proxy_helpers::remote_scan_policy(&state.db, repo.id).await?;
-        if let Some(blocked) =
-            sidecar_blocked_by_package_verdict(state, &repo.key, policy, subdir, filename, &request)
-                .await
+        if let Some(blocked) = sidecar_blocked_by_package_verdict(
+            state, repo.id, &repo.key, policy, subdir, filename, &request,
+        )
+        .await
         {
             return Err(blocked);
         }
@@ -9564,6 +9745,7 @@ async fn serve_sidecar(
                 }
                 if let Some(blocked) = sidecar_blocked_by_package_verdict(
                     state,
+                    member.id,
                     &member.key,
                     policy,
                     subdir,
@@ -10049,7 +10231,7 @@ async fn store_conda_package(
         .map_err(|e| {
             // #4609: a full disk is the server's capacity, not a bad request
             // and not an opaque 500: 507 + Retry-After, logged with the cause.
-            super::upload_body::disk_full_response(&e).unwrap_or_else(|| {
+            super::upload_body::storage_failure_response(&e).unwrap_or_else(|| {
                 tracing::error!("Storage error writing conda package: {}", e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
             })
@@ -10196,6 +10378,7 @@ async fn store_conda_package(
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         "conda",
         &pkg_name,
@@ -15282,6 +15465,68 @@ mod tests {
         };
 
         assertions.await;
+        fx.teardown().await;
+    }
+
+    /// #5685: the download of a hosted package (`download_package`'s
+    /// `get_stream`) against a store that is down answers `503` with
+    /// `Retry-After`, and against one that is full `507` without it, with no
+    /// backend text in the body. It answered a hard-coded `500`.
+    #[tokio::test]
+    async fn package_download_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+        let filename = "outage5685-1.0-0.tar.bz2";
+        let path = format!("noarch/{filename}");
+        let storage_key = format!("conda/{}/{}", fx.repo_id, path);
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &storage_key,
+            &path,
+            "outage5685",
+            "1.0",
+            "application/x-tar",
+            Bytes::from_static(b"fake-conda-package-bytes-5685"),
+            fx.user_id,
+        )
+        .await;
+
+        for (message, want) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&fx.pool, &fx.state, fx.repo_id, &message).await;
+            let app = tdh::router_with_auth(
+                super::router(),
+                state,
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let (status, body, headers) = tdh::send_with_headers(
+                app,
+                tdh::get(format!("/{}/noarch/{filename}", fx.repo_key)),
+            )
+            .await;
+            assert_eq!(status, want, "{}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want == StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            tdh::assert_no_storage_backend_text("conda package GET", &body);
+        }
         fx.teardown().await;
     }
 
@@ -21905,38 +22150,294 @@ mod virtual_channel_tests {
         server
     }
 
-    /// F3 (#4192): by default a member that cannot be fetched fails the
-    /// virtual request with 502 naming the member, for repodata and
-    /// channeldata alike, instead of serving a smaller index with 200.
+    /// #5621 (was F3, #4192, a 502): by default a member that cannot be
+    /// fetched (an upstream 500) is left out, for repodata and channeldata
+    /// alike: the hosted member's records are served, marked partial and
+    /// uncacheable, instead of failing the request.
     #[tokio::test]
-    async fn failed_member_fails_the_virtual_request_by_default() {
+    async fn unavailable_member_is_left_out_and_marked_partial_by_default_5621() {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
         let server = broken_upstream().await;
         let rig = VirtualRig::new(pool, &server.uri()).await;
         seed_hosted_record(&rig.pool, rig.hosted_id, "noarch", "acme-core-1.0-0.conda").await;
-        let remote_key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
-            .bind(rig.remote_id)
-            .fetch_one(&rig.pool)
-            .await
-            .unwrap();
-        let (status, body, _) = rig
+        let remote_key = rig.remote_key.clone();
+        let (status, body, headers) = rig
             .get(format!("/{}/noarch/repodata.json", rig.virtual_key))
             .await;
-        let (cd_status, cd_body, _) = rig
+        let (cd_status, cd_body, cd_headers) = rig
             .get(format!("/{}/channeldata.json", rig.virtual_key))
             .await;
         rig.cleanup().await;
 
-        let body = String::from_utf8_lossy(&body);
-        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-        assert!(
-            body.contains(&remote_key),
-            "the 502 must name the member: {body}"
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed(&doc), vec!["acme-core-1.0-0.conda"]);
+        assert_partial_5621(&headers, &remote_key);
+        assert_eq!(
+            cd_status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&cd_body)
         );
-        assert_eq!(cd_status, StatusCode::BAD_GATEWAY);
-        assert!(String::from_utf8_lossy(&cd_body).contains(&remote_key));
+        assert_partial_5621(&cd_headers, &remote_key);
+    }
+
+    fn assert_partial_5621(headers: &HeaderMap, missing: &str) {
+        assert_eq!(
+            headers
+                .get(proxy_helpers::PARTIAL_MEMBERS_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(missing)
+        );
+        assert_eq!(
+            headers.get(CACHE_CONTROL).and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        assert!(headers.get("warning").is_some());
+        assert!(headers.get(ETAG).is_none());
+    }
+
+    /// A public virtual over Remote members only, one per upstream, in
+    /// priority order (#5621). Returns the virtual's key, the member keys and
+    /// the state; `cleanup_remote_only` removes everything.
+    async fn remote_only_virtual_5621(
+        pool: &sqlx::PgPool,
+        upstreams: &[String],
+    ) -> (
+        uuid::Uuid,
+        String,
+        Vec<(uuid::Uuid, String)>,
+        crate::api::SharedState,
+        tempfile::TempDir,
+    ) {
+        let (virtual_id, virtual_key, _vd) = tdh::create_repo(pool, "virtual", "conda").await;
+        tdh::publish_repo(pool, virtual_id).await;
+        let mut members = Vec::new();
+        for (i, upstream) in upstreams.iter().enumerate() {
+            let (id, key, _d) = tdh::create_repo(pool, "remote", "conda").await;
+            sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+                .bind(upstream)
+                .bind(id)
+                .execute(pool)
+                .await
+                .expect("point remote at mock upstream");
+            tdh::publish_repo(pool, id).await;
+            tdh::link_virtual_member(pool, virtual_id, id, i as i32 + 1).await;
+            members.push((id, key));
+        }
+        let cache = tempfile::tempdir().expect("proxy cache tempdir");
+        let root = cache.path().to_str().expect("utf8 tempdir").to_string();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), &root);
+        let state = tdh::build_state_with_proxy(pool.clone(), &root, proxy);
+        (virtual_id, virtual_key, members, state, cache)
+    }
+
+    async fn cleanup_remote_only(
+        pool: &sqlx::PgPool,
+        virtual_id: uuid::Uuid,
+        members: &[(uuid::Uuid, String)],
+    ) {
+        for id in std::iter::once(virtual_id).chain(members.iter().map(|(id, _)| *id)) {
+            let _ = sqlx::query(
+                "DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1 OR member_repo_id = $1",
+            )
+            .bind(id)
+            .execute(pool)
+            .await;
+            let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+    }
+
+    /// An upstream publishing only the plain `noarch/repodata.json` (the
+    /// compressed encodings 404) listing `filenames`.
+    async fn plain_repodata_upstream_5621(filenames: &[&str]) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(upstream_repodata("noarch", filenames)),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// An upstream answering `status` for everything.
+    async fn status_upstream_5621(status: u16) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn get_5621(
+        state: &crate::api::SharedState,
+        uri: String,
+    ) -> (StatusCode, Bytes, HeaderMap) {
+        tdh::send_with_headers(tdh::router_anon(router(), state.clone()), tdh::get(uri)).await
+    }
+
+    /// #5621: [503 member, healthy member] serves the healthy member's
+    /// records with 200, marked partial; [401/403/451 member, healthy member]
+    /// serves them complete (a permanent answer is a miss, #5504).
+    #[tokio::test]
+    async fn remote_member_outcomes_in_the_merge_5621() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        for code in [503u16, 401, 403, 451] {
+            let first = status_upstream_5621(code).await;
+            let good = plain_repodata_upstream_5621(&["rich-13.0-pyh_0.conda"]).await;
+            let (virtual_id, virtual_key, members, state, _cache) =
+                remote_only_virtual_5621(&pool, &[first.uri(), good.uri()]).await;
+            let (status, body, headers) =
+                get_5621(&state, format!("/{virtual_key}/noarch/repodata.json")).await;
+            cleanup_remote_only(&pool, virtual_id, &members).await;
+
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{code}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(listed(&doc), vec!["rich-13.0-pyh_0.conda"], "{code}");
+            if code == 503 {
+                assert_partial_5621(&headers, &members[0].1);
+            } else {
+                assert!(
+                    headers.get(proxy_helpers::PARTIAL_MEMBERS_HEADER).is_none(),
+                    "{code}: a permanent answer is not a partial merge"
+                );
+            }
+        }
+    }
+
+    /// #5621: with every member unavailable, repodata.json and
+    /// channeldata.json are a retryable 503 with `Retry-After`, never a 502
+    /// or an empty channel.
+    #[tokio::test]
+    async fn only_unavailable_members_answer_503_5621() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let down = status_upstream_5621(503).await;
+        let (virtual_id, virtual_key, members, state, _cache) =
+            remote_only_virtual_5621(&pool, &[down.uri()]).await;
+        let mut answers = Vec::new();
+        for uri in [
+            format!("/{virtual_key}/noarch/repodata.json"),
+            format!("/{virtual_key}/channeldata.json"),
+        ] {
+            answers.push((uri.clone(), get_5621(&state, uri).await));
+        }
+        cleanup_remote_only(&pool, virtual_id, &members).await;
+
+        for (uri, (status, body, headers)) in answers {
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{uri}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert!(
+                headers.get(axum::http::header::RETRY_AFTER).is_some(),
+                "{uri}: the 503 must carry Retry-After"
+            );
+        }
+    }
+
+    /// #5621: a member that does not answer within the virtual member
+    /// deadline is left out promptly (the conda merge used to wait for the
+    /// upstream client's own timeout, 60 s), and the healthy member is
+    /// served, marked partial.
+    #[tokio::test]
+    async fn stalled_member_is_left_out_within_the_deadline_5621() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let stalled = tdh::SilentUpstream::start().await;
+        let good = plain_repodata_upstream_5621(&["rich-13.0-pyh_0.conda"]).await;
+        let (virtual_id, virtual_key, members, state, _cache) =
+            remote_only_virtual_5621(&pool, &[stalled.uri(), good.uri()]).await;
+        let started = std::time::Instant::now();
+        let (status, body, headers) = proxy_helpers::with_virtual_member_deadline(
+            // #5823: generous, so the healthy member (an immediate local answer)
+            // is always inside it; the stalled member never answers at all.
+            std::time::Duration::from_secs(5),
+            get_5621(&state, format!("/{virtual_key}/noarch/repodata.json")),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        cleanup_remote_only(&pool, virtual_id, &members).await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed(&doc), vec!["rich-13.0-pyh_0.conda"]);
+        assert_partial_5621(&headers, &members[0].1);
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "the member deadline must bound the wait: took {elapsed:?}"
+        );
+    }
+
+    /// #4192 still holds for a member whose document cannot be read: an
+    /// upstream `repodata.json` that is not JSON fails the merge with 502
+    /// naming the member by default, and is left out (partial) when the
+    /// virtual opted in with `virtual_metadata_partial`.
+    #[tokio::test]
+    async fn unparseable_member_is_strict_unless_opted_in_4192_5621() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        for opted_in in [false, true] {
+            let garbage = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(wm_path("/noarch/repodata.json"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+                .mount(&garbage)
+                .await;
+            let good = plain_repodata_upstream_5621(&["rich-13.0-pyh_0.conda"]).await;
+            let (virtual_id, virtual_key, members, state, _cache) =
+                remote_only_virtual_5621(&pool, &[garbage.uri(), good.uri()]).await;
+            if opted_in {
+                sqlx::query(
+                    "INSERT INTO repository_config (repository_id, key, value) \
+                     VALUES ($1, $2, 'true')",
+                )
+                .bind(virtual_id)
+                .bind(proxy_helpers::VIRTUAL_METADATA_PARTIAL_CONFIG_KEY)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            let (status, body, headers) =
+                get_5621(&state, format!("/{virtual_key}/noarch/repodata.json")).await;
+            cleanup_remote_only(&pool, virtual_id, &members).await;
+
+            let text = String::from_utf8_lossy(&body);
+            if opted_in {
+                assert_eq!(status, StatusCode::OK, "{text}");
+                assert_partial_5621(&headers, &members[0].1);
+            } else {
+                assert_eq!(status, StatusCode::BAD_GATEWAY, "{text}");
+                assert!(
+                    text.contains(&members[0].1),
+                    "the 502 names the member: {text}"
+                );
+            }
+        }
     }
 
     /// F3 (#4192): a virtual that opted into degraded merges serves what the
@@ -23373,9 +23874,10 @@ mod virtual_channel_tests {
         );
     }
 
-    /// #4708: a virtual whose remote member fails follows the member-failure
-    /// policy on the siblings exactly as on repodata.json: strict by default
-    /// (502 naming the member), never an empty 200.
+    /// #4708 / #5621: a virtual whose remote member fails follows the
+    /// member-failure policy on the siblings exactly as on repodata.json: a
+    /// member that could not answer (500) is left out and the sibling served
+    /// marked partial (it was a 502 before #5621), never an unmarked 200.
     #[tokio::test]
     async fn virtual_siblings_follow_the_member_failure_policy_4708() {
         let Some(pool) = tdh::try_pool().await else {
@@ -23391,23 +23893,28 @@ mod virtual_channel_tests {
         }
         let rig = VirtualRig::new(pool, &server.uri()).await;
         let v = rig.virtual_key.clone();
-        let (cur_status, cur_body, _) = rig.get(format!("/{v}/noarch/current_repodata.json")).await;
-        let (re_status, re_body, _) = rig.get(format!("/{v}/noarch/run_exports.json")).await;
+        let (cur_status, cur_body, cur_headers) =
+            rig.get(format!("/{v}/noarch/current_repodata.json")).await;
+        let (re_status, re_body, re_headers) =
+            rig.get(format!("/{v}/noarch/run_exports.json")).await;
         let remote_key = rig.remote_key.clone();
         rig.cleanup().await;
-        for (doc, status, body) in [
-            ("current_repodata.json", cur_status, cur_body),
-            ("run_exports.json", re_status, re_body),
+        for (doc, status, body, headers) in [
+            ("current_repodata.json", cur_status, cur_body, cur_headers),
+            ("run_exports.json", re_status, re_body, re_headers),
         ] {
             assert_eq!(
                 status,
-                StatusCode::BAD_GATEWAY,
+                StatusCode::OK,
                 "{doc}: {}",
                 String::from_utf8_lossy(&body)
             );
-            assert!(
-                String::from_utf8_lossy(&body).contains(&remote_key),
-                "{doc}"
+            assert_eq!(
+                headers
+                    .get(proxy_helpers::PARTIAL_MEMBERS_HEADER)
+                    .and_then(|v| v.to_str().ok()),
+                Some(remote_key.as_str()),
+                "{doc}: marked partial, naming the member"
             );
         }
     }
@@ -24016,6 +24523,42 @@ mod scan_on_proxy_tests {
             writer.finish().unwrap();
         }
         zip_buf
+    }
+
+    /// #5504: conda's own scan-aware walk. With the unscanned higher-priority
+    /// member missing (404), a scanning member whose upstream fails (5xx or
+    /// 429) makes the package a retryable 503, and one that refuses
+    /// permanently (403) a 404; both used to read as a miss.
+    #[tokio::test]
+    async fn scanning_member_5xx_answers_503_and_4xx_answers_404_5504() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mut got = Vec::new();
+        for broken in [503u16, 429, 403] {
+            let rig = tdh::MissAndBrokenVirtual::new(&pool, "conda", broken).await;
+            tdh::enable_proxy_scan(&pool, rig.repo_ids[2], "fail_open").await;
+            let dir = std::env::temp_dir().join(format!("condascan5504-{}", rig.virtual_key));
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+            let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+            let (status, _) = tdh::send(
+                tdh::router_anon(router(), state.clone()),
+                tdh::get(format!("/{}/noarch/pkg5504-1.0-0.conda", rig.virtual_key)),
+            )
+            .await;
+            got.push((broken, status));
+            rig.cleanup(&pool).await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert_eq!(
+            got,
+            vec![
+                (503, StatusCode::SERVICE_UNAVAILABLE),
+                (429, StatusCode::SERVICE_UNAVAILABLE),
+                (403, StatusCode::NOT_FOUND),
+            ]
+        );
     }
 
     /// A `.tar.bz2` (v1) package declaring `name` / `version`.
@@ -24637,6 +25180,45 @@ mod scan_on_proxy_tests {
         assert_eq!(clean_sigs, StatusCode::OK);
         assert_eq!(&clean_sigs_body[..], b"[]");
         assert_eq!(recorded_sigs, StatusCode::OK);
+    }
+
+    /// #4987: a sidecar refused on its package's verdict leaves the same
+    /// `PROXY_SCAN_BLOCKED` row the gate writes for the package itself,
+    /// naming the sidecar and the package's digest. The package is cached
+    /// under record-only first, so the only refusal is the sidecar's.
+    #[tokio::test]
+    async fn remote_sigs_sidecar_refusal_is_audited_4987() {
+        let vuln = "certifi-2022.12.7-pyhd8ed1ab_0.conda";
+        let vuln_bytes = conda_v2("certifi", "2022.12.7");
+        let server = MockServer::start().await;
+        mount_package(&server, vuln, &vuln_bytes).await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/noarch/{vuln}.sigs")))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+            .mount(&server)
+            .await;
+        let Some(rig) = RemoteRig::new(&server.uri(), None).await else {
+            return;
+        };
+        let digest = digest_of(&vuln_bytes);
+        seed_verdict(&rig.fx.pool, &digest, Some("high")).await;
+        configure_scan(&rig.fx.pool, rig.fx.repo_id, "record_only", Some("high")).await;
+        let (pkg, _, _) = rig.get(&format!("noarch/{vuln}")).await;
+        configure_scan(&rig.fx.pool, rig.fx.repo_id, "fail_open", Some("high")).await;
+        let (sigs, sigs_body, sigs_headers) = rig.get(&format!("noarch/{vuln}.sigs")).await;
+        let row =
+            tdh::audit_row_eventually(&rig.fx.pool, rig.fx.repo_id, "PROXY_SCAN_BLOCKED").await;
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(rig.fx.repo_id)
+            .execute(&rig.fx.pool)
+            .await;
+        rig.teardown(std::slice::from_ref(&digest)).await;
+
+        assert_eq!(pkg, StatusCode::OK, "record-only serves the package");
+        assert_scan_blocked(sigs, &sigs_body, &sigs_headers, &format!("{vuln}.sigs"));
+        assert_eq!(row.details["path"], format!("{vuln}.sigs"));
+        assert_eq!(row.details["checksum_sha256"], digest);
+        assert_eq!(row.details["attempts"], 1);
     }
 
     /// The `/t/<token>/` forms (conda's `.condarc` layout and rattler's) run
@@ -26225,8 +26807,10 @@ mod cep16_proxy_tests {
     }
 
     /// A member whose index FETCH fails is handled like a failed repodata
-    /// member (#4192): 502 naming it by default, a partial index marked as
-    /// such when the virtual opts in. Hosted shards stay served either way.
+    /// member (#5621; a 502 by default before it): left out, the index served
+    /// marked partial, with or without the virtual's opt-in, and a shard the
+    /// merge could not rule out is a retryable 503, not a silent 404. Hosted
+    /// shards stay served either way.
     #[tokio::test]
     async fn virtual_shard_index_applies_the_member_failure_policy_4577() {
         let Some(pool) = tdh::try_pool().await else {
@@ -26268,20 +26852,20 @@ mod cep16_proxy_tests {
         let (partial_status, partial_body, partial_headers) = rig.get(format!("/{v}{INDEX}")).await;
         rig.cleanup().await;
 
-        assert_eq!(strict_status, StatusCode::BAD_GATEWAY);
-        assert!(
-            String::from_utf8_lossy(&strict_body).contains(&remote_key),
+        assert_eq!(
+            strict_status,
+            StatusCode::OK,
             "{}",
             String::from_utf8_lossy(&strict_body)
         );
+        assert_eq!(index_names(&decode_index(&strict_body)), vec!["acme-core"]);
         assert_eq!(hosted_shard_status, StatusCode::OK);
         assert_eq!(
             unknown_shard_status,
-            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
             "a shard the merge could not rule out (a member failed) is not a silent 404: {}",
             String::from_utf8_lossy(&unknown_shard_body)
         );
-        assert!(String::from_utf8_lossy(&unknown_shard_body).contains(&remote_key));
         assert_eq!(partial_status, StatusCode::OK);
         assert_eq!(
             partial_headers
@@ -27199,5 +27783,62 @@ mod duplicate_entry_tests {
             ("pkg-demo-1.0.0-0.tar.zst", &pkg),
         ]);
         assert!(established(&check(v2, &ok_v2).1));
+    }
+}
+
+/// #5484: the conda path token is checked as the password of the user named
+/// `token`; a TOTP-enrolled account must not pass on its password.
+#[cfg(test)]
+mod path_token_totp_5484 {
+    use super::authenticate_with_token;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn path_token_password_is_refused_for_a_totp_account() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let id = Uuid::new_v4();
+        let hash = bcrypt::hash("conda-path-secret-5484", 4).expect("hash");
+        // The username is fixed by the handler. If another row already holds
+        // it, this test cannot control that account; skip rather than flake.
+        let inserted = sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, is_active, \
+             is_admin, totp_enabled, totp_secret) \
+             VALUES ($1, 'token', $2, $3, 'local', true, false, true, 'JBSWY3DPEHPK3PXP') \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(id)
+        .bind(format!("conda-5484-{}@test.local", id.simple()))
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .expect("seed user")
+        .rows_affected();
+        if inserted == 0 {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("conda-5484-{}", id));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let refused =
+            authenticate_with_token(&state.db, &state.config, "conda-path-secret-5484").await;
+        sqlx::query("UPDATE users SET totp_enabled = false WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("drop totp");
+        let allowed =
+            authenticate_with_token(&state.db, &state.config, "conda-path-secret-5484").await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(
+            refused.err().map(|r| r.status()),
+            Some(axum::http::StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(allowed.ok(), Some(id));
     }
 }

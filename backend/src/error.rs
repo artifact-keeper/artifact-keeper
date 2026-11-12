@@ -10,7 +10,17 @@ use thiserror::Error;
 
 /// Retry-After hint (seconds) sent on 503 Service Unavailable responses so
 /// well-behaved clients back off instead of hammering a saturated server.
-const RETRY_AFTER_SECS_ON_503: &str = "1";
+pub(crate) const RETRY_AFTER_SECS_ON_503: &str = "1";
+
+/// Client-facing message for `507 STORAGE_FULL` (#5650). Every route uses this
+/// wording, the OCI `/v2` envelope included, so no backend error text (bucket
+/// names, request ids, XML) reaches a client.
+pub(crate) const STORAGE_FULL_MESSAGE: &str =
+    "Storage is full: the storage backend refused the write for lack of space";
+
+/// Client-facing message for `503 STORAGE_UNAVAILABLE` (#5649).
+pub(crate) const STORAGE_UNAVAILABLE_MESSAGE: &str =
+    "Storage backend is temporarily unavailable, retry shortly";
 
 /// Application result type alias
 pub type Result<T> = std::result::Result<T, AppError>;
@@ -195,6 +205,13 @@ pub enum AppError {
     #[error("Validation error ({code}): {message}")]
     CodedValidation { code: &'static str, message: String },
 
+    /// A 409 that carries its own machine-readable `code` instead of the
+    /// generic `CONFLICT`, for a refusal a client is expected to recognise
+    /// (e.g. `mcp_name_case_conflict` on a promotion into an MCP registry,
+    /// #5435).
+    #[error("Conflict ({code}): {message}")]
+    CodedConflict { code: &'static str, message: String },
+
     /// The request was well-formed and syntactically valid but asks for a
     /// configuration that is semantically unsupported in this release (e.g. a
     /// Debian proxy filter that requests metadata regeneration/re-signing, or
@@ -263,6 +280,16 @@ pub enum AppError {
     #[error("Service unavailable: {0}")]
     ServiceUnavailable(String),
 
+    /// A repository member could not answer (an upstream outage, #5504), so
+    /// a virtual repository's walk or merge answers `503` + `Retry-After`
+    /// instead of a `404` the client would cache. Same status, code and body
+    /// as [`Self::ServiceUnavailable`], but an EXPECTED outcome of an upstream
+    /// outage, not a server fault: logged at `warn` (#5623), so an outage does
+    /// not add an ERROR line per client request. The member walk already
+    /// logs each member that could not answer.
+    #[error("Service unavailable: {0}")]
+    MemberUnavailable(String),
+
     /// A scanner's backing engine/CLI is not present in this deployment, so the
     /// scan cannot run at all — distinct from the scan running and failing. The
     /// hardened runtime image routes container-image scans through the Harbor
@@ -326,6 +353,26 @@ impl AppError {
         }
     }
 
+    /// The storage failure class this error carries (#5649, #5650): the
+    /// backend could not be reached in time, or refused the write for lack
+    /// of space.
+    ///
+    /// Read from the message because storage errors are re-wrapped as
+    /// strings on their way to the handler (`AppError::Storage(e.to_string())`
+    /// in most format handlers, `Internal(format!(..))` in a few services);
+    /// the backends tag the message with a fixed marker so the class survives
+    /// that (see [`crate::storage::failure`]). An `Io` error only ever
+    /// classifies as out of space: a reset connection there is usually the
+    /// client hanging up mid-upload, not the store.
+    pub(crate) fn storage_failure(&self) -> Option<crate::storage::StorageFailure> {
+        use crate::storage::StorageFailure;
+        match self {
+            Self::Storage(msg) | Self::Internal(msg) => StorageFailure::from_message(msg),
+            Self::Io(err) => StorageFailure::from_io(err),
+            _ => None,
+        }
+    }
+
     /// The Postgres SQLSTATE this error carries, when it is still typed.
     ///
     /// Only `Display` reaches most logs, and neither `sqlx::Error` nor
@@ -376,10 +423,24 @@ impl AppError {
             Self::PreconditionFailed(_) => (StatusCode::PRECONDITION_FAILED, "PRECONDITION_FAILED"),
             Self::Validation(_) => (StatusCode::BAD_REQUEST, "VALIDATION_ERROR"),
             Self::CodedValidation { code, .. } => (StatusCode::BAD_REQUEST, code),
+            Self::CodedConflict { code, .. } => (StatusCode::CONFLICT, code),
             Self::UnprocessableEntity(_) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "UNPROCESSABLE_ENTITY")
             }
             Self::QuotaExceeded(_) => (StatusCode::INSUFFICIENT_STORAGE, "QUOTA_EXCEEDED"),
+            // #5650: the storage backend refused the write for lack of space
+            // (a MinIO bucket quota, a full volume). Not a server bug and not
+            // retryable until an operator frees space.
+            e if e.storage_failure() == Some(crate::storage::StorageFailure::Full) => {
+                (StatusCode::INSUFFICIENT_STORAGE, "STORAGE_FULL")
+            }
+            // #5649: the storage backend could not be reached or did not
+            // answer within the connect timeout / retry budget. Nothing was
+            // stored, so the request is retryable: 503 + Retry-After, the
+            // same contract as `DATABASE_UNAVAILABLE`.
+            e if e.storage_failure() == Some(crate::storage::StorageFailure::Unavailable) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "STORAGE_UNAVAILABLE")
+            }
             // ENAMETOOLONG is a client-supplied path that exceeds the
             // underlying filesystem's name limit (255 bytes on ext4/xfs).
             // Surfacing this as 500 makes abuse / fuzzing payloads look
@@ -406,7 +467,9 @@ impl AppError {
             Self::UpstreamAuth(_) => (StatusCode::BAD_GATEWAY, "UPSTREAM_AUTH_FAILED"),
             Self::OidcNoIdToken(_) => (StatusCode::BAD_GATEWAY, "OIDC_NO_ID_TOKEN"),
             Self::CodedBadGateway { code, .. } => (StatusCode::BAD_GATEWAY, code),
-            Self::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE"),
+            Self::ServiceUnavailable(_) | Self::MemberUnavailable(_) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE")
+            }
             Self::ScannerEngineUnavailable(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "SCANNER_ENGINE_UNAVAILABLE",
@@ -445,6 +508,9 @@ impl AppError {
             Self::Authentication(_) | Self::Unauthorized(_) | Self::Authorization(_) => {
                 tracing::Level::WARN
             }
+            // #5623: an upstream outage behind a virtual repository is an
+            // expected, retryable answer, not a fault of this server.
+            Self::MemberUnavailable(_) => tracing::Level::WARN,
             Self::QuotaExceeded(_) => tracing::Level::INFO,
             // A 5xx by status, but an intentional, documented gap: nothing
             // failed, so it must not read as a server fault in the logs.
@@ -472,6 +538,14 @@ impl AppError {
             }
             Self::Database(_) | Self::Sqlx(_) => "Database operation failed".to_string(),
             Self::Migration(_) => "Database migration failed".to_string(),
+            // #5649 / #5650: fixed wording. The backend's own text (a MinIO
+            // XML error naming the bucket and request ids) stays in the log.
+            e if e.storage_failure() == Some(crate::storage::StorageFailure::Full) => {
+                STORAGE_FULL_MESSAGE.to_string()
+            }
+            e if e.storage_failure() == Some(crate::storage::StorageFailure::Unavailable) => {
+                STORAGE_UNAVAILABLE_MESSAGE.to_string()
+            }
             Self::Storage(msg) if is_name_too_long(msg) => {
                 "Path segment exceeds filesystem name length limit".to_string()
             }
@@ -499,14 +573,32 @@ impl AppError {
             | Self::UpstreamAuth(msg)
             | Self::OidcNoIdToken(msg)
             | Self::ServiceUnavailable(msg)
+            | Self::MemberUnavailable(msg)
             | Self::ScannerEngineUnavailable(msg)
             | Self::NotImplemented(msg) => msg.clone(),
-            Self::CodedValidation { message, .. } | Self::CodedBadGateway { message, .. } => {
-                message.clone()
-            }
+            Self::CodedValidation { message, .. }
+            | Self::CodedConflict { message, .. }
+            | Self::CodedBadGateway { message, .. } => message.clone(),
             Self::Json(_) => "Invalid JSON".to_string(),
         }
     }
+}
+
+/// Response extension on a `5xx` that is an expected, deliberate answer
+/// rather than a server fault (#5623, #5701): the [`AppError`] behind it chose
+/// a log level below `error` (an upstream member outage, a quota refusal, a
+/// saturated connection pool, a documented `501`). The HTTP trace layer's
+/// classifier ([`crate::api::middleware::request_span::ServerErrorsExceptExpected`])
+/// reads it so the same response is not logged again as an ERROR
+/// `response failed` line.
+#[derive(Debug, Clone, Copy)]
+pub struct ExpectedOutcome;
+
+/// Whether a response of `status`, logged at `level`, is an expected `5xx`
+/// that gets [`ExpectedOutcome`]. Pure, so the rule is pinned without a
+/// subscriber.
+fn expected_server_status(status: StatusCode, level: tracing::Level) -> bool {
+    status.is_server_error() && level != tracing::Level::ERROR
 }
 
 impl IntoResponse for AppError {
@@ -530,8 +622,14 @@ impl IntoResponse for AppError {
         }
         let (status, code) = self.status_and_code();
         let message = self.user_message();
+        if let Some(class) = self.storage_failure() {
+            // Feeds the storage check on `/health` and `/readyz`: a full
+            // bucket still answers the connectivity probe (#5650).
+            crate::storage::failure::record_failure(class);
+        }
 
-        match self.log_level() {
+        let level = self.log_level();
+        match level {
             tracing::Level::ERROR => tracing::error!(error = %self, code = code, "Request error"),
             tracing::Level::WARN => tracing::warn!(error = %self, code = code, "Request error"),
             _ => tracing::info!(error = %self, code = code, "Request error"),
@@ -543,6 +641,9 @@ impl IntoResponse for AppError {
         }));
 
         let mut response = (status, body).into_response();
+        if expected_server_status(status, level) {
+            response.extensions_mut().insert(ExpectedOutcome);
+        }
         // Tell well-behaved clients to back off on capacity-shed responses so
         // they retry on a slower cadence and don't compound the saturation.
         if status == StatusCode::SERVICE_UNAVAILABLE {
@@ -1096,7 +1197,7 @@ mod tests {
 
     #[test]
     fn test_storage_unrelated_error_still_500() {
-        let err = AppError::Storage("disk quota exceeded".into());
+        let err = AppError::Storage("object checksum mismatch".into());
         let (status, _) = err.status_and_code();
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -1250,5 +1351,166 @@ mod tests {
             AppError::ServiceUnavailable("at capacity".into()).log_level(),
             tracing::Level::ERROR
         );
+    }
+
+    /// #5623: a member outage answers exactly what `ServiceUnavailable` does
+    /// (503, `SERVICE_UNAVAILABLE`, its message, `Retry-After`), logs at WARN,
+    /// and is marked [`ExpectedOutcome`] for the trace layer; a plain
+    /// `ServiceUnavailable` keeps ERROR and no marker.
+    #[test]
+    fn member_unavailable_is_a_warn_level_503_5623() {
+        let err = AppError::MemberUnavailable("member down".into());
+        assert_eq!(
+            err.status_and_code(),
+            (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE")
+        );
+        assert_eq!(err.user_message(), "member down");
+        assert_eq!(err.log_level(), tracing::Level::WARN);
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers()[header::RETRY_AFTER],
+            RETRY_AFTER_SECS_ON_503
+        );
+        assert!(response.extensions().get::<ExpectedOutcome>().is_some());
+
+        let plain = AppError::ServiceUnavailable("at capacity".into()).into_response();
+        assert!(plain.extensions().get::<ExpectedOutcome>().is_none());
+    }
+
+    /// Only a 5xx logged below ERROR is an expected outcome: a 4xx is never a
+    /// trace-layer failure to begin with, and an ERROR 5xx stays a failure.
+    #[test]
+    fn expected_server_status_rule_5623() {
+        use tracing::Level;
+        assert!(expected_server_status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Level::WARN
+        ));
+        assert!(expected_server_status(
+            StatusCode::INSUFFICIENT_STORAGE,
+            Level::INFO
+        ));
+        assert!(!expected_server_status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Level::ERROR
+        ));
+        assert!(!expected_server_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Level::ERROR
+        ));
+        assert!(!expected_server_status(StatusCode::NOT_FOUND, Level::INFO));
+    }
+
+    // -----------------------------------------------------------------------
+    // #5649 / #5650: storage outage -> 503 + Retry-After, storage full -> 507,
+    // neither echoing the backend's own error text.
+    // -----------------------------------------------------------------------
+
+    /// What MinIO answers a PUT into a bucket at its quota, as the S3 backend
+    /// renders it: the XML names the bucket and carries request ids.
+    fn minio_quota_error() -> String {
+        format!(
+            "Failed to put object 'generic/x.bin': {}",
+            crate::storage::StorageFailure::Full.tag(
+                "S3 request failed. caused by: Server returned non-2xx status code: \
+                 400 Bad Request: <?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>\
+                 XMinioAdminBucketQuotaExceeded</Code><Message>Bucket quota exceeded</Message>\
+                 <BucketName>ak-secret-bucket</BucketName><RequestId>17A2B3C4D5E6F708</RequestId>\
+                 <HostId>dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8</HostId>\
+                 </Error>"
+            )
+        )
+    }
+
+    /// streaming-invariant: test scaffolding exempt — an error body is a small
+    /// bounded JSON document, not an artifact path (#1608).
+    #[allow(clippy::disallowed_methods)]
+    async fn rendered(err: AppError) -> (StatusCode, axum::http::HeaderMap, String) {
+        let response = err.into_response();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn assert_no_backend_text(body: &str) {
+        for needle in [
+            "XMinio",
+            "<Error>",
+            "<?xml",
+            "ak-secret-bucket",
+            "17A2B3C4D5E6F708",
+            "caused by",
+            "connection refused",
+        ] {
+            assert!(
+                !body.contains(needle),
+                "response body must not carry backend text {needle:?}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_full_maps_to_507_with_a_neutral_body_5650() {
+        crate::storage::failure::reset_failure_signal();
+        // Re-wrapped the way the format handlers do (`map_storage_err`).
+        let inner = AppError::Storage(minio_quota_error());
+        for err in [
+            AppError::Storage(inner.to_string()),
+            AppError::Internal(format!("upload failed: {inner}")),
+            AppError::Io(std::io::Error::from_raw_os_error(28)),
+        ] {
+            let label = format!("{err:?}");
+            let (status, headers, body) = rendered(err).await;
+            assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{label}");
+            assert!(headers.get(header::RETRY_AFTER).is_none(), "{label}");
+            let json: serde_json::Value = serde_json::from_str(&body).expect("json");
+            assert_eq!(json["code"], "STORAGE_FULL", "{label}");
+            assert_eq!(json["message"], STORAGE_FULL_MESSAGE, "{label}");
+            assert_no_backend_text(&body);
+        }
+        assert!(
+            crate::storage::failure::refused_for_space_within(
+                crate::storage::failure::STORAGE_FULL_SIGNAL_WINDOW
+            ),
+            "a 507 must feed the storage health signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_unavailable_maps_to_503_with_retry_after_5649() {
+        let err = AppError::Storage(format!(
+            "Failed to put object 'k': {}",
+            crate::storage::StorageFailure::Unavailable.tag(
+                "S3 connection refused. caused by: Error performing PUT <url> in 10.2s, \
+                 after 6 retries - HTTP error: error sending request: connection refused"
+            )
+        ));
+        let (status, headers, body) = rendered(err).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            headers.get(header::RETRY_AFTER).unwrap(),
+            RETRY_AFTER_SECS_ON_503
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(json["code"], "STORAGE_UNAVAILABLE");
+        assert_eq!(json["message"], STORAGE_UNAVAILABLE_MESSAGE);
+        assert_no_backend_text(&body);
+    }
+
+    /// An upstream-proxy failure also travels as `AppError::Storage`; without
+    /// a backend's marker it keeps its old status.
+    #[test]
+    fn untagged_storage_errors_keep_their_status() {
+        let err = AppError::Storage("Failed to fetch from upstream: operation timed out".into());
+        assert_eq!(
+            err.status_and_code(),
+            (StatusCode::INTERNAL_SERVER_ERROR, "STORAGE_ERROR")
+        );
+        let reset = AppError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert_eq!(reset.status_and_code().1, "IO_ERROR");
     }
 }

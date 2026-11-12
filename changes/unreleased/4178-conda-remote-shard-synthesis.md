@@ -1,5 +1,0 @@
----
-section: Added
-issues: [#4178]
----
-- **Remote conda repositories whose upstream publishes no CEP-16 shard index serve shards synthesised from the cached upstream repodata** (#4178). Such a remote answered 404 on `repodata_shards.msgpack.zst`, so pixi, rattler and other CEP-16 clients downloaded the whole `repodata.json` on every solve, and a virtual channel with such a member served no shard index at all. The remote now stream-parses the upstream `repodata.json.zst` (or `.bz2`, or plain) its proxy cache holds, without holding the plain document, stores one shard per package name alongside hosted shards (migration 306, `origin = 'synthesized'`), and serves the index and the shards itself; a virtual's shard index includes those members. When the cached upstream document changes past the remote's metadata TTL the shards are marked stale and rebuilt before the index is served again; an unchanged document is a no-op. Synthesised shards are checked against their address before they are served, like hosted ones.

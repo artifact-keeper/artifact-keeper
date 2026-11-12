@@ -207,9 +207,23 @@ async fn depth_response(
         .get_stream(&storage_key)
         .await
         .map_err(IntoResponse::into_response)?;
+    // #5076: a row a scanning Remote holds goes through the scan gate.
+    let proxy_helpers::StoredRowBody { body: stream, scan } = gate_stored_rpm(
+        state,
+        storage.as_ref(),
+        repo,
+        path,
+        path.rsplit('/').next().unwrap_or(path),
+        &storage_key,
+        size_bytes,
+        stream,
+    )
+    .await?;
     crate::services::artifact_service::record_download(&state.db, id, ctx).await;
-    let mut response =
-        build_rpm_package_response(Body::from_stream(stream), "", size_bytes, &checksum);
+    let mut response = proxy_helpers::StoredRowBody::stamp(
+        scan,
+        build_rpm_package_response(Body::from_stream(stream), "", size_bytes, &checksum),
+    );
     // The stored basename, not its URL form; the shared helper keeps any
     // name a valid header (quoted-string escapes, RFC 5987 for non-ASCII).
     let disposition = crate::api::download_response::content_disposition_attachment(
@@ -347,11 +361,7 @@ async fn serve_stored_publication_blob(
                 .unwrap(),
         )),
         Err(crate::error::AppError::NotFound(_)) => Ok(None),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            crate::api::handlers::storage_err_message(&e),
-        )
-            .into_response()),
+        Err(e) => Err(crate::api::handlers::storage_err_plain(&e)),
     }
 }
 
@@ -463,6 +473,7 @@ async fn try_proxy_repodata(
         upstream_path,
         expected_checksum,
         RepositoryFormat::Rpm,
+        false,
     )
     .await?;
 
@@ -655,13 +666,10 @@ async fn serve_version_package(
 
     // Cache into the immutable frozen store, then stream the verified bytes.
     let size = bytes.len() as i64;
-    storage.put(&cache_key, bytes.clone()).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            crate::api::handlers::storage_err_message(&e),
-        )
-            .into_response()
-    })?;
+    storage
+        .put(&cache_key, bytes.clone())
+        .await
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     Ok(build_rpm_package_response(
         Body::from(bytes),
@@ -1246,11 +1254,7 @@ async fn stored_repodata_response(
             };
             Ok(repodata_bytes_response(file, bytes))
         }
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            crate::api::handlers::storage_err_message(&e),
-        )
-            .into_response()),
+        Err(e) => Err(crate::api::handlers::storage_err_plain(&e)),
     }
 }
 
@@ -2975,19 +2979,28 @@ async fn upstream_proxy(
         let stream = storage
             .get_stream(&artifact.storage_key)
             .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    crate::api::handlers::storage_err_message(&e),
-                )
-                    .into_response()
-            })?;
-
-        return Ok(build_rpm_package_response(
-            Body::from_stream(stream),
+            .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
+        // #5076: the Remote's own row goes through the scan gate.
+        let proxy_helpers::StoredRowBody { body: stream, scan } = gate_stored_rpm(
+            &state,
+            storage.as_ref(),
+            &repo,
+            &upstream_path,
             filename,
+            &artifact.storage_key,
             artifact.size_bytes,
-            &artifact.checksum_sha256,
+            stream,
+        )
+        .await?;
+
+        return Ok(proxy_helpers::StoredRowBody::stamp(
+            scan,
+            build_rpm_package_response(
+                Body::from_stream(stream),
+                filename,
+                artifact.size_bytes,
+                &artifact.checksum_sha256,
+            ),
         ));
     }
 
@@ -3021,6 +3034,7 @@ async fn upstream_proxy(
         "application/x-rpm",
         Some(filename),
         RepositoryFormat::Rpm,
+        ctx.is_head,
     )
     .await?;
     // #3649: count the proxied serve. The streaming helper answers a warm
@@ -3137,6 +3151,40 @@ fn rpm_identity(
         None,
         rpm_release_from_dist_tag(&header.release),
     )
+}
+
+/// A stored `artifacts` row an RPM route has opened, through the scan gate
+/// when `repo` is a Remote that scans on proxy (#5076): graded as the same
+/// file proxied through the route would be. `path` decides, as on the proxied
+/// path, whether the file is metadata (never gated); `filename` is the name
+/// the request asks for, which the package must declare.
+#[allow(clippy::too_many_arguments)]
+async fn gate_stored_rpm(
+    state: &SharedState,
+    storage: &dyn crate::storage::StorageBackend,
+    repo: &RepoInfo,
+    path: &str,
+    filename: &str,
+    storage_key: &str,
+    size_bytes: i64,
+    body: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+) -> Result<proxy_helpers::StoredRowBody, Response> {
+    if rpm_path_is_metadata(path) {
+        return Ok(proxy_helpers::StoredRowBody { body, scan: None });
+    }
+    proxy_helpers::gate_opened_stored_row(
+        state,
+        storage,
+        &proxy_helpers::StoredRow {
+            repo,
+            filename,
+            storage_key,
+            size_bytes,
+        },
+        RpmPackage,
+        body,
+    )
+    .await
 }
 
 /// Inline scan-and-block for one RPM proxy file from one Remote repository
@@ -3316,22 +3364,31 @@ async fn download_package(
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
+    // #5076: a row a scanning Remote holds goes through the scan gate.
+    let proxy_helpers::StoredRowBody { body: stream, scan } = gate_stored_rpm(
+        &state,
+        storage.as_ref(),
+        &repo,
+        &format!("packages/{pkg_path}"),
+        filename,
+        &artifact.storage_key,
+        artifact.size_bytes,
+        stream,
+    )
+    .await?;
 
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
-    Ok(build_rpm_package_response(
-        Body::from_stream(stream),
-        filename,
-        artifact.size_bytes,
-        &artifact.checksum_sha256,
+    Ok(proxy_helpers::StoredRowBody::stamp(
+        scan,
+        build_rpm_package_response(
+            Body::from_stream(stream),
+            filename,
+            artifact.size_bytes,
+            &artifact.checksum_sha256,
+        ),
     ))
 }
 
@@ -3626,6 +3683,7 @@ async fn store_rpm(
         crate::services::package_service::register_published_package(
             &state.db,
             &state.event_bus,
+            crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
             repo.id,
             "rpm",
             &pkg_name,
@@ -4347,11 +4405,17 @@ pub async fn rebuild_repodata(
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
     crate::api::handlers::repositories::require_repo_write_access(&auth, &repo, &service).await?;
-    crate::api::handlers::repositories::require_repo_action(
+    // A refusal to a caller who cannot read the repository is the unknown-key
+    // 404, like the write gate's own refusals (#5458, #5645).
+    let write = crate::api::handlers::repositories::require_repo_action(
         &auth,
         repo.id,
         "write",
         &state.permission_service,
+    )
+    .await;
+    crate::api::handlers::repositories::hide_write_denial_from_non_readers(
+        write, &auth, &repo, &service,
     )
     .await?;
     if repo.format != RepositoryFormat::Rpm || repo.repo_type != RepositoryType::Local {
@@ -5521,6 +5585,62 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(&body[..], b"rpm-bytes");
+        f.teardown().await;
+    }
+
+    /// #5685: the download of a hosted package (`download_package`'s
+    /// `get_stream`) against a store that is down answers `503` with
+    /// `Retry-After`, and against one that is full `507` without it, with no
+    /// backend text in the body. It answered a hard-coded `500`.
+    #[tokio::test]
+    async fn package_download_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "rpm/outage5685/1.0/outage5685-1.0-1.x86_64.rpm",
+            "outage5685/1.0/outage5685-1.0-1.x86_64.rpm",
+            "outage5685",
+            "1.0",
+            "application/x-rpm",
+            bytes::Bytes::from_static(b"rpm-bytes-5685"),
+            f.user_id,
+        )
+        .await;
+
+        for (message, want) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&f.pool, &f.state, f.repo_id, &message).await;
+            let app = tdh::router_anon(super::router(), state);
+            let (status, body, headers) = tdh::send_with_headers(
+                app,
+                tdh::get(format!(
+                    "/{}/packages/outage5685-1.0-1.x86_64.rpm",
+                    f.repo_key
+                )),
+            )
+            .await;
+            assert_eq!(status, want, "{}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want == StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            tdh::assert_no_storage_backend_text("rpm package GET", &body);
+        }
         f.teardown().await;
     }
 
@@ -9113,6 +9233,22 @@ mod scan_on_proxy_4112 {
 
     archive_scan_suite!(case);
 
+    /// #5076: a row the scanning Remote holds itself is served through the
+    /// gate, as the proxied file is. Fails on `main`: the row streamed
+    /// ungated (200, no `X-AK-Scan`) under every policy.
+    #[tokio::test]
+    async fn a_stored_row_of_a_scanning_remote_is_gated_5076() {
+        crate::api::handlers::proxy_scan_archive::test_support::stored_row_is_gated(
+            case,
+            crate::api::handlers::proxy_scan_archive::test_support::StoredRowSeed {
+                path: format!("packages/{FILE}"),
+                name: "dtf-libs".to_string(),
+                version: "1.0-1.el9_2".to_string(),
+            },
+        )
+        .await;
+    }
+
     /// The yum layout dnf actually fetches, through the catch-all.
     fn catchall_case(_mock: &str) -> ArchiveCase {
         let path = format!("9/BaseOS/x86_64/os/Packages/d/{FILE}");
@@ -9137,6 +9273,21 @@ mod scan_on_proxy_4112 {
         ts::fail_open_first_pull_is_served_pending(catchall_case).await;
         ts::virtual_member_is_gated(catchall_case).await;
         ts::without_scan_on_proxy_streams_unscanned(catchall_case).await;
+    }
+
+    /// #5076: the Remote's own row found by file name on the catch-all is
+    /// gated too.
+    #[tokio::test]
+    async fn a_stored_row_on_the_catch_all_is_gated_5076() {
+        ts::stored_row_is_gated(
+            catchall_case,
+            ts::StoredRowSeed {
+                path: format!("9/BaseOS/x86_64/os/Packages/d/{FILE}"),
+                name: "dtf-libs".to_string(),
+                version: "1.0-1.el9_2".to_string(),
+            },
+        )
+        .await;
     }
 
     /// Repository metadata on the catch-all still streams through a scanning

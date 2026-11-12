@@ -11,8 +11,8 @@ artifact is still cached and downloadable.
 
 | Class | Examples | Default lifetime | On expiry |
 | --- | --- | --- | --- |
-| **Mutable** | npm packument, PyPI simple index, `maven-metadata.xml`, OCI tag, Go `@v/list`, Cargo sparse index, conda `repodata.json`, RPM `repomd.xml`, Hugging Face `resolve/main/...` and model info at a branch | 300 s (5 min) | revalidated against upstream, then refilled |
-| **Immutable** | npm tarball (`…/-/<pkg>-<ver>.tgz`), wheel/sdist, `.jar`, `.crate`, OCI digest blob, RPM package, Hugging Face file or model info at a 40-hex commit sha (`<model>/resolve/<sha>/...`) | 315360000 s (~10 years) | never expires, never revalidated |
+| **Mutable** | npm packument, PyPI simple index, `maven-metadata.xml`, OCI tag, Go `@v/list`, Cargo sparse index, conda `repodata.json`, RPM `repomd.xml`, Hugging Face `resolve/main/...` and model info at a branch, Go checksum database tree head (`sumdb/<host>/latest`) | 300 s (5 min) | revalidated against upstream, then refilled |
+| **Immutable** | npm tarball (`…/-/<pkg>-<ver>.tgz`), wheel/sdist, `.jar`, `.crate`, OCI digest blob, RPM package, Hugging Face file or model info at a 40-hex commit sha (`<model>/resolve/<sha>/...`), Go checksum database tiles and `lookup/<module>@<version>` | 315360000 s (~10 years) | never expires, never revalidated |
 
 Classification is by **path shape**, not by format alone — see
 `backend/src/services/cache_classifier.rs`. The bias is deliberate: a mutable

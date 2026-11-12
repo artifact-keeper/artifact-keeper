@@ -394,8 +394,11 @@ pub(crate) fn connect_error(status: StatusCode, code: &str, message: &str) -> Re
     // The database sites pass `db_status(&e)` with `internal`; a 503 there
     // (saturated pool, unreachable database) is Connect's retryable
     // `unavailable`, the code Connect itself maps HTTP 503 to (#4765).
+    // A full store (507, #5685) is Connect's `resource_exhausted`.
     let code = if status == StatusCode::SERVICE_UNAVAILABLE && code == "internal" {
         "unavailable"
+    } else if status == StatusCode::INSUFFICIENT_STORAGE && code == "internal" {
+        "resource_exhausted"
     } else {
         code
     };
@@ -821,11 +824,9 @@ async fn save_label_index(
         &checksum_sha256,
     );
     storage.put(&storage_key, bytes).await.map_err(|e| {
-        connect_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            crate::api::handlers::storage_err_message(&e),
-        )
+        crate::api::handlers::storage_err_response(&e, |status, message| {
+            connect_error(status, "internal", message)
+        })
     })?;
 
     // NO-SCAN-ON-UPLOAD: the `_labels` index is a registry-generated JSON
@@ -1359,18 +1360,25 @@ async fn upload(
         )?;
 
         // Store via StorageBackend
-        let storage_key = build_module_storage_key(&module_name, &commit_digest);
+        // Repo-scoped on a shared cloud namespace (#5662), so two repositories
+        // holding the same commit do not collide on one key; reads go through
+        // the row's storage_key, so legacy flat-key rows keep serving.
+        let storage_key = build_module_storage_key(
+            crate::storage::StorageKeyScheme::from_env(),
+            &repo.storage_backend,
+            repo.id,
+            &module_name,
+            &commit_digest,
+        );
         proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
             .await?;
         let storage = state
             .storage_for_repo(&repo.storage_location())
             .map_err(|e| e.into_response())?;
         storage.put(&storage_key, bundle_bytes).await.map_err(|e| {
-            connect_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                crate::api::handlers::storage_err_message(&e),
-            )
+            crate::api::handlers::storage_err_response(&e, |status, message| {
+                connect_error(status, "internal", message)
+            })
         })?;
 
         super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
@@ -1486,6 +1494,7 @@ async fn upload(
         crate::services::package_service::register_published_package(
             &state.db,
             &state.event_bus,
+            crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
             repo.id,
             "protobuf",
             &module_name,
@@ -1710,11 +1719,9 @@ async fn download(
             .storage_for_repo(&repo.storage_location())
             .map_err(|e| e.into_response())?;
         let bundle_data = storage.get(&storage_key).await.map_err(|e| {
-            connect_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                crate::api::handlers::storage_err_message(&e),
-            )
+            crate::api::handlers::storage_err_response(&e, |status, message| {
+                connect_error(status, "internal", message)
+            })
         })?;
 
         // #2561: permit-scoped decode, fast-fail 503 on saturation.
@@ -2063,9 +2070,23 @@ fn compute_commit_digest(files: &[(String, Vec<u8>)]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Build the storage key for a protobuf module commit.
-fn build_module_storage_key(module_name: &str, commit_digest: &str) -> String {
-    format!("modules/{}/commits/{}", module_name, commit_digest)
+/// Build the storage key for a protobuf module commit: the artifact path
+/// (`modules/{module}/commits/{digest}`) on a repo-isolated backend or under
+/// the flat scheme, `modules/{repository_id}/{module}/commits/{digest}` on a
+/// shared cloud namespace (#5662).
+fn build_module_storage_key(
+    scheme: crate::storage::StorageKeyScheme,
+    storage_backend: &str,
+    repo_id: uuid::Uuid,
+    module_name: &str,
+    commit_digest: &str,
+) -> String {
+    scheme.write_key(
+        storage_backend,
+        "modules",
+        repo_id,
+        &format!("{}/commits/{}", module_name, commit_digest),
+    )
 }
 
 /// Build the artifact path for a protobuf module commit.
@@ -2729,9 +2750,47 @@ mod tests {
     #[test]
     fn test_build_module_storage_key() {
         assert_eq!(
-            build_module_storage_key("buf/validate", "abc123"),
+            build_module_storage_key(
+                crate::storage::StorageKeyScheme::RepoScoped,
+                "filesystem",
+                uuid::Uuid::new_v4(),
+                "buf/validate",
+                "abc123",
+            ),
             "modules/buf/validate/commits/abc123"
         );
+    }
+
+    /// #5662: a shared cloud namespace gets the repo-scoped key, and the
+    /// `STORAGE_KEY_SCHEME=flat` opt-out keeps the legacy shared key.
+    #[test]
+    fn protobuf_storage_key_is_repo_scoped_on_cloud_5662() {
+        use crate::storage::StorageKeyScheme;
+        let repo_id = uuid::Uuid::new_v4();
+        for backend in ["s3", "gcs", "azure"] {
+            assert_eq!(
+                build_module_storage_key(
+                    StorageKeyScheme::RepoScoped,
+                    backend,
+                    repo_id,
+                    "buf/validate",
+                    "abc123",
+                ),
+                format!("modules/{repo_id}/buf/validate/commits/abc123"),
+                "{backend}"
+            );
+            assert_eq!(
+                build_module_storage_key(
+                    StorageKeyScheme::Flat,
+                    backend,
+                    repo_id,
+                    "buf/validate",
+                    "abc123",
+                ),
+                "modules/buf/validate/commits/abc123",
+                "{backend}"
+            );
+        }
     }
 
     #[test]
@@ -2744,7 +2803,13 @@ mod tests {
 
     #[test]
     fn test_build_module_storage_key_same_as_artifact_path() {
-        let key = build_module_storage_key("a/b", "hash");
+        let key = build_module_storage_key(
+            crate::storage::StorageKeyScheme::RepoScoped,
+            "filesystem",
+            uuid::Uuid::new_v4(),
+            "a/b",
+            "hash",
+        );
         let path = build_module_artifact_path("a/b", "hash");
         assert_eq!(key, path);
     }
@@ -3121,6 +3186,133 @@ mod tests {
             "the client push queues the commit and the label index; \
              the replicated push must not queue another task"
         );
+    }
+
+    /// #5685: against a store that is down, a `buf push` of a new commit
+    /// (`upload`'s bundle `storage.put`), a label move on a stored commit
+    /// (`save_label_index`'s `storage.put`, reached through the idempotent
+    /// re-push with `labelRefs`) and a `Download` of a stored commit
+    /// (`download`'s `storage.get`) answer `503` + `Retry-After` with Connect
+    /// code `unavailable`; against one that is full, `507` without it and
+    /// code `resource_exhausted`. The message is the fixed one, with no
+    /// backend text or storage-class marker. All three answered a hard-coded
+    /// 500 `internal`.
+    #[tokio::test]
+    async fn upload_labels_and_download_map_storage_outage_and_full_without_echoing_the_error_5685()
+    {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use base64::Engine;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let upload_body = |proto: &[u8], labels: serde_json::Value| {
+            let body = serde_json::json!({
+                "contents": [{
+                    "moduleRef": { "owner": "acme", "module": "outage5685" },
+                    "files": [{
+                        "path": "acme/outage5685/v1/o.proto",
+                        "content": base64::engine::general_purpose::STANDARD.encode(proto),
+                    }],
+                    "labelRefs": labels,
+                }],
+            });
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap())
+        };
+        let upload_uri = format!(
+            "/{}/buf.registry.module.v1beta1.UploadService/Upload",
+            fx.repo_key
+        );
+        let download_uri = format!(
+            "/{}/buf.registry.module.v1beta1.DownloadService/Download",
+            fx.repo_key
+        );
+        let stored: &[u8] = b"syntax = \"proto3\";\n// stored 5685\n";
+
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                upload_uri.clone(),
+                "application/json",
+                upload_body(stored, serde_json::json!([])),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "push while storage works: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        for (message, want, code, expected) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                "resource_exhausted",
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&fx.pool, &fx.state, fx.repo_id, &message).await;
+            let download_body = serde_json::json!({
+                "values": [{ "resourceRef": { "owner": "acme", "module": "outage5685" } }],
+            });
+            let requests = [
+                (
+                    "Upload (new commit)",
+                    tdh::post(
+                        upload_uri.clone(),
+                        "application/json",
+                        upload_body(
+                            b"syntax = \"proto3\";\n// never stored 5685\n",
+                            serde_json::json!([]),
+                        ),
+                    ),
+                ),
+                (
+                    "Upload (label move)",
+                    tdh::post(
+                        upload_uri.clone(),
+                        "application/json",
+                        upload_body(stored, serde_json::json!([{ "name": "release" }])),
+                    ),
+                ),
+                (
+                    "Download",
+                    tdh::post(
+                        download_uri.clone(),
+                        "application/json",
+                        bytes::Bytes::from(serde_json::to_vec(&download_body).unwrap()),
+                    ),
+                ),
+            ];
+            for (label, req) in requests {
+                let app = tdh::router_with_auth(
+                    super::router(),
+                    state.clone(),
+                    tdh::make_auth(fx.user_id, &fx.username),
+                );
+                let (status, body, headers) = tdh::send_with_headers(app, req).await;
+                assert_eq!(status, want, "{label}: {}", String::from_utf8_lossy(&body));
+                assert_eq!(
+                    headers.contains_key(axum::http::header::RETRY_AFTER),
+                    want == StatusCode::SERVICE_UNAVAILABLE,
+                    "{label}: Retry-After only on the 503"
+                );
+                tdh::assert_no_storage_backend_text(&format!("protobuf {label}"), &body);
+                let json: serde_json::Value =
+                    serde_json::from_slice(&body).expect("Connect error envelope is JSON");
+                assert_eq!(json["code"], code, "{label}: Connect code");
+                assert_eq!(json["message"], expected, "{label}: fixed message");
+            }
+        }
+        fx.teardown().await;
     }
 
     /// #4916: every label move stores a new content-addressed JSON document.
@@ -3746,6 +3938,59 @@ pub(crate) mod integrity_tests {
         // Pin the premise: the recorded checksum is NOT the bundle's digest.
         use sha2::Digest;
         assert_ne!(recorded.trim(), hex::encode(sha2::Sha256::digest(&body)));
+    }
+
+    /// The protobuf BSR routes under `/buf` beside the raw artifact download
+    /// route, which serves a commit's stored bundle byte for byte (the BSR
+    /// `Download` RPC re-encodes the bundle's files as JSON).
+    fn upload_and_raw_download_router() -> axum::Router<crate::api::SharedState> {
+        axum::Router::new()
+            .nest("/buf", super::router())
+            .merge(crate::api::handlers::repositories::download_router())
+    }
+
+    /// #5662: the same commit uploads into two protobuf repositories on a
+    /// shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_commit_uploads_to_two_cloud_repositories_5662() {
+        use base64::Engine;
+        let path = "acme/scoped/v1/thing.proto";
+        let proto = b"syntax = \"proto3\";\nmessage Scoped5662 {}\n";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(proto);
+        let digest = super::compute_commit_digest(&[(path.to_string(), proto.to_vec())]);
+        // The stored object is the bundle the upload builds from these files.
+        let Ok(bundle) = super::build_bundle(&[super::UploadFile {
+            path: path.to_string(),
+            content: encoded.clone(),
+        }]) else {
+            panic!("build the expected bundle");
+        };
+        let body = serde_json::to_vec(&serde_json::json!({
+            "contents": [{
+                "moduleRef": { "owner": "acme", "module": "scoped" },
+                "files": [{ "path": path, "content": encoded }],
+            }],
+        }))
+        .unwrap();
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "protobuf",
+            key_prefix: "modules",
+            router: upload_and_raw_download_router,
+            publish: &|key| {
+                vec![tdh::post(
+                    format!("/buf/{key}/buf.registry.module.v1beta1.UploadService/Upload"),
+                    "application/json",
+                    bytes::Bytes::from(body.clone()),
+                )]
+            },
+            download: &|key| {
+                tdh::get(format!(
+                    "/{key}/download/modules/acme/scoped/commits/{digest}"
+                ))
+            },
+            expected: &bundle,
+        })
+        .await;
     }
 
     /// #3910 review (B1): the scrub must not flag protobuf commit bundles as

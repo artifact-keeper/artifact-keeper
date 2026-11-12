@@ -490,13 +490,7 @@ async fn serve_download(
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
     Ok(response.body(Body::from_stream(stream)).unwrap())
 }
@@ -1037,6 +1031,7 @@ async fn publish_plugin(
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         FORMAT_KEY,
         &name,
@@ -1281,6 +1276,109 @@ mod tests {
         assert_eq!(meta["sha256"], sha);
         let catalog = catalog.expect("catalog row");
         assert_eq!(catalog.version, "1.2.0");
+    }
+
+    /// Downloads of a published archive are the count the Packages API
+    /// reports for that version and its package (#5260): the agent-plugins
+    /// route records the same `download_statistics` rows as every other
+    /// hosted serve, and the catalog count reads them from there.
+    #[tokio::test]
+    async fn downloads_show_in_package_counts_5260() {
+        let Some(fx) = tdh::Fixture::setup("local", "agentplugins").await else {
+            return;
+        };
+        let zip_bytes = claude_zip("counted", "1.0.0");
+        let sha = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(&zip_bytes))
+        };
+        let (status, body) = publish(&fx, "counted", "1.0.0", zip_bytes).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM artifacts WHERE repository_id = $1 AND checksum_sha256 = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(&sha)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("published artifact");
+        let package_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM packages WHERE repository_id = $1 AND name = $2")
+                .bind(fx.repo_id)
+                .bind("counted")
+                .fetch_one(&fx.pool)
+                .await
+                .expect("published package");
+
+        let app = tdh::router_with_auth(
+            Router::new()
+                .nest("/agentplugins", super::router())
+                .nest("/packages", crate::api::handlers::packages::router()),
+            fx.state.clone(),
+            tdh::make_auth(fx.user_id, &fx.username),
+        );
+        for _ in 0..3 {
+            let (dl_status, _) = tdh::send(
+                app.clone(),
+                tdh::get(format!(
+                    "/agentplugins/{}/counted/1.0.0/counted-1.0.0.zip",
+                    fx.repo_key
+                )),
+            )
+            .await;
+            assert_eq!(dl_status, StatusCode::OK);
+        }
+        assert_eq!(
+            tdh::download_count_eventually(&fx.pool, artifact_id, 3).await,
+            3
+        );
+
+        let (detail_status, detail_body) =
+            tdh::send(app.clone(), tdh::get(format!("/packages/{package_id}"))).await;
+        let (versions_status, versions_body) = tdh::send(
+            app.clone(),
+            tdh::get(format!("/packages/{package_id}/versions")),
+        )
+        .await;
+        let (list_status, list_body) = tdh::send(
+            app,
+            tdh::get(format!("/packages?repository_key={}", fx.repo_key)),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            detail_status,
+            StatusCode::OK,
+            "detail: {}",
+            String::from_utf8_lossy(&detail_body)
+        );
+        assert_eq!(
+            versions_status,
+            StatusCode::OK,
+            "versions: {}",
+            String::from_utf8_lossy(&versions_body)
+        );
+        assert_eq!(
+            list_status,
+            StatusCode::OK,
+            "list: {}",
+            String::from_utf8_lossy(&list_body)
+        );
+        let detail: Value = serde_json::from_slice(&detail_body).expect("detail json");
+        let versions: Value = serde_json::from_slice(&versions_body).expect("versions json");
+        let list: Value = serde_json::from_slice(&list_body).expect("list json");
+        assert_eq!(detail["download_count"], 3);
+        assert_eq!(versions["versions"][0]["version"], "1.0.0");
+        assert_eq!(versions["versions"][0]["download_count"], 3);
+        let listed = list["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| item["name"] == "counted")
+            .expect("counted package listed");
+        assert_eq!(listed["download_count"], 3);
     }
 
     /// Every class of refused publish is a 400 and stores nothing.
@@ -2350,5 +2448,66 @@ mod tests {
         assert!(staging_obj.starts_with(&format!("agentplugins/{staging}/")));
         assert!(prod_obj.starts_with(&format!("agentplugins/{prod}/")));
         assert_eq!(stored, 2, "two physical objects in the shared bucket");
+    }
+
+    /// #5685: `serve_download`'s `get_stream` answered a hard-coded 500 on
+    /// any storage failure. A store that is down now answers `503` with
+    /// `Retry-After`, one that is full `507` without it, and neither body
+    /// carries the backend's text.
+    #[tokio::test]
+    async fn download_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        let Some(fx) = tdh::Fixture::setup("local", "agentplugins").await else {
+            return;
+        };
+        let (status, body) = publish(
+            &fx,
+            "outage-tools",
+            "1.0.0",
+            claude_zip("outage-tools", "1.0.0"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "publish while storage works: {body}"
+        );
+
+        for (message, want, want_body) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&fx.pool, &fx.state, fx.repo_id, &message).await;
+            let app = tdh::router_with_auth(
+                super::router(),
+                state,
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let (status, body, headers) = tdh::send_with_headers(
+                app,
+                tdh::get(format!(
+                    "/{}/outage-tools/1.0.0/outage-tools-1.0.0.zip",
+                    fx.repo_key
+                )),
+            )
+            .await;
+            assert_eq!(status, want, "GET: {}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want == StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            assert_eq!(&body[..], want_body.as_bytes());
+            tdh::assert_no_storage_backend_text("agentplugins download", &body);
+        }
+        fx.teardown().await;
     }
 }

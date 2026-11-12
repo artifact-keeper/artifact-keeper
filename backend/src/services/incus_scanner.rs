@@ -363,30 +363,17 @@ async fn run_trivy_scan(
     label: &str,
 ) -> Result<TrivyReport> {
     let rootfs_str = rootfs.to_string_lossy();
-    let mut args = vec!["filesystem"];
-    if let Some(url) = server_url {
-        args.push("--server");
-        args.push(url);
-    }
-    args.extend_from_slice(&[
-        "--format",
-        "json",
-        // #3296: the shared allowlist includes UNKNOWN so ungraded CVEs
-        // reach the report instead of being dropped at the CLI.
-        "--severity",
-        crate::services::scanner_service::TRIVY_FS_SEVERITY_LIST,
-        "--quiet",
-        "--timeout",
-        "10m",
+    // Shared with the trivy-fs scanner, including `--offline-scan` (#5666):
+    // a rootfs carries the POMs of every Java application installed in it.
+    let args = crate::services::trivy_fs_scanner::trivy_filesystem_args(
         &rootfs_str,
-    ]);
+        server_url,
+        "10m",
+        false,
+    );
 
-    let mut command = tokio::process::Command::new("trivy");
-    // Same #3455 fix as `run_extractor` above and the grype/trivy-fs spawns:
-    // this scan runs inside the caller's inline-proxy-gate timeout, and a
-    // dropped-on-timeout future must not leave the trivy child running.
-    command.kill_on_drop(true);
-    let output = command
+    // `kill_on_drop` (#3455) and the no-phone-home environment (#5666).
+    let output = crate::services::trivy_fs_scanner::trivy_cli_command()
         .args(&args)
         .output()
         .await

@@ -290,6 +290,7 @@ async fn download_cookbook(
                         upstream_url,
                         &upstream_path,
                         "application/octet-stream",
+                        ctx.is_head,
                     )
                     .await?;
                     // #3649: count the proxied serve. The streaming helper answers a warm
@@ -357,13 +358,7 @@ async fn download_cookbook(
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
@@ -509,7 +504,15 @@ async fn upload_cookbook(
 
     // Stream the staged tarball into the repo's StorageBackend, from local
     // scratch or by copying the object the backend already staged (#4990).
-    let storage_key = format!("chef/{}/{}/{}", cookbook_name, cookbook_version, filename);
+    // Repo-scoped on a shared cloud namespace (#5662), so two repositories
+    // holding the same cookbook version do not collide on one key; reads go
+    // through the row's storage_key, so legacy flat-key rows keep serving.
+    let storage_key = crate::storage::StorageKeyScheme::from_env().write_key(
+        &repo.storage_backend,
+        "chef",
+        repo.id,
+        &format!("{}/{}/{}", cookbook_name, cookbook_version, filename),
+    );
     let put = proxy_helpers::put_staged_body(
         &state,
         &repo,
@@ -596,6 +599,7 @@ async fn upload_cookbook(
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         "chef",
         &cookbook_name,
@@ -966,6 +970,72 @@ mod tests {
             "/chef/chef-local/api/v1/cookbooks/nginx/versions/12.0.0/download"
         );
     }
+
+    /// #5685: `download_cookbook`'s `get_stream` answered a hard-coded 500 on
+    /// any storage failure. A store that is down now answers `503` with
+    /// `Retry-After`, one that is full `507` without it, and neither body
+    /// carries the backend's text.
+    #[tokio::test]
+    async fn download_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "chef").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            "cookbooks/outage5685/1.0.0/outage5685-1.0.0.tar.gz",
+            "cookbooks/outage5685/1.0.0/outage5685-1.0.0.tar.gz",
+            "outage5685",
+            "1.0.0",
+            "application/gzip",
+            bytes::Bytes::from_static(b"cookbook-5685"),
+            fx.user_id,
+        )
+        .await;
+
+        for (message, want, want_body) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&fx.pool, &fx.state, fx.repo_id, &message).await;
+            let app = tdh::router_with_auth(
+                super::router(),
+                state,
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let (status, body, headers) = tdh::send_with_headers(
+                app,
+                tdh::get(format!(
+                    "/{}/api/v1/cookbooks/outage5685/versions/1.0.0/download",
+                    fx.repo_key
+                )),
+            )
+            .await;
+            assert_eq!(status, want, "GET: {}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want == StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            assert_eq!(&body[..], want_body.as_bytes());
+            tdh::assert_no_storage_backend_text("chef download", &body);
+        }
+        fx.teardown().await;
+    }
 }
 
 #[cfg(ak_test_shard = "handlers-1")]
@@ -1026,6 +1096,32 @@ mod upload_stream_tests {
         body.extend_from_slice(tarball);
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         bytes::Bytes::from(body)
+    }
+
+    /// #5662: the same cookbook version uploads into two Chef repositories
+    /// on a shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_cookbook_uploads_to_two_cloud_repositories_5662() {
+        let tarball = b"one cookbook two supermarkets carry (#5662)";
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "chef",
+            key_prefix: "chef",
+            router: super::router,
+            publish: &|key| {
+                vec![tdh::post(
+                    format!("/{key}/api/v1/cookbooks"),
+                    "multipart/form-data; boundary=CHEFBND",
+                    cookbook_multipart("CHEFBND", "shared-cb", "1.0.0", tarball),
+                )]
+            },
+            download: &|key| {
+                tdh::get(format!(
+                    "/{key}/api/v1/cookbooks/shared-cb/versions/1.0.0/download"
+                ))
+            },
+            expected: tarball,
+        })
+        .await;
     }
 
     #[tokio::test]
