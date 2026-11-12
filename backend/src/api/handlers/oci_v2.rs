@@ -13628,9 +13628,15 @@ async fn handle_tags_list(
         Err(e) => return e,
     };
 
+    // #5794: the response `name` is the full `<name>` from the request path
+    // (`<repo key>/<image>`), not the image path inside the AK repository.
+    // The distribution spec answers `{"name": "<name>", "tags": [...]}`, and
+    // two repositories holding the same image path would otherwise be
+    // indistinguishable to a client that keys on the returned name.
+
     // n=0: return empty list per spec
     if n == 0 {
-        return build_tags_response(&repo.image, vec![]);
+        return build_tags_response(image_name, vec![]);
     }
 
     // The CALLER, for the virtual-member walk. For a Virtual repo the read
@@ -13666,7 +13672,7 @@ async fn handle_tags_list(
         );
     }
 
-    build_tags_response_with_pagination(&repo.image, page, has_more, image_name, n)
+    build_tags_response_with_pagination(page, has_more, image_name, n)
 }
 
 async fn resolve_tags_page(
@@ -13742,10 +13748,11 @@ async fn resolve_local_tags_page(
     Ok((page.tags, page.has_more))
 }
 
-/// Build a JSON response for tags/list with no pagination.
-fn build_tags_response(image: &str, tags: Vec<String>) -> Response {
+/// Build a JSON response for tags/list with no pagination. `name` is the
+/// full `<name>` of the request path (#5794).
+fn build_tags_response(name: &str, tags: Vec<String>) -> Response {
     let resp = TagsListResponse {
-        name: image.to_string(),
+        name: name.to_string(),
         tags,
     };
     let json = serde_json::to_string(&resp).unwrap_or_default();
@@ -13758,8 +13765,9 @@ fn build_tags_response(image: &str, tags: Vec<String>) -> Response {
 }
 
 /// Build a JSON response for tags/list with optional Link pagination header.
+/// `image_name` is the full `<name>` of the request path: it is both the
+/// response `name` (#5794) and the `Link` path.
 fn build_tags_response_with_pagination(
-    image: &str,
     page: Vec<String>,
     has_more: bool,
     image_name: &str,
@@ -13778,7 +13786,7 @@ fn build_tags_response_with_pagination(
     }
 
     let resp = TagsListResponse {
-        name: image.to_string(),
+        name: image_name.to_string(),
         tags: page,
     };
     let json = serde_json::to_string(&resp).unwrap_or_default();
@@ -35090,6 +35098,125 @@ mod cross_repo_session_regression_tests {
             !String::from_utf8_lossy(&body).contains("int1"),
             "the challenge must not carry the tag list"
         );
+    }
+
+    /// #5794: `tags/list` answers `name` as the full `<name>` of the request
+    /// path (`<repo key>/<image>`), on a hosted repository AND on a Virtual
+    /// repository serving it, for the unpaginated response, the paginated
+    /// one (`?n=1`, which also carries the `Link` header) and `?n=0`. Before
+    /// the fix every one of them answered the bare image path
+    /// (`aktest/tags`).
+    #[tokio::test]
+    async fn tags_list_name_is_full_request_name_5794() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        const IMAGE: &str = "aktest/tags";
+        // create_docker_repo marks the hosted repo is_public = true.
+        let (hosted_id, hosted_key, hosted_dir) = create_docker_repo(&pool, "tags5794").await;
+        let (virt_id, virt_key, virt_dir) = tdh::create_repo(&pool, "virtual", "docker").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(virt_id)
+            .execute(&pool)
+            .await
+            .expect("publish virtual");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virt_id)
+        .bind(hosted_id)
+        .execute(&pool)
+        .await
+        .expect("link virtual member");
+        let digest = format!("sha256:{}", "5".repeat(64));
+        for tag in ["1.0", "1.1", "2.0"] {
+            sqlx::query(
+                "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) \
+                 VALUES ($1, $2, $3, $4, 'application/vnd.oci.image.manifest.v1+json')",
+            )
+            .bind(hosted_id)
+            .bind(IMAGE)
+            .bind(tag)
+            .bind(&digest)
+            .execute(&pool)
+            .await
+            .expect("seed tag");
+        }
+        let state = tdh::build_state(pool.clone(), hosted_dir.to_str().unwrap());
+
+        // (repo key, query, expect a Link header, expected tag count)
+        let mut results = Vec::new();
+        for key in [&hosted_key, &virt_key] {
+            for (query, expect_link, expect_tags) in
+                [("", false, 3usize), ("?n=1", true, 1), ("?n=0", false, 0)]
+            {
+                let req = Request::builder()
+                    .method("GET")
+                    .uri(format!("/{}/{}/tags/list{}", key, IMAGE, query))
+                    .header("Authorization", "Bearer anonymous")
+                    .body(Body::empty())
+                    .unwrap();
+                let (status, body, headers) =
+                    tdh::send_with_headers(router(None).with_state(state.clone()), req).await;
+                let link = headers
+                    .get("Link")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                results.push((
+                    key.clone(),
+                    query,
+                    expect_link,
+                    expect_tags,
+                    status,
+                    link,
+                    body,
+                ));
+            }
+        }
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virt_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(hosted_id)
+            .execute(&pool)
+            .await;
+        for repo in [hosted_id, virt_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo)
+                .execute(&pool)
+                .await;
+        }
+        let _ = std::fs::remove_dir_all(&hosted_dir);
+        let _ = std::fs::remove_dir_all(&virt_dir);
+
+        for (key, query, expect_link, expect_tags, status, link, body) in results {
+            assert_eq!(status, StatusCode::OK, "GET {key}/{IMAGE}/tags/list{query}");
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(
+                json["name"],
+                format!("{key}/{IMAGE}"),
+                "tags/list{query} on {key} must answer the full request <name>"
+            );
+            assert_eq!(
+                json["tags"].as_array().map(Vec::len),
+                Some(expect_tags),
+                "tags/list{query} on {key}: {json}"
+            );
+            assert_eq!(
+                link.is_some(),
+                expect_link,
+                "tags/list{query} on {key}: Link header {link:?}"
+            );
+            if let Some(link) = link {
+                assert!(
+                    link.contains(&format!("/v2/{key}/{IMAGE}/tags/list")),
+                    "the Link path must name the same <name>: {link}"
+                );
+            }
+        }
     }
 
     /// #3275: `GET /v2/<name>/blobs/uploads/<uuid>` is the upload-status
