@@ -733,7 +733,14 @@ impl SamlService {
 
     /// Generate SAML AuthnRequest and return redirect URL
     pub fn create_authn_request(&self) -> Result<SamlAuthnRequest> {
-        let request_id = format!("_id{}", Uuid::new_v4());
+        self.create_authn_request_with_id_prefix("_id")
+    }
+
+    /// [`Self::create_authn_request`] with the AuthnRequest id starting with
+    /// `id_prefix` (an `xs:ID`, so it must start with a letter or `_`). A
+    /// command-line login (#5486) uses `sso_binding::CLI_SAML_REQUEST_PREFIX`.
+    pub fn create_authn_request_with_id_prefix(&self, id_prefix: &str) -> Result<SamlAuthnRequest> {
+        let request_id = format!("{id_prefix}{}", Uuid::new_v4());
         let relay_state = Uuid::new_v4().to_string();
         let issue_instant = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
@@ -783,6 +790,18 @@ impl SamlService {
 
     /// Process SAML Response and extract user information
     pub async fn authenticate(&self, saml_response_b64: &str) -> Result<SamlUserInfo> {
+        self.authenticate_request(saml_response_b64)
+            .await
+            .map(|(user, _)| user)
+    }
+
+    /// [`Self::authenticate`], also returning the AuthnRequest id the response
+    /// answered (its validated, now consumed `InResponseTo`), which the ACS
+    /// binds the sign-in's exchange code to (#5486).
+    pub async fn authenticate_request(
+        &self,
+        saml_response_b64: &str,
+    ) -> Result<(SamlUserInfo, String)> {
         // Decode base64 response
         let decoded = base64_decode(saml_response_b64).map_err(|e| {
             AppError::Authentication(format!("Failed to decode SAML response: {}", e))
@@ -838,7 +857,7 @@ impl SamlService {
             "SAML authentication successful"
         );
 
-        Ok(user_info)
+        Ok((user_info, request_id.to_string()))
     }
 
     /// Parse SAML Response XML
