@@ -2575,24 +2575,11 @@ mod tests {
             session_status(&pool, &user_code).await.as_deref(),
             Some("pending")
         );
-        let failures: i64 = {
-            audit_count(
-                &pool,
-                "DEVICE_AUTHORIZATION_FAILED",
-                ("user_id::text", user_id.to_string()),
-            )
-            .await;
-            // Let the remaining fire-and-forget writes land.
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            sqlx::query_scalar(
-                "SELECT COUNT(*) FROM audit_log WHERE action = 'DEVICE_AUTHORIZATION_FAILED' \
-                 AND user_id = $1",
-            )
-            .bind(user_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-        };
+        // The six writes are fire-and-forget; wait for all of them rather
+        // than sleeping a fixed time after the first one lands (#5882).
+        // `audit_approval` records the approver as the resource.
+        let failures =
+            h::audit_count_eventually(&pool, user_id, "DEVICE_AUTHORIZATION_FAILED", 6).await;
         assert_eq!(failures, 6, "3 wrong codes + 3 throttled attempts");
 
         // Another user is unaffected by this user's budget.
