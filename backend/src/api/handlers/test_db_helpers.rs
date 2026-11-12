@@ -1040,13 +1040,22 @@ impl crate::storage::StorageBackend for FallbackProbeStorage {
 /// is where a stopped or full store refuses them.
 pub struct FailingStorage {
     message: String,
+    fail_exists: bool,
 }
 
 impl FailingStorage {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            fail_exists: false,
         }
+    }
+
+    /// `exists` fails with the same error too, as it does against a store
+    /// that is down: the read paths that probe before they read (#5894).
+    pub fn failing_exists(mut self) -> Self {
+        self.fail_exists = true;
+        self
     }
 
     fn fail<T>(&self) -> crate::error::Result<T> {
@@ -1063,6 +1072,9 @@ impl crate::storage::StorageBackend for FailingStorage {
         self.fail()
     }
     async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+        if self.fail_exists {
+            return self.fail();
+        }
         Ok(false)
     }
     async fn delete(&self, _key: &str) -> crate::error::Result<()> {
@@ -1095,12 +1107,22 @@ pub async fn route_repo_to_failing_storage(
     repo_id: Uuid,
     message: &str,
 ) -> SharedState {
+    route_repo_to_storage(pool, state, repo_id, FailingStorage::new(message)).await
+}
+
+/// [`route_repo_to_failing_storage`] with the failing backend given.
+pub async fn route_repo_to_storage(
+    pool: &PgPool,
+    state: &SharedState,
+    repo_id: Uuid,
+    failing: FailingStorage,
+) -> SharedState {
     sqlx::query("UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1")
         .bind(repo_id)
         .execute(pool)
         .await
         .expect("move repository onto the failing backend");
-    let failing: Arc<dyn crate::storage::StorageBackend> = Arc::new(FailingStorage::new(message));
+    let failing: Arc<dyn crate::storage::StorageBackend> = Arc::new(failing);
     let mut backends: std::collections::HashMap<String, Arc<dyn crate::storage::StorageBackend>> =
         std::collections::HashMap::new();
     backends.insert("s3".to_string(), failing);
@@ -4286,6 +4308,80 @@ impl AuthzQueryOutage {
             let _ = tx.rollback().await;
         }
         self.pool.close().await;
+    }
+}
+
+/// A database that cannot answer queries on some tables, for the #5894
+/// regressions: every query through [`Self::pool`] that reads one of
+/// `tables` is cancelled by `statement_timeout` (`canceling statement due to
+/// statement timeout`, the classification a 503 is answered for), while
+/// every other query through it runs normally.
+///
+/// Each table is shadowed, in a schema of its own that only this pool puts
+/// first on its `search_path`, by a view over a function that sleeps before
+/// returning the real rows, so the stall happens even for a lookup that
+/// matches nothing. Other tests and other pools never see the schema, so
+/// unlike a table lock nothing else waits. Returns `None` without a database.
+pub struct TableQueryOutage {
+    pub pool: PgPool,
+    admin: PgPool,
+    schema: String,
+}
+
+impl TableQueryOutage {
+    pub async fn start(admin: &PgPool, tables: &[&str]) -> Option<Self> {
+        use std::str::FromStr;
+        let url = crate::testing::require_db_url()?;
+        let schema = format!("ak_outage_{}", Uuid::new_v4().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(admin)
+            .await
+            .expect("create outage schema");
+        for table in tables {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "CREATE FUNCTION {schema}.stall_{table}() RETURNS SETOF public.{table} \
+                 LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(30); \
+                 RETURN QUERY SELECT * FROM public.{table}; END $$"
+            )))
+            .execute(admin)
+            .await
+            .expect("create stall function");
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "CREATE VIEW {schema}.{table} AS SELECT * FROM {schema}.stall_{table}()"
+            )))
+            .execute(admin)
+            .await
+            .expect("create stall view");
+        }
+        let search_path = format!("{schema},public");
+        let opts = sqlx::postgres::PgConnectOptions::from_str(&url)
+            .expect("parse DATABASE_URL")
+            .options([
+                ("search_path", search_path.as_str()),
+                ("statement_timeout", "1000"),
+            ]);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .connect_with(opts)
+            .await
+            .expect("connect outage pool");
+        Some(Self {
+            pool,
+            admin: admin.clone(),
+            schema,
+        })
+    }
+
+    /// Close the pool and drop the schema.
+    pub async fn end(self) {
+        self.pool.close().await;
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {} CASCADE",
+            self.schema
+        )))
+        .execute(&self.admin)
+        .await;
     }
 }
 
