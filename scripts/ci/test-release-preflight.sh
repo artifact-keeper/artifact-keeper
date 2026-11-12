@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Self-test for scripts/ci/release-preflight.sh checks 1, 3, 4, 5 and 6
+# Self-test for scripts/ci/release-preflight.sh checks 1, 3, 4, 5, 6 and 7
 # (issues #3308, #3309, #3338 and #3339).
 #
 # WHY THIS EXISTS
@@ -83,6 +83,9 @@ case "$1" in
   api)
     case "$2" in
       graphql)
+        # Check 7's milestone query (check-e2e-proof.py), only when a check-7
+        # case sets it.
+        if [ -n "${FAKE_E2E_GRAPHQL-}" ]; then printf '%s\n' "$FAKE_E2E_GRAPHQL"; exit 0; fi
         # The PR -> closing-issue map for check 5. $FAKE_CLOSES_MAP is already
         # in the `<pr>:<issue>,<issue>` shape the real --jq produces.
         [ "${FAKE_GRAPHQL_FAIL-0}" = "1" ] && exit 1
@@ -95,6 +98,10 @@ case "$1" in
           exit 1
         fi
         [ -n "${FAKE_CLOSES_MAP-}" ] && printf '%s\n' "$FAKE_CLOSES_MAP"
+        exit 0
+        ;;
+      *milestones*)
+        [ -n "${FAKE_E2E_MILESTONES-}" ] && printf '%s\n' "$FAKE_E2E_MILESTONES"
         exit 0
         ;;
       *actions/workflows/docker-publish.yml/runs*)
@@ -967,6 +974,73 @@ expect "notes marked DRAFT -> NOT READY" 1 "unfinished markers"
 # 6d. No notes file for the version is reported, not blocked.
 rm -f "$REPO_DIR/.github/release-notes/9.9.9.md"
 expect "no notes file yet -> READY (noted)" 0 "does not exist yet"
+
+echo
+echo "release-preflight check 7 (end-to-end proof for every closed bug)"
+
+# Check 7 runs scripts/ci/check-e2e-proof.py milestone (its own logic has its
+# own self-test, test-check-e2e-proof.sh). These cases pin the WIRING: which
+# milestone and tests ref it asks about, and how its three exit codes map onto
+# the preflight's in each mode. The base fixture is READY with checks 4 and 5
+# skipped, so the exit codes are a statement about check 7 alone. The fake
+# records its arguments and replays $FAKE_E2E_RC.
+FAKE_E2E="$WORK/fake-check-e2e-proof.py"
+cat > "$FAKE_E2E" <<'FAKE'
+import os, sys
+open(os.environ["FAKE_E2E_ARGS"], "w").write(" ".join(sys.argv[1:]) + "\n")
+rc = int(os.environ.get("FAKE_E2E_RC", "0"))
+if rc == 1:
+    print("  #4242   MISSING   no tier, suite or exemption (#4243): a bug")
+    print("  totals: MISSING 1, covered 3")
+elif rc == 2:
+    print("INFRA: gh api graphql failed", file=sys.stderr)
+sys.exit(rc)
+FAKE
+export FAKE_E2E_ARGS="$WORK/e2e-args.txt"
+
+PREFLIGHT_E2E_PROOF_CMD="$FAKE_E2E" FAKE_E2E_RC=1 \
+  expect "7a. missing proof, default mode -> READY with a warning (advisory)" 0 "(advisory; PREFLIGHT_E2E_PROOF_MODE=enforce blocks)"
+if grep -qF "#4242   MISSING" "$WORK/out.txt"; then pass "7a. the advisory run still lists the missing bug"; else fail "7a. missing bug not listed"; fi
+if grep -qF "milestone --milestone 9.9.9 --repo artifact-keeper/artifact-keeper --tests-ref main" "$FAKE_E2E_ARGS"; then
+  pass "7a. asks about the Cargo.toml milestone with tests at main"
+else
+  fail "7a. wrong arguments: $(cat "$FAKE_E2E_ARGS")"
+fi
+PREFLIGHT_E2E_PROOF_MODE=enforce PREFLIGHT_E2E_PROOF_CMD="$FAKE_E2E" FAKE_E2E_RC=1 \
+  expect "7b. missing proof, enforce -> NOT READY" 1 "#4242   MISSING"
+PREFLIGHT_E2E_PROOF_MODE=enforce PREFLIGHT_E2E_PROOF_CMD="$FAKE_E2E" FAKE_E2E_RC=0 \
+  expect "7c. every bug proven, enforce -> READY" 0 "every closed bug in 9.9.9 has an end-to-end proof"
+PREFLIGHT_E2E_PROOF_MODE=enforce PREFLIGHT_E2E_PROOF_CMD="$FAKE_E2E" FAKE_E2E_RC=2 \
+  expect "7d. could not measure, enforce -> INFRA" 2 "INFRA: check 7 could not list"
+PREFLIGHT_E2E_PROOF_CMD="$FAKE_E2E" FAKE_E2E_RC=2 \
+  expect "7e. could not measure, advisory -> READY with a warning" 0 "check 7 could not be measured (advisory)"
+PREFLIGHT_E2E_PROOF_MODE=enforce PREFLIGHT_E2E_PROOF_CMD="$WORK/absent.py" \
+  expect "7f. script missing, enforce -> INFRA" 2 "check 7 cannot list"
+PREFLIGHT_E2E_PROOF_MODE=bogus PREFLIGHT_E2E_PROOF_CMD="$FAKE_E2E" \
+  expect "7g. unknown mode -> NOT READY (a typo must not disable the check)" 1 "neither advisory nor enforce"
+PREFLIGHT_REF=release/9.9.x PREFLIGHT_E2E_PROOF_CMD="$FAKE_E2E" FAKE_E2E_RC=0 \
+  expect "7h. a release line reads the same-named test branch" 0 "artifact-keeper-test@release/9.9.x"
+PREFLIGHT_SKIP_E2E_PROOF=1 PREFLIGHT_E2E_PROOF_MODE=enforce PREFLIGHT_E2E_PROOF_CMD="$WORK/absent.py" \
+  expect "7i. PREFLIGHT_SKIP_E2E_PROOF=1 -> not run" 0 "PREFLIGHT_SKIP_E2E_PROOF=1; skipped."
+
+# 7j. The real script end to end, offline: a fixture test tree with one wired
+#     tier, the gh stub answering the milestone list and query. Bug #300 is
+#     covered, #301 is not; enforce blocks on #301 only.
+TESTS7="$WORK/tests7"
+mkdir -p "$TESTS7/deploy-test/harness/tiers/wired" "$TESTS7/.github/workflows"
+printf 'PROFILES="x"\nORACLE="oracle.sh"\nCOVERS="300"\n' > "$TESTS7/deploy-test/harness/tiers/wired/manifest"
+printf 'begin_test "FIX #300: ok"\n' > "$TESTS7/deploy-test/harness/tiers/wired/oracle.sh"
+printf 'jobs:\n  dtf-gate:\n    strategy:\n      matrix:\n        include:\n          - group: g\n            tiers: wired\n' \
+  > "$TESTS7/.github/workflows/release-gate.yml"
+e2e_issue() { printf '{"number":%s,"title":"bug %s","stateReason":"COMPLETED","labels":{"nodes":[{"name":"type:bug"}]},"closedByPullRequestsReferences":{"nodes":[]}}' "$1" "$1"; }
+e2e_graphql() { printf '{"data":{"repository":{"milestone":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[%s]}}}}}' "$1"; }
+REAL_E2E="$(dirname "$SCRIPT")/check-e2e-proof.py"
+PREFLIGHT_E2E_PROOF_MODE=enforce PREFLIGHT_E2E_PROOF_CMD="$REAL_E2E" PREFLIGHT_TESTS_DIR="$TESTS7" \
+  FAKE_E2E_MILESTONES='[{"number":9,"title":"9.9.9"}]' FAKE_E2E_GRAPHQL="$(e2e_graphql "$(e2e_issue 300),$(e2e_issue 301)")" \
+  expect "7j. real script: one bug without a proof -> NOT READY" 1 "#301    MISSING"
+PREFLIGHT_E2E_PROOF_MODE=enforce PREFLIGHT_E2E_PROOF_CMD="$REAL_E2E" PREFLIGHT_TESTS_DIR="$TESTS7" \
+  FAKE_E2E_MILESTONES='[{"number":9,"title":"9.9.9"}]' FAKE_E2E_GRAPHQL="$(e2e_graphql "$(e2e_issue 300)")" \
+  expect "7k. real script: every bug covered by a wired tier -> READY" 0 "every closed bug in 9.9.9"
 
 echo
 if [ "$fails" -eq 0 ]; then

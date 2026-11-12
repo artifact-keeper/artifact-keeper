@@ -89,6 +89,7 @@ related workflows) enforces, in order of how fast you can reproduce each locally
 | Smoke E2E | docker compose up + smoke profile | `./scripts/run-e2e-tests.sh` |
 | Security audit | `cargo audit` on the dependency tree | `cargo audit` |
 | Linked issue | PR body must reference an issue (`Closes #N`) | n/a (PR body) |
+| E2E proof (advisory) | a bug-fix PR declares its end-to-end proof or exemption (see [End-to-end proof for bug fixes](#end-to-end-proof-for-bug-fixes)) | `python3 scripts/ci/check-e2e-proof.py pr --pr <N> --no-write` |
 | CHANGELOG fragments | every `changes/unreleased/*.md` is well-formed | `python3 scripts/ci/changelog-fragments.py validate` |
 | CodeQL | static analysis | n/a (runs in CI) |
 
@@ -197,6 +198,64 @@ For PRs that aren't bug fixes (`feat/`, `chore/`, `docs/`, `ci/`,
 This is part of [Hardening Core](https://github.com/orgs/artifact-keeper/projects/2),
 the stability program tracking the work to make every release deploy
 clean from a fresh helm install.
+
+## End-to-end proof for bug fixes
+
+On top of the regression test above, every bug fix comes with an end-to-end
+test in [`artifact-keeper-test`](https://github.com/artifact-keeper/artifact-keeper-test),
+or says why it cannot have one. A unit test proves the function; the end-to-end
+test proves the deployment, driven the way a user drives it.
+
+**What counts as a bug PR:** the linked `Closes #N` issue is `type:bug`, or the
+title type is `fix`, or the head branch matches `fix/*`.
+
+**Declaring the proof.** The PR body declares it with one of these lines
+(outside HTML comments and code blocks, which are ignored):
+
+| Line | Meaning |
+| --- | --- |
+| `E2E: artifact-keeper-test#N` | A test PR that adds or extends a tier or suite. |
+| `E2E: tier <name>` | An existing tier that covers the issue (its manifest `COVERS` it). |
+| `E2E: suite tests/<area>/<file>.sh` | Existing coverage that goes red on the bug and names the issue. |
+| `E2E-Exempt: <category>: <reason>` | No end-to-end test, with the reason. Also needs the label `no-e2e-required`. |
+| no line, with the maintainer's label `needs-e2e-test` | Deferred. The check passes, the label is copied to the issue, and the release backstop blocks until a tier covers it. |
+
+**Exemption categories:** `test-only`, `build-ci`, `deps`, `docs`,
+`internal-unreachable` (must name the unit or integration test),
+`race-window` (must name the barrier, failpoint or stress test that forces the
+window), and `embargoed: GHSA-...` (while the advisory is a draft, the public
+tier asserts only a harmless facet).
+
+**Automatic exemptions:** title types `test`, `ci`, `docs`, `chore` and
+`build`, and diffs only in docs, `.github`, `scripts`, `changes`, `Cargo.lock`
+or audit config (`.cargo/audit.toml`, `.trivyignore`, `.vex/`).
+
+**Flake fixes** carry the `ci` or `testing` label and a line
+`Flake-Proof: <how reproduced>; <N> consecutive passes under <load>`. File new
+flaky-test issues as `type:chore` + `ci`, not `type:bug`.
+
+**What the check verifies on the test PR:** it lives in artifact-keeper-test,
+is open or merged, touches `deploy-test/harness/tiers/**` or `tests/**`, names
+the backend issue (`artifact-keeper#N`), and has a `## Validation` section with
+a RED line (the pre-fix image fails the FIX cases) and a GREEN line (the fixed
+image passes). The tier conventions (names, `COVERS=`, `FIX #N:` case labels,
+the Validation format) are in the test repo.
+
+**Release lines:** a PR into `release/X.Y.x` cites a test PR whose base is the
+test repo's `release/X.Y.x`, and tiers and suites are read from that branch. A
+backport inherits its original PR's exemption through the `(cherry picked from
+commit ...)` trailer.
+
+A backend fix may merge before its test PR. The release preflight (check 7)
+is the backstop: every closed `type:bug` issue in the milestone needs a tier
+that covers it and is wired into the release gate, an exemption on its PR, or a
+reviewed row in [`scripts/ci/e2e-exemptions.tsv`](scripts/ci/e2e-exemptions.tsv).
+
+The PR check is `Require E2E proof for bug fixes`
+([`require-e2e-proof.yml`](.github/workflows/require-e2e-proof.yml), rules in
+`scripts/ci/check-e2e-proof.py`). It is **advisory** until the 1.12.0 backfill
+lands: it reports a warning but does not block the merge. Run it locally with
+`python3 scripts/ci/check-e2e-proof.py pr --pr <number> --no-write`.
 
 ## Reporting Security Issues
 

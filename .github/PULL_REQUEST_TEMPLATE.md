@@ -16,6 +16,31 @@ Reviewers should not approve fix/* PRs without a checked box.
 - [ ] This PR is a `fix/*` AND adds/updates a test that would have caught the bug
 - [ ] N/A — this is not a bug fix
 
+## End-to-end proof (bug fixes)
+<!--
+A bug PR (its linked issue is type:bug, its title type is `fix`, or its branch
+is fix/*) also needs an end-to-end proof in artifact-keeper-test. Declare it
+with ONE line, outside this comment (see CONTRIBUTING.md, "End-to-end proof
+for bug fixes"):
+
+  E2E: artifact-keeper-test#N              a test PR that adds or extends a
+                                           tier or suite; it names this issue
+                                           and has a `## Validation` section
+                                           with a RED and a GREEN line
+  E2E: tier <name>                         an existing tier that covers it
+  E2E: suite tests/<area>/<file>.sh        an existing suite that goes red on
+                                           the bug and names the issue
+  E2E-Exempt: <category>: <reason>         plus the label no-e2e-required.
+      Categories: test-only, build-ci, deps, docs, internal-unreachable (name
+      the unit/integration test), race-window (name the barrier/failpoint/
+      stress test), embargoed: GHSA-... (harmless facet only until disclosure)
+
+Flake fixes: the `ci` or `testing` label and
+  Flake-Proof: <how reproduced>; <N> consecutive passes under <load>
+A PR into release/X.Y.x cites a test PR against artifact-keeper-test's
+release/X.Y.x. Titles of type test/ci/docs/chore/build are exempt.
+-->
+
 ## Changelog
 <!--
 User-facing changes add ONE new file, changes/unreleased/<issue-number>-<slug>.md,

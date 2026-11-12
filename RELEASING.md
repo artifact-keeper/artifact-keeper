@@ -161,6 +161,27 @@ names the same commit.
    forgotten draft would otherwise publish with the gaps invisible. Resolve or
    delete every marker in the prep PR.
 
+   Check 7 is the **end-to-end proof backstop** (CONTRIBUTING.md, "End-to-end
+   proof for bug fixes"). It runs
+   `scripts/ci/check-e2e-proof.py milestone --milestone X.Y.Z --tests-ref <ref>`
+   and needs every closed `type:bug` issue in the milestone to have one of:
+   a tier whose manifest `COVERS` it and that is wired into the release gate
+   (`dtf-gate` or `dtf-advisory` in artifact-keeper-test's `release-gate.yml`),
+   a suite its closing PR names, an exemption on its closing PR, or a reviewed
+   row in `scripts/ci/e2e-exemptions.tsv`. An issue still labelled
+   `needs-e2e-test` (deferred at PR time) blocks, and so does a tier that
+   covers the issue but is not wired yet. The tests ref is the same-named
+   artifact-keeper-test branch: `main` for a cut from main, `release/X.Y.x` for
+   a maintenance line. Exit 1 is NOT READY and exit 2 is INFRA, as for the
+   other checks.
+
+   Check 7 is **advisory** until the 1.12.0 backfill lands: it prints its
+   findings as `[warn]` and never blocks the cut. To make it blocking, set
+   `PREFLIGHT_E2E_PROOF_MODE=enforce` (in `release-preflight.yml`, or change
+   the default in the script). Fix a finding by landing and wiring the tier, or
+   by adding a ledger row the maintainer has reviewed; do not delete the
+   `needs-e2e-test` label to get past it.
+
    **Cut checklist, beyond the preflight.** Before dispatching the candidate,
    also confirm the secrets the post-release jobs need (step 8): the
    `DISCORD_RELEASE_WEBHOOK` webhook is live (rotate it if the last
