@@ -41,6 +41,12 @@ set -a; . ./.env.local-dev; set +a
 AK_PRE_PUSH_TESTS=1 git push
 ```
 
+The npm scan-on-proxy regression tests in `handlers-1` skip locally when npm
+is unavailable. CI uses Node.js 22 with npm 10.9.9 and sets
+`AK_TESTS_REQUIRE_NPM=1` so missing npm fails instead of silently skipping.
+Local runs do not enforce a particular npm version; use
+`npm install --global npm@10.9.9` to match CI.
+
 A full test build peaks around 20 GB of rustc memory, which is why this is not the default.
 
 The hooks are fast local feedback, not a substitute for CI. Bypass once with

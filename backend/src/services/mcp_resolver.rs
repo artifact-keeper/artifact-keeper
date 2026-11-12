@@ -54,6 +54,10 @@ const BATCH: i64 = 8;
 type PostCommit = (Vec<PackagePin>, Vec<(Uuid, Uuid)>);
 
 const FILL_JSON_MAX: usize = 8 * 1024 * 1024;
+/// One deadline over a whole fill: every format request it makes, response
+/// head and body alike (#5395). Shorter than [`CLAIM_SECS`], so a stalled
+/// fill gives its job up before another replica may claim it.
+pub const FILL_DEADLINE: Duration = Duration::from_secs(300);
 
 // ---------------------------------------------------------------------------
 // Resolution at publish
@@ -72,6 +76,12 @@ pub struct Pending {
     pub fill_repository: String,
     pub fill_repository_id: Uuid,
     pub fill_format: String,
+    /// The submitted `registryBaseUrl` (accepted under `open` when foreign,
+    /// #5452), so the pin a fill produces records
+    /// [`mcp_packages::FOREIGN_COORDINATES_WARNING`] as a direct pin does.
+    /// Never fetched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_base_url: Option<String>,
 }
 
 impl Pending {
@@ -80,6 +90,7 @@ impl Pending {
             "registryType": self.registry_type,
             "identifier": self.identifier,
             "version": self.version,
+            "registryBaseUrl": self.registry_base_url,
             "transport": {"type": "stdio"},
         }))
         .expect("a pending package is a valid package")
@@ -114,10 +125,9 @@ pub async fn resolve_document(
     server: &fmt::ServerJson,
     base_url: &str,
 ) -> Result<Resolution, McpError> {
+    // `open` resolves exactly as `own-repos` does (#5452): it only accepts
+    // foreign coordinates (`mcp_packages::resolve_package`).
     let mut out = Resolution::default();
-    if settings.policy == fmt::PackagePolicy::Open {
-        return Ok(out);
-    }
     for (index, pkg) in server.packages.iter().enumerate() {
         if pkg.registry_type == "mcpb" {
             out.pins
@@ -128,11 +138,19 @@ pub async fn resolve_document(
             Ok(pin) => out.pins.push(pin),
             Err(McpError::PackageNotFound { index, detail }) => {
                 let repo = &settings.repos[&pkg.registry_type];
-                let Some(remote) = fill_target(&state.db, repo).await? else {
+                let Some(remote) = fill_target(&state.db, repo, pkg).await? else {
                     return Err(McpError::PackageNotFound { index, detail });
                 };
+                // Foreign coordinates (`open`) are neither pinned from nor
+                // filled through a Remote of another upstream (#5452).
+                if !mcp_packages::remote_may_serve(pkg, repo, &remote, base_url) {
+                    return Err(mcp_packages::foreign_through_remote(index, pkg, &remote));
+                }
                 match cached_pin(&state.db, repo, &remote, index, pkg).await? {
-                    Some(pin) => out.pins.push(pin),
+                    Some(mut pin) => {
+                        mcp_packages::note_foreign_coordinates(&mut pin, pkg, repo, base_url);
+                        out.pins.push(pin)
+                    }
                     None => out.pending.push(Pending {
                         index,
                         registry_type: pkg.registry_type.clone(),
@@ -141,6 +159,7 @@ pub async fn resolve_document(
                         fill_repository: remote.key.clone(),
                         fill_repository_id: remote.id,
                         fill_format: remote.format.clone(),
+                        registry_base_url: pkg.registry_base_url.clone(),
                     }),
                 }
             }
@@ -154,29 +173,40 @@ fn db_err(e: impl std::fmt::Display) -> McpError {
     McpError::Internal(e.to_string())
 }
 
-/// The Remote a missing package can be filled through: the backing
-/// repository itself, or the first Remote member (by priority) of a Virtual
-/// one. `None` for a hosted backing repository (nothing to fill from).
-pub async fn fill_target(db: &PgPool, repo: &BackingRepo) -> Result<Option<BackingRepo>, McpError> {
+/// The Remote a missing package `pkg` can be filled through: the backing
+/// repository itself, or, for a Virtual one, the Remote member its route
+/// would serve `pkg` from ([`fill_remote`]: the member walk with nested
+/// Virtuals inlined and equal priorities broken by key, and the format's
+/// shadowing guard), so a fill never goes through a Remote the pin would
+/// then be refused for (#5537). `None` for a hosted backing repository, or a
+/// Virtual with no Remote member that would serve `pkg` (nothing to fill
+/// from).
+///
+/// [`fill_remote`]: crate::services::mcp_virtual_serve::fill_remote
+pub async fn fill_target(
+    db: &PgPool,
+    repo: &BackingRepo,
+    pkg: &fmt::Package,
+) -> Result<Option<BackingRepo>, McpError> {
     if repo.is_remote() {
         return Ok(Some(repo.clone()));
     }
     if !repo.is_virtual() {
         return Ok(None);
     }
-    let key: Option<String> = sqlx::query_scalar(
-        "SELECT r.key FROM virtual_repo_members m JOIN repositories r ON r.id = m.member_repo_id \
-         WHERE m.virtual_repo_id = $1 AND r.repo_type = 'remote' ORDER BY m.priority LIMIT 1",
+    let remote = crate::services::mcp_virtual_serve::fill_remote(
+        db,
+        repo.id,
+        &pkg.registry_type,
+        &pkg.identifier,
+        pkg.version.as_deref(),
     )
-    .bind(repo.id)
-    .fetch_optional(db)
-    .await
-    .map_err(db_err)?;
-    match key {
-        Some(k) => Ok(mcp_packages::repos_by_key(db, &[k])
+    .await?;
+    match remote {
+        Some((id, key)) => Ok(mcp_packages::repos_by_key(db, &[key])
             .await?
             .into_iter()
-            .next()),
+            .find(|r| r.id == id)),
         None => Ok(None),
     }
 }
@@ -241,30 +271,19 @@ pub fn cache_key(registry_type: &str, identifier: &str, version: &str) -> Option
     }
 }
 
-/// Whether a PyPI distribution file name is `name`'s `version`: a wheel
-/// (`{dist}-{version}-...whl`) or an sdist (`{name}-{version}.tar.gz`,
-/// `.zip`), names compared PEP 503-normalised.
+/// Whether a PyPI distribution file name is `name`'s `version`: a wheel, an
+/// egg or an sdist of any extension the download route serves
+/// ([`pypi_file_parts`]), names compared PEP 503-normalised.
+///
+/// [`pypi_file_parts`]: crate::services::mcp_virtual_serve::pypi_file_parts
 pub fn pypi_file_matches(file: &str, name: &str, version: &str) -> bool {
     use crate::formats::pypi::PypiHandler;
-    let want = PypiHandler::normalize_name(name);
-    let (dist, ver) = if let Some(stem) = file.strip_suffix(".whl") {
-        let mut parts = stem.splitn(3, '-');
-        match (parts.next(), parts.next()) {
-            (Some(d), Some(v)) => (d, v),
-            _ => return false,
+    match crate::services::mcp_virtual_serve::pypi_file_parts(file) {
+        Some((dist, ver)) => {
+            ver == version && PypiHandler::normalize_name(dist) == PypiHandler::normalize_name(name)
         }
-    } else if let Some(stem) = file
-        .strip_suffix(".tar.gz")
-        .or_else(|| file.strip_suffix(".zip"))
-    {
-        match stem.rsplit_once('-') {
-            Some(pair) => pair,
-            None => return false,
-        }
-    } else {
-        return false;
-    };
-    ver == version && PypiHandler::normalize_name(dist) == want
+        None => false,
+    }
 }
 
 /// The proxy-cache entry of a package in `remote`, as `(path, sha256)`.
@@ -276,9 +295,81 @@ async fn find_cached(
     let Some(version) = pkg.version.as_deref() else {
         return Ok(None);
     };
-    let Some(key) = cache_key(&pkg.registry_type, &pkg.identifier, version) else {
+    cached_entry(db, remote.id, &pkg.registry_type, &pkg.identifier, version).await
+}
+
+/// The longest a catalog lookup waits for an in-flight fill of the entry it
+/// misses (#5702): about twice the streaming publish tail's own bound, and
+/// never longer than one resolver tick, which would pin the entry anyway.
+fn catalog_fill_wait() -> Duration {
+    (2 * crate::services::proxy_service::TEE_PUBLISH_WAIT_MAX).min(resolver_interval())
+}
+
+/// The resolver tick: `MCP_RESOLVER_INTERVAL_SECS`, default 15 s.
+fn resolver_interval() -> Duration {
+    let secs = std::env::var("MCP_RESOLVER_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(15);
+    Duration::from_secs(secs)
+}
+
+/// Whether the proxy-cache `path` is an entry `key` names (`identifier`
+/// `version` for PyPI's file match).
+fn key_names_path(key: &CacheKey, path: &str, identifier: &str, version: &str) -> bool {
+    match key {
+        CacheKey::Exact(p) => path == p,
+        CacheKey::PypiFiles { prefix } => path
+            .strip_prefix(prefix.as_str())
+            .is_some_and(|f| !f.contains('/') && pypi_file_matches(f, identifier, version)),
+        CacheKey::Nupkg { v3_path, v2_path } => path == v3_path || path == v2_path,
+    }
+}
+
+/// The proxy-cache entry of `registry_type` `identifier@version` in the
+/// Remote `remote_id`, as `(path, sha256)`: [`find_cached`] by its parts.
+///
+/// A miss that this process is filling right now (a pull-through whose
+/// client already has the bytes while the cache writer's tail still commits
+/// the catalog row) is waited for, at most [`catalog_fill_wait`], and read
+/// again (#5702): a publish straight after `npm install` then pins the
+/// entry (`200`) instead of answering `202 resolving`. A fill on another
+/// replica is not seen; that publish still answers `202` and the resolver
+/// pins it on its next tick.
+pub(crate) async fn cached_entry(
+    db: &PgPool,
+    remote_id: Uuid,
+    registry_type: &str,
+    identifier: &str,
+    version: &str,
+) -> Result<Option<(String, String)>, McpError> {
+    let Some(key) = cache_key(registry_type, identifier, version) else {
         return Ok(None);
     };
+    if let Some(found) = catalog_entry(db, remote_id, &key, identifier, version).await? {
+        return Ok(Some(found));
+    }
+    let waited = crate::services::proxy_service::await_catalog_fill(
+        remote_id,
+        |path| key_names_path(&key, path, identifier, version),
+        catalog_fill_wait(),
+    )
+    .await;
+    if !waited {
+        return Ok(None);
+    }
+    catalog_entry(db, remote_id, &key, identifier, version).await
+}
+
+/// The `proxy_cache_artifacts` row `key` names, as `(path, sha256)`.
+async fn catalog_entry(
+    db: &PgPool,
+    remote_id: Uuid,
+    key: &CacheKey,
+    identifier: &str,
+    version: &str,
+) -> Result<Option<(String, String)>, McpError> {
     // Proxy-cache paths are exact, case-sensitive storage keys (the format
     // handlers look an entry up by its exact key), so the match is exact:
     // folding case would pin, say, `1.0.0-RC.1` for a `1.0.0-rc.1` request.
@@ -286,7 +377,7 @@ async fn find_cached(
     // the version (filtered exactly below), so the row cap cannot cut the
     // right file off.
     use crate::api::handlers::escape_like_literal;
-    let pattern = match &key {
+    let pattern = match key {
         CacheKey::Exact(p) => escape_like_literal(p),
         CacheKey::PypiFiles { prefix } => format!(
             "{}%{}%",
@@ -296,7 +387,7 @@ async fn find_cached(
         CacheKey::Nupkg { v3_path, .. } => escape_like_literal(v3_path),
     };
     // A NuGet V2 upstream caches the package under its own key.
-    let exact = match &key {
+    let exact = match key {
         CacheKey::Nupkg { v2_path, .. } => Some(v2_path.as_str()),
         _ => None,
     };
@@ -306,17 +397,17 @@ async fn find_cached(
            AND (path LIKE $2 ESCAPE '\\' OR path = $3) \
          ORDER BY path LIMIT 200",
     )
-    .bind(remote.id)
+    .bind(remote_id)
     .bind(&pattern)
     .bind(exact)
     .fetch_all(db)
     .await
     .map_err(db_err)?;
-    Ok(rows.into_iter().find(|(path, _)| match &key {
+    Ok(rows.into_iter().find(|(path, _)| match key {
         CacheKey::PypiFiles { .. } => path
             .rsplit('/')
             .next()
-            .is_some_and(|f| pypi_file_matches(f, &pkg.identifier, version)),
+            .is_some_and(|f| pypi_file_matches(f, identifier, version)),
         _ => true,
     }))
 }
@@ -327,20 +418,35 @@ async fn find_cached(
 /// Remote MCP ingest uses it after the `artifacts` lookup misses: npm, PyPI,
 /// NuGet and Cargo packages pulled through a Remote live only in its proxy
 /// cache.
+///
+/// Foreign coordinates (`open`) naming another registry than the Remote's
+/// upstream are refused ([`mcp_packages::remote_may_serve`]); the pin records
+/// [`mcp_packages::FOREIGN_COORDINATES_WARNING`] when they name it.
 pub async fn cached_pin_through(
     db: &PgPool,
     mapped: &BackingRepo,
     index: usize,
     pkg: &fmt::Package,
+    base_url: &str,
 ) -> Result<Option<PackagePin>, McpError> {
-    match fill_target(db, mapped).await? {
-        Some(remote) => cached_pin(db, mapped, &remote, index, pkg).await,
-        None => Ok(None),
+    let Some(remote) = fill_target(db, mapped, pkg).await? else {
+        return Ok(None);
+    };
+    if !mcp_packages::remote_may_serve(pkg, mapped, &remote, base_url) {
+        return Err(mcp_packages::foreign_through_remote(index, pkg, &remote));
     }
+    let mut found = cached_pin(db, mapped, &remote, index, pkg).await?;
+    if let Some(pin) = found.as_mut() {
+        mcp_packages::note_foreign_coordinates(pin, pkg, mapped, base_url);
+    }
+    Ok(found)
 }
 
 /// A pin on a package `remote` (the mapped repository or its Remote member)
-/// has in its proxy cache.
+/// has in its proxy cache. Every path that pins a proxy-cache entry (the
+/// publish, the asynchronous fill, Remote MCP ingest) comes through here, so
+/// each refuses a pin the mapped Virtual would not serve from `remote`
+/// (`mcp_package_shadowed`, #5456).
 async fn cached_pin(
     db: &PgPool,
     mapped: &BackingRepo,
@@ -351,7 +457,7 @@ async fn cached_pin(
     let Some((path, sha256)) = find_cached(db, remote, pkg).await? else {
         return Ok(None);
     };
-    Ok(Some(PackagePin {
+    let pin = PackagePin {
         index,
         registry_type: pkg.registry_type.clone(),
         submitted: SubmittedRef {
@@ -362,6 +468,7 @@ async fn cached_pin(
             repository: mapped.key.clone(),
             repository_id: remote.id,
             artifact_ids: Vec::new(),
+            artifact_sha256s: Vec::new(),
             sha256: Some(sha256),
             name: None,
             tag: None,
@@ -375,7 +482,9 @@ async fn cached_pin(
             download_path: None,
         },
         drift: None,
-    }))
+    };
+    mcp_packages::refuse_shadowed_cache_pin(db, mapped, &pin).await?;
+    Ok(Some(pin))
 }
 
 // ---------------------------------------------------------------------------
@@ -421,6 +530,7 @@ fn bundle_pin(
             repository: repo_key.to_string(),
             repository_id: repo_id,
             artifact_ids: vec![artifact_id],
+            artifact_sha256s: Vec::new(),
             sha256: Some(sha256.to_string()),
             name: None,
             tag: None,
@@ -828,8 +938,9 @@ fn auth_of(user: &crate::models::user::User, scope: &RequestedScope) -> AuthExte
     })
 }
 
-/// One in-process GET through a format router, as the publisher. Returns the
-/// status and (for JSON documents) the body.
+/// One in-process GET through a format router, as the publisher, finished
+/// (head and body) by `deadline`. Returns the status and (for JSON
+/// documents) the body.
 async fn route_get(
     state: &SharedState,
     format: &str,
@@ -837,6 +948,7 @@ async fn route_get(
     auth: &AuthExtension,
     bearer: Option<&str>,
     want_body: bool,
+    deadline: tokio::time::Instant,
 ) -> Result<(StatusCode, Option<bytes::Bytes>), String> {
     let router = match format {
         "npm" => crate::api::handlers::npm::router(),
@@ -872,32 +984,50 @@ async fn route_get(
     let app = router
         .with_state(state.clone())
         .layer(axum::Extension::<Option<AuthExtension>>(Some(auth.clone())));
-    let resp = tokio::time::timeout(Duration::from_secs(300), app.oneshot(req))
-        .await
-        .map_err(|_| "the backing repository did not answer within 300 s".to_string())?
-        .map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let body = if want_body && status.is_success() {
-        #[allow(clippy::disallowed_methods)]
-        // STREAMING-EXEMPT: a package metadata document capped at FILL_JSON_MAX
-        // (8 MiB), not an artifact body (#1608)
-        let bytes = axum::body::to_bytes(resp.into_body(), FILL_JSON_MAX)
-            .await
-            .map_err(|e| e.to_string())?;
-        Some(bytes)
-    } else {
-        // Drain frame by frame (never buffered) so a streamed body completes
-        // and the cache commit runs.
-        use http_body_util::BodyExt as _;
-        let mut body = resp.into_body();
-        while let Some(frame) = body.frame().await {
-            if frame.is_err() {
-                break;
+    exchange(app, req, want_body, deadline).await
+}
+
+/// Send `req` through `app` and read the response body, all of it by
+/// `deadline` (#5395): the head alone is not enough, since a slow upstream
+/// can trickle a body and hold the job and its worker slot indefinitely. A
+/// miss is an `Err`, which [`fill`] records as a retryable failure.
+async fn exchange(
+    app: axum::Router,
+    req: Request<Body>,
+    want_body: bool,
+    deadline: tokio::time::Instant,
+) -> Result<(StatusCode, Option<bytes::Bytes>), String> {
+    let run = async {
+        let resp = app.oneshot(req).await.map_err(|e| e.to_string())?;
+        let status = resp.status();
+        let body = if want_body && status.is_success() {
+            #[allow(clippy::disallowed_methods)]
+            // STREAMING-EXEMPT: a package metadata document capped at FILL_JSON_MAX
+            // (8 MiB), not an artifact body (#1608)
+            let bytes = axum::body::to_bytes(resp.into_body(), FILL_JSON_MAX)
+                .await
+                .map_err(|e| e.to_string())?;
+            Some(bytes)
+        } else {
+            // Drain frame by frame (never buffered) so a streamed body completes
+            // and the cache commit runs.
+            use http_body_util::BodyExt as _;
+            let mut body = resp.into_body();
+            while let Some(frame) = body.frame().await {
+                if frame.is_err() {
+                    break;
+                }
             }
-        }
-        None
+            None
+        };
+        Ok((status, body))
     };
-    Ok((status, body))
+    tokio::time::timeout_at(deadline, run).await.map_err(|_| {
+        format!(
+            "the backing repository did not finish the fill within its deadline ({} s)",
+            FILL_DEADLINE.as_secs()
+        )
+    })?
 }
 
 /// Fill `p` through its Remote as `user`.
@@ -912,6 +1042,8 @@ pub async fn fill(
         None => format!("{} {}", p.registry_type, p.identifier),
     };
     let auth = auth_of(user, scope);
+    // One deadline for every request of this fill, head and body (#5395).
+    let deadline = tokio::time::Instant::now() + FILL_DEADLINE;
     // The fill runs as the publisher, who must be able to read the Remote
     // (the format routes run without the visibility middleware here).
     match mcp_packages::caller_may_map(&state.db, &auth, p.fill_repository_id).await {
@@ -933,12 +1065,12 @@ pub async fn fill(
         p.registry_type.as_str()
     };
     let result = if p.registry_type == "oci" {
-        fill_oci(state, p, user, &auth).await
+        fill_oci(state, p, user, &auth, deadline).await
     } else if p.registry_type == "pypi" {
-        fill_pypi(state, p, &auth).await
+        fill_pypi(state, p, &auth, deadline).await
     } else {
         match fill_path(p, None) {
-            Some(path) => route_get(state, route_format, &path, &auth, None, false)
+            Some(path) => route_get(state, route_format, &path, &auth, None, false, deadline)
                 .await
                 .map(|(s, _)| s),
             None => {
@@ -956,11 +1088,12 @@ async fn fill_pypi(
     state: &SharedState,
     p: &Pending,
     auth: &AuthExtension,
+    deadline: tokio::time::Instant,
 ) -> Result<StatusCode, String> {
     let name = mcp_packages::lookup_name("pypi", &p.identifier);
     let version = p.version.as_deref().unwrap_or_default();
     let json_path = format!("/{}/pypi/{name}/{version}/json", p.fill_repository);
-    let (status, body) = route_get(state, "pypi", &json_path, auth, None, true).await?;
+    let (status, body) = route_get(state, "pypi", &json_path, auth, None, true, deadline).await?;
     if !status.is_success() {
         return Ok(status);
     }
@@ -970,7 +1103,9 @@ async fn fill_pypi(
         return Ok(StatusCode::NOT_FOUND);
     };
     let path = fill_path(p, Some(&file)).ok_or("no PyPI fill path")?;
-    Ok(route_get(state, "pypi", &path, auth, None, false).await?.0)
+    Ok(route_get(state, "pypi", &path, auth, None, false, deadline)
+        .await?
+        .0)
 }
 
 /// OCI: a manifest pull by the submitted tag or digest, authenticated with a
@@ -981,6 +1116,7 @@ async fn fill_oci(
     p: &Pending,
     user: &crate::models::user::User,
     auth: &AuthExtension,
+    deadline: tokio::time::Instant,
 ) -> Result<StatusCode, String> {
     let r = fmt::parse_oci_identifier(&p.identifier).map_err(|_| "invalid OCI identifier")?;
     let reference = r
@@ -995,9 +1131,11 @@ async fn fill_oci(
     .generate_scan_token(user, &p.fill_repository, 300)
     .map_err(|e| e.to_string())?;
     let path = format!("/{}/{}/manifests/{reference}", p.fill_repository, r.path);
-    Ok(route_get(state, "oci", &path, auth, Some(&token), false)
-        .await?
-        .0)
+    Ok(
+        route_get(state, "oci", &path, auth, Some(&token), false, deadline)
+            .await?
+            .0,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1179,16 +1317,35 @@ async fn resolve_pending(
             index: Some(p.index),
         });
     };
-    let remote = mcp_packages::repos_by_key(&state.db, std::slice::from_ref(&p.fill_repository))
-        .await
-        .map_err(|e| Step::Retry(e.detail()))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| Step::Failed {
-            code: "mcp_package_not_found",
-            detail: format!("repository '{}' no longer exists", p.fill_repository),
-            index: Some(p.index),
-        })?;
+    // The fill target is recomputed from the current mapping and must be the
+    // repository recorded at publish: a pin is never assembled from the
+    // mapping of one moment and the Remote of another.
+    let remote = match fill_target(&state.db, mapped, &pkg).await {
+        Ok(Some(remote)) if remote.id == p.fill_repository_id => remote,
+        Ok(_) => {
+            return Err(Step::Failed {
+                code: "mcp_package_not_found",
+                detail: format!(
+                    "registryType '{}' no longer fills through repository '{}'; publish again",
+                    p.registry_type, p.fill_repository
+                ),
+                index: Some(p.index),
+            })
+        }
+        Err(McpError::Internal(m)) | Err(McpError::Misconfigured(m)) => return Err(Step::Retry(m)),
+        Err(e) => return Err(Step::Retry(e.detail())),
+    };
+    // Fill through the repository as it is now (its key may have changed).
+    let current;
+    let p = if remote.key == p.fill_repository {
+        p
+    } else {
+        current = Pending {
+            fill_repository: remote.key.clone(),
+            ..p.clone()
+        };
+        &current
+    };
     let look = || async {
         if p.registry_type == "oci" {
             match mcp_packages::resolve_one(state, settings, p.index, &pkg, base).await {
@@ -1197,7 +1354,18 @@ async fn resolve_pending(
                 Err(e) => Err(e),
             }
         } else {
-            cached_pin(&state.db, mapped, &remote, p.index, &pkg).await
+            // No policy re-check here: a pin does not depend on the policy
+            // (#5452), only the hostname check does, and that ran at publish.
+            // What can change since is the Remote, so the foreign-coordinate
+            // rule is checked against the fill target again.
+            if !mcp_packages::remote_may_serve(&pkg, mapped, &remote, base) {
+                return Err(mcp_packages::foreign_through_remote(p.index, &pkg, &remote));
+            }
+            let mut found = cached_pin(&state.db, mapped, &remote, p.index, &pkg).await;
+            if let Ok(Some(pin)) = found.as_mut() {
+                mcp_packages::note_foreign_coordinates(pin, &pkg, mapped, base);
+            }
+            found
         }
     };
     let to_step = |e: McpError| match e {
@@ -1418,13 +1586,9 @@ async fn after_resolved(
 /// Spawn the resolver loop (every replica ticks; jobs are row-claimed).
 /// `MCP_RESOLVER_INTERVAL_SECS` (default 15) sets the tick.
 pub fn spawn(state: SharedState, shutdown: CancellationToken) {
-    let secs = std::env::var("MCP_RESOLVER_INTERVAL_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(15);
+    let interval = resolver_interval();
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(secs));
+        let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -1440,6 +1604,160 @@ pub fn spawn(state: SharedState, shutdown: CancellationToken) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #5702: a lookup that misses an entry this process is committing (the
+    /// pull-through's client already has the bytes, the catalog row lands in
+    /// the writer's tail) waits for the fill and finds it; with no fill in
+    /// flight a miss answers at once.
+    #[tokio::test]
+    async fn cached_entry_waits_for_an_in_flight_fill_5702() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (remote, _key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let path = "@acme/echo/-/echo-1.0.0.tgz";
+        let started = std::time::Instant::now();
+        assert_eq!(
+            cached_entry(&pool, remote, "npm", "@acme/echo", "1.0.0")
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "no fill: no wait"
+        );
+        // Another package's fill is not waited for either.
+        let other = crate::services::proxy_service::test_catalog_fill(
+            remote,
+            "@acme/other/-/other-1.0.0.tgz",
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(
+            cached_entry(&pool, remote, "npm", "@acme/echo", "1.0.0")
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "other fill: no wait"
+        );
+        drop(other);
+
+        let fill = crate::services::proxy_service::test_catalog_fill(remote, path);
+        let writer = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                sqlx::query(
+                    "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, \
+                     metadata_key, size_bytes, checksum_sha256) VALUES ($1, $2, $3, $4, 1, $5)",
+                )
+                .bind(remote)
+                .bind(path)
+                .bind(format!("proxy-cache/{remote}/c"))
+                .bind(format!("proxy-cache/{remote}/c.meta"))
+                .bind("ab".repeat(32))
+                .execute(&pool)
+                .await
+                .unwrap();
+                drop(fill);
+            })
+        };
+        let found = cached_entry(&pool, remote, "npm", "@acme/echo", "1.0.0")
+            .await
+            .unwrap();
+        writer.await.unwrap();
+        assert_eq!(found, Some((path.to_string(), "ab".repeat(32))));
+        assert!(catalog_fill_wait() <= resolver_interval());
+        assert!(catalog_fill_wait() >= crate::services::proxy_service::TEE_PUBLISH_WAIT_MAX);
+
+        sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(remote)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(remote)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn key_names_path_matches_what_the_lookup_matches_5702() {
+        let npm = cache_key("npm", "@acme/echo", "1.0.0").unwrap();
+        assert!(key_names_path(
+            &npm,
+            "@acme/echo/-/echo-1.0.0.tgz",
+            "@acme/echo",
+            "1.0.0"
+        ));
+        assert!(!key_names_path(
+            &npm,
+            "@acme/echo/-/echo-1.0.1.tgz",
+            "@acme/echo",
+            "1.0.0"
+        ));
+        let pypi = cache_key("pypi", "Echo_Pkg", "1.0.0").unwrap();
+        assert!(key_names_path(
+            &pypi,
+            "simple/echo-pkg/echo_pkg-1.0.0-py3-none-any.whl",
+            "Echo_Pkg",
+            "1.0.0"
+        ));
+        assert!(!key_names_path(
+            &pypi,
+            "simple/echo-pkg/echo_pkg-1.0.1.tar.gz",
+            "Echo_Pkg",
+            "1.0.0"
+        ));
+        let nuget = cache_key("nuget", "Acme.Echo", "1.0").unwrap();
+        assert!(key_names_path(
+            &nuget,
+            "v2/package/acme.echo/1.0.0/package.nupkg",
+            "Acme.Echo",
+            "1.0"
+        ));
+    }
+
+    /// #5452: a pending package keeps its submitted `registryBaseUrl` through
+    /// the job record, so the filled pin can record the coordinates it
+    /// replaced; a record written before the field existed still loads.
+    #[test]
+    fn pending_keeps_the_submitted_registry_base_url() {
+        let p = Pending {
+            index: 1,
+            registry_type: "npm".into(),
+            identifier: "@acme/echo".into(),
+            version: Some("2.0.0".into()),
+            fill_repository: "npm-remote".into(),
+            fill_repository_id: Uuid::nil(),
+            fill_format: "npm".into(),
+            registry_base_url: Some("https://registry.npmjs.org".into()),
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["registryBaseUrl"], "https://registry.npmjs.org");
+        assert_eq!(serde_json::from_value::<Pending>(v).unwrap(), p);
+        assert_eq!(
+            p.package().registry_base_url.as_deref(),
+            Some("https://registry.npmjs.org")
+        );
+        let legacy = serde_json::json!({
+            "index": 0, "registryType": "npm", "identifier": "@acme/echo", "version": "1.0.0",
+            "fillRepository": "npm-remote", "fillRepositoryId": Uuid::nil(), "fillFormat": "npm",
+        });
+        let old: Pending = serde_json::from_value(legacy).unwrap();
+        assert_eq!(old.registry_base_url, None);
+        assert!(serde_json::to_value(&old)
+            .unwrap()
+            .get("registryBaseUrl")
+            .is_none());
+        assert_eq!(old.package().registry_base_url, None);
+    }
 
     /// Review finding 12: the asynchronous fill runs with the publishing
     /// token's scope (repository allowlist, scopes), recorded on the
@@ -1470,5 +1788,44 @@ mod tests {
         let blind = none.apply(account);
         assert!(!blind.can_access_repo(allowed));
         assert!(!blind.has_scope("read:artifacts"));
+    }
+
+    /// A router whose `/stall` answers `200` at once with one chunk, then a
+    /// body that never ends: a slow upstream trickling a fill.
+    fn stalling_router() -> axum::Router {
+        axum::Router::new().route(
+            "/stall",
+            axum::routing::get(|| async {
+                let chunk = futures::stream::once(async {
+                    Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"{"))
+                });
+                Body::from_stream(futures::StreamExt::chain(chunk, futures::stream::pending()))
+            }),
+        )
+    }
+
+    /// #5395: the fill deadline covers the body, not only the head. A body
+    /// that stalls after a prompt `200` ends the exchange with an error (a
+    /// retryable fill failure) at the deadline, whether the body is read as
+    /// a JSON document or drained.
+    #[tokio::test]
+    async fn a_body_stalled_after_the_head_ends_at_the_fill_deadline() {
+        for want_body in [true, false] {
+            let req = Request::builder()
+                .uri("/stall")
+                .body(Body::empty())
+                .unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+            let out = tokio::time::timeout(
+                Duration::from_secs(10),
+                exchange(stalling_router(), req, want_body, deadline),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!("want_body={want_body}: the stalled body outlived the fill deadline")
+            });
+            let err = out.expect_err("a stalled body is not a served fill");
+            assert!(err.contains("deadline"), "{err}");
+        }
     }
 }

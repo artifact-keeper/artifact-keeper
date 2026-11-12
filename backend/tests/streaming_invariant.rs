@@ -112,10 +112,15 @@ use std::path::{Path, PathBuf};
 /// PyPI JSON index, ...), reads the answer once under `FILL_JSON_MAX` (8 MiB).
 /// Artifact bodies on the same path are drained frame by frame, never
 /// buffered. New file mcp_resolver.rs: 1, total 32 -> 33.
+///
+/// Reconciliation (#5820): #5778 (#5631) reads the upstream npm audit
+/// advisories through `post_json_uncached_capped` instead of a hand-rolled
+/// capped `axum::body::to_bytes`, so npm.rs drops one exempt site.
+/// Phase progress: npm.rs 6 -> 5, total 33 -> 32.
 const ALLOWLIST: &[(&str, usize)] = &[
     ("src/api/handlers/conda/merge_gate.rs", 1),
     ("src/api/handlers/goproxy.rs", 1),
-    ("src/api/handlers/npm.rs", 6),
+    ("src/api/handlers/npm.rs", 5),
     ("src/api/handlers/oci_v2.rs", 2),
     ("src/api/handlers/plugins.rs", 2),
     ("src/api/handlers/proxy_helpers.rs", 2),
@@ -478,8 +483,8 @@ fn streaming_invariant_exempt_sites_match_allowlist() {
 
     let total: usize = actual_marks.values().sum();
     assert_eq!(
-        total, 33,
-        "expected 33 exempt sites after #1608 Phase 4b + #2491 reconciliation \
+        total, 32,
+        "expected 32 exempt sites after #1608 Phase 4b + #2491 reconciliation \
          + PF-005 (#2517) generic multipart streaming (repositories.rs -2) \
          + RPM curation-sync reconciliation (scheduler_service.rs +1) \
          + packument HTTP caching (#3052, npm.rs +1) \
@@ -487,7 +492,8 @@ fn streaming_invariant_exempt_sites_match_allowlist() {
          + the /v2/token form peek (#4020, rate_limit.rs +1) \
          + the virtual conda merge error replay (#4608, merge_gate.rs +1) \
          + the OCI completion retry replay (#4902, oci_v2.rs +1) \
-         + the MCP resolver's capped metadata read (#5253, mcp_resolver.rs +1); \
+         + the MCP resolver's capped metadata read (#5253, mcp_resolver.rs +1) \
+         + the npm audit read through the proxy's capped helper (#5778, npm.rs -1); \
          got {total}"
     );
 }
@@ -546,10 +552,14 @@ fn streaming_invariant_exempt_sites_match_allowlist() {
 /// GHSA-9f9r-c4w8-rjv9: Git LFS `upload_object` now streams through
 /// `stage_stream_content_addressed` + `put_stream`, so the gitlfs.rs row is
 /// removed.
+///
+/// #5364: the hosted Conan recipe and package file uploads stage their body
+/// through `GenericStagedBody::stage_for_repo` + `put_staged_body` (only a
+/// bounded `conanmanifest.txt` is read back for the revision admission), so
+/// the conan.rs row is removed.
 const RAW_BODY_BLOB_ALLOWLIST: &[(&str, usize)] = &[
     ("src/api/handlers/cocoapods.rs", 1),
     ("src/api/handlers/composer.rs", 1),
-    ("src/api/handlers/conan.rs", 2),
     ("src/api/handlers/debian.rs", 1),
     ("src/api/handlers/goproxy.rs", 2),
     ("src/api/handlers/proxy_helpers.rs", 1),

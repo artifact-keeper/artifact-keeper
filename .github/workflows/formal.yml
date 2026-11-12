@@ -1,0 +1,58 @@
+name: Formal Models
+
+# Checks the Lean 4 models under formal/ (#5717). They are not part of the
+# Rust build, so without this job a model is only checked when someone runs
+# Lake by hand, and a proof broken by an edit would go unnoticed.
+
+on:
+  pull_request:
+    branches: [main, 'release/**']
+    paths:
+      - 'formal/**'
+      - '.github/workflows/formal.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'formal/**'
+      - '.github/workflows/formal.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: formal-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lake-build:
+    name: Lean models build with no warnings
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      # elan, the Lean toolchain manager. Pinned to a release and verified by
+      # checksum; bump both together. The Lean version itself is pinned in
+      # formal/lean-toolchain, which elan reads.
+      ELAN_VERSION: v4.2.4
+      ELAN_SHA256: 42b94d4244e8353142c456ec0e4ca6528fd898a6c604d4059f494e706e431f63
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install elan
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/elan.tar.gz" \
+            "https://github.com/leanprover/elan/releases/download/${ELAN_VERSION}/elan-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${ELAN_SHA256}  $RUNNER_TEMP/elan.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/elan.tar.gz" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/elan-init" -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Build the models
+        working-directory: formal
+        # --wfail turns warnings into errors, so a proof left as `sorry`
+        # fails the job.
+        run: lake build --wfail

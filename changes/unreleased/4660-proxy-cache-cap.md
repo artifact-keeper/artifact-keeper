@@ -1,5 +1,0 @@
----
-section: Added
-issues: [#4660]
----
-- **A remote repository's proxy cache can be capped in bytes, with least-recently-used eviction** (#4660). `PUT /api/v1/repositories/{key}/proxy-cache-cap` with `{"cap_bytes": N}` sets the cap, `GET` returns it with the bytes and entries the cache holds now, and `DELETE` removes it (repository `admin` action). Before, a remote's cache grew until a lifecycle age window expired: `quota_bytes` only skips a single oversized object and lifecycle `size_quota_bytes` is refused on a remote. After every cache fill, the least recently used entries are evicted until the cache is back at or under the cap; their download history is kept. An object larger than the cap is served without being cached, and if eviction cannot get under the cap (storage refusing deletes) new fills are served without being cached until it can. Setting a cap below current usage evicts at once. New counters `ak_proxy_cache_cap_evicted_entries_total`, `ak_proxy_cache_cap_evicted_bytes_total` and `ak_proxy_cache_cap_refusing_total`. See `docs/proxy-cache-cap.md`.

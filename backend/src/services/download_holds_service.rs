@@ -27,6 +27,7 @@ use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+use crate::services::scan_result_service::ProxyBlockedKey;
 
 /// How a quarantine row currently behaves at the download gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -354,31 +355,59 @@ pub struct PolicyBlockPage {
     pub evaluated: i64,
 }
 
-/// Where a policy-blocks page resumes: proxy-cache rows first (an offset into
-/// the ordered listing), then hosted artifacts newest first (a keyset).
+/// Where a policy-blocks page resumes: proxy-cache rows first, after the last
+/// one examined (a keyset over repository key, path and digest, #4987), then
+/// hosted artifacts newest first (a keyset).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyBlockCursor {
-    Proxy { offset: usize },
+    Proxy { after: ProxyBlockedKey },
     Hosted { created_at: DateTime<Utc>, id: Uuid },
 }
 
 impl PolicyBlockCursor {
     pub fn encode(&self) -> String {
+        use base64::Engine as _;
+        let b64 = |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s);
         match self {
-            Self::Proxy { offset } => format!("p.{offset}"),
+            Self::Proxy { after } => format!(
+                "p.{}.{}.{}",
+                b64(&after.repository_key),
+                b64(&after.path),
+                b64(&after.checksum_sha256)
+            ),
             Self::Hosted { created_at, id } => {
                 format!("h.{}.{id}", created_at.timestamp_micros())
             }
         }
     }
 
+    /// Parse a cursor [`Self::encode`] wrote. A proxy cursor of the offset
+    /// form earlier releases wrote (`p.<offset>`) is refused like any other
+    /// unreadable cursor: the client starts the listing again.
     pub fn parse(raw: &str) -> Result<Self> {
+        use base64::Engine as _;
         let bad = || AppError::Validation(format!("invalid policy-blocks cursor '{raw}'"));
+        let text = |part: &str| -> Result<String> {
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(part)
+                .map_err(|_| bad())?;
+            String::from_utf8(bytes).map_err(|_| bad())
+        };
+        if let Some(rest) = raw.strip_prefix("p.") {
+            let parts: Vec<&str> = rest.split('.').collect();
+            let [key, path, digest] = parts[..] else {
+                return Err(bad());
+            };
+            return Ok(Self::Proxy {
+                after: ProxyBlockedKey {
+                    repository_key: text(key)?,
+                    path: text(path)?,
+                    checksum_sha256: text(digest)?,
+                },
+            });
+        }
         let mut parts = raw.splitn(3, '.');
         match (parts.next(), parts.next(), parts.next()) {
-            (Some("p"), Some(offset), None) => Ok(Self::Proxy {
-                offset: offset.parse().map_err(|_| bad())?,
-            }),
             (Some("h"), Some(micros), Some(id)) => Ok(Self::Hosted {
                 created_at: DateTime::from_timestamp_micros(micros.parse().map_err(|_| bad())?)
                     .ok_or_else(bad)?,
@@ -466,21 +495,22 @@ impl DownloadHoldsService {
         let mut page = PolicyBlockPage::default();
         let mut keyset: Option<(DateTime<Utc>, Uuid)> = None;
 
-        let proxy_offset = match cursor {
-            None => Some(0),
-            Some(PolicyBlockCursor::Proxy { offset }) => Some(*offset),
+        // `Some(after)` while the proxy half is still being paged (`None`
+        // inside: from its start).
+        let proxy_after: Option<Option<&ProxyBlockedKey>> = match cursor {
+            None => Some(None),
+            Some(PolicyBlockCursor::Proxy { after }) => Some(Some(after)),
             Some(PolicyBlockCursor::Hosted { created_at, id }) => {
                 keyset = Some((*created_at, *id));
                 None
             }
         };
-        if let Some(offset) = proxy_offset {
-            let entries =
+        if let Some(after) = proxy_after {
+            let proxy_page =
                 crate::services::scan_result_service::ScanResultService::new(self.db.clone())
-                    .list_blocked_proxy_entries(repository_key)
+                    .list_blocked_proxy_entries_page(repository_key, after, limit as usize)
                     .await?;
-            let take = (limit as usize).min(entries.len().saturating_sub(offset));
-            for e in entries.iter().skip(offset).take(take) {
+            for e in &proxy_page.entries {
                 page.items.push(PolicyBlock {
                     source: "proxy-cache",
                     artifact_id: None,
@@ -497,13 +527,8 @@ impl DownloadHoldsService {
                     scanned_at: Some(e.scanned_at),
                 });
             }
-            if offset + take < entries.len() {
-                page.next_cursor = Some(
-                    PolicyBlockCursor::Proxy {
-                        offset: offset + take,
-                    }
-                    .encode(),
-                );
+            if let Some(after) = proxy_page.resume_after {
+                page.next_cursor = Some(PolicyBlockCursor::Proxy { after }.encode());
                 return Ok(page);
             }
         }

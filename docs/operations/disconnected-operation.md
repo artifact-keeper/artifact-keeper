@@ -40,7 +40,7 @@ starts outbound work that an operator turned off.
 | `curation_sync` | Each Staging repository's upstream metadata, and the popularity lookups (`pypistats.org`, `api.npmjs.org`) made while evaluating it. Runs every 5 min for repositories past `curation_sync_interval_secs`. | `backend/src/services/scheduler_service.rs`, "Curation upstream metadata sync" |
 | `environment_reeval` | OSV (`query_osv_detailed`), when advisory deltas are pending. Runs every 60 s. | `backend/src/services/scheduler_service.rs`, "Environment advisory re-evaluation" |
 | `npm_upstream_feed` | npm's replication feed (`NPM_UPSTREAM_FEED_URL`), when `NPM_UPSTREAM_FEED_ENABLED=true`. While the switch is on, the consumer also releases its leadership. | `backend/src/services/upstream_feed.rs`, `FeedConsumer::run` |
-| `peer_sync` | Peer instances: push and mirror replication transfers. Queued tasks stay queued. Runs every 10 s. | `backend/src/services/sync_worker.rs`, `spawn_sync_worker` |
+| `peer_sync` | Peer instances: push and mirror replication transfers, and the scheduled `mirror` passes that queue them (#5342). Queued tasks stay queued; a schedule that comes due while paused runs once after resume. Runs every 10 s (schedules checked every 60 s). | `backend/src/services/sync_worker.rs`, `spawn_sync_worker` |
 | `mcp_remote_sync` | The upstream MCP registry of each Remote MCP repository. The per-repository cursor survives a paused tick, so the sync resumes from it. | `backend/src/services/mcp_remote.rs`, `spawn` |
 
 ## Popularity lookups: an internal mirror, or off
@@ -81,8 +81,11 @@ services the operator configured inside the deployment, not an upstream:
   upload cleanup, and the rest of the local maintenance jobs.
 
 Request-time proxy fetches are out of scope. A Remote repository still asks
-its upstream when a client requests something that is not cached. That
-behaviour belongs to a per-Remote cache-only mode.
+its upstream when a client requests something that is not cached. To stop
+that, put the Remote in cache-only mode (`PUT
+/api/v1/repositories/{key}/upstream-mode`, or `PROXY_UPSTREAM_MODE=cache_only`
+for every Remote, #5282); see
+[Proxy cache freshness](../proxy-cache-freshness.md#cache-only-offline-mode-upstream_mode-5282).
 
 ## Adding a scheduled upstream job
 

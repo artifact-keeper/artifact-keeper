@@ -689,20 +689,6 @@ impl PypiHandler {
     }
 }
 
-/// Canonicalize a numeric PEP 440 release segment into its components: drop
-/// leading zeros from each component and trailing zero components so `1.0` and
-/// `1.0.0` agree.
-fn release_components(release: &str) -> Vec<u64> {
-    let mut nums: Vec<u64> = release
-        .split('.')
-        .map(|p| p.parse::<u64>().unwrap_or(0))
-        .collect();
-    while nums.len() > 1 && *nums.last().unwrap() == 0 {
-        nums.pop();
-    }
-    nums
-}
-
 /// The pre-release position of a version, ordered `dev < pre < final`.
 ///
 /// Variant order is the sort order — `derive(Ord)` on an enum compares by
@@ -770,108 +756,96 @@ struct Pep440Parts {
     local: Option<Vec<String>>,
 }
 
+/// PEP 440's version grammar: `packaging.version.VERSION_PATTERN`, group for
+/// group, case-insensitive and anchored the way `packaging` anchors it
+/// (surrounding whitespace allowed). `\A`/`\z` rather than `^`/`$` so a
+/// trailing newline is whitespace to strip, never a silent accept.
+static PEP440_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+    regex::Regex::new(concat!(
+        // Letters and digits are ASCII-only (`-u`); only the surrounding
+        // whitespace is Unicode, as in Python.
+        r"\A\s*(?i-u:v?",
+        r"(?:(?P<epoch>[0-9]+)!)?",
+        r"(?P<release>[0-9]+(?:\.[0-9]+)*)",
+        r"(?P<pre>[-_.]?(?P<pre_l>alpha|a|b|beta|c|rc|pre|preview)[-_.]?(?P<pre_n>[0-9]+)?)?",
+        r"(?P<post>(?:-(?P<post_n1>[0-9]+))|(?:[-_.]?(?:post|rev|r)[-_.]?(?P<post_n2>[0-9]+)?))?",
+        r"(?P<dev>[-_.]?dev[-_.]?(?P<dev_n>[0-9]+)?)?",
+        r"(?:\+(?P<local>[a-z0-9]+(?:[-_.][a-z0-9]+)*))?",
+        r")\s*\z",
+    ))
+    .expect("PEP 440 version pattern is a valid regex")
+});
+
 /// Parse a PEP 440 version into its components, or `None` if the input is not
-/// recognisably PEP 440.
+/// a PEP 440 version.
+///
+/// Accepts exactly what `packaging.version.Version` accepts, with one
+/// difference: a number too large for `u64` is `None` here (Python integers
+/// are unbounded). It used to read as `0`, which made
+/// `99999999999999999999` the same version as `0`.
+/// `pep440_reference_vectors` holds this to `packaging`'s own answers.
 fn parse_pep440(version: &str) -> Option<Pep440Parts> {
-    let v = version.trim().trim_start_matches(['v', 'V']);
-    if v.is_empty() {
-        return None;
-    }
-
-    // Local segment (everything after the first `+`). A PEP 427 wheel filename
-    // escapes `+` and `.` runs in the local part to `_`, so treat `_` as a
-    // local separator alongside `.`/`-`.
-    let (public, local) = match v.split_once('+') {
-        Some((p, l)) => (p, Some(l)),
-        None => (v, None),
+    let caps = PEP440_RE.captures(version)?;
+    let number = |name: &str| -> Option<Option<u64>> {
+        match caps.name(name) {
+            None => Some(None),
+            Some(m) => m.as_str().parse::<u64>().ok().map(Some),
+        }
     };
 
-    let lower = public.to_ascii_lowercase();
+    let epoch = number("epoch")?.unwrap_or(0);
 
-    // Epoch: `N!`.
-    let (epoch_str, rest) = match lower.split_once('!') {
-        Some((e, r)) => {
-            if e.is_empty() || !e.chars().all(|c| c.is_ascii_digit()) {
-                return None;
-            }
-            (e, r)
-        }
-        None => ("0", lower.as_str()),
-    };
-    let epoch: u64 = epoch_str.parse().ok()?;
-
-    // Greedily take the leading release: `digits(.digits)*`. The remainder
-    // holds the optional pre / post / dev / implicit-post qualifiers.
-    let (release_str, suffix) = split_release(rest)?;
-    let release = release_components(&release_str);
-
-    // Tokenize the qualifier suffix into alternating digit / alpha runs,
-    // treating `.`/`-`/`_` purely as separators (PEP 440 normalisation).
-    let tokens = tokenize_version(suffix)?;
-
-    let mut pre: Option<(&'static str, u64)> = None;
-    let mut post: Option<u64> = None;
-    let mut dev: Option<u64> = None;
-    let mut i = 0;
-    while i < tokens.len() {
-        let tok = &tokens[i];
-        // A bare number directly after the release is an implicit post
-        // release (`1.0-1`).
-        if tok.chars().all(|c| c.is_ascii_digit())
-            && pre.is_none()
-            && post.is_none()
-            && dev.is_none()
-        {
-            post = Some(tok.parse().ok()?);
-            i += 1;
-            continue;
-        }
-        let label = match tok.as_str() {
-            "a" | "alpha" => Some(("pre", "a")),
-            "b" | "beta" => Some(("pre", "b")),
-            "c" | "rc" | "pre" | "preview" => Some(("pre", "rc")),
-            "post" | "rev" | "r" => Some(("post", "")),
-            "dev" => Some(("dev", "")),
-            _ => None,
-        };
-        let (kind, prelabel) = label?;
-        // Optional trailing number for this qualifier.
-        let n = if i + 1 < tokens.len() && tokens[i + 1].chars().all(|c| c.is_ascii_digit()) {
-            let parsed = tokens[i + 1].parse().ok()?;
-            i += 2;
-            parsed
-        } else {
-            i += 1;
-            0
-        };
-        match kind {
-            "pre" => pre = Some((prelabel, n)),
-            "post" => post = Some(n),
-            "dev" => dev = Some(n),
-            _ => unreachable!(),
-        }
+    let mut release = caps["release"]
+        .split('.')
+        .map(|n| n.parse::<u64>().ok())
+        .collect::<Option<Vec<u64>>>()?;
+    while release.len() > 1 && release.last() == Some(&0) {
+        release.pop();
     }
 
-    // PEP 440 local version: one or more `[a-zA-Z0-9]+` segments joined by a
-    // single `.`/`-`/`_`. A present-but-empty local (`1.0+`), an empty segment
-    // from a leading/trailing/doubled separator (`1.0+_foo`, `1.0+a..b`), or a
-    // non-alphanumeric segment (`1.0++`) is INVALID — reject it rather than
-    // silently mangling it, so the canonical key can't false-equate two
-    // distinct/invalid inputs. (#3111)
-    let local = match local {
+    let pre = match caps.name("pre_l") {
         None => None,
-        Some(l) => {
-            if l.is_empty() {
-                return None;
-            }
-            let segs: Vec<&str> = l.split(['.', '-', '_']).collect();
-            if segs
+        Some(label) => {
+            let label = match label.as_str().to_ascii_lowercase().as_str() {
+                "a" | "alpha" => "a",
+                "b" | "beta" => "b",
+                _ => "rc", // c, rc, pre, preview
+            };
+            Some((label, number("pre_n")?.unwrap_or(0)))
+        }
+    };
+
+    // `-N` is the implicit post release; `post` / `rev` / `r` with no number is 0.
+    let post = match caps.name("post") {
+        None => None,
+        Some(_) => Some(match number("post_n1")? {
+            Some(n) => n,
+            None => number("post_n2")?.unwrap_or(0),
+        }),
+    };
+
+    let dev = match caps.name("dev") {
+        None => None,
+        Some(_) => Some(number("dev_n")?.unwrap_or(0)),
+    };
+
+    // Local segments are compared numerically when all digits, so one that
+    // does not fit `u64` cannot be ordered and the version is not parsed.
+    let local = match caps.name("local") {
+        None => None,
+        Some(local) => {
+            let segments: Vec<String> = local
+                .as_str()
+                .split(['.', '-', '_'])
+                .map(str::to_ascii_lowercase)
+                .collect();
+            if segments
                 .iter()
-                .any(|s| s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric()))
+                .any(|s| s.bytes().all(|b| b.is_ascii_digit()) && s.parse::<u64>().is_err())
             {
                 return None;
             }
-            Some(segs.iter().map(|s| s.to_ascii_lowercase()).collect())
+            Some(segments)
         }
     };
 
@@ -883,74 +857,6 @@ fn parse_pep440(version: &str) -> Option<Pep440Parts> {
         dev,
         local,
     })
-}
-
-/// Split the leading `digits(.digits)*` release off a PEP 440 public-version
-/// body (epoch already removed). Returns the release and the remaining
-/// qualifier suffix (which may start with a separator). `None` if the body
-/// does not start with a digit.
-fn split_release(body: &str) -> Option<(String, &str)> {
-    if !body.starts_with(|c: char| c.is_ascii_digit()) {
-        return None;
-    }
-    let bytes = body.as_bytes();
-    let mut end = 0;
-    let mut expect_digit = true;
-    while end < bytes.len() {
-        let c = bytes[end] as char;
-        if c.is_ascii_digit() {
-            expect_digit = false;
-            end += 1;
-        } else if c == '.' && !expect_digit {
-            // A `.` continues the release only if another digit follows.
-            if bytes
-                .get(end + 1)
-                .map(|b| b.is_ascii_digit())
-                .unwrap_or(false)
-            {
-                expect_digit = true;
-                end += 1;
-            } else {
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-    Some((body[..end].to_string(), &body[end..]))
-}
-
-/// Split a PEP 440 public-version body into alternating digit / alpha runs,
-/// treating `.`/`-`/`_` as separators. Returns `None` on any other character.
-fn tokenize_version(body: &str) -> Option<Vec<String>> {
-    let mut tokens = Vec::new();
-    let mut cur = String::new();
-    let mut cur_digit = false;
-    for c in body.chars() {
-        if c == '.' || c == '-' || c == '_' {
-            if !cur.is_empty() {
-                tokens.push(std::mem::take(&mut cur));
-            }
-        } else if c.is_ascii_digit() {
-            if !cur.is_empty() && !cur_digit {
-                tokens.push(std::mem::take(&mut cur));
-            }
-            cur_digit = true;
-            cur.push(c);
-        } else if c.is_ascii_alphabetic() {
-            if !cur.is_empty() && cur_digit {
-                tokens.push(std::mem::take(&mut cur));
-            }
-            cur_digit = false;
-            cur.push(c);
-        } else {
-            return None;
-        }
-    }
-    if !cur.is_empty() {
-        tokens.push(cur);
-    }
-    Some(tokens)
 }
 
 /// Minimal HTML escaper for the PEP 503 simple-index renderer. Escapes the
@@ -2171,5 +2077,152 @@ Project-URL: Documentation, https://docs.example.com
         let info = PypiHandler::extract_sdist_metadata(&sdist).unwrap();
         assert_eq!(info.name, "pkg");
         assert_eq!(info.version, "1.0");
+    }
+
+    // -- agreement with pypa/packaging (PEP 440) ---------------------------------
+
+    /// One line of `test_fixtures/reference/pep440.jsonl`.
+    #[derive(serde::Deserialize)]
+    struct Pep440Reference {
+        version: String,
+        valid: bool,
+        normalized: Option<String>,
+        prerelease: Option<bool>,
+        rank: Option<u32>,
+    }
+
+    fn pep440_reference() -> Vec<Pep440Reference> {
+        include_str!("../../test_fixtures/reference/pep440.jsonl")
+            .lines()
+            .skip(1) // provenance header
+            .map(|line| serde_json::from_str(line).expect("fixture line parses"))
+            .collect()
+    }
+
+    /// Everything `packaging` accepts, this parser accepts, orders the same
+    /// way, equates exactly when `packaging` does, and classifies the same as
+    /// a pre-release. Regenerate the fixture with
+    /// `scripts/reference/gen_pep440_fixture.py`.
+    #[test]
+    fn pep440_reference_vectors() {
+        let reference = pep440_reference();
+        // The one documented difference: a number past `u64` is not parsed.
+        let fits_u64 = |v: &str| {
+            v.split(|c: char| !c.is_ascii_digit())
+                .all(|run| run.trim_start_matches('0').len() < 20)
+        };
+        let valid: Vec<&Pep440Reference> = reference
+            .iter()
+            .filter(|r| r.valid && fits_u64(&r.version))
+            .collect();
+        assert!(valid.len() > 2000, "fixture loaded");
+        for r in reference
+            .iter()
+            .filter(|r| r.valid && !fits_u64(&r.version))
+        {
+            assert_eq!(
+                PypiHandler::canonical_version(&r.version),
+                None,
+                "{:?} has a number past u64 and must not be read as some other version",
+                r.version
+            );
+        }
+
+        let mut problems: Vec<String> = Vec::new();
+        let mut keys = Vec::with_capacity(valid.len());
+        let mut rejected = 0usize;
+        for r in &valid {
+            let key = PypiHandler::pep440_sort_key(&r.version);
+            let canonical = PypiHandler::canonical_version(&r.version);
+            if key.is_none() || canonical.is_none() {
+                rejected += 1;
+            }
+            if (key.is_none() || canonical.is_none()) && rejected <= 6 {
+                problems.push(format!(
+                    "rejected: {:?} is valid PEP 440 (normalizes to {:?})",
+                    r.version, r.normalized
+                ));
+            }
+            if let Some(pre) = PypiHandler::is_prerelease(&r.version) {
+                if Some(pre) != r.prerelease {
+                    problems.push(format!(
+                        "prerelease: {:?} is {:?} here, {:?} in packaging",
+                        r.version, pre, r.prerelease
+                    ));
+                }
+            }
+            keys.push((key, canonical));
+        }
+
+        let mut order = 0usize;
+        let mut equality = 0usize;
+        for (i, a) in valid.iter().enumerate() {
+            let (Some(ka), Some(ca)) = (&keys[i].0, &keys[i].1) else {
+                continue;
+            };
+            for (j, b) in valid.iter().enumerate().skip(i + 1) {
+                let (Some(kb), Some(cb)) = (&keys[j].0, &keys[j].1) else {
+                    continue;
+                };
+                let expected = a.rank.cmp(&b.rank);
+                if ka.cmp(kb) != expected {
+                    order += 1;
+                    if order <= 8 {
+                        problems.push(format!(
+                            "order: {:?} vs {:?} is {:?} here, {:?} in packaging",
+                            a.version,
+                            b.version,
+                            ka.cmp(kb),
+                            expected
+                        ));
+                    }
+                }
+                if (ca == cb) != (a.rank == b.rank) {
+                    equality += 1;
+                    if equality <= 8 {
+                        problems.push(format!(
+                            "equality: {:?} vs {:?} canonicalize to {:?} / {:?}, packaging says {}",
+                            a.version,
+                            b.version,
+                            ca,
+                            cb,
+                            if a.rank == b.rank {
+                                "equal"
+                            } else {
+                                "different"
+                            }
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "{} rejected, {} order and {} equality disagreements with packaging; first problems:\n{}",
+            rejected,
+            order,
+            equality,
+            problems
+                .iter()
+                .take(40)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// Nothing `packaging` rejects is read as a version: an invalid spelling
+    /// must not stand in for a real version at an equality gate.
+    #[test]
+    fn pep440_strings_packaging_rejects_are_rejected() {
+        let accepted: Vec<String> = pep440_reference()
+            .iter()
+            .filter(|r| !r.valid)
+            .filter_map(|r| {
+                PypiHandler::canonical_version(&r.version)
+                    .map(|c| format!("{:?} -> {c}", r.version))
+            })
+            .collect();
+        assert!(accepted.is_empty(), "accepted:\n{}", accepted.join("\n"));
     }
 }

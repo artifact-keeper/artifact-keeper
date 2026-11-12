@@ -631,8 +631,34 @@ fn extract_element_text(fragment: &str, tag: &str) -> Option<String> {
 /// mapping (`<plugins><plugin>...`) rather than an artifact-level version
 /// list. Unlike a version list, a peer cannot regenerate this document from
 /// the versioned artifacts it receives (#4916).
+///
+/// Group-level metadata never carries `<versioning>`: that block is the
+/// artifact-level (and version-level) version index. A document that has
+/// both is an artifact-level index that merely mentions `<plugins>` and must
+/// stay on the row-less metadata path (#5693).
 pub fn is_plugin_prefix_metadata_document(xml: &str) -> bool {
-    xml.contains("<plugins")
+    xml.contains("<plugins") && !xml.contains("<versioning")
+}
+
+/// Whether `path` can name a group-level `maven-metadata.xml`
+/// (`groupPath/maven-metadata.xml`), the only place Maven writes a
+/// plugin-prefix mapping (#5693).
+///
+/// A version-level path (`g/a/1.0-SNAPSHOT/maven-metadata.xml`, whose parent
+/// segment starts with a digit like every Maven version) never is. A
+/// `g/maven-metadata.xml` and a `g/a/maven-metadata.xml` path cannot be told
+/// apart by shape alone (`org/apache/maven/plugins` is a groupId), so the
+/// artifact-level case is excluded by the body check in
+/// [`is_plugin_prefix_metadata_document`].
+pub fn is_group_level_metadata_path(path: &str) -> bool {
+    let normalized = path.trim_start_matches('/');
+    let Some(group_path) = normalized.strip_suffix("/maven-metadata.xml") else {
+        return false;
+    };
+    match group_path.rsplit('/').next() {
+        Some(parent) => !parent.is_empty() && !parent.starts_with(|c: char| c.is_ascii_digit()),
+        None => false,
+    }
 }
 
 /// Parse the `<plugins>` block of a group-level plugin-prefix
@@ -1200,6 +1226,32 @@ mod tests {
   </plugins>
 </metadata>
 "#;
+
+    #[test]
+    fn plugin_prefix_detection_requires_group_level_shape_5693() {
+        assert!(is_plugin_prefix_metadata_document(PLUGIN_PREFIX_DOC_A));
+        let artifact_level = "<metadata><groupId>com.x</groupId><artifactId>lib</artifactId>\
+            <versioning><versions><version>1.0</version></versions></versioning>\
+            <plugins><plugin><prefix>p</prefix></plugin></plugins></metadata>";
+        assert!(!is_plugin_prefix_metadata_document(artifact_level));
+        assert!(!is_plugin_prefix_metadata_document(
+            "<metadata><versioning/></metadata>"
+        ));
+
+        assert!(is_group_level_metadata_path(
+            "org/apache/maven/plugins/maven-metadata.xml"
+        ));
+        assert!(is_group_level_metadata_path("/com/maven-metadata.xml"));
+        assert!(is_group_level_metadata_path("com/x/lib/maven-metadata.xml"));
+        assert!(!is_group_level_metadata_path(
+            "com/x/lib/1.0-SNAPSHOT/maven-metadata.xml"
+        ));
+        assert!(!is_group_level_metadata_path(
+            "com/x/lib/2.0/maven-metadata.xml"
+        ));
+        assert!(!is_group_level_metadata_path("maven-metadata.xml"));
+        assert!(!is_group_level_metadata_path("com/x/lib/lib-1.0.pom"));
+    }
 
     #[test]
     fn test_parse_plugin_prefix_entries() {

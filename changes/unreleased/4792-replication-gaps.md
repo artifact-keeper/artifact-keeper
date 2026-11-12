@@ -1,7 +1,0 @@
----
-section: Fixed
-issues: [#4792]
----
-- **Peer replication no longer echoes NuGet and nested-layout RPM writes, and a pacman signature or conda attestation added after its package now reaches push peers** (#4792). Follow-up to #4725. The NuGet push handler and the `repodata_depth > 0` branch of the RPM upload queued push sync tasks even for a write that arrived from a peer (`X-Artifact-Keeper-Replication: true`), so the write was pushed out again to every push peer of the repository; both now skip the fan-out like every other format. A pacman `.sig` and a conda CEP-27 attestation are stored in their package's metadata, and uploading one queued nothing, so a peer that had already received the package never got it. Attaching one now delivers the package again with its new metadata (the finished push task is re-armed, and a push that was in flight when the signature or attestation arrived is re-armed when it finishes).
-
-  On the receiving side, a trusted peer pushing the exact bytes that are already live at a path is now accepted as a replay that refreshes the artifact's metadata, instead of being refused with 409 as an immutable republish. Client uploads of identical bytes to an occupied coordinate are still refused, and a peer still cannot change the bytes of a released coordinate. A peer running an older release keeps refusing the replay, so the signature or attestation reaches it only after it is upgraded.

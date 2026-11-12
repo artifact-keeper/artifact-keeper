@@ -1,0 +1,13 @@
+-- #5386: MCP capability snapshot history is deduplicated and bounded.
+--
+-- A probe or report whose `content_hash`, `outcome` and `auth_state` equal
+-- the newest snapshot of the same (artifact, source, origin) no longer adds a
+-- row: the newest row's `last_seen_at` is bumped instead, so an unchanged
+-- remote keeps one row however often it is probed. `observed_at` stays the
+-- first time that content was seen; `last_seen_at` is the latest time. NULL
+-- on rows written before this migration (readers fall back to
+-- `observed_at`).
+--
+-- Adding a nullable column without a default is catalog-only: no rewrite,
+-- no long lock on `mcp_capability_snapshots`.
+ALTER TABLE mcp_capability_snapshots ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;

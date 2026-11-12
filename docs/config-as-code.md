@@ -26,10 +26,10 @@ Both routes are instance-admin only (`admin_middleware`, like every
 `/api/v1/admin` route). An unknown key in `repositories=` answers 404.
 
 The export reads each setting through the handler behind its own GET route
-(`GET /api/v1/repositories/{key}`, `/cache-ttl`, `/on-upstream-not-found`,
-`/stale-if-error-grace`, `/upstream-filter`, `/routing-rules`,
-`/egress-proxy`, `/npm-scope-policy`, `/members`), so it reports exactly what
-those routes report.
+(`GET /api/v1/repositories/{key}`, `/upstream-mode`, `/cache-ttl`,
+`/on-upstream-not-found`, `/stale-if-error-grace`, `/upstream-filter`,
+`/routing-rules`, `/egress-proxy`, `/npm-scope-policy`, `/members`), so it
+reports exactly what those routes report.
 
 ## Document shape
 
@@ -50,6 +50,7 @@ those routes report.
       "versioning_enabled": false,
       "curation_enabled": false,
       "curation_default_action": "allow",
+      "upstream_mode": "cache_only",
       "cache_ttl_seconds": 600,
       "on_upstream_not_found": "keep",
       "stale_if_error_grace_seconds": 7200,
@@ -84,12 +85,20 @@ those routes report.
 - Order is stable: repositories by `key`, virtual members by `priority` then
   `key`, fields in a fixed order. Two exports of an unchanged instance differ
   only in `exported_at` and `producer`.
-- Fields at their default are omitted: `egress_proxy` absent means `inherit`,
-  `upstream_filter` absent means no filter, `npm_scope_policy` absent means no
-  restriction, `stale_if_error_grace_seconds` absent means the instance
-  default, an empty `routing_rules` or `members` list is omitted.
+- Fields at their default are omitted: `upstream_mode` absent means `online`,
+  `egress_proxy` absent means `inherit`, `upstream_filter` absent means no
+  filter, `npm_scope_policy` absent means no restriction,
+  `stale_if_error_grace_seconds` absent means the instance default, an empty
+  `routing_rules` or `members` list is omitted.
+- `upstream_mode` is the mode stored for the Remote (`upstream_mode` of
+  `GET .../upstream-mode`), not the effective one: the instance-wide
+  `PROXY_UPSTREAM_MODE=cache_only` environment variable belongs to the
+  instance and is not exported.
 - Remote-only settings appear only on `remote` repositories; `members` only on
   `virtual` ones.
+- `curation_source_repository_key` names the Remote a staging repository's
+  curation sync ingests from. It is applied after that Remote, and a key that
+  is neither in the document nor on the target fails the plan.
 - `storage_backend` is not exported: it is chosen by the target instance.
 - Unknown fields are refused on import, so a typo cannot be silently ignored.
 

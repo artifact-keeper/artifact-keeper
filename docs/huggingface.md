@@ -44,7 +44,10 @@ outlive the upstream, for example on an instance that will be disconnected.
 Model info at a branch (`main`) and other mutable paths are revalidated after
 the TTL (5 minutes by default), and a raised TTL only applies to an entry
 from its next revalidation, so raising it after seeding leaves the entries
-already cached on the old lifetime:
+already cached on the old lifetime. Paths at a 40-character commit sha
+(`<model>/resolve/<sha>/...`, which is how `snapshot_download` fetches its
+files, and model info and tree listings at a sha) are immutable cache entries
+and are never revalidated, whatever the TTL (#5283):
 
 ```bash
 curl -X PUT https://registry.example.com/api/v1/repositories/hf-remote/cache-ttl \
@@ -87,7 +90,7 @@ the same model, and **a pattern has to match both**:
 | Request | Path sent upstream |
 |---------|--------------------|
 | Model info (`model_info`, the first call of `snapshot_download` and `hf download`) | `api/models/<org>/<name>`, `api/models/<org>/<name>/revision/<rev>` |
-| File listing (`list_repo_tree`, and `snapshot_download` in `huggingface_hub` 2.x) | `api/models/<org>/<name>/tree/<rev>`, with the query string once #5321 forwards it (`?recursive=true`, `&cursor=...`) |
+| File listing (`list_repo_tree`, and `snapshot_download` in `huggingface_hub` 2.x) | `api/models/<org>/<name>/tree/<rev>`, followed by its query in one canonical spelling: `recursive=true`, `expand=true` and `cursor=...` in that order, a `false` flag left out (`?recursive=true`, `?recursive=true&cursor=...`) |
 | File download (`hf_hub_download`) | `<org>/<name>/resolve/<rev>/<file>` |
 
 A filter written as `^acme/` admits the files but refuses model info, so
@@ -283,7 +286,7 @@ Files uploaded to a Local repository are judged by the model-file scanner
 `torch.load`, and safetensors and GGUF headers are checked for malformed or
 inconsistent structure. A pickle importing a primitive such as `os.system` is
 a critical `malicious` finding. Files proxied by a Remote repository are not
-judged yet. See [Model-file scanning](security/model-file-scanning.md) for
+judged yet (Hugging Face has no scan-on-proxy). See [Model-file scanning](security/model-file-scanning.md) for
 what is checked, the limits, and what it does not catch.
 
 ## Limitations
@@ -302,15 +305,6 @@ Anything not listed under Endpoints answers 404. In particular:
   repository keeps no model rows for proxied files, so it returns `[]` rather
   than searching the Hub. `whoami`, `paths-info`, repository creation and the
   commit/upload API are not implemented.
-- **Tree listings for Remote repositories drop the query string** (#5321).
-  The Hub's `recursive`, `expand` and pagination `cursor` parameters are not
-  forwarded, so a Remote answers `list_repo_tree` with the top level and its
-  first page only. `snapshot_download` in `huggingface_hub` 2.x takes its file
-  list from `api/models/{model_id}/tree/{commit}?recursive=true`, not from the
-  model-info `siblings`, so through a Remote it currently misses every file
-  in a subdirectory (for example `1_Pooling/config.json`) while reporting
-  success. Until #5321 is fixed, fetch such files with `hf_hub_download`, or
-  check a snapshot against the model-info `siblings` list.
 - **Xet storage is hidden from clients.** Xet fields are stripped from
   proxied metadata so clients download through the ordinary `/resolve/` path
   (and through the cache) rather than fetching Xet chunks directly from the

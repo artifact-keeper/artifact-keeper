@@ -68,6 +68,9 @@ pub const MAX_SUMMARY_VERSIONS: usize = 200;
 pub const MAX_BACKFILL_NAMES: i64 = 50;
 /// Ingested versions a run retries package resolution for.
 pub const MAX_RERESOLVE: i64 = 100;
+/// Failed backfill attempts of one row before it is retried only once a day
+/// (#5675): a name that cannot be stored no longer costs every sync.
+pub const MAX_BACKFILL_ATTEMPTS: i64 = 5;
 /// The watermark never runs closer to the run's start than this, so an
 /// upstream entry updated while a pass was paging past it is read again.
 pub const WATERMARK_OVERLAP_SECS: i64 = 600;
@@ -75,6 +78,11 @@ pub const WATERMARK_OVERLAP_SECS: i64 = 600;
 pub const DEFAULT_SYNC_INTERVAL_SECS: i64 = 3600;
 /// How often the scheduler looks for repositories that are due.
 pub const SCHEDULER_TICK_SECS: u64 = 300;
+/// A Remote never synced is not due until it is this old (#5402): its
+/// create stores the settings that govern upstream contact (upstream mode,
+/// egress proxy, `mcp_remote_sync_paused`) right after the row, and a
+/// scheduler tick between the two must not start a pass without them.
+pub const FIRST_SYNC_GRACE_SECS: i64 = 60;
 const SCHEDULER_LEASE: &str = "mcp_remote_sync";
 const SCHEDULER_LEASE_TTL_SECS: f64 = 330.0;
 
@@ -453,15 +461,21 @@ pub fn registry_changed(stored: &RegistryState, upstream: &RegistryState) -> boo
         || stored.updated_at != upstream.updated_at
 }
 
-/// A package to resolve: an upstream `registryBaseUrl` that names the host of
-/// the backing Remote's own upstream is the same registry the Remote proxies,
-/// so it is dropped for the lookup (the served form points at the backing
-/// repository anyway).
+/// A package to resolve: an upstream `registryBaseUrl` under the backing
+/// Remote's own upstream URL (same origin and a path under it,
+/// [`mcp_packages::url_is_under`]) is the registry the Remote proxies, so it
+/// is dropped for the lookup (the served form points at the backing
+/// repository anyway). A pin of such a package records
+/// [`mcp_packages::FOREIGN_COORDINATES_WARNING`], as a publish naming the
+/// upstream does ([`pin_packages`]).
 pub fn for_resolution(pkg: &fmt::Package, repo: Option<&BackingRepo>) -> fmt::Package {
     let mut p = pkg.clone();
     if let (Some(given), Some(repo)) = (p.registry_base_url.as_deref(), repo) {
-        let upstream = repo.upstream_url.as_deref().map(fmt::host_of);
-        if repo.repo_type == "remote" && upstream.as_deref() == Some(fmt::host_of(given).as_str()) {
+        let under = repo
+            .upstream_url
+            .as_deref()
+            .is_some_and(|up| mcp_packages::url_is_under(up, given));
+        if repo.repo_type == "remote" && under {
             p.registry_base_url = None;
         }
     }
@@ -516,6 +530,9 @@ pub enum SyncError {
     /// The first upstream page could not be read.
     Upstream(String),
     Database(String),
+    /// Scheduled upstream jobs are paused on this instance (#5288): a manual
+    /// trigger starts no pass either (#5404).
+    Paused,
 }
 
 impl std::fmt::Display for SyncError {
@@ -526,12 +543,98 @@ impl std::fmt::Display for SyncError {
             SyncError::NoProxy => write!(f, "outbound fetches are not available"),
             SyncError::Upstream(e) => write!(f, "upstream: {e}"),
             SyncError::Database(e) => write!(f, "database: {e}"),
+            SyncError::Paused => write!(
+                f,
+                "scheduled upstream jobs are paused on this instance (upstream_jobs_paused); \
+                 no sync starts until the switch is off"
+            ),
         }
     }
 }
 
 fn db_err(e: impl std::fmt::Display) -> String {
     format!("database: {e}")
+}
+
+/// Why an ingest failed.
+///
+/// A failure to write the version's bytes to the repository's storage is
+/// kept apart from the rest (#5660): an approval answers it instead of
+/// reporting the approval done and deferring the ingest to the next sync,
+/// which is right for an unreachable upstream but hid a storage refusal that
+/// every retry repeats.
+#[derive(Debug)]
+pub enum IngestError {
+    /// Upstream unreachable or answering something unusable, a database
+    /// error: the next sync retries.
+    Deferred(String),
+    /// The version's bytes could not be stored (the cross-repository write
+    /// guard's 409, a quota refusal, a backend failure).
+    Store(crate::error::AppError),
+}
+
+impl std::fmt::Display for IngestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Deferred(e) => f.write_str(e),
+            Self::Store(e) => write!(f, "storage: {e}"),
+        }
+    }
+}
+
+impl From<String> for IngestError {
+    fn from(e: String) -> Self {
+        Self::Deferred(e)
+    }
+}
+
+impl From<IngestError> for String {
+    fn from(e: IngestError) -> Self {
+        e.to_string()
+    }
+}
+
+/// The error a failed storage write of `key` answered with `status`, as the
+/// service-layer error an approval returns.
+fn store_failure(key: &str, status: axum::http::StatusCode) -> crate::error::AppError {
+    use crate::error::AppError;
+    use axum::http::StatusCode;
+    let message = format!("storing '{key}' failed ({status})");
+    match status {
+        StatusCode::CONFLICT => AppError::Conflict(message),
+        // A size cap (the upload limit), not a quota: its own `400` code
+        // instead of `507 QUOTA_EXCEEDED` (#5675).
+        StatusCode::PAYLOAD_TOO_LARGE => AppError::CodedValidation {
+            code: "PAYLOAD_TOO_LARGE",
+            message,
+        },
+        StatusCode::INSUFFICIENT_STORAGE => AppError::QuotaExceeded(message),
+        _ => AppError::Storage(message),
+    }
+}
+
+/// Write the bytes of an ingested version under `key`.
+///
+/// The cross-repository write guard runs here first so its refusal keeps
+/// its message ("already owned by another repository") for the approval to
+/// answer; `put_artifact_bytes` runs it again, with the quota preflight.
+async fn store_version_bytes(
+    state: &SharedState,
+    repo: &RepoInfo,
+    key: &str,
+    bytes: axum::body::Bytes,
+) -> Result<(), IngestError> {
+    crate::services::artifact_service::guard_foreign_storage_key_for_backend(
+        &state.db,
+        repo.id,
+        &repo.storage_backend,
+        key,
+    )
+    .await
+    .map_err(IngestError::Store)?;
+    proxy_helpers::put_artifact_bytes(state, repo, key, bytes)
+        .await
+        .map_err(|r| IngestError::Store(store_failure(key, r.status())))
 }
 
 /// Everything one run (or one approval-triggered ingest) reads once.
@@ -775,13 +878,17 @@ pub async fn upsert_row(
     .map_err(db_err)
 }
 
-/// Clear `metadata.needsIngest` on a row once its versions are in.
+/// Clear `metadata.needsIngest` (and the backfill attempt record) on a row
+/// once its versions are in.
 async fn clear_needs_ingest(db: &PgPool, id: Uuid) -> Result<(), String> {
-    sqlx::query("UPDATE curation_packages SET metadata = metadata - 'needsIngest' WHERE id = $1")
-        .bind(id)
-        .execute(db)
-        .await
-        .map_err(db_err)?;
+    sqlx::query(
+        "UPDATE curation_packages SET metadata = metadata - 'needsIngest' \
+         - 'backfillAttempts' - 'backfillAttemptedAt' WHERE id = $1",
+    )
+    .bind(id)
+    .execute(db)
+    .await
+    .map_err(db_err)?;
     Ok(())
 }
 
@@ -848,8 +955,10 @@ async fn pin_packages(
 ) -> (Vec<PackagePin>, Vec<Unresolved>) {
     let mut pins = Vec::new();
     let mut unresolved = Vec::new();
+    // `open` pins as `own-repos` does (#5452); it only accepts foreign
+    // coordinates. A package that does not pin leaves the version
+    // `unresolvable`.
     let settings = match &run.packages {
-        Ok(s) if s.policy == PackagePolicy::Open => return (pins, unresolved),
         Ok(s) => s,
         Err(detail) => {
             let all = server
@@ -896,6 +1005,7 @@ async fn pin_packages(
                     repo,
                     index,
                     &candidate,
+                    "",
                 )
                 .await
                 {
@@ -908,6 +1018,15 @@ async fn pin_packages(
         match found {
             Ok(mut pin) => {
                 pin.submitted.identifier = pkg.identifier.clone();
+                // The upstream's `registryBaseUrl` was replaced by the
+                // backing repository's, as on a publish naming it (#5452).
+                let warning = mcp_packages::FOREIGN_COORDINATES_WARNING.to_string();
+                if pkg.registry_base_url.is_some()
+                    && candidate.registry_base_url.is_none()
+                    && !pin.resolved.warnings.contains(&warning)
+                {
+                    pin.resolved.warnings.push(warning);
+                }
                 pins.push(pin);
             }
             Err(e) => unresolved.push(Unresolved {
@@ -918,6 +1037,18 @@ async fn pin_packages(
         }
     }
     (pins, unresolved)
+}
+
+/// The `packages[]` indexes of a stored version that no pin covers.
+fn unpinned_indexes(stored: &fmt::StoredVersion) -> Vec<usize> {
+    let count = stored
+        .server
+        .get("packages")
+        .and_then(|p| p.as_array())
+        .map_or(0, Vec::len);
+    (0..count)
+        .filter(|i| !stored.pins.iter().any(|p| p.index == *i))
+        .collect()
 }
 
 /// An upstream URL as it may be stored, served or audited: userinfo
@@ -969,22 +1100,28 @@ async fn insert_version(
     admitted: &Admitted,
     metadata: &serde_json::Value,
     pins: &[PackagePin],
-) -> Result<Uuid, String> {
+) -> Result<Uuid, IngestError> {
     let db = &run.state.db;
     let repo = run.repo;
     let name = &admitted.server.name;
     let version = &admitted.server.version;
     let path = fmt::storage_path(name, version);
-    let key = fmt::storage_key(name, version, &admitted.sha256);
+    // Repo-scoped on a shared cloud namespace (#5660): two Remotes of one
+    // upstream hold the same version without sharing its object.
+    let key = fmt::storage_key(
+        fmt::KeyScope::of(&repo.storage_backend, repo.id),
+        name,
+        version,
+        &admitted.sha256,
+    );
     let size = admitted.bytes.len() as i64;
-    proxy_helpers::put_artifact_bytes(
+    store_version_bytes(
         run.state,
         repo,
         &key,
         axum::body::Bytes::from(admitted.bytes.clone()),
     )
-    .await
-    .map_err(|r| format!("storage: {}", r.status()))?;
+    .await?;
     let mut tx =
         crate::api::handlers::publish_quota::begin_admitted_publish(db, repo.id, &path, size)
             .await
@@ -1197,7 +1334,7 @@ async fn mark_drifted(db: &PgPool, id: Uuid) -> Result<(), String> {
 pub async fn ingest_entry(
     run: &RunCtx<'_>,
     entry: &UpstreamEntry,
-) -> Result<IngestOutcome, String> {
+) -> Result<IngestOutcome, IngestError> {
     let admitted = match admit_upstream(entry) {
         Ok(a) => a,
         Err(e) => {
@@ -1290,7 +1427,7 @@ pub async fn ingest_entry(
 /// lacks and that is not stored yet is read on its own with
 /// `include_deleted=true`: a version already deleted upstream is then stored
 /// with status `deleted`, as in `mirror` mode.
-pub async fn ingest_name(run: &RunCtx<'_>, name: &str) -> Result<SyncSummary, String> {
+pub async fn ingest_name(run: &RunCtx<'_>, name: &str) -> Result<SyncSummary, IngestError> {
     // A name whose every version is deleted upstream has no list (`404`):
     // its summarised versions are still read one by one.
     let (page, list_err) = match run.fetch(&versions_path(name)).await {
@@ -1343,7 +1480,7 @@ pub async fn ingest_name(run: &RunCtx<'_>, name: &str) -> Result<SyncSummary, St
         }
     }
     match list_err {
-        Some(e) if read_alone == 0 => Err(e),
+        Some(e) if read_alone == 0 => Err(e.into()),
         _ => Ok(summary),
     }
 }
@@ -1384,7 +1521,7 @@ pub async fn ingest_version(
     run: &RunCtx<'_>,
     name: &str,
     version: &str,
-) -> Result<IngestOutcome, String> {
+) -> Result<IngestOutcome, IngestError> {
     let bytes = run.fetch(&version_path(name, version)).await?;
     let doc: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| format!("upstream sent invalid JSON: {e}"))?;
@@ -1533,12 +1670,51 @@ async fn apply_page(
                 Err(e) => {
                     // An approved name retries through `backfill`.
                     mark_needs_ingest(&run.state.db, row.id).await?;
-                    summary.errors.push(e);
+                    summary.errors.push(e.into());
                 }
             }
         }
     }
     Ok(())
+}
+
+/// What a targeted fetch of one name found (#5408).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NameFetch {
+    /// `mcp_server_deny` matches the name: nothing was fetched or recorded.
+    Denied,
+    /// The upstream's version list of the name was recorded in the catalog
+    /// as a sync page would record it; the versions it lists.
+    Recorded(Vec<String>),
+}
+
+/// Fetch one name's version list (`GET {upstream}/v0.1/servers/{name}/versions`)
+/// through the sync's outbound path (SSRF guard, upstream credentials,
+/// egress proxy, the upstream gate and its cache-only refusal, the
+/// `UPSTREAM_FETCHED` audit) and record it in the catalog exactly as a sync
+/// page carrying those entries would (#5408): a new name row with the
+/// lookalike check and `mcp_auto_approve_namespaces`, the cached summary,
+/// and the ingest of versions that are already approved. A later sync
+/// therefore finds the name known.
+pub async fn record_name_from_upstream(
+    state: &SharedState,
+    repo: &RepoInfo,
+    name: &str,
+) -> Result<NameFetch, String> {
+    let mut run = RunCtx::load(state, repo).await.map_err(|e| e.to_string())?;
+    if run.denied(name) {
+        return Ok(NameFetch::Denied);
+    }
+    let bytes = run.fetch(&versions_path(name)).await?;
+    let mut page = parse_page(&bytes)?;
+    page.entries.retain(|e| e.name == name);
+    page.next_cursor = None;
+    let versions = page.entries.iter().map(|e| e.version.clone()).collect();
+    if !page.entries.is_empty() {
+        let mut summary = SyncSummary::default();
+        apply_page(&mut run, &page, &mut summary).await?;
+    }
+    Ok(NameFetch::Recorded(versions))
 }
 
 /// Move the PENDING name row `target` to review, flagged as a lookalike of
@@ -1653,16 +1829,7 @@ fn absorb(into: &mut SyncSummary, from: &SyncSummary) {
 /// Names (and pins) an approval flagged `needsIngest` that no page carried:
 /// ingest them from their per-server version list.
 async fn backfill(run: &RunCtx<'_>, summary: &mut SyncSummary) -> Result<(), String> {
-    let pending: Vec<StoredRow> = sqlx::query_as(
-        "SELECT id, package_name, version, status, metadata FROM curation_packages \
-         WHERE staging_repo_id = $1 AND format = 'mcp' AND status = 'approved' \
-           AND metadata ? 'needsIngest' ORDER BY package_name, version LIMIT $2",
-    )
-    .bind(run.repo.id)
-    .bind(MAX_BACKFILL_NAMES)
-    .fetch_all(&run.state.db)
-    .await
-    .map_err(db_err)?;
+    let pending = backfill_candidates(&run.state.db, run.repo.id, MAX_BACKFILL_NAMES).await?;
     for row in pending {
         if run.denied(&row.package_name) {
             continue;
@@ -1684,9 +1851,55 @@ async fn backfill(run: &RunCtx<'_>, summary: &mut SyncSummary) -> Result<(), Str
                 summary.backfilled_names += 1;
                 clear_needs_ingest(&run.state.db, row.id).await?;
             }
-            Err(e) => summary.errors.push(e),
+            Err(e) => {
+                record_backfill_failure(&run.state.db, row.id).await?;
+                summary.errors.push(e.into());
+            }
         }
     }
+    Ok(())
+}
+
+/// The rows [`backfill`] attempts this run (#5675): least recently
+/// attempted first (never attempted before any), so rows that keep failing
+/// cannot starve the rest once they fill the batch; a row that failed
+/// [`MAX_BACKFILL_ATTEMPTS`] times is picked again only a day after its last
+/// attempt.
+async fn backfill_candidates(
+    db: &PgPool,
+    repo_id: Uuid,
+    limit: i64,
+) -> Result<Vec<StoredRow>, String> {
+    sqlx::query_as(
+        "SELECT id, package_name, version, status, metadata FROM curation_packages \
+         WHERE staging_repo_id = $1 AND format = 'mcp' AND status = 'approved' \
+           AND metadata ? 'needsIngest' \
+           AND (COALESCE((metadata->>'backfillAttempts')::bigint, 0) < $3 \
+                OR (metadata->>'backfillAttemptedAt')::timestamptz < now() - interval '1 day') \
+         ORDER BY (metadata->>'backfillAttemptedAt')::timestamptz ASC NULLS FIRST, \
+                  package_name, version \
+         LIMIT $2",
+    )
+    .bind(repo_id)
+    .bind(limit)
+    .bind(MAX_BACKFILL_ATTEMPTS)
+    .fetch_all(db)
+    .await
+    .map_err(db_err)
+}
+
+/// Count a failed backfill attempt of a row and stamp when it was made.
+async fn record_backfill_failure(db: &PgPool, id: Uuid) -> Result<(), String> {
+    sqlx::query(
+        "UPDATE curation_packages SET metadata = metadata || jsonb_build_object( \
+           'backfillAttempts', COALESCE((metadata->>'backfillAttempts')::bigint, 0) + 1, \
+           'backfillAttemptedAt', now()) \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .execute(db)
+    .await
+    .map_err(db_err)?;
     Ok(())
 }
 
@@ -1694,11 +1907,19 @@ async fn backfill(run: &RunCtx<'_>, summary: &mut SyncSummary) -> Result<(), Str
 /// unresolved packages (a package pulled through the backing Remote since,
 /// a mapping added since).
 async fn re_resolve(run: &RunCtx<'_>, summary: &mut SyncSummary) -> Result<(), String> {
+    // A version needs another attempt when a package of it has no pin: one
+    // the sync reported unresolved, and one stored unpinned with an empty
+    // `unresolved` list, as `open` ingested every package before #5452.
+    // Least recently attempted first, so versions that keep failing do not
+    // starve the rest of the batch.
     let rows: Vec<(Uuid, serde_json::Value)> = sqlx::query_as(
         "SELECT a.id, m.metadata FROM artifacts a JOIN artifact_metadata m ON m.artifact_id = a.id \
          WHERE a.repository_id = $1 AND a.is_deleted = false AND m.format = 'mcp' \
-           AND jsonb_array_length(COALESCE(m.metadata->'ingest'->'unresolved', '[]'::jsonb)) > 0 \
-         ORDER BY a.name, a.version LIMIT $2",
+           AND (jsonb_array_length(COALESCE(m.metadata->'ingest'->'unresolved', '[]'::jsonb)) > 0 \
+             OR jsonb_array_length(COALESCE(m.metadata->'packages', '[]'::jsonb)) \
+                < jsonb_array_length(COALESCE(m.metadata->'server'->'packages', '[]'::jsonb))) \
+         ORDER BY COALESCE(m.metadata->'ingest'->>'reResolveAttemptedAt', '') , a.name, a.version \
+         LIMIT $2",
     )
     .bind(run.repo.id)
     .bind(MAX_RERESOLVE)
@@ -1712,13 +1933,24 @@ async fn re_resolve(run: &RunCtx<'_>, summary: &mut SyncSummary) -> Result<(), S
         let Ok(server) = serde_json::from_value::<ServerJson>(stored.server.clone()) else {
             continue;
         };
-        let before: Vec<Unresolved> = meta
-            .pointer("/ingest/unresolved")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        let indexes: Vec<usize> = before.iter().map(|u| u.index).collect();
+        let indexes = unpinned_indexes(&stored);
         let (new_pins, still) = pin_packages(run, &server, Some(&indexes)).await;
         if new_pins.is_empty() {
+            // Record the attempt (and what is still unresolved) so the next
+            // pass tries the versions not attempted yet first. A version
+            // stored without `ingest` gets one, so it cannot sort first
+            // forever.
+            sqlx::query(
+                "UPDATE artifact_metadata SET metadata = jsonb_set(metadata, '{ingest}', \
+                 COALESCE(metadata->'ingest', '{}'::jsonb) || jsonb_build_object( \
+                   'unresolved', $2::jsonb, 'reResolveAttemptedAt', now()::text)) \
+                 WHERE artifact_id = $1",
+            )
+            .bind(id)
+            .bind(serde_json::to_value(&still).unwrap_or_default())
+            .execute(&run.state.db)
+            .await
+            .map_err(db_err)?;
             continue;
         }
         let mut pins = stored.pins.clone();
@@ -1813,20 +2045,105 @@ async fn save_state(db: &PgPool, repo_id: Uuid, s: &SyncState, ok: bool) -> Resu
     Ok(())
 }
 
+/// The advisory-lock object id of a repository's sync lock.
+fn lock_object_id(repo_id: Uuid) -> i32 {
+    crate::services::cluster_lock::lease_object_id(&format!("mcp-remote-sync/{repo_id}"))
+}
+
 /// Hold the per-repository sync lock (cluster-wide) for the rest of the run.
 async fn lock_repo(
     db: &PgPool,
     repo_id: Uuid,
 ) -> Result<crate::services::cluster_lock::ClusterLease, SyncError> {
-    use crate::services::cluster_lock::{lease_object_id, ClusterLock, PgAdvisoryLock};
+    use crate::services::cluster_lock::{ClusterLock, PgAdvisoryLock};
     PgAdvisoryLock::new(db.clone())
-        .try_acquire(
-            SYNC_LOCK_CLASS,
-            lease_object_id(&format!("mcp-remote-sync/{repo_id}")),
-        )
+        .try_acquire(SYNC_LOCK_CLASS, lock_object_id(repo_id))
         .await
         .map_err(|e| SyncError::Database(e.to_string()))?
         .ok_or(SyncError::Busy)
+}
+
+/// Whether any replica runs a sync of the repository right now: its sync
+/// lock is held (read from `pg_locks`, so the check never takes the lock and
+/// cannot make a starting pass answer [`SyncError::Busy`]).
+pub async fn sync_running(db: &PgPool, repo_id: Uuid) -> Result<bool, String> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' \
+             AND classid::bigint = $1 AND objid::bigint = $2 AND objsubid = 2 AND granted)",
+    )
+    .bind(i64::from(SYNC_LOCK_CLASS))
+    .bind(i64::from(lock_object_id(repo_id) as u32))
+    .fetch_one(db)
+    .await
+    .map_err(db_err)
+}
+
+/// Record a background pass that ended before it stored its own outcome
+/// (a database error, or the repository changed under it), so its poller
+/// sees it end instead of an unchanged state. An unreadable first page is
+/// already stored by the pass itself.
+async fn record_failure(db: &PgPool, repo_id: Uuid, e: &SyncError) {
+    if matches!(e, SyncError::Upstream(_)) {
+        return;
+    }
+    let stored = sqlx::query(
+        "INSERT INTO mcp_remote_sync_state (repository_id, last_started_at, last_finished_at, last_error) \
+         VALUES ($1, now(), now(), $2) \
+         ON CONFLICT (repository_id) DO UPDATE SET \
+             last_started_at = COALESCE(mcp_remote_sync_state.last_started_at, now()), \
+             last_finished_at = now(), last_error = $2",
+    )
+    .bind(repo_id)
+    .bind(e.to_string())
+    .execute(db)
+    .await;
+    if let Err(err) = stored {
+        tracing::warn!(repository_id = %repo_id, error = %err, "MCP remote sync failure not recorded");
+    }
+}
+
+/// Start a sync of `repo` in the background (the manual trigger, #5404).
+///
+/// Everything that can refuse the run is checked before this returns: no
+/// proxy service, scheduled upstream jobs paused (#5288, the switch the
+/// scheduled pass obeys), not a Remote MCP repository, and the repository's
+/// sync lock, which is taken here ([`SyncError::Busy`] when another run holds
+/// it) and handed to the spawned pass. The pass is the scheduler's
+/// ([`run_locked`]), on a task of its own, so it does not end with the
+/// request that started it; its outcome is the stored [`SyncState`].
+pub async fn start_sync(state: &SharedState, repo: RepoInfo) -> Result<(), SyncError> {
+    if state.proxy_service.is_none() {
+        return Err(SyncError::NoProxy);
+    }
+    if upstream_pause::upstream_jobs_paused(&state.db).await {
+        return Err(SyncError::Paused);
+    }
+    RunCtx::load(state, &repo).await?;
+    let lease = lock_repo(&state.db, repo.id).await?;
+    let state = state.clone();
+    tokio::spawn(async move {
+        let result = match RunCtx::load(&state, &repo).await {
+            Ok(mut run) => run_locked(&mut run).await,
+            Err(e) => Err(e),
+        };
+        lease.release().await;
+        if let Err(e) = &result {
+            record_failure(&state.db, repo.id, e).await;
+        }
+        match result {
+            Ok(s) => tracing::info!(
+                repository = %repo.key,
+                pages = s.pages,
+                ingested = s.ingested,
+                complete = s.complete,
+                "MCP remote manual sync finished"
+            ),
+            Err(e) => {
+                tracing::warn!(repository = %repo.key, error = %e, "MCP remote manual sync failed")
+            }
+        }
+    });
+    Ok(())
 }
 
 /// Run one sync of `repo` (manual trigger or scheduler). Holds the
@@ -1953,7 +2270,7 @@ pub async fn ingest_after_approval(
     repo: &RepoInfo,
     name: &str,
     version: &str,
-) -> Result<SyncSummary, String> {
+) -> Result<SyncSummary, IngestError> {
     let run = RunCtx::load(state, repo).await.map_err(|e| e.to_string())?;
     if run.denied(name) {
         return Ok(SyncSummary::default());
@@ -1978,21 +2295,27 @@ pub fn sync_interval_secs(raw: Option<&str>) -> i64 {
         .unwrap_or(DEFAULT_SYNC_INTERVAL_SECS)
 }
 
-/// Remote MCP repositories due for a sync: never synced, past the
-/// interval, or with an unfinished pass to resume.
+/// Remote MCP repositories due for a sync: never synced (and older than
+/// [`FIRST_SYNC_GRACE_SECS`]), past the interval, or with an unfinished pass
+/// to resume. A Remote with `mcp_remote_sync_paused` is never due (#5402).
 pub async fn due_repositories(db: &PgPool, interval_secs: i64) -> Result<Vec<String>, String> {
     sqlx::query_scalar(
         "SELECT r.key FROM repositories r \
          LEFT JOIN mcp_remote_sync_state s ON s.repository_id = r.id \
          WHERE r.format = 'mcp' AND r.repo_type = 'remote' AND r.upstream_url IS NOT NULL \
            AND r.key NOT LIKE '~deleting~%' \
-           AND (s.last_started_at IS NULL \
+           AND NOT EXISTS (SELECT 1 FROM repository_config c WHERE c.repository_id = r.id \
+                           AND c.key = $2 AND c.value = 'true') \
+           AND ((s.last_started_at IS NULL \
+                 AND r.created_at < now() - make_interval(secs => $3)) \
                 OR s.last_started_at < now() - make_interval(secs => $1) \
                 OR (s.resume_cursor IS NOT NULL \
                     AND s.last_started_at < now() - make_interval(secs => 300))) \
          ORDER BY s.last_started_at NULLS FIRST",
     )
     .bind(interval_secs as f64)
+    .bind(mcp_settings::REMOTE_SYNC_PAUSED_KEY)
+    .bind(FIRST_SYNC_GRACE_SECS as f64)
     .fetch_all(db)
     .await
     .map_err(db_err)
@@ -2069,25 +2392,38 @@ pub fn spawn(state: SharedState, shutdown: tokio_util::sync::CancellationToken) 
                 _ = shutdown.cancelled() => return,
                 _ = ticker.tick() => {}
             }
-            if pause.skip_tick(&state.db).await {
-                continue;
-            }
-            let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
-                &state.db,
-                SCHEDULER_LEASE,
-                SCHEDULER_LEASE_TTL_SECS,
-            )
-            .await
-            else {
-                continue;
-            };
-            let (renewal, lost) =
-                lease.spawn_renewal_with_cancellation(state.db.clone(), SCHEDULER_LEASE_TTL_SECS);
-            run_due(&state, interval_secs, &lost).await;
-            drop(renewal);
-            lease.release(&state.db).await;
+            scheduler_tick(&state, interval_secs, &mut pause).await;
         }
     });
+}
+
+/// One tick of the scheduled sync: skipped, before the lease and any
+/// network work, while scheduled upstream jobs are paused; otherwise the due
+/// repositories are synced under the scheduler lease. `false` when the tick
+/// was skipped (paused, or another replica holds the lease).
+pub async fn scheduler_tick(
+    state: &SharedState,
+    interval_secs: i64,
+    pause: &mut UpstreamPauseGate,
+) -> bool {
+    if pause.skip_tick(&state.db).await {
+        return false;
+    }
+    let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+        &state.db,
+        SCHEDULER_LEASE,
+        SCHEDULER_LEASE_TTL_SECS,
+    )
+    .await
+    else {
+        return false;
+    };
+    let (renewal, lost) =
+        lease.spawn_renewal_with_cancellation(state.db.clone(), SCHEDULER_LEASE_TTL_SECS);
+    run_due(state, interval_secs, &lost).await;
+    drop(renewal);
+    lease.release(&state.db).await;
+    true
 }
 
 #[cfg(ak_test_shard = "services-1")]
@@ -2120,6 +2456,131 @@ mod tests {
             ak_sha256: None,
             ak_source: false,
         }
+    }
+
+    /// #5675: a storage `413` is a size cap with its own `400` code, not
+    /// `507 QUOTA_EXCEEDED`; a full store (`507`) stays a quota refusal.
+    #[test]
+    fn store_failure_maps_413_to_its_own_code_5675() {
+        use crate::error::AppError;
+        use axum::http::StatusCode;
+        let too_large = store_failure("k", StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            matches!(
+                too_large,
+                AppError::CodedValidation {
+                    code: "PAYLOAD_TOO_LARGE",
+                    ..
+                }
+            ),
+            "{too_large:?}"
+        );
+        assert!(matches!(
+            store_failure("k", StatusCode::INSUFFICIENT_STORAGE),
+            AppError::QuotaExceeded(_)
+        ));
+        assert!(matches!(
+            store_failure("k", StatusCode::CONFLICT),
+            AppError::Conflict(_)
+        ));
+        assert!(matches!(
+            store_failure("k", StatusCode::INTERNAL_SERVER_ERROR),
+            AppError::Storage(_)
+        ));
+    }
+
+    /// #5675: backfill picks never-attempted rows first, then the least
+    /// recently attempted, so failing rows cannot starve later names; a
+    /// row that failed [`MAX_BACKFILL_ATTEMPTS`] times waits a day; a
+    /// success clears the attempt record.
+    #[tokio::test]
+    async fn backfill_rotates_and_caps_failing_rows_5675() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _key, dir) = tdh::create_repo(&pool, "remote", "mcp").await;
+        let mut ids = std::collections::HashMap::new();
+        for name in ["io.a/fails", "io.b/once", "io.c/fresh"] {
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO curation_packages (staging_repo_id, remote_repo_id, format, \
+                 package_name, version, upstream_path, status, metadata) \
+                 VALUES ($1, $1, 'mcp', $2, '1.0.0', $2, 'approved', '{\"needsIngest\": true}') \
+                 RETURNING id",
+            )
+            .bind(repo)
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            ids.insert(name, id);
+        }
+        let picked = |limit| {
+            let pool = pool.clone();
+            async move {
+                backfill_candidates(&pool, repo, limit)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.package_name)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(picked(10).await, ["io.a/fails", "io.b/once", "io.c/fresh"]);
+        record_backfill_failure(&pool, ids["io.b/once"])
+            .await
+            .unwrap();
+        // The failed row goes to the back; with a batch of two the fresh
+        // name behind it is reached.
+        assert_eq!(picked(2).await, ["io.a/fails", "io.c/fresh"]);
+        for _ in 0..MAX_BACKFILL_ATTEMPTS {
+            record_backfill_failure(&pool, ids["io.a/fails"])
+                .await
+                .unwrap();
+        }
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT (metadata->>'backfillAttempts')::bigint FROM curation_packages WHERE id = $1",
+        )
+        .bind(ids["io.a/fails"])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempts, MAX_BACKFILL_ATTEMPTS);
+        assert_eq!(
+            picked(10).await,
+            ["io.c/fresh", "io.b/once"],
+            "capped row waits"
+        );
+        sqlx::query(
+            "UPDATE curation_packages SET metadata = jsonb_set(metadata, '{backfillAttemptedAt}', \
+             to_jsonb(now() - interval '2 days')) WHERE id = $1",
+        )
+        .bind(ids["io.a/fails"])
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            picked(10).await,
+            ["io.c/fresh", "io.a/fails", "io.b/once"],
+            "a day later the capped row is retried"
+        );
+        clear_needs_ingest(&pool, ids["io.b/once"]).await.unwrap();
+        let meta: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM curation_packages WHERE id = $1")
+                .bind(ids["io.b/once"])
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            meta.get("needsIngest").is_none() && meta.get("backfillAttempts").is_none(),
+            "{meta}"
+        );
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2523,6 +2984,29 @@ mod tests {
         assert!(for_resolution(&pkg, Some(&other))
             .registry_base_url
             .is_some());
+        // #5452: a path-scoped upstream (one project of a shared host) is
+        // not another project on the same host.
+        let gitlab = |project: u32| -> fmt::Package {
+            serde_json::from_value(serde_json::json!({
+                "registryType": "pypi", "identifier": "tool", "version": "1.0.0",
+                "registryBaseUrl": format!(
+                    "https://gitlab.com/api/v4/projects/{project}/packages/pypi/simple"
+                ),
+                "transport": {"type": "stdio"},
+            }))
+            .unwrap()
+        };
+        let project = backing(
+            "remote",
+            "https://gitlab.com/api/v4/projects/222/packages/pypi/simple",
+        );
+        assert!(for_resolution(&gitlab(111), Some(&project))
+            .registry_base_url
+            .is_some());
+        assert_eq!(
+            for_resolution(&gitlab(222), Some(&project)).registry_base_url,
+            None
+        );
         let local = backing("local", "https://registry.npmjs.org");
         assert!(for_resolution(&pkg, Some(&local))
             .registry_base_url
@@ -2569,6 +3053,7 @@ mod tests {
             (SyncError::NoProxy, "outbound"),
             (SyncError::Upstream("x".into()), "upstream"),
             (SyncError::Database("x".into()), "database"),
+            (SyncError::Paused, "paused"),
         ] {
             assert!(e.to_string().contains(needle));
         }

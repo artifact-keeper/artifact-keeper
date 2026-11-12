@@ -1,5 +1,0 @@
----
-section: Changed
-issues: [#5002]
----
-- **Format-native single-PUT uploads into S3-, GCS- and Azure-backed repositories no longer spool the whole artifact to local scratch** (#5002). NuGet, PyPI, Terraform, JetBrains, Swift, Git LFS, Helm, Ansible, Chef and Pub now stage the request body on the repository's own backend, computing SHA-256, SHA-1 and MD5 in the same pass, and promote it with a server-side copy (NuGet and PyPI through the content-addressed upload path). A route that has to open the archive to parse it — a NuGet `.nuspec`, a wheel or sdist, a Terraform module archive or provider manifest, a Swift manifest fallback, a Helm `Chart.yaml`, an Ansible collection manifest, a Pub `pubspec.yaml` — downloads the staged object to one temporary file just for that read and removes it. Filesystem repositories, backends without native streaming, and formats whose processing reads the body as a file keep the local spool, as #4990 requires. See `docs/operations/upload-scratch-disk.md`.

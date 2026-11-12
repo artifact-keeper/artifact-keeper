@@ -145,9 +145,11 @@ fn parse_peer_status(s: &str) -> Option<PeerStatus> {
 )]
 async fn list_peers(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(peer_id): Path<Uuid>,
     Query(query): Query<ListPeersQuery>,
 ) -> Result<Json<Vec<PeerResponse>>> {
+    auth.require_admin()?;
     let service = PeerService::new(state.db.clone());
     let status_filter = query.status.as_ref().and_then(|s| parse_peer_status(s));
     let peers = service.list_peers(peer_id, status_filter).await?;
@@ -189,8 +191,10 @@ async fn list_peers(
 )]
 async fn discover_peers(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(peer_id): Path<Uuid>,
 ) -> Result<Json<Vec<DiscoverablePeerResponse>>> {
+    auth.require_admin()?;
     let service = PeerService::new(state.db.clone());
     let peers = service.discover_peers(peer_id).await?;
 
@@ -320,8 +324,10 @@ async fn mark_unreachable(
 )]
 async fn get_chunk_availability(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path((peer_id, artifact_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<ChunkAvailabilityResponse>> {
+    auth.require_admin()?;
     let row = sqlx::query!(
         r#"
         SELECT peer_instance_id, artifact_id, chunk_bitmap, total_chunks, available_chunks
@@ -391,8 +397,10 @@ async fn update_chunk_availability(
 )]
 async fn get_peers_with_chunks(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path((peer_id, artifact_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Vec<ChunkAvailabilityResponse>>> {
+    auth.require_admin()?;
     let service = TransferService::new(state.db.clone());
     let peers = service.get_peers_with_chunks(artifact_id, peer_id).await?;
 
@@ -427,8 +435,10 @@ async fn get_peers_with_chunks(
 )]
 async fn get_scored_peers(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path((peer_id, artifact_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Vec<ScoredPeerResponse>>> {
+    auth.require_admin()?;
     let service = PeerService::new(state.db.clone());
     let peers = service
         .get_scored_peers_for_artifact(peer_id, artifact_id)

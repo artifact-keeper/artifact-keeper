@@ -59,11 +59,16 @@ That also means one rejected package request writes exactly one
 A Basic password is tried in this order, and the directory is contacted only
 after all of the following fail:
 
-1. the local bcrypt password hash;
-2. a short-lived Artifact Keeper JWT (supported by CI keyless flows);
-3. an Artifact Keeper API token (only on the format/registry surfaces, not on
-   the management API);
-4. the LDAP/AD bind — the passthrough.
+1. a password shaped like an Artifact Keeper JWT is checked only as a
+   short-lived access token (supported by CI keyless flows);
+2. a password exactly shaped like an Artifact Keeper API token (41 bytes:
+   8 hex, `_`, 32 hex) is checked only as an API token on the format/registry
+   surfaces, is refused on the management API, and is never checked as a
+   password (#5640);
+3. any other password is checked against the local bcrypt password hash
+   (while the passthrough is enabled, a directory user with no local hash
+   skips the local timing pad, so cached passthrough requests run no bcrypt);
+4. the LDAP/AD bind — the passthrough (never for a token-shaped password).
 
 This preserves existing local-account and token-based client setups. A user
 who has both a local password hash and an LDAP account keeps using the local
@@ -110,6 +115,10 @@ password; the directory is not consulted.
   request writes exactly one `LOGIN_FAILED` event, whether the directory
   rejected the password or the failure was served from the failure window.
   Passwords are never included.
+- **TOTP still applies.** A directory user who enrolled TOTP in Artifact
+  Keeper is refused with `401` on the directory password, as a local account
+  is on the format routes; such accounts use an API token as the password.
+  See [two-factor-and-passwords.md](two-factor-and-passwords.md).
 - **Locally managed accounts are never bound.** If a username exists with
   `auth_provider` other than `ldap`, the passthrough refuses without contacting
   the directory: a mistyped local password must not spend an AD account's

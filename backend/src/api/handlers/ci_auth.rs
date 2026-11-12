@@ -925,6 +925,7 @@ mod tests {
             groups: vec!["ci".to_string()],
             required_admin_group: None,
             auto_create_users: true,
+            provider_id: None,
         };
         let remaining = |token: &str| {
             let claims = auth_service

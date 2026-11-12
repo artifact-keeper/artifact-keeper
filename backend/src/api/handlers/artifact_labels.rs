@@ -186,8 +186,13 @@ async fn list_labels(
 ) -> Result<Json<ArtifactLabelsListResponse>> {
     let auth = authorize_label_read(auth)?;
 
-    check_artifact_visibility(&Some(auth), id, &state.db, "read").await?;
+    let auth = Some(auth);
+    check_artifact_visibility(&auth, id, &state.db, "read").await?;
     live_artifact_repository_id(&state.db, id).await?;
+    // #5253: a held MCP server version answers as a missing artifact.
+    if !super::artifacts::mcp_servable(&state, auth.as_ref(), id).await? {
+        return Err(AppError::NotFound(format!("Artifact {id} not found")));
+    }
 
     let label_service = ArtifactLabelService::new(state.db.clone());
     let labels = label_service.get_labels(id).await?;
@@ -1023,6 +1028,50 @@ mod label_write_authz_4193 {
             after,
             pairs(&[("stage", "qa")]),
             "a refused label mutation must leave the labels untouched"
+        );
+    }
+
+    /// #5625 through the routes: `PUT`, `POST` and `DELETE` on
+    /// `/api/v1/artifacts/{id}/labels` re-evaluate the artifact's replication,
+    /// and that took the artifact off every peer subscribed to its repository
+    /// by hand (`POST /peers/{id}/repositories`), as no sync policy listed
+    /// them. A label write is metadata: such a peer keeps the artifact (no
+    /// delete task, its old cancelled delete stays cancelled). The
+    /// policy-managed peer, which the new labels take out of scope, is the
+    /// control.
+    #[tokio::test]
+    async fn test_5625_label_writes_keep_manually_subscribed_peers() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_labelled_artifact(&fx).await;
+        let peers = tdh::setup_manual_peer_fixture(
+            fx.pool.clone(),
+            fx.user_id,
+            fx.repo_id,
+            artifact_id,
+            &[(true, true), (false, true), (true, false)],
+        )
+        .await;
+        let member_auth = tdh::make_auth(fx.user_id, &fx.username);
+
+        let answers = mutate_labels(&fx, &member_auth, artifact_id).await;
+        let states = peers.task_states().await;
+        peers.teardown().await;
+        fx.teardown().await;
+
+        let statuses: Vec<StatusCode> = answers.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            statuses,
+            [StatusCode::OK, StatusCode::OK, StatusCode::NO_CONTENT],
+            "the label writes must succeed: {answers:?}"
+        );
+        assert_eq!(
+            states,
+            tdh::expected_after_label_write_5625(),
+            "#5625: a label write must not queue a delete for a manually \
+             subscribed peer (enabled or disabled); only the policy-managed peer \
+             leaves the policy's scope"
         );
     }
 

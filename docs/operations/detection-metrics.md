@@ -49,7 +49,8 @@ listener.
 
 | Value | Limits |
 |---|---|
-| `login` | `POST /api/v1/auth/login`, per (username, source IP) |
+| `login` | `POST /api/v1/auth/login` and the LDAP login `POST /api/v1/auth/sso/ldap/{id}/login`, per (username, source IP) |
+| `basic_password` | failed HTTP Basic `username:password` verifications on the package routes, `/v2` and the management API, per (username, source IP); sized like `RATE_LIMIT_TOKEN_EXCHANGE_PER_WINDOW` |
 | `token` | `/v2/token` password exchanges, per (username, source IP) |
 | `login_global` | the global backstop shared by login and `/v2/token` |
 | `auth` | the public `/api/v1/auth` routes (refresh, logout, ...) and TOTP verification |

@@ -939,7 +939,13 @@ async fn publish_package(
     )
     .await?;
 
-    let storage_key = build_hex_storage_key(&pkg_name, &pkg_version);
+    let storage_key = build_hex_storage_key(
+        crate::storage::StorageKeyScheme::from_env(),
+        &repo.storage_backend,
+        repo.id,
+        &pkg_name,
+        &pkg_version,
+    );
     proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, body.clone()).await?;
 
     let size_bytes = body.len() as i64;
@@ -978,6 +984,7 @@ async fn publish_package(
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         "hex",
         &pkg_name,
@@ -1841,10 +1848,25 @@ fn build_hex_artifact_path(name: &str, version: &str) -> String {
     format!("{}/{}/{}", name, version, filename)
 }
 
-/// Build the storage key: `hex/{name}/{version}/{name}-{version}.tar`
-fn build_hex_storage_key(name: &str, version: &str) -> String {
+/// Build the storage key: `hex/{name}/{version}/{name}-{version}.tar`.
+///
+/// Repo-scoped on a shared cloud namespace (#5662), so two repositories
+/// holding the same package version do not collide on one key; reads go
+/// through the row's storage_key, so legacy flat-key rows keep serving.
+fn build_hex_storage_key(
+    scheme: crate::storage::StorageKeyScheme,
+    storage_backend: &str,
+    repo_id: Uuid,
+    name: &str,
+    version: &str,
+) -> String {
     let filename = build_hex_filename(name, version);
-    format!("hex/{}/{}/{}", name, version, filename)
+    scheme.write_key(
+        storage_backend,
+        "hex",
+        repo_id,
+        &format!("{}/{}/{}", name, version, filename),
+    )
 }
 
 /// Build a tarball download URL: `/hex/{repo_key}/tarballs/{name}-{version}.tar`
@@ -2785,24 +2807,55 @@ mod tests {
     // build_hex_storage_key
     // -----------------------------------------------------------------------
 
+    /// The key on a filesystem backend, which keeps the legacy flat layout.
+    fn fs_hex_storage_key(name: &str, version: &str) -> String {
+        build_hex_storage_key(
+            crate::storage::StorageKeyScheme::RepoScoped,
+            "filesystem",
+            Uuid::new_v4(),
+            name,
+            version,
+        )
+    }
+
     #[test]
     fn test_build_hex_storage_key() {
         assert_eq!(
-            build_hex_storage_key("jason", "1.4.0"),
+            fs_hex_storage_key("jason", "1.4.0"),
             "hex/jason/1.4.0/jason-1.4.0.tar"
         );
     }
 
     #[test]
     fn test_build_hex_storage_key_starts_with_hex() {
-        let key = build_hex_storage_key("plug", "2.0.0");
+        let key = fs_hex_storage_key("plug", "2.0.0");
         assert!(key.starts_with("hex/"));
     }
 
     #[test]
     fn test_build_hex_storage_key_contains_filename() {
-        let key = build_hex_storage_key("ecto", "3.11.0");
+        let key = fs_hex_storage_key("ecto", "3.11.0");
         assert!(key.ends_with("ecto-3.11.0.tar"));
+    }
+
+    #[test]
+    fn hex_storage_key_is_repo_scoped_on_cloud_5662() {
+        use crate::storage::StorageKeyScheme;
+        let repo_id = Uuid::new_v4();
+        let key =
+            |scheme, backend| build_hex_storage_key(scheme, backend, repo_id, "jason", "1.4.0");
+        for backend in ["s3", "gcs", "azure"] {
+            assert_eq!(
+                key(StorageKeyScheme::RepoScoped, backend),
+                format!("hex/{repo_id}/jason/1.4.0/jason-1.4.0.tar"),
+                "{backend}"
+            );
+            assert_eq!(
+                key(StorageKeyScheme::Flat, backend),
+                "hex/jason/1.4.0/jason-1.4.0.tar",
+                "{backend}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -3364,6 +3417,34 @@ mod tests {
             .body(axum::body::Body::from(tar_data))
             .unwrap();
         tdh::send(f.router_with_auth(super::router()), req).await
+    }
+
+    /// #5662: the same package version publishes into two Hex repositories on
+    /// a shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_package_publishes_to_two_cloud_repositories_5662() {
+        let metadata = r#"{<<"name">>, <<"shared5662">>}.
+{<<"version">>, <<"1.0.0">>}.
+"#;
+        let tar_data = build_tar(&[
+            ("CHECKSUM", REAL_CHECKSUM.as_bytes()),
+            ("metadata.config", metadata.as_bytes()),
+        ]);
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "hex",
+            key_prefix: "hex",
+            router: super::router,
+            publish: &|key| {
+                vec![tdh::post(
+                    format!("/{key}/publish"),
+                    "application/octet-stream",
+                    bytes::Bytes::from(tar_data.clone()),
+                )]
+            },
+            download: &|key| tdh::get(format!("/{key}/tarballs/shared5662-1.0.0.tar")),
+            expected: &tar_data,
+        })
+        .await;
     }
 
     /// #2561: an authenticated hex publish decodes the outer tarball through
@@ -4087,7 +4168,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Seed a hex release row at an explicit `path` — a real tarball in
-    /// storage plus a caller-chosen (valid 64-hex) outer checksum — the way
+    /// storage, recorded with its real SHA-256 as the outer checksum (the
+    /// download verifies the bytes against it, #4989) — the way
     /// legacy / generic-upload rows exist in the wild: the row's spelling can
     /// disagree in case with the fold-winner spelling the registry
     /// advertises. Returns the artifact id and the stored tarball bytes.
@@ -4096,7 +4178,6 @@ mod tests {
         name: &str,
         version: &str,
         path: &str,
-        checksum: &str,
     ) -> (Uuid, Vec<u8>) {
         let metadata =
             format!("{{<<\"name\">>,<<\"{name}\">>}}.\n{{<<\"version\">>,<<\"{version}\">>}}.\n");
@@ -4118,6 +4199,7 @@ mod tests {
             f.user_id,
         )
         .await;
+        let checksum = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&tar));
         sqlx::query("UPDATE artifacts SET checksum_sha256 = $1 WHERE id = $2")
             .bind(checksum)
             .bind(artifact_id)
@@ -4166,31 +4248,13 @@ mod tests {
 
         // Loser spelling "Foo" owns 2.0.0 (older row); winner spelling "foo"
         // owns 1.0.0 on a strictly newer second, so the fold picks "foo".
-        let (foo2_id, foo2_tar) = seed_release_at_path(
-            &f,
-            "Foo",
-            "2.0.0",
-            "Foo/2.0.0/Foo-2.0.0.tar",
-            &"2".repeat(64),
-        )
-        .await;
-        let (foo1_id, foo1_tar) = seed_release_at_path(
-            &f,
-            "foo",
-            "1.0.0",
-            "foo/1.0.0/foo-1.0.0.tar",
-            &"1".repeat(64),
-        )
-        .await;
+        let (foo2_id, foo2_tar) =
+            seed_release_at_path(&f, "Foo", "2.0.0", "Foo/2.0.0/Foo-2.0.0.tar").await;
+        let (foo1_id, foo1_tar) =
+            seed_release_at_path(&f, "foo", "1.0.0", "foo/1.0.0/foo-1.0.0.tar").await;
         // Unrelated package: must keep resolving to its own bytes.
-        let (bar_id, bar_tar) = seed_release_at_path(
-            &f,
-            "bar",
-            "1.0.0",
-            "bar/1.0.0/bar-1.0.0.tar",
-            &"3".repeat(64),
-        )
-        .await;
+        let (bar_id, bar_tar) =
+            seed_release_at_path(&f, "bar", "1.0.0", "bar/1.0.0/bar-1.0.0.tar").await;
         pin_created_at(&f, foo2_id, 1_750_000_000, 0).await;
         pin_created_at(&f, foo1_id, 1_750_000_010, 0).await;
         pin_created_at(&f, bar_id, 1_750_000_020, 0).await;
@@ -4268,30 +4332,12 @@ mod tests {
         // than the winner's). The canonical-spelling row must win version
         // 1.0.0: it is the row the exact-spelling download for
         // `foo-1.0.0.tar` resolves.
-        let (foo1_id, foo1_tar) = seed_release_at_path(
-            &f,
-            "foo",
-            "1.0.0",
-            "foo/1.0.0/foo-1.0.0.tar",
-            &"1".repeat(64),
-        )
-        .await;
-        let (big1_id, _) = seed_release_at_path(
-            &f,
-            "Foo",
-            "1.0.0",
-            "Foo/1.0.0/Foo-1.0.0.tar",
-            &"2".repeat(64),
-        )
-        .await;
-        let (foo2_id, _) = seed_release_at_path(
-            &f,
-            "foo",
-            "2.0.0",
-            "foo/2.0.0/foo-2.0.0.tar",
-            &"3".repeat(64),
-        )
-        .await;
+        let (foo1_id, foo1_tar) =
+            seed_release_at_path(&f, "foo", "1.0.0", "foo/1.0.0/foo-1.0.0.tar").await;
+        let (big1_id, _) =
+            seed_release_at_path(&f, "Foo", "1.0.0", "Foo/1.0.0/Foo-1.0.0.tar").await;
+        let (foo2_id, _) =
+            seed_release_at_path(&f, "foo", "2.0.0", "foo/2.0.0/foo-2.0.0.tar").await;
         pin_created_at(&f, foo1_id, 1_750_000_000, 0).await;
         pin_created_at(&f, big1_id, 1_750_000_010, 0).await;
         pin_created_at(&f, foo2_id, 1_750_000_020, 0).await;
@@ -4310,7 +4356,7 @@ mod tests {
         );
         assert_eq!(
             pkg.releases[0].outer_checksum,
-            Some(vec![0x11u8; 32]),
+            Some(<sha2::Sha256 as sha2::Digest>::digest(&foo1_tar).to_vec()),
             "the advertised 1.0.0 checksum must be the canonical-spelling row's"
         );
 

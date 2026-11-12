@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#4902]
----
-- **A retried OCI blob completion no longer fails with 409 "upload session is already being modified"** (#4902). When a reverse proxy timed out the final `PUT ?digest=` of a large layer (Envoy and Envoy Gateway cut at 15 s by default) or the client dropped the connection, the backend abandoned the completion mid-way and left the upload session locked for six hours, so the identical `PUT` that containerd 2.x re-sends after a 504 was refused and the push failed. The completion now runs to its end even when its request is dropped. A retry with the same digest waits for it (up to `OCI_UPLOAD_COMPLETION_RETRY_WAIT_SECS`, default 30 s) and gets the same result, or 503 with `Retry-After` while it is still running; a retry after it finished gets 201; a retry with a different digest is still 409. A session held by a replica that died is reclaimable after five minutes instead of six hours. See `docs/operations/oci-reverse-proxy-timeouts.md` for the proxy timeouts to set.

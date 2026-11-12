@@ -697,17 +697,20 @@ impl ProxyScanService {
             .map_err(|e| AppError::Database(e.to_string()))
     }
 
-    /// The stored verdict for `(checksum_sha256, scan_type)` and the number of
+    /// The stored verdict for `(checksum_sha256, scan_type)`, the number of
     /// components it was graded on (`components_cataloged`, `None` when not
-    /// recorded), for the rescan's replacement rule (#3396). Runtime query
-    /// (no macro) so this adds no offline sqlx data.
+    /// recorded), the coordinate it was graded as (`pin_identity`) and its
+    /// `max_severity` (#5628), for the rescan's replacement rule (#3396).
+    /// Runtime query (no macro) so this adds no offline sqlx data.
+    #[allow(clippy::type_complexity)]
     pub async fn lookup_verdict_catalog(
         &self,
         checksum_sha256: &str,
         scan_type: &str,
-    ) -> Result<Option<(String, Option<i32>)>> {
-        sqlx::query_as::<_, (String, Option<i32>)>(
-            "SELECT verdict, components_cataloged FROM proxy_scan_results \
+    ) -> Result<Option<(String, Option<i32>, Option<String>, Option<String>)>> {
+        sqlx::query_as::<_, (String, Option<i32>, Option<String>, Option<String>)>(
+            "SELECT verdict, components_cataloged, pin_identity, max_severity \
+             FROM proxy_scan_results \
              WHERE checksum_sha256 = $1 AND scan_type = $2",
         )
         .bind(checksum_sha256)

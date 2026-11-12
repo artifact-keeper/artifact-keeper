@@ -1761,6 +1761,13 @@ mod tests {
         assert_eq!(done["user"], "alice");
         assert_eq!(done["ip"], "198.51.100.9");
         assert!(done["latency_ms"].is_u64(), "{done:?}");
+        // A request that completed is not also reported as cancelled (#5220).
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l["fields"]["message"] == "Request cancelled"),
+            "{lines:?}"
+        );
     }
 
     /// An anonymous request carries no `user` key at all, rather than a
@@ -1800,6 +1807,148 @@ mod tests {
         assert!(!done.contains_key("user"), "{done:?}");
         assert!(!done.contains_key("ip"), "no client-IP scope: {done:?}");
         assert_eq!(done["status"], 200);
+    }
+
+    /// A request whose future is dropped before the handler returns (the
+    /// client disconnected, or a timeout layer gave up) logs `Request
+    /// cancelled` with the fields of `Request completed` minus the status,
+    /// instead of leaving no line at all (#5220).
+    #[tokio::test]
+    async fn test_json_request_cancelled_line_when_the_future_is_dropped() {
+        use axum::{body::Body, routing::get, Router};
+        use tower::ServiceExt;
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("info"))
+            .with(build_fmt_layer_with_writer(
+                LogFormat::Json,
+                false,
+                capture.clone(),
+            ));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let app = Router::new()
+            .route(
+                "/slow/:id",
+                get(|| async {
+                    crate::api::middleware::request_span::record_user("bob");
+                    std::future::pending::<()>().await
+                }),
+            )
+            .layer(axum::middleware::from_fn(
+                crate::api::middleware::tracing::correlation_id_middleware,
+            ))
+            .layer(
+                tower_http::trace::TraceLayer::new_for_http().make_span_with(
+                    |request: &axum::http::Request<Body>| {
+                        crate::api::middleware::tracing::make_http_request_span(request, &[])
+                    },
+                ),
+            );
+        let request = axum::http::Request::builder()
+            .uri("/slow/1?token=secret")
+            .header("x-correlation-id", "corr-5220")
+            .body(Body::empty())
+            .unwrap();
+        let ip: std::net::IpAddr = "198.51.100.20".parse().unwrap();
+        let in_flight =
+            crate::api::middleware::client_ip::with_client_ip_scope(Some(ip), app.oneshot(request));
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(100), in_flight).await;
+        assert!(outcome.is_err(), "the handler never answers");
+
+        let lines = json_lines(&capture);
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l["fields"]["message"] == "Request completed"),
+            "{lines:?}"
+        );
+        let cancelled = lines
+            .iter()
+            .find(|l| l["fields"]["message"] == "Request cancelled")
+            .unwrap_or_else(|| panic!("no Request cancelled line in {lines:?}"));
+        assert_eq!(cancelled["level"], "WARN");
+        assert_eq!(cancelled["fields"]["method"], "GET");
+        let uri = cancelled["fields"]["uri"].as_str().unwrap();
+        assert!(uri.starts_with("/slow/1"), "{uri}");
+        assert!(!uri.contains("secret"), "{uri}");
+        assert_eq!(cancelled["correlation_id"], "corr-5220");
+        assert_eq!(cancelled["http.route"], "/slow/:id");
+        assert_eq!(cancelled["user"], "bob");
+        assert_eq!(cancelled["ip"], "198.51.100.20");
+        // The middleware's clock starts a little after the caller's timeout
+        // does, and `latency_ms` truncates, so allow for that slack.
+        assert!(
+            cancelled["latency_ms"].as_u64().unwrap() >= 50,
+            "{cancelled:?}"
+        );
+        assert!(!cancelled.contains_key("status"), "{cancelled:?}");
+    }
+
+    /// A panic that unwinds through the middleware drops the same guard, but
+    /// the client did not cancel anything: it is logged as `Request panicked`
+    /// at ERROR, not as `Request cancelled`.
+    #[tokio::test]
+    async fn test_json_request_panicked_line_when_the_handler_panics() {
+        use axum::{body::Body, routing::get, Router};
+        use futures::FutureExt;
+        use tower::ServiceExt;
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("info"))
+            .with(build_fmt_layer_with_writer(
+                LogFormat::Json,
+                false,
+                capture.clone(),
+            ));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let app = Router::new()
+            .route(
+                "/boom",
+                get(|| async {
+                    if std::hint::black_box(true) {
+                        panic!("handler bug");
+                    }
+                    "unreachable"
+                }),
+            )
+            .layer(axum::middleware::from_fn(
+                crate::api::middleware::tracing::correlation_id_middleware,
+            ))
+            .layer(
+                tower_http::trace::TraceLayer::new_for_http().make_span_with(
+                    |request: &axum::http::Request<Body>| {
+                        crate::api::middleware::tracing::make_http_request_span(request, &[])
+                    },
+                ),
+            );
+        let request = axum::http::Request::builder()
+            .uri("/boom")
+            .header("x-correlation-id", "corr-5220-panic")
+            .body(Body::empty())
+            .unwrap();
+        let outcome = std::panic::AssertUnwindSafe(app.oneshot(request))
+            .catch_unwind()
+            .await;
+        assert!(outcome.is_err(), "the handler panics");
+
+        let lines = json_lines(&capture);
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l["fields"]["message"] == "Request cancelled"),
+            "{lines:?}"
+        );
+        let panicked = lines
+            .iter()
+            .find(|l| l["fields"]["message"] == "Request panicked")
+            .unwrap_or_else(|| panic!("no Request panicked line in {lines:?}"));
+        assert_eq!(panicked["level"], "ERROR");
+        assert_eq!(panicked["correlation_id"], "corr-5220-panic");
+        assert_eq!(panicked["fields"]["method"], "GET");
     }
 
     // ── build_otel_resource ─────────────────────────────────────────────
