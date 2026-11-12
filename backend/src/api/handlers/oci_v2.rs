@@ -6825,11 +6825,8 @@ async fn enforce_hosted_blob_scope(
             "BLOB_UNKNOWN",
             "blob not found",
         )),
-        Err(e) => Err(oci_error(
-            crate::api::handlers::db_status(&e.to_string()),
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        )),
+        // #5894: the sanitised message, never the sqlx text.
+        Err(e) => Err(oci_db_error(&e)),
     }
 }
 
