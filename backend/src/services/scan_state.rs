@@ -54,6 +54,39 @@ pub(crate) const LATEST_PER_SCAN_TYPE_SQL: &str = r#"
     ORDER BY scan_type, completed_at DESC NULLS LAST, created_at DESC
 "#;
 
+/// Whether some scanner's LATEST row for an artifact is a completed scan that
+/// cataloged nothing (`scan_completeness = 'not_cataloged'`, #4036), for the
+/// scan policies' `block_uncataloged` (#4994).
+///
+/// Same per-`scan_type` window as [`LATEST_PER_SCAN_TYPE_SQL`] and as the
+/// coverage counts of `scan_result_service::recalculate_score`, so a policy
+/// refuses exactly the artifacts the repository's coverage reports as
+/// uncataloged (and the ones it reports as failed whose other scanner
+/// cataloged nothing). A later rescan that catalogs the artifact clears it.
+pub(crate) const ANY_LATEST_UNCATALOGED_SQL: &str = r#"
+    SELECT EXISTS (
+        SELECT 1
+          FROM (SELECT DISTINCT ON (scan_type) status, scan_completeness
+                  FROM scan_results
+                 WHERE artifact_id = $1
+                 ORDER BY scan_type, completed_at DESC NULLS LAST, created_at DESC) latest
+         WHERE latest.status = 'completed'
+           AND latest.scan_completeness = 'not_cataloged'
+    )
+"#;
+
+/// Run [`ANY_LATEST_UNCATALOGED_SQL`] for one artifact.
+pub(crate) async fn any_latest_uncataloged(
+    db: &sqlx::PgPool,
+    artifact_id: uuid::Uuid,
+) -> crate::error::Result<bool> {
+    sqlx::query_scalar(ANY_LATEST_UNCATALOGED_SQL)
+        .bind(artifact_id)
+        .fetch_one(db)
+        .await
+        .map_err(|e| crate::error::AppError::Database(e.to_string()))
+}
+
 /// Whether ANY scanner's latest row is a genuine failure (#3142).
 ///
 /// Input must be the rows returned by [`LATEST_PER_SCAN_TYPE_SQL`] — one row
