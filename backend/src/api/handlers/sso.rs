@@ -4798,6 +4798,192 @@ mod tests {
                 .is_err());
             }
         }
+
+        /// #5486: a command-line login (`client=cli`) ends in the browser on a
+        /// plain-text page with the exchange code, sets no cookies there, and
+        /// the code is redeemable only with the client's binding cookie. Both
+        /// the TOTP and the non-TOTP outcome.
+        #[tokio::test]
+        #[allow(clippy::disallowed_methods)] // streaming-invariant: test exempt — buffering a small text body in a test assertion is not an artifact path (#1608)
+        async fn complete_federated_login_for_a_cli_login_only_shows_the_code_5486() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let dir = std::env::temp_dir().join(format!("fed-5486c-{}", Uuid::new_v4()));
+            let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+            let svc = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+            let cli_state = format!("{}abc", sso_binding::CLI_OIDC_STATE_PREFIX);
+            let (cookie_name, binding) =
+                sso_binding::binding_cookie(&state.config.jwt_secret, &cli_state);
+            let cookie = format!("{cookie_name}={binding}");
+
+            for totp in [false, true] {
+                let user = seed(&pool, totp).await;
+                let tokens = svc.generate_tokens(&user).expect("tokens");
+                let (status, body, headers) = {
+                    let resp = complete_federated_login(
+                        &state,
+                        &svc,
+                        &user,
+                        &tokens,
+                        "oidc",
+                        &binding,
+                        FederatedHandoff::Cli,
+                    )
+                    .await
+                    .expect("completion");
+                    let status = resp.status();
+                    let headers = resp.headers().clone();
+                    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                        .await
+                        .expect("body");
+                    (status, String::from_utf8(body.to_vec()).unwrap(), headers)
+                };
+                let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                    .bind(user.id)
+                    .execute(&pool)
+                    .await;
+                assert_eq!(status, StatusCode::OK, "totp={totp}");
+                assert_eq!(headers.get_all("set-cookie").iter().count(), 0);
+                assert!(headers.get("location").is_none());
+                assert!(headers["content-type"]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("text/plain"));
+                assert_eq!(headers["cache-control"], "no-store");
+                assert_eq!(headers["referrer-policy"], "no-referrer");
+                let code = body
+                    .split_whitespace()
+                    .find(|w| w.len() == 64 && w.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .unwrap_or_else(|| panic!("the page shows the code: {body}"))
+                    .to_string();
+
+                let mut with_cookie = axum::http::HeaderMap::new();
+                with_cookie.insert("cookie", cookie.parse().unwrap());
+                assert!(sso_binding::require_exchange_binding(
+                    &with_cookie,
+                    &state.config.jwt_secret,
+                    &code
+                )
+                .is_ok());
+                assert!(sso_binding::require_exchange_binding(
+                    &axum::http::HeaderMap::new(),
+                    &state.config.jwt_secret,
+                    &code
+                )
+                .is_err());
+            }
+        }
+
+        /// #5486: `GET /complete` (the SAML same-site step) sets the session
+        /// only in the browser holding the binding cookie, never consumes the
+        /// code, and never sets a TOTP-pending code as a session.
+        #[tokio::test]
+        async fn sso_complete_sets_the_session_only_in_the_starting_browser_5486() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let dir = std::env::temp_dir().join(format!("fed-5486s-{}", Uuid::new_v4()));
+            let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+            let secret = state.config.jwt_secret.clone();
+            let (cookie_name, binding) = sso_binding::binding_cookie(&secret, "_id-5486s");
+            let cookie = format!("{cookie_name}={binding}");
+            let (other_name, other) = sso_binding::binding_cookie(&secret, "_id-other");
+            let other = format!("{other_name}={other}");
+
+            let get = |uri: String, cookie: Option<String>| {
+                let app = router().with_state(state.clone());
+                async move {
+                    let mut req = Request::builder().method("GET").uri(uri);
+                    if let Some(c) = cookie {
+                        req = req.header("cookie", c);
+                    }
+                    tdh::send_with_headers(app, req.body(axum::body::Body::empty()).unwrap()).await
+                }
+            };
+
+            // A session code.
+            let code = sso_binding::mint_exchange_code(&secret, &binding);
+            crate::services::auth_config_service::AuthConfigService::store_exchange_code(
+                &pool,
+                &code,
+                "access-5486",
+                "refresh-5486",
+            )
+            .await
+            .expect("store code");
+            let uri = format!("/complete?code={code}");
+            for presented in [None, Some(other.clone())] {
+                let (status, _, headers) = get(uri.clone(), presented.clone()).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{presented:?}");
+                assert!(headers.get("set-cookie").is_none());
+            }
+            let (status, _, headers) = get(uri.clone(), Some(cookie.clone())).await;
+            assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+            assert_eq!(headers["location"], format!("/callback?code={code}"));
+            assert!(headers
+                .get_all("set-cookie")
+                .iter()
+                .any(|c| c.to_str().unwrap().starts_with("ak_access_token=")));
+            // Not consumed: the web UI still redeems it at `/exchange`.
+            let (status, _, _) = get(uri, Some(cookie.clone())).await;
+            assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+
+            // A TOTP-pending code (#5484): no session, just the hand-off.
+            let pending = sso_binding::mint_exchange_code(&secret, &binding);
+            crate::services::auth_config_service::AuthConfigService::store_exchange_code(
+                &pool,
+                &pending,
+                "pending-token-5486",
+                "",
+            )
+            .await
+            .expect("store pending code");
+            let (status, _, headers) =
+                get(format!("/complete?code={pending}"), Some(cookie.clone())).await;
+            assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+            assert_eq!(headers["location"], format!("/callback?code={pending}"));
+            assert!(headers.get("set-cookie").is_none());
+
+            // An unknown (but well-bound) code.
+            let unknown = sso_binding::mint_exchange_code(&secret, &binding);
+            let (status, _, _) = get(format!("/complete?code={unknown}"), Some(cookie)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+            for c in [&code, &pending] {
+                let _ = sqlx::query("DELETE FROM sso_exchange_codes WHERE code = $1")
+                    .bind(c)
+                    .execute(&pool)
+                    .await;
+            }
+        }
+
+        /// #5486: an unknown `client` on either login URL is refused before
+        /// anything is looked up or created.
+        #[tokio::test]
+        async fn login_refuses_an_unknown_client_5486() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let dir = std::env::temp_dir().join(format!("fed-5486q-{}", Uuid::new_v4()));
+            let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+            let id = Uuid::new_v4();
+            for uri in [
+                format!("/oidc/{id}/login?client=mobile"),
+                format!("/saml/{id}/login?client=mobile"),
+            ] {
+                let (status, _) = tdh::send(
+                    router().with_state(state.clone()),
+                    Request::builder()
+                        .method("GET")
+                        .uri(&uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            }
+        }
     }
 
     mod sync_db {
