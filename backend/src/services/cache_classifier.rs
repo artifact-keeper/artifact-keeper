@@ -352,6 +352,46 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
     }
 }
 
+/// [`classify`] for a path in a repository's own stored layout (#5626).
+///
+/// [`classify`] keys on the upstream URL shapes the proxy cache stores under.
+/// The hosted npm and cargo publish routes store a release under
+/// `<name>/<version>/<file>` instead (npm `<pkg>/<ver>/<pkg>-<ver>.tgz`,
+/// scoped `@scope/<pkg>/<ver>/<pkg>-<ver>.tgz`; cargo
+/// `<crate>/<ver>/<crate>-<ver>.crate`), which carries neither npm's `/-/`
+/// segment nor cargo's `crates/` one, so [`classify`] alone calls a hosted
+/// release mutable. This also recognises those stored shapes as immutable.
+pub fn classify_stored(format: &RepositoryFormat, path: &str) -> Mutability {
+    let classified = classify(format, path);
+    if classified.is_immutable() {
+        return classified;
+    }
+    let stored_release = match format {
+        RepositoryFormat::Npm
+        | RepositoryFormat::Yarn
+        | RepositoryFormat::Pnpm
+        | RepositoryFormat::Bower => crate::formats::npm::tarball_url_path_from_stored(path)
+            .is_some_and(|url| classify(format, &url).is_immutable()),
+        RepositoryFormat::Cargo => is_stored_cargo_crate(&path.to_ascii_lowercase()),
+        _ => false,
+    };
+    if stored_release {
+        Mutability::Immutable
+    } else {
+        classified
+    }
+}
+
+/// Whether a (lower-cased) path is a hosted cargo release as the cargo
+/// publish route stores it: `<crate>/<ver>/<crate>-<ver>.crate`.
+fn is_stored_cargo_crate(lower: &str) -> bool {
+    let parts: Vec<&str> = lower.trim_start_matches('/').split('/').collect();
+    let [name, version, file] = parts[..] else {
+        return false;
+    };
+    !name.is_empty() && !version.is_empty() && file == format!("{name}-{version}.crate")
+}
+
 /// Whether `path` is a *known* mutable index / pointer file for `format` — i.e.
 /// a file the format genuinely rewrites in place (a `maven-metadata.xml`, an npm
 /// packument, the PyPI simple index, an OCI tag manifest, the Cargo sparse
@@ -2159,5 +2199,45 @@ mod tests {
             "docker-compose.test.yml NEG_TTL_SECONDS must equal \
              cache_classifier::NEGATIVE_CACHE_TTL_SECS"
         );
+    }
+
+    /// #5626: the hosted npm and cargo publish routes store a release under
+    /// `<name>/<version>/<file>`; that stored shape is a release, while the
+    /// packument, the sparse index and look-alike paths stay mutable.
+    #[test]
+    fn classify_stored_recognises_hosted_npm_and_cargo_releases_5626() {
+        let immutable = [
+            (RepositoryFormat::Npm, "lodash/4.17.21/lodash-4.17.21.tgz"),
+            (RepositoryFormat::Npm, "@acme/widget/1.0.0/widget-1.0.0.tgz"),
+            (RepositoryFormat::Npm, "lodash/-/lodash-4.17.21.tgz"),
+            (RepositoryFormat::Yarn, "left-pad/1.3.0/left-pad-1.3.0.tgz"),
+            (RepositoryFormat::Cargo, "serde/1.0.0/serde-1.0.0.crate"),
+            (RepositoryFormat::Cargo, "/Serde/1.0.0/serde-1.0.0.crate"),
+            (RepositoryFormat::Cargo, "crates/serde/serde-1.0.0.crate"),
+        ];
+        for (format, path) in immutable {
+            assert!(
+                classify_stored(&format, path).is_immutable(),
+                "{format:?} {path} is a release"
+            );
+        }
+        let mutable = [
+            (RepositoryFormat::Npm, "lodash"),
+            (RepositoryFormat::Npm, "lodash/4.17.21/other-4.17.21.tgz"),
+            (RepositoryFormat::Npm, "lodash/4.17.21/lodash-4.17.22.tgz"),
+            (RepositoryFormat::Cargo, "config.json"),
+            (RepositoryFormat::Cargo, "se/rd/serde"),
+            (RepositoryFormat::Cargo, "serde/1.0.0/other-1.0.0.crate"),
+            (RepositoryFormat::Cargo, "serde/serde-1.0.0.crate"),
+            (RepositoryFormat::Generic, "serde/1.0.0/serde-1.0.0.crate"),
+        ];
+        for (format, path) in mutable {
+            assert!(
+                !classify_stored(&format, path).is_immutable(),
+                "{format:?} {path} is not a release"
+            );
+        }
+        // Anything `classify` already calls a release stays one.
+        assert!(classify_stored(&RepositoryFormat::Maven, "a/b/1.0/b-1.0.jar").is_immutable());
     }
 }

@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::promotion::PromotionRule;
+use crate::models::security::AcceptedGradeStatus;
 use crate::services::scan_state::{classify_scan_state, ScanState, ScanStateRow, SCAN_STATE_SQL};
 
 // ---------------------------------------------------------------------------
@@ -29,6 +30,8 @@ pub struct CreatePromotionRuleInput {
     pub max_artifact_age_days: Option<i32>,
     pub min_health_score: Option<i32>,
     pub auto_promote: bool,
+    #[serde(default)]
+    pub accepted_grade_status: AcceptedGradeStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +45,8 @@ pub struct UpdatePromotionRuleInput {
     pub max_artifact_age_days: Option<i32>,
     pub min_health_score: Option<i32>,
     pub auto_promote: Option<bool>,
+    #[serde(default)]
+    pub accepted_grade_status: Option<AcceptedGradeStatus>,
 }
 
 /// Result of evaluating a single artifact against a single rule.
@@ -236,9 +241,9 @@ impl PromotionRuleService {
                 name, source_repo_id, target_repo_id, is_enabled,
                 max_cve_severity, allowed_licenses, require_signature,
                 min_staging_hours, max_artifact_age_days, min_health_score,
-                auto_promote
+                auto_promote, accepted_grade_status
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             RETURNING *
             "#,
         )
@@ -253,6 +258,7 @@ impl PromotionRuleService {
         .bind(input.max_artifact_age_days)
         .bind(input.min_health_score)
         .bind(input.auto_promote)
+        .bind(input.accepted_grade_status.as_str())
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -310,6 +316,9 @@ impl PromotionRuleService {
         let min_health_score = input.min_health_score.or(existing.min_health_score);
         let auto_promote = input.auto_promote.unwrap_or(existing.auto_promote);
         let allowed_licenses = input.allowed_licenses.or(existing.allowed_licenses);
+        let accepted_grade_status = input
+            .accepted_grade_status
+            .unwrap_or_else(|| AcceptedGradeStatus::from_db(&existing.accepted_grade_status));
 
         let rule: PromotionRule = sqlx::query_as::<_, PromotionRule>(
             r#"
@@ -318,6 +327,7 @@ impl PromotionRuleService {
                 allowed_licenses = $5, require_signature = $6,
                 min_staging_hours = $7, max_artifact_age_days = $8,
                 min_health_score = $9, auto_promote = $10,
+                accepted_grade_status = $11,
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -333,6 +343,7 @@ impl PromotionRuleService {
         .bind(max_artifact_age_days)
         .bind(min_health_score)
         .bind(auto_promote)
+        .bind(accepted_grade_status.as_str())
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -456,6 +467,21 @@ impl PromotionRuleService {
             if let Some(score) = self.get_artifact_health_score(artifact_id).await? {
                 if let Some(v) = check_min_health_score(min_score, score) {
                     violations.push(v);
+                }
+                // #4994: the health score weighs in the repository security
+                // score, which stays 100 when the repository's scans failed or
+                // cataloged nothing. Check the source repository's grade
+                // status too, failing closed unless the rule was relaxed.
+                // Only when the artifact has a health score: like a quality
+                // gate (#4156), a rule skips an artifact that has none yet.
+                let accepted = AcceptedGradeStatus::from_db(&rule.accepted_grade_status);
+                if accepted != AcceptedGradeStatus::Any {
+                    let state = crate::services::scan_result_service::repo_grade_state_of_artifact(
+                        &self.db,
+                        artifact_id,
+                    )
+                    .await?;
+                    violations.extend(state.violation(accepted));
                 }
             }
         }
@@ -1089,6 +1115,7 @@ mod tests {
             max_artifact_age_days: Some(90),
             min_health_score: Some(75),
             auto_promote: true,
+            accepted_grade_status: AcceptedGradeStatus::Rated,
         };
         let json = serde_json::to_string(&input).unwrap();
         let parsed: CreatePromotionRuleInput = serde_json::from_str(&json).unwrap();

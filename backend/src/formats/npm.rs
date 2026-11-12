@@ -166,49 +166,96 @@ impl Default for NpmHandler {
 
 /// Validate an npm package name against the registry's accepted shape.
 ///
-/// npm names are case-insensitive, must be lowercase, may contain
-/// hyphens, dots, and underscores, and may be prefixed by `@scope/`.
-/// Length is bounded to 214 bytes per npm's published validator. The
-/// shadowing guard restricts to ASCII because SQL `LOWER()` is
-/// ASCII-only, so a unicode-homoglyph name would case-fold differently
-/// in Postgres and Rust, opening a homoglyph-shadowing attack.
+/// Follows npm's `validate-npm-package-name` rules for NEW packages (#5725),
+/// with three deliberate differences:
 ///
-/// `@scope/name` shape is preserved: the slash is a permitted scope
-/// separator, but it must appear at most once and be flanked by valid
-/// scope and name segments. A bare `@`, multiple slashes, or empty
-/// segments are rejected.
+/// - core-module names (`http`, `buffer`, `events`, ...) are accepted: npm
+///   only warns about them, and real packages with those names exist;
+/// - characters are restricted to lowercase ASCII. SQL `LOWER()` is
+///   ASCII-only, so a unicode-homoglyph name would case-fold differently in
+///   Postgres and Rust, opening a homoglyph-shadowing attack (uppercase is
+///   rejected too, #3955);
+/// - a scope or package segment that is exactly `.` or `..` is rejected even
+///   where npm would accept it, because a storage key containing a dot
+///   segment can collide with another package's key once a path layer
+///   normalises it.
+///
+/// Shape:
+///
+/// - `node_modules` and `favicon.ico` (any case) are refused, as npm does;
+/// - an unscoped name starts with `[a-z0-9]` and continues with
+///   `[a-z0-9._-]`;
+/// - a scoped name is `@scope/name` with exactly one slash. The scope is
+///   `[a-z0-9._~-]` and may start with any of them; the name is
+///   `[a-z0-9._-]` and must not start with `.`. npm's leading `.`/`_` rule
+///   applies to the whole string, which starts with `@`, so `@_scope/x`,
+///   `@.scope/x`, `@~scope/x` and `@scope/_x` are valid; `~` in the final
+///   segment makes a name invalid for new packages.
+///
+/// Length is bounded to 214 bytes per npm's published validator.
 ///
 /// Cross-format shadowing guard primitive (#1217 follow-up, ak-hv3s).
 pub(crate) fn is_valid_npm_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 214 {
         return false;
     }
+    if is_npm_blocked_name(name) {
+        return false;
+    }
     // Scoped name: `@scope/name`
     if let Some(rest) = name.strip_prefix('@') {
-        let mut split = rest.splitn(2, '/');
-        let scope = split.next().unwrap_or("");
-        let pkg = split.next().unwrap_or("");
-        if scope.is_empty() || pkg.is_empty() {
+        let Some((scope, pkg)) = rest.split_once('/') else {
             return false;
-        }
-        return is_valid_npm_segment(scope) && is_valid_npm_segment(pkg);
+        };
+        return is_valid_npm_scope_segment(scope) && is_valid_npm_scoped_package_segment(pkg);
     }
-    is_valid_npm_segment(name)
+    is_valid_npm_unscoped_name(name)
 }
 
-/// Validate a single scope or unscoped npm name segment.
-/// Must start with a lowercase letter or digit; allow `-`, `_`, `.`
-/// internally. Path-traversal characters (`/`, `..`, `%`) and any
+/// Whole names npm refuses outright (`validate-npm-package-name`'s exclusion
+/// list), compared case-insensitively.
+const NPM_BLOCKED_NAMES: [&str; 2] = ["node_modules", "favicon.ico"];
+
+/// `node_modules` or `favicon.ico`, in any case: names npm never publishes.
+pub(crate) fn is_npm_blocked_name(name: &str) -> bool {
+    NPM_BLOCKED_NAMES
+        .iter()
+        .any(|blocked| name.eq_ignore_ascii_case(blocked))
+}
+
+/// `[a-z0-9._-]`: the characters of an npm package-name segment.
+fn is_npm_name_char(c: char) -> bool {
+    c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.')
+}
+
+/// A segment that is exactly `.` or `..`: a path dot segment.
+pub(crate) fn is_dot_segment(s: &str) -> bool {
+    s == "." || s == ".."
+}
+
+/// The scope of a scoped name (`@<scope>/name`, without the `@`): non-empty,
+/// `[a-z0-9._~-]`, never a dot segment. A leading `.`, `_`, `-` or `~` is
+/// allowed, as npm allows it.
+pub(crate) fn is_valid_npm_scope_segment(s: &str) -> bool {
+    !s.is_empty() && !is_dot_segment(s) && s.chars().all(|c| is_npm_name_char(c) || c == '~')
+}
+
+/// The package part of a scoped name (`@scope/<name>`): non-empty,
+/// `[a-z0-9._-]`, not starting with `.` (which also rules out the dot
+/// segments).
+fn is_valid_npm_scoped_package_segment(s: &str) -> bool {
+    !s.is_empty() && !s.starts_with('.') && s.chars().all(is_npm_name_char)
+}
+
+/// An unscoped name: starts with a lowercase letter or digit and continues
+/// with `[a-z0-9._-]`. Path-traversal characters (`/`, `%`) and any
 /// uppercase/non-ASCII characters are rejected.
-fn is_valid_npm_segment(s: &str) -> bool {
+fn is_valid_npm_unscoped_name(s: &str) -> bool {
     let mut chars = s.chars();
     let Some(first) = chars.next() else {
         return false;
     };
-    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
-        return false;
-    }
-    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || c == '.')
+    (first.is_ascii_lowercase() || first.is_ascii_digit()) && chars.all(is_npm_name_char)
 }
 
 /// Parse the package name out of an npm tarball URL path.
@@ -1075,6 +1122,89 @@ mod tests {
                                                // 215 chars
         let too_long = "a".repeat(215);
         assert!(!is_valid_npm_name(&too_long));
+    }
+
+    /// #5725: npm's leading `.`/`_` rule applies to the whole name, which for
+    /// a scoped package starts with `@`, so the scope and the package part
+    /// may start with characters an unscoped name may not.
+    #[test]
+    fn test_is_valid_npm_name_accepts_npm_scoped_shapes_5725() {
+        for name in [
+            "@scope/_name",
+            "@.scope/name",
+            "@_scope/name",
+            "@~scope/name",
+            "@-s/x",
+            "@s/-x",
+            "@scope/name.",
+            "@s/x..y",
+        ] {
+            assert!(is_valid_npm_name(name), "{name} must be accepted");
+        }
+    }
+
+    /// #5725: dot segments stay rejected (storage keys must not collide), and
+    /// npm's two blocked names are refused in any case.
+    #[test]
+    fn test_is_valid_npm_name_rejects_dot_segments_and_blocked_names_5725() {
+        for name in [
+            "@./x",
+            "@../x",
+            "@s/.",
+            "@s/..",
+            "@s/.name",
+            "@s/~x",
+            "@s/x/y",
+            ".",
+            "..",
+            "node_modules",
+            "favicon.ico",
+            "NODE_MODULES",
+            "Favicon.ICO",
+            "@Scope/x",
+        ] {
+            assert!(!is_valid_npm_name(name), "{name} must be rejected");
+        }
+        // Only the whole name is blocked.
+        assert!(is_valid_npm_name("@scope/node_modules"));
+        assert!(is_valid_npm_name("node_modules2"));
+    }
+
+    /// npm only WARNS about core-module names, and packages named after them
+    /// exist; they stay valid here.
+    #[test]
+    fn test_is_valid_npm_name_keeps_builtin_names_5725() {
+        for name in ["http", "buffer", "events", "fs"] {
+            assert!(is_valid_npm_name(name), "{name}");
+        }
+    }
+
+    /// `is_valid_npm_name` agrees with npm's `validate-npm-package-name`
+    /// (`validForNewPackages`, reference fixture) on every vector except the
+    /// documented exceptions: core-module names, which npm only warns about.
+    #[test]
+    fn npm_name_reference_vectors() {
+        // Core-module names in the fixture: npm warns, we accept.
+        const BUILTIN_EXCEPTIONS: [&str; 2] = ["http", "fs"];
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../test_fixtures/reference/npm.json")).unwrap();
+        let names = fixture["names"].as_array().unwrap();
+        assert!(names.len() > 50, "fixture must carry the name vectors");
+        let mut mismatches = Vec::new();
+        for row in names {
+            let name = row["name"].as_str().unwrap();
+            let expected = row["valid_for_new"].as_bool().unwrap();
+            let got = is_valid_npm_name(name);
+            if BUILTIN_EXCEPTIONS.contains(&name) {
+                assert!(got, "builtin {name} must stay accepted");
+                assert!(!expected, "fixture changed for builtin {name}");
+                continue;
+            }
+            if got != expected {
+                mismatches.push(format!("{name:?}: npm={expected} ours={got}"));
+            }
+        }
+        assert!(mismatches.is_empty(), "mismatches: {mismatches:#?}");
     }
 
     #[test]

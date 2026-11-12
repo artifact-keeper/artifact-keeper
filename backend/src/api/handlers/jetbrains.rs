@@ -257,13 +257,7 @@ async fn download_plugin(
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
@@ -443,7 +437,15 @@ async fn upload_plugin(
     // Store the file — from local scratch or by copying the object the
     // repository's backend already staged (#4990). `put_staged_body` performs
     // the cross-repo write guard and quota preflight itself.
-    let storage_key = format!("jetbrains/{}/{}/{}", plugin_name, plugin_version, filename);
+    // Repo-scoped on a shared cloud namespace (#5662), so two repositories
+    // holding the same plugin version do not collide on one key; reads go
+    // through the row's storage_key, so legacy flat-key rows keep serving.
+    let storage_key = crate::storage::StorageKeyScheme::from_env().write_key(
+        &repo.storage_backend,
+        "jetbrains",
+        repo.id,
+        &format!("{}/{}/{}", plugin_name, plugin_version, filename),
+    );
     let size_bytes = staged.size_bytes();
     proxy_helpers::put_staged_body(
         &state,
@@ -521,6 +523,7 @@ async fn upload_plugin(
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         "jetbrains",
         &plugin_name,
@@ -1087,6 +1090,80 @@ mod tests {
         assert_eq!(&body[..], blob, "streamed body must equal upstream bytes");
         teardown().await;
     }
+
+    /// #5685: the download of a published plugin whose store is down answers
+    /// `503` with `Retry-After`, and one whose store is full `507` without
+    /// it, with the fixed message and no backend text or storage-class
+    /// marker. It answered a hard-coded 500.
+    #[tokio::test]
+    async fn download_plugin_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "jetbrains").await else {
+            return;
+        };
+        let boundary = "----AKBoundary5685";
+        let body = multipart_body(
+            boundary,
+            &binary_plugin_zip(),
+            "com.example.outage5685",
+            "1.0.0",
+        );
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!("/{}/plugin/uploadPlugin", fx.repo_key),
+                &format!("multipart/form-data; boundary={boundary}"),
+                body,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "publish while storage works: {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        for (message, want, expected) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&fx.pool, &fx.state, fx.repo_id, &message).await;
+            let app = tdh::router_with_auth(
+                super::router(),
+                state,
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let (status, body, headers) = tdh::send_with_headers(
+                app,
+                tdh::get(format!(
+                    "/{}/plugin/download/com.example.outage5685/1.0.0",
+                    fx.repo_key
+                )),
+            )
+            .await;
+            assert_eq!(status, want, "{}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want == StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            tdh::assert_no_storage_backend_text("jetbrains GET plugin", &body);
+            assert_eq!(&body[..], expected.as_bytes(), "fixed message");
+        }
+        fx.teardown().await;
+    }
     use super::*;
 
     #[test]
@@ -1486,6 +1563,34 @@ mod tests {
             "a raw upload -> download round trip must return the exact uploaded bytes"
         );
         assert_eq!(stored, Some((expected_sha, zip.len() as i64)));
+    }
+
+    /// #5662: the same plugin version uploads into two JetBrains repositories
+    /// on a shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_plugin_version_uploads_to_two_cloud_repositories_5662() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let zip = binary_plugin_zip();
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "jetbrains",
+            key_prefix: "jetbrains",
+            router: super::router,
+            publish: &|key| {
+                vec![tdh::post(
+                    format!("/{key}/plugin/uploadPlugin"),
+                    "multipart/form-data; boundary=JBBND5662",
+                    multipart_body("JBBND5662", &zip, "com.example.scoped5662", "1.0.0"),
+                )]
+            },
+            download: &|key| {
+                tdh::get(format!(
+                    "/{key}/plugin/download/com.example.scoped5662/1.0.0"
+                ))
+            },
+            expected: &zip,
+        })
+        .await;
     }
 
     /// #4725: a plugin upload to a hosted repository must queue a push sync

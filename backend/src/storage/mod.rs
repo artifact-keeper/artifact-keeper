@@ -1,6 +1,7 @@
 //! Storage backends.
 
 pub mod azure;
+pub mod failure;
 pub mod filesystem;
 pub mod gcs;
 pub mod keys;
@@ -10,6 +11,7 @@ pub mod registry;
 pub mod s3;
 pub mod verify;
 
+pub use failure::StorageFailure;
 pub use keys::StorageKeyScheme;
 pub use path_format::StoragePathFormat;
 pub use registry::{backend_is_repo_isolated, StorageLocation, StorageRegistry};
@@ -20,6 +22,123 @@ use futures::stream::BoxStream;
 use std::time::Duration;
 
 use crate::error::Result;
+
+/// Default for `STORAGE_CONNECT_TIMEOUT_SECS`: how long one connection
+/// attempt to the object store may take (#5649).
+pub const DEFAULT_STORAGE_CONNECT_TIMEOUT_SECS: u64 = 3;
+
+/// Default for `STORAGE_OPERATION_TIMEOUT_SECS`: how long one control-plane
+/// storage request (head, exists, list, delete) keeps retrying before it
+/// gives up (#5649).
+pub const DEFAULT_STORAGE_OPERATION_TIMEOUT_SECS: u64 = 15;
+
+/// Default for `STORAGE_BULK_RETRY_TIMEOUT_SECS`: the retry budget of one
+/// payload request (get/put, multipart part, copy). `object_store` counts it
+/// from the start of the request, so it has to outlast a long transfer;
+/// 180s is `object_store`'s own default (#5649).
+pub const DEFAULT_STORAGE_BULK_RETRY_TIMEOUT_SECS: u64 = 180;
+
+/// Longest pause between two retries of one storage request. The retry budget
+/// is checked before each pause, so the pause is what a request can overrun
+/// its budget by; `object_store`'s default lets it grow to 15s.
+pub const STORAGE_MAX_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Connect and retry bounds for object-store requests (#5649).
+///
+/// Without them a stopped MinIO made every upload and download hang: each
+/// attempt to reach the gone host waited out `object_store`'s 5s connect
+/// timeout, backoff grew to 15s, and failed attempts were retried for up to
+/// three minutes, so a client gave up on its own timeout long before the
+/// server answered. With them a request against an unreachable store answers
+/// `503 STORAGE_UNAVAILABLE` with `Retry-After` within about 15-30s: the
+/// connect timeout and the [`STORAGE_MAX_RETRY_BACKOFF`] cap bound each
+/// attempt, `operation` bounds the retries of a control-plane request, and a
+/// fixed retry count bounds a payload request (see `s3_retry_config`).
+///
+/// `bulk_retry` is deliberately long: `object_store` measures it from the
+/// start of the request and checks it only after a failure, so a shorter
+/// budget would take every retry away from a transfer that has been running
+/// longer than it. A transfer that is making progress is governed by
+/// `S3_BULK_TIMEOUT_SECS`, and a single control-plane request by
+/// `S3_CONTROL_TIMEOUT_SECS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageTimeouts {
+    /// `STORAGE_CONNECT_TIMEOUT_SECS`: one TCP/TLS connection attempt.
+    pub connect: Duration,
+    /// `STORAGE_OPERATION_TIMEOUT_SECS`: no retry of a failed control-plane
+    /// request is started once it has been running this long.
+    pub operation: Duration,
+    /// `STORAGE_BULK_RETRY_TIMEOUT_SECS`: the same for a payload request.
+    pub bulk_retry: Duration,
+}
+
+impl Default for StorageTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(DEFAULT_STORAGE_CONNECT_TIMEOUT_SECS),
+            operation: Duration::from_secs(DEFAULT_STORAGE_OPERATION_TIMEOUT_SECS),
+            bulk_retry: Duration::from_secs(DEFAULT_STORAGE_BULK_RETRY_TIMEOUT_SECS),
+        }
+    }
+}
+
+impl StorageTimeouts {
+    /// Read `STORAGE_CONNECT_TIMEOUT_SECS`, `STORAGE_OPERATION_TIMEOUT_SECS`
+    /// and `STORAGE_BULK_RETRY_TIMEOUT_SECS`.
+    pub fn from_env() -> Self {
+        let var = |name| std::env::var(name).ok();
+        Self::from_values(
+            var("STORAGE_CONNECT_TIMEOUT_SECS").as_deref(),
+            var("STORAGE_OPERATION_TIMEOUT_SECS").as_deref(),
+            var("STORAGE_BULK_RETRY_TIMEOUT_SECS").as_deref(),
+        )
+    }
+
+    /// Parse the three settings. A missing, zero or unparsable value keeps
+    /// its default: an unbounded wait is exactly what #5649 removed, so it
+    /// cannot be configured back in by accident.
+    pub fn from_values(
+        connect: Option<&str>,
+        operation: Option<&str>,
+        bulk_retry: Option<&str>,
+    ) -> Self {
+        fn secs(name: &str, raw: Option<&str>, default: u64) -> Duration {
+            match raw.map(str::trim) {
+                None | Some("") => Duration::from_secs(default),
+                Some(v) => match v.parse::<u64>() {
+                    Ok(n) if n > 0 => Duration::from_secs(n),
+                    _ => {
+                        tracing::warn!(
+                            setting = name,
+                            value = v,
+                            default,
+                            "ignoring invalid storage timeout; it must be a whole number of \
+                             seconds above zero"
+                        );
+                        Duration::from_secs(default)
+                    }
+                },
+            }
+        }
+        Self {
+            connect: secs(
+                "STORAGE_CONNECT_TIMEOUT_SECS",
+                connect,
+                DEFAULT_STORAGE_CONNECT_TIMEOUT_SECS,
+            ),
+            operation: secs(
+                "STORAGE_OPERATION_TIMEOUT_SECS",
+                operation,
+                DEFAULT_STORAGE_OPERATION_TIMEOUT_SECS,
+            ),
+            bulk_retry: secs(
+                "STORAGE_BULK_RETRY_TIMEOUT_SECS",
+                bulk_retry,
+                DEFAULT_STORAGE_BULK_RETRY_TIMEOUT_SECS,
+            ),
+        }
+    }
+}
 
 /// Key namespaces that are anchored at the **bucket root**, never under the
 /// configured `S3_PREFIX`.
@@ -491,6 +610,25 @@ pub(crate) async fn buffered_put_stream_fallback<B: StorageBackend + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_timeouts_default_and_reject_unbounded_values_5649() {
+        assert_eq!(
+            StorageTimeouts::from_values(None, None, None),
+            StorageTimeouts::default()
+        );
+        let set = StorageTimeouts::from_values(Some("1"), Some(" 7 "), Some("90"));
+        assert_eq!(set.connect, Duration::from_secs(1));
+        assert_eq!(set.operation, Duration::from_secs(7));
+        assert_eq!(set.bulk_retry, Duration::from_secs(90));
+        for bad in ["0", "-3", "soon", ""] {
+            assert_eq!(
+                StorageTimeouts::from_values(Some(bad), Some(bad), Some(bad)),
+                StorageTimeouts::default(),
+                "{bad:?} must keep the bounded default"
+            );
+        }
+    }
 
     #[test]
     fn test_presigned_url_source_s3() {

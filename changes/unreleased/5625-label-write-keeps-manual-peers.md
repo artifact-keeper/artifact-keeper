@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#5625]
+---
+- **Adding, changing or removing an artifact label no longer deletes the artifact from peers subscribed to its repository by hand** ([#5625]). Every label write (`PUT`, `POST` and `DELETE` on `/api/v1/artifacts/{id}/labels`) re-evaluates the artifact's replication, and that evaluation worked out which peers should hold the artifact from sync policies only. A peer subscribed with `POST /api/v1/peers/{id}/repositories` is not in any policy, so every such peer that had received the artifact was sent a delete a few seconds after the label write, while the hub still served the artifact. A manual subscription now decides for its peer: an enabled push or mirror subscription keeps the artifact (and gets it, if it never did), and a disabled or pull subscription is left alone. Peers managed by a sync policy are evaluated as before, and a delete re-queued for them starts as a fresh first attempt instead of carrying the error message and retry count of an old cancelled task.

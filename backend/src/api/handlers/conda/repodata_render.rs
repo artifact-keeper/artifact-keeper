@@ -21,7 +21,7 @@
 //! bounded by the encoded documents, not by the row set. The bytes are the
 //! ones the `serde_json::Value` render produces (asserted by the tests).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
 
 use axum::http::StatusCode;
@@ -74,6 +74,9 @@ struct Listing {
     /// `current_repodata.json`: per package name the newest visible row,
     /// then per filename (a later name overwrites, as the map insert did).
     current: BTreeMap<String, Uuid>,
+    /// Filenames of rows a scan policy blocks (#4978 item 6) that no listed
+    /// row carries: they join the `removed` array, like withdrawn rows.
+    refused: BTreeSet<String>,
 }
 
 /// Pass 1: decide which row each document lists, streaming the repository's
@@ -100,8 +103,8 @@ async fn listing(
     )
     .bind(repo_id)
     .fetch(db);
-    let mut out = Listing::default();
-    let mut latest: BTreeMap<String, (String, Uuid)> = BTreeMap::new();
+    // The subdir's visible rows, newest first: `(id, filename, name)`.
+    let mut visible: Vec<(Uuid, String, String)> = Vec::new();
     while let Some(row) = rows.try_next().await.map_err(failed)? {
         if is_withdrawn(row.quarantine_status.as_deref(), row.quarantine_until, now) {
             continue;
@@ -114,12 +117,29 @@ async fn listing(
             continue;
         }
         let filename = row.path.rsplit('/').next().unwrap_or(&row.path).to_string();
-        let name = row.meta_name.unwrap_or(row.name);
+        visible.push((row.id, filename, row.meta_name.unwrap_or(row.name)));
+    }
+    drop(rows);
+    // #4288 item 1 / #4978 item 6: a row a scan policy blocks is refused by
+    // the download gate, so it is not listed either.
+    let ids: Vec<Uuid> = visible.iter().map(|(id, _, _)| *id).collect();
+    let refused = super::policy_refused(db, repo_id, &ids).await?;
+
+    let mut out = Listing::default();
+    let mut latest: BTreeMap<String, (String, Uuid)> = BTreeMap::new();
+    for (id, filename, name) in visible {
+        if refused.contains(&id) {
+            if is_conda_package(&filename) {
+                out.refused.insert(filename);
+            }
+            continue;
+        }
+        let row_id = id;
         latest
             .entry(name)
-            .or_insert_with(|| (filename.clone(), row.id));
+            .or_insert_with(|| (filename.clone(), row_id));
         if is_conda_package(&filename) {
-            out.full.insert(filename, row.id);
+            out.full.insert(filename, row_id);
         }
     }
     for (filename, id) in latest.into_values() {
@@ -127,6 +147,7 @@ async fn listing(
             out.current.insert(filename, id);
         }
     }
+    out.refused.retain(|f| !out.full.contains_key(f));
     Ok(out)
 }
 
@@ -341,7 +362,18 @@ pub(crate) async fn render_subdir_chunked(
     rows_per_chunk: usize,
 ) -> Result<RenderedSubdir, Response> {
     let listing = listing(db, repo_id, subdir, now).await?;
-    let removed = serde_json::json!(removed);
+    let removed = if listing.refused.is_empty() {
+        serde_json::json!(removed)
+    } else {
+        let mut all: Vec<&str> = removed
+            .iter()
+            .map(String::as_str)
+            .chain(listing.refused.iter().map(String::as_str))
+            .collect();
+        all.sort_unstable();
+        all.dedup();
+        serde_json::json!(all)
+    };
     let mut writers = Writers {
         json: PrettyDoc::new(subdir)?,
         zst: ZstTee::new()?,

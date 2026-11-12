@@ -43,13 +43,14 @@ use crate::api::handlers::proxy_helpers;
 use crate::api::handlers::queue_push_sync_tasks_for_upload;
 // The bearer challenge is built in the middleware half so this module and
 // `guest_access_guard` emit byte-identical `WWW-Authenticate` values (#3854).
+use crate::api::middleware::auth::{verify_basic_password, BasicPasswordOutcome};
 use crate::api::middleware::oci_errors::{www_authenticate_header, OCI_TOKEN_SERVICE};
 use crate::api::middleware::rate_limit::LoginRateLimitState;
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::models::user::User;
-use crate::services::auth_service::AuthService;
+use crate::services::auth_service::{is_api_token_shape, is_jwt_shape, AuthService, TimingPad};
 use crate::services::metrics_service::AuthFailureReason;
 use crate::services::repository_service::{format_handler_key, parse_format_str};
 use crate::services::scanner_service::ProxyScanClass;
@@ -100,6 +101,8 @@ fn oci_error_detail(
     message: &str,
     detail: Option<serde_json::Value>,
 ) -> Response {
+    let (status, code, message) = oci_storage_envelope(status, code, message);
+    let message: &str = &message;
     // The database sites pass `db_status(&e)` with `INTERNAL_ERROR`; when
     // that status is a 503 (saturated pool, unreachable database) the error is
     // transient, so it carries the same `UNAVAILABLE` code the other
@@ -124,6 +127,77 @@ fn oci_error_detail(
             .body(Body::from(json))
             .unwrap(),
     )
+}
+
+/// Code for the `507` a push gets when the storage backend is out of space
+/// (#5650). The distribution spec has no code for it; like `UNAVAILABLE`,
+/// clients print it next to the message.
+const OCI_INSUFFICIENT_STORAGE: &str = "INSUFFICIENT_STORAGE";
+
+/// Neutral message for a storage failure that has no class of its own.
+const OCI_STORAGE_FAILED_MESSAGE: &str = "storage operation failed";
+
+/// The status, code and message a `/v2` error answers with once storage
+/// failures are taken out of it (#5649, #5650).
+///
+/// Every OCI error goes through [`oci_error_detail`], and the storage sites
+/// hand it the storage error's own text (`&e.to_string()`) under a 500. That
+/// is how `docker push` into a bucket at its MinIO quota printed MinIO's XML
+/// error document, bucket name and request ids included. Here, for a 5xx
+/// only:
+///
+/// * an out-of-space refusal becomes `507 INSUFFICIENT_STORAGE`,
+/// * an unreachable or timed-out backend becomes `503 UNAVAILABLE` (with
+///   `Retry-After`, added below like every other OCI 503),
+/// * any other 5xx keeps its status but loses the store's own error text
+///   (XML documents, the raw S3 error).
+///
+/// Client errors (4xx) are left alone: their messages are written for the
+/// client.
+fn oci_storage_envelope<'a>(
+    status: StatusCode,
+    code: &'a str,
+    message: &'a str,
+) -> (StatusCode, &'a str, std::borrow::Cow<'a, str>) {
+    use crate::storage::StorageFailure;
+    if !status.is_server_error() {
+        return (status, code, message.into());
+    }
+    let class = StorageFailure::from_message(message);
+    if class.is_some() || carries_storage_backend_text(message) {
+        // The backend's text stays in the server log only.
+        tracing::warn!(error = %message, code, "OCI storage error");
+    }
+    match class {
+        Some(class) => {
+            crate::storage::failure::record_failure(class);
+            match class {
+                StorageFailure::Full => (
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    OCI_INSUFFICIENT_STORAGE,
+                    crate::error::STORAGE_FULL_MESSAGE.into(),
+                ),
+                StorageFailure::Unavailable => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "UNAVAILABLE",
+                    crate::error::STORAGE_UNAVAILABLE_MESSAGE.into(),
+                ),
+            }
+        }
+        None if carries_storage_backend_text(message) => {
+            (status, code, OCI_STORAGE_FAILED_MESSAGE.into())
+        }
+        None => (status, code, message.into()),
+    }
+}
+
+/// Whether an OCI error message carries an object store's own error text:
+/// its XML error document, or the raw error the S3 backend appends after
+/// `caused by:` (which names the endpoint's answer verbatim). Messages
+/// Artifact Keeper writes itself, such as which upload part is short and by
+/// how many bytes, stay readable.
+fn carries_storage_backend_text(message: &str) -> bool {
+    message.contains("<?xml") || message.contains("<Error>") || message.contains("caused by:")
 }
 
 fn oci_internal_error(message: &str) -> Response {
@@ -290,11 +364,14 @@ async fn validate_token(
 /// could not be completed: the database could not answer
 /// ([`AppError::is_db_unavailable`]) or the bcrypt concurrency cap shed the
 /// request. That answers a retryable 503, because docker and CI clients abort
-/// or re-prompt on 401 but retry on 503.
+/// or re-prompt on 401 but retry on 503. `RateLimited` means a Basic password
+/// was refused unverified because its login budget is spent (#5485): 429 with
+/// `Retry-After`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OciAuthError {
     Invalid,
     Unavailable,
+    RateLimited(u64),
 }
 
 impl OciAuthError {
@@ -321,12 +398,47 @@ fn oci_auth_unavailable() -> Response {
     resp
 }
 
+/// 429 for a Basic password refused because its login budget is spent
+/// (#5485), in the registry's error envelope.
+fn oci_auth_rate_limited(retry_after: u64) -> Response {
+    let mut resp = oci_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "TOOMANYREQUESTS",
+        "too many failed authentication attempts, retry later",
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after.to_string()) {
+        resp.headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, value);
+    }
+    resp
+}
+
 /// The response for a failed `/v2` authentication: the 401 challenge for a
 /// bad credential, a retryable 503 when validation could not be completed.
 fn oci_auth_failure(error: OciAuthError, base_url: &str, scope: Option<&str>) -> Response {
     match error {
         OciAuthError::Invalid => unauthorized_challenge_with_scope(base_url, scope),
         OciAuthError::Unavailable => oci_auth_unavailable(),
+        OciAuthError::RateLimited(retry_after) => oci_auth_rate_limited(retry_after),
+    }
+}
+
+/// The local-password arm of an OCI Basic credential (#5485, #5683): the
+/// middleware's [`verify_basic_password`], so a `/v2` Basic password costs
+/// one bcrypt under the same login budget as every other Basic surface. OCI
+/// runs no LDAP passthrough after it.
+async fn oci_basic_password(
+    auth_service: &AuthService,
+    username: &str,
+    password: &str,
+) -> Result<User, OciAuthError> {
+    match verify_basic_password(auth_service, username, password, false).await {
+        BasicPasswordOutcome::Verified(user) => Ok(*user),
+        BasicPasswordOutcome::RateLimited(retry_after) => {
+            Err(OciAuthError::RateLimited(retry_after))
+        }
+        BasicPasswordOutcome::Overloaded => Err(OciAuthError::Unavailable),
+        BasicPasswordOutcome::Rejected { .. } => Err(OciAuthError::Invalid),
     }
 }
 
@@ -388,6 +500,25 @@ async fn authenticate_oci_read(
     base_url: &str,
     scope: &str,
 ) -> Result<Option<crate::services::auth_service::Claims>, Response> {
+    Ok(
+        authenticate_oci_read_with_scopes(state, headers, base_url, scope)
+            .await?
+            .map(|(claims, _)| claims),
+    )
+}
+
+/// A caller and its API-token action scopes (`None` for a JWT or password
+/// login), as [`authenticate_oci_read_with_scopes`] returns them.
+type OciReadAuth = (crate::services::auth_service::Claims, Option<Vec<String>>);
+
+/// [`authenticate_oci_read`] that also returns the API-token action scopes,
+/// for a read that must know whether the caller could also push (#5606).
+async fn authenticate_oci_read_with_scopes(
+    state: &SharedState,
+    headers: &HeaderMap,
+    base_url: &str,
+    scope: &str,
+) -> Result<Option<OciReadAuth>, Response> {
     if is_anonymous_token(headers) {
         return Ok(None);
     }
@@ -399,7 +530,34 @@ async fn authenticate_oci_read(
     if !oci_scopes_grant(&token_scopes, OCI_SCOPE_READ) {
         return Err(oci_forbidden_scope(OCI_SCOPE_READ));
     }
-    Ok(Some(claims))
+    Ok(Some((claims, token_scopes)))
+}
+
+/// Whether the caller of a HEAD may push to `repo` (#5606): a hosted
+/// repository (one that stores its own manifests), a credential whose action
+/// scopes grant `write:artifacts`, and the repository `write` decision a push
+/// takes ([`oci_write_decision`]). An anonymous caller never may.
+///
+/// `docker push` checks the manifest and its blobs with `HEAD` before it
+/// uploads, and aborts on any answer other than 200 or 404. The pull gate
+/// answering that HEAD with a hold's 403/409 therefore made a held tag
+/// impossible to replace with a fixed image. A HEAD carries no body, and a
+/// caller who may push can overwrite the tag anyway, so such a caller is told
+/// that the held manifest or blob exists. A GET of the held bytes stays
+/// refused for everyone.
+async fn caller_may_push(
+    state: &SharedState,
+    auth: Option<&OciReadAuth>,
+    repo: &OciRepoInfo,
+) -> bool {
+    let Some((claims, token_scopes)) = auth else {
+        return false;
+    };
+    stores_own_manifests(&repo.repo_type)
+        && oci_scopes_grant(token_scopes, OCI_SCOPE_WRITE)
+        && oci_write_decision(state, claims, repo.id, "write")
+            .await
+            .is_ok()
 }
 
 /// Authenticate an OCI request and also return the API-token scopes if the
@@ -502,21 +660,31 @@ async fn verify_oci_credential(
         OciCredential::Basic { username, password } => {
             let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
 
-            // Try API token in the password field first (service accounts, CI
-            // pipelines, registry mirrors, curl scripts). #1195: `authenticate`
-            // bumps `users.failed_login_attempts` on every bcrypt miss, so any
-            // OCI verb (manifest GET, blob HEAD, blob PUT, etc.) that
-            // presented Basic `<user>:<api_token>` would lock the service
-            // account out after `account_lockout_threshold` requests. Mirrors
-            // the #1145 fix on `/v2/token`. `validate_api_token` has no
-            // failure-counter side effect and runs a constant-time bcrypt
-            // pad on miss so this reorder is safe. The username from Basic
-            // auth is ignored when an API token validates (matching the
-            // /v2/token behavior): the token itself identifies the user.
-            let validated = match auth_service.validate_api_token(&password).await {
-                Ok(validation) => Some(validation),
-                Err(e) if unavailable(&e) => return Err(OciAuthError::Unavailable),
-                Err(_) => None,
+            // The password is classified by its shape, exactly like the auth
+            // middleware's `resolve_basic_pair` (#5640, #5683), cheapest check
+            // first, and a token-shaped secret is only ever a token:
+            //
+            // * API-token-shaped: only an API token (service accounts, CI
+            //   pipelines, registry mirrors, curl scripts). #1195: trying the
+            //   password first bumped `failed_login_attempts` on every OCI
+            //   verb presenting Basic `<user>:<api_token>`. And falling
+            //   through to the password check after a token miss cost a dead
+            //   token a cost-12 bcrypt and an auth-capacity permit on every
+            //   `docker` retry (#5683); `validate_api_token` refuses an
+            //   unknown, revoked or expired token before any bcrypt (#5633).
+            //   The Basic username is ignored when the token validates
+            //   (matching `/v2/token`): the token identifies the user.
+            // * JWT-shaped: only an AK access token (HMAC, no bcrypt), below.
+            // * Anything else: one password check under the Basic-password
+            //   login budget (`oci_basic_password`, #5485).
+            let validated = if is_api_token_shape(&password) {
+                match auth_service.validate_api_token(&password).await {
+                    Ok(validation) => Some(validation),
+                    Err(e) if unavailable(&e) => return Err(OciAuthError::Unavailable),
+                    Err(_) => return Err(OciAuthError::Invalid),
+                }
+            } else {
+                None
             };
             if let Some(validation) = validated {
                 let scopes = validation.scopes.clone();
@@ -546,15 +714,28 @@ async fn verify_oci_credential(
                 return Ok((claims, Some(scopes)));
             }
 
-            // Fall through to username/password authentication. Re-generate
+            // Username/password authentication for a secret that is not
+            // token-shaped; a rejection ends the chain. Re-generate
             // short-lived claims so downstream code has a consistent Claims
             // value regardless of the authentication method.
-            let authenticated = match auth_service.authenticate(&username, &password).await {
-                Ok(pair) => Some(pair),
-                Err(e) if unavailable(&e) => return Err(OciAuthError::Unavailable),
-                Err(_) => None,
+            let authenticated = if is_jwt_shape(&password) {
+                None
+            } else {
+                Some(oci_basic_password(&auth_service, &username, &password).await?)
             };
-            if let Some((user, _tokens)) = authenticated {
+            if let Some(user) = authenticated {
+                // #5484: `/v2/token` refuses a TOTP-enrolled account's
+                // password; the direct Basic credential on the registry
+                // routes must too, or a stolen password alone pushes and
+                // pulls. Such an account uses an API token as the password.
+                if crate::api::middleware::auth::format_route_password_refusal(&user).is_some() {
+                    tracing::info!(
+                        target: "security",
+                        username = %user.username,
+                        "OCI password authentication refused; TOTP is enabled, the account needs an API token"
+                    );
+                    return Err(OciAuthError::Invalid);
+                }
                 let claims = auth_service
                     .generate_tokens(&user)
                     .map_err(|_| OciAuthError::Invalid)
@@ -566,9 +747,10 @@ async fn verify_oci_credential(
                 return Ok((claims, None));
             }
 
-            // Final fallback: accept a valid AK access token (JWT) as the Docker
-            // password. Enables the CI/CD keyless push flow where the token from
-            // the OIDC exchange is used directly as the Docker credential.
+            // A JWT-shaped password: accept a valid AK access token as the
+            // Docker password. Enables the CI/CD keyless push flow where the
+            // token from the OIDC exchange is used directly as the Docker
+            // credential.
             let jwt_claims = match auth_service.validate_access_token_async(&password).await {
                 Ok(claims) => Some(claims),
                 Err(e) if unavailable(&e) => return Err(OciAuthError::Unavailable),
@@ -3028,6 +3210,14 @@ pub(crate) async fn persist_tag_and_refs_in_tx(
     )
     .await?;
 
+    // 5. #5793: the image now holds the manifest. The link outlives a tag
+    //    overwrite, so the old digest stays pullable under this image
+    //    (#1681) but under no other name. A repository whose first manifest
+    //    this is has nothing to backfill and is scoped from now on.
+    crate::services::oci_image_scope::link_manifest(&mut **tx, repo_id, name, manifest_digest)
+        .await?;
+    crate::services::oci_image_scope::mark_if_new_in_tx(tx, repo_id, manifest_digest).await?;
+
     Ok(moved_from)
 }
 
@@ -3377,6 +3567,15 @@ async fn resolve_repo_for_write(
 fn requested_repo_key(image_name: &str) -> &str {
     match image_name.find('/') {
         Some(idx) => &image_name[..idx],
+        None => image_name,
+    }
+}
+
+/// The image part of a `/v2` name: everything after the repository key
+/// ([`requested_repo_key`]), split exactly as [`resolve_repo_inner`] does.
+fn requested_image(image_name: &str) -> &str {
+    match image_name.find('/') {
+        Some(idx) => &image_name[idx + 1..],
         None => image_name,
     }
 }
@@ -3919,6 +4118,18 @@ pub async fn resolve_virtual_blob(
         .ok()
         .flatten()
         .map(|row| (row.size_bytes, row.storage_key));
+        // #5793: a hosted member serves the blob only under an image that
+        // holds it, exactly as a direct pull of the member.
+        let local = match local {
+            Some(row) => {
+                let member_repo = oci_repo_info_from_member(member, image_name);
+                blob_scope_allows(state, &member_repo, digest)
+                    .await
+                    .unwrap_or(false)
+                    .then_some(row)
+            }
+            None => None,
+        };
 
         if let Some(resolution) = local_blob_resolution(local, member) {
             return Some(resolution);
@@ -3956,7 +4167,7 @@ pub async fn resolve_virtual_blob(
                     // #2260 rule the direct-Remote blob path documents. A
                     // Docker pull through a virtual parent is counted once at
                     // the manifest, never per layer.
-                    match proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(
+                    let fetch = proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(
                         proxy,
                         member.id,
                         &member.key,
@@ -3966,9 +4177,31 @@ pub async fn resolve_virtual_blob(
                         expected_checksum.clone(),
                         member.format.clone(),
                         is_head,
-                    )
-                    .await
-                    {
+                    );
+                    // #5810: a member that has not started answering within
+                    // the download deadline is passed over for this request,
+                    // like the two-phase download walk. Any member's bytes
+                    // are as good as another's here: the client verifies them
+                    // against the digest and the cache commit is gated on it.
+                    let fetched = match proxy_helpers::virtual_member_download_deadline(
+                        proxy.upstream_read_timeout(),
+                    ) {
+                        Some(deadline) => match tokio::time::timeout(deadline, fetch).await {
+                            Ok(fetched) => fetched,
+                            Err(_) => {
+                                proxy_helpers::record_virtual_member_download_deadline_miss(
+                                    &member.key,
+                                    &upstream_path,
+                                    deadline,
+                                );
+                                // Not evidence the blob is absent (#3836).
+                                indeterminate = true;
+                                break;
+                            }
+                        },
+                        None => fetch.await,
+                    };
+                    match fetched {
                         Ok(result) => return Some(VirtualBlobResolution::RemoteStream { result }),
                         Err(error) => {
                             indeterminate |= !upstream_error_is_definitive_miss(&error);
@@ -4087,6 +4320,10 @@ pub async fn resolve_virtual_manifest(
             };
             let row = match recorded {
                 Some(row) => Some(row),
+                // #5793: a hosted member answered above, scoped to the
+                // image; its repository-wide tag rows must not resolve the
+                // digest under a name that does not hold it.
+                None if stores_own_manifests(&member_repo.repo_type) => None,
                 None => sqlx::query!(
                     "SELECT manifest_digest, manifest_content_type FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2 LIMIT 1",
                     member.id,
@@ -5490,6 +5727,7 @@ async fn handle_refresh_grant(state: &SharedState, form: &TokenForm) -> Response
 async fn token(
     State(state): State<SharedState>,
     headers: HeaderMap,
+    pad_budget: Option<Extension<crate::api::middleware::rate_limit::LoginPadBudget>>,
     query: Result<Query<TokenQuery>, QueryRejection>,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
@@ -5590,7 +5828,8 @@ async fn token(
                 // #4750: an outage while checking a presented JWT is a
                 // retryable 503, not "invalid credentials".
                 Err(OciAuthError::Unavailable) => return oci_auth_unavailable(),
-                Err(OciAuthError::Invalid) => None,
+                // A Bearer credential has no password budget to spend.
+                Err(OciAuthError::Invalid | OciAuthError::RateLimited(_)) => None,
             };
             if let Some(claims) = bearer_claims {
                 let auth_service =
@@ -5783,115 +6022,137 @@ async fn token(
     };
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-    // Try the API-token path first, fall back to username/password.
+    // Classified by the password's shape, like `resolve_basic_pair` in the
+    // auth middleware (#5640, #5683): cheapest check first, and never a
+    // password bcrypt (or an auth-capacity permit) for an issued-token-shaped
+    // secret.
     //
-    // Reverse order — `authenticate(username, api_token)` first — increments
-    // `failed_login_attempts` on every CI push that uses an API token in the
-    // password field (the standard `docker login -p $API_TOKEN` flow), since
-    // bcrypt-comparing the token against the user's password hash always
-    // fails. After `account_lockout_threshold` builds the service account
-    // locks itself out. `validate_api_token` has no failure-counter side
-    // effect, so trying it first keeps the lockout counter accurate while
-    // still falling through to bcrypt for actual passwords.
-    let (user, tokens, authenticated_via_api_token) =
-        match auth_service.validate_api_token(&credentials.1).await {
-            // #4750: validation that could not be completed is a retryable 503;
-            // falling through to the next credential shape would end in a 401.
+    // * API-token-shaped: only an API token. Trying `authenticate(username,
+    //   api_token)` first incremented `failed_login_attempts` on every CI push
+    //   using the standard `docker login -p $API_TOKEN` flow (#1145), and
+    //   falling through to it after a token miss still cost a dead token a
+    //   cost-12 bcrypt and an auth-capacity permit. `validate_api_token` has
+    //   no failure-counter side effect and refuses an unknown, revoked or
+    //   expired token before any bcrypt (#5633).
+    // * JWT-shaped: only an AK access token (HMAC, no bcrypt), the CI/CD
+    //   keyless push flow:
+    //     1. Exchange GitHub OIDC JWT → AK access_token  (ci_auth handler)
+    //     2. docker login -u <ci-user> -p <access_token>  (this path)
+    //     3. docker push ...
+    //   This mirrors how Artifactory handles its OIDC-issued tokens.
+    // * Anything else: the username/password check (one bcrypt).
+    let password = credentials.1.as_str();
+    let invalid = || {
+        oci_error(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "invalid username or password",
+        )
+    };
+    let (user, tokens, authenticated_via_api_token) = if is_api_token_shape(password) {
+        match auth_service.validate_api_token(password).await {
+            // Carry the token's repository and action ceilings onto the minted
+            // OCI bearer (#2290/#2430) and cap it at the token's own expiry
+            // (#3460); `api_token_exchange_response` is shared with the Bearer
+            // slot so the two cannot drift.
+            Ok(validation) => return api_token_exchange_response(&auth_service, validation),
+            // #4750: validation that could not be completed is a retryable
+            // 503, not a 401.
             Err(ref e) if OciAuthError::classify(e) == OciAuthError::Unavailable => {
                 return oci_auth_unavailable()
             }
-            Ok(validation) => {
-                // Carry the token's repository and action ceilings onto the minted
-                // OCI bearer (#2290/#2430) and cap it at the token's own expiry
-                // (#3460); `api_token_exchange_response` is shared with the Bearer
-                // slot so the two cannot drift.
-                return api_token_exchange_response(&auth_service, validation);
+            Err(e) => {
+                record_token_auth_failure(AuthFailureReason::for_token_error(
+                    &e,
+                    AuthFailureReason::InvalidToken,
+                ));
+                return invalid();
             }
-            Err(_) => match auth_service
-                .authenticate_with_reason(&credentials.0, &credentials.1)
-                .await
-            {
-                Ok((user, tokens)) => (user, tokens, false),
-                Err(ref f) if OciAuthError::classify(&f.error) == OciAuthError::Unavailable => {
-                    return oci_auth_unavailable()
-                }
-                Err(password_failure) => {
-                    // Final fallback: accept a valid AK access token (JWT) as the
-                    // Docker password. This enables the CI/CD keyless push flow:
-                    //   1. Exchange GitHub OIDC JWT → AK access_token  (ci_auth handler)
-                    //   2. docker login -u <ci-user> -p <access_token>  (this path)
-                    //   3. docker push ...
-                    // This mirrors how Artifactory handles its OIDC-issued tokens.
-                    match auth_service
-                        .validate_access_token_async(&credentials.1)
-                        .await
-                    {
-                        Ok(claims) => {
-                            let user = match sqlx::query_as::<_, User>(
-                                "SELECT * FROM users WHERE id = $1",
-                            )
-                            .bind(claims.sub)
-                            .fetch_one(&state.db)
-                            .await
-                            {
-                                Ok(u) => u,
-                                Err(ref e)
-                                    if AppError::Database(e.to_string()).is_db_unavailable() =>
-                                {
-                                    return oci_auth_unavailable()
-                                }
-                                Err(_) => {
-                                    return oci_error(
-                                        StatusCode::UNAUTHORIZED,
-                                        "UNAUTHORIZED",
-                                        "user not found",
-                                    )
-                                }
-                            };
-                            // Preserve the incoming access token's action-scope
-                            // ceiling and repository scope on the re-minted bearer
-                            // so this keyless fallback cannot re-widen a restricted
-                            // token (#2430/#2290). Cap at the presented token's
-                            // `exp` (#3460): the re-mint must not extend lifetime.
-                            let tokens = match auth_service.generate_tokens_with_scope_capped(
-                                &user,
-                                claims.scopes.clone(),
-                                claims.allowed_repo_ids.clone(),
-                                chrono::DateTime::<chrono::Utc>::from_timestamp(claims.exp, 0),
-                            ) {
-                                Ok(t) => t,
-                                Err(_) => {
-                                    return oci_error(
-                                        StatusCode::INTERNAL_SERVER_ERROR,
-                                        "INTERNAL_ERROR",
-                                        "failed to generate tokens",
-                                    )
-                                }
-                            };
-                            // Treat like an API token: bypass the TOTP guard below.
-                            (user, tokens, true)
-                        }
-                        Err(ref e) if OciAuthError::classify(e) == OciAuthError::Unavailable => {
-                            return oci_auth_unavailable()
-                        }
-                        Err(_) => {
-                            // Neither an API token, a password nor an access
-                            // token: count it as the password rejection (#4676).
-                            record_token_auth_failure(
-                                password_failure
-                                    .metric_reason()
-                                    .unwrap_or(AuthFailureReason::BadPassword),
-                            );
-                            return oci_error(
-                                StatusCode::UNAUTHORIZED,
-                                "UNAUTHORIZED",
-                                "invalid username or password",
-                            );
-                        }
+        }
+    } else if is_jwt_shape(password) {
+        match auth_service.validate_access_token_async(password).await {
+            Ok(claims) => {
+                let user = match sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
+                    .bind(claims.sub)
+                    .fetch_one(&state.db)
+                    .await
+                {
+                    Ok(u) => u,
+                    Err(ref e) if AppError::Database(e.to_string()).is_db_unavailable() => {
+                        return oci_auth_unavailable()
                     }
-                }
-            },
+                    Err(_) => {
+                        return oci_error(
+                            StatusCode::UNAUTHORIZED,
+                            "UNAUTHORIZED",
+                            "user not found",
+                        )
+                    }
+                };
+                // Preserve the incoming access token's action-scope ceiling and
+                // repository scope on the re-minted bearer so this keyless path
+                // cannot re-widen a restricted token (#2430/#2290). Cap at the
+                // presented token's `exp` (#3460): the re-mint must not extend
+                // lifetime.
+                let tokens = match auth_service.generate_tokens_with_scope_capped(
+                    &user,
+                    claims.scopes.clone(),
+                    claims.allowed_repo_ids.clone(),
+                    chrono::DateTime::<chrono::Utc>::from_timestamp(claims.exp, 0),
+                ) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        return oci_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "INTERNAL_ERROR",
+                            "failed to generate tokens",
+                        )
+                    }
+                };
+                // Treat like an API token: bypass the TOTP guard below.
+                (user, tokens, true)
+            }
+            Err(ref e) if OciAuthError::classify(e) == OciAuthError::Unavailable => {
+                return oci_auth_unavailable()
+            }
+            Err(e) => {
+                record_token_auth_failure(AuthFailureReason::for_token_error(
+                    &e,
+                    AuthFailureReason::InvalidToken,
+                ));
+                return invalid();
+            }
+        }
+    } else {
+        // The password arm pays the bcrypt timing pad while this source IP is
+        // within its failed-login budget, which the `/v2/token` rate-limit
+        // middleware computes exactly as for `/api/v1/auth/login` (#5485): an
+        // unknown or federated username then costs the same bcrypt as a wrong
+        // password for a real account. An absent extension (the handler
+        // mounted without that middleware) pads, the safe default.
+        let pad = match pad_budget {
+            Some(Extension(budget)) if !budget.within_budget => TimingPad::Off,
+            _ => TimingPad::On,
         };
+        match auth_service
+            .authenticate_basic_with_reason(&credentials.0, password, pad)
+            .await
+        {
+            Ok((user, tokens)) => (user, tokens, false),
+            Err(ref f) if OciAuthError::classify(&f.error) == OciAuthError::Unavailable => {
+                return oci_auth_unavailable()
+            }
+            Err(password_failure) => {
+                // Count it as the password rejection (#4676).
+                record_token_auth_failure(
+                    password_failure
+                        .metric_reason()
+                        .unwrap_or(AuthFailureReason::BadPassword),
+                );
+                return invalid();
+            }
+        }
+    };
 
     // Block password-based OCI token requests when the user has TOTP 2FA
     // enabled. Docker CLI cannot perform a TOTP challenge, so the user
@@ -5979,7 +6240,8 @@ async fn version_check(
         // #4750: a presented credential that could not be checked is a
         // retryable 503, not a 401 that makes `docker login` give up.
         Err(OciAuthError::Unavailable) => return oci_auth_unavailable(),
-        Err(OciAuthError::Invalid) => {}
+        // A Bearer credential has no password budget to spend.
+        Err(OciAuthError::Invalid | OciAuthError::RateLimited(_)) => {}
     }
 
     // Accept Basic Auth directly (curl -u user:pass, HTTP clients)
@@ -5994,28 +6256,30 @@ async fn version_check(
             }
             Err(_) => None,
         };
-        if let Some(resp) = outcome(
-            auth_service
-                .authenticate(&username, &password)
-                .await
-                .map(|_| ()),
-        ) {
-            return resp;
-        }
-
-        // Fall back to API token in the password field
-        if let Some(resp) = outcome(auth_service.validate_api_token(&password).await.map(|_| ())) {
-            return resp;
-        }
-
-        // Final fallback: accept AK JWT access token in the Basic password field.
-        // This enables CI keyless flows that use `docker login -u <ci-user> -p <access_token>`.
-        if let Some(resp) = outcome(
-            auth_service
-                .validate_access_token_async(&password)
-                .await
-                .map(|_| ()),
-        ) {
+        // Classified by the password's shape like `resolve_basic_pair`
+        // (#5640, #5683): an API-token-shaped secret is only an API token (it
+        // answers from the token cache, and a dead one is refused without a
+        // bcrypt or an auth permit), a JWT-shaped one only an AK access token
+        // (the CI keyless `docker login -u <ci-user> -p <access_token>`), and
+        // anything else one password check under the Basic-password login
+        // budget (#5485).
+        let checked = if is_api_token_shape(&password) {
+            outcome(auth_service.validate_api_token(&password).await.map(|_| ()))
+        } else if is_jwt_shape(&password) {
+            outcome(
+                auth_service
+                    .validate_access_token_async(&password)
+                    .await
+                    .map(|_| ()),
+            )
+        } else {
+            match oci_basic_password(&auth_service, &username, &password).await {
+                Ok(_) => Some(version_check_ok()),
+                Err(OciAuthError::Invalid) => None,
+                Err(error) => Some(oci_auth_failure(error, base_url.as_str(), None)),
+            }
+        };
+        if let Some(resp) = checked {
             return resp;
         }
     }
@@ -6286,6 +6550,13 @@ async fn enforce_blob_scan_reblock(
                 "blocking blob pull: every image in scope that references this blob is \
                  blocked by scan policy"
             );
+            // #4987: audited and counted as the manifest gate's refusal is.
+            proxy_helpers::note_stored_verdict_block(
+                &state.db,
+                repo.id,
+                &format!("{}@{}", repo.image, lookup_digest),
+                lookup_digest,
+            );
             return Err(oci_error(
                 StatusCode::FORBIDDEN,
                 "DENIED",
@@ -6311,6 +6582,114 @@ async fn enforce_blob_scan_reblock(
     Ok(())
 }
 
+/// How many manifests that reference a blob the scope check resolves one by
+/// one under the image when no manifest the image holds directly references
+/// it (an index child, a legacy-marked manifest). A base layer shared by more
+/// manifests than this is found through the direct arm in practice.
+const BLOB_SCOPE_CANDIDATE_MANIFESTS: i64 = 16;
+
+/// #5793: whether `repo.image` holds blob `digest` in a hosted repository:
+/// the blob was uploaded or mounted under it, or a manifest that resolves
+/// under it references it. A blob held through a manifest is linked on
+/// first read so the next one is a single lookup. `true` for a repository
+/// the backfill has not reached yet (the old repository-wide rule) and for a
+/// digest the repository does not hold at all (the read answers 404 itself).
+async fn hosted_blob_in_scope(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    digest: &str,
+) -> Result<bool, sqlx::Error> {
+    use crate::services::oci_image_scope;
+    if !oci_image_scope::scope_enforced(&state.db, repo.id).await? {
+        return Ok(true);
+    }
+    let link = oci_image_scope::blob_link_state(&state.db, repo.id, &repo.image, digest).await?;
+    if !link.blob_exists || link.linked {
+        return Ok(true);
+    }
+    let mut held = link.referenced;
+    if !held {
+        let candidates = oci_image_scope::blob_candidate_manifests(
+            &state.db,
+            repo.id,
+            digest,
+            BLOB_SCOPE_CANDIDATE_MANIFESTS,
+        )
+        .await?;
+        for manifest in candidates {
+            if resolve_hosted_digest(state, repo, &manifest)
+                .await?
+                .is_some()
+            {
+                held = true;
+                break;
+            }
+        }
+    }
+    if held {
+        if let Err(e) = oci_image_scope::link_blob(&state.db, repo.id, &repo.image, digest).await {
+            tracing::debug!(error = %e, digest = %digest, "derived blob link insert failed");
+        }
+    }
+    Ok(held)
+}
+
+/// #5793: whether a blob read on `repo` may serve `digest`: always on a
+/// Remote or Virtual repository (their own scoping applies), and on a hosted
+/// one when [`hosted_blob_in_scope`] holds, or under
+/// `AK_OCI_BLOB_SCOPE=report`, which serves the miss and counts it.
+async fn blob_scope_allows(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    digest: &str,
+) -> Result<bool, sqlx::Error> {
+    blob_scope_allows_in(
+        state,
+        repo,
+        digest,
+        crate::services::oci_image_scope::blob_scope_mode(),
+    )
+    .await
+}
+
+/// [`blob_scope_allows`] under an explicit `AK_OCI_BLOB_SCOPE` mode.
+async fn blob_scope_allows_in(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    digest: &str,
+    mode: crate::services::oci_image_scope::BlobScopeMode,
+) -> Result<bool, sqlx::Error> {
+    use crate::services::oci_image_scope::{record_blob_scope_miss, BlobScopeMode};
+    if !stores_own_manifests(&repo.repo_type) || hosted_blob_in_scope(state, repo, digest).await? {
+        return Ok(true);
+    }
+    record_blob_scope_miss(&repo.key, &repo.image, digest, mode);
+    Ok(mode == BlobScopeMode::Report)
+}
+
+/// [`blob_scope_allows`] as the GET/HEAD blob gate: `404 BLOB_UNKNOWN` for a
+/// blob the image does not hold. Runs before the scan re-block, so a name
+/// that does not hold the blob learns nothing about its scan state.
+async fn enforce_hosted_blob_scope(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    digest: &str,
+) -> Result<(), Response> {
+    match blob_scope_allows(state, repo, digest).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(oci_error(
+            StatusCode::NOT_FOUND,
+            "BLOB_UNKNOWN",
+            "blob not found",
+        )),
+        Err(e) => Err(oci_error(
+            crate::api::handlers::db_status(&e.to_string()),
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        )),
+    }
+}
+
 async fn handle_head_blob(
     state: &SharedState,
     headers: &HeaderMap,
@@ -6323,10 +6702,11 @@ async fn handle_head_blob(
     // Bind the authenticated claims (don't discard) so scanner-scoped pull
     // tokens can be enforced per-repository below (#2093). The helper also
     // enforces the token's `read:artifacts` action ceiling (#3408).
-    let claims = match authenticate_oci_read(state, headers, base_url, &scope).await {
+    let auth = match authenticate_oci_read_with_scopes(state, headers, base_url, &scope).await {
         Ok(c) => c,
         Err(resp) => return resp,
     };
+    let claims = auth.as_ref().map(|(claims, _)| claims.clone());
 
     // Anonymous tokens may only access public repositories, and a key naming
     // no repository answers them with the same challenge (#3730).
@@ -6372,11 +6752,21 @@ async fn handle_head_blob(
     // pull still resolves a blob stored under its canonical lowercase digest.
     let lookup_digest = canonical_blob_lookup_digest(digest);
 
+    // #5793: a hosted repository serves the blob only under an image that
+    // holds it.
+    if let Err(resp) = enforce_hosted_blob_scope(state, &repo, &lookup_digest).await {
+        return resp;
+    }
+
     // #3258: HEAD must apply the same scan re-block as GET (including the
     // #3245 `scan_on_proxy` scoping) and answer 403 where GET would; before
     // this, HEAD leaked the existence and exact size of blocked content.
+    // #5606: except to a caller who may push here, whose `docker push` checks
+    // each blob with a HEAD and aborts on the 403. The GET stays refused.
     if let Err(resp) = enforce_blob_scan_reblock(state, &claims, &repo, &lookup_digest).await {
-        return resp;
+        if !caller_may_push(state, auth.as_ref(), &repo).await {
+            return resp;
+        }
     }
     let blob = sqlx::query!(
         "SELECT size_bytes, storage_key FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
@@ -6903,6 +7293,13 @@ async fn handle_get_blob(
     // poison the cache with a partial object.
     let range_header = headers.get(RANGE).and_then(|v| v.to_str().ok());
 
+    // #5793: a hosted repository serves the blob only under an image that
+    // holds it. Before the scan re-block, so another name answers 404, not
+    // 403.
+    if let Err(resp) = enforce_hosted_blob_scope(state, &repo, &lookup_digest).await {
+        return resp;
+    }
+
     // #3003 round 2 (HIGH-3): a blob belonging to an image we already scanned
     // and found VULNERABLE must not serve. Checked before the storage read and
     // before any upstream fetch. Shared with HEAD (#3258) via
@@ -7111,6 +7508,13 @@ async fn handle_get_blob(
 ///   holds whenever the two repos share a location and correctly declines the
 ///   mount when they do not, rather than registering a row pointing at an
 ///   object the target cannot read.
+///
+/// #5793: the source image must hold the blob (uploaded or mounted under it,
+/// or referenced by a manifest that resolves under it), and a satisfied mount
+/// links the blob to the target image. A mount from another image of the
+/// SAME repository is honoured too: it registers nothing but that link (the
+/// repository already holds the bytes and is charged for them), so a client
+/// can reuse a layer under a new image name without uploading it again.
 #[allow(clippy::too_many_arguments)]
 async fn try_mount_blob(
     state: &SharedState,
@@ -7118,6 +7522,7 @@ async fn try_mount_blob(
     target_repo_id: Uuid,
     target_location: &crate::storage::StorageLocation,
     image_name: &str,
+    target_image: &str,
     mount_digest: &str,
     from_image: &str,
 ) -> Option<Response> {
@@ -7129,10 +7534,6 @@ async fn try_mount_blob(
     // it holds the blob. The repo being WRITTEN is `target_repo_id`, already
     // format-gated by `handle_start_upload`'s `resolve_repo_for_write`.
     let source = resolve_repo(&state.db, from_image).await.ok()?;
-    // Mounting from the target itself is a no-op; let the normal path run.
-    if source.id == target_repo_id {
-        return None;
-    }
 
     // Read authorization on the SOURCE repo, evaluated independently of the
     // target. A public repo confers the read baseline; otherwise the caller
@@ -7165,6 +7566,43 @@ async fn try_mount_blob(
         return None;
     }
 
+    // #5793: the source image must hold the blob, as a pull of it would.
+    if !blob_scope_allows(state, &source, &canonical)
+        .await
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let created = || {
+        Response::builder()
+            .status(StatusCode::CREATED)
+            .header(LOCATION, format!("/v2/{}/blobs/{}", image_name, canonical))
+            .header("Docker-Content-Digest", canonical.as_str())
+            .header(CONTENT_LENGTH, "0")
+            .body(Body::empty())
+            .unwrap()
+    };
+    if source.id == target_repo_id {
+        // Same repository: the bytes and their quota charge are already
+        // here; only the target image's claim is new.
+        if let Err(e) = crate::services::oci_image_scope::link_blob(
+            &state.db,
+            target_repo_id,
+            target_image,
+            &canonical,
+        )
+        .await
+        {
+            tracing::warn!(digest = %canonical, "OCI same-repository blob mount link failed: {}", e);
+            return None;
+        }
+        tracing::debug!(
+            repo = %source.key, from = %source.image, to = %target_image, digest = %canonical,
+            "OCI same-repository blob mount satisfied (#5793)"
+        );
+        return Some(created());
+    }
+
     // A mount charges the target repository the blob's bytes, so it is
     // admitted against the target's storage quotas like an upload (#4422).
     // A denial answers 507; a failed check falls back to a normal upload, as
@@ -7194,6 +7632,17 @@ async fn try_mount_blob(
         tracing::warn!(digest = %canonical, "OCI blob mount row insert failed: {}", e);
         return None;
     }
+    if let Err(e) = crate::services::oci_image_scope::link_blob(
+        &mut *tx,
+        target_repo_id,
+        target_image,
+        &canonical,
+    )
+    .await
+    {
+        tracing::warn!(digest = %canonical, "OCI blob mount link insert failed: {}", e);
+        return None;
+    }
     if let Err(e) = tx.commit().await {
         tracing::warn!(digest = %canonical, "OCI blob mount commit failed: {}", e);
         return None;
@@ -7203,15 +7652,7 @@ async fn try_mount_blob(
         from = %source.key, to = %image_name, digest = %canonical,
         "OCI cross-repo blob mount satisfied"
     );
-    Some(
-        Response::builder()
-            .status(StatusCode::CREATED)
-            .header(LOCATION, format!("/v2/{}/blobs/{}", image_name, canonical))
-            .header("Docker-Content-Digest", canonical.as_str())
-            .header(CONTENT_LENGTH, "0")
-            .body(Body::empty())
-            .unwrap(),
-    )
+    Some(created())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7261,6 +7702,7 @@ async fn handle_start_upload(
         );
     }
     let repo_id = repo.id;
+    let image = repo.image.clone();
     let location = repo.location;
 
     // Cross-repository blob mount (#3109). Attempted before any upload session
@@ -7268,8 +7710,10 @@ async fn handle_start_upload(
     // that cannot be satisfied returns None and falls through to the normal
     // upload path, as the spec requires.
     if let (Some(mount), Some(from)) = (query_mount, query_mount_from) {
-        if let Some(resp) =
-            try_mount_blob(state, &claims, repo_id, &location, image_name, mount, from).await
+        if let Some(resp) = try_mount_blob(
+            state, &claims, repo_id, &location, image_name, &image, mount, from,
+        )
+        .await
         {
             return resp;
         }
@@ -7519,6 +7963,27 @@ async fn handle_start_upload(
                 .await;
             return oci_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            );
+        }
+
+        // #5793: the blob was uploaded under this image, so it resolves
+        // under it before any manifest references it (a client HEADs it
+        // before the manifest PUT). Same transaction as the row.
+        if let Err(e) = crate::services::oci_image_scope::link_blob(
+            &mut *blob_tx,
+            repo_id,
+            &image,
+            canonical_digest.as_str(),
+        )
+        .await
+        {
+            let _ = blob_tx.rollback().await;
+            delete_storage_key_best_effort(&storage, &temp_key, "monolithic blob link failed")
+                .await;
+            return oci_error(
+                crate::api::handlers::db_status(&e.to_string()),
                 "INTERNAL_ERROR",
                 &e.to_string(),
             );
@@ -9598,17 +10063,29 @@ async fn complete_claimed_oci_upload(job: OciUploadCompletionJob) -> Response {
     }
     // On conflict clear any `pending_delete_at` marker (#1660): finalizing a
     // chunked upload of a blob GC had marked resurrects it, mirroring the
-    // monolithic-upload path above.
-    if let Err(e) = sqlx::query(
-        "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, digest) DO UPDATE SET pending_delete_at = NULL",
-    )
-    .bind(session.repository_id)
-    .bind(&digest)
-    .bind(size_bytes)
-    .bind(&blob_key)
-    .execute(&mut *tx)
-    .await
-    {
+    // monolithic-upload path above. #5793: in the same transaction, the
+    // blob is linked to the image it was uploaded under, so it resolves
+    // under that image before a manifest references it.
+    let committed: Result<(), sqlx::Error> = async {
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, digest) DO UPDATE SET pending_delete_at = NULL",
+        )
+        .bind(session.repository_id)
+        .bind(&digest)
+        .bind(size_bytes)
+        .bind(&blob_key)
+        .execute(&mut *tx)
+        .await?;
+        crate::services::oci_image_scope::link_blob(
+            &mut *tx,
+            session.repository_id,
+            requested_image(image_name),
+            &digest,
+        )
+        .await
+    }
+    .await;
+    if let Err(e) = committed {
         let _ = tx.rollback().await;
         if final_part.is_some() {
             delete_storage_key_best_effort(&storage, &final_part_key, "oci_blobs insert failed")
@@ -9624,7 +10101,11 @@ async fn complete_claimed_oci_upload(job: OciUploadCompletionJob) -> Response {
         {
             return reset_resp;
         }
-        return oci_error(crate::api::handlers::db_status(&e.to_string()), "INTERNAL_ERROR", &e.to_string());
+        return oci_error(
+            crate::api::handlers::db_status(&e.to_string()),
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        );
     }
 
     let deleted = match sqlx::query(
@@ -9836,35 +10317,43 @@ pub(crate) fn resolve_manifest_content_type(stored: Option<&str>, body: &[u8]) -
 /// How a digest reference resolves on a repository that stores its own
 /// manifests (#1683): through the repository's `oci_manifests` row, the
 /// first-class record of the manifests it holds, scoped to the requested
-/// image name (#4525). Returns the media type to serve, or `None` (404).
+/// image name (#4525, #5793). Returns the media type to serve, or `None`
+/// (404).
 ///
 /// * A tag of THIS image pointing at the digest always resolves (a digest
-///   push records one too).
-/// * Otherwise the row resolves unless the digest was deleted under this
-///   image ([`digest_deleted_under_image`]): every manifest row of the image
-///   for those bytes is in the trash. A delete by digest under another image
-///   name, or a tag overwrite, leaves the digest addressable here, exactly
-///   as before.
-/// * Exception: a manifest whose image rows went to the trash only through
-///   tag deletes (no by-digest delete marker) still resolves while an index
-///   that references it is live under this image name
-///   ([`live_ancestor_under_image`]). That is the untagged child of a tagged
-///   (or by-digest pullable) index: the index pull fetches it by digest, so
-///   answering 404 would break the pull of a live image.
+///   push records one too), and so does a live manifest row of the image for
+///   those bytes.
+/// * A digest deleted under this image ([`image_rows_all_deleted`]: every
+///   manifest row of the image for those bytes is in the trash) answers 404
+///   when the delete named the digest, and otherwise resolves only while an
+///   index that references it is live under this image name
+///   ([`live_ancestor_under_image`]): the untagged child of a tagged (or
+///   by-digest pullable) index, whose index pull fetches it by digest.
+/// * An image with no row for the digest at all resolves it only when the
+///   image holds it (#5793): through its `oci_image_manifests` link (the old
+///   digest of an overwritten tag, #1681), an index live under the image
+///   that references it, or the backfill's legacy marker for a manifest
+///   overwritten before the upgrade, under an image that already holds
+///   content here ([`oci_image_scope::legacy_applies`]). Any other name, a
+///   never-pushed one included, answers 404. A repository the backfill has
+///   not reached yet keeps the old repository-wide rule
+///   ([`oci_image_scope::scope_enforced`]).
 /// * No row but a tag of this image: a manifest a pre-1.11 replica pushed
 ///   during a rolling upgrade before the reconcile recorded it. Served from
 ///   the tag and counted in `ak_oci_manifest_reads_without_row_total`.
 ///
-/// This replaces the #1681 content-addressable fallback, which inferred
-/// ownership from `manifest_blob_refs`/`oci_manifest_refs` edges: the row is
-/// that proof now. A shared cloud backend does not namespace
-/// `oci-manifests/<digest>` per repository, so the row being per repository
-/// is what stops one repository from serving another's manifest by digest.
+/// A shared cloud backend does not namespace `oci-manifests/<digest>` per
+/// repository, so the row being per repository is what stops one repository
+/// from serving another's manifest by digest.
+///
+/// [`oci_image_scope::legacy_applies`]: crate::services::oci_image_scope::legacy_applies
+/// [`oci_image_scope::scope_enforced`]: crate::services::oci_image_scope::scope_enforced
 async fn resolve_hosted_digest(
     state: &SharedState,
     repo: &OciRepoInfo,
     digest: &str,
 ) -> Result<Option<String>, sqlx::Error> {
+    use crate::services::oci_image_scope;
     let tag_row = sqlx::query_as::<_, (String, String)>(SELECT_IMAGE_DIGEST_TAG_ROW_SQL)
         .bind(repo.id)
         .bind(&repo.image)
@@ -9877,15 +10366,38 @@ async fn resolve_hosted_digest(
         (Some(content_type), Some(_)) => Ok(Some(content_type)),
         (Some(content_type), None) => {
             let rows = digest_manifest_row_states(state, repo, digest).await?;
-            if !image_rows_all_deleted(&rows, &repo.image) {
+            if image_rows_all_deleted(&rows, &repo.image) {
+                if image_rows_deleted_by_digest(&rows, &repo.image, digest) {
+                    return Ok(None);
+                }
+                let scoped = oci_image_scope::scope_enforced(&state.db, repo.id).await?;
+                return Ok(live_ancestor_under_image(state, repo, digest, scoped)
+                    .await?
+                    .then_some(content_type));
+            }
+            if image_has_live_row(&rows, &repo.image) {
                 return Ok(Some(content_type));
             }
-            if image_rows_deleted_by_digest(&rows, &repo.image, digest) {
-                return Ok(None);
+            // #5793: no row of this image names the digest.
+            if !oci_image_scope::scope_enforced(&state.db, repo.id).await? {
+                return Ok(Some(content_type));
             }
-            Ok(live_ancestor_under_image(state, repo, digest)
-                .await?
-                .then_some(content_type))
+            if oci_image_scope::manifest_linked(&state.db, repo.id, &repo.image, digest).await?
+                || live_ancestor_under_image(state, repo, digest, true).await?
+            {
+                return Ok(Some(content_type));
+            }
+            if oci_image_scope::legacy_applies(&state.db, repo.id, &repo.image, digest).await? {
+                // Remember the image's claim, so the manifest's blobs resolve
+                // under it too and a later delete under it can drop it.
+                if let Err(e) =
+                    oci_image_scope::link_manifest(&state.db, repo.id, &repo.image, digest).await
+                {
+                    tracing::debug!(error = %e, "legacy manifest link insert failed");
+                }
+                return Ok(Some(content_type));
+            }
+            Ok(None)
         }
         (None, Some((_, tag_content_type))) => {
             metrics::counter!("ak_oci_manifest_reads_without_row_total").increment(1);
@@ -9896,10 +10408,22 @@ async fn resolve_hosted_digest(
     }
 }
 
+/// Whether one of the repository's manifest rows for these bytes is a live
+/// row of `image` (a tag-path or digest-path row the image still holds).
+fn image_has_live_row(rows: &[(String, bool, String)], image: &str) -> bool {
+    rows.iter().any(|(path, is_deleted, repo_key)| {
+        !*is_deleted
+            && crate::services::oci_migration_reindex::manifest_row_image(path, repo_key).as_deref()
+                == Some(image)
+    })
+}
+
 /// Whether an index that references `digest` (directly or through nested
 /// indexes, at most [`MAX_INDEX_NESTING`] levels up) is live under
-/// `repo.image` (#1683): tagged under that image name, or recorded in
-/// `oci_manifests` with none of the image's manifest rows for it in the trash.
+/// `repo.image` (#1683): tagged under that image name, or held by it
+/// (recorded in `oci_manifests` before the repository is scoped, linked to
+/// the image after, #5793) with none of the image's manifest rows for it in
+/// the trash.
 const LIVE_ANCESTOR_UNDER_IMAGE_SQL: &str = r#"
     WITH RECURSIVE anc(digest, depth) AS (
         SELECT omr.parent_digest, 1
@@ -9920,9 +10444,19 @@ const LIVE_ANCESTOR_UNDER_IMAGE_SQL: &str = r#"
                   AND ot.manifest_digest = anc.digest
               )
            OR (
-                EXISTS (
-                    SELECT 1 FROM oci_manifests pm
-                    WHERE pm.repository_id = $1 AND pm.digest = anc.digest
+                -- #5793: once the repository is scoped ($5) the index must
+                -- be held by this image, not merely recorded in the
+                -- repository.
+                (
+                    (NOT $5 AND EXISTS (
+                        SELECT 1 FROM oci_manifests pm
+                        WHERE pm.repository_id = $1 AND pm.digest = anc.digest
+                    ))
+                    OR ($5 AND EXISTS (
+                        SELECT 1 FROM oci_image_manifests il
+                        WHERE il.repository_id = $1 AND il.image = $3
+                          AND il.digest = anc.digest
+                    ))
                 )
                 AND NOT EXISTS (
                     SELECT 1 FROM artifacts a
@@ -9943,12 +10477,14 @@ async fn live_ancestor_under_image(
     state: &SharedState,
     repo: &OciRepoInfo,
     digest: &str,
+    scoped: bool,
 ) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(LIVE_ANCESTOR_UNDER_IMAGE_SQL)
         .bind(repo.id)
         .bind(digest)
         .bind(&repo.image)
         .bind(MAX_INDEX_NESTING)
+        .bind(scoped)
         .fetch_one(&state.db)
         .await
 }
@@ -10299,10 +10835,11 @@ async fn handle_head_manifest(
     // Bind the authenticated claims (don't discard) so scanner-scoped pull
     // tokens can be enforced per-repository below (#2093). The helper also
     // enforces the token's `read:artifacts` action ceiling (#3408).
-    let claims = match authenticate_oci_read(state, headers, base_url, &scope).await {
+    let auth = match authenticate_oci_read_with_scopes(state, headers, base_url, &scope).await {
         Ok(c) => c,
         Err(resp) => return resp,
     };
+    let claims = auth.as_ref().map(|(claims, _)| claims.clone());
 
     // Anonymous tokens may only access public repositories, and a key naming
     // no repository answers them with the same challenge (#3730).
@@ -10420,11 +10957,20 @@ async fn handle_head_manifest(
         {
             // #2912: same gate as the GET path, so a HEAD does not report a
             // quarantined image as available and a client cannot use it to
-            // confirm the image exists.
+            // confirm the image exists. #5606: except to a caller who may push
+            // here, so `docker push` can replace a held tag. Headers only; the
+            // GET stays refused.
             if let Some(blocked) =
                 oci_manifest_quarantine_block(state, repo.id, &manifest_digest).await
             {
-                return blocked;
+                if !caller_may_push(state, auth.as_ref(), &repo).await {
+                    return blocked;
+                }
+                tracing::info!(
+                    repo = %repo.key,
+                    manifest_digest = %manifest_digest,
+                    "answering a held manifest's HEAD to a caller who may push (no body)"
+                );
             }
 
             return build_local_manifest_response(&manifest_digest, &content_type, data, false);
@@ -12625,6 +13171,7 @@ async fn commit_pushed_manifest(
         crate::services::package_service::register_published_package_with_metadata(
             &state.db,
             &state.event_bus,
+            crate::services::package_service::PublishedArtifact::new(artifact_id, m.uploaded_by),
             m.repo_id,
             m.image,
             m.reference,
@@ -13396,9 +13943,15 @@ async fn handle_tags_list(
         Err(e) => return e,
     };
 
+    // #5794: the response `name` is the full `<name>` from the request path
+    // (`<repo key>/<image>`), not the image path inside the AK repository.
+    // The distribution spec answers `{"name": "<name>", "tags": [...]}`, and
+    // two repositories holding the same image path would otherwise be
+    // indistinguishable to a client that keys on the returned name.
+
     // n=0: return empty list per spec
     if n == 0 {
-        return build_tags_response(&repo.image, vec![]);
+        return build_tags_response(image_name, vec![]);
     }
 
     // The CALLER, for the virtual-member walk. For a Virtual repo the read
@@ -13434,7 +13987,7 @@ async fn handle_tags_list(
         );
     }
 
-    build_tags_response_with_pagination(&repo.image, page, has_more, image_name, n)
+    build_tags_response_with_pagination(page, has_more, image_name, n)
 }
 
 async fn resolve_tags_page(
@@ -13510,10 +14063,11 @@ async fn resolve_local_tags_page(
     Ok((page.tags, page.has_more))
 }
 
-/// Build a JSON response for tags/list with no pagination.
-fn build_tags_response(image: &str, tags: Vec<String>) -> Response {
+/// Build a JSON response for tags/list with no pagination. `name` is the
+/// full `<name>` of the request path (#5794).
+fn build_tags_response(name: &str, tags: Vec<String>) -> Response {
     let resp = TagsListResponse {
-        name: image.to_string(),
+        name: name.to_string(),
         tags,
     };
     let json = serde_json::to_string(&resp).unwrap_or_default();
@@ -13526,8 +14080,9 @@ fn build_tags_response(image: &str, tags: Vec<String>) -> Response {
 }
 
 /// Build a JSON response for tags/list with optional Link pagination header.
+/// `image_name` is the full `<name>` of the request path: it is both the
+/// response `name` (#5794) and the `Link` path.
 fn build_tags_response_with_pagination(
-    image: &str,
     page: Vec<String>,
     has_more: bool,
     image_name: &str,
@@ -13546,7 +14101,7 @@ fn build_tags_response_with_pagination(
     }
 
     let resp = TagsListResponse {
-        name: image.to_string(),
+        name: image_name.to_string(),
         tags: page,
     };
     let json = serde_json::to_string(&resp).unwrap_or_default();
@@ -14195,6 +14750,27 @@ async fn handle_referrers(
                 &e.to_string(),
             )
         }
+    };
+    // #5793: on a hosted repository a referrer is listed under `<name>` only
+    // when it resolves under that image, as a pull of it by digest would.
+    let rows = if stores_own_manifests(&repo.repo_type) {
+        let mut scoped = Vec::with_capacity(rows.len());
+        for row in rows {
+            match resolve_hosted_digest(state, &repo, &row.manifest_digest).await {
+                Ok(Some(_)) => scoped.push(row),
+                Ok(None) => {}
+                Err(e) => {
+                    return oci_error(
+                        crate::api::handlers::db_status(&e.to_string()),
+                        "INTERNAL_ERROR",
+                        &e.to_string(),
+                    )
+                }
+            }
+        }
+        scoped
+    } else {
+        rows
     };
 
     let filter = query.get("artifactType").map(|s| s.as_str());
@@ -14960,6 +15536,17 @@ pub(crate) async fn delete_oci_manifest_content_in_tx(
     // Without the lock a push committing between the reads and the delete
     // left a tagged manifest with no record.
     crate::services::oci_manifests::lock_in_tx(tx, repo_id, digest).await?;
+    // #5793: this image stops holding the manifest once it is deleted by
+    // digest under it, or its last tag naming it is gone. Other images'
+    // links are untouched (#4466).
+    crate::services::oci_image_scope::unlink_manifest_in_tx(
+        tx,
+        repo_id,
+        image,
+        digest,
+        scope == OciIndexDeleteScope::ContentAddressed,
+    )
+    .await?;
     let digest_still_tagged = sqlx::query_scalar!(
         "SELECT EXISTS(SELECT 1 FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2)",
         repo_id,
@@ -19613,6 +20200,318 @@ mod tests {
                 .expect("malformed digest reference must be treated as a tag");
         assert_eq!(returned_digest, super::compute_sha256(&body));
     }
+
+    // -----------------------------------------------------------------------
+    // #5683: the OCI Basic paths (`GET /v2/`, `verify_oci_credential` behind
+    // every manifest/blob verb, and `/v2/token`) classify the password by
+    // shape like the auth middleware's `resolve_basic_pair` (#5640): a dead
+    // token-shaped password is refused without a password bcrypt, i.e.
+    // without an auth-capacity permit, and only a real password pays one.
+    //
+    // Counted, not timed, exactly like `basic_token_first_5640` in
+    // `middleware/auth.rs`: `bcrypt_verify_counter` counts every
+    // `AuthService::verify_password` call, the only place the permit is
+    // taken. nextest's process-per-test isolation keeps it private.
+    // -----------------------------------------------------------------------
+    mod oci_basic_token_first_5683 {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::auth_service::bcrypt_verify_counter;
+        use std::sync::atomic::Ordering;
+
+        const SECRET: &str = "test-secret-at-least-32-bytes-long-for-5683";
+        const PASSWORD: &str = "Correct-Horse-Battery-5683";
+
+        fn verifies() -> u64 {
+            bcrypt_verify_counter().load(Ordering::Relaxed)
+        }
+
+        fn basic_headers(username: &str, password: &str) -> HeaderMap {
+            let enc =
+                base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Basic {enc}")).expect("header value"),
+            );
+            headers
+        }
+
+        /// A local account with a real (cost-4) password hash, hashed with
+        /// `bcrypt::hash` directly so seeding takes no permit and no count.
+        async fn local_user(pool: &sqlx::PgPool) -> (Uuid, String) {
+            let id = Uuid::new_v4();
+            let username = format!("ph-5683-{id}");
+            let hash = bcrypt::hash(PASSWORD, 4).expect("hash password");
+            sqlx::query(
+                r#"INSERT INTO users
+                   (id, username, email, password_hash, auth_provider,
+                    is_admin, is_active, is_service_account)
+                   VALUES ($1, $2, $3, $4, 'local', false, true, false)"#,
+            )
+            .bind(id)
+            .bind(&username)
+            .bind(format!("{username}@test.local"))
+            .bind(&hash)
+            .execute(pool)
+            .await
+            .expect("insert local user");
+            (id, username)
+        }
+
+        async fn failed_logins(pool: &sqlx::PgPool, user_id: Uuid) -> i32 {
+            sqlx::query_scalar("SELECT failed_login_attempts FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(pool)
+                .await
+                .expect("read failed_login_attempts")
+        }
+
+        async fn drop_user(pool: &sqlx::PgPool, user_id: Uuid) {
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+
+        async fn v2_status(state: &SharedState, headers: HeaderMap) -> StatusCode {
+            version_check(
+                State(state.clone()),
+                headers,
+                RequestBaseUrl("http://localhost:8080".to_string()),
+            )
+            .await
+            .status()
+        }
+
+        async fn token_status(state: &SharedState, headers: HeaderMap) -> StatusCode {
+            token(
+                State(state.clone()),
+                headers,
+                None,
+                Ok(Query(TokenQuery {
+                    service: None,
+                    account: None,
+                    offline_token: None,
+                })),
+                Ok(Bytes::new()),
+            )
+            .await
+            .status()
+        }
+
+        /// `(minted, expired, revoked)` API tokens for `user_id`.
+        async fn tokens(svc: &AuthService, pool: &sqlx::PgPool, user_id: Uuid) -> [String; 3] {
+            let mut out = Vec::new();
+            let mut ids = Vec::new();
+            for name in ["live", "expired", "revoked"] {
+                let (token, id) = svc
+                    .generate_api_token(user_id, name, vec!["read:artifacts".into()], None)
+                    .await
+                    .expect("mint token");
+                out.push(token);
+                ids.push(id);
+            }
+            sqlx::query(
+                "UPDATE api_tokens SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
+            )
+            .bind(ids[1])
+            .execute(pool)
+            .await
+            .expect("expire");
+            sqlx::query("UPDATE api_tokens SET revoked_at = NOW() WHERE id = $1")
+                .bind(ids[2])
+                .execute(pool)
+                .await
+                .expect("revoke");
+            out.try_into().expect("three tokens")
+        }
+
+        /// The issue's shape: a dead token as the Basic password on `GET
+        /// /v2/`, on an OCI verb (`verify_oci_credential`) and on
+        /// `/v2/token` is a 401 with no bcrypt and no failed-login write.
+        /// Before the fix each of them fell through to the password check
+        /// and paid a bcrypt (and an auth permit) per request.
+        #[tokio::test]
+        async fn oci_basic_dead_token_runs_no_bcrypt() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = test_state_with_secret_and_pool(SECRET, pool.clone());
+            let svc = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+            let (user_id, username) = local_user(&pool).await;
+            let [_live, expired, revoked] = tokens(&svc, &pool, user_id).await;
+            let never_minted = format!("deadbeef_{}", Uuid::new_v4().simple());
+            // JWT-shaped, signed with a key this server does not hold.
+            let foreign_jwt =
+                mint_access_jwt("some-other-secret-at-least-32-bytes", user_id, &username);
+
+            let before = verifies();
+            let mut answers = Vec::new();
+            for secret in [&never_minted, &expired, &revoked, &foreign_jwt] {
+                let headers = basic_headers(&username, secret);
+                answers.push((
+                    secret.clone(),
+                    v2_status(&state, headers.clone()).await,
+                    verify_oci_credential(&state.db, &state.config, &headers)
+                        .await
+                        .err(),
+                    token_status(&state, headers).await,
+                ));
+            }
+            let ran = verifies() - before;
+            let failed = failed_logins(&pool, user_id).await;
+            drop_user(&pool, user_id).await;
+
+            for (secret, v2, verb, exchange) in answers {
+                assert_eq!(v2, StatusCode::UNAUTHORIZED, "GET /v2/ with {secret}");
+                assert_eq!(verb, Some(OciAuthError::Invalid), "OCI verb with {secret}");
+                assert_eq!(
+                    exchange,
+                    StatusCode::UNAUTHORIZED,
+                    "/v2/token with {secret}"
+                );
+            }
+            assert_eq!(
+                ran, 0,
+                "dead tokens as the OCI Basic password ran {ran} bcrypt verifies (each one \
+                 takes an auth-capacity permit, #5683)"
+            );
+            assert_eq!(failed, 0, "a dead token is not a failed login");
+        }
+
+        /// Positive controls: a live API token, a live access token and the
+        /// real password still authenticate on all three paths; a live token
+        /// costs only its own verify, and a wrong password still pays exactly
+        /// one bcrypt on each path.
+        #[tokio::test]
+        async fn oci_basic_live_credentials_still_authenticate() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = test_state_with_secret_and_pool(SECRET, pool.clone());
+            let svc = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+            let (user_id, username) = local_user(&pool).await;
+            let [live, _expired, _revoked] = tokens(&svc, &pool, user_id).await;
+            let jwt = mint_access_jwt(SECRET, user_id, &username);
+
+            let mut answers = Vec::new();
+            for secret in [&live, &jwt, &PASSWORD.to_string()] {
+                let headers = basic_headers(&username, secret);
+                answers.push((
+                    secret.clone(),
+                    v2_status(&state, headers.clone()).await,
+                    verify_oci_credential(&state.db, &state.config, &headers)
+                        .await
+                        .map(|(claims, _)| claims.sub)
+                        .ok(),
+                    token_status(&state, headers).await,
+                ));
+            }
+
+            // A live token costs exactly its own verify on each path (each
+            // handler builds its own `AuthService`, so there is no shared
+            // token cache to hit), never a second, password bcrypt.
+            let headers = basic_headers(&username, &live);
+            let before = verifies();
+            let cached = (
+                v2_status(&state, headers.clone()).await,
+                verify_oci_credential(&state.db, &state.config, &headers)
+                    .await
+                    .is_ok(),
+                token_status(&state, headers).await,
+            );
+            let cached_cost = verifies() - before;
+
+            let headers = basic_headers(&username, "wrong-password");
+            let mut wrong = Vec::new();
+            for path in 0..3 {
+                let before = verifies();
+                let status = match path {
+                    0 => v2_status(&state, headers.clone()).await,
+                    1 => match verify_oci_credential(&state.db, &state.config, &headers).await {
+                        Ok(_) => StatusCode::OK,
+                        Err(_) => StatusCode::UNAUTHORIZED,
+                    },
+                    _ => token_status(&state, headers.clone()).await,
+                };
+                wrong.push((path, status, verifies() - before));
+            }
+            drop_user(&pool, user_id).await;
+
+            for (secret, v2, verb, exchange) in answers {
+                assert_eq!(v2, StatusCode::OK, "GET /v2/ with {secret}");
+                assert_eq!(verb, Some(user_id), "OCI verb with {secret}");
+                assert_eq!(exchange, StatusCode::OK, "/v2/token with {secret}");
+            }
+            assert_eq!(cached, (StatusCode::OK, true, StatusCode::OK));
+            assert_eq!(cached_cost, 3, "a live API token costs one verify per path");
+            for (path, status, cost) in wrong {
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "path {path}");
+                assert_eq!(cost, 1, "a wrong password pays one bcrypt on path {path}");
+            }
+        }
+        /// #5485: the OCI Basic password arm draws on the Basic-password
+        /// login budget like every other Basic surface. Once the
+        /// (username, IP) failure budget is spent, `GET /v2/` and an OCI verb
+        /// answer 429 with `Retry-After` and run no bcrypt.
+        #[tokio::test]
+        async fn oci_basic_password_is_refused_once_the_budget_is_spent() {
+            use crate::api::middleware::client_ip::with_client_ip_scope;
+            use crate::api::middleware::rate_limit::{
+                install_basic_password_budget, LoginRateLimitState, RateLimitExemptions,
+                RateLimitState, RateLimiter,
+            };
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            install_basic_password_budget(LoginRateLimitState {
+                inner: RateLimitState {
+                    limiter: Arc::new(RateLimiter::new(1, 900)),
+                    exemptions: Arc::new(RateLimitExemptions::new(Vec::new(), false)),
+                    enabled: true,
+                    trusted_proxies: Arc::new(Vec::new()),
+                },
+                backstop: Arc::new(RateLimiter::new(1_000_000, 900)),
+                failed_by_ip: Arc::new(RateLimiter::new(1_000, 900)),
+                audit: None,
+            });
+            let state = test_state_with_secret_and_pool(SECRET, pool.clone());
+            let (user_id, username) = local_user(&pool).await;
+            let ip: std::net::IpAddr = "198.51.100.21".parse().unwrap();
+            let wrong = basic_headers(&username, "wrong-password");
+            let right = basic_headers(&username, PASSWORD);
+
+            let first = with_client_ip_scope(Some(ip), v2_status(&state, wrong.clone())).await;
+            let before = verifies();
+            let refused = with_client_ip_scope(Some(ip), async {
+                version_check(
+                    State(state.clone()),
+                    right.clone(),
+                    RequestBaseUrl("http://localhost:8080".to_string()),
+                )
+                .await
+            })
+            .await;
+            let verb = with_client_ip_scope(
+                Some(ip),
+                verify_oci_credential(&state.db, &state.config, &right),
+            )
+            .await
+            .err();
+            let ran = verifies() - before;
+            drop_user(&pool, user_id).await;
+
+            assert_eq!(first, StatusCode::UNAUTHORIZED);
+            assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert!(refused
+                .headers()
+                .contains_key(axum::http::header::RETRY_AFTER));
+            assert!(matches!(verb, Some(OciAuthError::RateLimited(s)) if s > 0));
+            assert_eq!(ran, 0, "a refused Basic password runs no bcrypt");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -21732,6 +22631,92 @@ mod token_lockout_regression_tests {
     /// request and locked the account out after `account_lockout_threshold`
     /// calls. This test exercises `authenticate_oci_with_scopes` directly and asserts
     /// the counter stays at zero across many requests.
+    /// #5484: `docker` clients that skip `/v2/token` send Basic
+    /// `user:password` on every verb. `/v2/token` refuses a TOTP-enrolled
+    /// account's password; the direct credential used to accept it. Now both
+    /// refuse it, the account's API token still works as the password, and
+    /// an account without TOTP still authenticates with its password.
+    #[tokio::test]
+    async fn direct_basic_password_is_refused_for_a_totp_account_5484() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (plain_id, plain_name) = tdh::create_user(&pool).await;
+        let pwd_hash = bcrypt::hash("real-test-password", 4).expect("bcrypt hash");
+        sqlx::query("UPDATE users SET password_hash = $1 WHERE id = ANY($2)")
+            .bind(&pwd_hash)
+            .bind(vec![user_id, plain_id])
+            .execute(&pool)
+            .await
+            .expect("update password_hash");
+        sqlx::query(
+            "UPDATE users SET totp_enabled = true, totp_secret = 'JBSWY3DPEHPK3PXP' WHERE id = $1",
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("enrol totp");
+
+        let storage_dir = std::env::temp_dir().join(format!("oci-5484-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        let (api_token, _) = auth_service
+            .generate_api_token(user_id, "oci-5484", vec!["*".to_string()], None)
+            .await
+            .expect("generate API token");
+        let headers_for = |user: &str, secret: &str| {
+            let mut headers = HeaderMap::new();
+            let value = format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(format!("{user}:{secret}"))
+            );
+            headers.insert(
+                AUTHORIZATION,
+                axum::http::HeaderValue::from_str(&value).expect("valid basic header"),
+            );
+            headers
+        };
+
+        let password = authenticate_oci_with_scopes(
+            &state.db,
+            &state.config,
+            &headers_for(&username, "real-test-password"),
+        )
+        .await;
+        let token = authenticate_oci_with_scopes(
+            &state.db,
+            &state.config,
+            &headers_for(&username, &api_token),
+        )
+        .await;
+        let plain = authenticate_oci_with_scopes(
+            &state.db,
+            &state.config,
+            &headers_for(&plain_name, "real-test-password"),
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = ANY($1)")
+            .bind(vec![user_id, plain_id])
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert!(
+            matches!(password, Err(OciAuthError::Invalid)),
+            "a TOTP account's password must be refused: {:?}",
+            password.map(|(c, _)| c.sub)
+        );
+        assert_eq!(token.expect("API token as the password").0.sub, user_id);
+        assert_eq!(plain.expect("password without TOTP").0.sub, plain_id);
+    }
+
     #[tokio::test]
     async fn authenticate_oci_verb_basic_auth_does_not_bump_failed_login_attempts() {
         let Some(pool) = tdh::try_pool().await else {
@@ -22967,6 +23952,763 @@ mod manifest_digest_db_tests {
         );
 
         cleanup(&fx).await;
+    }
+
+    // -----------------------------------------------------------------
+    // #5793: a hosted digest resolves only under an image that holds it.
+    // -----------------------------------------------------------------
+
+    const SCOPE_MANIFEST_CT: &str = "application/vnd.oci.image.manifest.v1+json";
+    const SCOPE_INDEX_CT: &str = "application/vnd.oci.image.index.v1+json";
+
+    fn sha256_digest(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("sha256:{:x}", hasher.finalize())
+    }
+
+    /// An image manifest naming `config` and `layer` (with their real sizes).
+    fn scope_image_manifest(config: &[u8], layer: &[u8], note: &str) -> Bytes {
+        Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": SCOPE_MANIFEST_CT,
+                "config": {
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": sha256_digest(config),
+                    "size": config.len(),
+                },
+                "layers": [{
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": sha256_digest(layer),
+                    "size": layer.len(),
+                }],
+                "annotations": {"note": note},
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn scope_index(child: &str, child_len: usize) -> Bytes {
+        Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": SCOPE_INDEX_CT,
+                "manifests": [{
+                    "mediaType": SCOPE_MANIFEST_CT,
+                    "digest": child,
+                    "size": child_len,
+                    "platform": {"architecture": "amd64", "os": "linux"},
+                }],
+            }))
+            .unwrap(),
+        )
+    }
+
+    /// Requests against one fixture repository, as `fx.user_id`.
+    struct ScopeRig {
+        fx: tdh::Fixture,
+        auth: String,
+    }
+
+    impl ScopeRig {
+        async fn setup() -> Option<Self> {
+            if std::env::var("DATABASE_URL").is_err() {
+                if require_db_under_coverage() {
+                    panic!("DATABASE_URL must be set for OCI image-scope tests");
+                }
+                return None;
+            }
+            let fx = tdh::Fixture::setup("local", "docker")
+                .await
+                .expect("fixture setup");
+            tdh::grant_repo_actions(
+                &fx.pool,
+                fx.repo_id,
+                fx.user_id,
+                &["read", "write", "delete"],
+            )
+            .await;
+            let auth = bearer(&fx).await;
+            Some(Self { fx, auth })
+        }
+
+        async fn call(
+            &self,
+            method: Method,
+            path: String,
+            content_type: Option<&str>,
+            body: Bytes,
+        ) -> (StatusCode, HeaderMap, Bytes) {
+            send(
+                router(None).with_state(self.fx.state.clone()),
+                req(method, path, &self.auth, content_type, body),
+            )
+            .await
+        }
+
+        /// `<method> /v2/<key>/<image>/<rest>`, answering the status only.
+        async fn status(&self, method: Method, image: &str, rest: &str) -> StatusCode {
+            self.call(
+                method,
+                format!("/{}/{}/{}", self.fx.repo_key, image, rest),
+                None,
+                Bytes::new(),
+            )
+            .await
+            .0
+        }
+
+        /// The OCI error code of a `GET /v2/<key>/<image>/<rest>`.
+        async fn error_code(&self, image: &str, rest: &str) -> String {
+            let (_, _, body) = self
+                .call(
+                    Method::GET,
+                    format!("/{}/{}/{}", self.fx.repo_key, image, rest),
+                    None,
+                    Bytes::new(),
+                )
+                .await;
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v["errors"][0]["code"].as_str().map(str::to_string))
+                .unwrap_or_default()
+        }
+
+        /// Monolithic blob upload under `image`.
+        async fn push_blob(&self, image: &str, bytes: &[u8]) -> String {
+            let digest = sha256_digest(bytes);
+            let (st, _, body) = self
+                .call(
+                    Method::POST,
+                    format!(
+                        "/{}/{}/blobs/uploads/?digest={}",
+                        self.fx.repo_key, image, digest
+                    ),
+                    Some("application/octet-stream"),
+                    Bytes::copy_from_slice(bytes),
+                )
+                .await;
+            assert_eq!(
+                st,
+                StatusCode::CREATED,
+                "blob upload under {image}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            digest
+        }
+
+        async fn push_manifest(
+            &self,
+            image: &str,
+            reference: &str,
+            ct: &str,
+            body: &Bytes,
+        ) -> String {
+            let (st, h, resp) = self
+                .call(
+                    Method::PUT,
+                    format!("/{}/{}/manifests/{}", self.fx.repo_key, image, reference),
+                    Some(ct),
+                    body.clone(),
+                )
+                .await;
+            assert_eq!(
+                st,
+                StatusCode::CREATED,
+                "PUT {image}:{reference}: {}",
+                String::from_utf8_lossy(&resp)
+            );
+            h["Docker-Content-Digest"].to_str().unwrap().to_string()
+        }
+
+        /// Push a config + layer and an image manifest referencing them under
+        /// `image:reference`; returns (manifest digest, manifest bytes, layer
+        /// digest).
+        async fn push_image(
+            &self,
+            image: &str,
+            reference: &str,
+            note: &str,
+        ) -> (String, Bytes, String) {
+            let config = format!("{{\"note\":\"{note}\"}}").into_bytes();
+            let layer = format!("layer bytes of {note}").into_bytes();
+            self.push_blob(image, &config).await;
+            let layer_digest = self.push_blob(image, &layer).await;
+            let manifest = scope_image_manifest(&config, &layer, note);
+            let digest = self
+                .push_manifest(image, reference, SCOPE_MANIFEST_CT, &manifest)
+                .await;
+            (digest, manifest, layer_digest)
+        }
+
+        async fn scoped(&self) -> bool {
+            crate::services::oci_image_scope::scope_enforced(&self.fx.pool, self.fx.repo_id)
+                .await
+                .expect("read scope marker")
+        }
+
+        async fn teardown(self) {
+            for table in ["oci_image_scope_backfill", "oci_manifests"] {
+                let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                    "DELETE FROM {table} WHERE repository_id = $1"
+                )))
+                .bind(self.fx.repo_id)
+                .execute(&self.fx.pool)
+                .await;
+            }
+            cleanup(&self.fx).await;
+        }
+    }
+
+    /// #5793: a never-pushed name, and a name that holds a different image,
+    /// answer 404 MANIFEST_UNKNOWN / BLOB_UNKNOWN for an index digest, its
+    /// platform child and a layer, while the image that holds them serves
+    /// all three. On `main` every one of these resolved under any name.
+    #[tokio::test]
+    async fn digest_resolves_only_under_an_image_that_holds_it_5793() {
+        let Some(rig) = ScopeRig::setup().await else {
+            return;
+        };
+        // A multi-platform push: the child by digest, then the index by tag.
+        let config = b"{\"arch\":\"amd64\"}".to_vec();
+        let layer = b"aktest/tags layer bytes".to_vec();
+        rig.push_blob("aktest/tags", &config).await;
+        let layer_digest = rig.push_blob("aktest/tags", &layer).await;
+        let child = scope_image_manifest(&config, &layer, "child");
+        let child_digest = sha256_digest(&child);
+        rig.push_manifest("aktest/tags", &child_digest, SCOPE_MANIFEST_CT, &child)
+            .await;
+        let index = scope_index(&child_digest, child.len());
+        let index_digest = rig
+            .push_manifest("aktest/tags", "1.0", SCOPE_INDEX_CT, &index)
+            .await;
+        // A different image in the same repository.
+        let (other_digest, _, other_layer) = rig.push_image("other/img", "v1", "other").await;
+        let scoped = rig.scoped().await;
+
+        let index_ref = format!("manifests/{index_digest}");
+        let child_ref = format!("manifests/{child_digest}");
+        let blob_ref = format!("blobs/{layer_digest}");
+        let mut got = Vec::new();
+        for image in ["nobody/ever", "other/img"] {
+            for rest in [&index_ref, &child_ref, &blob_ref] {
+                got.push((
+                    format!("GET {image}/{rest}"),
+                    rig.status(Method::GET, image, rest).await,
+                    rig.error_code(image, rest).await,
+                ));
+                got.push((
+                    format!("HEAD {image}/{rest}"),
+                    rig.status(Method::HEAD, image, rest).await,
+                    String::new(),
+                ));
+            }
+        }
+        let holder: Vec<(String, StatusCode)> = {
+            let mut v = Vec::new();
+            for rest in [&index_ref, &child_ref, &blob_ref, &"tags/list".to_string()] {
+                v.push((
+                    format!("aktest/tags/{rest}"),
+                    rig.status(Method::GET, "aktest/tags", rest).await,
+                ));
+            }
+            v.push((
+                "other/img own manifest".into(),
+                rig.status(
+                    Method::GET,
+                    "other/img",
+                    &format!("manifests/{other_digest}"),
+                )
+                .await,
+            ));
+            v.push((
+                "other/img own layer".into(),
+                rig.status(Method::GET, "other/img", &format!("blobs/{other_layer}"))
+                    .await,
+            ));
+            v
+        };
+        let foreign_layer = rig
+            .status(Method::GET, "aktest/tags", &format!("blobs/{other_layer}"))
+            .await;
+        rig.teardown().await;
+
+        assert!(scoped, "a repository's first push scopes it");
+        for (what, status, code) in got {
+            assert_eq!(status, StatusCode::NOT_FOUND, "{what}");
+            if what.starts_with("GET") {
+                let want = if what.contains("/blobs/") {
+                    "BLOB_UNKNOWN"
+                } else {
+                    "MANIFEST_UNKNOWN"
+                };
+                assert_eq!(code, want, "{what}");
+            }
+        }
+        for (what, status) in holder {
+            assert_eq!(status, StatusCode::OK, "{what}");
+        }
+        assert_eq!(
+            foreign_layer,
+            StatusCode::NOT_FOUND,
+            "aktest/tags must not serve other/img's layer"
+        );
+    }
+
+    /// #1681 under #5793: the old digest of an overwritten tag stays pullable
+    /// by digest under its own image (through the image's link), and only
+    /// there.
+    #[tokio::test]
+    async fn overwritten_tag_digest_stays_pullable_only_under_its_image_5793() {
+        let Some(rig) = ScopeRig::setup().await else {
+            return;
+        };
+        let (old_digest, old_body, old_layer) = rig.push_image("xb", "v1", "old").await;
+        let (new_digest, _, _) = rig.push_image("xb", "v1", "new").await;
+        rig.push_image("xd", "v1", "xd").await;
+        let (st, _, body) = rig
+            .call(
+                Method::GET,
+                format!("/{}/xb/manifests/{}", rig.fx.repo_key, old_digest),
+                None,
+                Bytes::new(),
+            )
+            .await;
+        let new_by_digest = rig
+            .status(Method::GET, "xb", &format!("manifests/{new_digest}"))
+            .await;
+        let old_layer_xb = rig
+            .status(Method::GET, "xb", &format!("blobs/{old_layer}"))
+            .await;
+        let never = rig
+            .status(Method::GET, "xc", &format!("manifests/{old_digest}"))
+            .await;
+        let other = rig
+            .status(Method::GET, "xd", &format!("manifests/{old_digest}"))
+            .await;
+        rig.teardown().await;
+
+        assert_eq!(st, StatusCode::OK, "xb@old digest after the overwrite");
+        assert_eq!(body, old_body);
+        assert_eq!(new_by_digest, StatusCode::OK);
+        assert_eq!(
+            old_layer_xb,
+            StatusCode::OK,
+            "the old image's layer under xb"
+        );
+        assert_eq!(never, StatusCode::NOT_FOUND, "a never-pushed name");
+        assert_eq!(
+            other,
+            StatusCode::NOT_FOUND,
+            "a name holding a different image"
+        );
+    }
+
+    /// The pre-upgrade overwrite (#1681 via the legacy marker): a tag
+    /// overwritten before migration 363 left no row naming its old digest.
+    /// Before the backfill the old repository-wide rule still serves it
+    /// (reads work while the repository is unmarked); the first backfill
+    /// marks it legacy, after which it resolves under an image that holds
+    /// content (xb) but not under a never-pushed name. A second pass changes
+    /// nothing.
+    #[tokio::test]
+    async fn pre_upgrade_overwrite_resolves_through_the_legacy_marker_5793() {
+        let Some(rig) = ScopeRig::setup().await else {
+            return;
+        };
+        let (old_digest, _, _) = rig.push_image("xb", "v1", "old").await;
+        let (new_digest, _, _) = rig.push_image("xb", "v1", "new").await;
+        // Back to the pre-363 state: no links, no marker.
+        sqlx::query("DELETE FROM oci_image_manifests WHERE repository_id = $1")
+            .bind(rig.fx.repo_id)
+            .execute(&rig.fx.pool)
+            .await
+            .expect("drop links");
+        sqlx::query("DELETE FROM oci_image_blobs WHERE repository_id = $1")
+            .bind(rig.fx.repo_id)
+            .execute(&rig.fx.pool)
+            .await
+            .expect("drop blob links");
+        sqlx::query("DELETE FROM oci_image_scope_backfill WHERE repository_id = $1")
+            .bind(rig.fx.repo_id)
+            .execute(&rig.fx.pool)
+            .await
+            .expect("drop marker");
+        let old_ref = format!("manifests/{old_digest}");
+        let before = (
+            rig.status(Method::GET, "xb", &old_ref).await,
+            rig.status(Method::GET, "nobody", &old_ref).await,
+        );
+
+        let first =
+            crate::services::oci_image_scope::run_backfill(&rig.fx.pool, Some(rig.fx.repo_id))
+                .await;
+        let after = (
+            rig.status(Method::GET, "xb", &old_ref).await,
+            rig.status(Method::GET, "nobody", &old_ref).await,
+            rig.status(Method::GET, "xb", &format!("manifests/{new_digest}"))
+                .await,
+            rig.status(Method::GET, "nobody", &format!("manifests/{new_digest}"))
+                .await,
+        );
+        let second =
+            crate::services::oci_image_scope::run_backfill(&rig.fx.pool, Some(rig.fx.repo_id))
+                .await;
+        let legacy_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_image_manifests WHERE repository_id = $1 AND image = ''",
+        )
+        .bind(rig.fx.repo_id)
+        .fetch_one(&rig.fx.pool)
+        .await
+        .expect("count legacy markers");
+        rig.teardown().await;
+
+        assert_eq!(
+            before,
+            (StatusCode::OK, StatusCode::OK),
+            "before the backfill the repository keeps the old rule"
+        );
+        assert_eq!(first.repositories_completed, 1, "{first:?}");
+        assert_eq!(
+            first.legacy_markers, 1,
+            "only the overwritten digest is legacy: {first:?}"
+        );
+        assert!(first.links_inserted >= 1, "{first:?}");
+        assert_eq!(
+            after.0,
+            StatusCode::OK,
+            "xb@old digest through the legacy marker"
+        );
+        assert_eq!(
+            after.1,
+            StatusCode::NOT_FOUND,
+            "never-pushed name after the backfill"
+        );
+        assert_eq!(after.2, StatusCode::OK, "xb@new digest");
+        assert_eq!(
+            after.3,
+            StatusCode::NOT_FOUND,
+            "never-pushed name, tagged digest"
+        );
+        assert_eq!(
+            (
+                second.repositories_completed,
+                second.legacy_markers,
+                second.links_inserted
+            ),
+            (0, 0, 0),
+            "a second pass is a no-op: {second:?}"
+        );
+        // The legacy read linked xb, so the marker is all that stays legacy.
+        assert_eq!(legacy_rows, 1);
+    }
+
+    /// A push a 1.11 replica serves writes no link. The reconcile's recurring
+    /// backfill pass links it, so a later overwrite keeps the old digest
+    /// pullable under its image (without the pass it would 404).
+    #[tokio::test]
+    async fn mixed_version_push_is_linked_by_the_next_backfill_pass_5793() {
+        let Some(rig) = ScopeRig::setup().await else {
+            return;
+        };
+        rig.push_image("first", "v1", "first").await;
+        let (old_digest, _, _) = rig.push_image("app", "v1", "old").await;
+        // What a 1.11 replica leaves: no link for its push.
+        sqlx::query("DELETE FROM oci_image_manifests WHERE repository_id = $1 AND image = 'app'")
+            .bind(rig.fx.repo_id)
+            .execute(&rig.fx.pool)
+            .await
+            .expect("drop the push's link");
+        let tagged_before = rig
+            .status(Method::GET, "app", &format!("manifests/{old_digest}"))
+            .await;
+        let pass =
+            crate::services::oci_image_scope::run_backfill(&rig.fx.pool, Some(rig.fx.repo_id))
+                .await;
+        rig.push_image("app", "v1", "new").await;
+        let after_overwrite = rig
+            .status(Method::GET, "app", &format!("manifests/{old_digest}"))
+            .await;
+        rig.teardown().await;
+
+        assert_eq!(
+            tagged_before,
+            StatusCode::OK,
+            "a tagged digest resolves through its tag"
+        );
+        assert!(
+            pass.links_inserted >= 1,
+            "the pass links the 1.11 push: {pass:?}"
+        );
+        assert_eq!(
+            pass.legacy_markers, 0,
+            "a scoped repository gets no new markers"
+        );
+        assert_eq!(
+            after_overwrite,
+            StatusCode::OK,
+            "the reconciled link keeps the overwritten digest pullable under app"
+        );
+    }
+
+    /// #4525 under #5793, directly and through a Virtual repository: after
+    /// `DELETE xa@<digest>` the digest answers 404 under xa and keeps
+    /// resolving under xb; through the Virtual, under a never-pushed name, it
+    /// answers 404 as well.
+    #[tokio::test]
+    async fn digest_deleted_under_one_image_is_scoped_directly_and_via_virtual_5793() {
+        let Some(rig) = ScopeRig::setup().await else {
+            return;
+        };
+        let (digest, _, layer) = rig.push_image("xa", "v1", "shared").await;
+        let manifest =
+            scope_image_manifest(b"{\"note\":\"shared\"}", b"layer bytes of shared", "shared");
+        rig.push_manifest("xb", "v1", SCOPE_MANIFEST_CT, &manifest)
+            .await;
+        let (st, _, _) = rig
+            .call(
+                Method::DELETE,
+                format!("/{}/xa/manifests/{}", rig.fx.repo_key, digest),
+                None,
+                Bytes::new(),
+            )
+            .await;
+
+        let (virt_id, virt_key, virt_dir) =
+            tdh::create_repo(&rig.fx.pool, "virtual", "docker").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virt_id)
+        .bind(rig.fx.repo_id)
+        .execute(&rig.fx.pool)
+        .await
+        .expect("link virtual member");
+        tdh::grant_repo_actions(&rig.fx.pool, virt_id, rig.fx.user_id, &["read"]).await;
+        let via = |image: &str, rest: &str| format!("/{virt_key}/{image}/{rest}");
+        let m = format!("manifests/{digest}");
+        let direct = (
+            rig.status(Method::GET, "xa", &m).await,
+            rig.status(Method::GET, "xb", &m).await,
+        );
+        let mut virt = Vec::new();
+        for (image, rest) in [
+            ("xa", m.clone()),
+            ("xb", m.clone()),
+            ("nobody", m.clone()),
+            ("xb", format!("blobs/{layer}")),
+            ("nobody", format!("blobs/{layer}")),
+        ] {
+            virt.push(
+                rig.call(Method::GET, via(image, &rest), None, Bytes::new())
+                    .await
+                    .0,
+            );
+        }
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virt_id)
+            .execute(&rig.fx.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virt_id)
+            .execute(&rig.fx.pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&virt_dir);
+        rig.teardown().await;
+
+        assert_eq!(st, StatusCode::ACCEPTED, "DELETE xa@digest");
+        assert_eq!(
+            direct,
+            (StatusCode::NOT_FOUND, StatusCode::OK),
+            "direct xa / xb"
+        );
+        assert_eq!(
+            virt[0],
+            StatusCode::NOT_FOUND,
+            "virtual xa@digest after the delete"
+        );
+        assert_eq!(virt[1], StatusCode::OK, "virtual xb@digest");
+        assert_eq!(virt[2], StatusCode::NOT_FOUND, "virtual never-pushed name");
+        assert_eq!(virt[3], StatusCode::OK, "virtual xb layer");
+        assert_eq!(
+            virt[4],
+            StatusCode::NOT_FOUND,
+            "virtual never-pushed name, layer"
+        );
+    }
+
+    /// The conformance push flow: a chunked blob upload under an image is
+    /// HEAD-able under that image before any manifest references it (and not
+    /// under another name), then the manifest PUT referencing it succeeds.
+    #[tokio::test]
+    async fn uploaded_blob_heads_under_its_image_before_the_manifest_put_5793() {
+        let Some(rig) = ScopeRig::setup().await else {
+            return;
+        };
+        rig.push_image("seed", "v1", "seed").await; // scopes the repository
+        let config = b"{\"flow\":\"chunked\"}".to_vec();
+        rig.push_blob("flow", &config).await;
+        let layer = b"chunked upload layer bytes".to_vec();
+        let layer_digest = sha256_digest(&layer);
+        let (st, h, _) = rig
+            .call(
+                Method::POST,
+                format!("/{}/flow/blobs/uploads/", rig.fx.repo_key),
+                None,
+                Bytes::new(),
+            )
+            .await;
+        assert_eq!(st, StatusCode::ACCEPTED, "open upload session");
+        let location = h[LOCATION].to_str().unwrap().to_string();
+        let location = location
+            .strip_prefix("/v2")
+            .unwrap_or(&location)
+            .to_string();
+        let (st, h, _) = rig
+            .call(
+                Method::PATCH,
+                location.clone(),
+                Some("application/octet-stream"),
+                Bytes::from(layer.clone()),
+            )
+            .await;
+        assert_eq!(st, StatusCode::ACCEPTED, "PATCH chunk");
+        let location = h[LOCATION].to_str().unwrap().to_string();
+        let location = location
+            .strip_prefix("/v2")
+            .unwrap_or(&location)
+            .to_string();
+        let sep = if location.contains('?') { '&' } else { '?' };
+        let (st, _, body) = rig
+            .call(
+                Method::PUT,
+                format!("{location}{sep}digest={layer_digest}"),
+                Some("application/octet-stream"),
+                Bytes::new(),
+            )
+            .await;
+        assert_eq!(
+            st,
+            StatusCode::CREATED,
+            "finalize: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let blob = format!("blobs/{layer_digest}");
+        let head_own = rig.status(Method::HEAD, "flow", &blob).await;
+        let head_other = rig.status(Method::HEAD, "seed", &blob).await;
+        let manifest = scope_image_manifest(&config, &layer, "flow");
+        let put = rig
+            .call(
+                Method::PUT,
+                format!("/{}/flow/manifests/v1", rig.fx.repo_key),
+                Some(SCOPE_MANIFEST_CT),
+                manifest,
+            )
+            .await
+            .0;
+        let pull_layer = rig.status(Method::GET, "flow", &blob).await;
+        rig.teardown().await;
+
+        assert_eq!(head_own, StatusCode::OK, "HEAD under the uploading image");
+        assert_eq!(
+            head_other,
+            StatusCode::NOT_FOUND,
+            "HEAD under another image"
+        );
+        assert_eq!(put, StatusCode::CREATED, "manifest PUT");
+        assert_eq!(pull_layer, StatusCode::OK);
+    }
+
+    /// A mount from another image of the same repository is honoured (201)
+    /// when that image holds the blob, and links it to the target image; a
+    /// mount the source cannot satisfy falls back to an upload session (202).
+    #[tokio::test]
+    async fn same_repository_mount_links_the_blob_to_the_target_image_5793() {
+        let Some(rig) = ScopeRig::setup().await else {
+            return;
+        };
+        let (_, _, layer) = rig.push_image("src", "v1", "mount").await;
+        let blob = format!("blobs/{layer}");
+        let before = rig.status(Method::HEAD, "dst", &blob).await;
+        let mount = |from: &str, digest: &str| {
+            format!(
+                "/{key}/dst/blobs/uploads/?mount={digest}&from={key}/{from}",
+                key = rig.fx.repo_key
+            )
+        };
+        let (mounted, h, _) = rig
+            .call(Method::POST, mount("src", &layer), None, Bytes::new())
+            .await;
+        let location = h
+            .get(LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let after = rig.status(Method::HEAD, "dst", &blob).await;
+        let missing = sha256_digest(b"never uploaded");
+        let (not_held, _, _) = rig
+            .call(Method::POST, mount("src", &missing), None, Bytes::new())
+            .await;
+        let (wrong_source, _, _) = rig
+            .call(Method::POST, mount("nobody", &layer), None, Bytes::new())
+            .await;
+        rig.teardown().await;
+
+        assert_eq!(
+            before,
+            StatusCode::NOT_FOUND,
+            "dst does not hold the layer yet"
+        );
+        assert_eq!(mounted, StatusCode::CREATED, "same-repository mount");
+        assert!(
+            location.ends_with(&format!("/dst/blobs/{layer}")),
+            "{location}"
+        );
+        assert_eq!(after, StatusCode::OK, "the mount links the layer to dst");
+        assert_eq!(
+            not_held,
+            StatusCode::ACCEPTED,
+            "a missing blob opens an upload"
+        );
+        assert_eq!(
+            wrong_source,
+            StatusCode::ACCEPTED,
+            "a source image that does not hold the blob opens an upload"
+        );
+    }
+
+    /// `AK_OCI_BLOB_SCOPE=report` serves the blob enforcement refuses (and
+    /// counts the miss); the image that holds the blob is served either way.
+    #[tokio::test]
+    async fn report_mode_serves_an_unheld_blob_that_enforce_refuses_5793() {
+        use crate::services::oci_image_scope::BlobScopeMode;
+        let Some(rig) = ScopeRig::setup().await else {
+            return;
+        };
+        let (_, _, layer) = rig.push_image("src", "v1", "report").await;
+        let Ok(mut repo) = resolve_repo(&rig.fx.pool, &format!("{}/nobody", rig.fx.repo_key)).await
+        else {
+            panic!("resolve repo");
+        };
+        let state = &rig.fx.state;
+        let nobody = (
+            blob_scope_allows_in(state, &repo, &layer, BlobScopeMode::Enforce)
+                .await
+                .expect("scope check"),
+            blob_scope_allows_in(state, &repo, &layer, BlobScopeMode::Report)
+                .await
+                .expect("scope check"),
+        );
+        repo.image = "src".to_string();
+        let holder = blob_scope_allows_in(state, &repo, &layer, BlobScopeMode::Enforce)
+            .await
+            .expect("scope check");
+        rig.teardown().await;
+
+        assert_eq!(nobody, (false, true), "enforce refuses, report serves");
+        assert!(holder, "the holding image is served under enforcement");
     }
 
     /// Repo-scoped content addressing: on a shared storage backend a digest
@@ -26263,6 +28005,163 @@ mod oci_blob_upload_streaming_tests {
         );
 
         f.teardown().await;
+    }
+
+    /// #5649 / #5650: a `docker push` against an object store that is out of
+    /// space answers `507` in the `/v2` error envelope, and against one that
+    /// cannot be reached `503 UNAVAILABLE` with `Retry-After`, on both blob
+    /// upload shapes (monolithic POST and chunked PATCH). Before the fix both
+    /// were a 500 whose message was the store's own error text: MinIO's XML
+    /// document with the bucket name and request ids.
+    #[tokio::test]
+    async fn blob_upload_maps_storage_full_and_outage_5650() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let content = Bytes::from_static(b"oci layer 5650");
+        let digest = compute_sha256(&content);
+
+        for (message, want_status, want_code) in [
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                OCI_INSUFFICIENT_STORAGE,
+            ),
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "UNAVAILABLE",
+            ),
+        ] {
+            // Chunked: the session is opened while storage still works (the
+            // fixture's filesystem), then the store fails under the PATCH.
+            sqlx::query(
+                "UPDATE repositories SET storage_backend = 'filesystem', storage_path = $2 \
+                 WHERE id = $1",
+            )
+            .bind(f.inner.repo_id)
+            .bind(f.inner.storage_dir.to_string_lossy().into_owned())
+            .execute(&f.inner.pool)
+            .await
+            .expect("back on the working store");
+            let (status, headers, body) = send(
+                f.app(),
+                request(
+                    Method::POST,
+                    format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                    &f.authorization,
+                    Bytes::new(),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::ACCEPTED, "start upload: {body:?}");
+            let upload_uuid = headers
+                .get("Docker-Upload-UUID")
+                .and_then(|v| v.to_str().ok())
+                .expect("Docker-Upload-UUID")
+                .to_string();
+
+            let state = tdh::route_repo_to_failing_storage(
+                &f.inner.pool,
+                &f.inner.state,
+                f.inner.repo_id,
+                &message,
+            )
+            .await;
+            let app = router(None).with_state(state);
+
+            // Monolithic: POST with the digest and the whole body.
+            let monolithic = send(
+                app.clone(),
+                request(
+                    Method::POST,
+                    format!(
+                        "/{}/image/blobs/uploads/?digest={}",
+                        f.inner.repo_key, digest
+                    ),
+                    &f.authorization,
+                    content.clone(),
+                ),
+            )
+            .await;
+            let chunked = send(
+                app.clone(),
+                request(
+                    Method::PATCH,
+                    format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                    &f.authorization,
+                    content.clone(),
+                ),
+            )
+            .await;
+
+            for (shape, (status, headers, body)) in
+                [("monolithic POST", monolithic), ("chunked PATCH", chunked)]
+            {
+                let label = format!("{shape} ({want_code})");
+                assert_eq!(
+                    status,
+                    want_status,
+                    "{label}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+                let json: serde_json::Value =
+                    serde_json::from_slice(&body).expect("/v2 error envelope");
+                assert_eq!(json["errors"][0]["code"], want_code, "{label}");
+                assert_eq!(
+                    headers.contains_key(axum::http::header::RETRY_AFTER),
+                    want_status == StatusCode::SERVICE_UNAVAILABLE,
+                    "{label}: Retry-After goes on the 503 only"
+                );
+                tdh::assert_no_storage_backend_text(&label, &body);
+            }
+        }
+
+        f.teardown().await;
+    }
+
+    /// The `/v2` envelope keeps client errors as written and never lets a
+    /// storage error's own text through on a 5xx, classified or not.
+    #[test]
+    fn oci_storage_envelope_rewrites_only_storage_5xx_5650() {
+        let full = AppError::Storage(tdh::minio_quota_exceeded_error()).to_string();
+        let (status, code, message) = oci_storage_envelope(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "BLOB_UPLOAD_UNKNOWN",
+            &full,
+        );
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(code, OCI_INSUFFICIENT_STORAGE);
+        assert_eq!(message, crate::error::STORAGE_FULL_MESSAGE);
+
+        let down = AppError::Storage(tdh::minio_unreachable_error()).to_string();
+        let (status, code, _) =
+            oci_storage_envelope(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &down);
+        assert_eq!(
+            (status, code),
+            (StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE")
+        );
+
+        let other = AppError::Storage(
+            "Failed to copy: S3 request failed. caused by: <Error><Code>InternalError</Code>\
+             <BucketName>ak-quota-bucket-5650</BucketName></Error>"
+                .into(),
+        )
+        .to_string();
+        let (status, code, message) =
+            oci_storage_envelope(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &other);
+        assert_eq!(
+            (status, code),
+            (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR")
+        );
+        assert_eq!(message, OCI_STORAGE_FAILED_MESSAGE);
+
+        // A 4xx message is written for the client and passes through, even
+        // one that happens to mention storage.
+        let (status, _, message) =
+            oci_storage_envelope(StatusCode::BAD_REQUEST, "DIGEST_INVALID", &full);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(message, full);
     }
 
     #[tokio::test]
@@ -34305,6 +36204,125 @@ mod cross_repo_session_regression_tests {
         );
     }
 
+    /// #5794: `tags/list` answers `name` as the full `<name>` of the request
+    /// path (`<repo key>/<image>`), on a hosted repository AND on a Virtual
+    /// repository serving it, for the unpaginated response, the paginated
+    /// one (`?n=1`, which also carries the `Link` header) and `?n=0`. Before
+    /// the fix every one of them answered the bare image path
+    /// (`aktest/tags`).
+    #[tokio::test]
+    async fn tags_list_name_is_full_request_name_5794() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        const IMAGE: &str = "aktest/tags";
+        // create_docker_repo marks the hosted repo is_public = true.
+        let (hosted_id, hosted_key, hosted_dir) = create_docker_repo(&pool, "tags5794").await;
+        let (virt_id, virt_key, virt_dir) = tdh::create_repo(&pool, "virtual", "docker").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(virt_id)
+            .execute(&pool)
+            .await
+            .expect("publish virtual");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virt_id)
+        .bind(hosted_id)
+        .execute(&pool)
+        .await
+        .expect("link virtual member");
+        let digest = format!("sha256:{}", "5".repeat(64));
+        for tag in ["1.0", "1.1", "2.0"] {
+            sqlx::query(
+                "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) \
+                 VALUES ($1, $2, $3, $4, 'application/vnd.oci.image.manifest.v1+json')",
+            )
+            .bind(hosted_id)
+            .bind(IMAGE)
+            .bind(tag)
+            .bind(&digest)
+            .execute(&pool)
+            .await
+            .expect("seed tag");
+        }
+        let state = tdh::build_state(pool.clone(), hosted_dir.to_str().unwrap());
+
+        // (repo key, query, expect a Link header, expected tag count)
+        let mut results = Vec::new();
+        for key in [&hosted_key, &virt_key] {
+            for (query, expect_link, expect_tags) in
+                [("", false, 3usize), ("?n=1", true, 1), ("?n=0", false, 0)]
+            {
+                let req = Request::builder()
+                    .method("GET")
+                    .uri(format!("/{}/{}/tags/list{}", key, IMAGE, query))
+                    .header("Authorization", "Bearer anonymous")
+                    .body(Body::empty())
+                    .unwrap();
+                let (status, body, headers) =
+                    tdh::send_with_headers(router(None).with_state(state.clone()), req).await;
+                let link = headers
+                    .get("Link")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                results.push((
+                    key.clone(),
+                    query,
+                    expect_link,
+                    expect_tags,
+                    status,
+                    link,
+                    body,
+                ));
+            }
+        }
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virt_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(hosted_id)
+            .execute(&pool)
+            .await;
+        for repo in [hosted_id, virt_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo)
+                .execute(&pool)
+                .await;
+        }
+        let _ = std::fs::remove_dir_all(&hosted_dir);
+        let _ = std::fs::remove_dir_all(&virt_dir);
+
+        for (key, query, expect_link, expect_tags, status, link, body) in results {
+            assert_eq!(status, StatusCode::OK, "GET {key}/{IMAGE}/tags/list{query}");
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(
+                json["name"],
+                format!("{key}/{IMAGE}"),
+                "tags/list{query} on {key} must answer the full request <name>"
+            );
+            assert_eq!(
+                json["tags"].as_array().map(Vec::len),
+                Some(expect_tags),
+                "tags/list{query} on {key}: {json}"
+            );
+            assert_eq!(
+                link.is_some(),
+                expect_link,
+                "tags/list{query} on {key}: Link header {link:?}"
+            );
+            if let Some(link) = link {
+                assert!(
+                    link.contains(&format!("/v2/{key}/{IMAGE}/tags/list")),
+                    "the Link path must name the same <name>: {link}"
+                );
+            }
+        }
+    }
+
     /// #3275: `GET /v2/<name>/blobs/uploads/<uuid>` is the upload-status
     /// probe. The distribution spec requires `204 No Content` with `Location`
     /// and `Range` headers so a client can resume a chunked upload after a
@@ -37992,10 +40010,33 @@ mod proxy_scan_block_tests {
         let clean_cfg_status = get_blob(clean_config.clone()).await;
         let clean_layer_status = get_blob(clean_layer.clone()).await;
 
+        // #4987: each refused blob leaves a PROXY_SCAN_BLOCKED row naming it,
+        // as the manifest gate's refusal does; a served blob leaves none.
+        let audited =
+            tdh::audit_count_eventually(&fx.pool, fx.repo_id, "PROXY_SCAN_BLOCKED", 2).await;
+        let mut audited_paths: Vec<String> = sqlx::query_scalar(
+            "SELECT details->>'path' FROM audit_log \
+              WHERE resource_id = $1 AND action = 'PROXY_SCAN_BLOCKED'",
+        )
+        .bind(fx.repo_id)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("audit paths");
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+
         for d in [&vuln_digest, &clean_digest] {
             cleanup_proxy_scan_row(&fx.pool, d.strip_prefix("sha256:").unwrap()).await;
         }
         fx.teardown().await;
+
+        assert_eq!(audited, 2, "one row per refused blob");
+        audited_paths.sort();
+        let mut want = vec![format!("app@{vuln_config}"), format!("app@{vuln_layer}")];
+        want.sort();
+        assert_eq!(audited_paths, want);
 
         assert_eq!(
             vuln_cfg_status,
@@ -41964,6 +44005,224 @@ mod proxy_scan_block_tests {
             enforced_blobs,
             (StatusCode::FORBIDDEN, StatusCode::FORBIDDEN),
             "enforcement blocks the blobs from the same recorded verdict"
+        );
+    }
+
+    /// #5606: `docker push` of a fixed image over a held tag. docker checks
+    /// the manifest and each blob with `HEAD` before it uploads and aborts on
+    /// anything but 200/404, so a caller who may push is answered the held
+    /// manifest's and blob's headers (no body). Every GET of the held bytes
+    /// stays refused, a pull-only caller (another user, or the writer's own
+    /// read-scoped token) is refused the HEAD too, and after the fixed image
+    /// replaces the tag the held digest is still refused by digest.
+    #[tokio::test]
+    async fn push_over_a_held_tag_heads_without_serving_the_held_bytes_5606() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        tdh::grant_repo_actions(&fx.pool, fx.repo_id, fx.user_id, &["read", "write"]).await;
+        let (reader, _) = tdh::create_user(&fx.pool).await;
+        tdh::grant_repo_actions(&fx.pool, fx.repo_id, reader, &["read"]).await;
+        let reader_bearer = tdh::bearer_for(&fx.state, reader).await;
+        let auth_service = AuthService::new(fx.state.db.clone(), Arc::new(fx.state.config.clone()));
+        let basic = |token: String| {
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(format!("{}:{}", fx.username, token))
+            )
+        };
+        let writer = basic(
+            auth_service
+                .generate_api_token(fx.user_id, "push-5606", vec!["*".to_string()], None)
+                .await
+                .expect("push token")
+                .0,
+        );
+        let writer_pull_only = basic(
+            auth_service
+                .generate_api_token(
+                    fx.user_id,
+                    "pull-5606",
+                    vec!["read:artifacts".to_string()],
+                    None,
+                )
+                .await
+                .expect("pull token")
+                .0,
+        );
+
+        let storage = fx
+            .state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: fx.storage_dir.to_string_lossy().into_owned(),
+            })
+            .expect("storage");
+        let layer = unique_fixture_bytes("held-5606-layer");
+        let (cfg1, cfg2) = (
+            unique_fixture_bytes("held-5606-cfg"),
+            unique_fixture_bytes("fixed-5606-cfg"),
+        );
+        for bytes in [&layer, &cfg1, &cfg2] {
+            let d = compute_sha256(bytes);
+            storage
+                .put(&blob_storage_key(&d), Bytes::from(bytes.clone()))
+                .await
+                .expect("put blob");
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(fx.repo_id)
+            .bind(&d)
+            .bind(bytes.len() as i64)
+            .bind(blob_storage_key(&d))
+            .execute(&fx.pool)
+            .await
+            .expect("insert oci_blobs");
+        }
+        let (held, _, layer_digest) = image_manifest(&cfg1, &layer);
+        let (fixed, _, _) = image_manifest(&cfg2, &layer);
+        let (held_digest, fixed_digest) = (compute_sha256(&held), compute_sha256(&fixed));
+
+        let call = |method: Method, auth: String, path: String, body: Bytes| {
+            let app = router(None).with_state(fx.state.clone());
+            let key = fx.repo_key.clone();
+            async move {
+                let req = Request::builder()
+                    .method(method)
+                    .uri(format!("/{key}/app/{path}"))
+                    .header(AUTHORIZATION, auth)
+                    .header(CONTENT_TYPE, IMAGE_MANIFEST_MT)
+                    .body(Body::from(body))
+                    .unwrap();
+                let resp = app.oneshot(req).await.expect("oneshot");
+                let status = resp.status();
+                let digest = resp
+                    .headers()
+                    .get("Docker-Content-Digest")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                (status, digest, body)
+            }
+        };
+        let tag = || "manifests/1.0".to_string();
+        let (s, _, b) = call(Method::PUT, writer.clone(), tag(), held.clone()).await;
+        assert_eq!(s, StatusCode::CREATED, "{}", String::from_utf8_lossy(&b));
+        // The image is held (an administrator's quarantine on its tag row),
+        // and its scan found it vulnerable, which re-blocks its blobs.
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL, \
+             quarantine_source = 'admin' WHERE repository_id = $1 AND path = 'v2/app/manifests/1.0'",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("hold the tag");
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                held_digest.strip_prefix("sha256:").unwrap(),
+                "grype",
+                "vulnerable",
+                1,
+                1,
+                0,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-1.0.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let blob = || format!("blobs/{layer_digest}");
+        let (head_status, head_digest, head_body) =
+            call(Method::HEAD, writer.clone(), tag(), Bytes::new()).await;
+        let writer_get = call(Method::GET, writer.clone(), tag(), Bytes::new())
+            .await
+            .0;
+        let pull_only_head = call(Method::HEAD, writer_pull_only.clone(), tag(), Bytes::new())
+            .await
+            .0;
+        let reader_head = call(Method::HEAD, reader_bearer.clone(), tag(), Bytes::new())
+            .await
+            .0;
+        let reader_get = call(Method::GET, reader_bearer.clone(), tag(), Bytes::new())
+            .await
+            .0;
+        let writer_blob_head = call(Method::HEAD, writer.clone(), blob(), Bytes::new())
+            .await
+            .0;
+        let writer_blob_get = call(Method::GET, writer.clone(), blob(), Bytes::new())
+            .await
+            .0;
+        let reader_blob_head = call(Method::HEAD, reader_bearer.clone(), blob(), Bytes::new())
+            .await
+            .0;
+
+        let (put_status, _, put_body) =
+            call(Method::PUT, writer.clone(), tag(), fixed.clone()).await;
+        let (after_status, after_digest, _) =
+            call(Method::GET, reader_bearer.clone(), tag(), Bytes::new()).await;
+        let held_by_digest = |auth: String| {
+            let path = format!("manifests/{held_digest}");
+            let call = &call;
+            async move { call(Method::GET, auth, path, Bytes::new()).await.0 }
+        };
+        let reader_held_by_digest = held_by_digest(reader_bearer.clone()).await;
+        let writer_held_by_digest = held_by_digest(writer.clone()).await;
+
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+            .bind(fx.user_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup_user(&fx.pool, reader).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            (head_status, head_digest.as_deref(), head_body.len()),
+            (StatusCode::OK, Some(held_digest.as_str()), 0),
+            "a caller who may push is answered the held manifest's headers, no body"
+        );
+        assert_eq!(
+            writer_get,
+            StatusCode::CONFLICT,
+            "GET stays refused to the writer"
+        );
+        assert_eq!(
+            (pull_only_head, reader_head, reader_get),
+            (
+                StatusCode::CONFLICT,
+                StatusCode::CONFLICT,
+                StatusCode::CONFLICT
+            ),
+            "a pull-only caller is refused HEAD and GET"
+        );
+        assert_eq!(
+            (writer_blob_head, writer_blob_get, reader_blob_head),
+            (StatusCode::OK, StatusCode::FORBIDDEN, StatusCode::FORBIDDEN),
+            "the held image's blob: HEAD for the writer only, GET for no one"
+        );
+        assert_eq!(
+            put_status,
+            StatusCode::CREATED,
+            "the fixed image replaces the held tag: {}",
+            String::from_utf8_lossy(&put_body)
+        );
+        assert_eq!(
+            (after_status, after_digest.as_deref()),
+            (StatusCode::OK, Some(fixed_digest.as_str())),
+            "the tag now serves the fixed image"
+        );
+        assert_eq!(
+            (reader_held_by_digest, writer_held_by_digest),
+            (StatusCode::CONFLICT, StatusCode::CONFLICT),
+            "the held digest is still not served by digest"
         );
     }
 }
@@ -47356,9 +49615,11 @@ mod action_scope_structural_tests {
     /// `enforce_token_repo_scope` is documented to.
     #[test]
     fn the_read_scope_gate_precedes_the_admin_bypass() {
+        // `authenticate_oci_read` delegates to the variant that also returns
+        // the token scopes (#5606); the gate lives there.
         let gate = SRC
-            .find("async fn authenticate_oci_read(")
-            .expect("authenticate_oci_read must exist");
+            .find("async fn authenticate_oci_read_with_scopes(")
+            .expect("authenticate_oci_read_with_scopes must exist");
         let bypass = SRC
             .find("if claims.is_admin || claims.scan_pull_repo.is_some()")
             .expect("the oci_read_permitted admin bypass must exist");
@@ -48902,6 +51163,7 @@ mod token_exchange_expiry_cap_3460 {
         let resp = token(
             State(state),
             headers,
+            None,
             Ok(Query(TokenQuery {
                 service: None,
                 account: None,
@@ -49044,6 +51306,7 @@ mod token_exchange_bearer_api_token_4903 {
         token(
             State(state),
             headers,
+            None,
             Ok(Query(TokenQuery {
                 service: Some(OCI_TOKEN_SERVICE.to_string()),
                 account: None,

@@ -8,6 +8,10 @@ use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::user::User;
 use crate::services::auth_service::AuthService;
+use crate::services::scanner_adapter_client::{
+    adapter_status_is_unreachable, with_adapter_resubmits, AdapterAttemptError, AdapterPollClock,
+    AdapterResubmit,
+};
 use crate::services::scanner_service::{ScanOutput, ScanTarget, Scanner};
 
 #[cfg(test)]
@@ -761,14 +765,19 @@ impl ImageScanner {
     /// poll budget is exhausted. Honors a `Refresh-After` header when present.
     ///
     /// Fail-closed: a never-ready report, a non-2xx terminal status, or a
-    /// transport error all return `Err(AppError::BadGateway)` — never an empty
-    /// report.
-    async fn poll_report(&self, scan_id: &str) -> Result<HarborScanReport> {
+    /// transport error that outlasts the restart grace all return
+    /// `Err(AppError::BadGateway)` — never an empty report. A 404 (unknown id) or a trivy cache-lock failure is marked
+    /// resubmittable (#5657, [`AdapterResubmit`]); `run_image_scan` decides.
+    async fn poll_report(
+        &self,
+        scan_id: &str,
+    ) -> std::result::Result<HarborScanReport, AdapterAttemptError> {
         let url = format!("{}/api/v1/scan/{}/report", self.adapter_url, scan_id);
-        let deadline = std::time::Instant::now() + Self::REPORT_POLL_BUDGET;
+        let mut clock =
+            AdapterPollClock::new("Scanner adapter image scan", Self::REPORT_POLL_BUDGET);
 
         loop {
-            let resp = self
+            let sent = self
                 .poll_http
                 .get(&url)
                 .header(
@@ -776,16 +785,36 @@ impl ImageScanner {
                     "application/vnd.security.vulnerability.report; version=1.1",
                 )
                 .send()
-                .await
-                .map_err(|e| {
-                    AppError::BadGateway(format!("Scanner adapter report request failed: {}", e))
-                })?;
+                .await;
+            // #5657: an adapter being replaced is unreachable (or its Service
+            // answers 502/503/504) for a moment; keep polling through a
+            // bounded grace so its successor can answer 404 and the scan be
+            // resubmitted, rather than failing on the gap.
+            let resp = match sent {
+                Ok(resp) if !adapter_status_is_unreachable(resp.status()) => resp,
+                outcome => {
+                    let detail = match outcome {
+                        Ok(resp) => {
+                            format!("Scanner adapter returned {} fetching report", resp.status())
+                        }
+                        Err(e) => format!("Scanner adapter report request failed: {}", e),
+                    };
+                    match clock.unreachable(scan_id, &detail) {
+                        Some(wait) => {
+                            tokio::time::sleep(wait).await;
+                            continue;
+                        }
+                        None => return Err(AppError::BadGateway(detail).into()),
+                    }
+                }
+            };
 
             let status = resp.status();
 
             if status.is_success() {
                 return resp.json::<HarborScanReport>().await.map_err(|e| {
                     AppError::BadGateway(format!("Failed to parse scanner adapter report: {}", e))
+                        .into()
                 });
             }
 
@@ -794,34 +823,34 @@ impl ImageScanner {
             // else — including a 404 — is terminal: #2092 returns 404 for a
             // genuinely unknown/expired scan id, so treating it as pending would
             // poll fruitlessly until the ~280s budget is exhausted, tying up a
-            // scan worker for ~5 minutes. Fail fast (still fail-closed: an Err,
-            // never an Ok-with-0-findings).
+            // scan worker for ~5 minutes. Stop polling at once (still
+            // fail-closed: an Err, never an Ok-with-0-findings); the caller
+            // resubmits once or twice when the id was lost (#5657).
             let pending = status == reqwest::StatusCode::FOUND;
             if !pending {
                 let text = resp.text().await.unwrap_or_default();
-                return Err(AppError::BadGateway(format!(
-                    "Scanner adapter returned {} fetching report: {}",
-                    status, text
-                )));
+                return Err(AdapterAttemptError {
+                    resubmit: AdapterResubmit::classify(status, &text),
+                    error: AppError::BadGateway(format!(
+                        "Scanner adapter returned {} fetching report: {}",
+                        status, text
+                    )),
+                });
             }
 
-            let refresh_after = resp
-                .headers()
-                .get("Refresh-After")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .map(std::time::Duration::from_secs)
-                .unwrap_or(Self::REPORT_POLL_INTERVAL);
-
-            if std::time::Instant::now() + refresh_after >= deadline {
-                return Err(AppError::BadGateway(format!(
-                    "Scanner adapter report for {} not ready within {}s budget",
-                    scan_id,
-                    Self::REPORT_POLL_BUDGET.as_secs()
-                )));
+            // Time the adapter reports the job `Queued` (1.7.0+) is not
+            // charged to the budget (#5657).
+            match clock.pending(scan_id, resp.headers(), Self::REPORT_POLL_INTERVAL) {
+                Some(wait) => tokio::time::sleep(wait).await,
+                None => {
+                    return Err(AppError::BadGateway(format!(
+                        "Scanner adapter report for {} not ready within {}s budget",
+                        scan_id,
+                        Self::REPORT_POLL_BUDGET.as_secs()
+                    ))
+                    .into())
+                }
             }
-
-            tokio::time::sleep(refresh_after).await;
         }
     }
 
@@ -833,10 +862,6 @@ impl ImageScanner {
         mime_type: &str,
         repo_key: Option<&str>,
     ) -> Result<ScanOutput> {
-        // Readiness gate first so a down adapter fails the scan with a clear
-        // BadGateway rather than mid-stream.
-        self.check_adapter_health().await?;
-
         let registry_url = self.registry_url().await;
         // Mint a per-repository scoped pull token only when we know which repo
         // is being scanned (the repository-aware `scan_target` path). The
@@ -851,8 +876,17 @@ impl ImageScanner {
         };
         info!("Starting adapter image scan for {}", reference_label);
 
-        let scan_id = self.submit_scan(&body).await?;
-        let report = self.poll_report(&scan_id).await?;
+        // Readiness gate, submit, poll -- repeated with the same request when
+        // the adapter lost the job (replaced pod) or trivy's cache lock failed
+        // it (#5657). The gate runs first each time so a down adapter fails
+        // the scan with a clear BadGateway rather than mid-stream.
+        let (this, body) = (self, &body);
+        let report = with_adapter_resubmits("Scanner adapter image scan", move || async move {
+            this.check_adapter_health().await?;
+            let scan_id = this.submit_scan(body).await?;
+            this.poll_report(&scan_id).await
+        })
+        .await?;
 
         // Cache the adapter-reported scanner version for `version()` — the
         // in-image trivy --version probe is gone (#2059).
@@ -1600,6 +1634,219 @@ mod tests {
             "a 404 report (unknown scan id) must fail the scan immediately, got {:?}",
             result
         );
+        // #5657: a lost id is resubmitted, but only a bounded number of times.
+        assert_eq!(
+            count_posts(&server).await,
+            crate::services::scanner_adapter_client::ADAPTER_SCAN_ATTEMPTS as usize
+        );
+    }
+
+    async fn count_posts(server: &wiremock::MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.method == wiremock::http::Method::POST)
+            .count()
+    }
+
+    /// Mount a ready probe and a submit endpoint that hands out `ids` in
+    /// order (the last one repeats), as successive adapter jobs would.
+    async fn mount_ready_and_submit_sequence(server: &wiremock::MockServer, ids: &[&str]) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("GET"))
+            .and(path("/probe/ready"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(server)
+            .await;
+        for (i, id) in ids.iter().enumerate() {
+            let mock = Mock::given(method("POST"))
+                .and(path("/api/v1/scan"))
+                .respond_with(
+                    ResponseTemplate::new(202).set_body_json(serde_json::json!({ "id": id })),
+                );
+            if i + 1 < ids.len() {
+                mock.up_to_n_times(1).mount(server).await;
+            } else {
+                mock.mount(server).await;
+            }
+        }
+    }
+
+    async fn mount_report(
+        server: &wiremock::MockServer,
+        id: &str,
+        resp: wiremock::ResponseTemplate,
+    ) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/api/v1/scan/{id}/report"
+            )))
+            .respond_with(resp)
+            .mount(server)
+            .await;
+    }
+
+    fn one_finding_report() -> serde_json::Value {
+        serde_json::json!({
+            "scanner": {"name": "Trivy", "version": "0.71.2"},
+            "vulnerabilities": [{
+                "id": "CVE-2026-0001", "package": "openssl", "version": "3.1.0",
+                "fix_version": "3.1.1", "severity": "High"
+            }]
+        })
+    }
+
+    /// #5657: the adapter pod was replaced mid-scan, so the id it handed out
+    /// is unknown to its successor (404). The scan is submitted again and
+    /// completes with the new job's report instead of failing.
+    #[tokio::test]
+    async fn test_adapter_unknown_scan_id_after_restart_is_resubmitted() {
+        use wiremock::ResponseTemplate;
+
+        let server = wiremock::MockServer::start().await;
+        mount_ready_and_submit_sequence(&server, &["before-restart", "after-restart"]).await;
+        mount_report(
+            &server,
+            "before-restart",
+            ResponseTemplate::new(404).set_body_string("unknown scan id"),
+        )
+        .await;
+        mount_report(
+            &server,
+            "after-restart",
+            ResponseTemplate::new(200).set_body_json(one_finding_report()),
+        )
+        .await;
+
+        let out = ImageScanner::new(server.uri())
+            .scan(&oci_image_artifact(), None, &Bytes::new())
+            .await
+            .expect("a lost scan id must be resubmitted, not fail the scan");
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!(count_posts(&server).await, 2);
+    }
+
+    /// #5657: the adapter pod is replaced mid-scan. While it is away the
+    /// report poll sees 503s (no ready endpoint behind the Service); the
+    /// replacement answers 404 for the old id. The poll rides out the gap and
+    /// the scan is resubmitted instead of failing.
+    #[tokio::test]
+    async fn test_adapter_replaced_mid_scan_is_polled_through_and_resubmitted() {
+        use wiremock::ResponseTemplate;
+
+        let server = wiremock::MockServer::start().await;
+        mount_ready_and_submit_sequence(&server, &["old-pod", "new-pod"]).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/scan/old-pod/report"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(3)
+            .mount(&server)
+            .await;
+        mount_report(
+            &server,
+            "old-pod",
+            ResponseTemplate::new(404).set_body_string("unknown scan id"),
+        )
+        .await;
+        mount_report(
+            &server,
+            "new-pod",
+            ResponseTemplate::new(200).set_body_json(one_finding_report()),
+        )
+        .await;
+
+        let out = ImageScanner::new(server.uri())
+            .scan(&oci_image_artifact(), None, &Bytes::new())
+            .await
+            .expect("an adapter replaced mid-scan must not fail the scan");
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!(count_posts(&server).await, 2);
+    }
+
+    /// #5657: a job waiting in the adapter's queue (302 + `X-Scan-Status:
+    /// Queued`) is polled until it runs, as one submission.
+    #[tokio::test]
+    async fn test_adapter_queued_job_is_waited_for() {
+        use wiremock::ResponseTemplate;
+
+        let server = wiremock::MockServer::start().await;
+        mount_ready_and_submit_sequence(&server, &["queued"]).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/scan/queued/report"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Refresh-After", "0")
+                    .insert_header("X-Scan-Status", "Queued"),
+            )
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        mount_report(
+            &server,
+            "queued",
+            ResponseTemplate::new(200).set_body_json(one_finding_report()),
+        )
+        .await;
+
+        let out = ImageScanner::new(server.uri())
+            .scan(&oci_image_artifact(), None, &Bytes::new())
+            .await
+            .expect("a queued job must be waited for");
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!(count_posts(&server).await, 1);
+    }
+
+    /// #5657: an older adapter fails all but one of several concurrent image
+    /// scans on trivy's cache lock. That failure is resubmitted after a
+    /// backoff; any other failed job still fails the scan on the spot.
+    #[tokio::test]
+    async fn test_adapter_cache_lock_failure_is_resubmitted_other_failures_are_not() {
+        use wiremock::ResponseTemplate;
+
+        let server = wiremock::MockServer::start().await;
+        mount_ready_and_submit_sequence(&server, &["locked", "retried"]).await;
+        mount_report(
+            &server,
+            "locked",
+            ResponseTemplate::new(500).set_body_string(
+                "scan failed: trivy scan failed for backend:8080/app:1: exit status 1: \
+                 FATAL Fatal error run error: image scan error: unable to initialize fs cache: \
+                 cache may be in use by another process: timeout",
+            ),
+        )
+        .await;
+        mount_report(
+            &server,
+            "retried",
+            ResponseTemplate::new(200).set_body_json(one_finding_report()),
+        )
+        .await;
+        let out = ImageScanner::new(server.uri())
+            .scan(&oci_image_artifact(), None, &Bytes::new())
+            .await
+            .expect("a cache-lock failure must be resubmitted");
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!(count_posts(&server).await, 2);
+
+        // Control: a job that failed for any other reason is not resubmitted.
+        let server = wiremock::MockServer::start().await;
+        mount_ready_and_submit_sequence(&server, &["broken"]).await;
+        mount_report(
+            &server,
+            "broken",
+            ResponseTemplate::new(500).set_body_string("scan failed: FATAL failed to pull image"),
+        )
+        .await;
+        let err = ImageScanner::new(server.uri())
+            .scan(&oci_image_artifact(), None, &Bytes::new())
+            .await
+            .expect_err("a failed job fails the scan");
+        assert!(matches!(err, AppError::BadGateway(_)), "{err:?}");
+        assert_eq!(count_posts(&server).await, 1);
     }
 
     /// An empty scan id from the submit endpoint must fail the scan up front:

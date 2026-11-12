@@ -1,0 +1,5 @@
+---
+section: Security
+issues: [#5518]
+---
+- **An MCP server version can no longer pin an OCI image named on another host to a same-named image behind a Virtual** ([#5518]). When the `oci` backing repository of an MCP registry was a Virtual, the image host was ignored: `evil.example/acme/mcp:1.2` was pinned to whichever member held `acme/mcp:1.2`, such as the `ghcr.io` image a Remote member proxies, and served at Artifact Keeper coordinates, under `own-repos` as well as `open`. The host is now checked against the member whose manifest would be served. A Remote member must proxy the named host (Docker Hub aliases count as one host); otherwise the publish is refused with `422 mcp_external_registry` under either policy, no fill is queued through that Remote, and a Remote MCP sync stores the version as unresolvable. A hosted member serves another host's name only under `open`, and the pin records `foreign_coordinates_replaced`. An image named on the Virtual itself (`<host>/<virtual>/<image>`) pins as before.

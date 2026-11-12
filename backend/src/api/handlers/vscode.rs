@@ -4271,13 +4271,7 @@ async fn download_vsix(
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
@@ -4405,19 +4399,23 @@ async fn publish_extension(
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
     // Store the file
-    let storage_key = build_vscode_storage_key(&publisher, &ext_name, &ext_version);
+    let storage_key = build_vscode_storage_key(
+        crate::storage::StorageKeyScheme::from_env(),
+        &repo.storage_backend,
+        repo.id,
+        &publisher,
+        &ext_name,
+        &ext_version,
+    );
     proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
         .await?;
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body.clone()).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            crate::api::handlers::storage_err_message(&e),
-        )
-            .into_response()
-    })?;
+    storage
+        .put(&storage_key, body.clone())
+        .await
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     let vscode_metadata = build_vscode_metadata(&manifest);
 
@@ -4489,6 +4487,7 @@ async fn publish_extension(
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         "vscode",
         &extension_id,
@@ -4603,9 +4602,25 @@ fn build_vscode_artifact_path(publisher: &str, name: &str, version: &str) -> Str
 }
 
 /// Build the storage key for a VS Code extension.
-fn build_vscode_storage_key(publisher: &str, name: &str, version: &str) -> String {
+///
+/// Repo-scoped on a shared cloud namespace (#5662), so two repositories
+/// holding the same extension version do not collide on one key; reads go
+/// through the row's storage_key, so legacy flat-key rows keep serving.
+fn build_vscode_storage_key(
+    scheme: crate::storage::StorageKeyScheme,
+    storage_backend: &str,
+    repo_id: uuid::Uuid,
+    publisher: &str,
+    name: &str,
+    version: &str,
+) -> String {
     let filename = build_vsix_filename(publisher, name, version);
-    format!("vscode/{}/{}/{}", publisher, name, filename)
+    scheme.write_key(
+        storage_backend,
+        "vscode",
+        repo_id,
+        &format!("{}/{}/{}", publisher, name, filename),
+    )
 }
 
 /// Build the download URL for a VS Code extension.
@@ -8528,6 +8543,93 @@ mod tests {
         assert_eq!(&body[..], blob, "streamed body must equal upstream bytes");
         teardown().await;
     }
+
+    /// #5685: an extension publish (`publish_extension`'s `storage.put`)
+    /// against a store that is down answers `503` with `Retry-After`, and
+    /// against one that is full `507` without it; the legacy VSIX download of
+    /// a published extension (`download_vsix`'s `get_stream`) answers the
+    /// outage `503`. Neither body echoes the backend error. Both sites
+    /// answered a hard-coded `500`.
+    #[tokio::test]
+    async fn extension_publish_and_download_maps_storage_outage_and_full_without_echoing_the_error_5685(
+    ) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::header::RETRY_AFTER;
+
+        let publish = |version: &'static str, body: &'static [u8], key: &str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/{key}/api/extensions"))
+                .header("x-publisher", "outage5685")
+                .header("x-extension-name", "tools")
+                .header("x-extension-version", version)
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        };
+
+        let Some(fx) = tdh::Fixture::setup("local", "vscode").await else {
+            return;
+        };
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            publish("1.0.0", b"vsix-bytes-5685", &fx.repo_key),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "publish while storage works: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        for (message, want) in [
+            (
+                tdh::minio_unreachable_error(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                axum::http::StatusCode::INSUFFICIENT_STORAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&fx.pool, &fx.state, fx.repo_id, &message).await;
+            let app = tdh::router_with_auth(
+                super::router(),
+                state.clone(),
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let (status, body, headers) =
+                tdh::send_with_headers(app, publish("2.0.0", b"vsix-bytes-outage", &fx.repo_key))
+                    .await;
+            assert_eq!(status, want, "publish: {}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(RETRY_AFTER),
+                want == axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            tdh::assert_no_storage_backend_text("vscode publish", &body);
+
+            if want == axum::http::StatusCode::SERVICE_UNAVAILABLE {
+                let app = tdh::router_with_auth(
+                    super::router(),
+                    state.clone(),
+                    tdh::make_auth(fx.user_id, &fx.username),
+                );
+                let (status, body, headers) = tdh::send_with_headers(
+                    app,
+                    tdh::get(format!(
+                        "/{}/extensions/outage5685/tools/1.0.0/download",
+                        fx.repo_key
+                    )),
+                )
+                .await;
+                assert_eq!(status, want, "download: {}", String::from_utf8_lossy(&body));
+                assert!(headers.contains_key(RETRY_AFTER));
+                tdh::assert_no_storage_backend_text("vscode download", &body);
+            }
+        }
+        fx.teardown().await;
+    }
     use super::*;
 
     // -----------------------------------------------------------------------
@@ -8618,24 +8720,65 @@ mod tests {
     // build_vscode_storage_key
     // -----------------------------------------------------------------------
 
+    /// The key on a filesystem backend, which keeps the legacy flat layout.
+    fn fs_vscode_storage_key(publisher: &str, name: &str, version: &str) -> String {
+        build_vscode_storage_key(
+            crate::storage::StorageKeyScheme::RepoScoped,
+            "filesystem",
+            uuid::Uuid::new_v4(),
+            publisher,
+            name,
+            version,
+        )
+    }
+
     #[test]
     fn test_build_vscode_storage_key() {
         assert_eq!(
-            build_vscode_storage_key("esbenp", "prettier-vscode", "10.1.0"),
+            fs_vscode_storage_key("esbenp", "prettier-vscode", "10.1.0"),
             "vscode/esbenp/prettier-vscode/esbenp.prettier-vscode-10.1.0.vsix"
         );
     }
 
     #[test]
     fn test_build_vscode_storage_key_starts_with_vscode() {
-        let key = build_vscode_storage_key("ms-python", "python", "1.0.0");
+        let key = fs_vscode_storage_key("ms-python", "python", "1.0.0");
         assert!(key.starts_with("vscode/"));
     }
 
     #[test]
     fn test_build_vscode_storage_key_ends_with_vsix() {
-        let key = build_vscode_storage_key("ms-vscode", "cpptools", "1.18.0");
+        let key = fs_vscode_storage_key("ms-vscode", "cpptools", "1.18.0");
         assert!(key.ends_with(".vsix"));
+    }
+
+    #[test]
+    fn vscode_storage_key_is_repo_scoped_on_cloud_5662() {
+        use crate::storage::StorageKeyScheme;
+        let repo_id = uuid::Uuid::new_v4();
+        let key = |scheme, backend| {
+            build_vscode_storage_key(
+                scheme,
+                backend,
+                repo_id,
+                "esbenp",
+                "prettier-vscode",
+                "10.1.0",
+            )
+        };
+        let path = "esbenp/prettier-vscode/esbenp.prettier-vscode-10.1.0.vsix";
+        for backend in ["s3", "gcs", "azure"] {
+            assert_eq!(
+                key(StorageKeyScheme::RepoScoped, backend),
+                format!("vscode/{repo_id}/{path}"),
+                "{backend}"
+            );
+            assert_eq!(
+                key(StorageKeyScheme::Flat, backend),
+                format!("vscode/{path}"),
+                "{backend}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -10250,6 +10393,29 @@ mod vsix_manifest_publish_tests {
             "a benign name must still publish: {ok_status} {}",
             String::from_utf8_lossy(&ok_body)
         );
+    }
+
+    /// #5662: the same extension version publishes into two VS Code
+    /// repositories on a shared cloud namespace (on main the second answered
+    /// 409).
+    #[tokio::test]
+    async fn same_extension_publishes_to_two_cloud_repositories_5662() {
+        let package = vsix("acme", "shared5662", "1.0.0", "universal");
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "vscode",
+            key_prefix: "vscode",
+            router: super::router,
+            publish: &|key| {
+                vec![tdh::post(
+                    format!("/{key}/api/extensions"),
+                    "application/octet-stream",
+                    bytes::Bytes::from(package.clone()),
+                )]
+            },
+            download: &|key| tdh::get(format!("/{key}/extensions/acme/shared5662/1.0.0/download")),
+            expected: &package,
+        })
+        .await;
     }
 
     /// `vsce package` output publishes with no `x-*` header and its fields are

@@ -292,10 +292,7 @@ pub enum Outcome {
 
 /// Whether `item` has `version` approved and ingested.
 fn pinned_and_ingested(item: &catalog::CatalogItem, version: &str) -> bool {
-    item.pins
-        .iter()
-        .any(|p| p.version == version && p.status == STATUS_APPROVED)
-        && item.ingested.iter().any(|v| v.version == version)
+    approved_pin(item, version) && item.ingested.iter().any(|v| v.version == version)
 }
 
 /// Seed one `name@version`, and the catalog id of the name once known.
@@ -374,15 +371,42 @@ pub async fn seed_one(
     {
         Ok(r) => match r.ingest_error {
             None => (Outcome::Pinned, id),
-            Some(e) => (
-                Outcome::Failed(format!(
-                    "approved, but not ingested yet ({e}); the next sync retries it"
-                )),
-                id,
-            ),
+            Some(e) => (not_ingested_yet(&e), id),
         },
-        Err(e) => (Outcome::Failed(e.to_string()), id),
+        // A store error surfaces after the approval was recorded (#5672):
+        // keep saying so when the pin stands (#5675).
+        Err(e) => {
+            let approved = catalog::item_by_name(&state.db, repo, name)
+                .await
+                .is_ok_and(|item| approved_pin(&item, version));
+            (pin_failure(&e.to_string(), approved), id)
+        }
     }
+}
+
+/// The outcome of a pin that was approved but whose version is not stored.
+fn not_ingested_yet(cause: &str) -> Outcome {
+    Outcome::Failed(format!(
+        "approved, but not ingested yet ({cause}); the next sync retries it"
+    ))
+}
+
+/// The outcome of a pin that failed with `cause`: when the approval was
+/// recorded before the failure (`approved`, a store error), the
+/// "approved, but not ingested yet" context the deferred path gives.
+fn pin_failure(cause: &str, approved: bool) -> Outcome {
+    if approved {
+        not_ingested_yet(&format!("storage: {cause}"))
+    } else {
+        Outcome::Failed(cause.to_string())
+    }
+}
+
+/// Whether `item` holds an approved pin of `version`.
+fn approved_pin(item: &catalog::CatalogItem, version: &str) -> bool {
+    item.pins
+        .iter()
+        .any(|p| p.version == version && p.status == STATUS_APPROVED)
 }
 
 /// Read a seed job of `repo`.

@@ -161,6 +161,45 @@ pub async fn cleanup_soft_deleted_artifact(
     .await;
 }
 
+/// [`cleanup_soft_deleted_artifact`] for a write whose new row stores its
+/// bytes under `new_storage_key` (#5675): a purged row that named another
+/// key (a Git LFS object stored under the legacy flat key before #5672,
+/// re-pushed under its repository-scoped key) hands that key to the storage
+/// GC as a candidate, the way a conditional replace does
+/// (`record_replaced_object_gc_candidate`). Without it the old object was an
+/// orphan the row-driven GC no longer saw. The candidate sweep deletes the
+/// object only if nothing else references the key. Fire-and-forget like the
+/// plain cleanup: a failure only leaves the old object where it was.
+pub async fn cleanup_soft_deleted_artifact_reclaiming(
+    db: &sqlx::PgPool,
+    repository_id: uuid::Uuid,
+    location: &crate::storage::StorageLocation,
+    path: &str,
+    new_storage_key: &str,
+) {
+    let scope = crate::services::storage_gc_service::oci_gc_candidate_scope(location);
+    if let Err(e) = sqlx::query(
+        "WITH purged AS ( \
+             DELETE FROM artifacts \
+              WHERE repository_id = $1 AND path = $2 AND is_deleted = true \
+             RETURNING storage_key) \
+         INSERT INTO oci_gc_candidates \
+             (storage_key, storage_backend, storage_path, source_repository_id) \
+         SELECT DISTINCT storage_key, $3, $4, $1 FROM purged WHERE storage_key <> $5 \
+         ON CONFLICT (storage_backend, storage_path, storage_key) DO NOTHING",
+    )
+    .bind(repository_id)
+    .bind(path)
+    .bind(&scope.backend)
+    .bind(&scope.path)
+    .bind(new_storage_key)
+    .execute(db)
+    .await
+    {
+        tracing::warn!(%repository_id, path, error = %e, "soft-deleted artifact cleanup failed");
+    }
+}
+
 /// Remove any soft-deleted artifact at `(repository_id, path)` so a subsequent
 /// INSERT won't violate `UNIQUE(repository_id, path)` — UNLESS the coordinate is
 /// a *released* one AND the incoming bytes differ from the tombstoned bytes.
@@ -295,6 +334,14 @@ fn is_db_unavailable_display<E: std::fmt::Display + ?Sized>(e: &E) -> bool {
     crate::error::AppError::Database(e.to_string()).is_db_unavailable()
 }
 
+/// Whether a database error, as its rendered text, is a deadlock Postgres
+/// broke by rolling the transaction back (#4989), by the same rule the
+/// generic path's `DATABASE_DEADLOCK` 503 uses (#5168).
+fn is_deadlock_display<E: std::fmt::Display + ?Sized>(e: &E) -> bool {
+    use crate::error::DeadlockError as _;
+    crate::error::AppError::Database(e.to_string()).is_deadlock()
+}
+
 /// Pick the HTTP status for a database error when the response envelope is
 /// format-specific (npm/OCI/Git-LFS/etc.) and cannot go through `db_err`.
 ///
@@ -305,11 +352,13 @@ fn is_db_unavailable_display<E: std::fmt::Display + ?Sized>(e: &E) -> bool {
 /// [`crate::error::AppError::is_db_unavailable`] gives the generic path
 /// (#4750), so an `npm install`, a `docker pull` or a Git LFS batch during an
 /// outage sees a retryable 503 rather than a 500 (#4765). Every other DB
-/// failure (a query or data error) stays 500. Callers keep their own
+/// failure (a query or data error) stays 500. A deadlock Postgres broke by
+/// rolling the transaction back changed nothing, so it is a retryable 503
+/// too, as on the generic path (#5168, #4989). Callers keep their own
 /// format-specific error body and pass this for the status argument; the
 /// envelope helpers add `Retry-After` through [`with_retry_after_on_503`].
 pub fn db_status<E: std::fmt::Display + ?Sized>(e: &E) -> axum::http::StatusCode {
-    if is_db_unavailable_display(e) {
+    if is_db_unavailable_display(e) || is_deadlock_display(e) {
         axum::http::StatusCode::SERVICE_UNAVAILABLE
     } else {
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
@@ -343,6 +392,11 @@ pub fn db_err_message<E: std::fmt::Display + ?Sized>(e: &E) -> &'static str {
     } else if is_db_unavailable_display(&raw) {
         tracing::error!(error = %raw, code = "DATABASE_UNAVAILABLE", "Request error");
         "Database is temporarily unavailable, retry shortly"
+    } else if is_deadlock_display(&raw) {
+        // Logged at error, as on the generic path: a deadlock that reaches a
+        // client is still a lock-order bug.
+        tracing::error!(error = %raw, code = "DATABASE_DEADLOCK", "Request error");
+        "Database transaction was rolled back by a lock conflict, retry shortly"
     } else {
         tracing::error!(error = %raw, code = "DATABASE_ERROR", "Request error");
         "Database operation failed"
@@ -367,17 +421,75 @@ pub fn db_err_message<E: std::fmt::Display + ?Sized>(e: &E) -> &'static str {
 /// ENAMETOOLONG keeps its own wording for the same reason
 /// `AppError::user_message` gives it one: an over-long path segment is a
 /// client-caused condition the caller can act on, and the text names no path
-/// (#1047). The STATUS is deliberately left to the call site — these handlers
-/// answer 500 today and #3718 changes message text only.
+/// (#1047). A store that is down or full gets `AppError`'s fixed wording for
+/// that class (#5685). The STATUS is left to the call site: a route answering
+/// a storage failure builds it with [`storage_err_response`], which picks
+/// 503 / 507 / 500 from the same class.
 pub fn storage_err_message<E: std::fmt::Display + ?Sized>(e: &E) -> &'static str {
+    use crate::storage::StorageFailure;
     let raw = e.to_string();
-    if crate::error::is_name_too_long(&raw) {
-        tracing::warn!(error = %raw, code = "PATH_TOO_LONG", "Request error");
-        "Path segment exceeds filesystem name length limit"
-    } else {
-        tracing::error!(error = %raw, code = "STORAGE_ERROR", "Request error");
-        "Storage operation failed"
+    match StorageFailure::from_message(&raw) {
+        Some(StorageFailure::Full) => {
+            tracing::error!(error = %raw, code = "STORAGE_FULL", "Request error");
+            crate::error::STORAGE_FULL_MESSAGE
+        }
+        Some(StorageFailure::Unavailable) => {
+            tracing::error!(error = %raw, code = "STORAGE_UNAVAILABLE", "Request error");
+            crate::error::STORAGE_UNAVAILABLE_MESSAGE
+        }
+        None if crate::error::is_name_too_long(&raw) => {
+            tracing::warn!(error = %raw, code = "PATH_TOO_LONG", "Request error");
+            "Path segment exceeds filesystem name length limit"
+        }
+        None => {
+            tracing::error!(error = %raw, code = "STORAGE_ERROR", "Request error");
+            "Storage operation failed"
+        }
     }
+}
+
+/// The status a format route answers for a failed storage call (#5685): `503`
+/// when the store could not be reached in time, `507` when it refused the
+/// write for lack of space, else `500`. The class comes from the backend's
+/// marker on the error, never from its wording (see
+/// [`crate::storage::failure`]), the same rule `AppError` applies.
+pub fn storage_err_status<E: std::fmt::Display + ?Sized>(e: &E) -> axum::http::StatusCode {
+    use crate::storage::StorageFailure;
+    use axum::http::StatusCode;
+    match StorageFailure::from_message(&e.to_string()) {
+        Some(StorageFailure::Full) => StatusCode::INSUFFICIENT_STORAGE,
+        Some(StorageFailure::Unavailable) => StatusCode::SERVICE_UNAVAILABLE,
+        None => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// The response a format route answers for a failed storage call, built in
+/// the route's own envelope (#5685).
+///
+/// `envelope` gets the status ([`storage_err_status`]) and the fixed message
+/// ([`storage_err_message`]); the raw error is only logged. A `503` gets
+/// `Retry-After`, as `AppError`'s does, and a classified failure feeds the
+/// storage signal on `/health` and `/readyz`, so these routes report a down
+/// or full store exactly as the routes that go through `AppError::Storage`
+/// (#5649, #5650) do. Before this they answered a hard-coded `500`.
+pub fn storage_err_response<E: std::fmt::Display + ?Sized>(
+    e: &E,
+    envelope: impl FnOnce(axum::http::StatusCode, &'static str) -> axum::response::Response,
+) -> axum::response::Response {
+    let raw = e.to_string();
+    if let Some(class) = crate::storage::StorageFailure::from_message(&raw) {
+        crate::storage::failure::record_failure(class);
+    }
+    with_retry_after_on_503(envelope(
+        storage_err_status(&raw),
+        storage_err_message(&raw),
+    ))
+}
+
+/// [`storage_err_response`] for the routes whose error body is plain text.
+pub fn storage_err_plain<E: std::fmt::Display + ?Sized>(e: &E) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    storage_err_response(e, |status, message| (status, message).into_response())
 }
 
 /// Log `e` and return `context` as the client-facing message, for the
@@ -571,6 +683,7 @@ pub mod proxy_helpers;
 pub(crate) mod proxy_scan_archive;
 pub(crate) mod proxy_scan_inflight;
 pub mod pub_registry;
+pub(crate) mod publish_lock;
 pub mod publish_quota;
 pub mod puppet;
 pub mod pypi;
@@ -818,6 +931,22 @@ mod tests {
             );
             assert_eq!(db_err_message(&fault), "Database operation failed");
         }
+    }
+
+    /// #4989: a deadlock on a format route with its own envelope is the
+    /// generic path's retryable 503 (#5168), with the same wording, not a 500.
+    #[test]
+    fn test_db_status_and_message_treat_a_deadlock_as_retryable_4989() {
+        let deadlock = "error returned from database: deadlock detected".to_string();
+        assert_eq!(
+            db_status(&deadlock),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            db_err_message(&deadlock),
+            "Database transaction was rolled back by a lock conflict, retry shortly"
+        );
+        assert!(!db_err_message(&deadlock).contains("deadlock detected"));
     }
 
     #[test]
@@ -1156,6 +1285,68 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert tombstone");
+    }
+
+    /// #5675: purging a tombstone whose key differs from the new row's
+    /// journals the old key as a storage GC candidate; the same key (or no
+    /// tombstone) journals nothing.
+    #[tokio::test]
+    async fn reclaiming_cleanup_journals_the_replaced_key_5675() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let repo = make_repo(&pool, "generic").await;
+        let sha = "c".repeat(64);
+        let flat = format!("sk/{sha}");
+        let location = crate::storage::StorageLocation {
+            backend: "s3".into(),
+            path: String::new(),
+        };
+        let journaled = |key: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM oci_gc_candidates \
+                     WHERE storage_key = $1 AND storage_backend = 's3' AND source_repository_id = $2",
+                )
+                .bind(key)
+                .bind(repo)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let tombstones = |path: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+                )
+                .bind(repo)
+                .bind(path)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        // Same key: purged, nothing journaled.
+        insert_tombstone(&pool, repo, "lfs/same", &sha).await;
+        cleanup_soft_deleted_artifact_reclaiming(&pool, repo, &location, "lfs/same", &flat).await;
+        assert_eq!(tombstones("lfs/same").await, 0);
+        assert_eq!(journaled(flat.clone()).await, 0);
+        // Another key: purged and the old key journaled.
+        insert_tombstone(&pool, repo, "lfs/moved", &sha).await;
+        let scoped = format!("lfs/{repo}/{sha}");
+        cleanup_soft_deleted_artifact_reclaiming(&pool, repo, &location, "lfs/moved", &scoped)
+            .await;
+        assert_eq!(tombstones("lfs/moved").await, 0);
+        assert_eq!(journaled(flat.clone()).await, 1);
+        assert_eq!(journaled(scoped).await, 0);
+        let _ = sqlx::query("DELETE FROM oci_gc_candidates WHERE source_repository_id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await;
+        cleanup_repo(&pool, repo).await;
     }
 
     async fn cleanup_repo(pool: &sqlx::PgPool, repo: uuid::Uuid) {
@@ -2856,6 +3047,100 @@ mod raw_error_body_class_tests {
              reason instead. Offending sites:\n{}",
             offenders.join("\n")
         );
+    }
+
+    /// #5685: a storage failure's status comes from its class. A handler that
+    /// pairs `storage_err_message` with a hard-coded `500` answers a store
+    /// that is down or full with a 500 instead of `503` + `Retry-After` /
+    /// `507`; it must build the response with `storage_err_response` /
+    /// `storage_err_plain`, or take the status from `storage_err_status`.
+    #[test]
+    fn no_handler_answers_a_storage_failure_with_a_hard_coded_500_5685() {
+        let mut offenders: Vec<String> = Vec::new();
+        let mut files = 0usize;
+        for (path, src) in rust_sources() {
+            if !path.to_string_lossy().contains("api/handlers") {
+                continue;
+            }
+            files += 1;
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let tests = test_module_line_ranges(&src);
+            let lines: Vec<&str> = src.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                if !line.contains("storage_err_message(") || in_test_module(&tests, index + 1) {
+                    continue;
+                }
+                let window = &lines[index.saturating_sub(3)..index];
+                if window
+                    .iter()
+                    .any(|l| l.contains("StatusCode::INTERNAL_SERVER_ERROR"))
+                {
+                    offenders.push(format!("{name}:{}: {}", index + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            files > 30,
+            "#5685: the handler scan found only {files} files"
+        );
+        assert!(
+            offenders.is_empty(),
+            "#5685: these sites answer a storage failure with a hard-coded 500; build \
+             the response with `crate::api::handlers::storage_err_response` (or \
+             `storage_err_plain`) so a store that is down answers 503 and a full one \
+             507:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn storage_err_response_maps_the_class_and_keeps_the_envelope_5685() {
+        use crate::storage::StorageFailure;
+        use axum::http::{header, StatusCode};
+        use axum::response::IntoResponse;
+        for (raw, want, retry_after, message) in [
+            (
+                StorageFailure::Unavailable.tag("tcp connect error: connection refused"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                true,
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                StorageFailure::Full.tag("<Error><Code>XMinioAdminBucketQuotaExceeded</Code>"),
+                StatusCode::INSUFFICIENT_STORAGE,
+                false,
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+            // The wording alone never picks a class: a key may say anything.
+            (
+                "Failed to write No space left on device/connection refused".to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                false,
+                "Storage operation failed",
+            ),
+        ] {
+            assert_eq!(
+                crate::api::handlers::storage_err_status(&raw),
+                want,
+                "{raw}"
+            );
+            let response = crate::api::handlers::storage_err_response(&raw, |status, text| {
+                assert_eq!(text, message, "{raw}");
+                (status, [("x-envelope", "kept")], text).into_response()
+            });
+            assert_eq!(response.status(), want, "{raw}");
+            assert_eq!(response.headers()["x-envelope"], "kept");
+            assert_eq!(
+                response.headers().contains_key(header::RETRY_AFTER),
+                retry_after,
+                "{raw}"
+            );
+            assert_eq!(
+                crate::api::handlers::storage_err_plain(&raw).status(),
+                want,
+                "{raw}"
+            );
+        }
     }
 
     #[test]

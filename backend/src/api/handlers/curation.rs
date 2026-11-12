@@ -792,6 +792,84 @@ fn sync_tenant_access_allowed(repo_is_public: bool, has_repo_grant: bool) -> boo
     repo_is_public || has_repo_grant
 }
 
+/// Why `run_curation_sync_cycle` would skip this repository without doing
+/// anything (#5207), or `None` when a pass can run. Pure. Mirrors the sync's
+/// repository query (staging, curation enabled, a source with an upstream
+/// URL) and its format dispatch.
+fn curation_sync_unconfigured(
+    repo: &crate::models::repository::Repository,
+    source: Option<&crate::models::repository::Repository>,
+) -> Option<String> {
+    sync_refusal(
+        &repo.key,
+        repo.repo_type == crate::models::repository::RepositoryType::Staging,
+        repo.format.as_key(),
+        repo.curation_enabled,
+        source.map(|s| (s.key.as_str(), s.upstream_url.as_deref())),
+    )
+}
+
+/// [`curation_sync_unconfigured`] over the fields it reads. `source` is the
+/// linked repository's key and upstream URL.
+fn sync_refusal(
+    key: &str,
+    is_staging: bool,
+    format: &str,
+    curation_enabled: bool,
+    source: Option<(&str, Option<&str>)>,
+) -> Option<String> {
+    if !is_staging {
+        return Some(format!(
+            "'{key}' is not a staging repository; curation sync runs on staging repositories"
+        ));
+    }
+    if !crate::services::scheduler_service::curation_sync_supported(format) {
+        return Some(format!(
+            "curation sync is not available for {format} repositories"
+        ));
+    }
+    if !curation_enabled {
+        return Some(format!(
+            "curation is not enabled on '{key}'; set curation_enabled with \
+             PATCH /api/v1/repositories/{key}"
+        ));
+    }
+    let Some((source_key, upstream_url)) = source else {
+        return Some(format!(
+            "'{key}' has no curation source; set curation_source_repository_key with \
+             PATCH /api/v1/repositories/{key}"
+        ));
+    };
+    if upstream_url.is_none_or(str::is_empty) {
+        return Some(format!(
+            "curation source '{source_key}' has no upstream URL"
+        ));
+    }
+    None
+}
+
+/// Why the sync would skip `source` because its upstream URL is refused by
+/// the upstream URL validation (#5207), the same check the sync's client
+/// builder (`curation_client_for`) applies before any request.
+async fn source_upstream_url_refusal(
+    source: Option<&crate::models::repository::Repository>,
+) -> Result<Option<String>, AppError> {
+    let Some((key, url)) =
+        source.and_then(|s| s.upstream_url.as_ref().map(|u| (s.key.clone(), u.clone())))
+    else {
+        return Ok(None);
+    };
+    // Off the async worker: the validation may resolve the host.
+    let validation = tokio::task::spawn_blocking(move || {
+        crate::api::validation::validate_outbound_url(&url, "Upstream URL")
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("upstream URL validation task failed: {e}")))?;
+    Ok(validation
+        .err()
+        .map(|e| format!("the upstream URL of curation source '{key}' is not allowed: {e}")))
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/curation/repos/{repo_key}/sync",
@@ -800,7 +878,7 @@ fn sync_tenant_access_allowed(repo_is_public: bool, has_repo_grant: bool) -> boo
     responses(
         (status = 200, body = SyncTriggerResponse, description = "Staging repository: the pass ran"),
         (status = 202, body = SyncTriggerResponse, description = "Remote MCP registry: the pass started in the background; poll `status_url` (#5422)"),
-        (status = 409, description = "Remote MCP registry: a pass is already running, or scheduled upstream jobs are paused"),
+        (status = 409, description = "Nothing to sync (#5207): not a staging repository, a format without a curation sync, curation not enabled, no curation source with an upstream URL, or an upstream URL the upstream URL validation refuses; the message says which. Remote MCP registry: a pass is already running, or scheduled upstream jobs are paused"),
         (status = 403, description = "Not authorized to trigger a sync for this repo"),
         (status = 404, description = "Repository not found"),
     ),
@@ -886,6 +964,26 @@ async fn trigger_sync(
                 succeeded: true,
             }),
         ));
+    }
+
+    // #5207: a repository the sync would skip is refused (409) with the
+    // reason, instead of answering `succeeded: true` for a pass that did
+    // nothing. The same conditions as the sync's own repository query.
+    let source = match repo.curation_source_repo_id {
+        Some(id) => match repo_service.get_by_id(id).await {
+            Ok(source) => Some(source),
+            Err(AppError::NotFound(_)) => None,
+            Err(e) => return Err(e),
+        },
+        None => None,
+    };
+    if let Some(reason) = curation_sync_unconfigured(&repo, source.as_ref()) {
+        return Err(AppError::Conflict(reason));
+    }
+    // The sync skips a source whose upstream URL the upstream URL validation
+    // refuses, without a request, so that is a pass with nothing to do too.
+    if let Some(reason) = source_upstream_url_refusal(source.as_ref()).await? {
+        return Err(AppError::Conflict(reason));
     }
 
     // Run one sync pass for this repo. The pass applies the bounded-decompress
@@ -2231,6 +2329,114 @@ mod tests {
         assert!(!super::sync_tenant_access_allowed(false, false));
     }
 
+    #[test]
+    fn test_sync_refusal_pure() {
+        let remote = Some(("src", Some("https://u")));
+        assert_eq!(super::sync_refusal("k", true, "rpm", true, remote), None);
+        assert_eq!(super::sync_refusal("k", true, "yarn", true, remote), None);
+        let cases = [
+            ((true, "rpm", true, None), "no curation source"),
+            (
+                (true, "rpm", true, Some(("src", None))),
+                "has no upstream URL",
+            ),
+            ((true, "rpm", false, remote), "curation is not enabled"),
+            ((true, "maven", true, remote), "not available for maven"),
+            ((false, "rpm", true, remote), "is not a staging repository"),
+        ];
+        for ((staging, format, enabled, source), want) in cases {
+            let reason = super::sync_refusal("k", staging, format, enabled, source)
+                .unwrap_or_else(|| panic!("{want}: expected a refusal"));
+            assert!(reason.contains(want), "{reason}");
+        }
+    }
+
+    // #5207: a staging repository with no curation source answered 200
+    // `succeeded: true` for a pass that did nothing. It is a 409 naming the
+    // missing source now, and linking the source through PATCH (the field
+    // #5207 adds) makes the same trigger run.
+    #[tokio::test]
+    async fn test_trigger_sync_without_source_refused_until_linked_db() {
+        use crate::api::handlers::repositories::{update_repository, UpdateRepositoryRequest};
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // PyPI: an on-demand family, so a linked pass evaluates the (empty)
+        // queue the proxy filled and sends no request.
+        let (staging, skey, _sd) = tdh::create_repo(&pool, "staging", "pypi").await;
+        let (remote, rkey, _rd) = tdh::create_repo(&pool, "remote", "pypi").await;
+        sqlx::query("UPDATE repositories SET curation_enabled = true WHERE id = $1")
+            .bind(staging)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Loopback upstream, which the upstream URL validation refuses.
+        sqlx::query("UPDATE repositories SET upstream_url = 'http://127.0.0.1:1' WHERE id = $1")
+            .bind(remote)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (admin, aname) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, staging, admin).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let trigger = || {
+            super::trigger_sync(
+                State(state.clone()),
+                Extension(tdh::admin_auth(admin, &aname)),
+                Path(skey.clone()),
+            )
+        };
+
+        match trigger().await {
+            Err(AppError::Conflict(reason)) => {
+                assert!(reason.contains("no curation source"), "{reason}")
+            }
+            other => panic!("a sync with no curation source must be a 409: {other:?}"),
+        }
+        assert_eq!(
+            tdh::audit_count(&pool, staging, "CURATION_SYNC_TRIGGERED").await,
+            0,
+            "a refused trigger ran nothing"
+        );
+
+        let patch: UpdateRepositoryRequest =
+            serde_json::from_value(serde_json::json!({ "curation_source_repository_key": rkey }))
+                .unwrap();
+        let crate::api::extractors::Json(updated) = update_repository(
+            State(state.clone()),
+            Extension(Some(tdh::admin_auth(admin, &aname))),
+            Path(skey.clone()),
+            crate::api::extractors::Json(patch),
+        )
+        .await
+        .expect("link the curation source");
+        assert_eq!(updated.curation_source_repo_id, Some(remote));
+
+        // The sync would skip a source whose upstream URL is refused, so that
+        // is a 409 too, not a pass that did nothing and succeeded.
+        match trigger().await {
+            Err(AppError::Conflict(reason)) => {
+                assert!(reason.contains("is not allowed"), "{reason}")
+            }
+            other => panic!("a refused upstream URL must be a 409: {other:?}"),
+        }
+
+        let (server, _allowlisted) = tdh::non_loopback_mock_server().await;
+        sqlx::query("UPDATE repositories SET upstream_url = $2 WHERE id = $1")
+            .bind(remote)
+            .bind(server.uri())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (status, Json(ran)) = trigger().await.expect("a linked sync runs");
+        assert_eq!(status, StatusCode::OK);
+        assert!(ran.triggered && ran.succeeded, "{ran:?}");
+
+        tdh::cleanup(&pool, staging, admin).await;
+        tdh::cleanup(&pool, remote, admin).await;
+    }
+
     /// An API-token principal carrying the admin-mintable `trigger:sync` scope.
     fn sync_scope_token(user_id: Uuid, username: &str) -> AuthExtension {
         AuthExtension {
@@ -2254,11 +2460,11 @@ mod tests {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
-        // A curation staging repo whose remote points at an unreachable upstream,
-        // so the sync pass runs and safely no-ops (no network) — the trigger's
+        // A PyPI curation staging repo (an on-demand family): the sync pass
+        // evaluates the empty queue and sends no request — the trigger's
         // authz + audit behavior is what we assert.
-        let (staging, skey, _sd) = tdh::create_repo(&pool, "staging", "rpm").await;
-        let (remote, _rk, _rd) = tdh::create_repo(&pool, "remote", "rpm").await;
+        let (staging, skey, _sd) = tdh::create_repo(&pool, "staging", "pypi").await;
+        let (remote, _rk, _rd) = tdh::create_repo(&pool, "remote", "pypi").await;
         sqlx::query(
             "UPDATE repositories SET curation_enabled = true, curation_source_repo_id = $2 WHERE id = $1",
         )
@@ -2267,12 +2473,12 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        // Point the remote at a loopback address: the sync pass skips it
-        // without a request (the upstream URL validation refuses loopback), so
-        // it never waits on a DNS/HTTP timeout. The trigger's authz + audit
-        // behavior is what this asserts.
-        sqlx::query("UPDATE repositories SET upstream_url = 'http://127.0.0.1:1' WHERE id = $1")
+        // An allowlisted upstream the trigger accepts (#5207 refuses one the
+        // upstream URL validation would skip); nothing is fetched from it.
+        let (server, _allowlisted) = tdh::non_loopback_mock_server().await;
+        sqlx::query("UPDATE repositories SET upstream_url = $2 WHERE id = $1")
             .bind(remote)
+            .bind(server.uri())
             .execute(&pool)
             .await
             .unwrap();

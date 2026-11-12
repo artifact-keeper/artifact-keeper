@@ -645,3 +645,444 @@ async fn rebuilds_are_announced_off_the_shared_channel_4174() {
         );
     }
 }
+
+/// One package row and its metadata, written the way the upload route
+/// writes them (artifact row first, then its metadata). Returns the row id.
+async fn write_package(fx: &tdh::Fixture, name: &str, version: &str) -> uuid::Uuid {
+    let path = format!("noarch/{name}-{version}-h0_0.tar.bz2");
+    let id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+         checksum_sha256, content_type, storage_key) \
+         VALUES ($1, $2, $3, $4, 10, repeat('c', 64), 'application/octet-stream', $5) \
+         RETURNING id",
+    )
+    .bind(fx.repo_id)
+    .bind(&path)
+    .bind(name)
+    .bind(version)
+    .bind(format!("seed/{}/{path}", fx.repo_id))
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO artifact_metadata (artifact_id, format, metadata) VALUES ($1, 'conda', $2)",
+    )
+    .bind(id)
+    .bind(serde_json::json!({
+        "name": name, "version": version, "build": "h0_0", "build_number": 0,
+        "subdir": "noarch", "depends": [],
+    }))
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    id
+}
+
+/// Withdraw row `id` inside `tx` (a quarantine verdict, as the scanner or the
+/// console writes it). Such an update touches no repository-wide row, so
+/// two of them run concurrently.
+async fn reject(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: uuid::Uuid,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE artifacts SET quarantine_status = 'rejected' WHERE id = $1")
+        .bind(id)
+        .execute(&mut **tx)
+        .await
+        .map(|_| ())
+}
+
+/// #4978 item 2: two concurrent writers that mark the same package names in
+/// opposite orders through different rows (each withdraws one build of `dl-a`
+/// and one of `dl-b`) used to wait on each other's dirty-mark row until
+/// Postgres aborted one with `40P01`. Marks are append-only now: neither
+/// waits, both commit, and the next read rebuilds both shards from every mark.
+#[tokio::test]
+async fn opposite_order_writers_do_not_deadlock_on_dirty_marks_4978() {
+    let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+        return;
+    };
+    let a1 = write_package(&fx, "dl-a", "1.0").await;
+    let a2 = write_package(&fx, "dl-a", "2.0").await;
+    let a3 = write_package(&fx, "dl-a", "3.0").await;
+    let b1 = write_package(&fx, "dl-b", "1.0").await;
+    let b2 = write_package(&fx, "dl-b", "2.0").await;
+    let b3 = write_package(&fx, "dl-b", "3.0").await;
+    assert_eq!(
+        shard_of(&fx, "noarch", "dl-a").await.map(|l| l.len()),
+        Some(3)
+    );
+    assert_eq!(dirty_count(&fx).await, 0);
+
+    let mut first = fx.pool.begin().await.unwrap();
+    let mut second = fx.pool.begin().await.unwrap();
+    reject(&mut first, a1).await.unwrap();
+    reject(&mut second, b1).await.unwrap();
+    let first_done = async {
+        reject(&mut first, b2).await?;
+        first.commit().await
+    };
+    let second_done = async {
+        // Let the first writer reach its second mark first, so on the old
+        // layout it is already waiting on the second writer's `dl-b` mark.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        reject(&mut second, a2).await?;
+        second.commit().await
+    };
+    let (first_done, second_done) = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        futures::future::join(first_done, second_done),
+    )
+    .await
+    .expect("the writers finish");
+    first_done.expect("the first writer commits");
+    second_done.expect("the second writer commits");
+
+    // Each writer marked each key once, so the two keys carry two marks.
+    assert_eq!(dirty_count(&fx).await, 4);
+    for name in ["dl-a", "dl-b"] {
+        let listed = shard_of(&fx, "noarch", name).await.unwrap();
+        assert_eq!(listed.len(), 1, "{name}: {listed:?}");
+    }
+    assert_eq!(dirty_count(&fx).await, 0, "the read consumed every mark");
+
+    // A bulk write marks each key once, however many rows it touches.
+    sqlx::query("UPDATE artifacts SET quarantine_status = 'rejected' WHERE id = ANY($1)")
+        .bind(vec![a3, b3])
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE artifacts SET quarantine_status = 'quarantined' WHERE repository_id = $1")
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    assert_eq!(dirty_count(&fx).await, 4);
+    assert_eq!(shard_of(&fx, "noarch", "dl-a").await, None);
+    assert_eq!(dirty_count(&fx).await, 0);
+}
+
+/// Insert a conda row the way a writer other than the upload route may:
+/// `path`, row `name` and, when given, metadata naming `meta_name`.
+async fn insert_row(
+    fx: &tdh::Fixture,
+    path: &str,
+    name: &str,
+    meta_name: Option<&str>,
+) -> uuid::Uuid {
+    let id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+         checksum_sha256, content_type, storage_key) \
+         VALUES ($1, $2, $3, '1.0', 10, repeat('d', 64), 'application/octet-stream', $4) \
+         RETURNING id",
+    )
+    .bind(fx.repo_id)
+    .bind(path)
+    .bind(name)
+    .bind(format!("seed/{}/{path}", fx.repo_id))
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    if let Some(meta_name) = meta_name {
+        sqlx::query(
+            "INSERT INTO artifact_metadata (artifact_id, format, metadata) VALUES ($1, 'conda', $2)",
+        )
+        .bind(id)
+        .bind(serde_json::json!({
+            "name": meta_name, "version": "1.0", "build": "h0_0", "build_number": 0,
+            "subdir": "noarch", "depends": [],
+        }))
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    }
+    id
+}
+
+/// #4978 item 1: a row with no subdir (no metadata subdir, no `/` in its
+/// path) used to get no dirty mark, so writing it moved no revision. It now
+/// marks the `''` key, and rebuilding that key moves the repository's
+/// revision, which the virtual guard's owned-name cache is keyed on.
+#[tokio::test]
+async fn a_row_with_no_subdir_gets_its_own_mark_4978() {
+    let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+        return;
+    };
+    upload(&fx, "noarch", "ns-a", "1.0").await;
+    let before = shard_store::repo_state(&fx.pool, fx.repo_id)
+        .await
+        .unwrap()
+        .revision;
+    insert_row(&fx, "ns-loose-1.0-h0_0.tar.bz2", "ns-loose", None).await;
+    let marks: Vec<(String, String)> = sqlx::query_as(
+        "SELECT subdir, package_name FROM conda_shard_dirty WHERE repository_id = $1",
+    )
+    .bind(fx.repo_id)
+    .fetch_all(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(marks, vec![(String::new(), "ns-loose".to_string())]);
+    let after = shard_store::repo_state(&fx.pool, fx.repo_id)
+        .await
+        .unwrap()
+        .revision;
+    assert!(after > before, "{before} -> {after}");
+    assert_eq!(dirty_count(&fx).await, 0);
+    // No document serves the '' key: noarch keeps its revision and shards.
+    assert_eq!(
+        shard_of(&fx, "noarch", "ns-a").await.map(|l| l.len()),
+        Some(1)
+    );
+}
+
+/// A virtual over `members` (priority order), as a fixture.
+async fn virtual_over(first: &tdh::Fixture, members: &[uuid::Uuid]) -> uuid::Uuid {
+    let (virtual_id, _, _) = tdh::create_repo(&first.pool, "virtual", "conda").await;
+    for (priority, member) in members.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(virtual_id)
+        .bind(member)
+        .bind(priority as i32 + 1)
+        .execute(&first.pool)
+        .await
+        .unwrap();
+    }
+    virtual_id
+}
+
+/// #4978 item 1: the virtual dependency-confusion guard keeps its owned-name
+/// set per hosted member revision, so a second request reads no member rows,
+/// and every change that moves ownership (a new name, including on a row
+/// with no subdir, and a delete) is seen by the next request.
+#[tokio::test]
+async fn virtual_owned_names_are_kept_per_member_revision_4978() {
+    let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+        return;
+    };
+    upload(&fx, "noarch", "on-a", "1.0").await;
+    let virtual_id = virtual_over(&fx, &[fx.repo_id]).await;
+
+    let first = super::virtual_hosted_owned_names(&fx.pool, virtual_id)
+        .await
+        .unwrap();
+    assert!(first.contains("on-a"), "{first:?}");
+    let second = super::virtual_hosted_owned_names(&fx.pool, virtual_id)
+        .await
+        .unwrap();
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &second),
+        "unchanged members reuse the kept set"
+    );
+
+    insert_row(&fx, "On-Loose-1.0-h0_0.tar.bz2", "On-Loose", None).await;
+    let third = super::virtual_hosted_owned_names(&fx.pool, virtual_id)
+        .await
+        .unwrap();
+    assert!(third.contains("on-loose"), "{third:?}");
+
+    sqlx::query(
+        "UPDATE artifacts SET is_deleted = true WHERE repository_id = $1 AND name = 'on-a'",
+    )
+    .bind(fx.repo_id)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    let fourth = super::virtual_hosted_owned_names(&fx.pool, virtual_id)
+        .await
+        .unwrap();
+    assert!(!fourth.contains("on-a"), "{fourth:?}");
+    assert!(fourth.contains("on-loose"), "{fourth:?}");
+}
+
+/// #4978 item 3: a row whose metadata name differs from `artifacts.name`
+/// (beyond case) belongs to its metadata name's shard. The rebuild found rows
+/// by `artifacts.name` only, so a rebuild of that key alone (another build of
+/// the metadata name written later) dropped the record from the shard, while
+/// `repodata.json` still listed it.
+#[tokio::test]
+async fn a_row_named_differently_by_its_metadata_keeps_its_shard_4978() {
+    let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+        return;
+    };
+    let file = "mn-meta-1.0-h0_0.tar.bz2";
+    insert_row(&fx, &format!("noarch/{file}"), "mn-row", Some("mn-meta")).await;
+    assert_eq!(
+        shard_of(&fx, "noarch", "mn-meta").await,
+        Some(vec![file.to_string()])
+    );
+    // A second build of `mn-meta`, named the same in its row and metadata,
+    // marks only the `mn-meta` key; its rebuild must still find the first.
+    let second = "mn-meta-2.0-h0_0.tar.bz2";
+    insert_row(&fx, &format!("noarch/{second}"), "mn-meta", Some("mn-meta")).await;
+    assert_eq!(
+        shard_of(&fx, "noarch", "mn-meta").await,
+        Some(vec![file.to_string(), second.to_string()])
+    );
+    assert_eq!(shard_of(&fx, "noarch", "mn-row").await, None);
+    let (status, body, _) = get(&fx, "noarch/repodata.json").await;
+    assert_eq!(status, StatusCode::OK);
+    let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(doc["packages"].get(file).is_some(), "{doc}");
+}
+
+/// #4978 item 5: a reader that finds dirty keys while another session holds
+/// the repository's rebuild lock used to wait for that lock on a pooled
+/// connection, so a handful of readers exhausted the pool. Waiting readers
+/// now hold no connection, and all of them answer once the lock is free.
+#[tokio::test]
+async fn readers_waiting_for_a_rebuild_hold_no_connection_4978() {
+    let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+        return;
+    };
+    upload(&fx, "noarch", "rw-a", "1.0").await;
+    let small = crate::testing::try_pool_with(2).await.unwrap();
+
+    // Another session's rebuild: the lock held on a connection of its own.
+    let mut holder = fx.pool.acquire().await.unwrap();
+    let lock_args = (
+        0x4173_i32,
+        crate::services::cluster_lock::lease_object_id(&fx.repo_id.to_string()),
+    );
+    sqlx::query("SELECT pg_advisory_lock($1, $2)")
+        .bind(lock_args.0)
+        .bind(lock_args.1)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE artifacts SET quarantine_status = 'rejected' WHERE repository_id = $1")
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    assert!(dirty_count(&fx).await > 0);
+
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let pool = small.clone();
+            let repo_id = fx.repo_id;
+            tokio::spawn(async move {
+                shard_store::subdir_state(&pool, repo_id, "noarch")
+                    .await
+                    .map(|s| s.revision)
+                    .map_err(|r| r.status())
+            })
+        })
+        .collect();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let probe = tokio::time::timeout(std::time::Duration::from_secs(3), small.acquire()).await;
+    assert!(
+        matches!(probe, Ok(Ok(_))),
+        "a waiting reader must not hold a pooled connection"
+    );
+    drop(probe);
+
+    sqlx::query("SELECT pg_advisory_unlock($1, $2)")
+        .bind(lock_args.0)
+        .bind(lock_args.1)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    drop(holder);
+    let mut revisions = Vec::new();
+    for reader in readers {
+        revisions.push(reader.await.unwrap().expect("every reader answers"));
+    }
+    assert!(revisions.windows(2).all(|w| w[0] == w[1]), "{revisions:?}");
+    assert_eq!(dirty_count(&fx).await, 0);
+    assert_eq!(shard_of(&fx, "noarch", "rw-a").await, None);
+}
+
+/// The filenames of a `repodata.json`'s package maps and of its `removed`.
+fn listed_and_removed(body: &[u8]) -> (Vec<String>, Vec<String>) {
+    let doc: serde_json::Value = serde_json::from_slice(body).unwrap();
+    let mut listed: Vec<String> = ["packages", "packages.conda"]
+        .iter()
+        .flat_map(|k| doc[*k].as_object().unwrap().keys().cloned())
+        .collect();
+    listed.sort();
+    let removed = doc["removed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    (listed, removed)
+}
+
+/// #4978 item 6 (#4288 item 1): a package a scan policy blocks is refused by
+/// the download gate, and is now left out of every hosted listing too:
+/// `repodata.json` (named in `removed` instead), `current_repodata.json`,
+/// the shard index and `channeldata.json`. Lifting the policy lists it again.
+#[tokio::test]
+async fn scan_policy_blocked_packages_leave_the_listings_4978() {
+    let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+        return;
+    };
+    let pkg = upload(&fx, "noarch", "pb-a", "1.0").await;
+    let (_, body, _) = get(&fx, "noarch/repodata.json").await;
+    assert_eq!(listed_and_removed(&body), (vec![pkg.clone()], vec![]));
+
+    sqlx::query(
+        "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                    block_on_fail, is_enabled) \
+         VALUES ($1, $2, 'critical', true, false, true)",
+    )
+    .bind(format!("pb-4978-{}", fx.repo_id))
+    .bind(fx.repo_id)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    crate::services::quarantine_service::invalidate_listing_decisions();
+
+    let (status, _, _) = get(&fx, &format!("noarch/{pkg}")).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the download gate refuses it"
+    );
+    for doc in ["repodata.json", "repodata.json.zst", "repodata.json.bz2"] {
+        let (status, body, _) = get(&fx, &format!("noarch/{doc}")).await;
+        assert_eq!(status, StatusCode::OK, "{doc}");
+        let body = match doc {
+            "repodata.json.zst" => zstd::decode_all(&body[..]).unwrap(),
+            "repodata.json.bz2" => {
+                let mut out = Vec::new();
+                bzip2::read::BzDecoder::new(&body[..])
+                    .read_to_end(&mut out)
+                    .unwrap();
+                out
+            }
+            _ => body.to_vec(),
+        };
+        assert_eq!(
+            listed_and_removed(&body),
+            (vec![], vec![pkg.clone()]),
+            "{doc}"
+        );
+    }
+    let (_, current, _) = get(&fx, "noarch/current_repodata.json").await;
+    assert!(listed_and_removed(&current).0.is_empty());
+    assert_eq!(shard_of(&fx, "noarch", "pb-a").await, None);
+    let (_, channeldata, _) = get(&fx, "channeldata.json").await;
+    let channeldata: serde_json::Value = serde_json::from_slice(&channeldata).unwrap();
+    assert!(
+        channeldata["packages"].get("pb-a").is_none(),
+        "{channeldata}"
+    );
+
+    sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    crate::services::quarantine_service::invalidate_listing_decisions();
+    let (_, body, _) = get(&fx, "noarch/repodata.json").await;
+    assert_eq!(listed_and_removed(&body), (vec![pkg.clone()], vec![]));
+    assert_eq!(
+        shard_of(&fx, "noarch", "pb-a").await,
+        Some(vec![pkg.clone()])
+    );
+}

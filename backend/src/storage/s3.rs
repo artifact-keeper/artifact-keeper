@@ -874,6 +874,11 @@ pub struct S3Config {
     /// an upload below AWS's 10,000 parts.
     /// Clamped at use into [1, 10,000]. Default: [`S3_MULTIPART_MAX_PARTS`].
     pub max_parts: usize,
+    /// Connect timeout and retry budget for every request to the store
+    /// (`STORAGE_CONNECT_TIMEOUT_SECS` / `STORAGE_OPERATION_TIMEOUT_SECS`,
+    /// #5649). Without them each operation against a gone endpoint retried
+    /// 5s connection attempts for up to three minutes.
+    pub timeouts: crate::storage::StorageTimeouts,
 }
 
 /// CloudFront CDN configuration for signed URLs
@@ -989,6 +994,7 @@ impl S3Config {
             control_timeout_secs,
             max_single_copy_bytes,
             max_parts,
+            timeouts: crate::storage::StorageTimeouts::from_env(),
         })
     }
 
@@ -1059,6 +1065,7 @@ impl S3Config {
             control_timeout_secs: S3_CONTROL_TIMEOUT.as_secs(),
             max_single_copy_bytes: S3_MAX_SINGLE_COPY_SIZE,
             max_parts: S3_MULTIPART_MAX_PARTS,
+            timeouts: crate::storage::StorageTimeouts::default(),
         }
     }
 
@@ -1133,6 +1140,12 @@ impl S3Config {
     /// Override the control-plane request timeout (seconds). `0` disables it.
     pub fn with_control_timeout_secs(mut self, timeout_secs: u64) -> Self {
         self.control_timeout_secs = timeout_secs;
+        self
+    }
+
+    /// Override the connect timeout and retry budget (#5649).
+    pub fn with_storage_timeouts(mut self, timeouts: crate::storage::StorageTimeouts) -> Self {
+        self.timeouts = timeouts;
         self
     }
 
@@ -1267,6 +1280,121 @@ fn s3_requests_are_signed(access_key: Option<&str>, secret_key: Option<&str>) ->
     explicit_pair || !anonymous_s3_enabled()
 }
 
+/// Which S3 client a retry policy is for (#5649).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum S3Plane {
+    /// Head, exists, list, delete, multipart create/abort: small requests.
+    Control,
+    /// Payload get/put, multipart parts, server-side copy.
+    Bulk,
+}
+
+/// Retries of one bulk S3 request. With the 3s connect timeout and the 2s
+/// backoff cap, a store that is gone answers `503` after about
+/// 6 x (3s + 2s) = 30s at most.
+const S3_BULK_MAX_RETRIES: usize = 5;
+
+/// The retry policy for each S3 client (#5649).
+///
+/// `object_store` retries a failed connect, a timeout and a 5xx for up to
+/// three minutes by default, backing off up to 15s between attempts. Against
+/// a stopped MinIO, whose host no longer answers, each attempt also waited
+/// out a 5s connect timeout, which turned every upload and download into a
+/// request that hung until the store came back.
+///
+/// `object_store` measures the retry budget from the start of the request
+/// and checks it only after a failure, so the budget must outlast the
+/// request itself, or a long transfer loses every retry: a multipart part
+/// answered `503 SlowDown` after 12s, or a download reset mid-stream, would
+/// fail outright under a 10s budget. Hence two policies:
+///
+/// * **Control**: budget `STORAGE_OPERATION_TIMEOUT_SECS` (default 15s),
+///   `object_store`'s retry count. These requests are short, so the budget
+///   is what binds and a dead store answers `503` within it.
+/// * **Bulk**: budget `STORAGE_BULK_RETRY_TIMEOUT_SECS` (default 180s, as
+///   `object_store`'s own) so a long transfer keeps its retries, bounded
+///   instead by [`S3_BULK_MAX_RETRIES`] when the store is gone.
+///
+/// Both cap the pause between attempts at
+/// [`crate::storage::STORAGE_MAX_RETRY_BACKOFF`]; with the connect timeout,
+/// that cap is what removes the hang.
+fn s3_retry_config(
+    timeouts: &crate::storage::StorageTimeouts,
+    plane: S3Plane,
+) -> object_store::RetryConfig {
+    let (max_retries, retry_timeout) = match plane {
+        S3Plane::Control => (
+            object_store::RetryConfig::default().max_retries,
+            timeouts.operation,
+        ),
+        S3Plane::Bulk => (S3_BULK_MAX_RETRIES, timeouts.bulk_retry),
+    };
+    object_store::RetryConfig {
+        backoff: object_store::BackoffConfig {
+            max_backoff: crate::storage::STORAGE_MAX_RETRY_BACKOFF,
+            ..Default::default()
+        },
+        max_retries,
+        retry_timeout,
+    }
+}
+
+/// `object_store`'s rendering of a non-success response (its `RequestError`),
+/// which names neither the request URL nor the object path.
+const S3_STATUS_PREFIX: &str = "Server returned non-2xx status code: ";
+/// `object_store`'s rendering of a 200 whose body is an error document.
+const S3_ERROR_BODY_PREFIX: &str = "Server returned error response: ";
+
+/// Whether an `object_store` error means the store could not be reached or
+/// did not answer in time, or refused the write for lack of space (#5649,
+/// #5650).
+///
+/// Only typed parts of the error are read, never the whole message, which
+/// carries the object path and request URL (a key named `QuotaExceeded.bin`
+/// must not make a 507):
+///
+/// * the transport kind of the `HttpError` `object_store` gave up on
+///   (connect / timeout / interrupted);
+/// * otherwise the failed response, taken from the one link of the error
+///   chain that renders only the response: `object_store`'s request error,
+///   `Server returned non-2xx status code: <status>: <body>`. The status is
+///   parsed from there and the error code from the body's `<Code>` element
+///   (MinIO's `XMinioAdminBucketQuotaExceeded` for a PUT into a bucket at its
+///   quota). The links above it prefix the method, URL and path.
+fn s3_failure_class(err: &object_store::Error) -> Option<crate::storage::StorageFailure> {
+    use crate::storage::failure::xml_error_code;
+    use crate::storage::StorageFailure;
+    use object_store::client::{HttpError, HttpErrorKind};
+
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = current {
+        if let Some(http) = e.downcast_ref::<HttpError>() {
+            return matches!(
+                http.kind(),
+                HttpErrorKind::Connect
+                    | HttpErrorKind::Timeout
+                    | HttpErrorKind::Request
+                    | HttpErrorKind::Interrupted
+            )
+            .then_some(StorageFailure::Unavailable);
+        }
+        let rendered = e.to_string();
+        if let Some(rest) = rendered.strip_prefix(S3_STATUS_PREFIX) {
+            let status = rest
+                .get(..3)
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(0);
+            let body = rest.split_once(": ").map_or("", |(_, body)| body);
+            return StorageFailure::from_http_status(status, xml_error_code(body));
+        }
+        if let Some(body) = rendered.strip_prefix(S3_ERROR_BODY_PREFIX) {
+            return StorageFailure::from_http_status(0, xml_error_code(body));
+        }
+        current = e.source();
+    }
+    None
+}
+
 /// Classify an `object_store::Error` from S3 into a human-readable
 /// diagnostic. Used by both the runtime `health_check` and the boot
 /// `startup_probe` so the operator sees the same actionable message in
@@ -1355,7 +1483,12 @@ pub(crate) fn classify_s3_error(err: &object_store::Error) -> String {
         "S3 request failed"
     };
 
-    format!("{}. caused by: {}", category, raw)
+    // #5649 / #5650: lead with the marker the HTTP layer maps to
+    // `503 STORAGE_UNAVAILABLE` / `507 STORAGE_FULL`.
+    match s3_failure_class(err) {
+        Some(class) => class.tag(format!("{}. caused by: {}", category, raw)),
+        None => format!("{}. caused by: {}", category, raw),
+    }
 }
 
 /// Replace every `http(s)://...` URL in `text` with `<url>` (#3954).
@@ -1573,7 +1706,7 @@ impl S3Backend {
     ) -> Result<AmazonS3> {
         let timeout = (config.control_timeout_secs > 0)
             .then(|| Duration::from_secs(config.control_timeout_secs));
-        Self::build_store_with_timeout(config, access_key, secret_key, timeout)
+        Self::build_store_with_timeout(config, access_key, secret_key, timeout, S3Plane::Control)
     }
 
     /// Build the bulk-transfer store used for object payload movement:
@@ -1590,7 +1723,7 @@ impl S3Backend {
     ) -> Result<AmazonS3> {
         let timeout =
             (config.bulk_timeout_secs > 0).then(|| Duration::from_secs(config.bulk_timeout_secs));
-        Self::build_store_with_timeout(config, access_key, secret_key, timeout)
+        Self::build_store_with_timeout(config, access_key, secret_key, timeout, S3Plane::Bulk)
     }
 
     /// Clamp the configured single-copy ceiling into what the S3 API can
@@ -1618,7 +1751,8 @@ impl S3Backend {
     /// SigV4-signed per-call with [`AwsAuthorizer`], reusing the store's
     /// credential chain.
     fn build_raw_http_client(config: &S3Config) -> Result<reqwest::Client> {
-        let mut builder = crate::services::http_client::plain_client_builder();
+        let mut builder = crate::services::http_client::plain_client_builder()
+            .connect_timeout(config.timeouts.connect);
         if let Some(ca_path) = &config.ca_cert_path {
             let pem = std::fs::read(ca_path).map_err(|e| {
                 AppError::Config(format!("Failed to read CA cert '{}': {}", ca_path, e))
@@ -1643,13 +1777,17 @@ impl S3Backend {
         access_key: Option<&str>,
         secret_key: Option<&str>,
         timeout: Option<Duration>,
+        plane: S3Plane,
     ) -> Result<AmazonS3> {
         let mut client_opts = object_store::ClientOptions::new()
             .with_user_agent(http::HeaderValue::from_static(
                 crate::services::http_client::DEFAULT_USER_AGENT,
             ))
             .with_pool_max_idle_per_host(config.pool_max_idle_per_host)
-            .with_pool_idle_timeout(Duration::from_secs(config.pool_idle_timeout_secs));
+            .with_pool_idle_timeout(Duration::from_secs(config.pool_idle_timeout_secs))
+            // #5649: `object_store` allows 5s per connection attempt; a
+            // stopped store should be noticed sooner than that.
+            .with_connect_timeout(config.timeouts.connect);
 
         // `object_store` defaults this to 30s and applies it from the start of
         // connect until the response body is fully read, so it caps total
@@ -1693,7 +1831,8 @@ impl S3Backend {
         let mut builder = AmazonS3Builder::new()
             .with_bucket_name(&config.bucket)
             .with_region(&config.region)
-            .with_client_options(client_opts);
+            .with_client_options(client_opts)
+            .with_retry(s3_retry_config(&config.timeouts, plane));
 
         if let Some(endpoint) = &config.endpoint {
             builder = builder.with_endpoint(endpoint);
@@ -2980,21 +3119,25 @@ impl S3Backend {
                 send = send.timeout(timeout);
             }
             let response = send.send().await.map_err(|e| {
-                AppError::Storage(format!(
-                    "Failed to list objects (REST fallback): {}",
-                    e.without_url()
-                ))
+                crate::storage::failure::transport_storage_error(
+                    "Failed to list objects (REST fallback)",
+                    e,
+                )
             })?;
 
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             if !status.is_success() {
-                return Err(AppError::Storage(format!(
-                    "Failed to list objects (REST fallback): {} {}: {}",
+                return Err(crate::storage::failure::status_storage_error(
                     status.as_u16(),
-                    status.canonical_reason().unwrap_or(""),
-                    body
-                )));
+                    crate::storage::failure::xml_error_code(&body),
+                    format!(
+                        "Failed to list objects (REST fallback): {} {}: {}",
+                        status.as_u16(),
+                        status.canonical_reason().unwrap_or(""),
+                        body
+                    ),
+                ));
             }
 
             let page = parse_list_bucket_result(&body)?;
@@ -3173,19 +3316,23 @@ impl S3Backend {
             send = send.timeout(timeout);
         }
         let response = send.send().await.map_err(|e| {
-            AppError::Storage(format!("{} failed to send: {}", what, e.without_url()))
+            crate::storage::failure::transport_storage_error(&format!("{what} failed to send"), e)
         })?;
 
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(AppError::Storage(format!(
-                "{} failed: {} {}: {}",
-                what,
+            return Err(crate::storage::failure::status_storage_error(
                 status.as_u16(),
-                status.canonical_reason().unwrap_or(""),
-                body
-            )));
+                crate::storage::failure::xml_error_code(&body),
+                format!(
+                    "{} failed: {} {}: {}",
+                    what,
+                    status.as_u16(),
+                    status.canonical_reason().unwrap_or(""),
+                    body
+                ),
+            ));
         }
         parse_copy_part_etag(&body).ok_or_else(|| {
             AppError::Storage(format!(
@@ -5892,6 +6039,395 @@ mod tests {
             copy_length_fallback_latched: AtomicBool::new(false),
             disable_multi_delete,
         }
+    }
+
+    // --- #5649 / #5650: unreachable store and full bucket ---
+
+    /// An `S3Backend` for `endpoint` built through the production store
+    /// builders, so the connect timeout and retry budget in `config` are the
+    /// ones a deployment gets.
+    fn outage_backend(config: &S3Config) -> S3Backend {
+        let creds = (Some("AKIAIOSFODNN7EXAMPLE"), Some("secret"));
+        S3Backend {
+            store: S3Backend::build_store(config, creds.0, creds.1).expect("store"),
+            bulk_store: S3Backend::build_bulk_store(config, creds.0, creds.1).expect("bulk store"),
+            bucket: config.bucket.clone(),
+            region: config.region.clone(),
+            bulk_timeout: Some(Duration::from_secs(S3_DEFAULT_BULK_TIMEOUT_SECS)),
+            raw_http: S3Backend::build_raw_http_client(config).expect("raw client"),
+            max_single_copy_bytes: S3_MAX_SINGLE_COPY_SIZE,
+            max_parts: S3_MULTIPART_MAX_PARTS,
+            sign_requests: true,
+            prefix: None,
+            redirect_downloads: false,
+            cloudfront: None,
+            path_format: StoragePathFormat::Native,
+            signing_store: None,
+            provider: S3Provider::Generic,
+            control_timeout: Some(S3_CONTROL_TIMEOUT),
+            list_fallback_latched: AtomicBool::new(false),
+            copy_length_fallback_latched: AtomicBool::new(false),
+            disable_multi_delete: false,
+        }
+    }
+
+    fn outage_config(endpoint: &str) -> S3Config {
+        S3Config::new(
+            "ak-quota-bucket-5650".to_string(),
+            "us-east-1".to_string(),
+            Some(endpoint.to_string()),
+            None,
+        )
+        .with_storage_timeouts(crate::storage::StorageTimeouts {
+            connect: Duration::from_secs(1),
+            operation: Duration::from_secs(1),
+            bulk_retry: Duration::from_secs(1),
+        })
+    }
+
+    /// The status and body an error answers a client with.
+    ///
+    /// streaming-invariant: test scaffolding exempt — an error body is a small
+    /// bounded JSON document, not an artifact path (#1608).
+    #[allow(clippy::disallowed_methods)]
+    async fn client_view(err: AppError) -> (axum::http::StatusCode, String, bool) {
+        use axum::response::IntoResponse;
+        let response = err.into_response();
+        let status = response.status();
+        let retry_after = response.headers().contains_key("retry-after");
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        (
+            status,
+            String::from_utf8_lossy(&body).into_owned(),
+            retry_after,
+        )
+    }
+
+    /// A local endpoint whose connection attempts hang: a listener with a
+    /// zero backlog whose accept queue is already full, so the kernel drops
+    /// further SYNs, which is what a client sees when the store's host has
+    /// gone (a stopped MinIO container, a dead node) rather than refusing.
+    /// The returned guards keep the queue full.
+    async fn blackholed_endpoint() -> (String, Vec<std::net::TcpStream>, tokio::net::TcpListener) {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket.bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+        let listener = socket.listen(0).expect("listen");
+        let addr = listener.local_addr().expect("addr");
+        let fillers = (0..4)
+            .filter_map(|_| {
+                std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).ok()
+            })
+            .collect();
+        (format!("http://{addr}"), fillers, listener)
+    }
+
+    /// #5649 regression: with the store's host gone, every operation must fail
+    /// within the connect timeout and retry budget and answer
+    /// `503 STORAGE_UNAVAILABLE` + `Retry-After`. Before the fix each attempt
+    /// waited out `object_store`'s 5s connect timeout and the attempts were
+    /// retried for up to three minutes, so the request hung until the store
+    /// came back (clients gave up on their own 30s timeout).
+    #[tokio::test]
+    async fn test_unreachable_store_fails_fast_with_503_5649() {
+        use crate::storage::StorageBackend as _;
+        let (endpoint, _fillers, _listener) = blackholed_endpoint().await;
+        let backend = outage_backend(&outage_config(&endpoint));
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(25), async {
+            (
+                backend
+                    .put("generic/x.bin", Bytes::from_static(b"payload"))
+                    .await,
+                backend.exists("generic/x.bin").await,
+            )
+        })
+        .await
+        .expect("storage operations against a vanished store must not hang");
+        assert!(
+            started.elapsed() < Duration::from_secs(12),
+            "two operations took {:?}; each is bounded by about budget (1s) + connect \
+             (1s) + the 2s backoff cap",
+            started.elapsed()
+        );
+        let errors = [outcome.0.expect_err("put"), outcome.1.expect_err("exists")];
+        for err in errors {
+            assert_unavailable_to_the_client(err).await;
+        }
+    }
+
+    /// #5649: a refused connection (nothing listening) is reported the same.
+    #[tokio::test]
+    async fn test_refused_connection_is_503_5649() {
+        use crate::storage::StorageBackend as _;
+        let backend = outage_backend(&outage_config("http://127.0.0.1:1"));
+        let err = tokio::time::timeout(Duration::from_secs(20), backend.get("generic/x.bin"))
+            .await
+            .expect("must not hang")
+            .expect_err("nothing listens on port 1");
+        assert_unavailable_to_the_client(err).await;
+    }
+
+    async fn assert_unavailable_to_the_client(err: AppError) {
+        let label = err.to_string();
+        assert_eq!(
+            err.storage_failure(),
+            Some(crate::storage::StorageFailure::Unavailable),
+            "{label}"
+        );
+        let (status, body, retry_after) = client_view(err).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{label}"
+        );
+        assert!(retry_after, "{label}: 503 must carry Retry-After");
+        assert!(body.contains("STORAGE_UNAVAILABLE"), "{body}");
+        assert!(!body.contains("127.0.0.1"), "{body}");
+    }
+
+    /// #5649: a store that answers but keeps failing with 503 is retried only
+    /// for the budget, then reported unavailable.
+    #[tokio::test]
+    async fn test_store_answering_503_is_unavailable_within_budget_5649() {
+        use crate::storage::StorageBackend as _;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(503).set_body_string(
+                "<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>",
+            ))
+            .mount(&server)
+            .await;
+        let backend = outage_backend(&outage_config(&server.uri()));
+        let err = tokio::time::timeout(
+            Duration::from_secs(20),
+            backend.put("generic/x.bin", Bytes::from_static(b"payload")),
+        )
+        .await
+        .expect("must not hang")
+        .expect_err("a 503 store refuses the write");
+        assert_eq!(
+            err.storage_failure(),
+            Some(crate::storage::StorageFailure::Unavailable),
+            "{err}"
+        );
+    }
+
+    /// #5650 regression: MinIO refuses a PUT into a bucket at its quota with
+    /// `400 XMinioAdminBucketQuotaExceeded`. That must answer
+    /// `507 STORAGE_FULL` with a neutral body: before the fix it was
+    /// `500 STORAGE_ERROR`, and the OCI routes echoed the XML (bucket name,
+    /// request ids) to the client.
+    #[tokio::test]
+    async fn test_bucket_quota_refusal_is_507_with_neutral_body_5650() {
+        use crate::storage::StorageBackend as _;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let quota = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\
+            <Code>XMinioAdminBucketQuotaExceeded</Code><Message>Bucket quota exceeded</Message>\
+            <BucketName>ak-quota-bucket-5650</BucketName><Resource>/ak-quota-bucket-5650/x.bin\
+            </Resource><RequestId>187A0F1E2D3C4B5A</RequestId><HostId>dd9025bab4ad464b\
+            </HostId></Error>";
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(400).set_body_string(quota))
+            .mount(&server)
+            .await;
+        let backend = outage_backend(&outage_config(&server.uri()));
+
+        for err in [
+            backend
+                .put("generic/x.bin", Bytes::from_static(b"payload"))
+                .await
+                .expect_err("quota refuses the put"),
+            backend
+                .put_stream(
+                    "generic/y.bin",
+                    Box::pin(futures::stream::once(async {
+                        Ok(Bytes::from_static(b"payload"))
+                    })),
+                )
+                .await
+                .expect_err("quota refuses the streamed put"),
+        ] {
+            let label = err.to_string();
+            assert_eq!(
+                err.storage_failure(),
+                Some(crate::storage::StorageFailure::Full),
+                "{label}"
+            );
+            let (status, body, _) = client_view(err).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::INSUFFICIENT_STORAGE,
+                "{label}"
+            );
+            assert!(body.contains("STORAGE_FULL"), "{body}");
+            for needle in [
+                "XMinio",
+                "ak-quota-bucket-5650",
+                "187A0F1E2D3C4B5A",
+                "<Error>",
+            ] {
+                assert!(!body.contains(needle), "{needle} leaked: {body}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_s3_failure_class_reads_the_transport_kind_5649() {
+        use object_store::client::{HttpError, HttpErrorKind};
+        #[derive(Debug, thiserror::Error)]
+        #[error("boom")]
+        struct Boom;
+        for (kind, want) in [
+            (
+                HttpErrorKind::Connect,
+                Some(crate::storage::StorageFailure::Unavailable),
+            ),
+            (
+                HttpErrorKind::Timeout,
+                Some(crate::storage::StorageFailure::Unavailable),
+            ),
+            (HttpErrorKind::Decode, None),
+        ] {
+            let err = object_store::Error::Generic {
+                store: "S3",
+                source: Box::new(HttpError::new(kind, Boom)),
+            };
+            assert_eq!(s3_failure_class(&err), want, "{kind:?}");
+            assert_eq!(
+                crate::storage::StorageFailure::from_message(&classify_s3_error(&err)),
+                want,
+                "{kind:?}: the class must survive into the error text"
+            );
+        }
+    }
+
+    #[test]
+    fn test_retry_budget_comes_from_the_storage_timeouts_5649() {
+        let timeouts = crate::storage::StorageTimeouts {
+            connect: Duration::from_secs(2),
+            operation: Duration::from_secs(7),
+            bulk_retry: Duration::from_secs(150),
+        };
+        let control = s3_retry_config(&timeouts, S3Plane::Control);
+        assert_eq!(control.retry_timeout, Duration::from_secs(7));
+        assert_eq!(
+            control.max_retries,
+            object_store::RetryConfig::default().max_retries
+        );
+        let bulk = s3_retry_config(&timeouts, S3Plane::Bulk);
+        assert_eq!(bulk.retry_timeout, Duration::from_secs(150));
+        assert_eq!(bulk.max_retries, S3_BULK_MAX_RETRIES);
+        for retry in [control, bulk] {
+            assert_eq!(
+                retry.backoff.max_backoff,
+                crate::storage::STORAGE_MAX_RETRY_BACKOFF
+            );
+        }
+    }
+
+    /// #5649 review: `object_store` measures the retry budget from the start
+    /// of the request, so a payload request that fails after running longer
+    /// than the control-plane budget must still be retried. A PUT answered
+    /// `503 SlowDown` after 3s, then accepted, succeeds although the
+    /// control-plane budget is 1s.
+    #[tokio::test]
+    async fn test_slow_bulk_request_keeps_its_retries_5649() {
+        use crate::storage::StorageBackend as _;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_string("<Error><Code>SlowDown</Code></Error>")
+                    .set_delay(Duration::from_secs(3)),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"ok\""))
+            .mount(&server)
+            .await;
+        let config =
+            outage_config(&server.uri()).with_storage_timeouts(crate::storage::StorageTimeouts {
+                connect: Duration::from_secs(1),
+                operation: Duration::from_secs(1),
+                ..Default::default()
+            });
+        let backend = outage_backend(&config);
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            backend.put("generic/x.bin", Bytes::from_static(b"payload")),
+        )
+        .await
+        .expect("must not hang")
+        .expect("the retried PUT succeeds");
+    }
+
+    /// #5649 review: with the long default payload budget, a gone store
+    /// still answers 503 promptly; the bulk retry count is what bounds it.
+    #[tokio::test]
+    async fn test_dead_store_bounds_a_bulk_put_by_its_retry_count_5649() {
+        use crate::storage::StorageBackend as _;
+        let (endpoint, _fillers, _listener) = blackholed_endpoint().await;
+        let config =
+            outage_config(&endpoint).with_storage_timeouts(crate::storage::StorageTimeouts {
+                connect: Duration::from_secs(1),
+                ..Default::default()
+            });
+        let backend = outage_backend(&config);
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(
+            Duration::from_secs(40),
+            backend.put("generic/x.bin", Bytes::from_static(b"payload")),
+        )
+        .await
+        .expect("a bulk PUT against a gone store must not hang")
+        .expect_err("nothing answers");
+        assert!(
+            started.elapsed() < Duration::from_secs(25),
+            "took {:?}: 6 attempts x (1s connect + 2s backoff cap) at most",
+            started.elapsed()
+        );
+        assert_unavailable_to_the_client(err).await;
+    }
+
+    /// #5650 review: classification never reads the object key. A key that
+    /// spells out codes, answered with a plain 400 `AccessDenied` whose body
+    /// quotes the key, stays a 500 and leaves the health signal alone.
+    #[tokio::test]
+    async fn test_key_naming_a_code_does_not_classify_5650() {
+        use crate::storage::StorageBackend as _;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        crate::storage::failure::reset_failure_signal();
+        let key = "generic/QuotaExceeded-SlowDown-ServerBusy-OperationTimedOut.bin";
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(400).set_body_string(format!(
+                "<?xml version=\"1.0\"?><Error><Code>AccessDenied</Code>\
+                 <Message>XMinioAdminBucketQuotaExceeded</Message><Key>{key}</Key>\
+                 <Resource>/b/{key}</Resource></Error>"
+            )))
+            .mount(&server)
+            .await;
+        let backend = outage_backend(&outage_config(&server.uri()));
+        let err = backend
+            .put(key, Bytes::from_static(b"payload"))
+            .await
+            .expect_err("access denied");
+        assert_eq!(err.storage_failure(), None, "{err}");
+        let (status, _, _) = client_view(err).await;
+        assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            !crate::storage::failure::refused_for_space_within(
+                crate::storage::failure::STORAGE_FULL_SIGNAL_WINDOW
+            ),
+            "a spoofing key must not flip the storage health check"
+        );
     }
 
     /// #4980: the upload commit guard's presence check never answers from the

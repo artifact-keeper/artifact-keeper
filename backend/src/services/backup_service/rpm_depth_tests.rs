@@ -71,6 +71,7 @@ async fn archive(
         artifacts_unreadable: 0,
         total_size_bytes: size,
         checksum: checksum.clone(),
+        contents: BackupContents::default(),
     };
     let tar =
         build_backup_tar(&tables, &contents, &serde_json::to_vec(&manifest).unwrap()).unwrap();

@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#5622]
+---
+- **An Alpine Virtual's `APKINDEX.tar.gz` now lists its hosted members' packages, and a member outage answers 503 instead of an empty index** ([#5622]). A Virtual with a hosted (Local or Staging) member served a signed index with no packages, although the hosted repository listed them and their `.apk` files downloaded through the Virtual, so `apk add` through it could not find any hosted package; with a Remote member as well, only that remote's upstream index was served. The Virtual's index is now the merge, in member priority order, of every hosted member's packages and every answering Remote member's upstream entries, signed with the Virtual's own key (a Virtual with only Remote members still passes the first answering upstream index through unchanged, so its upstream signature keeps verifying). When no member contributes and at least one could not answer (an upstream 5xx, a refused connection or a timeout), the index answers a retryable `503` with `Retry-After` rather than a `200` empty index that apk would cache; an empty index is served only when every member answered definitively.

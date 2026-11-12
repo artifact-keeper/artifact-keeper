@@ -163,32 +163,14 @@ impl MultiHasher {
 /// Mlmodel only) APPENDS an immutable revision to `artifact_versions` instead
 /// of conflicting, so both checks are relaxed for the HEAD row. Old revisions
 /// stay immutable and addressable.
-pub(crate) async fn enforce_path_immutability(
-    db: &PgPool,
-    repository_id: Uuid,
-    repo: Option<&Repository>,
-    path: &str,
-    version: Option<&str>,
-    checksum_sha256: &str,
-) -> Result<()> {
-    enforce_path_immutability_with(
-        db,
-        repository_id,
-        repo,
-        path,
-        version,
-        checksum_sha256,
-        false,
-    )
-    .await
-}
-
-/// [`enforce_path_immutability`] for a conditional write (#4186).
+///
+/// For a conditional write (#4186, and chunked completion since #4989)
 /// `replaces_current` is true when the write carries an `If-Match` that the
 /// caller has already found to hold: the client named the live content it
 /// replaces, so check 1 (live overwrite) does not apply. Check 2, the
 /// release-immutability backstop, still does, so a released coordinate
 /// cannot be swapped for different bytes even with a matching `If-Match`.
+/// An unconditional write passes `false`.
 pub(crate) async fn enforce_path_immutability_with(
     db: &PgPool,
     repository_id: Uuid,
@@ -356,6 +338,15 @@ struct PriorHeadRow {
     uploaded_by: Option<Uuid>,
 }
 
+/// One soft-deleted artifact version, as
+/// [`ArtifactService::retract_deleted_versions`] needs it (#5676).
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct DeletedVersion {
+    pub name: String,
+    pub path: String,
+    pub version: Option<String>,
+}
+
 /// Compact artifact value struct shared by the download / delete epilogues
 /// (audit entries, download events).
 ///
@@ -431,7 +422,13 @@ async fn dedup_probe(storage: &dyn StorageBackend, storage_key: &str) -> bool {
 /// storage GC candidate. Recorded in the publishing transaction so it exists
 /// exactly when the replace commits. Idempotent; the candidate sweep drops
 /// the row without touching the object if anything still references the key.
-async fn record_replaced_object_gc_candidate(
+///
+/// A row already journalled for the key (an earlier replace, a repository
+/// delete, a failed GC delete) has its `recorded_at` refreshed (#4989): the
+/// sweep only takes rows older than the grace window, so keeping the older
+/// stamp could collect the object the moment this replace commits, with
+/// none of the grace a reader still holding the old bytes is given.
+pub(crate) async fn record_replaced_object_gc_candidate(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     repo: &Repository,
     old_key: &str,
@@ -442,7 +439,8 @@ async fn record_replaced_object_gc_candidate(
         "INSERT INTO oci_gc_candidates \
              (storage_key, storage_backend, storage_path, source_repository_id) \
          VALUES ($1, $2, $3, $4) \
-         ON CONFLICT (storage_backend, storage_path, storage_key) DO NOTHING",
+         ON CONFLICT (storage_backend, storage_path, storage_key) \
+             DO UPDATE SET recorded_at = NOW()",
     )
     .bind(old_key)
     .bind(&scope.backend)
@@ -2969,6 +2967,18 @@ impl ArtifactService {
             audit_fire_and_forget(self.db.clone(), entry).await;
         }
 
+        // A deleted version must stop being advertised (#5604, #5632).
+        Self::retract_deleted_versions(
+            &self.db,
+            artifact.repository_id,
+            &[DeletedVersion {
+                name: artifact.name.clone(),
+                path: artifact.path.clone(),
+                version: artifact.version.clone(),
+            }],
+        )
+        .await;
+
         // #3411 part 1: `artifact.deleted` is mapped by `webhook_producer` and
         // was likewise never emitted. Symmetric with the upload emit, and on
         // the same choke point the audit write uses.
@@ -2987,6 +2997,91 @@ impl ArtifactService {
                     );
                 }
             });
+        }
+    }
+
+    /// Stop advertising soft-deleted versions of repository `repository_id`
+    /// (#5604, #5632, #5676): move each affected catalog row's Latest to the
+    /// newest version still live and, for an npm repository only, drop the
+    /// dist-tags that name a version with no live artifact left.
+    ///
+    /// The single post-commit step every soft delete shares: the per-artifact
+    /// [`Self::finish_delete`] calls it with one version, and the lifecycle
+    /// sweeps, which soft-delete in bulk SQL, call it once per run with every
+    /// version they removed. Versions are grouped per catalog row
+    /// ([`package_service::catalog_package_name`], so Maven's
+    /// `groupId:artifactId` row is found) and per npm package, so a sweep that
+    /// removes many versions of one package costs one refresh and one
+    /// dist-tags write for it. Best-effort: a failure is logged and never
+    /// fails the delete.
+    ///
+    /// [`package_service::catalog_package_name`]: crate::services::package_service::catalog_package_name
+    pub async fn retract_deleted_versions(
+        db: &PgPool,
+        repository_id: Uuid,
+        deleted: &[DeletedVersion],
+    ) {
+        use crate::services::package_service::{
+            catalog_package_name, refresh_package_latest, repository_format,
+        };
+        if deleted.is_empty() {
+            return;
+        }
+        let format = match repository_format(db, repository_id).await {
+            Ok(Some(format)) => format,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to read the format of repository {} after a delete: {}",
+                    repository_id,
+                    e
+                );
+                return;
+            }
+        };
+        let catalog_rows: std::collections::BTreeSet<String> = deleted
+            .iter()
+            .map(|d| catalog_package_name(&format, &d.path, &d.name))
+            .collect();
+        for catalog in &catalog_rows {
+            if let Err(e) = refresh_package_latest(db, repository_id, catalog).await {
+                tracing::warn!(
+                    "Failed to refresh catalog latest of {} in repository {} after a delete: {}",
+                    catalog,
+                    repository_id,
+                    e
+                );
+            }
+        }
+        if format != "npm" {
+            return;
+        }
+        let mut by_package: std::collections::BTreeMap<&str, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for d in deleted {
+            if let Some(ref version) = d.version {
+                by_package
+                    .entry(d.name.as_str())
+                    .or_default()
+                    .push(version.clone());
+            }
+        }
+        for (package, versions) in by_package {
+            if let Err(e) = crate::api::handlers::npm::drop_dist_tags_for_deleted_versions(
+                db,
+                repository_id,
+                package,
+                &versions,
+            )
+            .await
+            {
+                tracing::warn!(
+                    "Failed to drop dist-tags of deleted versions of {} in repository {}: {}",
+                    package,
+                    repository_id,
+                    e
+                );
+            }
         }
     }
 

@@ -1031,6 +1031,50 @@ mod label_write_authz_4193 {
         );
     }
 
+    /// #5625 through the routes: `PUT`, `POST` and `DELETE` on
+    /// `/api/v1/artifacts/{id}/labels` re-evaluate the artifact's replication,
+    /// and that took the artifact off every peer subscribed to its repository
+    /// by hand (`POST /peers/{id}/repositories`), as no sync policy listed
+    /// them. A label write is metadata: such a peer keeps the artifact (no
+    /// delete task, its old cancelled delete stays cancelled). The
+    /// policy-managed peer, which the new labels take out of scope, is the
+    /// control.
+    #[tokio::test]
+    async fn test_5625_label_writes_keep_manually_subscribed_peers() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_labelled_artifact(&fx).await;
+        let peers = tdh::setup_manual_peer_fixture(
+            fx.pool.clone(),
+            fx.user_id,
+            fx.repo_id,
+            artifact_id,
+            &[(true, true), (false, true), (true, false)],
+        )
+        .await;
+        let member_auth = tdh::make_auth(fx.user_id, &fx.username);
+
+        let answers = mutate_labels(&fx, &member_auth, artifact_id).await;
+        let states = peers.task_states().await;
+        peers.teardown().await;
+        fx.teardown().await;
+
+        let statuses: Vec<StatusCode> = answers.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            statuses,
+            [StatusCode::OK, StatusCode::OK, StatusCode::NO_CONTENT],
+            "the label writes must succeed: {answers:?}"
+        );
+        assert_eq!(
+            states,
+            tdh::expected_after_label_write_5625(),
+            "#5625: a label write must not queue a delete for a manually \
+             subscribed peer (enabled or disabled); only the policy-managed peer \
+             leaves the policy's scope"
+        );
+    }
+
     /// Pin the #4193 gate structurally: the DB-backed tests above skip without
     /// Postgres, so assert in source that every label mutation routes through
     /// the repository half, and that the repository half asks the per-action

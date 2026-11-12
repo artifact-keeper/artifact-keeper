@@ -1,0 +1,7 @@
+---
+section: Fixed
+issues: [#4978, #4987, #4288]
+---
+- **Hosted conda channels no longer list packages a scan policy blocks, and their read path no longer deadlocks writers or exhausts the connection pool** (#4288, #4978, #4987). `repodata.json` and its encodings, `current_repodata.json`, `run_exports.json`, `channeldata.json`, the shard index and the hosted half of a virtual channel's documents now leave out a package whose download the scan policy refuses (403) and name it in `removed`, as they already did for quarantined packages; decisions are cached for a minute, so on other replicas a listing can trail a scan or policy change by up to about two minutes, while the download gate is always current. The shard dirty marks are now append-only, so two writes that touch the same package names in different orders no longer deadlock (`40P01`, answered as a retryable 503). A read waiting for another session's shard rebuild no longer holds a database connection; it answers `503` with `Retry-After: 1` after 10 s. A row whose metadata name differs from its artifact name keeps its shard. A virtual channel's dependency-confusion guard reads its hosted members' package names once per change instead of on every request, shard requests included.
+
+  Upgrade: migration 360 swaps the dirty-mark table's primary key and replaces the trigger functions. It locks only that small table, waits at most 5 s per attempt and retries; uploads, deletes and reads keep working during and after a rolling upgrade.

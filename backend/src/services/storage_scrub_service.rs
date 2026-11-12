@@ -21,7 +21,9 @@
 //! - **Race-tolerant**: a mismatch or a missing object is only recorded after
 //!   re-reading the row and confirming it is still live and still points at
 //!   the same key and digest, so a concurrent republish, soft-delete, or
-//!   storage GC reap is never reported as corruption.
+//!   storage GC reap is never reported as corruption. A repair writes under
+//!   the upload commit guard's GC journal slot (#4980/#4982), so it never
+//!   races a storage GC delete of the same key (#4989).
 //! - **Non-destructive**: a finding never mutates the referencing row (the
 //!   download path already refuses to complete a corrupt body, #3919). A
 //!   repair is attempted only when `repair` is requested, the object's key is
@@ -272,6 +274,9 @@ enum RepairOutcome {
     NoVerifiedCopy,
     /// `max_bytes` ran out with candidates still unread.
     BudgetExhausted,
+    /// A storage GC pass holds a fresh delete lease on the key, so a write
+    /// now could land before that delete (#4989).
+    GcCollecting,
 }
 
 impl StorageScrubService {
@@ -575,6 +580,13 @@ impl StorageScrubService {
                 Ok(RepairOutcome::NoVerifiedCopy) => {
                     detail = Some("no verified good copy available".into())
                 }
+                Ok(RepairOutcome::GcCollecting) => {
+                    detail = Some(
+                        "storage GC is removing this object; not repaired, a later run \
+                         retries it"
+                            .into(),
+                    )
+                }
                 Ok(RepairOutcome::BudgetExhausted) => {
                     detail = Some(
                         "repair stopped at the byte budget before every copy was tried; \
@@ -671,13 +683,34 @@ impl StorageScrubService {
             let Some(spool) = spool else {
                 continue;
             };
+            // #4989: write under the upload commit guard (#4980/#4982). Its
+            // transaction holds the key's GC journal slot until the write is
+            // verified, so a GC claim that journals the key meanwhile waits
+            // and re-checks after it, and a GC pass that already leased the
+            // key (its delete may still land) is not raced: the repair is
+            // left to a later run.
+            let mut tx = self
+                .db
+                .begin()
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            let guard = crate::services::artifact_service::guard_cas_key_for_commit(
+                &mut tx,
+                target,
+                &t.location(),
+                &t.storage_key,
+            )
+            .await?;
+            if guard == crate::services::artifact_service::CasKeyGuard::Collecting {
+                return Ok(RepairOutcome::GcCollecting);
+            }
             // Re-check the target row right before writing so a key that was
             // deleted or re-pointed meanwhile is not resurrected.
             let live: bool = sqlx::query_scalar(still_live_sql(kind))
                 .bind(t.id)
                 .bind(&t.storage_key)
                 .bind(&t.checksum)
-                .fetch_one(&self.db)
+                .fetch_one(&mut *tx)
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?;
             if !live {
@@ -686,6 +719,9 @@ impl StorageScrubService {
             target.put_file(&t.storage_key, spool.path()).await?;
             let (check, read) = Self::check_object(target, t).await?;
             result.bytes_read += read;
+            tx.commit()
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
             if check == ObjectCheck::Intact {
                 return Ok(RepairOutcome::Repaired(format!(
                     "{}:{} ({})",
@@ -1301,6 +1337,97 @@ mod db_tests {
         assert_eq!(&fixed[..], original);
         assert_eq!(res2.corrupt, 0, "{res2:?}");
         assert_eq!(res2.intact, 1, "{res2:?}");
+    }
+
+    /// #4989: a repair does not race a storage GC delete of its key. With a
+    /// GC pass holding a fresh delete lease on the key (its delete may still
+    /// land), the repair is left to a later run instead of writing a copy
+    /// that delete would remove; once the lease is gone the repair runs.
+    #[tokio::test]
+    async fn scrub_repair_waits_out_a_gc_delete_lease_4989() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let Some(donor_fx) = tdh::Fixture::setup("local", "generic").await else {
+            fx.teardown().await;
+            return;
+        };
+        let original = b"scrub-gc-leased-bytes";
+        let cas = crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+            &sha_hex(original),
+        );
+        let (bad, _) = seed_at(&fx, &cas, "g/bad.bin", original, b"scrub-gc-leased-byteX").await;
+        seed_at(&donor_fx, &cas, "g/copy.bin", original, original).await;
+        let scope = crate::services::storage_gc_service::oci_gc_candidate_scope(&StorageLocation {
+            backend: "filesystem".into(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        });
+        // A GC pass claimed the key for delete just now.
+        sqlx::query(
+            "INSERT INTO oci_gc_candidates (storage_key, storage_backend, storage_path, \
+                 source_repository_id, leased_at) VALUES ($1, $2, $3, $4, NOW())",
+        )
+        .bind(&cas)
+        .bind(&scope.backend)
+        .bind(&scope.path)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("gc lease");
+
+        let svc = StorageScrubService::new(fx.pool.clone(), fx.state.storage_registry.clone());
+        let leased = svc.run(&opts(&fx, true)).await.expect("scrub run");
+        let leased_status = finding_status(&fx.pool, bad).await;
+        let leased_bytes = fs_storage(&fx).get(&cas).await.expect("object");
+        let detail: Option<String> = sqlx::query_scalar(
+            "SELECT detail FROM storage_scrub_findings WHERE object_kind = 'artifact' \
+             AND object_id = $1",
+        )
+        .bind(bad)
+        .fetch_optional(&fx.pool)
+        .await
+        .expect("detail")
+        .flatten();
+
+        // The GC delete failed and released its lease (#5168).
+        sqlx::query(
+            "UPDATE oci_gc_candidates SET leased_at = NULL \
+             WHERE storage_key = $1 AND storage_backend = $2 AND storage_path = $3",
+        )
+        .bind(&cas)
+        .bind(&scope.backend)
+        .bind(&scope.path)
+        .execute(&fx.pool)
+        .await
+        .expect("release lease");
+        let released = svc.run(&opts(&fx, true)).await.expect("second run");
+        let fixed = fs_storage(&fx).get(&cas).await.expect("object");
+        sqlx::query(
+            "DELETE FROM oci_gc_candidates \
+             WHERE storage_key = $1 AND storage_backend = $2 AND storage_path = $3",
+        )
+        .bind(&cas)
+        .bind(&scope.backend)
+        .bind(&scope.path)
+        .execute(&fx.pool)
+        .await
+        .expect("cleanup");
+        fx.teardown().await;
+        donor_fx.teardown().await;
+
+        assert_eq!(leased.repaired, 0, "{leased:?}");
+        assert_eq!(leased_status.as_deref(), Some("corrupt"));
+        assert_eq!(
+            &leased_bytes[..],
+            b"scrub-gc-leased-byteX",
+            "nothing written"
+        );
+        assert!(
+            detail.as_deref().is_some_and(|d| d.contains("storage GC")),
+            "{detail:?}"
+        );
+        assert_eq!(released.repaired, 1, "{released:?}");
+        assert_eq!(&fixed[..], original);
     }
 
     /// #3910 review (nit): a path-keyed object whose file name IS its digest

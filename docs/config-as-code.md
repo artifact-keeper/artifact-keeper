@@ -96,6 +96,9 @@ reports exactly what those routes report.
   instance and is not exported.
 - Remote-only settings appear only on `remote` repositories; `members` only on
   `virtual` ones.
+- `curation_source_repository_key` names the Remote a staging repository's
+  curation sync ingests from. It is applied after that Remote, and a key that
+  is neither in the document nor on the target fails the plan.
 - `storage_backend` is not exported: it is chosen by the target instance.
 - Unknown fields are refused on import, so a typo cannot be silently ignored.
 

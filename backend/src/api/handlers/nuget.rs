@@ -2546,6 +2546,51 @@ fn nupkg_identity(
     }
 }
 
+/// The NuGet rule for a stored `.nupkg` row of a scanning Remote (#5076):
+/// [`nupkg_identity`], the rule the proxied package is gated under, in the
+/// shape the stored-row gate takes.
+struct StoredNupkg<'a> {
+    id_lower: &'a str,
+    version: &'a str,
+}
+
+impl crate::api::handlers::proxy_scan_archive::ArchiveKind for StoredNupkg<'_> {
+    const LABEL: &'static str = "nuget package";
+    const CONTENT_TYPE: &'static str = "application/octet-stream";
+
+    fn requested(&self) -> String {
+        format!("{}@{}", self.id_lower, self.version)
+    }
+
+    fn identity(
+        &self,
+        filename: &str,
+        bytes: &bytes::Bytes,
+    ) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+        use crate::api::handlers::proxy_scan_archive::ArchiveIdentity;
+        match nupkg_identity(filename, self.id_lower, self.version, bytes) {
+            proxy_helpers::ProxyScanIdentity::Established(pin) => ArchiveIdentity::Pinned(pin),
+            proxy_helpers::ProxyScanIdentity::NotApplicable => ArchiveIdentity::ContentGraded,
+            proxy_helpers::ProxyScanIdentity::Unestablished => ArchiveIdentity::Disagrees(
+                "the package's .nuspec does not declare the requested id and version".to_string(),
+            ),
+        }
+    }
+}
+
+/// The name a stored NuGet row is gated under (#5076): the requested file
+/// name when the proxied gate scans it, otherwise the row's own `.nupkg`
+/// name. A flat-container row is looked up by id and version alone, so a
+/// request for the `.nuspec` would otherwise serve the package bytes under a
+/// name the gate skips.
+fn stored_nupkg_gate_name(filename: &str, id_lower: &str, version: &str) -> String {
+    if nuget_file_is_scanned(filename) {
+        filename.to_string()
+    } else {
+        build_nupkg_filename(id_lower, version)
+    }
+}
+
 /// The 200 for a `.nupkg` the scan gate let through: the buffered bytes,
 /// verbatim, so the coding they arrived under is declared (#3149/#3184). The
 /// content type is upstream's when it sent one, as on the streaming arm.
@@ -4232,9 +4277,43 @@ async fn flatcontainer_download(
     // emit a `Content-Length` the body never satisfies, leaving the client
     // hanging or treating a complete file as truncated.
     let mut content_length = artifact.size_bytes;
+    let mut scan = None;
     let body: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>> =
         match storage.get_stream(&artifact.storage_key).await {
-            Ok(stream) => stream,
+            Ok(stream) => {
+                // #4989: the stored object is verified against the row (#4323).
+                let stream = crate::storage::verify::verify_row_serve(
+                    stream,
+                    &artifact.checksum_sha256,
+                    &filename,
+                    artifact.size_bytes,
+                    ctx.is_head,
+                    || format!("{repo_key}/{package_id_lower}/{version}/{filename}"),
+                )
+                .await?;
+                // #5076: a row a scanning Remote holds goes through the scan
+                // gate, graded as the proxied package would be. The repair
+                // arms below gate (or digest-pin) their own bytes.
+                let gate_name = stored_nupkg_gate_name(&filename, &package_id_lower, &version);
+                let gated = proxy_helpers::gate_opened_stored_row(
+                    &state,
+                    storage.as_ref(),
+                    &proxy_helpers::StoredRow {
+                        repo: &repo,
+                        filename: &gate_name,
+                        storage_key: &artifact.storage_key,
+                        size_bytes: artifact.size_bytes,
+                    },
+                    StoredNupkg {
+                        id_lower: &package_id_lower,
+                        version: &version,
+                    },
+                    stream,
+                )
+                .await?;
+                scan = gated.scan;
+                gated.body
+            }
             Err(crate::error::AppError::NotFound(missing)) => {
                 let remote_proxy = if repo.repo_type == RepositoryType::Remote {
                     match (&repo.upstream_url, &state.proxy_service) {
@@ -4246,11 +4325,7 @@ async fn flatcontainer_download(
                 };
 
                 let Some((upstream_url, proxy)) = remote_proxy else {
-                    return Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        crate::api::handlers::storage_err_message(&missing),
-                    )
-                        .into_response());
+                    return Err(crate::api::handlers::storage_err_plain(&missing));
                 };
 
                 let sub_path =
@@ -4299,7 +4374,9 @@ async fn flatcontainer_download(
                             )
                             .await
                             {
-                                return Err(proxy_helpers::scan_blocked_response(&filename));
+                                return Err(proxy_helpers::audited_scan_blocked_response(
+                                    &state.db, repo.id, &filename, &expected,
+                                ));
                             }
                         }
 
@@ -4434,11 +4511,7 @@ async fn flatcontainer_download(
                 }
             }
             Err(e) => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    crate::api::handlers::storage_err_message(&e),
-                )
-                    .into_response());
+                return Err(crate::api::handlers::storage_err_plain(&e));
             }
         };
 
@@ -4446,18 +4519,21 @@ async fn flatcontainer_download(
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
     use futures::StreamExt as _;
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .header(CONTENT_LENGTH, content_length.to_string())
-        .body(Body::from_stream(
-            body.map(|r| r.map_err(|e| std::io::Error::other(e.to_string()))),
-        ))
-        .unwrap())
+    Ok(proxy_helpers::StoredRowBody::stamp(
+        scan,
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .header(
+                "Content-Disposition",
+                format!("attachment; filename=\"{}\"", filename),
+            )
+            .header(CONTENT_LENGTH, content_length.to_string())
+            .body(Body::from_stream(
+                body.map(|r| r.map_err(|e| std::io::Error::other(e.to_string()))),
+            ))
+            .unwrap(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -4971,7 +5047,7 @@ async fn v2_download(
     let repo_ids: Vec<uuid::Uuid> = locations.iter().map(|(id, _)| *id).collect();
     let artifact = sqlx::query!(
         r#"
-        SELECT id, repository_id, storage_key, size_bytes
+        SELECT id, repository_id, storage_key, size_bytes, checksum_sha256
         FROM artifacts
         WHERE repository_id = ANY($1::uuid[])
           AND is_deleted = false
@@ -5030,31 +5106,58 @@ async fn v2_download(
     crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
         .await
         .map_err(|e| e.into_response())?;
+    let filename = build_nupkg_filename(&id_lower, version);
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
+    // #4989: the stored object is verified against the row (#4323).
+    let stream = crate::storage::verify::verify_row_serve(
+        stream,
+        &artifact.checksum_sha256,
+        &filename,
+        artifact.size_bytes,
+        ctx.is_head,
+        || format!("{}/{filename}", artifact.repository_id),
+    )
+    .await?;
+    // #5076: a row of a scanning Remote (one with no upstream to proxy, the
+    // only Remote that reaches this lookup) goes through the scan gate. A
+    // Virtual's ids are its hosted members, which are never gated.
+    let proxy_helpers::StoredRowBody { body: stream, scan } =
+        proxy_helpers::gate_opened_stored_row(
+            state,
+            storage.as_ref(),
+            &proxy_helpers::StoredRow {
+                repo,
+                filename: &filename,
+                storage_key: &artifact.storage_key,
+                size_bytes: artifact.size_bytes,
+            },
+            StoredNupkg {
+                id_lower: &id_lower,
+                version,
+            },
+            stream,
+        )
+        .await?;
     crate::services::artifact_service::record_download(&state.db, artifact.id, ctx).await;
     use futures::StreamExt as _;
-    let filename = build_nupkg_filename(&id_lower, version);
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
-        .body(Body::from_stream(
-            stream.map(|r| r.map_err(|e| std::io::Error::other(e.to_string()))),
-        ))
-        .unwrap())
+    Ok(proxy_helpers::StoredRowBody::stamp(
+        scan,
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .header(
+                "Content-Disposition",
+                format!("attachment; filename=\"{}\"", filename),
+            )
+            .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
+            .body(Body::from_stream(
+                stream.map(|r| r.map_err(|e| std::io::Error::other(e.to_string()))),
+            ))
+            .unwrap(),
+    ))
 }
 
 /// Standard base64 encode (used for the OData `PackageHash`).
@@ -7474,6 +7577,65 @@ mod read_db_tests {
             "search must surface the package description; body={json}"
         );
 
+        f.teardown().await;
+    }
+
+    /// #5685: the download of a pushed package whose store is down answers
+    /// `503` with `Retry-After`, and one whose store is full `507` without
+    /// it, on both the V3 flat container (`flatcontainer_download`'s
+    /// `get_stream` error arm) and the V2 package route (`v2_download`), with
+    /// the fixed message and no backend text or storage-class marker. Both
+    /// answered a hard-coded 500.
+    #[tokio::test]
+    async fn download_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        push_pkg(&f, &f.repo_key, "Qa.Outage5685", "1.0.0", "storage outage").await;
+
+        for (message, want, expected) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&f.pool, &f.state, f.repo_id, &message).await;
+            for (label, uri) in [
+                (
+                    "V3 flatcontainer",
+                    format!(
+                        "/{}/v3/flatcontainer/qa.outage5685/1.0.0/qa.outage5685.1.0.0.nupkg",
+                        f.repo_key
+                    ),
+                ),
+                (
+                    "V2 package",
+                    format!("/{}/v2/package/Qa.Outage5685/1.0.0", f.repo_key),
+                ),
+            ] {
+                let app = tdh::router_with_auth(
+                    super::router(),
+                    state.clone(),
+                    tdh::make_auth(f.user_id, &f.username),
+                );
+                let (status, body, headers) = tdh::send_with_headers(app, tdh::get(uri)).await;
+                assert_eq!(status, want, "{label}: {}", String::from_utf8_lossy(&body));
+                assert_eq!(
+                    headers.contains_key(axum::http::header::RETRY_AFTER),
+                    want == StatusCode::SERVICE_UNAVAILABLE,
+                    "{label}: Retry-After only on the 503"
+                );
+                tdh::assert_no_storage_backend_text(&format!("nuget {label}"), &body);
+                assert_eq!(&body[..], expected.as_bytes(), "{label}: fixed message");
+            }
+        }
         f.teardown().await;
     }
 
@@ -12619,6 +12781,47 @@ mod scan_on_proxy_tests {
         zip.finish().unwrap().into_inner()
     }
 
+    /// The flat-container `.nupkg` as the shared archive rig drives it
+    /// (#5076): the row's bytes, graded under the pin the proxied gate gives
+    /// the same package.
+    fn stored_row_case(
+        _mock: &str,
+    ) -> crate::api::handlers::proxy_scan_archive::test_support::ArchiveCase {
+        crate::api::handlers::proxy_scan_archive::test_support::ArchiveCase {
+            format: "nuget",
+            router: super::router,
+            uri: Box::new(|key| format!("/{key}/{FLAT}")),
+            package_path: format!("/flat/{ID}/{VERSION}/{FILE}"),
+            extra: Vec::new(),
+            body: nupkg(ID, VERSION),
+            recorded_path: FLAT.to_string(),
+            file: FILE.to_string(),
+            pin: crate::services::scanner_service::hosted_upload_pin(
+                "nuget",
+                FILE,
+                ID,
+                Some(VERSION),
+            ),
+        }
+    }
+
+    /// #5076: a `.nupkg` row the scanning Remote holds itself (replicated,
+    /// or pushed into the remote) is served through the gate, as the proxied
+    /// package is. Fails on `main`: the row streamed ungated (200, no
+    /// `X-AK-Scan`) under every policy.
+    #[tokio::test]
+    async fn a_stored_row_of_a_scanning_remote_is_gated_5076() {
+        crate::api::handlers::proxy_scan_archive::test_support::stored_row_is_gated(
+            stored_row_case,
+            crate::api::handlers::proxy_scan_archive::test_support::StoredRowSeed {
+                path: FLAT.to_string(),
+                name: ID.to_string(),
+                version: VERSION.to_string(),
+            },
+        )
+        .await;
+    }
+
     /// A V3 upstream advertising `{uri}/flat/` as its PackageBaseAddress.
     async fn v3_upstream() -> MockServer {
         let server = MockServer::start().await;
@@ -13198,6 +13401,14 @@ mod scan_on_proxy_tests {
         let (status, body, _) = pull_anon(&state, &fx.repo_key, FLAT).await;
         assert_scan_blocked(status, &body, FILE);
         assert_eq!(tdh::download_count(&fx.pool, row).await, 0);
+        // #4987: audited as the gate's own refusal is.
+        let audit = tdh::audit_row_eventually(&fx.pool, fx.repo_id, "PROXY_SCAN_BLOCKED").await;
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        assert_eq!(audit.details["path"], FILE);
+        assert_eq!(audit.details["checksum_sha256"], digest);
 
         server.verify().await;
         tdh::drop_proxy_verdicts(&fx.pool, &[digest]).await;
@@ -13788,5 +13999,49 @@ mod duplicate_entry_tests {
         }
         let single = zip_with(&[("Demo.nuspec", &good), ("lib/a.dll", b"x")]);
         assert!(established(&check(&single).1));
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod hosted_serve_verification_4989_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+
+    /// #4989 (#4323 remainder): the hosted NuGet download, V3 flat container
+    /// and V2, verifies the stored bytes against the row. A corrupt object is the 502 `STORED_OBJECT_INTEGRITY` with none of
+    /// its bytes, not a 200 under the checksum it was uploaded with.
+    #[tokio::test]
+    async fn hosted_download_refuses_a_corrupt_object_4989() {
+        let Some(fx) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        tdh::seed_corrupt_artifact(
+            &fx,
+            "v4989/1.0.0/v4989.1.0.0.nupkg",
+            "v4989",
+            "1.0.0",
+            "application/octet-stream",
+            b"stored bytes 4989",
+            b"stored bytes 498X",
+        )
+        .await;
+        let key = fx.repo_key.clone();
+        let send = |req| tdh::send(fx.router_with_auth(super::router()), req);
+        let (get_0, body_0) = send(tdh::get(format!(
+            "/{key}/v3/flatcontainer/v4989/1.0.0/v4989.1.0.0.nupkg"
+        )))
+        .await;
+        let (head_0, _) = send(tdh::head(format!(
+            "/{key}/v3/flatcontainer/v4989/1.0.0/v4989.1.0.0.nupkg"
+        )))
+        .await;
+        let (get_1, body_1) = send(tdh::get(format!("/{key}/v2/package/v4989/1.0.0"))).await;
+        let (head_1, _) = send(tdh::head(format!("/{key}/v2/package/v4989/1.0.0"))).await;
+        fx.teardown().await;
+        tdh::assert_integrity_refusal(get_0, &body_0, b"stored bytes 498X");
+        assert_eq!(head_0, StatusCode::OK, "a HEAD reads and verifies nothing");
+        tdh::assert_integrity_refusal(get_1, &body_1, b"stored bytes 498X");
+        assert_eq!(head_1, StatusCode::OK, "a HEAD reads and verifies nothing");
     }
 }

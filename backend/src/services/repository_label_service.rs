@@ -27,6 +27,14 @@ pub struct LabelEntry {
     pub value: String,
 }
 
+/// A label of a repository changed: drop the cached listing decisions of the
+/// generated indexes (#4987), which otherwise follow the change only when
+/// their TTL expires. Labels are part of what an artifact is matched by, so a
+/// listing must not keep a decision taken before the change.
+fn label_changed() {
+    crate::services::quarantine_service::invalidate_listing_decisions();
+}
+
 /// Service for managing repository labels.
 pub struct RepositoryLabelService {
     db: PgPool,
@@ -85,6 +93,7 @@ impl RepositoryLabelService {
         }
 
         tx.commit().await?;
+        label_changed();
 
         self.get_labels(repository_id).await
     }
@@ -110,6 +119,7 @@ impl RepositoryLabelService {
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+        label_changed();
 
         Ok(label)
     }
@@ -125,6 +135,9 @@ impl RepositoryLabelService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        if result.rows_affected() > 0 {
+            label_changed();
+        }
         Ok(result.rows_affected() > 0)
     }
 

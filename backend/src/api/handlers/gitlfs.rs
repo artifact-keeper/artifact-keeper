@@ -621,7 +621,16 @@ async fn upload_object(
     )
     .await?;
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+    // A tombstone stored under the legacy flat key hands that object to the
+    // storage GC rather than orphaning it (#5675).
+    super::cleanup_soft_deleted_artifact_reclaiming(
+        &state.db,
+        repo.id,
+        &repo.storage_location(),
+        &artifact_path,
+        &storage_key,
+    )
+    .await;
 
     // Insert artifact record
     let mut tx = super::publish_quota::begin_admitted_publish(
@@ -835,12 +844,7 @@ async fn download_object(
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
-        .map_err(|e| {
-            lfs_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-        })?;
+        .map_err(|e| crate::api::handlers::storage_err_response(&e, lfs_error_response))?;
 
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
@@ -1825,6 +1829,69 @@ mod tests {
             vec![path],
             "only the client upload queues a push task; the replicated one must not"
         );
+    }
+
+    /// #5685: a download of a stored LFS object whose store is down answers
+    /// `503` with `Retry-After`, and one whose store is full `507` without
+    /// it, in the LFS `{"message": …}` envelope with the fixed message and
+    /// no backend text or storage-class marker. It answered a hard-coded 500.
+    #[tokio::test]
+    async fn download_object_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(f) = tdh::Fixture::setup("local", "gitlfs").await else {
+            return;
+        };
+        let content = b"lfs-storage-outage-5685".to_vec();
+        let oid = format!("{:x}", Sha256::digest(&content));
+        let (status, body) = tdh::send(
+            f.router_with_auth(super::router()),
+            tdh::put(
+                format!("/{}/objects/{}", f.repo_key, oid),
+                Bytes::from(content),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "LFS upload while storage works: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        for (message, want, expected) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&f.pool, &f.state, f.repo_id, &message).await;
+            let app = tdh::router_with_auth(
+                super::router(),
+                state,
+                tdh::make_auth(f.user_id, &f.username),
+            );
+            let (status, body, headers) =
+                tdh::send_with_headers(app, tdh::get(format!("/{}/objects/{}", f.repo_key, oid)))
+                    .await;
+            assert_eq!(status, want, "{}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want == StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            tdh::assert_no_storage_backend_text("gitlfs GET object", &body);
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).expect("LFS error envelope is JSON");
+            assert_eq!(json["message"], expected, "LFS envelope message");
+        }
+        f.teardown().await;
     }
 
     // -----------------------------------------------------------------------
