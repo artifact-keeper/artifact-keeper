@@ -104,6 +104,13 @@ oci() { # <identifier> [extra package fields JSON]
       package: ({registryType: "oci", identifier: $id, transport: {type: "stdio"}} + $x)}'
 }
 
+# `events --since` takes whole seconds, so a case's window opens at the start
+# of the second it began in. A guest an earlier step started in that same
+# second (CI runs a real probe right before this script) would be counted
+# against the first case. Let that second pass first; each case's own
+# `sleep 1` does the same for the case after it.
+sleep 1
+
 echo "== #5446: npm and PyPI guests install only from this AK instance"
 for k in npm pypi; do
   refused "$k: public registry" "$(pkg "$k" '"https://registry.npmjs.org/"')"
