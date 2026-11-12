@@ -1988,6 +1988,8 @@ impl CiOidcService {
             // only happens for a mapping made by an earlier version that
             // never had one. The admin-configured mapping is the opt-in.
             auto_create_users: true,
+            // The key above already names the CI provider (#5483).
+            provider_id: None,
         }
     }
 

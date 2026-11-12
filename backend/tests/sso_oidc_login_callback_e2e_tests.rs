@@ -1853,3 +1853,73 @@ async fn test_oidc_callback_challenges_a_totp_enrolled_user_5484() {
     .expect("a TOTP pending token for /auth/totp/verify");
     assert_eq!(Some(claims.sub), user_id);
 }
+
+/// #5483: two OIDC providers that both issue one `sub` (two GitLab instances
+/// numbering users from 1) sign in to two accounts, each bound to its own
+/// provider. Before the fix the second provider's callback signed in as the
+/// first provider's user and overwrote its username and email.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + non-loopback IP"]
+async fn test_oidc_same_sub_at_two_providers_signs_in_two_accounts_5483() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let (Some(idp_a), Some(idp_b)) = (MockIdp::start().await, MockIdp::start().await) else {
+        return;
+    };
+    let provider_a = create_provider(&pool, &idp_a).await;
+    let provider_b = create_provider(&pool, &idp_b).await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let sub = format!("oidc-sub-5483-{suffix}");
+
+    for (idp, provider_id, who) in [
+        (&idp_a, provider_a, "victim"),
+        (&idp_b, provider_b, "intruder"),
+    ] {
+        let (sso_state, nonce) = login_state_nonce(&pool, provider_id).await;
+        idp.mount_token_endpoint(
+            &nonce,
+            json!({
+                "sub": sub,
+                "preferred_username": format!("{who}-5483-{suffix}"),
+                "email": format!("{who}-5483-{suffix}@example.test"),
+            }),
+        )
+        .await;
+        let resp = do_callback_state(&pool, provider_id, &sso_state).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "{who}'s callback must sign in"
+        );
+    }
+
+    let rows: Vec<(String, Option<String>, Option<Uuid>)> = sqlx::query_as(
+        "SELECT username, email, auth_provider_id FROM users \
+         WHERE external_id = $1 AND auth_provider = 'oidc' ORDER BY username",
+    )
+    .bind(&sub)
+    .fetch_all(&pool)
+    .await
+    .expect("accounts for the shared sub");
+    assert_eq!(
+        rows,
+        vec![
+            (
+                format!("intruder-5483-{suffix}"),
+                Some(format!("intruder-5483-{suffix}@example.test")),
+                Some(provider_b),
+            ),
+            (
+                format!("victim-5483-{suffix}"),
+                Some(format!("victim-5483-{suffix}@example.test")),
+                Some(provider_a),
+            ),
+        ],
+        "the same sub at a second provider must be a second account"
+    );
+
+    delete_user_by_sub(&pool, &sub).await;
+    delete_provider(&pool, provider_a).await;
+    delete_provider(&pool, provider_b).await;
+}
