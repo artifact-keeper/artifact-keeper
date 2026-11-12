@@ -5518,6 +5518,7 @@ mod tests {
                 totp_policy: None,
                 api_token_expiry_policy: None,
                 max_upload_size_bytes: 10_737_418_240,
+                quotas: Default::default(),
                 metrics_port: None,
                 grpc_bind_ip: crate::config::DEFAULT_LISTENER_BIND_IP,
                 metrics_bind_ip: crate::config::DEFAULT_LISTENER_BIND_IP,

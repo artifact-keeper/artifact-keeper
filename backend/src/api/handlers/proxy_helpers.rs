@@ -6978,7 +6978,12 @@ pub async fn local_fetch_or_redirect(
                 try_presigned_redirect(storage.as_ref(), &artifact.storage_key, true, expiry).await
             }
         };
-        if let Some(redirect) = redirect {
+        if let Some(mut redirect) = redirect {
+            // The transfer quota counts the object when the URL is issued.
+            crate::services::quota::http::tag_presigned_download(
+                &mut redirect,
+                artifact.size_bytes,
+            );
             return Ok(redirect);
         }
     }
@@ -7053,7 +7058,20 @@ pub async fn try_hosted_blob_redirect(
     let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
     // `try_presigned_redirect` additionally verifies `supports_redirect()` and
     // returns `None` for filesystem backends or on a signing error.
-    let redirect = try_presigned_redirect(storage, storage_key, true, expiry).await?;
+    let mut redirect = try_presigned_redirect(storage, storage_key, true, expiry).await?;
+    // The transfer quota counts the object when the URL is issued.
+    if state.transfer_meter.enabled() {
+        let size: Option<i64> =
+            sqlx::query_scalar("SELECT size_bytes FROM artifacts WHERE id = $1")
+                .bind(artifact_id)
+                .fetch_optional(&state.db)
+                .await
+                .ok()
+                .flatten();
+        if let Some(size) = size {
+            crate::services::quota::http::tag_presigned_download(&mut redirect, size);
+        }
+    }
     // Count-at-redirect (#2260): record BEFORE handing back the 302, matching the
     // generic download handler. A body-less redirect otherwise never counts.
     // Only GETs reach here (HEAD returned above), so the recorder's `ctx.is_head`
@@ -20616,6 +20634,7 @@ mod tests {
                 totp_policy: None,
                 api_token_expiry_policy: None,
                 max_upload_size_bytes: 10_737_418_240,
+                quotas: Default::default(),
                 metrics_port: None,
                 grpc_bind_ip: crate::config::DEFAULT_LISTENER_BIND_IP,
                 metrics_bind_ip: crate::config::DEFAULT_LISTENER_BIND_IP,
