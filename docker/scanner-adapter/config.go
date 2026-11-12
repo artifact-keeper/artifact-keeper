@@ -93,6 +93,16 @@ type Config struct {
 	// image scan at a time can use the on-disk analysis cache. Default 4; 0
 	// removes the bound.
 	MaxConcurrentScans int
+	// MaxImageBytes (SCANNER_MAX_IMAGE_BYTES) refuses an image whose
+	// compressed config and layers add up to more than this many bytes,
+	// before trivy runs (#5909): trivy downloads every layer into CacheDir
+	// and holds the analysed layers in memory, so an image too large for the
+	// pod's memory or ephemeral-storage limit got the adapter OOM-killed or
+	// evicted mid-scan. The job ends TooLarge (report 422,
+	// X-Scan-Status: TooLarge), not Failed. A manifest that cannot be read
+	// never blocks a scan. Default 0: no bound. The right value depends on
+	// the pod's limits, which the adapter does not know.
+	MaxImageBytes int64
 	// JobTTL is how long a finished job (report or error) is retained before the
 	// sweeper evicts it.
 	JobTTL time.Duration
@@ -167,6 +177,7 @@ func LoadConfig() *Config {
 		FsMaxUploadBytes:    getenvInt64("SCANNER_FS_MAX_UPLOAD_BYTES", 64*1024*1024*1024),
 		JobTTL:              getenvDuration("SCANNER_JOB_TTL", 30*time.Minute),
 		MaxConcurrentScans:  getenvIntNonNeg("SCANNER_MAX_CONCURRENT_SCANS", 4),
+		MaxImageBytes:       getenvInt64NonNeg("SCANNER_MAX_IMAGE_BYTES", 0),
 		LogLevel:            getenv("SCANNER_LOG_LEVEL", "info"),
 		ScannerVersion:      os.Getenv("SCANNER_SCANNER_VERSION"),
 		TrivyServer:         strings.TrimRight(strings.TrimSpace(os.Getenv("SCANNER_TRIVY_SERVER")), "/"),
@@ -268,6 +279,20 @@ func getenvIntNonNeg(key string, def int) int {
 		return def
 	}
 	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < 0 {
+		return def
+	}
+	return n
+}
+
+// getenvInt64NonNeg parses a non-negative int64, allowing 0 (unlike
+// getenvInt64). Used for byte limits where 0 = "no bound".
+func getenvInt64NonNeg(key string, def int64) int64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
 	if err != nil || n < 0 {
 		return def
 	}

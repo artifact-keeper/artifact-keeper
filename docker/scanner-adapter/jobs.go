@@ -22,6 +22,10 @@ const (
 	StatusSucceeded JobStatus = "Succeeded"
 	// StatusFailed: the scan errored; the report endpoint must 500 (fail-closed).
 	StatusFailed JobStatus = "Failed"
+	// StatusTooLarge: the image is over SCANNER_MAX_IMAGE_BYTES and was not
+	// scanned (#5909). Terminal; the report endpoint answers 422 with
+	// X-Scan-Status: TooLarge, so a client can tell it from a failed scan.
+	StatusTooLarge JobStatus = "TooLarge"
 )
 
 // Job is a single scan request's state. Exactly one of Report (image scan,
@@ -134,13 +138,24 @@ func (s *JobStore) Fail(id, errMsg string) {
 	}
 }
 
+// TooLarge records why the image was not scanned and marks the job
+// TooLarge.
+func (s *JobStore) TooLarge(id, msg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if job, ok := s.jobs[id]; ok {
+		job.Err = msg
+		job.Status = StatusTooLarge
+	}
+}
+
 // sweep evicts finished jobs older than the TTL. Returns the number evicted.
 func (s *JobStore) sweep(now time.Time) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := 0
 	for id, job := range s.jobs {
-		terminal := job.Status == StatusSucceeded || job.Status == StatusFailed
+		terminal := job.Status == StatusSucceeded || job.Status == StatusFailed || job.Status == StatusTooLarge
 		if terminal && now.Sub(job.Created) > s.ttl {
 			delete(s.jobs, id)
 			n++

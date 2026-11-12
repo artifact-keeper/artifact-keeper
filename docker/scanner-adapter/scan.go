@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -38,11 +39,13 @@ type Scanner struct {
 	imageCacheMu sync.Mutex
 	// ipWarned records the registry hosts warnIPPartition already logged.
 	ipWarned sync.Map
+	// registryClient reads image manifests for the size check (#5909).
+	registryClient *http.Client
 }
 
 // NewScanner constructs a Scanner bound to cfg.
 func NewScanner(cfg *Config) *Scanner {
-	return &Scanner{cfg: cfg}
+	return &Scanner{cfg: cfg, registryClient: newRegistryHTTPClient(cfg)}
 }
 
 // trimRegistryHost strips any scheme and trailing slash from a registry URL so
