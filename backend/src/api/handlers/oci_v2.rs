@@ -1276,11 +1276,9 @@ async fn put_request_body_stream(
         // The streamed body exceeded the configured max upload size: this is a
         // payload-size rejection, so surface 413 Payload Too Large (not 400) so
         // clients and proxies can distinguish "too big" from a malformed body.
-        Err(e) if limit_exceeded.load(Ordering::Relaxed) => Err(oci_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "BLOB_UPLOAD_INVALID",
-            &e.to_string(),
-        )),
+        Err(_) if limit_exceeded.load(Ordering::Relaxed) => {
+            Err(upload_session_size_error(max_upload_size_bytes))
+        }
         Err(e) if matches!(&e, AppError::Validation(_)) => Err(oci_error(
             StatusCode::BAD_REQUEST,
             "BLOB_UPLOAD_INVALID",
@@ -1343,14 +1341,8 @@ fn upload_session_size_error(max_upload_size_bytes: u64) -> Response {
     // cumulative session size exceeds the configured cap. Rejecting on the
     // declared size lets us refuse an oversized chunk before streaming a single
     // byte, which is the cheap DoS guard for the /v2 blob upload routes.
-    oci_error(
-        StatusCode::PAYLOAD_TOO_LARGE,
-        "BLOB_UPLOAD_INVALID",
-        &format!(
-            "upload session exceeds configured max upload size of {} bytes",
-            max_upload_size_bytes
-        ),
-    )
+    crate::services::quota::QuotaRefusal::upload_size(max_upload_size_bytes, None)
+        .into_oci_response()
 }
 
 fn upload_session_body_limit(existing_bytes: i64, max_upload_size_bytes: u64) -> usize {
@@ -4121,6 +4113,11 @@ async fn cache_manifest_reference_locally(
     content: &Bytes,
     content_type: Option<&str>,
 ) -> Result<String, String> {
+    // At the instance storage quota a Remote serves the manifest it fetched
+    // without caching it (the caller falls back to the computed digest).
+    if crate::services::quota::storage::at_quota(&state.db).await {
+        return Err("instance storage quota reached; not caching".to_string());
+    }
     let digest = compute_sha256(content);
     let storage = state
         .storage_for_repo(&repo.location)
@@ -6477,7 +6474,7 @@ async fn handle_get_blob(
             // #2894: offload the transfer to the object store with a 307 to a
             // presigned URL when enabled. A remote repo probes for the object
             // first, because a missing one is re-fetched from upstream below.
-            if let Some(redirect) = oci_blob_redirect::try_stored_blob_redirect(
+            if let Some(mut redirect) = oci_blob_redirect::try_stored_blob_redirect(
                 state,
                 storage.as_ref(),
                 &b.storage_key,
@@ -6486,6 +6483,8 @@ async fn handle_get_blob(
             )
             .await
             {
+                // The transfer quota counts the blob when the URL is issued.
+                crate::services::quota::http::tag_presigned_download(&mut redirect, b.size_bytes);
                 return redirect;
             }
             // Stream the blob straight from the backend instead of buffering the
@@ -6728,7 +6727,7 @@ async fn try_mount_blob(
 
     // A mount charges the target repository the blob's bytes, so it is
     // admitted against the target's storage quotas like an upload (#4422).
-    // A denial answers 507; a failed check falls back to a normal upload, as
+    // A denial answers 403; a failed check falls back to a normal upload, as
     // every other unsatisfiable mount does.
     let mut tx = state.db.begin().await.ok()?;
     if let Err(outcome) = mount_quota_refusal(
@@ -11831,18 +11830,15 @@ pub(crate) async fn index_child_artifact_size_sum(
 }
 
 /// #4422: a storage-quota decision as the error an OCI push answers: `None`
-/// when the push fits, `507 DENIED` naming the repository or project quota that
-/// refuses it, or a 500 when the check itself failed.
+/// when the push fits, `403 DENIED` naming the repository, project or
+/// instance quota that refuses it (with its limit and usage in `detail`), or a
+/// 500 when the check itself failed.
 fn oci_quota_refusal(
-    decision: crate::error::Result<Option<crate::services::repository_service::QuotaScope>>,
+    decision: crate::error::Result<Option<crate::services::repository_service::QuotaDenial>>,
 ) -> Option<Response> {
     match decision {
         Ok(None) => None,
-        Ok(Some(scope)) => Some(oci_error(
-            StatusCode::INSUFFICIENT_STORAGE,
-            "DENIED",
-            scope.exceeded_message(),
-        )),
+        Ok(Some(denial)) => Some(denial.refusal().into_oci_response()),
         Err(e) => {
             tracing::error!("storage quota check failed: {e}");
             Some(oci_error(
@@ -11854,15 +11850,15 @@ fn oci_quota_refusal(
     }
 }
 
-/// #4422: a blob mount's quota decision. `Err(Some(507))` refuses the mount;
+/// #4422: a blob mount's quota decision. `Err(Some(403))` refuses the mount;
 /// `Err(None)` (the check itself failed) falls back to a normal upload
 /// session, per [`try_mount_blob`]'s contract that a mount never errors.
 fn mount_quota_refusal(
-    decision: crate::error::Result<Option<crate::services::repository_service::QuotaScope>>,
+    decision: crate::error::Result<Option<crate::services::repository_service::QuotaDenial>>,
 ) -> Result<(), Option<Response>> {
     match decision {
         Ok(None) => Ok(()),
-        Ok(Some(scope)) => Err(oci_quota_refusal(Ok(Some(scope)))),
+        Ok(Some(denial)) => Err(oci_quota_refusal(Ok(Some(denial)))),
         Err(e) => {
             tracing::warn!("blob mount quota check failed; falling back to an upload: {e}");
             Err(None)
@@ -24748,7 +24744,7 @@ mod oci_blob_upload_streaming_tests {
             .await;
             assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{uri}: {body:?}");
             assert!(
-                String::from_utf8_lossy(&body).contains("BLOB_UPLOAD_INVALID"),
+                String::from_utf8_lossy(&body).contains("SIZE_INVALID"),
                 "{uri}: {body:?}"
             );
             assert_eq!(
@@ -29613,7 +29609,7 @@ mod cross_repo_session_regression_tests {
     }
 
     /// #4422 review: the chunked `docker push` path (POST, PATCH, PUT
-    /// `?digest=`) is refused with `507 DENIED` when the blob exceeds the
+    /// `?digest=`) is refused with `403 DENIED` when the blob exceeds the
     /// quota. The refusal rolls back (no `oci_blobs` row) and resets the
     /// session, so the same PUT succeeds once the quota allows it.
     #[tokio::test]
@@ -29685,7 +29681,7 @@ mod cross_repo_session_regression_tests {
 
         let (status, body) = send(complete()).await;
         let body = String::from_utf8_lossy(&body);
-        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{body}");
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
         assert!(body.contains("DENIED"), "{body}");
         let blobs: i64 =
             sqlx::query_scalar("SELECT count(*) FROM oci_blobs WHERE repository_id = $1")
@@ -30142,12 +30138,13 @@ mod cross_repo_session_regression_tests {
         let resp = oci_quota_refusal(Err(AppError::Database("x".into()))).expect("refused");
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         // A mount: a denial refuses, a failed check falls back to an upload.
-        use crate::services::repository_service::QuotaScope;
+        use crate::services::repository_service::{QuotaDenial, QuotaScope};
         assert!(mount_quota_refusal(Ok(None)).is_ok());
-        let refused = mount_quota_refusal(Ok(Some(QuotaScope::Project))).unwrap_err();
+        let refused =
+            mount_quota_refusal(Ok(Some(QuotaDenial::new(QuotaScope::Project, 1, 1)))).unwrap_err();
         assert_eq!(
             refused.expect("a denial refuses").status(),
-            StatusCode::INSUFFICIENT_STORAGE
+            StatusCode::FORBIDDEN
         );
         assert!(mount_quota_refusal(Err(AppError::Database("x".into())))
             .unwrap_err()
@@ -30157,7 +30154,7 @@ mod cross_repo_session_regression_tests {
     /// #4422: a `docker push` is admitted against the repository's storage
     /// quota on every write it makes. A blob that would exceed the quota (a
     /// monolithic upload or a cross-repository mount) is refused with the
-    /// registry's `507 DENIED` and nothing is recorded; a re-push of a blob the
+    /// registry's `403 DENIED` and nothing is recorded; a re-push of a blob the
     /// repository holds costs nothing, and the manifest (charged 0, #4545) is
     /// accepted.
     #[tokio::test]
@@ -30188,8 +30185,9 @@ mod cross_repo_session_regression_tests {
             }
         };
         let refused = |(status, body): (StatusCode, String), what: &str| {
-            assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{what}: {body}");
+            assert_eq!(status, StatusCode::FORBIDDEN, "{what}: {body}");
             assert!(body.contains("DENIED"), "{what}: {body}");
+            assert!(body.contains("\"scope\":\"repository\""), "{what}: {body}");
             assert!(
                 body.contains("Repository storage quota exceeded"),
                 "{what}: {body}"

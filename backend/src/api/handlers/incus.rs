@@ -724,12 +724,12 @@ async fn upsert_artifact(p: UpsertArtifactParams<'_>) -> Result<Uuid, String> {
         .begin()
         .await
         .map_err(|e| format!("database error: {e}"))?;
-    if let Some(scope) =
+    if let Some(denial) =
         super::publish_quota::locked_quota_denial(&mut tx, db, repo_id, artifact_path, size_bytes)
             .await
             .map_err(|e| format!("database error: {e}"))?
     {
-        return Err(scope.exceeded_message().to_string());
+        return Err(denial.exceeded_message());
     }
     let artifact = sqlx::query(
         r#"
@@ -2685,7 +2685,7 @@ async fn run_finalize(
 ) -> Result<Uuid, String> {
     // Refuse an over-quota image before pushing its bytes to the backend
     // (#4422); the authoritative admission runs with the row INSERT.
-    if let Some(scope) = super::publish_quota::preflight_quota_denial(
+    if let Some(denial) = super::publish_quota::preflight_quota_denial(
         &state.db,
         p.repo_id,
         super::publish_quota::PublishAt::Path(&p.artifact_path),
@@ -2694,7 +2694,7 @@ async fn run_finalize(
     .await
     .map_err(|e| format!("database error: {e}"))?
     {
-        return Err(scope.exceeded_message().to_string());
+        return Err(denial.exceeded_message());
     }
     put_staged_upload_to_storage(
         state,
@@ -5275,7 +5275,7 @@ mod streaming_pipeline_regression_tests {
         let (status, body) = tdh::send(f.router_with_auth(router()), req).await;
         assert_eq!(
             status,
-            StatusCode::INSUFFICIENT_STORAGE,
+            StatusCode::FORBIDDEN,
             "{}",
             String::from_utf8_lossy(&body)
         );

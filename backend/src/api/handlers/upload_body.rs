@@ -138,7 +138,7 @@ impl UploadBodyError {
     /// HTTP status and machine-readable code for this outcome.
     pub fn status_and_code(&self) -> (StatusCode, &'static str) {
         match self {
-            Self::TooLarge { .. } => (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
+            Self::TooLarge { .. } => (StatusCode::PAYLOAD_TOO_LARGE, "PAYLOAD_TOO_LARGE"),
             Self::Incomplete { .. } => (StatusCode::REQUEST_TIMEOUT, "incomplete_body"),
             Self::Stalled => (StatusCode::REQUEST_TIMEOUT, "upload_stalled"),
             Self::CapacityExhausted { .. } => {
@@ -167,6 +167,15 @@ impl UploadBodyError {
 
 impl IntoResponse for UploadBodyError {
     fn into_response(self) -> Response {
+        if let Self::TooLarge { limit, .. } = &self {
+            // The upload-size refusal every route answers (code
+            // `PAYLOAD_TOO_LARGE` with `limit_bytes`), with this message.
+            return crate::services::quota::QuotaRefusal {
+                message: self.to_string(),
+                ..crate::services::quota::QuotaRefusal::upload_size(*limit, None)
+            }
+            .into_response();
+        }
         let (status, code) = self.status_and_code();
         match &self {
             Self::CapacityExhausted { .. }

@@ -95,6 +95,7 @@ pub mod proxy_service;
 pub mod pypi_analysis;
 pub mod quality_check_service;
 pub mod quarantine_service;
+pub mod quota;
 pub mod remote_instance_service;
 pub mod repo_selector_service;
 pub mod repository_label_service;

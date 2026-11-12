@@ -15026,10 +15026,10 @@ mod tests {
             (status, String::from_utf8_lossy(&body).into_owned())
         };
         let (status, body) = quota_body(second.expect_err("over the project cap")).await;
-        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(body.contains("Project storage quota exceeded"), "{body}");
         let (status, body) = quota_body(sibling.expect_err("sibling shares the cap")).await;
-        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(body.contains("Project storage quota exceeded"), "{body}");
         assert_eq!(member_versions, vec!["1.0.0".to_string()]);
         assert_eq!(sibling_rows, 0, "a rejected publish must not land");

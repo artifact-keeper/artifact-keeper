@@ -2324,7 +2324,7 @@ fn is_write_method(method: &Method) -> bool {
 /// The narrower question "may an ANONYMOUS caller issue this POST against a
 /// public repository?" is answered by [`is_anonymous_readable_format_post`],
 /// which is deliberately a strict subset.
-fn is_non_mutating_format_post(path: &str) -> bool {
+pub(crate) fn is_non_mutating_format_post(path: &str) -> bool {
     let trimmed = path.trim_start_matches('/');
     let mut segments = trimmed.split('/');
     match segments.next() {

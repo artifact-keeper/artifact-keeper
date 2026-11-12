@@ -1156,6 +1156,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             state.upstream_feed_status.clone(),
         );
 
+    // Instance quotas: add this replica's download transfer count to the
+    // shared monthly counter, and keep the quota gauges current.
+    let _transfer_quota_flusher = state.transfer_meter.spawn_flusher();
+    if state.config.quotas.storage_quota_bytes > 0 || state.config.quotas.transfer_quota_bytes > 0 {
+        tracing::info!(
+            storage_quota_bytes = state.config.quotas.storage_quota_bytes,
+            transfer_quota_bytes = state.config.quotas.transfer_quota_bytes,
+            transfer_grace_percent = state.config.quotas.transfer_grace_percent,
+            "instance quotas enabled"
+        );
+    }
+
     // Spawn background schedulers (metrics snapshots, health monitor, lifecycle)
     scheduler_service::spawn_all(
         db_pool.clone(),

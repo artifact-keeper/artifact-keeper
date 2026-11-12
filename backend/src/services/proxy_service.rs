@@ -6285,11 +6285,17 @@ impl ProxyService {
                 // exactly the paths that serve proxy traffic. See
                 // [`Self::resolve_quota_bytes`].
                 let quota_bytes = self.resolve_quota_bytes(repo).await;
-                let quota_ok = !cache_classifier::exceeds_single_object_quota(
+                let within_ceiling = !cache_classifier::exceeds_single_object_quota(
                     quota_bytes,
                     resp.content.len() as i64,
                 );
-                if !quota_ok {
+                // At the instance storage quota the body is served, not cached.
+                let fill_admitted = !within_ceiling || self.cache_fill_admitted(repo).await;
+                let quota_ok = within_ceiling && fill_admitted;
+                if !fill_admitted {
+                    self.note_served_without_cache(repo.id, cache_path).await;
+                }
+                if !within_ceiling {
                     tracing::warn!(
                         target: "security",
                         repository = %repo.key,
@@ -7246,6 +7252,20 @@ impl ProxyService {
         // cache write, which would hand out a held artifact with no releasable
         // record. Under a hold the answer is the same 409 the tee path gives.
         let max_cache_bytes = Self::quota_to_cache_ceiling(self.resolve_quota_bytes(repo).await);
+        if !self.cache_fill_admitted(repo).await {
+            // At the instance storage quota: stream it, write nothing.
+            self.note_served_without_cache(repo.id, cache_path).await;
+            if hold_active {
+                return Err(AppError::Conflict(
+                    "Artifact is quarantined and pending security review".to_string(),
+                ));
+            }
+            return Ok(StreamHandle {
+                body: upstream.body,
+                headers,
+                cache_published: None,
+            });
+        }
         if let (Some(limit), Some(advertised)) = (max_cache_bytes, upstream.content_length) {
             if advertised > limit {
                 tracing::warn!(
@@ -8725,6 +8745,20 @@ impl ProxyService {
             .flatten()
         };
         raw.filter(|q| *q > 0)
+    }
+
+    /// Whether `repo` takes a cache fill now: `false` while the instance is
+    /// at its storage quota. A Remote then still serves what it fetches
+    /// upstream; it only stops caching it.
+    async fn cache_fill_admitted(&self, repo: &Repository) -> bool {
+        if crate::services::quota::storage::at_quota(&self.db).await {
+            tracing::debug!(
+                repository = %repo.key,
+                "instance storage quota reached; serving without caching"
+            );
+            return false;
+        }
+        true
     }
 
     /// The configured quota expressed as the per-object cache ceiling used by
