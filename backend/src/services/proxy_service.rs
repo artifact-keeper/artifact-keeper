@@ -30955,4 +30955,3 @@ mod finish_fill_on_drop_5509 {
         assert_eq!(follower_of_a_dropped_leader(true).await, None);
     }
 }
-
