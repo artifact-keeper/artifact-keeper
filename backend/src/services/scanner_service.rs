@@ -5477,6 +5477,22 @@ impl ComponentEcosystem {
     pub fn engine_catalogs_the_package(self) -> bool {
         !matches!(self, ComponentEcosystem::Conda)
     }
+
+    /// Stored token for a queued scan job: the
+    /// [`ExpectedComponent::pin_identity`] prefix, already persisted, so a
+    /// worker on a different build reads it back.
+    pub fn as_db_str(self) -> &'static str {
+        self.identity_token()
+    }
+
+    /// `None` for a token this build does not know. A wrong ecosystem writes
+    /// the wrong pin file, and the engine then grades nothing while reporting
+    /// clean, so callers must refuse rather than guess.
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|eco| eco.identity_token() == value)
+    }
 }
 
 /// The identity a proxied artifact is being SERVED AS — derived from the
@@ -28292,6 +28308,18 @@ tonic-build = "0.12"
             assert!(eco.engine_catalogs_the_package(), "{eco:?}");
         }
         assert!(!ComponentEcosystem::Conda.engine_catalogs_the_package());
+    }
+
+    /// A queued job stores the ecosystem as a token a worker on another build
+    /// decodes. A rename that updates only one side silently drops the pin,
+    /// and an unpinned scan grades nothing while recording `clean`.
+    #[test]
+    fn test_ecosystem_db_token_round_trips() {
+        for eco in ComponentEcosystem::ALL {
+            assert_eq!(ComponentEcosystem::from_db_str(eco.as_db_str()), Some(eco));
+        }
+        assert_eq!(ComponentEcosystem::from_db_str("java"), None);
+        assert_eq!(ComponentEcosystem::from_db_str(""), None);
     }
 
     /// #4594: a conda package the engine scanned to completion and cataloged

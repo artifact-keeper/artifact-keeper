@@ -666,8 +666,24 @@ pub fn lazy_pool() -> PgPool {
         .expect("lazy pool")
 }
 
+/// Turn the durable scan queue on and run a worker for it. Hold the guard for the
+/// test's duration. Tests using it belong in nextest's `db-serial` group: the
+/// queue claim is unfiltered, so two workers would grade each other's jobs.
+pub fn with_scan_worker(mut state: SharedState) -> (SharedState, tokio_util::sync::DropGuard) {
+    Arc::get_mut(&mut state)
+        .expect("state not shared yet")
+        .config
+        .scan_queue_enabled = true;
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    crate::services::scan_worker::spawn_scan_worker(state.clone(), shutdown.clone());
+    (state, shutdown.drop_guard())
+}
+
 fn cfg(storage_path: &str) -> Config {
     Config {
+        scan_worker_enabled: true,
+        scan_queue_enabled: false,
+        scan_worker_concurrency: None,
         database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
         bind_address: "127.0.0.1:0".into(),
         log_level: "error".into(),

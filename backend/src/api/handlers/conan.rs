@@ -5439,6 +5439,9 @@ mod tests {
 
         fn test_config(storage_path: &str) -> Config {
             Config {
+                scan_worker_enabled: true,
+                scan_queue_enabled: false,
+                scan_worker_concurrency: None,
                 database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
                 bind_address: "127.0.0.1:0".into(),
                 log_level: "error".into(),

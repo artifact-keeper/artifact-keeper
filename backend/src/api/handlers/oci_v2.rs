@@ -12487,6 +12487,9 @@ async fn gate_oci_proxy_manifest_scan(
         repo.id,
         &image_ref,
         &digest_hex,
+        // An image has no single cached object to queue, so it scans on the
+        // serve path.
+        None,
         synthetic,
         manifest_body,
         action,
