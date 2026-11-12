@@ -21388,7 +21388,7 @@ mod remote_blob_streaming_fallback_tests {
                     .and_then(|v| v.to_str().ok()),
                 Some(digest.as_str())
             );
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
                 .await
                 .expect("collect streamed layer");
             assert_eq!(body.len(), layer.len());
@@ -21657,7 +21657,7 @@ mod remote_blob_streaming_fallback_tests {
         assert!(outcome.is_indeterminate(), "never negative-cacheable");
         let resp = outcome.upstream_auth_error().expect("an error response");
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await
             .unwrap();
         let body = String::from_utf8_lossy(&body);
@@ -21782,7 +21782,7 @@ mod virtual_blob_streaming_fallback_tests {
             .get("Docker-Content-Digest")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await
             .expect("collect streamed body")
             .to_vec();
@@ -22152,7 +22152,7 @@ mod virtual_blob_streaming_fallback_tests {
             .get("Docker-Content-Digest")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await
             .expect("collect streamed body")
             .to_vec();
@@ -22218,7 +22218,7 @@ mod virtual_blob_streaming_fallback_tests {
             .get(CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await
             .expect("collect body")
             .to_vec();
@@ -22395,7 +22395,7 @@ mod virtual_blob_streaming_fallback_tests {
             .get(CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await
             .expect("collect body")
             .to_vec();
@@ -23551,6 +23551,8 @@ mod manifest_digest_fallback_tests {
     /// backend is unreachable, answers the retryable `503 UNAVAILABLE` (with
     /// `Retry-After`) instead of falling through to `404 MANIFEST_UNKNOWN`.
     /// Any other read error still falls through, so a Remote refetches.
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — buffering a small error body in a test assertion is not an artifact path (#1608)
     #[tokio::test]
     async fn resolve_answers_503_when_storage_is_unreachable_5894() {
         let digest = compute_sha256(OCI_IMAGE_MANIFEST);
@@ -23559,11 +23561,10 @@ mod manifest_digest_fallback_tests {
         let down = tdh::FailingStorage::new(tdh::minio_unreachable_error());
         let resp = resolve_local_manifest_from_storage(&down, "latest", row())
             .await
-            .err()
-            .expect("an unreachable store must not fall through");
+            .expect_err("an unreachable store must not fall through");
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(resp.headers().contains_key(axum::http::header::RETRY_AFTER));
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).expect("/v2 envelope");
