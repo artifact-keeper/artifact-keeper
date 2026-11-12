@@ -222,6 +222,36 @@ fn oci_storage_unavailable(err: &crate::error::AppError) -> Option<Response> {
         .then(|| oci_internal_error(&err.to_string()))
 }
 
+/// The `/v2` answer to a database error on a pull's lookup (#5894): `503
+/// UNAVAILABLE` + `Retry-After` when the database could not be reached or
+/// answer in time (the classification `db_status` shares with
+/// `AppError::is_db_unavailable`, #4750/#4765), otherwise a 500. Never the
+/// `404` a swallowed error used to end in: "no row" is a definitive answer
+/// a client acts on, a lookup that did not run is not. The message is the
+/// sanitised one, never the sqlx text.
+fn oci_db_error<E: std::fmt::Display + ?Sized>(e: &E) -> Response {
+    oci_error(
+        crate::api::handlers::db_status(e),
+        "INTERNAL_ERROR",
+        crate::api::handlers::db_err_message(e),
+    )
+}
+
+/// [`oci_db_error`] for a shared helper that already answered in the generic
+/// JSON envelope (the virtual-member walk): keep its status, answer in the
+/// `/v2` envelope.
+fn oci_db_error_from(resp: &Response) -> Response {
+    if resp.status() == StatusCode::SERVICE_UNAVAILABLE {
+        oci_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "UNAVAILABLE",
+            "Database is temporarily unavailable, retry shortly",
+        )
+    } else {
+        oci_internal_error("database error")
+    }
+}
+
 fn unauthorized_challenge(base_url: &str) -> Response {
     unauthorized_challenge_with_scope(base_url, None)
 }
@@ -4075,19 +4105,23 @@ async fn authorized_virtual_members(
     auth: Option<&crate::api::middleware::auth::AuthExtension>,
     repo_id: Uuid,
     cache_key: &VirtualResolveKey,
-) -> Option<(Vec<crate::models::repository::Repository>, bool)> {
+) -> Result<Option<(Vec<crate::models::repository::Repository>, bool)>, Response> {
+    // #5894: a member enumeration or authorization that failed on the
+    // database is answered, not read as "no member has it".
     let all = proxy_helpers::fetch_virtual_members(&state.db, repo_id)
         .await
-        .ok()?;
+        .map_err(|resp| oci_db_error_from(&resp))?;
     let total = all.len();
-    let members = proxy_helpers::authorize_virtual_members(&state.db, auth, repo_id, all).await;
+    let members = proxy_helpers::try_authorize_virtual_members(&state.db, auth, repo_id, all)
+        .await
+        .map_err(|resp| oci_db_error_from(&resp))?;
     let cacheable = members.len() == total;
     let negative_cache_ttl =
         std::time::Duration::from_millis(state.config.oci_virtual_negative_cache_ttl_ms);
     if cacheable && virtual_negative_cache_hit(cache_key, negative_cache_ttl) {
-        return None;
+        return Ok(None);
     }
-    Some((members, cacheable))
+    Ok(Some((members, cacheable)))
 }
 
 /// Walk a virtual OCI repo's members in priority order, returning the
@@ -4116,9 +4150,33 @@ pub async fn resolve_virtual_blob(
     digest: &str,
     is_head: bool,
 ) -> Option<VirtualBlobResolution> {
+    try_resolve_virtual_blob(state, auth, repo_id, image_name, digest, is_head)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// [`resolve_virtual_blob`] that reports a database error instead of reading
+/// it as a miss (#5894). The walk still tries every member, and one that
+/// serves the blob wins; only when none does is a failed member lookup
+/// answered (`Err`: the `/v2` 503, or a 500) rather than `Ok(None)`, and
+/// such a walk is never negative-cached.
+async fn try_resolve_virtual_blob(
+    state: &SharedState,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
+    repo_id: Uuid,
+    image_name: &str,
+    digest: &str,
+    is_head: bool,
+) -> Result<Option<VirtualBlobResolution>, Response> {
     let cache_key = VirtualResolveKey::new(repo_id, VirtualResolveKind::Blob, image_name, digest);
 
-    let (members, cacheable) = authorized_virtual_members(state, auth, repo_id, &cache_key).await?;
+    let Some((members, cacheable)) =
+        authorized_virtual_members(state, auth, repo_id, &cache_key).await?
+    else {
+        return Ok(None);
+    };
+    let mut lookup_failed: Option<Response> = None;
 
     // #3836: see `resolve_virtual_manifest`. A 429 or 5xx from a member's
     // upstream is not evidence that the blob does not exist, and recording it
@@ -4126,31 +4184,39 @@ pub async fn resolve_virtual_blob(
     let mut indeterminate = false;
 
     for member in &members {
-        let local = sqlx::query!(
+        let local = match sqlx::query!(
             "SELECT size_bytes, storage_key FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
             member.id,
             digest
         )
         .fetch_optional(&state.db)
         .await
-        .ok()
-        .flatten()
-        .map(|row| (row.size_bytes, row.storage_key));
+        {
+            Ok(row) => row.map(|row| (row.size_bytes, row.storage_key)),
+            Err(e) => {
+                warn!(member = %member.key, digest = %digest, "virtual blob lookup failed: {}", e);
+                lookup_failed.get_or_insert_with(|| oci_db_error(&e));
+                None
+            }
+        };
         // #5793: a hosted member serves the blob only under an image that
         // holds it, exactly as a direct pull of the member.
         let local = match local {
             Some(row) => {
                 let member_repo = oci_repo_info_from_member(member, image_name);
-                blob_scope_allows(state, &member_repo, digest)
-                    .await
-                    .unwrap_or(false)
-                    .then_some(row)
+                match blob_scope_allows(state, &member_repo, digest).await {
+                    Ok(allowed) => allowed.then_some(row),
+                    Err(e) => {
+                        lookup_failed.get_or_insert_with(|| oci_db_error(&e));
+                        None
+                    }
+                }
             }
             None => None,
         };
 
         if let Some(resolution) = local_blob_resolution(local, member) {
-            return Some(resolution);
+            return Ok(Some(resolution));
         }
 
         if should_attempt_remote_member(
@@ -4220,7 +4286,9 @@ pub async fn resolve_virtual_blob(
                         None => fetch.await,
                     };
                     match fetched {
-                        Ok(result) => return Some(VirtualBlobResolution::RemoteStream { result }),
+                        Ok(result) => {
+                            return Ok(Some(VirtualBlobResolution::RemoteStream { result }))
+                        }
                         Err(error) => {
                             indeterminate |= !upstream_error_is_definitive_miss(&error);
                             continue;
@@ -4231,6 +4299,9 @@ pub async fn resolve_virtual_blob(
         }
     }
 
+    if let Some(resp) = lookup_failed {
+        return Err(resp);
+    }
     if cacheable && !indeterminate {
         virtual_negative_cache_insert(
             cache_key,
@@ -4238,7 +4309,7 @@ pub async fn resolve_virtual_blob(
             state.config.oci_virtual_negative_cache_max_entries,
         );
     }
-    None
+    Ok(None)
 }
 
 /// Walk a virtual OCI repo's members in priority order, returning the
@@ -4280,13 +4351,36 @@ pub async fn resolve_virtual_manifest(
     image_name: &str,
     reference: &str,
     accept: Option<&str>,
-) -> Option<(
+) -> Option<VirtualManifestResolution> {
+    try_resolve_virtual_manifest(state, auth, repo_id, image_name, reference, accept)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// What [`resolve_virtual_manifest`] resolves: `(digest, content type,
+/// bytes, resolving member, re-fetched from upstream)`.
+pub type VirtualManifestResolution = (
     String,
     Option<String>,
     Bytes,
     crate::models::repository::Repository,
     bool,
-)> {
+);
+
+/// [`resolve_virtual_manifest`] that reports a database error, or a member
+/// store that cannot be reached, instead of reading it as a miss (#5894). As
+/// in [`try_resolve_virtual_blob`], a member that serves the manifest wins;
+/// only a walk that found nothing answers the failure (`Err`, the `/v2` 503
+/// or a 500), and it is never negative-cached.
+async fn try_resolve_virtual_manifest(
+    state: &SharedState,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
+    repo_id: Uuid,
+    image_name: &str,
+    reference: &str,
+    accept: Option<&str>,
+) -> Result<Option<VirtualManifestResolution>, Response> {
     let is_digest_ref = is_digest_reference(reference);
 
     // #1348 round 1, concern #2: same negative-cache short-circuit as
@@ -4295,7 +4389,12 @@ pub async fn resolve_virtual_manifest(
     let cache_key =
         VirtualResolveKey::new(repo_id, VirtualResolveKind::Manifest, image_name, reference);
 
-    let (members, cacheable) = authorized_virtual_members(state, auth, repo_id, &cache_key).await?;
+    let Some((members, cacheable)) =
+        authorized_virtual_members(state, auth, repo_id, &cache_key).await?
+    else {
+        return Ok(None);
+    };
+    let mut lookup_failed: Option<Response> = None;
 
     // #3836: set when any member left the question unanswered (a throttled or
     // failing upstream, or a digest mismatch we refused to serve). A walk that
@@ -4328,11 +4427,15 @@ pub async fn resolve_virtual_manifest(
             // is the fallback (a Remote member's cache, or a row not yet
             // recorded).
             let recorded = if stores_own_manifests(&member_repo.repo_type) {
-                resolve_hosted_digest(state, &member_repo, reference)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|content_type| (reference.to_string(), Some(content_type)))
+                match resolve_hosted_digest(state, &member_repo, reference).await {
+                    Ok(found) => {
+                        found.map(|content_type| (reference.to_string(), Some(content_type)))
+                    }
+                    Err(e) => {
+                        lookup_failed.get_or_insert_with(|| oci_db_error(&e));
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -4342,20 +4445,24 @@ pub async fn resolve_virtual_manifest(
                 // image; its repository-wide tag rows must not resolve the
                 // digest under a name that does not hold it.
                 None if stores_own_manifests(&member_repo.repo_type) => None,
-                None => sqlx::query!(
+                None => match sqlx::query!(
                     "SELECT manifest_digest, manifest_content_type FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2 LIMIT 1",
                     member.id,
                     reference
                 )
                 .fetch_optional(&state.db)
                 .await
-                .ok()
-                .flatten()
-                .map(|row| (row.manifest_digest, Some(row.manifest_content_type))),
+                {
+                    Ok(row) => row.map(|row| (row.manifest_digest, Some(row.manifest_content_type))),
+                    Err(e) => {
+                        lookup_failed.get_or_insert_with(|| oci_db_error(&e));
+                        None
+                    }
+                },
             };
             (row, false)
         } else {
-            let row = sqlx::query!(
+            let row = match sqlx::query!(
                 "SELECT manifest_digest, manifest_content_type FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
                 member.id,
                 image_name,
@@ -4363,9 +4470,13 @@ pub async fn resolve_virtual_manifest(
             )
             .fetch_optional(&state.db)
             .await
-            .ok()
-            .flatten()
-            .map(|row| (row.manifest_digest, row.manifest_content_type));
+            {
+                Ok(row) => row.map(|row| (row.manifest_digest, row.manifest_content_type)),
+                Err(e) => {
+                    lookup_failed.get_or_insert_with(|| oci_db_error(&e));
+                    None
+                }
+            };
             // #3725: a Remote member's tag row is trusted only while its
             // proxy-cache entry is within TTL, exactly as the direct Remote
             // path (#3712) — revalidated in the MEMBER's context, so the
@@ -4380,7 +4491,10 @@ pub async fn resolve_virtual_manifest(
                 row,
             )
             .await
-            .unwrap_or((None, false));
+            .unwrap_or_else(|e| {
+                lookup_failed.get_or_insert_with(|| oci_db_error(&e));
+                (None, false)
+            });
             (
                 row.map(|(digest, content_type)| (digest, Some(content_type))),
                 refetched,
@@ -4390,14 +4504,22 @@ pub async fn resolve_virtual_manifest(
         if let Some((manifest_digest, content_type)) = local {
             let manifest_key = manifest_storage_key(&manifest_digest);
             if let Ok(storage) = state.storage_for_repo(&member.storage_location()) {
-                if let Ok(data) = storage.get(&manifest_key).await {
-                    return Some((
-                        manifest_digest,
-                        content_type,
-                        data,
-                        member.clone(),
-                        refetched,
-                    ));
+                match storage.get(&manifest_key).await {
+                    Ok(data) => {
+                        return Ok(Some((
+                            manifest_digest,
+                            content_type,
+                            data,
+                            member.clone(),
+                            refetched,
+                        )));
+                    }
+                    // #5894: an unreachable member store is not a miss.
+                    Err(e) => {
+                        if let Some(resp) = oci_storage_unavailable(&e) {
+                            lookup_failed.get_or_insert(resp);
+                        }
+                    }
                 }
             }
         }
@@ -4443,7 +4565,7 @@ pub async fn resolve_virtual_manifest(
                             ct.as_deref(),
                         )
                         .await;
-                        return Some((digest, ct, body, member.clone(), true));
+                        return Ok(Some((digest, ct, body, member.clone(), true)));
                     }
                     None => {
                         warn!(
@@ -4465,6 +4587,9 @@ pub async fn resolve_virtual_manifest(
         }
     }
 
+    if let Some(resp) = lookup_failed {
+        return Err(resp);
+    }
     if cacheable && !indeterminate {
         virtual_negative_cache_insert(
             cache_key,
@@ -4472,7 +4597,7 @@ pub async fn resolve_virtual_manifest(
             state.config.oci_virtual_negative_cache_max_entries,
         );
     }
-    None
+    Ok(None)
 }
 
 fn cached_manifest_reference_key(repo_type: &str, reference: &str, digest: &str) -> String {
@@ -6839,7 +6964,10 @@ async fn handle_head_blob(
             tracing::debug!(repo = %repo.key, digest = %digest, "HEAD blob: no oci_blobs row - will proxy from upstream");
         }
         Err(e) => {
+            // #5894: the lookup did not run; answering the fall-through's
+            // 404 would tell the client the blob does not exist.
             warn!("DB error checking blob: {}", e);
+            return oci_db_error(&e);
         }
     }
 
@@ -6848,9 +6976,13 @@ async fn handle_head_blob(
         // excluded from the walk, so a public virtual cannot launder a private
         // member's bytes.
         let auth = virtual_caller_auth(claims.as_ref());
-        if let Some(resolution) =
-            resolve_virtual_blob(state, auth.as_ref(), repo.id, &repo.image, digest, true).await
-        {
+        let resolved =
+            try_resolve_virtual_blob(state, auth.as_ref(), repo.id, &repo.image, digest, true)
+                .await;
+        if let Some(resolution) = match resolved {
+            Ok(resolution) => resolution,
+            Err(resp) => return resp,
+        } {
             return match resolution {
                 VirtualBlobResolution::Local {
                     size_bytes,
@@ -7403,7 +7535,9 @@ async fn handle_get_blob(
             tracing::debug!(repo = %repo.key, digest = %digest, "GET blob: no oci_blobs row - will proxy from upstream");
         }
         Err(e) => {
+            // #5894: see the HEAD path.
             warn!("DB error reading blob: {}", e);
+            return oci_db_error(&e);
         }
     }
 
@@ -7412,9 +7546,13 @@ async fn handle_get_blob(
         // excluded from the walk, so a public virtual cannot launder a private
         // member's bytes.
         let auth = virtual_caller_auth(claims.as_ref());
-        if let Some(resolution) =
-            resolve_virtual_blob(state, auth.as_ref(), repo.id, &repo.image, digest, false).await
-        {
+        let resolved =
+            try_resolve_virtual_blob(state, auth.as_ref(), repo.id, &repo.image, digest, false)
+                .await;
+        if let Some(resolution) = match resolved {
+            Ok(resolution) => resolution,
+            Err(resp) => return resp,
+        } {
             return match resolution {
                 VirtualBlobResolution::Local {
                     size_bytes,
@@ -10956,15 +11094,10 @@ async fn handle_head_manifest(
     // gone for as long as the registry records it. The row is per
     // repository, which stops a shared cloud backend from leaking another
     // repo's digest. HEAD mirrors GET headers without a body.
+    // #5894: a database that cannot answer is a retryable 503, not a 500.
     let tag_row = match lookup_manifest_tag_row(state, &repo, reference).await {
         Ok(row) => row,
-        Err(e) => {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            )
-        }
+        Err(e) => return oci_db_error(&e),
     };
     // Forward the client's `Accept` header so the upstream registry returns
     // the manifest representation the client can actually consume (#586
@@ -10983,13 +11116,7 @@ async fn handle_head_manifest(
             .await
         {
             Ok((row, _)) => row,
-            Err(e) => {
-                return oci_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "INTERNAL_ERROR",
-                    &e.to_string(),
-                )
-            }
+            Err(e) => return oci_db_error(&e),
         };
     if tag_row.is_some() {
         let storage = match state.storage_for_repo(&repo.location) {
@@ -11040,17 +11167,19 @@ async fn handle_head_manifest(
         // as on the direct path, a HEAD indexes nothing (#3611).
         // #3268 review F2: see `authorized_virtual_members`.
         let auth = virtual_caller_auth(claims.as_ref());
-        if let Some((manifest_digest, content_type, data, member, _refetched)) =
-            resolve_virtual_manifest(
-                state,
-                auth.as_ref(),
-                repo.id,
-                &repo.image,
-                reference,
-                Some(&accept),
-            )
-            .await
-        {
+        let resolved = try_resolve_virtual_manifest(
+            state,
+            auth.as_ref(),
+            repo.id,
+            &repo.image,
+            reference,
+            Some(&accept),
+        )
+        .await;
+        if let Some((manifest_digest, content_type, data, member, _refetched)) = match resolved {
+            Ok(resolution) => resolution,
+            Err(resp) => return resp,
+        } {
             // #2912 parity with the direct HEAD local arm above, keyed on the
             // resolving MEMBER: a manifest quarantined or rejected in the
             // member must not be reported as available through the Virtual.
@@ -12547,15 +12676,10 @@ async fn handle_get_manifest(
     // retrievable by digest after its tags are gone for as long as the
     // registry records it. The row is per repository, which stops a shared
     // cloud backend from leaking another repo's digest.
+    // #5894: a database that cannot answer is a retryable 503, not a 500.
     let tag_row = match lookup_manifest_tag_row(state, &repo, reference).await {
         Ok(row) => row,
-        Err(e) => {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            )
-        }
+        Err(e) => return oci_db_error(&e),
     };
     // Forward the client's `Accept` header so the upstream registry returns
     // the manifest representation the client can actually consume (#586
@@ -12574,13 +12698,7 @@ async fn handle_get_manifest(
             .await
         {
             Ok(outcome) => outcome,
-            Err(e) => {
-                return oci_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "INTERNAL_ERROR",
-                    &e.to_string(),
-                )
-            }
+            Err(e) => return oci_db_error(&e),
         };
     if tag_row.is_some() {
         let storage = match state.storage_for_repo(&repo.location) {
@@ -12688,17 +12806,19 @@ async fn handle_get_manifest(
     if repo.repo_type == RepositoryType::Virtual {
         // #3268 review F2: see `authorized_virtual_members`.
         let auth = virtual_caller_auth(claims.as_ref());
-        if let Some((manifest_digest, content_type, data, member, refetched)) =
-            resolve_virtual_manifest(
-                state,
-                auth.as_ref(),
-                repo.id,
-                &repo.image,
-                reference,
-                Some(&accept),
-            )
-            .await
-        {
+        let resolved = try_resolve_virtual_manifest(
+            state,
+            auth.as_ref(),
+            repo.id,
+            &repo.image,
+            reference,
+            Some(&accept),
+        )
+        .await;
+        if let Some((manifest_digest, content_type, data, member, refetched)) = match resolved {
+            Ok(resolution) => resolution,
+            Err(resp) => return resp,
+        } {
             // The resolving member in its own context (#3023): the scan gate,
             // the catalog write and the download count below all key on it.
             let member_repo = oci_repo_info_from_member(&member, &repo.image);
@@ -21388,7 +21508,7 @@ mod remote_blob_streaming_fallback_tests {
                     .and_then(|v| v.to_str().ok()),
                 Some(digest.as_str())
             );
-            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
                 .expect("collect streamed layer");
             assert_eq!(body.len(), layer.len());
@@ -21657,7 +21777,7 @@ mod remote_blob_streaming_fallback_tests {
         assert!(outcome.is_indeterminate(), "never negative-cacheable");
         let resp = outcome.upstream_auth_error().expect("an error response");
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let body = String::from_utf8_lossy(&body);
@@ -21782,7 +21902,7 @@ mod virtual_blob_streaming_fallback_tests {
             .get("Docker-Content-Digest")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .expect("collect streamed body")
             .to_vec();
@@ -22152,7 +22272,7 @@ mod virtual_blob_streaming_fallback_tests {
             .get("Docker-Content-Digest")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .expect("collect streamed body")
             .to_vec();
@@ -22218,7 +22338,7 @@ mod virtual_blob_streaming_fallback_tests {
             .get(CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .expect("collect body")
             .to_vec();
@@ -22395,7 +22515,7 @@ mod virtual_blob_streaming_fallback_tests {
             .get(CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .expect("collect body")
             .to_vec();
@@ -23564,7 +23684,7 @@ mod manifest_digest_fallback_tests {
             .expect_err("an unreachable store must not fall through");
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(resp.headers().contains_key(axum::http::header::RETRY_AFTER));
-        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).expect("/v2 envelope");
@@ -28214,19 +28334,11 @@ mod oci_blob_upload_streaming_tests {
         f.teardown().await;
     }
 
-    /// #5894: with the object store down, a pull of a blob and a manifest the
-    /// repository holds answers `503 UNAVAILABLE` + `Retry-After`, on GET and
-    /// HEAD alike. Before the fix the blob GET and both manifest verbs read
-    /// the storage error as "not stored here" and answered `404
-    /// BLOB_UNKNOWN` / `MANIFEST_UNKNOWN`, which a client takes as "this
-    /// image does not exist". A blob whose object is really gone still
-    /// answers 404.
-    #[tokio::test]
-    async fn pull_of_stored_content_answers_503_while_storage_is_down_5894() {
-        let Some(f) = OciUploadFixture::setup().await else {
-            return;
-        };
-        let repo = f.inner.repo_key.clone();
+    /// Push a config blob and an image manifest (`image:v1`, no layers)
+    /// into the fixture's repository; returns `(blob digest, manifest
+    /// digest)` (#5894).
+    async fn push_test_image(f: &OciUploadFixture) -> (String, String) {
+        let repo = &f.inner.repo_key;
         let config = Bytes::from_static(b"{\"architecture\":\"amd64\",\"os\":\"linux\"}");
         let blob_digest = compute_sha256(&config);
         let (status, _, body) = send(
@@ -28261,6 +28373,23 @@ mod oci_blob_upload_streaming_tests {
             .and_then(|v| v.to_str().ok())
             .expect("Docker-Content-Digest")
             .to_string();
+        (blob_digest, manifest_digest)
+    }
+
+    /// #5894: with the object store down, a pull of a blob and a manifest the
+    /// repository holds answers `503 UNAVAILABLE` + `Retry-After`, on GET and
+    /// HEAD alike. Before the fix the blob GET and both manifest verbs read
+    /// the storage error as "not stored here" and answered `404
+    /// BLOB_UNKNOWN` / `MANIFEST_UNKNOWN`, which a client takes as "this
+    /// image does not exist". A blob whose object is really gone still
+    /// answers 404.
+    #[tokio::test]
+    async fn pull_of_stored_content_answers_503_while_storage_is_down_5894() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let repo = f.inner.repo_key.clone();
+        let (blob_digest, manifest_digest) = push_test_image(&f).await;
 
         let pulls = [
             (Method::GET, format!("/{repo}/image/blobs/{blob_digest}")),
@@ -28357,6 +28486,157 @@ mod oci_blob_upload_streaming_tests {
         let json: serde_json::Value = serde_json::from_slice(&body).expect("/v2 error envelope");
         assert_eq!(json["errors"][0]["code"], "BLOB_UNKNOWN");
 
+        f.teardown().await;
+    }
+
+    /// #5894, database facet: a pull whose blob or manifest lookup cannot be
+    /// answered by the database answers `503 UNAVAILABLE` + `Retry-After`, on
+    /// GET and HEAD, on a hosted repository and through a virtual one. Before
+    /// the fix the blob lookup's error was logged and fell through to `404
+    /// BLOB_UNKNOWN`, the manifest tag lookup answered a 500, and the virtual
+    /// walk read a failed member lookup as "no member has it" (404).
+    ///
+    /// The outage is [`tdh::TableQueryOutage`]: through its pool every query
+    /// on the shadowed tables hits `statement_timeout`, everything else
+    /// (repository, auth, scan gates) works.
+    #[tokio::test]
+    async fn pull_answers_503_when_the_database_lookup_fails_5894() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let pool = f.inner.pool.clone();
+        let repo = f.inner.repo_key.clone();
+        let (blob_digest, manifest_digest) = push_test_image(&f).await;
+        // The hosted name scope (#5793) reads `oci_blobs` before the lookup
+        // under test; with the repository not yet backfilled it is skipped,
+        // so the outage meets the lookup itself.
+        sqlx::query("DELETE FROM oci_image_scope_backfill WHERE repository_id = $1")
+            .bind(f.inner.repo_id)
+            .execute(&pool)
+            .await
+            .expect("unmark backfill");
+        // A public virtual repository whose only member is the fixture's.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(f.inner.repo_id)
+            .execute(&pool)
+            .await
+            .expect("member public");
+        let virt_id = Uuid::new_v4();
+        let virt = format!("oci-5894-virt-{}", &virt_id.simple().to_string()[..8]);
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
+             VALUES ($1, $2, $2, $3, 'virtual', 'docker'::repository_format, true)",
+        )
+        .bind(virt_id)
+        .bind(&virt)
+        .bind(format!("/tmp/{virt}"))
+        .execute(&pool)
+        .await
+        .expect("insert virtual repo");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virt_id)
+        .bind(f.inner.repo_id)
+        .execute(&pool)
+        .await
+        .expect("link member");
+
+        let blob_pulls = [
+            (Method::GET, format!("/{repo}/image/blobs/{blob_digest}")),
+            (Method::HEAD, format!("/{repo}/image/blobs/{blob_digest}")),
+            (Method::GET, format!("/{virt}/image/blobs/{blob_digest}")),
+            (Method::HEAD, format!("/{virt}/image/blobs/{blob_digest}")),
+        ];
+        let manifest_pulls = [
+            (Method::GET, format!("/{repo}/image/manifests/v1")),
+            (Method::HEAD, format!("/{repo}/image/manifests/v1")),
+            (
+                Method::GET,
+                format!("/{repo}/image/manifests/{manifest_digest}"),
+            ),
+            (Method::GET, format!("/{virt}/image/manifests/v1")),
+            (Method::HEAD, format!("/{virt}/image/manifests/v1")),
+        ];
+        // Control: every pull is served while the database answers.
+        for (method, uri) in blob_pulls.iter().chain(manifest_pulls.iter()) {
+            let (status, _, body) = send(
+                f.app(),
+                request(method.clone(), uri.clone(), &f.authorization, Bytes::new()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{method} {uri}: {body:?}");
+        }
+
+        async fn assert_503(app: Router, authorization: &str, method: &Method, uri: &str) {
+            let label = format!("{method} {uri} with the lookup failing");
+            let (status, headers, body) = send(
+                app,
+                request(method.clone(), uri.to_string(), authorization, Bytes::new()),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{label}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                "{label}: Retry-After"
+            );
+            if *method == Method::GET {
+                let json: serde_json::Value =
+                    serde_json::from_slice(&body).expect("/v2 error envelope");
+                assert_eq!(json["errors"][0]["code"], "UNAVAILABLE", "{label}");
+                let text = String::from_utf8_lossy(&body);
+                assert!(!text.contains("statement timeout"), "{label}: {text}");
+            }
+        }
+        fn with_pool(state: &SharedState, pool: &sqlx::PgPool) -> SharedState {
+            let mut next = (**state).clone();
+            next.db = pool.clone();
+            Arc::new(next)
+        }
+
+        for (tables, pulls) in [
+            (&["oci_blobs"][..], &blob_pulls[..]),
+            (&["oci_tags", "oci_manifests"][..], &manifest_pulls[..]),
+        ] {
+            let outage = tdh::TableQueryOutage::start(&pool, tables)
+                .await
+                .expect("outage pool");
+            let state = with_pool(&f.inner.state, &outage.pool);
+            let app = router(None).with_state(state.clone());
+            for (method, uri) in pulls {
+                assert_503(app.clone(), &f.authorization, method, uri).await;
+            }
+            // The virtual walk itself (its member lookups), not only the
+            // virtual repository's own lookup in front of it.
+            virtual_negative_cache_clear();
+            let walk = if tables[0] == "oci_blobs" {
+                try_resolve_virtual_blob(&state, None, virt_id, "image", &blob_digest, false)
+                    .await
+                    .map(|r| r.is_some())
+            } else {
+                try_resolve_virtual_manifest(&state, None, virt_id, "image", "v1", None)
+                    .await
+                    .map(|r| r.is_some())
+            };
+            let resp = walk.expect_err("a failed member lookup is not a miss");
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{tables:?}");
+            outage.end().await;
+        }
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virt_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virt_id)
+            .execute(&pool)
+            .await;
         f.teardown().await;
     }
 
