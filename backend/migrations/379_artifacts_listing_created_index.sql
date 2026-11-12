@@ -1,8 +1,8 @@
 -- no-transaction
--- 346_artifacts_listing_created_index.sql
+-- 379_artifacts_listing_created_index.sql
 -- #5040: the flat artifact listing sorted by creation time
 -- (`GET /api/v1/repositories/{key}/artifacts?sort_by=created_at`), same shape
--- as 345 on `(repository_id, created_at, id)`.
+-- as 378 on `(repository_id, created_at, id)`.
 --
 -- Cost: two scans of `artifacts` under SHARE UPDATE EXCLUSIVE, which blocks no
 -- reads or writes; the build first waits for transactions already open on the

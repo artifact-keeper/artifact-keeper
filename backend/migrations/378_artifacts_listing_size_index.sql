@@ -1,12 +1,12 @@
 -- no-transaction
--- 345_artifacts_listing_size_index.sql
+-- 378_artifacts_listing_size_index.sql
 -- #5040: the flat artifact listing sorted by size
 -- (`GET /api/v1/repositories/{key}/artifacts?sort_by=size`) pages a repository
 -- with `WHERE repository_id = $1 AND is_deleted = false ... ORDER BY size_bytes,
 -- id` and continues from a `(size_bytes, id)` keyset. Without an index leading
 -- on `(repository_id, size_bytes)` every page reads and sorts all of the
 -- repository's rows. Partial on `is_deleted = false` like the listing, which
--- never shows tombstoned artifacts. The created-at order is 346.
+-- never shows tombstoned artifacts. The created-at order is 379.
 --
 -- Cost: two scans of `artifacts` under SHARE UPDATE EXCLUSIVE, which blocks no
 -- reads or writes; the build first waits for transactions already open on the

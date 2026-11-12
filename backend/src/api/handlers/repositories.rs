@@ -8145,6 +8145,16 @@ pub async fn list_artifacts(
         Some(cursor) if sort != ArtifactSort::DEFAULT => {
             Some(sorted_cursor_position(sort, cursor)?)
         }
+        // A path cursor has an empty second part; a sorted one carries a row
+        // id. Replaying a sorted cursor without its order would page from a
+        // made-up path, so it is refused like the reverse case.
+        Some((_, id)) if !id.is_empty() => {
+            return Err(AppError::Validation(
+                "invalid `cursor` parameter for this `sort_by` / `sort_order`: pass the \
+                 `next_cursor` of a previous response with the same order"
+                    .to_string(),
+            ))
+        }
         _ => None,
     };
     let offset = if keyset.is_some() { 0 } else { offset };
@@ -9983,9 +9993,6 @@ fn decode_keyset_cursor(cursor: &str) -> Option<(String, String)> {
     }
 }
 
-/// Decode the optional `?cursor=` query parameter, mapping a malformed value
-/// to a 400-class validation error instead of silently restarting the walk
-/// from the beginning.
 /// The `(sort value, id)` a sorted listing continues after, from a decoded
 /// cursor whose first part is `<sort tag>:<value>` and second the row id. A
 /// cursor from another order, or one whose value the order cannot bind, is a
@@ -10007,6 +10014,9 @@ fn sorted_cursor_position(sort: ArtifactSort, cursor: &(String, String)) -> Resu
     }
 }
 
+/// Decode the optional `?cursor=` query parameter, mapping a malformed value
+/// to a 400-class validation error instead of silently restarting the walk
+/// from the beginning.
 fn decode_cursor_param(cursor: Option<&str>) -> Result<Option<(String, String)>> {
     match cursor {
         None => Ok(None),
@@ -44461,6 +44471,8 @@ mod artifact_sort_5040_tests {
                 key.as_str(),
                 format!("sort_by=size&sort_order=desc&cursor={size_cursor}"),
             ),
+            // A sorted cursor replayed under the default path order.
+            (key.as_str(), format!("cursor={size_cursor}")),
         ] {
             let (status, body) = list(&fx, repo, &query).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
