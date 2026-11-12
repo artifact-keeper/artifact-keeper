@@ -7537,6 +7537,87 @@ mod tests {
         );
     }
 
+    /// #5862: a backend whose prefix is `Some("")` (what `S3_PREFIX=""` used to
+    /// produce) still names a single-slash source in its `UploadPartCopy`.
+    ///
+    /// The fixture models S3 the way it behaves for a doubled slash: only the
+    /// plain `bucket/key` source resolves, `bucket//key` answers `NoSuchKey`.
+    #[tokio::test]
+    async fn test_large_copy_with_an_empty_prefix_names_a_single_slash_source_5862() {
+        use wiremock::matchers::{header, method, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let size = 5_u64 * 1024 * 1024 * 1024 + 1;
+        let source = "ab/cd/ef0123";
+        let dest = "ab/cd/ef0123-copy";
+        let expected_source = "test-bucket/ab/cd/ef0123";
+
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", size.to_string())
+                    .insert_header("last-modified", "Fri, 07 Aug 2026 18:09:54 GMT")
+                    .insert_header("ETag", "\"large-source\""),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(query_param_is_missing("uploadId"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>copy-upload-id</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(query_param("uploadId", "copy-upload-id"))
+            .and(header("x-amz-copy-source", expected_source))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CopyPartResult><ETag>&#34;part-copy-etag&#34;</ETag></CopyPartResult>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(query_param("uploadId", "copy-upload-id"))
+            .respond_with(ResponseTemplate::new(404).set_body_string(
+                "<Error><Code>NoSuchKey</Code><Message>The specified key does not \
+                 exist.</Message></Error>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(query_param("uploadId", "copy-upload-id"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"complete-copy\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+
+        let mut backend = mock_s3_backend(&server.uri(), false).await;
+        backend.prefix = Some(String::new());
+        S3Backend::copy(&backend, source, dest)
+            .await
+            .unwrap_or_else(|e| panic!("#5862: the copy must name '{expected_source}': {e}"));
+
+        let sources: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|r| {
+                r.headers
+                    .get("x-amz-copy-source")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            })
+            .collect();
+        assert!(!sources.is_empty(), "#5862: no part copy was sent");
+        assert!(
+            sources.iter().all(|s| s == expected_source),
+            "#5862: every part copy must name '{expected_source}', got {sources:?}"
+        );
+    }
+
     /// The integrity half of #3164: with the old restream shape, `dest` was
     /// already fully published (multipart upload completed) before any
     /// verification could run. With server-side part copies the publish point
