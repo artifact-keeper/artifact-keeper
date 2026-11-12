@@ -3535,7 +3535,7 @@ fn normalize_npm_scopes(raw: &[String]) -> Result<Vec<String>> {
         if !crate::api::handlers::npm::is_valid_npm_scope(scope) {
             return Err(AppError::Validation(format!(
                 "Invalid npm scope '{}': scopes must start with '@' followed by \
-                 lowercase letters, digits, '-', '_' or '.' (not leading '.'/'_')",
+                 lowercase letters, digits, '-', '_', '.' or '~' (not '.' or '..')",
                 scope
             )));
         }

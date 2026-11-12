@@ -103,6 +103,11 @@ pub struct QualityGate {
     pub enforce_on_download: bool,
     pub action: String,
     pub is_enabled: bool,
+    /// `rated`, `incomplete` or `any` (#4994, migration 361): the weakest
+    /// repository grade status `min_security_score` / `min_health_score`
+    /// accept. Read through
+    /// [`crate::models::security::AcceptedGradeStatus::from_db`].
+    pub accepted_grade_status: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

@@ -1365,6 +1365,9 @@ pub struct ReconcileStats {
     pub rows_removed: usize,
     /// Removals that failed (logged at WARN, retried next pass).
     pub remove_failed: usize,
+    /// The per-image link backfill that runs after the add and remove
+    /// halves (#5793, [`crate::services::oci_image_scope::run_backfill`]).
+    pub image_scope: crate::services::oci_image_scope::ScopeBackfillStats,
 }
 
 /// One keyset page (`(repository_id, digest) > ($1, $2)`, `LIMIT $3`) of stale
@@ -1547,6 +1550,12 @@ async fn reconcile_unlocked(
         ..ReconcileStats::default()
     };
     remove_stale_rows(db, repository_id, page_size, &mut stats).await;
+    // #5793: attribute manifests to the images that hold them once the
+    // repository's rows are reconciled (a removed row takes its links with
+    // it). Recurring, so a push a 1.11 replica served (which writes no link)
+    // is linked on the next pass; a repository's first pass also writes its
+    // legacy markers and switches its reads to the per-image rule.
+    stats.image_scope = crate::services::oci_image_scope::run_backfill(db, repository_id).await;
     metrics::counter!("ak_oci_manifests_reconcile_rows_added_total")
         .increment(stats.added.rows_inserted as u64);
     metrics::counter!("ak_oci_manifests_reconcile_rows_removed_total")
