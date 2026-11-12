@@ -1,7 +1,7 @@
 //! Durable scan queue: enqueue, claim, finalize. Keeps grype off the request path.
 //!
 //! A `RowClaimedQueue` ([`crate::services::cluster_work`]), the claim CTE follows
-//! `sync_worker::claim_pending_sync_tasks`. Schema in migration 377.
+//! `sync_worker::claim_pending_sync_tasks`. Schema in migration 362.
 //!
 //! Jobs carry a storage reference, never the bytes, and that reference may
 //! dangle: the proxy cache write is best-effort, so the worker retries then drops.
@@ -50,7 +50,7 @@ pub fn enqueue_signal() -> &'static std::sync::Arc<tokio::sync::Notify> {
     ENQUEUE_SIGNAL.get_or_init(|| std::sync::Arc::new(tokio::sync::Notify::new()))
 }
 
-/// Which shape of work a job is. Migration 377's CHECK keeps the kind and its
+/// Which shape of work a job is. Migration 362's CHECK keeps the kind and its
 /// payload columns in agreement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanJobKind {
@@ -540,10 +540,21 @@ impl ScanQueue {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let total: i64 = rows
-            .first()
-            .and_then(|r| r.try_get("total").ok())
-            .unwrap_or(0);
+        let total: i64 = match rows.first() {
+            Some(r) => r.try_get("total").unwrap_or(0),
+            // Past the last page the window has no row to ride on, so count
+            // separately rather than report an empty queue.
+            None if offset > 0 => sqlx::query_scalar(
+                "SELECT COUNT(*) FROM scan_queue \
+                 WHERE ($1::text IS NULL OR state = $1) AND ($2::text IS NULL OR kind = $2)",
+            )
+            .bind(state_filter)
+            .bind(kind_filter)
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?,
+            None => 0,
+        };
         let items = rows
             .iter()
             .map(|r| ScanQueueJobRow {
@@ -777,6 +788,38 @@ mod tests {
             "a lapsed claim is not a live consumer"
         );
 
+        drop_repo(&pool, repo).await;
+    }
+
+    /// A page past the last row still reports the real total, so a pager that
+    /// overshoots (rows drained between two requests) can step back.
+    #[tokio::test]
+    async fn list_jobs_reports_the_total_past_the_last_page() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        for d in ["page01", "page02", "page03"] {
+            q.enqueue_proxy_file(
+                repo,
+                &format!("c/{d}.crate"),
+                d,
+                None,
+                10,
+                None,
+                PRIORITY_BACKFILL,
+            )
+            .await
+            .expect("enqueue");
+        }
+        let (items, total) = q.list_jobs(None, None, 2, 0).await.expect("page 1");
+        assert_eq!((items.len(), total), (2, 3));
+        let (items, total) = q.list_jobs(None, None, 2, 10).await.expect("past end");
+        assert_eq!((items.len(), total), (0, 3));
+        let (items, total) = q
+            .list_jobs(Some("failed"), None, 2, 10)
+            .await
+            .expect("filtered, past end");
+        assert_eq!((items.len(), total), (0, 0));
         drop_repo(&pool, repo).await;
     }
 
