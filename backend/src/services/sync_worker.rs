@@ -1501,7 +1501,7 @@ async fn execute_transfer(
 /// fails, a different digest, a task with no checksum — is not applied, and
 /// the caller keeps the failure.
 async fn peer_already_holds_pushed_bytes(
-    client: &reqwest::Client,
+    client: &crate::services::http_client::Client,
     peer_endpoint: &str,
     peer_api_key: &str,
     task: &TaskRow,
@@ -7222,7 +7222,7 @@ mod tests {
         let claimed = claim_pending_sync_tasks(pool, peer_id, 5, 5, 3, "worker-5699", 60.0)
             .await
             .expect("claim");
-        let client = reqwest::Client::new();
+        let client: crate::services::http_client::Client = reqwest::Client::new().into();
         let runs = claimed.iter().map(|task| {
             execute_transfer(
                 pool,
