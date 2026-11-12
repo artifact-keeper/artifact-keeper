@@ -14,6 +14,7 @@ use crate::api::handlers::repositories::require_visible;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::models::security::AcceptedGradeStatus;
 use crate::services::quality_check_service::QualityCheckService;
 use crate::services::repository_service::RepositoryService;
 
@@ -231,6 +232,15 @@ pub struct CreateGateRequest {
     pub enforce_on_download: bool,
     #[serde(default = "default_warn")]
     pub action: String,
+    /// The weakest repository grade status `min_security_score` and
+    /// `min_health_score` accept (#4994): `rated` (default: a repository whose
+    /// scans failed, cataloged nothing or assessed only in part fails the
+    /// gate even at a score of 100), `incomplete` (only a repository with
+    /// nothing assessed fails) or `any` (the score alone decides, the
+    /// behaviour before 1.12). Not checked when neither threshold is set.
+    #[serde(default)]
+    #[schema(default = "rated")]
+    pub accepted_grade_status: AcceptedGradeStatus,
 }
 
 fn default_true() -> bool {
@@ -256,6 +266,9 @@ pub struct UpdateGateRequest {
     pub enforce_on_download: Option<bool>,
     pub action: Option<String>,
     pub is_enabled: Option<bool>,
+    /// See [`CreateGateRequest::accepted_grade_status`]; omitted leaves it as is.
+    #[serde(default)]
+    pub accepted_grade_status: Option<AcceptedGradeStatus>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -276,6 +289,13 @@ pub struct GateResponse {
     pub enforce_on_download: bool,
     pub action: String,
     pub is_enabled: bool,
+    /// The weakest repository grade status `min_security_score` and
+    /// `min_health_score` accept (#4994): `rated` (default: a repository whose
+    /// scans failed, cataloged nothing or assessed only in part fails the
+    /// gate even at a score of 100), `incomplete` (only a repository with
+    /// nothing assessed fails) or `any` (the score alone decides, the
+    /// behaviour before 1.12). Not checked when neither threshold is set.
+    pub accepted_grade_status: AcceptedGradeStatus,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -370,6 +390,7 @@ impl From<crate::models::quality::QualityGate> for GateResponse {
             enforce_on_download: g.enforce_on_download,
             action: g.action,
             is_enabled: g.is_enabled,
+            accepted_grade_status: AcceptedGradeStatus::from_db(&g.accepted_grade_status),
             created_at: g.created_at,
             updated_at: g.updated_at,
         }
@@ -971,6 +992,7 @@ async fn create_gate(
         enforce_on_promotion: body.enforce_on_promotion,
         enforce_on_download: body.enforce_on_download,
         action: body.action,
+        accepted_grade_status: body.accepted_grade_status,
     };
     let gate = qc_service.create_gate(input).await?;
     state
@@ -1041,6 +1063,7 @@ async fn update_gate(
         enforce_on_download: body.enforce_on_download,
         action: body.action,
         is_enabled: body.is_enabled,
+        accepted_grade_status: body.accepted_grade_status,
     };
     let gate = qc_service.update_gate(id, input).await?;
     state
@@ -1169,6 +1192,7 @@ async fn evaluate_gate(
         GateResponse,
         GateEvaluationResponse,
         GateViolationResponse,
+        AcceptedGradeStatus,
     ))
 )]
 pub struct QualityGatesApiDoc;
