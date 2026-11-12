@@ -4716,6 +4716,11 @@ fn check_token_validation_result(
 
 /// A supplied value must have the shape of a generated token, since
 /// `validate_api_token` refuses anything else before the lookup (#5640).
+///
+/// The shape alone accepts `00000000_000…0`, so the secret part must also use
+/// at least [`SUPPLIED_TOKEN_MIN_DISTINCT_DIGITS`] different hex digits. A
+/// random 32-digit value falls under that with probability around 1e-8, so
+/// this refuses only hand-typed or patterned values, not real random ones.
 pub(crate) fn validate_supplied_token(token: &str) -> Result<()> {
     if !is_api_token_shape(token) {
         return Err(AppError::Validation(
@@ -4723,8 +4728,23 @@ pub(crate) fn validate_supplied_token(token: &str) -> Result<()> {
                 .to_string(),
         ));
     }
+    let distinct = token.as_bytes()[9..]
+        .iter()
+        .map(u8::to_ascii_lowercase)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    if distinct < SUPPLIED_TOKEN_MIN_DISTINCT_DIGITS {
+        return Err(AppError::Validation(
+            "token secret looks hand-made (too few different hex digits); supply a random value"
+                .to_string(),
+        ));
+    }
     Ok(())
 }
+
+/// Minimum number of different hex digits in the 32-digit secret of a
+/// caller-supplied token (#5864).
+pub(crate) const SUPPLIED_TOKEN_MIN_DISTINCT_DIGITS: usize = 8;
 
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
@@ -6588,6 +6608,9 @@ mod tests {
         assert!(validate_supplied_token("0123ABCD_0123456789ABCDEF0123456789ABCDEF").is_ok());
         for bad in [
             "a".repeat(41),
+            // Right shape, but a patterned secret.
+            format!("0123abcd_{}", "0".repeat(32)),
+            format!("0123abcd_{}", &"0123456".repeat(5)[..32]),
             format!("0123abcd-{}", "f".repeat(32)),
             format!("0123abcd_{}", "f".repeat(31)),
             format!("0123abcd_{}", "f".repeat(33)),

@@ -479,7 +479,10 @@ impl TokenService {
                 // Get token details
                 if let Some(prefix) = AuthService::api_token_prefix(token) {
                     if let Ok(Some(token_info)) = sqlx::query!(
-                        "SELECT scopes, expires_at FROM api_tokens WHERE token_prefix = $1",
+                        // Live row first: a re-minted caller-supplied value
+                        // shares its prefix with the revoked token (#5864).
+                        "SELECT scopes, expires_at FROM api_tokens WHERE token_prefix = $1 \
+                         ORDER BY revoked_at IS NOT NULL LIMIT 1",
                         prefix
                     )
                     .fetch_optional(&self.db)
@@ -533,7 +536,9 @@ impl TokenService {
             return Err(AppError::Authentication("Invalid token format".to_string()));
         };
         let token_info = sqlx::query!(
-            "SELECT scopes FROM api_tokens WHERE token_prefix = $1",
+            // Live row first, as in `validate_api_token` (#5864).
+            "SELECT scopes FROM api_tokens WHERE token_prefix = $1 \
+             ORDER BY revoked_at IS NOT NULL LIMIT 1",
             prefix
         )
         .fetch_optional(&self.db)

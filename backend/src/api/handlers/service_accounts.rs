@@ -112,7 +112,7 @@ pub struct UpdateServiceAccountRequest {
 
 /// Unknown fields are refused (400) rather than dropped (#4226): a misspelled
 /// `repo_selector` used to mint an unrestricted token.
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateTokenRequest {
     pub name: String,
@@ -131,7 +131,24 @@ pub struct CreateTokenRequest {
     /// rotated in an external store. Same shape as a generated token (8 hex
     /// digits, `_`, 32 hex digits), the first 8 must not match a live token
     /// (409). Stored hashed.
+    #[schema(write_only)]
     pub token: Option<String>,
+}
+
+/// Hand-written so a caller-supplied `token` never reaches a log line through
+/// `{:?}` (#5864).
+impl std::fmt::Debug for CreateTokenRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateTokenRequest")
+            .field("name", &self.name)
+            .field("scopes", &self.scopes)
+            .field("expires_in_days", &self.expires_in_days)
+            .field("description", &self.description)
+            .field("repository_ids", &self.repository_ids)
+            .field("repo_selector", &self.repo_selector)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -985,6 +1002,23 @@ pub struct ServiceAccountsApiDoc;
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    /// A caller-supplied secret must not reach a log line through `{:?}`.
+    #[test]
+    fn create_token_request_debug_redacts_a_supplied_token() {
+        let secret = "0123abcd_0123456789abcdef0123456789abcdef";
+        let req: CreateTokenRequest = serde_json::from_value(serde_json::json!({
+            "name": "vault",
+            "scopes": ["read:artifacts"],
+            "token": secret,
+        }))
+        .expect("parse");
+        let shown = format!("{req:?}");
+        assert!(!shown.contains(secret), "{shown}");
+        assert!(!shown.contains("0123456789abcdef"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+        assert!(shown.contains("vault"), "{shown}");
+    }
 
     #[tokio::test]
     async fn scope_analysis_and_token_rows_flag_invalid_or_deleted_restrictions() {
