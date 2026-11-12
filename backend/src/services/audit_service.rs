@@ -104,7 +104,7 @@ pub enum AuditAction {
     /// An instance administrator released such a lock: handed a policy back
     /// to the repository's admins, or reopened a review (#4238).
     AgeGateLockReleased,
-    /// A user asked for a package exception (migration 345). Distinct from
+    /// A user asked for a package exception (migration 375). Distinct from
     /// `AgeGateQueued`, which is a gate noticing rather than a human asking.
     ExceptionRequested,
 

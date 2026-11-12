@@ -322,7 +322,7 @@ pub(crate) struct ReviewPolicyView {
     /// basis, threshold, and upstream on every decision.
     pub is_automatic: bool,
     pub identity: ReviewIdentityMatch,
-    /// `expires_at` is set and already in the past (migration 345). Resolved
+    /// `expires_at` is set and already in the past (migration 375). Resolved
     /// by the caller against one `now` so this stays a pure view and the whole
     /// decision remains testable without a clock.
     ///
@@ -332,7 +332,7 @@ pub(crate) struct ReviewPolicyView {
     pub expired: bool,
 }
 
-/// The queue's gate values (migration 345). `age` is the default so a row
+/// The queue's gate values (migration 375). `age` is the default so a row
 /// written before the column existed, or read through a `SELECT` that omits
 /// it, still behaves as the age gate it was.
 pub const GATE_AGE: &str = "age";
@@ -354,7 +354,7 @@ pub fn parse_gate(value: &str) -> Result<&'static str> {
 }
 
 /// Is this row the age gate's? `None` means the column was not selected, which
-/// only happens on pre-345 reads, and those rows are all age rows.
+/// only happens on pre-375 reads, and those rows are all age rows.
 pub(crate) fn is_age_gate(gate: Option<&str>) -> bool {
     gate.unwrap_or(GATE_AGE) == GATE_AGE
 }
@@ -436,7 +436,7 @@ pub(crate) enum AgeGateCheckAction {
 /// * below the threshold, only a *manual* approval whose identity matches the
 ///   current policy (or a pre-identity legacy manual approval) still allows;
 /// * a manual approval under a different identity, an EXPIRED manual approval
-///   (migration 345), or any automatic approval that no longer holds (raised
+///   (migration 375), or any automatic approval that no longer holds (raised
 ///   threshold, switched mode, repointed upstream, legacy row), is voided back
 ///   to pending and blocks;
 /// * anything else blocks and records/bumps the pending review.
@@ -696,7 +696,7 @@ pub struct AgeGateReview {
     #[sqlx(default)]
     pub instance_locked: bool,
     /// Which withhold gate filed this row: `age` | `scan` | `curation`
-    /// (migration 345).
+    /// (migration 375).
     #[sqlx(default)]
     pub gate: Option<String>,
     /// A human's stated reason for wanting this package. `None` means nobody
@@ -708,6 +708,10 @@ pub struct AgeGateReview {
     /// Who filed the justification. `None` on auto-filed rows.
     #[sqlx(default)]
     pub requested_by: Option<Uuid>,
+    /// The requester's username, so a reviewer who is not an admin (and so
+    /// cannot look users up) can see who asked. `None` when unknown.
+    #[sqlx(default)]
+    pub requested_by_username: Option<String>,
     /// When an approval stops being honored. `None` = never expires.
     /// Evaluated at READ time, so an exception lapses without a sweep.
     #[sqlx(default)]
@@ -1423,7 +1427,7 @@ impl AgeGateService {
     ///
     /// `gates` filters which withhold gates to include; `None` means ALL of
     /// them, which is what the unified reviewer queue wants. The age-gate admin
-    /// endpoint passes `["age"]` so its contract is unchanged by migration 345
+    /// endpoint passes `["age"]` so its contract is unchanged by migration 375
     /// making the table multi-gate.
     ///
     /// `justified_only` selects the reviewer's DEFAULT view: rows a human
@@ -1475,10 +1479,12 @@ impl AgeGateService {
                 repo.key as repository_key,
                 reviewer.username as reviewed_by_username,
                 reviewer.is_service_account as reviewed_by_is_service_account,
+                requester.username as requested_by_username,
                 r.instance_locked
             FROM age_gate_reviews r
             INNER JOIN repositories repo ON repo.id = r.repository_id
             LEFT JOIN users reviewer ON reviewer.id = r.reviewed_by
+            LEFT JOIN users requester ON requester.id = r.requested_by
             WHERE ($1::text[] IS NULL OR r.gate = ANY($1))
               AND ($2::text IS NULL OR repo.key = $2)
               AND ($3::text[] IS NULL OR r.status = ANY($3))
@@ -1514,10 +1520,12 @@ impl AgeGateService {
                 repo.key as repository_key,
                 reviewer.username as reviewed_by_username,
                 reviewer.is_service_account as reviewed_by_is_service_account,
+                requester.username as requested_by_username,
                 r.instance_locked
             FROM age_gate_reviews r
             INNER JOIN repositories repo ON repo.id = r.repository_id
             LEFT JOIN users reviewer ON reviewer.id = r.reviewed_by
+            LEFT JOIN users requester ON requester.id = r.requested_by
             WHERE r.id = $1
             "#,
         )
@@ -1902,7 +1910,7 @@ impl AgeGateService {
         package_name: &str,
         exclude_version: &str,
     ) -> Result<Option<LastKnownGood>> {
-        // The join is scoped to `gate = 'age'` (migration 345): the table now
+        // The join is scoped to `gate = 'age'` (migration 375): the table now
         // holds a row per (gate, coordinate), so an unscoped join would let a
         // `scan` or `curation` row decide age eligibility, a pending scan
         // exception would hide an age-approved version from LKG, and an
@@ -4002,7 +4010,7 @@ mod tests {
     #[test]
     fn is_age_gate_treats_an_unselected_column_as_age() {
         assert!(is_age_gate(Some(GATE_AGE)));
-        // A `SELECT` that omits `gate`, or a pre-345 row, must behave as the
+        // A `SELECT` that omits `gate`, or a pre-375 row, must behave as the
         // age gate it was, never as some other gate's exception.
         assert!(is_age_gate(None));
         assert!(!is_age_gate(Some(GATE_SCAN)));
@@ -4089,7 +4097,7 @@ mod tests {
             "a manual approval under a different identity is voided"
         );
         // An EXPIRED manual approval is voided the same way a stale one is
-        // (migration 345): the exception lapsed, so the package goes back on
+        // (migration 375): the exception lapsed, so the package goes back on
         // the queue rather than continuing to be served.
         assert_eq!(
             decide_age_gate_check(Some(&expired_view("approved", false, Matches)), false),
