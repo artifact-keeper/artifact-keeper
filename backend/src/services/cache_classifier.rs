@@ -373,12 +373,28 @@ pub fn classify_stored(format: &RepositoryFormat, path: &str) -> Mutability {
         | RepositoryFormat::Bower => crate::formats::npm::tarball_url_path_from_stored(path)
             .is_some_and(|url| classify(format, &url).is_immutable()),
         RepositoryFormat::Cargo => is_stored_cargo_crate(&path.to_ascii_lowercase()),
+        RepositoryFormat::Go => go_download_path_from_stored(path)
+            .is_some_and(|url| classify(format, &url).is_immutable()),
         _ => false,
     };
     if stored_release {
         Mutability::Immutable
     } else {
         classified
+    }
+}
+
+/// The `@v/` download path of a hosted Go module file, which the upload
+/// route stores as `<module>/<ver>/<ver>.zip` and `<module>/<ver>/go.mod`
+fn go_download_path_from_stored(path: &str) -> Option<String> {
+    let (module_version, file) = path.trim_start_matches('/').rsplit_once('/')?;
+    let (module, version) = module_version.rsplit_once('/')?;
+    if file == format!("{version}.zip") {
+        Some(format!("{module}/@v/{version}.zip"))
+    } else if file == "go.mod" {
+        Some(format!("{module}/@v/{version}.mod"))
+    } else {
+        None
     }
 }
 
@@ -2214,6 +2230,8 @@ mod tests {
             (RepositoryFormat::Cargo, "serde/1.0.0/serde-1.0.0.crate"),
             (RepositoryFormat::Cargo, "/Serde/1.0.0/serde-1.0.0.crate"),
             (RepositoryFormat::Cargo, "crates/serde/serde-1.0.0.crate"),
+            (RepositoryFormat::Go, "example.com/mod/v1.2.3/v1.2.3.zip"),
+            (RepositoryFormat::Go, "example.com/mod/v1.2.3/go.mod"),
         ];
         for (format, path) in immutable {
             assert!(
@@ -2230,6 +2248,9 @@ mod tests {
             (RepositoryFormat::Cargo, "serde/1.0.0/other-1.0.0.crate"),
             (RepositoryFormat::Cargo, "serde/serde-1.0.0.crate"),
             (RepositoryFormat::Generic, "serde/1.0.0/serde-1.0.0.crate"),
+            (RepositoryFormat::Go, "example.com/mod/master/master.zip"),
+            (RepositoryFormat::Go, "example.com/mod/v1.2.3/other.zip"),
+            (RepositoryFormat::Go, "go.mod"),
         ];
         for (format, path) in mutable {
             assert!(
