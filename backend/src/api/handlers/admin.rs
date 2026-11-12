@@ -975,6 +975,9 @@ fn validate_settings_update(
             )));
         }
     }
+    if let Some((_, after)) = changed_exception_request_url(request, current) {
+        crate::services::exception_queue::validate_url_template(&after)?;
+    }
     if let Some(v) = request.edge_stale_threshold_minutes {
         if stale_threshold_pinned && v != current.edge_stale_threshold_minutes {
             return Err(AppError::Validation(format!(
@@ -3416,6 +3419,18 @@ mod tests {
             Some("https://help.example/{package}")
         );
         assert!(validate(posted_back, false).is_ok());
+        // Handed to every refused client to click, so only an absolute http(s) URL is stored
+        for bad in [
+            "javascript:alert(1)//{package}",
+            "/exceptions/request",
+            "https://help.example/{package}\r\nX-Evil: 1",
+        ] {
+            assert!(
+                validate(serde_json::json!({ "exception_request_url": bad }), false).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+        assert!(validate(serde_json::json!({ "exception_request_url": "" }), false).is_ok());
     }
 
     /// #5652: `allow_anonymous_download` (never enforced) is gone from the
