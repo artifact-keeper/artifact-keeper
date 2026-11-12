@@ -52,6 +52,10 @@ one delays the merge by the deadline, not by the upstream client's own 60 s
 timeout. Raise it if a member's cold metadata fetch (for example a large conda
 channel's `repodata.json.zst` over a slow link) takes longer.
 
+Artifact downloads through a virtual repository have a separate deadline,
+`AK_VIRTUAL_MEMBER_DOWNLOAD_DEADLINE_SECS`. See
+[virtual downloads](virtual-downloads.md).
+
 ## `virtual_metadata_partial`
 
 Set on a virtual repository through the repository API. The setting controls
