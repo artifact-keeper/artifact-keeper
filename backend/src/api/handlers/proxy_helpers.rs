@@ -27858,15 +27858,10 @@ mod proxy_download_recording_tests {
     #[test]
     fn virtual_member_authorization_is_fallible_on_every_client_facing_path() {
         // Call sites that may still flatten, as (file, enclosing function),
-        // each with the reason. `oci_v2`'s blob/manifest walk reaches the
-        // helper through its own `authorized_virtual_members`, whose `Option`
-        // return already means "stop the walk" and whose `None` is
-        // load-bearing for the virtual negative cache; making the
-        // authorization failure distinguishable there is a signature change
-        // across both resolvers and their handlers. Scoped to that one
-        // function (#5504), so a new flattening call elsewhere in `oci_v2.rs`
-        // is caught like any other.
-        const EXEMPT: &[(&str, &str)] = &[("oci_v2.rs", "authorized_virtual_members")];
+        // each with the reason. Empty: `oci_v2`'s blob/manifest walk, the last
+        // exemption (#5504), now authorizes through the fallible form and
+        // answers a failed query as 503 (#5894).
+        const EXEMPT: &[(&str, &str)] = &[];
 
         let mut flattening: Vec<(&str, String)> = Vec::new();
         for (file, src) in SERVE_SOURCES {
