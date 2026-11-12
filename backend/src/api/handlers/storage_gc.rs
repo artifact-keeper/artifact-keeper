@@ -164,6 +164,7 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
 /// instance-wide endpoint.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.maintenance")), ("x-resource" = json!("instance"))),
     path = "/{key}/storage-gc",
     context_path = "/api/v1/repositories",
     tag = "repositories",

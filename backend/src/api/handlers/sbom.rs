@@ -153,6 +153,7 @@ pub struct ProxySbomQuery {
 /// SBOM id, no listing, and no delete.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("repo:key"))),
     path = "/api/v1/repositories/{key}/security/proxy-sbom",
     params(ProxySbomQuery, ("key" = String, Path, description = "Repository key")),
     responses(

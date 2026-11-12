@@ -2620,6 +2620,7 @@ async fn delete_policy(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/security",
     context_path = "/api/v1/repositories",
     tag = "security",
@@ -2823,6 +2824,7 @@ async fn list_repo_coverage_artifacts(
 
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/security",
     context_path = "/api/v1/repositories",
     tag = "security",
@@ -2873,7 +2875,8 @@ async fn update_repo_security(
     let tier = crate::services::age_gate_service::ActorTier::of(auth.is_admin);
     let write = svc
         .upsert_config_as(repo.id, &body.config, tier, body.instance_locked)
-        .await?;
+        .await
+        .map_err(|e| crate::api::authz::shadow_marker::keep_refusal("admin_tier", e))?;
 
     // Every change to the scan configuration is an enforcement change
     // (scanning on/off, threshold, block_on_policy_violation, or the proxy
@@ -3042,6 +3045,7 @@ async fn list_artifact_scans(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/security/scans",
     context_path = "/api/v1/repositories",
     tag = "security",
@@ -3489,6 +3493,7 @@ async fn count_proxy_scan_paths(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/security/proxy-scans",
     context_path = "/api/v1/repositories",
     tag = "security",
@@ -3931,6 +3936,7 @@ pub struct ProxyRescanResponse {
 /// inventory and per-CVE detail exactly as an inline gated pull would (#3396).
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("security.scan")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/security/proxy-scans/rescan",
     context_path = "/api/v1/repositories",
     tag = "security",
@@ -9093,8 +9099,11 @@ mod tests {
             serde_json::json!({"instance_locked": false}),
             serde_json::json!({"instance_locked": true}),
         ] {
-            let r = put(repo_admin.clone(), body.clone()).await;
-            refused.push((body, matches!(r, Err(AppError::Authorization(_)))));
+            let (r, recorded) =
+                crate::api::authz::shadow_marker::scope(put(repo_admin.clone(), body.clone()))
+                    .await;
+            let kept = recorded.kept_refusal == Some("admin_tier");
+            refused.push((body, matches!(r, Err(AppError::Authorization(_))) && kept));
         }
         let after_refusals = current().await;
 

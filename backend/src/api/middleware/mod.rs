@@ -5,6 +5,7 @@ pub mod client_ip;
 pub mod demo;
 pub mod download_telemetry;
 pub mod guest_access;
+pub mod iam_shadow;
 pub mod metrics;
 pub mod nul_path;
 pub(crate) mod oci_errors;

@@ -13242,6 +13242,7 @@ async fn authorize_oci_replication_write(
         AppError::Authentication("Authentication required".to_string()).into_response()
     })?;
     if !crate::api::handlers::is_replication_request(headers) {
+        crate::api::authz::shadow_marker::note_kept_refusal("replication_only");
         return Err(oci_error(
             StatusCode::FORBIDDEN,
             "DENIED",
@@ -13300,6 +13301,27 @@ fn is_valid_replication_reference(reference: &str, digest: &str) -> bool {
 /// place, so replaying a partially-completed transfer is harmless. Blobs are
 /// always sent BEFORE the manifest so the peer never commits a manifest whose
 /// blobs are missing.
+#[utoipa::path(
+    put,
+    operation_id = "replicate_oci_blob",
+    extensions(("x-required-permission" = json!("artifact.write")), ("x-resource" = json!("repo:key"))),
+    path = "/{key}/oci/blobs/{digest}",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ("digest" = String, Path, description = "Content digest, `sha256:<hex>`"),
+    ),
+    request_body(content_type = "application/octet-stream", description = "The blob bytes"),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 201, description = "Stored, or already present"),
+        (status = 400, description = "The body does not match the digest"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Not a replication peer, or not authorized to write to this repository"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
 pub async fn replicate_oci_blob(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<crate::api::middleware::auth::AuthExtension>>,
@@ -13429,6 +13451,27 @@ pub async fn replicate_oci_blob(
 /// [`commit_pushed_manifest`] — the same commit a native `docker push` takes,
 /// so a replicated manifest is indistinguishable from a pushed one and is
 /// never visible with missing blobs.
+#[utoipa::path(
+    put,
+    operation_id = "replicate_oci_manifest",
+    extensions(("x-required-permission" = json!("artifact.write")), ("x-resource" = json!("repo:key"))),
+    path = "/{key}/oci/manifests/{digest}",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ("digest" = String, Path, description = "Content digest, `sha256:<hex>`"),
+    ),
+    request_body(content_type = "application/octet-stream", description = "The manifest bytes"),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 201, description = "Stored, or already present"),
+        (status = 400, description = "The body does not match the digest"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Not a replication peer, or not authorized to write to this repository"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
 pub async fn replicate_oci_manifest(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<crate::api::middleware::auth::AuthExtension>>,

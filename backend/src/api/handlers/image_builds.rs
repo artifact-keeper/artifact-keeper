@@ -309,6 +309,7 @@ fn require_container_repo(repo: &Repository) -> Result<()> {
 /// only unless `AK_IMAGE_BUILD_ADMIN_ONLY=false`.
 fn require_may_build(auth: &AuthExtension, settings: &ImageBuildSettings) -> Result<()> {
     if !settings.caller_may_build(auth.is_admin) {
+        crate::api::authz::shadow_marker::note_kept_refusal("instance_setting");
         return Err(AppError::Authorization(
             "image builds are restricted to administrators on this instance (AK_IMAGE_BUILD_ADMIN_ONLY)".to_string(),
         ));
@@ -686,6 +687,7 @@ const SELECT_LIVE_MANIFEST_ROW_PATHS_SQL: &str = concat!(
 #[utoipa::path(
     get,
     operation_id = "inspect_image",
+    extensions(("x-required-permission" = json!("artifact.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/image-inspect",
     context_path = "/api/v1/repositories",
     tag = "image-builds",
@@ -735,6 +737,7 @@ async fn inspect_image(
 #[utoipa::path(
     get,
     operation_id = "image_build_settings",
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/image-builds/settings",
     context_path = "/api/v1/repositories",
     tag = "image-builds",
@@ -761,6 +764,7 @@ async fn build_settings(
 #[utoipa::path(
     get,
     operation_id = "image_build_base_info",
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/image-builds/base-info",
     context_path = "/api/v1/repositories",
     tag = "image-builds",
@@ -840,6 +844,7 @@ async fn base_image_info(
 #[utoipa::path(
     post,
     operation_id = "render_image_build",
+    extensions(("x-required-permission" = json!("image_build.create")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/image-builds/render",
     context_path = "/api/v1/repositories",
     tag = "image-builds",
@@ -870,6 +875,7 @@ async fn render_build(
 #[utoipa::path(
     get,
     operation_id = "list_image_builds",
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/image-builds",
     context_path = "/api/v1/repositories",
     tag = "image-builds",
@@ -897,6 +903,7 @@ async fn list_builds(
 #[utoipa::path(
     post,
     operation_id = "create_image_build",
+    extensions(("x-required-permission" = json!("image_build.create")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/image-builds",
     context_path = "/api/v1/repositories",
     tag = "image-builds",
@@ -955,6 +962,7 @@ async fn create_build(
 #[utoipa::path(
     get,
     operation_id = "get_image_build",
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/image-builds/{id}",
     context_path = "/api/v1/repositories",
     tag = "image-builds",
@@ -986,6 +994,7 @@ async fn get_build(
 #[utoipa::path(
     get,
     operation_id = "get_image_build_log",
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/image-builds/{id}/log",
     context_path = "/api/v1/repositories",
     tag = "image-builds",
@@ -1144,6 +1153,20 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("local repositories only"));
+    }
+
+    #[tokio::test]
+    async fn the_admin_only_refusal_is_kept_by_the_handler() {
+        let s = settings();
+        let (refused, recorded) =
+            crate::api::authz::shadow_marker::scope(async { require_may_build(&auth(false), &s) })
+                .await;
+        assert!(matches!(refused, Err(AppError::Authorization(_))));
+        assert_eq!(recorded.kept_refusal, Some("instance_setting"));
+        let (_, recorded) =
+            crate::api::authz::shadow_marker::scope(async { require_may_build(&auth(true), &s) })
+                .await;
+        assert_eq!(recorded.kept_refusal, None);
     }
 
     #[test]
