@@ -225,7 +225,9 @@ pub struct NexusChecksum {
 
 impl NexusClient {
     /// Create a new Nexus client
-    pub fn new(config: NexusClientConfig) -> Result<Self, ArtifactoryError> {
+    pub fn new(mut config: NexusClientConfig) -> Result<Self, ArtifactoryError> {
+        // every request appends a path, and Nexus 404s the `//` a trailing slash gives
+        config.base_url = config.base_url.trim().trim_end_matches('/').to_string();
         // `timeout()` covers reading the body, so it killed any download that
         // took longer than it, reported as "error decoding response body". That
         // made the real size limit depend on throughput. Bound the connect and
@@ -1519,6 +1521,38 @@ mod tests {
         .unwrap();
 
         assert_eq!(client.get_version().await.unwrap().version, "3.61.0-02");
+    }
+
+    #[tokio::test]
+    async fn test_trailing_slash_base_url_requests_single_slash_paths_5479() {
+        let (server, _) = setup_nexus_mock(
+            "/service/rest/v1/status/writable",
+            ResponseTemplate::new(200),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/repository/raw-hosted/a/b.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"x".to_vec()))
+            .mount(&server)
+            .await;
+        let client = NexusClient::new(NexusClientConfig {
+            base_url: format!(" {}/ ", server.uri()),
+            throttle_delay_ms: 0,
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(
+            client.ping().await.unwrap(),
+            "ping must hit the single-slash path"
+        );
+        assert_eq!(
+            client
+                .download_artifact("raw-hosted", "a/b.txt")
+                .await
+                .unwrap(),
+            bytes::Bytes::from_static(b"x")
+        );
     }
 
     #[test]
