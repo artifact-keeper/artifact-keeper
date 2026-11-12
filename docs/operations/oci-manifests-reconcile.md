@@ -40,6 +40,10 @@ Since 1.12.0 the table is also what the registry reads (#1683, third slice):
   and when it prunes the refs of a manifest it retires the manifest's row in
   the same run if nothing else keeps it.
 
+Since 1.12.0 a hosted repository also scopes manifest and blob digests to the
+image name that holds them, through per-image links the reconcile backfills;
+see [OCI digests scoped to the image name](oci-image-scope.md) (#5793).
+
 The #1681 content-addressable fallback, which inferred that a repository owned
 a digest from its `manifest_blob_refs` and `oci_manifest_refs` rows, is gone:
 the row is that proof now. Like those rows it is per repository, which is what

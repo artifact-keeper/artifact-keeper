@@ -6959,8 +6959,7 @@ pub(crate) fn format_trivy_version(raw: &str) -> Option<String> {
 /// metadata timestamp (#3287). Accepts both the space-separated shape
 /// (`2026-08-10 01:31:31 +0000 UTC`) and the ISO shape
 /// (`2026-08-10T01:31:31Z`), reducing either to the date. Day resolution
-/// matches the daily CVE-DB release cadence of both Grype and Trivy, and keeps
-/// the composed token within `scan_results.scanner_version`'s `VARCHAR(50)`.
+/// matches the daily CVE-DB release cadence of both Grype and Trivy.
 pub(crate) fn db_build_date_token(value: &str) -> Option<String> {
     let first = value.split_whitespace().next()?;
     let date = first.split('T').next().unwrap_or(first);
@@ -9586,8 +9585,70 @@ impl ScannerService {
         force: bool,
         bypass_dedup: bool,
     ) -> Result<()> {
-        self.scan_artifact_inner(artifact_id, force, bypass_dedup, Some(prepared))
-            .await
+        // #5830: the trigger handler already returned these ids, and the
+        // scan runs detached, so whatever it returns nobody reads. Keep the
+        // ids to fail every row it did not finish, with the reason, instead
+        // of leaving them `running` until the stuck-scan janitor reaps them.
+        let prepared_ids: Vec<(String, Uuid)> = prepared
+            .iter()
+            .map(|(scan_type, id)| (scan_type.clone(), *id))
+            .collect();
+        let result = self
+            .scan_artifact_inner(artifact_id, force, bypass_dedup, Some(prepared))
+            .await;
+        self.fail_unfinished_prepared_scans(artifact_id, prepared_ids, result.as_ref().err())
+            .await;
+        result
+    }
+
+    /// Fail each of a trigger's pre-allocated `prepared` rows the scan left
+    /// `running` (#5830).
+    ///
+    /// A scan returns before its scanners reach their rows when the artifact
+    /// is gone, its bytes cannot be read, or a database call fails before or
+    /// between scanners. Each such row ends `failed` with that error, and the
+    /// artifact gets the same fail-closed treatment as a scanner that errored
+    /// ([`Self::flag_after_failed_scan`]). A row the scan finished is not
+    /// touched (the update is guarded on `running`), and a scan that returned
+    /// `Ok` with a row still `running` names that too rather than leaving it.
+    /// Best-effort: an error here is logged, and the janitor stays the
+    /// backstop.
+    async fn fail_unfinished_prepared_scans(
+        &self,
+        artifact_id: Uuid,
+        mut prepared: Vec<(String, Uuid)>,
+        error: Option<&AppError>,
+    ) {
+        prepared.sort();
+        let mut scanned: Option<String> = None;
+        let mut failed_any = false;
+        for (scan_type, scan_id) in prepared {
+            let reason = match error {
+                Some(e) => format!("scan stopped before the {scan_type} scanner finished: {e}"),
+                None => format!("scan finished without running the {scan_type} scanner"),
+            };
+            match self
+                .scan_result_service
+                .fail_scan_if_running(scan_id, &reason)
+                .await
+            {
+                Ok(Some(checksum)) => {
+                    warn!("Scan {} of artifact {}: {}", scan_id, artifact_id, reason);
+                    failed_any = true;
+                    scanned = scanned.or(checksum);
+                }
+                Ok(None) => {}
+                Err(e) => error!(
+                    "Failed to fail unfinished scan {} of artifact {}: {}",
+                    scan_id, artifact_id, e
+                ),
+            }
+        }
+        // The hold binds to the bytes the rows were prepared for.
+        if failed_any {
+            self.flag_after_failed_scan(artifact_id, scanned.as_deref())
+                .await;
+        }
     }
 
     /// Run the leaf scanners over raw in-memory bytes with NO `artifacts` row
@@ -10599,7 +10660,13 @@ impl ScannerService {
                     } else {
                         (effective_completeness, completeness_reason.clone())
                     };
-                    self.scan_result_service
+                    // #5564: a `complete_scan` write the schema still refuses
+                    // (before 342, an over-long scanner version or vuln-db
+                    // identity) must fail THIS scan, named, and the set moves
+                    // on. The `?` here used to abandon the row `running` and
+                    // skip every later scanner.
+                    if let Err(e) = self
+                        .scan_result_service
                         .complete_scan(
                             scan_result.id,
                             total,
@@ -10617,7 +10684,22 @@ impl ScannerService {
                             written_reason.as_deref(),
                             vuln_db.as_ref(),
                         )
+                        .await
+                    {
+                        let reason =
+                            format!("{} could not record its scan result: {e}", scanner.name());
+                        error!("Scan of artifact {}: {}", artifact_id, reason);
+                        self.record_failed_scan(
+                            artifact_id,
+                            &artifact.checksum_sha256,
+                            scan_result.id,
+                            scanner.as_ref(),
+                            &reason,
+                            started_at,
+                        )
                         .await?;
+                        continue;
+                    }
                     catalog_set.record_completed(
                         scan_result.id,
                         contributed,
@@ -11408,6 +11490,16 @@ impl ScannerService {
             );
         }
 
+        self.flag_after_failed_scan(artifact_id, Some(scanned))
+            .await;
+        Ok(())
+    }
+
+    /// The artifact side of a failed scan: `flagged` unless it is already in
+    /// a blocking state, then `block_on_fail` policies (#2912) bound to
+    /// `scanned`, the bytes the scan was for (the hold is unbound when that
+    /// is unknown, as [`Self::scan_hold_row`] does for `None`).
+    async fn flag_after_failed_scan(&self, artifact_id: Uuid, scanned: Option<&str>) {
         // Mark as flagged on failure (conservative), but never
         // downgrade an artifact that is already in a blocking or
         // admin-controlled quarantine-workflow state. A scanner
@@ -11437,7 +11529,6 @@ impl ScannerService {
         // update_quarantine_status (#2912).
         self.enforce_policy_after_failed_scan(artifact_id, scanned)
             .await;
-        Ok(())
     }
 
     /// Apply scan policies after a scan *failed* (#2912).
@@ -11455,7 +11546,7 @@ impl ScannerService {
     /// The hold binds to the bytes the scan read (`scanned`, #5646): when an
     /// OCI tag moved to another image during the scan, the old image's row is
     /// held, not the new one.
-    async fn enforce_policy_after_failed_scan(&self, artifact_id: Uuid, scanned: &str) {
+    async fn enforce_policy_after_failed_scan(&self, artifact_id: Uuid, scanned: Option<&str>) {
         let repository_id: Option<Uuid> =
             match sqlx::query_scalar("SELECT repository_id FROM artifacts WHERE id = $1")
                 .bind(artifact_id)
@@ -11499,7 +11590,7 @@ impl ScannerService {
             violations = %reason,
             "Quarantining artifact after failed scan due to scan policy violation"
         );
-        let (row_id, bind) = match self.scan_hold_row(artifact_id, Some(scanned)).await {
+        let (row_id, bind) = match self.scan_hold_row(artifact_id, scanned).await {
             Ok(Some(target)) => target,
             Ok(None) => return,
             Err(e) => {
@@ -14394,9 +14485,6 @@ mod tests {
         assert_eq!(format_grype_db_build("no such database"), None);
         assert_eq!(db_build_date_token("  "), None);
         assert_eq!(db_build_date_token("unknown"), None);
-        // The composed grype token stays within scan_results.scanner_version's
-        // VARCHAR(50).
-        assert!("grype-0.83.0+db-2026-08-10".len() <= 50);
     }
 
     /// #3296: the shared `trivy filesystem` severity allowlist must admit
@@ -30606,6 +30694,148 @@ tonic-build = "0.12"
         fx.teardown().await;
     }
 
+    /// A `ScannerService` over the fixture with one never-applicable scanner,
+    /// for the #5830 early-return tests: they return before any scanner runs.
+    fn early_return_scanner(fx: &crate::api::handlers::test_db_helpers::Fixture) -> ScannerService {
+        ScannerService {
+            db: fx.pool.clone(),
+            scanners: vec![Arc::new(NeverApplicableScanner)],
+            scan_result_service: Arc::new(ScanResultService::new(fx.pool.clone())),
+            scan_config_service: Arc::new(ScanConfigService::new(fx.pool.clone())),
+            storage: fx.state.storage.clone(),
+            storage_registry: fx.state.storage_registry.clone(),
+            storage_base_path: fx.storage_dir.to_string_lossy().into_owned(),
+            scan_workspace_path: fx
+                .storage_dir
+                .join("scan-workspace")
+                .to_string_lossy()
+                .into_owned(),
+            dependency_track: None,
+        }
+    }
+
+    async fn scan_row_state(
+        pool: &PgPool,
+        scan_id: Uuid,
+    ) -> (String, Option<String>, bool, String) {
+        sqlx::query_as(
+            "SELECT status, error_message, completed_at IS NOT NULL, inventory_status \
+             FROM scan_results WHERE id = $1",
+        )
+        .bind(scan_id)
+        .fetch_one(pool)
+        .await
+        .expect("read scan row")
+    }
+
+    /// #5830: a manual scan whose blob is gone from storage returns before any
+    /// scanner runs. Its pre-allocated rows must end `failed` with the storage
+    /// error at once, not stay `running` until the stuck-scan janitor; a row
+    /// already terminal is left alone, and the artifact is flagged as for any
+    /// failed scan.
+    #[tokio::test]
+    async fn test_scan_with_prepared_fails_rows_when_blob_is_missing() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        // No blob is written under this key.
+        let artifact_id = insert_minimal_artifact(&fx.pool, fx.repo_id, &fresh_checksum()).await;
+        let scanner = early_return_scanner(&fx);
+        let grype = scanner
+            .scan_result_service
+            .create_scan_result(artifact_id, fx.repo_id, "grype")
+            .await
+            .expect("pre-allocate running scan");
+        let finished = scanner
+            .scan_result_service
+            .create_scan_result(artifact_id, fx.repo_id, "openscap")
+            .await
+            .expect("pre-allocate second scan");
+        sqlx::query(
+            "UPDATE scan_results SET status = 'completed', completed_at = NOW() WHERE id = $1",
+        )
+        .bind(finished.id)
+        .execute(&fx.pool)
+        .await
+        .expect("complete second scan");
+
+        let mut prepared = HashMap::new();
+        prepared.insert("grype".to_string(), grype.id);
+        prepared.insert("openscap".to_string(), finished.id);
+        let err = scanner
+            .scan_artifact_with_prepared(artifact_id, prepared, true, true)
+            .await
+            .expect_err("a missing blob fails the scan");
+
+        let (status, message, completed, inventory) = scan_row_state(&fx.pool, grype.id).await;
+        assert_eq!(status, "failed", "the row must not be left running");
+        assert!(completed, "a failed row is terminal");
+        assert_eq!(inventory, "failed");
+        assert_eq!(
+            message.as_deref(),
+            Some(format!("scan stopped before the grype scanner finished: {err}").as_str()),
+            "error_message carries the real error"
+        );
+
+        let (status, message, _, _) = scan_row_state(&fx.pool, finished.id).await;
+        assert_eq!(status, "completed", "a finished row is not touched");
+        assert_eq!(message, None);
+
+        let quarantine: Option<String> =
+            sqlx::query_scalar("SELECT quarantine_status FROM artifacts WHERE id = $1")
+                .bind(artifact_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("read artifact");
+        assert_eq!(
+            quarantine.as_deref(),
+            Some("flagged"),
+            "fail-closed as a scanner error"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    /// #5830: the artifact was deleted between the trigger and the task, so
+    /// the scan returns `NotFound` before loading anything. The prepared row
+    /// ends `failed` with that reason.
+    #[tokio::test]
+    async fn test_scan_with_prepared_fails_rows_when_artifact_was_deleted() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = insert_minimal_artifact(&fx.pool, fx.repo_id, &fresh_checksum()).await;
+        let scanner = early_return_scanner(&fx);
+        let row = scanner
+            .scan_result_service
+            .create_scan_result(artifact_id, fx.repo_id, "grype")
+            .await
+            .expect("pre-allocate running scan");
+        soft_delete_artifact(&fx.pool, artifact_id).await;
+
+        let mut prepared = HashMap::new();
+        prepared.insert("grype".to_string(), row.id);
+        let err = scanner
+            .scan_artifact_with_prepared(artifact_id, prepared, true, true)
+            .await
+            .expect_err("a deleted artifact fails the scan");
+        assert!(matches!(err, AppError::NotFound(_)), "{err}");
+
+        let (status, message, completed, _) = scan_row_state(&fx.pool, row.id).await;
+        assert_eq!(status, "failed");
+        assert!(completed);
+        assert_eq!(
+            message.as_deref(),
+            Some(format!("scan stopped before the grype scanner finished: {err}").as_str())
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
     #[tokio::test]
     async fn test_scan_artifact_inner_supplies_repository_context_to_scanners() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -31418,6 +31648,8 @@ tonic-build = "0.12"
             scanner_name: String,
             scan_type: &'static str,
             outcome: FakeOutcome,
+            version: Option<String>,
+            vuln_db: Option<VulnDbProvenance>,
         }
 
         impl FakeScanner {
@@ -31426,10 +31658,24 @@ tonic-build = "0.12"
                 findings: Vec<RawFinding>,
                 packages: Vec<RawPackage>,
             ) -> Arc<dyn Scanner> {
+                Self::completed_with_provenance(scan_type, findings, packages, None, None)
+            }
+
+            /// A completed scan that also reports the provenance the
+            /// orchestrator persists on `scan_results` (#5564).
+            fn completed_with_provenance(
+                scan_type: &'static str,
+                findings: Vec<RawFinding>,
+                packages: Vec<RawPackage>,
+                version: Option<String>,
+                vuln_db: Option<VulnDbProvenance>,
+            ) -> Arc<dyn Scanner> {
                 Arc::new(FakeScanner {
                     scanner_name: format!("fake-{scan_type}"),
                     scan_type,
                     outcome: FakeOutcome::Complete { findings, packages },
+                    version,
+                    vuln_db,
                 })
             }
 
@@ -31450,6 +31696,8 @@ tonic-build = "0.12"
                         packages,
                         cataloged,
                     },
+                    version: None,
+                    vuln_db: None,
                 })
             }
 
@@ -31458,6 +31706,8 @@ tonic-build = "0.12"
                     scanner_name: format!("fake-{scan_type}"),
                     scan_type,
                     outcome: FakeOutcome::Fail(reason.to_string()),
+                    version: None,
+                    vuln_db: None,
                 })
             }
         }
@@ -31470,6 +31720,14 @@ tonic-build = "0.12"
 
             fn scan_type(&self) -> &str {
                 self.scan_type
+            }
+
+            async fn version(&self) -> Option<String> {
+                self.version.clone()
+            }
+
+            async fn vuln_db(&self) -> Option<VulnDbProvenance> {
+                self.vuln_db.clone()
             }
 
             async fn scan(
@@ -31929,6 +32187,102 @@ tonic-build = "0.12"
             assert!(
                 message.contains("`cve_id` is 46 characters") && message.contains(&overlong_id),
                 "the error must name the column and the finding, got: {message}"
+            );
+            assert_eq!(
+                grype_row.status, "completed",
+                "the next scanner in the set must still run"
+            );
+            assert_eq!(grype_row.findings_count, 2);
+        }
+
+        /// #5564: both provenance columns were bounded (`scanner_version`
+        /// `VARCHAR(50)`, `vuln_db_version` `VARCHAR(100)`). A longer
+        /// scanner-supplied value made `complete_scan` fail, which stranded
+        /// the scan `running` until the janitor failed it and skipped every
+        /// later scanner. Both are `TEXT` now: the values must persist whole
+        /// and the scan must complete with its real counts.
+        #[tokio::test]
+        async fn test_long_scanner_and_vuln_db_versions_complete_and_persist_whole() {
+            let scanner_version = format!("scanner-adapter/trivy:{}", "a".repeat(80));
+            let vuln_db_version = format!("grype-db-v6.1.10+{}", "b".repeat(200));
+            assert!(scanner_version.len() > 50);
+            assert!(vuln_db_version.len() > 100);
+            let scanner = FakeScanner::completed_with_provenance(
+                "image",
+                two_cve_findings(),
+                two_packages(),
+                Some(scanner_version.clone()),
+                Some(
+                    VulnDbProvenance::new(vuln_db_version.clone(), None)
+                        .expect("non-empty db identity"),
+                ),
+            );
+            let Some((fx, artifact_id)) =
+                setup_and_scan("image-long-provenance", vec![scanner], None).await
+            else {
+                return;
+            };
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "image").await;
+            let scan_id = latest_scan_id(&fx.pool, artifact_id, "image").await;
+            let stored: (Option<String>, Option<String>) = sqlx::query_as(
+                "SELECT scanner_version, vuln_db_version FROM scan_results WHERE id = $1",
+            )
+            .bind(scan_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read the provenance back");
+            finish(fx).await;
+
+            assert_eq!(
+                row.status, "completed",
+                "a long provenance string must not fail the scan: {:?}",
+                row.error_message
+            );
+            assert_eq!(row.findings_count, 2);
+            assert_eq!(
+                stored,
+                (Some(scanner_version), Some(vuln_db_version)),
+                "both provenance values are stored whole, never truncated"
+            );
+        }
+
+        /// #5564: a `complete_scan` the schema still refuses must fail THIS
+        /// scan, named, and the set moves on. A NUL cannot be stored in a
+        /// PostgreSQL text column, so it stands in for any remaining refusal
+        /// now that the width limits are gone. The `?` used to abandon the row
+        /// `running` and skip every later scanner.
+        #[tokio::test]
+        async fn test_unstorable_provenance_fails_its_scan_by_name_and_set_continues() {
+            let image = FakeScanner::completed_with_provenance(
+                "image",
+                two_cve_findings(),
+                Vec::new(),
+                Some("image-1.0.0".to_string()),
+                Some(
+                    VulnDbProvenance::new("grype-db\u{0}corrupt", None)
+                        .expect("non-empty db identity"),
+                ),
+            );
+            let Some((fx, artifact_id)) = setup_and_scan(
+                "image-unstorable-provenance",
+                vec![image, grype_completed()],
+                None,
+            )
+            .await
+            else {
+                return;
+            };
+
+            let image_row = latest_scan_row(&fx.pool, artifact_id, "image").await;
+            let grype_row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            finish(fx).await;
+
+            assert_failed_closed(&image_row, "could not record its scan result");
+            let message = image_row.error_message.unwrap_or_default();
+            assert!(
+                message.contains("fake-image"),
+                "the error must name the scanner, got: {message}"
             );
             assert_eq!(
                 grype_row.status, "completed",
