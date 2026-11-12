@@ -3210,6 +3210,14 @@ pub(crate) async fn persist_tag_and_refs_in_tx(
     )
     .await?;
 
+    // 5. #5793: the image now holds the manifest. The link outlives a tag
+    //    overwrite, so the old digest stays pullable under this image
+    //    (#1681) but under no other name. A repository whose first manifest
+    //    this is has nothing to backfill and is scoped from now on.
+    crate::services::oci_image_scope::link_manifest(&mut **tx, repo_id, name, manifest_digest)
+        .await?;
+    crate::services::oci_image_scope::mark_if_new_in_tx(tx, repo_id, manifest_digest).await?;
+
     Ok(moved_from)
 }
 
@@ -3559,6 +3567,15 @@ async fn resolve_repo_for_write(
 fn requested_repo_key(image_name: &str) -> &str {
     match image_name.find('/') {
         Some(idx) => &image_name[..idx],
+        None => image_name,
+    }
+}
+
+/// The image part of a `/v2` name: everything after the repository key
+/// ([`requested_repo_key`]), split exactly as [`resolve_repo_inner`] does.
+fn requested_image(image_name: &str) -> &str {
+    match image_name.find('/') {
+        Some(idx) => &image_name[idx + 1..],
         None => image_name,
     }
 }
@@ -4101,6 +4118,18 @@ pub async fn resolve_virtual_blob(
         .ok()
         .flatten()
         .map(|row| (row.size_bytes, row.storage_key));
+        // #5793: a hosted member serves the blob only under an image that
+        // holds it, exactly as a direct pull of the member.
+        let local = match local {
+            Some(row) => {
+                let member_repo = oci_repo_info_from_member(member, image_name);
+                blob_scope_allows(state, &member_repo, digest)
+                    .await
+                    .unwrap_or(false)
+                    .then_some(row)
+            }
+            None => None,
+        };
 
         if let Some(resolution) = local_blob_resolution(local, member) {
             return Some(resolution);
@@ -4291,6 +4320,10 @@ pub async fn resolve_virtual_manifest(
             };
             let row = match recorded {
                 Some(row) => Some(row),
+                // #5793: a hosted member answered above, scoped to the
+                // image; its repository-wide tag rows must not resolve the
+                // digest under a name that does not hold it.
+                None if stores_own_manifests(&member_repo.repo_type) => None,
                 None => sqlx::query!(
                     "SELECT manifest_digest, manifest_content_type FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2 LIMIT 1",
                     member.id,
@@ -6549,6 +6582,114 @@ async fn enforce_blob_scan_reblock(
     Ok(())
 }
 
+/// How many manifests that reference a blob the scope check resolves one by
+/// one under the image when no manifest the image holds directly references
+/// it (an index child, a legacy-marked manifest). A base layer shared by more
+/// manifests than this is found through the direct arm in practice.
+const BLOB_SCOPE_CANDIDATE_MANIFESTS: i64 = 16;
+
+/// #5793: whether `repo.image` holds blob `digest` in a hosted repository:
+/// the blob was uploaded or mounted under it, or a manifest that resolves
+/// under it references it. A blob held through a manifest is linked on
+/// first read so the next one is a single lookup. `true` for a repository
+/// the backfill has not reached yet (the old repository-wide rule) and for a
+/// digest the repository does not hold at all (the read answers 404 itself).
+async fn hosted_blob_in_scope(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    digest: &str,
+) -> Result<bool, sqlx::Error> {
+    use crate::services::oci_image_scope;
+    if !oci_image_scope::scope_enforced(&state.db, repo.id).await? {
+        return Ok(true);
+    }
+    let link = oci_image_scope::blob_link_state(&state.db, repo.id, &repo.image, digest).await?;
+    if !link.blob_exists || link.linked {
+        return Ok(true);
+    }
+    let mut held = link.referenced;
+    if !held {
+        let candidates = oci_image_scope::blob_candidate_manifests(
+            &state.db,
+            repo.id,
+            digest,
+            BLOB_SCOPE_CANDIDATE_MANIFESTS,
+        )
+        .await?;
+        for manifest in candidates {
+            if resolve_hosted_digest(state, repo, &manifest)
+                .await?
+                .is_some()
+            {
+                held = true;
+                break;
+            }
+        }
+    }
+    if held {
+        if let Err(e) = oci_image_scope::link_blob(&state.db, repo.id, &repo.image, digest).await {
+            tracing::debug!(error = %e, digest = %digest, "derived blob link insert failed");
+        }
+    }
+    Ok(held)
+}
+
+/// #5793: whether a blob read on `repo` may serve `digest`: always on a
+/// Remote or Virtual repository (their own scoping applies), and on a hosted
+/// one when [`hosted_blob_in_scope`] holds, or under
+/// `AK_OCI_BLOB_SCOPE=report`, which serves the miss and counts it.
+async fn blob_scope_allows(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    digest: &str,
+) -> Result<bool, sqlx::Error> {
+    blob_scope_allows_in(
+        state,
+        repo,
+        digest,
+        crate::services::oci_image_scope::blob_scope_mode(),
+    )
+    .await
+}
+
+/// [`blob_scope_allows`] under an explicit `AK_OCI_BLOB_SCOPE` mode.
+async fn blob_scope_allows_in(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    digest: &str,
+    mode: crate::services::oci_image_scope::BlobScopeMode,
+) -> Result<bool, sqlx::Error> {
+    use crate::services::oci_image_scope::{record_blob_scope_miss, BlobScopeMode};
+    if !stores_own_manifests(&repo.repo_type) || hosted_blob_in_scope(state, repo, digest).await? {
+        return Ok(true);
+    }
+    record_blob_scope_miss(&repo.key, &repo.image, digest, mode);
+    Ok(mode == BlobScopeMode::Report)
+}
+
+/// [`blob_scope_allows`] as the GET/HEAD blob gate: `404 BLOB_UNKNOWN` for a
+/// blob the image does not hold. Runs before the scan re-block, so a name
+/// that does not hold the blob learns nothing about its scan state.
+async fn enforce_hosted_blob_scope(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    digest: &str,
+) -> Result<(), Response> {
+    match blob_scope_allows(state, repo, digest).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(oci_error(
+            StatusCode::NOT_FOUND,
+            "BLOB_UNKNOWN",
+            "blob not found",
+        )),
+        Err(e) => Err(oci_error(
+            crate::api::handlers::db_status(&e.to_string()),
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        )),
+    }
+}
+
 async fn handle_head_blob(
     state: &SharedState,
     headers: &HeaderMap,
@@ -6610,6 +6751,12 @@ async fn handle_head_blob(
     // Check oci_blobs table. Look up by the canonical digest so an upper-case
     // pull still resolves a blob stored under its canonical lowercase digest.
     let lookup_digest = canonical_blob_lookup_digest(digest);
+
+    // #5793: a hosted repository serves the blob only under an image that
+    // holds it.
+    if let Err(resp) = enforce_hosted_blob_scope(state, &repo, &lookup_digest).await {
+        return resp;
+    }
 
     // #3258: HEAD must apply the same scan re-block as GET (including the
     // #3245 `scan_on_proxy` scoping) and answer 403 where GET would; before
@@ -7146,6 +7293,13 @@ async fn handle_get_blob(
     // poison the cache with a partial object.
     let range_header = headers.get(RANGE).and_then(|v| v.to_str().ok());
 
+    // #5793: a hosted repository serves the blob only under an image that
+    // holds it. Before the scan re-block, so another name answers 404, not
+    // 403.
+    if let Err(resp) = enforce_hosted_blob_scope(state, &repo, &lookup_digest).await {
+        return resp;
+    }
+
     // #3003 round 2 (HIGH-3): a blob belonging to an image we already scanned
     // and found VULNERABLE must not serve. Checked before the storage read and
     // before any upstream fetch. Shared with HEAD (#3258) via
@@ -7354,6 +7508,13 @@ async fn handle_get_blob(
 ///   holds whenever the two repos share a location and correctly declines the
 ///   mount when they do not, rather than registering a row pointing at an
 ///   object the target cannot read.
+///
+/// #5793: the source image must hold the blob (uploaded or mounted under it,
+/// or referenced by a manifest that resolves under it), and a satisfied mount
+/// links the blob to the target image. A mount from another image of the
+/// SAME repository is honoured too: it registers nothing but that link (the
+/// repository already holds the bytes and is charged for them), so a client
+/// can reuse a layer under a new image name without uploading it again.
 #[allow(clippy::too_many_arguments)]
 async fn try_mount_blob(
     state: &SharedState,
@@ -7361,6 +7522,7 @@ async fn try_mount_blob(
     target_repo_id: Uuid,
     target_location: &crate::storage::StorageLocation,
     image_name: &str,
+    target_image: &str,
     mount_digest: &str,
     from_image: &str,
 ) -> Option<Response> {
@@ -7372,10 +7534,6 @@ async fn try_mount_blob(
     // it holds the blob. The repo being WRITTEN is `target_repo_id`, already
     // format-gated by `handle_start_upload`'s `resolve_repo_for_write`.
     let source = resolve_repo(&state.db, from_image).await.ok()?;
-    // Mounting from the target itself is a no-op; let the normal path run.
-    if source.id == target_repo_id {
-        return None;
-    }
 
     // Read authorization on the SOURCE repo, evaluated independently of the
     // target. A public repo confers the read baseline; otherwise the caller
@@ -7408,6 +7566,43 @@ async fn try_mount_blob(
         return None;
     }
 
+    // #5793: the source image must hold the blob, as a pull of it would.
+    if !blob_scope_allows(state, &source, &canonical)
+        .await
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let created = || {
+        Response::builder()
+            .status(StatusCode::CREATED)
+            .header(LOCATION, format!("/v2/{}/blobs/{}", image_name, canonical))
+            .header("Docker-Content-Digest", canonical.as_str())
+            .header(CONTENT_LENGTH, "0")
+            .body(Body::empty())
+            .unwrap()
+    };
+    if source.id == target_repo_id {
+        // Same repository: the bytes and their quota charge are already
+        // here; only the target image's claim is new.
+        if let Err(e) = crate::services::oci_image_scope::link_blob(
+            &state.db,
+            target_repo_id,
+            target_image,
+            &canonical,
+        )
+        .await
+        {
+            tracing::warn!(digest = %canonical, "OCI same-repository blob mount link failed: {}", e);
+            return None;
+        }
+        tracing::debug!(
+            repo = %source.key, from = %source.image, to = %target_image, digest = %canonical,
+            "OCI same-repository blob mount satisfied (#5793)"
+        );
+        return Some(created());
+    }
+
     // A mount charges the target repository the blob's bytes, so it is
     // admitted against the target's storage quotas like an upload (#4422).
     // A denial answers 507; a failed check falls back to a normal upload, as
@@ -7437,6 +7632,17 @@ async fn try_mount_blob(
         tracing::warn!(digest = %canonical, "OCI blob mount row insert failed: {}", e);
         return None;
     }
+    if let Err(e) = crate::services::oci_image_scope::link_blob(
+        &mut *tx,
+        target_repo_id,
+        target_image,
+        &canonical,
+    )
+    .await
+    {
+        tracing::warn!(digest = %canonical, "OCI blob mount link insert failed: {}", e);
+        return None;
+    }
     if let Err(e) = tx.commit().await {
         tracing::warn!(digest = %canonical, "OCI blob mount commit failed: {}", e);
         return None;
@@ -7446,15 +7652,7 @@ async fn try_mount_blob(
         from = %source.key, to = %image_name, digest = %canonical,
         "OCI cross-repo blob mount satisfied"
     );
-    Some(
-        Response::builder()
-            .status(StatusCode::CREATED)
-            .header(LOCATION, format!("/v2/{}/blobs/{}", image_name, canonical))
-            .header("Docker-Content-Digest", canonical.as_str())
-            .header(CONTENT_LENGTH, "0")
-            .body(Body::empty())
-            .unwrap(),
-    )
+    Some(created())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7504,6 +7702,7 @@ async fn handle_start_upload(
         );
     }
     let repo_id = repo.id;
+    let image = repo.image.clone();
     let location = repo.location;
 
     // Cross-repository blob mount (#3109). Attempted before any upload session
@@ -7511,8 +7710,10 @@ async fn handle_start_upload(
     // that cannot be satisfied returns None and falls through to the normal
     // upload path, as the spec requires.
     if let (Some(mount), Some(from)) = (query_mount, query_mount_from) {
-        if let Some(resp) =
-            try_mount_blob(state, &claims, repo_id, &location, image_name, mount, from).await
+        if let Some(resp) = try_mount_blob(
+            state, &claims, repo_id, &location, image_name, &image, mount, from,
+        )
+        .await
         {
             return resp;
         }
@@ -7762,6 +7963,27 @@ async fn handle_start_upload(
                 .await;
             return oci_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            );
+        }
+
+        // #5793: the blob was uploaded under this image, so it resolves
+        // under it before any manifest references it (a client HEADs it
+        // before the manifest PUT). Same transaction as the row.
+        if let Err(e) = crate::services::oci_image_scope::link_blob(
+            &mut *blob_tx,
+            repo_id,
+            &image,
+            canonical_digest.as_str(),
+        )
+        .await
+        {
+            let _ = blob_tx.rollback().await;
+            delete_storage_key_best_effort(&storage, &temp_key, "monolithic blob link failed")
+                .await;
+            return oci_error(
+                crate::api::handlers::db_status(&e.to_string()),
                 "INTERNAL_ERROR",
                 &e.to_string(),
             );
@@ -9841,17 +10063,29 @@ async fn complete_claimed_oci_upload(job: OciUploadCompletionJob) -> Response {
     }
     // On conflict clear any `pending_delete_at` marker (#1660): finalizing a
     // chunked upload of a blob GC had marked resurrects it, mirroring the
-    // monolithic-upload path above.
-    if let Err(e) = sqlx::query(
-        "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, digest) DO UPDATE SET pending_delete_at = NULL",
-    )
-    .bind(session.repository_id)
-    .bind(&digest)
-    .bind(size_bytes)
-    .bind(&blob_key)
-    .execute(&mut *tx)
-    .await
-    {
+    // monolithic-upload path above. #5793: in the same transaction, the
+    // blob is linked to the image it was uploaded under, so it resolves
+    // under that image before a manifest references it.
+    let committed: Result<(), sqlx::Error> = async {
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, digest) DO UPDATE SET pending_delete_at = NULL",
+        )
+        .bind(session.repository_id)
+        .bind(&digest)
+        .bind(size_bytes)
+        .bind(&blob_key)
+        .execute(&mut *tx)
+        .await?;
+        crate::services::oci_image_scope::link_blob(
+            &mut *tx,
+            session.repository_id,
+            requested_image(image_name),
+            &digest,
+        )
+        .await
+    }
+    .await;
+    if let Err(e) = committed {
         let _ = tx.rollback().await;
         if final_part.is_some() {
             delete_storage_key_best_effort(&storage, &final_part_key, "oci_blobs insert failed")
@@ -9867,7 +10101,11 @@ async fn complete_claimed_oci_upload(job: OciUploadCompletionJob) -> Response {
         {
             return reset_resp;
         }
-        return oci_error(crate::api::handlers::db_status(&e.to_string()), "INTERNAL_ERROR", &e.to_string());
+        return oci_error(
+            crate::api::handlers::db_status(&e.to_string()),
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        );
     }
 
     let deleted = match sqlx::query(
@@ -10079,35 +10317,43 @@ pub(crate) fn resolve_manifest_content_type(stored: Option<&str>, body: &[u8]) -
 /// How a digest reference resolves on a repository that stores its own
 /// manifests (#1683): through the repository's `oci_manifests` row, the
 /// first-class record of the manifests it holds, scoped to the requested
-/// image name (#4525). Returns the media type to serve, or `None` (404).
+/// image name (#4525, #5793). Returns the media type to serve, or `None`
+/// (404).
 ///
 /// * A tag of THIS image pointing at the digest always resolves (a digest
-///   push records one too).
-/// * Otherwise the row resolves unless the digest was deleted under this
-///   image ([`digest_deleted_under_image`]): every manifest row of the image
-///   for those bytes is in the trash. A delete by digest under another image
-///   name, or a tag overwrite, leaves the digest addressable here, exactly
-///   as before.
-/// * Exception: a manifest whose image rows went to the trash only through
-///   tag deletes (no by-digest delete marker) still resolves while an index
-///   that references it is live under this image name
-///   ([`live_ancestor_under_image`]). That is the untagged child of a tagged
-///   (or by-digest pullable) index: the index pull fetches it by digest, so
-///   answering 404 would break the pull of a live image.
+///   push records one too), and so does a live manifest row of the image for
+///   those bytes.
+/// * A digest deleted under this image ([`image_rows_all_deleted`]: every
+///   manifest row of the image for those bytes is in the trash) answers 404
+///   when the delete named the digest, and otherwise resolves only while an
+///   index that references it is live under this image name
+///   ([`live_ancestor_under_image`]): the untagged child of a tagged (or
+///   by-digest pullable) index, whose index pull fetches it by digest.
+/// * An image with no row for the digest at all resolves it only when the
+///   image holds it (#5793): through its `oci_image_manifests` link (the old
+///   digest of an overwritten tag, #1681), an index live under the image
+///   that references it, or the backfill's legacy marker for a manifest
+///   overwritten before the upgrade, under an image that already holds
+///   content here ([`oci_image_scope::legacy_applies`]). Any other name, a
+///   never-pushed one included, answers 404. A repository the backfill has
+///   not reached yet keeps the old repository-wide rule
+///   ([`oci_image_scope::scope_enforced`]).
 /// * No row but a tag of this image: a manifest a pre-1.11 replica pushed
 ///   during a rolling upgrade before the reconcile recorded it. Served from
 ///   the tag and counted in `ak_oci_manifest_reads_without_row_total`.
 ///
-/// This replaces the #1681 content-addressable fallback, which inferred
-/// ownership from `manifest_blob_refs`/`oci_manifest_refs` edges: the row is
-/// that proof now. A shared cloud backend does not namespace
-/// `oci-manifests/<digest>` per repository, so the row being per repository
-/// is what stops one repository from serving another's manifest by digest.
+/// A shared cloud backend does not namespace `oci-manifests/<digest>` per
+/// repository, so the row being per repository is what stops one repository
+/// from serving another's manifest by digest.
+///
+/// [`oci_image_scope::legacy_applies`]: crate::services::oci_image_scope::legacy_applies
+/// [`oci_image_scope::scope_enforced`]: crate::services::oci_image_scope::scope_enforced
 async fn resolve_hosted_digest(
     state: &SharedState,
     repo: &OciRepoInfo,
     digest: &str,
 ) -> Result<Option<String>, sqlx::Error> {
+    use crate::services::oci_image_scope;
     let tag_row = sqlx::query_as::<_, (String, String)>(SELECT_IMAGE_DIGEST_TAG_ROW_SQL)
         .bind(repo.id)
         .bind(&repo.image)
@@ -10120,15 +10366,38 @@ async fn resolve_hosted_digest(
         (Some(content_type), Some(_)) => Ok(Some(content_type)),
         (Some(content_type), None) => {
             let rows = digest_manifest_row_states(state, repo, digest).await?;
-            if !image_rows_all_deleted(&rows, &repo.image) {
+            if image_rows_all_deleted(&rows, &repo.image) {
+                if image_rows_deleted_by_digest(&rows, &repo.image, digest) {
+                    return Ok(None);
+                }
+                let scoped = oci_image_scope::scope_enforced(&state.db, repo.id).await?;
+                return Ok(live_ancestor_under_image(state, repo, digest, scoped)
+                    .await?
+                    .then_some(content_type));
+            }
+            if image_has_live_row(&rows, &repo.image) {
                 return Ok(Some(content_type));
             }
-            if image_rows_deleted_by_digest(&rows, &repo.image, digest) {
-                return Ok(None);
+            // #5793: no row of this image names the digest.
+            if !oci_image_scope::scope_enforced(&state.db, repo.id).await? {
+                return Ok(Some(content_type));
             }
-            Ok(live_ancestor_under_image(state, repo, digest)
-                .await?
-                .then_some(content_type))
+            if oci_image_scope::manifest_linked(&state.db, repo.id, &repo.image, digest).await?
+                || live_ancestor_under_image(state, repo, digest, true).await?
+            {
+                return Ok(Some(content_type));
+            }
+            if oci_image_scope::legacy_applies(&state.db, repo.id, &repo.image, digest).await? {
+                // Remember the image's claim, so the manifest's blobs resolve
+                // under it too and a later delete under it can drop it.
+                if let Err(e) =
+                    oci_image_scope::link_manifest(&state.db, repo.id, &repo.image, digest).await
+                {
+                    tracing::debug!(error = %e, "legacy manifest link insert failed");
+                }
+                return Ok(Some(content_type));
+            }
+            Ok(None)
         }
         (None, Some((_, tag_content_type))) => {
             metrics::counter!("ak_oci_manifest_reads_without_row_total").increment(1);
@@ -10139,10 +10408,22 @@ async fn resolve_hosted_digest(
     }
 }
 
+/// Whether one of the repository's manifest rows for these bytes is a live
+/// row of `image` (a tag-path or digest-path row the image still holds).
+fn image_has_live_row(rows: &[(String, bool, String)], image: &str) -> bool {
+    rows.iter().any(|(path, is_deleted, repo_key)| {
+        !*is_deleted
+            && crate::services::oci_migration_reindex::manifest_row_image(path, repo_key).as_deref()
+                == Some(image)
+    })
+}
+
 /// Whether an index that references `digest` (directly or through nested
 /// indexes, at most [`MAX_INDEX_NESTING`] levels up) is live under
-/// `repo.image` (#1683): tagged under that image name, or recorded in
-/// `oci_manifests` with none of the image's manifest rows for it in the trash.
+/// `repo.image` (#1683): tagged under that image name, or held by it
+/// (recorded in `oci_manifests` before the repository is scoped, linked to
+/// the image after, #5793) with none of the image's manifest rows for it in
+/// the trash.
 const LIVE_ANCESTOR_UNDER_IMAGE_SQL: &str = r#"
     WITH RECURSIVE anc(digest, depth) AS (
         SELECT omr.parent_digest, 1
@@ -10163,9 +10444,19 @@ const LIVE_ANCESTOR_UNDER_IMAGE_SQL: &str = r#"
                   AND ot.manifest_digest = anc.digest
               )
            OR (
-                EXISTS (
-                    SELECT 1 FROM oci_manifests pm
-                    WHERE pm.repository_id = $1 AND pm.digest = anc.digest
+                -- #5793: once the repository is scoped ($5) the index must
+                -- be held by this image, not merely recorded in the
+                -- repository.
+                (
+                    (NOT $5 AND EXISTS (
+                        SELECT 1 FROM oci_manifests pm
+                        WHERE pm.repository_id = $1 AND pm.digest = anc.digest
+                    ))
+                    OR ($5 AND EXISTS (
+                        SELECT 1 FROM oci_image_manifests il
+                        WHERE il.repository_id = $1 AND il.image = $3
+                          AND il.digest = anc.digest
+                    ))
                 )
                 AND NOT EXISTS (
                     SELECT 1 FROM artifacts a
@@ -10186,12 +10477,14 @@ async fn live_ancestor_under_image(
     state: &SharedState,
     repo: &OciRepoInfo,
     digest: &str,
+    scoped: bool,
 ) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(LIVE_ANCESTOR_UNDER_IMAGE_SQL)
         .bind(repo.id)
         .bind(digest)
         .bind(&repo.image)
         .bind(MAX_INDEX_NESTING)
+        .bind(scoped)
         .fetch_one(&state.db)
         .await
 }
@@ -14458,6 +14751,27 @@ async fn handle_referrers(
             )
         }
     };
+    // #5793: on a hosted repository a referrer is listed under `<name>` only
+    // when it resolves under that image, as a pull of it by digest would.
+    let rows = if stores_own_manifests(&repo.repo_type) {
+        let mut scoped = Vec::with_capacity(rows.len());
+        for row in rows {
+            match resolve_hosted_digest(state, &repo, &row.manifest_digest).await {
+                Ok(Some(_)) => scoped.push(row),
+                Ok(None) => {}
+                Err(e) => {
+                    return oci_error(
+                        crate::api::handlers::db_status(&e.to_string()),
+                        "INTERNAL_ERROR",
+                        &e.to_string(),
+                    )
+                }
+            }
+        }
+        scoped
+    } else {
+        rows
+    };
 
     let filter = query.get("artifactType").map(|s| s.as_str());
     let (body, filtered) = build_referrers_index(&rows, filter);
@@ -15222,6 +15536,17 @@ pub(crate) async fn delete_oci_manifest_content_in_tx(
     // Without the lock a push committing between the reads and the delete
     // left a tagged manifest with no record.
     crate::services::oci_manifests::lock_in_tx(tx, repo_id, digest).await?;
+    // #5793: this image stops holding the manifest once it is deleted by
+    // digest under it, or its last tag naming it is gone. Other images'
+    // links are untouched (#4466).
+    crate::services::oci_image_scope::unlink_manifest_in_tx(
+        tx,
+        repo_id,
+        image,
+        digest,
+        scope == OciIndexDeleteScope::ContentAddressed,
+    )
+    .await?;
     let digest_still_tagged = sqlx::query_scalar!(
         "SELECT EXISTS(SELECT 1 FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2)",
         repo_id,
@@ -23627,6 +23952,763 @@ mod manifest_digest_db_tests {
         );
 
         cleanup(&fx).await;
+    }
+
+    // -----------------------------------------------------------------
+    // #5793: a hosted digest resolves only under an image that holds it.
+    // -----------------------------------------------------------------
+
+    const SCOPE_MANIFEST_CT: &str = "application/vnd.oci.image.manifest.v1+json";
+    const SCOPE_INDEX_CT: &str = "application/vnd.oci.image.index.v1+json";
+
+    fn sha256_digest(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("sha256:{:x}", hasher.finalize())
+    }
+
+    /// An image manifest naming `config` and `layer` (with their real sizes).
+    fn scope_image_manifest(config: &[u8], layer: &[u8], note: &str) -> Bytes {
+        Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": SCOPE_MANIFEST_CT,
+                "config": {
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": sha256_digest(config),
+                    "size": config.len(),
+                },
+                "layers": [{
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": sha256_digest(layer),
+                    "size": layer.len(),
+                }],
+                "annotations": {"note": note},
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn scope_index(child: &str, child_len: usize) -> Bytes {
+        Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": SCOPE_INDEX_CT,
+                "manifests": [{
+                    "mediaType": SCOPE_MANIFEST_CT,
+                    "digest": child,
+                    "size": child_len,
+                    "platform": {"architecture": "amd64", "os": "linux"},
+                }],
+            }))
+            .unwrap(),
+        )
+    }
+
+    /// Requests against one fixture repository, as `fx.user_id`.
+    struct ScopeRig {
+        fx: tdh::Fixture,
+        auth: String,
+    }
+
+    impl ScopeRig {
+        async fn setup() -> Option<Self> {
+            if std::env::var("DATABASE_URL").is_err() {
+                if require_db_under_coverage() {
+                    panic!("DATABASE_URL must be set for OCI image-scope tests");
+                }
+                return None;
+            }
+            let fx = tdh::Fixture::setup("local", "docker")
+                .await
+                .expect("fixture setup");
+            tdh::grant_repo_actions(
+                &fx.pool,
+                fx.repo_id,
+                fx.user_id,
+                &["read", "write", "delete"],
+            )
+            .await;
+            let auth = bearer(&fx).await;
+            Some(Self { fx, auth })
+        }
+
+        async fn call(
+            &self,
+            method: Method,
+            path: String,
+            content_type: Option<&str>,
+            body: Bytes,
+        ) -> (StatusCode, HeaderMap, Bytes) {
+            send(
+                router(None).with_state(self.fx.state.clone()),
+                req(method, path, &self.auth, content_type, body),
+            )
+            .await
+        }
+
+        /// `<method> /v2/<key>/<image>/<rest>`, answering the status only.
+        async fn status(&self, method: Method, image: &str, rest: &str) -> StatusCode {
+            self.call(
+                method,
+                format!("/{}/{}/{}", self.fx.repo_key, image, rest),
+                None,
+                Bytes::new(),
+            )
+            .await
+            .0
+        }
+
+        /// The OCI error code of a `GET /v2/<key>/<image>/<rest>`.
+        async fn error_code(&self, image: &str, rest: &str) -> String {
+            let (_, _, body) = self
+                .call(
+                    Method::GET,
+                    format!("/{}/{}/{}", self.fx.repo_key, image, rest),
+                    None,
+                    Bytes::new(),
+                )
+                .await;
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v["errors"][0]["code"].as_str().map(str::to_string))
+                .unwrap_or_default()
+        }
+
+        /// Monolithic blob upload under `image`.
+        async fn push_blob(&self, image: &str, bytes: &[u8]) -> String {
+            let digest = sha256_digest(bytes);
+            let (st, _, body) = self
+                .call(
+                    Method::POST,
+                    format!(
+                        "/{}/{}/blobs/uploads/?digest={}",
+                        self.fx.repo_key, image, digest
+                    ),
+                    Some("application/octet-stream"),
+                    Bytes::copy_from_slice(bytes),
+                )
+                .await;
+            assert_eq!(
+                st,
+                StatusCode::CREATED,
+                "blob upload under {image}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            digest
+        }
+
+        async fn push_manifest(
+            &self,
+            image: &str,
+            reference: &str,
+            ct: &str,
+            body: &Bytes,
+        ) -> String {
+            let (st, h, resp) = self
+                .call(
+                    Method::PUT,
+                    format!("/{}/{}/manifests/{}", self.fx.repo_key, image, reference),
+                    Some(ct),
+                    body.clone(),
+                )
+                .await;
+            assert_eq!(
+                st,
+                StatusCode::CREATED,
+                "PUT {image}:{reference}: {}",
+                String::from_utf8_lossy(&resp)
+            );
+            h["Docker-Content-Digest"].to_str().unwrap().to_string()
+        }
+
+        /// Push a config + layer and an image manifest referencing them under
+        /// `image:reference`; returns (manifest digest, manifest bytes, layer
+        /// digest).
+        async fn push_image(
+            &self,
+            image: &str,
+            reference: &str,
+            note: &str,
+        ) -> (String, Bytes, String) {
+            let config = format!("{{\"note\":\"{note}\"}}").into_bytes();
+            let layer = format!("layer bytes of {note}").into_bytes();
+            self.push_blob(image, &config).await;
+            let layer_digest = self.push_blob(image, &layer).await;
+            let manifest = scope_image_manifest(&config, &layer, note);
+            let digest = self
+                .push_manifest(image, reference, SCOPE_MANIFEST_CT, &manifest)
+                .await;
+            (digest, manifest, layer_digest)
+        }
+
+        async fn scoped(&self) -> bool {
+            crate::services::oci_image_scope::scope_enforced(&self.fx.pool, self.fx.repo_id)
+                .await
+                .expect("read scope marker")
+        }
+
+        async fn teardown(self) {
+            for table in ["oci_image_scope_backfill", "oci_manifests"] {
+                let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                    "DELETE FROM {table} WHERE repository_id = $1"
+                )))
+                .bind(self.fx.repo_id)
+                .execute(&self.fx.pool)
+                .await;
+            }
+            cleanup(&self.fx).await;
+        }
+    }
+
+    /// #5793: a never-pushed name, and a name that holds a different image,
+    /// answer 404 MANIFEST_UNKNOWN / BLOB_UNKNOWN for an index digest, its
+    /// platform child and a layer, while the image that holds them serves
+    /// all three. On `main` every one of these resolved under any name.
+    #[tokio::test]
+    async fn digest_resolves_only_under_an_image_that_holds_it_5793() {
+        let Some(rig) = ScopeRig::setup().await else {
+            return;
+        };
+        // A multi-platform push: the child by digest, then the index by tag.
+        let config = b"{\"arch\":\"amd64\"}".to_vec();
+        let layer = b"aktest/tags layer bytes".to_vec();
+        rig.push_blob("aktest/tags", &config).await;
+        let layer_digest = rig.push_blob("aktest/tags", &layer).await;
+        let child = scope_image_manifest(&config, &layer, "child");
+        let child_digest = sha256_digest(&child);
+        rig.push_manifest("aktest/tags", &child_digest, SCOPE_MANIFEST_CT, &child)
+            .await;
+        let index = scope_index(&child_digest, child.len());
+        let index_digest = rig
+            .push_manifest("aktest/tags", "1.0", SCOPE_INDEX_CT, &index)
+            .await;
+        // A different image in the same repository.
+        let (other_digest, _, other_layer) = rig.push_image("other/img", "v1", "other").await;
+        let scoped = rig.scoped().await;
+
+        let index_ref = format!("manifests/{index_digest}");
+        let child_ref = format!("manifests/{child_digest}");
+        let blob_ref = format!("blobs/{layer_digest}");
+        let mut got = Vec::new();
+        for image in ["nobody/ever", "other/img"] {
+            for rest in [&index_ref, &child_ref, &blob_ref] {
+                got.push((
+                    format!("GET {image}/{rest}"),
+                    rig.status(Method::GET, image, rest).await,
+                    rig.error_code(image, rest).await,
+                ));
+                got.push((
+                    format!("HEAD {image}/{rest}"),
+                    rig.status(Method::HEAD, image, rest).await,
+                    String::new(),
+                ));
+            }
+        }
+        let holder: Vec<(String, StatusCode)> = {
+            let mut v = Vec::new();
+            for rest in [&index_ref, &child_ref, &blob_ref, &"tags/list".to_string()] {
+                v.push((
+                    format!("aktest/tags/{rest}"),
+                    rig.status(Method::GET, "aktest/tags", rest).await,
+                ));
+            }
+            v.push((
+                "other/img own manifest".into(),
+                rig.status(
+                    Method::GET,
+                    "other/img",
+                    &format!("manifests/{other_digest}"),
+                )
+                .await,
+            ));
+            v.push((
+                "other/img own layer".into(),
+                rig.status(Method::GET, "other/img", &format!("blobs/{other_layer}"))
+                    .await,
+            ));
+            v
+        };
+        let foreign_layer = rig
+            .status(Method::GET, "aktest/tags", &format!("blobs/{other_layer}"))
+            .await;
+        rig.teardown().await;
+
+        assert!(scoped, "a repository's first push scopes it");
+        for (what, status, code) in got {
+            assert_eq!(status, StatusCode::NOT_FOUND, "{what}");
+            if what.starts_with("GET") {
+                let want = if what.contains("/blobs/") {
+                    "BLOB_UNKNOWN"
+                } else {
+                    "MANIFEST_UNKNOWN"
+                };
+                assert_eq!(code, want, "{what}");
+            }
+        }
+        for (what, status) in holder {
+            assert_eq!(status, StatusCode::OK, "{what}");
+        }
+        assert_eq!(
+            foreign_layer,
+            StatusCode::NOT_FOUND,
+            "aktest/tags must not serve other/img's layer"
+        );
+    }
+
+    /// #1681 under #5793: the old digest of an overwritten tag stays pullable
+    /// by digest under its own image (through the image's link), and only
+    /// there.
+    #[tokio::test]
+    async fn overwritten_tag_digest_stays_pullable_only_under_its_image_5793() {
+        let Some(rig) = ScopeRig::setup().await else {
+            return;
+        };
+        let (old_digest, old_body, old_layer) = rig.push_image("xb", "v1", "old").await;
+        let (new_digest, _, _) = rig.push_image("xb", "v1", "new").await;
+        rig.push_image("xd", "v1", "xd").await;
+        let (st, _, body) = rig
+            .call(
+                Method::GET,
+                format!("/{}/xb/manifests/{}", rig.fx.repo_key, old_digest),
+                None,
+                Bytes::new(),
+            )
+            .await;
+        let new_by_digest = rig
+            .status(Method::GET, "xb", &format!("manifests/{new_digest}"))
+            .await;
+        let old_layer_xb = rig
+            .status(Method::GET, "xb", &format!("blobs/{old_layer}"))
+            .await;
+        let never = rig
+            .status(Method::GET, "xc", &format!("manifests/{old_digest}"))
+            .await;
+        let other = rig
+            .status(Method::GET, "xd", &format!("manifests/{old_digest}"))
+            .await;
+        rig.teardown().await;
+
+        assert_eq!(st, StatusCode::OK, "xb@old digest after the overwrite");
+        assert_eq!(body, old_body);
+        assert_eq!(new_by_digest, StatusCode::OK);
+        assert_eq!(
+            old_layer_xb,
+            StatusCode::OK,
+            "the old image's layer under xb"
+        );
+        assert_eq!(never, StatusCode::NOT_FOUND, "a never-pushed name");
+        assert_eq!(
+            other,
+            StatusCode::NOT_FOUND,
+            "a name holding a different image"
+        );
+    }
+
+    /// The pre-upgrade overwrite (#1681 via the legacy marker): a tag
+    /// overwritten before migration 363 left no row naming its old digest.
+    /// Before the backfill the old repository-wide rule still serves it
+    /// (reads work while the repository is unmarked); the first backfill
+    /// marks it legacy, after which it resolves under an image that holds
+    /// content (xb) but not under a never-pushed name. A second pass changes
+    /// nothing.
+    #[tokio::test]
+    async fn pre_upgrade_overwrite_resolves_through_the_legacy_marker_5793() {
+        let Some(rig) = ScopeRig::setup().await else {
+            return;
+        };
+        let (old_digest, _, _) = rig.push_image("xb", "v1", "old").await;
+        let (new_digest, _, _) = rig.push_image("xb", "v1", "new").await;
+        // Back to the pre-363 state: no links, no marker.
+        sqlx::query("DELETE FROM oci_image_manifests WHERE repository_id = $1")
+            .bind(rig.fx.repo_id)
+            .execute(&rig.fx.pool)
+            .await
+            .expect("drop links");
+        sqlx::query("DELETE FROM oci_image_blobs WHERE repository_id = $1")
+            .bind(rig.fx.repo_id)
+            .execute(&rig.fx.pool)
+            .await
+            .expect("drop blob links");
+        sqlx::query("DELETE FROM oci_image_scope_backfill WHERE repository_id = $1")
+            .bind(rig.fx.repo_id)
+            .execute(&rig.fx.pool)
+            .await
+            .expect("drop marker");
+        let old_ref = format!("manifests/{old_digest}");
+        let before = (
+            rig.status(Method::GET, "xb", &old_ref).await,
+            rig.status(Method::GET, "nobody", &old_ref).await,
+        );
+
+        let first =
+            crate::services::oci_image_scope::run_backfill(&rig.fx.pool, Some(rig.fx.repo_id))
+                .await;
+        let after = (
+            rig.status(Method::GET, "xb", &old_ref).await,
+            rig.status(Method::GET, "nobody", &old_ref).await,
+            rig.status(Method::GET, "xb", &format!("manifests/{new_digest}"))
+                .await,
+            rig.status(Method::GET, "nobody", &format!("manifests/{new_digest}"))
+                .await,
+        );
+        let second =
+            crate::services::oci_image_scope::run_backfill(&rig.fx.pool, Some(rig.fx.repo_id))
+                .await;
+        let legacy_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_image_manifests WHERE repository_id = $1 AND image = ''",
+        )
+        .bind(rig.fx.repo_id)
+        .fetch_one(&rig.fx.pool)
+        .await
+        .expect("count legacy markers");
+        rig.teardown().await;
+
+        assert_eq!(
+            before,
+            (StatusCode::OK, StatusCode::OK),
+            "before the backfill the repository keeps the old rule"
+        );
+        assert_eq!(first.repositories_completed, 1, "{first:?}");
+        assert_eq!(
+            first.legacy_markers, 1,
+            "only the overwritten digest is legacy: {first:?}"
+        );
+        assert!(first.links_inserted >= 1, "{first:?}");
+        assert_eq!(
+            after.0,
+            StatusCode::OK,
+            "xb@old digest through the legacy marker"
+        );
+        assert_eq!(
+            after.1,
+            StatusCode::NOT_FOUND,
+            "never-pushed name after the backfill"
+        );
+        assert_eq!(after.2, StatusCode::OK, "xb@new digest");
+        assert_eq!(
+            after.3,
+            StatusCode::NOT_FOUND,
+            "never-pushed name, tagged digest"
+        );
+        assert_eq!(
+            (
+                second.repositories_completed,
+                second.legacy_markers,
+                second.links_inserted
+            ),
+            (0, 0, 0),
+            "a second pass is a no-op: {second:?}"
+        );
+        // The legacy read linked xb, so the marker is all that stays legacy.
+        assert_eq!(legacy_rows, 1);
+    }
+
+    /// A push a 1.11 replica serves writes no link. The reconcile's recurring
+    /// backfill pass links it, so a later overwrite keeps the old digest
+    /// pullable under its image (without the pass it would 404).
+    #[tokio::test]
+    async fn mixed_version_push_is_linked_by_the_next_backfill_pass_5793() {
+        let Some(rig) = ScopeRig::setup().await else {
+            return;
+        };
+        rig.push_image("first", "v1", "first").await;
+        let (old_digest, _, _) = rig.push_image("app", "v1", "old").await;
+        // What a 1.11 replica leaves: no link for its push.
+        sqlx::query("DELETE FROM oci_image_manifests WHERE repository_id = $1 AND image = 'app'")
+            .bind(rig.fx.repo_id)
+            .execute(&rig.fx.pool)
+            .await
+            .expect("drop the push's link");
+        let tagged_before = rig
+            .status(Method::GET, "app", &format!("manifests/{old_digest}"))
+            .await;
+        let pass =
+            crate::services::oci_image_scope::run_backfill(&rig.fx.pool, Some(rig.fx.repo_id))
+                .await;
+        rig.push_image("app", "v1", "new").await;
+        let after_overwrite = rig
+            .status(Method::GET, "app", &format!("manifests/{old_digest}"))
+            .await;
+        rig.teardown().await;
+
+        assert_eq!(
+            tagged_before,
+            StatusCode::OK,
+            "a tagged digest resolves through its tag"
+        );
+        assert!(
+            pass.links_inserted >= 1,
+            "the pass links the 1.11 push: {pass:?}"
+        );
+        assert_eq!(
+            pass.legacy_markers, 0,
+            "a scoped repository gets no new markers"
+        );
+        assert_eq!(
+            after_overwrite,
+            StatusCode::OK,
+            "the reconciled link keeps the overwritten digest pullable under app"
+        );
+    }
+
+    /// #4525 under #5793, directly and through a Virtual repository: after
+    /// `DELETE xa@<digest>` the digest answers 404 under xa and keeps
+    /// resolving under xb; through the Virtual, under a never-pushed name, it
+    /// answers 404 as well.
+    #[tokio::test]
+    async fn digest_deleted_under_one_image_is_scoped_directly_and_via_virtual_5793() {
+        let Some(rig) = ScopeRig::setup().await else {
+            return;
+        };
+        let (digest, _, layer) = rig.push_image("xa", "v1", "shared").await;
+        let manifest =
+            scope_image_manifest(b"{\"note\":\"shared\"}", b"layer bytes of shared", "shared");
+        rig.push_manifest("xb", "v1", SCOPE_MANIFEST_CT, &manifest)
+            .await;
+        let (st, _, _) = rig
+            .call(
+                Method::DELETE,
+                format!("/{}/xa/manifests/{}", rig.fx.repo_key, digest),
+                None,
+                Bytes::new(),
+            )
+            .await;
+
+        let (virt_id, virt_key, virt_dir) =
+            tdh::create_repo(&rig.fx.pool, "virtual", "docker").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virt_id)
+        .bind(rig.fx.repo_id)
+        .execute(&rig.fx.pool)
+        .await
+        .expect("link virtual member");
+        tdh::grant_repo_actions(&rig.fx.pool, virt_id, rig.fx.user_id, &["read"]).await;
+        let via = |image: &str, rest: &str| format!("/{virt_key}/{image}/{rest}");
+        let m = format!("manifests/{digest}");
+        let direct = (
+            rig.status(Method::GET, "xa", &m).await,
+            rig.status(Method::GET, "xb", &m).await,
+        );
+        let mut virt = Vec::new();
+        for (image, rest) in [
+            ("xa", m.clone()),
+            ("xb", m.clone()),
+            ("nobody", m.clone()),
+            ("xb", format!("blobs/{layer}")),
+            ("nobody", format!("blobs/{layer}")),
+        ] {
+            virt.push(
+                rig.call(Method::GET, via(image, &rest), None, Bytes::new())
+                    .await
+                    .0,
+            );
+        }
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virt_id)
+            .execute(&rig.fx.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virt_id)
+            .execute(&rig.fx.pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&virt_dir);
+        rig.teardown().await;
+
+        assert_eq!(st, StatusCode::ACCEPTED, "DELETE xa@digest");
+        assert_eq!(
+            direct,
+            (StatusCode::NOT_FOUND, StatusCode::OK),
+            "direct xa / xb"
+        );
+        assert_eq!(
+            virt[0],
+            StatusCode::NOT_FOUND,
+            "virtual xa@digest after the delete"
+        );
+        assert_eq!(virt[1], StatusCode::OK, "virtual xb@digest");
+        assert_eq!(virt[2], StatusCode::NOT_FOUND, "virtual never-pushed name");
+        assert_eq!(virt[3], StatusCode::OK, "virtual xb layer");
+        assert_eq!(
+            virt[4],
+            StatusCode::NOT_FOUND,
+            "virtual never-pushed name, layer"
+        );
+    }
+
+    /// The conformance push flow: a chunked blob upload under an image is
+    /// HEAD-able under that image before any manifest references it (and not
+    /// under another name), then the manifest PUT referencing it succeeds.
+    #[tokio::test]
+    async fn uploaded_blob_heads_under_its_image_before_the_manifest_put_5793() {
+        let Some(rig) = ScopeRig::setup().await else {
+            return;
+        };
+        rig.push_image("seed", "v1", "seed").await; // scopes the repository
+        let config = b"{\"flow\":\"chunked\"}".to_vec();
+        rig.push_blob("flow", &config).await;
+        let layer = b"chunked upload layer bytes".to_vec();
+        let layer_digest = sha256_digest(&layer);
+        let (st, h, _) = rig
+            .call(
+                Method::POST,
+                format!("/{}/flow/blobs/uploads/", rig.fx.repo_key),
+                None,
+                Bytes::new(),
+            )
+            .await;
+        assert_eq!(st, StatusCode::ACCEPTED, "open upload session");
+        let location = h[LOCATION].to_str().unwrap().to_string();
+        let location = location
+            .strip_prefix("/v2")
+            .unwrap_or(&location)
+            .to_string();
+        let (st, h, _) = rig
+            .call(
+                Method::PATCH,
+                location.clone(),
+                Some("application/octet-stream"),
+                Bytes::from(layer.clone()),
+            )
+            .await;
+        assert_eq!(st, StatusCode::ACCEPTED, "PATCH chunk");
+        let location = h[LOCATION].to_str().unwrap().to_string();
+        let location = location
+            .strip_prefix("/v2")
+            .unwrap_or(&location)
+            .to_string();
+        let sep = if location.contains('?') { '&' } else { '?' };
+        let (st, _, body) = rig
+            .call(
+                Method::PUT,
+                format!("{location}{sep}digest={layer_digest}"),
+                Some("application/octet-stream"),
+                Bytes::new(),
+            )
+            .await;
+        assert_eq!(
+            st,
+            StatusCode::CREATED,
+            "finalize: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let blob = format!("blobs/{layer_digest}");
+        let head_own = rig.status(Method::HEAD, "flow", &blob).await;
+        let head_other = rig.status(Method::HEAD, "seed", &blob).await;
+        let manifest = scope_image_manifest(&config, &layer, "flow");
+        let put = rig
+            .call(
+                Method::PUT,
+                format!("/{}/flow/manifests/v1", rig.fx.repo_key),
+                Some(SCOPE_MANIFEST_CT),
+                manifest,
+            )
+            .await
+            .0;
+        let pull_layer = rig.status(Method::GET, "flow", &blob).await;
+        rig.teardown().await;
+
+        assert_eq!(head_own, StatusCode::OK, "HEAD under the uploading image");
+        assert_eq!(
+            head_other,
+            StatusCode::NOT_FOUND,
+            "HEAD under another image"
+        );
+        assert_eq!(put, StatusCode::CREATED, "manifest PUT");
+        assert_eq!(pull_layer, StatusCode::OK);
+    }
+
+    /// A mount from another image of the same repository is honoured (201)
+    /// when that image holds the blob, and links it to the target image; a
+    /// mount the source cannot satisfy falls back to an upload session (202).
+    #[tokio::test]
+    async fn same_repository_mount_links_the_blob_to_the_target_image_5793() {
+        let Some(rig) = ScopeRig::setup().await else {
+            return;
+        };
+        let (_, _, layer) = rig.push_image("src", "v1", "mount").await;
+        let blob = format!("blobs/{layer}");
+        let before = rig.status(Method::HEAD, "dst", &blob).await;
+        let mount = |from: &str, digest: &str| {
+            format!(
+                "/{key}/dst/blobs/uploads/?mount={digest}&from={key}/{from}",
+                key = rig.fx.repo_key
+            )
+        };
+        let (mounted, h, _) = rig
+            .call(Method::POST, mount("src", &layer), None, Bytes::new())
+            .await;
+        let location = h
+            .get(LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let after = rig.status(Method::HEAD, "dst", &blob).await;
+        let missing = sha256_digest(b"never uploaded");
+        let (not_held, _, _) = rig
+            .call(Method::POST, mount("src", &missing), None, Bytes::new())
+            .await;
+        let (wrong_source, _, _) = rig
+            .call(Method::POST, mount("nobody", &layer), None, Bytes::new())
+            .await;
+        rig.teardown().await;
+
+        assert_eq!(
+            before,
+            StatusCode::NOT_FOUND,
+            "dst does not hold the layer yet"
+        );
+        assert_eq!(mounted, StatusCode::CREATED, "same-repository mount");
+        assert!(
+            location.ends_with(&format!("/dst/blobs/{layer}")),
+            "{location}"
+        );
+        assert_eq!(after, StatusCode::OK, "the mount links the layer to dst");
+        assert_eq!(
+            not_held,
+            StatusCode::ACCEPTED,
+            "a missing blob opens an upload"
+        );
+        assert_eq!(
+            wrong_source,
+            StatusCode::ACCEPTED,
+            "a source image that does not hold the blob opens an upload"
+        );
+    }
+
+    /// `AK_OCI_BLOB_SCOPE=report` serves the blob enforcement refuses (and
+    /// counts the miss); the image that holds the blob is served either way.
+    #[tokio::test]
+    async fn report_mode_serves_an_unheld_blob_that_enforce_refuses_5793() {
+        use crate::services::oci_image_scope::BlobScopeMode;
+        let Some(rig) = ScopeRig::setup().await else {
+            return;
+        };
+        let (_, _, layer) = rig.push_image("src", "v1", "report").await;
+        let Ok(mut repo) = resolve_repo(&rig.fx.pool, &format!("{}/nobody", rig.fx.repo_key)).await
+        else {
+            panic!("resolve repo");
+        };
+        let state = &rig.fx.state;
+        let nobody = (
+            blob_scope_allows_in(state, &repo, &layer, BlobScopeMode::Enforce)
+                .await
+                .expect("scope check"),
+            blob_scope_allows_in(state, &repo, &layer, BlobScopeMode::Report)
+                .await
+                .expect("scope check"),
+        );
+        repo.image = "src".to_string();
+        let holder = blob_scope_allows_in(state, &repo, &layer, BlobScopeMode::Enforce)
+            .await
+            .expect("scope check");
+        rig.teardown().await;
+
+        assert_eq!(nobody, (false, true), "enforce refuses, report serves");
+        assert!(holder, "the holding image is served under enforcement");
     }
 
     /// Repo-scoped content addressing: on a shared storage backend a digest
