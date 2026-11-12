@@ -7221,11 +7221,7 @@ mod catalog_registration_tests {
         fx.teardown().await;
 
         let body = String::from_utf8_lossy(&body);
-        assert_eq!(
-            status,
-            axum::http::StatusCode::INSUFFICIENT_STORAGE,
-            "{body}"
-        );
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
         assert!(body.contains("Repository storage quota exceeded"), "{body}");
         assert_eq!(rows, 0, "a refused publish must leave no artifact row");
     }
