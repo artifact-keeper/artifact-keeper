@@ -2471,6 +2471,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #5608: deleting a group removes the fine-grained permission rules that
+    /// name it. Pre-fix the rows survived the DELETE (no FK on the polymorphic
+    /// principal pair) and showed up as `principal_name: null`.
+    #[tokio::test]
+    async fn test_delete_group_removes_its_permission_rules_5608() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Path, State};
+        use axum::Extension;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-grp-delete-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (group_id, _group_name) = tdh::create_group(&pool).await;
+        let (repo_id, _repo_name, storage_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        tdh::grant_permission(&pool, "group", group_id, "repository", repo_id, &["read"]).await;
+
+        let deleted = delete_group(
+            State(state),
+            Extension(Some(tdh::admin_auth(admin_id, &admin_name))),
+            Path(group_id),
+        )
+        .await;
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM permissions \
+             WHERE principal_type = 'group' AND principal_id = $1",
+        )
+        .bind(group_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count the deleted group's rules");
+
+        tdh::cleanup(&pool, repo_id, admin_id).await;
+        let _ = std::fs::remove_dir_all(storage_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(deleted.is_ok(), "delete_group failed: {deleted:?}");
+        assert_eq!(
+            remaining, 0,
+            "deleting a group must remove its permission rules (#5608)"
+        );
+    }
+
     /// Router-level (#4027): `GET /{id}/members` dispatches to the list handler
     /// instead of answering 405, also for an LDAP-synced group whose membership
     /// is read-only locally, and pages walk the whole group in a stable order
