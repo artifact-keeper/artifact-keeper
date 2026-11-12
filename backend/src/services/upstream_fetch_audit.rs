@@ -379,7 +379,9 @@ mod tests {
             Some(200),
             false,
         );
-        let repo = Uuid::new_v4();
+        // A fixed, digits-only id: a random UUID is hex and sometimes contains
+        // "abc", which the secret check below would report as a leak (#5877).
+        let repo = Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888);
         let d = f.details(
             UpstreamCaller::Proxy,
             Some(repo),
