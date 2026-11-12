@@ -4167,7 +4167,7 @@ pub async fn resolve_virtual_blob(
                     // #2260 rule the direct-Remote blob path documents. A
                     // Docker pull through a virtual parent is counted once at
                     // the manifest, never per layer.
-                    match proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(
+                    let fetch = proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(
                         proxy,
                         member.id,
                         &member.key,
@@ -4177,9 +4177,31 @@ pub async fn resolve_virtual_blob(
                         expected_checksum.clone(),
                         member.format.clone(),
                         is_head,
-                    )
-                    .await
-                    {
+                    );
+                    // #5810: a member that has not started answering within
+                    // the download deadline is passed over for this request,
+                    // like the two-phase download walk. Any member's bytes
+                    // are as good as another's here: the client verifies them
+                    // against the digest and the cache commit is gated on it.
+                    let fetched = match proxy_helpers::virtual_member_download_deadline(
+                        proxy.upstream_read_timeout(),
+                    ) {
+                        Some(deadline) => match tokio::time::timeout(deadline, fetch).await {
+                            Ok(fetched) => fetched,
+                            Err(_) => {
+                                proxy_helpers::record_virtual_member_download_deadline_miss(
+                                    &member.key,
+                                    &upstream_path,
+                                    deadline,
+                                );
+                                // Not evidence the blob is absent (#3836).
+                                indeterminate = true;
+                                break;
+                            }
+                        },
+                        None => fetch.await,
+                    };
+                    match fetched {
                         Ok(result) => return Some(VirtualBlobResolution::RemoteStream { result }),
                         Err(error) => {
                             indeterminate |= !upstream_error_is_definitive_miss(&error);
