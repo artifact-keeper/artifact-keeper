@@ -173,6 +173,28 @@ line of `SCANNER_SCAN_TOKENS_FILE` (picked up without a restart), point
 `TRIVY_ADAPTER_TOKEN` / `TRIVY_ADAPTER_TOKEN_FILE` at it and restart the
 backend (it reads the token at startup), then remove the old line.
 
+## Image size limit (adapter >= 1.7.0)
+
+trivy downloads every layer of an image into `SCANNER_TRIVY_CACHE_DIR` and
+holds the analysed layers in memory, so an image larger than the pod's memory
+or ephemeral-storage limit gets the adapter OOM-killed or evicted part-way
+through the scan, along with every other scan running on it (#5909).
+
+| Variable | Effect |
+|---|---|
+| `SCANNER_MAX_IMAGE_BYTES` | Default `0` (no bound). When set, the adapter reads the image manifest with the scan request's credential before running trivy (for an index, the `linux/<adapter arch>` image, else `linux/amd64`) and adds up the config and layer sizes. Above the limit the image is not scanned: trivy does not run and the report route answers `422` with `X-Scan-Status: TooLarge` and `not scanned: image too large: <image> is <n> bytes (compressed layers), over SCANNER_MAX_IMAGE_BYTES=<limit>`. A manifest that cannot be read or measured never blocks a scan: the adapter logs why and scans as it would without the limit. |
+
+The sizes are the compressed sizes the registry reports, i.e. what trivy
+downloads; unpacked layers are larger. Set the limit well under both the
+pod's memory limit and its ephemeral-storage limit (`SCANNER_TRIVY_CACHE_DIR`
+and the temp dir), and lower it, or lower `SCANNER_MAX_CONCURRENT_SCANS`,
+when several large images can be scanned at once. The backend records a
+refused image as a failed scan whose error reads `not scanned: image too
+large ...`, and does not resubmit it.
+
+A filesystem-scan upload over `SCANNER_FS_MAX_UPLOAD_BYTES` is answered `413`
+with `not scanned: workspace too large` (it was a `400 invalid workspace tar`).
+
 ## Offline use and vulnerability-DB import (adapter >= 1.7.0)
 
 For a disconnected install, set one switch:

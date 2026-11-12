@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -199,7 +201,15 @@ func (s *Server) acquireScanSlot(id string) (release func()) {
 
 // runJob executes the scan and records the outcome. Detached from the request
 // context so a client disconnect does not cancel the scan.
+//
+// The image size check (#5909) runs first, outside the scan slots: it is two
+// manifest GETs at most, and an image it refuses never waits for a slot.
 func (s *Server) runJob(id string, req ScanRequest) {
+	if tooLarge := s.scanner.checkImageSize(context.Background(), &req); tooLarge != nil {
+		log.Printf("scan %s refused: %v", id, tooLarge)
+		s.jobs.TooLarge(id, tooLarge.Error())
+		return
+	}
 	defer s.acquireScanSlot(id)()
 	report, err := s.scanner.Scan(context.Background(), &req)
 	if err != nil {
@@ -237,7 +247,13 @@ func (s *Server) handleFsScan(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := untarWorkspaceOpts(body, dir, s.cfg.CachePartitionMode == partitionModeRegistry); err != nil {
 		_ = os.RemoveAll(dir)
-		// An over-cap body surfaces here as a read error from MaxBytesReader.
+		// An over-cap body surfaces here as a read error from MaxBytesReader:
+		// answer it as such (413), not as a malformed tar (#5909).
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, fmt.Sprintf("not scanned: workspace too large: over SCANNER_FS_MAX_UPLOAD_BYTES=%d", s.cfg.FsMaxUploadBytes), http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "invalid workspace tar: "+err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -284,8 +300,9 @@ func (s *Server) handleFsReport(w http.ResponseWriter, r *http.Request) {
 // serveJobReport implements the shared report-polling contract for both scan
 // families: 200 + body when Succeeded, 500 when Failed (fail-closed — a trivy
 // error is NEVER a 200 with empty findings), 302 + integer Refresh-After while
-// Pending/Queued/Running (the state in X-Scan-Status, #5657), 404 for an
-// unknown/expired id.
+// Pending/Queued/Running (the state in X-Scan-Status, #5657), 422 with
+// X-Scan-Status: TooLarge for an image refused by SCANNER_MAX_IMAGE_BYTES
+// (#5909), 404 for an unknown/expired id.
 func (s *Server) serveJobReport(w http.ResponseWriter, id, contentType string, body func(*Job) any) {
 	job, ok := s.jobs.Get(id)
 	if !ok {
@@ -301,6 +318,12 @@ func (s *Server) serveJobReport(w http.ResponseWriter, id, contentType string, b
 		writeJSON(w, http.StatusOK, body(job))
 	case StatusFailed:
 		http.Error(w, "scan failed: "+job.Err, http.StatusInternalServerError)
+	case StatusTooLarge:
+		// Not a scan failure: the image was refused before trivy ran
+		// (#5909). Clients that do not know the header still read a
+		// terminal non-2xx answer, i.e. no report.
+		w.Header().Set(scanStatusHeader, string(job.Status))
+		http.Error(w, job.Err, http.StatusUnprocessableEntity)
 	default:
 		w.Header().Set("Refresh-After", "5")
 		w.Header().Set(scanStatusHeader, string(job.Status))
@@ -310,8 +333,10 @@ func (s *Server) serveJobReport(w http.ResponseWriter, id, contentType string, b
 
 // scanStatusHeader carries a pending job's state (Pending, Queued or Running)
 // on the 302 report response, so the backend can tell a scan waiting for a
-// slot from one that is running (#5657). Not part of the Harbor contract;
-// clients that ignore it see the same 302 + Refresh-After as before.
+// slot from one that is running (#5657), and the TooLarge state on the 422
+// of an image refused by SCANNER_MAX_IMAGE_BYTES (#5909). Not part of the
+// Harbor contract; clients that ignore it see the same 302 + Refresh-After
+// as before, and a terminal non-2xx for TooLarge.
 const scanStatusHeader = "X-Scan-Status"
 
 // writeJSON writes v as a JSON response with the given status.
