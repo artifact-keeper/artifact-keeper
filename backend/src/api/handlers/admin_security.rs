@@ -1138,7 +1138,8 @@ fn validate_scan_queue_filters(state: Option<&str>, kind: Option<&str>) -> Resul
     responses(
         (status = 200, description = "Outstanding scan jobs and queue depth", body = ScanQueueResponse),
         (status = 400, description = "Unknown state or kind"),
-        (status = 403, description = "Admin privileges required")
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin privileges required, or a repository-scoped token")
     ),
     security(("bearer_auth" = []))
 )]
@@ -1147,7 +1148,9 @@ pub async fn get_scan_queue(
     Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ScanQueueQuery>,
 ) -> Result<Json<ScanQueueResponse>> {
-    require_admin(&auth)?;
+    // Rows name repositories and cache paths across the whole instance, so a
+    // repository-scoped admin token must not read them (#4273, #4550).
+    auth.require_unscoped_admin("the instance-wide scan queue")?;
     validate_scan_queue_filters(query.state.as_deref(), query.kind.as_deref())?;
     let (offset, per_page, _, _) = blast_page_bounds(query.page, query.per_page);
 
@@ -2283,5 +2286,31 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
 
         tdh::cleanup_user(&pool, user_id).await;
+    }
+}
+
+/// The scan queue lists rows of every repository (their ids and proxy-cache
+/// paths), so it takes the same gate as the other instance-wide admin
+/// listings: 401 anonymous, 403 to a non-admin and to a repository-scoped admin
+/// token or JWT, 200 to an unscoped admin.
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod router_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    #[tokio::test]
+    async fn scan_queue_refuses_anonymous_non_admin_and_repo_scoped_admin_tokens() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        tdh::assert_admin_routes_refuse_repo_scoped_tokens(
+            &fx,
+            &[
+                "/api/v1/admin/security/scan-queue",
+                "/api/v1/admin/security/scan-queue?state=failed&kind=proxy_file",
+            ],
+        )
+        .await;
+        fx.teardown().await;
     }
 }

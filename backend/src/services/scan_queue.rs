@@ -1,7 +1,7 @@
 //! Durable scan queue: enqueue, claim, finalize. Keeps grype off the request path.
 //!
 //! A `RowClaimedQueue` ([`crate::services::cluster_work`]), the claim CTE follows
-//! `sync_worker::claim_pending_sync_tasks`. Schema in migration 362.
+//! `sync_worker::claim_pending_sync_tasks`. Schema in migration 377.
 //!
 //! Jobs carry a storage reference, never the bytes, and that reference may
 //! dangle: the proxy cache write is best-effort, so the worker retries then drops.
@@ -50,7 +50,7 @@ pub fn enqueue_signal() -> &'static std::sync::Arc<tokio::sync::Notify> {
     ENQUEUE_SIGNAL.get_or_init(|| std::sync::Arc::new(tokio::sync::Notify::new()))
 }
 
-/// Which shape of work a job is. Migration 362's CHECK keeps the kind and its
+/// Which shape of work a job is. Migration 377's CHECK keeps the kind and its
 /// payload columns in agreement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanJobKind {
@@ -611,6 +611,7 @@ impl ScanQueue {
     }
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

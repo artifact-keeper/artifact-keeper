@@ -460,6 +460,7 @@ fn queue_gauges(rows: &[crate::services::scan_queue::ScanQueueDepth]) -> QueueGa
     (depths, oldest)
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

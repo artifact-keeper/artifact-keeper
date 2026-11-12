@@ -509,7 +509,8 @@ costs rows rather than memory.
   deleted, since the verdict row is the record. A job that failed for good is
   kept for seven days so its error can be read.
 
-`GET /api/v1/admin/security/scan-queue` (admin only) lists the outstanding jobs
+`GET /api/v1/admin/security/scan-queue` (admin only, and refused to a
+repository-scoped token, since it lists every repository's jobs) lists the outstanding jobs
 and the depth per kind and state. Hosted scans share the queue at the lowest
 priority, so a rescan of a whole repository cannot starve a waiting pull.
 

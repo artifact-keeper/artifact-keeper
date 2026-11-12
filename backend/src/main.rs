@@ -1288,7 +1288,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         state.proxy_service.clone(),
     );
 
-    // Drains the durable scan queue (migration 362) when SCAN_QUEUE_ENABLED and
+    // Drains the durable scan queue (migration 377) when SCAN_QUEUE_ENABLED and
     // SCAN_WORKER_ENABLED are both on, before the listeners bind
     artifact_keeper_backend::services::scan_worker::spawn_scan_worker(
         state.clone(),

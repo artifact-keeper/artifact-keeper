@@ -81,3 +81,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_scan_queue_digest_active
 CREATE UNIQUE INDEX IF NOT EXISTS uq_scan_queue_artifact_active
     ON scan_queue (kind, artifact_id)
     WHERE state IN ('pending', 'running') AND artifact_id IS NOT NULL;
+
+-- Foreign-key lookups. Deleting an artifact or a repository checks this table
+-- for rows in every state, terminal ones included, which the partial unique
+-- indexes above cannot answer, so without these each delete scans the table.
+CREATE INDEX IF NOT EXISTS idx_scan_queue_artifact_id
+    ON scan_queue (artifact_id)
+    WHERE artifact_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_scan_queue_repository_id
+    ON scan_queue (repository_id)
+    WHERE repository_id IS NOT NULL;
