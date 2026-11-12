@@ -2939,7 +2939,7 @@ mod tests {
     mod iam_route_guard {
         use super::super::{api_v1_routes, build_login_rate_limit_state, UploadAdmission};
         use crate::api::authz::registry::{
-            compare_with_live, RouteKey, RouteRegistry, API_V1_PREFIX,
+            canonical_route, compare_with_live, RouteKey, RouteRegistry, API_V1_PREFIX,
         };
         use crate::api::authz::route_inventory::{assert_matches_baseline, enumerate_routes};
         use crate::api::middleware::rate_limit::RateLimitExemptions;
@@ -3025,11 +3025,15 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn declared_label_operations_are_live_and_covered() {
-            let live = live_api_v1_routes(&api_v1_router());
+        async fn declared_operations_are_live() {
+            let live: BTreeSet<RouteKey> = live_api_v1_routes(&api_v1_router())
+                .into_iter()
+                .map(|(method, path)| (method, canonical_route(&path)))
+                .collect();
             let registry = registry();
             let declared = registry.declared_keys();
-            assert_eq!(declared.len(), 4, "{declared:?}");
+            // The four label operations plus the 111 repository and artifact operations.
+            assert_eq!(declared.len(), 115, "{declared:?}");
             assert!(declared.is_subset(&live), "{declared:?}");
         }
 

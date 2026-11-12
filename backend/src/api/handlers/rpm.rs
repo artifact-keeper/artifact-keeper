@@ -4370,6 +4370,7 @@ pub struct RebuildRepodataResponse {
 /// requested. Needs the repository `write` permission, like an upload.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("repository.maintenance")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/rpm/repodata/rebuild",
     context_path = "/api/v1/repositories",
     tag = "repositories",

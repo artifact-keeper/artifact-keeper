@@ -61,6 +61,28 @@ pub(crate) async fn check_artifact_visibility(
     db: &sqlx::PgPool,
     action: &str,
 ) -> Result<()> {
+    let mut repo_id = None;
+    let decision = artifact_visibility_decision(auth, artifact_id, db, action, &mut repo_id).await;
+    if let (Ok(()), Some(repo_id)) = (&decision, repo_id) {
+        // For the IAM shadow comparison (#4214): this gate proves READ
+        // visibility only, whatever `action` says.
+        crate::api::authz::shadow_marker::note_passed(
+            repo_id,
+            crate::api::authz::shadow_marker::LegacyLevel::Read,
+        );
+    }
+    decision
+}
+
+/// The decision of [`check_artifact_visibility`]; sets `found` to the
+/// artifact's repository when there is one.
+async fn artifact_visibility_decision(
+    auth: &Option<AuthExtension>,
+    artifact_id: Uuid,
+    db: &sqlx::PgPool,
+    action: &str,
+    found: &mut Option<Uuid>,
+) -> Result<()> {
     // Always fetch repo info so we can check both visibility and token scope.
     let repo_info: Option<(
         Uuid,
@@ -79,6 +101,7 @@ pub(crate) async fn check_artifact_visibility(
         // No matching repo means the artifact query upstream will 404.
         return Ok(());
     };
+    *found = Some(repo_id);
 
     // #5694: from the moment its delete job is queued, a repository is renamed
     // to `~deleting~<job id>` and is gone on every by-key surface. Its
@@ -113,7 +136,7 @@ pub(crate) async fn check_artifact_visibility(
                         user_id = %ext.user_id,
                         "token repository scope denied read; answering the existence-hiding 404"
                     );
-                    return Err(hidden_artifact());
+                    return Err(hidden_artifact(repo_id));
                 }
                 return Err(AppError::Authorization(
                     "Token does not have access to this repository".to_string(),
@@ -140,14 +163,14 @@ pub(crate) async fn check_artifact_visibility(
                     )
                     .await?
                 {
-                    return Err(hidden_artifact());
+                    return Err(hidden_artifact(repo_id));
                 }
             }
             Ok(())
         }
         None => {
             if !visibility.allows_anonymous_read() {
-                return Err(hidden_artifact());
+                return Err(hidden_artifact(repo_id));
             }
             Ok(())
         }
@@ -156,8 +179,8 @@ pub(crate) async fn check_artifact_visibility(
 
 /// The existence-hiding answer to a refused artifact read: the same 404 as a
 /// missing id, marked for the IAM shadow comparison (#4214).
-fn hidden_artifact() -> AppError {
-    crate::api::authz::shadow_marker::note_hidden_refusal();
+fn hidden_artifact(repository_id: Uuid) -> AppError {
+    crate::api::authz::shadow_marker::note_hidden_refusal(repository_id);
     AppError::NotFound("Artifact not found".to_string())
 }
 
@@ -218,6 +241,7 @@ pub struct ArtifactStatsResponse {
 /// Get artifact by ID
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("artifact.read")), ("x-resource" = json!("artifact:id"))),
     path = "/{id}",
     context_path = "/api/v1/artifacts",
     tag = "artifacts",
@@ -396,6 +420,7 @@ pub(crate) async fn mcp_servable(
 /// Get artifact metadata by artifact ID
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("artifact.read")), ("x-resource" = json!("artifact:id"))),
     path = "/{id}/metadata",
     context_path = "/api/v1/artifacts",
     tag = "artifacts",
@@ -452,6 +477,7 @@ pub async fn get_artifact_metadata(
 /// Get artifact download statistics
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("artifact.read")), ("x-resource" = json!("artifact:id"))),
     path = "/{id}/stats",
     context_path = "/api/v1/artifacts",
     tag = "artifacts",

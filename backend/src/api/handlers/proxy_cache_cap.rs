@@ -116,6 +116,7 @@ async fn response(state: &SharedState, repo: &Repository) -> Result<ProxyCacheCa
 /// Get the proxy-cache cap and usage of a remote repository
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/proxy-cache-cap",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -150,6 +151,7 @@ pub async fn get_proxy_cache_cap(
 /// download history.
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/proxy-cache-cap",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -184,6 +186,7 @@ pub async fn set_proxy_cache_cap(
 /// Remove the proxy-cache cap of a remote repository
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/proxy-cache-cap",
     context_path = "/api/v1/repositories",
     tag = "repositories",

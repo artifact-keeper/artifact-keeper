@@ -238,6 +238,7 @@ async fn live_checksums(
 /// Report which of the given artifacts the repository does not already hold.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("artifact.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/artifacts-missing",
     context_path = "/api/v1/repositories",
     tag = "repositories",

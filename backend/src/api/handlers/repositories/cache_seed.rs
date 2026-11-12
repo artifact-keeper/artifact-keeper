@@ -362,6 +362,7 @@ pub(crate) fn classify_fetch_error(e: &AppError) -> ItemOutcome {
 /// refusal apply to it. Requires repository admin, like `cache/invalidate`.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("repository.maintenance")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/cache/seed",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -452,6 +453,7 @@ fn require_seedable(repo: &Repository) -> Result<()> {
 /// Read a seed job and its inventory.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.maintenance")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/cache/seed/{job_id}",
     context_path = "/api/v1/repositories",
     tag = "repositories",

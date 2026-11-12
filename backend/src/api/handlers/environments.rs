@@ -104,6 +104,7 @@ pub struct AdvisoryTransitionsQuery {
 /// index; the #4053 SBOM endpoint deliberately stores nothing.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("environment.write")), ("x-resource" = json!("repo:key"))),
     path = "/api/v1/repositories/{key}/environments",
     tag = "environments",
     params(IngestEnvironmentQuery, ("key" = String, Path, description = "Repository key")),
@@ -204,6 +205,7 @@ pub(crate) fn ingest_envelope(
 /// List the environments stored in a repository.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("environment.read")), ("x-resource" = json!("repo:key"))),
     path = "/api/v1/repositories/{key}/environments",
     tag = "environments",
     params(("key" = String, Path, description = "Repository key")),
@@ -236,6 +238,7 @@ async fn list_environments(
 /// Show one stored environment with its per-scope counts.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("environment.read")), ("x-resource" = json!("repo:key"))),
     path = "/api/v1/repositories/{key}/environments/{id}",
     tag = "environments",
     params(("key" = String, Path, description = "Repository key"), ("id" = Uuid, Path, description = "Environment id")),
@@ -276,6 +279,7 @@ async fn get_environment(
 /// Delete a stored environment (memberships and edges cascade).
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("environment.write")), ("x-resource" = json!("repo:key"))),
     path = "/api/v1/repositories/{key}/environments/{id}",
     tag = "environments",
     params(("key" = String, Path, description = "Repository key"), ("id" = Uuid, Path, description = "Environment id")),
@@ -518,6 +522,7 @@ pub(crate) fn transitions_envelope(transitions: &[TransitionRecord]) -> serde_js
 /// present affectedness state, as last evaluated against the feeds.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("environment.read")), ("x-resource" = json!("repo:key"))),
     path = "/api/v1/repositories/{key}/environments/{id}/advisories",
     tag = "environments",
     params(("key" = String, Path, description = "Repository key"), ("id" = Uuid, Path, description = "Environment id")),

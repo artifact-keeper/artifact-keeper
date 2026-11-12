@@ -407,17 +407,24 @@ async fn apply_review_decision(
     let tier = ActorTier::of(auth.is_admin);
     let (review, mut details) = match decision {
         ReviewDecision::Approve => {
-            let review = svc.approve_as(id, auth.user_id, tier, reason).await?;
+            let review = svc
+                .approve_as(id, auth.user_id, tier, reason)
+                .await
+                .map_err(|e| crate::api::authz::shadow_marker::keep_refusal("admin_tier", e))?;
             let details = build_review_audit_details(&review, reason);
             (review, details)
         }
         ReviewDecision::Reject => {
+            // Rejecting only tightens, so no tier refuses it: nothing to mark.
             let review = svc.reject_as(id, auth.user_id, tier, reason).await?;
             let details = build_review_audit_details(&review, reason);
             (review, details)
         }
         ReviewDecision::Reopen => {
-            let (previous_status, review) = svc.reopen_as(id, auth.user_id, tier, reason).await?;
+            let (previous_status, review) = svc
+                .reopen_as(id, auth.user_id, tier, reason)
+                .await
+                .map_err(|e| crate::api::authz::shadow_marker::keep_refusal("admin_tier", e))?;
             let details = build_reopen_audit_details(&review, &previous_status, reason);
             (review, details)
         }
@@ -616,6 +623,7 @@ pub async fn reopen_review(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/age-gate",
     context_path = "/api/v1/repositories",
     tag = "age-gate",
@@ -654,6 +662,7 @@ pub async fn get_repo_age_gate(
 
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/age-gate",
     context_path = "/api/v1/repositories",
     tag = "age-gate",
@@ -717,7 +726,8 @@ pub async fn update_repo_age_gate(
     let tier = ActorTier::of(auth.is_admin);
     let write = svc
         .update_repo_config_as(repo.id, next, tier, body.instance_locked)
-        .await?;
+        .await
+        .map_err(|e| crate::api::authz::shadow_marker::keep_refusal("admin_tier", e))?;
     let previous = write.previous;
 
     let audit = AuditService::new(state.db.clone());
@@ -791,6 +801,7 @@ pub async fn update_repo_age_gate(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("age_gate.review")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/age-gate/reviews",
     context_path = "/api/v1/repositories",
     tag = "age-gate",
@@ -825,6 +836,7 @@ pub async fn list_repo_reviews(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("age_gate.review")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/age-gate/reviews/{id}",
     context_path = "/api/v1/repositories",
     tag = "age-gate",
@@ -854,6 +866,7 @@ pub async fn get_repo_review(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("age_gate.review")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/age-gate/reviews/{id}/{decision}",
     context_path = "/api/v1/repositories",
     tag = "age-gate",
@@ -1862,12 +1875,15 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["instance_locked"], true);
         for decision in ["approve", "reopen"] {
-            let (status, _) = send(&repo_admin, rejected, decision).await;
+            let ((status, _), recorded) =
+                crate::api::authz::shadow_marker::scope(send(&repo_admin, rejected, decision))
+                    .await;
             assert_eq!(
                 status,
                 axum::http::StatusCode::FORBIDDEN,
                 "a repository admin must not {decision} an instance admin's rejection"
             );
+            assert_eq!(recorded.kept_refusal, Some("admin_tier"), "{decision}");
         }
         assert_eq!(review_status(&pool, rejected).await, "rejected");
 
@@ -1944,8 +1960,16 @@ mod tests {
         assert_eq!(change["actor_tier"], "repository_admin");
         assert_eq!(change["relaxed"], false);
         // Still locked after the tightening: it cannot then be dropped.
-        let (status, _) = put(&repo_admin, &locked_key, true, 30, "first_seen").await;
+        let ((status, _), recorded) = crate::api::authz::shadow_marker::scope(put(
+            &repo_admin,
+            &locked_key,
+            true,
+            30,
+            "first_seen",
+        ))
+        .await;
         assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(recorded.kept_refusal, Some("admin_tier"));
 
         let (status, _) = put(&repo_admin, &own_key, true, 30, "first_seen").await;
         assert_eq!(status, axum::http::StatusCode::OK);

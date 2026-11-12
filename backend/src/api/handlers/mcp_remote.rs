@@ -65,6 +65,7 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     paths(
         list_catalog,
         get_server_encoded,
+        get_server_split,
         decide,
         bulk_approve,
         bulk_block,
@@ -163,6 +164,7 @@ async fn remote_info(state: &SharedState, key: &str) -> Result<RepoInfo> {
 #[utoipa::path(
     get,
     operation_id = "mcp_remote_list_catalog",
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/mcp/catalog",
     context_path = "/api/v1/repositories",
     tag = "mcp",
@@ -210,12 +212,13 @@ async fn get_server(
 #[utoipa::path(
     get,
     operation_id = "mcp_remote_get_server_encoded",
-    path = "/{key}/mcp/catalog/servers/{serverName}",
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
+    path = "/{key}/mcp/catalog/servers/{ns}",
     context_path = "/api/v1/repositories",
     tag = "mcp",
     params(
         ("key" = String, Path, description = "Remote MCP repository key"),
-        ("serverName" = String, Path, description = "Server name, URL-encoded or with a literal slash"),
+        ("ns" = String, Path, description = "Server name, URL-encoded (`io.github.acme%2Fserver`)"),
     ),
     responses((status = 200, body = CatalogItem), (status = 404, description = "Unknown name"))
 )]
@@ -227,6 +230,20 @@ pub async fn get_server_encoded(
     get_server(&state, auth, &key, &ns).await
 }
 
+#[utoipa::path(
+    get,
+    operation_id = "mcp_remote_get_server_split",
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
+    path = "/{key}/mcp/catalog/servers/{ns}/{name}",
+    context_path = "/api/v1/repositories",
+    tag = "mcp",
+    params(
+        ("key" = String, Path, description = "Remote MCP repository key"),
+        ("ns" = String, Path, description = "Server namespace, the part of the name before the slash"),
+        ("name" = String, Path, description = "Server name within the namespace"),
+    ),
+    responses((status = 200, body = CatalogItem), (status = 404, description = "Unknown name"))
+)]
 pub async fn get_server_split(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -245,6 +262,7 @@ pub struct DecisionRequest {
 #[utoipa::path(
     post,
     operation_id = "mcp_remote_decide",
+    extensions(("x-required-permission" = json!("curation.review")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/mcp/catalog/{id}/{decision}",
     context_path = "/api/v1/repositories",
     tag = "mcp",
@@ -323,6 +341,7 @@ pub struct BulkDecideRequest {
 #[utoipa::path(
     post,
     operation_id = "mcp_remote_bulk_approve",
+    extensions(("x-required-permission" = json!("curation.review")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/mcp/catalog/bulk-approve",
     context_path = "/api/v1/repositories",
     tag = "mcp",
@@ -349,6 +368,7 @@ pub async fn bulk_approve(
     if !auth.is_admin && crate::services::mcp_settings::spans_namespaces(&pattern) {
         let rows = crate::services::mcp_settings::load_rows(&state.db, repo.id).await?;
         if crate::services::mcp_settings::locks_of(&rows).posture {
+            crate::api::authz::shadow_marker::note_kept_refusal("admin_only_option");
             return Err(AppError::Authorization(format!(
                 "{} is locked by an instance administrator for this repository: a bulk \
                  approval may not span namespaces (`{pattern}`); name the namespace",
@@ -374,6 +394,7 @@ pub async fn bulk_approve(
 #[utoipa::path(
     post,
     operation_id = "mcp_remote_bulk_block",
+    extensions(("x-required-permission" = json!("curation.review")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/mcp/catalog/bulk-block",
     context_path = "/api/v1/repositories",
     tag = "mcp",
@@ -413,6 +434,7 @@ pub async fn bulk_block(
 #[utoipa::path(
     post,
     operation_id = "mcp_remote_bulk_decide",
+    extensions(("x-required-permission" = json!("curation.review")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/mcp/catalog/bulk-decide",
     context_path = "/api/v1/repositories",
     tag = "mcp",
@@ -457,6 +479,7 @@ pub struct PinRequest {
 #[utoipa::path(
     post,
     operation_id = "mcp_remote_create_pin",
+    extensions(("x-required-permission" = json!("curation.review")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/mcp/catalog/pins",
     context_path = "/api/v1/repositories",
     tag = "mcp",
@@ -607,6 +630,7 @@ pub struct ApprovalRequestBody {
 #[utoipa::path(
     post,
     operation_id = "mcp_remote_request_approval",
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/mcp/catalog/{id}/request-approval",
     context_path = "/api/v1/repositories",
     tag = "mcp",
@@ -650,6 +674,7 @@ pub struct SyncStatusResponse {
 #[utoipa::path(
     get,
     operation_id = "mcp_remote_sync_status",
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/mcp/sync",
     context_path = "/api/v1/repositories",
     tag = "mcp",
@@ -702,6 +727,7 @@ async fn triggering_repo(state: &SharedState, auth: &AuthExtension, key: &str) -
 #[utoipa::path(
     post,
     operation_id = "mcp_remote_start_seed",
+    extensions(("x-required-permission" = json!("repository.maintenance")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/mcp/seed",
     context_path = "/api/v1/repositories",
     tag = "mcp",
@@ -736,6 +762,7 @@ pub async fn start_seed(
 #[utoipa::path(
     get,
     operation_id = "mcp_remote_get_seed",
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/mcp/seed/{job_id}",
     context_path = "/api/v1/repositories",
     tag = "mcp",
@@ -774,6 +801,7 @@ pub fn sync_error(e: SyncError) -> AppError {
 #[utoipa::path(
     post,
     operation_id = "mcp_remote_trigger_sync",
+    extensions(("x-required-permission" = json!("repository.maintenance")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/mcp/sync",
     context_path = "/api/v1/repositories",
     tag = "mcp",
@@ -1381,8 +1409,10 @@ mod tests {
             let env = &env;
             async move { env.call(Some(auth), "POST", &uri, Some(body)).await }
         };
-        let (s, b) = bulk(owner.clone(), "*").await;
+        let ((s, b), recorded) =
+            crate::api::authz::shadow_marker::scope(bulk(owner.clone(), "*")).await;
         assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+        assert_eq!(recorded.kept_refusal, Some("admin_only_option"));
         // Full-name globs only: a bare namespace is refused with the hint.
         let (s, b) = bulk(owner.clone(), "io.github.acme").await;
         assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{b}");

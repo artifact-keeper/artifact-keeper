@@ -202,9 +202,12 @@ Declare exactly one of these forms:
 
 - `x-required-permission` and `x-resource` always go together. The resolver
   must be one of the closed set in `backend/src/api/authz/declaration.rs`
-  (`repo:key`, `artifact:id`, `project:id`, `group:id`, `instance`), and the
-  permission must be applicable at the resolver's scope (`project.read` cannot
-  be checked on a repository).
+  (`repo:key`, `artifact:id`, `project:id`, `project:body`, `group:id`,
+  `instance`), and the permission must be applicable at the resolver's scope
+  (`project.read` cannot be checked on a repository).
+- `project:body` is for an operation whose project comes from the request
+  body (repository creation). The handler reports the project it authorized
+  with `shadow_marker::note_target`, or the instance when the body names none.
 - Unknown permissions, unknown resolvers, partial or conflicting declarations
   fail the guard with the operation named.
 

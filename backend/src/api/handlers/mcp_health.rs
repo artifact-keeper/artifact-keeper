@@ -49,6 +49,7 @@ fn not_found() -> AppError {
 #[utoipa::path(
     get,
     operation_id = "mcp_server_health",
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/mcp/servers/{name}/versions/{version}/health",
     context_path = "/api/v1/repositories",
     tag = "mcp",
@@ -76,6 +77,7 @@ async fn health_encoded(
 #[utoipa::path(
     get,
     operation_id = "mcp_server_health_split",
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/mcp/servers/{ns}/{name}/versions/{version}/health",
     context_path = "/api/v1/repositories",
     tag = "mcp",
@@ -129,11 +131,19 @@ async fn health_impl(
             .await
             .map_err(|e| AppError::Database(e.to_string()))?
             .ok_or_else(not_found)?;
+    // Both refusals stay here after enforcement: health needs a real grant,
+    // with no anonymous or public-read baseline (#4214).
     let Some(caller) = auth else {
-        return Err(not_found());
+        return Err(crate::api::authz::shadow_marker::keep_refusal(
+            "grant_required",
+            not_found(),
+        ));
     };
     if !super::quarantine::caller_passes_reason_gate(&state.db, caller, repo_id).await? {
-        return Err(not_found());
+        return Err(crate::api::authz::shadow_marker::keep_refusal(
+            "grant_required",
+            not_found(),
+        ));
     }
     let row: Option<(Uuid, serde_json::Value)> = sqlx::query_as(
         "SELECT a.id, m.metadata FROM artifacts a \

@@ -35,7 +35,8 @@ pub struct Resolver {
 }
 
 /// The closed resolver table. `kind:param` names the resource kind and the
-/// path parameter that identifies it.
+/// path parameter that identifies it; `kind:body` names a resource the
+/// request body identifies, which the handler reports after reading it.
 pub const RESOLVERS: &[Resolver] = &[
     Resolver {
         id: "repo:key",
@@ -47,6 +48,10 @@ pub const RESOLVERS: &[Resolver] = &[
     },
     Resolver {
         id: "project:id",
+        scope: Scope::Project,
+    },
+    Resolver {
+        id: "project:body",
         scope: Scope::Project,
     },
     Resolver {
@@ -339,6 +344,18 @@ mod tests {
             &json!({"x-required-permission": "system.settings.read", "x-resource": "instance"})
         )
         .is_ok());
+        // Repository creation on the project its body names.
+        assert!(parse_operation(
+            &json!({"x-required-permission": "repository.create", "x-resource": "project:body"})
+        )
+        .is_ok());
+        assert!(matches!(
+            kind(json!({"x-required-permission": "group.manage", "x-resource": "project:body"})),
+            DeclarationErrorKind::ScopeMismatch {
+                resolver: "project:body",
+                ..
+            }
+        ));
         // Group permissions need a group or the instance.
         assert!(parse_operation(
             &json!({"x-required-permission": "group.manage", "x-resource": "repo:key"})

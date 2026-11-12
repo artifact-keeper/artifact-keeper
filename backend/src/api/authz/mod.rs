@@ -16,3 +16,9 @@ pub mod shadow_marker;
 // not shard-gated (its own tests are).
 #[cfg(test)]
 pub(crate) mod route_inventory;
+
+// The declaration table of the repository and artifact operations; only its
+// tests read it.
+#[cfg(ak_test_shard = "services-2")]
+#[cfg(test)]
+mod repository_declarations;

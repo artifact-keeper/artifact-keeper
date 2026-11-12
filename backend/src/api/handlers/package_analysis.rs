@@ -458,6 +458,7 @@ fn build_response(
 /// means we ran and could not read the bytes.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("artifact.read")), ("x-resource" = json!("artifact:id"))),
     path = "/{id}/package-analysis",
     context_path = "/api/v1/artifacts",
     tag = "artifacts",
