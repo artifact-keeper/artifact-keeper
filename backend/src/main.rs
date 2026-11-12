@@ -1199,6 +1199,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             repo_miss_cache: state.repo_miss_cache.clone(),
             permission_service: state.permission_service.clone(),
             npm_packument_cache: state.npm_packument_cache.clone(),
+            iam_snapshot: state.iam_shadow.as_ref().map(|s| s.provider.clone()),
         },
         runtime_shutdown_token.clone(),
     )

@@ -971,7 +971,8 @@ fn api_v1_routes(
         });
     }
 
-    Router::new()
+    let iam_shadow = state.iam_shadow.clone();
+    let routes = Router::new()
         // System configuration. The endpoint is reachable without auth so
         // frontends can discover login/upload affordances pre-authentication,
         // but it runs through `optional_auth_middleware` so the handler can
@@ -1725,7 +1726,18 @@ fn api_v1_routes(
                     auth_service,
                     auth_middleware,
                 )),
-        )
+        );
+    // IAM shadow evaluation (#4214), only when enabled: above every nest's
+    // auth middleware, below the CSRF check and the rate limiter, so a 403 or
+    // 429 those answer before any handler runs is never compared.
+    let routes = match iam_shadow {
+        Some(shadow) => routes.layer(middleware::from_fn_with_state(
+            shadow,
+            crate::api::middleware::iam_shadow::iam_shadow_middleware,
+        )),
+        None => routes,
+    };
+    routes
         // Web-UI CSRF contract (#3065): a state-changing request authenticated
         // by the session cookie must carry the `X-Requested-With` header the
         // web UI sends. Applied to the whole nest so it also covers the

@@ -113,7 +113,7 @@ pub(crate) async fn check_artifact_visibility(
                         user_id = %ext.user_id,
                         "token repository scope denied read; answering the existence-hiding 404"
                     );
-                    return Err(AppError::NotFound("Artifact not found".to_string()));
+                    return Err(hidden_artifact());
                 }
                 return Err(AppError::Authorization(
                     "Token does not have access to this repository".to_string(),
@@ -140,18 +140,25 @@ pub(crate) async fn check_artifact_visibility(
                     )
                     .await?
                 {
-                    return Err(AppError::NotFound("Artifact not found".to_string()));
+                    return Err(hidden_artifact());
                 }
             }
             Ok(())
         }
         None => {
             if !visibility.allows_anonymous_read() {
-                return Err(AppError::NotFound("Artifact not found".to_string()));
+                return Err(hidden_artifact());
             }
             Ok(())
         }
     }
+}
+
+/// The existence-hiding answer to a refused artifact read: the same 404 as a
+/// missing id, marked for the IAM shadow comparison (#4214).
+fn hidden_artifact() -> AppError {
+    crate::api::authz::shadow_marker::note_hidden_refusal();
+    AppError::NotFound("Artifact not found".to_string())
 }
 
 /// Create artifact routes

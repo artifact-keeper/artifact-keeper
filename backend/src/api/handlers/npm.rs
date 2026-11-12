@@ -15803,6 +15803,7 @@ mod tests {
                 repo_miss_cache: state_b.repo_miss_cache.clone(),
                 permission_service: state_b.permission_service.clone(),
                 npm_packument_cache: state_b.npm_packument_cache.clone(),
+                iam_snapshot: None,
             },
             shutdown.clone(),
         )

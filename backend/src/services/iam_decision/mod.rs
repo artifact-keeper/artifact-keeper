@@ -8,6 +8,7 @@
 
 pub mod context;
 pub mod decide;
+pub mod provider;
 pub mod resource_index;
 pub mod snapshot;
 

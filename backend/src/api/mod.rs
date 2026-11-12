@@ -262,6 +262,9 @@ pub struct AppState {
     /// refreshed with the written value on write, closed when unreadable. Every consumer of "is anonymous access allowed"
     /// asks this instead of `config.guest_access_enabled`.
     pub guest_access_policy: Arc<crate::services::guest_access_policy::GuestAccessPolicy>,
+    /// IAM shadow evaluation on `/api/v1` (#4214). `None` unless
+    /// `IAM_SHADOW_EVALUATION` is on.
+    pub iam_shadow: Option<Arc<crate::api::middleware::iam_shadow::IamShadow>>,
 }
 
 /// Build an auth-concurrency semaphore from a config value, or `None` when
@@ -312,6 +315,7 @@ impl AppState {
         let npm_packument_cache = NpmPackumentCache::from_config(&config);
         let npm_attestation_cache = NpmAttestationCache::from_config(&config);
         let guest_access_policy = build_guest_access_policy(&db, &config);
+        let iam_shadow = crate::api::middleware::iam_shadow::IamShadow::from_config(&db, &config);
         Self {
             config,
             db,
@@ -341,6 +345,7 @@ impl AppState {
             rpm_repodata_cache: Arc::new(RpmRepodataCache::new()),
             auth_semaphore,
             guest_access_policy,
+            iam_shadow,
         }
     }
 
@@ -364,6 +369,7 @@ impl AppState {
         let npm_packument_cache = NpmPackumentCache::from_config(&config);
         let npm_attestation_cache = NpmAttestationCache::from_config(&config);
         let guest_access_policy = build_guest_access_policy(&db, &config);
+        let iam_shadow = crate::api::middleware::iam_shadow::IamShadow::from_config(&db, &config);
         Self {
             config,
             db,
@@ -393,6 +399,7 @@ impl AppState {
             rpm_repodata_cache: Arc::new(RpmRepodataCache::new()),
             auth_semaphore,
             guest_access_policy,
+            iam_shadow,
         }
     }
 
