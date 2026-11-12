@@ -36,16 +36,22 @@ pub const CAP_SECURITY_REVIEW: &str = "security_review";
 /// are low-traffic, and resolving it in middleware would put a second authz
 /// query on every proxy pull to serve a handful of reviewer routes.
 async fn require_security_review(db: &sqlx::PgPool, auth: &AuthExtension) -> Result<()> {
+    // The queue spans every repository, so a repository-restricted credential
+    // never reads or decides it, not even an admin's (#4273, #4550). Checked
+    // ahead of the admin shortcut for that reason.
+    if matches!(
+        auth.allowed_repo_ids,
+        crate::models::access_scope::AccessScope::Restricted(_)
+    ) {
+        return Err(AppError::Authorization(
+            "Repository-scoped tokens cannot read or decide package exceptions".to_string(),
+        ));
+    }
     if auth.is_admin {
         return Ok(());
     }
-    // Spans every repository, so a scoped or repository-restricted token never wields it
-    if auth.scopes.is_some()
-        || !matches!(
-            auth.allowed_repo_ids,
-            crate::models::access_scope::AccessScope::Admin
-        )
-    {
+    // A scoped token never wields the capability
+    if auth.scopes.is_some() {
         return Err(AppError::Authorization(
             "Security review requires an unrestricted credential".to_string(),
         ));
@@ -163,6 +169,8 @@ pub struct AgeGateReviewResponse {
     pub review_reason: Option<String>,
     /// Who filed the justification. `None` on an auto-filed row.
     pub requested_by: Option<Uuid>,
+    /// The requester's username, `None` on an auto-filed row or a deleted account.
+    pub requested_by_username: Option<String>,
     pub request_count: i32,
     pub last_requested_at: chrono::DateTime<chrono::Utc>,
     /// When a granted exception lapses. `null` = never expires.
@@ -250,6 +258,25 @@ fn require_grant_reason(reason: Option<&str>) -> Result<&str> {
     }
 }
 
+/// Separation of duties on a scan or curation grant: whoever filed the
+/// justification on the row cannot be the one who grants it, admins included,
+/// like promotion approvals (`approval_separation_of_duties_ok`). The age gate
+/// keeps its old contract, an admin could always approve any age row.
+///
+/// `requested_by` is the latest requester, so this stops the plain "ask and
+/// grant it yourself" case. It does not stop a reviewer granting an auto-filed
+/// row for a pull they made, which needs no request at all.
+fn require_not_own_request(requested_by: Option<Uuid>, actor: Uuid, age: bool) -> Result<()> {
+    if !age && requested_by == Some(actor) {
+        return Err(AppError::Authorization(
+            "Separation of duties: you cannot grant an exception you requested. \
+             A different reviewer must decide it."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve the request's expiry choice into a concrete instant.
 ///
 /// Pure, so the default / bounds / mutual-exclusion rules are testable without
@@ -322,6 +349,7 @@ fn review_to_response(review: AgeGateReview) -> AgeGateReviewResponse {
         reviewed_at: review.reviewed_at,
         review_reason: review.review_reason,
         requested_by: review.requested_by,
+        requested_by_username: review.requested_by_username,
         request_count: review.request_count,
         last_requested_at: review.last_requested_at,
         expires_at: review.expires_at,
@@ -595,6 +623,7 @@ async fn apply_review_decision(
     let tier = ActorTier::of(auth.is_admin);
     let (review, mut details) = match decision {
         ReviewDecision::Approve => {
+            require_not_own_request(current.requested_by, auth.user_id, age)?;
             let reason = if age {
                 reason
             } else {
@@ -899,7 +928,11 @@ pub async fn get_exception(
     tag = "age-gate",
     security(("bearer_auth" = [])),
     request_body = ApproveReviewRequest,
-    responses((status = 200, body = AgeGateReviewResponse))
+    responses(
+        (status = 200, body = AgeGateReviewResponse),
+        (status = 400, description = "A scan or curation grant without a reason, or an invalid expiry"),
+        (status = 403, description = "No security_review capability, a narrowed token, or the caller requested this exception"),
+    )
 )]
 pub async fn approve_exception(
     state: State<SharedState>,
@@ -953,7 +986,12 @@ pub async fn reopen_exception(
     tag = "age-gate",
     security(("bearer_auth" = [])),
     request_body = CreateExceptionRequest,
-    responses((status = 200, body = AgeGateReviewResponse))
+    responses(
+        (status = 200, body = AgeGateReviewResponse),
+        (status = 400, description = "Unknown gate, or a missing or oversized field"),
+        (status = 404, description = "Repository not found or not visible to the caller"),
+        (status = 409, description = "The caller already has the maximum number of open requests"),
+    )
 )]
 pub async fn request_exception(
     State(state): State<SharedState>,
@@ -995,6 +1033,8 @@ pub async fn request_exception(
         digest: None,
     };
 
+    exception_queue::require_open_request_budget(&state.db, auth.user_id, &coord).await?;
+
     let id = exception_queue::file_request(
         &state.db,
         Some(&state.event_bus),
@@ -1018,6 +1058,8 @@ pub async fn request_exception(
                     "gate": gate,
                     "package": coord.package_name,
                     "version": coord.package_version,
+                    // The row keeps only the latest requester's reason, so the audit keeps each one
+                    "justification": body.justification.trim(),
                 })),
         )
         .await;
@@ -1475,6 +1517,7 @@ mod tests {
             gate: Some("age".to_string()),
             justification: None,
             requested_by: None,
+            requested_by_username: None,
             expires_at: None,
             basis_digest: None,
         }
@@ -1533,6 +1576,33 @@ mod tests {
             require_security_review(&pool, &auth).await,
             Err(AppError::Authorization(_))
         ));
+    }
+
+    /// The queue spans every repository, so a repo-restricted admin token is refused too
+    #[tokio::test]
+    async fn a_repo_restricted_admin_token_cannot_reach_the_queue() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::lazy_pool();
+        let mut auth = tdh::make_auth(Uuid::new_v4(), "admin");
+        auth.is_admin = true;
+        assert!(require_security_review(&pool, &auth).await.is_ok());
+        auth.allowed_repo_ids =
+            crate::models::access_scope::AccessScope::Restricted(vec![Uuid::new_v4()]);
+        assert!(matches!(
+            require_security_review(&pool, &auth).await,
+            Err(AppError::Authorization(_))
+        ));
+    }
+
+    #[test]
+    fn a_requester_never_grants_their_own_exception() {
+        let me = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        assert!(require_not_own_request(Some(me), me, false).is_err());
+        assert!(require_not_own_request(Some(other), me, false).is_ok());
+        assert!(require_not_own_request(None, me, false).is_ok());
+        // The age gate keeps its contract: an admin could always approve any age row
+        assert!(require_not_own_request(Some(me), me, true).is_ok());
     }
 
     #[test]
@@ -2419,6 +2489,32 @@ mod tests {
             "an omitted gate lists every gate here"
         );
         assert_eq!(list["items"][0]["gate"], "scan");
+
+        // Separation of duties: the reviewer who asked for it cannot grant it
+        sqlx::query(
+            "UPDATE age_gate_reviews SET requested_by = $2, justification = 'mine' WHERE id = $1",
+        )
+        .bind(scan_id)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("file as the reviewer");
+        let (status, _) = tdh::send(
+            app(),
+            tdh::post(
+                format!("/reviews/{scan_id}/approve"),
+                "application/json",
+                body(),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(review_status(&pool, scan_id).await, "pending");
+        sqlx::query("UPDATE age_gate_reviews SET requested_by = NULL WHERE id = $1")
+            .bind(scan_id)
+            .execute(&pool)
+            .await
+            .expect("clear requester");
 
         let (status, _) = tdh::send(
             app(),
