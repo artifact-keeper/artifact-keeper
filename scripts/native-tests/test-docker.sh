@@ -262,8 +262,9 @@ else
     fail "Tags list does not contain expected tag: $TAGS_RESP"
 fi
 
-# Verify response has correct name field
-if echo "$TAGS_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['name']=='e2e-test'" 2>/dev/null; then
+# Verify response has correct name field: the full request name, repository
+# key included, as the distribution spec requires (#5794)
+if echo "$TAGS_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['name']=='$REPO_KEY/e2e-test'" 2>/dev/null; then
     pass "Tags list has correct name field"
 else
     fail "Tags list name field incorrect: $TAGS_RESP"

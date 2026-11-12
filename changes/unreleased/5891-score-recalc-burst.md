@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#5891]
+---
+- **Many scan results ingested at once into one repository no longer answer 500 "could not serialize access"** (#5891). The repository security score recalculation added by #5006 took its per-repository lock inside its REPEATABLE READ transaction, after the snapshot was taken. A recalculation that found the lock busy had to start over, every restart counted against its 8-attempt cap, and the last attempt computed from a stale snapshot and failed. With 6 or more concurrent `POST /api/v1/security/findings/external` calls (or scan completions) in one repository, some answered 500, even though the stored score ended up right. The lock is now taken on the connection before the transaction begins, so recalculations of one repository wait in line and each reads a snapshot that includes the previous one's commit. Only a real serialization conflict counts as a retry. If a recalculation is cancelled while it holds the lock, its connection is closed rather than returned to the pool, so the lock is never left held.
