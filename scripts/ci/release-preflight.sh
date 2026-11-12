@@ -140,6 +140,11 @@
 #      `DRAFT` marker. The 1.11.0 notes were drafted on main ahead of the cut
 #      with TODOs in HTML comments (#4468); a comment does not render, so an
 #      unfinished draft would publish silently as the Release body.
+#   7. END-TO-END PROOF FOR EVERY CLOSED BUG (advisory until the 1.12.0
+#      backfill lands; hard with PREFLIGHT_E2E_PROOF_MODE=enforce): every
+#      closed type:bug issue in the milestone has a tier wired into the
+#      release gate that COVERS it, a suite, or an exemption
+#      (scripts/ci/check-e2e-proof.py milestone). Rationale at the check.
 #
 # Exit-code contract (mirrors scripts/ci/check-migration-ledger.sh):
 #   0  ready       -- no blocking problem found.
@@ -949,6 +954,85 @@ else
       ok "${notes_file} has no TODO or DRAFT markers"
     fi
   fi
+fi
+echo
+
+# --- check 7: every closed bug in the milestone has an end-to-end proof ------
+#
+# Every bug fix must land with an end-to-end proof in artifact-keeper-test, or
+# an exemption that says why it cannot (CONTRIBUTING.md, "End-to-end proof for
+# bug fixes"). The PR-time check (require-e2e-proof.yml) can be satisfied
+# before the tier is wired, and a fix may merge before its test PR, so this is
+# the backstop: scripts/ci/check-e2e-proof.py milestone lists every closed
+# type:bug issue in the milestone named by the Cargo.toml version and needs,
+# for each, a tier that COVERS it and is wired into the release gate at the
+# tests ref, a suite its closing PR names, a row in
+# scripts/ci/e2e-exemptions.tsv, or an exemption on the closing PR. An issue
+# still labelled needs-e2e-test (deferred at PR time) blocks.
+#
+# The tests ref is the same-named artifact-keeper-test branch: main for main,
+# release/X.Y.x for a maintenance line (the line's gate runs that branch).
+#
+# ADVISORY BY DEFAULT while the 1.12.0 backfill lands: PREFLIGHT_E2E_PROOF_MODE
+#   advisory (default)  report the findings as [warn]; never blocks, never INFRA
+#   enforce             missing proof -> blocking (exit 1); could not
+#                       measure -> INFRA (exit 2), the same contract as 3-5
+# To make it blocking, change the default below to `enforce` (or set the
+# variable in release-preflight.yml).
+# Other overrides: PREFLIGHT_SKIP_E2E_PROOF=1 (do not run), PREFLIGHT_E2E_MILESTONE
+# (default: Cargo.toml version without a pre-release suffix), PREFLIGHT_TESTS_REF,
+# PREFLIGHT_TESTS_DIR (a local artifact-keeper-test checkout instead of a fetch),
+# PREFLIGHT_E2E_PROOF_CMD (the script; the self-test replaces it).
+echo "7) every closed bug in the milestone has an end-to-end proof (artifact-keeper-test)"
+e2e_mode="${PREFLIGHT_E2E_PROOF_MODE:-advisory}"
+e2e_cmd="${PREFLIGHT_E2E_PROOF_CMD:-scripts/ci/check-e2e-proof.py}"
+e2e_milestone="${PREFLIGHT_E2E_MILESTONE:-${cargo_ver%%-*}}"
+if is_release_branch_ref; then e2e_tests_ref_default="$AUDIT_REF"; else e2e_tests_ref_default="main"; fi
+e2e_tests_ref="${PREFLIGHT_TESTS_REF:-$e2e_tests_ref_default}"
+# Report one finding at the strength the mode allows.
+e2e_finding() { if [[ "$e2e_mode" == "enforce" ]]; then bad "$@"; else warn "$* (advisory; PREFLIGHT_E2E_PROOF_MODE=enforce blocks)"; fi; }
+if [[ "${PREFLIGHT_SKIP_E2E_PROOF:-0}" == "1" ]]; then
+  note "PREFLIGHT_SKIP_E2E_PROOF=1; skipped."
+elif [[ "$e2e_mode" != "advisory" && "$e2e_mode" != "enforce" ]]; then
+  bad "PREFLIGHT_E2E_PROOF_MODE='$e2e_mode' is neither advisory nor enforce"
+elif [[ -z "$e2e_milestone" ]]; then
+  note "no Cargo.toml version to name the milestone (check 2 reported it); skipped."
+elif [[ ! -f "$e2e_cmd" ]] || ! command -v python3 >/dev/null 2>&1; then
+  if [[ "$e2e_mode" == "enforce" ]]; then
+    echo "INFRA: ${e2e_cmd} or python3 is missing; check 7 cannot list the milestone's bugs" >&2
+    infra_exit
+  fi
+  warn "${e2e_cmd} or python3 is missing; check 7 not measured (advisory)"
+else
+  e2e_args=(milestone --milestone "$e2e_milestone" --repo "$REPO")
+  if [[ -n "${PREFLIGHT_TESTS_DIR:-}" ]]; then
+    e2e_args+=(--tests-dir "$PREFLIGHT_TESTS_DIR" --tests-ref "$e2e_tests_ref")
+  else
+    e2e_args+=(--tests-ref "$e2e_tests_ref")
+  fi
+  note "milestone ${e2e_milestone}, tests at artifact-keeper-test@${e2e_tests_ref}, mode ${e2e_mode}"
+  e2e_rc=0
+  e2e_out="$(python3 "$e2e_cmd" "${e2e_args[@]}" 2>&1)" || e2e_rc=$?
+  case "$e2e_rc" in
+    0)
+      ok "every closed bug in ${e2e_milestone} has an end-to-end proof or an exemption"
+      ;;
+    1)
+      e2e_finding "closed bugs in ${e2e_milestone} without an end-to-end proof in the gate:"
+      printf '%s\n' "$e2e_out" | grep -E '^  #[0-9]+ +(MISSING|DEFERRED|UNWIRED) ' | head -200 | cut -c1-150 | sed 's/^/  /' || true
+      printf '%s\n' "$e2e_out" | grep -E '^  totals:' | sed 's/^/  /' || true
+      note "  -> add a tier (COVERS=\"N\", a FIX #N case, wired into release-gate.yml), or a reviewed"
+      note "     row in scripts/ci/e2e-exemptions.tsv. CONTRIBUTING.md has the rules."
+      ;;
+    *)
+      if [[ "$e2e_mode" == "enforce" ]]; then
+        printf '%s\n' "$e2e_out" | tail -5 >&2
+        echo "INFRA: check 7 could not list the milestone's bugs or read artifact-keeper-test@${e2e_tests_ref}" >&2
+        infra_exit
+      fi
+      warn "check 7 could not be measured (advisory): $(printf '%s\n' "$e2e_out" | grep -m1 INFRA | cut -c1-120 || true)"
+      ;;
+  esac
 fi
 echo
 # --- verdict ----------------------------------------------------------------
