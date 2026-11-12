@@ -18,9 +18,15 @@
 //! Public / global repos are never enumerated (`exposure: everyone` /
 //! `effectively-everyone`).
 //!
+//! `GET /findings` (the drill-down behind the dashboard severity tiles) lists
+//! the vulnerabilities a tile counted, from the shared open-findings
+//! definition (#4338) so the list and the tile cannot disagree.
+//!
 //! Everything here is mounted under the `/admin` nest (admin_middleware),
 //! and each handler re-checks `is_admin` as defense in depth: download
-//! attribution is sensitive telemetry.
+//! attribution is sensitive telemetry. The drill-down goes further and
+//! refuses a repository-scoped admin token outright (#4550), because its rows
+//! name artifacts in every repository.
 
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -52,6 +58,8 @@ pub fn router() -> Router<SharedState> {
             "/artifact/:artifact_id/accessible-users",
             get(artifact_accessible_users),
         )
+        // Drill-down behind the dashboard severity tiles.
+        .route("/findings", get(list_cve_findings))
 }
 
 /// Default page size for the downloaders listing.
@@ -1085,13 +1093,195 @@ pub async fn artifact_accessible_users(
     ))
 }
 
+// === CVE drill-down behind the dashboard tiles ===
+
+/// Query for [`list_cve_findings`]. Omitting every filter lists every counted
+/// vulnerability.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ListCveFindingsQuery {
+    /// Restrict to one repository, as the per-repository tiles do.
+    pub repository_id: Option<Uuid>,
+    /// `critical` | `high` | `medium` | `low`. The dashboards' severity
+    /// buckets count OPEN vulnerabilities only (#4338), so a severity tile
+    /// links here with `state=open` to match its own number.
+    pub severity: Option<String>,
+    /// `open` | `acknowledged` | `all` (default). `fixed` is rejected: the
+    /// Fixed tile is derived by comparing scans, not from these rows.
+    pub state: Option<String>,
+    /// `artifact` rolls the same vulnerabilities up per affected artifact;
+    /// any other value is refused.
+    pub group_by: Option<String>,
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+}
+
+/// One vulnerability as the dashboards count it: a distinct (artifact,
+/// advisory) pair at its highest reported severity.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CveFindingRow {
+    pub artifact_id: Uuid,
+    pub artifact_path: String,
+    pub repository_id: Uuid,
+    /// The CVE id, upper-cased, or the finding title when the scanner
+    /// reported no CVE id (GHSA/OSV-only advisories, OpenSCAP rules).
+    pub cve_id: String,
+    pub severity: String,
+    /// True only when a live decision covers every finding row behind this
+    /// vulnerability (#5153), matching the tiles' `BOOL_AND`.
+    pub is_acknowledged: bool,
+    pub title: Option<String>,
+    pub affected_component: Option<String>,
+    pub affected_version: Option<String>,
+    pub fixed_version: Option<String>,
+    pub source_url: Option<String>,
+    pub repository_key: String,
+    /// Username of whoever acknowledged it most recently.
+    pub acknowledged_by: Option<String>,
+    pub acknowledged_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub acknowledged_reason: Option<String>,
+    /// When the earliest decision behind it lapses and it reopens (#5153).
+    /// `None`: until revoked, or not acknowledged.
+    pub acknowledgement_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Earliest detection across every scan, so it does not reset on rescan.
+    pub first_detected_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One affected artifact, for `group_by=artifact`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AffectedArtifactRow {
+    pub artifact_id: Uuid,
+    pub artifact_path: String,
+    pub repository_id: Uuid,
+    pub critical: i64,
+    pub high: i64,
+    pub medium: i64,
+    pub low: i64,
+    pub total: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ListCveFindingsResponse {
+    pub items: Vec<CveFindingRow>,
+    /// Populated instead of `items` when `group_by=artifact`.
+    pub artifacts: Vec<AffectedArtifactRow>,
+    /// Rows before paging: vulnerabilities, or artifacts under
+    /// `group_by=artifact`, because that is what the page is over.
+    pub total: i64,
+}
+
+/// Map a severity word onto the rank the shared counts CTE assigns
+/// (`open_findings::SEVERITY_RANK_SQL`).
+fn severity_rank(word: &str) -> Result<i32> {
+    match word.to_ascii_lowercase().as_str() {
+        "critical" => Ok(4),
+        "high" => Ok(3),
+        "medium" => Ok(2),
+        "low" => Ok(1),
+        other => Err(AppError::Validation(format!(
+            "unknown severity {other:?}; expected critical, high, medium or low"
+        ))),
+    }
+}
+
+/// Map a state word onto the `acknowledged` predicate the shared counts CTE
+/// assigns. `fixed` is refused rather than ignored: the Fixed tile is derived
+/// by comparing scans (a CVE an earlier scan reported and the latest one no
+/// longer does), so it has no row here, and silently serving it as "all"
+/// would show a list that disagrees with the tile that linked to it.
+fn state_ack_filter(word: &str) -> Result<Option<bool>> {
+    match word.to_ascii_lowercase().as_str() {
+        "open" => Ok(Some(false)),
+        "acknowledged" | "ack" => Ok(Some(true)),
+        "all" => Ok(None),
+        "fixed" => Err(AppError::Validation(
+            "state=fixed is not listable: the fixed count is derived by comparing scans, \
+             not from the finding rows this endpoint pages over"
+                .to_string(),
+        )),
+        other => Err(AppError::Validation(format!(
+            "unknown state {other:?}; expected open, acknowledged or all"
+        ))),
+    }
+}
+
+/// Whether `group_by` asks for the per-artifact roll-up. An unknown value is
+/// refused, like an unknown state, rather than served as the flat list.
+fn group_by_artifact(word: Option<&str>) -> Result<bool> {
+    match word {
+        None => Ok(false),
+        Some(w) if w.eq_ignore_ascii_case("artifact") => Ok(true),
+        Some(other) => Err(AppError::Validation(format!(
+            "unknown group_by {other:?}; expected artifact"
+        ))),
+    }
+}
+
+/// List the vulnerabilities behind a dashboard tile, `total` equals the tile.
+///
+/// The rows come from the same `vulnerabilities` CTE the tiles count with
+/// ([`crate::services::open_findings`], #4338), so the two cannot disagree.
+#[utoipa::path(
+    get,
+    path = "/findings",
+    context_path = "/api/v1/admin/security",
+    tag = "admin",
+    params(ListCveFindingsQuery),
+    responses(
+        (status = 200, description = "Vulnerabilities behind a dashboard tile", body = ListCveFindingsResponse),
+        (status = 400, description = "Unknown severity, state or group_by, or state=fixed"),
+        (status = 403, description = "Admin privileges required, or the token is repository-scoped")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_cve_findings(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Query(query): Query<ListCveFindingsQuery>,
+) -> Result<Json<ListCveFindingsResponse>> {
+    // Artifact paths and CVE ids from every repository, where the tiles
+    // disclose only counts: a repository-scoped admin token is refused like
+    // on the other instance-wide listings (#4550, #4273).
+    auth.require_unscoped_admin("the vulnerability drill-down")?;
+
+    let rank = query.severity.as_deref().map(severity_rank).transpose()?;
+    let ack = query
+        .state
+        .as_deref()
+        .map(state_ack_filter)
+        .transpose()?
+        .flatten();
+    let by_artifact = group_by_artifact(query.group_by.as_deref())?;
+    let (offset, limit, _, _) = blast_page_bounds(query.page, query.per_page);
+
+    let svc = crate::services::sbom_service::SbomService::new(state.db.clone());
+    if by_artifact {
+        let (artifacts, total) = svc
+            .list_affected_artifacts(query.repository_id, rank, ack, limit, offset)
+            .await?;
+        return Ok(Json(ListCveFindingsResponse {
+            items: Vec::new(),
+            artifacts,
+            total,
+        }));
+    }
+    let (items, total) = svc
+        .list_cve_findings(query.repository_id, rank, ack, limit, offset)
+        .await?;
+    Ok(Json(ListCveFindingsResponse {
+        items,
+        artifacts: Vec::new(),
+        total,
+    }))
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
         cve_blast_radius,
         artifact_blast_radius,
         cve_accessible_users,
-        artifact_accessible_users
+        artifact_accessible_users,
+        list_cve_findings,
     ),
     components(schemas(
         BlastRadiusResponse,
@@ -1103,6 +1293,9 @@ pub async fn artifact_accessible_users(
         AccessibleUsersResponse,
         RepoExposure,
         AccessibleUser,
+        CveFindingRow,
+        AffectedArtifactRow,
+        ListCveFindingsResponse,
     ))
 )]
 pub struct AdminSecurityApiDoc;
@@ -1115,6 +1308,48 @@ mod tests {
     // -----------------------------------------------------------------------
     // Pure helpers — no DB required.
     // -----------------------------------------------------------------------
+
+    /// The severity words the API accepts must map onto the ranks the shared
+    /// counts CTE assigns, or a tile and its list disagree silently.
+    #[test]
+    fn severity_words_map_onto_the_shared_rank_table() {
+        for (word, rank) in [("critical", 4), ("high", 3), ("medium", 2), ("low", 1)] {
+            assert_eq!(severity_rank(word).expect(word), rank);
+            assert!(crate::services::open_findings::SEVERITY_RANK_SQL
+                .contains(&format!("WHEN '{word}' THEN {rank}")));
+        }
+        assert!(severity_rank("CRITICAL").is_ok(), "case-insensitive");
+        assert!(severity_rank("info").is_err(), "no info tile to drill into");
+        assert!(severity_rank("'; DROP TABLE artifacts; --").is_err());
+    }
+
+    /// `fixed` is refused, not quietly treated as "all": the Fixed tile is
+    /// derived by comparing scans, so there is no row here to list and a
+    /// silent fallback would show a list that contradicts the tile.
+    #[test]
+    fn state_fixed_is_refused_rather_than_served_as_everything() {
+        assert_eq!(state_ack_filter("open").expect("open"), Some(false));
+        assert_eq!(state_ack_filter("acknowledged").expect("ack"), Some(true));
+        assert_eq!(state_ack_filter("ack").expect("ack"), Some(true));
+        assert_eq!(state_ack_filter("all").expect("all"), None);
+        let err = state_ack_filter("fixed").expect_err("fixed must not list");
+        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+        assert!(matches!(
+            state_ack_filter("whatever").expect_err("unknown state"),
+            AppError::Validation(_)
+        ));
+    }
+
+    #[test]
+    fn group_by_accepts_artifact_and_refuses_anything_else() {
+        assert!(!group_by_artifact(None).expect("absent"));
+        assert!(group_by_artifact(Some("artifact")).expect("artifact"));
+        assert!(group_by_artifact(Some("Artifact")).expect("case-insensitive"));
+        assert!(matches!(
+            group_by_artifact(Some("cve")).expect_err("unknown group_by"),
+            AppError::Validation(_)
+        ));
+    }
 
     #[test]
     fn test_blast_page_bounds_defaults() {
@@ -2179,5 +2414,26 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
 
         tdh::cleanup_user(&pool, user_id).await;
+    }
+}
+
+/// Through the real router: the `/admin` nest's `admin_middleware` and the
+/// handler's unscoped-admin gate, for every credential shape (#4550).
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod router_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    #[tokio::test]
+    async fn findings_refuse_anonymous_non_admin_and_repo_scoped_admin_tokens() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        tdh::assert_admin_routes_refuse_repo_scoped_tokens(
+            &fx,
+            &["/api/v1/admin/security/findings"],
+        )
+        .await;
+        fx.teardown().await;
     }
 }
