@@ -1699,6 +1699,12 @@ impl LifecycleService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?
             .rows_affected();
+        // #5793: an image whose manifest rows for a digest the policy just
+        // trashed no longer holds that digest, so its link goes too (or the
+        // digest would resolve under it again once the trash is purged).
+        crate::services::oci_image_scope::unlink_deleted_manifests(&mut *conn, scope.repo_filter())
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
         if removed > 0 {
             tracing::info!(
                 "Lifecycle cascade: removed {} stale oci_tags rows for soft-deleted manifests (scope: {})",

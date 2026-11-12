@@ -3273,6 +3273,124 @@ pub(crate) fn upstream_candidate_indices(classes: &[MemberCacheClass]) -> Vec<us
 /// [`resolve_members_two_phase`]).
 pub(crate) const MAX_VIRTUAL_FANOUT: usize = 16;
 
+/// How a [`resolve_members_two_phase`] walk treats each Remote member's
+/// upstream answer beyond plain priority order (#5810). The default (no
+/// deadline) waits for every member as long as its upstream client allows.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct MemberWalk<'p> {
+    /// The requested path, for the log lines a member's miss writes.
+    pub(crate) path: &'p str,
+    /// How long one member may take to produce its outcome before it is
+    /// treated as unavailable for this request.
+    pub(crate) deadline: Option<std::time::Duration>,
+}
+
+impl<'p> MemberWalk<'p> {
+    /// The walk an artifact download through `proxy_service` makes:
+    /// bounded by [`virtual_member_download_deadline`] (no deadline without
+    /// a proxy: no member can then reach an upstream).
+    pub(crate) fn download(proxy_service: Option<&ProxyService>, path: &'p str) -> Self {
+        Self {
+            path,
+            deadline: proxy_service
+                .and_then(|p| virtual_member_download_deadline(p.upstream_read_timeout())),
+        }
+    }
+}
+
+/// Environment variable bounding, in seconds, how long one Remote member of a
+/// virtual repository may take to start answering an artifact download
+/// (#5810) before the walk serves the next member. `0` disables the deadline.
+pub const VIRTUAL_MEMBER_DOWNLOAD_DEADLINE_ENV: &str = "AK_VIRTUAL_MEMBER_DOWNLOAD_DEADLINE_SECS";
+
+/// Default download deadline (#5810). Like the metadata member deadline
+/// ([`DEFAULT_VIRTUAL_MEMBER_METADATA_TIMEOUT_SECS`]), far above a healthy
+/// member's time to first byte and well under the 60 s upstream read timeout
+/// a hung member used to add to every download.
+pub const DEFAULT_VIRTUAL_MEMBER_DOWNLOAD_DEADLINE_SECS: u64 = 20;
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Test-only override of [`virtual_member_download_deadline`] for the
+    /// requests a test drives (see [`with_virtual_member_download_deadline`]).
+    static VIRTUAL_MEMBER_DOWNLOAD_DEADLINE_OVERRIDE: Option<std::time::Duration>;
+}
+
+/// [`VIRTUAL_MEMBER_DOWNLOAD_DEADLINE_ENV`] as a number of seconds:
+/// [`DEFAULT_VIRTUAL_MEMBER_DOWNLOAD_DEADLINE_SECS`] when unset or not a
+/// number, `0` (disabled) when set to zero.
+fn parse_virtual_member_download_deadline_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_VIRTUAL_MEMBER_DOWNLOAD_DEADLINE_SECS)
+}
+
+/// The download deadline for `secs`, clamped to the upstream read timeout
+/// (`PROXY_UPSTREAM_READ_TIMEOUT_SECS`) since a longer one could never fire
+/// before the client gives up on the member itself. `None` when disabled.
+fn clamp_virtual_member_download_deadline(
+    secs: u64,
+    read_timeout: std::time::Duration,
+) -> Option<std::time::Duration> {
+    (secs > 0).then(|| std::time::Duration::from_secs(secs).min(read_timeout))
+}
+
+/// The per-member download deadline (#5810) for a proxy whose upstream read
+/// timeout is `read_timeout`: [`VIRTUAL_MEMBER_DOWNLOAD_DEADLINE_ENV`]
+/// (default [`DEFAULT_VIRTUAL_MEMBER_DOWNLOAD_DEADLINE_SECS`]) clamped to it,
+/// or `None` when the variable is `0`.
+pub fn virtual_member_download_deadline(
+    read_timeout: std::time::Duration,
+) -> Option<std::time::Duration> {
+    #[cfg(test)]
+    if let Ok(deadline) = VIRTUAL_MEMBER_DOWNLOAD_DEADLINE_OVERRIDE.try_with(|d| *d) {
+        return deadline;
+    }
+    static SECS: OnceLock<u64> = OnceLock::new();
+    let secs = *SECS.get_or_init(|| {
+        parse_virtual_member_download_deadline_secs(
+            std::env::var(VIRTUAL_MEMBER_DOWNLOAD_DEADLINE_ENV)
+                .ok()
+                .as_deref(),
+        )
+    });
+    clamp_virtual_member_download_deadline(secs, read_timeout)
+}
+
+/// Run `fut` with the download deadline set to `deadline` (`None`: disabled)
+/// for every virtual download it makes on this task. Test-only.
+#[cfg(test)]
+pub(crate) async fn with_virtual_member_download_deadline<F: std::future::Future>(
+    deadline: Option<std::time::Duration>,
+    fut: F,
+) -> F::Output {
+    VIRTUAL_MEMBER_DOWNLOAD_DEADLINE_OVERRIDE
+        .scope(deadline, fut)
+        .await
+}
+
+/// Count and log `member` missing the download deadline (#5810) on `path`:
+/// the walk treats it as unavailable for this request and serves the next
+/// member.
+pub fn record_virtual_member_download_deadline_miss(
+    member: &str,
+    path: &str,
+    deadline: std::time::Duration,
+) {
+    metrics::counter!(
+        "ak_virtual_member_download_timeouts_total",
+        "member" => member.to_string(),
+    )
+    .increment(1);
+    tracing::warn!(
+        member = %member,
+        path = %redact_proxy_path_for_diagnostics(path),
+        deadline_secs = deadline.as_secs_f64(),
+        "virtual member did not start answering a download within the member deadline \
+         ({VIRTUAL_MEMBER_DOWNLOAD_DEADLINE_ENV}); its answer is discarded and the next \
+         member is tried"
+    );
+}
+
 /// Two-phase, priority-preserving virtual-member resolution (#2069).
 ///
 /// Pass 1 calls `probe` on members in priority order, stopping at the first
@@ -3335,6 +3453,20 @@ pub(crate) const MAX_VIRTUAL_FANOUT: usize = 16;
 ///   it only includes candidates ranked above the first Pass-1 cache hit, minus
 ///   the top one already confirmed.
 ///
+/// Per-member download deadline (#5810): with [`MemberWalk::deadline`] set,
+/// every Pass-2 `upstream` call (the confirmed top candidate and each fan-out
+/// future) is bounded by it. A member that has not produced its
+/// outcome by then is [`MemberResolveOutcome::Unavailable`] for this request:
+/// its late answer is discarded (the future is dropped), the miss is counted
+/// in `ak_virtual_member_download_timeouts_total{member}` and logged, and the
+/// walk settles the next member in priority order. Every member that answers
+/// inside the deadline keeps its priority. The download `upstream` closures
+/// return once the member's response headers (and, when it declares a
+/// `Content-Length`, its first body byte, #4759) are in, so this bounds the
+/// time to first byte only, never the body transfer. Pass 1 is not bounded:
+/// it never contacts an upstream. `None` waits for every member as long as
+/// its upstream client allows.
+///
 /// Runs in an `INTERNAL` `resolve_virtual_members` span (#4455); each member's
 /// proxy fetch is a `proxy_fetch` child of it.
 #[tracing::instrument(
@@ -3352,6 +3484,7 @@ pub(crate) async fn resolve_members_two_phase<'a, T, E, P, PFut, U, UFut>(
     members: &'a [Repository],
     probe: P,
     upstream: U,
+    walk: MemberWalk<'a>,
 ) -> Option<MemberResolveOutcome<T, E>>
 where
     P: Fn(&'a Repository) -> PFut,
@@ -3406,6 +3539,22 @@ where
     };
 
     let upstream = &upstream;
+    // #5810: each member's upstream answer, bounded by the download deadline.
+    let bounded = move |member: &'a Repository| {
+        let fetch = upstream(member);
+        async move {
+            let Some(deadline) = walk.deadline else {
+                return fetch.await;
+            };
+            match tokio::time::timeout(deadline, fetch).await {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    record_virtual_member_download_deadline_miss(&member.key, walk.path, deadline);
+                    MemberResolveOutcome::Unavailable
+                }
+            }
+        }
+    };
 
     // Pass 2, step 1 — confirm the HIGHEST-priority candidate on its own. If it
     // produces a non-miss it is the overall winner (nothing outranks it), so we
@@ -3413,7 +3562,7 @@ where
     // cold-positive fan-out for the common "top member has it" case (#2069): a
     // first request for an artifact the top remote member holds costs exactly
     // one upstream request, not one per member.
-    let first_outcome = upstream(&members[first]).await;
+    let first_outcome = bounded(&members[first]).await;
     if !first_outcome.passes() {
         return Some(first_outcome);
     }
@@ -3441,7 +3590,8 @@ where
         .enumerate()
         .map(|(rank, &i)| {
             let member = &members[i];
-            async move { (rank, upstream(member).await) }
+            let fetch = bounded(member);
+            async move { (rank, fetch.await) }
         })
         .collect();
 
@@ -3963,6 +4113,8 @@ where
                 None => MemberResolveOutcome::Miss,
             }
         },
+        // #5810: a hung member is passed over after the download deadline.
+        MemberWalk::download(proxy_service, path),
     )
     .await;
 
@@ -4248,6 +4400,8 @@ where
                     None => MemberResolveOutcome::Miss,
                 }
             },
+            // #5810: a hung member is passed over after the download deadline.
+            MemberWalk::download(proxy_service, path),
         )
         .await;
 
@@ -4451,6 +4605,13 @@ where
                     MemberResolveOutcome::Miss
                 }
             }
+        },
+        // The `upstream` closure already bounds each member by the metadata
+        // member deadline (#4508), whose miss ends the walk with a 502 naming
+        // the member, so no download deadline applies on top (#5810).
+        MemberWalk {
+            path,
+            ..MemberWalk::default()
         },
     )
     .await;
@@ -15940,6 +16101,219 @@ mod tests {
         vec![test_local_member("m0"), test_local_member("m1")]
     }
 
+    // ── #5810: per-member download deadline in the two-phase walk ──
+    //
+    // Every member needs an upstream round-trip (Pass 1 is a cache miss), so
+    // the walk confirms the top candidate alone and then fans out over the
+    // rest. Time is paused: a hung member is `pending()` forever, and the
+    // clock only moves when every task is idle, so the elapsed time is
+    // exactly the deadline the walk waited, independent of the runner.
+
+    const DEADLINE_5810: std::time::Duration = std::time::Duration::from_secs(20);
+
+    fn members_5810(keys: &[&str]) -> Vec<Repository> {
+        keys.iter().map(|k| test_local_member(k)).collect()
+    }
+
+    fn deadline_5810(after: std::time::Duration) -> MemberWalk<'static> {
+        MemberWalk {
+            path: "com/example/lib/1.0/lib-1.0.jar",
+            deadline: Some(after),
+        }
+    }
+
+    /// Resolve `members` where every member needs upstream and `answer`
+    /// says what each member's upstream does, given its key: `None` hangs
+    /// forever, `Some((delay, outcome))` answers `outcome` after `delay`.
+    async fn walk_5810(
+        members: &[Repository],
+        answer: impl Fn(&str) -> Option<(std::time::Duration, MemberResolveOutcome<String, String>)>,
+        walk: MemberWalk<'static>,
+    ) -> (
+        Option<MemberResolveOutcome<String, String>>,
+        std::time::Duration,
+    ) {
+        let started = tokio::time::Instant::now();
+        let answer = &answer;
+        let out = resolve_members_two_phase::<String, String, _, _, _, _>(
+            members,
+            |_m| async move { (MemberCacheClass::NeedsUpstream, None) },
+            |m| {
+                let planned = answer(&m.key);
+                async move {
+                    match planned {
+                        Some((delay, outcome)) => {
+                            tokio::time::sleep(delay).await;
+                            outcome
+                        }
+                        None => std::future::pending().await,
+                    }
+                }
+            },
+            walk,
+        )
+        .await;
+        (out, started.elapsed())
+    }
+
+    fn hit_5810(v: &str) -> Option<(std::time::Duration, MemberResolveOutcome<String, String>)> {
+        Some((
+            std::time::Duration::ZERO,
+            MemberResolveOutcome::Hit(v.to_string()),
+        ))
+    }
+
+    /// #5810: a hung top candidate no longer holds a lower member's hit for
+    /// the upstream read timeout; the hit is served at the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn two_phase_hung_top_candidate_serves_lower_hit_at_deadline_5810() {
+        let members = members_5810(&["hung", "ok"]);
+        let (out, elapsed) = walk_5810(
+            &members,
+            |k| if k == "ok" { hit_5810("ok") } else { None },
+            deadline_5810(DEADLINE_5810),
+        )
+        .await;
+        match out {
+            Some(MemberResolveOutcome::Hit(v)) => assert_eq!(v, "ok"),
+            other => panic!("expected the lower member's hit, got {other:?}"),
+        }
+        assert_eq!(elapsed, DEADLINE_5810, "served exactly at the deadline");
+    }
+
+    /// #5810: a hung member in the middle of the fan-out is passed over at
+    /// the deadline, and the next member in priority order wins, not the
+    /// fastest one.
+    #[tokio::test(start_paused = true)]
+    async fn two_phase_hung_middle_candidate_in_fan_out_5810() {
+        let members = members_5810(&["miss", "hung", "slow", "fast"]);
+        let (out, elapsed) = walk_5810(
+            &members,
+            |k| match k {
+                "miss" => Some((std::time::Duration::ZERO, MemberResolveOutcome::Miss)),
+                "slow" => Some((
+                    std::time::Duration::from_secs(5),
+                    MemberResolveOutcome::Hit("slow".to_string()),
+                )),
+                "fast" => hit_5810("fast"),
+                _ => None,
+            },
+            deadline_5810(DEADLINE_5810),
+        )
+        .await;
+        match out {
+            Some(MemberResolveOutcome::Hit(v)) => {
+                assert_eq!(v, "slow", "priority still decides among answering members")
+            }
+            other => panic!("expected the next member's hit, got {other:?}"),
+        }
+        assert_eq!(elapsed, DEADLINE_5810);
+    }
+
+    /// #5810: when every member is hung the walk is `Unavailable` (the
+    /// retryable 503), after one deadline for the top candidate and one for
+    /// the fan-out, which runs its members in parallel.
+    #[tokio::test(start_paused = true)]
+    async fn two_phase_all_members_hung_is_unavailable_5810() {
+        let members = members_5810(&["a", "b", "c"]);
+        let (out, elapsed) = walk_5810(&members, |_| None, deadline_5810(DEADLINE_5810)).await;
+        assert!(
+            matches!(out, Some(MemberResolveOutcome::Unavailable)),
+            "expected Unavailable, got {out:?}"
+        );
+        assert_eq!(elapsed, DEADLINE_5810 * 2);
+    }
+
+    /// #5810: no deadline (`AK_VIRTUAL_MEMBER_DOWNLOAD_DEADLINE_SECS=0`)
+    /// restores the old wait: the walk holds the lower hit until the hung
+    /// member's own upstream timeout ends it.
+    #[tokio::test(start_paused = true)]
+    async fn two_phase_without_deadline_waits_for_the_member_5810() {
+        let members = members_5810(&["slow-fail", "ok"]);
+        let read_timeout = std::time::Duration::from_secs(60);
+        let (out, elapsed) = walk_5810(
+            &members,
+            |k| match k {
+                "slow-fail" => Some((read_timeout, MemberResolveOutcome::Unavailable)),
+                _ => hit_5810("ok"),
+            },
+            MemberWalk::default(),
+        )
+        .await;
+        match out {
+            Some(MemberResolveOutcome::Hit(v)) => assert_eq!(v, "ok"),
+            other => panic!("expected the lower member's hit, got {other:?}"),
+        }
+        assert_eq!(elapsed, read_timeout, "no deadline: waits the full timeout");
+    }
+
+    /// #5810: a higher member answering inside the deadline still wins over
+    /// a lower member that answered first, in both the top-candidate step
+    /// and the fan-out.
+    #[tokio::test(start_paused = true)]
+    async fn two_phase_member_inside_deadline_keeps_priority_5810() {
+        let just_inside = DEADLINE_5810 - std::time::Duration::from_millis(1);
+        let members = members_5810(&["top", "low"]);
+        let (out, elapsed) = walk_5810(
+            &members,
+            |k| match k {
+                "top" => Some((just_inside, MemberResolveOutcome::Hit("top".to_string()))),
+                _ => hit_5810("low"),
+            },
+            deadline_5810(DEADLINE_5810),
+        )
+        .await;
+        match out {
+            Some(MemberResolveOutcome::Hit(v)) => assert_eq!(v, "top"),
+            other => panic!("expected the top member's hit, got {other:?}"),
+        }
+        assert_eq!(elapsed, just_inside);
+
+        let members = members_5810(&["miss", "mid", "low"]);
+        let (out, _) = walk_5810(
+            &members,
+            |k| match k {
+                "miss" => Some((std::time::Duration::ZERO, MemberResolveOutcome::Miss)),
+                "mid" => Some((just_inside, MemberResolveOutcome::Hit("mid".to_string()))),
+                _ => hit_5810("low"),
+            },
+            deadline_5810(DEADLINE_5810),
+        )
+        .await;
+        match out {
+            Some(MemberResolveOutcome::Hit(v)) => assert_eq!(v, "mid"),
+            other => panic!("expected the middle member's hit, got {other:?}"),
+        }
+    }
+
+    /// #5810: the deadline setting. Unset or garbage is the default, `0`
+    /// disables it, and it never exceeds the upstream read timeout.
+    #[test]
+    fn virtual_member_download_deadline_setting_5810() {
+        use std::time::Duration;
+        assert_eq!(
+            parse_virtual_member_download_deadline_secs(None),
+            DEFAULT_VIRTUAL_MEMBER_DOWNLOAD_DEADLINE_SECS
+        );
+        assert_eq!(
+            parse_virtual_member_download_deadline_secs(Some("soon")),
+            DEFAULT_VIRTUAL_MEMBER_DOWNLOAD_DEADLINE_SECS
+        );
+        assert_eq!(parse_virtual_member_download_deadline_secs(Some(" 7 ")), 7);
+        assert_eq!(parse_virtual_member_download_deadline_secs(Some("0")), 0);
+        let read = Duration::from_secs(60);
+        assert_eq!(clamp_virtual_member_download_deadline(0, read), None);
+        assert_eq!(
+            clamp_virtual_member_download_deadline(20, read),
+            Some(Duration::from_secs(20))
+        );
+        assert_eq!(
+            clamp_virtual_member_download_deadline(600, read),
+            Some(read),
+            "clamped to PROXY_UPSTREAM_READ_TIMEOUT_SECS"
+        );
+    }
+
     /// #4931: `member_count` must be an OTLP integer, not a string. The field
     /// is a `usize`, which has no OpenTelemetry value type; converting it at
     /// the span keeps dashboards able to aggregate it numerically.
@@ -15954,6 +16328,7 @@ mod tests {
             &members,
             |_m| async move { (MemberCacheClass::DefiniteMiss, None) },
             |_m| async move { MemberResolveOutcome::Miss },
+            MemberWalk::default(),
         )
         .await;
         assert!(out.is_none());
@@ -15990,6 +16365,7 @@ mod tests {
                 c.fetch_add(1, Ordering::SeqCst);
                 async move { MemberResolveOutcome::Hit("upstream".to_string()) }
             },
+            MemberWalk::default(),
         )
         .await;
         match out {
@@ -16020,6 +16396,7 @@ mod tests {
                 async move { class }
             },
             |_m| async move { MemberResolveOutcome::Hit("upstream0".to_string()) },
+            MemberWalk::default(),
         )
         .await;
         match out {
@@ -16045,6 +16422,7 @@ mod tests {
                 async move { class }
             },
             |_m| async move { MemberResolveOutcome::Miss },
+            MemberWalk::default(),
         )
         .await;
         match out {
@@ -16067,6 +16445,7 @@ mod tests {
                 c.fetch_add(1, Ordering::SeqCst);
                 async move { MemberResolveOutcome::Hit("x".to_string()) }
             },
+            MemberWalk::default(),
         )
         .await;
         assert!(out.is_none());
@@ -16087,6 +16466,7 @@ mod tests {
                 };
                 async move { r }
             },
+            MemberWalk::default(),
         )
         .await;
         match out {
@@ -16116,6 +16496,7 @@ mod tests {
                     }
                 }
             },
+            MemberWalk::default(),
         )
         .await;
         match out {
@@ -16153,6 +16534,7 @@ mod tests {
                     }
                 }
             },
+            MemberWalk::default(),
         )
         .await;
         assert!(
@@ -16196,6 +16578,7 @@ mod tests {
                 u.fetch_add(1, Ordering::SeqCst);
                 async move { MemberResolveOutcome::Hit("upstream".to_string()) }
             },
+            MemberWalk::default(),
         )
         .await;
         assert!(matches!(out, Some(MemberResolveOutcome::Hit(ref v)) if v == "hit0"));
@@ -16234,6 +16617,7 @@ mod tests {
                 let key = m.key.clone();
                 async move { MemberResolveOutcome::Hit(format!("hit-{key}")) }
             },
+            MemberWalk::default(),
         )
         .await;
         match out {
@@ -16269,6 +16653,7 @@ mod tests {
                     }
                 }
             },
+            MemberWalk::default(),
         )
         .await;
         match out {
@@ -16319,6 +16704,7 @@ mod tests {
                 };
                 async move { outcome }
             },
+            MemberWalk::default(),
         )
         .await
     }
