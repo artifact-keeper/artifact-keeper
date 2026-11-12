@@ -7,13 +7,16 @@ use chrono::{DateTime, Utc};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::Arc;
 use tar::{Archive, Builder};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio_util::io::{ReaderStream, StreamReader, SyncIoBridge};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -440,15 +443,42 @@ const RESTORE_TABLE_ORDER: &[&str] = &[
     "api_tokens",
 ];
 
-/// Build a tar.gz archive from pre-fetched table data and artifact data.
-///
-/// Uses `tar::Builder::append_data` instead of `header.set_path` + `tar.append`
-/// so that paths longer than 100 characters are written as GNU LongLink
-/// extensions (fixes #758).
-///
-/// `tables` is a list of (table_name, json_bytes) pairs.
-/// `artifacts` is a list of (storage_key, content) pairs.
-/// `manifest` is the serialized backup manifest.
+/// Entries queued for the archive writer, each an open stream, not its bytes
+const ARCHIVE_QUEUE_DEPTH: usize = 2;
+
+const ARCHIVE_CHUNK: usize = 256 * 1024;
+
+struct ArchiveEntry {
+    /// Name the payload checksum covers, a table name or a storage key
+    name: String,
+    path: String,
+    size: u64,
+    body: BoxStream<'static, Result<Bytes>>,
+}
+
+enum ArchivePiece {
+    Entry(ArchiveEntry),
+    /// The writer fills in the payload checksum and appends it last
+    Seal(BackupManifest),
+}
+
+/// `append_data` writes paths over 100 characters as GNU LongLink (#758)
+fn append_tar_entry<W: Write>(
+    tar: &mut Builder<W>,
+    path: &str,
+    size: u64,
+    data: impl Read,
+) -> Result<()> {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(size);
+    header.set_mode(0o644);
+    header.set_mtime(Utc::now().timestamp() as u64);
+    header.set_cksum();
+    tar.append_data(&mut header, path, data)?;
+    Ok(())
+}
+
+#[cfg(test)]
 fn build_backup_tar(
     tables: &[(&str, &[u8])],
     artifacts: &[(&str, &[u8])],
@@ -458,39 +488,281 @@ fn build_backup_tar(
     {
         let encoder = GzEncoder::new(&mut tar_buffer, Compression::default());
         let mut tar = Builder::new(encoder);
-
         for (table, json_bytes) in tables {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(json_bytes.len() as u64);
-            header.set_mode(0o644);
-            header.set_mtime(Utc::now().timestamp() as u64);
-            header.set_cksum();
-
-            tar.append_data(&mut header, format!("database/{}.json", table), *json_bytes)?;
+            let path = format!("database/{}.json", table);
+            append_tar_entry(&mut tar, &path, json_bytes.len() as u64, *json_bytes)?;
         }
-
         for (key, content) in artifacts {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(content.len() as u64);
-            header.set_mode(0o644);
-            header.set_mtime(Utc::now().timestamp() as u64);
-            header.set_cksum();
-
-            tar.append_data(&mut header, format!("artifacts/{}", key), *content)?;
+            let path = format!("artifacts/{}", key);
+            append_tar_entry(&mut tar, &path, content.len() as u64, *content)?;
         }
-
-        let mut header = tar::Header::new_gnu();
-        header.set_size(manifest.len() as u64);
-        header.set_mode(0o644);
-        header.set_mtime(Utc::now().timestamp() as u64);
-        header.set_cksum();
-
-        tar.append_data(&mut header, "manifest.json", manifest)?;
-
+        append_tar_entry(&mut tar, "manifest.json", manifest.len() as u64, manifest)?;
         tar.into_inner()?.finish()?;
     }
-
     Ok(tar_buffer)
+}
+
+/// Entry body fed into the payload checksum, the tar header already promised its length
+struct EntryBody<'a, R> {
+    inner: R,
+    remaining: u64,
+    summary: &'a mut PayloadSummary,
+    name: &'a str,
+}
+
+impl<R: Read> Read for EntryBody<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            return match self.inner.read(&mut [0u8; 1])? {
+                0 => Ok(0),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{} is longer than its stored size", self.name),
+                )),
+            };
+        }
+        let max = buf
+            .len()
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        let n = self.inner.read(&mut buf[..max])?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("{} is shorter than its stored size", self.name),
+            ));
+        }
+        self.summary.update(&buf[..n]);
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
+/// Runs on a blocking thread, a channel closed before the seal means the backup failed
+fn write_archive(
+    mut pieces: mpsc::Receiver<ArchivePiece>,
+    out: impl Write,
+) -> Result<BackupManifest> {
+    let mut tar = Builder::new(GzEncoder::new(out, Compression::default()));
+    let mut summary = PayloadSummary::default();
+    while let Some(piece) = pieces.blocking_recv() {
+        match piece {
+            ArchivePiece::Entry(entry) => {
+                summary.begin(&entry.name, entry.size);
+                let reader = blocking_reader(entry.body);
+                let body = EntryBody {
+                    inner: reader,
+                    remaining: entry.size,
+                    summary: &mut summary,
+                    name: &entry.name,
+                };
+                append_tar_entry(&mut tar, &entry.path, entry.size, body)?;
+            }
+            ArchivePiece::Seal(mut manifest) => {
+                (manifest.total_size_bytes, manifest.checksum) = summary.finish();
+                let bytes = serde_json::to_vec_pretty(&manifest)?;
+                append_tar_entry(
+                    &mut tar,
+                    "manifest.json",
+                    bytes.len() as u64,
+                    bytes.as_slice(),
+                )?;
+                tar.into_inner()?.finish()?.flush()?;
+                return Ok(manifest);
+            }
+        }
+    }
+    Err(AppError::Internal(
+        "backup archive abandoned before it was sealed".to_string(),
+    ))
+}
+
+/// The pipe closes the same way on failure, so an unsealed archive ends in an
+/// error and the backend discards the partial object instead of publishing it
+fn sealed_archive_stream(
+    pipe: tokio::io::DuplexStream,
+    sealed: oneshot::Receiver<bool>,
+) -> BoxStream<'static, Result<Bytes>> {
+    let verdict = futures::stream::once(sealed).filter_map(|sealed| {
+        let verdict: Option<Result<Bytes>> = match sealed {
+            Ok(true) => None,
+            _ => Some(Err(AppError::Internal(
+                "backup archive was not sealed".to_string(),
+            ))),
+        };
+        futures::future::ready(verdict)
+    });
+    ReaderStream::with_capacity(pipe, ARCHIVE_CHUNK)
+        .map_err(|e| AppError::Storage(format!("backup archive stream: {e}")))
+        .chain(verdict)
+        .boxed()
+}
+
+/// A synchronous reader over a storage stream, for tar on a blocking thread
+fn blocking_reader(stream: BoxStream<'static, Result<Bytes>>) -> impl Read {
+    SyncIoBridge::new(StreamReader::new(
+        stream.map_err(|e| std::io::Error::other(e.to_string())),
+    ))
+}
+
+/// The first location takes the archive stream, the others copy from a location already written
+async fn restore_to(
+    backend: Arc<dyn crate::storage::StorageBackend>,
+    key: &str,
+    body: Option<BoxStream<'static, Result<Bytes>>>,
+    copy_from: Option<&Arc<dyn crate::storage::StorageBackend>>,
+) -> Result<Arc<dyn crate::storage::StorageBackend>> {
+    let source = match (body, copy_from) {
+        (Some(body), _) => body,
+        (None, Some(from)) => from.get_stream(key).await?,
+        (None, None) => {
+            return Err(AppError::Storage(
+                "its archive stream went to a location that failed".to_string(),
+            ))
+        }
+    };
+    backend.put_stream(key, source).await?;
+    Ok(backend)
+}
+
+/// What the verify pass keeps of an archive
+struct ScannedArchive {
+    /// The `database/*` and `manifest.json` entries, in archive order
+    entries: Vec<(std::path::PathBuf, Vec<u8>)>,
+    checksum: String,
+    /// One per `artifacts/` entry, in archive order, for the write pass to match
+    artifact_digests: Vec<[u8; 32]>,
+    /// Storage keys of the `artifacts/` entries, to report rows whose bytes are missing
+    artifact_keys: std::collections::HashSet<String>,
+}
+
+/// Restore pass one: hash the whole payload, holding only the small entries
+fn scan_archive(
+    compressed: impl Read,
+    limits: ExtractLimits,
+    compressed_len: u64,
+    max_buffered: u64,
+) -> Result<ScannedArchive> {
+    let mut summary = PayloadSummary::default();
+    let mut entries = Vec::new();
+    let mut artifact_digests = Vec::new();
+    let mut artifact_keys = std::collections::HashSet::new();
+    let mut buffered = 0u64;
+    let mut chunk = vec![0u8; ARCHIVE_CHUNK];
+    BackupService::walk_archive(compressed, limits, compressed_len, |path, size, body| {
+        let name = payload_name(path);
+        if let (Some(name), Some(key)) = (&name, artifact_storage_key(path)) {
+            summary.begin(name, size);
+            let mut digest = PayloadSummary::default();
+            digest.begin(name, size);
+            loop {
+                let n = body.read(&mut chunk)?;
+                if n == 0 {
+                    break;
+                }
+                summary.update(&chunk[..n]);
+                digest.update(&chunk[..n]);
+            }
+            artifact_digests.push(digest.digest());
+            artifact_keys.insert(key);
+            return Ok(());
+        }
+        let is_manifest = path.file_name().and_then(|n| n.to_str()) == Some("manifest.json");
+        if name.is_none() && !is_manifest {
+            return Ok(());
+        }
+        buffered = buffered.saturating_add(size);
+        if buffered > max_buffered {
+            return Err(AppError::Validation(format!(
+                "archive rejected: its table dumps and manifest exceed the {max_buffered} bytes \
+                 a restore holds in memory"
+            )));
+        }
+        let mut content = Vec::new();
+        body.read_to_end(&mut content)?;
+        if let Some(name) = &name {
+            summary.begin(name, content.len() as u64);
+            summary.update(&content);
+        }
+        entries.push((path.to_path_buf(), content));
+        Ok(())
+    })?;
+    Ok(ScannedArchive {
+        entries,
+        checksum: summary.finish().1,
+        artifact_digests,
+        artifact_keys,
+    })
+}
+
+/// One artifact on its way out of the archive in the write pass
+struct RestoreEntry {
+    storage_key: String,
+    body: BoxStream<'static, Result<Bytes>>,
+}
+
+/// Restore pass two: stream each artifact to the restore loop. An entry that
+/// differs from what pass one verified ends its stream in an error, so the
+/// storage backend never publishes it
+fn stream_artifact_entries(
+    compressed: impl Read,
+    limits: ExtractLimits,
+    compressed_len: u64,
+    digests: &[[u8; 32]],
+    out: mpsc::Sender<RestoreEntry>,
+) -> Result<()> {
+    let changed = || {
+        AppError::Validation(
+            "archive integrity check failed: the archive changed after it was verified; \
+             refusing to restore the rest of it"
+                .to_string(),
+        )
+    };
+    let mut expected = digests.iter();
+    let mut chunk = vec![0u8; ARCHIVE_CHUNK];
+    BackupService::walk_archive(compressed, limits, compressed_len, |path, size, body| {
+        let Some(storage_key) = artifact_storage_key(path) else {
+            return Ok(());
+        };
+        let expected = expected.next().ok_or_else(changed)?;
+        let (tx, rx) = mpsc::channel(2);
+        let mut digest = PayloadSummary::default();
+        digest.begin(&storage_key, size);
+        let entry = RestoreEntry {
+            storage_key,
+            body: tokio_stream::wrappers::ReceiverStream::new(rx).boxed(),
+        };
+        if out.blocking_send(entry).is_err() {
+            return Err(AppError::Internal(
+                "restore stopped reading the archive".to_string(),
+            ));
+        }
+        // A writer that gave up still has the entry read and checked
+        let mut open = true;
+        loop {
+            let n = body.read(&mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            digest.update(&chunk[..n]);
+            if open {
+                open = tx
+                    .blocking_send(Ok(Bytes::copy_from_slice(&chunk[..n])))
+                    .is_ok();
+            }
+        }
+        if digest.digest() != *expected {
+            let _ = tx.blocking_send(Err(changed()));
+            return Err(changed());
+        }
+        Ok(())
+    })?;
+    match expected.next() {
+        Some(_) => Err(changed()),
+        None => Ok(()),
+    }
 }
 
 /// Normalize the operator-supplied backup key prefix (`BACKUP_S3_PREFIX`).
@@ -581,6 +853,7 @@ fn resolve_backup_filename(name: Option<&str>, file_id: Uuid) -> Result<String> 
 }
 
 /// Count entries under the `artifacts/` prefix in a tar.gz archive.
+#[cfg(test)]
 fn count_artifacts_in_tar(tar_data: &[u8]) -> Result<i64> {
     let decoder = GzDecoder::new(tar_data);
     let mut archive = Archive::new(decoder);
@@ -692,17 +965,45 @@ fn backup_includes_artifact_bytes(backup_type: BackupType) -> bool {
 ///
 /// The digest covers entry names and lengths as well as content so a renamed
 /// or reordered entry cannot collide with a clean archive.
+#[cfg(test)]
 fn payload_summary<'a>(entries: impl Iterator<Item = (&'a str, &'a [u8])>) -> (i64, String) {
-    let mut hasher = Sha256::new();
-    let mut total_size_bytes: i64 = 0;
+    let mut summary = PayloadSummary::default();
     for (name, bytes) in entries {
-        hasher.update((name.len() as u64).to_le_bytes());
-        hasher.update(name.as_bytes());
-        hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(bytes);
-        total_size_bytes += bytes.len() as i64;
+        summary.begin(name, bytes.len() as u64);
+        summary.update(bytes);
     }
-    (total_size_bytes, format!("{:x}", hasher.finalize()))
+    summary.finish()
+}
+
+/// [`payload_summary`] for streamed entries: `begin`, then `update` with the bytes in order
+#[derive(Default)]
+struct PayloadSummary {
+    hasher: Sha256,
+    total_size_bytes: i64,
+}
+
+impl PayloadSummary {
+    fn begin(&mut self, name: &str, len: u64) {
+        self.hasher.update((name.len() as u64).to_le_bytes());
+        self.hasher.update(name.as_bytes());
+        self.hasher.update(len.to_le_bytes());
+        self.total_size_bytes += len as i64;
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        self.hasher.update(bytes);
+    }
+
+    fn finish(self) -> (i64, String) {
+        (
+            self.total_size_bytes,
+            format!("{:x}", self.hasher.finalize()),
+        )
+    }
+
+    fn digest(self) -> [u8; 32] {
+        self.hasher.finalize().into()
+    }
 }
 
 /// Map extracted archive entries back to the `(name, bytes)` payload pairs
@@ -710,23 +1011,35 @@ fn payload_summary<'a>(entries: impl Iterator<Item = (&'a str, &'a [u8])>) -> (i
 /// its table name, `artifacts/<key>` its storage key; `manifest.json` (and
 /// anything unrecognized) is not payload. Entry order is tar order, which is
 /// the order the backup hashed them in.
+#[cfg(test)]
 fn archive_payload_entries(entries: &[(std::path::PathBuf, Vec<u8>)]) -> Vec<(String, &[u8])> {
     entries
         .iter()
-        .filter_map(|(path, content)| {
-            if path.starts_with("database/") {
-                path.file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|table| (table.to_string(), content.as_slice()))
-            } else if path.starts_with("artifacts/") {
-                path.strip_prefix("artifacts/")
-                    .ok()
-                    .map(|key| (key.to_string_lossy().to_string(), content.as_slice()))
-            } else {
-                None
-            }
-        })
+        .filter_map(|(path, content)| payload_name(path).map(|name| (name, content.as_slice())))
         .collect()
+}
+
+/// The name an archive entry is hashed under, `None` for anything that is not payload
+fn payload_name(path: &std::path::Path) -> Option<String> {
+    if path.starts_with("database/") {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .map(|table| table.to_string())
+    } else if path.starts_with("artifacts/") {
+        path.strip_prefix("artifacts/")
+            .ok()
+            .map(|key| key.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
+/// The storage key an `artifacts/` entry restores to
+fn artifact_storage_key(path: &std::path::Path) -> Option<String> {
+    path.strip_prefix("artifacts/")
+        .ok()
+        .map(|key| key.to_string_lossy().to_string())
+        .filter(|key| !key.is_empty())
 }
 
 /// Ceiling on decompressed bytes relative to the archive's compressed size
@@ -752,25 +1065,12 @@ const MIN_DECOMPRESSED_BYTES: u64 = 32 * 1024 * 1024;
 ///
 /// Belt and braces next to the byte budget: entry headers are themselves bytes
 /// off the budget, so an entry swarm already costs, but a hard count keeps the
-/// `Vec` of paths bounded regardless of how the byte budget was derived.
+/// verify pass's per-artifact digests (32 bytes each) bounded.
 const MAX_ARCHIVE_ENTRIES: usize = 1_000_000;
 
-/// Hard ceiling on decompressed bytes, whatever the ratio arm computes (#3373).
-///
-/// [`MAX_DECOMPRESSION_RATIO`] alone makes the budget a function of a length the
-/// archive itself controls: `size_bytes` is checked first, but gzip tolerates
-/// arbitrary trailing bytes, so a tamperer can pad an archive to exactly the
-/// recorded length and buy the matching budget. At 100x, a 2 GiB backup would
-/// hand out 200 GiB.
-///
-/// 8 GiB is a ceiling on what this restore path can do *at all* rather than a
-/// policy about backup size: `do_restore` holds the compressed archive and every
-/// decompressed entry in memory simultaneously (`tar::Archive` is `!Send`, so
-/// the async restore cannot hold it across an await), so an archive that
-/// genuinely expands past this could not be restored on any realistic host
-/// regardless of this constant. Restoring archives larger than this needs a
-/// streaming restore, not a bigger number.
-const MAX_DECOMPRESSED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Ceiling on what a restore holds in memory: the table dumps and the manifest,
+/// read before the archive is verified (#3373, #5336)
+const MAX_BUFFERED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Bounds applied while decompressing a restore archive (#3373).
 ///
@@ -784,17 +1084,13 @@ pub struct ExtractLimits {
 
 impl ExtractLimits {
     /// Bounds for an archive of `compressed_len` compressed bytes:
-    /// `clamp(compressed_len * RATIO, MIN_DECOMPRESSED_BYTES, MAX_DECOMPRESSED_BYTES)`.
-    ///
-    /// The floor keeps a small legitimate backup from being refused for being
-    /// small; the ratio keeps a large one from being refused for being large;
-    /// the absolute ceiling keeps the budget from being a function of a length
-    /// the archive controls. See each constant for why.
-    pub fn for_archive(compressed_len: usize) -> Self {
-        let ratio_budget = (compressed_len as u64).saturating_mul(MAX_DECOMPRESSION_RATIO);
+    /// `max(compressed_len * RATIO, MIN_DECOMPRESSED_BYTES)`. No absolute
+    /// ceiling: the restore streams, so a bigger budget costs time, not memory
+    pub fn for_archive(compressed_len: u64) -> Self {
+        let ratio_budget = compressed_len.saturating_mul(MAX_DECOMPRESSION_RATIO);
         Self {
             max_entries: MAX_ARCHIVE_ENTRIES,
-            max_total_bytes: ratio_budget.clamp(MIN_DECOMPRESSED_BYTES, MAX_DECOMPRESSED_BYTES),
+            max_total_bytes: ratio_budget.max(MIN_DECOMPRESSED_BYTES),
         }
     }
 }
@@ -838,7 +1134,7 @@ fn reject_unsafe_entry_path(path: &std::path::Path) -> Result<()> {
 }
 
 /// The refusal an archive gets for busting its decompression budget (#3373).
-fn bomb_error(limits: &ExtractLimits, compressed_len: usize) -> AppError {
+fn bomb_error(limits: &ExtractLimits, compressed_len: u64) -> AppError {
     AppError::Validation(format!(
         "archive rejected: decompressing it exceeds the {} byte limit for an archive of {} \
          compressed bytes, which is the shape of a decompression bomb",
@@ -906,7 +1202,7 @@ impl std::fmt::Display for IntegrityAnchor {
 fn verify_archive_integrity(
     recorded_checksum: Option<&str>,
     manifest: Option<&BackupManifest>,
-    entries: &[(std::path::PathBuf, Vec<u8>)],
+    actual: &str,
     allow_unverified: bool,
 ) -> std::result::Result<IntegrityAnchor, String> {
     let recorded = recorded_checksum.map(str::trim).filter(|c| !c.is_empty());
@@ -937,8 +1233,6 @@ fn verify_archive_integrity(
         }
     };
 
-    let payload = archive_payload_entries(entries);
-    let (_, actual) = payload_summary(payload.iter().map(|(n, b)| (n.as_str(), *b)));
     if !actual.eq_ignore_ascii_case(expected) {
         return Err(format!(
             "archive integrity check failed: the {} payload checksum for this backup is {} but \
@@ -1177,12 +1471,10 @@ fn archive_oci_repositories(
 /// Storage keys the archive's own `artifacts` rows reference but whose bytes
 /// it does not carry (#5654), sorted. A restore of those rows produces
 /// artifacts that 404.
-fn archive_missing_artifact_bytes(entries: &[(std::path::PathBuf, Vec<u8>)]) -> Vec<String> {
-    let present: std::collections::HashSet<String> = entries
-        .iter()
-        .filter_map(|(path, _)| path.strip_prefix("artifacts/").ok())
-        .map(|key| key.to_string_lossy().into_owned())
-        .collect();
+fn archive_missing_artifact_bytes(
+    entries: &[(std::path::PathBuf, Vec<u8>)],
+    present: &std::collections::HashSet<String>,
+) -> Vec<String> {
     let mut missing: Vec<String> = archive_table_rows(entries, "artifacts")
         .iter()
         .filter_map(|row| row.get("storage_key")?.as_str())
@@ -1295,6 +1587,24 @@ fn validated_restore_rows(table: &str, content: &[u8]) -> Result<Vec<serde_json:
         )));
     }
     Ok(serde_json::from_slice(content)?)
+}
+
+/// A backend that cannot report the length without reading gets that one object buffered
+async fn open_sized_stream(
+    backend: &dyn crate::storage::StorageBackend,
+    key: &str,
+) -> Result<(u64, BoxStream<'static, Result<Bytes>>)> {
+    match backend.stored_size(key).await? {
+        Some(size) => Ok((size, backend.get_stream(key).await?)),
+        None => {
+            let bytes = backend.get(key).await?;
+            let size = bytes.len() as u64;
+            Ok((
+                size,
+                futures::stream::once(async move { Ok(bytes) }).boxed(),
+            ))
+        }
+    }
 }
 
 impl BackupService {
@@ -1701,78 +2011,47 @@ impl BackupService {
         )
         .await?;
         snapshot.commit().await?;
-        // Read each artifact's bytes, tracking failures rather than discarding
-        // them (#3170). A read that fails means the archive will not contain
-        // that artifact's content; that must never be invisible.
-        let mut artifact_data: Vec<(String, Vec<u8>)> = Vec::new();
-        let mut unreadable: Vec<(String, String)> = Vec::new();
-        for artifact in artifacts {
-            ensure_backup_not_cancelled(cancel)?;
-            match self.read_artifact(&artifact).await {
-                Ok(content) => artifact_data.push((artifact.storage_key.clone(), content.to_vec())),
-                Err(e) => {
-                    tracing::warn!(
-                        backup_id = %backup_id,
-                        storage_key = %artifact.storage_key,
-                        locations = artifact.locations.len(),
-                        error = %e,
-                        "backup could not read artifact bytes; the archive will not contain this object"
-                    );
-                    unreadable.push((artifact.storage_key, e.to_string()));
-                }
-            }
-        }
 
-        let tables_ref: Vec<(&str, &[u8])> = table_data
-            .iter()
-            .map(|(name, data)| (name.as_str(), data.as_slice()))
-            .collect();
-        let artifacts_ref: Vec<(&str, &[u8])> = artifact_data
-            .iter()
-            .map(|(key, data)| (key.as_str(), data.as_slice()))
-            .collect();
-
-        // Build manifest. Both counts are recorded so an archive can be audited
-        // after the fact without re-running the backup (#3170), and the payload
-        // size/checksum give the archive an integrity value the restore path
-        // verifies (#3011).
-        let (total_size_bytes, checksum) = payload_summary(
-            tables_ref
-                .iter()
-                .copied()
-                .chain(artifacts_ref.iter().copied()),
-        );
-        let manifest = BackupManifest {
-            version: "1.0".to_string(),
-            backup_id,
-            backup_type: backup.backup_type,
-            created_at: Utc::now(),
-            database_tables: table_names.iter().map(|s| s.to_string()).collect(),
-            artifact_count: artifact_data.len() as i64,
-            artifacts_unreadable: unreadable.len() as i64,
-            total_size_bytes,
-            checksum,
-            contents,
-        };
-        let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-
-        // Build tar.gz archive using append_data (supports paths > 100 chars)
-        let tar_buffer = build_backup_tar(&tables_ref, &artifacts_ref, &manifest_bytes)?;
-
-        // A claim lost while chunks were being gathered must abort BEFORE the
-        // externally visible side effect — the archive write — not after (#3084).
-        ensure_backup_not_cancelled(cancel)?;
-
-        // Store backup
         let storage_path = backup
             .storage_path
-            .as_ref()
+            .clone()
             .ok_or_else(|| AppError::Internal("Backup has no storage path".to_string()))?;
-        // The archive itself is written to the (optionally separate) backup
-        // bucket; the source artifacts read above stay on primary storage.
-        self.archive_storage
-            .put(storage_path, Bytes::from(tar_buffer.clone()))
-            .await?;
+
+        // Entries stream through a blocking tar+gzip writer into a pipe the archive store uploads from (#5336)
+        let (pieces, pieces_rx) = mpsc::channel(ARCHIVE_QUEUE_DEPTH);
+        let (sink, pipe) = tokio::io::duplex(ARCHIVE_CHUNK);
+        let (sealed_tx, sealed_rx) = oneshot::channel();
+        let writer = tokio::task::spawn_blocking(move || {
+            let written = write_archive(pieces_rx, SyncIoBridge::new(sink));
+            let _ = sealed_tx.send(written.is_ok());
+            written
+        });
+        let upload = self
+            .archive_storage
+            .put_stream(&storage_path, sealed_archive_stream(pipe, sealed_rx));
+        let feed = self.feed_archive(
+            pieces,
+            &backup,
+            &table_names,
+            table_data,
+            artifacts,
+            contents,
+            cancel,
+        );
+        let (fed, uploaded) = tokio::join!(feed, upload);
+        let written = writer
+            .await
+            .map_err(|e| AppError::Internal(format!("backup archive writer: {e}")))?;
+
+        // A failed stage stops the others, report the cause, not the broken pipe it left behind
+        let (artifact_count, unreadable) = fed?;
+        let (manifest, put) = match (written, uploaded) {
+            (Ok(manifest), Ok(put)) => (manifest, put),
+            (Err(AppError::Io(e)), Err(upload)) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                return Err(upload)
+            }
+            (Err(e), _) | (Ok(_), Err(e)) => return Err(e),
+        };
 
         // Update backup record. `payload_checksum` records the manifest's
         // digest on the ROW as well, which is what gives the restore path an
@@ -1781,7 +2060,6 @@ impl BackupService {
         // manifest — cannot reach this column. `size_bytes` is the archive's
         // own length and is checked the same way, before a byte is
         // decompressed.
-        let artifact_count = count_artifacts_in_tar(&tar_buffer)?;
         sqlx::query(
             r#"
             UPDATE backups
@@ -1791,7 +2069,7 @@ impl BackupService {
             "#,
         )
         .bind(backup_id)
-        .bind(tar_buffer.len() as i64)
+        .bind(put.bytes_written as i64)
         .bind(artifact_count)
         .bind(&manifest.checksum)
         .execute(&self.db)
@@ -1868,6 +2146,81 @@ impl BackupService {
             excluded_tables: excluded_tables(&catalog),
             oci_repositories,
         })
+    }
+
+    /// An artifact that cannot be opened is left out and recorded (#3170), one that
+    /// fails partway fails the backup since its header is already written
+    #[allow(clippy::too_many_arguments)]
+    async fn feed_archive(
+        &self,
+        pieces: mpsc::Sender<ArchivePiece>,
+        backup: &Backup,
+        table_names: &[&str],
+        table_data: Vec<(String, Vec<u8>)>,
+        artifacts: Vec<ArtifactObject>,
+        contents: BackupContents,
+        cancel: &CancellationToken,
+    ) -> Result<(i64, Vec<(String, String)>)> {
+        let mut artifact_count: i64 = 0;
+        let mut unreadable: Vec<(String, String)> = Vec::new();
+        // A failed send means the writer stopped, it or the upload reports why
+        for (name, json_bytes) in table_data {
+            let entry = ArchiveEntry {
+                path: format!("database/{}.json", name),
+                size: json_bytes.len() as u64,
+                body: futures::stream::once(async move { Ok(Bytes::from(json_bytes)) }).boxed(),
+                name,
+            };
+            if pieces.send(ArchivePiece::Entry(entry)).await.is_err() {
+                return Ok((artifact_count, unreadable));
+            }
+        }
+        for artifact in artifacts {
+            ensure_backup_not_cancelled(cancel)?;
+            let (size, body) = match self.open_artifact(&artifact).await {
+                Ok(opened) => opened,
+                Err(e) => {
+                    tracing::warn!(
+                        backup_id = %backup.id,
+                        storage_key = %artifact.storage_key,
+                        locations = artifact.locations.len(),
+                        error = %e,
+                        "backup could not read artifact bytes; the archive will not contain this object"
+                    );
+                    unreadable.push((artifact.storage_key, e.to_string()));
+                    continue;
+                }
+            };
+            let entry = ArchiveEntry {
+                path: format!("artifacts/{}", artifact.storage_key),
+                size,
+                body,
+                name: artifact.storage_key,
+            };
+            if pieces.send(ArchivePiece::Entry(entry)).await.is_err() {
+                return Ok((artifact_count, unreadable));
+            }
+            artifact_count += 1;
+        }
+
+        // Checked before the seal, which is what lets the upload publish the archive (#3084)
+        ensure_backup_not_cancelled(cancel)?;
+
+        // Both counts are recorded so an archive can be audited without re-running it (#3170)
+        let manifest = BackupManifest {
+            version: "1.0".to_string(),
+            backup_id: backup.id,
+            backup_type: backup.backup_type,
+            created_at: Utc::now(),
+            database_tables: table_names.iter().map(|s| s.to_string()).collect(),
+            artifact_count,
+            artifacts_unreadable: unreadable.len() as i64,
+            total_size_bytes: 0,
+            checksum: String::new(),
+            contents,
+        };
+        let _ = pieces.send(ArchivePiece::Seal(manifest)).await;
+        Ok((artifact_count, unreadable))
     }
 
     async fn export_table(conn: &mut sqlx::PgConnection, table: &str) -> Result<serde_json::Value> {
@@ -1995,18 +2348,23 @@ impl BackupService {
     /// shared object is still captured when one repository's copy is missing.
     /// Falls back to the deployment-global handle when no registry is attached
     /// (legacy construction), preserving the historical behavior exactly.
-    async fn read_artifact(&self, artifact: &ArtifactObject) -> Result<Bytes> {
+    async fn open_artifact(
+        &self,
+        artifact: &ArtifactObject,
+    ) -> Result<(u64, BoxStream<'static, Result<Bytes>>)> {
         let Some(registry) = &self.storage_registry else {
-            return self.storage.get(&artifact.storage_key).await;
+            let size = self.storage.size(&artifact.storage_key).await?;
+            let body = self.storage.get_stream(&artifact.storage_key).await?;
+            return Ok((size, body));
         };
         let mut last_error = None;
         for location in &artifact.locations {
-            let read = match registry.backend_for(location) {
-                Ok(backend) => backend.get(&artifact.storage_key).await,
+            let opened = match registry.backend_for(location) {
+                Ok(backend) => open_sized_stream(backend.as_ref(), &artifact.storage_key).await,
                 Err(e) => Err(e),
             };
-            match read {
-                Ok(content) => return Ok(content),
+            match opened {
+                Ok(opened) => return Ok(opened),
                 Err(e) => last_error = Some(e),
             }
         }
@@ -2179,8 +2537,8 @@ impl BackupService {
 
     /// Restore from a backup.
     ///
-    /// Extracts all tar entries synchronously first (tar::Archive is !Send),
-    /// then performs async database/storage restore operations.
+    /// Reads the archive twice: once to verify it, holding only the table
+    /// dumps, then again to stream the artifacts to storage.
     pub async fn restore(&self, backup_id: Uuid, options: RestoreOptions) -> Result<RestoreResult> {
         let backup = self.get_by_id(backup_id).await?;
 
@@ -2258,7 +2616,7 @@ impl BackupService {
             .as_ref()
             .ok_or_else(|| AppError::Internal("Backup has no storage path".to_string()))?;
         // Read the archive back from the (optionally separate) backup bucket.
-        let tar_data = self.archive_storage.get(storage_path).await?;
+        let archive_len = self.archive_storage.size(storage_path).await?;
 
         // The archive's own length was recorded on the row at capture time, so
         // it can be checked before a single byte is decompressed (#3373). This
@@ -2267,20 +2625,31 @@ impl BackupService {
         // decompression. Rows with no recorded length predate `size_bytes`
         // being written and fall through to the checks below.
         if let Some(recorded_len) = backup.size_bytes {
-            if recorded_len >= 0 && tar_data.len() as i64 != recorded_len {
+            if recorded_len >= 0 && archive_len as i64 != recorded_len {
                 return Err(AppError::Validation(format!(
                     "archive integrity check failed: this backup recorded an archive of {} bytes \
                      but {} bytes were read back from storage; refusing to restore from an \
                      archive that is not the one that was captured",
-                    recorded_len,
-                    tar_data.len()
+                    recorded_len, archive_len
                 )));
             }
         }
 
-        // Phase 1: Extract all entries synchronously (tar::Archive is !Send).
-        // Bounded: see `extract_entries_bounded` (#3373).
-        let entries = Self::extract_entries(&tar_data)?;
+        // Pass one reads the whole archive and writes nothing, so an archive
+        // that fails verification never reaches live storage (#5336)
+        let limits = ExtractLimits::for_archive(archive_len);
+        let compressed = self.archive_storage.get_stream(storage_path).await?;
+        let scanned = tokio::task::spawn_blocking(move || {
+            scan_archive(
+                blocking_reader(compressed),
+                limits,
+                archive_len,
+                MAX_BUFFERED_BYTES,
+            )
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("restore verify pass: {e}")))??;
+        let entries = scanned.entries;
 
         // The archive is the untrusted input. Establish that its contents are
         // the ones this backup captured BEFORE any row is ingested (#3373).
@@ -2290,7 +2659,7 @@ impl BackupService {
         let integrity_anchor = verify_archive_integrity(
             backup.payload_checksum.as_deref(),
             manifest.as_ref(),
-            &entries,
+            &scanned.checksum,
             options.allow_unverified_archive,
         )
         .map_err(AppError::Validation)?;
@@ -2407,7 +2776,7 @@ impl BackupService {
             ));
         }
         if backup_includes_artifact_bytes(backup.backup_type) {
-            let missing = archive_missing_artifact_bytes(&entries);
+            let missing = archive_missing_artifact_bytes(&entries, &scanned.artifact_keys);
             if !missing.is_empty() {
                 result.errors.push(format!(
                     "archive is missing the bytes of {} artifact object(s) its own artifact rows \
@@ -2443,6 +2812,27 @@ impl BackupService {
                 validate_restore_layouts(&mut conn, &layouts, false).await?;
                 Self::restore_tables(&mut conn, &entries, &layouts, false, &mut result).await?;
             }
+            // #5793: an archive from before migration 363 carries no
+            // per-image links. Its repositories go back to the
+            // repository-wide digest rule until the next `oci_manifests`
+            // maintenance pass re-runs their first backfill, instead of
+            // answering 404 for every restored digest no tag names.
+            if backup_table(&entries, "oci_image_scope_backfill").is_none() {
+                let ids: Vec<Uuid> = archive_table_rows(&entries, "repositories")
+                    .iter()
+                    .filter_map(|row| row.get("id")?.as_str()?.parse().ok())
+                    .collect();
+                if !ids.is_empty() {
+                    if let Err(e) =
+                        crate::services::oci_image_scope::reset_backfill(&self.db, &ids).await
+                    {
+                        result.errors.push(format!(
+                            "failed to reset the OCI image-scope backfill of the restored \
+                             repositories: {e}"
+                        ));
+                    }
+                }
+            }
         }
 
         // Restore artifact files. The archive's own artifact rows say which
@@ -2464,51 +2854,62 @@ impl BackupService {
                 }
                 None => std::collections::HashMap::new(),
             };
-            for (path, content) in &entries {
-                if !path.starts_with("artifacts/") {
-                    continue;
-                }
-                let storage_key = path
-                    .strip_prefix("artifacts/")
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                if storage_key.is_empty() {
-                    continue;
-                }
-
-                let content = Bytes::from(content.clone());
-                let (Some(registry), Some(locations)) =
-                    (&self.storage_registry, artifact_locations.get(&storage_key))
-                else {
-                    match self.storage.put(&storage_key, content).await {
-                        Ok(_) => result.artifacts_restored += 1,
-                        Err(e) => result
-                            .errors
-                            .push(format!("Failed to restore {}: {}", storage_key, e)),
-                    }
-                    continue;
-                };
-                // Every owner was refused above (and reported there).
-                if locations.is_empty() {
-                    continue;
-                }
-                let mut restored_everywhere = true;
-                for location in locations {
-                    let write = match registry.backend_for(location) {
-                        Ok(backend) => backend.put(&storage_key, content.clone()).await,
-                        Err(e) => Err(e),
+            // Pass two streams each artifact from the archive to its locations
+            if !scanned.artifact_digests.is_empty() {
+                let compressed = self.archive_storage.get_stream(storage_path).await?;
+                let digests = scanned.artifact_digests;
+                let (tx, mut restored) = mpsc::channel(1);
+                let reader = tokio::task::spawn_blocking(move || {
+                    let compressed = blocking_reader(compressed);
+                    stream_artifact_entries(compressed, limits, archive_len, &digests, tx)
+                });
+                while let Some(RestoreEntry { storage_key, body }) = restored.recv().await {
+                    let (Some(registry), Some(locations)) =
+                        (&self.storage_registry, artifact_locations.get(&storage_key))
+                    else {
+                        match self.storage.put_stream(&storage_key, body).await {
+                            Ok(_) => result.artifacts_restored += 1,
+                            Err(e) => result
+                                .errors
+                                .push(format!("Failed to restore {}: {}", storage_key, e)),
+                        }
+                        continue;
                     };
-                    if let Err(e) = write {
-                        restored_everywhere = false;
-                        result.errors.push(format!(
-                            "Failed to restore {} to {} '{}': {}",
-                            storage_key, location.backend, location.path, e
-                        ));
+                    // Every owner was refused above (and reported there).
+                    if locations.is_empty() {
+                        continue;
+                    }
+                    let mut body = Some(body);
+                    let mut copy_from = None;
+                    let mut restored_everywhere = true;
+                    for location in locations {
+                        let write = match registry.backend_for(location) {
+                            Ok(backend) => {
+                                restore_to(backend, &storage_key, body.take(), copy_from.as_ref())
+                                    .await
+                            }
+                            Err(e) => Err(e),
+                        };
+                        match write {
+                            Ok(backend) => {
+                                copy_from.get_or_insert(backend);
+                            }
+                            Err(e) => {
+                                restored_everywhere = false;
+                                result.errors.push(format!(
+                                    "Failed to restore {} to {} '{}': {}",
+                                    storage_key, location.backend, location.path, e
+                                ));
+                            }
+                        }
+                    }
+                    if restored_everywhere {
+                        result.artifacts_restored += 1;
                     }
                 }
-                if restored_everywhere {
-                    result.artifacts_restored += 1;
-                }
+                reader
+                    .await
+                    .map_err(|e| AppError::Internal(format!("restore write pass: {e}")))??;
             }
         }
 
@@ -2533,24 +2934,33 @@ impl BackupService {
             .and_then(|(_, content)| serde_json::from_slice::<BackupManifest>(content).ok())
     }
 
-    /// Extract all entries from a tar.gz archive synchronously, under the
-    /// default bounds for an archive of this compressed size.
-    ///
-    /// Returns a Vec of (path, content) pairs so that async code can
-    /// process them without holding the non-Send Archive across await points.
+    #[cfg(test)]
     fn extract_entries(tar_data: &[u8]) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
-        Self::extract_entries_bounded(tar_data, ExtractLimits::for_archive(tar_data.len()))
+        Self::extract_entries_bounded(tar_data, ExtractLimits::for_archive(tar_data.len() as u64))
     }
 
-    /// Extract a tar.gz archive under explicit bounds (#3373).
+    #[cfg(test)]
+    fn extract_entries_bounded(
+        tar_data: &[u8],
+        limits: ExtractLimits,
+    ) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
+        let mut entries = Vec::new();
+        Self::walk_archive(tar_data, limits, tar_data.len() as u64, |path, _, body| {
+            let mut content = Vec::new();
+            body.read_to_end(&mut content)?;
+            entries.push((path.to_path_buf(), content));
+            Ok(())
+        })?;
+        Ok(entries)
+    }
+
+    /// Walk a tar.gz archive under explicit bounds (#3373), handing each entry
+    /// with its size to `visit`. Both restore passes go through here.
     ///
-    /// The whole archive is decompressed into memory — that is inherent to the
-    /// restore design, because `tar::Archive` is `!Send` and the async restore
-    /// cannot hold it across an await. Without a bound that makes the archive a
-    /// decompression-bomb surface: the compressed bytes are attacker-controlled
-    /// in the same threat model that motivates the checksum
-    /// ([`verify_archive_integrity`]), and a few hundred kilobytes of zeros
-    /// expand to gigabytes.
+    /// Without a bound the archive is a decompression-bomb surface: the
+    /// compressed bytes are attacker-controlled in the same threat model that
+    /// motivates the checksum ([`verify_archive_integrity`]), and a few hundred
+    /// kilobytes of zeros expand to gigabytes.
     ///
     /// **The budget wraps the decoded stream BEFORE `tar::Archive::new`, and it
     /// has to.** A bound applied after the entry iterator yields cannot be
@@ -2577,16 +2987,16 @@ impl BackupService {
     /// rather than downstream so the guarantee does not depend on which storage
     /// backend happens to be configured: an entry whose path is absolute, or
     /// contains a `..` component, or has a root/prefix component, is refused.
-    fn extract_entries_bounded(
-        tar_data: &[u8],
+    fn walk_archive(
+        compressed: impl Read,
         limits: ExtractLimits,
-    ) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
-        let decoder = GzDecoder::new(tar_data);
+        compressed_len: u64,
+        mut visit: impl FnMut(&std::path::Path, u64, &mut dyn Read) -> Result<()>,
+    ) -> Result<()> {
+        let decoder = GzDecoder::new(compressed);
         let budgeted = bounded_archive::budgeted_to(decoder, limits.max_total_bytes);
         let mut archive = Archive::new(budgeted);
-        let mut entries: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
 
-        let compressed_len = tar_data.len();
         let read_err = |what: &str, e: &std::io::Error| -> AppError {
             if bounded_archive::is_decompression_budget_breach(e) {
                 bomb_error(&limits, compressed_len)
@@ -2595,9 +3005,10 @@ impl BackupService {
             }
         };
 
-        for entry in archive
+        for (seen, entry) in archive
             .entries()
             .map_err(|e| read_err("read archive entries", &e))?
+            .enumerate()
         {
             let mut entry = entry.map_err(|e| read_err("read entry", &e))?;
             let path = entry
@@ -2605,7 +3016,7 @@ impl BackupService {
                 .map_err(|e| read_err("read entry path", &e))?
                 .to_path_buf();
 
-            if entries.len() >= limits.max_entries {
+            if seen >= limits.max_entries {
                 return Err(AppError::Validation(format!(
                     "archive rejected: it holds more than {} entries, which is past the limit \
                      this restore will decompress",
@@ -2614,15 +3025,14 @@ impl BackupService {
             }
             reject_unsafe_entry_path(&path)?;
 
-            let mut content = Vec::new();
-            entry
-                .read_to_end(&mut content)
-                .map_err(|e| read_err("read entry data", &e))?;
-
-            entries.push((path, content));
+            let size = entry.size();
+            visit(&path, size, &mut entry).map_err(|e| match e {
+                AppError::Io(e) => read_err("read entry data", &e),
+                other => other,
+            })?;
         }
 
-        Ok(entries)
+        Ok(())
     }
 
     /// Restore the allowlisted tables of `entries` in dependency order over
@@ -3276,6 +3686,13 @@ mod tests {
 
     /// The archived rows of one Docker repository whose manifest row (and
     /// manifest bytes) a backup captured. Nothing else of the image is there.
+    fn archived_keys(entries: &[(PathBuf, Vec<u8>)]) -> std::collections::HashSet<String> {
+        entries
+            .iter()
+            .filter_map(|(path, _)| artifact_storage_key(path))
+            .collect()
+    }
+
     fn oci_archive_entries(repo_id: Uuid, with_manifest_bytes: bool) -> Vec<(PathBuf, Vec<u8>)> {
         let repositories = serde_json::json!([{ "id": repo_id, "key": "docker-local" }]);
         let artifacts = serde_json::json!([
@@ -3319,7 +3736,7 @@ mod tests {
             ["docker-local"],
             "a legacy archive (no manifest contents) is caught from its own rows"
         );
-        assert!(archive_missing_artifact_bytes(&entries).is_empty());
+        assert!(archive_missing_artifact_bytes(&entries, &archived_keys(&entries)).is_empty());
 
         let mut manifest: BackupManifest = serde_json::from_value(serde_json::json!({
             "version": "1.0", "backup_id": Uuid::nil(), "backup_type": "full",
@@ -3352,14 +3769,16 @@ mod tests {
         }
         assert!(archive_oci_repositories(&with_images, Some(&manifest)).is_empty());
         assert_eq!(
-            archive_missing_artifact_bytes(&with_images),
+            archive_missing_artifact_bytes(&with_images, &archived_keys(&with_images)),
             std::slice::from_ref(&blob_key)
         );
         with_images.push((
             PathBuf::from(format!("artifacts/{blob_key}")),
             b"x".to_vec(),
         ));
-        assert!(archive_missing_artifact_bytes(&with_images).is_empty());
+        assert!(
+            archive_missing_artifact_bytes(&with_images, &archived_keys(&with_images)).is_empty()
+        );
         let owners = archive_artifact_owners(&with_images);
         assert_eq!(owners.owners[&blob_key], vec![repo_id]);
     }
@@ -3368,7 +3787,7 @@ mod tests {
     fn archive_rows_without_bytes_are_reported_missing_5654() {
         let entries = oci_archive_entries(Uuid::new_v4(), false);
         assert_eq!(
-            archive_missing_artifact_bytes(&entries),
+            archive_missing_artifact_bytes(&entries, &archived_keys(&entries)),
             ["oci-manifests/sha256/ab/abcdef"]
         );
     }
@@ -3683,6 +4102,257 @@ mod tests {
 
         // 3 artifacts should be counted (database entries and manifest excluded)
         assert_eq!(count_artifacts_in_tar(&tar_data).unwrap(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Streamed archive writer (#5336)
+    // -----------------------------------------------------------------------
+
+    fn archive_piece(name: &str, path: &str, size: u64, chunks: &[&'static [u8]]) -> ArchivePiece {
+        let chunks: Vec<Result<Bytes>> = chunks.iter().map(|c| Ok(Bytes::from_static(c))).collect();
+        ArchivePiece::Entry(ArchiveEntry {
+            name: name.to_string(),
+            path: path.to_string(),
+            size,
+            body: futures::stream::iter(chunks).boxed(),
+        })
+    }
+
+    fn unsealed_manifest() -> BackupManifest {
+        BackupManifest {
+            version: "1.0".to_string(),
+            backup_id: Uuid::new_v4(),
+            backup_type: BackupType::Full,
+            created_at: Utc::now(),
+            database_tables: vec!["users".to_string()],
+            artifact_count: 1,
+            artifacts_unreadable: 0,
+            total_size_bytes: 0,
+            checksum: String::new(),
+            contents: BackupContents::default(),
+        }
+    }
+
+    async fn write_pieces(pieces: Vec<ArchivePiece>) -> (Result<BackupManifest>, Vec<u8>) {
+        let (tx, rx) = mpsc::channel(ARCHIVE_QUEUE_DEPTH);
+        let writer = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            let written = write_archive(rx, &mut out);
+            (written, out)
+        });
+        for piece in pieces {
+            let _ = tx.send(piece).await;
+        }
+        drop(tx);
+        writer.await.unwrap()
+    }
+
+    /// The payload checksum of extracted entries, as the verify pass computes it
+    fn archive_digest(entries: &[(std::path::PathBuf, Vec<u8>)]) -> String {
+        let payload = archive_payload_entries(entries);
+        payload_summary(payload.iter().map(|(n, b)| (n.as_str(), *b))).1
+    }
+
+    #[tokio::test]
+    async fn streamed_archive_restores_like_the_in_memory_one_5336() {
+        let key = format!("proxy-cache/{}/{}", "deep/".repeat(25), "artifact.jar");
+        let (manifest, archive) = write_pieces(vec![
+            archive_piece("users", "database/users.json", 5, &[b"[1,", b"2]"]),
+            archive_piece(&key, &format!("artifacts/{key}"), 6, &[b"ab", b"cd", b"ef"]),
+            ArchivePiece::Seal(unsealed_manifest()),
+        ])
+        .await;
+        let manifest = manifest.expect("sealed archive");
+        let expected =
+            payload_summary([("users", &b"[1,2]"[..]), (key.as_str(), &b"abcdef"[..])].into_iter());
+        assert_eq!(
+            (manifest.total_size_bytes, manifest.checksum.clone()),
+            expected
+        );
+
+        let entries = BackupService::extract_entries(&archive).expect("extract");
+        let content = |path: &str| {
+            entries
+                .iter()
+                .find(|(p, _)| p == std::path::Path::new(path))
+                .map(|(_, c)| c.clone())
+        };
+        assert_eq!(content("database/users.json").unwrap(), b"[1,2]");
+        assert_eq!(content(&format!("artifacts/{key}")).unwrap(), b"abcdef");
+        let parsed = BackupService::read_manifest(&entries).expect("manifest entry");
+        assert_eq!(parsed.checksum, expected.1);
+        assert_eq!(
+            verify_archive_integrity(
+                Some(&expected.1),
+                Some(&parsed),
+                &archive_digest(&entries),
+                false
+            ),
+            Ok(IntegrityAnchor::Recorded)
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_archive_refuses_a_body_that_does_not_match_its_stored_size_5336() {
+        for (size, chunks) in [
+            (10, &[&b"short"[..]][..]),
+            (3, &[&b"lo"[..], &b"ng"[..]][..]),
+        ] {
+            let (written, _) = write_pieces(vec![
+                archive_piece("k", "artifacts/k", size, chunks),
+                ArchivePiece::Seal(unsealed_manifest()),
+            ])
+            .await;
+            let err =
+                written.expect_err("a body that is not its stored size must fail the archive");
+            assert!(err.to_string().contains("stored size"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_archive_is_not_finished_without_its_seal_5336() {
+        let (written, _) = write_pieces(vec![archive_piece("k", "artifacts/k", 1, &[b"x"])]).await;
+        let err = written.expect_err("an archive the backup never sealed is not an archive");
+        assert!(err.to_string().contains("sealed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_upload_only_completes_once_the_archive_is_sealed_5336() {
+        for sealed in [true, false] {
+            let (mut sink, pipe) = tokio::io::duplex(ARCHIVE_CHUNK);
+            let (sealed_tx, sealed_rx) = oneshot::channel();
+            let upload = sealed_archive_stream(pipe, sealed_rx);
+            tokio::io::AsyncWriteExt::write_all(&mut sink, b"partial")
+                .await
+                .unwrap();
+            drop(sink);
+            if sealed {
+                sealed_tx.send(true).unwrap();
+            } else {
+                drop(sealed_tx);
+            }
+            let items: Vec<Result<Bytes>> = upload.collect().await;
+            assert_eq!(items[0].as_ref().unwrap(), &Bytes::from_static(b"partial"));
+            assert_eq!(items.len(), if sealed { 1 } else { 2 });
+            assert_eq!(items.last().unwrap().is_err(), !sealed);
+        }
+    }
+
+    type Streamed = Vec<(String, Vec<Result<Bytes>>)>;
+
+    async fn write_pass(archive: Vec<u8>, digests: Vec<[u8; 32]>) -> (Result<()>, Streamed) {
+        let (tx, mut rx) = mpsc::channel(1);
+        let len = archive.len() as u64;
+        let reader = tokio::task::spawn_blocking(move || {
+            let limits = ExtractLimits::for_archive(len);
+            stream_artifact_entries(archive.as_slice(), limits, len, &digests, tx)
+        });
+        let mut seen = Vec::new();
+        while let Some(entry) = rx.recv().await {
+            seen.push((entry.storage_key, entry.body.collect().await));
+        }
+        (reader.await.unwrap(), seen)
+    }
+
+    fn scan(archive: &[u8], max_buffered: u64) -> Result<ScannedArchive> {
+        let len = archive.len() as u64;
+        scan_archive(archive, ExtractLimits::for_archive(len), len, max_buffered)
+    }
+
+    #[tokio::test]
+    async fn restore_verifies_the_archive_then_streams_each_artifact_5336() {
+        let artifacts = [("a/1", &b"one"[..]), ("a/2", &b"two"[..])];
+        let archive = build_backup_tar(&[("users", b"[]")], &artifacts, b"{}").unwrap();
+        let scanned = scan(&archive, MAX_BUFFERED_BYTES).unwrap();
+        let entries = BackupService::extract_entries(&archive).unwrap();
+        assert_eq!(scanned.checksum, archive_digest(&entries));
+        let held: Vec<String> = scanned
+            .entries
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(held, ["database/users.json", "manifest.json"]);
+
+        let (written, seen) = write_pass(archive, scanned.artifact_digests).await;
+        written.expect("an unchanged archive streams cleanly");
+        let bodies: Vec<(String, Vec<u8>)> = seen
+            .into_iter()
+            .map(|(key, chunks)| {
+                let bytes = chunks.into_iter().flat_map(|c| c.unwrap().to_vec());
+                (key, bytes.collect())
+            })
+            .collect();
+        let expected: Vec<(String, Vec<u8>)> = artifacts
+            .iter()
+            .map(|(k, c)| (k.to_string(), c.to_vec()))
+            .collect();
+        assert_eq!(bodies, expected);
+    }
+
+    #[test]
+    fn pass_one_keeps_the_archived_keys_for_the_missing_bytes_check_5336() {
+        let rows = serde_json::to_vec(&serde_json::json!([
+            { "storage_key": "a/1" },
+            { "storage_key": "a/2" },
+        ]))
+        .unwrap();
+        let archive =
+            build_backup_tar(&[("artifacts", rows.as_slice())], &[("a/1", b"one")], b"{}").unwrap();
+        let scanned = scan(&archive, MAX_BUFFERED_BYTES).unwrap();
+        assert_eq!(
+            archive_missing_artifact_bytes(&scanned.entries, &scanned.artifact_keys),
+            ["a/2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_write_pass_refuses_an_archive_that_changed_after_it_was_verified_5336() {
+        let honest = build_backup_tar(&[], &[("a/1", b"one"), ("a/2", b"two")], b"{}").unwrap();
+        let digests = scan(&honest, MAX_BUFFERED_BYTES).unwrap().artifact_digests;
+
+        let swapped = build_backup_tar(&[], &[("a/1", b"one"), ("a/2", b"TWO")], b"{}").unwrap();
+        let (written, seen) = write_pass(swapped, digests.clone()).await;
+        let err = written.expect_err("a changed entry must stop the restore");
+        assert!(
+            err.to_string().contains("changed after it was verified"),
+            "{err}"
+        );
+        assert!(seen[0].1.iter().all(|c| c.is_ok()));
+        assert!(
+            seen[1].1.last().unwrap().is_err(),
+            "the changed entry ends in an error, so storage never publishes it"
+        );
+
+        let fewer = [("a/1", &b"one"[..])];
+        let more = [("a/1", &b"one"[..]), ("a/2", b"two"), ("a/3", b"new")];
+        for artifacts in [&fewer[..], &more[..]] {
+            let archive = build_backup_tar(&[], artifacts, b"{}").unwrap();
+            let (written, _) = write_pass(archive, digests.clone()).await;
+            assert!(
+                written.is_err(),
+                "a different set of artifacts must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_verify_pass_caps_what_it_holds_in_memory_5336() {
+        let table = vec![b'x'; 2048];
+        let artifact = vec![0u8; 8192];
+        let archive = build_backup_tar(
+            &[("users", table.as_slice())],
+            &[("a/1", artifact.as_slice())],
+            b"{}",
+        )
+        .unwrap();
+        assert!(
+            scan(&archive, 4096).is_ok(),
+            "an artifact past the cap is only hashed, never held"
+        );
+        let err = scan(&archive, 1024)
+            .err()
+            .expect("table dumps past the cap are refused");
+        assert!(err.to_string().contains("holds in memory"), "{err}");
     }
 
     // -----------------------------------------------------------------------
@@ -4392,6 +5062,422 @@ mod tests {
             created_by: None,
             name: None,
         }
+    }
+
+    /// Bytes read from the source but not yet written to the sink, the most a run holds at once
+    #[derive(Default)]
+    struct Meter {
+        read: std::sync::atomic::AtomicU64,
+        written: std::sync::atomic::AtomicU64,
+        peak: std::sync::atomic::AtomicU64,
+    }
+
+    impl Meter {
+        fn read(&self, n: usize) {
+            self.read
+                .fetch_add(n as u64, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn wrote(&self, n: usize) {
+            use std::sync::atomic::Ordering::SeqCst;
+            let written_before = self.written.fetch_add(n as u64, SeqCst);
+            let held = self.read.load(SeqCst).saturating_sub(written_before);
+            self.peak.fetch_max(held, SeqCst);
+        }
+
+        fn peak(&self) -> u64 {
+            self.peak.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn restart(&self) {
+            self.read.store(0, std::sync::atomic::Ordering::SeqCst);
+            self.written.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// In-memory storage that streams in 64 KiB chunks and reports every byte to a [`Meter`]
+    struct MeteredStorage {
+        objects: std::sync::Mutex<std::collections::HashMap<String, Bytes>>,
+        meter: Arc<Meter>,
+        /// Restart the meter on every read, so only the latest pass over an archive counts
+        restarts: bool,
+    }
+
+    impl MeteredStorage {
+        fn new(
+            meter: &Arc<Meter>,
+            objects: std::collections::HashMap<String, Bytes>,
+            restarts: bool,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                objects: std::sync::Mutex::new(objects),
+                meter: meter.clone(),
+                restarts,
+            })
+        }
+
+        fn open(&self, key: &str) -> Result<Bytes> {
+            if self.restarts {
+                self.meter.restart();
+            }
+            self.object(key)
+        }
+
+        fn object(&self, key: &str) -> Result<Bytes> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(key.to_string()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for MeteredStorage {
+        async fn put(&self, key: &str, content: Bytes) -> Result<()> {
+            self.meter.wrote(content.len());
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), content);
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            let bytes = self.open(key)?;
+            self.meter.read(bytes.len());
+            Ok(bytes)
+        }
+        async fn exists(&self, key: &str) -> Result<bool> {
+            Ok(self.objects.lock().unwrap().contains_key(key))
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.objects.lock().unwrap().remove(key);
+            Ok(())
+        }
+        async fn list(&self, _prefix: Option<&str>) -> Result<Vec<String>> {
+            Ok(self.objects.lock().unwrap().keys().cloned().collect())
+        }
+        async fn copy(&self, source: &str, dest: &str) -> Result<()> {
+            let bytes = self.object(source)?;
+            self.objects.lock().unwrap().insert(dest.to_string(), bytes);
+            Ok(())
+        }
+        async fn size(&self, key: &str) -> Result<u64> {
+            Ok(self.object(key)?.len() as u64)
+        }
+        async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
+            let bytes = self.open(key)?;
+            let chunks: Vec<Bytes> = bytes
+                .chunks(64 * 1024)
+                .map(|c| bytes.slice_ref(c))
+                .collect();
+            let meter = self.meter.clone();
+            Ok(futures::stream::iter(chunks)
+                .map(move |chunk| {
+                    meter.read(chunk.len());
+                    Ok(chunk)
+                })
+                .boxed())
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            mut stream: BoxStream<'static, Result<Bytes>>,
+        ) -> Result<crate::services::storage_service::PutStreamResult> {
+            let mut stored = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                self.meter.wrote(chunk.len());
+                stored.extend_from_slice(&chunk);
+            }
+            let bytes_written = stored.len() as u64;
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), Bytes::from(stored));
+            Ok(crate::services::storage_service::PutStreamResult {
+                checksum_sha256: String::new(),
+                bytes_written,
+            })
+        }
+    }
+
+    /// Random bytes don't compress, so archive bytes track artifact bytes
+    const METERED_ARTIFACTS: usize = 16;
+    const METERED_ARTIFACT_BYTES: usize = 1024 * 1024;
+    /// Well above a streamed run's few chunks, well below the 16 MiB a buffering run holds
+    const METERED_PEAK_LIMIT: u64 = 4 * 1024 * 1024;
+
+    async fn metered_backup(pool: &PgPool) -> (Uuid, Backup, Arc<Meter>, Arc<MeteredStorage>) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use rand08::RngCore;
+
+        let (repo_id, _, repo_dir) = tdh::create_repo(pool, "local", "generic").await;
+        let _ = std::fs::remove_dir_all(repo_dir);
+        let mut objects = std::collections::HashMap::new();
+        for _ in 0..METERED_ARTIFACTS {
+            let key = format!("ab/cd/{}", Uuid::new_v4().simple());
+            let mut bytes = vec![0u8; METERED_ARTIFACT_BYTES];
+            rand08::thread_rng().fill_bytes(&mut bytes);
+            insert_artifact_with_key(pool, repo_id, &key, bytes.len()).await;
+            objects.insert(key, Bytes::from(bytes));
+        }
+        let meter = Arc::new(Meter::default());
+        let source = MeteredStorage::new(&meter, objects, false);
+        let archive = MeteredStorage::new(&meter, Default::default(), false);
+        let service = BackupService::with_archive_storage(
+            pool.clone(),
+            Arc::new(StorageService::new(source)),
+            Arc::new(StorageService::new(archive.clone())),
+        );
+        let job = service
+            .create(full_backup_of(repo_id))
+            .await
+            .expect("create backup job");
+        let run = service.execute_run(job.id).await.expect("execute backup");
+        assert!(run.failure.is_none(), "{:?}", run.failure);
+        (repo_id, run.backup, meter, archive)
+    }
+
+    /// #5336. FAILS ON MAIN: every artifact was read into memory before a byte of the archive was written
+    #[tokio::test]
+    async fn backup_streams_artifacts_into_the_archive_5336() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, backup, meter, archive) = metered_backup(&pool).await;
+
+        assert_eq!(backup.status, BackupStatus::Completed);
+        assert_eq!(backup.artifact_count, Some(METERED_ARTIFACTS as i64));
+        let read = meter.read.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(read, (METERED_ARTIFACTS * METERED_ARTIFACT_BYTES) as u64);
+        assert!(
+            meter.peak() < METERED_PEAK_LIMIT,
+            "the backup held {} bytes at once",
+            meter.peak()
+        );
+        let stored = archive
+            .object(backup.storage_path.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(backup.size_bytes, Some(stored.len() as i64));
+        assert_eq!(
+            count_artifacts_in_tar(&stored).unwrap(),
+            METERED_ARTIFACTS as i64
+        );
+
+        let _ = sqlx::query("DELETE FROM backups WHERE id = $1")
+            .bind(backup.id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// #5336. FAILS ON MAIN: the archive and every entry were in memory before the first artifact was written
+    #[tokio::test]
+    async fn restore_streams_artifacts_out_of_the_archive_5336() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, backup, _, archive) = metered_backup(&pool).await;
+        let archived = archive.objects.lock().unwrap().clone();
+        let stored = archived[backup.storage_path.as_deref().unwrap()].clone();
+
+        let meter = Arc::new(Meter::default());
+        let dest = MeteredStorage::new(&meter, Default::default(), false);
+        let service = BackupService::with_archive_storage(
+            pool.clone(),
+            Arc::new(StorageService::new(dest.clone())),
+            Arc::new(StorageService::new(MeteredStorage::new(
+                &meter, archived, true,
+            ))),
+        );
+        let result = service
+            .restore(backup.id, artifacts_only_restore())
+            .await
+            .expect("restore archive");
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.artifacts_restored, METERED_ARTIFACTS as i32);
+        assert!(
+            meter.peak() < METERED_PEAK_LIMIT,
+            "the restore held {} bytes at once",
+            meter.peak()
+        );
+        for (path, content) in BackupService::extract_entries(&stored).unwrap() {
+            if let Some(key) = artifact_storage_key(&path) {
+                assert_eq!(dest.object(&key).unwrap(), content, "{key}");
+            }
+        }
+
+        let _ = sqlx::query("DELETE FROM backups WHERE id = $1")
+            .bind(backup.id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// #5336: the verify pass refuses a tampered artifact before a row or a byte is written
+    #[tokio::test]
+    async fn a_tampered_artifact_is_refused_before_anything_is_written_5336() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let storage = MeteredStorage::new(&Arc::new(Meter::default()), Default::default(), false);
+        let service =
+            BackupService::new(pool.clone(), Arc::new(StorageService::new(storage.clone())));
+        let username = format!("tampered-{}", Uuid::new_v4().simple());
+        let users = serde_json::to_vec(&[crafted_admin_user_row(&username)]).unwrap();
+        let key = format!("ab/cd/{}", Uuid::new_v4().simple());
+        let honest = [("users", users.as_slice()), (key.as_str(), &b"honest"[..])];
+        let (_, recorded) = payload_summary(honest.into_iter());
+        let manifest = manifest_bytes_with_checksum(&["users"], &recorded);
+        let archive = build_backup_tar(
+            &[("users", users.as_slice())],
+            &[(key.as_str(), &b"forged"[..])],
+            &manifest,
+        )
+        .unwrap();
+        let backup_id =
+            seed_archive_as_backup(&pool, &service, archive, Some(&recorded), true).await;
+
+        let options = RestoreOptions {
+            restore_database: true,
+            restore_artifacts: true,
+            ..Default::default()
+        };
+        let err = service
+            .restore(backup_id, options)
+            .await
+            .expect_err("a tampered artifact must fail verification");
+        assert!(err.to_string().contains("integrity"), "{err}");
+        assert!(
+            storage.object(&key).is_err(),
+            "no artifact byte reaches storage"
+        );
+        assert_eq!(
+            user_rows_named(&pool, &username).await,
+            0,
+            "no row is ingested"
+        );
+
+        let _ = sqlx::query("DELETE FROM backups WHERE id = $1")
+            .bind(backup_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// Streams that fail after their first chunk, uploads that fail outright
+    struct BrokenStorage(Arc<dyn crate::services::storage_service::StorageBackend>);
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for BrokenStorage {
+        async fn put(&self, key: &str, content: Bytes) -> Result<()> {
+            self.0.put(key, content).await
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            self.0.get(key).await
+        }
+        async fn exists(&self, key: &str) -> Result<bool> {
+            self.0.exists(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.0.delete(key).await
+        }
+        async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+            self.0.list(prefix).await
+        }
+        async fn copy(&self, source: &str, dest: &str) -> Result<()> {
+            self.0.copy(source, dest).await
+        }
+        async fn size(&self, key: &str) -> Result<u64> {
+            self.0.size(key).await
+        }
+        async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
+            let failure = futures::stream::once(async {
+                Err::<Bytes, AppError>(AppError::Storage("injected read failure".to_string()))
+            });
+            Ok(self.0.get_stream(key).await?.take(1).chain(failure).boxed())
+        }
+        async fn put_stream(
+            &self,
+            _key: &str,
+            mut stream: BoxStream<'static, Result<Bytes>>,
+        ) -> Result<crate::services::storage_service::PutStreamResult> {
+            let _ = stream.next().await;
+            Err(AppError::Storage("injected upload failure".to_string()))
+        }
+    }
+
+    /// Back up one random 1 MiB artifact with a broken source or a broken
+    /// archive store, returning the run's failure and whether an archive landed
+    async fn backup_with_a_fault(pool: &PgPool, broken_source: bool) -> (String, bool) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let (repo_id, _, repo_dir) = tdh::create_repo(pool, "local", "generic").await;
+        let _ = std::fs::remove_dir_all(repo_dir);
+        let key = format!("ab/cd/{}", Uuid::new_v4().simple());
+        let mut bytes = vec![0u8; 1024 * 1024];
+        rand08::RngCore::fill_bytes(&mut rand08::thread_rng(), &mut bytes);
+        insert_artifact_with_key(pool, repo_id, &key, bytes.len()).await;
+        let meter = Arc::new(Meter::default());
+        let source = MeteredStorage::new(&meter, [(key, Bytes::from(bytes))].into(), false);
+        let archive = MeteredStorage::new(&meter, Default::default(), false);
+        let wrap = |storage: Arc<MeteredStorage>, broken: bool| {
+            let backend: Arc<dyn crate::services::storage_service::StorageBackend> = if broken {
+                Arc::new(BrokenStorage(storage))
+            } else {
+                storage
+            };
+            Arc::new(StorageService::new(backend))
+        };
+        let service = BackupService::with_archive_storage(
+            pool.clone(),
+            wrap(source, broken_source),
+            wrap(archive.clone(), !broken_source),
+        );
+        let job = service
+            .create(full_backup_of(repo_id))
+            .await
+            .expect("create backup job");
+        let run = service.execute_run(job.id).await.expect("execute backup");
+        let published = !archive.objects.lock().unwrap().is_empty();
+        let _ = sqlx::query("DELETE FROM backups WHERE id = $1")
+            .bind(job.id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+        (
+            run.failure.expect("a fault must fail the backup"),
+            published,
+        )
+    }
+
+    /// #5336: a read failing partway fails the run, its header is already in the
+    /// archive. Either fault reports its own cause, not the broken pipe it leaves
+    #[tokio::test]
+    async fn a_fault_mid_backup_fails_the_run_and_publishes_nothing_5336() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (failure, published) = backup_with_a_fault(&pool, true).await;
+        assert!(failure.contains("injected read failure"), "{failure}");
+        assert!(!published, "a failed backup publishes no archive");
+        let (failure, published) = backup_with_a_fault(&pool, false).await;
+        assert!(failure.contains("injected upload failure"), "{failure}");
+        assert!(!published, "a failed backup publishes no archive");
     }
 
     /// #5053: a filesystem repository stores artifact bytes under its own
@@ -5307,7 +6393,7 @@ mod tests {
             "a written manifest must carry a real checksum and size (#3011)"
         );
         assert_eq!(
-            verify_archive_integrity(None, Some(&parsed), &entries, false),
+            verify_archive_integrity(None, Some(&parsed), &archive_digest(&entries), false),
             Ok(IntegrityAnchor::Manifest),
             "an untampered archive must verify against its manifest"
         );
@@ -5327,13 +6413,13 @@ mod tests {
         let tar = build_backup_tar(&tampered_tables, &artifacts, &manifest_bytes).unwrap();
         let entries = BackupService::extract_entries(&tar).unwrap();
         let parsed = BackupService::read_manifest(&entries).unwrap();
-        let err = verify_archive_integrity(None, Some(&parsed), &entries, false)
+        let err = verify_archive_integrity(None, Some(&parsed), &archive_digest(&entries), false)
             .expect_err("tampered payload must fail verification");
         assert!(err.contains("integrity"), "got: {err}");
 
         // The waiver accepts an archive that cannot be checked; it never
         // accepts one that provably fails its check (#3373).
-        let err = verify_archive_integrity(None, Some(&parsed), &entries, true)
+        let err = verify_archive_integrity(None, Some(&parsed), &archive_digest(&entries), true)
             .expect_err("allow_unverified_archive must not waive a FAILED checksum");
         assert!(err.contains("integrity"), "got: {err}");
     }
@@ -5351,7 +6437,7 @@ mod tests {
         let entries = BackupService::extract_entries(&tar).unwrap();
         let parsed = BackupService::read_manifest(&entries).unwrap();
 
-        let err = verify_archive_integrity(None, Some(&parsed), &entries, false)
+        let err = verify_archive_integrity(None, Some(&parsed), &archive_digest(&entries), false)
             .expect_err("a blank checksum must not disable the check");
         assert!(
             err.contains("cannot be established") && err.contains("allow_unverified_archive"),
@@ -5359,7 +6445,7 @@ mod tests {
         );
 
         assert_eq!(
-            verify_archive_integrity(None, Some(&parsed), &entries, true),
+            verify_archive_integrity(None, Some(&parsed), &archive_digest(&entries), true),
             Ok(IntegrityAnchor::Waived),
             "an operator may still deliberately restore a pre-#3011 archive"
         );
@@ -5367,7 +6453,7 @@ mod tests {
         // A missing manifest is the same situation as a blanked field, and was
         // the second way to reach the old skip: `read_manifest` returned None
         // and no verification ran at all.
-        let err = verify_archive_integrity(None, None, &entries, false)
+        let err = verify_archive_integrity(None, None, &archive_digest(&entries), false)
             .expect_err("an archive with no manifest at all must not skip the check either");
         assert!(err.contains("cannot be established"), "got: {err}");
     }
@@ -5451,7 +6537,12 @@ mod tests {
         let entries = BackupService::extract_entries(&tar).unwrap();
         let parsed = BackupService::read_manifest(&entries).unwrap();
         assert_eq!(
-            verify_archive_integrity(Some(&recorded), Some(&parsed), &entries, false),
+            verify_archive_integrity(
+                Some(&recorded),
+                Some(&parsed),
+                &archive_digest(&entries),
+                false
+            ),
             Ok(IntegrityAnchor::Recorded)
         );
 
@@ -5472,7 +6563,12 @@ mod tests {
 
         // Self-consistent, so the manifest anchor alone accepts it...
         assert_eq!(
-            verify_archive_integrity(None, Some(&tampered_manifest), &tampered_entries, false),
+            verify_archive_integrity(
+                None,
+                Some(&tampered_manifest),
+                &archive_digest(&tampered_entries),
+                false
+            ),
             Ok(IntegrityAnchor::Manifest),
             "a manifest checksum only ever proves the archive agrees with itself"
         );
@@ -5480,7 +6576,7 @@ mod tests {
         let err = verify_archive_integrity(
             Some(&recorded),
             Some(&tampered_manifest),
-            &tampered_entries,
+            &archive_digest(&tampered_entries),
             false,
         )
         .expect_err("the recorded digest must refuse a rewritten archive");
@@ -5489,14 +6585,23 @@ mod tests {
         // Blanking the manifest checksum does not fall back to "unverifiable"
         // when a recorded digest exists — the recorded one still applies.
         let blanked = manifest_for(tampered.len(), artifacts.len(), (0, String::new()));
-        let err =
-            verify_archive_integrity(Some(&recorded), Some(&blanked), &tampered_entries, false)
-                .expect_err("blanking the manifest must not downgrade to no check");
+        let err = verify_archive_integrity(
+            Some(&recorded),
+            Some(&blanked),
+            &archive_digest(&tampered_entries),
+            false,
+        )
+        .expect_err("blanking the manifest must not downgrade to no check");
         assert!(err.contains("recorded"), "got: {err}");
 
         // Nor does the waiver reach it: the check is possible and it fails.
-        let err = verify_archive_integrity(Some(&recorded), None, &tampered_entries, true)
-            .expect_err("allow_unverified_archive must not waive a recorded-digest mismatch");
+        let err = verify_archive_integrity(
+            Some(&recorded),
+            None,
+            &archive_digest(&tampered_entries),
+            true,
+        )
+        .expect_err("allow_unverified_archive must not waive a recorded-digest mismatch");
         assert!(err.contains("recorded"), "got: {err}");
     }
 
@@ -5616,16 +6721,17 @@ mod tests {
         );
         assert!(big.max_total_bytes > MIN_DECOMPRESSED_BYTES);
 
-        // The ratio is clamped, so the budget is never purely a function of a
-        // length the archive controls (gzip tolerates trailing bytes, so a
-        // tamperer can pad to whatever `size_bytes` records). At 100x, a 2 GiB
-        // archive would otherwise buy a 200 GiB budget.
+        // No absolute ceiling: the restore streams, so a budget past 8 GiB
+        // costs time, not memory (#5336)
         let padded = ExtractLimits::for_archive(2 * 1024 * 1024 * 1024);
-        assert_eq!(padded.max_total_bytes, MAX_DECOMPRESSED_BYTES);
+        assert_eq!(
+            padded.max_total_bytes,
+            2 * 1024 * 1024 * 1024 * MAX_DECOMPRESSION_RATIO
+        );
 
         // No overflow panic on an absurd input.
-        let huge = ExtractLimits::for_archive(usize::MAX);
-        assert_eq!(huge.max_total_bytes, MAX_DECOMPRESSED_BYTES);
+        let huge = ExtractLimits::for_archive(u64::MAX);
+        assert_eq!(huge.max_total_bytes, u64::MAX);
         assert_eq!(huge.max_entries, MAX_ARCHIVE_ENTRIES);
     }
 
@@ -6570,6 +7676,10 @@ mod tests {
             "oci_blobs",
             "oci_tags",
             "oci_manifests",
+            // #5793: the per-image links and the scope marker travel too.
+            "oci_image_manifests",
+            "oci_image_blobs",
+            "oci_image_scope_backfill",
             "groups",
             "webhooks",
         ] {
@@ -6629,6 +7739,21 @@ mod tests {
             .await
             .expect("restore runs");
         let after_pulls = pulls().await;
+        // #5793: the restored repository is still scoped to its image names,
+        // so a name that never held the layer still answers 404.
+        let (foreign_layer_status, _) = send(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/{}/nobody/blobs/{}",
+                    fx.repo_key,
+                    digest_of(&layer_body)
+                ))
+                .header("Authorization", &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
         let count = |sql: &'static str, id: Uuid| {
             let pool = pool.clone();
             async move {
@@ -6651,6 +7776,16 @@ mod tests {
         )
         .await;
         let webhooks = count("SELECT COUNT(*) FROM webhooks WHERE id = $1", webhook_id).await;
+        let scope_marker = count(
+            "SELECT COUNT(*) FROM oci_image_scope_backfill WHERE repository_id = $1",
+            fx.repo_id,
+        )
+        .await;
+        let manifest_links = count(
+            "SELECT COUNT(*) FROM oci_image_manifests WHERE repository_id = $1 AND image = 'app'",
+            fx.repo_id,
+        )
+        .await;
         let setting: Option<serde_json::Value> =
             sqlx::query_scalar("SELECT value FROM system_settings WHERE key = $1")
                 .bind(&setting_key)
@@ -6681,6 +7816,19 @@ mod tests {
             assert_eq!(status, StatusCode::OK, "pull {path} after the restore");
             assert!(same, "{path} bytes after the restore");
         }
+        assert_eq!(
+            scope_marker, 1,
+            "the repository's scope marker is restored (#5793)"
+        );
+        assert!(
+            manifest_links >= 1,
+            "the image's manifest link is restored (#5793)"
+        );
+        assert_eq!(
+            foreign_layer_status,
+            StatusCode::NOT_FOUND,
+            "after the restore the layer still resolves only under the image that holds it"
+        );
         assert_eq!(groups, 1, "the group is restored");
         assert_eq!(members, 1, "the group member is restored");
         assert_eq!(permissions, 1, "the group's permission is restored");

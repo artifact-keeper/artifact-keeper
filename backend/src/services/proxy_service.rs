@@ -6222,6 +6222,12 @@ impl ProxyService {
         &self.db
     }
 
+    /// The upstream client's read timeout (`PROXY_UPSTREAM_READ_TIMEOUT_SECS`,
+    /// #5220), which caps the virtual-member download deadline (#5810).
+    pub(crate) fn upstream_read_timeout(&self) -> std::time::Duration {
+        self.upstream_timeouts.read()
+    }
+
     /// Fetch artifact from upstream if not cached or cache expired.
     /// Returns (content, content_type) tuple.
     ///
