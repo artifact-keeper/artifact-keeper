@@ -660,8 +660,19 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
 """
 
 
+LEDGER_SCOPES = ("issue", "facet")
+
+
 def read_ledger(path):
-    """issue -> (category, reason) from the TSV ledger."""
+    """issue -> {"issue": (category, reason) | None, "facets": [(category, reason)]}.
+
+    An optional fourth column is the scope: `issue` (the default) exempts the
+    whole issue; `facet` records that ONE facet of an otherwise end-to-end
+    covered issue has no end-to-end test, and why. A facet row never exempts
+    the issue: the backstop still needs a wired tier, and prints the row as a
+    note next to it. An issue may have several facet rows, but at most one
+    `issue` row, and not both.
+    """
     out = {}
     with open(path, encoding="utf-8") as fh:
         for lineno, line in enumerate(fh, 1):
@@ -669,19 +680,75 @@ def read_ledger(path):
             if not line.strip() or line.startswith("#"):
                 continue
             cols = line.split("\t")
-            if len(cols) != 3 or not cols[0].strip().isdigit():
-                raise ValueError(f"{path}:{lineno}: want `issue<TAB>category<TAB>reason`")
+            if len(cols) not in (3, 4) or not cols[0].strip().isdigit():
+                raise ValueError(f"{path}:{lineno}: want `issue<TAB>category<TAB>reason[<TAB>scope]`")
             n, cat, reason = int(cols[0]), cols[1].strip(), cols[2].strip()
+            scope = cols[3].strip() if len(cols) == 4 else "issue"
+            if scope not in LEDGER_SCOPES:
+                raise ValueError(f"{path}:{lineno}: unknown scope '{scope}' (one of: {', '.join(LEDGER_SCOPES)})")
             if cat not in LEDGER_CATEGORIES:
                 raise ValueError(f"{path}:{lineno}: unknown category '{cat}'")
             if len(reason) < 10:
                 raise ValueError(f"{path}:{lineno}: #{n} needs a reason")
             if cat in NAMES_A_TEST and not TEST_NAME_RE.search(reason):
                 raise ValueError(f"{path}:{lineno}: #{n} '{cat}' must name its test")
+            entry = out.setdefault(n, {"issue": None, "facets": []})
+            if scope == "issue":
+                if entry["issue"] or entry["facets"]:
+                    raise ValueError(f"{path}:{lineno}: #{n} has an issue row and another row")
+                entry["issue"] = (cat, reason)
+            else:
+                if entry["issue"]:
+                    raise ValueError(f"{path}:{lineno}: #{n} has an issue row and a facet row")
+                entry["facets"].append((cat, reason))
+    return out
+
+
+def read_fix_prs(path):
+    """issue -> [PR numbers] from the fix-PR override file.
+
+    The backstop reads an issue's closing PRs from GitHub's closing
+    references, which name the PR whose body said `Closes #N`. When the fix
+    landed elsewhere (another PR fixed it and the closing PR only added a
+    test), a row here names the PR(s) whose body and labels count instead.
+    Columns: issue, comma-separated PR numbers, reason. A missing file is an
+    empty table.
+    """
+    out = {}
+    if not os.path.exists(path):
+        return out
+    with open(path, encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, 1):
+            line = line.rstrip("\n")
+            if not line.strip() or line.startswith("#"):
+                continue
+            cols = line.split("\t")
+            if len(cols) != 3 or not cols[0].strip().isdigit():
+                raise ValueError(f"{path}:{lineno}: want `issue<TAB>pr[,pr]<TAB>reason`")
+            prs = [p.strip().lstrip("#") for p in cols[1].split(",") if p.strip()]
+            if not prs or not all(p.isdigit() for p in prs):
+                raise ValueError(f"{path}:{lineno}: PR numbers must be `N` or `N,M`")
+            if len(cols[2].strip()) < 10:
+                raise ValueError(f"{path}:{lineno}: #{cols[0]} needs a reason")
+            n = int(cols[0])
             if n in out:
                 raise ValueError(f"{path}:{lineno}: #{n} listed twice")
-            out[n] = (cat, reason)
+            out[n] = [int(p) for p in prs]
     return out
+
+
+def fetch_pr_node(repo, number):
+    """A PR in the GraphQL node shape the milestone query returns."""
+    pr = gh_api(f"repos/{repo}/pulls/{number}")
+    return {
+        "number": pr["number"],
+        "title": pr.get("title") or "",
+        "body": pr.get("body") or "",
+        "merged": bool(pr.get("merged")),
+        "headRefName": (pr.get("head") or {}).get("ref") or "",
+        "baseRefName": (pr.get("base") or {}).get("ref") or "",
+        "labels": {"nodes": [{"name": n} for n in label_names(pr)]},
+    }
 
 
 def gate_tiers(workflow_text):
@@ -739,6 +806,7 @@ def run_milestone(args):
     repo, test_repo = args.repo, args.test_repo
     try:
         ledger = read_ledger(args.exemptions)
+        fix_prs = read_fix_prs(args.fix_prs)
     except (OSError, ValueError) as e:
         print(f"INFRA: exemption ledger: {e}", file=sys.stderr)
         return 2
@@ -784,6 +852,9 @@ def run_milestone(args):
             rows.append((n, "skip", f"closed as {issue['stateReason'].lower()}"))
             continue
         ilabels = [lbl["name"] for lbl in issue["labels"]["nodes"]]
+        if n in fix_prs:
+            issue = dict(issue)
+            issue["closedByPullRequestsReferences"] = {"nodes": [fetch_pr_node(repo, p) for p in fix_prs[n]]}
         status, detail = proof_for_issue(n, issue, ilabels, ledger, by_issue, fixes, gate, tree, repo)
         if status in ("MISSING", "DEFERRED", "UNWIRED"):
             blocking += 1
@@ -807,6 +878,13 @@ def proof_for_issue(n, issue, ilabels, ledger, by_issue, fixes, gate, tree, repo
     # Every issue here is type:bug, so the closing PR's title type and diff
     # paths never exempt it (the rule run_pr applies): a bug closed by a
     # `test: ...` PR still needs a tier, a suite, or an explicit exemption.
+    status, detail = _proof_for_issue(n, issue, ilabels, ledger, by_issue, fixes, gate, tree)
+    for cat, reason in (ledger.get(n) or {}).get("facets", []):
+        detail += f" [facet without e2e, {cat}: {reason[:70]}]"
+    return status, detail
+
+
+def _proof_for_issue(n, issue, ilabels, ledger, by_issue, fixes, gate, tree):
     tiers = by_issue.get(n, [])
     wired = [t for t in tiers if t in gate]
     if wired:
@@ -814,8 +892,9 @@ def proof_for_issue(n, issue, ilabels, ledger, by_issue, fixes, gate, tree, repo
         extra = "" if n in fixes.get(t, set()) else " (warning: no `FIX #N` case)"
         stale = f"; remove {DEFER_LABEL}" if DEFER_LABEL in ilabels else ""
         return "covered", f"tier {t} ({gate[t]}){extra}{stale}"
-    if n in ledger:
-        return "exempt", f"ledger: {ledger[n][0]}: {ledger[n][1][:80]}"
+    row = (ledger.get(n) or {}).get("issue")
+    if row:
+        return "exempt", f"ledger: {row[0]}: {row[1][:80]}"
     prs = issue["closedByPullRequestsReferences"]["nodes"]
     for pr in prs:
         body = sanitize(pr.get("body"))
@@ -874,6 +953,7 @@ def main(argv=None):
     m.add_argument("--test-repo", default=DEFAULT_TEST_REPO)
     here = os.path.dirname(os.path.abspath(__file__))
     m.add_argument("--exemptions", default=os.path.join(here, "e2e-exemptions.tsv"))
+    m.add_argument("--fix-prs", default=os.path.join(here, "e2e-fix-prs.tsv"))
     args = ap.parse_args(argv)
     if args.cmd == "milestone" and not (args.tests_ref or args.tests_dir):
         ap.error("milestone needs --tests-ref or --tests-dir")

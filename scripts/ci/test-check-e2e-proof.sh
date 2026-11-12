@@ -316,6 +316,10 @@ jobs:
             tiers: advisory
 YML
 printf '# header\n4814\ttest-only\tFlaky unit test; the fix changes only the test.\n' > "$WORK/ledger.tsv"
+# Facet rows (fourth column `facet`) are notes, never exemptions.
+printf '200\tinternal-unreachable\tThe signed metadata facet: alpine.rs test_extract_pkginfo_reads_a_signed_apk_5170.\tfacet\n' >> "$WORK/ledger.tsv"
+printf '202\tinternal-unreachable\tOne facet only: covered by some_module::a_facet_unit_test.\tfacet\n' >> "$WORK/ledger.tsv"
+printf '# none\n' > "$WORK/fixprs.tsv"
 
 # issue <n> <labels-json> <closing PRs json> [stateReason]
 issue() { printf '{"number":%s,"title":"bug %s","stateReason":"%s","labels":{"nodes":%s},"closedByPullRequestsReferences":{"nodes":%s}}' \
@@ -335,7 +339,7 @@ ms_world() { # <issue nodes, comma separated> [extra jq]
 run_ms() {
   ( PATH="$STUB:$PATH" GH_WORLD="$WORK/world.json" GH_WRITES="$WORK/writes.log" \
       python3 "$SCRIPT" milestone --milestone "${MS:-1.12.0}" --tests-dir "$TESTS" --repo "$R" \
-      --exemptions "${LEDGER_FILE:-$WORK/ledger.tsv}" >"$WORK/out.txt" 2>&1 )
+      --exemptions "${LEDGER_FILE:-$WORK/ledger.tsv}" --fix-prs "${FIXPRS_FILE:-$WORK/fixprs.tsv}" >"$WORK/out.txt" 2>&1 )
   echo $?
 }
 expect_ms() { # <label> <want> <needle> <nodes> [extra jq]
@@ -378,6 +382,30 @@ expect_ms "graphql failure is INFRA" 2 "INFRA" "$(issue 200 "$BUG" '[]')" '.grap
 printf '4980\trace-window\tthe window is a few microseconds wide\n' > "$WORK/bad.tsv"
 LEDGER_FILE="$WORK/bad.tsv" expect_ms "ledger race-window row naming no test is refused" 2 "must name its test" "$(issue 200 "$BUG" '[]')"
 LEDGER_FILE="$LEDGER" expect_ms "the real ledger parses" 0 "READY" "$(issue 200 "$BUG" "[$P300]")"
+FIXPRS_FILE="$HERE/e2e-fix-prs.tsv" expect_ms "the real fix-PR overrides parse" 0 "READY" "$(issue 200 "$BUG" "[$P300]")"
+
+echo
+echo "check-e2e-proof.py milestone: facet rows and fix-PR overrides"
+expect_ms "facet row on a wired-tier issue -> covered, with the facet noted" 0 "facet without e2e, internal-unreachable" \
+  "$(issue 200 "$BUG" "[$P300]")"
+expect_ms "facet row alone does not exempt the issue -> MISSING" 1 "MISSING" "$(issue 202 "$BUG" "[$P300]")"
+printf '4814\ttest-only\tFlaky unit test; the fix changes only the test.\twhole\n' > "$WORK/badscope.tsv"
+LEDGER_FILE="$WORK/badscope.tsv" expect_ms "unknown ledger scope is refused" 2 "unknown scope 'whole'" "$(issue 200 "$BUG" '[]')"
+cp "$WORK/ledger.tsv" "$WORK/twofacets.tsv"
+printf '200\trace-window\tA second facet: forced by db.rs real_deadlock_answers_503_with_retry_after_5168.\tfacet\n' >> "$WORK/twofacets.tsv"
+LEDGER_FILE="$WORK/twofacets.tsv" expect_ms "two facet rows on one issue are both noted" 0 "facet without e2e, race-window" "$(issue 200 "$BUG" "[$P300]")"
+printf '4814\ttest-only\tA facet of a fully exempt issue makes no sense.\tfacet\n' >> "$WORK/twofacets.tsv"
+LEDGER_FILE="$WORK/twofacets.tsv" expect_ms "an issue row plus a facet row is refused" 2 "has an issue row and" "$(issue 200 "$BUG" '[]')"
+# #5461's shape: GitHub's closing reference is a test-only PR; the fix PR
+# named in the override carries the exemption the backstop must read.
+printf '208\t310\tThe fix landed in #310; #300 only added the regression test.\n' > "$WORK/fixprs-208.tsv"
+FIXPRS_FILE="$WORK/fixprs-208.tsv" expect_ms "fix-PR override: the named PR's exemption counts" 0 "#310: deps" \
+  "$(issue 208 "$BUG" "[$P300]")" \
+  '.GET["repos/\(env.R)/pulls/310"] = {number: 310, title: "fix(deps): x", body: "E2E-Exempt: deps: bump for RUSTSEC-2026-0002", merged: true, head: {ref: "fix/x"}, base: {ref: "main"}, labels: [{name: "no-e2e-required"}]}'
+expect_ms "without the override the closing PR is used -> MISSING via #300" 1 "(#300)" "$(issue 208 "$BUG" "[$P300]")"
+FIXPRS_FILE="$WORK/fixprs-208.tsv" expect_ms "override naming a PR that does not exist -> INFRA" 2 "INFRA" "$(issue 208 "$BUG" "[$P300]")"
+printf '208\tabc\tThe fix landed somewhere else entirely.\n' > "$WORK/fixprs-bad.tsv"
+FIXPRS_FILE="$WORK/fixprs-bad.tsv" expect_ms "malformed override file is refused" 2 "PR numbers must be" "$(issue 200 "$BUG" '[]')"
 
 echo
 if [ "$fails" -gt 0 ]; then
