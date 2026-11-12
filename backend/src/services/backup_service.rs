@@ -1597,6 +1597,68 @@ fn validated_restore_rows(table: &str, content: &[u8]) -> Result<Vec<serde_json:
     Ok(serde_json::from_slice(content)?)
 }
 
+/// What restoring one table's rows did (#5856).
+#[derive(Debug, Default)]
+struct TableRestore {
+    /// Rows in the archive.
+    rows: usize,
+    /// Rows inserted. A row that already exists is skipped, not counted.
+    restored: usize,
+    /// One `key (error)` line per row that failed.
+    failed: Vec<String>,
+}
+
+/// The primary key columns of `table`, empty when it has none or the catalog
+/// cannot be read (the row is then named by its position).
+async fn primary_key_columns(conn: &mut sqlx::PgConnection, table: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT a.attname::text FROM pg_index i \
+         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+         WHERE i.indrelid = to_regclass($1) AND i.indisprimary \
+         ORDER BY array_position(i.indkey::int2[], a.attnum)",
+    )
+    .bind(table)
+    .fetch_all(conn)
+    .await
+    .unwrap_or_default()
+}
+
+/// Name an archived row by its primary key, never by its contents (#5856).
+fn row_label(row: &serde_json::Value, primary_key: &[String], index: usize) -> String {
+    let parts: Vec<String> = primary_key
+        .iter()
+        .filter_map(|column| {
+            let value = row.get(column)?;
+            let value = match value {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                _ => return None,
+            };
+            Some(format!("{column}={value}"))
+        })
+        .collect();
+    if parts.is_empty() || parts.len() != primary_key.len() {
+        format!("row {}", index + 1)
+    } else {
+        parts.join(",")
+    }
+}
+
+/// Why a row failed, without the values PostgreSQL quotes for a data
+/// exception (`invalid input syntax for type uuid: "..."`), which could be
+/// the row's secret (#5856). Integrity violations name only the constraint.
+fn row_error(error: &sqlx::Error) -> String {
+    match error {
+        sqlx::Error::Database(db) => match db.code() {
+            Some(code) if code.starts_with("22") => {
+                format!("a value does not fit its column (SQLSTATE {code})")
+            }
+            _ => db.message().to_string(),
+        },
+        _ => "database error".to_string(),
+    }
+}
+
 /// A backend that cannot report the length without reading gets that one object buffered
 async fn open_sized_stream(
     backend: &dyn crate::storage::StorageBackend,
@@ -3078,6 +3140,11 @@ impl BackupService {
     /// `conn`. `strict` (a depth-bearing archive, `conn` inside one
     /// transaction) turns any failure into an error; otherwise failures are
     /// collected into `result` and the restore continues.
+    ///
+    /// Archived user, role and group ids that exist here under another id
+    /// are mapped onto the live rows first (#5856), so a restore into a
+    /// server with its own bootstrap admin and seeded roles keeps the rows
+    /// that refer to them.
     async fn restore_tables(
         conn: &mut sqlx::PgConnection,
         entries: &[(std::path::PathBuf, Vec<u8>)],
@@ -3085,6 +3152,12 @@ impl BackupService {
         strict: bool,
         result: &mut RestoreResult,
     ) -> Result<()> {
+        let remap = IdentityRemap::build(&mut *conn, |table| {
+            backup_table(entries, table)
+                .map(|content| validated_restore_rows(table, content))
+                .transpose()
+        })
+        .await?;
         for table_name in RESTORE_TABLE_ORDER
             .iter()
             .copied()
@@ -3093,10 +3166,25 @@ impl BackupService {
             let Some(content) = backup_table(entries, table_name) else {
                 continue;
             };
-            match Self::restore_table_in(&mut *conn, table_name, content, strict).await {
-                Ok(rows) => {
-                    tracing::info!("Restored {} rows into table '{}'", rows, table_name);
+            match Self::restore_table_in(&mut *conn, table_name, content, strict, &remap).await {
+                Ok(table) => {
+                    tracing::info!(
+                        "Restored {} rows into table '{}'",
+                        table.restored,
+                        table_name
+                    );
                     result.tables_restored.push(table_name.to_string());
+                    // Every row that did not go in is part of the archive that
+                    // did not come back, so the restore cannot be `completed`.
+                    if !table.failed.is_empty() {
+                        result.errors.push(format!(
+                            "Failed to restore {} of {} row(s) into '{}': {}",
+                            table.failed.len(),
+                            table.rows,
+                            table_name,
+                            capped_list(&table.failed, 5)
+                        ));
+                    }
                 }
                 Err(e) => {
                     if strict
@@ -3123,13 +3211,13 @@ impl BackupService {
     /// Restore a single database table from JSON data.
     /// Uses jsonb_populate_record for proper type coercion.
     #[cfg(test)]
-    async fn restore_table(&self, table: &str, content: &[u8]) -> Result<usize> {
+    async fn restore_table(&self, table: &str, content: &[u8]) -> Result<TableRestore> {
         // Validate (allowlist, JSON) before touching the pool.
         if validated_restore_rows(table, content)?.is_empty() {
-            return Ok(0);
+            return Ok(TableRestore::default());
         }
         let mut conn = self.db.acquire().await?;
-        Self::restore_table_in(&mut conn, table, content, false).await
+        Self::restore_table_in(&mut conn, table, content, false, &IdentityRemap::default()).await
     }
 
     async fn restore_table_in(
@@ -3137,44 +3225,53 @@ impl BackupService {
         table: &str,
         content: &[u8],
         strict: bool,
-    ) -> Result<usize> {
-        let rows = validated_restore_rows(table, content)?;
-        let mut restored = 0usize;
+        remap: &IdentityRemap,
+    ) -> Result<TableRestore> {
+        let mut rows = validated_restore_rows(table, content)?;
+        let mut outcome = TableRestore {
+            rows: rows.len(),
+            ..TableRestore::default()
+        };
+        // Read only once a row fails, to name it by its key.
+        let mut primary_key: Option<Vec<String>> = None;
 
-        for row in &rows {
-            // Use jsonb_populate_record to let Postgres handle type coercion
-            let query = format!(
-                "INSERT INTO {table} SELECT * FROM jsonb_populate_record(NULL::{table}, $1) ON CONFLICT DO NOTHING"
-            );
-
-            let insert = sqlx::query(sqlx::AssertSqlSafe(&*query)).bind(row);
+        // Use jsonb_populate_record to let Postgres handle type coercion
+        let query = format!(
+            "INSERT INTO {table} SELECT * FROM jsonb_populate_record(NULL::{table}, $1) ON CONFLICT DO NOTHING"
+        );
+        for (index, row) in rows.iter_mut().enumerate() {
+            remap.apply(table, row);
+            let insert = sqlx::query(sqlx::AssertSqlSafe(&*query)).bind(&*row);
             if strict {
                 // `conn` is the restore's one transaction and any failure
                 // aborts all of it, so a per-row savepoint would only add a
                 // subtransaction per row.
-                restored += insert.execute(&mut *conn).await?.rows_affected() as usize;
+                outcome.restored += insert.execute(&mut *conn).await?.rows_affected() as usize;
                 continue;
             }
             // `conn` is not in a transaction: each row commits on its own.
             match insert.execute(&mut *conn).await {
                 Ok(result) => {
-                    restored += result.rows_affected() as usize;
+                    outcome.restored += result.rows_affected() as usize;
                 }
                 Err(e) => {
                     if crate::services::rpm_layout::database_error(&e.to_string()).is_some() {
                         return Err(e.into());
                     }
-                    tracing::warn!(
-                        "Failed to restore row in '{}': {} (row: {})",
-                        table,
-                        e,
-                        serde_json::to_string(row).unwrap_or_default()
-                    );
+                    if primary_key.is_none() {
+                        primary_key = Some(primary_key_columns(&mut *conn, table).await);
+                    }
+                    let key = row_label(row, primary_key.as_deref().unwrap_or_default(), index);
+                    let error = row_error(&e);
+                    // The row itself can hold token hashes or encrypted
+                    // secrets, so only its key is logged (#5856).
+                    tracing::warn!(table, row = %key, error = %error, "Failed to restore row");
+                    outcome.failed.push(format!("{key} ({error})"));
                 }
             }
         }
 
-        Ok(restored)
+        Ok(outcome)
     }
 
     /// Delete a backup
@@ -3353,6 +3450,12 @@ impl std::fmt::Display for RestoreStatus {
 }
 
 mod content_tables;
+mod identity_remap;
+use identity_remap::IdentityRemap;
+
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod restore_identity_tests;
 
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
@@ -4676,7 +4779,8 @@ mod tests {
             service
                 .restore_table("users", b"[]")
                 .await
-                .expect("allowlisted table passes validation"),
+                .expect("allowlisted table passes validation")
+                .rows,
             0
         );
     }

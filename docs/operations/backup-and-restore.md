@@ -101,12 +101,36 @@ ran. Read `status`, not just the HTTP code:
   - Artifacts that were unreadable at backup time (opt-in partial backups).
   - An archive checked only against its own manifest (captured before
     backups recorded their payload checksum on the backup row, #3373).
+  - Rows that could not be inserted. One message per table gives the count
+    and names each row by its primary key with the database's reason, for
+    example `Failed to restore 2 of 40 row(s) into 'artifacts': id=... (insert
+    or update on table "artifacts" violates foreign key constraint ...)`.
+    The server log has the same table and key at WARN, never the row itself.
 - `excluded` lists the categories the archive does not carry. Whatever the
   `status`, a restore never brings these back.
 
 Rows that already exist on the target server are kept as they are: every
 table restores with `ON CONFLICT DO NOTHING`, so a restore adds what is
 missing and never overwrites a live row, a live setting or a live group.
+
+## Restoring into another server
+
+A restore can target a different server from the one that took the backup,
+for example a fresh install. That server has its own bootstrap `admin` and
+its own seeded roles, each created with a random id. Before inserting any row,
+a restore matches archived users by `username`, roles by `name` and groups by
+`name` against the rows the server already has (#5856). When one exists under
+another id, every archived row that refers to it (a repository's
+`created_by`, an artifact's `uploaded_by`, `user_roles`, `role_assignments`,
+group members, fine-grained `permissions` of a user or group, webhooks, API
+tokens, and so on) is restored pointing at the existing row.
+
+The existing row itself is kept as it is. In particular the target's `admin`
+keeps its own password, and it takes over everything the archived `admin`
+owned, including the archived `admin`'s API tokens. Revoke those after the
+restore if the target's `admin` is not meant to hold them. Archived users
+that do not exist on the target are restored with their archived ids and
+password hashes.
 
 ## Docker/OCI repositories
 
