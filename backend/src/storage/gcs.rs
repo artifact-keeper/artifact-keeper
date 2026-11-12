@@ -199,16 +199,59 @@ fn is_transient_status(status: u16) -> bool {
     status == 429 || (500..=599).contains(&status)
 }
 
-/// Map a failed upstream status to the right `AppError`. Transient statuses
-/// (429/5xx) become `ServiceUnavailable` (HTTP 503, retryable by callers);
-/// everything else stays `Storage` (HTTP 500).
+/// GCS error `reason`s that mean "retry later": rate limits, and
+/// `quotaExceeded`, which GCS also answers for API-usage quotas, so it is not
+/// proof the bucket is full (#5650 review).
+const GCS_RETRYABLE_REASONS: &[&str] = &[
+    "quotaExceeded",
+    "rateLimitExceeded",
+    "userRateLimitExceeded",
+];
+
+/// The `reason` of each entry in a GCS JSON error body
+/// (`{"error":{"errors":[{"reason":...}]}}`). Only these exact values are
+/// read, never the rest of the body, which can quote the object name.
+fn gcs_error_reasons(body: &str) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.pointer("/error/errors").cloned())
+        .and_then(|errors| errors.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|e| e.get("reason").and_then(|r| r.as_str()).map(str::to_string))
+        .collect()
+}
+
+/// Map a failed upstream status to the right `AppError` (#5649, #5650): 507
+/// is out of space (`507 STORAGE_FULL`); a transient status (429/5xx) or a
+/// rate / usage-quota `reason` is retryable (`503 STORAGE_UNAVAILABLE`);
+/// everything else stays `Storage` (500). The body is kept for the log only:
+/// a classified error answers the client with a fixed message.
 fn map_status_error(status: u16, context: &str, body: &str) -> AppError {
+    use crate::storage::StorageFailure;
     let msg = format!("{} (status {}): {}", context, status, body);
-    if is_transient_status(status) {
-        AppError::ServiceUnavailable(msg)
+    let class = if status == 507 {
+        Some(StorageFailure::Full)
+    } else if is_transient_status(status)
+        || gcs_error_reasons(body)
+            .iter()
+            .any(|r| GCS_RETRYABLE_REASONS.contains(&r.as_str()))
+    {
+        Some(StorageFailure::Unavailable)
     } else {
-        AppError::Storage(msg)
+        None
+    };
+    match class {
+        Some(class) => AppError::Storage(class.tag(msg)),
+        None => AppError::Storage(msg),
     }
+}
+
+/// A GCS failure that is retryable without a response to classify (a
+/// network error mid-upload, exhausted chunk retries): `503
+/// STORAGE_UNAVAILABLE`, with `message` kept for the log.
+fn gcs_unavailable(message: String) -> AppError {
+    AppError::Storage(crate::storage::StorageFailure::Unavailable.tag(message))
 }
 
 /// Map a reqwest error to a storage error without the request URL. A
@@ -217,7 +260,8 @@ fn map_status_error(status: u16, context: &str, body: &str) -> AppError {
 /// responses and the health check, so only the operation and the error kind
 /// are kept.
 fn request_error(operation: &str, e: reqwest::Error) -> AppError {
-    AppError::Storage(format!("{}: {}", operation, e.without_url()))
+    // #5649: a refused connection or a timeout is tagged unavailable (503).
+    crate::storage::failure::transport_storage_error(operation, e)
 }
 
 /// Check that an HTTP response indicates success; return an error with context otherwise.
@@ -628,8 +672,13 @@ impl GcsBackend {
         // single-shot puts of single-MB OCI layers. JWT token exchange
         // (service-account-key mode) rides this client too; ADC metadata
         // token fetches do NOT (see metadata_server_client).
+        // #5649: one connection attempt is bounded by
+        // STORAGE_CONNECT_TIMEOUT_SECS on both clients, so a stopped endpoint
+        // is reported unavailable instead of stalling for the whole timeout.
+        let connect_timeout = crate::storage::StorageTimeouts::from_env().connect;
         let client = crate::services::http_client::base_client_builder()
             .timeout(Duration::from_secs(30))
+            .connect_timeout(connect_timeout)
             .build()
             .map_err(|e| AppError::Storage(format!("Failed to create HTTP client: {}", e)))?;
 
@@ -639,6 +688,7 @@ impl GcsBackend {
         // object can legitimately run long.
         let stream_client = crate::services::http_client::base_client_builder()
             .timeout(Duration::from_secs(1800))
+            .connect_timeout(connect_timeout)
             .build()
             .map_err(|e| {
                 AppError::Storage(format!("Failed to create streaming HTTP client: {}", e))
@@ -1410,7 +1460,7 @@ impl GcsBackend {
             .send()
             .await
             .map_err(|e| {
-                AppError::ServiceUnavailable(format!(
+                gcs_unavailable(format!(
                     "GCS resumable finalize (range {}) network error: {}",
                     range,
                     e.without_url()
@@ -1496,13 +1546,13 @@ impl GcsBackend {
                 }
                 Err(e) => {
                     if attempt < CHUNK_MAX_ATTEMPTS {
-                        last_err = Some(AppError::ServiceUnavailable(format!(
+                        last_err = Some(gcs_unavailable(format!(
                             "GCS resumable PUT (range {}) network error: {}",
                             range,
                             e.without_url()
                         )));
                     } else {
-                        return Err(AppError::ServiceUnavailable(format!(
+                        return Err(gcs_unavailable(format!(
                             "GCS resumable PUT (range {}) network error: {}",
                             range,
                             e.without_url()
@@ -1550,9 +1600,8 @@ impl GcsBackend {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| {
-            AppError::ServiceUnavailable("GCS resumable PUT exhausted retries".to_string())
-        }))
+        Err(last_err
+            .unwrap_or_else(|| gcs_unavailable("GCS resumable PUT exhausted retries".to_string())))
     }
 
     /// Drive the resumable upload loop after the session is initiated.
@@ -2149,28 +2198,61 @@ mod tests {
         assert!(!is_transient_status(404));
     }
 
+    /// #5649 review: a transient status answers `503 STORAGE_UNAVAILABLE`
+    /// with a fixed message, no longer `SERVICE_UNAVAILABLE` echoing the GCS
+    /// body.
     #[test]
-    fn test_map_status_error_transient_is_service_unavailable() {
-        assert!(matches!(
-            map_status_error(503, "ctx", "body"),
-            AppError::ServiceUnavailable(_)
-        ));
-        assert!(matches!(
-            map_status_error(429, "ctx", "body"),
-            AppError::ServiceUnavailable(_)
-        ));
+    fn test_map_status_error_transient_is_storage_unavailable() {
+        use crate::storage::StorageFailure;
+        for status in [503, 429, 500] {
+            let err =
+                map_status_error(status, "ctx", "{\"error\":{\"message\":\"secret-object\"}}");
+            assert_eq!(
+                err.storage_failure(),
+                Some(StorageFailure::Unavailable),
+                "{err}"
+            );
+            let response = axum::response::IntoResponse::into_response(err);
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
     }
 
     #[test]
     fn test_map_status_error_permanent_is_storage() {
-        assert!(matches!(
-            map_status_error(400, "ctx", "body"),
-            AppError::Storage(_)
-        ));
-        assert!(matches!(
-            map_status_error(403, "ctx", "body"),
-            AppError::Storage(_)
-        ));
+        for status in [400, 403] {
+            let err = map_status_error(status, "ctx", "body");
+            assert!(matches!(err, AppError::Storage(_)));
+            assert_eq!(err.storage_failure(), None);
+        }
+    }
+
+    /// #5650 review: only 507 is "full". `quotaExceeded` is also GCS's answer
+    /// to an API-usage quota, so it is retryable (503), not 507; and a body
+    /// that merely quotes a reason (an object named after one) is neither.
+    #[test]
+    fn test_map_status_error_out_of_space_is_full_5650() {
+        use crate::storage::StorageFailure;
+        let insufficient = map_status_error(507, "GCS upload", "");
+        assert_eq!(insufficient.storage_failure(), Some(StorageFailure::Full));
+        let quota = map_status_error(
+            403,
+            "GCS upload",
+            r#"{"error":{"errors":[{"reason":"quotaExceeded"}]}}"#,
+        );
+        assert_eq!(
+            quota.storage_failure(),
+            Some(StorageFailure::Unavailable),
+            "{quota}"
+        );
+        let spoof = map_status_error(
+            403,
+            "GCS upload",
+            r#"{"error":{"errors":[{"reason":"forbidden","message":"quotaExceeded.bin"}]}}"#,
+        );
+        assert_eq!(spoof.storage_failure(), None, "{spoof}");
     }
 
     #[tokio::test]
@@ -3845,7 +3927,10 @@ mod tests {
         assert!(
             matches!(
                 &result,
-                Err(AppError::ServiceUnavailable(message)) if message.contains("503")
+                Err(err @ AppError::Storage(message))
+                    if message.contains("503")
+                        && err.storage_failure()
+                            == Some(crate::storage::StorageFailure::Unavailable)
             ),
             "fallback operational failures must not become false misses: {result:?}"
         );

@@ -26,7 +26,6 @@ use std::sync::Arc;
 use axum::http::{header, HeaderName, Method};
 use axum::Router;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tower_http::trace::TraceLayer;
 
 use rand::RngExt;
 
@@ -992,6 +991,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             let proxy_service = Arc::new(
                 ProxyService::new(db_pool.clone(), Arc::new(storage_svc), proxy_cache_scope)
                     .with_stale_if_error_grace_secs(config.proxy_stale_if_error_grace_secs)
+                    .with_upstream_settings(config.proxy_upstream)
                     .with_upstream_fetch_audit(config.audit_upstream_fetches),
             );
             app_state.set_proxy_service(proxy_service);
@@ -1433,7 +1433,9 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .layer(axum::middleware::from_fn(
             artifact_keeper_backend::api::middleware::security_headers::security_headers_middleware,
         ))
-        .layer(TraceLayer::new_for_http().make_span_with(
+        // #5623 / #5701: a deliberate 5xx (a member outage's 503, a quota
+        // 507) is not logged again as an ERROR `response failed` line.
+        .layer(artifact_keeper_backend::api::middleware::request_span::http_trace_layer().make_span_with(
             move |request: &axum::http::Request<axum::body::Body>| {
                 // Inbound W3C trace context is adopted only from trusted
                 // proxies once RATE_LIMIT_TRUSTED_PROXY_CIDRS is set (#4195).

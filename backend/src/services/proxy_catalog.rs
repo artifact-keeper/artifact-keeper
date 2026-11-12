@@ -65,12 +65,55 @@ pub async fn upsert(
     upstream_url: Option<&str>,
     quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<()> {
+    upsert_fill(
+        db,
+        repository_id,
+        path,
+        storage_key,
+        metadata_key,
+        size_bytes,
+        checksum_sha256,
+        content_type,
+        upstream_url,
+        quarantine_until,
+        false,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// [`upsert`] for the commit of a fill that recorded its hold up front with
+/// [`mark_hold_fetching`] (#5223).
+///
+/// With `keep_release` set, a release stamped on the row is kept instead of
+/// reset: [`mark_hold_fetching`] cleared any earlier release when this fill
+/// started, so a release on the row now was made against this fill, after
+/// its `409` went out, and applies to the bytes being committed. The hold
+/// column is then left cleared too. Without `keep_release` this is exactly
+/// [`upsert`].
+///
+/// Returns whether the committed row reads released, so the caller can drop
+/// the hold from the sidecar it has just written.
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_fill(
+    db: &PgPool,
+    repository_id: Uuid,
+    path: &str,
+    storage_key: &str,
+    metadata_key: &str,
+    size_bytes: i64,
+    checksum_sha256: Option<&str>,
+    content_type: Option<&str>,
+    upstream_url: Option<&str>,
+    quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
+    keep_release: bool,
+) -> Result<bool> {
     // #4463: the fetched URL is built from the Remote's `upstream_url`, which
     // may embed `user:password@`. The column is only a record of where the
     // bytes came from, so it never needs the credentials.
     let upstream_url =
         upstream_url.map(|u| crate::services::proxy_service::strip_url_userinfo(u).0);
-    sqlx::query(
+    sqlx::query_scalar::<_, bool>(
         r#"
         INSERT INTO proxy_cache_artifacts
             (repository_id, path, storage_key, metadata_key, size_bytes,
@@ -86,10 +129,16 @@ pub async fn upsert(
             upstream_url     = EXCLUDED.upstream_url,
             cached_at        = now(),
             last_accessed_at = now(),
-            quarantine_until = EXCLUDED.quarantine_until,
             -- A new cache write is a new upstream evaluation: any earlier
-            -- manual release applied to the previous bytes, not these.
-            quarantine_released_at = NULL
+            -- manual release applied to the previous bytes, not these. The
+            -- exception (#5223) is a release made during THIS fill ($10).
+            quarantine_until = CASE
+                WHEN $10 AND proxy_cache_artifacts.quarantine_released_at IS NOT NULL
+                THEN NULL ELSE EXCLUDED.quarantine_until END,
+            quarantine_released_at = CASE
+                WHEN $10 THEN proxy_cache_artifacts.quarantine_released_at
+                ELSE NULL END
+        RETURNING quarantine_released_at IS NOT NULL
         "#,
     )
     .bind(repository_id)
@@ -101,10 +150,69 @@ pub async fn upsert(
     .bind(content_type)
     .bind(upstream_url)
     .bind(quarantine_until)
+    .bind(keep_release)
+    .fetch_one(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))
+}
+
+/// Record a held fill's catalog row BEFORE its `409` is answered (#5223).
+///
+/// The streaming leader refuses a download under a Package Age Policy hold
+/// straight away and finishes the fetch in the background; the authoritative
+/// row is only written by the tee's commit. Without this row the release
+/// endpoint, which reads the catalog, answered 404 for the whole fetch.
+///
+/// Inserts a placeholder (`size_bytes = 0`, `checksum_sha256 IS NULL`, the
+/// same shape [`record_proxy_download`] uses) carrying the hold, so the path
+/// is releasable at once. On conflict the body fields are left alone and:
+///
+/// * an authoritative row (earlier bytes) takes the new hold and loses any
+///   earlier release, as the commit's [`upsert`] would: a new fetch is a new
+///   upstream evaluation;
+/// * a placeholder row is another fill of this path still in flight; a
+///   release already made against it is kept, so this fill does not undo it.
+///
+/// The commit then calls [`upsert_fill`] with `keep_release`. Returns the
+/// affected-row count.
+pub async fn mark_hold_fetching(
+    db: &PgPool,
+    repository_id: Uuid,
+    path: &str,
+    storage_key: &str,
+    metadata_key: &str,
+    quarantine_until: chrono::DateTime<chrono::Utc>,
+) -> Result<u64> {
+    let res = sqlx::query(
+        r#"
+        INSERT INTO proxy_cache_artifacts
+            (repository_id, path, storage_key, metadata_key, size_bytes,
+             cached_at, last_accessed_at, quarantine_until)
+        VALUES ($1, $2, $3, $4, 0, now(), now(), $5)
+        ON CONFLICT (repository_id, path) DO UPDATE SET
+            quarantine_until = CASE
+                WHEN proxy_cache_artifacts.size_bytes = 0
+                 AND proxy_cache_artifacts.checksum_sha256 IS NULL
+                 AND proxy_cache_artifacts.quarantine_released_at IS NOT NULL
+                THEN proxy_cache_artifacts.quarantine_until
+                ELSE EXCLUDED.quarantine_until END,
+            quarantine_released_at = CASE
+                WHEN proxy_cache_artifacts.size_bytes = 0
+                 AND proxy_cache_artifacts.checksum_sha256 IS NULL
+                THEN proxy_cache_artifacts.quarantine_released_at
+                ELSE NULL END,
+            last_accessed_at = now()
+        "#,
+    )
+    .bind(repository_id)
+    .bind(path)
+    .bind(storage_key)
+    .bind(metadata_key)
+    .bind(quarantine_until)
     .execute(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
-    Ok(())
+    Ok(res.rows_affected())
 }
 
 /// True when a stored catalog row is the transient placeholder
@@ -2156,5 +2264,160 @@ mod tests {
 
         assert_eq!(attributed, 1);
         assert_eq!(rows, vec![None, Some(digest.clone()), Some(digest)]);
+    }
+
+    /// The quarantine columns of one row, for the #5223 tests.
+    async fn hold_cols(
+        pool: &PgPool,
+        repo: Uuid,
+        path: &str,
+    ) -> (
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        let row = find_quarantine_row(pool, repo, path)
+            .await
+            .unwrap()
+            .expect("catalog row");
+        (row.quarantine_until, row.quarantine_released_at)
+    }
+
+    /// #5223: a held fill's row exists before its 409, a release lands on it
+    /// mid-fetch, and the commit keeps the release instead of resetting it.
+    /// A second fill of the same path that starts after the release (its
+    /// marker finds the in-flight placeholder) does not undo it either: the
+    /// "possibly related" re-imposed hold.
+    #[tokio::test]
+    async fn test_release_during_held_fill_survives_commit_5223() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = insert_repo(&pool).await;
+        let path = "pkg/held-5223.whl";
+        let until = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        mark_hold_fetching(&pool, repo, path, "k", "m", until)
+            .await
+            .unwrap();
+        let row = find_quarantine_row(&pool, repo, path)
+            .await
+            .unwrap()
+            .expect("the held fill is recorded before its 409");
+        assert_eq!(mark_quarantine_released(&pool, row.id).await.unwrap(), 1);
+
+        // A concurrent fill of the same path records its own hold.
+        mark_hold_fetching(&pool, repo, path, "k", "m", until)
+            .await
+            .unwrap();
+        let (held, released) = hold_cols(&pool, repo, path).await;
+        assert!(
+            held.is_none() && released.is_some(),
+            "{held:?} {released:?}"
+        );
+
+        // Both fills commit with the hold they computed.
+        for _ in 0..2 {
+            let stands = upsert_fill(
+                &pool,
+                repo,
+                path,
+                "k",
+                "m",
+                9,
+                Some("c"),
+                None,
+                None,
+                Some(until),
+                true,
+            )
+            .await
+            .unwrap();
+            assert!(stands, "the release made during the fill stands");
+        }
+        let (held, released) = hold_cols(&pool, repo, path).await;
+        cleanup_repo(&pool, repo).await;
+        assert!(held.is_none(), "{held:?}");
+        assert!(released.is_some());
+    }
+
+    /// #5223: outside a fill the existing contract is unchanged. A new fetch
+    /// of an authoritative, released row is a new upstream evaluation: its
+    /// marker re-imposes the hold, and a plain [`upsert`] resets the release.
+    #[tokio::test]
+    async fn test_new_fill_of_released_entry_is_held_again_5223() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = insert_repo(&pool).await;
+        let until = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        for (i, refill_marks) in [true, false].into_iter().enumerate() {
+            let path = format!("pkg/refetch-{i}.whl");
+            upsert(
+                &pool,
+                repo,
+                &path,
+                "k",
+                "m",
+                9,
+                Some("c"),
+                None,
+                None,
+                Some(until),
+            )
+            .await
+            .unwrap();
+            let row = find_quarantine_row(&pool, repo, &path)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(mark_quarantine_released(&pool, row.id).await.unwrap(), 1);
+
+            let stands = if refill_marks {
+                mark_hold_fetching(&pool, repo, &path, "k", "m", until)
+                    .await
+                    .unwrap();
+                let (held, released) = hold_cols(&pool, repo, &path).await;
+                assert!(held.is_some() && released.is_none(), "marker re-holds");
+                upsert_fill(
+                    &pool,
+                    repo,
+                    &path,
+                    "k",
+                    "m",
+                    9,
+                    Some("c"),
+                    None,
+                    None,
+                    Some(until),
+                    true,
+                )
+                .await
+                .unwrap()
+            } else {
+                upsert_fill(
+                    &pool,
+                    repo,
+                    &path,
+                    "k",
+                    "m",
+                    9,
+                    Some("c"),
+                    None,
+                    None,
+                    Some(until),
+                    false,
+                )
+                .await
+                .unwrap()
+            };
+            let (held, released) = hold_cols(&pool, repo, &path).await;
+            assert!(!stands);
+            assert!(
+                held.is_some() && released.is_none(),
+                "{held:?} {released:?}"
+            );
+        }
+        cleanup_repo(&pool, repo).await;
     }
 }

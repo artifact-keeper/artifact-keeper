@@ -1,0 +1,78 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, repository_id, storage_key, size_bytes, checksum_sha256\n        FROM artifacts\n        WHERE repository_id = ANY($1::uuid[])\n          AND is_deleted = false\n          AND LOWER(name) = $2\n          AND version = $3\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "artifacts",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "repository_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "artifacts",
+            "name": "repository_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "storage_key",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "artifacts",
+            "name": "storage_key"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "size_bytes",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "artifacts",
+            "name": "size_bytes"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "checksum_sha256",
+        "type_info": "Bpchar",
+        "origin": {
+          "Table": {
+            "table": "artifacts",
+            "name": "checksum_sha256"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "69238487156acd2cf5e75aed3721214174ae970697be31f48514b8d1e6796198"
+}

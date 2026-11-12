@@ -1963,13 +1963,97 @@ async fn execute_due_backup_schedules(
     Ok(())
 }
 
-/// Normalize a cron expression: if 5-field, prepend "0 " for the seconds field.
+/// Normalize a cron expression for the `cron` crate. A 5-field expression is
+/// standard cron: prepend "0 " for the seconds field and spell the weekdays as
+/// names, because the crate numbers weekdays 1-7 from Sunday while standard
+/// cron numbers them 0-7 with 0 and 7 both Sunday. Other shapes pass through.
 pub(crate) fn normalize_cron_expression(cron_expr: &str) -> String {
-    if cron_expr.split_whitespace().count() == 5 {
-        format!("0 {}", cron_expr)
-    } else {
-        cron_expr.to_string()
+    let fields: Vec<&str> = cron_expr.split_whitespace().collect();
+    if fields.len() != 5 {
+        return cron_expr.to_string();
     }
+    format!(
+        "0 {} {}",
+        fields[..4].join(" "),
+        standard_cron_weekdays(fields[4])
+    )
+}
+
+/// Rewrite a standard-cron day-of-week field as day names (`1-5` becomes
+/// `MON,TUE,WED,THU,FRI`). A field it cannot read is returned unchanged, so the
+/// `cron` crate still rejects it with its own error.
+fn standard_cron_weekdays(field: &str) -> String {
+    const NAMES: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+    // Every day-name spelling the `cron` crate accepts, so a field that mixes
+    // names and numbers is translated whole instead of passing through with
+    // the crate's numbering for the numbers.
+    const ALIASES: [(&str, usize); 16] = [
+        ("sun", 0),
+        ("sunday", 0),
+        ("mon", 1),
+        ("monday", 1),
+        ("tue", 2),
+        ("tues", 2),
+        ("tuesday", 2),
+        ("wed", 3),
+        ("wednesday", 3),
+        ("thu", 4),
+        ("thurs", 4),
+        ("thursday", 4),
+        ("fri", 5),
+        ("friday", 5),
+        ("sat", 6),
+        ("saturday", 6),
+    ];
+    let bound = |t: &str| -> Option<usize> {
+        if let Ok(n) = t.parse::<usize>() {
+            return (n <= 7).then_some(n);
+        }
+        ALIASES
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(t))
+            .map(|(_, day)| *day)
+    };
+    let mut days = [false; 7];
+    for item in field.split(',') {
+        let (range, step, stepped) = match item.split_once('/') {
+            Some((range, step)) => match step.parse::<usize>() {
+                Ok(step) if step > 0 => (range, step, true),
+                _ => return field.to_string(),
+            },
+            None => (item, 1, false),
+        };
+        let (lo, hi) = match range {
+            "*" | "?" => (0, 6),
+            _ => match range.split_once('-') {
+                Some((a, b_str)) => match (bound(a), bound(b_str)) {
+                    // A Sunday name as the upper bound means 7, so `MON-SUN`
+                    // runs Monday to Sunday while `SUN-SUN` stays Sunday.
+                    (Some(a), Some(0)) if a > 0 && b_str.parse::<usize>().is_err() => (a, 7),
+                    (Some(a), Some(b)) if a <= b => (a, b),
+                    _ => return field.to_string(),
+                },
+                // `N/step` runs from N to the field maximum, 7 (Sunday).
+                None => match bound(range) {
+                    Some(a) if stepped => (a, 7),
+                    Some(a) => (a, a),
+                    None => return field.to_string(),
+                },
+            },
+        };
+        for day in (lo..=hi).step_by(step) {
+            days[day % 7] = true;
+        }
+    }
+    if days.iter().all(|d| *d) {
+        return "*".to_string();
+    }
+    NAMES
+        .iter()
+        .zip(days)
+        .filter_map(|(name, on)| on.then_some(*name))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Parse a (possibly already normalized) cron expression into a Schedule.
@@ -2181,8 +2265,8 @@ async fn run_curation_sync_cycle_for(
         // The client this Remote's fetches use, built the way the proxy reaches
         // that upstream: the stored URL passes the upstream URL validation and
         // the requests go out on the Remote's egress route.
-        let client = match curation_client_for(db, *remote_id, upstream_url).await {
-            Ok(CurationClient::Ready(client)) => client,
+        let (client, env_proxy) = match curation_client_for(db, *remote_id, upstream_url).await {
+            Ok(CurationClient::Ready { client, env_proxy }) => (client, env_proxy),
             Ok(CurationClient::Refused(reason)) => {
                 // Skipped without a request and left unstamped, so a URL or
                 // allowlist fix takes effect on the next tick.
@@ -2260,40 +2344,43 @@ async fn run_curation_sync_cycle_for(
                 }
                 // Fetch repomd.xml as raw bytes so a detached signature can be
                 // verified over the exact content before its checksums are trusted.
-                let repomd_bytes =
-                    match crate::services::upstream_tracing::send_upstream(repomd_req).await {
-                        Ok(resp) if resp.status().is_success() => {
-                            #[allow(clippy::disallowed_methods)]
-                            // STREAMING-EXEMPT: capped-metadata (upstream repomd.xml) buffered for signature verify + href parse; not an artifact blob (#1608)
-                            match resp.bytes().await {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    record_curation_failure(
-                                        &mut failures,
-                                        *staging_id,
-                                        format_args!("repomd.xml read error: {}", e.without_url()),
-                                    );
-                                    continue;
-                                }
+                let repomd_bytes = match crate::services::upstream_tracing::send_upstream_for(
+                    repomd_req, env_proxy,
+                )
+                .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        #[allow(clippy::disallowed_methods)]
+                        // STREAMING-EXEMPT: capped-metadata (upstream repomd.xml) buffered for signature verify + href parse; not an artifact blob (#1608)
+                        match resp.bytes().await {
+                            Ok(b) => b,
+                            Err(e) => {
+                                record_curation_failure(
+                                    &mut failures,
+                                    *staging_id,
+                                    format_args!("repomd.xml read error: {}", e.without_url()),
+                                );
+                                continue;
                             }
                         }
-                        Ok(resp) => {
-                            record_curation_failure(
-                                &mut failures,
-                                *staging_id,
-                                format_args!("repomd.xml fetch failed: {}", resp.status()),
-                            );
-                            continue;
-                        }
-                        Err(e) => {
-                            record_curation_failure(
-                                &mut failures,
-                                *staging_id,
-                                format_args!("repomd.xml fetch error: {}", e.without_url()),
-                            );
-                            continue;
-                        }
-                    };
+                    }
+                    Ok(resp) => {
+                        record_curation_failure(
+                            &mut failures,
+                            *staging_id,
+                            format_args!("repomd.xml fetch failed: {}", resp.status()),
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        record_curation_failure(
+                            &mut failures,
+                            *staging_id,
+                            format_args!("repomd.xml fetch error: {}", e.without_url()),
+                        );
+                        continue;
+                    }
+                };
 
                 // GPG-verify-before-ingest (#2357 S4): when a trusted key is
                 // configured on the remote, fetch repomd.xml.asc and verify the
@@ -2328,8 +2415,10 @@ async fn run_curation_sync_cycle_for(
                             asc_req =
                                 crate::services::upstream_auth::apply_upstream_auth(asc_req, auth);
                         }
-                        let asc = match crate::services::upstream_tracing::send_upstream(asc_req)
-                            .await
+                        let asc = match crate::services::upstream_tracing::send_upstream_for(
+                            asc_req, env_proxy,
+                        )
+                        .await
                         {
                             Ok(resp) if resp.status().is_success() => {
                                 resp.text().await.unwrap_or_default()
@@ -2415,7 +2504,9 @@ async fn run_curation_sync_cycle_for(
                     primary_req =
                         crate::services::upstream_auth::apply_upstream_auth(primary_req, auth);
                 }
-                match crate::services::upstream_tracing::send_upstream(primary_req).await {
+                match crate::services::upstream_tracing::send_upstream_for(primary_req, env_proxy)
+                    .await
+                {
                     Ok(resp) if resp.status().is_success() => {
                         #[allow(clippy::disallowed_methods)]
                         // STREAMING-EXEMPT: capped-metadata (upstream repo index) buffered for checksum-pin + decode; not an artifact blob (#1608)
@@ -2553,7 +2644,9 @@ async fn run_curation_sync_cycle_for(
                     packages_req =
                         crate::services::upstream_auth::apply_upstream_auth(packages_req, auth);
                 }
-                match crate::services::upstream_tracing::send_upstream(packages_req).await {
+                match crate::services::upstream_tracing::send_upstream_for(packages_req, env_proxy)
+                    .await
+                {
                     Ok(resp) if resp.status().is_success() => {
                         #[allow(clippy::disallowed_methods)]
                         // STREAMING-EXEMPT: capped-metadata (upstream repo index) buffered for gz-decode; not an artifact blob (#1608)
@@ -2591,7 +2684,11 @@ async fn run_curation_sync_cycle_for(
                                 plain_req, auth,
                             );
                         }
-                        match crate::services::upstream_tracing::send_upstream(plain_req).await {
+                        match crate::services::upstream_tracing::send_upstream_for(
+                            plain_req, env_proxy,
+                        )
+                        .await
+                        {
                             Ok(resp) if resp.status().is_success() => {
                                 let content = resp.text().await.map_err(|e| e.without_url())?;
                                 curation_sync::parse_deb_packages_index(&content, "main")
@@ -2785,7 +2882,12 @@ fn log_curation_filter_refusal(staging_id: uuid::Uuid, remote_key: &str, artifac
 
 /// The client for one Remote's curation fetches, or why there is none.
 enum CurationClient {
-    Ready(crate::services::http_client::Client),
+    /// `env_proxy`: the client follows the environment proxy (`inherit`), so
+    /// its plain-HTTP requests are rechecked before each send (#5459).
+    Ready {
+        client: crate::services::http_client::Client,
+        env_proxy: bool,
+    },
     /// The stored upstream URL is refused by the upstream URL validation.
     Refused(String),
 }
@@ -2819,7 +2921,10 @@ async fn curation_client_for(
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| format!("could not build the HTTP client: {e}"))?;
-    Ok(CurationClient::Ready(client))
+    Ok(CurationClient::Ready {
+        client,
+        env_proxy: !egress.overrides_default_routing(),
+    })
 }
 
 /// Log one staging repo's RPM curation-sync failure and record it so the cycle
@@ -2864,6 +2969,14 @@ const MAX_VERIFY_DIST_BYTES: usize = 128 * 1024 * 1024;
 /// PyPI: its packages are not on pypi.org.
 pub(crate) fn ondemand_curation_family(format: &str) -> Option<&'static str> {
     crate::services::curation::popularity_source::ecosystem_for_format(format)
+}
+
+/// Whether [`run_curation_sync_cycle`] does anything for a staging repository
+/// of this format (#5207): rpm and debian walk the upstream index, the
+/// on-demand families evaluate what the proxy enqueued. Every other format
+/// falls through the sync's `_ => continue` arm without a request.
+pub(crate) fn curation_sync_supported(format: &str) -> bool {
+    matches!(format, "rpm" | "debian") || ondemand_curation_family(format).is_some()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3320,6 +3433,19 @@ mod tests {
         }
         for f in ["conda", "rpm", "debian", "maven", "docker", "generic", ""] {
             assert_eq!(super::ondemand_curation_family(f), None, "{f}");
+        }
+    }
+
+    #[test]
+    fn curation_sync_supported_matches_the_sync_dispatch() {
+        // #5207: exactly the formats the sync loop has an arm for.
+        for f in [
+            "rpm", "debian", "pypi", "poetry", "jupyter", "npm", "yarn", "pnpm",
+        ] {
+            assert!(super::curation_sync_supported(f), "{f}");
+        }
+        for f in ["conda", "maven", "docker", "generic", "helm", ""] {
+            assert!(!super::curation_sync_supported(f), "{f}");
         }
     }
 
@@ -3860,6 +3986,53 @@ mod tests {
     #[test]
     fn test_normalize_cron_5_field() {
         assert_eq!(normalize_cron_expression("0 0 * * *"), "0 0 0 * * *");
+    }
+
+    #[test]
+    fn test_normalize_cron_standard_weekdays() {
+        for (input, want) in [
+            ("30 3 * * 0", "0 30 3 * * SUN"),
+            ("30 3 * * 7", "0 30 3 * * SUN"),
+            ("30 3 * * 1", "0 30 3 * * MON"),
+            ("0 0 * * 1-5", "0 0 0 * * MON,TUE,WED,THU,FRI"),
+            ("0 0 * * 1-7", "0 0 0 * * *"),
+            ("0 0 * * 0,6", "0 0 0 * * SUN,SAT"),
+            ("0 0 * * */2", "0 0 0 * * SUN,TUE,THU,SAT"),
+            ("0 0 * * 1-5/2", "0 0 0 * * MON,WED,FRI"),
+            ("0 0 * * MON-SUN", "0 0 0 * * *"),
+            ("0 0 * * fri", "0 0 0 * * FRI"),
+            ("0 0 * * 0-6", "0 0 0 * * *"),
+            ("0 0 * * 1/2", "0 0 0 * * SUN,MON,WED,FRI"),
+            ("0 0 * * 3/1", "0 0 0 * * SUN,WED,THU,FRI,SAT"),
+            ("0 0 * * 7/2", "0 0 0 * * SUN"),
+            ("0 0 * * SUN-SUN", "0 0 0 * * SUN"),
+            ("0 0 * * 1,Monday", "0 0 0 * * MON"),
+            ("0 0 * * Tues-THURSDAY", "0 0 0 * * TUE,WED,THU"),
+            ("0 0 * * 8", "0 0 0 * * 8"),
+            ("0 0 * * */0", "0 0 0 * * */0"),
+            ("0 0 * * 1,5L", "0 0 0 * * 1,5L"),
+        ] {
+            assert_eq!(normalize_cron_expression(input), want, "{input}");
+        }
+    }
+
+    /// The crate reads a bare `1` as Sunday. Standard cron means Monday, and
+    /// every 5-field schedule goes through this normalization.
+    #[test]
+    fn test_standard_cron_monday_fires_on_monday() {
+        use chrono::Datelike;
+        let schedule = parse_cron_schedule(&normalize_cron_expression("0 3 * * 1"))
+            .expect("a valid weekday schedule");
+        for next in schedule.upcoming(chrono::Utc).take(3) {
+            assert_eq!(next.weekday(), chrono::Weekday::Mon);
+        }
+        assert!(parse_cron_schedule(&normalize_cron_expression("0 3 * * 0")).is_some());
+        // `7/2` is Sunday only; it must not become an empty, unparseable field.
+        let sunday = parse_cron_schedule(&normalize_cron_expression("0 3 * * 7/2"))
+            .expect("7/2 is a valid weekday schedule");
+        for next in sunday.upcoming(chrono::Utc).take(3) {
+            assert_eq!(next.weekday(), chrono::Weekday::Sun);
+        }
     }
 
     #[test]

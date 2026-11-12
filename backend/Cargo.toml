@@ -49,7 +49,11 @@ tower-http.workspace = true
 # can set an HTTP/1 header-read timeout, which `axum::serve` cannot (#4665).
 # Both are already in the tree through axum.
 hyper = { version = "1", features = ["http1", "http2", "server"] }
-hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
+# `client-proxy`: the guarded outbound clients read the environment proxy
+# with the same matcher reqwest uses, so they can check each proxied
+# destination before handing it to the proxy (#5459). reqwest already
+# compiles it in.
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio", "client-proxy"] }
 
 # Database
 sqlx.workspace = true
@@ -272,6 +276,10 @@ prost-build.workspace = true
 
 [dev-dependencies]
 tokio-test = "0.4"
+# Property tests for the pure decision cores (version comparators, scan-state
+# classification, routing rules): state a law, let proptest hunt the
+# counterexample and shrink it.
+proptest = "1"
 # setrlimit(RLIMIT_FSIZE) in the filesystem storage tests, to make a write
 # fail on demand (#4646). Already in the tree transitively.
 libc = "0.2"

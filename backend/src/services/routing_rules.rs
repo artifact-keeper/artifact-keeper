@@ -345,4 +345,21 @@ mod tests {
         let rules: Vec<RoutingRule> = serde_json::from_str(json).unwrap();
         assert_eq!(rules.len(), 2);
     }
+
+    // -- property tests --------------------------------------------------------
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4000))]
+
+        /// A rule that validates and has no `$` in its template rewrites every
+        /// matching path to exactly that template.
+        #[test]
+        fn a_template_without_placeholders_is_returned_unchanged(
+            path in "[a-c/$0-2]{0,8}",
+            template in "[a-c/]{0,8}",
+        ) {
+            let rules = [rule("(.*)", &template)];
+            proptest::prop_assert_eq!(apply_routing_rules(&path, &rules), Some(template));
+        }
+    }
 }

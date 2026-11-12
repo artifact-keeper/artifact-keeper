@@ -23,6 +23,13 @@
 //!   scan id, or an unparseable body maps to [`AppError::Internal`]: the scan
 //!   engine ran and broke, so the scan fails closed (`failed`), never a
 //!   silent zero-finding completion.
+//! * Two of those failures are not the scan's fault and are submitted again
+//!   first, up to [`ADAPTER_SCAN_ATTEMPTS`] in all (#5657): an unknown scan id
+//!   (the adapter keeps jobs in memory, so a pod replaced mid-scan forgets
+//!   them) and a job trivy failed on its cache lock (several image scans at
+//!   once on an adapter before 1.7.0). Both clients share that rule
+//!   ([`with_adapter_resubmits`]); only after the last attempt does the error
+//!   above apply.
 //!
 //! `ImageScanner` (image_scanner.rs) keeps its own, stricter contract — every
 //! adapter error is `BadGateway`/fail-closed (#2088) — because container-image
@@ -48,6 +55,260 @@ pub(crate) fn fs_upload_cap_bytes() -> u64 {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(DEFAULT_MAX_FS_UPLOAD_BYTES)
+}
+
+/// Why a failed scanner-adapter job is submitted again instead of failing the
+/// scan (#5657). Shared by the image client (`ImageScanner`) and the
+/// filesystem client below; scans only read the artifact, so a resubmission
+/// is idempotent -- the adapter assigns a fresh job id and nothing else
+/// changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdapterResubmit {
+    /// The report poll answered 404: the adapter no longer knows the job id.
+    /// The adapter keeps jobs in memory, so a pod replaced mid-scan (a
+    /// `helm upgrade`, an eviction) forgets every job it had accepted.
+    UnknownScanId,
+    /// The job failed because trivy's on-disk analysis cache was locked by a
+    /// concurrent scan ("cache may be in use by another process"). Adapters
+    /// before 1.7.0 fail every image scan but one when several run at once.
+    CacheBusy,
+}
+
+/// What trivy prints when it cannot lock its analysis cache within its own
+/// 5s timeout; the adapter passes it through in the failed job's error.
+const TRIVY_CACHE_BUSY_MARKER: &str = "cache may be in use by another process";
+
+/// Submissions per scan, the first included.
+pub(crate) const ADAPTER_SCAN_ATTEMPTS: u32 = 3;
+
+/// Base delay before resubmitting after a cache-lock failure, doubled per
+/// attempt; the lock is held for as long as the other scan runs, so an
+/// immediate retry would just collide again. (Tests run on milliseconds.)
+#[cfg(not(test))]
+const ADAPTER_CACHE_BUSY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(test)]
+const ADAPTER_CACHE_BUSY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Delay before resubmitting after an unknown scan id: a replacement pod
+/// that answers is already up, so only a short pause.
+#[cfg(not(test))]
+const ADAPTER_UNKNOWN_ID_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(test)]
+const ADAPTER_UNKNOWN_ID_BACKOFF: std::time::Duration = std::time::Duration::from_millis(1);
+
+impl AdapterResubmit {
+    /// Classify a terminal (non-200, non-302) report response.
+    pub(crate) fn classify(status: reqwest::StatusCode, body: &str) -> Option<Self> {
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Some(Self::UnknownScanId);
+        }
+        if status.is_server_error() && body.to_ascii_lowercase().contains(TRIVY_CACHE_BUSY_MARKER) {
+            return Some(Self::CacheBusy);
+        }
+        None
+    }
+
+    /// Delay before submission `next_attempt` (2-based).
+    fn delay(self, next_attempt: u32) -> std::time::Duration {
+        match self {
+            Self::UnknownScanId => ADAPTER_UNKNOWN_ID_BACKOFF,
+            Self::CacheBusy => {
+                ADAPTER_CACHE_BUSY_BACKOFF * 2u32.pow(next_attempt.saturating_sub(2))
+            }
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Self::UnknownScanId => {
+                "the adapter no longer knows the scan id (restarted or replaced)"
+            }
+            Self::CacheBusy => "trivy's scan cache was locked by a concurrent scan",
+        }
+    }
+}
+
+/// One submit-and-poll round's failure: the error to surface, and whether
+/// the round may be repeated ([`AdapterResubmit`]).
+#[derive(Debug)]
+pub(crate) struct AdapterAttemptError {
+    pub error: AppError,
+    pub resubmit: Option<AdapterResubmit>,
+}
+
+impl From<AppError> for AdapterAttemptError {
+    fn from(error: AppError) -> Self {
+        Self {
+            error,
+            resubmit: None,
+        }
+    }
+}
+
+/// Run `attempt` (readiness, submit, poll) up to [`ADAPTER_SCAN_ATTEMPTS`]
+/// times, resubmitting only on an [`AdapterResubmit`] failure (#5657). Any
+/// other error, or a resubmittable one on the last attempt, is returned as
+/// is, so the error-mapping contracts of both clients are unchanged.
+pub(crate) async fn with_adapter_resubmits<T, F, Fut>(label: &str, mut attempt: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, AdapterAttemptError>>,
+{
+    let mut n = 1;
+    loop {
+        match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(AdapterAttemptError {
+                error,
+                resubmit: Some(reason),
+            }) if n < ADAPTER_SCAN_ATTEMPTS => {
+                n += 1;
+                let delay = reason.delay(n);
+                tracing::warn!(
+                    "{}: {}; resubmitting (attempt {}/{}) in {:?}: {}",
+                    label,
+                    reason.describe(),
+                    n,
+                    ADAPTER_SCAN_ATTEMPTS,
+                    delay,
+                    error
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(e) => return Err(e.error),
+        }
+    }
+}
+
+/// Response header in which scanner-adapter 1.7.0 and later say where a
+/// pending (302) job is (#5657): `Queued` while it waits for one of the
+/// adapter's `SCANNER_MAX_CONCURRENT_SCANS` slots, `Running` once trivy runs.
+/// Older adapters send no such header; their pending jobs count as running.
+pub(crate) const ADAPTER_SCAN_STATUS_HEADER: &str = "X-Scan-Status";
+
+/// Longest a job may wait in the adapter's queue on top of a client's own
+/// poll budget. Time spent `Queued` is not charged to that budget, which is
+/// sized for one trivy run, so a burst of scans waits for a slot instead of
+/// timing out behind the scans ahead of it.
+const ADAPTER_QUEUE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// How long a report poll keeps retrying while the adapter cannot be reached
+/// or answers 502/503/504 (#5657). A `helm upgrade` takes the old pod away
+/// before the new one answers; once it does, it answers 404 for the old id
+/// and the scan is resubmitted. Beyond this the poll fails as before.
+#[cfg(not(test))]
+const ADAPTER_RESTART_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+#[cfg(test)]
+const ADAPTER_RESTART_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Delay between report polls while the adapter is unreachable.
+#[cfg(not(test))]
+const ADAPTER_UNREACHABLE_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const ADAPTER_UNREACHABLE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Whether a report-poll status means the adapter itself is momentarily
+/// away (a pod being replaced, a Service with no ready endpoint) rather than
+/// an answer about the job.
+pub(crate) fn adapter_status_is_unreachable(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+/// The deadline bookkeeping shared by the image and filesystem report polls
+/// (#5657): a run budget that queued time does not consume (bounded by
+/// [`ADAPTER_QUEUE_BUDGET`]), and a bounded grace for an adapter that is
+/// briefly unreachable.
+pub(crate) struct AdapterPollClock {
+    label: &'static str,
+    run_deadline: std::time::Instant,
+    hard_deadline: std::time::Instant,
+    unreachable_since: Option<std::time::Instant>,
+    queued_logged: bool,
+}
+
+impl AdapterPollClock {
+    pub(crate) fn new(label: &'static str, budget: std::time::Duration) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            label,
+            run_deadline: now + budget,
+            hard_deadline: now + budget + ADAPTER_QUEUE_BUDGET,
+            unreachable_since: None,
+            queued_logged: false,
+        }
+    }
+
+    /// The adapter answered 302 with `headers`. Returns how long to wait
+    /// before the next poll, or `None` when the budget is spent.
+    pub(crate) fn pending(
+        &mut self,
+        scan_id: &str,
+        headers: &reqwest::header::HeaderMap,
+        default_wait: std::time::Duration,
+    ) -> Option<std::time::Duration> {
+        self.pending_at(std::time::Instant::now(), scan_id, headers, default_wait)
+    }
+
+    fn pending_at(
+        &mut self,
+        now: std::time::Instant,
+        scan_id: &str,
+        headers: &reqwest::header::HeaderMap,
+        default_wait: std::time::Duration,
+    ) -> Option<std::time::Duration> {
+        self.unreachable_since = None;
+        let wait = headers
+            .get("Refresh-After")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(default_wait);
+        let queued = headers
+            .get(ADAPTER_SCAN_STATUS_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("queued"));
+        if queued {
+            if !self.queued_logged {
+                self.queued_logged = true;
+                tracing::info!(
+                    "{} {} is queued in the scanner-adapter behind other scans",
+                    self.label,
+                    scan_id
+                );
+            }
+            self.run_deadline = (self.run_deadline + wait).min(self.hard_deadline);
+        }
+        (now + wait < self.run_deadline).then_some(wait)
+    }
+
+    /// The poll could not reach the adapter, or it answered 502/503/504.
+    /// Returns how long to wait before polling again, or `None` once the
+    /// restart grace or the budget is spent.
+    pub(crate) fn unreachable(
+        &mut self,
+        scan_id: &str,
+        detail: &str,
+    ) -> Option<std::time::Duration> {
+        let now = std::time::Instant::now();
+        let since = *self.unreachable_since.get_or_insert(now);
+        if now.duration_since(since) >= ADAPTER_RESTART_GRACE
+            || now + ADAPTER_UNREACHABLE_POLL >= self.run_deadline
+        {
+            return None;
+        }
+        tracing::warn!(
+            "{} {}: scanner-adapter unreachable ({}); polling again",
+            self.label,
+            scan_id,
+            detail
+        );
+        Some(ADAPTER_UNREACHABLE_POLL)
+    }
 }
 
 /// Which engine a trivy-based filesystem scanner drives: the legacy local CLI
@@ -221,11 +482,18 @@ impl ScannerAdapterFsClient {
     }
 
     /// Upload a tarred workspace and wait for trivy's native report.
-    /// The single public entry point: readiness gate, submit, poll.
+    /// The single public entry point: readiness gate, submit, poll -- again,
+    /// with the same tar, when the adapter lost the job or trivy's cache
+    /// lock failed it (#5657).
     pub async fn scan_workspace_tar(&self, tar: Vec<u8>) -> Result<FsScanReportBody> {
-        self.ensure_ready().await?;
-        let scan_id = self.submit(tar).await?;
-        self.poll_report(&scan_id).await
+        let tar = bytes::Bytes::from(tar);
+        let (this, tar) = (self, &tar);
+        with_adapter_resubmits("Scanner-adapter filesystem scan", move || async move {
+            this.ensure_ready().await?;
+            let scan_id = this.submit(tar.clone()).await?;
+            this.poll_report(&scan_id).await
+        })
+        .await
     }
 
     /// Availability-class error: the sidecar is down/unready, which degrades
@@ -273,7 +541,7 @@ impl ScannerAdapterFsClient {
     /// POST the tar body; returns the adapter-assigned job id. Transport
     /// errors and 503s are availability; any other adapter response that is
     /// not a valid accepted job is fail-closed `Internal`.
-    async fn submit(&self, tar: Vec<u8>) -> Result<String> {
+    async fn submit(&self, tar: bytes::Bytes) -> Result<String> {
         let url = format!("{}/api/v1/filesystem/scan", self.adapter_url);
         let resp = self
             .http
@@ -313,24 +581,41 @@ impl ScannerAdapterFsClient {
     /// Poll the report endpoint until terminal or the budget is exhausted.
     ///
     /// * 200 → parse `{report, stderr}` (parse failure is `Internal`).
-    /// * 302 → pending; honor `Refresh-After`.
+    /// * 302 → pending; honor `Refresh-After`. Time the adapter reports the
+    ///   job `Queued` is not charged to the budget ([`AdapterPollClock`]).
+    /// * transport error or 502/503/504 → polled again for a bounded grace
+    ///   (an adapter being replaced, #5657), then `ScannerEngineUnavailable`.
     /// * budget exhausted → `ScannerEngineUnavailable` (availability).
     /// * any other status (500 failed job, 404 unknown id) → `Internal`
-    ///   (the engine ran and broke — fail closed).
-    async fn poll_report(&self, scan_id: &str) -> Result<FsScanReportBody> {
+    ///   (the engine ran and broke — fail closed), marked resubmittable when
+    ///   it is an unknown id or a cache-lock failure ([`AdapterResubmit`]).
+    async fn poll_report(
+        &self,
+        scan_id: &str,
+    ) -> std::result::Result<FsScanReportBody, AdapterAttemptError> {
         let url = format!(
             "{}/api/v1/filesystem/scan/{}/report",
             self.adapter_url, scan_id
         );
-        let deadline = std::time::Instant::now() + Self::POLL_BUDGET;
+        let mut clock = AdapterPollClock::new("Scanner-adapter filesystem scan", Self::POLL_BUDGET);
 
         loop {
-            let resp = self
-                .poll_http
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| self.unavailable(format!("report poll failed: {}", e)))?;
+            let resp = match self.poll_http.get(&url).send().await {
+                Ok(resp) if !adapter_status_is_unreachable(resp.status()) => resp,
+                outcome => {
+                    let detail = match outcome {
+                        Ok(resp) => format!("report poll answered {}", resp.status()),
+                        Err(e) => format!("report poll failed: {}", e),
+                    };
+                    match clock.unreachable(scan_id, &detail) {
+                        Some(wait) => {
+                            tokio::time::sleep(wait).await;
+                            continue;
+                        }
+                        None => return Err(self.unavailable(detail).into()),
+                    }
+                }
+            };
 
             let status = resp.status();
             if status.is_success() {
@@ -339,32 +624,32 @@ impl ScannerAdapterFsClient {
                         "Scanner-adapter filesystem report did not parse: {}",
                         e
                     ))
+                    .into()
                 });
             }
             if status != reqwest::StatusCode::FOUND {
                 let text = resp.text().await.unwrap_or_default();
-                return Err(AppError::Internal(format!(
-                    "Scanner-adapter filesystem scan {} failed with {}: {}",
-                    scan_id, status, text
-                )));
+                return Err(AdapterAttemptError {
+                    resubmit: AdapterResubmit::classify(status, &text),
+                    error: AppError::Internal(format!(
+                        "Scanner-adapter filesystem scan {} failed with {}: {}",
+                        scan_id, status, text
+                    )),
+                });
             }
 
-            let refresh_after = resp
-                .headers()
-                .get("Refresh-After")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .map(std::time::Duration::from_secs)
-                .unwrap_or(Self::POLL_INTERVAL);
-
-            if std::time::Instant::now() + refresh_after >= deadline {
-                return Err(self.unavailable(format!(
-                    "report for scan {} not ready within the {}s budget",
-                    scan_id,
-                    Self::POLL_BUDGET.as_secs()
-                )));
+            match clock.pending(scan_id, resp.headers(), Self::POLL_INTERVAL) {
+                Some(wait) => tokio::time::sleep(wait).await,
+                None => {
+                    return Err(self
+                        .unavailable(format!(
+                            "report for scan {} not ready within the {}s budget",
+                            scan_id,
+                            Self::POLL_BUDGET.as_secs()
+                        ))
+                        .into())
+                }
             }
-            tokio::time::sleep(refresh_after).await;
         }
     }
 }
@@ -584,6 +869,258 @@ mod tests {
         assert!(
             matches!(err, AppError::Internal(_)),
             "a failed adapter job must fail the scan closed (Internal), got {err:?}"
+        );
+        // An ordinary failed job is not resubmitted (#5657).
+        assert_eq!(fs_posts(&server).await, 1);
+    }
+
+    async fn fs_posts(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.method == wiremock::http::Method::POST)
+            .count()
+    }
+
+    /// Ready probe + a submit endpoint that hands out `first` once, then
+    /// `then` for every later submission.
+    async fn mount_fs_two_jobs(server: &MockServer, first: &str, then: &str) {
+        Mock::given(method("GET"))
+            .and(path("/probe/ready"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/filesystem/scan"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(serde_json::json!({"id": first})),
+            )
+            .up_to_n_times(1)
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/filesystem/scan"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({"id": then})))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_fs_report(server: &MockServer, id: &str, resp: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/filesystem/scan/{id}/report")))
+            .respond_with(resp)
+            .mount(server)
+            .await;
+    }
+
+    fn ok_fs_report() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "report": {"Results": []}, "stderr": ""
+        }))
+    }
+
+    /// #5657: an adapter replaced mid-scan answers 404 for the id its
+    /// predecessor issued; the workspace is uploaded again and the scan
+    /// completes.
+    #[tokio::test]
+    async fn test_unknown_scan_id_is_resubmitted() {
+        let server = MockServer::start().await;
+        mount_fs_two_jobs(&server, "fs-lost", "fs-new").await;
+        mount_fs_report(
+            &server,
+            "fs-lost",
+            ResponseTemplate::new(404).set_body_string("unknown scan id"),
+        )
+        .await;
+        mount_fs_report(&server, "fs-new", ok_fs_report()).await;
+
+        let client = ScannerAdapterFsClient::new(server.uri());
+        client
+            .scan_workspace_tar(tiny_tar())
+            .await
+            .expect("a lost scan id must be resubmitted");
+        assert_eq!(fs_posts(&server).await, 2);
+        // The same workspace both times.
+        let bodies: Vec<Vec<u8>> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method == wiremock::http::Method::POST)
+            .map(|r| r.body)
+            .collect();
+        assert_eq!(bodies[0], bodies[1]);
+    }
+
+    /// #5657: a job failed by trivy's cache lock is resubmitted; one that
+    /// keeps losing its id gives up after the bounded number of attempts.
+    #[tokio::test]
+    async fn test_cache_lock_resubmitted_and_attempts_bounded() {
+        let server = MockServer::start().await;
+        mount_fs_two_jobs(&server, "fs-locked", "fs-ok").await;
+        mount_fs_report(
+            &server,
+            "fs-locked",
+            ResponseTemplate::new(500).set_body_string(
+                "scan failed: trivy filesystem scan failed: exit status 1: \
+                 cache may be in use by another process: timeout",
+            ),
+        )
+        .await;
+        mount_fs_report(&server, "fs-ok", ok_fs_report()).await;
+        ScannerAdapterFsClient::new(server.uri())
+            .scan_workspace_tar(tiny_tar())
+            .await
+            .expect("a cache-lock failure must be resubmitted");
+        assert_eq!(fs_posts(&server).await, 2);
+
+        let server = MockServer::start().await;
+        mount_fs_ready_and_submit(&server, "fs-gone").await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/v1/filesystem/scan/.+/report$"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("unknown scan id"))
+            .mount(&server)
+            .await;
+        let err = ScannerAdapterFsClient::new(server.uri())
+            .scan_workspace_tar(tiny_tar())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Internal(_)), "{err:?}");
+        assert_eq!(fs_posts(&server).await, ADAPTER_SCAN_ATTEMPTS as usize);
+    }
+
+    /// #5657: time the adapter reports a job `Queued` is not charged to the
+    /// run budget (bounded by the queue budget); a `Running` or unlabelled
+    /// pending answer is.
+    #[test]
+    fn test_poll_clock_does_not_charge_queued_time() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        use std::time::{Duration, Instant};
+        let headers = |refresh: &str, state: Option<&str>| {
+            let mut h = HeaderMap::new();
+            h.insert("Refresh-After", HeaderValue::from_str(refresh).unwrap());
+            if let Some(state) = state {
+                h.insert(
+                    ADAPTER_SCAN_STATUS_HEADER,
+                    HeaderValue::from_str(state).unwrap(),
+                );
+            }
+            h
+        };
+        let budget = Duration::from_secs(10);
+        let fallback = Duration::from_secs(5);
+        // Polls `clock` with `h` on a simulated wall clock that advances by
+        // each granted wait; returns how many waits were granted.
+        let granted = |clock: &mut AdapterPollClock, h: &HeaderMap, limit: usize| {
+            let mut now = Instant::now();
+            let mut n = 0;
+            while let Some(wait) = clock.pending_at(now, "id", h, fallback) {
+                now += wait;
+                n += 1;
+                if n == limit {
+                    break;
+                }
+            }
+            n
+        };
+
+        // A 60s wait overruns a 10s budget for a running job...
+        let mut clock = AdapterPollClock::new("t", budget);
+        assert_eq!(granted(&mut clock, &headers("60", Some("Running")), 100), 0);
+        let mut clock = AdapterPollClock::new("t", budget);
+        assert_eq!(granted(&mut clock, &headers("60", None), 100), 0);
+        // ...but a queued job is granted 60s waits until the 30-minute queue
+        // budget is spent: 30 of them, not one more.
+        let mut clock = AdapterPollClock::new("t", budget);
+        assert_eq!(granted(&mut clock, &headers("60", Some("queued")), 100), 30);
+        // Without a Refresh-After the client's own 5s interval applies; a
+        // second wait would end on the 10s deadline, so only one.
+        let mut clock = AdapterPollClock::new("t", budget);
+        assert_eq!(granted(&mut clock, &HeaderMap::new(), 100), 1);
+    }
+
+    /// #5657: a `helm upgrade` takes the adapter away mid-scan (its Service
+    /// answers 503), then the replacement pod answers 404 for the old id. The
+    /// poll rides out the gap, the scan is resubmitted, and it completes.
+    #[tokio::test]
+    async fn test_adapter_replaced_mid_scan_is_polled_through_and_resubmitted() {
+        let server = MockServer::start().await;
+        mount_fs_two_jobs(&server, "fs-old-pod", "fs-new-pod").await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/filesystem/scan/fs-old-pod/report"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(3)
+            .mount(&server)
+            .await;
+        mount_fs_report(
+            &server,
+            "fs-old-pod",
+            ResponseTemplate::new(404).set_body_string("unknown scan id"),
+        )
+        .await;
+        mount_fs_report(&server, "fs-new-pod", ok_fs_report()).await;
+
+        ScannerAdapterFsClient::new(server.uri())
+            .scan_workspace_tar(tiny_tar())
+            .await
+            .expect("an adapter replaced mid-scan must not fail the scan");
+        assert_eq!(fs_posts(&server).await, 2);
+    }
+
+    /// An adapter that stays away past the restart grace still fails the
+    /// scan as unavailable, with no resubmission.
+    #[tokio::test]
+    async fn test_adapter_unreachable_past_grace_is_unavailable() {
+        let server = MockServer::start().await;
+        mount_fs_ready_and_submit(&server, "fs-gone").await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/v1/filesystem/scan/.+/report$"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let err = ScannerAdapterFsClient::new(server.uri())
+            .scan_workspace_tar(tiny_tar())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::ScannerEngineUnavailable(_)),
+            "{err:?}"
+        );
+        assert_eq!(fs_posts(&server).await, 1);
+    }
+
+    #[test]
+    fn test_adapter_resubmit_classification() {
+        use reqwest::StatusCode;
+        assert_eq!(
+            AdapterResubmit::classify(StatusCode::NOT_FOUND, "unknown scan id"),
+            Some(AdapterResubmit::UnknownScanId)
+        );
+        assert_eq!(
+            AdapterResubmit::classify(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "scan failed: ... Cache may be in use by another process: timeout"
+            ),
+            Some(AdapterResubmit::CacheBusy)
+        );
+        assert_eq!(
+            AdapterResubmit::classify(StatusCode::INTERNAL_SERVER_ERROR, "scan failed: boom"),
+            None
+        );
+        assert_eq!(
+            AdapterResubmit::classify(
+                StatusCode::BAD_REQUEST,
+                "cache may be in use by another process"
+            ),
+            None
+        );
+        // Backoff grows for the lock, stays short for a lost id.
+        assert!(AdapterResubmit::CacheBusy.delay(3) > AdapterResubmit::CacheBusy.delay(2));
+        assert_eq!(
+            AdapterResubmit::UnknownScanId.delay(3),
+            AdapterResubmit::UnknownScanId.delay(2)
         );
     }
 

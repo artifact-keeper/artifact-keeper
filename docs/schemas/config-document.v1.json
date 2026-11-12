@@ -42,6 +42,7 @@
         "custom_user_agent": { "type": "string" },
         "curation_enabled": { "type": "boolean" },
         "curation_default_action": { "enum": ["allow", "review"] },
+        "curation_source_repository_key": { "type": "string", "minLength": 1 },
         "members": {
           "type": "array",
           "items": {
@@ -50,6 +51,10 @@
             "required": ["key", "priority"],
             "properties": { "key": { "type": "string" }, "priority": { "type": "integer" } }
           }
+        },
+        "upstream_mode": {
+          "enum": ["online", "cache_only"],
+          "description": "Remote repositories. Absent means online (the default); only cache_only is exported."
         },
         "cache_ttl_seconds": { "type": "integer", "minimum": 1 },
         "on_upstream_not_found": { "enum": ["keep", "delete"] },

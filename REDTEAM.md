@@ -139,6 +139,83 @@ and never as a finding.
 | curl + jq | - | HTTP testing, JSON parsing |
 | openssl | - | TLS certificate inspection |
 
+## HTML application UI (RT-15)
+
+The suite above and `docker-compose.test.yml` start the backend only. A
+red-team rig built from them reaches the JSON API and the opt-in Swagger UI,
+and **no HTML application**. The repository, catalog, capability, curation
+and audit views are a separate component with its own releases (#2708):
+
+| | |
+| --- | --- |
+| Source | [`artifact-keeper/artifact-keeper-web`](https://github.com/artifact-keeper/artifact-keeper-web) |
+| Image | `ghcr.io/artifact-keeper/artifact-keeper-web` (`artifactkeeper/web` on Docker Hub) |
+| Deployment | the `web` service of [`docker-compose.yml`](docker-compose.yml), pinned by `ARTIFACT_KEEPER_WEB_VERSION` (#4481), behind Caddy |
+| Stored-content rendering tests | `e2e/suites/interactions/security/rt15-mcp-stored-content.spec.ts` in that repository |
+
+A raw-JSON or Swagger check therefore cannot show that stored content stays
+inert in the UI (#5472). #5472 named `artifact-keeper-test` as the primary
+regression destination, but the rendering case lives in the web repository's
+Playwright suite instead. The test repository's release gate
+(`release-gate.yml`, which the web image publish calls) runs no browser
+suite, and it does not run this one.
+
+The suite stores hostile MCP content through a live backend: a publish, a CI
+capability report, a status change, a Remote synced from a hostile upstream
+registry, an unprivileged reader's approval request and an administrator's
+approval reason. It then opens the following views in Chromium:
+
+- the MCP repository views
+- the catalog
+- server detail, each tab and each capability panel
+- curation
+- the audit log
+
+Each view is opened as an administrator and as an unprivileged reader, with
+and without the web server's Content-Security-Policy. The suite fails on
+script execution, active nodes, active-scheme URLs or requests to an attacker
+origin. artifact-keeper/artifact-keeper-web#1106 lists the views it covers
+and the stored fields the UI does not render at all.
+
+The suite runs in the web repository's `E2E Interactions` CI job against the
+backend `dev` image. That job is **advisory**: E2E is not a required check
+there, so a red run does not block a merge and someone has to read it. To run
+the suite by hand, see that repository's `docker-compose.e2e-mcp-upstream.yml`.
+
+Two #5472 criteria are covered elsewhere, not by this suite:
+
+- **Terminal controls in logs:** the red-team rig's DEBUG-log analysis, plus
+  the backend test `telemetry::tests::test_json_request_line_has_siem_fields_top_level`
+  (JSON logs never carry ANSI).
+- **Authorization unaffected by display text:**
+  `mcp_capabilities::db_tests::capability_reports_run_the_namespace_gate` and
+  `mcp_namespaces::tests::namespace_rule_grants_nothing_outside_the_mcp_gate`.
+  The suite adds its own checks that a reader is shown no lint findings,
+  audit rows or approval queue.
+
+When a release assessment covers the UI, record the web revision and image
+digest next to the backend's, and deploy that exact image rather than a tag:
+
+```bash
+skopeo inspect --format '{{.Digest}} {{index .Labels "org.opencontainers.image.revision"}}' \
+  docker://ghcr.io/artifact-keeper/artifact-keeper-web:<version>
+# then ARTIFACT_KEEPER_WEB_VERSION=<version>@sha256:<digest> docker compose up -d web
+```
+
+Web `1.11.2` (`sha256:c17f1bff9a8bc1646efded313c107a003c383f7c03b213b389cdf789302267a5`,
+revision `6a43afc`) predates the MCP UI: it serves no MCP views and does not
+proxy `/mcp/`. The first web release with MCP views will be the next one,
+1.12.0, which contains `b65f961` and artifact-keeper/artifact-keeper-web#1106.
+
+The suite has passed against `b65f961` plus #1106, built from source, with
+backend `dev` revision `ad20810`
+(`sha256:a55b5d560c18e66efdac3107e13d4239cbae59c15fcbad4eccd88365ace27c5f`).
+`b65f961` is the `artifact-keeper-web:dev` image
+(`sha256:e05124d427420f81fbc2656bbad1cd50a5e3333a5cfae27859a61c6f1812e5ff`).
+That build is not the release. RT-15 is marked PASS only after the suite is
+rerun against the 1.12.0 web image, deployed by its digest, and that digest
+is recorded here.
+
 ## When to Run
 
 - Before any release

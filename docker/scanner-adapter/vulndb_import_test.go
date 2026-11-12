@@ -230,10 +230,10 @@ func TestOfflineScanArgs(t *testing.T) {
 		}
 	}
 	// SkipDBUpdate alone now also reaches filesystem scans, without the
-	// offline-only flags.
+	// offline-only Java DB flag.
 	cfg.Offline = false
 	joined := strings.Join(s.buildFsArgs("/work"), " ")
-	if !strings.Contains(joined, "--skip-db-update") || strings.Contains(joined, "--offline-scan") {
+	if !strings.Contains(joined, "--skip-db-update") || strings.Contains(joined, "--skip-java-db-update") {
 		t.Errorf("SkipDBUpdate fs args: %s", joined)
 	}
 }

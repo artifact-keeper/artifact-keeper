@@ -265,9 +265,35 @@ fn filter_allowed(
         .collect()
 }
 
+/// A host the resolver refuses before any lookup, with the ordinary
+/// connect-time SSRF refusal (#5459). `env_proxy_guard` sends a request here
+/// to obtain a `reqwest::Error` for a destination it refused before sending
+/// (`reqwest` has no public constructor). `.invalid` (RFC 2606) never
+/// resolves, so nothing leaves the process. The caller counts the refusal.
+pub(crate) const REFUSED_DESTINATION_PROXY_HOST: &str = "ssrf-refused.artifact-keeper.invalid";
+
+/// The connect-time refusal error, worded so
+/// [`crate::services::ssrf_refusal::is_ssrf_refusal_error`] recognizes it.
+fn connect_refusal() -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "all resolved addresses {}",
+            crate::services::ssrf_refusal::CONNECT_REFUSAL_PHRASE
+        ),
+    ))
+}
+
 impl Resolve for SsrfGuardResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let mode = self.mode;
+        if name
+            .as_str()
+            .eq_ignore_ascii_case(REFUSED_DESTINATION_PROXY_HOST)
+        {
+            // Counted by the caller that refused the destination (#5459).
+            return Box::pin(async { Err(connect_refusal()) });
+        }
         // Exempt the configured egress-proxy host (issue #2570): matched by
         // EXACT full-host equality BEFORE the mode-specific filter. Computed
         // here (sync, outside the future) so no reference into `self` is held.
@@ -298,14 +324,7 @@ impl Resolve for SsrfGuardResolver {
                     "SSRF DNS guard blocked all resolved addresses for host"
                 );
                 crate::services::metrics_service::record_ssrf_block(mode.ssrf_surface());
-                let err: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!(
-                        "all resolved addresses {}",
-                        crate::services::ssrf_refusal::CONNECT_REFUSAL_PHRASE
-                    ),
-                ));
-                return Err(err);
+                return Err(connect_refusal());
             }
             let addrs: Addrs = Box::new(allowed.into_iter());
             Ok(addrs)
@@ -420,6 +439,47 @@ mod tests {
             assert_eq!(
                 counted.get("ak_ssrf_blocks_total", &[("surface", surface)]),
                 1,
+                "{surface}"
+            );
+        }
+    }
+
+    /// #5459: the refused-destination host is refused by every resolver mode
+    /// before any lookup, with the standard connect-time refusal wording,
+    /// even when the exempt set names it. The caller counts the refusal, so
+    /// the resolver does not count it again.
+    #[test]
+    fn refused_destination_proxy_host_is_refused_without_lookup_5459() {
+        use crate::services::metrics_service::capture_counters_async;
+        let ((), counted) = capture_counters_async(|| async {
+            for mode in [
+                ResolverMode::Upstream,
+                ResolverMode::TrustedInternal,
+                ResolverMode::Webhook,
+                ResolverMode::SsoDiscovery,
+            ] {
+                let resolver = SsrfGuardResolver {
+                    mode,
+                    exempt_proxy_hosts: exempt_set(&[REFUSED_DESTINATION_PROXY_HOST]),
+                };
+                let name: Name = REFUSED_DESTINATION_PROXY_HOST
+                    .to_ascii_uppercase()
+                    .parse()
+                    .expect("valid dns name");
+                let err = match resolver.resolve(name).await {
+                    Ok(_) => panic!("{mode:?} resolved the refused-destination host"),
+                    Err(e) => e,
+                };
+                assert!(
+                    crate::services::ssrf_refusal::is_ssrf_refusal_error(err.as_ref()),
+                    "{mode:?}: {err}"
+                );
+            }
+        });
+        for surface in ["upstream", "internal", "webhook", "sso"] {
+            assert_eq!(
+                counted.get("ak_ssrf_blocks_total", &[("surface", surface)]),
+                0,
                 "{surface}"
             );
         }

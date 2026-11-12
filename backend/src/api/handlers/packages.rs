@@ -16,7 +16,10 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::access_scope::AccessScope;
 use crate::services::curation_service::version_compare;
-use crate::services::package_service::{live_package_predicate, live_package_version_predicate};
+use crate::services::package_service::{
+    live_package_predicate, live_package_version_predicate, newest_catalog_version,
+    package_download_count_over_versions, package_download_counts, version_download_count_sql,
+};
 use crate::services::repository_service::{
     build_visibility_clause_for, RepoVisibility, VisibilityBind,
 };
@@ -194,7 +197,11 @@ pub struct PackageRow {
     pub format: String,
     pub description: Option<String>,
     pub size_bytes: i64,
-    pub download_count: i64,
+    /// Downloads of the package's versions, from the same download history
+    /// the artifact download stats read (#5346). `null` when the repository
+    /// cannot attribute downloads to this package (a Remote package cataloged
+    /// without a digest), so a client can tell "not tracked" from a real 0.
+    pub download_count: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     #[schema(value_type = Object)]
@@ -210,7 +217,11 @@ pub struct PackageResponse {
     pub format: String,
     pub description: Option<String>,
     pub size_bytes: i64,
-    pub download_count: i64,
+    /// Downloads of the package's versions, from the same download history
+    /// the artifact download stats read (#5346). `null` when the repository
+    /// cannot attribute downloads to this package (a Remote package cataloged
+    /// without a digest), so a client can tell "not tracked" from a real 0.
+    pub download_count: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     #[schema(value_type = Object)]
@@ -306,10 +317,57 @@ pub async fn list_packages(
     // and keeps `total` honest at the same time.
     let live_packages = live_package_predicate();
 
+    // MCP rows (#5253): the catalog rows of the whole filtered set this
+    // caller is shown (`None`: the listing cannot contain an MCP row). The
+    // page and the count both keep only those, so `total` and every page
+    // count the rows the caller sees.
+    let mcp_shown: Option<Vec<Uuid>> = if query.format.as_deref().is_none_or(|f| f == "mcp") {
+        let mcp_sql = format!(
+            r#"
+            SELECT p.id, p.repository_id, p.name, p.version
+            FROM packages p
+            JOIN repositories r ON r.id = p.repository_id
+            WHERE ($1::uuid[] IS NULL OR r.id = ANY($1))
+              AND r.format::text = 'mcp'
+              AND ($3::text IS NULL OR p.name ILIKE $3 ESCAPE '\')
+              AND ({count_clause})
+              AND {live_packages}
+              AND ($2::text IS NULL OR $2 = 'mcp')
+            ORDER BY p.updated_at DESC
+            LIMIT $5
+            "#
+        );
+        let mcp_query =
+            sqlx::query_as::<_, (Uuid, Uuid, String, String)>(sqlx::AssertSqlSafe(&*mcp_sql))
+                .bind(filter.repo_ids.clone())
+                .bind(&query.format)
+                .bind(&search_pattern);
+        let mcp_query = match &count_ids {
+            Some(ids) => mcp_query.bind(ids.clone()),
+            None => mcp_query.bind(count_user_id),
+        };
+        let rows = mcp_query
+            .bind(super::mcp::GENERIC_LISTING_VERSION_CAP)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let mut shown = Vec::with_capacity(rows.len());
+        for (id, repo_id, name, version) in rows {
+            let view =
+                super::mcp::catalog_view(&state, auth.as_ref(), repo_id, &name, &version).await;
+            if view != super::mcp::CatalogView::Hide {
+                shown.push(id);
+            }
+        }
+        Some(shown)
+    } else {
+        None
+    };
+
     let page_sql = format!(
         r#"
         SELECT p.id, r.key as repository_key, p.name, p.version, r.format::text as format,
-               p.description, p.size_bytes, p.download_count, p.created_at, p.updated_at,
+               p.description, p.size_bytes, NULL::BIGINT AS download_count, p.created_at, p.updated_at,
                p.metadata
         FROM packages p
         JOIN repositories r ON r.id = p.repository_id
@@ -318,6 +376,7 @@ pub async fn list_packages(
           AND ($3::text IS NULL OR p.name ILIKE $3 ESCAPE '\')
           AND ({page_clause})
           AND {live_packages}
+          AND ($7::uuid[] IS NULL OR r.format::text <> 'mcp' OR p.id = ANY($7))
         ORDER BY p.updated_at DESC
         OFFSET $4
         LIMIT $5
@@ -335,10 +394,15 @@ pub async fn list_packages(
         None => page_query.bind(page_user_id),
     };
     let packages: Vec<PackageRow> = page_query
+        .bind(mcp_shown.clone())
         .fetch_all(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-    let (packages, hidden) = apply_mcp_catalog_views(&state, auth.as_ref(), packages).await;
+    // The rows were decided above; this applies each one's view (a held
+    // version's row shows the newest servable one).
+    let (packages, _hidden) = apply_mcp_catalog_views(&state, auth.as_ref(), packages).await;
+    let packages = with_live_latest(&state, packages).await?;
+    let packages = with_download_counts(&state, auth.as_ref(), packages).await?;
 
     let count_sql = format!(
         r#"
@@ -350,6 +414,7 @@ pub async fn list_packages(
           AND ($3::text IS NULL OR p.name ILIKE $3 ESCAPE '\')
           AND ({count_clause})
           AND {live_packages}
+          AND ($5::uuid[] IS NULL OR r.format::text <> 'mcp' OR p.id = ANY($5))
         "#
     );
     let count_query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*count_sql))
@@ -361,10 +426,11 @@ pub async fn list_packages(
         Some(ids) => count_query.bind(ids.clone()),
         None => count_query.bind(count_user_id),
     };
-    let total: i64 = count_query.fetch_one(&state.db).await.unwrap_or(0);
-    // MCP rows this reader is served no version of are left out of the page
-    // and, best effort, of the total.
-    let total = (total - hidden as i64).max(0);
+    let total: i64 = count_query
+        .bind(mcp_shown)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
 
     let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
 
@@ -447,7 +513,7 @@ pub async fn get_package(
     let sql = format!(
         r#"
         SELECT p.id, r.key as repository_key, p.name, p.version, r.format::text as format,
-               p.description, p.size_bytes, p.download_count, p.created_at, p.updated_at,
+               p.description, p.size_bytes, NULL::BIGINT AS download_count, p.created_at, p.updated_at,
                p.metadata
         FROM packages p
         JOIN repositories r ON r.id = p.repository_id
@@ -470,9 +536,14 @@ pub async fn get_package(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Package not found".to_string()))?;
-    let mut package = apply_mcp_catalog_views(&state, auth.as_ref(), vec![package])
+    let package = apply_mcp_catalog_views(&state, auth.as_ref(), vec![package])
         .await
         .0
+        .pop()
+        .ok_or_else(|| AppError::NotFound("Package not found".to_string()))?;
+    let package = with_live_latest(&state, vec![package]).await?;
+    let mut package = with_download_counts(&state, auth.as_ref(), package)
+        .await?
         .pop()
         .ok_or_else(|| AppError::NotFound("Package not found".to_string()))?;
 
@@ -490,7 +561,9 @@ pub async fn get_package(
 pub struct PackageVersionRow {
     pub version: String,
     pub size_bytes: i64,
-    pub download_count: i64,
+    /// Downloads of this version (#5346); `null` when not tracked, as on
+    /// [`PackageResponse::download_count`].
+    pub download_count: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub checksum_sha256: String,
 }
@@ -499,7 +572,9 @@ pub struct PackageVersionRow {
 pub struct PackageVersionResponse {
     pub version: String,
     pub size_bytes: i64,
-    pub download_count: i64,
+    /// Downloads of this version (#5346); `null` when not tracked, as on
+    /// [`PackageResponse::download_count`].
+    pub download_count: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub checksum_sha256: String,
 }
@@ -602,9 +677,11 @@ pub async fn get_package_versions(
     // soft-deleted version disappears from the list and comes back on restore
     // without any catalog write.
     let live_versions = live_package_version_predicate();
+    let download_count = version_download_count_sql();
     let versions_sql = format!(
         r#"
-        SELECT pv.version, pv.size_bytes, pv.download_count, pv.created_at, pv.checksum_sha256
+        SELECT pv.version, pv.size_bytes, {download_count} AS download_count,
+               pv.created_at, pv.checksum_sha256
         FROM package_versions pv
         JOIN packages p ON p.id = pv.package_id
         JOIN repositories r ON r.id = p.repository_id
@@ -634,6 +711,95 @@ pub async fn get_package_versions(
             .map(PackageVersionResponse::from)
             .collect(),
     }))
+}
+
+/// Show each row's newest LIVE version as its Latest (#5632).
+///
+/// `packages.version` is moved off a deleted version when the delete runs
+/// ([`crate::services::package_service::refresh_package_latest`]); this
+/// is the read-side backstop for a row that still names a version whose bytes
+/// are gone (a delete path that bypassed it, or rows written before it): the
+/// row reports its newest version with a live artifact, by the same liveness
+/// test the version list uses, instead of an install that fails. Rows whose
+/// version is live, MCP rows (decided by [`apply_mcp_catalog_views`]) and
+/// rows with no live version (already filtered out) pass through.
+async fn with_live_latest(
+    state: &SharedState,
+    mut rows: Vec<PackageRow>,
+) -> Result<Vec<PackageRow>> {
+    let ids: Vec<Uuid> = rows
+        .iter()
+        .filter(|r| r.format != "mcp")
+        .map(|r| r.id)
+        .collect();
+    if ids.is_empty() {
+        return Ok(rows);
+    }
+    let live_versions = live_package_version_predicate();
+    let sql = format!(
+        r#"
+        SELECT pv.package_id, pv.version, pv.size_bytes
+        FROM package_versions pv
+        JOIN packages p ON p.id = pv.package_id
+        JOIN repositories r ON r.id = p.repository_id
+        WHERE pv.package_id = ANY($1)
+          AND {live_versions}
+        "#
+    );
+    let live: Vec<(Uuid, String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
+        .bind(&ids)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let mut by_package: std::collections::HashMap<Uuid, Vec<(String, i64)>> =
+        std::collections::HashMap::new();
+    for (id, version, size) in live {
+        by_package.entry(id).or_default().push((version, size));
+    }
+    for row in rows.iter_mut().filter(|r| r.format != "mcp") {
+        let Some(versions) = by_package.get(&row.id) else {
+            continue;
+        };
+        if versions.iter().any(|(v, _)| *v == row.version) {
+            continue;
+        }
+        if let Some((version, size)) = newest_catalog_version(versions) {
+            row.version = version.clone();
+            row.size_bytes = *size;
+        }
+    }
+    Ok(rows)
+}
+
+/// Fill each row's `download_count` from the recorded download history
+/// (#5346), one batched query for the whole page rather than one per row.
+///
+/// An MCP package (#5253) counts only the versions `auth` may list
+/// ([`mcp_visible_versions`]), the same versions its version list shows, so
+/// a reader who does not hold the registry never sees a held version's
+/// downloads. A failed lookup lists no version, so the count is `null`.
+async fn with_download_counts(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    mut rows: Vec<PackageRow>,
+) -> Result<Vec<PackageRow>> {
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    let counts = package_download_counts(&state.db, &ids)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    for row in &mut rows {
+        row.download_count = counts.get(&row.id).copied().flatten();
+        if row.format != "mcp" {
+            continue;
+        }
+        if let Some(versions) = mcp_visible_versions(state, auth, row.id).await {
+            let versions: Vec<String> = versions.into_iter().collect();
+            row.download_count = package_download_count_over_versions(&state.db, row.id, &versions)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+    }
+    Ok(rows)
 }
 
 /// The MCP rows of `rows` as `auth` may see them (#5253): a row whose
@@ -674,10 +840,25 @@ async fn apply_mcp_catalog_views(
                 out.push(row);
             }
             CatalogView::Show {
+                artifact_id,
                 version,
                 description,
                 metadata,
             } => {
+                // The figures and times are the shown version's own, never
+                // the held one's (#5253): its `package_versions` row, or its
+                // artifact when it has none. A failed read hides the row.
+                let Some(figures) =
+                    shown_version_figures(state, row.id, artifact_id, &version).await
+                else {
+                    hidden += 1;
+                    continue;
+                };
+                // The download count is filled afterwards over the versions
+                // the reader may list ([`with_download_counts`]).
+                row.size_bytes = figures.0;
+                row.created_at = figures.1;
+                row.updated_at = figures.2;
                 row.version = version;
                 row.description = description;
                 let mut metadata = metadata;
@@ -691,14 +872,47 @@ async fn apply_mcp_catalog_views(
     (out, hidden)
 }
 
+/// `(size_bytes, created_at, updated_at)` of the version an MCP catalog row
+/// shows a reader in place of a held one: its `package_versions` row
+/// (`updated_at` is the version's own creation), else its server.json
+/// artifact. `None` on a read failure.
+async fn shown_version_figures(
+    state: &SharedState,
+    package_id: Uuid,
+    artifact_id: Uuid,
+    version: &str,
+) -> Option<(
+    i64,
+    chrono::DateTime<chrono::Utc>,
+    chrono::DateTime<chrono::Utc>,
+)> {
+    let pv: Option<(i64, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT size_bytes, created_at FROM package_versions \
+         WHERE package_id = $1 AND version = $2",
+    )
+    .bind(package_id)
+    .bind(version)
+    .fetch_optional(&state.db)
+    .await
+    .ok()?;
+    if let Some((size, created)) = pv {
+        return Some((size, created, created));
+    }
+    sqlx::query_as("SELECT size_bytes, created_at, updated_at FROM artifacts WHERE id = $1")
+        .bind(artifact_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()?
+}
+
 /// For an MCP package, the versions `auth` may list (`None`: all of them, a
-/// holder or another format).
+/// holder or another format). A lookup that fails lists none (fail closed).
 async fn mcp_visible_versions(
     state: &SharedState,
     auth: Option<&AuthExtension>,
     package_id: Uuid,
 ) -> Option<std::collections::HashSet<String>> {
-    let row: Option<(Uuid, String)> = sqlx::query_as(
+    let row: Option<(Uuid, String)> = match sqlx::query_as(
         "SELECT p.repository_id, p.name FROM packages p \
          JOIN repositories r ON r.id = p.repository_id \
          WHERE p.id = $1 AND r.format = 'mcp'",
@@ -706,8 +920,10 @@ async fn mcp_visible_versions(
     .bind(package_id)
     .fetch_optional(&state.db)
     .await
-    .ok()
-    .flatten();
+    {
+        Ok(row) => row,
+        Err(_) => return Some(Default::default()),
+    };
     let (repo_id, name) = row?;
     super::mcp::catalog_visible_versions(state, auth, repo_id, &name).await
 }
@@ -733,6 +949,23 @@ mod tests {
     use chrono::Utc;
     use serde_json;
 
+    /// #5253: when the MCP package lookup fails, an MCP package's version
+    /// list is empty (fail closed), never every version.
+    #[tokio::test]
+    async fn mcp_visible_versions_fails_closed() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://invalid:invalid@127.0.0.1:1/none")
+            .expect("lazy pool");
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::api::handlers::test_db_helpers::build_state(pool, dir.path().to_str().unwrap());
+        assert_eq!(
+            mcp_visible_versions(&state, None, Uuid::new_v4()).await,
+            Some(Default::default())
+        );
+    }
+
     fn make_package_row() -> PackageRow {
         let now = Utc::now();
         PackageRow {
@@ -743,7 +976,7 @@ mod tests {
             format: "npm".to_string(),
             description: Some("A test package".to_string()),
             size_bytes: 1024,
-            download_count: 42,
+            download_count: Some(42),
             created_at: now,
             updated_at: now,
             metadata: Some(serde_json::json!({"license": "MIT"})),
@@ -831,7 +1064,7 @@ mod tests {
         PackageVersionRow {
             version: "2.0.0".to_string(),
             size_bytes: 2048,
-            download_count: 10,
+            download_count: Some(10),
             created_at: Utc::now(),
             checksum_sha256: "abc123def456".to_string(),
         }
@@ -853,7 +1086,7 @@ mod tests {
         assert_eq!(resp.format, "npm");
         assert_eq!(resp.description.as_deref(), Some("A test package"));
         assert_eq!(resp.size_bytes, 1024);
-        assert_eq!(resp.download_count, 42);
+        assert_eq!(resp.download_count, Some(42));
         assert!(resp.metadata.is_some());
     }
 
@@ -884,9 +1117,9 @@ mod tests {
     #[test]
     fn test_package_row_to_response_zero_downloads() {
         let mut row = make_package_row();
-        row.download_count = 0;
+        row.download_count = Some(0);
         let resp = PackageResponse::from(row);
-        assert_eq!(resp.download_count, 0);
+        assert_eq!(resp.download_count, Some(0));
     }
 
     // -----------------------------------------------------------------------
@@ -899,7 +1132,7 @@ mod tests {
         let resp = PackageVersionResponse::from(row);
         assert_eq!(resp.version, "2.0.0");
         assert_eq!(resp.size_bytes, 2048);
-        assert_eq!(resp.download_count, 10);
+        assert_eq!(resp.download_count, Some(10));
         assert_eq!(resp.checksum_sha256, "abc123def456");
     }
 
@@ -2011,6 +2244,85 @@ mod tests {
             f.teardown().await;
         }
 
+        /// #5632 read-side backstop: a row whose stored `packages.version`
+        /// names a version with no live artifact (soft-deleted behind the
+        /// delete hook's back) reports its newest live version as Latest, in
+        /// the listing and the detail view, and goes back once it is restored.
+        #[tokio::test]
+        async fn latest_falls_back_to_newest_live_version_5632() {
+            let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+                return;
+            };
+            let (pkg, _) = seed_backed_package(&f.pool, f.repo_id, "latest-chart", "1.0.0").await;
+            seed_backed_package(&f.pool, f.repo_id, "latest-chart", "1.1.0").await;
+            let (_, newest) =
+                seed_backed_package(&f.pool, f.repo_id, "latest-chart", "2.0.0").await;
+
+            let listed_latest = |f: &tdh::Fixture| {
+                let app = app(f);
+                let key = f.repo_key.clone();
+                async move {
+                    let (status, body) =
+                        tdh::send(app, tdh::get(format!("/?repository_key={key}"))).await;
+                    assert_eq!(status, StatusCode::OK);
+                    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    json["items"][0]["version"].as_str().unwrap().to_string()
+                }
+            };
+            let detail_latest = |f: &tdh::Fixture| {
+                let app = app(f);
+                async move {
+                    let (status, body) = tdh::send(app, tdh::get(format!("/{pkg}"))).await;
+                    assert_eq!(status, StatusCode::OK);
+                    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    json["version"].as_str().unwrap().to_string()
+                }
+            };
+            assert_eq!(listed_latest(&f).await, "2.0.0");
+
+            set_deleted(&f.pool, f.repo_id, &newest, true).await;
+            let after_listed = listed_latest(&f).await;
+            let after_detail = detail_latest(&f).await;
+            let after_versions = listed_versions(&f, pkg).await;
+
+            // Restore through the real trash restore (its object must exist).
+            let path = "latest-chart/2.0.0/asset.bin";
+            let id: Uuid = sqlx::query_scalar(
+                "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(f.repo_id)
+            .bind(path)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+            f.state
+                .storage_for_repo(
+                    &tdh::make_repo_info(f.repo_id, &f.repo_key, &f.storage_dir, "local", None)
+                        .storage_location(),
+                )
+                .unwrap()
+                .put(path, bytes::Bytes::from_static(b"chart"))
+                .await
+                .unwrap();
+            crate::api::handlers::trash::trash_service(&f.state)
+                .restore(id)
+                .await
+                .expect("restore");
+            let restored = detail_latest(&f).await;
+            f.teardown().await;
+
+            assert_eq!(
+                after_listed, "1.1.0",
+                "listing Latest skips the deleted 2.0.0"
+            );
+            assert_eq!(
+                after_detail, "1.1.0",
+                "detail Latest skips the deleted 2.0.0"
+            );
+            assert_eq!(after_versions, vec!["1.1.0", "1.0.0"]);
+            assert_eq!(restored, "2.0.0", "a restore makes 2.0.0 Latest again");
+        }
+
         /// Remote repositories are exempt: proxy-cached artifacts are
         /// deliberately not written to `artifacts` (#1278/#1280) while their
         /// catalog rows are (#1999), so a liveness join must not hide them.
@@ -2031,6 +2343,246 @@ mod tests {
             let total = listed_total(&f).await;
             f.teardown().await;
             assert_eq!(total, 1, "proxy-cached catalog rows must stay listed");
+        }
+    }
+
+    /// An untracked count serializes as an explicit `null` (#5346), so a
+    /// client can tell "not tracked" from a real 0.
+    #[test]
+    fn test_untracked_download_count_serializes_as_null() {
+        let mut row = make_package_row();
+        row.download_count = None;
+        let json = serde_json::to_value(PackageResponse::from(row)).unwrap();
+        assert!(json.as_object().unwrap().contains_key("download_count"));
+        assert!(json["download_count"].is_null());
+    }
+
+    // -----------------------------------------------------------------------
+    // #5346: package and version download counts come from the recorded
+    // download history (`download_statistics`, `proxy_download_statistics`),
+    // not from the never-written `download_count` columns.
+    // -----------------------------------------------------------------------
+    mod download_counts_db {
+        use super::catalog_liveness_db::seed_backed_package;
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        fn app(f: &tdh::Fixture) -> axum::Router {
+            tdh::router_with_auth(router(), f.state.clone(), make_auth(f.user_id, false, None))
+        }
+
+        async fn get_json(f: &tdh::Fixture, path: String) -> serde_json::Value {
+            let (status, body) = tdh::send(app(f), tdh::get(path)).await;
+            assert_eq!(status, StatusCode::OK);
+            serde_json::from_slice(&body).expect("json body")
+        }
+
+        async fn package_count(f: &tdh::Fixture, pkg: Uuid) -> serde_json::Value {
+            get_json(f, format!("/{pkg}")).await["download_count"].clone()
+        }
+
+        async fn listed_count(f: &tdh::Fixture, name: &str) -> serde_json::Value {
+            let json = get_json(f, format!("/?repository_key={}", f.repo_key)).await;
+            json["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .find(|i| i["name"] == name)
+                .unwrap_or_else(|| panic!("{name} listed"))["download_count"]
+                .clone()
+        }
+
+        async fn version_counts(
+            f: &tdh::Fixture,
+            pkg: Uuid,
+        ) -> std::collections::HashMap<String, serde_json::Value> {
+            get_json(f, format!("/{pkg}/versions")).await["versions"]
+                .as_array()
+                .expect("versions")
+                .iter()
+                .map(|v| {
+                    (
+                        v["version"].as_str().unwrap().to_string(),
+                        v["download_count"].clone(),
+                    )
+                })
+                .collect()
+        }
+
+        async fn artifact_id(pool: &sqlx::PgPool, repo_id: Uuid, checksum: &str) -> Uuid {
+            sqlx::query_scalar(
+                "SELECT id FROM artifacts WHERE repository_id = $1 AND checksum_sha256 = $2",
+            )
+            .bind(repo_id)
+            .bind(checksum)
+            .fetch_one(pool)
+            .await
+            .expect("artifact id")
+        }
+
+        /// What `record_download`'s batch flush writes: one row per served body.
+        async fn record_downloads(pool: &sqlx::PgPool, artifact_id: Uuid, n: usize) {
+            for _ in 0..n {
+                sqlx::query("INSERT INTO download_statistics (artifact_id) VALUES ($1)")
+                    .bind(artifact_id)
+                    .execute(pool)
+                    .await
+                    .expect("record download");
+            }
+        }
+
+        /// One proxy serve as `proxy_catalog::record_proxy_download` writes it.
+        async fn record_proxy_download(
+            pool: &sqlx::PgPool,
+            repo_id: Uuid,
+            path: &str,
+            checksum: Option<&str>,
+            proxy_cache_id: Option<Uuid>,
+        ) {
+            sqlx::query(
+                "INSERT INTO proxy_download_statistics \
+                 (proxy_cache_id, repository_id, path, checksum_sha256) VALUES ($1, $2, $3, $4)",
+            )
+            .bind(proxy_cache_id)
+            .bind(repo_id)
+            .bind(path)
+            .bind(checksum)
+            .execute(pool)
+            .await
+            .expect("record proxy download");
+        }
+
+        async fn seed_remote_version(
+            pool: &sqlx::PgPool,
+            repo_id: Uuid,
+            name: &str,
+            version: &str,
+            checksum: &str,
+        ) -> Uuid {
+            let pkg: Uuid = sqlx::query_scalar(
+                "INSERT INTO packages (repository_id, name, version, size_bytes) \
+                 VALUES ($1, $2, $3, 1) \
+                 ON CONFLICT (repository_id, name) DO UPDATE SET version = EXCLUDED.version \
+                 RETURNING id",
+            )
+            .bind(repo_id)
+            .bind(name)
+            .bind(version)
+            .fetch_one(pool)
+            .await
+            .expect("seed remote package");
+            sqlx::query(
+                "INSERT INTO package_versions (package_id, version, size_bytes, checksum_sha256) \
+                 VALUES ($1, $2, 1, $3)",
+            )
+            .bind(pkg)
+            .bind(version)
+            .bind(checksum)
+            .execute(pool)
+            .await
+            .expect("seed remote version");
+            pkg
+        }
+
+        /// After N downloads of a hosted package version, the version list,
+        /// the package detail and the listing all report them. A version's
+        /// count includes every file of that version (here a second asset
+        /// recorded under the same name and version), and a package with no
+        /// downloads reports a real 0, not `null`.
+        #[tokio::test]
+        async fn hosted_package_and_versions_report_recorded_downloads() {
+            let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+                return;
+            };
+            let (pkg, v1) = seed_backed_package(&f.pool, f.repo_id, "dl-chart", "1.0.0").await;
+            let (_, v2) = seed_backed_package(&f.pool, f.repo_id, "dl-chart", "2.0.0").await;
+            let (quiet, _) = seed_backed_package(&f.pool, f.repo_id, "quiet-chart", "1.0.0").await;
+            let extra: Uuid = sqlx::query_scalar(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, 'dl-chart/1.0.0/extra.bin', 'dl-chart', '1.0.0', 1, $2, \
+                 'application/octet-stream', 'dl-chart/1.0.0/extra.bin') RETURNING id",
+            )
+            .bind(f.repo_id)
+            .bind("e".repeat(64))
+            .fetch_one(&f.pool)
+            .await
+            .expect("seed second asset");
+
+            record_downloads(&f.pool, artifact_id(&f.pool, f.repo_id, &v1).await, 3).await;
+            record_downloads(&f.pool, extra, 1).await;
+            record_downloads(&f.pool, artifact_id(&f.pool, f.repo_id, &v2).await, 2).await;
+
+            let versions = version_counts(&f, pkg).await;
+            let detail = package_count(&f, pkg).await;
+            let listed = listed_count(&f, "dl-chart").await;
+            let quiet_detail = package_count(&f, quiet).await;
+            let quiet_listed = listed_count(&f, "quiet-chart").await;
+            f.teardown().await;
+
+            assert_eq!(versions["1.0.0"], 4, "1.0.0: 3 + 1 downloads of its files");
+            assert_eq!(versions["2.0.0"], 2);
+            assert_eq!(detail, 6, "package detail sums its versions");
+            assert_eq!(listed, 6, "listing reports the same count");
+            assert_eq!(quiet_detail, 0, "no downloads is a real 0");
+            assert_eq!(quiet_listed, 0);
+        }
+
+        /// A Remote package reports its pull-through serves from
+        /// `proxy_download_statistics`: rows that carry the version's digest,
+        /// and older rows with no digest that link to a cached object with it.
+        /// A version cataloged without a digest cannot be attributed and is
+        /// `null`, as is a package with only such versions.
+        #[tokio::test]
+        async fn remote_package_reports_proxy_downloads_or_null() {
+            let Some(f) = tdh::Fixture::setup("remote", "maven").await else {
+                return;
+            };
+            let digest = "a".repeat(64);
+            let pkg =
+                seed_remote_version(&f.pool, f.repo_id, "com.example:proxied", "1.0.0", &digest)
+                    .await;
+            seed_remote_version(&f.pool, f.repo_id, "com.example:proxied", "0.9.0", "").await;
+            let untracked =
+                seed_remote_version(&f.pool, f.repo_id, "com.example:streamed", "1.0.0", "").await;
+
+            let path = "com/example/proxied/1.0.0/proxied-1.0.0.jar";
+            let cache_id: Uuid = sqlx::query_scalar(
+                "INSERT INTO proxy_cache_artifacts \
+                 (repository_id, path, storage_key, metadata_key, size_bytes, checksum_sha256) \
+                 VALUES ($1, $2, $2, $2, 1, $3) RETURNING id",
+            )
+            .bind(f.repo_id)
+            .bind(path)
+            .bind(&digest)
+            .fetch_one(&f.pool)
+            .await
+            .expect("seed proxy cache row");
+            record_proxy_download(&f.pool, f.repo_id, path, Some(&digest), Some(cache_id)).await;
+            record_proxy_download(&f.pool, f.repo_id, path, Some(&digest), None).await;
+            // Recorded before the digest column existed (#4542).
+            record_proxy_download(&f.pool, f.repo_id, path, None, Some(cache_id)).await;
+            // Another object's serve.
+            record_proxy_download(&f.pool, f.repo_id, "other.jar", Some(&"b".repeat(64)), None)
+                .await;
+
+            let versions = version_counts(&f, pkg).await;
+            let detail = package_count(&f, pkg).await;
+            let listed = listed_count(&f, "com.example:proxied").await;
+            let untracked_detail = package_count(&f, untracked).await;
+            let untracked_listed = listed_count(&f, "com.example:streamed").await;
+            f.teardown().await;
+
+            assert_eq!(versions["1.0.0"], 3, "three serves of the version's digest");
+            assert!(versions["0.9.0"].is_null(), "no digest: not tracked");
+            assert_eq!(detail, 3);
+            assert_eq!(listed, 3);
+            assert!(
+                untracked_detail.is_null(),
+                "untracked package is null, not 0"
+            );
+            assert!(untracked_listed.is_null());
         }
     }
 }

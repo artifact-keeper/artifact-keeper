@@ -1,0 +1,6 @@
+name = "artifact-keeper-formal"
+version = "0.1.0"
+defaultTargets = ["ArtifactKeeper"]
+
+[[lean_lib]]
+name = "ArtifactKeeper"

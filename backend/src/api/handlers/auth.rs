@@ -27,7 +27,7 @@ use crate::services::audit_service::{
     AuditEntry, AuditService, ResourceType,
 };
 use crate::services::auth_config_service::AuthConfigService;
-use crate::services::auth_service::{AuthService, TimingPad};
+use crate::services::auth_service::{local_login_gate, AuthService, LocalLoginGate, TimingPad};
 use crate::services::totp_policy;
 
 /// Fire-and-forget auth audit log. Failures are silently ignored so audit
@@ -223,57 +223,6 @@ pub struct UserResponse {
     pub display_name: Option<String>,
     pub is_admin: bool,
     pub totp_enabled: bool,
-}
-
-/// Outcome of the local-login policy decision in [`local_login_gate`].
-#[derive(Debug, PartialEq, Eq)]
-enum LocalLoginGate {
-    /// Local login may proceed.
-    Allow,
-    /// Local login is rejected because SSO is enforced for this user.
-    RejectSso,
-}
-
-/// Decide whether a *verified* local credential may complete login.
-///
-/// Evaluated AFTER `AuthService::authenticate` succeeds, so `user_is_admin`
-/// is a proven property of the caller, not a claim from the request. When any
-/// SSO provider is enabled (issue #213) non-admin local login stays disabled,
-/// but a verified admin retains a break-glass recovery path by default so a
-/// misconfigured SSO provider can be repaired in-band (issue #443). The
-/// legacy `ALLOW_LOCAL_ADMIN_LOGIN` flag (`allow_local_admin_login`) is kept
-/// as a back-compat input; it only ever applied to the admin account and must
-/// never broaden access for non-admin users.
-///
-/// A deployment that wants strict "SSO-only, no exceptions" enforcement can
-/// opt in via `SSO_DISABLE_ADMIN_BREAK_GLASS` (`disable_admin_break_glass`,
-/// #2018): when set, even the verified-admin break-glass is rejected while SSO
-/// is enabled. The flag defaults to `false`, so the historical break-glass
-/// behaviour is unchanged for existing deployments.
-fn local_login_gate(
-    sso_enabled: bool,
-    user_is_admin: bool,
-    allow_local_admin_login: bool,
-    disable_admin_break_glass: bool,
-) -> LocalLoginGate {
-    match (
-        sso_enabled,
-        user_is_admin,
-        allow_local_admin_login,
-        disable_admin_break_glass,
-    ) {
-        // No SSO providers enabled: local login is unchanged for everyone.
-        (false, _, _, _) => LocalLoginGate::Allow,
-        // Opt-in strict SSO-only (#2018): the admin break-glass is disabled,
-        // so even a verified admin must use SSO. This is the stricter posture
-        // and takes precedence over the legacy allow-local-admin flag.
-        (true, true, _, true) => LocalLoginGate::RejectSso,
-        // Verified-admin break-glass (default; supersedes the legacy flag,
-        // which only ever allowed the admin account).
-        (true, true, _, false) => LocalLoginGate::Allow,
-        // Non-admins must use SSO; neither flag ever broadens them.
-        (true, false, _, _) => LocalLoginGate::RejectSso,
-    }
 }
 
 /// DB-backed enforcement of the local-login SSO policy for an already-verified
@@ -3723,8 +3672,9 @@ mod personal_token_repo_selector_tests {
         );
         assert_eq!(
             write(&rig, &token, &rig.repo_b.1).await,
-            StatusCode::FORBIDDEN,
-            "a write to B outside the selector must be refused"
+            StatusCode::NOT_FOUND,
+            "a write to private B outside the selector must be refused with the \
+             existence-hiding 404 (#5458)"
         );
 
         cleanup(&rig).await;

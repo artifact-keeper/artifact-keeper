@@ -110,6 +110,9 @@ pub enum McpError {
     ExternalRegistry { index: usize, detail: String },
     /// Package not present in its backing repository (422).
     PackageNotFound { index: usize, detail: String },
+    /// A package a Virtual backing repository would serve from another
+    /// member than the one holding it (422, #5456).
+    PackageShadowed { index: usize, detail: String },
     /// An `mcpb` bundle that does not satisfy the publishing repository's
     /// `mcp_require_bundle_signature` (unsigned, or a signer not on the
     /// trusted list) (422).
@@ -126,6 +129,9 @@ pub enum McpError {
     ServerDenied { name: String },
     /// `(name, version)` already published (409).
     VersionExists,
+    /// A new server name that differs only in letter case from `existing`,
+    /// a name this hosted repository already recorded (409, #5434).
+    NameCaseConflict { name: String, existing: String },
     /// `search` shorter than 3 characters (422, upstream parity).
     SearchTooShort,
     /// A malformed query parameter (`limit`, `cursor`, `updated_since`,
@@ -161,6 +167,7 @@ impl McpError {
             | McpError::OciFloatingTag { .. }
             | McpError::ExternalRegistry { .. }
             | McpError::PackageNotFound { .. }
+            | McpError::PackageShadowed { .. }
             | McpError::BundleSignatureRequired { .. }
             | McpError::PackageVersionUnpinned { .. }
             | McpError::OciNotAnImage { .. }
@@ -168,7 +175,7 @@ impl McpError {
             McpError::ReservedNamespace { .. }
             | McpError::NamespaceNotAllowed { .. }
             | McpError::ServerDenied { .. } => 403,
-            McpError::VersionExists => 409,
+            McpError::VersionExists | McpError::NameCaseConflict { .. } => 409,
             McpError::Misconfigured(_) | McpError::Internal(_) => 500,
         }
     }
@@ -182,6 +189,7 @@ impl McpError {
             McpError::OciFloatingTag { .. } => "mcp_oci_floating_tag",
             McpError::ExternalRegistry { .. } => "mcp_external_registry",
             McpError::PackageNotFound { .. } => "mcp_package_not_found",
+            McpError::PackageShadowed { .. } => "mcp_package_shadowed",
             McpError::BundleSignatureRequired { .. } => "mcp_bundle_signature_required",
             McpError::PackageVersionUnpinned { .. } => "mcp_package_version_unpinned",
             McpError::OciNotAnImage { .. } => "mcp_oci_not_an_image",
@@ -189,6 +197,7 @@ impl McpError {
             McpError::NamespaceNotAllowed { .. } => "mcp_namespace_not_allowed",
             McpError::ServerDenied { .. } => "mcp_server_denied",
             McpError::VersionExists => "mcp_version_exists",
+            McpError::NameCaseConflict { .. } => "mcp_name_case_conflict",
             McpError::SearchTooShort => "mcp_search_too_short",
             McpError::Misconfigured(_) => "mcp_repository_misconfigured",
             McpError::Internal(_) => "mcp_internal_error",
@@ -215,6 +224,7 @@ impl McpError {
             ),
             McpError::ExternalRegistry { index, detail }
             | McpError::PackageNotFound { index, detail }
+            | McpError::PackageShadowed { index, detail }
             | McpError::BundleSignatureRequired { index, detail } => {
                 format!("packages[{index}]: {detail}")
             }
@@ -237,6 +247,10 @@ impl McpError {
             McpError::VersionExists => {
                 "this server version already exists; publish a new version".to_string()
             }
+            McpError::NameCaseConflict { name, existing } => format!(
+                "server name '{name}' differs only in letter case from '{existing}', which \
+                 this registry already holds; publish under '{existing}' or choose another name"
+            ),
             McpError::SearchTooShort => "search must be at least 3 characters".to_string(),
             McpError::Misconfigured(_) => {
                 "this repository's MCP package settings are inconsistent; ask an administrator"
@@ -462,11 +476,29 @@ pub fn parse_server_json(bytes: &[u8]) -> std::result::Result<ServerJson, McpErr
             format!("document nests deeper than {MAX_DEPTH} levels"),
         ));
     }
-    if let Err(e) = serde_json::from_slice::<NoDuplicateKeys>(bytes) {
+    if let Err(e) = reject_duplicate_json_keys(bytes) {
         return Err(McpError::invalid("", format!("invalid server.json: {e}")));
     }
     serde_json::from_slice(bytes)
         .map_err(|e| McpError::invalid("", format!("invalid server.json: {e}")))
+}
+
+/// `s` as shown in an error detail: control characters and quotes escaped,
+/// at most 200 characters (archive entry names, JSON member names).
+pub fn shown(s: &str) -> String {
+    s.chars()
+        .take(200)
+        .collect::<String>()
+        .escape_debug()
+        .to_string()
+}
+
+/// Fail when `bytes` is not JSON or holds an object with a repeated member
+/// name anywhere (server.json, and an MCPB bundle's `manifest.json`, #5468):
+/// `serde_json` would otherwise keep the last value, and another parser may
+/// keep the first.
+pub fn reject_duplicate_json_keys(bytes: &[u8]) -> serde_json::Result<()> {
+    serde_json::from_slice::<NoDuplicateKeys>(bytes).map(|_| ())
 }
 
 /// Walks a JSON document and fails on an object with a repeated member name
@@ -514,7 +546,10 @@ impl<'de> serde::Deserialize<'de> for NoDuplicateKeys {
                 let mut seen = std::collections::HashSet::new();
                 while let Some(key) = map.next_key::<String>()? {
                     if !seen.insert(key.clone()) {
-                        return Err(serde::de::Error::custom(format!("duplicate key `{key}`")));
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate key `{}`",
+                            shown(&key)
+                        )));
                     }
                     map.next_value::<NoDuplicateKeys>()?;
                 }
@@ -613,6 +648,367 @@ fn check_http_url(path: &str, value: Option<&str>) -> V {
     }
 }
 
+/// Cap on the expansions of one transport URL template checked at publish
+/// (#5529): the product of every variable's distinct publisher values.
+pub const MAX_URL_TEMPLATE_EXPANSIONS: usize = 256;
+
+/// What a variable with no publisher value stands for while the other
+/// variables are expanded: a client-supplied value cannot change a scheme
+/// the template spells out, and `1` is a valid host label, port and path.
+/// A variable with no value in the scheme position stands for nothing
+/// instead, so a later variable's value is checked as the scheme.
+const UNBOUND_VARIABLE_STAND_IN: &str = "1";
+
+/// Why a transport URL template can reach a client as something other than
+/// an absolute `http(s)` URL (#5529).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UrlTemplateIssue {
+    /// Filling the variables with these publisher values (`value`,
+    /// `default`, `placeholder`, `choices`) yields `expansion`, not an
+    /// `http(s)` URL.
+    NotHttp {
+        assignments: Vec<(String, String)>,
+        expansion: String,
+    },
+    /// The variable that opens the template (and so picks the scheme),
+    /// declared or not, has no publisher value.
+    UnboundScheme { variable: String },
+    /// More than [`MAX_URL_TEMPLATE_EXPANSIONS`] expansions (`count`
+    /// saturates).
+    TooManyExpansions { count: usize },
+}
+
+impl UrlTemplateIssue {
+    pub fn message(&self) -> String {
+        fn quoted(s: &str) -> String {
+            const MAX: usize = 120;
+            let clipped = if s.chars().count() > MAX {
+                format!("{}...", s.chars().take(MAX).collect::<String>())
+            } else {
+                s.to_string()
+            };
+            format!("\"{}\"", shown(&clipped))
+        }
+        match self {
+            UrlTemplateIssue::NotHttp {
+                assignments,
+                expansion,
+            } => {
+                let with = assignments
+                    .iter()
+                    .map(|(k, v)| format!("variable `{k}` = {}", quoted(v)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "with {with} this URL expands to {}, which is not an absolute http or https URL",
+                    quoted(expansion)
+                )
+            }
+            UrlTemplateIssue::UnboundScheme { variable } => format!(
+                "variable `{variable}` picks the URL scheme and needs a `default` or `choices` \
+                 that are absolute http or https URLs"
+            ),
+            UrlTemplateIssue::TooManyExpansions { count } => format!(
+                "the URL template's variables expand to {count} URLs, more than the \
+                 {MAX_URL_TEMPLATE_EXPANSIONS} checked: offer fewer `choices`"
+            ),
+        }
+    }
+}
+
+/// How much of a URL template [`remote_url_issue`] / [`package_url_issue`]
+/// expand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UrlExpansion {
+    /// Every combination of every variable's values, refused past
+    /// [`MAX_URL_TEMPLATE_EXPANSIONS`] (publish).
+    All,
+    /// Each value of the scheme-position variable on its own, the others
+    /// standing in for client input: linear, never too many (the lint of a
+    /// stored template that publish would refuse as too large).
+    SchemeOnly,
+}
+
+/// The values a client that takes the publisher's word fills a URL
+/// variable with: `value`, `default`, `placeholder` (clients pre-fill it)
+/// and every `choices` entry.
+fn publisher_values(input: &Input) -> impl Iterator<Item = &str> {
+    input
+        .value
+        .iter()
+        .chain(input.default.iter())
+        .chain(input.placeholder.iter())
+        .chain(input.choices.iter().flatten())
+        .map(String::as_str)
+}
+
+/// The distinct publisher values of every input in `inputs`; `None` when
+/// there is no input (an undeclared variable).
+fn union_values<'a>(inputs: impl Iterator<Item = &'a Input>) -> Option<Vec<&'a str>> {
+    let mut declared = false;
+    let mut out: Vec<&str> = Vec::new();
+    for input in inputs {
+        declared = true;
+        for v in publisher_values(input) {
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        }
+    }
+    declared.then_some(out)
+}
+
+/// One piece of a `{variable}` URL template.
+enum Seg<'s> {
+    Lit(&'s str),
+    Var(&'s str),
+}
+
+/// `template` split into literal and `{variable}` pieces (an unclosed `{`
+/// ends the scan, the rest dropped), and the distinct variable names in
+/// order of first use.
+fn template_segments(template: &str) -> (Vec<Seg<'_>>, Vec<&str>) {
+    let mut segs = Vec::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let Some(len) = rest[open..].find('}') else {
+            break;
+        };
+        if open > 0 {
+            segs.push(Seg::Lit(&rest[..open]));
+        }
+        segs.push(Seg::Var(&rest[open + 1..open + len]));
+        rest = &rest[open + len + 1..];
+    }
+    if !rest.is_empty() {
+        segs.push(Seg::Lit(rest));
+    }
+    let mut names: Vec<&str> = Vec::new();
+    for s in &segs {
+        if let Seg::Var(n) = s {
+            if !names.contains(n) {
+                names.push(n);
+            }
+        }
+    }
+    (segs, names)
+}
+
+/// The URLs a client that takes the publisher's word builds from the
+/// `{variable}` template `template` (#5547): every combination of the
+/// publisher values `values_of` finds, a variable without one left as
+/// `{name}` (client input). When the combinations exceed
+/// [`MAX_URL_TEMPLATE_EXPANSIONS`], each variable's values are tried on
+/// their own instead, the others at their first value, so every publisher
+/// value still appears in some expansion. Empty when no variable has a
+/// publisher value (the template itself is all there is to check).
+pub fn url_template_expansions<'a>(
+    template: &str,
+    values_of: impl Fn(&str) -> Option<Vec<&'a str>>,
+) -> Vec<String> {
+    let (segs, names) = template_segments(template);
+    let values: Vec<Vec<&str>> = names
+        .iter()
+        .map(|n| values_of(n).unwrap_or_default())
+        .collect();
+    if values.iter().all(Vec::is_empty) {
+        return Vec::new();
+    }
+    let render = |pick: &[usize]| -> String {
+        segs.iter()
+            .map(|s| match s {
+                Seg::Lit(l) => (*l).to_string(),
+                Seg::Var(n) => {
+                    let i = names.iter().position(|m| m == n).unwrap_or(0);
+                    match values[i].get(pick[i]) {
+                        Some(v) => (*v).to_string(),
+                        None => format!("{{{n}}}"),
+                    }
+                }
+            })
+            .collect()
+    };
+    let count = values
+        .iter()
+        .fold(1usize, |acc, v| acc.saturating_mul(v.len().max(1)));
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |u: String| {
+        if !out.contains(&u) {
+            out.push(u);
+        }
+    };
+    if count <= MAX_URL_TEMPLATE_EXPANSIONS {
+        let mut pick = vec![0usize; names.len()];
+        for _ in 0..count {
+            push(render(&pick));
+            for (i, p) in pick.iter_mut().enumerate() {
+                *p += 1;
+                if *p < values[i].len() {
+                    break;
+                }
+                *p = 0;
+            }
+        }
+    } else {
+        for (i, vs) in values.iter().enumerate() {
+            for j in 0..vs.len() {
+                let mut pick = vec![0usize; names.len()];
+                pick[i] = j;
+                push(render(&pick));
+            }
+        }
+    }
+    out
+}
+
+/// Every expansion of the `{variable}` template `template` against the
+/// publisher values `values_of` finds (`None`: undeclared) must be an
+/// absolute `http(s)` URL ([`is_http_url`], as for every other URL in a
+/// server.json). A variable with no value stands in for client input; one
+/// in the scheme position, declared or not, is refused, since whatever the
+/// client fills in picks the scheme (the later variables are still
+/// expanded, so a value of theirs that reaches the scheme is named). A
+/// template with no publisher value and a literal scheme is left to the
+/// shape check alone.
+pub fn url_template_issue<'a>(
+    template: &str,
+    values_of: impl Fn(&str) -> Option<Vec<&'a str>>,
+    mode: UrlExpansion,
+) -> Option<UrlTemplateIssue> {
+    let (segs, names) = template_segments(template);
+    let mut values: Vec<Vec<&str>> = names
+        .iter()
+        .map(|n| values_of(n).unwrap_or_default())
+        .collect();
+    // The variable in the scheme position, if the template opens with one.
+    let scheme = match segs.first() {
+        Some(Seg::Var(n)) => names.iter().position(|m| m == n),
+        _ => None,
+    };
+    let unbound_scheme = scheme.filter(|&i| values[i].is_empty()).map(|i| names[i]);
+    if mode == UrlExpansion::SchemeOnly {
+        // Only the scheme variable varies; the others take one value each.
+        for (i, v) in values.iter_mut().enumerate() {
+            if Some(i) != scheme {
+                v.truncate(1);
+            }
+        }
+    }
+    if unbound_scheme.is_none() && values.iter().all(Vec::is_empty) {
+        return None;
+    }
+    let count = values
+        .iter()
+        .fold(1usize, |acc, v| acc.saturating_mul(v.len().max(1)));
+    if count > MAX_URL_TEMPLATE_EXPANSIONS {
+        return Some(UrlTemplateIssue::TooManyExpansions { count });
+    }
+    let mut pick = vec![0usize; names.len()];
+    for _ in 0..count {
+        let value_of = |i: usize| values[i].get(pick[i]).copied();
+        let expansion: String = segs
+            .iter()
+            .map(|s| match s {
+                Seg::Lit(l) => *l,
+                Seg::Var(n) => {
+                    let i = names.iter().position(|m| m == n).unwrap_or(0);
+                    value_of(i).unwrap_or(if Some(i) == scheme {
+                        ""
+                    } else {
+                        UNBOUND_VARIABLE_STAND_IN
+                    })
+                }
+            })
+            .collect();
+        // With no scheme variable value, an expansion that is not a URL at
+        // all is the unbound scheme (reported below), not a later value's
+        // fault; one a later value gave a scheme is that value's.
+        let blamed = unbound_scheme.is_none() || url::Url::parse(&expansion).is_ok();
+        if blamed && (!is_http_url(&expansion) || has_forbidden_chars(&expansion)) {
+            let assignments = (0..names.len())
+                .filter_map(|i| value_of(i).map(|v| (names[i].to_string(), v.to_string())))
+                .collect();
+            return Some(UrlTemplateIssue::NotHttp {
+                assignments,
+                expansion,
+            });
+        }
+        for (i, p) in pick.iter_mut().enumerate() {
+            *p += 1;
+            if *p < values[i].len() {
+                break;
+            }
+            *p = 0;
+        }
+    }
+    unbound_scheme.map(|v| UrlTemplateIssue::UnboundScheme {
+        variable: v.to_string(),
+    })
+}
+
+/// [`url_template_issue`] for a remote: its variables are the remote's
+/// `variables` map.
+pub fn remote_url_issue(remote: &Transport, mode: UrlExpansion) -> Option<UrlTemplateIssue> {
+    let url = remote.url.as_deref()?;
+    url_template_issue(url, |n| remote_values(remote, n), mode)
+}
+
+/// The publisher values of a remote's URL variable `n` (its `variables`).
+fn remote_values<'a>(remote: &'a Transport, n: &str) -> Option<Vec<&'a str>> {
+    union_values(remote.variables.as_ref()?.get(n).into_iter())
+}
+
+/// [`url_template_expansions`] of a remote's `url`.
+pub fn remote_url_expansions(remote: &Transport) -> Vec<String> {
+    remote
+        .url
+        .as_deref()
+        .map(|u| url_template_expansions(u, |n| remote_values(remote, n)))
+        .unwrap_or_default()
+}
+
+/// [`url_template_issue`] for a package transport: its variables are the
+/// package's arguments (by `valueHint` or `name`) and environment variables
+/// (by `name`), as the upstream schema describes `transport.url`. Every
+/// matching input counts (several may share a name), so the values are the
+/// union of all of theirs.
+pub fn package_url_issue(p: &Package, mode: UrlExpansion) -> Option<UrlTemplateIssue> {
+    let url = p.transport.url.as_deref()?;
+    url_template_issue(url, |n| package_values(p, n), mode)
+}
+
+/// The publisher values of a package transport URL variable `n`: those of
+/// every argument (by `valueHint` or `name`) and environment variable (by
+/// `name`) so called.
+fn package_values<'a>(p: &'a Package, n: &str) -> Option<Vec<&'a str>> {
+    let envs = p
+        .environment_variables
+        .iter()
+        .filter(move |e| e.name.as_deref() == Some(n));
+    let args = p
+        .runtime_arguments
+        .iter()
+        .chain(&p.package_arguments)
+        .filter(move |a| a.value_hint.as_deref() == Some(n) || a.name.as_deref() == Some(n));
+    union_values(envs.chain(args))
+}
+
+/// [`url_template_expansions`] of a package's `transport.url`.
+pub fn package_url_expansions(p: &Package) -> Vec<String> {
+    p.transport
+        .url
+        .as_deref()
+        .map(|u| url_template_expansions(u, |n| package_values(p, n)))
+        .unwrap_or_default()
+}
+
+fn check_url_template(path: &str, issue: Option<UrlTemplateIssue>) -> V {
+    match issue {
+        Some(i) => Err(McpError::invalid(path, i.message())),
+        None => Ok(()),
+    }
+}
+
 /// A version string a publisher may use: 1..=255 characters, not `latest`,
 /// not a range, and safe as one path segment.
 pub fn check_version(path: &str, v: &str) -> V {
@@ -638,6 +1034,47 @@ pub fn check_version(path: &str, v: &str) -> V {
         ));
     }
     Ok(())
+}
+
+/// SemVer 2.0.0, exactly one version, without build metadata (registry
+/// versions carry none, and npm reads `1.2.3+x.tgz` as a file).
+const NPM_EXACT_VERSION_RE: &str = r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$";
+/// A PEP 440 version (the `packaging` grammar), exactly one version.
+const PYPI_EXACT_VERSION_RE: &str = r"^(?i:v?([0-9]+!)?[0-9]+(\.[0-9]+)*([-_.]?(a|b|c|rc|alpha|beta|pre|preview)[-_.]?[0-9]*)?((-[0-9]+)|([-_.]?(post|rev|r)[-_.]?[0-9]*))?([-_.]?dev[-_.]?[0-9]*)?(\+[a-z0-9]+([-_.][a-z0-9]+)*)?)$";
+/// The longest npm or PyPI package version accepted.
+pub const MAX_EXACT_VERSION_LEN: usize = 256;
+
+/// The exact-version rule for an `npm` or `pypi` package version, shared by
+/// publish ([`validate_server_json`]) and the introspection worker's sandbox
+/// (#5446, #5549): `Err` names what the version must be. npm wants one
+/// SemVer 2.0.0 version without build metadata (`1.2`, `v1.2.3` and
+/// dist-tags such as `next` are not one), PyPI one PEP 440 version (no
+/// specifier); neither may end in `.tgz`, `.tar` or `.tar.gz` (npm opens
+/// such a spec as a file). Other registry types are not checked here.
+pub fn exact_package_version(
+    registry_type: &str,
+    v: &str,
+) -> std::result::Result<(), &'static str> {
+    let (ok, what) = match registry_type {
+        "npm" => (
+            re(NPM_EXACT_VERSION_RE).is_match(v),
+            "an exact SemVer version without build metadata",
+        ),
+        "pypi" => (
+            re(PYPI_EXACT_VERSION_RE).is_match(v),
+            "an exact PEP 440 version",
+        ),
+        _ => return Ok(()),
+    };
+    let lower = v.to_ascii_lowercase();
+    let archive = [".tgz", ".tar", ".tar.gz"]
+        .iter()
+        .any(|x| lower.ends_with(x));
+    if ok && v.len() <= MAX_EXACT_VERSION_LEN && !archive {
+        Ok(())
+    } else {
+        Err(what)
+    }
 }
 
 pub fn check_name(name: &str) -> V {
@@ -876,6 +1313,18 @@ fn validate_package(i: usize, p: &Package, allow_floating_oci: bool) -> V {
     }
     if let Some(v) = p.version.as_deref() {
         check_version(&format!("{path}.version"), v)?;
+        // A publish states one exact version the sandbox can run (#5549);
+        // a document ingested from an upstream registry keeps the looser
+        // rule, as for a floating OCI tag, and the worker reports it
+        // `unsupported` instead.
+        if !allow_floating_oci {
+            exact_package_version(&p.registry_type, v).map_err(|what| {
+                McpError::invalid(
+                    format!("{path}.version"),
+                    format!("must be {what} (not a range, tag or partial version)"),
+                )
+            })?;
+        }
     }
     check_http_url(
         &format!("{path}.registryBaseUrl"),
@@ -911,6 +1360,10 @@ fn validate_package(i: usize, p: &Package, allow_floating_oci: bool) -> V {
         &format!("{path}.environmentVariables"),
         &p.environment_variables,
         InputRole::KeyValue,
+    )?;
+    check_url_template(
+        &format!("{path}.transport.url"),
+        package_url_issue(p, UrlExpansion::All),
     )
 }
 
@@ -1036,6 +1489,10 @@ fn validate_document(s: &ServerJson, allow_floating_oci: bool, require_install: 
     }
     for (i, r) in s.remotes.iter().enumerate() {
         validate_transport(&format!("remotes[{i}]"), r, true)?;
+        check_url_template(
+            &format!("remotes[{i}].url"),
+            remote_url_issue(r, UrlExpansion::All),
+        )?;
     }
     Ok(())
 }
@@ -1158,11 +1615,58 @@ pub fn storage_path(name: &str, version: &str) -> String {
     format!("servers/{name}/{version}/server.json")
 }
 
-/// `artifacts.storage_key` of a server version: content-addressed, so a
-/// publish that loses the race for a version cannot overwrite the bytes of
-/// the one that won.
-pub fn storage_key(name: &str, version: &str, sha256: &str) -> String {
-    format!("mcp/{name}/{version}/{sha256}.json")
+/// Where one repository's new MCP objects are keyed: its id and storage
+/// backend under the `STORAGE_KEY_SCHEME` (#2624).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyScope<'a> {
+    pub scheme: crate::storage::StorageKeyScheme,
+    pub storage_backend: &'a str,
+    pub repository_id: Uuid,
+}
+
+impl<'a> KeyScope<'a> {
+    /// The scope of a repository on `storage_backend`, under the scheme the
+    /// environment selects.
+    pub fn of(storage_backend: &'a str, repository_id: Uuid) -> Self {
+        Self {
+            scheme: crate::storage::StorageKeyScheme::from_env(),
+            storage_backend,
+            repository_id,
+        }
+    }
+
+    fn key(self, path: &str) -> String {
+        self.scheme
+            .write_key(self.storage_backend, "mcp", self.repository_id, path)
+    }
+}
+
+/// `artifacts.storage_key` a new server version is written to:
+/// content-addressed, so a publish that loses the race for a version cannot
+/// overwrite the bytes of the one that won.
+///
+/// On a shared cloud namespace (S3/GCS/Azure) the key is the repo-scoped
+/// `mcp/{repository_id}/{name}/{version}/{sha256}.json`, so two MCP
+/// repositories holding the same version (two Remotes of one upstream, a
+/// hosted copy) write two objects. The flat `mcp/{name}/...` key they used to
+/// share made the second repository's write fail the cross-repository write
+/// guard with 409 (#5660). Filesystem backends and `STORAGE_KEY_SCHEME=flat`
+/// keep the flat key. Existing objects are untouched: every MCP read resolves
+/// the object through the `storage_key` its artifact row recorded.
+pub fn storage_key(scope: KeyScope<'_>, name: &str, version: &str, sha256: &str) -> String {
+    scope.key(&format!("{name}/{version}/{sha256}.json"))
+}
+
+/// `artifacts.storage_key` a new MCPB bundle is written to, scoped as
+/// [`storage_key`] is (#5660).
+pub fn bundle_storage_key(
+    scope: KeyScope<'_>,
+    name: &str,
+    version: &str,
+    sha256: &str,
+    file: &str,
+) -> String {
+    scope.key(&format!("{name}/{version}/bundles/{sha256}/{file}"))
 }
 
 /// `(name, version)` from a [`storage_path`].
@@ -1176,21 +1680,223 @@ pub fn parse_storage_path(path: &str) -> Option<(String, String)> {
     }
 }
 
-pub fn encode_cursor(name: &str, version: &str) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("{name}:{version}"))
+/// Listing cursors are sealed: AES-256-GCM under a key derived from the
+/// instance's `jwt_secret`, bound to the repository that issued them and to
+/// the listing kind. A client cannot read the position a cursor names and
+/// cannot make one up. The MCP Registry API treats `cursor` as an opaque
+/// string, so the format is free to change.
+///
+/// A reader listing's cursor never names a row the reader is not served,
+/// not even sealed (#5453): it is a [`ListingResume`], the last row the
+/// listing served and the internal id of the last row it read past it.
+///
+/// Wire form: `base64url(0x01 || nonce(12) || ciphertext+tag)`, no padding;
+/// the plaintext is a JSON array of strings, the first the listing kind.
+#[derive(Clone)]
+pub struct CursorSeal {
+    key: [u8; 32],
 }
 
-pub fn decode_cursor(cursor: &str) -> std::result::Result<(String, String), McpError> {
-    let bad = || McpError::invalid_query("cursor", "invalid cursor");
-    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(cursor.trim_end_matches('='))
-        .map_err(|_| bad())?;
-    let text = String::from_utf8(raw).map_err(|_| bad())?;
-    let (name, version) = text.split_once(':').ok_or_else(bad)?;
-    if name.is_empty() || version.is_empty() {
-        return Err(bad());
+/// The listing a cursor belongs to (the first plaintext element).
+pub mod cursor_kind {
+    /// `GET /servers` of a hosted or Remote repository.
+    pub const SERVERS: &str = "s";
+    /// `GET /x/com.artifactkeeper/holds`.
+    pub const HOLDS: &str = "h";
+    /// `GET /servers` of a Virtual repository (member key, then position).
+    pub const VIRTUAL: &str = "m";
+}
+
+const CURSOR_SEAL_VERSION: u8 = 1;
+/// A cursor longer than this is refused before it is decoded.
+const MAX_CURSOR_LEN: usize = 4096;
+
+impl std::fmt::Debug for CursorSeal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CursorSeal(..)")
     }
-    Ok((name.to_string(), version.to_string()))
+}
+
+impl CursorSeal {
+    /// The seal of an instance whose `jwt_secret` is `secret`
+    /// (HMAC-SHA256 key derivation with a label of its own, so the key is
+    /// unrelated to the token-signing key).
+    pub fn from_secret(secret: &str) -> Self {
+        use hmac::{Hmac, Mac};
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes())
+            .expect("HMAC-SHA256 accepts any key length");
+        mac.update(b"artifact-keeper/mcp-listing-cursor/aes-256-gcm/v1");
+        Self {
+            key: mac.finalize().into_bytes().into(),
+        }
+    }
+
+    fn aad(scope: Uuid) -> Vec<u8> {
+        let mut aad = b"ak-mcp-cursor/v1:".to_vec();
+        aad.extend_from_slice(scope.as_bytes());
+        aad
+    }
+
+    /// Seal `parts` for the listing of repository `scope`.
+    pub fn seal(&self, scope: Uuid, parts: &[&str]) -> String {
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        use aes_gcm::{Aes256Gcm, Nonce};
+        let cipher = Aes256Gcm::new_from_slice(&self.key).expect("a 32-byte key");
+        let nonce: [u8; 12] = rand::random();
+        let plain = serde_json::to_vec(parts).expect("strings serialize");
+        let aad = Self::aad(scope);
+        let ct = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &plain,
+                    aad: &aad,
+                },
+            )
+            .expect("AES-256-GCM encryption does not fail");
+        let mut out = Vec::with_capacity(1 + nonce.len() + ct.len());
+        out.push(CURSOR_SEAL_VERSION);
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ct);
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(out)
+    }
+
+    /// The parts of a cursor this instance sealed for `scope`; anything else
+    /// (made up, altered, issued by another repository or under another
+    /// secret) is the listing's `400 invalid cursor`.
+    pub fn open(&self, scope: Uuid, cursor: &str) -> std::result::Result<Vec<String>, McpError> {
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        use aes_gcm::{Aes256Gcm, Nonce};
+        let bad = || McpError::invalid_query("cursor", "invalid cursor");
+        if cursor.len() > MAX_CURSOR_LEN {
+            return Err(bad());
+        }
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(cursor.trim_end_matches('='))
+            .map_err(|_| bad())?;
+        if raw.len() < 1 + 12 + 16 || raw[0] != CURSOR_SEAL_VERSION {
+            return Err(bad());
+        }
+        let cipher = Aes256Gcm::new_from_slice(&self.key).expect("a 32-byte key");
+        let aad = Self::aad(scope);
+        let plain = cipher
+            .decrypt(
+                Nonce::from_slice(&raw[1..13]),
+                Payload {
+                    msg: &raw[13..],
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| bad())?;
+        serde_json::from_slice(&plain).map_err(|_| bad())
+    }
+
+    /// A `name, version` keyset position of listing `kind` of `scope`.
+    pub fn encode_position(&self, scope: Uuid, kind: &str, name: &str, version: &str) -> String {
+        self.seal(scope, &[kind, name, version])
+    }
+
+    /// Inverse of [`Self::encode_position`].
+    pub fn decode_position(
+        &self,
+        scope: Uuid,
+        kind: &str,
+        cursor: &str,
+    ) -> std::result::Result<(String, String), McpError> {
+        let bad = || McpError::invalid_query("cursor", "invalid cursor");
+        match <[String; 3]>::try_from(self.open(scope, cursor)?) {
+            Ok([k, name, version]) if k == kind && !name.is_empty() && !version.is_empty() => {
+                Ok((name, version))
+            }
+            _ => Err(bad()),
+        }
+    }
+
+    /// A reader listing's [`ListingResume`] of listing `kind` of `scope`.
+    pub fn encode_resume(&self, scope: Uuid, kind: &str, at: &ListingResume) -> String {
+        let (name, version) = at
+            .after
+            .as_ref()
+            .map(|(n, v)| (n.as_str(), v.as_str()))
+            .unwrap_or(("", ""));
+        self.seal(scope, &[kind, name, version, &encode_read(at.read)])
+    }
+
+    /// Inverse of [`Self::encode_resume`]. A plain position of
+    /// [`Self::encode_position`] (a cursor issued before #5453) resumes after
+    /// it.
+    pub fn decode_resume(
+        &self,
+        scope: Uuid,
+        kind: &str,
+        cursor: &str,
+    ) -> std::result::Result<ListingResume, McpError> {
+        let bad = || McpError::invalid_query("cursor", "invalid cursor");
+        let parts = self.open(scope, cursor)?;
+        let (k, name, version, read) = match parts.as_slice() {
+            [k, n, v] => (k, n, v, None),
+            [k, n, v, r] => (k, n, v, decode_read(r).ok_or_else(bad)?),
+            _ => return Err(bad()),
+        };
+        if k != kind {
+            return Err(bad());
+        }
+        let after = match (name.is_empty(), version.is_empty()) {
+            (false, false) => Some((name.clone(), version.clone())),
+            (true, true) if read.is_some() => None,
+            _ => return Err(bad()),
+        };
+        Ok(ListingResume { after, read })
+    }
+}
+
+/// Where a reader listing resumes (#5453): after the keyset position
+/// `after` (the last row it served, `None`: the start), or, when it read
+/// past rows it does not serve (held, refused, unparseable), after the last
+/// of them, which it names only by its internal artifact id `read`. The id
+/// is a random UUID: fixed-length, unordered, and meaningless outside this
+/// instance, so a cursor never carries the name or version of a row the
+/// caller is not served, sealed or not. The listing looks the id up on
+/// resume (deleted rows included) and continues strictly after it, at the
+/// cost of a keyset resume at any depth; if the row was purged it resumes
+/// after `after` instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListingResume {
+    pub after: Option<(String, String)>,
+    pub read: Option<Uuid>,
+}
+
+impl ListingResume {
+    /// Resume after the served row `name@version`.
+    pub fn after(name: &str, version: &str) -> Self {
+        Self {
+            after: Some((name.to_string(), version.to_string())),
+            read: None,
+        }
+    }
+
+    /// Account for one row a scan read, in order: a served row becomes the
+    /// position; an unserved one is remembered by its id only.
+    pub fn advance_one(&mut self, id: Uuid, key: (String, String), served: bool) {
+        if served {
+            self.after = Some(key);
+            self.read = None;
+        } else {
+            self.read = Some(id);
+        }
+    }
+}
+
+/// `read` at a fixed width (the nil UUID for none), so the sealed cursor's
+/// length does not say whether the listing read past unserved rows.
+pub fn encode_read(read: Option<Uuid>) -> String {
+    read.unwrap_or(Uuid::nil()).hyphenated().to_string()
+}
+
+/// Inverse of [`encode_read`]; `None` for anything that is not a UUID.
+pub fn decode_read(s: &str) -> Option<Option<Uuid>> {
+    let id = Uuid::parse_str(s).ok().filter(|_| s.len() == 36)?;
+    Some((!id.is_nil()).then_some(id))
 }
 
 // ---------------------------------------------------------------------------
@@ -1471,9 +2177,18 @@ pub fn validate_status_change(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PackagePolicy {
-    /// Default: every package resolves to an AK repository of its format.
+    /// Default: every package resolves to an AK repository of its format,
+    /// and its coordinates must name that repository (`registryBaseUrl`
+    /// omitted or this instance's, an OCI image on this instance or the
+    /// backing Remote's upstream).
     OwnRepos,
-    /// Explicit opt-out: packages stored and served verbatim, not gated.
+    /// Foreign coordinates accepted (#5452): a `registryBaseUrl` or OCI image
+    /// host naming another registry is not refused. The package itself is
+    /// still looked up by name and version (an image by path and tag or
+    /// digest) in the mapped backing repository, pinned, served at its AK
+    /// coordinates and gated exactly as under `own-repos`; one that does not
+    /// resolve is refused at publish, or held (`unresolvable`) when synced or
+    /// stored without a pin. Nothing is served verbatim.
     Open,
 }
 
@@ -1511,6 +2226,11 @@ pub struct ResolvedPin {
     /// The backing `artifacts` rows the gate evaluates.
     #[serde(default)]
     pub artifact_ids: Vec<Uuid>,
+    /// The sha256 of each `artifact_ids` row at publish, in the same order
+    /// (absent on pins taken before #5456): a row whose bytes changed in
+    /// place no longer counts as the pinned row.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_sha256s: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1657,27 +2377,37 @@ impl StoredVersion {
         })
     }
 
-    /// Whether every `packages[]` entry of the server has a pin. A version
-    /// published under `open` and read under `own-repos` (or whose pins were
-    /// lost) is `unresolvable`.
+    /// The first `packages[]` entry of the server with no pin, if any. Such a
+    /// version is `unresolvable` under either policy: one stored before
+    /// #5452 under `open` (which pinned nothing), one whose pins were lost,
+    /// or a synced version a package of which did not resolve.
     pub fn unpinned_package(&self) -> Option<String> {
+        self.unpinned_packages().into_iter().next().map(|(_, l)| l)
+    }
+
+    /// Every `packages[]` entry with no pin, as `(index, label)` (the label
+    /// as [`PackagePin::label`] would name it).
+    pub fn unpinned_packages(&self) -> Vec<(usize, String)> {
         let packages = self
             .server
             .get("packages")
             .and_then(|p| p.as_array())
             .cloned()
             .unwrap_or_default();
-        packages.iter().enumerate().find_map(|(i, p)| {
-            if self.pins.iter().any(|pin| pin.index == i) {
-                return None;
-            }
-            let ty = p.get("registryType").and_then(|v| v.as_str()).unwrap_or("");
-            let id = p.get("identifier").and_then(|v| v.as_str()).unwrap_or("");
-            Some(match p.get("version").and_then(|v| v.as_str()) {
-                Some(v) => format!("{ty}:{id}@{v}"),
-                None => format!("{ty}:{id}"),
+        packages
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !self.pins.iter().any(|pin| pin.index == *i))
+            .map(|(i, p)| {
+                let ty = p.get("registryType").and_then(|v| v.as_str()).unwrap_or("");
+                let id = p.get("identifier").and_then(|v| v.as_str()).unwrap_or("");
+                let label = match p.get("version").and_then(|v| v.as_str()) {
+                    Some(v) => format!("{ty}:{id}@{v}"),
+                    None => format!("{ty}:{id}"),
+                };
+                (i, label)
             })
-        })
+            .collect()
     }
 }
 
@@ -1706,21 +2436,19 @@ pub fn host_of(base_url: &str) -> String {
         .unwrap_or_else(|| "localhost".to_string())
 }
 
-/// The served form of a stored `server`: under `own-repos` every pinned
-/// package is rewritten to its AK coordinates (`registryBaseUrl` for
-/// npm/pypi/nuget/cargo, `identifier` with `@sha256:` for OCI, original in
-/// `_meta[com.artifactkeeper/resolved]`); under `open` the stored document is
-/// returned untouched.
+/// The served form of a stored `server`: every pinned package is rewritten
+/// to its AK coordinates (`registryBaseUrl` for npm/pypi/nuget/cargo,
+/// `identifier` with `@sha256:` for OCI, original in
+/// `_meta[com.artifactkeeper/resolved]`), whatever the package policy: an
+/// `open` document is pinned and served the same way (#5452). A package with
+/// no pin is left as stored, but the version is never served then: the
+/// serve decision holds it `unresolvable` ([`StoredVersion::unpinned_package`]).
 pub fn rewrite_packages_for_serve(
     server: &serde_json::Value,
     pins: &[PackagePin],
-    policy: PackagePolicy,
     base_url: &str,
 ) -> serde_json::Value {
     let mut out = server.clone();
-    if policy == PackagePolicy::Open {
-        return out;
-    }
     let base = base_url.trim_end_matches('/');
     let oci_host = host_of(base);
     let Some(packages) = out.get_mut("packages").and_then(|p| p.as_array_mut()) else {
@@ -1743,21 +2471,22 @@ pub fn rewrite_packages_for_serve(
                 None => format!("{oci_host}/{}/{name}@{digest}", r.repository),
             };
             pkg.insert("identifier".into(), identifier.into());
-            let meta = pkg.entry("_meta").or_insert_with(|| serde_json::json!({}));
-            if let Some(meta) = meta.as_object_mut() {
-                meta.insert(
-                    AK_RESOLVED_META_KEY.into(),
-                    serde_json::json!({
-                        "submittedIdentifier": pin.submitted.identifier,
-                        "digest": digest,
-                        "mediaType": r.media_type,
-                        "children": r.children,
-                        "backingRepository": r.repository,
-                        "resolvedAt": r.resolved_at,
-                    }),
-                );
+            let mut resolved = serde_json::json!({
+                "submittedIdentifier": pin.submitted.identifier,
+                "digest": digest,
+                "mediaType": r.media_type,
+                "children": r.children,
+                "backingRepository": r.repository,
+                "resolvedAt": r.resolved_at,
+            });
+            if !r.warnings.is_empty() {
+                resolved["warnings"] = serde_json::json!(r.warnings);
             }
+            set_resolved_meta(pkg, resolved);
         } else {
+            // What the publisher named, so a client (and a reviewer) can see
+            // that a foreign registry was replaced by this one (#5452).
+            let submitted = pkg.get("registryBaseUrl").cloned();
             pkg.insert(
                 "registryBaseUrl".into(),
                 format!(
@@ -1766,9 +2495,37 @@ pub fn rewrite_packages_for_serve(
                 )
                 .into(),
             );
+            let mut resolved = serde_json::json!({
+                "submittedIdentifier": pin.submitted.identifier,
+                "sha256": r.sha256,
+                "backingRepository": r.repository,
+                "resolvedAt": r.resolved_at,
+            });
+            if let Some(url) = submitted.filter(|u| !u.is_null()) {
+                resolved["submittedRegistryBaseUrl"] = url;
+            }
+            if !r.warnings.is_empty() {
+                resolved["warnings"] = serde_json::json!(r.warnings);
+            }
+            set_resolved_meta(pkg, resolved);
         }
     }
     out
+}
+
+/// Set `_meta["com.artifactkeeper/resolved"]` of a served package, replacing
+/// whatever the stored document carried under that key.
+fn set_resolved_meta(
+    pkg: &mut serde_json::Map<String, serde_json::Value>,
+    resolved: serde_json::Value,
+) {
+    let meta = pkg.entry("_meta").or_insert_with(|| serde_json::json!({}));
+    if !meta.is_object() {
+        *meta = serde_json::json!({});
+    }
+    if let Some(meta) = meta.as_object_mut() {
+        meta.insert(AK_RESOLVED_META_KEY.into(), resolved);
+    }
 }
 
 /// One server version as a list/detail entry: `{server, _meta}`.
@@ -1989,6 +2746,9 @@ pub enum GateOutcome {
     },
     /// The pinned artifact or manifest is gone (or was never pinned).
     Unresolvable,
+    /// A Virtual backing repository now serves the pinned coordinate from
+    /// another member than the pinned one (#5456).
+    Shadowed,
     /// The gate could not be evaluated.
     Unavailable,
 }
@@ -2193,6 +2953,14 @@ pub fn decide_mcp_serve(
                     "mcp_unresolvable",
                     "A package this server version runs can no longer be resolved",
                     serde_json::json!({"package": gate.package}),
+                )
+            }
+            GateOutcome::Shadowed => {
+                return refuse(
+                    "unresolvable",
+                    "mcp_unresolvable",
+                    "A package this server version runs can no longer be resolved",
+                    serde_json::json!({"package": gate.package, "gate": "shadowed"}),
                 )
             }
         }
@@ -2480,6 +3248,65 @@ mod tests {
         );
     }
 
+    /// #5549: publish refuses an npm or PyPI package version the sandbox
+    /// worker would report `unsupported`: one exact SemVer version (npm) or
+    /// PEP 440 version (PyPI). A document ingested from an upstream registry
+    /// keeps the looser rule; other registry types are unaffected.
+    #[test]
+    fn package_versions_must_be_exact_for_npm_and_pypi_5549() {
+        let with = |p: serde_json::Value| doc(serde_json::json!({"remotes": [], "packages": [p]}));
+        let pypi = |v: &str| {
+            npm(serde_json::json!({"registryType": "pypi", "identifier": "acme-mcp", "version": v}))
+        };
+        for v in [
+            "1.2",
+            "1",
+            "v1.2.3",
+            "next",
+            "beta",
+            "1.2.3+build.5",
+            "01.2.3",
+            "1.2.3.tgz",
+        ] {
+            let d = with(npm(serde_json::json!({"version": v})));
+            match check(d.clone()) {
+                Err(McpError::Invalid { path, msg }) => {
+                    assert_eq!(path, "packages[0].version", "npm {v}");
+                    assert!(msg.contains("exact SemVer"), "npm {v}: {msg}");
+                }
+                other => panic!("npm {v}: expected Invalid, got {other:?}"),
+            }
+            // Ingest keeps the looser rule.
+            let s = parse_server_json(&serde_json::to_vec(&d).unwrap()).unwrap();
+            assert!(
+                validate_server_json_opts(&s, true).is_ok(),
+                "ingest npm {v}"
+            );
+        }
+        for v in ["1.0.0", "0.1.0-beta.2", "10.20.30-rc.1"] {
+            assert!(
+                check(with(npm(serde_json::json!({"version": v})))).is_ok(),
+                "npm {v}"
+            );
+        }
+        for v in ["next", "1.0.tar.gz", "1.0-final"] {
+            assert_eq!(
+                invalid_path(with(pypi(v))),
+                "packages[0].version",
+                "pypi {v}"
+            );
+        }
+        for v in ["1.0", "2", "1.0.0rc1", "1.0.post1", "1!2.0", "1.0+local.1"] {
+            assert!(check(with(pypi(v))).is_ok(), "pypi {v}");
+        }
+        // Other registry types keep the generic rule only.
+        let nuget = npm(
+            serde_json::json!({"registryType": "nuget", "identifier": "Acme.Mcp", "version": "1.2"}),
+        );
+        assert!(check(with(nuget)).is_ok());
+        assert_eq!(exact_package_version("cargo", "1.2"), Ok(()));
+    }
+
     #[test]
     fn package_rules() {
         let with = |p: serde_json::Value| doc(serde_json::json!({"remotes": [], "packages": [p]}));
@@ -2512,7 +3339,7 @@ mod tests {
             "packages[0].transport.type"
         );
         assert!(check(with(npm(
-            serde_json::json!({"transport": {"type": "streamable-http", "url": "{baseUrl}/mcp"}})
+            serde_json::json!({"transport": {"type": "streamable-http", "url": "{baseUrl}/mcp"}, "environmentVariables": [{"name": "baseUrl", "default": "https://mcp.acme.test"}]})
         )))
         .is_ok());
         assert_eq!(
@@ -2635,6 +3462,210 @@ mod tests {
             )),
             "packages[0].runtimeArguments[0].variables.bad-key"
         );
+    }
+
+    /// The refusal `check` gives one remote (`url`, `variables`), as
+    /// `(path, detail)`; `None` when it publishes.
+    fn remote_refusal(url: &str, variables: serde_json::Value) -> Option<(String, String)> {
+        let mut remote = serde_json::json!({"type": "sse", "url": url});
+        if !variables.is_null() {
+            remote["variables"] = variables;
+        }
+        match check(doc(serde_json::json!({"remotes": [remote]}))) {
+            Ok(_) => None,
+            Err(e @ McpError::Invalid { .. }) => {
+                assert_eq!(e.code(), "mcp_invalid_server_json");
+                let McpError::Invalid { path, msg } = e else {
+                    unreachable!()
+                };
+                Some((path, msg))
+            }
+            Err(other) => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn templated_remote_urls_expand_to_http_only() {
+        // #5529: the issue's rig, a `choices`-only variant, and every
+        // active scheme, all refused with the literal path's code and path.
+        for (vars, var, value) in [
+            (
+                serde_json::json!({"base": {"default": "javascript:alert(1)//"}}),
+                "base",
+                "javascript:alert(1)//",
+            ),
+            (
+                serde_json::json!({"base": {"choices": ["https://ok.example", "javascript:alert(1)//"]}}),
+                "base",
+                "javascript:alert(1)//",
+            ),
+            (
+                serde_json::json!({"base": {"default": "data:text/html,<b>x</b>"}}),
+                "base",
+                "data:text/html,<b>x</b>",
+            ),
+            (
+                serde_json::json!({"base": {"default": "https://ok.example", "choices": ["vbscript:msgbox(1)"]}}),
+                "base",
+                "vbscript:msgbox(1)",
+            ),
+        ] {
+            let (path, msg) = remote_refusal("{base}/sse", vars.clone())
+                .unwrap_or_else(|| panic!("{vars} published"));
+            assert_eq!(path, "remotes[0].url");
+            assert!(
+                msg.contains(&format!("variable `{var}` = \"{value}\""))
+                    && msg.contains(&format!("\"{value}/sse\"")),
+                "{msg}"
+            );
+        }
+        // The literal form, for the code and path the expansion reuses.
+        assert_eq!(
+            remote_refusal("javascript:alert(1)//sse", serde_json::Value::Null)
+                .unwrap()
+                .0,
+            "remotes[0].url"
+        );
+        // A declared variable in the scheme position with no value: the
+        // client's input picks the scheme.
+        let (path, msg) = remote_refusal(
+            "{base}/sse",
+            serde_json::json!({"base": {"isRequired": true}}),
+        )
+        .unwrap();
+        assert_eq!(path, "remotes[0].url");
+        assert!(
+            msg.contains("variable `base` picks the URL scheme"),
+            "{msg}"
+        );
+        // A variable that is only the scheme segment, with a non-http
+        // choice, beside a value-less path variable.
+        assert!(remote_refusal(
+            "{scheme}://x.example/{path}",
+            serde_json::json!({"scheme": {"choices": ["https", "javascript"]}, "path": {}})
+        )
+        .is_some());
+        // An undeclared variable in the scheme position is refused too; one
+        // anywhere else stands for client input and publishes.
+        let (_, msg) = remote_refusal("{base}/sse", serde_json::Value::Null).unwrap();
+        assert!(
+            msg.contains("variable `base` picks the URL scheme"),
+            "{msg}"
+        );
+        // A later variable's value that reaches the scheme is named.
+        let (_, msg) = remote_refusal(
+            "{a}{b}",
+            serde_json::json!({"b": {"default": "javascript:x"}}),
+        )
+        .unwrap();
+        assert!(msg.contains(r#"variable `b` = "javascript:x""#), "{msg}");
+        // An undeclared scheme variable whose neighbour supplies an http(s)
+        // scheme still picks it.
+        let (_, msg) = remote_refusal(
+            "{a}{b}",
+            serde_json::json!({"b": {"default": "https://x.example"}}),
+        )
+        .unwrap();
+        assert!(msg.contains("variable `a` picks the URL scheme"), "{msg}");
+        // A placeholder is pre-filled by clients, so it is a value too.
+        assert!(remote_refusal(
+            "{base}/sse",
+            serde_json::json!({"base": {"placeholder": "javascript:alert(1)//"}})
+        )
+        .is_some());
+        assert!(remote_refusal("https://x.example/{tenant}", serde_json::Value::Null).is_none());
+        // More than 256 expansions: refused rather than enumerated.
+        let choices = |n: usize| serde_json::json!({"choices": (0..n).map(|i| format!("v{i}")).collect::<Vec<_>>()});
+        let (path, msg) = remote_refusal(
+            "https://x.example/{a}/{b}/{c}",
+            serde_json::json!({"a": choices(10), "b": choices(10), "c": choices(3)}),
+        )
+        .unwrap();
+        assert_eq!(path, "remotes[0].url");
+        assert!(
+            msg.contains("expand to 300 URLs, more than the 256"),
+            "{msg}"
+        );
+        assert!(remote_refusal(
+            "https://x.example/{a}/{b}",
+            serde_json::json!({"a": choices(16), "b": choices(16)})
+        )
+        .is_none());
+        // Benign controls.
+        assert!(remote_refusal(
+            "https://{host}/sse",
+            serde_json::json!({"host": {"default": "mcp.acme.test"}})
+        )
+        .is_none());
+        assert!(remote_refusal(
+            "{base}/sse",
+            serde_json::json!({"base": {"default": "https://x.example", "choices": ["https://x.example", "http://y.example:8080"]}})
+        )
+        .is_none());
+        assert!(remote_refusal(
+            "https://x.example/{tenant}/sse",
+            serde_json::json!({"tenant": {"isRequired": true}})
+        )
+        .is_none());
+        assert!(remote_refusal(
+            "https://{host}:{port}/{tenant}",
+            serde_json::json!({"host": {}, "port": {"default": "8443"}, "tenant": {}})
+        )
+        .is_none());
+        // A host default cannot leave the template's scheme; it only names
+        // the authority, as a literal URL could.
+        assert!(remote_refusal(
+            "https://{host}/sse",
+            serde_json::json!({"host": {"default": "bad host"}})
+        )
+        .is_some());
+        // A long offending value is clipped in the detail.
+        let long = format!("javascript:{}", "a".repeat(200));
+        let (_, msg) =
+            remote_refusal("{base}", serde_json::json!({"base": {"default": long}})).unwrap();
+        assert!(msg.contains("...\"") && msg.len() < 400, "{msg}");
+        // Quotes and backticks in a value cannot unbalance the detail.
+        let (_, msg) = remote_refusal(
+            "{base}/sse",
+            serde_json::json!({"base": {"default": "javascript:`x`\"y\""}}),
+        )
+        .unwrap();
+        assert!(msg.contains(r#"= "javascript:`x`\"y\"""#), "{msg}");
+        // An unclosed brace is literal text, as before.
+        assert_eq!(
+            url_template_issue("https://x.example/{a", |_| None, UrlExpansion::All),
+            None
+        );
+    }
+
+    #[test]
+    fn templated_package_transport_urls_expand_to_http_only() {
+        let with = |p: serde_json::Value| doc(serde_json::json!({"remotes": [], "packages": [p]}));
+        let transport = |url: &str| serde_json::json!({"type": "streamable-http", "url": url});
+        for extra in [
+            serde_json::json!({"transport": transport("{baseUrl}/mcp"), "environmentVariables": [{"name": "baseUrl", "default": "javascript:alert(1)//"}]}),
+            serde_json::json!({"transport": transport("{baseUrl}/mcp"), "packageArguments": [{"type": "positional", "valueHint": "baseUrl", "choices": ["data:text/html,x"]}]}),
+            serde_json::json!({"transport": transport("{baseUrl}/mcp"), "environmentVariables": [{"name": "baseUrl"}]}),
+            serde_json::json!({"transport": transport("{baseUrl}/mcp")}),
+            // Every input matching the variable counts, not the first.
+            serde_json::json!({"transport": transport("{baseUrl}/mcp"),
+                "environmentVariables": [{"name": "baseUrl", "default": "https://ok.example"}],
+                "packageArguments": [{"type": "positional", "valueHint": "baseUrl", "default": "javascript:alert(1)//"}]}),
+            serde_json::json!({"transport": transport("{baseUrl}/mcp"),
+                "environmentVariables": [{"name": "baseUrl", "default": "https://ok.example"}, {"name": "baseUrl", "default": "javascript:alert(1)//"}]}),
+            serde_json::json!({"transport": transport("{baseUrl}/mcp"),
+                "runtimeArguments": [{"type": "positional", "valueHint": "baseUrl", "default": "https://ok.example"}],
+                "packageArguments": [{"type": "named", "name": "baseUrl", "default": "javascript:alert(1)//"}]}),
+        ] {
+            assert_eq!(invalid_path(with(npm(extra))), "packages[0].transport.url");
+        }
+        for extra in [
+            serde_json::json!({"transport": transport("{baseUrl}/mcp"), "environmentVariables": [{"name": "baseUrl", "default": "http://localhost:3000"}]}),
+            serde_json::json!({"transport": transport("http://localhost:{port}/mcp"), "runtimeArguments": [{"type": "named", "name": "--port", "valueHint": "port", "default": "3000"}]}),
+            serde_json::json!({"transport": transport("http://localhost:{port}/mcp"), "environmentVariables": [{"name": "port"}]}),
+        ] {
+            assert!(check(with(npm(extra.clone()))).is_ok(), "{extra}");
+        }
     }
 
     #[test]
@@ -2937,9 +3968,14 @@ mod tests {
             storage_path("com.acme/w", "1.0"),
             "servers/com.acme/w/1.0/server.json"
         );
+        let on_filesystem = KeyScope::of("filesystem", Uuid::new_v4());
         assert_eq!(
-            storage_key("com.acme/w", "1.0", "ab"),
+            storage_key(on_filesystem, "com.acme/w", "1.0", "ab"),
             "mcp/com.acme/w/1.0/ab.json"
+        );
+        assert_eq!(
+            bundle_storage_key(on_filesystem, "com.acme/w", "1.0", "ab", "w.mcpb"),
+            "mcp/com.acme/w/1.0/bundles/ab/w.mcpb"
         );
         assert_eq!(
             parse_storage_path("servers/com.acme/w/1.0/server.json"),
@@ -2947,14 +3983,112 @@ mod tests {
         );
         assert_eq!(parse_storage_path("servers/w/1.0/server.json"), None);
         assert_eq!(parse_storage_path("other/a/b/c/server.json"), None);
-        let c = encode_cursor("com.acme/w", "1.0.0");
+    }
+
+    /// #5660: a shared cloud namespace gets the repo-scoped key for a
+    /// server version and a bundle alike, and the `STORAGE_KEY_SCHEME=flat`
+    /// opt-out keeps the legacy shared key.
+    #[test]
+    fn storage_keys_are_repo_scoped_on_cloud_5660() {
+        use crate::storage::StorageKeyScheme;
+        let repository_id = Uuid::new_v4();
+        for backend in ["s3", "gcs", "azure"] {
+            let scoped = KeyScope {
+                scheme: StorageKeyScheme::RepoScoped,
+                storage_backend: backend,
+                repository_id,
+            };
+            let flat = KeyScope {
+                scheme: StorageKeyScheme::Flat,
+                ..scoped
+            };
+            assert_eq!(
+                storage_key(scoped, "com.acme/w", "1.0", "ab"),
+                format!("mcp/{repository_id}/com.acme/w/1.0/ab.json"),
+                "{backend}"
+            );
+            assert_eq!(
+                bundle_storage_key(scoped, "com.acme/w", "1.0", "ab", "w.mcpb"),
+                format!("mcp/{repository_id}/com.acme/w/1.0/bundles/ab/w.mcpb"),
+                "{backend}"
+            );
+            assert_eq!(
+                storage_key(flat, "com.acme/w", "1.0", "ab"),
+                "mcp/com.acme/w/1.0/ab.json",
+                "{backend}"
+            );
+            assert_eq!(
+                bundle_storage_key(flat, "com.acme/w", "1.0", "ab", "w.mcpb"),
+                "mcp/com.acme/w/1.0/bundles/ab/w.mcpb",
+                "{backend}"
+            );
+        }
+    }
+
+    /// Finding 4: a listing cursor is opaque and sealed. It round-trips for
+    /// the repository and listing that issued it, names nothing a client can
+    /// read, and a made-up, altered, replayed (other repository, other
+    /// listing) or foreign-secret cursor is the `400 invalid cursor`.
+    #[test]
+    fn cursors_are_sealed_and_bound() {
+        use base64::Engine as _;
+        let seal = CursorSeal::from_secret("a-test-secret-of-some-length-0123456789");
+        let (repo, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let c = seal.encode_position(repo, cursor_kind::SERVERS, "com.acme/w", "1.0.0");
         assert_eq!(
-            decode_cursor(&c).unwrap(),
+            seal.decode_position(repo, cursor_kind::SERVERS, &c)
+                .unwrap(),
             ("com.acme/w".into(), "1.0.0".into())
         );
-        for bad in ["!!!", "bm9jb2xvbg", "", "Ondo", "dzo"] {
-            assert!(decode_cursor(bad).is_err(), "{bad}");
+        assert!(c
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&c)
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("com.acme"),
+            "the position is not readable"
+        );
+        // Two cursors for one position differ (random nonce).
+        assert_ne!(
+            c,
+            seal.encode_position(repo, cursor_kind::SERVERS, "com.acme/w", "1.0.0")
+        );
+        let mut tampered = raw.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        let tampered = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tampered);
+        let plain = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("com.acme/w:1.0.0");
+        let foreign = CursorSeal::from_secret("another-secret-of-some-length-0123456789")
+            .encode_position(repo, cursor_kind::SERVERS, "com.acme/w", "1.0.0");
+        let long = "A".repeat(5000);
+        for bad in [
+            "!!!",
+            "bm9jb2xvbg",
+            "",
+            "Ondo",
+            plain.as_str(),
+            tampered.as_str(),
+            foreign.as_str(),
+            long.as_str(),
+        ] {
+            assert_eq!(
+                seal.decode_position(repo, cursor_kind::SERVERS, bad)
+                    .unwrap_err()
+                    .code(),
+                "mcp_invalid_query",
+                "{bad}"
+            );
         }
+        assert!(seal
+            .decode_position(other, cursor_kind::SERVERS, &c)
+            .is_err());
+        assert!(seal.decode_position(repo, cursor_kind::HOLDS, &c).is_err());
+        let virt = seal.seal(repo, &[cursor_kind::VIRTUAL, "m1", "", ""]);
+        assert_eq!(seal.open(repo, &virt).unwrap(), vec!["m", "m1", "", ""]);
+        assert!(seal
+            .decode_position(repo, cursor_kind::SERVERS, &virt)
+            .is_err());
     }
 
     #[test]
@@ -3016,6 +4150,7 @@ mod tests {
                 repository: format!("{ty}-local"),
                 repository_id: Uuid::nil(),
                 artifact_ids: vec![],
+                artifact_sha256s: Vec::new(),
                 sha256: None,
                 name: Some("acme/mcp".into()),
                 tag: tag.map(Into::into),
@@ -3047,16 +4182,26 @@ mod tests {
             pin(3, "oci", None),
             pin(9, "npm", None),
         ];
-        let out = rewrite_packages_for_serve(
-            &server,
-            &pins,
-            PackagePolicy::OwnRepos,
-            "https://ak.test:8443/",
-        );
+        let mut pins = pins;
+        pins[0].resolved.warnings = vec!["foreign_coordinates_replaced".into()];
+        let out = rewrite_packages_for_serve(&server, &pins, "https://ak.test:8443/");
         assert_eq!(
             out["packages"][0]["registryBaseUrl"],
             "https://ak.test:8443/npm/npm-local"
         );
+        // #5452: the replaced coordinates and the pin's warnings are served.
+        let npm = &out["packages"][0]["_meta"][AK_RESOLVED_META_KEY];
+        assert_eq!(
+            npm["submittedRegistryBaseUrl"],
+            "https://registry.npmjs.org"
+        );
+        assert_eq!(
+            npm["warnings"],
+            serde_json::json!(["foreign_coordinates_replaced"])
+        );
+        assert_eq!(npm["backingRepository"], "npm-local");
+        let nuget = &out["packages"][2]["_meta"][AK_RESOLVED_META_KEY];
+        assert!(nuget.get("submittedRegistryBaseUrl").is_none() && nuget.get("warnings").is_none());
         let hex = "c".repeat(64);
         assert_eq!(
             out["packages"][1]["identifier"],
@@ -3073,10 +4218,6 @@ mod tests {
         assert_eq!(
             out["packages"][3]["identifier"],
             format!("ak.test:8443/oci-local/acme/mcp@sha256:{hex}")
-        );
-        assert_eq!(
-            rewrite_packages_for_serve(&server, &pins, PackagePolicy::Open, "https://ak.test"),
-            server
         );
         assert_eq!(host_of("not a url"), "localhost");
         assert_eq!(pins[0].label(), "npm:@acme/w@1.0.0");
@@ -3196,6 +4337,14 @@ mod tests {
                 "mcp_namespace_not_allowed",
             ),
             (McpError::VersionExists, 409, "mcp_version_exists"),
+            (
+                McpError::NameCaseConflict {
+                    name: "io.Acme/t".into(),
+                    existing: "io.acme/t".into(),
+                },
+                409,
+                "mcp_name_case_conflict",
+            ),
             (McpError::SearchTooShort, 422, "mcp_search_too_short"),
             (
                 McpError::Misconfigured("x".into()),

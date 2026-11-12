@@ -219,7 +219,7 @@ async fn resolve_virtual_blob_walks_to_third_member_when_first_two_404() {
     add_member(&pool, virt_id, member_c, 3).await;
 
     let state = build_state(pool.clone(), &storage_path);
-    let res = resolve_virtual_blob(&state, None, virt_id, "myimage", &blob_digest).await;
+    let res = resolve_virtual_blob(&state, None, virt_id, "myimage", &blob_digest, false).await;
 
     match res {
         // #2274: the remote member blob is now STREAMED (teed into the proxy
@@ -285,13 +285,13 @@ async fn resolve_virtual_blob_returns_none_when_no_member_has_it_and_negative_ca
     let state = build_state(pool.clone(), &storage_path);
 
     // First probe: walks both upstreams, gets None.
-    let first = resolve_virtual_blob(&state, None, virt_id, "missing", &blob_digest).await;
+    let first = resolve_virtual_blob(&state, None, virt_id, "missing", &blob_digest, false).await;
     assert!(first.is_none(), "expected None on first probe");
 
     // Second probe immediately after: should hit the negative cache and
     // NOT re-walk the upstreams. The mock `.expect(1)` enforces this on
     // server drop.
-    let second = resolve_virtual_blob(&state, None, virt_id, "missing", &blob_digest).await;
+    let second = resolve_virtual_blob(&state, None, virt_id, "missing", &blob_digest, false).await;
     assert!(
         second.is_none(),
         "expected None on second probe (negative cache hit)"
@@ -501,7 +501,7 @@ async fn published_blob_visible_on_second_probe(config_tweak: fn(&mut Config)) -
     config_tweak(&mut config);
     let state = build_state_with_config(pool.clone(), &storage_path, config);
 
-    let first = resolve_virtual_blob(&state, None, virt_id, "wiring", &blob_digest).await;
+    let first = resolve_virtual_blob(&state, None, virt_id, "wiring", &blob_digest, false).await;
     assert!(
         first.is_none(),
         "nothing serves the blob on the first probe"
@@ -509,7 +509,7 @@ async fn published_blob_visible_on_second_probe(config_tweak: fn(&mut Config)) -
 
     publish_blob(&pool, local_member, &blob_digest, 30).await;
 
-    let second = resolve_virtual_blob(&state, None, virt_id, "wiring", &blob_digest).await;
+    let second = resolve_virtual_blob(&state, None, virt_id, "wiring", &blob_digest, false).await;
     let visible = matches!(second, Some(VirtualBlobResolution::Local { .. }));
 
     cleanup(&pool, &[virt_id, remote_member, local_member]).await;

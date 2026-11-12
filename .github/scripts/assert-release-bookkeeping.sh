@@ -39,6 +39,18 @@
 #      when reconstructing what shipped, and it is one rename away from being
 #      published as some other version's body.
 #
+#      ONE EXCEPTION: a prep that is merged but not yet promoted (#5602). The
+#      Release Candidate workflow runs this script from a checkout of `main`
+#      with the certified commit's `.github/release-notes/` overlaid on top,
+#      and `git checkout <sha> -- <dir>` never deletes. So while main carries
+#      the prep for a newer version (1.12.0.md, before v1.12.0 exists), every
+#      candidate for an older maintenance line sees that file. A version-named
+#      file is therefore accepted as "pending a later release" when its
+#      version is NEWER than the one being released AND newer than every
+#      stable tag and Release that exists. The second condition keeps the
+#      original case red: 1.7.5 was overtaken by v1.7.6, so a release that
+#      never happened is still an orphan, whatever is being published.
+#
 # WHICH REF IS READ, and why it matters. Every check here reads the CHECKED-OUT
 # ref -- the one being released -- never `main`. `main` and `release/1.7.x`
 # hold DISJOINT halves of the 1.7.x curated notes set: `main` has
@@ -70,6 +82,18 @@ NOTES_DIR=".github/release-notes"
 problems=0
 
 refuse() { echo "::error title=$1::$2"; problems=$((problems + 1)); }
+
+# version_gt A B: true when X.Y.Z version A is strictly newer than B. Numeric
+# per field (1.11.13 > 1.11.2, 1.12.0 > 1.11.13); `10#` keeps a leading zero
+# from being read as octal. Callers pass final X.Y.Z versions only.
+version_gt() {
+  local a1 a2 a3 b1 b2 b3
+  IFS=. read -r a1 a2 a3 <<<"$1"
+  IFS=. read -r b1 b2 b3 <<<"$2"
+  (( 10#$a1 != 10#$b1 )) && { (( 10#$a1 > 10#$b1 )); return; }
+  (( 10#$a2 != 10#$b2 )) && { (( 10#$a2 > 10#$b2 )); return; }
+  (( 10#$a3 > 10#$b3 ))
+}
 
 if [[ -z "${GITHUB_REPOSITORY:-}" ]]; then
   echo "::error title=Release bookkeeping unverifiable::GITHUB_REPOSITORY is not set; cannot resolve tags or releases."
@@ -146,6 +170,15 @@ else
       refuse "Release bookkeeping unverifiable" \
         "The tag listing for ${GITHUB_REPOSITORY} came back empty, which cannot be true for a repository that has releases. Failing closed rather than reporting every notes file as an orphan."
     else
+      # The newest FINAL version that has a tag or a Release. A notes file
+      # newer than this and newer than ${VERSION} has not been overtaken by
+      # any release, so it can still be a prep awaiting its own run (#5602).
+      newest_known=""
+      while IFS= read -r t; do
+        t="${t#v}"
+        [[ "$t" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+        if [[ -z "$newest_known" ]] || version_gt "$t" "$newest_known"; then newest_known="$t"; fi
+      done < <(printf '%s\n%s\n' "$known_tags" "$known_rels")
       orphans=0
       for f in "${NOTES_DIR}"/*.md; do
         [[ -e "$f" ]] || continue
@@ -159,13 +192,16 @@ else
           echo "  ${base}: tag v${base} exists. OK."
         elif printf '%s\n' "$known_rels" | grep -qx "v${base}"; then
           echo "  ${base}: no tag, but a Release exists. OK."
+        elif version_gt "$base" "$VERSION" \
+             && { [[ -z "$newest_known" ]] || version_gt "$base" "$newest_known"; }; then
+          echo "  ${base}: no tag or Release yet, but newer than ${VERSION} and than every existing release (newest: v${newest_known:-none}); pending a later release. OK."
         else
           orphans=$((orphans + 1))
           refuse "Orphaned release-notes file" \
             "${NOTES_DIR}/${base}.md describes version ${base}, which has neither a git tag nor a GitHub Release. Either that release never happened and the file should be deleted, or the version it names is wrong. ${base} is not what this run is publishing, so nothing here will fix itself (#3429, #3537)."
         fi
       done
-      [[ "$orphans" -eq 0 ]] && echo "  every version-named notes file maps to a tag or a Release."
+      [[ "$orphans" -eq 0 ]] && echo "  every version-named notes file maps to a tag, a Release, or a pending later release."
     fi
   fi
 fi

@@ -4,12 +4,99 @@ use axum::http::HeaderMap;
 
 /// Request marker set by peer replication writes. Receiving handlers use this
 /// to avoid queuing the replicated write back to the origin peer.
+///
+/// The marker is a client-set header, so it is a routing hint only (sync-loop
+/// suppression, the OCI replication routes' entry check). It never grants a
+/// privilege on its own: every replication *exemption* goes through
+/// [`trusted_peer_replication`] (#5455).
 pub(crate) fn is_replication_request(headers: &HeaderMap) -> bool {
     headers
         .get("x-artifact-keeper-replication")
         .and_then(|value| value.to_str().ok())
         .map(|value| matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
         .unwrap_or(false)
+}
+
+/// Whether this request is a peer replication that may take a replication
+/// exemption: skipping the storage quota, bringing the source row's metadata
+/// instead of the server deriving it, refreshing an identical or mutable
+/// replicated row in place, deleting a released (immutable) artifact, or
+/// writing to and deleting from an MCP registry through the generic routes.
+///
+/// The one decision for every such exemption (#5455), so the chunked, raw,
+/// multipart, delete and immutability paths cannot drift apart. The
+/// replication header is client-set, so it must accompany an independently
+/// authenticated peer identity. Nothing binds an inbound credential to a
+/// registered peer (`peer_instances.api_key` is the key this instance
+/// presents to that peer, not the one the peer presents here); a peer link
+/// is set up with an instance administrator's token on the receiving side,
+/// and an administrator can already override every one of these checks, so
+/// the administrator is the peer identity. A service account is an ordinary
+/// writer: with the header it gets exactly what it gets without it.
+///
+/// Fan-out suppression (not queuing a replicated write back out to peers)
+/// stays keyed on the raw header ([`is_replication_request`]) by design. A
+/// writer that forges it can only keep its own write from fanning out, which
+/// it could equally do by not writing; keying it on this decision instead
+/// would make a peer whose key is a service-account token push every write it
+/// receives straight back to the origin, a replication loop.
+pub(crate) fn trusted_peer_replication(
+    auth: &crate::api::middleware::auth::AuthExtension,
+    headers: &HeaderMap,
+) -> bool {
+    trusted_peer_replication_marked(auth, is_replication_request(headers))
+}
+
+/// [`trusted_peer_replication`] for a call site whose replication marker is
+/// not (only) the request header: a chunked upload session records the
+/// marker at creation and the completion request may not repeat it.
+pub(crate) fn trusted_peer_replication_marked(
+    auth: &crate::api::middleware::auth::AuthExtension,
+    marked: bool,
+) -> bool {
+    if marked && !auth.is_admin {
+        warn_ignored_replication_header(auth);
+    }
+    marked && auth.is_admin
+}
+
+/// Seconds between two [`warn_ignored_replication_header`] lines, so a peer
+/// pushing a backlog under the wrong key logs once a minute, not per request.
+const IGNORED_REPLICATION_WARN_INTERVAL_SECS: i64 = 60;
+
+/// Unix seconds of the last [`warn_ignored_replication_header`] line.
+static IGNORED_REPLICATION_LAST_WARN: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(i64::MIN);
+
+/// Whether a throttled warning last written at `last` is due again at `now`.
+fn throttled_warn_due(last: i64, now: i64, interval: i64) -> bool {
+    last == i64::MIN || now.saturating_sub(last) >= interval
+}
+
+/// Rate-limited operator hint (#5455): a request carried the replication
+/// header under a credential that is not an administrator's, so it was
+/// handled as an ordinary write. Usually a peer link whose key here is a
+/// service-account token.
+fn warn_ignored_replication_header(auth: &crate::api::middleware::auth::AuthExtension) {
+    use std::sync::atomic::Ordering;
+    let now = chrono::Utc::now().timestamp();
+    let last = IGNORED_REPLICATION_LAST_WARN.load(Ordering::Relaxed);
+    if !throttled_warn_due(last, now, IGNORED_REPLICATION_WARN_INTERVAL_SECS) {
+        return;
+    }
+    if IGNORED_REPLICATION_LAST_WARN
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    tracing::warn!(
+        user_id = %auth.user_id,
+        username = %auth.username,
+        service_account = auth.is_service_account,
+        "replication header from non-admin principal ignored; re-issue the peer key as an \
+         administrator token"
+    );
 }
 
 /// Queue push sync tasks for a freshly committed hosted upload so every
@@ -72,6 +159,45 @@ pub async fn cleanup_soft_deleted_artifact(
     .bind(path)
     .execute(db)
     .await;
+}
+
+/// [`cleanup_soft_deleted_artifact`] for a write whose new row stores its
+/// bytes under `new_storage_key` (#5675): a purged row that named another
+/// key (a Git LFS object stored under the legacy flat key before #5672,
+/// re-pushed under its repository-scoped key) hands that key to the storage
+/// GC as a candidate, the way a conditional replace does
+/// (`record_replaced_object_gc_candidate`). Without it the old object was an
+/// orphan the row-driven GC no longer saw. The candidate sweep deletes the
+/// object only if nothing else references the key. Fire-and-forget like the
+/// plain cleanup: a failure only leaves the old object where it was.
+pub async fn cleanup_soft_deleted_artifact_reclaiming(
+    db: &sqlx::PgPool,
+    repository_id: uuid::Uuid,
+    location: &crate::storage::StorageLocation,
+    path: &str,
+    new_storage_key: &str,
+) {
+    let scope = crate::services::storage_gc_service::oci_gc_candidate_scope(location);
+    if let Err(e) = sqlx::query(
+        "WITH purged AS ( \
+             DELETE FROM artifacts \
+              WHERE repository_id = $1 AND path = $2 AND is_deleted = true \
+             RETURNING storage_key) \
+         INSERT INTO oci_gc_candidates \
+             (storage_key, storage_backend, storage_path, source_repository_id) \
+         SELECT DISTINCT storage_key, $3, $4, $1 FROM purged WHERE storage_key <> $5 \
+         ON CONFLICT (storage_backend, storage_path, storage_key) DO NOTHING",
+    )
+    .bind(repository_id)
+    .bind(path)
+    .bind(&scope.backend)
+    .bind(&scope.path)
+    .bind(new_storage_key)
+    .execute(db)
+    .await
+    {
+        tracing::warn!(%repository_id, path, error = %e, "soft-deleted artifact cleanup failed");
+    }
 }
 
 /// Remove any soft-deleted artifact at `(repository_id, path)` so a subsequent
@@ -208,6 +334,14 @@ fn is_db_unavailable_display<E: std::fmt::Display + ?Sized>(e: &E) -> bool {
     crate::error::AppError::Database(e.to_string()).is_db_unavailable()
 }
 
+/// Whether a database error, as its rendered text, is a deadlock Postgres
+/// broke by rolling the transaction back (#4989), by the same rule the
+/// generic path's `DATABASE_DEADLOCK` 503 uses (#5168).
+fn is_deadlock_display<E: std::fmt::Display + ?Sized>(e: &E) -> bool {
+    use crate::error::DeadlockError as _;
+    crate::error::AppError::Database(e.to_string()).is_deadlock()
+}
+
 /// Pick the HTTP status for a database error when the response envelope is
 /// format-specific (npm/OCI/Git-LFS/etc.) and cannot go through `db_err`.
 ///
@@ -218,11 +352,13 @@ fn is_db_unavailable_display<E: std::fmt::Display + ?Sized>(e: &E) -> bool {
 /// [`crate::error::AppError::is_db_unavailable`] gives the generic path
 /// (#4750), so an `npm install`, a `docker pull` or a Git LFS batch during an
 /// outage sees a retryable 503 rather than a 500 (#4765). Every other DB
-/// failure (a query or data error) stays 500. Callers keep their own
+/// failure (a query or data error) stays 500. A deadlock Postgres broke by
+/// rolling the transaction back changed nothing, so it is a retryable 503
+/// too, as on the generic path (#5168, #4989). Callers keep their own
 /// format-specific error body and pass this for the status argument; the
 /// envelope helpers add `Retry-After` through [`with_retry_after_on_503`].
 pub fn db_status<E: std::fmt::Display + ?Sized>(e: &E) -> axum::http::StatusCode {
-    if is_db_unavailable_display(e) {
+    if is_db_unavailable_display(e) || is_deadlock_display(e) {
         axum::http::StatusCode::SERVICE_UNAVAILABLE
     } else {
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
@@ -256,6 +392,11 @@ pub fn db_err_message<E: std::fmt::Display + ?Sized>(e: &E) -> &'static str {
     } else if is_db_unavailable_display(&raw) {
         tracing::error!(error = %raw, code = "DATABASE_UNAVAILABLE", "Request error");
         "Database is temporarily unavailable, retry shortly"
+    } else if is_deadlock_display(&raw) {
+        // Logged at error, as on the generic path: a deadlock that reaches a
+        // client is still a lock-order bug.
+        tracing::error!(error = %raw, code = "DATABASE_DEADLOCK", "Request error");
+        "Database transaction was rolled back by a lock conflict, retry shortly"
     } else {
         tracing::error!(error = %raw, code = "DATABASE_ERROR", "Request error");
         "Database operation failed"
@@ -280,17 +421,75 @@ pub fn db_err_message<E: std::fmt::Display + ?Sized>(e: &E) -> &'static str {
 /// ENAMETOOLONG keeps its own wording for the same reason
 /// `AppError::user_message` gives it one: an over-long path segment is a
 /// client-caused condition the caller can act on, and the text names no path
-/// (#1047). The STATUS is deliberately left to the call site — these handlers
-/// answer 500 today and #3718 changes message text only.
+/// (#1047). A store that is down or full gets `AppError`'s fixed wording for
+/// that class (#5685). The STATUS is left to the call site: a route answering
+/// a storage failure builds it with [`storage_err_response`], which picks
+/// 503 / 507 / 500 from the same class.
 pub fn storage_err_message<E: std::fmt::Display + ?Sized>(e: &E) -> &'static str {
+    use crate::storage::StorageFailure;
     let raw = e.to_string();
-    if crate::error::is_name_too_long(&raw) {
-        tracing::warn!(error = %raw, code = "PATH_TOO_LONG", "Request error");
-        "Path segment exceeds filesystem name length limit"
-    } else {
-        tracing::error!(error = %raw, code = "STORAGE_ERROR", "Request error");
-        "Storage operation failed"
+    match StorageFailure::from_message(&raw) {
+        Some(StorageFailure::Full) => {
+            tracing::error!(error = %raw, code = "STORAGE_FULL", "Request error");
+            crate::error::STORAGE_FULL_MESSAGE
+        }
+        Some(StorageFailure::Unavailable) => {
+            tracing::error!(error = %raw, code = "STORAGE_UNAVAILABLE", "Request error");
+            crate::error::STORAGE_UNAVAILABLE_MESSAGE
+        }
+        None if crate::error::is_name_too_long(&raw) => {
+            tracing::warn!(error = %raw, code = "PATH_TOO_LONG", "Request error");
+            "Path segment exceeds filesystem name length limit"
+        }
+        None => {
+            tracing::error!(error = %raw, code = "STORAGE_ERROR", "Request error");
+            "Storage operation failed"
+        }
     }
+}
+
+/// The status a format route answers for a failed storage call (#5685): `503`
+/// when the store could not be reached in time, `507` when it refused the
+/// write for lack of space, else `500`. The class comes from the backend's
+/// marker on the error, never from its wording (see
+/// [`crate::storage::failure`]), the same rule `AppError` applies.
+pub fn storage_err_status<E: std::fmt::Display + ?Sized>(e: &E) -> axum::http::StatusCode {
+    use crate::storage::StorageFailure;
+    use axum::http::StatusCode;
+    match StorageFailure::from_message(&e.to_string()) {
+        Some(StorageFailure::Full) => StatusCode::INSUFFICIENT_STORAGE,
+        Some(StorageFailure::Unavailable) => StatusCode::SERVICE_UNAVAILABLE,
+        None => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// The response a format route answers for a failed storage call, built in
+/// the route's own envelope (#5685).
+///
+/// `envelope` gets the status ([`storage_err_status`]) and the fixed message
+/// ([`storage_err_message`]); the raw error is only logged. A `503` gets
+/// `Retry-After`, as `AppError`'s does, and a classified failure feeds the
+/// storage signal on `/health` and `/readyz`, so these routes report a down
+/// or full store exactly as the routes that go through `AppError::Storage`
+/// (#5649, #5650) do. Before this they answered a hard-coded `500`.
+pub fn storage_err_response<E: std::fmt::Display + ?Sized>(
+    e: &E,
+    envelope: impl FnOnce(axum::http::StatusCode, &'static str) -> axum::response::Response,
+) -> axum::response::Response {
+    let raw = e.to_string();
+    if let Some(class) = crate::storage::StorageFailure::from_message(&raw) {
+        crate::storage::failure::record_failure(class);
+    }
+    with_retry_after_on_503(envelope(
+        storage_err_status(&raw),
+        storage_err_message(&raw),
+    ))
+}
+
+/// [`storage_err_response`] for the routes whose error body is plain text.
+pub fn storage_err_plain<E: std::fmt::Display + ?Sized>(e: &E) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    storage_err_response(e, |status, message| (status, message).into_response())
 }
 
 /// Log `e` and return `context` as the client-facing message, for the
@@ -366,6 +565,9 @@ pub mod metadata_epoch;
 
 #[cfg(test)]
 pub(crate) mod test_db_helpers;
+
+#[cfg(test)]
+pub(crate) mod mcp_shadow_fixtures;
 
 /// #4559: router-level tests for tokens scoped to a virtual repository.
 #[cfg(ak_test_shard = "router")]
@@ -481,6 +683,7 @@ pub mod proxy_helpers;
 pub(crate) mod proxy_scan_archive;
 pub(crate) mod proxy_scan_inflight;
 pub mod pub_registry;
+pub(crate) mod publish_lock;
 pub mod publish_quota;
 pub mod puppet;
 pub mod pypi;
@@ -728,6 +931,22 @@ mod tests {
             );
             assert_eq!(db_err_message(&fault), "Database operation failed");
         }
+    }
+
+    /// #4989: a deadlock on a format route with its own envelope is the
+    /// generic path's retryable 503 (#5168), with the same wording, not a 500.
+    #[test]
+    fn test_db_status_and_message_treat_a_deadlock_as_retryable_4989() {
+        let deadlock = "error returned from database: deadlock detected".to_string();
+        assert_eq!(
+            db_status(&deadlock),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            db_err_message(&deadlock),
+            "Database transaction was rolled back by a lock conflict, retry shortly"
+        );
+        assert!(!db_err_message(&deadlock).contains("deadlock detected"));
     }
 
     #[test]
@@ -1066,6 +1285,68 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert tombstone");
+    }
+
+    /// #5675: purging a tombstone whose key differs from the new row's
+    /// journals the old key as a storage GC candidate; the same key (or no
+    /// tombstone) journals nothing.
+    #[tokio::test]
+    async fn reclaiming_cleanup_journals_the_replaced_key_5675() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let repo = make_repo(&pool, "generic").await;
+        let sha = "c".repeat(64);
+        let flat = format!("sk/{sha}");
+        let location = crate::storage::StorageLocation {
+            backend: "s3".into(),
+            path: String::new(),
+        };
+        let journaled = |key: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM oci_gc_candidates \
+                     WHERE storage_key = $1 AND storage_backend = 's3' AND source_repository_id = $2",
+                )
+                .bind(key)
+                .bind(repo)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let tombstones = |path: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+                )
+                .bind(repo)
+                .bind(path)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        // Same key: purged, nothing journaled.
+        insert_tombstone(&pool, repo, "lfs/same", &sha).await;
+        cleanup_soft_deleted_artifact_reclaiming(&pool, repo, &location, "lfs/same", &flat).await;
+        assert_eq!(tombstones("lfs/same").await, 0);
+        assert_eq!(journaled(flat.clone()).await, 0);
+        // Another key: purged and the old key journaled.
+        insert_tombstone(&pool, repo, "lfs/moved", &sha).await;
+        let scoped = format!("lfs/{repo}/{sha}");
+        cleanup_soft_deleted_artifact_reclaiming(&pool, repo, &location, "lfs/moved", &scoped)
+            .await;
+        assert_eq!(tombstones("lfs/moved").await, 0);
+        assert_eq!(journaled(flat.clone()).await, 1);
+        assert_eq!(journaled(scoped).await, 0);
+        let _ = sqlx::query("DELETE FROM oci_gc_candidates WHERE source_repository_id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await;
+        cleanup_repo(&pool, repo).await;
     }
 
     async fn cleanup_repo(pool: &sqlx::PgPool, repo: uuid::Uuid) {
@@ -2768,6 +3049,100 @@ mod raw_error_body_class_tests {
         );
     }
 
+    /// #5685: a storage failure's status comes from its class. A handler that
+    /// pairs `storage_err_message` with a hard-coded `500` answers a store
+    /// that is down or full with a 500 instead of `503` + `Retry-After` /
+    /// `507`; it must build the response with `storage_err_response` /
+    /// `storage_err_plain`, or take the status from `storage_err_status`.
+    #[test]
+    fn no_handler_answers_a_storage_failure_with_a_hard_coded_500_5685() {
+        let mut offenders: Vec<String> = Vec::new();
+        let mut files = 0usize;
+        for (path, src) in rust_sources() {
+            if !path.to_string_lossy().contains("api/handlers") {
+                continue;
+            }
+            files += 1;
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let tests = test_module_line_ranges(&src);
+            let lines: Vec<&str> = src.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                if !line.contains("storage_err_message(") || in_test_module(&tests, index + 1) {
+                    continue;
+                }
+                let window = &lines[index.saturating_sub(3)..index];
+                if window
+                    .iter()
+                    .any(|l| l.contains("StatusCode::INTERNAL_SERVER_ERROR"))
+                {
+                    offenders.push(format!("{name}:{}: {}", index + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            files > 30,
+            "#5685: the handler scan found only {files} files"
+        );
+        assert!(
+            offenders.is_empty(),
+            "#5685: these sites answer a storage failure with a hard-coded 500; build \
+             the response with `crate::api::handlers::storage_err_response` (or \
+             `storage_err_plain`) so a store that is down answers 503 and a full one \
+             507:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn storage_err_response_maps_the_class_and_keeps_the_envelope_5685() {
+        use crate::storage::StorageFailure;
+        use axum::http::{header, StatusCode};
+        use axum::response::IntoResponse;
+        for (raw, want, retry_after, message) in [
+            (
+                StorageFailure::Unavailable.tag("tcp connect error: connection refused"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                true,
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                StorageFailure::Full.tag("<Error><Code>XMinioAdminBucketQuotaExceeded</Code>"),
+                StatusCode::INSUFFICIENT_STORAGE,
+                false,
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+            // The wording alone never picks a class: a key may say anything.
+            (
+                "Failed to write No space left on device/connection refused".to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                false,
+                "Storage operation failed",
+            ),
+        ] {
+            assert_eq!(
+                crate::api::handlers::storage_err_status(&raw),
+                want,
+                "{raw}"
+            );
+            let response = crate::api::handlers::storage_err_response(&raw, |status, text| {
+                assert_eq!(text, message, "{raw}");
+                (status, [("x-envelope", "kept")], text).into_response()
+            });
+            assert_eq!(response.status(), want, "{raw}");
+            assert_eq!(response.headers()["x-envelope"], "kept");
+            assert_eq!(
+                response.headers().contains_key(header::RETRY_AFTER),
+                retry_after,
+                "{raw}"
+            );
+            assert_eq!(
+                crate::api::handlers::storage_err_plain(&raw).status(),
+                want,
+                "{raw}"
+            );
+        }
+    }
+
     #[test]
     fn the_gate_recognises_the_shape_it_guards_3667() {
         // The needle must match the exact source form the 39 sites used and
@@ -2908,6 +3283,186 @@ mod raw_error_body_class_tests {
              them — a stale exemption silently excuses the next site that reuses the \
              wording:\n{}",
             unmatched.join("\n")
+        );
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod replication_peer_identity_gate_5455 {
+    // -----------------------------------------------------------------------
+    // #5455: every replication exemption goes through one decision.
+    //
+    // The replication header is client-set. "A service account plus the
+    // header" was once read as a peer on the chunked, raw, multipart, delete
+    // and immutability paths, each with its own copy of the rule, and the
+    // copies drifted (#5368 narrowed the MCP one only). The exemptions now
+    // call `trusted_peer_replication` / `trusted_peer_replication_marked`;
+    // this gate pins every exemption site to them and every remaining raw
+    // use of the marker to the routing-only sites below.
+    // -----------------------------------------------------------------------
+    use super::like_pattern_escape_class_tests::{rust_sources, test_module_line_ranges};
+
+    /// Production uses of the raw marker, `is_replication_request(..)`, per
+    /// file: all are routing (sync-loop suppression, the OCI replication
+    /// routes' entry check, the Maven plugin-prefix merge, the chunked
+    /// commit's marker that feeds `trusted_peer_replication_marked`). A new
+    /// use that would grant an exemption must call the helper instead; a
+    /// genuinely routing-only one is added here.
+    const RAW_MARKER_SITES: &[(&str, usize)] = &[
+        ("api/handlers/mod.rs", 2),
+        ("api/handlers/debian.rs", 1),
+        ("api/handlers/goproxy.rs", 1),
+        ("api/handlers/incus.rs", 2),
+        ("api/handlers/maven.rs", 2),
+        ("api/handlers/npm.rs", 1),
+        ("api/handlers/oci_v2.rs", 1),
+        ("api/handlers/pypi.rs", 1),
+        ("api/handlers/repositories.rs", 2),
+        ("api/handlers/upload.rs", 1),
+    ];
+
+    /// `(file, fn)` of every replication exemption: each must decide through
+    /// the shared helper, directly or through `mcp_generic_mutation_refusal`
+    /// (itself pinned here). `delete_artifact`'s immutability guard needs
+    /// none: the helper implies an admin, who is exempt anyway.
+    const EXEMPTION_SITES: &[(&str, &str)] = &[
+        ("api/handlers/upload.rs", "create_session"),
+        ("api/handlers/upload.rs", "complete_session_commit"),
+        (
+            "api/handlers/repositories.rs",
+            "persist_generic_staged_upload",
+        ),
+        (
+            "api/handlers/repositories.rs",
+            "mcp_generic_mutation_refusal",
+        ),
+        ("api/handlers/repositories.rs", "delete_artifact"),
+    ];
+
+    fn relative(path: &std::path::Path) -> String {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        path.strip_prefix(&src)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    /// Non-comment production lines (1-based number, text) of `src`.
+    fn production_lines(src: &str) -> Vec<(usize, &str)> {
+        let tests = test_module_line_ranges(src);
+        src.lines()
+            .enumerate()
+            .map(|(i, line)| (i + 1, line))
+            .filter(|(n, line)| {
+                !tests.iter().any(|(from, to)| n >= from && n <= to)
+                    && !line.trim_start().starts_with("//")
+            })
+            .collect()
+    }
+
+    /// The body of the top-level `fn name(` in `src`, up to its closing
+    /// brace at column 0.
+    fn fn_body<'a>(src: &'a str, name: &str) -> Option<&'a str> {
+        let at = [format!("async fn {name}("), format!("fn {name}(")]
+            .iter()
+            .find_map(|needle| src.find(needle.as_str()))?;
+        let end = src[at..].find("\n}\n").map(|e| at + e).unwrap_or(src.len());
+        Some(&src[at..end])
+    }
+
+    #[test]
+    fn raw_replication_marker_is_routing_only() {
+        let mut seen = std::collections::BTreeMap::<String, usize>::new();
+        for (path, src) in rust_sources() {
+            let file = relative(&path);
+            for (_, line) in production_lines(&src) {
+                if line.contains("is_replication_request(")
+                    && !line.contains("fn is_replication_request(")
+                {
+                    *seen.entry(file.clone()).or_default() += 1;
+                }
+            }
+        }
+        let expected: std::collections::BTreeMap<String, usize> = RAW_MARKER_SITES
+            .iter()
+            .map(|(f, n)| (f.to_string(), *n))
+            .collect();
+        assert_eq!(
+            seen, expected,
+            "#5455: a raw `is_replication_request` use changed. The header is \
+             client-set; an exemption must decide through \
+             `trusted_peer_replication`, and a routing-only use is listed in \
+             RAW_MARKER_SITES"
+        );
+    }
+
+    #[test]
+    fn no_replication_decision_trusts_a_service_account() {
+        let mut offenders = Vec::new();
+        for (path, src) in rust_sources() {
+            let file = relative(&path);
+            for (n, line) in production_lines(&src) {
+                let lower = line.to_ascii_lowercase();
+                let retired = line.contains("replication_exemption_trusted")
+                    || line.contains("mcp_replication_trusted");
+                if retired || (lower.contains("replication") && line.contains("is_service_account"))
+                {
+                    offenders.push(format!("{file}:{n}: {}", line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "#5455: a service account (or a retired per-path rule) decides a \
+             replication exemption; use `trusted_peer_replication`:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn ignored_header_warning_is_throttled() {
+        use super::throttled_warn_due as due;
+        assert!(due(i64::MIN, 0, 60), "the first one is written");
+        assert!(!due(1_000, 1_059, 60));
+        assert!(due(1_000, 1_060, 60));
+        // A non-admin marked request is still refused while the warning is
+        // being throttled.
+        let writer = crate::api::middleware::auth::AuthExtension {
+            is_service_account: true,
+            ..Default::default()
+        };
+        assert!(!super::trusted_peer_replication_marked(&writer, true));
+        assert!(!super::trusted_peer_replication_marked(&writer, true));
+    }
+
+    #[test]
+    fn every_exemption_site_uses_the_shared_decision() {
+        let sources: std::collections::BTreeMap<String, String> = rust_sources()
+            .into_iter()
+            .map(|(path, src)| (relative(&path), src))
+            .collect();
+        for (file, name) in EXEMPTION_SITES {
+            let src = sources
+                .get(*file)
+                .unwrap_or_else(|| panic!("{file} not found"));
+            let body = fn_body(src, name).unwrap_or_else(|| panic!("{file}: fn {name} not found"));
+            assert!(
+                body.contains("trusted_peer_replication(")
+                    || body.contains("trusted_peer_replication_marked(")
+                    || body.contains("mcp_generic_mutation_refusal("),
+                "#5455: {file}::{name} must decide its replication exemption \
+                 through `trusted_peer_replication`"
+            );
+        }
+        let helper = fn_body(
+            &sources["api/handlers/mod.rs"],
+            "trusted_peer_replication_marked",
+        )
+        .expect("the shared decision");
+        assert!(
+            !helper.contains("is_service_account"),
+            "#5455: a service account is not a peer identity"
         );
     }
 }

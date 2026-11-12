@@ -117,11 +117,294 @@ pub fn live_package_version_predicate() -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Catalog download counts (#5346)
+// ---------------------------------------------------------------------------
+//
+// The `packages.download_count` / `package_versions.download_count` columns
+// (migration 019) were never written, so every package reported 0. The counts
+// are computed at read time from the download history the serve paths already
+// record instead: `download_statistics` (hosted, one row per served body,
+// written off the hot path by the batched download-event dispatcher, #2522)
+// and `proxy_download_statistics` (Remote pull-through serves, #2270/#4539).
+// Nothing is added to the download path, and the counts cannot drift from the
+// artifact download stats because they are the same rows.
+//
+// The stored columns stay (a 1.11 pod in a rolling upgrade still selects
+// them) but are no longer read.
+
+/// SQL expression for one `package_versions` row's download count (#5346).
+/// Expects `pv`, `p` and `r` in scope.
+///
+/// Hosted serves: the `download_statistics` rows of the version's artifacts in
+/// the package's repository, i.e. the artifact carrying the version's
+/// representative checksum (the catalog's liveness join, #3660) plus every
+/// artifact recorded under the package's name and the version (the other
+/// files of a multi-file version, such as a Hugging Face model revision). It is
+/// the sum of the download counts the artifact pages show for those files.
+///
+/// Remote serves: the `proxy_download_statistics` rows of the repository that
+/// carry the version's digest (#4542), plus older rows with no digest of their
+/// own that still link to a cached object with it (the same two arms the
+/// blast-radius report reads).
+///
+/// `NULL` means "not tracked": a Remote version cataloged without a digest
+/// (a streamed Maven pull-through, whose checksum is unknown when the row is
+/// written) cannot be tied to any recorded serve, which is different from a
+/// real 0. Every lookup is indexed: `idx_artifacts_checksum` /
+/// `idx_artifacts_repo_name_version`, `idx_download_stats_artifact`,
+/// `idx_proxy_dl_stats_checksum`, `idx_proxy_cache_repo_checksum` and
+/// `idx_proxy_dl_stats_cache`.
+pub fn version_download_count_sql() -> &'static str {
+    r#"(CASE
+    WHEN r.repo_type = 'remote' AND COALESCE(pv.checksum_sha256, '') = '' THEN NULL
+    ELSE (
+        SELECT COUNT(*)
+        FROM download_statistics ds_pkg
+        WHERE ds_pkg.artifact_id IN (
+            SELECT a_dl.id
+            FROM artifacts a_dl
+            WHERE a_dl.repository_id = p.repository_id
+              AND (
+                    (pv.checksum_sha256 <> '' AND a_dl.checksum_sha256 = pv.checksum_sha256)
+                    OR (a_dl.name = p.name AND a_dl.version = pv.version)
+              )
+        )
+    ) + (
+        CASE WHEN r.repo_type = 'remote' THEN (
+            SELECT COUNT(*)
+            FROM proxy_download_statistics pd_pkg
+            WHERE pd_pkg.repository_id = p.repository_id
+              AND pd_pkg.checksum_sha256 = pv.checksum_sha256
+        ) + (
+            SELECT COUNT(*)
+            FROM proxy_download_statistics pd_pkg
+            JOIN proxy_cache_artifacts pc_pkg ON pc_pkg.id = pd_pkg.proxy_cache_id
+            WHERE pc_pkg.repository_id = p.repository_id
+              AND pc_pkg.checksum_sha256 = pv.checksum_sha256
+              AND pd_pkg.checksum_sha256 IS NULL
+        ) ELSE 0 END
+    )
+END)"#
+}
+
+/// Download counts of the packages in `package_ids` (#5346): the sum of their
+/// live versions' counts ([`version_download_count_sql`]), so a package
+/// reports the total of the versions its version list shows. One statement
+/// for a whole listing page. A package missing from the map, or mapped to
+/// `None`, is not tracked (a Remote package with no version digest).
+pub async fn package_download_counts(
+    db: &PgPool,
+    package_ids: &[Uuid],
+) -> sqlx::Result<std::collections::HashMap<Uuid, Option<i64>>> {
+    if package_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let sql = format!(
+        r#"
+        SELECT p.id, SUM({count})::BIGINT
+        FROM packages p
+        JOIN repositories r ON r.id = p.repository_id
+        JOIN package_versions pv ON pv.package_id = p.id
+        WHERE p.id = ANY($1)
+          AND {live}
+        GROUP BY p.id
+        "#,
+        count = version_download_count_sql(),
+        live = live_package_version_predicate(),
+    );
+    let rows: Vec<(Uuid, Option<i64>)> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
+        .bind(package_ids)
+        .fetch_all(db)
+        .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// [`package_download_counts`] of one package over only the live versions in
+/// `versions` (#5253: the MCP versions a caller may list). `None` when none of
+/// them is live, or none is tracked, as for a package with no counted version.
+pub async fn package_download_count_over_versions(
+    db: &PgPool,
+    package_id: Uuid,
+    versions: &[String],
+) -> sqlx::Result<Option<i64>> {
+    if versions.is_empty() {
+        return Ok(None);
+    }
+    let sql = format!(
+        r#"
+        SELECT SUM({count})::BIGINT
+        FROM packages p
+        JOIN repositories r ON r.id = p.repository_id
+        JOIN package_versions pv ON pv.package_id = p.id
+        WHERE p.id = $1
+          AND pv.version = ANY($2)
+          AND {live}
+        "#,
+        count = version_download_count_sql(),
+        live = live_package_version_predicate(),
+    );
+    sqlx::query_scalar(sqlx::AssertSqlSafe(&*sql))
+        .bind(package_id)
+        .bind(versions)
+        .fetch_one(db)
+        .await
+}
+
 /// Rows removed by [`prune_catalog_for_purged_artifact`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogPrune {
     pub versions_removed: u64,
     pub packages_removed: u64,
+}
+
+/// The newest of `versions` by the catalog's own ordering
+/// ([`version_compare`], the rule the publish upsert uses to move
+/// `packages.version` forward), with its size. `None` for an empty slice.
+pub fn newest_catalog_version(versions: &[(String, i64)]) -> Option<&(String, i64)> {
+    versions.iter().reduce(|best, v| {
+        if version_compare(&v.0, &best.0) > 0 {
+            v
+        } else {
+            best
+        }
+    })
+}
+
+/// What [`refresh_package_latest`] found and did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LatestRefresh {
+    /// The repository's format (`repository_format` as text), `None` when the
+    /// repository is gone. Returned so the delete hook can gate its npm-only
+    /// step without a round trip of its own.
+    pub format: Option<String>,
+    /// Whether `packages.version` was moved.
+    pub moved: bool,
+}
+
+/// Point the `(repository_id, name)` catalog row at its newest version that
+/// still has a live artifact (#5632).
+///
+/// `packages.version` is the "Latest" the catalog and the UI install snippet
+/// show, and the publish upsert only ever moves it forward. Both directions
+/// of a soft delete call this: a delete (the version may be gone, so Latest
+/// moves down to what is left) and a trash restore (the version is back, so
+/// Latest moves up to it again). The ordering is [`version_compare`], the
+/// publish upsert's own rule; liveness is the read paths' predicate. A row
+/// with no live version is left alone (the read paths hide it, and a restore
+/// re-points it), as are Remote repositories (#3660). The write is
+/// conditional on the version read, so a concurrent publish wins.
+///
+/// The row is found by `(repository_id, name)` (the `packages` unique key) and
+/// its versions by `package_id`, both indexed. `name` is the CATALOG name:
+/// callers holding an artifact row map it with [`catalog_package_name`] (or
+/// call [`refresh_package_latest_for_artifact`]), since Maven's catalog name is
+/// `groupId:artifactId`, not the artifact name (#5676).
+pub async fn refresh_package_latest(
+    db: &PgPool,
+    repository_id: Uuid,
+    name: &str,
+) -> sqlx::Result<LatestRefresh> {
+    let row: Option<(String, String, Option<Uuid>, Option<String>)> = sqlx::query_as(
+        "SELECT r.format::text, r.repo_type::text, p.id, p.version \
+         FROM repositories r \
+         LEFT JOIN packages p ON p.repository_id = r.id AND p.name = $2 \
+         WHERE r.id = $1",
+    )
+    .bind(repository_id)
+    .bind(name)
+    .fetch_optional(db)
+    .await?;
+    let Some((format, repo_type, package_id, current)) = row else {
+        return Ok(LatestRefresh::default());
+    };
+    let mut out = LatestRefresh {
+        format: Some(format),
+        moved: false,
+    };
+    let (Some(package_id), Some(current)) = (package_id, current) else {
+        return Ok(out);
+    };
+    if repo_type == "remote" {
+        return Ok(out);
+    }
+
+    let live_version = live_package_version_predicate();
+    let live: Vec<(String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
+        r#"
+        SELECT pv.version, pv.size_bytes
+        FROM package_versions pv
+        JOIN packages p ON p.id = pv.package_id
+        JOIN repositories r ON r.id = p.repository_id
+        WHERE pv.package_id = $1
+          AND {live_version}
+        "#
+    )))
+    .bind(package_id)
+    .fetch_all(db)
+    .await?;
+    let Some((newest, size)) = newest_catalog_version(&live) else {
+        return Ok(out);
+    };
+    if *newest == current {
+        return Ok(out);
+    }
+    out.moved = sqlx::query(
+        "UPDATE packages SET version = $3, size_bytes = $4, updated_at = NOW() \
+         WHERE id = $1 AND version = $2",
+    )
+    .bind(package_id)
+    .bind(&current)
+    .bind(newest)
+    .bind(size)
+    .execute(db)
+    .await?
+    .rows_affected()
+        > 0;
+    Ok(out)
+}
+
+/// The catalog package name the artifact row `(path, name)` of a `format`
+/// repository registers under (#5676).
+///
+/// The artifact name for every format but the ones whose publish path
+/// catalogues parsed coordinates the row does not carry: Maven/Gradle
+/// (`groupId:artifactId`, #2723) and SBT (`org/module`). Same derivation as
+/// the catalog backfill ([`backfill_catalog_coordinates`]); a path that does
+/// not parse (a Maven sidecar) falls back to the artifact name, which finds
+/// no catalog row.
+pub fn catalog_package_name(format: &str, path: &str, name: &str) -> String {
+    match format {
+        "maven" | "gradle" | "sbt" => backfill_catalog_coordinates(format, path, name, Some("_"))
+            .map(|(catalog, _)| catalog)
+            .unwrap_or_else(|| name.to_string()),
+        _ => name.to_string(),
+    }
+}
+
+/// The format (`repository_format` as text) of repository `repository_id`,
+/// `None` when it is gone.
+pub async fn repository_format(db: &PgPool, repository_id: Uuid) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar("SELECT format::text FROM repositories WHERE id = $1")
+        .bind(repository_id)
+        .fetch_optional(db)
+        .await
+}
+
+/// [`refresh_package_latest`] for the catalog row the artifact `(path, name)`
+/// registers under (#5676): what a trash restore calls, so a restored Maven
+/// version moves its `groupId:artifactId` row's Latest back up.
+pub async fn refresh_package_latest_for_artifact(
+    db: &PgPool,
+    repository_id: Uuid,
+    name: &str,
+    path: &str,
+) -> sqlx::Result<LatestRefresh> {
+    let Some(format) = repository_format(db, repository_id).await? else {
+        return Ok(LatestRefresh::default());
+    };
+    let catalog = catalog_package_name(&format, path, name);
+    refresh_package_latest(db, repository_id, &catalog).await
 }
 
 /// Drop the catalog rows left behind by a HARD-deleted artifact (#3660).
@@ -203,6 +486,27 @@ pub async fn prune_catalog_for_purged_artifact(
 // Hosted publish registration (#3659)
 // ---------------------------------------------------------------------------
 
+/// The `artifacts` row a hosted publish has just written, as its handler
+/// already holds it: the id its INSERT returned and the `uploaded_by` it bound.
+///
+/// This is everything the `artifact.uploaded` event needs, so the registration
+/// below never reads the row back (#5573).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishedArtifact {
+    pub id: Uuid,
+    pub uploaded_by: Option<Uuid>,
+}
+
+impl PublishedArtifact {
+    /// The row `id` written with `uploaded_by = uploaded_by`.
+    pub fn new(id: Uuid, uploaded_by: Uuid) -> Self {
+        Self {
+            id,
+            uploaded_by: Some(uploaded_by),
+        }
+    }
+}
+
 /// Fire-and-forget catalog registration for a hosted publish (#3659), plus the
 /// `artifact.uploaded` domain event that publish owes its subscribers (#3411).
 ///
@@ -210,11 +514,12 @@ pub async fn prune_catalog_for_purged_artifact(
 /// `artifacts` INSERT: keyed on the format's own coordinates (never the
 /// filename), tagged with the format in `metadata`, and unable to fail the
 /// publish — [`PackageService::try_create_or_update_from_artifact`] swallows
-/// and logs.
+/// and logs. `published` is the row that INSERT wrote.
 #[allow(clippy::too_many_arguments)]
 pub async fn register_published_package(
     db: &PgPool,
     event_bus: &Arc<EventBus>,
+    published: PublishedArtifact,
     repository_id: Uuid,
     format: &str,
     name: &str,
@@ -226,6 +531,7 @@ pub async fn register_published_package(
     register_published_package_with_metadata(
         db,
         event_bus,
+        published,
         repository_id,
         name,
         version,
@@ -249,10 +555,31 @@ pub async fn register_published_package(
 /// `ArtifactService::finalize_upload` already emits — keep calling
 /// [`PackageService::try_create_or_update_from_artifact`] directly and stay
 /// silent. See #3411.
+///
+/// Before this existed the event had exactly one producer,
+/// `ArtifactService::finalize_upload`, which only the generic upload API goes
+/// through: a `cargo publish`, `npm publish` or `docker push` fired no webhook
+/// and no email subscription at all. Hanging the emit off the shared catalog
+/// registration gives every hosted format handler the producer it lacked,
+/// without ~20 per-handler emit sites to keep in step.
+///
+/// The event carries `published` exactly as `finalize_upload`'s does: the
+/// artifact id as the entity and its uploader as the actor. It used to resolve
+/// the row by `(repository_id, checksum_sha256)` instead, a query no index
+/// serves that became the largest database cost of a busy hosted Maven
+/// repository's publishing, and that named the wrong row when another live
+/// file in the repository had the same content (#5573).
+///
+/// Only `artifact.uploaded`, never `artifact.created`: both names collapse
+/// onto the single `artifact_uploaded` subscription in
+/// `webhook_producer::map_event_type` and `email_dispatcher`, so emitting both
+/// would double-deliver. `.created` stays an accepted alias on the consuming
+/// side only.
 #[allow(clippy::too_many_arguments)]
 pub async fn register_published_package_with_metadata(
     db: &PgPool,
     event_bus: &Arc<EventBus>,
+    published: PublishedArtifact,
     repository_id: Uuid,
     name: &str,
     version: &str,
@@ -273,74 +600,12 @@ pub async fn register_published_package_with_metadata(
         )
         .await;
 
-    emit_artifact_uploaded(db, event_bus, repository_id, name, version, checksum_sha256).await;
-}
-
-/// Publish `artifact.uploaded` for one freshly published asset (#3411).
-///
-/// Before this existed the event had exactly one producer,
-/// `ArtifactService::finalize_upload`, which only the generic upload API goes
-/// through: a `cargo publish`, `npm publish` or `docker push` fired no webhook
-/// and no email subscription at all. Hanging the emit off the shared catalog
-/// registration gives every hosted format handler the producer it lacked,
-/// without ~20 per-handler emit sites to keep in step.
-///
-/// Fire-and-forget in the same sense the rest of the publish tail is:
-/// `EventBus::publish` is a non-blocking broadcast send that drops the event
-/// when nobody is subscribed, and the artifact lookup below degrades to the
-/// package coordinate rather than failing. Nothing here can fail the publish.
-///
-/// The lookup is the one round trip this costs: `DomainEvent` carries an
-/// `entity_id` and an actor, and the shared registration is handed neither, so
-/// the artifacts row the handler INSERTed immediately before is resolved by its
-/// `(repository_id, checksum_sha256)` — the same pair the catalog liveness join
-/// uses — to reproduce exactly what `finalize_upload`'s event carries.
-async fn emit_artifact_uploaded(
-    db: &PgPool,
-    event_bus: &Arc<EventBus>,
-    repository_id: Uuid,
-    name: &str,
-    version: &str,
-    checksum_sha256: &str,
-) {
-    let row: Option<(Uuid, Option<Uuid>)> = sqlx::query_as(
-        r#"
-        SELECT id, uploaded_by
-          FROM artifacts
-         WHERE repository_id = $1
-           AND checksum_sha256 = $2
-           AND is_deleted = false
-         ORDER BY created_at DESC
-         LIMIT 1
-        "#,
-    )
-    .bind(repository_id)
-    .bind(checksum_sha256)
-    .fetch_optional(db)
-    .await
-    .unwrap_or_else(|e| {
-        warn!("Failed to resolve artifact for artifact.uploaded event: {e}");
-        None
-    });
-
-    // A format whose publish writes no `artifacts` row (or writes it after the
-    // catalog) still fires the event — the coordinate identifies the asset well
-    // enough for a subscriber to act on, and a missing event is the bug being
-    // fixed.
-    let (entity_id, actor) = match row {
-        Some((artifact_id, uploaded_by)) => (
-            artifact_id.to_string(),
-            uploaded_by.map(|id| id.to_string()),
-        ),
-        None => (format!("{name}@{version}"), None),
-    };
-
-    // Only `artifact.uploaded`, never `artifact.created`: both names collapse
-    // onto the single `artifact_uploaded` subscription in
-    // `webhook_producer::map_event_type` and `email_dispatcher`, so emitting
-    // both would double-deliver. `.created` stays an accepted alias on the
-    // consuming side only.
-    event_bus.emit_for_repo("artifact.uploaded", entity_id, repository_id, actor);
+    event_bus.emit_for_repo(
+        "artifact.uploaded",
+        published.id,
+        repository_id,
+        published.uploaded_by.map(|id| id.to_string()),
+    );
 }
 
 /// Service for managing package and package_version records.
@@ -1046,6 +1311,34 @@ mod tests {
                  hosted publish entry point, which emits artifact.uploaded (#3411)"
             );
         }
+    }
+
+    /// #5573: the hosted publish registration emits `artifact.uploaded` from
+    /// the row its caller passes and never reads `artifacts` back. The read
+    /// it used to do, `(repository_id, checksum_sha256)` ordered by
+    /// `created_at`, has no fitting index and was the largest database cost
+    /// of a busy Maven repository's publishing.
+    #[test]
+    fn hosted_publish_registration_does_not_query_artifacts() {
+        let src = include_str!("package_service.rs");
+        let start = src
+            .find("pub async fn register_published_package(")
+            .expect("registration entry point exists");
+        let end = src
+            .find("/// Service for managing package and package_version records.")
+            .expect("PackageService follows the registration");
+        let registration = &src[start..end];
+        for needle in ["FROM artifacts", "sqlx::query"] {
+            assert!(
+                !registration.contains(needle),
+                "the publish registration must not query the database for the event \
+                 (found `{needle}`); the caller passes the row it wrote (#5573)"
+            );
+        }
+        assert!(
+            registration.contains("\"artifact.uploaded\"") && registration.contains("published.id"),
+            "the registration emits artifact.uploaded for the row it was handed"
+        );
     }
 
     // -----------------------------------------------------------------------

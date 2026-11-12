@@ -5,7 +5,12 @@ preconditions `If-Match` and `If-None-Match` (RFC 9110 section 13), so a tool
 that keeps an index document (`index.yaml`, a lock file, a manifest) in a
 generic repository can update it without losing a concurrent writer's change
 (#4186). The multipart upload routes (`POST .../artifacts/{path}` and
-`POST .../artifacts`) evaluate the same headers.
+`POST .../artifacts`) evaluate the same headers, and so does the completion
+of a chunked upload (`PUT /api/v1/uploads/{session_id}/complete`, #4989):
+send the headers on the completing request, which is the write. A chunked
+completion refused with 412 (or 400 for a malformed header) writes nothing
+and leaves the session open, so it can be completed again with the right tag
+without re-uploading its chunks.
 
 ## The ETag
 
@@ -18,6 +23,11 @@ ETag: "3bfc269594ef649228e9a74bab00f042efc91d5acc6fbee31a382e80d42388fe"
 It is returned on the upload's `201` and on `GET` / `HEAD` of
 `/api/v1/repositories/{key}/download/{path}` (next to `X-Checksum-Sha256`,
 which carries the same value unquoted). It is a strong tag.
+
+A download through a virtual repository carries the validator of the member
+that served it: a hosted member's quoted SHA-256 as above, or a remote
+member's upstream `ETag`. A ranged `GET` with `If-Range` naming that value
+answers `206`; any other value answers `200` with the whole object (#5615).
 
 ## Preconditions
 

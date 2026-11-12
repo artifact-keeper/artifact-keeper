@@ -274,11 +274,25 @@ pub async fn missing_artifacts(
 
     let items = validate_items(&req.items)?;
     let checked = items.len();
-    let live = if items.is_empty() {
+    let mut live = if items.is_empty() {
         HashMap::new()
     } else {
         live_checksums(&state.db, repo.id, &distinct_paths(&items)).await?
     };
+    // MCP registries (#5253): a path the caller is not served (a held server
+    // version, or a bundle of one) is absent, as on every other read route.
+    if repo.format == crate::models::repository::RepositoryFormat::Mcp && !live.is_empty() {
+        let mut gate = super::mcp::GenericArtifactGate::new(&state, auth.as_ref());
+        if !gate.holds_all(&[repo.id]).await {
+            let mut served = HashMap::with_capacity(live.len());
+            for (path, sums) in live {
+                if gate.visible(repo.id, &path).await {
+                    served.insert(path, sums);
+                }
+            }
+            live = served;
+        }
+    }
     Ok(Json(MissingArtifactsResponse {
         checked,
         missing: classify_missing(items, &live),
@@ -336,6 +350,14 @@ pub(crate) async fn already_present_for_session(
         declared.total_size,
         declared.version,
     ) {
+        return None;
+    }
+    // #5253: never report a held MCP server version as present.
+    if repo.format == crate::models::repository::RepositoryFormat::Mcp
+        && !super::mcp::GenericArtifactGate::new(state, Some(auth))
+            .visible(repo.id, declared.path)
+            .await
+    {
         return None;
     }
     // The row alone is not enough: the object must still be in storage, or a
@@ -801,7 +823,20 @@ mod tests {
         drop_session(&fx, &body).await;
         tdh::cleanup_user(&fx.pool, writer_id).await;
 
-        // Replication never takes the short-circuit, even when asked to.
+        // Replication (a peer: an administrator's token with the header,
+        // #5455) never takes the short-circuit, even when asked to.
+        let (status, body) = init_session_with(
+            &fx,
+            tdh::admin_auth(fx.user_id, &fx.username),
+            request("ferry/blob.bin", &sha, content.len(), Some(true)),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "replication: {body}");
+        drop_session(&fx, &body).await;
+
+        // #5455: a forged header (an ordinary writer, not the peer) is not a
+        // replication: it takes the short-circuit like a plain request.
         let (status, body) = init_session_with(
             &fx,
             auth.clone(),
@@ -809,8 +844,8 @@ mod tests {
             true,
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED, "replication: {body}");
-        drop_session(&fx, &body).await;
+        assert_eq!(status, StatusCode::OK, "forged header: {body}");
+        assert_eq!(body["already_present"], true, "forged header: {body}");
 
         // A soft-deleted row is not "present": the upload must go through.
         set_deleted(&fx, "ferry/blob.bin", true).await;

@@ -584,6 +584,13 @@ mod tests {
             "test-only fixtures that seed rows; not a publish path",
         ),
         (
+            "shard_store_tests.rs",
+            "test-only module (handlers/conda): seeds catalog rows the upload \
+             route does not write (rows with no subdir, metadata names that \
+             differ from the row name, concurrent withdrawals) to pin the \
+             stored-shard rebuild (#4978); not a publish path",
+        ),
+        (
             "repodata_render_tests.rs",
             "test-only module (handlers/conda): seeds catalog rows of shapes the \
              upload route cannot produce, to pin the conda cursor render; not a \

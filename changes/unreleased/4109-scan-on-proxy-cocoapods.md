@@ -1,5 +1,0 @@
----
-section: Added
-issues: [#4109, #4097]
----
-- **Scan-on-proxy now gates pod archives from CocoaPods Remote and Virtual repositories** (#4109, part of #4097). With `scan_on_proxy` on, a proxied `pods/{name}-{version}.tar.gz` goes through the shared inline scan-and-block gate instead of streaming unscanned: a vulnerable archive is refused with 403 `scan_blocked`, a clean one is served with `X-AK-Scan: clean`, the verdict is reused for the same digest, and `fail_open`, `fail_closed` and `record_only` behave as they do for the other enforced formats. The pod's own `.podspec.json` must declare the requested name and version; an archive that does not is withheld under `fail_closed` (423) without being scanned. On Remote and Virtual CocoaPods repositories, a pod archive file name containing `?`, `#`, `;`, `\`, a stray `%`, a space or a control character after decoding is now refused with `400`. The bundled scanner has no CocoaPods advisory data, so a pod is graded on its contents and is only found vulnerable for a vendored component of an ecosystem the scanner does grade. `GET /api/v1/formats` now reports CocoaPods as `scan_on_proxy: "enforced"`.

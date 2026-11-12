@@ -1,5 +1,0 @@
----
-section: Changed
-issues: [#5283]
----
-- **Hugging Face files fetched by commit sha are cached as immutable instead of being revalidated against the Hub every five minutes** (#5283). The proxy cache classifier had no Hugging Face rules, and the Remote download path handed it a generic format anyway, so every proxied Hugging Face path got the conservative 300-second mutable TTL. A multi-gigabyte `model.safetensors` that `snapshot_download` fetched as `<model>/resolve/<sha>/...` was revalidated every five minutes after first use, although content addressed by a commit can never change. Now `<model>/resolve/<40-hex sha>/...`, and model info and tree listings at a commit sha, are immutable; branch, tag and `refs/pr/N` paths and model info without a revision stay mutable with the usual TTL. Model ids of one or two segments are both recognised, and a path that parses both ways is immutable only if every parse says so. Hosted Hugging Face coordinates are unaffected: a re-publish of the same file still answers 409.

@@ -26,9 +26,9 @@ type Config struct {
 	// is used verbatim instead of contacting the trivy DB registry.
 	SkipDBUpdate bool
 	// Offline (SCANNER_OFFLINE) is the single air-gap switch (#5287). It
-	// implies SkipDBUpdate, adds trivy's --offline-scan (no registry or API
-	// lookups during analysis) and --skip-java-db-update to every scan, and
-	// suppresses the startup DB download. The vulnerability DB then comes only
+	// implies SkipDBUpdate, adds --skip-java-db-update to every scan, and
+	// suppresses the startup DB download. (--offline-scan, no API lookups
+	// during analysis, is on for every scan since #5666; see noLookupArgs.) The vulnerability DB then comes only
 	// from what is already in CacheDir or from PUT /api/v1/vulndb. Default
 	// false: connected installs behave exactly as before.
 	Offline bool
@@ -78,6 +78,14 @@ type Config struct {
 	// POST /api/v1/filesystem/scan. The body is an UNCOMPRESSED tar, so this
 	// also bounds the extracted tree (no decompression amplification).
 	FsMaxUploadBytes int64
+	// MaxConcurrentScans (SCANNER_MAX_CONCURRENT_SCANS) bounds how many trivy
+	// scans (image and filesystem together) run at once in this adapter
+	// (#5657). Further jobs wait, reported as Queued on the report route,
+	// instead of all starting at once: every trivy run holds its own copy of
+	// the vulnerability DB and the analysed layers in memory, and only one
+	// image scan at a time can use the on-disk analysis cache. Default 4; 0
+	// removes the bound.
+	MaxConcurrentScans int
 	// JobTTL is how long a finished job (report or error) is retained before the
 	// sweeper evicts it.
 	JobTTL time.Duration
@@ -141,6 +149,7 @@ func LoadConfig() *Config {
 		FsScanTimeout:       getenvDuration("SCANNER_FS_SCAN_TIMEOUT", 10*time.Minute),
 		FsMaxUploadBytes:    getenvInt64("SCANNER_FS_MAX_UPLOAD_BYTES", 64*1024*1024*1024),
 		JobTTL:              getenvDuration("SCANNER_JOB_TTL", 30*time.Minute),
+		MaxConcurrentScans:  getenvIntNonNeg("SCANNER_MAX_CONCURRENT_SCANS", 4),
 		LogLevel:            getenv("SCANNER_LOG_LEVEL", "info"),
 		ScannerVersion:      os.Getenv("SCANNER_SCANNER_VERSION"),
 		TrivyServer:         strings.TrimRight(strings.TrimSpace(os.Getenv("SCANNER_TRIVY_SERVER")), "/"),

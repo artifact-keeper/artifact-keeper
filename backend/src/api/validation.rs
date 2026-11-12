@@ -14,7 +14,12 @@
 //!    [`is_blocked_url`] on every redirect hop. This closes the
 //!    redirect-follow bypass — without it, an upstream returning
 //!    `302 Location: http://[::ffff:127.0.0.1]/` would defeat layer 1.
-//! 3. Egress NetworkPolicy at the cluster layer is a defense-in-depth
+//! 3. Under an environment proxy (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+//!    either case) the guarded clients resolve and check every destination
+//!    they would hand to the proxy, refusing one that does not resolve,
+//!    since the connect-time resolver never sees a proxied destination
+//!    (#5459; `services::env_proxy_guard`).
+//! 4. Egress NetworkPolicy at the cluster layer is a defense-in-depth
 //!    follow-up tracked separately.
 //!
 //! # Residual gaps
@@ -23,6 +28,11 @@
 //! time and a private IP at fetch time is not caught by string-based
 //! validation. Mitigation requires a custom DNS resolver or pinning the
 //! resolved IP via `reqwest`'s `resolve_to_addrs`. Tracked as a follow-up.
+//!
+//! Proxied destinations: a proxy resolves the destination name itself, so
+//! the check in layer 3 cannot bind the proxy to the address it saw. An
+//! answer that changes between that check and the proxy's own lookup is
+//! for the proxy's destination policy to refuse.
 
 use crate::error::{AppError, Result};
 
@@ -76,6 +86,10 @@ const BLOCKED_HOSTS: &[&str] = &[
 pub(crate) enum BlockReason {
     Hostname(String),
     Ip(std::net::IpAddr),
+    /// A host name that did not resolve, where an unresolvable destination
+    /// is refused rather than left to connect time (a proxied destination,
+    /// #5459).
+    Unresolved(String),
 }
 
 impl BlockReason {
@@ -84,6 +98,7 @@ impl BlockReason {
         match self {
             BlockReason::Hostname(_) => "hostname",
             BlockReason::Ip(_) => "ip",
+            BlockReason::Unresolved(_) => "unresolved",
         }
     }
 }
@@ -375,6 +390,9 @@ fn block_reason_to_error(label: &str, reason: BlockReason, ctx: OutboundUrlConte
             AppError::Validation(format!("{} host '{}' is not allowed", label, host))
         }
         BlockReason::Ip(ip) => AppError::Validation(blocked_ip_message(label, ip, ctx)),
+        BlockReason::Unresolved(host) => {
+            AppError::Validation(format!("{} host '{}' could not be resolved", label, host))
+        }
     }
 }
 
@@ -458,20 +476,28 @@ fn is_blocked_url_in(url: &reqwest::Url, ctx: OutboundUrlContext) -> Option<Bloc
     is_blocked_host_str(host, ctx)
 }
 
-/// Decide whether a host string (a DNS name or an IP literal, possibly
-/// bracketed for IPv6 like `[::1]`) targets a blocked address for the
-/// given context. Factored out of [`is_blocked_url_in`] so the
-/// `BLOCKED_HOSTS` list, literal-IP rules, and hostname-resolution step
-/// live in one place and are shared by [`validate_outbound_ldap_url`]
-/// (which cannot reuse the http(s)-only [`validate_outbound_url`]).
-fn is_blocked_host_str(host: &str, ctx: OutboundUrlContext) -> Option<BlockReason> {
+/// The part of a host check that needs no DNS: the `BLOCKED_HOSTS` names
+/// and IP literals. Shared by the validation-time check
+/// ([`is_blocked_host_str`]) and the environment-proxy destination check
+/// (`services::env_proxy_guard`, #5459), which resolves asynchronously.
+pub(crate) enum HostVerdict {
+    /// Refused without a lookup.
+    Blocked(BlockReason),
+    /// An allowed IP literal: nothing to resolve.
+    Allowed,
+    /// A DNS name (lowercased, trailing dot removed) whose addresses decide.
+    Resolve(String),
+}
+
+/// See [`HostVerdict`]. `host` may be a bracketed IPv6 literal (`[::1]`).
+pub(crate) fn host_verdict(host: &str, ctx: OutboundUrlContext) -> HostVerdict {
     let host_lower = host.to_lowercase();
     // Strip a trailing dot so `localhost.` is treated like `localhost`.
     let host_normalized = host_lower.trim_end_matches('.');
 
     for blocked in BLOCKED_HOSTS {
         if host_normalized == *blocked || host_normalized.ends_with(&format!(".{}", blocked)) {
-            return Some(BlockReason::Hostname(host.to_string()));
+            return HostVerdict::Blocked(BlockReason::Hostname(host.to_string()));
         }
     }
 
@@ -482,13 +508,49 @@ fn is_blocked_host_str(host: &str, ctx: OutboundUrlContext) -> Option<BlockReaso
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
     if let Ok(ip) = bare_host.parse::<std::net::IpAddr>() {
-        if is_blocked_ip_in(ip, ctx) {
-            return Some(BlockReason::Ip(ip));
-        }
         // An IP literal carries no DNS resolution step, so once the IP
         // itself is cleared there is nothing more to check.
-        return None;
+        return match first_blocked_ip([ip], ctx) {
+            Some(reason) => HostVerdict::Blocked(reason),
+            None => HostVerdict::Allowed,
+        };
     }
+    HostVerdict::Resolve(host_normalized.to_string())
+}
+
+/// The first of `ips` the policy for `ctx` refuses, as a [`BlockReason`].
+pub(crate) fn first_blocked_ip(
+    ips: impl IntoIterator<Item = std::net::IpAddr>,
+    ctx: OutboundUrlContext,
+) -> Option<BlockReason> {
+    ips.into_iter()
+        .find(|ip| is_blocked_ip_in(*ip, ctx))
+        .map(BlockReason::Ip)
+}
+
+/// Decide whether a host string (a DNS name or an IP literal, possibly
+/// bracketed for IPv6 like `[::1]`) targets a blocked address for the
+/// given context. Factored out of [`is_blocked_url_in`] so the
+/// `BLOCKED_HOSTS` list, literal-IP rules, and hostname-resolution step
+/// live in one place and are shared by [`validate_outbound_ldap_url`]
+/// (which cannot reuse the http(s)-only [`validate_outbound_url`]).
+fn is_blocked_host_str(host: &str, ctx: OutboundUrlContext) -> Option<BlockReason> {
+    is_blocked_host_str_with(host, ctx, false)
+}
+
+/// [`is_blocked_host_str`], refusing a DNS name that does not resolve when
+/// `fail_closed` (a destination that will be handed to a proxy, which
+/// resolves it on its own, #5459).
+fn is_blocked_host_str_with(
+    host: &str,
+    ctx: OutboundUrlContext,
+    fail_closed: bool,
+) -> Option<BlockReason> {
+    let name = match host_verdict(host, ctx) {
+        HostVerdict::Blocked(reason) => return Some(reason),
+        HostVerdict::Allowed => return None,
+        HostVerdict::Resolve(name) => name,
+    };
 
     // The host is a DNS name, not an IP literal. The string-based checks
     // above (BLOCKED_HOSTS) only catch known service names, so an
@@ -505,16 +567,29 @@ fn is_blocked_host_str(host: &str, ctx: OutboundUrlContext) -> Option<BlockReaso
     // the resolved address into the request (reqwest `resolve_to_addrs`)
     // is the follow-up that closes the TOCTOU window.
     use std::net::ToSocketAddrs;
-    if let Ok(addrs) = (host_normalized, 0u16).to_socket_addrs() {
-        for addr in addrs {
-            let ip = addr.ip();
-            if is_blocked_ip_in(ip, ctx) {
-                return Some(BlockReason::Ip(ip));
+    match (name.as_str(), 0u16).to_socket_addrs() {
+        Ok(addrs) => {
+            let ips: Vec<std::net::IpAddr> = addrs.map(|a| a.ip()).collect();
+            if fail_closed && ips.is_empty() {
+                return Some(BlockReason::Unresolved(host.to_string()));
             }
+            first_blocked_ip(ips, ctx)
         }
+        Err(_) if fail_closed => Some(BlockReason::Unresolved(host.to_string())),
+        // A direct request resolves again at connect time, through the
+        // SSRF resolver, so an unresolvable name fails there.
+        Err(_) => None,
     }
+}
 
-    None
+/// [`is_blocked_url`] in any trust class, refusing a host name that does
+/// not resolve: for a destination that is about to be handed to a proxy
+/// (#5459).
+pub(crate) fn is_blocked_url_fail_closed(
+    url: &reqwest::Url,
+    ctx: OutboundUrlContext,
+) -> Option<BlockReason> {
+    is_blocked_host_str_with(url.host_str()?, ctx, true)
 }
 
 /// Return true when an IP must not be contacted from server-side requests.
@@ -903,7 +978,7 @@ fn ssrf_surface(ctx: OutboundUrlContext, label: &str) -> &'static str {
 
 fn record_block(label: &str, reason: &BlockReason, surface: &'static str) {
     let detail = match reason {
-        BlockReason::Hostname(host) => host.clone(),
+        BlockReason::Hostname(host) | BlockReason::Unresolved(host) => host.clone(),
         BlockReason::Ip(ip) => ip.to_string(),
     };
     tracing::warn!(
@@ -921,18 +996,168 @@ fn record_block(label: &str, reason: &BlockReason, surface: &'static str) {
 /// (`AK_SSRF_ALLOW_PRIVATE_CIDRS`, the per-context toggles) serialize on this
 /// lock, wherever they live: `cargo test` runs tests in parallel threads, so
 /// without it an env-mutating test can flip state under another test.
+///
+/// Take it through [`lock_outbound_policy_env`] (async) or
+/// [`lock_outbound_policy_env_blocking`] (sync tests), never with a bare
+/// `.lock()`: the mutex is not re-entrant, and a test that takes it twice in
+/// one task (two `tdh::non_loopback_mock_server()` / `mock_upstream` calls
+/// while the first guard is alive) used to wait on itself forever. That hung
+/// a CI run for 23 hours (#5537). The helpers turn that into an immediate,
+/// named panic, and bound every other wait.
 #[cfg(test)]
-pub(crate) static OUTBOUND_POLICY_ENV_LOCK: tokio::sync::Mutex<()> =
-    tokio::sync::Mutex::const_new(());
+static OUTBOUND_POLICY_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Who holds [`OUTBOUND_POLICY_ENV_LOCK`], and from which call site.
+///
+/// The owner is the tokio task when there is one, else the thread: a
+/// `#[tokio::test]` body runs in `block_on`, which is not a task, and a sync
+/// test has no runtime at all. Keying spawned tasks by task id (not thread)
+/// keeps two tasks that share a worker thread from reading as a re-entry.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OutboundPolicyEnvOwner {
+    Task(tokio::task::Id),
+    Thread(std::thread::ThreadId),
+}
+
+#[cfg(test)]
+impl OutboundPolicyEnvOwner {
+    fn current() -> Self {
+        match tokio::task::try_id() {
+            Some(id) => Self::Task(id),
+            None => Self::Thread(std::thread::current().id()),
+        }
+    }
+}
+
+#[cfg(test)]
+static OUTBOUND_POLICY_ENV_HOLDER: std::sync::Mutex<
+    Option<(OutboundPolicyEnvOwner, &'static str)>,
+> = std::sync::Mutex::new(None);
+
+/// How long a caller waits for another test to release the lock before
+/// failing. A legitimate holder keeps it for one test (seconds); this is a
+/// backstop for a cross-task deadlock the re-entry check cannot see, and is
+/// shorter than nextest's per-test `terminate-after` so the panic, which
+/// names the holder, is what the log shows.
+#[cfg(test)]
+pub(crate) const OUTBOUND_POLICY_ENV_LOCK_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(240);
+
+/// A held [`OUTBOUND_POLICY_ENV_LOCK`]. Dropping it (including during a
+/// panic unwind) releases the lock. `tokio::sync::Mutex` has no poisoning, so
+/// a test that panics while holding it does not wedge the tests after it.
+#[cfg(test)]
+pub(crate) struct OutboundPolicyEnvLock {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for OutboundPolicyEnvLock {
+    fn drop(&mut self) {
+        // Runs before `_guard` is dropped, so the holder is cleared while the
+        // lock is still held and a waiter never sees a stale holder.
+        *holder_slot() = None;
+    }
+}
+
+#[cfg(test)]
+fn holder_slot() -> std::sync::MutexGuard<'static, Option<(OutboundPolicyEnvOwner, &'static str)>> {
+    // A panic while the slot is held cannot leave it inconsistent (it is a
+    // plain `Option` write), so recover from poisoning rather than cascade.
+    OUTBOUND_POLICY_ENV_HOLDER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Panic now if the caller already holds the lock: waiting would never end.
+#[cfg(test)]
+fn refuse_reentry(site: &'static str, me: OutboundPolicyEnvOwner) {
+    // Copy out first: panicking with the slot locked would poison it.
+    let held = *holder_slot();
+    if let Some((owner, held_by)) = held {
+        if owner == me {
+            panic!(
+                "OUTBOUND_POLICY_ENV_LOCK re-entered by `{site}`: this test already holds it \
+                 (taken by `{held_by}`) and the lock is not re-entrant, so waiting would hang \
+                 forever (#5537). Keep one guard per test: reuse the first mock server, or drop \
+                 its guard before taking another."
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+fn record_holder(
+    site: &'static str,
+    me: OutboundPolicyEnvOwner,
+    guard: tokio::sync::MutexGuard<'static, ()>,
+) -> OutboundPolicyEnvLock {
+    *holder_slot() = Some((me, site));
+    OutboundPolicyEnvLock { _guard: guard }
+}
+
+#[cfg(test)]
+fn wait_expired(site: &'static str, waited: std::time::Duration) -> ! {
+    let held_by = holder_slot().map_or("<unknown>", |(_, s)| s);
+    panic!(
+        "`{site}` waited {waited:?} for OUTBOUND_POLICY_ENV_LOCK and `{held_by}` did not free it: \
+         a guard is being kept alive past its test, or two tasks of one test wait on each \
+         other (#5537)."
+    );
+}
+
+/// Take [`OUTBOUND_POLICY_ENV_LOCK`] from async code. `site` names the caller
+/// in the panic a re-entry or an expired wait produces.
+#[cfg(test)]
+pub(crate) async fn lock_outbound_policy_env(site: &'static str) -> OutboundPolicyEnvLock {
+    lock_outbound_policy_env_within(site, OUTBOUND_POLICY_ENV_LOCK_WAIT).await
+}
+
+/// [`lock_outbound_policy_env`] with an explicit wait bound (tests of the
+/// bound itself use a short one).
+#[cfg(test)]
+pub(crate) async fn lock_outbound_policy_env_within(
+    site: &'static str,
+    wait: std::time::Duration,
+) -> OutboundPolicyEnvLock {
+    let me = OutboundPolicyEnvOwner::current();
+    refuse_reentry(site, me);
+    match tokio::time::timeout(wait, OUTBOUND_POLICY_ENV_LOCK.lock()).await {
+        Ok(guard) => record_holder(site, me, guard),
+        Err(_) => wait_expired(site, wait),
+    }
+}
+
+/// Take [`OUTBOUND_POLICY_ENV_LOCK`] from a synchronous test (no runtime).
+#[cfg(test)]
+pub(crate) fn lock_outbound_policy_env_blocking(site: &'static str) -> OutboundPolicyEnvLock {
+    lock_outbound_policy_env_blocking_within(site, OUTBOUND_POLICY_ENV_LOCK_WAIT)
+}
+
+#[cfg(test)]
+pub(crate) fn lock_outbound_policy_env_blocking_within(
+    site: &'static str,
+    wait: std::time::Duration,
+) -> OutboundPolicyEnvLock {
+    let me = OutboundPolicyEnvOwner::current();
+    refuse_reentry(site, me);
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if let Ok(guard) = OUTBOUND_POLICY_ENV_LOCK.try_lock() {
+            return record_holder(site, me, guard);
+        }
+        if std::time::Instant::now() >= deadline {
+            wait_expired(site, wait);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
 
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// See [`OUTBOUND_POLICY_ENV_LOCK`]. These tests are synchronous, so they
-    /// take it with `blocking_lock`.
-    static ENV_LOCK: &tokio::sync::Mutex<()> = &OUTBOUND_POLICY_ENV_LOCK;
 
     /// Helper: assert that `validate_outbound_url(url, ...)` rejects with
     /// an error whose message contains both `label_part` (proving the
@@ -1445,13 +1670,14 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Issue #976: opt-in private-IP allowlist for upstream URLs.
-    // Tests serialize on ENV_LOCK because they mutate env vars.
+    // Tests serialize on OUTBOUND_POLICY_ENV_LOCK because they mutate env
+    // vars. They are synchronous, so they take it with the blocking helper.
     // -----------------------------------------------------------------------
 
     /// Take the env lock and snapshot any allowlist-related vars so the
     /// test restores them on drop. Pattern matches `test_cgnat_block_when_opted_in`.
     struct AllowlistGuard {
-        _lock: tokio::sync::MutexGuard<'static, ()>,
+        _lock: OutboundPolicyEnvLock,
         prev_allow: Option<String>,
         prev_webhook: Option<String>,
         prev_sso: Option<String>,
@@ -1461,7 +1687,7 @@ mod tests {
 
     impl AllowlistGuard {
         fn new() -> Self {
-            let lock = ENV_LOCK.blocking_lock();
+            let lock = lock_outbound_policy_env_blocking("validation::tests::AllowlistGuard");
             let g = Self {
                 _lock: lock,
                 prev_allow: std::env::var("UPSTREAM_ALLOW_PRIVATE_IPS").ok(),
@@ -2515,5 +2741,127 @@ mod tests {
         assert_eq!(get("peer"), 1);
         assert_eq!(get("ldap"), 1);
         assert_eq!(counted.get("ak_ssrf_blocks_total", &[]), 8);
+    }
+
+    // -----------------------------------------------------------------------
+    // #5537: OUTBOUND_POLICY_ENV_LOCK cannot hang a test. A re-entry fails at
+    // once by name, any other wait is bounded, and a panicking holder frees it.
+    // -----------------------------------------------------------------------
+
+    fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default()
+    }
+
+    /// The shape that hung a CI run for 23 hours: two wiremock upstreams in one
+    /// test, the first guard still alive. Before the fix the second call
+    /// waited on its own lock forever (this test then fails on the outer
+    /// timeout); now it panics at once and names both call sites.
+    #[tokio::test]
+    async fn a_second_mock_server_in_one_test_fails_by_name_instead_of_hanging_5537() {
+        use futures::FutureExt;
+        let (_server, _guard) =
+            crate::api::handlers::test_db_helpers::non_loopback_mock_server().await;
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            std::panic::AssertUnwindSafe(
+                crate::api::handlers::test_db_helpers::non_loopback_mock_server(),
+            )
+            .catch_unwind(),
+        )
+        .await
+        .expect("a second non_loopback_mock_server() in one test hung instead of failing (#5537)");
+        let msg = panic_text(
+            second
+                .err()
+                .expect("re-entry must panic, not hand out a second guard"),
+        );
+        assert!(
+            msg.contains("re-entered") && msg.contains("tdh::non_loopback_mock_server"),
+            "panic must name the re-entry and the call site, got: {msg}"
+        );
+    }
+
+    /// The sync path refuses a re-entry the same way.
+    #[test]
+    fn a_blocking_reentry_panics_instead_of_hanging_5537() {
+        let _first = lock_outbound_policy_env_blocking("first-site");
+        let second = std::panic::catch_unwind(|| {
+            let _ = lock_outbound_policy_env_blocking("second-site");
+        });
+        let msg = panic_text(second.expect_err("blocking re-entry must panic"));
+        assert!(
+            msg.contains("re-entered by `second-site`") && msg.contains("taken by `first-site`"),
+            "got: {msg}"
+        );
+    }
+
+    /// A lock held by ANOTHER task (not a re-entry) is waited on, but only for
+    /// the bound; the panic names the holder.
+    #[tokio::test]
+    async fn a_held_lock_is_a_bounded_wait_that_names_the_holder_5537() {
+        let _held = lock_outbound_policy_env("holder-site").await;
+        let started = std::time::Instant::now();
+        let waiter = tokio::spawn(lock_outbound_policy_env_within(
+            "waiter-site",
+            std::time::Duration::from_millis(200),
+        ));
+        let err = waiter
+            .await
+            .err()
+            .expect("the wait must expire, not succeed");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let msg = panic_text(err.into_panic());
+        assert!(
+            msg.contains("`waiter-site` waited") && msg.contains("`holder-site` did not free it"),
+            "got: {msg}"
+        );
+    }
+
+    /// Same bound on the blocking path, from another thread.
+    #[test]
+    fn a_held_lock_is_a_bounded_blocking_wait_5537() {
+        let _held = lock_outbound_policy_env_blocking("holder-site");
+        let started = std::time::Instant::now();
+        let err = std::thread::spawn(|| {
+            let _ = lock_outbound_policy_env_blocking_within(
+                "waiter-site",
+                std::time::Duration::from_millis(200),
+            );
+        })
+        .join()
+        .expect_err("the wait must expire, not succeed");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(panic_text(err).contains("`holder-site` did not free it"));
+    }
+
+    /// `tokio::sync::Mutex` does not poison: a test that panics while holding
+    /// the lock releases it and clears the holder, so the next test neither
+    /// waits nor reads as a re-entry.
+    #[tokio::test]
+    async fn a_holder_that_panics_releases_the_lock_5537() {
+        let crashed = tokio::spawn(async {
+            let _guard = lock_outbound_policy_env("crashing-holder").await;
+            panic!("test body failed while holding the lock");
+        })
+        .await;
+        assert!(crashed.is_err());
+        let again = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            lock_outbound_policy_env_within("next-test", std::time::Duration::from_secs(5)),
+        )
+        .await
+        .expect("lock must be free after its holder panicked");
+        // Read while held, so no other test can have set it since.
+        let holder = holder_slot().map(|(_, site)| site);
+        assert_eq!(
+            holder,
+            Some("next-test"),
+            "the panicked holder must be cleared"
+        );
+        drop(again);
     }
 }

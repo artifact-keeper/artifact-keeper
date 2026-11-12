@@ -36,14 +36,25 @@ const CANCEL_SUPERSEDED_PUSH_TASKS_SQL: &str = r#"
 
 /// Fan out a `delete` sync task to every eligible peer subscribed to the
 /// artifact's repository in push/mirror mode.
+///
+/// Not filtered on `pi.status`: the sync worker already skips offline peers when it claims
+/// tasks, so filtering here dropped the delete instead of deferring it, and the peer kept the
+/// artifact once it came back.
+///
+/// Each task carries the peer address (repository key and path) so it still
+/// reaches the peer after the row is purged (#5624).
 const ENQUEUE_DELETE_SYNC_TASKS_SQL: &str = r#"
-                INSERT INTO sync_tasks (id, peer_instance_id, artifact_id, task_type, status, priority)
-                SELECT gen_random_uuid(), pi.id, $1, 'delete', 'pending', 0
+                INSERT INTO sync_tasks (
+                    id, peer_instance_id, artifact_id, task_type, status, priority,
+                    target_repository_id, target_repository_key, target_path
+                )
+                SELECT gen_random_uuid(), pi.id, $1, 'delete', 'pending', 0,
+                       r.id, r.key, a.path
                 FROM peer_instances pi
                 JOIN peer_repo_subscriptions prs ON prs.peer_instance_id = pi.id
                 JOIN artifacts a ON a.repository_id = prs.repository_id AND a.id = $1
+                JOIN repositories r ON r.id = a.repository_id
                 WHERE pi.is_local = false
-                  AND pi.status IN ('online', 'syncing')
                   AND prs.replication_mode::text IN ('push', 'mirror')
                   AND prs.sync_enabled = true
                 ON CONFLICT (peer_instance_id, artifact_id, task_type) DO UPDATE SET
@@ -54,7 +65,10 @@ const ENQUEUE_DELETE_SYNC_TASKS_SQL: &str = r#"
                     completed_at = NULL,
                     claimed_by = NULL,
                     claim_token = NULL,
-                    claim_expires_at = NULL
+                    claim_expires_at = NULL,
+                    target_repository_id = EXCLUDED.target_repository_id,
+                    target_repository_key = EXCLUDED.target_repository_key,
+                    target_path = EXCLUDED.target_path
                 WHERE sync_tasks.status <> 'in_progress'
                 "#;
 
@@ -149,32 +163,14 @@ impl MultiHasher {
 /// Mlmodel only) APPENDS an immutable revision to `artifact_versions` instead
 /// of conflicting, so both checks are relaxed for the HEAD row. Old revisions
 /// stay immutable and addressable.
-pub(crate) async fn enforce_path_immutability(
-    db: &PgPool,
-    repository_id: Uuid,
-    repo: Option<&Repository>,
-    path: &str,
-    version: Option<&str>,
-    checksum_sha256: &str,
-) -> Result<()> {
-    enforce_path_immutability_with(
-        db,
-        repository_id,
-        repo,
-        path,
-        version,
-        checksum_sha256,
-        false,
-    )
-    .await
-}
-
-/// [`enforce_path_immutability`] for a conditional write (#4186).
+///
+/// For a conditional write (#4186, and chunked completion since #4989)
 /// `replaces_current` is true when the write carries an `If-Match` that the
 /// caller has already found to hold: the client named the live content it
 /// replaces, so check 1 (live overwrite) does not apply. Check 2, the
 /// release-immutability backstop, still does, so a released coordinate
 /// cannot be swapped for different bytes even with a matching `If-Match`.
+/// An unconditional write passes `false`.
 pub(crate) async fn enforce_path_immutability_with(
     db: &PgPool,
     repository_id: Uuid,
@@ -342,6 +338,15 @@ struct PriorHeadRow {
     uploaded_by: Option<Uuid>,
 }
 
+/// One soft-deleted artifact version, as
+/// [`ArtifactService::retract_deleted_versions`] needs it (#5676).
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct DeletedVersion {
+    pub name: String,
+    pub path: String,
+    pub version: Option<String>,
+}
+
 /// Compact artifact value struct shared by the download / delete epilogues
 /// (audit entries, download events).
 ///
@@ -417,7 +422,13 @@ async fn dedup_probe(storage: &dyn StorageBackend, storage_key: &str) -> bool {
 /// storage GC candidate. Recorded in the publishing transaction so it exists
 /// exactly when the replace commits. Idempotent; the candidate sweep drops
 /// the row without touching the object if anything still references the key.
-async fn record_replaced_object_gc_candidate(
+///
+/// A row already journalled for the key (an earlier replace, a repository
+/// delete, a failed GC delete) has its `recorded_at` refreshed (#4989): the
+/// sweep only takes rows older than the grace window, so keeping the older
+/// stamp could collect the object the moment this replace commits, with
+/// none of the grace a reader still holding the old bytes is given.
+pub(crate) async fn record_replaced_object_gc_candidate(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     repo: &Repository,
     old_key: &str,
@@ -428,7 +439,8 @@ async fn record_replaced_object_gc_candidate(
         "INSERT INTO oci_gc_candidates \
              (storage_key, storage_backend, storage_path, source_repository_id) \
          VALUES ($1, $2, $3, $4) \
-         ON CONFLICT (storage_backend, storage_path, storage_key) DO NOTHING",
+         ON CONFLICT (storage_backend, storage_path, storage_key) \
+             DO UPDATE SET recorded_at = NOW()",
     )
     .bind(old_key)
     .bind(&scope.backend)
@@ -2784,6 +2796,16 @@ impl ArtifactService {
         self.delete_with_sync_options(id, true).await
     }
 
+    /// [`Self::delete`] on behalf of the authenticated request principal,
+    /// recorded as the `ARTIFACT_DELETED` actor (#5455).
+    pub async fn delete_by(
+        &self,
+        id: Uuid,
+        actor: Option<&crate::api::middleware::auth::AuthExtension>,
+    ) -> Result<()> {
+        self.delete_as(id, true, actor).await
+    }
+
     /// Soft-delete an artifact, optionally suppressing peer sync task fan-out.
     ///
     /// Thin wrapper preserving the historical single-call shape: pre-flight,
@@ -2793,6 +2815,15 @@ impl ArtifactService {
     /// [`Self::prepare_delete`] / [`Self::commit_delete_in_tx`] /
     /// [`Self::finish_delete`] directly so the whole delete is atomic.
     pub async fn delete_with_sync_options(&self, id: Uuid, enqueue_sync_tasks: bool) -> Result<()> {
+        self.delete_as(id, enqueue_sync_tasks, None).await
+    }
+
+    async fn delete_as(
+        &self,
+        id: Uuid,
+        enqueue_sync_tasks: bool,
+        actor: Option<&crate::api::middleware::auth::AuthExtension>,
+    ) -> Result<()> {
         let artifact = self.prepare_delete(id).await?;
         let mut tx = self
             .db
@@ -2803,7 +2834,8 @@ impl ArtifactService {
         tx.commit()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
-        self.finish_delete(&artifact, enqueue_sync_tasks).await;
+        self.finish_delete(&artifact, enqueue_sync_tasks, actor)
+            .await;
         Ok(())
     }
 
@@ -2860,7 +2892,17 @@ impl ArtifactService {
     /// never fails the delete, so this deliberately runs AFTER the caller's
     /// COMMIT: none of it may hold the transaction open, and the audit write
     /// must not be rolled back with it.
-    pub async fn finish_delete(&self, artifact: &Artifact, enqueue_sync_tasks: bool) {
+    ///
+    /// `actor` is the authenticated principal that asked for the delete, when
+    /// there is one: it becomes the audit row's actor (#5455). `None` (a
+    /// service-internal delete with no request principal) leaves the actor
+    /// unset as before.
+    pub async fn finish_delete(
+        &self,
+        artifact: &Artifact,
+        enqueue_sync_tasks: bool,
+        actor: Option<&crate::api::middleware::auth::AuthExtension>,
+    ) {
         let id = artifact.id;
 
         // A delete supersedes any upload retries for the same artifact.
@@ -2899,10 +2941,18 @@ impl ArtifactService {
             use crate::services::audit_service::{
                 audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
             };
-            // The service-layer delete does not carry the acting principal, so
-            // `user_id` (the actor) is intentionally left unset here; the
-            // original uploader is recorded in `details` for context.
-            let entry = AuditEntry::new(AuditAction::ArtifactDeleted, ResourceType::Artifact)
+            // The acting principal, when the caller has one (#5455); a
+            // service-internal delete leaves `user_id` unset. The original
+            // uploader is recorded in `details` for context.
+            let entry = match actor {
+                Some(auth) => AuditEntry::for_principal(
+                    AuditAction::ArtifactDeleted,
+                    ResourceType::Artifact,
+                    auth,
+                ),
+                None => AuditEntry::new(AuditAction::ArtifactDeleted, ResourceType::Artifact),
+            };
+            let entry = entry
                 .resource(artifact.id)
                 .resource_name(artifact.path.clone())
                 .details_typed(crate::services::audit_export::details::ArtifactDetails {
@@ -2916,6 +2966,18 @@ impl ArtifactService {
                 });
             audit_fire_and_forget(self.db.clone(), entry).await;
         }
+
+        // A deleted version must stop being advertised (#5604, #5632).
+        Self::retract_deleted_versions(
+            &self.db,
+            artifact.repository_id,
+            &[DeletedVersion {
+                name: artifact.name.clone(),
+                path: artifact.path.clone(),
+                version: artifact.version.clone(),
+            }],
+        )
+        .await;
 
         // #3411 part 1: `artifact.deleted` is mapped by `webhook_producer` and
         // was likewise never emitted. Symmetric with the upload emit, and on
@@ -2935,6 +2997,91 @@ impl ArtifactService {
                     );
                 }
             });
+        }
+    }
+
+    /// Stop advertising soft-deleted versions of repository `repository_id`
+    /// (#5604, #5632, #5676): move each affected catalog row's Latest to the
+    /// newest version still live and, for an npm repository only, drop the
+    /// dist-tags that name a version with no live artifact left.
+    ///
+    /// The single post-commit step every soft delete shares: the per-artifact
+    /// [`Self::finish_delete`] calls it with one version, and the lifecycle
+    /// sweeps, which soft-delete in bulk SQL, call it once per run with every
+    /// version they removed. Versions are grouped per catalog row
+    /// ([`package_service::catalog_package_name`], so Maven's
+    /// `groupId:artifactId` row is found) and per npm package, so a sweep that
+    /// removes many versions of one package costs one refresh and one
+    /// dist-tags write for it. Best-effort: a failure is logged and never
+    /// fails the delete.
+    ///
+    /// [`package_service::catalog_package_name`]: crate::services::package_service::catalog_package_name
+    pub async fn retract_deleted_versions(
+        db: &PgPool,
+        repository_id: Uuid,
+        deleted: &[DeletedVersion],
+    ) {
+        use crate::services::package_service::{
+            catalog_package_name, refresh_package_latest, repository_format,
+        };
+        if deleted.is_empty() {
+            return;
+        }
+        let format = match repository_format(db, repository_id).await {
+            Ok(Some(format)) => format,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to read the format of repository {} after a delete: {}",
+                    repository_id,
+                    e
+                );
+                return;
+            }
+        };
+        let catalog_rows: std::collections::BTreeSet<String> = deleted
+            .iter()
+            .map(|d| catalog_package_name(&format, &d.path, &d.name))
+            .collect();
+        for catalog in &catalog_rows {
+            if let Err(e) = refresh_package_latest(db, repository_id, catalog).await {
+                tracing::warn!(
+                    "Failed to refresh catalog latest of {} in repository {} after a delete: {}",
+                    catalog,
+                    repository_id,
+                    e
+                );
+            }
+        }
+        if format != "npm" {
+            return;
+        }
+        let mut by_package: std::collections::BTreeMap<&str, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for d in deleted {
+            if let Some(ref version) = d.version {
+                by_package
+                    .entry(d.name.as_str())
+                    .or_default()
+                    .push(version.clone());
+            }
+        }
+        for (package, versions) in by_package {
+            if let Err(e) = crate::api::handlers::npm::drop_dist_tags_for_deleted_versions(
+                db,
+                repository_id,
+                package,
+                &versions,
+            )
+            .await
+            {
+                tracing::warn!(
+                    "Failed to drop dist-tags of deleted versions of {} in repository {}: {}",
+                    package,
+                    repository_id,
+                    e
+                );
+            }
         }
     }
 
@@ -5236,6 +5383,71 @@ mod tests {
         assert!(sql.contains("is_local = false"));
         assert!(sql.contains("ON CONFLICT"));
         assert!(sql.contains("WHERE sync_tasks.status <> 'in_progress'"));
+        // Gating on peer status here is what dropped every delete made while a
+        // peer was offline; the worker already gates delivery.
+        assert!(!sql.contains("pi.status"));
+    }
+
+    #[tokio::test]
+    async fn delete_enqueue_queues_for_offline_peer() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::peer_instance_service::{PeerInstanceService, ReplicationMode};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let peer_id = tdh::register_test_peer(&pool, "delete-offline", "t").await;
+        PeerInstanceService::new(pool.clone())
+            .assign_repository(
+                peer_id,
+                repo_id,
+                true,
+                Some(ReplicationMode::Push),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE peer_instances SET status = 'offline' WHERE id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key, is_deleted) \
+             VALUES ($1, 'a/b/offline.bin', 'offline.bin', 1, $2, 'application/octet-stream', $2, true) \
+             RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(format!("{:064x}", 2))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(ENQUEUE_DELETE_SYNC_TASKS_SQL)
+            .bind(artifact_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status::TEXT FROM sync_tasks \
+             WHERE peer_instance_id = $1 AND artifact_id = $2 AND task_type = 'delete'",
+        )
+        .bind(peer_id)
+        .bind(artifact_id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status.as_deref(), Some("pending"));
+
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

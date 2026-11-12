@@ -19,9 +19,9 @@
 
 use axum::body::Body;
 use axum::extract::{Path, RawQuery, State};
-use axum::http::header::{
-    CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_RANGE, RANGE,
-};
+#[cfg(test)]
+use axum::http::header::CONTENT_LENGTH;
+use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE, ETAG};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -34,6 +34,7 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
+use crate::api::handlers::proxy_helpers::{apply_range_to_streamed_serve, effective_range};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::services::proxy_service::UPSTREAM_COMMIT_HEADER;
@@ -52,10 +53,12 @@ const MAX_MODEL_ID_LEN: usize = 255;
 const MAX_REVISION_LEN: usize = 255;
 
 /// Maximum artifact path length. The `path` and `storage_key` columns are
-/// VARCHAR(2048). The storage key adds a `huggingface/` prefix (12 chars),
-/// so the artifact path must stay within 2036 to keep the storage key under
-/// the column limit.
-const MAX_PATH_LEN: usize = 2036;
+/// VARCHAR(2048). On a shared cloud namespace the storage key is repo-scoped
+/// (#5662) and prefixes the path with `huggingface/{repository_id}/`: 12
+/// chars for `huggingface/`, 36 for the UUID and 1 for its `/`, 49 in all.
+/// The artifact path must stay within 2048 - 49 = 1999 to keep the storage
+/// key under the column limit (the flat `huggingface/{path}` key is shorter).
+const MAX_PATH_LEN: usize = 1999;
 
 /// Total deadline for the best-effort model-info fallback in
 /// [`fetch_upstream_commit_sha`] (#2915).
@@ -1550,85 +1553,6 @@ async fn download_file_namespaced(
     .await
 }
 
-/// The `Range` to honour for this request, if any.
-///
-/// `Range` is defined for GET only (RFC 9110 §14.2), so a HEAD ignores it and
-/// keeps reporting the whole file. `If-Range` keeps it only for the current
-/// strong ETag; an older ETag or a date gets the whole file, which is the safe
-/// answer for a client resuming a file that may have changed (§13.1.5).
-fn effective_range<'a>(
-    headers: &'a HeaderMap,
-    etag: Option<&str>,
-    is_head: bool,
-) -> Option<&'a str> {
-    if is_head {
-        return None;
-    }
-    if let Some(validator) = headers.get(IF_RANGE) {
-        let current = etag.filter(|e| !e.starts_with("W/"));
-        if validator.to_str().ok() != current || current.is_none() {
-            return None;
-        }
-    }
-    headers.get(RANGE).and_then(|v| v.to_str().ok())
-}
-
-/// Apply the client's `Range` to a Remote or Virtual serve, which arrives from
-/// the shared streaming builder as a complete `200` (#5145).
-///
-/// The window is cut from the object's stream by
-/// [`ranged_stream_response`](crate::api::handlers::repositories::ranged_stream_response),
-/// as the OCI blob route does for its proxied bytes. `Range` is never forwarded
-/// upstream, so a cold serve still fills the cache with the whole file.
-///
-/// Left as it is: anything but a `200` (a presigned redirect's target answers
-/// `Range` itself), a content-coded body (a client's offsets describe the
-/// decoded file) and a body of unknown length.
-#[allow(clippy::result_large_err)]
-fn apply_range_to_streamed_serve(
-    resp: Response,
-    headers: &HeaderMap,
-    is_head: bool,
-) -> Result<Response, Response> {
-    use futures::StreamExt;
-
-    let total = resp
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-    let Some(total) = total.filter(|_| {
-        resp.status() == StatusCode::OK && !resp.headers().contains_key(CONTENT_ENCODING)
-    }) else {
-        return Ok(resp);
-    };
-
-    let etag = resp.headers().get(ETAG).and_then(|v| v.to_str().ok());
-    let range = effective_range(headers, etag, is_head);
-    let (mut parts, body) = resp.into_parts();
-    let stream = body
-        .into_data_stream()
-        .map(|chunk| chunk.map_err(|e| crate::error::AppError::BadGateway(e.to_string())))
-        .boxed();
-    let ranged = crate::api::handlers::repositories::ranged_stream_response(
-        range,
-        total,
-        stream,
-        Vec::new(),
-    )
-    .map_err(|e| e.into_response())?;
-
-    let (ranged_parts, ranged_body) = ranged.into_parts();
-    if ranged_parts.status == StatusCode::RANGE_NOT_SATISFIABLE {
-        // No representation is served, so none of its headers apply.
-        parts.headers.clear();
-    }
-    parts.status = ranged_parts.status;
-    parts.headers.remove(CONTENT_LENGTH);
-    parts.headers.extend(ranged_parts.headers);
-    Ok(Response::from_parts(parts, ranged_body))
-}
-
 /// The stored file at `artifact_path`, with what the resolve route serves it by.
 ///
 /// Runtime query rather than `sqlx::query!` so `checksum_sha256` can be read
@@ -1944,7 +1868,15 @@ async fn upload_file_impl(
     // Same quota preflight and cross-repository write guard as the buffered
     // `put_artifact_bytes` this replaces, then the staged bytes are streamed
     // (or copied server-side) to the final key and the staging copy released.
-    let storage_key = format!("huggingface/{}/{}/{}", model_id, revision, filename);
+    // Repo-scoped on a shared cloud namespace (#5662), so two repositories
+    // holding the same model file do not collide on one key; reads go
+    // through the row's storage_key, so legacy flat-key rows keep serving.
+    let storage_key = crate::storage::StorageKeyScheme::from_env().write_key(
+        &repo.storage_backend,
+        "huggingface",
+        repo.id,
+        &format!("{}/{}/{}", model_id, revision, filename),
+    );
     proxy_helpers::put_staged_body(
         &state,
         &repo,
@@ -2001,6 +1933,7 @@ async fn upload_file_impl(
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         "huggingface",
         &model_id,
@@ -2425,18 +2358,44 @@ mod tests {
         );
     }
 
+    /// The longest key the upload writes, the repo-scoped cloud key
+    /// (`huggingface/{repository_id}/` + path, #5662).
+    fn longest_storage_key(path: &str) -> String {
+        crate::storage::StorageKeyScheme::RepoScoped.write_key(
+            "s3",
+            "huggingface",
+            uuid::Uuid::new_v4(),
+            path,
+        )
+    }
+
     #[test]
     fn test_long_model_id_storage_key_fits_in_db() {
-        // Storage key adds "huggingface/" prefix (12 chars).
+        // The repo-scoped storage key adds "huggingface/{uuid}/" (49 chars).
         let model_id = "a".repeat(MAX_MODEL_ID_LEN);
         let revision = "main";
         let filename = "model.safetensors";
-        let key = format!("huggingface/{}/{}/{}", model_id, revision, filename);
+        let key = longest_storage_key(&format!("{}/{}/{}", model_id, revision, filename));
         assert!(
             key.len() <= 2048,
             "storage_key length {} exceeds VARCHAR(2048)",
             key.len()
         );
+    }
+
+    /// #5662: a path of exactly MAX_PATH_LEN still fits VARCHAR(2048) under
+    /// the repo-scoped cloud key, and the cap is not looser than that.
+    #[test]
+    fn test_max_path_len_storage_key_fits_in_db_5662() {
+        let key = longest_storage_key(&"p".repeat(MAX_PATH_LEN));
+        assert_eq!(key.len(), 2048);
+        let flat = crate::storage::StorageKeyScheme::Flat.write_key(
+            "s3",
+            "huggingface",
+            uuid::Uuid::new_v4(),
+            &"p".repeat(MAX_PATH_LEN),
+        );
+        assert!(flat.len() <= 2048);
     }
 
     #[test]
@@ -2452,10 +2411,7 @@ mod tests {
         assert_eq!(model_id.len(), 120);
         let path = format!("{}/{}/{}", model_id, "main", "weights.safetensors");
         assert!(path.len() <= MAX_PATH_LEN);
-        let key = format!(
-            "huggingface/{}/{}/{}",
-            model_id, "main", "weights.safetensors"
-        );
+        let key = longest_storage_key(&path);
         assert!(key.len() <= 2048);
     }
 
@@ -2637,6 +2593,29 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// #5662: the same model file uploads into two Hugging Face repositories
+    /// on a shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_model_file_uploads_to_two_cloud_repositories_5662() {
+        let file = b"{\"model_type\":\"scoped-5662\"}";
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "huggingface",
+            key_prefix: "huggingface",
+            router: super::router,
+            publish: &|key| {
+                vec![upload_request(
+                    key,
+                    "scoped5662-model",
+                    "config.json",
+                    Body::from(&file[..]),
+                )]
+            },
+            download: &|key| tdh::get(format!("/{key}/scoped5662-model/resolve/main/config.json")),
+            expected: file,
+        })
+        .await;
     }
 
     /// A body over `MAX_UPLOAD_SIZE`, sent with no `Content-Length` and in

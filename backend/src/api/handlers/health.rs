@@ -126,6 +126,15 @@ pub struct ReadyzResponse {
     /// when ready.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub failing: Vec<String>,
+    /// Dependencies that are unhealthy but do not gate readiness (#5649,
+    /// #5650): storage while the object store is unreachable or full, and
+    /// equally OpenSearch, the scanner or LDAP when unhealthy and not
+    /// required. The replica stays ready, since every replica shares the same
+    /// store and pulling them all would only turn a storage outage into a
+    /// total one, but a probe reader sees the degradation without reading
+    /// each dependency. Omitted when nothing is degraded.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub degraded: Vec<String>,
 }
 
 /// Status of one dependency on `/readyz`.
@@ -673,6 +682,7 @@ fn build_readyz_response(
     };
 
     let mut failing = Vec::new();
+    let mut degraded = Vec::new();
     if db_check.status != STATUS_HEALTHY {
         failing.push("database".to_string());
     }
@@ -687,6 +697,8 @@ fn build_readyz_response(
     ] {
         if dep.required && !dep.is_healthy() {
             failing.push(name.to_string());
+        } else if !dep.required && dep.status == STATUS_UNHEALTHY {
+            degraded.push(name.to_string());
         }
     }
 
@@ -705,6 +717,7 @@ fn build_readyz_response(
         },
         dependencies,
         failing,
+        degraded,
     };
 
     let status_code = if ready {
@@ -1012,7 +1025,7 @@ async fn probe_ldap_health(db: &sqlx::PgPool, config: &crate::config::Config) ->
 /// 503 under concurrency.
 ///
 /// S3, GCS, Azure: perform a real API call via the storage backend's
-/// `health_check()` method, with a 5-second timeout.
+/// `health_check()` method, bounded by [`STORAGE_PROBE_TIMEOUT`].
 /// Unhealthy filesystem-storage status that names the failed step but not the
 /// error (#3907).
 ///
@@ -1053,7 +1066,44 @@ fn redact_storage_urls(text: &str) -> String {
     .into_owned()
 }
 
+/// How long the storage probe may take before the check reports the backend
+/// unhealthy (#5649). The probe is one small write (filesystem) or one HEAD
+/// (object stores). Two seconds matches `/readyz`'s per-dependency deadline
+/// ([`READYZ_DEPENDENCY_TIMEOUT`]) and leaves room for a cross-region HEAD or
+/// a credential refresh (IRSA, instance profile) without flapping, while
+/// still reporting a stalled store promptly.
+const STORAGE_PROBE_TIMEOUT: Duration = READYZ_DEPENDENCY_TIMEOUT;
+
+/// Message for a storage check that a refused write marked degraded (#5650).
+const STORAGE_FULL_CHECK_MESSAGE: &str =
+    "storage backend refused writes for lack of space within the last 60s";
+
+/// Probe the storage backend, then fold in what requests saw (#5650).
+///
+/// A connectivity probe cannot see a full bucket: the HEAD still succeeds.
+/// Writes refused for lack of space are recorded where they are answered
+/// (`507 STORAGE_FULL`, see [`crate::storage::failure`]), and for
+/// [`crate::storage::failure::STORAGE_FULL_SIGNAL_WINDOW`] after the last one
+/// the check is unhealthy even when the probe passes.
 async fn probe_storage_health(
+    config: &crate::config::Config,
+    storage: &Arc<dyn StorageBackend>,
+) -> CheckStatus {
+    let probed = probe_storage_connectivity(config, storage).await;
+    if probed.status == STATUS_HEALTHY
+        && crate::storage::failure::refused_for_space_within(
+            crate::storage::failure::STORAGE_FULL_SIGNAL_WINDOW,
+        )
+    {
+        return CheckStatus {
+            status: STATUS_UNHEALTHY.to_string(),
+            message: Some(STORAGE_FULL_CHECK_MESSAGE.to_string()),
+        };
+    }
+    probed
+}
+
+async fn probe_storage_connectivity(
     config: &crate::config::Config,
     storage: &Arc<dyn StorageBackend>,
 ) -> CheckStatus {
@@ -1078,22 +1128,34 @@ async fn probe_storage_health(
             // matter (RO/full/unmounted/perms). Read-back is intentionally
             // dropped: it added nothing a liveness probe needs and was the
             // source of the cross-request data dependency.
-            match tokio::fs::write(&probe_path, b"ok").await {
-                Ok(()) => {
+            match tokio::time::timeout(STORAGE_PROBE_TIMEOUT, tokio::fs::write(&probe_path, b"ok"))
+                .await
+            {
+                Ok(Ok(())) => {
                     let _ = tokio::fs::remove_file(&probe_path).await;
                     CheckStatus {
                         status: STATUS_HEALTHY.to_string(),
                         message: None,
                     }
                 }
-                Err(e) => unhealthy_filesystem_storage("Storage write failed", &e),
+                Ok(Err(e)) => unhealthy_filesystem_storage("Storage write failed", &e),
+                // A hung volume (a stalled NFS mount) blocks every request
+                // that touches it; report it rather than waiting with it.
+                Err(_) => CheckStatus {
+                    status: STATUS_UNHEALTHY.to_string(),
+                    message: Some(format!(
+                        "Storage write timed out ({}s)",
+                        STORAGE_PROBE_TIMEOUT.as_secs()
+                    )),
+                },
             }
         }
         "s3" | "gcs" | "azure" => {
-            // Perform a real connectivity probe with a 5-second timeout so a
-            // slow or hung backend does not block the health endpoint.
+            // Perform a real connectivity probe, bounded by
+            // STORAGE_PROBE_TIMEOUT, so a slow or hung backend does not block
+            // the health endpoint (#5649).
             let probe = storage.health_check();
-            match tokio::time::timeout(Duration::from_secs(5), probe).await {
+            match tokio::time::timeout(STORAGE_PROBE_TIMEOUT, probe).await {
                 Ok(Ok(())) => CheckStatus {
                     status: STATUS_HEALTHY.to_string(),
                     message: None,
@@ -1113,8 +1175,9 @@ async fn probe_storage_health(
                 Err(_) => CheckStatus {
                     status: STATUS_UNHEALTHY.to_string(),
                     message: Some(format!(
-                        "{} storage probe timed out (5s)",
-                        config.storage_backend
+                        "{} storage probe timed out ({}s)",
+                        config.storage_backend,
+                        STORAGE_PROBE_TIMEOUT.as_secs()
                     )),
                 },
             }
@@ -1693,6 +1756,7 @@ mod tests {
             },
             dependencies: no_dependencies(),
             failing: Vec::new(),
+            degraded: Vec::new(),
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"status\":\"ready\""));
@@ -1713,6 +1777,7 @@ mod tests {
             },
             dependencies: no_dependencies(),
             failing: vec!["migrations".to_string()],
+            degraded: Vec::new(),
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"not_ready\""));
@@ -1889,6 +1954,121 @@ mod tests {
             gcs_bucket: Some("my-bucket".to_string()),
             ..crate::config::Config::test_config()
         }
+    }
+
+    /// Mock storage backend whose probe never answers: an object store that
+    /// accepts the connection and then stalls (#5649).
+    struct HangingMockBackend;
+
+    #[async_trait]
+    impl crate::storage::StorageBackend for HangingMockBackend {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Ok(Bytes::new())
+        }
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn health_check(&self) -> crate::error::Result<()> {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
+    }
+
+    /// #5649: a stalled object store is reported unhealthy within the 2s
+    /// probe bound, not after the 5s it used to take.
+    #[tokio::test]
+    async fn test_storage_probe_is_bounded_to_two_seconds_5649() {
+        crate::storage::failure::reset_failure_signal();
+        let config = test_config("s3");
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HangingMockBackend);
+        let started = Instant::now();
+        let status = probe_storage_health(&config, &storage).await;
+        let took = started.elapsed();
+        assert_eq!(status.status, STATUS_UNHEALTHY);
+        assert!(
+            took < Duration::from_millis(2500),
+            "a stalled store must fail the probe within ~2s, took {took:?}"
+        );
+        assert!(status.message.unwrap().contains("timed out (2s)"));
+    }
+
+    /// #5650: a bucket at its quota still answers the connectivity probe, so
+    /// the storage check is degraded by the writes that were refused, and
+    /// clears once none has been refused for the signal window.
+    #[tokio::test]
+    async fn test_storage_check_is_degraded_after_an_out_of_space_refusal_5650() {
+        let config = test_config("s3");
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HealthyMockBackend);
+        crate::storage::failure::reset_failure_signal();
+        assert_eq!(
+            probe_storage_health(&config, &storage).await.status,
+            STATUS_HEALTHY
+        );
+
+        // A 507 answered to a client is what records the refusal.
+        let refused = crate::error::AppError::Storage(
+            crate::storage::StorageFailure::Full.tag("Failed to put object"),
+        );
+        let _ = axum::response::IntoResponse::into_response(refused);
+        let degraded = probe_storage_health(&config, &storage).await;
+        assert_eq!(degraded.status, STATUS_UNHEALTHY);
+        assert_eq!(
+            degraded.message.as_deref(),
+            Some(STORAGE_FULL_CHECK_MESSAGE)
+        );
+
+        crate::storage::failure::reset_failure_signal();
+        assert_eq!(
+            probe_storage_health(&config, &storage).await.status,
+            STATUS_HEALTHY,
+            "the check clears once writes stop being refused"
+        );
+    }
+
+    /// #5649 / #5650: an unhealthy storage dependency does not make the
+    /// replica unready (every replica shares the store), but `/readyz` names
+    /// it under `degraded` so a probe reader sees it at a glance.
+    #[test]
+    fn test_readyz_reports_unhealthy_storage_as_degraded_5649() {
+        let mut dependencies = no_dependencies();
+        dependencies.storage = DependencyStatus::from_check(
+            CheckStatus {
+                status: STATUS_UNHEALTHY.to_string(),
+                message: Some("s3 storage probe timed out (2s)".to_string()),
+            },
+            false,
+            false,
+        );
+        let (status_code, response) =
+            build_readyz_response(healthy_check(), healthy_check(), false, dependencies);
+        assert_eq!(status_code, StatusCode::OK);
+        assert_eq!(response.status, "ready");
+        assert_eq!(response.degraded, vec!["storage".to_string()]);
+        assert!(response.failing.is_empty());
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["degraded"], serde_json::json!(["storage"]));
+        assert_eq!(json["dependencies"]["storage"]["status"], STATUS_UNHEALTHY);
+
+        let (_, healthy) =
+            build_readyz_response(healthy_check(), healthy_check(), false, no_dependencies());
+        let json = serde_json::to_value(&healthy).unwrap();
+        assert!(
+            json.get("degraded").is_none(),
+            "omitted when nothing is degraded"
+        );
     }
 
     #[tokio::test]

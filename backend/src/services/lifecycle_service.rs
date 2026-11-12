@@ -1324,6 +1324,16 @@ struct RetentionBinds<'a> {
     min_keep: Option<i64>,
 }
 
+/// The preview note of a policy whose scope includes MCP registries (#5368).
+pub(crate) fn mcp_skip_note(skipped: usize) -> String {
+    format!(
+        "{skipped} MCP registry repositor{} skipped: lifecycle policies never delete MCP server \
+         versions (soft-delete them through the MCP DELETE route, then purge them as an \
+         administrator)",
+        if skipped == 1 { "y" } else { "ies" }
+    )
+}
+
 pub struct LifecycleService {
     db: PgPool,
     /// Owner of the proxy-cache store, for evicting Remote repositories'
@@ -1417,7 +1427,18 @@ impl LifecycleService {
                 &parse_match_formats(&policy.config)?,
             )
             .await?;
+        let (repositories, skipped_mcp) = self.drop_mcp_repositories(repositories).await?;
         let mut result = Self::build_execution_result(&policy, dry_run, 0, 0, 0);
+        if skipped_mcp > 0 {
+            tracing::info!(
+                policy = %policy.name,
+                repositories = skipped_mcp,
+                "Lifecycle policy skips MCP registry repositories"
+            );
+            if dry_run {
+                result.errors.push(mcp_skip_note(skipped_mcp));
+            }
+        }
         if dry_run {
             // Report every stored-regex problem in the preview, and stop when
             // the policy cannot run as stored (a pattern that does not
@@ -1491,6 +1512,31 @@ impl LifecycleService {
         Ok(repositories)
     }
 
+    /// Drop MCP registry repositories from a policy's resolved repositories
+    /// (#5368), keeping the order; also how many were dropped. A server
+    /// version leaves an MCP repository only through the MCP routes (the
+    /// namespace-gated soft delete, then the admin purge), which recompute
+    /// `isLatest` and audit; a lifecycle soft delete would skip all of that
+    /// and release the version's OCI pins.
+    async fn drop_mcp_repositories(
+        &self,
+        mut repositories: Vec<Uuid>,
+    ) -> Result<(Vec<Uuid>, usize)> {
+        if repositories.is_empty() {
+            return Ok((repositories, 0));
+        }
+        let mcp: std::collections::HashSet<Uuid> =
+            sqlx::query_scalar("SELECT id FROM repositories WHERE id = ANY($1) AND format = 'mcp'")
+                .bind(&repositories)
+                .fetch_all(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .into_iter()
+                .collect();
+        repositories.retain(|id| !mcp.contains(id));
+        Ok((repositories, mcp.len()))
+    }
+
     /// The stored-regex problems of `policy` (#4461), checked on one pooled
     /// connection under the compile timeout.
     async fn stored_regex_problems_of(
@@ -1530,6 +1576,13 @@ impl LifecycleService {
             .begin()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
+        // The transaction's own timestamp: migration 261's trigger stamps
+        // every row this transaction soft-deletes with exactly this
+        // `deleted_at`, which is how step 3 finds them (#5676).
+        let deleted_at: DateTime<Utc> = sqlx::query_scalar("SELECT NOW()")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
         let result = Self::dispatch_execute(&mut tx, policy, false).await?;
         tx.commit()
             .await
@@ -1549,7 +1602,50 @@ impl LifecycleService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // Step 3 (#5676): the per-artifact delete path's advertising cleanup,
+        // batched. The sweeps above soft-delete in bulk SQL, so they never
+        // reach `ArtifactService::finish_delete`; without this a retention
+        // policy that removed an npm package's tagged version left `latest`
+        // naming it (ETARGET for clients) and the catalog's Latest on it.
+        if result.artifacts_removed > 0 {
+            self.retract_swept_versions(repository_id, deleted_at).await;
+        }
+
         Ok(result)
+    }
+
+    /// Stop advertising the versions a sweep of `repository_id` soft-deleted
+    /// in the transaction stamped `deleted_at` (#5676), through the same
+    /// [`ArtifactService::retract_deleted_versions`] step every per-artifact
+    /// delete runs: catalog Latest moves to the newest live version and, in an
+    /// npm repository, dist-tags naming a removed version are dropped.
+    /// Best-effort, as on the per-artifact path: the deletions are committed.
+    /// Rows a concurrent delete stamped later are included too, harmlessly:
+    /// the step only retracts versions that are no longer live.
+    ///
+    /// [`ArtifactService::retract_deleted_versions`]: crate::services::artifact_service::ArtifactService::retract_deleted_versions
+    async fn retract_swept_versions(&self, repository_id: Uuid, deleted_at: DateTime<Utc>) {
+        use crate::services::artifact_service::{ArtifactService, DeletedVersion};
+        let swept: Vec<DeletedVersion> = match sqlx::query_as(
+            "SELECT DISTINCT name, path, version FROM artifacts \
+             WHERE repository_id = $1 AND is_deleted = true AND deleted_at >= $2",
+        )
+        .bind(repository_id)
+        .bind(deleted_at)
+        .fetch_all(&self.db)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    "Lifecycle: failed to list the versions swept from repository {}: {}",
+                    repository_id,
+                    e
+                );
+                return;
+            }
+        };
+        ArtifactService::retract_deleted_versions(&self.db, repository_id, &swept).await;
     }
 
     /// Dispatch to the per-type implementation against a single
@@ -1603,6 +1699,12 @@ impl LifecycleService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?
             .rows_affected();
+        // #5793: an image whose manifest rows for a digest the policy just
+        // trashed no longer holds that digest, so its link goes too (or the
+        // digest would resolve under it again once the trash is purged).
+        crate::services::oci_image_scope::unlink_deleted_manifests(&mut *conn, scope.repo_filter())
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
         if removed > 0 {
             tracing::info!(
                 "Lifecycle cascade: removed {} stale oci_tags rows for soft-deleted manifests (scope: {})",
@@ -3080,6 +3182,123 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup docker repository");
+    }
+
+    /// #5368: a lifecycle policy never trashes an MCP server version (that
+    /// would release its OCI pins without the MCP delete's audit and
+    /// `isLatest` recompute): MCP repositories are skipped, with a preview
+    /// note; another repository in the same policy is still swept.
+    #[tokio::test]
+    async fn lifecycle_policy_leaves_mcp_server_versions_alone() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mcp_id = Uuid::new_v4();
+        let generic_id = Uuid::new_v4();
+        let suffix = mcp_id.simple();
+        for (id, format) in [(mcp_id, "mcp"), (generic_id, "generic")] {
+            let key = format!("lifecycle-{format}-{suffix}");
+            sqlx::query(
+                "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+                 VALUES ($1, $2, $2, $3, 'local', $4::text::repository_format)",
+            )
+            .bind(id)
+            .bind(&key)
+            .bind(format!("/tmp/{key}"))
+            .bind(format)
+            .execute(&pool)
+            .await
+            .expect("insert repository");
+        }
+        let old = Utc::now() - chrono::Duration::days(400);
+        let seed = |repo: Uuid, path: &'static str, name: &'static str| {
+            let pool = pool.clone();
+            async move {
+                let id = Uuid::new_v4();
+                sqlx::query(
+                    "INSERT INTO artifacts (id, repository_id, path, name, version, size_bytes, \
+                     checksum_sha256, content_type, storage_key, created_at) \
+                     VALUES ($1, $2, $3, $4, '1.0.0', 10, $5, 'application/json', $6, $7)",
+                )
+                .bind(id)
+                .bind(repo)
+                .bind(path)
+                .bind(name)
+                .bind("c".repeat(64))
+                .bind(format!("lifecycle-mcp/{id}"))
+                .bind(old)
+                .execute(&pool)
+                .await
+                .expect("insert artifact");
+                id
+            }
+        };
+        let server = seed(
+            mcp_id,
+            "servers/com.acme/old/1.0.0/server.json",
+            "com.acme/old",
+        )
+        .await;
+        let other = seed(generic_id, "old/1.0.0/old.bin", "old").await;
+
+        let service = LifecycleService::new(pool.clone());
+        let policy = service
+            .create_policy(CreateLifecyclePolicyRequest {
+                applies_to_all: false,
+                repository_ids: Some(vec![mcp_id, generic_id]),
+                repository_id: None,
+                name: format!("mcp-skip-{suffix}"),
+                description: None,
+                policy_type: "max_age_days".to_string(),
+                config: json!({"days": 30}),
+                priority: None,
+                cron_schedule: None,
+                enabled: None,
+            })
+            .await
+            .expect("create lifecycle policy");
+
+        let preview = service
+            .execute_policy(policy.id, true)
+            .await
+            .expect("preview");
+        assert_eq!(preview.artifacts_matched, 1, "{preview:?}");
+        assert!(
+            preview.errors.contains(&mcp_skip_note(1)),
+            "the preview says the MCP repository is skipped: {:?}",
+            preview.errors
+        );
+        let run = service
+            .execute_policy(policy.id, false)
+            .await
+            .expect("execute");
+        assert_eq!(run.artifacts_removed, 1, "{run:?}");
+        let deleted = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, bool>("SELECT is_deleted FROM artifacts WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(!deleted(server).await, "the MCP server.json row stays live");
+        assert!(deleted(other).await, "the generic artifact is swept");
+
+        let _ = service.delete_policy(policy.id).await;
+        for id in [mcp_id, generic_id] {
+            let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
     }
 
     // -----------------------------------------------------------------------

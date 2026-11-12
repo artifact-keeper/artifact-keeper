@@ -19,7 +19,7 @@ func main() {
 	cfg := LoadConfig()
 	srv := NewServer(cfg)
 	if cfg.Offline {
-		log.Printf("offline mode (SCANNER_OFFLINE): no vulnerability-DB or Java-DB download, scans run with --skip-db-update --skip-java-db-update --offline-scan; import a DB with PUT /api/v1/vulndb")
+		log.Printf("offline mode (SCANNER_OFFLINE): no vulnerability-DB or Java-DB download, scans run with --skip-db-update --skip-java-db-update (and, like every scan, --offline-scan); import a DB with PUT /api/v1/vulndb")
 	}
 	if cfg.AdapterToken == "" {
 		log.Printf("SCANNER_ADAPTER_TOKEN unset: GET/PUT /api/v1/vulndb are disabled")

@@ -76,7 +76,21 @@ Notes:
 
 - The low side sends `api_key` to the high side as a bearer token on every
   transfer, so issue it on the high side with write access to the target
-  repositories.
+  repositories. Issue it as an instance administrator's token, with the
+  `admin` (or `*`) scope: the high side honors the replication exemptions
+  (quota, the source's metadata, mirrored deletes of released artifacts, MCP
+  registries) only for an administrator sending the replication header
+  (#5455). A service-account token, or an administrator token without the
+  `admin` scope, replicates as an ordinary writer: its mirrored deletes of
+  released artifacts and its writes over a quota are refused and fail those
+  tasks, and the high side logs `replication header from non-admin principal
+  ignored` (at most once a minute).
+- Restrict that administrator token to the replicated repositories when you
+  mint it (`repository_ids`), so it cannot write anywhere else. Even so it is
+  an administrator's credential: whoever reads the low side's database (where
+  `peer_instances.api_key` is stored) holds administrator access to every
+  instance it pushes to. Protect the low side's database accordingly. A
+  credential bound to replication alone is tracked in #5516.
 - Each artifact is written to the high side at the same repository key and
   path, with `PUT /api/v1/repositories/{key}/artifacts/{path}`. Create the
   matching repositories on the high side first. The usual pattern is to
@@ -103,7 +117,7 @@ Notes:
 | Mode | What it does today |
 | --- | --- |
 | `push` | Every artifact uploaded to the repository is queued for the peer as it lands. Existing content is sent when you call the subscription's `sync` route. |
-| `mirror` | Queued exactly like `push`. The subscription also stores a cron `replication_schedule`, but nothing acts on it yet, so run the `sync` route yourself for a whole-repository pass. |
+| `mirror` | Queued like `push` as each artifact is uploaded. With a cron `replication_schedule` (UTC, for example `0 */6 * * *`), the sync worker also runs a whole-repository pass each time the schedule is due: it queues every artifact the peer has no task for, the same work as the `sync` route, and sets `last_replicated_at` when the pass is queued. A subscription that has never completed a pass runs one on the first check (about once a minute). Missed occurrences, for example while the backend was down or upstream jobs were paused, add up to one pass, not a backlog. An invalid cron expression is refused with 400. Without a schedule, `mirror` behaves exactly like `push`. |
 | `none` | Assigned, not replicated. |
 | `pull` | Refused with 400 on `POST /api/v1/peers/{id}/repositories` and on sync policies. It was accepted before, but nothing ever created a sync task for it, so such a subscription never moved a byte. Existing `pull` rows are left in place, logged once at startup and reported as inactive. Re-subscribe them with `push` or `mirror`. |
 
@@ -114,7 +128,10 @@ that `pull` names is not implemented.
 
 Use `POST /api/v1/peers/{id}/repositories/{repo_id}/sync` after the first
 subscription and after any gap in connectivity, to resend what the high side
-is missing. Tasks that already completed are not repeated.
+is missing, or give a `mirror` subscription a schedule so this happens on its
+own. Either way, tasks that already completed are not repeated, and a `sync`
+call counts as a pass: the schedule next fires at its first occurrence after
+the call.
 
 Read the subscription back with `GET /api/v1/peers/{id}/repositories/{repo_id}`
 to check its mode, schedule and filter. A `replication_filter`
@@ -210,6 +227,31 @@ for key in pypi-remote npm-remote ghcr-remote hf-remote; do
 done
 ```
 
+**Set upstream mode and egress proxy on create.** `POST /api/v1/repositories`
+takes `upstream_mode` and `egress_proxy` (the same bodies as the two `PUT`
+routes) for a Remote, and stores them before anything else, so the
+repository's first upstream request already obeys them (#5402). That
+matters for a Remote that contacts its upstream on its own, without a
+client: an MCP Remote's first sync used to start before a separate
+`PUT .../egress-proxy` or `PUT .../upstream-mode` could run, so its first
+pages bypassed the logging proxy. Create Remotes in their final state
+instead of pausing scheduled upstream jobs around the create:
+
+```bash
+curl -X POST "$AK/api/v1/repositories" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"key": "mcp-official", "name": "mcp-official", "format": "mcp", "repo_type": "remote",
+       "upstream_url": "https://registry.modelcontextprotocol.io",
+       "egress_proxy": {"mode": "explicit", "proxy_url": "http://egress-ledger:3128"},
+       "mcp_remote_sync_paused": true}'
+```
+
+`mcp_remote_sync_paused: true` (MCP Remotes only) also holds back the
+scheduled sync until you clear it with `PATCH`, for the settings that have
+no create field (cache TTL, upstream credentials set later). A Remote that
+was never synced is not due until it is a minute old in any case. Set the
+other settings in the table right after the create.
+
 Why each one matters:
 
 - **Cache TTL.** With the default 5 minutes, every index goes stale shortly
@@ -251,6 +293,16 @@ Policy, quotas and the scan-on-proxy refusal apply to it. Only the `paths`
 manifest exists in this release: the typed manifests (`pypi-requirements`,
 `npm-lockfile`, `oci-images`, `hf-models`) and seeding a Virtual repository
 answer `400`. See [Seeding a Remote's proxy cache](cache-seed.md).
+
+An MCP Remote has its own list form: `POST /api/v1/repositories/{key}/mcp/seed`
+with `{"servers": [{"name": "...", "version": "..."}]}` fetches each named
+server version from the upstream registry and pins it, without syncing the
+whole registry first (#5408). It runs in the background like a cache seed,
+answers `202` with a `statusUrl`, and reports each item as `pinned`,
+`already_pinned`, `refused` or `failed`. The item's packages are pinned
+through the Remote's own backing repositories, so seed those (npm, PyPI, OCI
+Remotes) too. See
+[MCP registry: Seeding named servers](mcp-registry.md#seeding-named-servers).
 
 ### Cache-only mode
 
@@ -305,8 +357,19 @@ loopback and link-local addresses stay blocked either way.
 
 ### Egress proxy
 
-By default (`inherit`) a Remote uses the process `HTTP_PROXY`, `HTTPS_PROXY`
-and `NO_PROXY`. Per repository you can set `direct` (never proxy) or
+By default (`inherit`) a Remote uses the process `HTTP_PROXY`, `HTTPS_PROXY`,
+`ALL_PROXY` and `NO_PROXY` (either case; upper case wins). A destination that
+would go through that proxy is first resolved by the backend and refused when
+it does not resolve or the outbound address policy refuses any of its
+addresses, exactly as a direct request would be. This applies to each new
+connection, each redirect hop and each plain-HTTP Remote request. The backend
+therefore needs its own DNS for proxied hosts. The proxy resolves the name
+again itself, so a DNS answer that changes between the two lookups is only
+caught by the proxy: give it a destination policy that refuses loopback,
+link-local, metadata and internal ranges as well. Set
+`AK_UPSTREAM_ENV_PROXY=ignore` to keep Remote and other upstream fetches off
+the environment proxy entirely (webhook, SSO and internal-service requests
+still use it). Per repository you can set `direct` (never proxy) or
 `explicit` with its own `proxy_url` and `no_proxy`; an explicit setting
 replaces the environment, it does not merge with it. The proxy URL may carry
 credentials; it is encrypted at rest and redacted in responses and logs. Read
@@ -365,7 +428,7 @@ The adapter (`docker/scanner-adapter`) has its own settings:
 
 | Variable | What it does | Offline value |
 | --- | --- | --- |
-| `SCANNER_OFFLINE` | The single air-gap switch (adapter 1.7.0 and later). Implies `SCANNER_TRIVY_SKIP_DB_UPDATE=true`, skips the startup database download, and runs every image and filesystem scan with `--skip-db-update --skip-java-db-update --offline-scan`, so trivy contacts no database registry, no Java DB registry and no other network API. | `true` |
+| `SCANNER_OFFLINE` | The single air-gap switch (adapter 1.7.0 and later). Implies `SCANNER_TRIVY_SKIP_DB_UPDATE=true`, skips the startup database download, and runs every image and filesystem scan with `--skip-db-update --skip-java-db-update`, so trivy contacts no database registry and no Java DB registry. | `true` |
 | `SCANNER_ADAPTER_TOKEN` | Shared bearer token for the adapter's own `vulndb` route (`PUT` imports a database, `GET` reports it). Unset, both answer 403. | A secret you generate |
 | `SCANNER_TRIVY_SKIP_DB_UPDATE` | Skip the startup download and pass `--skip-db-update` to image and filesystem scans. | `true` (implied by `SCANNER_OFFLINE`) |
 | `SCANNER_TRIVY_DB_REPOSITORY` | OCI repository the database is pulled from (`--db-repository`). Default is trivy's public mirror. | An OCI repository in your Artifact Keeper that holds a copy of the trivy DB artifact |
@@ -393,6 +456,21 @@ With `SCANNER_OFFLINE=true` the Java DB is never downloaded, so JAR files are
 matched only if a Java DB is already in `SCANNER_TRIVY_CACHE_DIR`. Seed it
 while connected if you scan Java.
 
+**No lookups during a scan, in any mode (1.12.0, adapter 1.7.0).** Every trivy
+scan -- the adapter's image and filesystem scans and the backend's own
+`trivy filesystem` runs -- passes `--offline-scan` and turns off trivy's
+version check and telemetry (`--skip-version-check --disable-telemetry`, or
+`TRIVY_SKIP_VERSION_CHECK` / `TRIVY_DISABLE_TELEMETRY` for a locally
+installed trivy). Before that, trivy resolved the parent POM and unpinned
+dependency versions of every `pom.xml` in an extracted JAR against
+`repo.maven.apache.org`, which failed the scan on a disconnected install,
+went around your Maven remote, and told Maven Central which dependencies the
+artifact uses; each run also called `check.trivy.dev`. `trivy filesystem`
+does not open JAR files, so the libraries bundled in a fat jar
+(`BOOT-INF/lib/`) or a war (`WEB-INF/lib/`) are now handed to it as a
+synthesized `.ak-scan-jar-inventory/pom.xml` built from their own
+`pom.properties`, and graded at the versions the archive ships.
+
 ### Dependency scanner (OSV)
 
 The built-in dependency scanner looks up advisories at scan time on
@@ -400,6 +478,14 @@ The built-in dependency scanner looks up advisories at scan time on
 Offline these lookups fail and the result is recorded as degraded, not clean.
 Leave `GITHUB_TOKEN` unset on a sealed instance. There is no switch to turn
 this scanner off.
+
+For a JAR, WAR or EAR (1.12.0, #5666) it reads the coordinates of the
+libraries bundled inside -- each `META-INF/maven/<groupId>/<artifactId>/pom.properties`
+in the archive and in the jars nested one level down (`BOOT-INF/lib/`,
+`WEB-INF/lib/`) -- and looks those up, at the versions the archive ships.
+Only those coordinates leave the instance, and only to the advisory feeds
+above; nothing is resolved against Maven Central. A library built without a
+`pom.properties` (some Gradle and sbt builds) is not named this way.
 
 ### Dependency-Track and OpenSCAP
 
@@ -433,7 +519,9 @@ curl -X PATCH "$AK/api/v1/admin/settings/system" \
 
 It pauses the curation upstream sync and its popularity lookups, the
 environment advisory re-evaluation (OSV), the npm change feed consumer, peer
-replication transfers and the Remote MCP registry sync. Each skips its tick
+replication transfers and scheduled `mirror` passes, and the Remote MCP
+registry sync. A `mirror` schedule that comes due while paused runs once on
+the first check after the switch is turned off. Each skips its tick
 before any network work and resumes where it stopped when the switch is
 turned off. `GET /api/v1/admin/settings/system` reports the state
 (`upstream_jobs_paused`, `upstream_jobs_paused_source`). Local jobs and
@@ -452,7 +540,7 @@ What each job contacts, and how to handle it individually:
 | Dependency scanner advisories | `api.osv.dev`, `api.github.com` | Runs on each scan, not on a timer. Leave `GITHUB_TOKEN` unset; see [section 4](#dependency-scanner-osv). |
 | Peer heartbeats and sync | The registered peers | Only peers you registered. The switch pauses replication transfers (queued tasks stay queued), not heartbeats; set `PEER_HEARTBEAT_ENABLED=false` to stop those. Unregister or disable subscriptions you no longer use. |
 | Webhooks, SMTP, LDAP, OIDC, tracing | Whatever you configured (`OTEL_EXPORTER_OTLP_ENDPOINT` for traces) | Point them at services inside the enclave, or leave them unset. |
-| MCP Remote sync | The upstream registry of each Remote MCP repository, hourly by default (`MCP_REMOTE_SYNC_INTERVAL_SECS`) | Paused by the switch (job `mcp_remote_sync`); the per-repository cursor survives, so it resumes from there. Cache-only mode does not cover it. See [MCP registry: Remote repositories](mcp-registry.md#remote-repositories). |
+| MCP Remote sync | The upstream registry of each Remote MCP repository, hourly by default (`MCP_REMOTE_SYNC_INTERVAL_SECS`) | Paused by the switch (job `mcp_remote_sync`); the per-repository cursor survives, so it resumes from there. `mcp_remote_sync_paused: true` pauses one Remote. A cache-only Remote's sync makes no upstream request (the shared upstream gate refuses each page that is not cached). Set any of these in the create body, not after it (#5402): see below and [MCP registry: Remote repositories](mcp-registry.md#remote-repositories). |
 
 Crash reporting is opt-in and off by default
 (`GET /api/v1/admin/telemetry/settings`). The backend has no update check.
@@ -469,12 +557,27 @@ cache entries (#5283). A Remote forwards the tree listing's `recursive`,
 files in subdirectories. See [Hugging Face](huggingface.md).
 
 **Go.** Point `GOPROXY` at the Go Remote. Artifact Keeper also answers the
-checksum database under the same prefix (`sumdb/sum.golang.org/...`), but
-that route is a pass-through: it is not cached, so it fails offline. Commit
-`go.sum`: a module whose hash is already in `go.sum` is not checked against
-the checksum database. For modules that are not (private modules, or new ones
-added on the high side), exclude them from checksum database lookups on the
-client:
+checksum database under the same prefix (`sumdb/sum.golang.org/...`) and
+caches its answers in the Remote's proxy cache (#5344), so `go` can verify a
+seeded module offline with the default `GOSUMDB`. The tiles
+(`sumdb/<host>/tile/...`) and the per-version lookups
+(`sumdb/<host>/lookup/<module>@<version>`) are immutable entries. The signed
+tree head (`sumdb/<host>/latest`) is mutable: it is revalidated after the
+cache TTL, served stale within the stale-if-error grace while the checksum
+database is unreachable, and served as it is in cache-only mode. To seed it,
+run the same `go mod download` through the Remote while it is connected; the
+toolchain fetches the lookups and tiles it needs.
+
+The upstream filter sees these fetches as the absolute URL
+(`https://sum.golang.org/...`), so an exclude pattern such as
+`^https://sum\.golang\.org/` stops them. Only `sum.golang.org` and
+`sum.golang.google.cn` are proxied, and the Remote's upstream credentials are
+never sent to them. A Hosted Go repository has no proxy cache and still
+passes these requests through uncached.
+
+Private modules, and modules added on the high side, are not in the public
+checksum database at all. Exclude them from lookups on the client, and commit
+`go.sum`:
 
 ```bash
 export GOPROXY=https://registry.example.com/go/go-remote
@@ -484,8 +587,37 @@ export GONOSUMDB=example.com/internal/*
 **npm.** `npm ci` from a lockfile installs cached tarballs without needing
 fresh metadata. `npm audit` and `npm audit signatures` call upstream endpoints
 (`/-/npm/v1/security/...`, `/-/npm/v1/attestations/...`) that Artifact Keeper
-passes through and does not cache positively. Offline they fail. Run them on
-the low side before content crosses.
+passes through and does not cache positively. Run them on the low side before
+content crosses. Offline, a Remote answers them as follows:
+
+| Request | Upstream unreachable | Refused by the upstream filter | Cache-only |
+| --- | --- | --- | --- |
+| `GET /-/npm/v1/attestations/...`, `/-/v1/search` and other `/-/` reads | `503 upstream unreachable: ...` | `404 path excluded by the upstream filter of repository '<key>'` | `404 not in cache; repository '<key>' is cache-only` |
+| `POST /-/npm/v1/security/advisories/bulk`, `/-/npm/v1/security/audits/quick` | `503 npm audit could not be performed through repository '<key>': upstream unavailable: ...` | `501 npm audit is not available through repository '<key>': ...` | `501 npm audit is not available through repository '<key>': ...` |
+| `GET /-/ping`, `/-/whoami` | answered locally | `404` (filter reason) | `404` (cache-only reason) |
+
+- An attestation answer still held in the attestation negative cache
+  (`NPM_ATTESTATION_NEGATIVE_CACHE_*`, a `404`/`410` for that version, held
+  for up to an hour by default) is served instead of the refusal or the `503`.
+  Positive attestation bundles are never cached, so `npm audit signatures`
+  cannot verify provenance offline.
+- An audit that cannot be performed is an error, never an empty advisory set
+  (#5631), so offline `npm audit` fails with the message above instead of
+  reporting `found 0 vulnerabilities`, and `npm install` prints an audit
+  warning. Audit on the low side. (Before 1.12.0 these endpoints answered
+  `200` with an empty advisory set, a false all-clear.)
+- `npm audit` through a Virtual repository is forwarded to the first Remote
+  member whose upstream answers the audit API, with that member's credentials,
+  egress proxy, upstream filter and scope policy. A Local or Staging
+  repository holds no advisory data and answers `501`, as does a Virtual with
+  no Remote member that can answer; `503` when a member's upstream was
+  contacted and failed.
+- A Virtual repository tries each Remote member in turn. When none answers it
+  returns `503` if a member was unreachable, otherwise `404` listing each
+  member's refusal reason.
+- `501 ... is not implemented for local repositories` is the answer of a Local
+  repository only (and of a Virtual repository with no Remote member, which
+  says so).
 
 **PyPI.** Hash-checking installs work offline: the hashes come from your lock
 file and the wheels are immutable cache entries. Only the simple index is
@@ -532,7 +664,8 @@ Run these after you disconnect, and again after any change.
 
    Requests made outside the proxy service (the `test-upstream` probe,
    curation sync, the popularity source, the npm change feed and `/-/`
-   passthroughs, the Go sumdb proxy) are not recorded. See
+   passthroughs, the Go sumdb pass-through of a Hosted repository) are not
+   recorded. See
    [Upstream contact](audit-events.md#upstream-contact).
 
 3. **Hits, not misses.** Scrape `GET /api/v1/admin/metrics` (or `/metrics` on

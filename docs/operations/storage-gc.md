@@ -90,6 +90,18 @@ write. Uploads of identical content take the same slot, so their commits run
 one after another (each waiting on a database connection meanwhile). Format handlers that write their own content-addressed rows outside the
 shared upload service are not covered yet.
 
+A storage scrub repair (`POST /api/v1/admin/storage-scrub` with `repair`)
+takes the same slot before it writes a verified copy over a damaged object,
+and holds it until the repaired object is re-verified (#4989). A GC claim of
+that key meanwhile waits and re-checks afterwards. While GC holds a fresh
+lease on the key the repair is skipped and the finding says so
+("storage GC is removing this object"); a later run retries it.
+
+The object a conditional replace (`If-Match`) leaves without a row is recorded
+as a candidate with a fresh `recorded_at`, also when the key already had a
+record (an earlier replace, a repository delete, a failed delete), so it
+always gets the full `BLOB_GC_MIN_AGE_SECS` grace from that replace (#4989).
+
 That re-check consults every reference table, which is wider than the
 soft-deleted-key scan alone. In particular an object that an `artifact_versions`
 row still names is kept: when the newest revision of an artifact in a

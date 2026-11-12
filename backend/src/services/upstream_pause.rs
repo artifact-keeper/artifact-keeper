@@ -125,9 +125,26 @@ pub async fn try_state(db: &PgPool) -> Result<UpstreamPauseState, sqlx::Error> {
     Ok(resolve(env_default(), Ok(stored.as_ref())))
 }
 
+/// Tests only: ignore the stored setting in this process, so a test is not
+/// paused by another test that is toggling `upstream_jobs_paused` in the shared
+/// test database at the same moment (the env default still applies; nextest
+/// runs each test in its own process).
+#[cfg(test)]
+static IGNORE_STORED_FOR_TESTS: AtomicBool = AtomicBool::new(false);
+
+/// Tests only: see [`IGNORE_STORED_FOR_TESTS`].
+#[cfg(test)]
+pub fn ignore_stored_setting_for_tests() {
+    IGNORE_STORED_FOR_TESTS.store(true, Ordering::Relaxed);
+}
+
 /// Read the switch for a scheduled job. Never fails: a read error is
 /// [`UpstreamPauseSource::Unavailable`] (paused).
 pub async fn state(db: &PgPool) -> UpstreamPauseState {
+    #[cfg(test)]
+    if IGNORE_STORED_FOR_TESTS.load(Ordering::Relaxed) {
+        return resolve(env_default(), Ok(None));
+    }
     match load_stored(db).await {
         Ok(stored) => resolve(env_default(), Ok(stored.as_ref())),
         Err(e) => {
@@ -371,7 +388,7 @@ mod tests {
                 include_str!("mcp_remote.rs"),
                 "MCP_REMOTE_SYNC_JOB",
                 ".skip_tick(",
-                "run_due(&state",
+                "run_due(state, interval_secs",
             ),
         ];
         let gate_ctor = format!("{}::new(", "UpstreamPauseGate");

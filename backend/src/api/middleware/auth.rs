@@ -25,6 +25,7 @@ use axum::{
 use base64::Engine;
 use uuid::Uuid;
 
+use crate::api::middleware::rate_limit::{basic_password_budget, BasicPasswordBudget};
 use crate::api::{
     CachedRepo, RepoCache, RepoMissCache, REPO_CACHE_TTL_SECS, REPO_MISS_CACHE_MAX_ENTRIES,
 };
@@ -32,7 +33,9 @@ use crate::error::AppError;
 use crate::models::access_scope::AccessScope;
 use crate::models::repository::{is_deleting_key, RepositoryVisibility};
 use crate::models::user::User;
-use crate::services::auth_service::{AuthService, Claims};
+use crate::services::auth_service::{
+    is_api_token_shape, is_jwt_shape, AuthService, Claims, TimingPad,
+};
 use crate::services::metrics_service::{
     record_auth_failure, AuthFailureReason, AuthFailureSurface,
 };
@@ -527,6 +530,22 @@ pub async fn require_auth_with_bearer_fallback(
                 .body(axum::body::Body::from("Invalid credentials"))
                 .unwrap()
         })?;
+    // #5484: as on the other format-route password paths, an account with
+    // TOTP enrolled must present an API token, not its password.
+    if let Some(refusal) = format_route_password_refusal(&user) {
+        tracing::info!(
+            target: "security",
+            username = %user.username,
+            reason = refusal.as_str(),
+            "password authentication refused; the account needs an API token"
+        );
+        record_auth_failure(AuthFailureSurface::Basic, AuthFailureReason::Scope);
+        return Err(Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("WWW-Authenticate", format!("Basic realm=\"{}\"", realm))
+            .body(axum::body::Body::from("Invalid credentials"))
+            .unwrap());
+    }
     Ok(user.id)
 }
 
@@ -960,76 +979,47 @@ pub async fn auth_middleware(
                 "Invalid Basic auth credentials",
                 Some((AuthFailureSurface::Basic, AuthFailureReason::InvalidToken)),
             )),
+            // Same token-first resolution as the optional-auth paths, with
+            // API tokens refused as the Basic password on this management
+            // surface (#2806): an issued-token-shaped password is never
+            // bcrypt-verified, and a real password pays exactly one bcrypt
+            // (#5640). A JWT access token as the password still works for the
+            // CI/CD keyless flows (OIDC token exchange) where Maven, twine and
+            // Helm send it there.
             Some((username, password)) => {
-                match auth_service
-                    .authenticate_with_reason(&username, &password)
-                    .await
-                    .map_err(|failure| {
-                        let reason = failure
-                            .metric_reason()
-                            .unwrap_or(AuthFailureReason::BadPassword);
-                        (failure.error, reason)
-                    }) {
-                    Ok((user, _token_pair)) => Ok(AuthExtension::from(user)),
-                    // A transient bcrypt-capacity shed must NOT be collapsed
-                    // into a 401. `authenticate()` runs bcrypt(cost=12) under a
-                    // process-wide concurrency cap (see
-                    // `auth_service::acquire_auth_permit_for_bcrypt`); when that
-                    // cap saturates under a burst of concurrent Basic-auth
-                    // requests it returns `AppError::ServiceUnavailable`, which
-                    // is a retryable 503, not "wrong password". Collapsing it to
-                    // 401 "Invalid credentials" is what made `twine upload` fail
-                    // in the release gate (a curl -u upload with byte-identical
-                    // credentials passed because it didn't coincide with a
-                    // saturated cap): twine does not retry on 401 but does on
-                    // 503. Surface the shed as 503 + Retry-After so well-behaved
-                    // clients back off and retry instead of aborting.
-                    Err((AppError::ServiceUnavailable(msg), _)) => {
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            [(axum::http::header::RETRY_AFTER, "1")],
-                            msg,
-                        )
-                            .into_response();
-                    }
-                    // A pool-acquire timeout during the credential DB lookup is
-                    // a transient capacity problem (POOL_EXHAUSTED), not "wrong
-                    // password": surface the same retryable 503 the #2101/#2102
-                    // handlers return rather than flattening it to a spurious
-                    // 401 (#2125). Clients retry on 503 but abort on 401.
-                    Err((ref e, _)) if e.is_db_unavailable() => {
+                let mut failure = None;
+                let mut refused = None;
+                let resolved = resolve_basic_pair(
+                    &auth_service,
+                    &username,
+                    &password,
+                    false,
+                    &mut failure,
+                    &mut refused,
+                )
+                .await;
+                // This surface answers the request and never runs the LDAP
+                // passthrough: audit a refused password here (#5653).
+                record_basic_refusal(&auth_service, refused, None).await;
+                match resolved {
+                    AuthOutcome::Resolved(ext) => Ok(ext),
+                    // A transient bcrypt-capacity shed or a pool-acquire
+                    // timeout is a retryable 503, never a 401: twine does not
+                    // retry on 401 but does on 503 (#2125).
+                    AuthOutcome::Overloaded => {
                         return service_unavailable_response();
                     }
-                    Err((_, password_reason)) => {
-                        // Try treating the password as a short-lived JWT access
-                        // token. This enables CI/CD keyless flows (e.g. OIDC
-                        // token exchange) where package managers like Maven,
-                        // pip/twine, and Helm send the AK access token as the
-                        // Basic-auth password. `From<Claims>` stamps `iat_ms` so
-                        // credential-change invalidation can exempt the calling
-                        // session.
-                        //
-                        // An API token is deliberately NOT accepted as the Basic
-                        // password here: this is the hard-auth middleware for the
-                        // management API (/api/v1/auth, /profile, /signing, …).
-                        // Per the openapi.rs contract, an API token is only ever
-                        // valid as a `Bearer`/`X-Api-Key` credential or the Basic
-                        // password on the FORMAT/registry endpoints (handled by
-                        // `repo_visibility_middleware` → `try_resolve_auth_outcome`
-                        // with `allow_basic_api_token=true`). Accepting it here
-                        // (added by #2798) over-reached the #2786 need; #2806
-                        // restores the /api/v1 Basic-auth boundary.
-                        match auth_service.validate_access_token_async(&password).await {
-                            Ok(claims) => Ok(AuthExtension::from(claims)),
-                            Err(ref e) if e.is_db_unavailable() => {
-                                return service_unavailable_response();
-                            }
-                            Err(_) => Err((
-                                "Invalid credentials",
-                                Some((AuthFailureSurface::Basic, password_reason)),
-                            )),
-                        }
+                    // The Basic-password login budget is spent (#5485).
+                    AuthOutcome::RateLimited(retry_after) => {
+                        return rate_limited_response(retry_after);
                     }
+                    AuthOutcome::InvalidCredential | AuthOutcome::NoCredential => Err((
+                        "Invalid credentials",
+                        Some(failure.unwrap_or((
+                            AuthFailureSurface::Basic,
+                            AuthFailureReason::BadPassword,
+                        ))),
+                    )),
                 }
             }
         },
@@ -1262,8 +1252,11 @@ pub(crate) enum AuthOutcome {
     /// it did not coincide with a saturated cap); twine does not retry on
     /// 401 but does on 503.
     Overloaded,
-    /// The shared login limiter refused an LDAP Basic-auth passthrough bind
-    /// (#3830). Carries the `Retry-After` seconds.
+    /// A login budget refused the credential before it was verified: the
+    /// shared login limiter refused an LDAP Basic-auth passthrough bind
+    /// (#3830), or the Basic `username:password` failure budget for this
+    /// username and source IP is spent (#5485). Carries the `Retry-After`
+    /// seconds; callers answer 429.
     RateLimited(u64),
 }
 
@@ -1312,9 +1305,43 @@ pub(crate) async fn try_resolve_auth_outcome(
     extracted: ExtractedToken<'_>,
     allow_basic_api_token: bool,
 ) -> AuthOutcome {
+    let mut refused = None;
+    let outcome = try_resolve_auth_outcome_deferring_audit(
+        auth_service,
+        extracted,
+        allow_basic_api_token,
+        &mut refused,
+    )
+    .await;
+    // The caller answers with this outcome and no LDAP passthrough follows:
+    // a refused Basic password is audited here (#5653).
+    record_basic_refusal(auth_service, refused, None).await;
+    outcome
+}
+
+/// [`try_resolve_auth_outcome`] that leaves the `LOGIN_FAILED` row of a
+/// refused Basic password to the caller (#5653): `refused` is set, and the
+/// caller passes it to [`record_basic_refusal`] when it answers the request
+/// itself, or drops it when a later layer re-resolves (and audits) the same
+/// credential. The guest-access guard uses it: it defers a bad Basic
+/// credential to the package route's own middleware, which runs the LDAP
+/// passthrough.
+#[tracing::instrument(name = "authenticate", level = "info", skip_all)]
+pub(crate) async fn try_resolve_auth_outcome_deferring_audit(
+    auth_service: &AuthService,
+    extracted: ExtractedToken<'_>,
+    allow_basic_api_token: bool,
+    refused: &mut Option<BasicRefusal>,
+) -> AuthOutcome {
     let mut failure = None;
-    let outcome =
-        resolve_auth_outcome(auth_service, extracted, allow_basic_api_token, &mut failure).await;
+    let outcome = resolve_auth_outcome(
+        auth_service,
+        extracted,
+        allow_basic_api_token,
+        &mut failure,
+        refused,
+    )
+    .await;
     if matches!(outcome, AuthOutcome::InvalidCredential) {
         let (surface, reason) =
             failure.unwrap_or((AuthFailureSurface::Api, AuthFailureReason::InvalidToken));
@@ -1347,9 +1374,19 @@ pub(crate) async fn try_resolve_auth_outcome_with_passthrough(
     method: &str,
 ) -> AuthOutcome {
     let mut failure = None;
-    let outcome =
-        resolve_auth_outcome(auth_service, extracted, allow_basic_api_token, &mut failure).await;
+    let mut refused = None;
+    let outcome = resolve_auth_outcome(
+        auth_service,
+        extracted,
+        allow_basic_api_token,
+        &mut failure,
+        &mut refused,
+    )
+    .await;
 
+    // Whether the passthrough refused the credential and wrote its own
+    // `provider: ldap` LOGIN_FAILED row, which then stands for this request.
+    let mut passthrough_audited = false;
     if matches!(outcome, AuthOutcome::InvalidCredential) && allow_basic_api_token {
         // `resolve_auth_outcome` already tried the same decoded pair as
         // bcrypt (and the Bearer form as a JWT/API token), so this only
@@ -1365,15 +1402,46 @@ pub(crate) async fn try_resolve_auth_outcome_with_passthrough(
             .await
             {
                 crate::services::ldap_basic_auth::Outcome::Resolved(user) => {
-                    return AuthOutcome::Resolved(AuthExtension::from(*user));
+                    // A directory user's password: the local refusal was not
+                    // a failed login. #5484: but a directory password is no
+                    // more than a local one, so the same policy applies.
+                    let mut ldap_failure = None;
+                    let mut ldap_refused = None;
+                    let outcome = password_outcome(
+                        auth_service,
+                        *user,
+                        true,
+                        &mut ldap_failure,
+                        &mut ldap_refused,
+                    )
+                    .await;
+                    if let Some((surface, reason)) = ldap_failure {
+                        record_auth_failure(surface, reason);
+                    }
+                    record_basic_refusal(auth_service, ldap_refused, None).await;
+                    return outcome;
                 }
                 crate::services::ldap_basic_auth::Outcome::RateLimited(retry_after) => {
+                    // The directory was never asked, so nothing else records
+                    // this attempt (#5653).
+                    record_basic_refusal(
+                        auth_service,
+                        refused,
+                        Some("ldap_passthrough_rate_limited"),
+                    )
+                    .await;
                     return AuthOutcome::RateLimited(retry_after);
                 }
                 crate::services::ldap_basic_auth::Outcome::Unavailable => {
                     return AuthOutcome::Overloaded;
                 }
-                crate::services::ldap_basic_auth::Outcome::Invalid => {}
+                crate::services::ldap_basic_auth::Outcome::Invalid => {
+                    // An enabled passthrough audits every refusal of a
+                    // non-empty username and password it is handed (#5653).
+                    passthrough_audited = crate::services::ldap_basic_auth::passthrough_enabled()
+                        && !username.is_empty()
+                        && !password.is_empty();
+                }
             }
         }
     }
@@ -1382,6 +1450,11 @@ pub(crate) async fn try_resolve_auth_outcome_with_passthrough(
         let (surface, reason) =
             failure.unwrap_or((AuthFailureSurface::Api, AuthFailureReason::InvalidToken));
         record_auth_failure(surface, reason);
+    }
+    // Refused locally, and the passthrough did not run or wrote no row: the
+    // local refusal is this request's one row (#5653).
+    if !passthrough_audited {
+        record_basic_refusal(auth_service, refused, None).await;
     }
     outcome
 }
@@ -1393,6 +1466,7 @@ async fn resolve_auth_outcome(
     extracted: ExtractedToken<'_>,
     allow_basic_api_token: bool,
     failure: &mut Option<AuthFailureLabels>,
+    refused: &mut Option<BasicRefusal>,
 ) -> AuthOutcome {
     match extracted {
         ExtractedToken::Bearer(token) => {
@@ -1416,15 +1490,25 @@ async fn resolve_auth_outcome(
             }
             // Some package managers (npm, cargo, goproxy) send Bearer tokens
             // that are base64-encoded `username:password` rather than JWTs or
-            // API keys. Try decoding as credentials before giving up.
+            // API keys. Try decoding as credentials before giving up, through
+            // the same shape-classified resolution as a Basic header (#5683):
+            // a dead token-shaped password is refused without a password
+            // bcrypt or an auth permit, and a real password pays one under the
+            // Basic-password budget. The Bearer failure labels above stand.
             if let Some((username, password)) = decode_basic_credentials(token) {
-                match auth_service.authenticate(&username, &password).await {
-                    Ok((user, _)) => return AuthOutcome::Resolved(AuthExtension::from(user)),
-                    // A transient bcrypt-capacity shed must surface as 503, not
-                    // 401. See `AuthOutcome::Overloaded`.
-                    Err(AppError::ServiceUnavailable(_)) => return AuthOutcome::Overloaded,
-                    Err(ref e) if e.is_db_unavailable() => return AuthOutcome::Overloaded,
-                    Err(_) => {}
+                let mut pair_failure = None;
+                match resolve_basic_pair(
+                    auth_service,
+                    &username,
+                    &password,
+                    allow_basic_api_token,
+                    &mut pair_failure,
+                    refused,
+                )
+                .await
+                {
+                    AuthOutcome::InvalidCredential | AuthOutcome::NoCredential => {}
+                    resolved_or_shed => return resolved_or_shed,
                 }
             }
             AuthOutcome::InvalidCredential
@@ -1446,66 +1530,15 @@ async fn resolve_auth_outcome(
                 *failure = Some((AuthFailureSurface::Basic, AuthFailureReason::InvalidToken));
                 return AuthOutcome::InvalidCredential;
             };
-            // Try bcrypt username/password auth first
-            match auth_service
-                .authenticate_with_reason(&username, &password)
-                .await
-            {
-                Ok((user, _)) => return AuthOutcome::Resolved(AuthExtension::from(user)),
-                // A transient bcrypt-capacity shed must surface as 503, not a
-                // 401. Without this, twine (which sends standard Basic auth)
-                // gets a spurious 401 under parallel-suite load and aborts,
-                // while a single curl -u upload with the same credentials
-                // succeeds. See `AuthOutcome::Overloaded`.
-                Err(ref f) if matches!(f.error, AppError::ServiceUnavailable(_)) => {
-                    return AuthOutcome::Overloaded
-                }
-                // A pool-acquire timeout is a retryable 503, never a 401.
-                // Short-circuit here so a saturated pool does not pay a second
-                // acquire-timeout on the API-token fallback below before the
-                // classifier reaches the same conclusion (#2125). See
-                // `AuthOutcome::Overloaded`.
-                Err(ref f) if f.error.is_db_unavailable() => return AuthOutcome::Overloaded,
-                // If every fallback below fails too, this is what the
-                // rejected credential counts as.
-                Err(f) => {
-                    *failure = Some((
-                        AuthFailureSurface::Basic,
-                        f.metric_reason().unwrap_or(AuthFailureReason::BadPassword),
-                    ));
-                }
-            }
-            // Try treating the password as a short-lived JWT access token.
-            // This enables CI/CD keyless flows (e.g. OIDC token exchange) where
-            // package managers like Maven, pip/twine, and Helm send the AK access
-            // token as the Basic auth password.
-            match auth_service.validate_access_token_async(&password).await {
-                Ok(claims) => return AuthOutcome::Resolved(AuthExtension::from(claims)),
-                Err(ref e) if e.is_db_unavailable() => return AuthOutcome::Overloaded,
-                Err(_) => {}
-            }
-            // Fall back to treating the password as an API token — compatible with
-            // pip netrc / Artifactory-style `token:<api_token>` credential format.
-            //
-            // Only the format/registry endpoints (`repo_visibility_middleware`)
-            // opt into this via `allow_basic_api_token=true`. The /api/v1
-            // management callers (`optional_auth_middleware`, `admin_middleware`)
-            // pass `false`, so an API token presented as a Basic password there is
-            // refused (falls through to `InvalidCredential`), honouring the
-            // openapi.rs contract (#2806). Bearer/X-Api-Key token auth and
-            // bcrypt/JWT Basic auth above are unaffected.
-            if !allow_basic_api_token {
-                return AuthOutcome::InvalidCredential;
-            }
-            match validate_api_token_with_scopes(auth_service, &password).await {
-                Ok(ext) => AuthOutcome::Resolved(ext),
-                // The token fallback also burns a bcrypt verify under the
-                // same process-wide cap; preserve the shed as Overloaded so
-                // pip-netrc-style `token:<api_token>` clients get the
-                // retryable 503, not a spurious 401.
-                Err(TokenAuthError::Overloaded) => AuthOutcome::Overloaded,
-                Err(TokenAuthError::Invalid(_)) => AuthOutcome::InvalidCredential,
-            }
+            resolve_basic_pair(
+                auth_service,
+                &username,
+                &password,
+                allow_basic_api_token,
+                failure,
+                refused,
+            )
+            .await
         }
         ExtractedToken::None => AuthOutcome::NoCredential,
         ExtractedToken::Invalid => {
@@ -1518,6 +1551,372 @@ async fn resolve_auth_outcome(
 // ---------------------------------------------------------------------------
 // Download ticket auth (?ticket= query param)
 // ---------------------------------------------------------------------------
+
+/// Resolve a decoded HTTP Basic `username:password` pair (#5640, #5633).
+///
+/// Order is by cost, cheapest first, and is shaped so a token never pays for
+/// a password check:
+///
+/// 1. **JWT-shaped password** (`eyJ…` compact JWS): validated as an AK access
+///    token (HMAC, no bcrypt) — the keyless CI/OIDC flow where Maven, twine
+///    or Helm send the access token as the password. Never bcrypt-verified.
+/// 2. **API-token-shaped password** (`<8 hex>_<32 hex>`): validated as an API
+///    token, which answers from the token cache after the first request and
+///    rejects an unknown, revoked or expired token before any bcrypt (see
+///    `AuthService::validate_api_token`). On the /api/v1 management surfaces
+///    (`allow_basic_api_token = false`) a token is not an accepted Basic
+///    password (#2806), so it is refused outright. Never bcrypt-verified as a
+///    password either: that is what cost every `user:<api_token>` request a
+///    cost-12 bcrypt (0.34 s) before the token was even tried, saturated the
+///    auth-concurrency cap into `503 Authentication service is at capacity`,
+///    and bumped the account's failed-login counter on every request.
+/// 3. **Anything else** is a password: one bcrypt via
+///    `AuthService::authenticate_basic_with_reason`, which pads the
+///    unknown-username, federated and hashless arms with the same bcrypt so
+///    an unknown username is not answered measurably faster than a known one.
+///    The pad is off while the LDAP Basic-auth passthrough is enabled on a
+///    surface that runs it: a directory user's password then takes the
+///    federated or no-local-row arm on every request on its way to the
+///    passthrough (cache hits included), and must not pay a bcrypt and an
+///    auth permit for it (see `AuthEntry::Basic`). The verification draws on
+///    the Basic-password login budget (#5485); see [`verify_basic_password`].
+///
+/// Consequence, deliberate: a local account whose password happens to be
+/// shaped exactly like an AK-issued token cannot use it as a Basic password
+/// on these surfaces (it still logs in at `POST /api/v1/auth/login`).
+/// Falling back to bcrypt for such a secret would put every invalid token
+/// back in front of the auth-capacity cap.
+///
+/// Sets `failure` to the `ak_auth_failures_total` labels before answering
+/// [`AuthOutcome::InvalidCredential`].
+async fn resolve_basic_pair(
+    auth_service: &AuthService,
+    username: &str,
+    password: &str,
+    allow_basic_api_token: bool,
+    failure: &mut Option<AuthFailureLabels>,
+    refused: &mut Option<BasicRefusal>,
+) -> AuthOutcome {
+    if is_jwt_shape(password) {
+        return match auth_service.validate_access_token_async(password).await {
+            Ok(claims) => AuthOutcome::Resolved(AuthExtension::from(claims)),
+            // Signature verified, DB lookup failed: retryable 503 (#4750).
+            Err(ref e) if e.is_db_unavailable() => AuthOutcome::Overloaded,
+            Err(e) => {
+                *failure = Some((
+                    AuthFailureSurface::Basic,
+                    AuthFailureReason::for_token_error(&e, AuthFailureReason::InvalidToken),
+                ));
+                AuthOutcome::InvalidCredential
+            }
+        };
+    }
+
+    if is_api_token_shape(password) {
+        // The /api/v1 management callers (`optional_auth_middleware`,
+        // `admin_middleware`, `auth_middleware`) pass `false`: an API token
+        // presented as a Basic password there is refused, honouring the
+        // openapi.rs contract (#2806). Only the format/registry endpoints
+        // (`repo_visibility_middleware`) accept the pip-netrc /
+        // Artifactory-style `user:<api_token>` form (#2786). The username is
+        // not checked against the token owner: `__token__:` / `token:` clients
+        // rely on the token alone identifying the user.
+        if !allow_basic_api_token {
+            *failure = Some((AuthFailureSurface::Basic, AuthFailureReason::InvalidToken));
+            return AuthOutcome::InvalidCredential;
+        }
+        return match validate_api_token_with_scopes(auth_service, password).await {
+            Ok(ext) => AuthOutcome::Resolved(ext),
+            // A live token's first (uncached) verify runs bcrypt under the
+            // process-wide cap; a shed there is a retryable 503, not a 401.
+            Err(TokenAuthError::Overloaded) => AuthOutcome::Overloaded,
+            Err(TokenAuthError::Invalid(reason)) => {
+                *failure = Some((AuthFailureSurface::Basic, reason));
+                AuthOutcome::InvalidCredential
+            }
+        };
+    }
+
+    match verify_basic_password(auth_service, username, password, allow_basic_api_token).await {
+        // #5484: a verified password is admitted only when it is all this
+        // surface may ask of the account.
+        BasicPasswordOutcome::Verified(user) => {
+            password_outcome(auth_service, *user, allow_basic_api_token, failure, refused).await
+        }
+        BasicPasswordOutcome::RateLimited(retry_after) => AuthOutcome::RateLimited(retry_after),
+        BasicPasswordOutcome::Overloaded => AuthOutcome::Overloaded,
+        BasicPasswordOutcome::Rejected {
+            metric,
+            audit_reason,
+        } => {
+            *failure = Some((AuthFailureSurface::Basic, metric));
+            // #5653: a refused Basic password is a failed login. Who writes
+            // its row is the caller's call (see `record_basic_refusal`).
+            *refused = Some(BasicRefusal {
+                username: username.to_string(),
+                reason: audit_reason,
+            });
+            AuthOutcome::InvalidCredential
+        }
+    }
+}
+
+/// The result of one HTTP Basic password verification
+/// ([`verify_basic_password`]).
+#[derive(Debug)]
+pub(crate) enum BasicPasswordOutcome {
+    /// The password is this local account's.
+    Verified(Box<User>),
+    /// The Basic-password login budget for this username and source IP is
+    /// spent; nothing was verified (#5485). Carries `Retry-After` seconds.
+    RateLimited(u64),
+    /// The bcrypt-capacity cap shed the verify, or the database was
+    /// unreachable: a retryable 503, never a 401.
+    Overloaded,
+    /// A credential-level rejection: its `ak_auth_failures_total` reason and
+    /// the `LOGIN_FAILED` audit reason (#5653).
+    Rejected {
+        metric: AuthFailureReason,
+        audit_reason: &'static str,
+    },
+}
+
+/// Verify an HTTP Basic `username:password` as a local password, under the
+/// Basic-password login budget (#5485).
+///
+/// The password arm of [`resolve_basic_pair`], shared with the OCI `/v2`
+/// handlers that read Basic credentials themselves (`GET /v2/`, every OCI
+/// verb, `/v2/token`), so every Basic password check on the format routes
+/// and the management API costs the same and draws on the same budget:
+///
+/// * a spent per-`(username, IP)` failure budget refuses before any bcrypt;
+/// * otherwise exactly one bcrypt runs: against the account's hash, or, for
+///   an unknown, federated or hashless username, against the dummy hash (the
+///   timing pad) while the source IP is within its failed-login budget;
+/// * a failure is charged to both budgets.
+///
+/// `passthrough_follows` is true when the LDAP Basic-auth passthrough runs
+/// after a rejection here (`repo_visibility_middleware` and the other
+/// `allow_basic_api_token = true` surfaces). With the passthrough enabled a
+/// local failure is then the normal first step of every directory user's
+/// request: it is neither padded (#5640) nor metered, because the
+/// passthrough's own limiter charges the directory bind instead.
+pub(crate) async fn verify_basic_password(
+    auth_service: &AuthService,
+    username: &str,
+    password: &str,
+    passthrough_follows: bool,
+) -> BasicPasswordOutcome {
+    let passthrough =
+        passthrough_follows && crate::services::ldap_basic_auth::passthrough_enabled();
+    let budget = if passthrough {
+        BasicPasswordBudget::Unmetered
+    } else {
+        basic_password_budget(username).await
+    };
+    if let BasicPasswordBudget::Refused(retry_after) = budget {
+        return BasicPasswordOutcome::RateLimited(retry_after);
+    }
+    let pad = if passthrough || !budget.pad_allowed() {
+        TimingPad::Off
+    } else {
+        TimingPad::On
+    };
+    match auth_service
+        .authenticate_basic_with_reason(username, password, pad)
+        .await
+    {
+        Ok((user, _)) => BasicPasswordOutcome::Verified(Box::new(user)),
+        // A transient bcrypt-capacity shed must surface as 503, not a 401.
+        // Without this, twine (which sends standard Basic auth) gets a
+        // spurious 401 under parallel-suite load and aborts, while a single
+        // curl -u upload with the same credentials succeeds. See
+        // `AuthOutcome::Overloaded`.
+        Err(ref f) if matches!(f.error, AppError::ServiceUnavailable(_)) => {
+            BasicPasswordOutcome::Overloaded
+        }
+        // A pool-acquire timeout is a retryable 503, never a 401 (#2125).
+        Err(ref f) if f.error.is_db_unavailable() => BasicPasswordOutcome::Overloaded,
+        Err(f) => {
+            budget.record_failure().await;
+            BasicPasswordOutcome::Rejected {
+                metric: f.metric_reason().unwrap_or(AuthFailureReason::BadPassword),
+                audit_reason: f.reason.unwrap_or("invalid_password"),
+            }
+        }
+    }
+}
+
+/// A Basic password the local check refused (#5653), waiting for the caller
+/// to decide whether this request's answer is a failed login.
+#[derive(Debug)]
+pub(crate) struct BasicRefusal {
+    username: String,
+    reason: &'static str,
+}
+
+/// How long one `(username, source IP)` pair's failed Basic logins are folded
+/// into one audit row (#5653).
+const BASIC_FAILURE_AUDIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Pairs remembered at most. When full, the pair audited longest ago is
+/// forgotten: a new pair is always recorded, so a flood of junk usernames
+/// cannot hide a targeted guess.
+const BASIC_FAILURE_AUDIT_MAX_TRACKED: usize = 10_000;
+
+/// Per pair: when its last row was written, and the refusals folded since.
+type BasicFailureSeen = std::collections::HashMap<(String, String), (Instant, u64)>;
+
+/// Whether a failed Basic login of `key` should be audited at `now`. `Some(n)`
+/// records it (and marks the pair), `n` being the refusals of that pair folded
+/// since its previous row; `None` folds it into the next row. A package client
+/// with a stale password retries on every request: one row per pair per
+/// [`BASIC_FAILURE_AUDIT_WINDOW`] keeps that from turning the audit table into
+/// a write amplifier, and the count keeps the volume visible.
+fn basic_failure_audit_should_record(
+    seen: &mut BasicFailureSeen,
+    key: (String, String),
+    now: Instant,
+) -> Option<u64> {
+    if let Some((last, suppressed)) = seen.get_mut(&key) {
+        if now.duration_since(*last) < BASIC_FAILURE_AUDIT_WINDOW {
+            *suppressed += 1;
+            return None;
+        }
+        let folded = *suppressed;
+        *last = now;
+        *suppressed = 0;
+        return Some(folded);
+    }
+    if seen.len() >= BASIC_FAILURE_AUDIT_MAX_TRACKED {
+        seen.retain(|_, (last, _)| now.duration_since(*last) < BASIC_FAILURE_AUDIT_WINDOW);
+        if seen.len() >= BASIC_FAILURE_AUDIT_MAX_TRACKED {
+            let oldest = seen
+                .iter()
+                .min_by_key(|(_, (last, _))| *last)
+                .map(|(k, _)| k.clone());
+            if let Some(oldest) = oldest {
+                seen.remove(&oldest);
+            }
+        }
+    }
+    seen.insert(key, (now, 0));
+    Some(0)
+}
+
+/// Write the `LOGIN_FAILED` row of a refused HTTP Basic password (#5653),
+/// sampled per `(username, verified source IP)`; `reason` overrides the local
+/// check's reason (a rate-limited passthrough). Never carries the password.
+/// A no-op for `None`.
+pub(crate) async fn record_basic_refusal(
+    auth_service: &AuthService,
+    refused: Option<BasicRefusal>,
+    reason: Option<&'static str>,
+) {
+    let Some(refused) = refused else {
+        return;
+    };
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<BasicFailureSeen>> =
+        std::sync::OnceLock::new();
+    let source = crate::api::middleware::client_ip::current_verified_client_ip()
+        .map(|ip| ip.to_string())
+        .unwrap_or_default();
+    let Some(suppressed) = basic_failure_audit_should_record(
+        &mut SEEN
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        (refused.username.clone(), source),
+        Instant::now(),
+    ) else {
+        return;
+    };
+    use crate::services::audit_export::details::AuthDetails;
+    use crate::services::audit_service::{AuditAction, AuditEntry, ResourceType};
+    let mut details = AuthDetails::failed_login(
+        Some(&refused.username),
+        Some(reason.unwrap_or(refused.reason)),
+    );
+    details.auth_method = Some("basic".to_string());
+    let mut details = serde_json::to_value(details).unwrap_or_default();
+    if let Some(map) = details.as_object_mut() {
+        map.insert(
+            "suppressed_since_last_row".to_string(),
+            serde_json::json!(suppressed),
+        );
+    }
+    let entry = AuditEntry::new(AuditAction::LoginFailed, ResourceType::User)
+        .actor_name(refused.username)
+        .with_request_client_ip()
+        .details(details);
+    crate::services::audit_service::audit_fire_and_forget(auth_service.db().clone(), entry).await;
+}
+
+/// Admit a password-verified `user` only when a password is all this surface
+/// may ask of them (#5484).
+///
+/// HTTP Basic `username:password` (and its base64-in-Bearer form) used to
+/// resolve straight to the account, so a stolen password reached
+/// `POST /api/v1/auth/tokens` and minted a non-expiring API token for an
+/// account with TOTP enrolled, and a local account kept working where SSO
+/// had disabled local login.
+///
+/// * Management API (`allow_basic_api_token = false`): every policy
+///   `POST /api/v1/auth/login` applies after the password
+///   ([`AuthService::password_only_refusal`]).
+/// * Format and registry routes (`true`): an account with TOTP enrolled is
+///   refused, as `/v2/token` already refuses it, since a package client
+///   cannot answer a TOTP challenge. The user-and-API-token form is the way
+///   in for such an account.
+///
+/// A refused account gets the same 401 as a wrong password.
+pub(crate) async fn password_outcome(
+    auth_service: &AuthService,
+    user: User,
+    allow_basic_api_token: bool,
+    failure: &mut Option<AuthFailureLabels>,
+    refused: &mut Option<BasicRefusal>,
+) -> AuthOutcome {
+    let refusal = if allow_basic_api_token {
+        Ok(format_route_password_refusal(&user))
+    } else {
+        auth_service.password_only_refusal(&user).await
+    };
+    match refusal {
+        Ok(None) => AuthOutcome::Resolved(AuthExtension::from(user)),
+        Ok(Some(refusal)) => {
+            tracing::info!(
+                target: "security",
+                username = %user.username,
+                reason = refusal.as_str(),
+                "password authentication refused; the account needs an API token"
+            );
+            *failure = Some((AuthFailureSurface::Basic, AuthFailureReason::Scope));
+            // A correct password the policy refused is still a failed login
+            // (#5653): the caller writes its LOGIN_FAILED row.
+            *refused = Some(BasicRefusal {
+                username: user.username.clone(),
+                reason: refusal.as_str(),
+            });
+            AuthOutcome::InvalidCredential
+        }
+        // The policy lookups are DB reads: an outage is a retryable 503.
+        Err(ref e) if e.is_db_unavailable() => AuthOutcome::Overloaded,
+        Err(e) => {
+            tracing::error!(error = %e, "password-only policy lookup failed; refusing");
+            AuthOutcome::Overloaded
+        }
+    }
+}
+
+/// The #5484 policy for a password on the format and registry routes: an
+/// account with TOTP enrolled must use an API token instead.
+pub(crate) fn format_route_password_refusal(
+    user: &User,
+) -> Option<crate::services::auth_service::PasswordOnlyRefusal> {
+    user.totp_enabled
+        .then_some(crate::services::auth_service::PasswordOnlyRefusal::SecondFactorRequired)
+}
 
 /// Extract the value of a `ticket` query parameter from a URI's query string.
 ///
@@ -1781,13 +2180,17 @@ pub async fn optional_auth_middleware(
     if matches!(outcome, AuthOutcome::Overloaded) {
         return service_unavailable_response();
     }
+    // The Basic-password login budget is spent (#5485): 429, never anonymous.
+    if let AuthOutcome::RateLimited(retry_after) = outcome {
+        return rate_limited_response(retry_after);
+    }
     let credential_invalid = matches!(outcome, AuthOutcome::InvalidCredential);
     let mut auth_ext: Option<AuthExtension> = match outcome {
         AuthOutcome::Resolved(ext) => Some(ext),
         AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
         // Handled above with an early 503 return.
         AuthOutcome::Overloaded => None,
-        // `try_resolve_auth_outcome` cannot produce this.
+        // Handled above with an early 429 return.
         AuthOutcome::RateLimited(_) => None,
     };
 
@@ -1935,11 +2338,12 @@ pub async fn repository_download_auth_middleware(
     // read this repository, so a reactive client sends its credential on the
     // retry. The handler's `require_visible` still runs for the pass-through
     // case; this only decides whether to challenge first.
-    if no_credential
-        && auth_ext.is_none()
-        && !download_anonymously_readable(&vis_state.db, &repo_key).await
-    {
-        return unauthorized_response_for(request.headers());
+    if no_credential && auth_ext.is_none() {
+        match download_anonymously_readable(&vis_state.db, &repo_key).await {
+            Some(true) => {}
+            Some(false) => return unauthorized_response_for(request.headers()),
+            None => return service_unavailable_response(),
+        }
     }
 
     record_request_user(auth_ext.as_ref());
@@ -1955,18 +2359,23 @@ pub async fn repository_download_auth_middleware(
 /// admits this request's client IP. A key that names no repository, and a
 /// lookup error, both answer `false`: fail closed, and byte-identical to the
 /// private case so the resulting 401 is not an existence oracle (#1808).
-async fn download_anonymously_readable(db: &sqlx::PgPool, repo_key: &str) -> bool {
+/// `None` means the database could not answer: a retryable 503, not a 401
+/// that Bazel and cargo treat as fatal.
+async fn download_anonymously_readable(db: &sqlx::PgPool, repo_key: &str) -> Option<bool> {
     let repo_service = crate::services::repository_service::RepositoryService::new(db.clone());
-    let Ok(repo) = repo_service.get_by_key(repo_key).await else {
-        return false;
+    let repo = match repo_service.get_by_key(repo_key).await {
+        Ok(repo) => repo,
+        Err(e) if e.is_db_unavailable() => return None,
+        Err(_) => return Some(false),
     };
     if repo.visibility.allows_anonymous_read() {
-        return true;
+        return Some(true);
     }
-    repo_service
-        .anonymous_can_read_repo(repo.id)
-        .await
-        .unwrap_or(false)
+    match repo_service.anonymous_can_read_repo(repo.id).await {
+        Ok(readable) => Some(readable),
+        Err(e) if e.is_db_unavailable() => None,
+        Err(_) => Some(false),
+    }
 }
 
 /// Admin-only middleware - requires authenticated admin user
@@ -2002,7 +2411,7 @@ pub async fn admin_middleware(
     let auth_ext = match try_resolve_auth_outcome(&auth_service, extracted, false).await {
         AuthOutcome::Resolved(ext) => ext,
         AuthOutcome::Overloaded => return service_unavailable_response(),
-        // `try_resolve_auth_outcome` cannot produce this.
+        // The Basic-password login budget is spent (#5485).
         AuthOutcome::RateLimited(retry_after) => {
             return rate_limited_response(retry_after);
         }
@@ -2723,6 +3132,80 @@ fn not_found_response() -> Response {
         .unwrap()
 }
 
+/// A request on the MCP registry surface (`/mcp/{key}/...`) of an MCP
+/// repository.
+fn is_mcp_surface(format: &str, path: &str) -> bool {
+    format == "mcp" && path.starts_with("/mcp/")
+}
+
+/// A retryable 503 for a permission lookup that could not run (the
+/// database is unreachable). Neutral on purpose: unlike
+/// [`service_unavailable_response`] it does not blame authentication
+/// capacity.
+fn permission_unavailable_response() -> Response {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(axum::http::header::RETRY_AFTER, "1")
+        .header(axum::http::header::CONTENT_TYPE, "text/plain")
+        .body(axum::body::Body::from(
+            "permission service temporarily unavailable",
+        ))
+        .unwrap()
+}
+
+/// The answer to a write or delete the caller may not make (#5458).
+///
+/// A caller who cannot even READ the repository gets the existence-hiding
+/// [`not_found_response`], byte for byte what a key naming no repository
+/// answers (the no-repository branch of [`repo_visibility_middleware`]), so
+/// an owner of some other repository cannot tell an existing private key from
+/// an unknown one by trying to publish to it on any format route. "Can read"
+/// is the REST visibility gate's own predicate (`require_visible`): an
+/// `internal` or `public` repository is readable by every resolved principal,
+/// a `private` one needs a grant carrying `read` (`RepoAccess::READ`). A
+/// caller who CAN read keeps the 403 (#3524): it already knows the repository
+/// exists, and the refusal says why. A lookup error fails closed with a
+/// retryable 503, never a 403 that would re-open the oracle.
+async fn write_denial(
+    db: &sqlx::PgPool,
+    ext: &AuthExtension,
+    repo_id: Uuid,
+    visibility: RepositoryVisibility,
+    action: &str,
+) -> Response {
+    if visibility.allows_authenticated_read() {
+        return forbidden_permission_response();
+    }
+    let readable = crate::services::repository_service::RepositoryService::new(db.clone())
+        .user_can_access_repo(
+            repo_id,
+            ext.user_id,
+            crate::services::repository_service::RepoAccess::READ,
+        )
+        .await;
+    match readable {
+        Ok(true) => forbidden_permission_response(),
+        Ok(false) => {
+            tracing::warn!(
+                repository_id = %repo_id,
+                user_id = %ext.user_id,
+                action,
+                "repository write denied to a caller who cannot read the repository; \
+                 answering the existence-hiding 404"
+            );
+            not_found_response()
+        }
+        Err(_) => {
+            tracing::error!(
+                repository_id = %repo_id,
+                user_id = %ext.user_id,
+                "repo access check failed: database unreachable"
+            );
+            permission_unavailable_response()
+        }
+    }
+}
+
 /// Map an HTTP method to a permission action string.
 ///
 /// Used by [`repo_visibility_middleware`] to determine the required permission
@@ -2913,9 +3396,13 @@ pub async fn repo_visibility_middleware(
             // A query ERROR is not evidence that the key names no repository,
             // so it must not be negative-cached (#3750): otherwise one
             // database blip would pin a real repository out of sight for a
-            // whole TTL. `.ok().flatten()` keeps the pre-existing answer for
-            // this request (an error falls into the no-repo branch below);
-            // only a genuine `Ok(None)` earns a tombstone.
+            // whole TTL. Only a genuine `Ok(None)` earns a tombstone.
+            // An unavailable database answers a retryable 503 once the sweep
+            // below has run: the no-repo branch turned a pool timeout into a
+            // 401 for anonymous pulls, which Bazel treats as fatal.
+            let db_unavailable = row
+                .as_ref()
+                .is_err_and(|e| AppError::Database(e.to_string()).is_db_unavailable());
             let query_succeeded = row.is_ok();
             let row = row.ok().flatten();
 
@@ -2981,6 +3468,9 @@ pub async fn repo_visibility_middleware(
                         miss_cache.insert(repo_key.to_string(), Instant::now());
                     }
                 }
+                if db_unavailable {
+                    return service_unavailable_response();
+                }
                 None
             }
         }
@@ -3011,6 +3501,10 @@ pub async fn repo_visibility_middleware(
         if matches!(outcome, AuthOutcome::Overloaded) {
             return service_unavailable_response();
         }
+        // The Basic-password login budget is spent (#5485).
+        if let AuthOutcome::RateLimited(retry_after) = outcome {
+            return rate_limited_response(retry_after);
+        }
         let credential_invalid = matches!(outcome, AuthOutcome::InvalidCredential);
         // #1808: Close the anonymous repo-existence oracle. An existing
         // *private* repo returns 401 to an anonymous caller (visibility check
@@ -3027,8 +3521,7 @@ pub async fn repo_visibility_middleware(
             AuthOutcome::Resolved(ext) => Some(ext),
             AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
             AuthOutcome::Overloaded => None,
-            // `try_resolve_auth_outcome` cannot produce this, but the enum is
-            // shared with the passthrough-aware call above.
+            // Handled above with an early 429 return.
             AuthOutcome::RateLimited(_) => None,
         };
         if credential_invalid && auth_ext.is_none() {
@@ -3215,7 +3708,7 @@ pub async fn repo_visibility_middleware(
             // Repository-scoped tokens are self-service, so a 403 here handed
             // any user holding a token to a repository of their own a
             // 200/403/404 existence oracle over every other private key.
-            // Writes keep the 403, matching #3524's decision for the ACL arm.
+            // Writes and deletes take the same 404 since #5458 (below).
             //
             // "Read" here is the set the ACL arm below calls a read: the
             // method-derived action plus the `non_mutating_post` routes
@@ -3228,15 +3721,22 @@ pub async fn repo_visibility_middleware(
             // public repository (the short-circuit above), but the two POSTs
             // do, and a public repository has no existence to hide: they keep
             // the 403 there, as `test_3648` pins.
-            if !visibility.allows_anonymous_read()
-                && (scope_gate_action == "read" || non_mutating_post)
-            {
+            //
+            // #5458: a WRITE (or delete) outside the token's scope is refused
+            // the same way on such a repository. The token cannot read it, so
+            // a 403 here, against the no-repository 404, told an existing
+            // private key from an unknown one on every format route. A public
+            // repository has no existence to hide and keeps the 403.
+            if !visibility.allows_anonymous_read() {
                 // Same fields and level as the two ACL read denials below, so
                 // the operator can still tell this from a missing repository.
-                tracing::info!(
+                let read = scope_gate_action == "read" || non_mutating_post;
+                tracing::warn!(
                     repository_id = %repo.id,
                     user_id = %ext.user_id,
-                    "token repository scope denied read; answering the existence-hiding 404"
+                    action = if read { "read" } else { scope_gate_action },
+                    "token repository scope denied the request; answering the \
+                     existence-hiding 404"
                 );
                 return not_found_response();
             }
@@ -3278,7 +3778,7 @@ pub async fn repo_visibility_middleware(
                 // rule counts here; the MCP write handler then decides the
                 // server name (`services::mcp_namespaces`). Anywhere else
                 // such a rule grants nothing.
-                let mcp_surface = repo.format == "mcp" && path.starts_with("/mcp/");
+                let mcp_surface = is_mcp_surface(&repo.format, &path);
                 let decision = if mcp_surface {
                     vis_state
                         .permission_service
@@ -3292,7 +3792,9 @@ pub async fn repo_visibility_middleware(
                 };
                 match decision {
                     Ok(true) => {}
-                    Ok(false) => return forbidden_permission_response(),
+                    Ok(false) => {
+                        return write_denial(&vis_state.db, ext, repo.id, visibility, action).await
+                    }
                     Err(_) => {
                         tracing::error!("permission check failed: database unreachable");
                         return service_unavailable_response();
@@ -3459,9 +3961,9 @@ pub async fn repo_visibility_middleware(
                             // answered `not_found_response()`. All three are now
                             // byte-identical, matching REST `require_visible`,
                             // which returns `NotFound` for every denial. Writes
-                            // are deliberately unchanged: a caller doing a PUT
-                            // has generally already read the repository, and 403
-                            // is the more useful answer there.
+                            // follow the same rule since #5458 (`write_denial`):
+                            // a caller who cannot read gets this 404, and only a
+                            // caller who CAN read keeps the more useful 403.
                             return not_found_response();
                         }
                     }
@@ -4047,6 +4549,107 @@ mod tests {
         let ext = AuthExtension::from(user);
         assert_eq!(ext.iat_ms, None);
         assert_eq!(ext.caller_iat_ms(), None);
+    }
+
+    fn password_only_test_user(totp_enabled: bool) -> User {
+        use crate::models::user::AuthProvider;
+        let now = chrono::Utc::now();
+        User {
+            id: Uuid::new_v4(),
+            username: "pw-5484".to_string(),
+            email: "pw-5484@example.com".to_string(),
+            password_hash: None,
+            auth_provider: AuthProvider::Local,
+            external_id: None,
+            display_name: None,
+            is_active: true,
+            is_admin: false,
+            is_service_account: false,
+            must_change_password: false,
+            totp_secret: None,
+            totp_enabled,
+            totp_backup_codes: None,
+            totp_verified_at: None,
+            failed_login_attempts: 0,
+            locked_until: None,
+            last_failed_login_at: None,
+            password_changed_at: now,
+            last_login_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// #5484: the management-API gate reads the TOTP policy and the enabled
+    /// SSO providers. If the database cannot answer, the password is neither
+    /// admitted nor refused: it is a retryable 503 (`Overloaded`).
+    #[tokio::test]
+    async fn password_outcome_is_overloaded_when_the_policy_lookup_fails_5484() {
+        let svc = make_test_auth_service();
+        let mut failure = None;
+        let outcome = password_outcome(
+            &svc,
+            password_only_test_user(false),
+            false,
+            &mut failure,
+            &mut None,
+        )
+        .await;
+        assert!(matches!(outcome, AuthOutcome::Overloaded), "{outcome:?}");
+        assert!(failure.is_none());
+    }
+
+    /// #5484: on the format routes the gate needs no lookup. A TOTP account's
+    /// password is refused and labelled; any other password is admitted.
+    #[tokio::test]
+    async fn password_outcome_on_format_routes_needs_no_lookup_5484() {
+        let svc = make_test_auth_service();
+        let mut failure = None;
+        let mut refused = None;
+        let refused_outcome = password_outcome(
+            &svc,
+            password_only_test_user(true),
+            true,
+            &mut failure,
+            &mut refused,
+        )
+        .await;
+        assert!(
+            matches!(refused_outcome, AuthOutcome::InvalidCredential),
+            "{refused_outcome:?}"
+        );
+        assert_eq!(
+            failure,
+            Some((AuthFailureSurface::Basic, AuthFailureReason::Scope))
+        );
+        // The refusal is handed to the caller as a failed login (#5653).
+        let refused = refused.expect("a BasicRefusal for the audit row");
+        assert_eq!(refused.username, "pw-5484");
+        assert_eq!(refused.reason, "second_factor_required");
+        let mut failure = None;
+        let admitted = password_outcome(
+            &svc,
+            password_only_test_user(false),
+            true,
+            &mut failure,
+            &mut None,
+        )
+        .await;
+        assert!(matches!(admitted, AuthOutcome::Resolved(_)), "{admitted:?}");
+        assert!(failure.is_none());
+    }
+
+    #[test]
+    fn password_only_refusal_reasons_are_stable_5484() {
+        use crate::services::auth_service::PasswordOnlyRefusal;
+        assert_eq!(
+            PasswordOnlyRefusal::SecondFactorRequired.as_str(),
+            "second_factor_required"
+        );
+        assert_eq!(
+            PasswordOnlyRefusal::SsoRequired.as_str(),
+            "local_login_disabled_sso"
+        );
     }
 
     #[test]
@@ -7044,12 +7647,160 @@ mod tests {
         );
     }
 
+    /// #5653: failed Basic logins are folded per (username, source) per
+    /// window, and the next row carries how many were folded.
+    #[test]
+    fn test_basic_failure_audit_is_sampled_per_pair_5653() {
+        let mut seen = BasicFailureSeen::new();
+        let t0 = Instant::now();
+        let key = |u: &str| (u.to_string(), "192.0.2.7".to_string());
+        assert_eq!(
+            basic_failure_audit_should_record(&mut seen, key("ci"), t0),
+            Some(0)
+        );
+        assert_eq!(
+            basic_failure_audit_should_record(&mut seen, key("ci"), t0),
+            None
+        );
+        assert_eq!(
+            basic_failure_audit_should_record(&mut seen, key("ci"), t0),
+            None
+        );
+        assert_eq!(
+            basic_failure_audit_should_record(&mut seen, key("other"), t0),
+            Some(0)
+        );
+        let later = t0 + BASIC_FAILURE_AUDIT_WINDOW;
+        assert_eq!(
+            basic_failure_audit_should_record(&mut seen, key("ci"), later),
+            Some(2),
+            "the next row reports the two refusals folded since the last one"
+        );
+    }
+
+    /// #5653 review: a full memory forgets the pair audited longest ago
+    /// instead of refusing new pairs, so flooding junk usernames cannot hide
+    /// a targeted guess.
+    #[test]
+    fn test_basic_failure_audit_records_new_pairs_when_full_5653() {
+        let mut seen = BasicFailureSeen::new();
+        let t0 = Instant::now();
+        let oldest = ("junk-0".to_string(), "198.51.100.1".to_string());
+        assert_eq!(
+            basic_failure_audit_should_record(&mut seen, oldest.clone(), t0),
+            Some(0)
+        );
+        let t1 = t0 + std::time::Duration::from_millis(1);
+        for i in 1..BASIC_FAILURE_AUDIT_MAX_TRACKED {
+            let key = (format!("junk-{i}"), "198.51.100.1".to_string());
+            assert!(basic_failure_audit_should_record(&mut seen, key, t1).is_some());
+        }
+        assert_eq!(seen.len(), BASIC_FAILURE_AUDIT_MAX_TRACKED);
+        let target = ("admin".to_string(), "198.51.100.1".to_string());
+        assert_eq!(
+            basic_failure_audit_should_record(&mut seen, target.clone(), t1),
+            Some(0),
+            "a new pair is recorded even when the memory is full"
+        );
+        assert_eq!(seen.len(), BASIC_FAILURE_AUDIT_MAX_TRACKED);
+        assert!(seen.contains_key(&target));
+        assert!(
+            !seen.contains_key(&oldest),
+            "the oldest pair is the one forgotten"
+        );
+    }
+
+    /// #5653 (DB-backed): a wrong Basic password writes a `LOGIN_FAILED` row
+    /// (`auth_method: basic`, the attempted username, never the password),
+    /// and a retry inside the window does not write a second one.
+    #[tokio::test]
+    async fn test_failed_basic_login_is_audited_db_5653() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let user_id = Uuid::new_v4();
+        let username = format!("ph-basic-fail-{user_id}");
+        let hash = AuthService::hash_password("right-password")
+            .await
+            .expect("hash password");
+        sqlx::query(
+            r#"INSERT INTO users
+               (id, username, email, password_hash, auth_provider,
+                is_admin, is_active, is_service_account)
+               VALUES ($1, $2, $3, $4, 'local', false, true, false)"#,
+        )
+        .bind(user_id)
+        .bind(&username)
+        .bind(format!("{username}@test.local"))
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .expect("insert local user");
+        let auth_service =
+            AuthService::new(pool.clone(), Arc::new(crate::config::Config::default()));
+        let basic =
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:wrong-password"));
+        for _ in 0..2 {
+            let outcome =
+                try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&basic), false).await;
+            assert!(
+                matches!(outcome, AuthOutcome::InvalidCredential),
+                "{outcome:?}"
+            );
+        }
+        let (db, name) = (&pool, username.as_str());
+        let fetch = || async move {
+            sqlx::query_as::<_, (serde_json::Value,)>(
+                "SELECT details FROM audit_log \
+                  WHERE action = 'LOGIN_FAILED' AND details->>'username' = $1",
+            )
+            .bind(name)
+            .fetch_all(db)
+            .await
+            .unwrap()
+        };
+        for _ in 0..50 {
+            if !fetch().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let rows = fetch().await;
+        let _ = sqlx::query("DELETE FROM audit_log WHERE details->>'username' = $1")
+            .bind(&username)
+            .execute(&pool)
+            .await;
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+
+        assert_eq!(rows.len(), 1, "one row per pair per window: {rows:?}");
+        let details = &rows[0].0;
+        assert_eq!(details["auth_method"], "basic");
+        assert_eq!(details["reason"], "invalid_password");
+        assert_eq!(details["suppressed_since_last_row"], 0);
+        assert!(
+            !details.to_string().contains("wrong-password"),
+            "the password must never be recorded: {details}"
+        );
+    }
+
     #[tokio::test]
     async fn test_2786_local_password_basic_auth_still_works() {
         use crate::api::handlers::test_db_helpers as tdh;
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
+        // A local password on the management API now also passes the
+        // SSO-only and TOTP policy gates (#5484), which read whole-database
+        // state; hold their test locks so a peer test's enabled SSO provider
+        // or TOTP policy cannot flip this baseline mid-test.
+        let _sso = tdh::sso_provider_serial_lock().await;
+        let _totp = tdh::totp_policy_serial_lock().await;
         // Local user with a real bcrypt password: the token fallback must not
         // regress ordinary username/password Basic auth.
         let user_id = Uuid::new_v4();
@@ -8399,7 +9150,12 @@ mod tests {
         let req = axum::http::Request::builder()
             .method(Method::GET)
             .uri("/probe")
-            .header("Authorization", "Bearer deadbeefdead")
+            // API-token-shaped, so it passes the pre-DB shape check (#5633)
+            // and actually reaches the timing-out prefix lookup.
+            .header(
+                "Authorization",
+                "Bearer deadbeef_0123456789abcdef0123456789abcdef",
+            )
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = run_through_optional_auth(req).await;
@@ -8488,6 +9244,72 @@ mod tests {
                 repo_visibility_middleware,
             ));
         app.oneshot(request).await.unwrap()
+    }
+
+    /// A pool timeout or a closed pool while resolving the repository row
+    /// is an outage, not "no such repository": an anonymous pull must get a
+    /// retryable 503, not the 401 that Bazel and cargo treat as fatal.
+    #[tokio::test]
+    async fn format_route_db_outage_answers_503_not_401() {
+        let state = make_vis_state(None).await;
+        state.db.close().await;
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/pypi/some-repo/simple/requests/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = run_through_visibility(state, req).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    /// Same outage on the generic download route
+    /// (`/repositories/{key}/download/*path`).
+    #[tokio::test]
+    async fn download_route_db_outage_answers_503_not_401() {
+        use axum::{middleware, routing::get, Router};
+        use tower::ServiceExt;
+
+        let state = make_vis_state(None).await;
+        state.db.close().await;
+        let app: Router = Router::new()
+            .route(
+                "/repositories/:key/download/*path",
+                get(|| async { (StatusCode::OK, "handler-reached") }),
+            )
+            .layer(middleware::from_fn_with_state(
+                state,
+                repository_download_auth_middleware,
+            ));
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/repositories/some-repo/download/a/b.tar.gz")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn genuine_miss_with_a_reachable_db_still_answers_401_and_is_tombstoned() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let mut state = make_vis_state(None).await;
+        state.db = pool;
+        let key = format!("db-outage-miss-{}", Uuid::new_v4());
+        let (status, _) =
+            anon_get_status_and_body(state.clone(), &format!("/pypi/{key}/simple/")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            state.repo_miss_cache.read().await.contains_key(&key),
+            "a query that found no row must still earn a tombstone"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -9292,9 +10114,16 @@ mod tests {
         let (private_status, private_body) =
             anon_get_status_and_body(private_state, "/pypi/acme-internal-core/simple/").await;
 
-        // NONEXISTENT repo: nothing in the cache; the cache-miss DB lookup
-        // against the lazy pool finds no row, exercising the no-repo branch.
+        // NONEXISTENT repo: a tombstone takes the same no-repo branch as a
+        // lookup that finds no row, without a database (the lazy pool is
+        // unreachable, and an unreachable database answers 503)
         let missing_state = make_vis_state(None).await;
+        seed_repo_miss(
+            &missing_state,
+            "zzz-nonexistent-repo-9",
+            std::time::Instant::now(),
+        )
+        .await;
         let (missing_status, missing_body) =
             anon_get_status_and_body(missing_state, "/pypi/zzz-nonexistent-repo-9/simple/").await;
 
@@ -9348,22 +10177,31 @@ mod tests {
         let (cached_status, cached_body) =
             anon_get_status_and_body(tombstoned, "/pypi/nope/simple/").await;
 
+        let private = make_vis_state(Some((
+            "nope".to_string(),
+            make_cached_repo(/* is_public */ false),
+        )))
+        .await;
+        let (private_status, private_body) =
+            anon_get_status_and_body(private, "/pypi/nope/simple/").await;
+
         let uncached = make_vis_state(None).await;
-        let (fresh_status, fresh_body) =
-            anon_get_status_and_body(uncached, "/pypi/nope/simple/").await;
+        let (fresh_status, _) = anon_get_status_and_body(uncached, "/pypi/nope/simple/").await;
 
         assert_eq!(
             cached_status,
             StatusCode::UNAUTHORIZED,
-            "a negative-cached key must answer with the same 401 challenge as a fresh miss"
+            "a negative-cached key must answer with the 401 challenge of a miss"
         );
         assert_eq!(
-            cached_status, fresh_status,
-            "the negative-cache path must not change the status of a miss"
+            (cached_status, cached_body),
+            (private_status, private_body),
+            "a negative-cached key must answer exactly like an existing private repo"
         );
         assert_eq!(
-            cached_body, fresh_body,
-            "the negative-cache path must not change the body of a miss"
+            fresh_status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "without the tombstone the lookup hits the unreachable pool, so the 401 above made no query"
         );
     }
 
@@ -9373,7 +10211,8 @@ mod tests {
         // to the lookup, and the stale entry is dropped by the `retain` sweep
         // on the write that follows. The lazy pool makes the lookup fail, so
         // nothing is re-inserted (an error is not evidence the key is free) —
-        // which is exactly what leaves the map empty to assert on.
+        // which is exactly what leaves the map empty to assert on. The failed
+        // lookup answers 503, which also shows the tombstone was not used.
         let state = make_vis_state(None).await;
         let expired_at =
             std::time::Instant::now() - std::time::Duration::from_secs(REPO_CACHE_TTL_SECS + 1);
@@ -9382,8 +10221,8 @@ mod tests {
         let resp = run_through_visibility(state.clone(), empty_get("/pypi/stale/simple/")).await;
         assert_eq!(
             resp.status(),
-            StatusCode::UNAUTHORIZED,
-            "an expired tombstone must not change the answer for an anonymous caller"
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an expired tombstone must be ignored, so the lookup runs and hits the unreachable pool"
         );
         assert!(
             !state.repo_miss_cache.read().await.contains_key("stale"),
@@ -9690,9 +10529,11 @@ mod tests {
         let status = run_through_visibility(state, req).await.status();
 
         api_alias_scoped_token_cleanup(&pool, user_id, decoy_id).await;
+        // Refused, and (#5458) with the existence-hiding 404: the token
+        // cannot read the private `othercrates` either.
         assert_eq!(
             status,
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
             "a token scoped to the repository `cargo` must not publish into \
              another repository through /api/cargo"
         );
@@ -9718,11 +10559,195 @@ mod tests {
         let status = run_through_visibility(state, req).await.status();
 
         api_alias_scoped_token_cleanup(&pool, user_id, decoy_id).await;
+        // Refused, and (#5458) with the existence-hiding 404: the token
+        // cannot read the private `helm-priv` either.
         assert_eq!(
             status,
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
             "a token scoped to the repository `helm` must not delete a chart \
              in another repository through /api/helm"
+        );
+    }
+
+    /// #5458: a write with a token scoped to another repository answers an
+    /// existing private key exactly as it answers an unknown one (the
+    /// existence-hiding 404), on the MCP surface and on every other format
+    /// route alike.
+    #[tokio::test]
+    async fn test_5458_write_outside_token_scope_matches_an_unknown_key() {
+        let decoy = format!("ak5458-decoy-{}", Uuid::new_v4());
+        let victim = format!("ak5458-victim-{}", Uuid::new_v4());
+        let unknown = format!("ak5458-unknown-{}", Uuid::new_v4());
+        let Some((pool, state, bearer, user_id, decoy_id)) =
+            api_alias_scoped_token_fixture(&decoy, &victim, &["read", "write"]).await
+        else {
+            return;
+        };
+        {
+            let mut cache = state.repo_cache.write().await;
+            for key in [&decoy, &victim] {
+                cache.get_mut(key.as_str()).unwrap().0.format = "mcp".to_string();
+            }
+        }
+        let send = |method: Method, path: String| {
+            let state = state.clone();
+            let bearer = bearer.clone();
+            async move {
+                let req = axum::http::Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", bearer)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let resp = run_through_visibility(state, req).await;
+                let status = resp.status();
+                let headers = resp.headers().clone();
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (status, headers, body)
+            }
+        };
+        let mut answers = Vec::new();
+        for (method, tail) in [
+            (Method::POST, "/mcp/{key}/v0.1/publish"),
+            (Method::POST, "/pypi/{key}/"),
+            (Method::PUT, "/npm/{key}/pkg"),
+            (Method::DELETE, "/npm/{key}/pkg/-/pkg-1.0.0.tgz"),
+        ] {
+            let existing = send(method.clone(), tail.replace("{key}", &victim)).await;
+            let missing = send(method.clone(), tail.replace("{key}", &unknown)).await;
+            answers.push((tail, existing, missing));
+        }
+        api_alias_scoped_token_cleanup(&pool, user_id, decoy_id).await;
+
+        for (tail, existing, missing) in answers {
+            assert_eq!(existing.0, StatusCode::NOT_FOUND, "{tail}");
+            assert_eq!(existing, missing, "{tail}: existing private vs unknown key");
+            assert_eq!(&existing.2[..], b"Repository not found", "{tail}");
+        }
+    }
+
+    /// #5458: through the real middleware, a write by an owner of ANOTHER
+    /// repository (no token scope involved) answers an existing private
+    /// pypi / npm key exactly (status, headers, body) as an unknown key; a
+    /// member who can read but not write keeps the 403; an `internal`
+    /// repository, readable by every authenticated caller, keeps the 403.
+    #[tokio::test]
+    async fn test_5458_write_denial_to_a_non_reader_matches_an_unknown_key() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (pypi_id, pypi_key, pypi_dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        let (npm_id, npm_key, npm_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let (int_id, int_key, int_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(int_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (own_id, _, own_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let (foreign, _) = tdh::create_user(&pool).await;
+        tdh::grant_repo_role(&pool, own_id, foreign, "repository-owner").await;
+        let (reader, _) = tdh::create_user(&pool).await;
+        for id in [pypi_id, npm_id] {
+            tdh::grant_repo_role(&pool, id, reader, "reader").await;
+        }
+        let tstate = tdh::build_state(pool.clone(), &own_dir.to_string_lossy());
+        let foreign_bearer = tdh::bearer_for(&tstate, foreign).await;
+        let reader_bearer = tdh::bearer_for(&tstate, reader).await;
+        let vis = RepoVisibilityState {
+            auth_service: Arc::new(AuthService::new(
+                pool.clone(),
+                Arc::new(tstate.config.clone()),
+            )),
+            db: pool.clone(),
+            repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            permission_service: Arc::new(PermissionService::new(pool.clone())),
+        };
+        let send = |method: Method, path: String, bearer: String| {
+            let vis = vis.clone();
+            async move {
+                let req = axum::http::Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", bearer)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let resp = run_through_visibility(vis, req).await;
+                let status = resp.status();
+                let headers = resp.headers().clone();
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (status, headers, body)
+            }
+        };
+        let unknown = format!("ak5458-unknown-{}", Uuid::new_v4());
+        let cases = [
+            (Method::POST, format!("/pypi/{pypi_key}/"), "/pypi/{u}/"),
+            (Method::PUT, format!("/npm/{npm_key}/pkg"), "/npm/{u}/pkg"),
+            (
+                Method::DELETE,
+                format!("/npm/{npm_key}/pkg/-/pkg-1.0.0.tgz"),
+                "/npm/{u}/pkg/-/pkg-1.0.0.tgz",
+            ),
+        ];
+        let mut answers = Vec::new();
+        for (method, existing_path, unknown_path) in &cases {
+            let existing = send(
+                method.clone(),
+                existing_path.clone(),
+                foreign_bearer.clone(),
+            )
+            .await;
+            let missing = send(
+                method.clone(),
+                unknown_path.replace("{u}", &unknown),
+                foreign_bearer.clone(),
+            )
+            .await;
+            let as_reader = send(method.clone(), existing_path.clone(), reader_bearer.clone())
+                .await
+                .0;
+            answers.push((existing_path.clone(), existing, missing, as_reader));
+        }
+        let internal = send(
+            Method::PUT,
+            format!("/npm/{int_key}/pkg"),
+            foreign_bearer.clone(),
+        )
+        .await
+        .0;
+        for (id, dir) in [
+            (pypi_id, &pypi_dir),
+            (npm_id, &npm_dir),
+            (int_id, &int_dir),
+            (own_id, &own_dir),
+        ] {
+            tdh::cleanup_member_repo(&pool, id, dir).await;
+        }
+        tdh::cleanup_user(&pool, foreign).await;
+        tdh::cleanup_user(&pool, reader).await;
+
+        for (path, existing, missing, as_reader) in answers {
+            assert_eq!(existing.0, StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(existing, missing, "{path}: existing private vs unknown key");
+            assert_eq!(&existing.2[..], b"Repository not found", "{path}");
+            assert_eq!(
+                as_reader,
+                StatusCode::FORBIDDEN,
+                "{path}: a reader keeps the 403"
+            );
+        }
+        assert_eq!(
+            internal,
+            StatusCode::FORBIDDEN,
+            "an internal repository is readable by every authenticated caller"
         );
     }
 
@@ -9737,7 +10762,8 @@ mod tests {
     /// `test_extract_repo_key_conda_t_route_is_not_a_token_channel`), so it is
     /// answered by the no-repo branch with the #1808 401 challenge rather than
     /// by the empty-key branch. Either way the body is never read, which is
-    /// what the third column pins.
+    /// what the third column pins. Both tests seed its tombstone, so the
+    /// no-repo branch is reached without a database.
     const EMPTY_REPO_KEY_PROBES: &[(Method, &str, StatusCode)] = &[
         (Method::PUT, "/npm//pkg", StatusCode::NOT_FOUND),
         (
@@ -9851,6 +10877,13 @@ mod tests {
         (Method::GET, "/general//x", StatusCode::NOT_FOUND),
     ];
 
+    async fn seed_probe_miss(state: &RepoVisibilityState, uri: &str) {
+        let key = extract_repo_key(uri);
+        if !key.is_empty() {
+            seed_repo_miss(state, &key, std::time::Instant::now()).await;
+        }
+    }
+
     /// A request body that records whether anything ever polled it.
     ///
     /// The generator does not run until the stream is first polled, so the flag
@@ -9906,6 +10939,7 @@ mod tests {
         // handler — and its strict extractor — never runs.
         for (method, uri, expected) in EMPTY_REPO_KEY_PROBES {
             let state = make_vis_state(None).await;
+            seed_probe_miss(&state, uri).await;
             let req = axum::http::Request::builder()
                 .method(method.clone())
                 .uri(*uri)
@@ -9946,6 +10980,7 @@ mod tests {
         for (method, uri, expected) in EMPTY_REPO_KEY_PROBES {
             let read = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let state = make_vis_state(None).await;
+            seed_probe_miss(&state, uri).await;
             let req = axum::http::Request::builder()
                 .method(method.clone())
                 .uri(*uri)
@@ -11785,8 +12820,9 @@ mod tests {
         );
         assert_eq!(
             private_put,
-            scope_denied(),
-            "#3648: private + out of scope + write stays refused by the scope gate"
+            not_found(),
+            "#3648: private + out of scope + write stays refused by the scope gate; since \
+             #5458 as the existence-hiding 404, like the read"
         );
         assert_eq!(
             vscode_private,
@@ -11824,8 +12860,8 @@ mod tests {
     /// compares the ACL branches. The caller is GRANTED on C so the scope gate
     /// is the only thing that can refuse it (drop the gate and it answers 200),
     /// and the in-scope control reads a PRIVATE repository through the same
-    /// rules-less branch. Writes are deliberately unchanged (#3524): the PUT on
-    /// C still answers the scope gate's 403.
+    /// rules-less branch. Since #5458 writes are unified too: the PUT on C
+    /// answers the same existence-hiding 404 as a key naming no repository.
     #[tokio::test]
     async fn test_3717_private_repo_scope_denial_matches_the_no_repo_answer() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -11921,6 +12957,7 @@ mod tests {
         let private_head = probe(&state, Method::HEAD, &key_c, &bearer).await;
         let missing_get = probe(&state, Method::GET, &key_missing, &bearer).await;
         let private_put = probe(&state, Method::PUT, &key_c, &bearer).await;
+        let missing_put = probe(&state, Method::PUT, &key_missing, &bearer).await;
 
         // The two `non_mutating_post` routes: POSTs the ACL arm reclassifies as
         // reads (git-lfs `objects/batch` is how an LFS client READS; conan
@@ -12010,15 +13047,18 @@ mod tests {
             "and that shared answer is the existence-hiding 404, not a shared 403"
         );
 
-        // The security half: writes are NOT unified (#3524).
+        // #5458: writes are unified too. A PUT to a private repository outside
+        // the token's scope is still refused by the scope gate, now with the
+        // same existence-hiding 404 a key naming no repository gets.
         assert_eq!(
             private_put,
-            (
-                StatusCode::FORBIDDEN,
-                "Token does not have access to this repository".to_string(),
-            ),
-            "#3717 must not touch writes: a PUT to a private repository outside the token's \
-             scope stays refused BY THE SCOPE GATE with 403"
+            (StatusCode::NOT_FOUND, "Repository not found".to_string()),
+            "#5458: a PUT to a private repository outside the token's scope is the \
+             existence-hiding 404"
+        );
+        assert_eq!(
+            private_put, missing_put,
+            "#5458: identical to an unknown key"
         );
     }
 
@@ -12205,5 +13245,1124 @@ mod tests {
 
         tdh::cleanup_user(&pool, user_id).await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // #5640 / #5633: Basic `user:<api_token>` is resolved token-first, and an
+    // invalid credential is refused before it can take an auth-capacity
+    // permit.
+    //
+    // Counted, not timed: `bcrypt_verify_counter` counts every
+    // `AuthService::verify_password` call, and `verify_password` is the only
+    // place the auth-capacity permit is taken, so "zero verifies" is "zero
+    // permits". The count is a process-global, which `cargo nextest`'s
+    // process-per-test isolation (mandated by CLAUDE.md and CI) keeps private
+    // to each test.
+    // -----------------------------------------------------------------------
+    mod basic_token_first_5640 {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::auth_service::bcrypt_verify_counter;
+        use std::sync::atomic::Ordering;
+
+        const PASSWORD: &str = "Correct-Horse-Battery-5640";
+
+        fn verifies() -> u64 {
+            bcrypt_verify_counter().load(Ordering::Relaxed)
+        }
+
+        fn basic(username: &str, password: &str) -> String {
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+        }
+
+        /// A token-shaped secret no token was ever minted for.
+        fn unknown_token() -> String {
+            format!("deadbeef_{}", Uuid::new_v4().simple())
+        }
+
+        /// A local account with a real (cost-4) password hash. Hashed with
+        /// `bcrypt::hash` directly so seeding takes no permit and no count.
+        async fn local_user(pool: &sqlx::PgPool) -> (Uuid, String) {
+            let id = Uuid::new_v4();
+            let username = format!("ph-5640-{id}");
+            let hash = bcrypt::hash(PASSWORD, 4).expect("hash password");
+            sqlx::query(
+                r#"INSERT INTO users
+                   (id, username, email, password_hash, auth_provider,
+                    is_admin, is_active, is_service_account)
+                   VALUES ($1, $2, $3, $4, 'local', false, true, false)"#,
+            )
+            .bind(id)
+            .bind(&username)
+            .bind(format!("{username}@test.local"))
+            .bind(&hash)
+            .execute(pool)
+            .await
+            .expect("insert local user");
+            (id, username)
+        }
+
+        /// `(failed_login_attempts, last_failed_login_at IS NOT NULL,
+        /// locked_until IS NOT NULL)`.
+        async fn lockout_state(pool: &sqlx::PgPool, user_id: Uuid) -> (i32, bool, bool) {
+            sqlx::query_as(
+                "SELECT failed_login_attempts, last_failed_login_at IS NOT NULL, \
+                 locked_until IS NOT NULL FROM users WHERE id = $1",
+            )
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .expect("read lockout state")
+        }
+
+        async fn drop_user(pool: &sqlx::PgPool, user_id: Uuid) {
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+
+        fn service(pool: &sqlx::PgPool) -> AuthService {
+            AuthService::new(pool.clone(), Arc::new(crate::config::Config::default()))
+        }
+
+        /// The issue's shape: `user:<api_token>` on a format route, N times.
+        /// Before the fix every request bcrypt-verified the token as the
+        /// user's password and wrote a failed login.
+        #[tokio::test]
+        async fn basic_user_token_runs_no_bcrypt_and_writes_no_failed_login() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let (user_id, username) = local_user(&pool).await;
+            let svc = service(&pool);
+            let (token, _) = svc
+                .generate_api_token(user_id, "maven", vec!["read:artifacts".into()], None)
+                .await
+                .expect("mint token");
+            let header = basic(&username, &token);
+
+            // The first request verifies the token itself once (uncached) —
+            // that is the token's own check, not a password check.
+            let before = verifies();
+            let first = try_resolve_auth_outcome(&svc, ExtractedToken::Basic(&header), true).await;
+            assert!(
+                matches!(first, AuthOutcome::Resolved(ref e) if e.is_api_token && e.user_id == user_id),
+                "user:<api_token> must resolve to the token owner, got {first:?}"
+            );
+            assert_eq!(verifies() - before, 1, "only the token's own verify");
+
+            const N: u64 = 20;
+            let before = verifies();
+            for _ in 0..N {
+                let outcome =
+                    try_resolve_auth_outcome(&svc, ExtractedToken::Basic(&header), true).await;
+                assert!(matches!(outcome, AuthOutcome::Resolved(_)), "{outcome:?}");
+            }
+            let ran = verifies() - before;
+            let state = lockout_state(&pool, user_id).await;
+            drop_user(&pool, user_id).await;
+
+            assert_eq!(
+                ran, 0,
+                "{N} cached Basic user:<api_token> requests ran {ran} bcrypt verifies: the \
+                 token was tried as a password first (#5640)"
+            );
+            assert_eq!(
+                state,
+                (0, false, false),
+                "user:<api_token> must never write the lockout columns (#5640)"
+            );
+        }
+
+        /// A token-shaped secret that is not a live token — never minted,
+        /// revoked, or expired — is a 401 with no bcrypt (no permit) and no
+        /// failed-login write, on both the format and the management path.
+        #[tokio::test]
+        async fn basic_user_bad_token_is_refused_without_bcrypt_or_failed_login() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let (user_id, username) = local_user(&pool).await;
+            let svc = Arc::new(service(&pool));
+            let (revoked, revoked_id) = svc
+                .generate_api_token(user_id, "revoked", vec!["read:artifacts".into()], None)
+                .await
+                .expect("mint token");
+            let (expired, expired_id) = svc
+                .generate_api_token(user_id, "expired", vec!["read:artifacts".into()], None)
+                .await
+                .expect("mint token");
+            sqlx::query("UPDATE api_tokens SET revoked_at = NOW() WHERE id = $1")
+                .bind(revoked_id)
+                .execute(&pool)
+                .await
+                .expect("revoke");
+            sqlx::query(
+                "UPDATE api_tokens SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
+            )
+            .bind(expired_id)
+            .execute(&pool)
+            .await
+            .expect("expire");
+
+            let before = verifies();
+            let mut format_outcomes = Vec::new();
+            for secret in [unknown_token(), revoked, expired] {
+                let header = basic(&username, &secret);
+                format_outcomes.push(
+                    try_resolve_auth_outcome(&svc, ExtractedToken::Basic(&header), true).await,
+                );
+                format_outcomes.push(
+                    try_resolve_auth_outcome(&svc, ExtractedToken::Basic(&header), false).await,
+                );
+            }
+            let mgmt = run_auth_middleware_with_service(
+                svc.clone(),
+                basic_get(&username, &unknown_token()),
+            )
+            .await
+            .status();
+            let ran = verifies() - before;
+            let state = lockout_state(&pool, user_id).await;
+            drop_user(&pool, user_id).await;
+
+            for outcome in &format_outcomes {
+                assert!(
+                    matches!(outcome, AuthOutcome::InvalidCredential),
+                    "a dead token as the Basic password must be InvalidCredential, got {outcome:?}"
+                );
+            }
+            assert_eq!(mgmt, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                ran, 0,
+                "a dead token as the Basic password ran {ran} bcrypt verifies (each one takes \
+                 an auth-capacity permit, #5633)"
+            );
+            assert_eq!(state, (0, false, false), "no failed-login write (#5640)");
+        }
+
+        /// Ordinary `user:password` Basic auth is unchanged: the right
+        /// password authenticates, and a wrong one still counts toward the
+        /// lockout. Lockout policy is not part of this fix.
+        #[tokio::test]
+        async fn basic_user_password_still_works_and_a_wrong_one_still_counts() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            // A local password on the management API now also passes the
+            // SSO-only and TOTP policy gates (#5484), which read whole-database
+            // state; hold their test locks so a peer test's enabled SSO provider
+            // or TOTP policy cannot flip this baseline mid-test.
+            let _sso = tdh::sso_provider_serial_lock().await;
+            let _totp = tdh::totp_policy_serial_lock().await;
+            let (user_id, username) = local_user(&pool).await;
+            let svc = Arc::new(service(&pool));
+
+            let good = basic(&username, PASSWORD);
+            let resolved = try_resolve_auth_outcome(&svc, ExtractedToken::Basic(&good), true).await;
+            let mgmt_ok =
+                run_auth_middleware_with_service(svc.clone(), basic_get(&username, PASSWORD))
+                    .await
+                    .status();
+
+            let bad = basic(&username, "wrong-password");
+            let before = verifies();
+            let rejected = try_resolve_auth_outcome(&svc, ExtractedToken::Basic(&bad), true).await;
+            let wrong_verifies = verifies() - before;
+            let mgmt_bad =
+                run_auth_middleware_with_service(svc.clone(), basic_get(&username, "also-wrong"))
+                    .await
+                    .status();
+            let state = lockout_state(&pool, user_id).await;
+            drop_user(&pool, user_id).await;
+
+            assert!(
+                matches!(resolved, AuthOutcome::Resolved(ref e) if !e.is_api_token && e.user_id == user_id),
+                "{resolved:?}"
+            );
+            assert_eq!(mgmt_ok, StatusCode::OK);
+            assert!(
+                matches!(rejected, AuthOutcome::InvalidCredential),
+                "{rejected:?}"
+            );
+            assert_eq!(mgmt_bad, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                wrong_verifies, 1,
+                "a wrong password pays exactly one bcrypt (no second, token-shaped dummy verify)"
+            );
+            assert_eq!(state.0, 2, "both wrong passwords count toward the lockout");
+            assert!(
+                state.1,
+                "last_failed_login_at is recorded for a wrong password"
+            );
+        }
+
+        /// The timing oracle (#5640: 0.67 s for a wrong password on an
+        /// existing account vs 0.32 s for an unknown one): a wrong Basic
+        /// password costs the same single bcrypt whether or not the username
+        /// exists, on both surfaces. Pinned by code path (the dummy-hash
+        /// verify on the unknown-username arm), not wall time.
+        #[tokio::test]
+        async fn basic_wrong_password_costs_one_bcrypt_for_known_and_unknown_users() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let (user_id, username) = local_user(&pool).await;
+            let svc = service(&pool);
+            let ghost = format!("ph-5640-ghost-{}", Uuid::new_v4());
+
+            let mut costs = Vec::new();
+            for allow in [true, false] {
+                for who in [username.as_str(), ghost.as_str()] {
+                    let header = basic(who, "wrong-password");
+                    let before = verifies();
+                    let outcome =
+                        try_resolve_auth_outcome(&svc, ExtractedToken::Basic(&header), allow).await;
+                    assert!(
+                        matches!(outcome, AuthOutcome::InvalidCredential),
+                        "{outcome:?}"
+                    );
+                    costs.push((allow, who == ghost, verifies() - before));
+                }
+            }
+            drop_user(&pool, user_id).await;
+
+            for (allow, unknown, cost) in costs {
+                assert_eq!(
+                    cost, 1,
+                    "wrong Basic password (allow_basic_api_token={allow}, unknown_user={unknown}) \
+                     ran {cost} bcrypt verifies; known and unknown usernames must both pay \
+                     exactly one so they take comparable time"
+                );
+            }
+        }
+
+        /// #5633: a burst of invalid credentials — a JWT that does not verify, garbage, a
+        /// never-minted and an expired API token as Bearer, and a dead token
+        /// as the Basic password — answers 401, never 503, even with the
+        /// auth-capacity cap fully held. Before the fix each of them ran a
+        /// bcrypt (the dummy-hash pad) under the cap.
+        #[tokio::test]
+        async fn invalid_credential_burst_never_sheds_to_503() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            // Under nextest this process installs the cap itself, so it can
+            // hold the only permit: any request that reached bcrypt would then
+            // wait out the 3 s queue and shed to 503. Outside nextest the cap
+            // is process-wide and shared with other tests, so it is left
+            // alone and the zero-verify count below carries the assertion.
+            let ours = if std::env::var_os("NEXTEST").is_some() {
+                let sem = Arc::new(tokio::sync::Semaphore::new(1));
+                crate::services::auth_service::install_global_auth_semaphore(Some(sem.clone()));
+                crate::services::auth_service::installed_global_auth_semaphore()
+                    .filter(|installed| Arc::ptr_eq(installed, &sem))
+            } else {
+                None
+            };
+
+            let (user_id, username) = local_user(&pool).await;
+            let svc = Arc::new(service(&pool));
+            let (expired, expired_id) = svc
+                .generate_api_token(user_id, "expired", vec!["read:artifacts".into()], None)
+                .await
+                .expect("mint token");
+            sqlx::query(
+                "UPDATE api_tokens SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
+            )
+            .bind(expired_id)
+            .execute(&pool)
+            .await
+            .expect("expire");
+            // JWT-shaped, but signed with a key this service does not hold
+            // (an expired or foreign session token behaves the same way).
+            let bad_jwt = mint_access_jwt(
+                "some-other-secret-at-least-32-bytes-long",
+                user_id,
+                &username,
+            );
+
+            let headers = [
+                format!("Bearer {bad_jwt}"),
+                "Bearer not-a-real-credential".to_string(),
+                format!("Bearer {}", unknown_token()),
+                format!("Bearer {expired}"),
+                format!("Basic {}", basic(&username, &unknown_token())),
+                format!("Basic {}", basic(&username, &expired)),
+            ];
+
+            // Seeding (the token mint hashes under the cap) is done; now hold
+            // the only permit for the whole burst.
+            let held = ours.map(|sem| sem.try_acquire_owned().expect("hold the only permit"));
+
+            let before = verifies();
+            let started = std::time::Instant::now();
+            let mut tasks = tokio::task::JoinSet::new();
+            for i in 0..64 {
+                let header = headers[i % headers.len()].clone();
+                let svc = svc.clone();
+                tasks.spawn(async move {
+                    let request = axum::http::Request::builder()
+                        .method(Method::GET)
+                        .uri("/probe")
+                        .header("Authorization", header)
+                        .body(axum::body::Body::empty())
+                        .unwrap();
+                    run_auth_middleware_with_service(svc, request)
+                        .await
+                        .status()
+                });
+            }
+            let mut statuses = Vec::new();
+            while let Some(status) = tasks.join_next().await {
+                statuses.push(status.expect("burst task"));
+            }
+            let elapsed = started.elapsed();
+            let ran = verifies() - before;
+            drop(held);
+            drop_user(&pool, user_id).await;
+
+            assert!(
+                statuses.iter().all(|s| *s == StatusCode::UNAUTHORIZED),
+                "every invalid credential must answer 401, never a retryable 503: {statuses:?}"
+            );
+            assert_eq!(
+                ran, 0,
+                "the burst ran {ran} bcrypt verifies (permits) (#5633)"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(3),
+                "the burst queued on the auth cap ({elapsed:?})"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // #5485: HTTP Basic `username:password` verification has a login budget.
+    // Counted with `bcrypt_verify_counter`, like `basic_token_first_5640`;
+    // nextest's process-per-test isolation keeps the counter and the
+    // installed budget private to each test.
+    // -----------------------------------------------------------------------
+    mod basic_password_budget_5485 {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::client_ip::with_client_ip_scope;
+        use crate::api::middleware::rate_limit::{
+            install_basic_password_budget, LoginRateLimitState, RateLimitExemptions,
+            RateLimitState, RateLimiter,
+        };
+        use crate::services::auth_service::bcrypt_verify_counter;
+        use std::net::IpAddr;
+        use std::sync::atomic::Ordering;
+
+        const PASSWORD: &str = "Correct-Horse-Battery-5485";
+
+        fn verifies() -> u64 {
+            bcrypt_verify_counter().load(Ordering::Relaxed)
+        }
+
+        fn basic(username: &str, password: &str) -> String {
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+        }
+
+        fn install(per_pair_failures: u32, per_ip_failures: u32) {
+            install_basic_password_budget(LoginRateLimitState {
+                inner: RateLimitState {
+                    limiter: Arc::new(RateLimiter::new(per_pair_failures, 900)),
+                    exemptions: Arc::new(RateLimitExemptions::new(Vec::new(), false)),
+                    enabled: true,
+                    trusted_proxies: Arc::new(Vec::new()),
+                },
+                backstop: Arc::new(RateLimiter::new(1_000_000, 900)),
+                failed_by_ip: Arc::new(RateLimiter::new(per_ip_failures, 900)),
+                audit: None,
+            });
+        }
+
+        async fn local_user(pool: &sqlx::PgPool) -> (Uuid, String) {
+            let id = Uuid::new_v4();
+            let username = format!("bb-5485-{id}");
+            let hash = bcrypt::hash(PASSWORD, 4).expect("hash password");
+            sqlx::query(
+                r#"INSERT INTO users
+                   (id, username, email, password_hash, auth_provider,
+                    is_admin, is_active, is_service_account)
+                   VALUES ($1, $2, $3, $4, 'local', false, true, false)"#,
+            )
+            .bind(id)
+            .bind(&username)
+            .bind(format!("{username}@test.local"))
+            .bind(&hash)
+            .execute(pool)
+            .await
+            .expect("insert local user");
+            (id, username)
+        }
+
+        async fn drop_user(pool: &sqlx::PgPool, user_id: Uuid) {
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+
+        /// One Basic attempt from `ip`: `(outcome, bcrypt verifies it ran)`.
+        async fn attempt(
+            svc: &AuthService,
+            ip: &str,
+            username: &str,
+            password: &str,
+            allow_basic_api_token: bool,
+        ) -> (AuthOutcome, u64) {
+            let header = basic(username, password);
+            let ip: IpAddr = ip.parse().expect("ip");
+            let before = verifies();
+            let outcome = with_client_ip_scope(
+                Some(ip),
+                try_resolve_auth_outcome(
+                    svc,
+                    ExtractedToken::Basic(&header),
+                    allow_basic_api_token,
+                ),
+            )
+            .await;
+            (outcome, verifies() - before)
+        }
+
+        fn service(pool: &sqlx::PgPool) -> AuthService {
+            AuthService::new(pool.clone(), Arc::new(crate::config::Config::default()))
+        }
+
+        /// Failed Basic password verifications are budgeted per (username,
+        /// source IP), on the format routes and on the management API alike.
+        /// Correct passwords are never charged. Once the pair's failures are
+        /// spent the next attempt is a 429 with no bcrypt, for a real account
+        /// and an unknown username identically, while the same username from
+        /// another address is unaffected. Before the fix every guess paid a
+        /// bcrypt and answered 401, without limit.
+        #[tokio::test]
+        async fn failed_basic_passwords_are_budgeted_per_username_and_ip() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            const BUDGET: u32 = 3;
+            install(BUDGET, 1_000);
+            let svc = service(&pool);
+            let (user_id, username) = local_user(&pool).await;
+            let ghost = format!("ghost-5485-{}", Uuid::new_v4().simple());
+            let ip = "198.51.100.7";
+
+            // Correct passwords cost one bcrypt each and are never charged.
+            let mut correct = Vec::new();
+            for _ in 0..(2 * BUDGET) {
+                correct.push(attempt(&svc, ip, &username, PASSWORD, true).await);
+            }
+
+            let mut guesses = Vec::new();
+            for allow in [true, false] {
+                let (who, name) = if allow {
+                    ("local", username.clone())
+                } else {
+                    ("ghost", ghost.clone())
+                };
+                for n in 0..BUDGET {
+                    let (outcome, ran) = attempt(&svc, ip, &name, "wrong", allow).await;
+                    guesses.push((who, n, outcome, ran));
+                }
+            }
+            let refused_local = attempt(&svc, ip, &username, "wrong", true).await;
+            let refused_owner = attempt(&svc, ip, &username, PASSWORD, false).await;
+            let refused_ghost = attempt(&svc, ip, &ghost, "wrong", false).await;
+            let other_ip = attempt(&svc, "198.51.100.8", &username, PASSWORD, true).await;
+            drop_user(&pool, user_id).await;
+
+            for (outcome, ran) in correct {
+                assert!(
+                    matches!(outcome, AuthOutcome::Resolved(ref e) if e.user_id == user_id),
+                    "{outcome:?}"
+                );
+                assert_eq!(ran, 1);
+            }
+            for (who, n, outcome, ran) in guesses {
+                assert!(
+                    matches!(outcome, AuthOutcome::InvalidCredential),
+                    "{who} guess {n} is inside the budget: {outcome:?}"
+                );
+                assert_eq!(
+                    ran, 1,
+                    "{who} guess {n} pays one bcrypt (pad for the ghost)"
+                );
+            }
+            for (label, (outcome, ran)) in [
+                ("local wrong", refused_local),
+                ("owner correct", refused_owner),
+                ("ghost wrong", refused_ghost),
+            ] {
+                assert!(
+                    matches!(outcome, AuthOutcome::RateLimited(s) if s > 0),
+                    "{label} past the budget must be refused with 429: {outcome:?}"
+                );
+                assert_eq!(ran, 0, "{label}: a refused attempt runs no bcrypt");
+            }
+            assert!(
+                matches!(other_ip.0, AuthOutcome::Resolved(ref e) if e.user_id == user_id),
+                "another source IP has its own budget: {:?}",
+                other_ip.0
+            );
+        }
+
+        /// The timing pad on Basic draws on the per-IP failed-login budget the
+        /// login endpoint uses. Within it an unknown username costs the same
+        /// bcrypt as a wrong password for a real account (no username oracle);
+        /// past it, cycling unknown usernames buys no more bcrypt work, while
+        /// a real account's password is still verified normally.
+        #[tokio::test]
+        async fn basic_timing_pad_follows_the_per_ip_failed_login_budget() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            const PER_IP: u32 = 4;
+            install(1_000, PER_IP);
+            let svc = service(&pool);
+            let (user_id, username) = local_user(&pool).await;
+            let ip = "198.51.100.9";
+
+            let mut padded = Vec::new();
+            for _ in 0..PER_IP {
+                let ghost = format!("ghost-5485-{}", Uuid::new_v4().simple());
+                padded.push(attempt(&svc, ip, &ghost, "wrong", true).await);
+            }
+            let ghost = format!("ghost-5485-{}", Uuid::new_v4().simple());
+            let unpadded = attempt(&svc, ip, &ghost, "wrong", true).await;
+            let real_wrong = attempt(&svc, ip, &username, "wrong", true).await;
+            let real_right = attempt(&svc, ip, &username, PASSWORD, true).await;
+            let other_ip = attempt(&svc, "198.51.100.10", &ghost, "wrong", true).await;
+            drop_user(&pool, user_id).await;
+
+            for (outcome, ran) in padded {
+                assert!(matches!(outcome, AuthOutcome::InvalidCredential));
+                assert_eq!(
+                    ran, 1,
+                    "within the per-IP budget an unknown username is padded"
+                );
+            }
+            assert!(matches!(unpadded.0, AuthOutcome::InvalidCredential));
+            assert_eq!(unpadded.1, 0, "past the per-IP budget the pad stops");
+            assert!(matches!(real_wrong.0, AuthOutcome::InvalidCredential));
+            assert_eq!(real_wrong.1, 1, "a stored hash is still verified");
+            assert!(matches!(real_right.0, AuthOutcome::Resolved(ref e) if e.user_id == user_id));
+            assert_eq!(other_ip.1, 1, "another source IP keeps its pad");
+        }
+    }
+    // -----------------------------------------------------------------------
+    // #5683: a Bearer header carrying base64 `user:<secret>` (npm, cargo,
+    // goproxy) is resolved like a Basic pair, token-first. A dead token there
+    // used to fall through to `authenticate` and pay a password bcrypt and an
+    // auth-capacity permit on every request.
+    // -----------------------------------------------------------------------
+    mod bearer_base64_token_first_5683 {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::auth_service::bcrypt_verify_counter;
+        use std::sync::atomic::Ordering;
+
+        const PASSWORD: &str = "Correct-Horse-Battery-5683";
+
+        fn verifies() -> u64 {
+            bcrypt_verify_counter().load(Ordering::Relaxed)
+        }
+
+        fn bearer_b64(username: &str, secret: &str) -> String {
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{secret}"))
+        }
+
+        async fn local_user(pool: &sqlx::PgPool) -> (Uuid, String) {
+            let id = Uuid::new_v4();
+            let username = format!("bb-5683-{id}");
+            let hash = bcrypt::hash(PASSWORD, 4).expect("hash password");
+            sqlx::query(
+                r#"INSERT INTO users
+                   (id, username, email, password_hash, auth_provider,
+                    is_admin, is_active, is_service_account)
+                   VALUES ($1, $2, $3, $4, 'local', false, true, false)"#,
+            )
+            .bind(id)
+            .bind(&username)
+            .bind(format!("{username}@test.local"))
+            .bind(&hash)
+            .execute(pool)
+            .await
+            .expect("insert local user");
+            (id, username)
+        }
+
+        async fn failed_logins(pool: &sqlx::PgPool, user_id: Uuid) -> i32 {
+            sqlx::query_scalar("SELECT failed_login_attempts FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(pool)
+                .await
+                .expect("read failed_login_attempts")
+        }
+
+        /// Dead tokens (never minted, expired, revoked, foreign-signed JWT)
+        /// in the Bearer base64 form are a 401 with no bcrypt and no failed
+        /// login, on the format and the management surfaces alike.
+        #[tokio::test]
+        async fn bearer_base64_dead_token_runs_no_bcrypt() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let config = crate::config::Config::default();
+            let svc = AuthService::new(pool.clone(), Arc::new(config.clone()));
+            let (user_id, username) = local_user(&pool).await;
+            let mut dead = vec![format!("deadbeef_{}", Uuid::new_v4().simple())];
+            for name in ["expired", "revoked"] {
+                let (token, id) = svc
+                    .generate_api_token(user_id, name, vec!["read:artifacts".into()], None)
+                    .await
+                    .expect("mint token");
+                let sql = if name == "expired" {
+                    "UPDATE api_tokens SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1"
+                } else {
+                    "UPDATE api_tokens SET revoked_at = NOW() WHERE id = $1"
+                };
+                sqlx::query(sql)
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+                    .expect("kill token");
+                dead.push(token);
+            }
+            dead.push(mint_access_jwt(
+                "some-other-secret-at-least-32-bytes-5683",
+                user_id,
+                &username,
+            ));
+
+            let before = verifies();
+            let mut answers = Vec::new();
+            for secret in &dead {
+                let header = bearer_b64(&username, secret);
+                for allow in [true, false] {
+                    answers.push((
+                        secret.clone(),
+                        allow,
+                        try_resolve_auth_outcome(&svc, ExtractedToken::Bearer(&header), allow)
+                            .await,
+                    ));
+                }
+            }
+            let ran = verifies() - before;
+            let failed = failed_logins(&pool, user_id).await;
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(&pool)
+                .await
+                .ok();
+
+            for (secret, allow, outcome) in answers {
+                assert!(
+                    matches!(outcome, AuthOutcome::InvalidCredential),
+                    "Bearer base64 {secret} (allow={allow}): {outcome:?}"
+                );
+            }
+            assert_eq!(
+                ran, 0,
+                "dead tokens in the Bearer base64 form ran {ran} bcrypt verifies (#5683)"
+            );
+            assert_eq!(failed, 0, "a dead token is not a failed login");
+        }
+
+        /// Positive controls: a live token resolves as its owner on the format
+        /// surface (and is refused on the management API, like Basic, #2806);
+        /// the real password resolves with one bcrypt, a wrong one is a 401
+        /// with one bcrypt.
+        #[tokio::test]
+        async fn bearer_base64_live_credentials_still_resolve() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let config = crate::config::Config::default();
+            let svc = AuthService::new(pool.clone(), Arc::new(config));
+            let (user_id, username) = local_user(&pool).await;
+            let (live, _) = svc
+                .generate_api_token(user_id, "npm", vec!["read:artifacts".into()], None)
+                .await
+                .expect("mint token");
+
+            let token_header = bearer_b64(&username, &live);
+            let format_token =
+                try_resolve_auth_outcome(&svc, ExtractedToken::Bearer(&token_header), true).await;
+            let before = verifies();
+            let mgmt_token =
+                try_resolve_auth_outcome(&svc, ExtractedToken::Bearer(&token_header), false).await;
+            let mgmt_token_cost = verifies() - before;
+
+            let right = bearer_b64(&username, PASSWORD);
+            let before = verifies();
+            let password =
+                try_resolve_auth_outcome(&svc, ExtractedToken::Bearer(&right), false).await;
+            let password_cost = verifies() - before;
+            let wrong = bearer_b64(&username, "wrong-password");
+            let before = verifies();
+            let wrong_outcome =
+                try_resolve_auth_outcome(&svc, ExtractedToken::Bearer(&wrong), true).await;
+            let wrong_cost = verifies() - before;
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(&pool)
+                .await
+                .ok();
+
+            assert!(
+                matches!(format_token, AuthOutcome::Resolved(ref e) if e.is_api_token && e.user_id == user_id),
+                "{format_token:?}"
+            );
+            assert!(
+                matches!(mgmt_token, AuthOutcome::InvalidCredential),
+                "{mgmt_token:?}"
+            );
+            assert_eq!(mgmt_token_cost, 0);
+            assert!(
+                matches!(password, AuthOutcome::Resolved(ref e) if !e.is_api_token && e.user_id == user_id),
+                "{password:?}"
+            );
+            assert_eq!(password_cost, 1);
+            assert!(matches!(wrong_outcome, AuthOutcome::InvalidCredential));
+            assert_eq!(wrong_cost, 1);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // #5484: a password alone must not sign in, on the management API, an
+    // account that `POST /api/v1/auth/login` would have sent to a TOTP
+    // challenge or to SSO. Every test drives the full router with the request
+    // shape from the issue: `curl -u victim:pw -X POST /api/v1/auth/tokens`.
+    // -----------------------------------------------------------------------
+    mod password_only_5484 {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::{Method, StatusCode};
+        use base64::Engine as _;
+        use sqlx::PgPool;
+        use uuid::Uuid;
+
+        const PASSWORD: &str = "Victim-Pa55word!";
+
+        /// A local account with `PASSWORD`, optionally admin and/or with TOTP
+        /// enrolled.
+        async fn seed_local_user(pool: &PgPool, is_admin: bool, totp: bool) -> (Uuid, String) {
+            let id = Uuid::new_v4();
+            let username = format!("ph-5484-{}", id.simple());
+            let hash = crate::services::auth_service::AuthService::hash_password(PASSWORD)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO users (id, username, email, password_hash, auth_provider, \
+                 is_admin, is_active, must_change_password, totp_enabled, totp_secret) \
+                 VALUES ($1, $2, $3, $4, 'local', $5, true, false, $6, $7)",
+            )
+            .bind(id)
+            .bind(&username)
+            .bind(format!("{username}@test.local"))
+            .bind(&hash)
+            .bind(is_admin)
+            .bind(totp)
+            .bind(totp.then_some("JBSWY3DPEHPK3PXP"))
+            .execute(pool)
+            .await
+            .expect("seed user");
+            (id, username)
+        }
+
+        async fn cleanup(pool: &PgPool, id: Uuid) {
+            let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+
+        async fn tokens_of(pool: &PgPool, id: Uuid) -> i64 {
+            sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens WHERE user_id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+
+        fn basic(username: &str) -> String {
+            let pair = format!("{username}:{PASSWORD}");
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(pair)
+            )
+        }
+
+        /// `curl -u <user>:<pw> -X POST /api/v1/auth/tokens -d '{...}'`.
+        async fn mint_with_password(state: &crate::api::SharedState, username: &str) -> StatusCode {
+            let req = axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/auth/tokens")
+                .header("Authorization", basic(username))
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"name":"x","scopes":["write:artifacts"]}"#,
+                ))
+                .unwrap();
+            tdh::send(crate::api::routes::create_router(state.clone()), req)
+                .await
+                .0
+        }
+
+        fn state(
+            pool: &PgPool,
+            mutate: impl FnOnce(&mut crate::config::Config),
+        ) -> crate::api::SharedState {
+            let dir = std::env::temp_dir().join(format!("ph-5484-{}", Uuid::new_v4()));
+            tdh::build_state_with(pool.clone(), dir.to_string_lossy().as_ref(), mutate)
+        }
+
+        /// The reporter's case: a TOTP-enrolled user's password used to mint a
+        /// non-expiring API token over Basic. The same request for an account
+        /// without TOTP still works, so the refusal is the TOTP gate.
+        #[tokio::test]
+        async fn basic_password_cannot_mint_an_api_token_for_a_totp_account() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            // The control / refusal must not flip on an SSO provider another
+            // test enabled meanwhile.
+            let _guard = tdh::sso_provider_serial_lock().await;
+            // Nor on a TOTP or token-expiry policy another test set.
+            let _totp = tdh::totp_policy_serial_lock().await;
+            let _token = tdh::token_policy_serial_lock().await;
+            let state = state(&pool, |_| {});
+            let (victim, victim_name) = seed_local_user(&pool, false, true).await;
+            let (plain, plain_name) = seed_local_user(&pool, false, false).await;
+
+            let refused = mint_with_password(&state, &victim_name).await;
+            let minted_for_victim = tokens_of(&pool, victim).await;
+            let control = mint_with_password(&state, &plain_name).await;
+            cleanup(&pool, victim).await;
+            cleanup(&pool, plain).await;
+
+            assert_eq!(refused, StatusCode::UNAUTHORIZED);
+            assert_eq!(minted_for_victim, 0, "no token minted for the TOTP account");
+            assert_eq!(control, StatusCode::OK, "the request shape itself works");
+        }
+
+        /// `curl -u admin:pw /api/v1/admin/...` for a TOTP-enrolled admin.
+        #[tokio::test]
+        async fn basic_password_is_refused_on_admin_routes_for_a_totp_admin() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = state(&pool, |_| {});
+            let (admin, admin_name) = seed_local_user(&pool, true, true).await;
+            let req = axum::http::Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/admin/backups")
+                .header("Authorization", basic(&admin_name))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let (status, _) =
+                tdh::send(crate::api::routes::create_router(state.clone()), req).await;
+            let mint = mint_with_password(&state, &admin_name).await;
+            let minted = tokens_of(&pool, admin).await;
+            cleanup(&pool, admin).await;
+
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "admin route");
+            assert_eq!(mint, StatusCode::UNAUTHORIZED, "token mint");
+            assert_eq!(minted, 0);
+        }
+
+        /// The TOTP enforcement policy (#2805) sends a covered account that
+        /// has not enrolled to enrolment at `/auth/login`; Basic must not skip
+        /// that step either.
+        #[tokio::test]
+        async fn basic_password_is_refused_when_the_policy_requires_enrolment() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            // The control / refusal must not flip on an SSO provider another
+            // test enabled meanwhile.
+            let _guard = tdh::sso_provider_serial_lock().await;
+            // Nor on a TOTP or token-expiry policy another test set.
+            let _totp = tdh::totp_policy_serial_lock().await;
+            let _token = tdh::token_policy_serial_lock().await;
+            let state = state(&pool, |c| {
+                c.totp_policy = Some(crate::services::totp_policy::TotpPolicy::RequiredForAll);
+            });
+            let (user, name) = seed_local_user(&pool, false, false).await;
+            let status = mint_with_password(&state, &name).await;
+            let minted = tokens_of(&pool, user).await;
+            cleanup(&pool, user).await;
+
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(minted, 0);
+        }
+
+        /// With an SSO provider enabled, `/auth/login` answers a non-admin
+        /// local account with "Local login is disabled when SSO is
+        /// configured"; Basic used to serve it anyway. The verified-admin
+        /// break-glass (#443) is kept, exactly as at `/auth/login`.
+        #[tokio::test]
+        async fn basic_password_honours_the_sso_only_local_login_policy() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let _guard = tdh::sso_provider_serial_lock().await;
+            // Nor on a TOTP or token-expiry policy another test set.
+            let _totp = tdh::totp_policy_serial_lock().await;
+            let _token = tdh::token_policy_serial_lock().await;
+            let state = state(&pool, |_| {});
+            let provider = format!("ph-5484-ldap-{}", Uuid::new_v4().simple());
+            sqlx::query(
+                "INSERT INTO ldap_configs (name, server_url, user_base_dn, is_enabled) \
+                 VALUES ($1, 'ldap://test.invalid', 'dc=test', true)",
+            )
+            .bind(&provider)
+            .execute(&pool)
+            .await
+            .expect("seed enabled LDAP provider");
+            let (user, name) = seed_local_user(&pool, false, false).await;
+            let (admin, admin_name) = seed_local_user(&pool, true, false).await;
+
+            let refused = mint_with_password(&state, &name).await;
+            let minted = tokens_of(&pool, user).await;
+            let break_glass = mint_with_password(&state, &admin_name).await;
+            cleanup(&pool, user).await;
+            cleanup(&pool, admin).await;
+            let _ = sqlx::query("DELETE FROM ldap_configs WHERE name = $1")
+                .bind(&provider)
+                .execute(&pool)
+                .await;
+
+            assert_eq!(refused, StatusCode::UNAUTHORIZED, "non-admin under SSO");
+            assert_eq!(minted, 0);
+            assert_eq!(break_glass, StatusCode::OK, "verified-admin break-glass");
+        }
+
+        /// On the format and registry routes (`allow_basic_api_token = true`)
+        /// a TOTP-enrolled account's password is refused as `/v2/token`
+        /// refuses it, in both the Basic and the base64-in-Bearer form. The
+        /// user-and-API-token form still works for that account, and a
+        /// password still works for an account without TOTP.
+        #[tokio::test]
+        async fn format_route_password_is_refused_for_a_totp_account() {
+            use super::super::{
+                try_resolve_auth_outcome_with_passthrough, AuthOutcome, ExtractedToken,
+            };
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = state(&pool, |_| {});
+            let svc = crate::services::auth_service::AuthService::new(
+                pool.clone(),
+                std::sync::Arc::new(state.config.clone()),
+            );
+            let (victim, victim_name) = seed_local_user(&pool, false, true).await;
+            let (plain, plain_name) = seed_local_user(&pool, false, false).await;
+            let (api_token, _) = svc
+                .generate_api_token(victim, "ph-5484", vec!["read:artifacts".into()], None)
+                .await
+                .expect("mint API token");
+            let enc = |user: &str, secret: &str| {
+                base64::engine::general_purpose::STANDARD.encode(format!("{user}:{secret}"))
+            };
+            let resolve = |cred: String, bearer: bool| {
+                let svc = &svc;
+                async move {
+                    let extracted = if bearer {
+                        ExtractedToken::Bearer(&cred)
+                    } else {
+                        ExtractedToken::Basic(&cred)
+                    };
+                    try_resolve_auth_outcome_with_passthrough(
+                        svc,
+                        extracted,
+                        true,
+                        "/pypi/ph-5484/simple/",
+                        "GET",
+                    )
+                    .await
+                }
+            };
+
+            let basic_victim = resolve(enc(&victim_name, PASSWORD), false).await;
+            let bearer_victim = resolve(enc(&victim_name, PASSWORD), true).await;
+            let token_victim = resolve(enc(&victim_name, &api_token), false).await;
+            let basic_plain = resolve(enc(&plain_name, PASSWORD), false).await;
+            let bearer_plain = resolve(enc(&plain_name, PASSWORD), true).await;
+            cleanup(&pool, victim).await;
+            cleanup(&pool, plain).await;
+
+            assert!(
+                matches!(basic_victim, AuthOutcome::InvalidCredential),
+                "Basic password, TOTP account: {basic_victim:?}"
+            );
+            assert!(
+                matches!(bearer_victim, AuthOutcome::InvalidCredential),
+                "base64 Bearer password, TOTP account: {bearer_victim:?}"
+            );
+            assert!(
+                matches!(&token_victim, AuthOutcome::Resolved(ext) if ext.user_id == victim),
+                "user:<api_token>, TOTP account: {token_victim:?}"
+            );
+            assert!(
+                matches!(&basic_plain, AuthOutcome::Resolved(ext) if ext.user_id == plain),
+                "Basic password, no TOTP: {basic_plain:?}"
+            );
+            assert!(
+                matches!(&bearer_plain, AuthOutcome::Resolved(ext) if ext.user_id == plain),
+                "base64 Bearer password, no TOTP: {bearer_plain:?}"
+            );
+        }
+
+        /// `require_auth_with_bearer_fallback` (npm, cargo, goproxy handlers)
+        /// verifies a base64 `user:pass` Bearer itself; it applies the same
+        /// format-route refusal.
+        #[tokio::test]
+        async fn bearer_fallback_refuses_a_totp_accounts_password() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = state(&pool, |_| {});
+            let (victim, victim_name) = seed_local_user(&pool, false, true).await;
+            let (plain, plain_name) = seed_local_user(&pool, false, false).await;
+            let call = |user: String| {
+                let pool = pool.clone();
+                let config = state.config.clone();
+                async move {
+                    let mut headers = axum::http::HeaderMap::new();
+                    let cred = base64::engine::general_purpose::STANDARD
+                        .encode(format!("{user}:{PASSWORD}"));
+                    headers.insert(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {cred}").parse().unwrap(),
+                    );
+                    super::super::require_auth_with_bearer_fallback(
+                        None, &headers, &pool, &config, "npm",
+                    )
+                    .await
+                }
+            };
+            let refused = call(victim_name).await;
+            let allowed = call(plain_name).await;
+            cleanup(&pool, victim).await;
+            cleanup(&pool, plain).await;
+
+            assert_eq!(
+                refused.err().map(|r| r.status()),
+                Some(StatusCode::UNAUTHORIZED)
+            );
+            assert_eq!(allowed.ok(), Some(plain));
+        }
     }
 }

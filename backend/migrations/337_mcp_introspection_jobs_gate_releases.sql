@@ -1,0 +1,11 @@
+-- #5463: an introspection job whose serve gate could not be evaluated at
+-- claim time is handed back to the queue (`mcp_introspection::release`)
+-- instead of being cancelled. `gate_releases` counts those hand-backs: the
+-- job is due again after a backoff that doubles with each one, and after
+-- `RELEASE_REFUNDS` of them a release spends the claim's attempt, so a gate
+-- that never becomes evaluable fails the job after `max_attempts` instead of
+-- cycling it forever.
+--
+-- A non-volatile default is catalog-only since PostgreSQL 11: no rewrite of
+-- `mcp_introspection_jobs`.
+ALTER TABLE mcp_introspection_jobs ADD COLUMN IF NOT EXISTS gate_releases INTEGER NOT NULL DEFAULT 0;

@@ -38,7 +38,10 @@
 //! shared, so the object (and its Maven checksum sidecars) is deleted only when
 //! no other `artifacts` row or `artifact_versions` revision in the same storage
 //! scope still references it; otherwise GC reclaims it later. Proxy-cache
-//! objects are never deleted: only the stale row goes.
+//! objects are never deleted: only the stale row goes. Before the row goes,
+//! the purge queues (or re-arms) a delete for every push/mirror peer in the
+//! same transaction; the task outlives the row and carries the repository key
+//! and path the sync worker sends it to (#5624).
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -50,6 +53,7 @@ use uuid::Uuid;
 use crate::api::dto::{Pagination, PaginationQuery};
 use crate::error::{AppError, Result};
 use crate::models::access_scope::AccessScope;
+use crate::services::peer_instance_service::{PeerInstanceService, PublishedArtifact};
 use crate::storage::{StorageLocation, StorageRegistry};
 
 /// Largest `per_page` the list endpoint honours.
@@ -365,6 +369,7 @@ impl TrashService {
         let mut tx = self.db.begin().await?;
         let sql = format!(
             "SELECT {TRASH_COLUMNS_SQL}, a.is_deleted, r.storage_backend, r.storage_path, \
+                    a.created_at, \
                     EXISTS (SELECT 1 FROM artifacts l \
                             WHERE l.repository_id = a.repository_id AND l.path = a.path \
                               AND l.is_deleted = false AND l.id <> a.id) AS path_taken \
@@ -404,7 +409,42 @@ impl TrashService {
         .bind(id)
         .execute(&mut *tx)
         .await?;
+
+        // A delete task queued while the artifact was trashed (possibly for a
+        // peer that was offline at the time) must not take the restored
+        // artifact off a peer after the fact: cancel it and queue a push in
+        // the same transaction (#5505). A crash between the restore and the
+        // commit cannot leave a live artifact with a pending delete.
+        PeerInstanceService::queue_restored_artifact_sync_tasks(
+            &mut tx,
+            &PublishedArtifact {
+                id: candidate.row.id,
+                repository_id: candidate.row.repository_id,
+                path: &candidate.row.path,
+                size_bytes: candidate.row.size_bytes,
+                created_at: candidate.created_at,
+            },
+        )
+        .await?;
         tx.commit().await?;
+
+        // The inverse of the delete hook (#5632): the restored version may be
+        // the newest live one again, so the catalog's Latest goes back to it.
+        // Best-effort: the restore itself is already committed.
+        if let Err(e) = crate::services::package_service::refresh_package_latest_for_artifact(
+            &self.db,
+            candidate.row.repository_id,
+            &candidate.row.name,
+            &candidate.row.path,
+        )
+        .await
+        {
+            tracing::warn!(
+                "Failed to refresh catalog latest after restoring artifact {}: {}",
+                id,
+                e
+            );
+        }
 
         Ok(candidate.row.into_restored())
     }
@@ -442,6 +482,18 @@ impl TrashService {
             .bind(id)
             .fetch_one(&mut *tx)
             .await?;
+
+        // The peers must lose the artifact too (#5624). Its delete tasks
+        // outlive the row (`ON DELETE SET NULL`) and carry the peer address,
+        // so queue (or re-arm) one per push/mirror subscriber before the row
+        // goes, in this transaction: a purge cannot commit without them.
+        PeerInstanceService::queue_deletes_before_removal(
+            &mut tx,
+            candidate.row.repository_id,
+            &candidate.row.repository_key,
+            &[id],
+        )
+        .await?;
 
         // promotion_approvals has no ON DELETE CASCADE.
         sqlx::query("DELETE FROM promotion_approvals WHERE artifact_id = $1")
@@ -509,6 +561,7 @@ struct RestoreCandidate {
     is_deleted: bool,
     storage_backend: String,
     storage_path: String,
+    created_at: DateTime<Utc>,
     path_taken: bool,
 }
 
@@ -635,6 +688,67 @@ pub(crate) mod tests {
         )
     }
 
+    /// Register a peer with a `push` subscription to the fixture repository.
+    async fn subscribe_peer(fx: &tdh::Fixture, tag: &str) -> Uuid {
+        subscribe_peer_with_mode(fx, tag, "push").await
+    }
+
+    /// Register a peer subscribed to the fixture repository in `mode`.
+    async fn subscribe_peer_with_mode(fx: &tdh::Fixture, tag: &str, mode: &str) -> Uuid {
+        let peer_id = tdh::register_test_peer(&fx.pool, "trash-restore", tag).await;
+        sqlx::query(
+            "INSERT INTO peer_repo_subscriptions \
+                 (peer_instance_id, repository_id, sync_enabled, replication_mode) \
+             VALUES ($1, $2, true, $3::text::replication_mode)",
+        )
+        .bind(peer_id)
+        .bind(fx.repo_id)
+        .bind(mode)
+        .execute(&fx.pool)
+        .await
+        .expect("subscribe peer");
+        peer_id
+    }
+
+    async fn seed_sync_task(
+        fx: &tdh::Fixture,
+        peer_id: Uuid,
+        artifact_id: Uuid,
+        task_type: &str,
+        status: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO sync_tasks (peer_instance_id, artifact_id, task_type, status) \
+             VALUES ($1, $2, $3, $4::text::sync_status)",
+        )
+        .bind(peer_id)
+        .bind(artifact_id)
+        .bind(task_type)
+        .bind(status)
+        .execute(&fx.pool)
+        .await
+        .expect("seed sync task");
+    }
+
+    /// `(status, error_message)` of the peer's task of `task_type`.
+    async fn sync_task_state(
+        fx: &tdh::Fixture,
+        peer_id: Uuid,
+        artifact_id: Uuid,
+        task_type: &str,
+    ) -> Option<(String, Option<String>)> {
+        sqlx::query_as(
+            "SELECT status::TEXT, error_message FROM sync_tasks \
+             WHERE peer_instance_id = $1 AND artifact_id = $2 AND task_type = $3",
+        )
+        .bind(peer_id)
+        .bind(artifact_id)
+        .bind(task_type)
+        .fetch_optional(&fx.pool)
+        .await
+        .expect("read sync task")
+    }
+
     #[tokio::test]
     async fn list_shows_trashed_rows_with_purge_time_and_restorability() {
         let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
@@ -711,6 +825,120 @@ pub(crate) mod tests {
         assert!(matches!(missing, Err(AppError::NotFound(_))), "{missing:?}");
     }
 
+    /// #5505: restores supersede the deletes queued while the artifact was
+    /// trashed, and re-push it even to a peer whose push already finished,
+    /// because that peer may have applied the delete in between.
+    #[tokio::test]
+    async fn restore_cancels_queued_deletes_and_rearms_pushes() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let uid = Uuid::new_v4().simple().to_string();
+        let path = format!("generic/restore-sync-{uid}");
+        let id = seed_trashed(&fx, &path, true).await;
+
+        // A peer that was offline when the artifact was deleted (#5497): its
+        // delete is queued and still pending.
+        let offline = subscribe_peer(&fx, &format!("{uid}-offline")).await;
+        sqlx::query("UPDATE peer_instances SET status = 'offline' WHERE id = $1")
+            .bind(offline)
+            .execute(&fx.pool)
+            .await
+            .expect("mark peer offline");
+        let failed = subscribe_peer(&fx, &format!("{uid}-failed")).await;
+        let inflight = subscribe_peer(&fx, &format!("{uid}-inflight")).await;
+        let completed = subscribe_peer(&fx, &format!("{uid}-completed")).await;
+        let clean = subscribe_peer(&fx, &format!("{uid}-clean")).await;
+
+        // Peers outside the push set: a pull-mode subscriber, and a push
+        // subscriber whose sync policy now excludes the artifact (the policy
+        // queued its delete when the peer dropped out of scope). The restore
+        // pushes nothing to them, so their deletes must still run.
+        let pull = subscribe_peer_with_mode(&fx, &format!("{uid}-pull"), "pull").await;
+        let excluded = subscribe_peer(&fx, &format!("{uid}-excluded")).await;
+        let policy_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO sync_policies \
+                 (name, repo_selector, peer_selector, artifact_filter, precedence) \
+             VALUES ($1, $2, $3, $4, 0) RETURNING id",
+        )
+        .bind(format!("trash-restore-exclude-{uid}"))
+        .bind(serde_json::json!({ "match_repos": [fx.repo_id] }))
+        .bind(serde_json::json!({ "match_peers": [excluded] }))
+        .bind(serde_json::json!({ "exclude_paths": [path.clone()] }))
+        .fetch_one(&fx.pool)
+        .await
+        .expect("insert sync policy");
+        sqlx::query(
+            "UPDATE peer_repo_subscriptions SET policy_id = $1 \
+             WHERE peer_instance_id = $2 AND repository_id = $3",
+        )
+        .bind(policy_id)
+        .bind(excluded)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach sync policy");
+
+        seed_sync_task(&fx, offline, id, "delete", "pending").await;
+        seed_sync_task(&fx, failed, id, "delete", "failed").await;
+        seed_sync_task(&fx, inflight, id, "delete", "in_progress").await;
+        seed_sync_task(&fx, completed, id, "push", "completed").await;
+        seed_sync_task(&fx, pull, id, "delete", "pending").await;
+        seed_sync_task(&fx, excluded, id, "delete", "pending").await;
+
+        let restored = service(&fx, 0).restore(id).await;
+        let offline_delete = sync_task_state(&fx, offline, id, "delete").await;
+        let failed_delete = sync_task_state(&fx, failed, id, "delete").await;
+        let inflight_delete = sync_task_state(&fx, inflight, id, "delete").await;
+        let mut pushes = Vec::new();
+        for peer_id in [offline, failed, inflight, completed, clean] {
+            pushes.push((peer_id, sync_task_state(&fx, peer_id, id, "push").await));
+        }
+        let mut out_of_scope = Vec::new();
+        for (label, peer_id) in [("pull-mode", pull), ("policy-excluded", excluded)] {
+            out_of_scope.push((
+                label,
+                sync_task_state(&fx, peer_id, id, "delete").await,
+                sync_task_state(&fx, peer_id, id, "push").await,
+            ));
+        }
+        let _ = sqlx::query("DELETE FROM sync_policies WHERE id = $1")
+            .bind(policy_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert!(restored.is_ok(), "{restored:?}");
+        for (label, state) in [("pending", offline_delete), ("failed", failed_delete)] {
+            let (status, message) = state.expect("superseded delete row");
+            assert_eq!(
+                status, "cancelled",
+                "a {label} delete must be superseded by the restore"
+            );
+            assert_eq!(message.as_deref(), Some("superseded by artifact restore"));
+        }
+        assert_eq!(
+            inflight_delete,
+            Some(("in_progress".to_string(), None)),
+            "a delete already in flight is left to finish; the push follows it"
+        );
+        for (peer_id, state) in pushes {
+            assert_eq!(
+                state.map(|(status, _)| status).as_deref(),
+                Some("pending"),
+                "restore must queue a pending push for peer {peer_id}"
+            );
+        }
+        for (label, delete, push) in out_of_scope {
+            assert_eq!(
+                delete,
+                Some(("pending".to_string(), None)),
+                "a {label} peer gets no push, so its delete must still run"
+            );
+            assert_eq!(push, None, "restore must not push to a {label} peer");
+        }
+    }
+
     #[tokio::test]
     async fn restore_refuses_oci_content_and_missing_objects() {
         let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
@@ -782,6 +1010,152 @@ pub(crate) mod tests {
         assert!(!row_left, "the trashed row is hard-deleted");
         assert!(!object_left, "an unshared object is deleted");
         assert!(matches!(again, Err(AppError::NotFound(_))), "{again:?}");
+    }
+
+    /// `(artifact_id, status, target_repository_key, target_path)` of every
+    /// delete task queued for `peer_id`.
+    async fn peer_deletes(
+        fx: &tdh::Fixture,
+        peer_id: Uuid,
+    ) -> Vec<(Option<Uuid>, String, Option<String>, Option<String>)> {
+        sqlx::query_as(
+            "SELECT artifact_id, status::TEXT, target_repository_key, target_path \
+             FROM sync_tasks WHERE peer_instance_id = $1 AND task_type = 'delete' \
+             ORDER BY target_path",
+        )
+        .bind(peer_id)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("read peer deletes")
+    }
+
+    /// #5624: purging a trashed artifact used to take its queued peer
+    /// deletes with it (`ON DELETE CASCADE`), so push peers kept serving it.
+    /// The deletes now survive the row, addressed by repository key and path:
+    /// one queued at trash time (without an address, as before migration
+    /// 340) keeps its place, and a subscriber that had none gets one.
+    #[tokio::test]
+    async fn purge_keeps_the_peer_deletes_addressed_by_path_5624() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let uid = Uuid::new_v4().simple().to_string();
+        let path = format!("generic/purge-peers-{uid}");
+        let id = seed_trashed(&fx, &path, true).await;
+
+        let queued = subscribe_peer(&fx, &format!("{uid}-queued")).await;
+        let unqueued = subscribe_peer(&fx, &format!("{uid}-unqueued")).await;
+        let pull = subscribe_peer_with_mode(&fx, &format!("{uid}-pull"), "pull").await;
+        // A peer whose subscription was disabled after the trash delete
+        // queued its delete: that delete must still survive the purge.
+        let disabled = subscribe_peer(&fx, &format!("{uid}-disabled")).await;
+        seed_sync_task(&fx, queued, id, "delete", "pending").await;
+        seed_sync_task(&fx, disabled, id, "delete", "failed").await;
+        sqlx::query(
+            "UPDATE peer_repo_subscriptions SET sync_enabled = false \
+             WHERE peer_instance_id = $1 AND repository_id = $2",
+        )
+        .bind(disabled)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("disable subscription");
+
+        let purged = service(&fx, 30).purge(id).await;
+        let queued_deletes = peer_deletes(&fx, queued).await;
+        let unqueued_deletes = peer_deletes(&fx, unqueued).await;
+        let pull_deletes = peer_deletes(&fx, pull).await;
+        let disabled_deletes = peer_deletes(&fx, disabled).await;
+        for peer in [queued, unqueued, pull, disabled] {
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+                .bind(peer)
+                .execute(&fx.pool)
+                .await;
+        }
+        fx.teardown().await;
+
+        assert!(purged.is_ok(), "{purged:?}");
+        let expected = vec![(
+            None,
+            "pending".to_string(),
+            Some(fx.repo_key.clone()),
+            Some(path.clone()),
+        )];
+        assert_eq!(
+            queued_deletes, expected,
+            "the delete queued at trash time must outlive the purged row"
+        );
+        assert_eq!(
+            unqueued_deletes, expected,
+            "a push subscriber without a queued delete gets one"
+        );
+        assert!(pull_deletes.is_empty(), "a pull subscriber gets nothing");
+        assert_eq!(
+            disabled_deletes,
+            vec![(
+                None,
+                "failed".to_string(),
+                Some(fx.repo_key.clone()),
+                Some(path.clone()),
+            )],
+            "a disabled subscriber's queued delete is kept and addressed, not re-armed"
+        );
+    }
+
+    /// #5699: a delete left by a purged artifact is addressed by path only,
+    /// and restoring a later artifact at that path used to cancel it for the
+    /// peers the restore re-pushes to, on the premise that the push replaces
+    /// the peer's copy. It does not (the peer refuses a push onto its live
+    /// copy with `409` immutable), so the peer kept the purged bytes. A
+    /// restore now cancels only the restored artifact's own delete; the
+    /// purged predecessor's delete stays queued and the push waits for it.
+    #[tokio::test]
+    async fn restore_keeps_a_purged_predecessors_delete_5699() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let uid = Uuid::new_v4().simple().to_string();
+        let path = format!("generic/restore-after-purge-{uid}");
+        let peer = subscribe_peer(&fx, &format!("{uid}-push")).await;
+        let svc = service(&fx, 30);
+        let first = seed_trashed(&fx, &path, true).await;
+        let purged = svc.purge(first).await;
+        let second = seed_trashed(&fx, &path, true).await;
+        seed_sync_task(&fx, peer, second, "delete", "pending").await;
+        let restored = svc.restore(second).await;
+        let predecessor = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT status::TEXT, error_message FROM sync_tasks \
+             WHERE peer_instance_id = $1 AND task_type = 'delete' AND artifact_id IS NULL",
+        )
+        .bind(peer)
+        .fetch_optional(&fx.pool)
+        .await
+        .expect("predecessor delete");
+        let own = sync_task_state(&fx, peer, second, "delete").await;
+        let push = sync_task_state(&fx, peer, second, "push").await;
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert!(purged.is_ok(), "{purged:?}");
+        assert!(restored.is_ok(), "{restored:?}");
+        assert_eq!(
+            predecessor,
+            Some(("pending".to_string(), None)),
+            "#5699: the purged artifact's delete must stay queued: the restore's \
+             push cannot replace the purged bytes on the peer"
+        );
+        assert_eq!(
+            own,
+            Some((
+                "cancelled".to_string(),
+                Some("superseded by artifact restore".to_string())
+            )),
+            "the restored artifact's own delete is still superseded"
+        );
+        assert_eq!(push.map(|(s, _)| s).as_deref(), Some("pending"));
     }
 
     #[tokio::test]
@@ -865,5 +1239,129 @@ pub(crate) mod tests {
         assert!(matches!(missing, Err(AppError::NotFound(_))), "{missing:?}");
         assert!(both_left, "a refused purge must change nothing");
         assert!(live_object_left);
+    }
+
+    /// #5676: the catalog-Latest hook finds a Maven row by its catalog name
+    /// (`groupId:artifactId`), not the artifact name (`artifactId`), in both
+    /// directions: a retention sweep of the newest version moves the stored
+    /// Latest down, and a trash restore of it moves Latest back up. Before,
+    /// the sweep never reached the hook and the restore looked up `widget`,
+    /// found no row, and left Latest where the delete put it.
+    #[tokio::test]
+    async fn maven_catalog_latest_follows_retention_delete_and_restore_5676() {
+        use crate::services::lifecycle_service::{CreateLifecyclePolicyRequest, LifecycleService};
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let mut ids = Vec::new();
+        for (version, checksum, age_days) in [("1.0", "a1", 0), ("2.0", "b2", 60)] {
+            let path = format!("com/acme/widget/{version}/widget-{version}.jar");
+            put_object(&fx, &path).await;
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                     checksum_sha256, content_type, storage_key, uploaded_by, created_at) \
+                 VALUES ($1, $2, 'widget', $3, 7, $4, 'application/java-archive', $2, $5, \
+                         NOW() - make_interval(days => $6)) \
+                 RETURNING id",
+            )
+            .bind(fx.repo_id)
+            .bind(&path)
+            .bind(version)
+            .bind(checksum)
+            .bind(fx.user_id)
+            .bind(age_days)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("insert maven artifact");
+            ids.push(id);
+        }
+        let package_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO packages (repository_id, name, version, size_bytes) \
+             VALUES ($1, 'com.acme:widget', '2.0', 7) RETURNING id",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("insert catalog row");
+        for (version, checksum) in [("1.0", "a1"), ("2.0", "b2")] {
+            sqlx::query(
+                "INSERT INTO package_versions (package_id, version, size_bytes, checksum_sha256) \
+                 VALUES ($1, $2, 7, $3)",
+            )
+            .bind(package_id)
+            .bind(version)
+            .bind(checksum)
+            .execute(&fx.pool)
+            .await
+            .expect("insert catalog version");
+        }
+        let stored_latest = || async {
+            sqlx::query_scalar::<_, String>("SELECT version FROM packages WHERE id = $1")
+                .bind(package_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("read catalog latest")
+        };
+
+        let lifecycle = LifecycleService::new(fx.pool.clone());
+        let policy = lifecycle
+            .create_policy(CreateLifecyclePolicyRequest {
+                applies_to_all: false,
+                repository_ids: None,
+                repository_id: Some(fx.repo_id),
+                name: format!("retention-{}", fx.repo_id.simple()),
+                description: None,
+                policy_type: "max_age_days".to_string(),
+                config: serde_json::json!({"days": 30}),
+                priority: None,
+                cron_schedule: None,
+                enabled: None,
+            })
+            .await
+            .expect("create policy");
+        let removed = lifecycle
+            .execute_policy(policy.id, false)
+            .await
+            .expect("execute policy")
+            .artifacts_removed;
+        let after_sweep = stored_latest().await;
+        let restored = service(&fx, 0).restore(ids[1]).await;
+        let after_restore = stored_latest().await;
+        let _ = sqlx::query("DELETE FROM lifecycle_policies WHERE id = $1")
+            .bind(policy.id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(removed, 1, "the sweep removes 2.0 only");
+        assert_eq!(after_sweep, "1.0", "Latest moves off the swept version");
+        restored.expect("restore 2.0");
+        assert_eq!(
+            after_restore, "2.0",
+            "Latest goes back to the restored version"
+        );
+    }
+
+    #[test]
+    fn catalog_package_name_maps_maven_and_sbt_coordinates_5676() {
+        use crate::services::package_service::catalog_package_name;
+        assert_eq!(
+            catalog_package_name("maven", "com/acme/widget/1.0/widget-1.0.jar", "widget"),
+            "com.acme:widget"
+        );
+        assert_eq!(
+            catalog_package_name("gradle", "com/acme/widget/1.0/widget-1.0.pom", "widget"),
+            "com.acme:widget"
+        );
+        // A path that does not parse keeps the artifact name.
+        assert_eq!(
+            catalog_package_name("maven", "com/acme/widget/maven-metadata.xml", "widget"),
+            "widget"
+        );
+        assert_eq!(
+            catalog_package_name("npm", "left-pad/1.0.0/left-pad-1.0.0.tgz", "left-pad"),
+            "left-pad"
+        );
     }
 }

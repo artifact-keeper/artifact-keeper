@@ -13,6 +13,9 @@ type JobStatus string
 const (
 	// StatusPending: accepted, not yet started.
 	StatusPending JobStatus = "Pending"
+	// StatusQueued: waiting for one of the adapter's MaxConcurrentScans scan
+	// slots (#5657). Reported to pollers in the X-Scan-Status header.
+	StatusQueued JobStatus = "Queued"
 	// StatusRunning: trivy is executing.
 	StatusRunning JobStatus = "Running"
 	// StatusSucceeded: a report is available.
@@ -93,6 +96,9 @@ func (s *JobStore) setStatus(id string, status JobStatus) {
 		job.Status = status
 	}
 }
+
+// Queued marks a job as waiting for a scan slot.
+func (s *JobStore) Queued(id string) { s.setStatus(id, StatusQueued) }
 
 // Running marks a job as executing.
 func (s *JobStore) Running(id string) { s.setStatus(id, StatusRunning) }

@@ -529,6 +529,7 @@ async fn download_archive(
                         upstream_url,
                         &upstream_path,
                         "application/octet-stream",
+                        ctx.is_head,
                     )
                     .await?;
                     // #3649: count the proxied serve. The streaming helper answers a warm
@@ -767,7 +768,15 @@ async fn upload_package(
 
     // Stream the staged archive into the repo's StorageBackend, from local
     // scratch or by copying the object the backend already staged (#4990).
-    let storage_key = format!("pub/{}/{}/{}", pkg_name, pkg_version, filename);
+    // The key is repo-scoped on a shared cloud namespace (#5662), so two
+    // repositories holding the same version do not collide on one key; reads
+    // go through the row's storage_key, so legacy flat-key rows keep serving.
+    let storage_key = crate::storage::StorageKeyScheme::from_env().write_key(
+        &repo.storage_backend,
+        "pub",
+        repo.id,
+        &format!("{}/{}/{}", pkg_name, pkg_version, filename),
+    );
     let put = proxy_helpers::put_staged_body(
         &state,
         &repo,
@@ -855,6 +864,7 @@ async fn upload_package(
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         "pub",
         pkg_name,
@@ -2539,6 +2549,29 @@ mod publish_protocol_tests {
             "finalize must return {{\"success\": {{\"message\": ...}}}}"
         );
         fx.teardown().await;
+    }
+
+    /// #5662: the same version uploads into two Pub repositories on a shared
+    /// cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_version_uploads_to_two_cloud_repositories_5662() {
+        let archive = pub_archive("shared_pkg", "1.0.0");
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "pub",
+            key_prefix: "pub",
+            router: super::router,
+            publish: &|key| {
+                let (ct, body) = multipart_file(&archive);
+                vec![tdh::post(
+                    format!("/{key}/api/packages/versions/newUpload"),
+                    &ct,
+                    body,
+                )]
+            },
+            download: &|key| tdh::get(format!("/{key}/packages/shared_pkg/versions/1.0.0.tar.gz")),
+            expected: &archive,
+        })
+        .await;
     }
 
     /// #4725: a hosted pub upload must queue a push sync task for a subscribed
