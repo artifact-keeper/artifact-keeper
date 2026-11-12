@@ -679,7 +679,7 @@ mod tests {
         let Some((pool, state, admin)) = setup().await else {
             return;
         };
-        let (group_id, _) = tdh::create_group(&pool).await;
+        let (group_id, group_name) = tdh::create_group(&pool).await;
         let (delegate_id, delegate_name) = tdh::create_user(&pool).await;
         let delegate = tdh::make_auth(delegate_id, &delegate_name);
         let rule =
@@ -712,8 +712,35 @@ mod tests {
             reviewers(&state, &admin, "PUT", format!("/groups/{group_id}")).await,
             StatusCode::NO_CONTENT
         );
-        assert_eq!(add(delegate).await, StatusCode::FORBIDDEN);
+        assert_eq!(add(delegate.clone()).await, StatusCode::FORBIDDEN);
         assert!(!can_review(&pool, newcomer).await);
+
+        // An SSO group is matched by name, so a rename could hand the role to another IdP group
+        let rename = |name: String| {
+            let state = state.clone();
+            let delegate = delegate.clone();
+            async move {
+                call(
+                    crate::api::handlers::groups::router(),
+                    &state,
+                    &delegate,
+                    "PUT",
+                    format!("/{group_id}"),
+                    Some(serde_json::json!({ "name": name, "description": "edited" })),
+                )
+                .await
+                .0
+            }
+        };
+        assert_eq!(
+            rename(format!("{group_name}-renamed")).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            rename(group_name.clone()).await,
+            StatusCode::OK,
+            "the description stays editable"
+        );
         assert_eq!(add(admin).await, StatusCode::OK);
         assert!(can_review(&pool, newcomer).await);
 
