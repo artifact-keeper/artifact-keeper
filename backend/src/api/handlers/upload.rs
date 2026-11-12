@@ -311,18 +311,20 @@ async fn create_session(
     // `max_upload_size` cap inside `create_session` still applies in that case.
     // Only a TRUSTED replication session (an authenticated peer,
     // `trusted_peer_replication`) is exempt: the header alone is client-set.
-    if !is_replication {
-        let denied_by = state
+    //
+    // The instance-wide storage quota has no replication exemption: a peer
+    // pushing into an instance at its quota is refused like any upload.
+    let denied_by = if is_replication {
+        crate::services::quota::storage::instance_denial(&state.db, req.total_size).await
+    } else {
+        state
             .create_repository_service()
             .quota_preflight(repo_id, req.total_size)
             .await
-            .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-        if let Some(scope) = denied_by {
-            return Err(map_err(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                scope.exceeded_message(),
-            ));
-        }
+    }
+    .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if let Some(denial) = denied_by {
+        return Err(denial.into_error().into_response());
     }
 
     let session = UploadService::create_session(upload_service::CreateSessionParams {
@@ -1255,11 +1257,22 @@ async fn complete_session_commit(
         }
         Err(e) => return Err(release_after_precommit_failure(&state.db, &session, e).await),
     };
-    // Only a TRUSTED replication session keeps the exemption: the replication
-    // header alone is client-set.
-    if !replication_trusted {
-        let admission =
-            match crate::services::repository_service::RepositoryService::new(state.db.clone())
+    // Only a TRUSTED replication session keeps the exemption from the
+    // repository quota (the replication header alone is client-set); the
+    // instance storage quota applies to it too.
+    {
+        let admission = if replication_trusted {
+            crate::services::quota::storage::instance_denial(&state.db, session.total_size)
+                .await
+                .map(
+                    |denied_by| crate::services::repository_service::QuotaAdmission {
+                        allowed: denied_by.is_none(),
+                        denied_by,
+                        base_usage: None,
+                    },
+                )
+        } else {
+            crate::services::repository_service::RepositoryService::new(state.db.clone())
                 .check_quota_locked(
                     &mut tx,
                     session.repository_id,
@@ -1267,14 +1280,15 @@ async fn complete_session_commit(
                     session.total_size,
                 )
                 .await
-            {
-                Ok(admission) => admission,
-                Err(e) => {
-                    drop(tx);
-                    return Err(release_after_precommit_failure(&state.db, &session, e).await);
-                }
-            };
-        if let Some(scope) = admission.denied_by {
+        };
+        let admission = match admission {
+            Ok(admission) => admission,
+            Err(e) => {
+                drop(tx);
+                return Err(release_after_precommit_failure(&state.db, &session, e).await);
+            }
+        };
+        if let Some(denial) = admission.denied_by {
             // Drop `tx` (rolls back). The stored blob is content-addressed;
             // when this completion wrote it, hand it to storage GC's
             // candidate sweep (#4990), which deletes it unless a row
@@ -1286,9 +1300,9 @@ async fn complete_session_commit(
                     .journal_unreferenced_upload_object(session.repository_id, &storage_key)
                     .await;
             }
-            let message = scope.exceeded_message();
+            let message = denial.exceeded_message();
             UploadService::fail_committing(&state.db, &session, &message.to_lowercase()).await;
-            return Err(map_err(StatusCode::INSUFFICIENT_STORAGE, message));
+            return Err(denial.into_error().into_response());
         }
     }
     // #4832: the `WHERE` is the live-overwrite rule of the
@@ -4396,7 +4410,7 @@ mod tests {
             .execute(&f.pool)
             .await;
 
-        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(status, StatusCode::FORBIDDEN);
         let body = String::from_utf8_lossy(&body);
         assert!(body.contains("Project storage quota exceeded"), "{body}");
     }
@@ -6243,7 +6257,7 @@ mod tests {
 
     /// #3916 with #2516: on the streaming path the locked quota admission
     /// still runs in the transaction that inserts the row, so a completion
-    /// over the repository quota answers 507, publishes no row, fails the
+    /// over the repository quota answers 403, publishes no row, fails the
     /// session and leaves no staging object behind.
     #[tokio::test]
     async fn complete_streaming_quota_denial_publishes_no_row() {
@@ -6269,7 +6283,7 @@ mod tests {
         let (status, body) = tdh::send(app, complete_req(session_id)).await;
         assert_eq!(
             status,
-            StatusCode::INSUFFICIENT_STORAGE,
+            StatusCode::FORBIDDEN,
             "body: {}",
             String::from_utf8_lossy(&body)
         );
@@ -7627,7 +7641,7 @@ mod tests {
         .await;
         assert_eq!(
             status,
-            StatusCode::INSUFFICIENT_STORAGE,
+            StatusCode::FORBIDDEN,
             "an untrusted replication header must not skip the locked quota admission: {}",
             String::from_utf8_lossy(&body)
         );
@@ -7636,7 +7650,7 @@ mod tests {
         let (status, _) = create_session_as(&f, &user, "quota/early.bin", payload, true).await;
         assert_eq!(
             status,
-            StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::FORBIDDEN,
             "an untrusted replication header must not skip the create-time quota check"
         );
         // #5455: nor a service account's.
@@ -7646,7 +7660,7 @@ mod tests {
             create_session_as(&f, &service_account, "quota/sa.bin", payload, true).await;
         assert_eq!(
             status,
-            StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::FORBIDDEN,
             "a service account's replication header must not skip the quota"
         );
         let admin = tdh::admin_auth(f.user_id, &f.username);
@@ -7699,7 +7713,7 @@ mod tests {
             complete_req(session.parse().unwrap()),
         )
         .await;
-        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(status, StatusCode::FORBIDDEN);
         let key = crate::services::artifact_service::ArtifactService::storage_key_from_checksum(&{
             use sha2::{Digest, Sha256};
             hex::encode(Sha256::digest(&payload))
