@@ -6,8 +6,9 @@
 //!   refusal from a missing resource. The hiding helpers call
 //!   [`note_hidden_refusal`] with the repository they hid.
 //! * The shared legacy checks record the strongest check that passed for a
-//!   repository ([`note_passed`]), so a later 4xx can be told from a refusal
-//!   that came before the check ran.
+//!   resource ([`note_passed`] for a repository, [`note_passed_on`] for any
+//!   resource), so a later 4xx can be told from a refusal that came before
+//!   the check ran.
 //! * A handler records refusals it keeps after enforcement
 //!   ([`note_kept_refusal`]) and, for a resource its body names, the target it
 //!   authorized ([`note_target`]).
@@ -82,8 +83,8 @@ impl LegacyLevel {
 pub struct Recorded {
     /// The repository of the first existence-hiding refusal.
     pub hidden_refusal: Option<Uuid>,
-    /// The strongest check that passed, per repository.
-    pub passed: Vec<(Uuid, LegacyLevel)>,
+    /// The strongest check that passed, per resource.
+    pub passed: Vec<(ScopeRef, LegacyLevel)>,
     /// The first refusal the handler keeps after enforcement, by reason.
     pub kept_refusal: Option<&'static str>,
     /// The resource a body-resolved declaration was authorized on.
@@ -93,11 +94,11 @@ pub struct Recorded {
 }
 
 impl Recorded {
-    /// The strongest check that passed on `repository_id`.
-    pub fn passed_on(&self, repository_id: Uuid) -> Option<LegacyLevel> {
+    /// The strongest check that passed on `resource`.
+    pub fn passed_on(&self, resource: ScopeRef) -> Option<LegacyLevel> {
         self.passed
             .iter()
-            .find(|(id, _)| *id == repository_id)
+            .find(|(r, _)| *r == resource)
             .map(|(_, level)| *level)
     }
 }
@@ -105,7 +106,7 @@ impl Recorded {
 #[derive(Default)]
 struct Recorder {
     hidden_refusal: Cell<Option<Uuid>>,
-    passed: RefCell<Vec<(Uuid, LegacyLevel)>>,
+    passed: RefCell<Vec<(ScopeRef, LegacyLevel)>>,
     kept_refusal: Cell<Option<&'static str>>,
     target: Cell<Option<ScopeRef>>,
     principal: Cell<Option<RecordedPrincipal>>,
@@ -129,11 +130,17 @@ pub fn note_hidden_refusal(repository_id: Uuid) {
 /// Record that a legacy check at `level` passed on `repository_id`; the
 /// strongest level per repository is kept.
 pub fn note_passed(repository_id: Uuid, level: LegacyLevel) {
+    note_passed_on(ScopeRef::Repository(repository_id), level);
+}
+
+/// Record that a legacy check at `level` passed on `resource`; the strongest
+/// level per resource is kept.
+pub fn note_passed_on(resource: ScopeRef, level: LegacyLevel) {
     let _ = RECORDER.try_with(|r| {
         let mut passed = r.passed.borrow_mut();
-        match passed.iter_mut().find(|(id, _)| *id == repository_id) {
+        match passed.iter_mut().find(|(kept_on, _)| *kept_on == resource) {
             Some((_, kept)) => *kept = (*kept).max(level),
-            None => passed.push((repository_id, level)),
+            None => passed.push((resource, level)),
         }
     });
 }
@@ -269,12 +276,45 @@ mod tests {
             note_passed(b, LegacyLevel::Write);
         })
         .await;
-        assert_eq!(recorded.passed_on(a), Some(LegacyLevel::Admin));
-        assert_eq!(recorded.passed_on(b), Some(LegacyLevel::Write));
-        assert_eq!(recorded.passed_on(Uuid::new_v4()), None);
+        assert_eq!(
+            recorded.passed_on(ScopeRef::Repository(a)),
+            Some(LegacyLevel::Admin)
+        );
+        assert_eq!(
+            recorded.passed_on(ScopeRef::Repository(b)),
+            Some(LegacyLevel::Write)
+        );
+        assert_eq!(
+            recorded.passed_on(ScopeRef::Repository(Uuid::new_v4())),
+            None
+        );
         note_passed(a, LegacyLevel::Admin);
         let ((), recorded) = scope(async {}).await;
         assert!(recorded.passed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn passes_on_different_kinds_of_resource_are_kept_apart() {
+        let id = Uuid::new_v4();
+        let ((), recorded) = scope(async {
+            note_passed(id, LegacyLevel::Read);
+            note_passed_on(ScopeRef::Project(id), LegacyLevel::Admin);
+            note_passed_on(ScopeRef::Instance, LegacyLevel::Admin);
+        })
+        .await;
+        assert_eq!(
+            recorded.passed_on(ScopeRef::Repository(id)),
+            Some(LegacyLevel::Read)
+        );
+        assert_eq!(
+            recorded.passed_on(ScopeRef::Project(id)),
+            Some(LegacyLevel::Admin)
+        );
+        assert_eq!(recorded.passed_on(ScopeRef::Group(id)), None);
+        assert_eq!(
+            recorded.passed_on(ScopeRef::Instance),
+            Some(LegacyLevel::Admin)
+        );
     }
 
     #[tokio::test]
@@ -345,13 +385,16 @@ mod tests {
             Some(repo_id),
             "the mark names the repository"
         );
-        assert_eq!(recorded.passed_on(repo_id), None);
+        assert_eq!(recorded.passed_on(ScopeRef::Repository(repo_id)), None);
         let (result, hidden) = marked(require_visible(&repo, &None, &service)).await;
         assert!(result.is_err() && hidden, "anonymous is refused and marked");
         let (result, recorded) =
             scope(require_visible(&repo, &Some(reader.clone()), &service)).await;
         assert!(result.is_ok() && recorded.hidden_refusal.is_none());
-        assert_eq!(recorded.passed_on(repo_id), Some(LegacyLevel::Read));
+        assert_eq!(
+            recorded.passed_on(ScopeRef::Repository(repo_id)),
+            Some(LegacyLevel::Read)
+        );
 
         // The hidden answer is byte-identical to the unknown-key 404.
         let unknown = service

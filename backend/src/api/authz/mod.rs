@@ -17,8 +17,13 @@ pub mod shadow_marker;
 #[cfg(test)]
 pub(crate) mod route_inventory;
 
-// The declaration table of the repository and artifact operations; only its
-// tests read it.
+// Shared support for the declaration table tests below. It holds no tests, so
+// like `route_inventory` it is not shard-gated.
+#[cfg(test)]
+pub(crate) mod declaration_table;
+#[cfg(ak_test_shard = "services-2")]
+#[cfg(test)]
+mod project_group_declarations;
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod repository_declarations;

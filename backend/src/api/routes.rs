@@ -3032,8 +3032,9 @@ mod tests {
                 .collect();
             let registry = registry();
             let declared = registry.declared_keys();
-            // The four label operations plus the 111 repository and artifact operations.
-            assert_eq!(declared.len(), 115, "{declared:?}");
+            // The four label operations, the 111 repository and artifact
+            // operations, and the 16 project and group operations.
+            assert_eq!(declared.len(), 131, "{declared:?}");
             assert!(declared.is_subset(&live), "{declared:?}");
         }
 

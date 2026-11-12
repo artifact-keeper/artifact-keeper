@@ -427,7 +427,7 @@ impl<'a> Projector<'a> {
             let from = vec![source.clone()];
             let anonymous = subject == SubjectRef::Anonymous;
 
-            // The instance-level sentinel gates repository creation.
+            // The instance-level sentinel gates repository and group creation.
             if rule.target_id == Uuid::nil() {
                 if anonymous {
                     continue;

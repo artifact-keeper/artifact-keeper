@@ -3,14 +3,9 @@
 //! document. A changed declaration fails here with the operation named, so
 //! the change is deliberate.
 
-use std::collections::BTreeMap;
+use super::declaration_table::{differences, parse, registry, unknown_requirement};
 
-use super::catalog::Permission;
-use super::declaration::RouteRequirement;
-use super::registry::{canonical_route, RouteKey, RouteRegistry};
-
-/// `METHOD route  requirement  resolver`, where the requirement is a catalog
-/// permission or `public`, and the resolver is `-` for a public operation.
+/// Rows in the format of [`parse`].
 const TABLE: &str = "
 GET    /api/v1/artifacts/:id  artifact.read  artifact:id
 GET    /api/v1/artifacts/:id/labels  artifact.read  artifact:id
@@ -131,99 +126,28 @@ GET    /api/v1/repositories/_/capabilities  public  -
 
 const PREFIXES: [&str; 2] = ["/api/v1/repositories", "/api/v1/artifacts"];
 
-fn in_scope(route: &str) -> bool {
-    PREFIXES
-        .iter()
-        .any(|p| route == *p || route.strip_prefix(p).is_some_and(|r| r.starts_with('/')))
-}
-
-/// The table as `(method, canonical route) -> (requirement, resolver)`.
-fn expected() -> BTreeMap<RouteKey, (String, String)> {
-    let mut rows = BTreeMap::new();
-    for line in TABLE.lines().filter(|l| !l.trim().is_empty()) {
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        let [method, route, requirement, resolver] = cols[..] else {
-            panic!("malformed table row: {line}");
-        };
-        let key = (method.to_string(), canonical_route(route));
-        let previous = rows.insert(key, (requirement.to_string(), resolver.to_string()));
-        assert!(previous.is_none(), "duplicate table row: {line}");
-    }
-    rows
-}
-
-fn rendered(requirement: &RouteRequirement) -> (String, String) {
-    match requirement {
-        RouteRequirement::Permission {
-            permission,
-            resolver,
-        } => (permission.id().to_string(), resolver.id.to_string()),
-        RouteRequirement::AuthenticationOnly => ("authenticated".into(), "-".into()),
-        RouteRequirement::Public => ("public".into(), "-".into()),
-    }
-}
-
-/// Rows that differ between the table and the registry, each naming its route.
-fn differences(
-    expected: &BTreeMap<RouteKey, (String, String)>,
-    registry: &RouteRegistry,
-) -> Vec<String> {
-    let declared: BTreeMap<RouteKey, (String, String)> = registry
-        .declared()
-        .filter(|((_, route), _)| in_scope(route))
-        .map(|((method, route), req)| ((method.clone(), canonical_route(route)), rendered(req)))
-        .collect();
-    let mut out = Vec::new();
-    for ((method, route), want) in expected {
-        match declared.get(&(method.clone(), route.clone())) {
-            None => out.push(format!("{method} {route}: in the table, not declared")),
-            Some(got) if got != want => out.push(format!(
-                "{method} {route}: table {} {}, declared {} {}",
-                want.0, want.1, got.0, got.1
-            )),
-            Some(_) => {}
-        }
-    }
-    for (method, route) in declared.keys() {
-        if !expected.contains_key(&(method.clone(), route.clone())) {
-            out.push(format!("{method} {route}: declared, not in the table"));
-        }
-    }
-    out
-}
-
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn registry() -> RouteRegistry {
-        RouteRegistry::from_api_doc(&crate::api::openapi::build_openapi())
-            .expect("valid authorization declarations")
-    }
-
     #[test]
     fn the_table_matches_the_declarations() {
-        let expected = expected();
+        let expected = parse(TABLE);
         assert_eq!(expected.len(), 115);
-        let diff = differences(&expected, &registry());
+        let diff = differences(&expected, &registry(), &PREFIXES);
         assert!(diff.is_empty(), "{}", diff.join("\n"));
     }
 
     #[test]
     fn every_table_requirement_is_known() {
-        for (key, (requirement, _)) in expected() {
-            assert!(
-                requirement == "public" || requirement.parse::<Permission>().is_ok(),
-                "{key:?}: {requirement}"
-            );
-        }
+        assert_eq!(unknown_requirement(&parse(TABLE)), None);
     }
 
     #[test]
     fn a_changed_row_is_reported_with_its_route() {
         let registry = registry();
-        let mut expected = expected();
+        let mut expected = parse(TABLE);
         let key = (
             "PUT".to_string(),
             "/api/v1/repositories/:key/cache-ttl".to_string(),
@@ -234,7 +158,7 @@ mod tests {
             "/api/v1/repositories/:key/storage".to_string(),
         );
         expected.remove(&missing);
-        let diff = differences(&expected, &registry);
+        let diff = differences(&expected, &registry, &PREFIXES);
         assert_eq!(diff.len(), 2, "{diff:?}");
         assert!(diff.iter().any(
             |d| d.starts_with("PUT /api/v1/repositories/:key/cache-ttl: table repository.read")

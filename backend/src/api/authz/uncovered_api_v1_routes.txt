@@ -17,8 +17,6 @@ DELETE /api/v1/admin/telemetry/crashes/:id
 DELETE /api/v1/admin/trash/:id
 DELETE /api/v1/auth/tokens/:token_id
 DELETE /api/v1/curation/rules/:id
-DELETE /api/v1/groups/:id
-DELETE /api/v1/groups/:id/members
 DELETE /api/v1/instances/:id
 DELETE /api/v1/instances/:id/proxy/*path
 DELETE /api/v1/migrations/:id
@@ -29,8 +27,6 @@ DELETE /api/v1/peers/:id/repositories/:repo_id
 DELETE /api/v1/permissions/:id
 DELETE /api/v1/plugins/:id
 DELETE /api/v1/profile/access-tokens/:token_id
-DELETE /api/v1/projects/:id
-DELETE /api/v1/projects/:id/members
 DELETE /api/v1/promotion-rules/:id
 DELETE /api/v1/quality/gates/:id
 DELETE /api/v1/quality/issues/:id/suppress
@@ -147,9 +143,6 @@ GET /api/v1/environments/lookup
 GET /api/v1/events/stream
 GET /api/v1/formats
 GET /api/v1/formats/:format_key
-GET /api/v1/groups
-GET /api/v1/groups/:id
-GET /api/v1/groups/:id/members
 GET /api/v1/instances
 GET /api/v1/instances/:id/proxy/*path
 GET /api/v1/mcp/pending-summary
@@ -186,9 +179,6 @@ GET /api/v1/plugins/:id
 GET /api/v1/plugins/:id/config
 GET /api/v1/plugins/:id/events
 GET /api/v1/profile/access-tokens
-GET /api/v1/projects
-GET /api/v1/projects/:id
-GET /api/v1/projects/:id/members
 GET /api/v1/promotion-rules
 GET /api/v1/promotion-rules/:id
 GET /api/v1/promotion/repositories/:key/promotion-history
@@ -350,8 +340,6 @@ POST /api/v1/curation/rules
 POST /api/v1/formats/:format_key/disable
 POST /api/v1/formats/:format_key/enable
 POST /api/v1/formats/:format_key/test
-POST /api/v1/groups
-POST /api/v1/groups/:id/members
 POST /api/v1/instances
 POST /api/v1/instances/:id/proxy/*path
 POST /api/v1/mcp/introspection/jobs/:id/complete
@@ -389,8 +377,6 @@ POST /api/v1/plugins/install/git
 POST /api/v1/plugins/install/local
 POST /api/v1/plugins/install/zip
 POST /api/v1/profile/access-tokens
-POST /api/v1/projects
-POST /api/v1/projects/:id/members
 POST /api/v1/promotion-rules
 POST /api/v1/promotion-rules/:id/evaluate
 POST /api/v1/promotion/repositories/:key/artifacts/:artifact_id/promote
@@ -455,13 +441,11 @@ PUT /api/v1/admin/sso/saml/:id
 PUT /api/v1/builds/:id
 PUT /api/v1/curation/rules/:id
 PUT /api/v1/dependency-track/analysis
-PUT /api/v1/groups/:id
 PUT /api/v1/instances/:id/proxy/*path
 PUT /api/v1/peers/:id/chunks/:artifact_id
 PUT /api/v1/peers/:id/labels
 PUT /api/v1/peers/:id/network-profile
 PUT /api/v1/permissions/:id
-PUT /api/v1/projects/:id
 PUT /api/v1/promotion-rules/:id
 PUT /api/v1/promotion/repositories/:key/release-target
 PUT /api/v1/quality/gates/:id

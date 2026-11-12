@@ -225,9 +225,10 @@ pub fn project_admin_permissions() -> BTreeSet<Permission> {
     ])
 }
 
-/// The capability the instance-level sentinel `admin` rule gates today.
+/// The capabilities the instance-level sentinel `admin` rule gates today:
+/// creating repositories and creating groups.
 pub fn sentinel_admin_permissions() -> BTreeSet<Permission> {
-    set(&[P::RepositoryCreate])
+    set(&[P::RepositoryCreate, P::GroupCreate])
 }
 
 /// What a group target's legacy action set confers, or `None` when the set has
@@ -422,7 +423,10 @@ mod tests {
 
     #[test]
     fn delegated_capabilities_are_exact() {
-        assert_eq!(sentinel_admin_permissions(), set(&[P::RepositoryCreate]));
+        assert_eq!(
+            sentinel_admin_permissions(),
+            set(&[P::RepositoryCreate, P::GroupCreate])
+        );
         let project_admin = project_admin_permissions();
         assert!(project_admin.contains(&P::ProjectUpdate));
         assert!(!project_admin.contains(&P::ProjectDelete));

@@ -126,8 +126,8 @@ pub fn legacy_outcome(
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => LegacyOutcome::Refuse,
         StatusCode::NOT_FOUND => LegacyOutcome::Unknown("secondary_resource"),
         s if s.is_client_error() => {
-            let passed = repository
-                .and_then(|id| recorded.passed_on(id))
+            let passed = recorded
+                .passed_on(resource)
                 .is_some_and(|level| level.satisfies(needed));
             if passed {
                 LegacyOutcome::Permit
@@ -682,10 +682,12 @@ mod tests {
             kept_refusal: Some("token_owner"),
             ..Recorded::default()
         };
-        let passed = |id, level| Recorded {
-            passed: vec![(id, level)],
+        let passed_at = |resource, level| Recorded {
+            passed: vec![(resource, level)],
             ..Recorded::default()
         };
+        let passed = |id, level| passed_at(ScopeRef::Repository(id), level);
+        let project = ScopeRef::Project(repo);
         let cases = [
             (StatusCode::OK, none.clone(), here, L::Admin, Permit),
             (StatusCode::NO_CONTENT, none.clone(), here, L::Write, Permit),
@@ -825,6 +827,42 @@ mod tests {
                 here,
                 L::Admin,
                 Unknown("validation_before_authorization"),
+            ),
+            // The same holds for a project, a group or the instance.
+            (
+                StatusCode::CONFLICT,
+                passed_at(project, L::Admin),
+                project,
+                L::Admin,
+                Permit,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                passed_at(ScopeRef::Project(other), L::Admin),
+                project,
+                L::Admin,
+                Unknown("validation_before_authorization"),
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                passed(repo, L::Admin),
+                project,
+                L::Admin,
+                Unknown("validation_before_authorization"),
+            ),
+            (
+                StatusCode::CONFLICT,
+                passed_at(ScopeRef::Group(repo), L::Admin),
+                ScopeRef::Group(repo),
+                L::Admin,
+                Permit,
+            ),
+            (
+                StatusCode::CONFLICT,
+                passed_at(ScopeRef::Instance, L::Admin),
+                ScopeRef::Instance,
+                L::Admin,
+                Permit,
             ),
             (
                 StatusCode::BAD_REQUEST,
@@ -1593,6 +1631,208 @@ mod end_to_end {
             .execute(&pool)
             .await;
         tdh::cleanup_user(&pool, admin).await;
+    }
+
+    #[tokio::test]
+    async fn project_and_group_management_is_compared() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (manager, _) = tdh::create_user(&pool).await;
+        let (member, _) = tdh::create_user(&pool).await;
+        let (instance_admin, _) = tdh::create_user(&pool).await;
+        sqlx::query("UPDATE users SET is_admin = true WHERE id = $1")
+            .bind(instance_admin)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mine = new_project(&pool).await;
+        let theirs = new_project(&pool).await;
+        let mine_key: String = sqlx::query_scalar("SELECT key FROM projects WHERE id = $1")
+            .bind(mine)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        tdh::grant_permission(&pool, "user", manager, "project", mine, &["admin"]).await;
+        let group = Uuid::new_v4();
+        sqlx::query("INSERT INTO groups (id, name, external_source) VALUES ($1, $2, 'ldap')")
+            .bind(group)
+            .bind(format!("shadow-ldap-{group}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        tdh::grant_permission(&pool, "user", manager, "group", group, &["admin"]).await;
+        tdh::grant_permission(
+            &pool,
+            "user",
+            manager,
+            crate::services::permission_service::SYSTEM_TARGET_TYPE,
+            crate::services::permission_service::SYSTEM_SENTINEL_ID,
+            &["admin"],
+        )
+        .await;
+        let mut rig = Rig::new(pool.clone(), &dir).await;
+        let bearer = tdh::bearer_for(&rig.state, manager).await;
+        let admin_bearer = tdh::bearer_for(&rig.state, instance_admin).await;
+        let auth = crate::services::auth_service::AuthService::new(
+            pool.clone(),
+            Arc::new(rig.state.config.clone()),
+        );
+        let (write_token, write_id) = auth
+            .generate_api_token(manager, "shadow-write", vec!["*".into()], None)
+            .await
+            .unwrap();
+        // A bare `write` scope can no longer be minted; tokens holding one
+        // predate scope validation, so the row is rewritten to match them.
+        sqlx::query("UPDATE api_tokens SET scopes = ARRAY['write'] WHERE id = $1")
+            .bind(write_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (scoped_token, scoped_id) = auth
+            .generate_api_token(manager, "shadow-scoped", vec!["*".into()], None)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+            .bind(scoped_id)
+            .bind(repo)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let add_member = || {
+            json_request(
+                "POST",
+                format!("/api/v1/projects/{mine}/members"),
+                serde_json::json!({
+                    "principal_type": "user", "principal_id": member, "actions": ["read"],
+                }),
+            )
+        };
+        let agrees = |c: &Comparison, legacy: LegacyOutcome| {
+            assert_eq!((c.legacy, c.class), (legacy, Class::Agree), "{c:?}");
+        };
+
+        // The project administrator manages their own project.
+        let (status, c) = rig
+            .call(
+                Some(&bearer),
+                empty_request("GET", format!("/api/v1/projects/{mine}")),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(c.permission, Permission::ProjectRead);
+        assert_eq!(c.resource, Some(ScopeRef::Project(mine)));
+        agrees(&c, LegacyOutcome::Permit);
+        let rename = json_request(
+            "PUT",
+            format!("/api/v1/projects/{mine}"),
+            serde_json::json!({"name": "renamed"}),
+        );
+        let (status, c) = rig.call(Some(&bearer), rename).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(c.permission, Permission::ProjectUpdate);
+        agrees(&c, LegacyOutcome::Permit);
+        let (status, c) = rig.call(Some(&bearer), add_member()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(c.permission, Permission::IamManage);
+        agrees(&c, LegacyOutcome::Permit);
+
+        // ... and not another project.
+        let (status, c) = rig
+            .call(
+                Some(&bearer),
+                empty_request("GET", format!("/api/v1/projects/{theirs}")),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(is_refusal(&c), "{c:?}");
+        agrees(&c, LegacyOutcome::Refuse);
+
+        // A duplicate project key after the instance check passed.
+        let duplicate = json_request(
+            "POST",
+            "/api/v1/projects".to_string(),
+            serde_json::json!({"key": mine_key, "name": "dup"}),
+        );
+        let (status, c) = rig.call(Some(&admin_bearer), duplicate).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(c.permission, Permission::ProjectCreate);
+        agrees(&c, LegacyOutcome::Permit);
+
+        // A member change on an identity-provider group after the group check.
+        let (status, c) = rig
+            .call(
+                Some(&bearer),
+                json_request(
+                    "POST",
+                    format!("/api/v1/groups/{group}/members"),
+                    serde_json::json!({"user_ids": [member]}),
+                ),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(c.permission, Permission::GroupManage);
+        assert_eq!(c.resource, Some(ScopeRef::Group(group)));
+        agrees(&c, LegacyOutcome::Permit);
+
+        // The sentinel holder creates a group.
+        let created = format!("shadow-created-{}", Uuid::new_v4().simple());
+        let (status, c) = rig
+            .call(
+                Some(&bearer),
+                json_request(
+                    "POST",
+                    "/api/v1/groups".to_string(),
+                    serde_json::json!({"name": created}),
+                ),
+            )
+            .await;
+        assert!(status.is_success(), "{status}");
+        assert_eq!(c.permission, Permission::GroupCreate);
+        agrees(&c, LegacyOutcome::Permit);
+
+        // The enumerated tightening: a `write` token no longer manages access.
+        let (status, c) = rig
+            .call(Some(&format!("Bearer {write_token}")), add_member())
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            (c.legacy, c.class),
+            (LegacyOutcome::Permit, Class::NewStricter),
+            "{c:?}"
+        );
+
+        // A repository-restricted token never reaches a project.
+        let (status, c) = rig
+            .call(
+                Some(&format!("Bearer {scoped_token}")),
+                empty_request("GET", format!("/api/v1/projects/{mine}")),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(is_refusal(&c), "{c:?}");
+        agrees(&c, LegacyOutcome::Refuse);
+
+        rig.shutdown.cancel();
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE id = ANY($1)")
+            .bind(vec![write_id, scoped_id])
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM groups WHERE id = $1 OR name = $2")
+            .bind(group)
+            .bind(&created)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = $1")
+            .bind(manager)
+            .execute(&pool)
+            .await;
+        delete_project(&pool, mine).await;
+        delete_project(&pool, theirs).await;
+        tdh::cleanup_user(&pool, member).await;
+        tdh::cleanup_user(&pool, instance_admin).await;
+        tdh::cleanup(&pool, repo, manager).await;
     }
 
     #[tokio::test]

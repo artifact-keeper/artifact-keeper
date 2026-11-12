@@ -70,6 +70,31 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
 }
 
+/// Require an instance administrator or a holder of `admin` on group `id`,
+/// refusing with `refusal` otherwise. For the IAM shadow comparison (#4214) a
+/// pass is recorded on the group, so a later 4xx is not read as a refusal.
+async fn require_group_admin(
+    state: &SharedState,
+    auth: &AuthExtension,
+    id: Uuid,
+    refusal: &str,
+) -> Result<()> {
+    if !auth.is_admin {
+        let has_perm = state
+            .permission_service
+            .check_permission(auth.user_id, "group", id, "admin", false)
+            .await?;
+        if !has_perm {
+            return Err(AppError::Authorization(refusal.to_string()));
+        }
+    }
+    crate::api::authz::shadow_marker::note_passed_on(
+        crate::services::iam_legacy_projection::ScopeRef::Group(id),
+        crate::api::authz::shadow_marker::LegacyLevel::Admin,
+    );
+    Ok(())
+}
+
 /// Whether a caller reads groups without per-caller scoping.
 ///
 /// Admins see every group (mirroring the admin short-circuit in the repository
@@ -258,6 +283,7 @@ pub struct GroupListResponse {
 /// List groups
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "",
     context_path = "/api/v1/groups",
     tag = "groups",
@@ -393,6 +419,7 @@ pub struct CreatedGroupRow {
 /// Create a group
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("group.create")), ("x-resource" = json!("instance"))),
     path = "",
     context_path = "/api/v1/groups",
     tag = "groups",
@@ -435,6 +462,10 @@ pub async fn create_group(
             ));
         }
     }
+    crate::api::authz::shadow_marker::note_passed_on(
+        crate::services::iam_legacy_projection::ScopeRef::Instance,
+        crate::api::authz::shadow_marker::LegacyLevel::Admin,
+    );
 
     let group: CreatedGroupRow = sqlx::query_as(
         r#"
@@ -485,6 +516,7 @@ pub async fn create_group(
 /// Get a group by ID
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/{id}",
     context_path = "/api/v1/groups",
     tag = "groups",
@@ -610,6 +642,7 @@ async fn fetch_group_members(
 /// Update a group
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("group.manage")), ("x-resource" = json!("group:id"))),
     path = "/{id}",
     context_path = "/api/v1/groups",
     tag = "groups",
@@ -636,18 +669,13 @@ pub async fn update_group(
     // GHSA-vvc3-h39c-mrq5: require the write scope on the token.
     auth.require_scope("write")?;
 
-    // Fine-grained permission check: non-admins need "admin" on the target group.
-    if !auth.is_admin {
-        let has_perm = state
-            .permission_service
-            .check_permission(auth.user_id, "group", id, "admin", false)
-            .await?;
-        if !has_perm {
-            return Err(AppError::Authorization(
-                "Insufficient permissions to update this group".to_string(),
-            ));
-        }
-    }
+    require_group_admin(
+        &state,
+        &auth,
+        id,
+        "Insufficient permissions to update this group",
+    )
+    .await?;
 
     let before: Option<(String, Option<String>)> =
         sqlx::query_as("SELECT name, description FROM groups WHERE id = $1")
@@ -709,6 +737,7 @@ pub async fn update_group(
 /// Delete a group
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("group.manage")), ("x-resource" = json!("group:id"))),
     path = "/{id}",
     context_path = "/api/v1/groups",
     tag = "groups",
@@ -733,18 +762,13 @@ pub async fn delete_group(
     // GHSA-vvc3-h39c-mrq5: deletion needs the delete scope.
     auth.require_scope("delete")?;
 
-    // Fine-grained permission check: non-admins need "admin" on the target group.
-    if !auth.is_admin {
-        let has_perm = state
-            .permission_service
-            .check_permission(auth.user_id, "group", id, "admin", false)
-            .await?;
-        if !has_perm {
-            return Err(AppError::Authorization(
-                "Insufficient permissions to delete this group".to_string(),
-            ));
-        }
-    }
+    require_group_admin(
+        &state,
+        &auth,
+        id,
+        "Insufficient permissions to delete this group",
+    )
+    .await?;
 
     let member_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM user_group_members WHERE group_id = $1")
@@ -813,6 +837,7 @@ async fn ensure_membership_editable(db: &sqlx::PgPool, id: Uuid) -> Result<()> {
 /// List a group's members
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/{id}/members",
     context_path = "/api/v1/groups",
     tag = "groups",
@@ -852,6 +877,7 @@ pub async fn list_group_members(
 /// Add members to a group
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("group.manage")), ("x-resource" = json!("group:id"))),
     path = "/{id}/members",
     context_path = "/api/v1/groups",
     tag = "groups",
@@ -878,18 +904,13 @@ pub async fn add_members(
     // GHSA-vvc3-h39c-mrq5: enforce write scope on token.
     auth.require_scope("write")?;
 
-    // Fine-grained permission check: non-admins need "admin" on the target group.
-    if !auth.is_admin {
-        let has_perm = state
-            .permission_service
-            .check_permission(auth.user_id, "group", id, "admin", false)
-            .await?;
-        if !has_perm {
-            return Err(AppError::Authorization(
-                "Insufficient permissions to manage group membership".to_string(),
-            ));
-        }
-    }
+    require_group_admin(
+        &state,
+        &auth,
+        id,
+        "Insufficient permissions to manage group membership",
+    )
+    .await?;
 
     ensure_membership_editable(&state.db, id).await?;
 
@@ -932,6 +953,7 @@ pub async fn add_members(
 /// Remove members from a group
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("group.manage")), ("x-resource" = json!("group:id"))),
     path = "/{id}/members",
     context_path = "/api/v1/groups",
     tag = "groups",
@@ -958,18 +980,13 @@ pub async fn remove_members(
     // GHSA-vvc3-h39c-mrq5: removing members is destructive; require delete scope.
     auth.require_scope("delete")?;
 
-    // Fine-grained permission check: non-admins need "admin" on the target group.
-    if !auth.is_admin {
-        let has_perm = state
-            .permission_service
-            .check_permission(auth.user_id, "group", id, "admin", false)
-            .await?;
-        if !has_perm {
-            return Err(AppError::Authorization(
-                "Insufficient permissions to manage group membership".to_string(),
-            ));
-        }
-    }
+    require_group_admin(
+        &state,
+        &auth,
+        id,
+        "Insufficient permissions to manage group membership",
+    )
+    .await?;
 
     ensure_membership_editable(&state.db, id).await?;
 
@@ -2581,6 +2598,145 @@ mod tests {
         for id in members.into_iter().chain([admin_id, outsider_id]) {
             tdh::cleanup_user(&pool, id).await;
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The group-administrator check refuses with each handler's own message,
+    /// and records a pass for the IAM shadow comparison (#4214) when it
+    /// admits, on the group or (for creation) on the instance.
+    #[tokio::test]
+    async fn group_admin_check_keeps_its_messages_and_records_passes_db() {
+        use crate::api::authz::shadow_marker::{scope, LegacyLevel};
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::iam_legacy_projection::ScopeRef;
+        use axum::http::StatusCode;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-grp-admin-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let (outsider_id, outsider_name) = tdh::create_user(&pool).await;
+        let (manager_id, manager_name) = tdh::create_user(&pool).await;
+        let group = Uuid::new_v4();
+        sqlx::query("INSERT INTO groups (id, name, external_source) VALUES ($1, $2, 'ldap')")
+            .bind(group)
+            .bind(format!("ph-grp-admin-ldap-{group}"))
+            .execute(&pool)
+            .await
+            .expect("seed ldap group");
+        tdh::grant_permission(&pool, "user", manager_id, "group", group, &["admin"]).await;
+        tdh::grant_permission(
+            &pool,
+            "user",
+            manager_id,
+            SYSTEM_TARGET_TYPE,
+            SYSTEM_SENTINEL_ID,
+            &["admin"],
+        )
+        .await;
+        let outsider = tdh::make_auth(outsider_id, &outsider_name);
+        let manager = tdh::make_auth(manager_id, &manager_name);
+        let call = |auth: &AuthExtension, method: &str, uri: String, body: String| {
+            tdh::send(
+                tdh::router_with_auth_ext(router(), state.clone(), auth.clone()),
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .expect("build request"),
+            )
+        };
+        let members = format!(r#"{{"user_ids":["{outsider_id}"]}}"#);
+        let rename = r#"{"name":"renamed"}"#.to_string();
+
+        for (method, uri, body, message) in [
+            (
+                "PUT",
+                format!("/{group}"),
+                rename.clone(),
+                "Insufficient permissions to update this group",
+            ),
+            (
+                "DELETE",
+                format!("/{group}"),
+                String::new(),
+                "Insufficient permissions to delete this group",
+            ),
+            (
+                "POST",
+                format!("/{group}/members"),
+                members.clone(),
+                "Insufficient permissions to manage group membership",
+            ),
+            (
+                "DELETE",
+                format!("/{group}/members"),
+                members.clone(),
+                "Insufficient permissions to manage group membership",
+            ),
+        ] {
+            let ((status, body), recorded) = scope(call(&outsider, method, uri, body)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method}");
+            assert!(
+                String::from_utf8_lossy(&body).contains(message),
+                "{method}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(recorded.passed_on(ScopeRef::Group(group)), None);
+        }
+
+        // The group's administrator passes the check; the identity provider
+        // still owns the membership.
+        let ((status, _), recorded) = scope(call(
+            &manager,
+            "POST",
+            format!("/{group}/members"),
+            members.clone(),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            recorded.passed_on(ScopeRef::Group(group)),
+            Some(LegacyLevel::Admin)
+        );
+
+        // A sentinel holder creates a group.
+        let name = format!("ph-grp-admin-new-{}", Uuid::new_v4());
+        let ((status, body), recorded) = scope(call(
+            &manager,
+            "POST",
+            "/".to_string(),
+            format!(r#"{{"name":"{name}"}}"#),
+        ))
+        .await;
+        assert!(status.is_success(), "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            recorded.passed_on(ScopeRef::Instance),
+            Some(LegacyLevel::Admin)
+        );
+        let ((status, _), recorded) = scope(call(
+            &outsider,
+            "POST",
+            "/".to_string(),
+            format!(r#"{{"name":"{name}-x"}}"#),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(recorded.passed_on(ScopeRef::Instance), None);
+
+        let _ = sqlx::query("DELETE FROM groups WHERE id = $1 OR name = $2")
+            .bind(group)
+            .bind(&name)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = $1")
+            .bind(manager_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, outsider_id).await;
+        tdh::cleanup_user(&pool, manager_id).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 

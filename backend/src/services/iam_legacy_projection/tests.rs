@@ -116,7 +116,7 @@ fn roles_conferring_nothing_and_non_authoritative_tables_create_no_grants() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn sentinel_admin_becomes_repository_creation_not_instance_admin() {
+fn sentinel_admin_becomes_repository_and_group_creation_not_instance_admin() {
     let mut w = World::new();
     let u = w.user("delegate");
     user_rule(&mut w, u, "repository", Uuid::nil(), &["admin"], None);
@@ -126,7 +126,7 @@ fn sentinel_admin_becomes_repository_creation_not_instance_admin() {
     assert_eq!(b[0].scope, ScopeRef::Instance);
     assert_eq!(
         role_effective_permissions(&b[0].role, ScopeRef::Instance),
-        BTreeSet::from([Permission::RepositoryCreate])
+        BTreeSet::from([Permission::RepositoryCreate, Permission::GroupCreate])
     );
     assert_ne!(b[0].role, RoleRef::System(SystemRole::Admin));
 }

@@ -40,6 +40,15 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
 }
 
+/// For the IAM shadow comparison (#4214): the instance-administrator check
+/// passed, so a later 4xx is not a refusal.
+fn note_instance_pass() {
+    crate::api::authz::shadow_marker::note_passed_on(
+        crate::services::iam_legacy_projection::ScopeRef::Instance,
+        crate::api::authz::shadow_marker::LegacyLevel::Admin,
+    );
+}
+
 /// Create project routes.
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -164,8 +173,17 @@ pub(crate) async fn require_project_admin(
     auth: &AuthExtension,
     project_id: Uuid,
 ) -> Result<()> {
+    // For the IAM shadow comparison (#4214): a later 4xx came after the
+    // project-administrator check passed.
+    let passed = || {
+        crate::api::authz::shadow_marker::note_passed_on(
+            crate::services::iam_legacy_projection::ScopeRef::Project(project_id),
+            crate::api::authz::shadow_marker::LegacyLevel::Admin,
+        );
+        Ok(())
+    };
     if auth.is_admin {
-        return Ok(());
+        return passed();
     }
     // Skip the lookup entirely for a repo-restricted credential: it can never
     // pass `project_admin_allowed`, whatever grants its principal holds.
@@ -179,7 +197,7 @@ pub(crate) async fn require_project_admin(
             .check_permission(auth.user_id, "project", project_id, "admin", false)
             .await?;
     if project_admin_allowed(auth, has_grant) {
-        Ok(())
+        passed()
     } else {
         Err(AppError::Authorization(
             "Project admin access required".to_string(),
@@ -374,6 +392,7 @@ pub struct RemoveProjectMemberRequest {
 /// List projects
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("project.read")), ("x-resource" = json!("instance"))),
     path = "",
     operation_id = "projects_list",
     context_path = "/api/v1/projects",
@@ -406,6 +425,7 @@ pub async fn list_projects(
 /// Create a project
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("project.create")), ("x-resource" = json!("instance"))),
     path = "",
     operation_id = "projects_create",
     context_path = "/api/v1/projects",
@@ -429,6 +449,7 @@ pub async fn create_project(
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
     auth.require_admin()?;
+    note_instance_pass();
 
     let payload: CreateProjectRequest = serde_json::from_slice(&body)
         .map_err(|e| AppError::Validation(format!("Invalid project payload: {}", e)))?;
@@ -461,6 +482,7 @@ pub async fn create_project(
 /// Get a project by ID
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("project.read")), ("x-resource" = json!("project:id"))),
     path = "/{id}",
     operation_id = "projects_get",
     context_path = "/api/v1/projects",
@@ -498,6 +520,7 @@ pub async fn get_project(
 /// Update a project (COALESCE semantics: omitted fields are unchanged)
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("project.update")), ("x-resource" = json!("project:id"))),
     path = "/{id}",
     operation_id = "projects_update",
     context_path = "/api/v1/projects",
@@ -525,7 +548,8 @@ pub async fn update_project(
     let payload: UpdateProjectRequest = serde_json::from_slice(&body)
         .map_err(|e| AppError::Validation(format!("Invalid project payload: {}", e)))?;
     if update_needs_global_admin(&payload) {
-        auth.require_admin()?;
+        auth.require_admin()
+            .map_err(|e| crate::api::authz::shadow_marker::keep_refusal("admin_only_option", e))?;
     }
 
     let project: Project = sqlx::query_as(
@@ -556,6 +580,7 @@ pub async fn update_project(
 /// unassigned (`project_id` -> NULL) by the FK's ON DELETE SET NULL.
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("project.delete")), ("x-resource" = json!("project:id"))),
     path = "/{id}",
     operation_id = "projects_delete",
     context_path = "/api/v1/projects",
@@ -577,6 +602,7 @@ pub async fn delete_project(
     let auth = require_auth(auth)?;
     auth.require_scope("delete")?;
     auth.require_admin()?;
+    note_instance_pass();
 
     // One tx: grants + project row go together, so a failure never leaves
     // orphaned project grants that a recreated project id could never match
@@ -617,6 +643,7 @@ pub async fn delete_project(
 /// List project members (grants on the project)
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("iam.manage")), ("x-resource" = json!("project:id"))),
     path = "/{id}/members",
     operation_id = "projects_list_members",
     context_path = "/api/v1/projects",
@@ -656,6 +683,7 @@ pub async fn list_project_members(
 /// Add or update a project membership grant
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("iam.manage")), ("x-resource" = json!("project:id"))),
     path = "/{id}/members",
     operation_id = "projects_add_member",
     context_path = "/api/v1/projects",
@@ -725,6 +753,7 @@ pub async fn add_project_member(
 /// Remove a project membership grant
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("iam.manage")), ("x-resource" = json!("project:id"))),
     path = "/{id}/members",
     operation_id = "projects_remove_member",
     context_path = "/api/v1/projects",
@@ -2208,6 +2237,85 @@ mod tests {
 
         fn remove_body(user: Uuid) -> String {
             format!(r#"{{"principal_type":"user","principal_id":"{user}"}}"#)
+        }
+
+        /// The IAM shadow comparison (#4214) learns which check passed and
+        /// which refusal the handler keeps; the responses do not change.
+        #[tokio::test]
+        async fn shadow_passes_and_the_quota_refusal_are_recorded() {
+            use crate::api::authz::shadow_marker::{scope, LegacyLevel};
+            use crate::services::iam_legacy_projection::ScopeRef;
+            let Some(f) = fixture().await else {
+                return;
+            };
+
+            // A project administrator raising the quota of their project.
+            let (status, recorded) = scope(call(
+                &f.state,
+                &f.auth,
+                "PUT",
+                format!("/{}", f.p),
+                r#"{"quota_bytes":1}"#,
+            ))
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(recorded.kept_refusal, Some("admin_only_option"));
+            assert_eq!(
+                recorded.passed_on(ScopeRef::Project(f.p)),
+                Some(LegacyLevel::Admin)
+            );
+
+            // Another project: refused before any pass.
+            let (status, recorded) = scope(call(
+                &f.state,
+                &f.auth,
+                "PUT",
+                format!("/{}", f.q),
+                r#"{"name":"x"}"#,
+            ))
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(recorded.passed_on(ScopeRef::Project(f.q)), None);
+            assert_eq!(recorded.kept_refusal, None);
+
+            // A malformed body after the project check passed.
+            let (status, recorded) =
+                scope(call(&f.state, &f.auth, "PUT", format!("/{}", f.p), "{")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                recorded.passed_on(ScopeRef::Project(f.p)),
+                Some(LegacyLevel::Admin)
+            );
+
+            // Instance checks: a duplicate key and a missing project.
+            let duplicate = format!(r#"{{"key":"{}","name":"dup"}}"#, f.p_key);
+            let (status, recorded) =
+                scope(call(&f.state, &admin(), "POST", "/".into(), &duplicate)).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(
+                recorded.passed_on(ScopeRef::Instance),
+                Some(LegacyLevel::Admin)
+            );
+            let (status, recorded) = scope(call(
+                &f.state,
+                &admin(),
+                "DELETE",
+                format!("/{}", Uuid::new_v4()),
+                "",
+            ))
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(
+                recorded.passed_on(ScopeRef::Instance),
+                Some(LegacyLevel::Admin)
+            );
+            // A project administrator is not an instance administrator.
+            let (status, recorded) =
+                scope(call(&f.state, &f.auth, "POST", "/".into(), &duplicate)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(recorded.passed_on(ScopeRef::Instance), None);
+
+            teardown(&f).await;
         }
 
         /// (e) Within-project management is intended and passes: get, rename,
