@@ -1,0 +1,71 @@
+name: Require E2E Proof
+
+# Every bug-fix PR names its end-to-end proof in artifact-keeper-test, or an
+# exemption with a reason (CONTRIBUTING.md, "End-to-end proof for bug fixes").
+# The rules live in scripts/ci/check-e2e-proof.py; its self-test is
+# scripts/ci/test-check-e2e-proof.sh (run by ci.yml).
+#
+# pull_request_target, like require-linked-issue.yml, so the token can copy
+# the needs-e2e-test label to the linked issue on fork PRs too. Safe: the job
+# checks out only the BASE ref, so the script that runs is the reviewed one on
+# the target branch, and the PR body is read from the event payload as data
+# (the script strips HTML comments, fenced code blocks and inline code spans
+# exactly as require-linked-issue.yml does). No PR code is checked out or run.
+#
+# ADVISORY for now: while the 1.12.0 backfill lands, a missing or invalid
+# proof is reported as a warning annotation and in the job summary, and the
+# job still succeeds. To make it blocking, set ENFORCE below to 'true' and add
+# "Require E2E proof for bug fixes" to the main and release/* rulesets'
+# required status checks.
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: write
+
+concurrency:
+  group: require-e2e-proof-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  require-e2e-proof:
+    name: Require E2E proof for bug fixes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      ENFORCE: 'false'
+    steps:
+      - name: Check out the base ref (never the PR head)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/ci
+          sparse-checkout-cone-mode: true
+
+      - name: Check the PR's end-to-end proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set +e
+          python3 scripts/ci/check-e2e-proof.py pr --event "$GITHUB_EVENT_PATH"
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            exit 0
+          fi
+          if [ "$rc" -eq 1 ]; then
+            msg="This bug-fix PR does not declare a valid end-to-end proof (see the job summary and CONTRIBUTING.md, \"End-to-end proof for bug fixes\")."
+          else
+            msg="The end-to-end proof check could not be measured (exit $rc); see the log."
+          fi
+          if [ "$ENFORCE" = "true" ]; then
+            echo "::error::$msg"
+            exit 1
+          fi
+          echo "::warning::$msg Advisory: this check does not block the merge yet."
