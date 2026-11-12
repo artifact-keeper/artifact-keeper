@@ -11154,7 +11154,7 @@ pub(crate) struct BlobVerdictRef {
     /// the #3243 severity-threshold gate. `None` (legacy rows) fails closed.
     pub max_severity: Option<String>,
     /// The verdict's CVSS summary, for a numeric threshold (#5263). Both
-    /// `None` (rows recorded before migration 361) fails closed under one.
+    /// `None` (rows recorded before migration 362) fails closed under one.
     pub max_cvss_score: Option<f64>,
     pub max_unscored_severity: Option<String>,
 }

@@ -480,7 +480,7 @@ A severity threshold compares the scanner's severity label. Two `high`
 findings scored 7.5 and 8.1 get the same decision, so a policy such as "block
 CVSS 8.0 and above" cannot be written as a severity threshold, and `critical`
 is a different policy. `cvss_threshold` adds the number (#5263, migration
-361).
+362).
 
 With `block_on_policy_violation` on and `cvss_threshold` set to, say, `8.0`:
 

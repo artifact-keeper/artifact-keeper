@@ -36,7 +36,7 @@ pub struct ProxyScanRow {
     pub scanner_version: Option<String>,
     pub scanned_at: DateTime<Utc>,
     /// Highest CVSS base score among all of the verdict's findings
-    /// that carry one (#5263, migration 361). NULL when none does, and on
+    /// that carry one (#5263, migration 362). NULL when none does, and on
     /// every verdict recorded before the column existed.
     ///
     /// Both columns must be selected. A missing projection is an error;
@@ -128,7 +128,7 @@ pub enum ProxySeverityGate {
 ///   own config never sets it; it only carries a severity-threshold gate that
 ///   was combined with this one ([`ProxySeverityGate::stricter`]); or
 /// * the verdict carries no CVSS summary at all (recorded before migration
-///   361, or kept ungraded on purpose). Fail closed, as an ungraded severity
+///   362, or kept ungraded on purpose). Fail closed, as an ungraded severity
 ///   is under a severity threshold: serve only what is KNOWN to be below.
 ///
 /// Scored `info` findings participate in the numeric summary. Unscored
@@ -225,7 +225,7 @@ impl VerdictGrade {
     }
 
     /// Whether the verdict carries a CVSS summary. `false` for a verdict
-    /// recorded before migration 361.
+    /// recorded before migration 362.
     pub fn has_cvss_summary(&self) -> bool {
         self.max_cvss_score.is_some() || self.max_unscored_severity.is_some()
     }
@@ -2728,7 +2728,7 @@ mod tests {
         assert!(!gate.blocks_grade(graded(Severity::Critical, Some(7.0), Some(Severity::Low))));
     }
 
-    /// A verdict with no CVSS summary (recorded before migration 361, or
+    /// A verdict with no CVSS summary (recorded before migration 362, or
     /// read by a seam that only knows the severity) blocks under a numeric
     /// threshold whatever its severity, and still serves or blocks by
     /// severity under a severity threshold.

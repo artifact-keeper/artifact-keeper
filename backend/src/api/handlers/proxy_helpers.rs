@@ -10992,7 +10992,7 @@ pub(crate) struct StoredRescanRow<'a> {
     pub pin_identity: Option<&'a str>,
     pub max_severity: Option<&'a str>,
     /// The stored CVSS summary (#5263); both `None` on a verdict recorded
-    /// before migration 361.
+    /// before migration 362.
     pub max_cvss_score: Option<f64>,
     pub max_unscored_severity: Option<&'a str>,
 }
@@ -11533,7 +11533,7 @@ pub(crate) enum ProxyScanServeOutcome {
 ///   the historical exemption even for a scored `Info` verdict;
 /// * under a numeric CVSS gate (#5263) the row's stored CVSS summary is
 ///   graded the same way a fresh scan's is, and a row with no summary
-///   (recorded before migration 361) blocks.
+///   (recorded before migration 362) blocks.
 pub(crate) fn stored_verdict_blocks_under_gate(
     row: Option<&crate::services::proxy_scan_service::ProxyScanRow>,
     severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
