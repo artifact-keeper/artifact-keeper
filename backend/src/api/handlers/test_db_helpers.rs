@@ -69,6 +69,44 @@ impl Drop for SsrfTestAllowlistGuard {
     }
 }
 
+/// An upstream that accepts connections and never answers (#5823): the
+/// member a virtual-member-deadline test leaves out. Unlike a wiremock
+/// response with `set_delay`, it cannot answer late on a slow runner, so the
+/// test's outcome depends only on the deadline, never on timing. Dropping it
+/// closes the listener and every connection it holds.
+pub struct SilentUpstream {
+    uri: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl SilentUpstream {
+    /// Bind `127.0.0.1` on an ephemeral port.
+    pub async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the silent upstream");
+        let uri = format!("http://{}", listener.local_addr().expect("local addr"));
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        Self { uri, task }
+    }
+
+    /// `http://127.0.0.1:<port>`, like `MockServer::uri`.
+    pub fn uri(&self) -> String {
+        self.uri.clone()
+    }
+}
+
+impl Drop for SilentUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// Start wiremock on a non-loopback interface accepted by the upstream SSRF
 /// policy, returning a guard that restores the process environment on drop.
 pub async fn non_loopback_mock_server() -> (wiremock::MockServer, SsrfTestAllowlistGuard) {

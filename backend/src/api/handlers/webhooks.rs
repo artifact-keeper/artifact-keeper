@@ -2254,6 +2254,41 @@ async fn claim_due_webhook_deliveries(
     claimed_by: &str,
     claim_ttl_secs: f64,
 ) -> std::result::Result<Vec<Claimed<RetryDeliveryRow>>, String> {
+    claim_due_webhook_deliveries_of(db, limit, claimed_by, claim_ttl_secs, None).await
+}
+
+/// [`claim_due_webhook_deliveries`] restricted to the given webhooks'
+/// deliveries, for tests that must claim their own fixture rows from a shared
+/// database whatever other tests have queued there (#5825): the fair batch
+/// can hold 50 other webhooks' rows ahead of them on every pass. Among the
+/// given webhooks the batch is filled with the same round-robin ranking.
+#[cfg(test)]
+async fn claim_due_webhook_deliveries_for_webhooks(
+    db: &sqlx::PgPool,
+    webhook_ids: &[Uuid],
+    limit: i64,
+    claimed_by: &str,
+    claim_ttl_secs: f64,
+) -> std::result::Result<Vec<Claimed<RetryDeliveryRow>>, String> {
+    claim_due_webhook_deliveries_of(
+        db,
+        limit,
+        claimed_by,
+        claim_ttl_secs,
+        Some(webhook_ids.to_vec()),
+    )
+    .await
+}
+
+/// The claim query. `only_webhooks` is `None` on every production path; the
+/// same statement, ranking and locking serve the test-only restricted form.
+async fn claim_due_webhook_deliveries_of(
+    db: &sqlx::PgPool,
+    limit: i64,
+    claimed_by: &str,
+    claim_ttl_secs: f64,
+    only_webhooks: Option<Vec<Uuid>>,
+) -> std::result::Result<Vec<Claimed<RetryDeliveryRow>>, String> {
     use sqlx::Row;
 
     // `FOR UPDATE` cannot share a query level with a window function, so the
@@ -2274,6 +2309,7 @@ async fn claim_due_webhook_deliveries(
               AND next_retry_at <= NOW()
               AND attempts < max_attempts
               AND (claim_expires_at IS NULL OR claim_expires_at <= NOW())
+              AND ($4::uuid[] IS NULL OR webhook_id = ANY($4))
         ),
         fair AS (
             SELECT id
@@ -2311,6 +2347,7 @@ async fn claim_due_webhook_deliveries(
     .bind(limit)
     .bind(claimed_by)
     .bind(claim_ttl_secs)
+    .bind(only_webhooks)
     .fetch_all(db)
     .await
     .map_err(|e| format!("Failed to claim retry queue: {}", e))?;
@@ -6870,13 +6907,28 @@ mod tests {
             claimed_by: &str,
             claim_ttl_secs: f64,
         ) -> Claimed<RetryDeliveryRow> {
+            // Scoped to the fixture's own webhook (#5825): the fair claim
+            // takes every webhook's first due row before any second, so with
+            // 50 or more other webhooks' rows due on the shared database the
+            // instance-wide batch can skip the fixture on every pass.
+            let webhook_id: Uuid =
+                sqlx::query_scalar("SELECT webhook_id FROM webhook_deliveries WHERE id = $1")
+                    .bind(fixture_delivery_id)
+                    .fetch_one(pool)
+                    .await
+                    .expect("fixture delivery webhook");
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(750);
 
             loop {
-                let mut claimed =
-                    claim_due_webhook_deliveries(pool, 50, claimed_by, claim_ttl_secs)
-                        .await
-                        .expect("claim ok");
+                let mut claimed = claim_due_webhook_deliveries_for_webhooks(
+                    pool,
+                    &[webhook_id],
+                    50,
+                    claimed_by,
+                    claim_ttl_secs,
+                )
+                .await
+                .expect("claim ok");
 
                 let fixture_index = claimed
                     .iter()
@@ -7118,6 +7170,15 @@ mod tests {
             fixture_ids: &[Uuid],
             claimed_by: &str,
         ) -> Vec<Claimed<RetryDeliveryRow>> {
+            // Restricted to the fixtures' webhooks (#5825), as in
+            // `claim_fixture_delivery`.
+            let webhook_ids: Vec<Uuid> = sqlx::query_scalar(
+                "SELECT DISTINCT webhook_id FROM webhook_deliveries WHERE id = ANY($1)",
+            )
+            .bind(fixture_ids)
+            .fetch_all(pool)
+            .await
+            .expect("fixture delivery webhooks");
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
             let mut held: Vec<Claimed<RetryDeliveryRow>> = Vec::new();
             while held.len() < fixture_ids.len() {
@@ -7127,9 +7188,15 @@ mod tests {
                     held.len(),
                     fixture_ids.len()
                 );
-                let claimed = claim_due_webhook_deliveries(pool, 50, claimed_by, 120.0)
-                    .await
-                    .expect("claim ok");
+                let claimed = claim_due_webhook_deliveries_for_webhooks(
+                    pool,
+                    &webhook_ids,
+                    50,
+                    claimed_by,
+                    120.0,
+                )
+                .await
+                .expect("claim ok");
                 for delivery in claimed {
                     if fixture_ids.contains(&delivery.id) {
                         held.push(delivery);
@@ -7162,9 +7229,19 @@ mod tests {
             let mut dead_claimed = 0usize;
             let mut healthy_claimed = false;
             while !healthy_claimed && tokio::time::Instant::now() < deadline {
-                let claimed = claim_due_webhook_deliveries(&pool, 50, "fairness-test", 60.0)
-                    .await
-                    .expect("claim ok");
+                // Restricted to this test's two webhooks (#5825): the
+                // round-robin ranking among them is what is under test, and
+                // other tests' due rows on the shared database must not fill
+                // the batch.
+                let claimed = claim_due_webhook_deliveries_for_webhooks(
+                    &pool,
+                    &[dead, healthy],
+                    50,
+                    "fairness-test",
+                    60.0,
+                )
+                .await
+                .expect("claim ok");
                 for delivery in &claimed {
                     if delivery.id == healthy_row {
                         healthy_claimed = true;

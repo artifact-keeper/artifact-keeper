@@ -630,9 +630,12 @@ enum AuthError {
 impl AuthError {
     fn from_app(error: &AppError) -> Self {
         match error {
-            AppError::Authentication(_) | AppError::NotFound(_) | AppError::Conflict(_) => {
-                Self::Invalid
-            }
+            // `Authorization`: a directory account not linked to a provider
+            // (#5483) is a refused credential, not an outage.
+            AppError::Authentication(_)
+            | AppError::Authorization(_)
+            | AppError::NotFound(_)
+            | AppError::Conflict(_) => Self::Invalid,
             other => {
                 if other.is_db_unavailable() || matches!(other, AppError::ServiceUnavailable(_)) {
                     Self::Unavailable
@@ -1023,10 +1026,14 @@ async fn sync_directory_user(
     // the federated sync: an admin disable must stay effective for package
     // clients (#4933), and this check also covers the window before the sync's
     // own `is_active` preservation runs.
+    // Scoped to this provider (#5483): the same DN in another directory is
+    // another account.
     let existing_by_dn = sqlx::query_as::<_, (Uuid, bool)>(
-        "SELECT id, is_active FROM users WHERE external_id = $1 AND auth_provider = 'ldap'",
+        "SELECT id, is_active FROM users \
+         WHERE external_id = $1 AND auth_provider = 'ldap' AND auth_provider_id = $2",
     )
     .bind(&ldap_user.dn)
+    .bind(row.id)
     .fetch_optional(db)
     .await
     .map_err(|e| AuthError::from_app(&AppError::Database(e.to_string())))?;
@@ -1045,6 +1052,7 @@ async fn sync_directory_user(
         // LDAP has no per-provider auto-create switch; login always
         // provisions, and the passthrough keeps that behaviour (#2057).
         auto_create_users: true,
+        provider_id: Some(row.id),
     };
     let user = auth_service
         .sync_federated_user(AuthProvider::Ldap, &credentials)
@@ -1462,13 +1470,14 @@ mod tests {
     /// Pin the provider on the account so the test is not at the mercy of
     /// other enabled providers another test may have left in the shared
     /// database. This also matches the production steady state: a directory
-    /// user is recorded with the provider that created them.
+    /// user is recorded with the provider that created them (and, since
+    /// #5483, bound to it).
     async fn insert_known_user(pool: &PgPool, username: &str, dn: &str, provider_id: Uuid) -> Uuid {
         let id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO users (id, username, email, auth_provider, external_id, is_active, \
-             is_admin, ldap_provider_id) \
-             VALUES ($1, $2, $3, 'ldap'::auth_provider, $4, true, false, $5)",
+             is_admin, ldap_provider_id, auth_provider_id) \
+             VALUES ($1, $2, $3, 'ldap'::auth_provider, $4, true, false, $5, $5)",
         )
         .bind(id)
         .bind(username)
@@ -1479,6 +1488,76 @@ mod tests {
         .await
         .expect("insert known user");
         id
+    }
+
+    /// #5484: `POST /api/v1/auth/sso/ldap/{id}/login` with only the directory
+    /// password used to issue tokens and session cookies to an LDAP user who
+    /// had enrolled TOTP. It now answers like `POST /auth/login`: a TOTP
+    /// challenge with no session. The same login for an account without TOTP
+    /// still gets its tokens.
+    #[tokio::test]
+    async fn test_ldap_login_challenges_a_totp_enrolled_user_5484() {
+        use axum::http::{Request, StatusCode};
+        if !encryption_key_available() {
+            return;
+        }
+        let Some(pool) = test_db_helpers::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-5484-ldap-{}", Uuid::new_v4()));
+        let state = test_db_helpers::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+
+        for totp in [true, false] {
+            let suffix = Uuid::new_v4().simple().to_string();
+            let username = format!("ldaptotp{suffix}");
+            let dn = format!("uid={username},ou=people,{BASE}");
+            let (port, _ops) = scripted_directory(&username, &dn, 0).await;
+            let provider_id = create_provider(&pool, &format!("totp-{suffix}"), port).await;
+            let user_id = insert_known_user(&pool, &username, &dn, provider_id).await;
+            sqlx::query("UPDATE users SET totp_enabled = $2, totp_secret = $3 WHERE id = $1")
+                .bind(user_id)
+                .bind(totp)
+                .bind(totp.then_some("JBSWY3DPEHPK3PXP"))
+                .execute(&pool)
+                .await
+                .expect("set totp");
+
+            let (status, bytes, headers) = test_db_helpers::send_with_headers(
+                crate::api::handlers::sso::ldap_login_router().with_state(state.clone()),
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/ldap/{provider_id}/login"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "username": username,
+                            "password": "directory-password",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await;
+            let cookies = headers.get_all("set-cookie").iter().count();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            cleanup(&pool, provider_id, &username).await;
+
+            assert_eq!(status, StatusCode::OK, "totp={totp}: {body}");
+            if totp {
+                assert_eq!(body["totp_required"], true, "{body}");
+                assert!(body["totp_token"].as_str().is_some_and(|t| !t.is_empty()));
+                assert_eq!(
+                    body["access_token"], "",
+                    "no session before the second factor"
+                );
+                assert_eq!(body["refresh_token"], "");
+                assert_eq!(cookies, 0, "no session cookies before the second factor");
+            } else {
+                assert!(body["totp_required"].is_null(), "{body}");
+                assert!(body["access_token"].as_str().is_some_and(|t| !t.is_empty()));
+                assert!(cookies > 0);
+            }
+        }
     }
 
     #[tokio::test]
@@ -1985,6 +2064,70 @@ mod tests {
             .execute(&pool)
             .await;
         cleanup(&pool, provider_id, &dir_user).await;
+    }
+
+    /// #5484: the passthrough used to admit a directory user who enrolled
+    /// TOTP in Artifact Keeper on the directory password alone. Like a local
+    /// password on the format routes (and `/v2/token`), it is now refused;
+    /// the same account without TOTP still resolves.
+    #[tokio::test]
+    async fn test_passthrough_refuses_a_totp_enrolled_user_5484() {
+        use crate::api::middleware::auth::{
+            try_resolve_auth_outcome_with_passthrough, AuthOutcome, ExtractedToken,
+        };
+        use base64::Engine as _;
+
+        if !encryption_key_available() {
+            return;
+        }
+        let Some(pool) = test_db_helpers::try_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let dir_user = format!("ldaptotpfmt{suffix}");
+        let dn = format!("uid={dir_user},ou=people,{BASE}");
+        let (port, _ops) = scripted_directory(&dir_user, &dn, 0x00).await;
+        let provider_id = create_provider(&pool, &format!("totpfmt-{suffix}"), port).await;
+        let user_id = insert_known_user(&pool, &dir_user, &dn, provider_id).await;
+        let auth = test_auth_service(&pool);
+        let _pin = test_seam::SettingsOverride::set(settings());
+
+        let mut outcomes = Vec::new();
+        for (totp, password) in [(false, "directory-password"), (true, "other-password")] {
+            sqlx::query("UPDATE users SET totp_enabled = $2, totp_secret = $3 WHERE id = $1")
+                .bind(user_id)
+                .bind(totp)
+                .bind(totp.then_some("JBSWY3DPEHPK3PXP"))
+                .execute(&pool)
+                .await
+                .expect("set totp");
+            // A distinct password per round so the credential cache cannot
+            // answer the second round from the first.
+            let encoded =
+                base64::engine::general_purpose::STANDARD.encode(format!("{dir_user}:{password}"));
+            outcomes.push(
+                try_resolve_auth_outcome_with_passthrough(
+                    &auth,
+                    ExtractedToken::Basic(&encoded),
+                    true,
+                    "/pypi/private/simple/",
+                    "GET",
+                )
+                .await,
+            );
+        }
+        cleanup(&pool, provider_id, &dir_user).await;
+
+        assert!(
+            matches!(&outcomes[0], AuthOutcome::Resolved(ext) if ext.user_id == user_id),
+            "no TOTP: {:?}",
+            outcomes[0]
+        );
+        assert!(
+            matches!(outcomes[1], AuthOutcome::InvalidCredential),
+            "TOTP enrolled: {:?}",
+            outcomes[1]
+        );
     }
 
     /// #5640 review: a directory user's correct password takes the local

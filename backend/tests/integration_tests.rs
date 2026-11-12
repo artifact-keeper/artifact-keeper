@@ -702,7 +702,8 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200, "Tags list should return 200");
         let body: Value = resp.json().await.unwrap();
-        assert_eq!(body["name"], "myimage");
+        // #5794: `name` is the full request `<name>`, repo key included.
+        assert_eq!(body["name"], format!("{}/myimage", repo_key));
         let tags = body["tags"].as_array().expect("tags should be an array");
         assert!(
             tags.iter().any(|t| t.as_str() == Some("v1.0")),

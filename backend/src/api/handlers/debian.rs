@@ -4230,27 +4230,87 @@ async fn pool_download(
         .await
         .map_err(|e| e.into_response())?;
 
-    let stream = storage
-        .get_stream(&artifact.storage_key)
-        .await
-        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
+    let filename = path.rsplit('/').next().unwrap_or(&path);
+    let route = DebPackageRoute::Pool {
+        component: &component,
+        path: &path,
+    };
+    // #5076: a row a scanning Remote holds goes through the scan gate,
+    // graded as the proxied file would be. Pool metadata (`.dsc`, ...) is
+    // not gated there either.
+    let proxy_helpers::StoredRowBody { body: stream, scan } =
+        if deb_serve_key(&route.upstream_path()).scannable {
+            let release = stored_deb_release(&state, &repo, route).await?;
+            proxy_helpers::open_stored_row(
+                &state,
+                storage.as_ref(),
+                &proxy_helpers::StoredRow {
+                    repo: &repo,
+                    filename,
+                    storage_key: &artifact.storage_key,
+                    size_bytes: artifact.size_bytes,
+                },
+                DebPackage {
+                    release,
+                    expected_sha256: None,
+                },
+            )
+            .await?
+        } else {
+            proxy_helpers::StoredRowBody {
+                body: storage
+                    .get_stream(&artifact.storage_key)
+                    .await
+                    .map_err(|e| crate::api::handlers::storage_err_plain(&e))?,
+                scan: None,
+            }
+        };
 
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
-    let filename = path.rsplit('/').next().unwrap_or(&path);
+    Ok(proxy_helpers::StoredRowBody::stamp(
+        scan,
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, DEBIAN_BINARY_CONTENT_TYPE)
+            .header(
+                "Content-Disposition",
+                format!("attachment; filename=\"{}\"", filename),
+            )
+            .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
+            .header("X-Checksum-SHA256", &artifact.checksum_sha256)
+            .body(Body::from_stream(stream))
+            .unwrap(),
+    ))
+}
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, DEBIAN_BINARY_CONTENT_TYPE)
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
-        .header("X-Checksum-SHA256", &artifact.checksum_sha256)
-        .body(Body::from_stream(stream))
-        .unwrap())
+/// The release a stored package row of `repo` is graded under (#5076): the
+/// one the proxied file would be graded under ([`deb_member_digest_and_release`])
+/// when the repository is a Remote that scans on proxy and can reach its
+/// upstream, else `None` (the version's own marker, else inconclusive, as for
+/// a proxied file whose suite names no release). Only looked up for a
+/// repository that gates its rows, so a hosted pull does no extra work.
+async fn stored_deb_release(
+    state: &SharedState,
+    repo: &RepoInfo,
+    route: DebPackageRoute<'_>,
+) -> Result<Option<crate::services::scanner_service::OsRelease>, Response> {
+    if proxy_helpers::stored_row_scan_policy(state, repo)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let (Some(upstream_url), Some(proxy)) =
+        (repo.upstream_url.as_deref(), state.proxy_service.as_deref())
+    else {
+        return Ok(None);
+    };
+    let (_, release) =
+        deb_member_digest_and_release(state, proxy, (repo.id, &repo.key, upstream_url), route)
+            .await?;
+    Ok(release)
 }
 
 // ---------------------------------------------------------------------------
@@ -10247,6 +10307,22 @@ mod scan_on_proxy_4111 {
     }
 
     archive_scan_suite!(case);
+
+    /// #5076: a row the scanning Remote holds itself is served through the
+    /// gate, as the proxied file is. Fails on `main`: the row streamed
+    /// ungated (200, no `X-AK-Scan`) under every policy.
+    #[tokio::test]
+    async fn a_stored_row_of_a_scanning_remote_is_gated_5076() {
+        crate::api::handlers::proxy_scan_archive::test_support::stored_row_is_gated(
+            case,
+            crate::api::handlers::proxy_scan_archive::test_support::StoredRowSeed {
+                path: format!("{POOL}/{FILE}"),
+                name: "libdtf".to_string(),
+                version: "1.0-1+deb12u1".to_string(),
+            },
+        )
+        .await;
+    }
 
     /// A vendor layout keeping the binaries under `dists/` (#3596).
     fn dists_case(_mock: &str) -> ArchiveCase {
