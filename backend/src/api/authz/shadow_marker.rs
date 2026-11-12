@@ -4,7 +4,13 @@
 //! * A legacy handler that refuses a caller who may not see a resource answers
 //!   the same 404 as an unknown key, so the response alone cannot tell a
 //!   refusal from a missing resource. The hiding helpers call
-//!   [`note_hidden_refusal`] on the branch that hides a refusal.
+//!   [`note_hidden_refusal`] with the repository they hid.
+//! * The shared legacy checks record the strongest check that passed for a
+//!   repository ([`note_passed`]), so a later 4xx can be told from a refusal
+//!   that came before the check ran.
+//! * A handler records refusals it keeps after enforcement
+//!   ([`note_kept_refusal`]) and, for a resource its body names, the target it
+//!   authorized ([`note_target`]).
 //! * The authentication middleware runs inside each `/api/v1` nest, below the
 //!   shadow layer, so it records the principal it resolved
 //!   ([`note_principal`]) and the API token that authenticated it
@@ -13,13 +19,14 @@
 //! Everything is task-local: nothing reaches the response, so no client can
 //! observe it, and outside a [`scope`] every `note_*` call is a no-op.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 
 use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
 use crate::models::access_scope::AccessScope;
+use crate::services::iam_legacy_projection::ScopeRef;
 
 /// The authenticated principal, reduced to what a comparison needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,17 +49,65 @@ impl RecordedPrincipal {
     }
 }
 
+/// A legacy repository check, by the action it proved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LegacyLevel {
+    Read,
+    Write,
+    Delete,
+    Admin,
+}
+
+impl LegacyLevel {
+    /// The level a legacy action string proves, if it is one.
+    pub fn of_action(action: &str) -> Option<LegacyLevel> {
+        match action {
+            "read" => Some(LegacyLevel::Read),
+            "write" => Some(LegacyLevel::Write),
+            "delete" => Some(LegacyLevel::Delete),
+            "admin" => Some(LegacyLevel::Admin),
+            _ => None,
+        }
+    }
+
+    /// Whether a passed check at `self` proves a check at `needed`: the same
+    /// action, `admin` (every action), or any check for a read.
+    pub fn satisfies(self, needed: LegacyLevel) -> bool {
+        self == needed || self == LegacyLevel::Admin || needed == LegacyLevel::Read
+    }
+}
+
 /// What the legacy request path recorded while it ran.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Recorded {
-    pub hidden_refusal: bool,
+    /// The repository of the first existence-hiding refusal.
+    pub hidden_refusal: Option<Uuid>,
+    /// The strongest check that passed, per repository.
+    pub passed: Vec<(Uuid, LegacyLevel)>,
+    /// The first refusal the handler keeps after enforcement, by reason.
+    pub kept_refusal: Option<&'static str>,
+    /// The resource a body-resolved declaration was authorized on.
+    pub target: Option<ScopeRef>,
     pub principal: Option<RecordedPrincipal>,
     pub api_token: Option<Uuid>,
 }
 
+impl Recorded {
+    /// The strongest check that passed on `repository_id`.
+    pub fn passed_on(&self, repository_id: Uuid) -> Option<LegacyLevel> {
+        self.passed
+            .iter()
+            .find(|(id, _)| *id == repository_id)
+            .map(|(_, level)| *level)
+    }
+}
+
 #[derive(Default)]
 struct Recorder {
-    hidden_refusal: Cell<bool>,
+    hidden_refusal: Cell<Option<Uuid>>,
+    passed: RefCell<Vec<(Uuid, LegacyLevel)>>,
+    kept_refusal: Cell<Option<&'static str>>,
+    target: Cell<Option<ScopeRef>>,
     principal: Cell<Option<RecordedPrincipal>>,
     api_token: Cell<Option<Uuid>>,
 }
@@ -62,9 +117,58 @@ tokio::task_local! {
 }
 
 /// Record that the request in flight was refused with an existence-hiding
-/// answer.
-pub fn note_hidden_refusal() {
-    let _ = RECORDER.try_with(|r| r.hidden_refusal.set(true));
+/// answer for `repository_id`; the first call wins.
+pub fn note_hidden_refusal(repository_id: Uuid) {
+    let _ = RECORDER.try_with(|r| {
+        if r.hidden_refusal.get().is_none() {
+            r.hidden_refusal.set(Some(repository_id));
+        }
+    });
+}
+
+/// Record that a legacy check at `level` passed on `repository_id`; the
+/// strongest level per repository is kept.
+pub fn note_passed(repository_id: Uuid, level: LegacyLevel) {
+    let _ = RECORDER.try_with(|r| {
+        let mut passed = r.passed.borrow_mut();
+        match passed.iter_mut().find(|(id, _)| *id == repository_id) {
+            Some((_, kept)) => *kept = (*kept).max(level),
+            None => passed.push((repository_id, level)),
+        }
+    });
+}
+
+/// Record a refusal the handler keeps after enforcement, by a fixed reason;
+/// the first call wins.
+pub fn note_kept_refusal(reason: &'static str) {
+    let _ = RECORDER.try_with(|r| {
+        if r.kept_refusal.get().is_none() {
+            r.kept_refusal.set(Some(reason));
+        }
+    });
+}
+
+/// Record `error` as a refusal the handler keeps after enforcement when it is
+/// one (an authentication, authorization or not-found answer), under a fixed
+/// `reason`; returns it unchanged.
+pub fn keep_refusal(reason: &'static str, error: crate::error::AppError) -> crate::error::AppError {
+    use crate::error::AppError;
+    if matches!(
+        error,
+        AppError::Authentication(_)
+            | AppError::Unauthorized(_)
+            | AppError::Authorization(_)
+            | AppError::NotFound(_)
+    ) {
+        note_kept_refusal(reason);
+    }
+    error
+}
+
+/// Record the resource the handler authorized for a body-resolved
+/// declaration; the last call wins.
+pub fn note_target(target: ScopeRef) {
+    let _ = RECORDER.try_with(|r| r.target.set(Some(target)));
 }
 
 /// Record the principal the authentication middleware resolved; the last call
@@ -86,6 +190,9 @@ pub async fn scope<F: Future>(fut: F) -> (F::Output, Recorded) {
             let output = fut.await;
             let recorded = RECORDER.with(|r| Recorded {
                 hidden_refusal: r.hidden_refusal.get(),
+                passed: r.passed.borrow().clone(),
+                kept_refusal: r.kept_refusal.get(),
+                target: r.target.get(),
                 principal: r.principal.get(),
                 api_token: r.api_token.get(),
             });
@@ -99,10 +206,10 @@ pub async fn scope<F: Future>(fut: F) -> (F::Output, Recorded) {
 mod tests {
     use super::*;
 
-    /// `scope`, keeping only the hidden-refusal mark.
+    /// `scope`, keeping only whether a hidden refusal was marked.
     async fn marked<F: Future>(fut: F) -> (F::Output, bool) {
         let (output, recorded) = scope(fut).await;
-        (output, recorded.hidden_refusal)
+        (output, recorded.hidden_refusal.is_some())
     }
 
     #[tokio::test]
@@ -116,7 +223,7 @@ mod tests {
         .await;
         assert_eq!(recorded.principal, Some(RecordedPrincipal::of(&ext)));
         assert_eq!(recorded.api_token, Some(token));
-        assert!(!recorded.hidden_refusal);
+        assert!(recorded.hidden_refusal.is_none());
         // Outside a scope: no panic, and the next scope starts empty.
         note_principal(&ext);
         note_api_token(token);
@@ -137,14 +244,65 @@ mod tests {
 
     #[tokio::test]
     async fn a_noted_refusal_is_seen_inside_its_scope_only() {
-        let ((), hidden) = marked(async { note_hidden_refusal() }).await;
-        assert!(hidden);
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        let ((), recorded) = scope(async {
+            note_hidden_refusal(first);
+            note_hidden_refusal(second);
+        })
+        .await;
+        assert_eq!(recorded.hidden_refusal, Some(first), "the first mark wins");
         let ((), hidden) = marked(async {}).await;
         assert!(!hidden);
         // Outside a scope: no panic, nothing recorded anywhere.
-        note_hidden_refusal();
+        note_hidden_refusal(first);
         let ((), hidden) = marked(async {}).await;
         assert!(!hidden);
+    }
+
+    #[tokio::test]
+    async fn passes_keep_the_strongest_level_per_repository() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let ((), recorded) = scope(async {
+            note_passed(a, LegacyLevel::Admin);
+            note_passed(a, LegacyLevel::Read);
+            note_passed(b, LegacyLevel::Read);
+            note_passed(b, LegacyLevel::Write);
+        })
+        .await;
+        assert_eq!(recorded.passed_on(a), Some(LegacyLevel::Admin));
+        assert_eq!(recorded.passed_on(b), Some(LegacyLevel::Write));
+        assert_eq!(recorded.passed_on(Uuid::new_v4()), None);
+        note_passed(a, LegacyLevel::Admin);
+        let ((), recorded) = scope(async {}).await;
+        assert!(recorded.passed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn kept_refusals_and_targets_are_recorded() {
+        let project = ScopeRef::Project(Uuid::new_v4());
+        let ((), recorded) = scope(async {
+            note_kept_refusal("token_owner");
+            note_kept_refusal("immutable_release");
+            note_target(ScopeRef::Instance);
+            note_target(project);
+        })
+        .await;
+        assert_eq!(recorded.kept_refusal, Some("token_owner"), "the first wins");
+        assert_eq!(recorded.target, Some(project), "the last wins");
+        note_kept_refusal("token_owner");
+        note_target(project);
+        let ((), recorded) = scope(async {}).await;
+        assert_eq!(recorded, Recorded::default());
+    }
+
+    #[test]
+    fn levels_satisfy_the_same_action_admin_or_a_read() {
+        use LegacyLevel::*;
+        assert!(Write.satisfies(Write) && Admin.satisfies(Delete) && Read.satisfies(Read));
+        assert!(Write.satisfies(Read) && Delete.satisfies(Read));
+        assert!(!Read.satisfies(Write) && !Delete.satisfies(Write) && !Write.satisfies(Admin));
+        assert_eq!(LegacyLevel::of_action("delete"), Some(Delete));
+        assert_eq!(LegacyLevel::of_action("own"), None);
     }
 
     use crate::api::handlers::artifacts::check_artifact_visibility;
@@ -180,14 +338,20 @@ mod tests {
         let reader = tdh::make_auth(reader, &reader_name);
 
         // require_visible: a hidden refusal marks; a permit does not.
-        let (result, hidden) = marked(require_visible(&repo, &outsider, &service)).await;
+        let (result, recorded) = scope(require_visible(&repo, &outsider, &service)).await;
         let refusal = result.expect_err("outsider is refused");
-        assert!(hidden);
+        assert_eq!(
+            recorded.hidden_refusal,
+            Some(repo_id),
+            "the mark names the repository"
+        );
+        assert_eq!(recorded.passed_on(repo_id), None);
         let (result, hidden) = marked(require_visible(&repo, &None, &service)).await;
         assert!(result.is_err() && hidden, "anonymous is refused and marked");
-        let (result, hidden) =
-            marked(require_visible(&repo, &Some(reader.clone()), &service)).await;
-        assert!(result.is_ok() && !hidden);
+        let (result, recorded) =
+            scope(require_visible(&repo, &Some(reader.clone()), &service)).await;
+        assert!(result.is_ok() && recorded.hidden_refusal.is_none());
+        assert_eq!(recorded.passed_on(repo_id), Some(LegacyLevel::Read));
 
         // The hidden answer is byte-identical to the unknown-key 404.
         let unknown = service

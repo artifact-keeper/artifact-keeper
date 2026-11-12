@@ -38,6 +38,21 @@ pub fn normalize_template(template: &str) -> String {
         .join("/")
 }
 
+/// A route with a trailing wildcard (`*path`) written as a parameter
+/// (`:path`). OpenAPI has no wildcard syntax, so a documented wildcard route
+/// normalizes to `:path`; axum cannot serve both forms at one position, so
+/// comparing in this form loses nothing.
+pub fn canonical_route(route: &str) -> String {
+    route
+        .split('/')
+        .map(|seg| match seg.strip_prefix('*') {
+            Some(name) => format!(":{name}"),
+            None => seg.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn is_api_v1(path: &str) -> bool {
     path == API_V1_PREFIX
         || path
@@ -116,10 +131,12 @@ impl RouteRegistry {
         Self::from_openapi(&value)
     }
 
-    /// The declaration for an exact method and normalized route, if any.
+    /// The declaration for a method and normalized route, if any. A
+    /// wildcard route (`*path`) finds the declaration of its documented
+    /// `{path}` form.
     pub fn requirement(&self, method: &str, route: &str) -> Option<&RouteRequirement> {
         self.operations
-            .get(&(method.to_uppercase(), route.to_string()))
+            .get(&(method.to_uppercase(), canonical_route(route)))
             .and_then(Option::as_ref)
     }
 
@@ -153,9 +170,16 @@ pub struct Coverage {
 /// directions. `live` holds method/route pairs already restricted to `/api/v1`.
 pub fn compare_with_live(registry: &RouteRegistry, live: &BTreeSet<RouteKey>) -> Coverage {
     let declared = registry.declared_keys();
+    let canonical = |(method, route): &RouteKey| (method.clone(), canonical_route(route));
+    let live_canonical: BTreeSet<RouteKey> = live.iter().map(canonical).collect();
     Coverage {
-        uncovered: live.difference(&declared).cloned().collect(),
-        stale: declared.difference(live).cloned().collect(),
+        // Reported in the live form, so the baseline keeps `*path`.
+        uncovered: live
+            .iter()
+            .filter(|key| !declared.contains(&canonical(key)))
+            .cloned()
+            .collect(),
+        stale: declared.difference(&live_canonical).cloned().collect(),
     }
 }
 
@@ -167,6 +191,35 @@ mod tests {
 
     fn doc(paths: Value) -> Value {
         json!({ "paths": paths })
+    }
+
+    #[test]
+    fn a_documented_wildcard_route_covers_the_live_wildcard() {
+        assert_eq!(
+            canonical_route("/api/v1/repositories/:key/artifacts/*path"),
+            "/api/v1/repositories/:key/artifacts/:path"
+        );
+        assert_eq!(canonical_route("/api/v1/a/:b"), "/api/v1/a/:b");
+        let op = json!({"x-required-permission": "artifact.read", "x-resource": "repo:key"});
+        let registry = RouteRegistry::from_operations([(
+            "get",
+            "/api/v1/repositories/{key}/artifacts/{path}",
+            &op,
+        )])
+        .unwrap();
+        let wildcard = "/api/v1/repositories/:key/artifacts/*path";
+        assert!(registry.requirement("GET", wildcard).is_some());
+        let live: BTreeSet<RouteKey> = [
+            ("GET".to_string(), wildcard.to_string()),
+            ("GET".to_string(), "/api/v1/other/*rest".to_string()),
+        ]
+        .into();
+        let coverage = compare_with_live(&registry, &live);
+        assert!(coverage.stale.is_empty(), "{coverage:?}");
+        assert_eq!(
+            coverage.uncovered,
+            [("GET".to_string(), "/api/v1/other/*rest".to_string())].into()
+        );
     }
 
     #[test]

@@ -85,6 +85,10 @@ pub fn system_role_permissions(role: SystemRole) -> BTreeSet<Permission> {
         P::RepositoryCredentialsUpdate,
         P::RepositoryTokenManage,
         P::RepositoryIamManage,
+        // Repository administrators review age-gated packages and the MCP
+        // catalog of their repository today.
+        P::AgeGateReview,
+        P::CurationReview,
     ];
     match role {
         SystemRole::Viewer => set(&viewer),
@@ -361,6 +365,8 @@ mod tests {
         }
         assert!(admin.contains(&P::RepositoryDelete));
         assert!(admin.contains(&P::RepositoryIamManage));
+        assert!(admin.contains(&P::AgeGateReview));
+        assert!(admin.contains(&P::CurationReview));
     }
 
     #[test]

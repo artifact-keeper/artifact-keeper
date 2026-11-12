@@ -872,16 +872,13 @@ mod tests {
         #[test]
         fn registry_resolves_only_known_operations() {
             let reg = build_registry();
-            // Other modules carry no extension yet, so only the four label
-            // operations are present.
-            assert_eq!(reg.declared().count(), 4, "registry: {reg:?}");
             for (method, path, _) in label_ops() {
                 assert!(reg.requirement(method.as_str(), path).is_some());
             }
             for (method, path) in [
                 ("PATCH", "/api/v1/repositories/:key/labels"),
                 ("POST", "/api/v1/repositories/:key/labels"),
-                ("GET", "/api/v1/repositories/:key"),
+                ("GET", "/api/v1/repositories/:key/no-such-operation"),
                 ("GET", "/api/v1/repositories/{key}/labels"),
             ] {
                 assert!(reg.requirement(method, path).is_none(), "{method} {path}");
@@ -1066,7 +1063,12 @@ mod tests {
         async fn router_enumeration_matches_registry() {
             let router = spike_router();
             let routes = enumerate_routes(&router);
-            let registry: BTreeSet<(String, String)> = build_registry().declared_keys();
+            // Only the label routes are mounted here; other modules declare the rest.
+            let registry: BTreeSet<(String, String)> = build_registry()
+                .declared_keys()
+                .into_iter()
+                .filter(|(_, path)| path.starts_with("/api/v1/repositories/:key/labels"))
+                .collect();
             assert_eq!(routes, registry);
 
             // Negative control: a router with an extra route must diverge,

@@ -265,6 +265,9 @@ pub(crate) async fn require_repo_action(
             AppError::ServiceUnavailable("permission service temporarily unavailable".to_string())
         })?;
     if allowed {
+        if let Some(level) = crate::api::authz::shadow_marker::LegacyLevel::of_action(action) {
+            crate::api::authz::shadow_marker::note_passed(repo_id, level);
+        }
         Ok(())
     } else {
         Err(AppError::Authorization(
@@ -308,13 +311,15 @@ pub(crate) async fn require_repo_admin(
     repo_id: Uuid,
     permission_service: &crate::services::permission_service::PermissionService,
 ) -> Result<()> {
-    if auth.is_admin {
-        return Ok(());
-    }
-    let has_admin = permission_service
-        .check_repository_action(auth.user_id, repo_id, "admin", false)
-        .await?;
+    let has_admin = auth.is_admin
+        || permission_service
+            .check_repository_action(auth.user_id, repo_id, "admin", false)
+            .await?;
     if has_admin {
+        crate::api::authz::shadow_marker::note_passed(
+            repo_id,
+            crate::api::authz::shadow_marker::LegacyLevel::Admin,
+        );
         Ok(())
     } else {
         Err(AppError::Authorization(
@@ -575,8 +580,18 @@ pub(crate) async fn require_visible(
     auth: &Option<AuthExtension>,
     repo_service: &RepositoryService,
 ) -> Result<()> {
+    // For the IAM shadow comparison (#4214): every way out that admits the
+    // caller goes through here, so a later 4xx is known to follow a read check
+    // that passed.
+    let passed = || {
+        crate::api::authz::shadow_marker::note_passed(
+            repo.id,
+            crate::api::authz::shadow_marker::LegacyLevel::Read,
+        );
+        Ok(())
+    };
     if repo.visibility.allows_anonymous_read() {
-        return Ok(());
+        return passed();
     }
     // #4498: the SAME body `RepositoryService::get_by_key` answers for a key
     // that names no repository. Naming the key here made the two 404s
@@ -585,7 +600,7 @@ pub(crate) async fn require_visible(
     // Every refusal below is hidden behind that 404; the marker lets the IAM
     // shadow comparison tell it from a missing key (#4214).
     let not_found = || {
-        crate::api::authz::shadow_marker::note_hidden_refusal();
+        crate::api::authz::shadow_marker::note_hidden_refusal(repo.id);
         AppError::NotFound(REPOSITORY_NOT_FOUND.to_string())
     };
     match auth {
@@ -603,7 +618,7 @@ pub(crate) async fn require_visible(
             // must keep confining it. A scoped token still gets the
             // existence-hiding 404 above.
             if repo.visibility.allows_authenticated_read() {
-                return Ok(());
+                return passed();
             }
             // Per-repo authorization: admins bypass; everyone else needs a
             // grant on this repo (or a global assignment) that carries `read`.
@@ -625,7 +640,7 @@ pub(crate) async fn require_visible(
                     )
                     .await?
             {
-                Ok(())
+                passed()
             } else {
                 Err(not_found())
             }
@@ -644,7 +659,7 @@ pub(crate) async fn require_visible(
                 .await
                 .unwrap_or(false);
             if granted {
-                Ok(())
+                passed()
             } else {
                 Err(not_found())
             }
@@ -762,10 +777,13 @@ async fn require_member_attachable(
             action = action,
             "denied virtual-member mutation: attaching an internal repository requires a read grant on it"
         );
-        return Err(AppError::Authorization(format!(
+        return Err(crate::api::authz::shadow_marker::keep_refusal(
+            "virtual_member",
+            AppError::Authorization(format!(
             "Attaching internal repository '{}' as a virtual member requires a read grant on it",
             member_repo.key
-        )));
+        )),
+        ));
     }
     Ok(())
 }
@@ -1898,6 +1916,7 @@ pub struct RepositoryCapabilities {
 /// Non-mutating feature detection, including on an installation with no repositories.
 #[utoipa::path(
     get, path = "/_/capabilities", context_path = "/api/v1/repositories",
+    extensions(("x-auth-requirement" = json!("public"))),
     tag = "repositories",
     responses((status = 200, description = "Repository capabilities", body = RepositoryCapabilities))
 )]
@@ -2895,6 +2914,7 @@ pub struct CacheTtlResponse {
 /// Set the proxy cache TTL for a repository
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/cache-ttl",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -2975,6 +2995,7 @@ pub async fn set_cache_ttl(
 /// Get the proxy cache TTL for a repository
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/cache-ttl",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -3058,6 +3079,7 @@ pub struct OnUpstreamNotFoundResponse {
 /// Set the upstream-not-found policy for a remote (proxy) repository
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/on-upstream-not-found",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -3135,6 +3157,7 @@ pub async fn set_on_upstream_not_found(
 /// Get the upstream-not-found policy for a repository
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/on-upstream-not-found",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -3229,6 +3252,7 @@ impl UpstreamModeResponse {
 /// Set the upstream mode (online / cache-only) of a remote (proxy) repository
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/upstream-mode",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -3283,6 +3307,7 @@ pub async fn set_upstream_mode(
 /// Get the upstream mode (online / cache-only) of a repository
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/upstream-mode",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -3339,6 +3364,7 @@ pub struct StaleIfErrorGraceResponse {
 /// Set the `stale-if-error` grace window for a repository (#4581)
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/stale-if-error-grace",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -3427,6 +3453,7 @@ pub async fn set_stale_if_error_grace(
 /// Get the `stale-if-error` grace window for a repository (#4581)
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/stale-if-error-grace",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -3932,6 +3959,7 @@ async fn with_npm_virtual_isolate(
 /// administrative tier, so non-admins need `repository:admin` on the target.
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/npm-scope-policy",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -4000,6 +4028,7 @@ pub async fn set_npm_scope_policy(
 /// (or global admin) as well.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/npm-scope-policy",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -4068,6 +4097,7 @@ pub struct InvalidateCacheResponse {
 /// contract (which ignores delete-of-missing on the storage backend).
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("repository.maintenance")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/cache/invalidate",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -4197,6 +4227,7 @@ fn require_pypi_tracks_repo(repo: &crate::models::repository::Repository) -> Res
 /// List the PEP 708 `tracks` declarations on a repository.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/pypi-tracks",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -4242,6 +4273,7 @@ pub async fn list_pypi_tracks(
 /// instead of isolating it (PEP 708, #1600).
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/pypi-tracks/{project}",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -4314,6 +4346,7 @@ pub async fn put_pypi_track(
 /// for that project name (#1600).
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/pypi-tracks/{project}",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -4494,6 +4527,7 @@ fn validate_format_supports_repo_type(
 /// List repositories
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -4710,6 +4744,7 @@ pub async fn list_repositories(
 /// Create a new repository
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("repository.create")), ("x-resource" = json!("project:body"))),
     path = "",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -4738,6 +4773,10 @@ pub async fn create_repository(
 
     let payload: CreateRepositoryRequest =
         serde_json::from_slice(&body).map_err(|e| AppError::Validation(e.to_string()))?;
+    crate::api::authz::shadow_marker::note_target(match payload.project_id {
+        Some(project_id) => crate::services::iam_legacy_projection::ScopeRef::Project(project_id),
+        None => crate::services::iam_legacy_projection::ScopeRef::Instance,
+    });
 
     // Fine-grained permission check: non-admins need "admin" on the system
     // sentinel or (#2473) project-admin on the project the request assigns
@@ -4892,7 +4931,8 @@ pub async fn create_repository(
         repo_type.as_str(),
         auth.is_admin,
         Default::default(),
-    )?;
+    )
+    .map_err(|e| crate::api::authz::shadow_marker::keep_refusal("admin_only_option", e))?;
     // Trusted cross-origin OCI bearer realms (#3591): validated up-front for
     // the same reason; persisted once `repo.id` exists.
     let oci_trusted_realms =
@@ -4935,8 +4975,11 @@ pub async fn create_repository(
         Some(requested) => {
             // Non-admin users cannot choose a non-default backend
             if !auth.is_admin {
-                return Err(AppError::Authorization(
-                    "Only admins can select a non-default storage backend".to_string(),
+                return Err(crate::api::authz::shadow_marker::keep_refusal(
+                    "admin_only_option",
+                    AppError::Authorization(
+                        "Only admins can select a non-default storage backend".to_string(),
+                    ),
                 ));
             }
             // Validate the requested backend is available
@@ -5385,6 +5428,7 @@ pub async fn create_repository(
 /// Get repository details
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -5592,6 +5636,7 @@ impl RepositoryStorageStatsResponse {
 /// repository's `logical_bytes`, `blob_count`, `dedup_scope` and `computed_at`.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/storage",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -5804,6 +5849,7 @@ pub struct RepositoryStorageTreeResponse {
 /// everyone else gets an existence-hiding 404.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/storage/tree",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -6323,6 +6369,7 @@ fn validate_update_config_fields(
 /// Update repository
 #[utoipa::path(
     patch,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -6430,7 +6477,10 @@ pub async fn update_repository(
     };
     if let Some((project_id, denial)) = required_project_admin {
         if !projects::can_assign_to_project(&state, &auth, project_id).await? {
-            return Err(AppError::Authorization(denial.to_string()));
+            return Err(crate::api::authz::shadow_marker::keep_refusal(
+                "target_project",
+                AppError::Authorization(denial.to_string()),
+            ));
         }
     }
     let key_changed = payload.key.as_deref().is_some_and(|k| k != existing.key);
@@ -6522,7 +6572,8 @@ pub async fn update_repository(
             existing.repo_type.as_str(),
             auth.is_admin,
             crate::services::mcp_settings::locks_of(&rows),
-        )?
+        )
+        .map_err(|e| crate::api::authz::shadow_marker::keep_refusal("admin_only_option", e))?
     };
     // Trusted cross-origin OCI bearer realms (#3591): validated before the
     // update for the same reason. Writing them is gated by the repository
@@ -7484,6 +7535,7 @@ async fn collect_repo_maven_derived_keys(state: &SharedState, repo_id: Uuid) -> 
 /// runs returns the same job.
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("repository.delete")), ("x-resource" = json!("repo:key"))),
     path = "/{key}",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -7987,6 +8039,7 @@ async fn list_artifacts_with_notice(
 /// List artifacts in repository
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/artifacts",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -10889,6 +10942,7 @@ fn is_docker_index_content_type(content_type: &str) -> bool {
 /// Get artifact metadata
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("artifact.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/artifacts/{path}",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -11251,6 +11305,7 @@ fn artifact_version_to_response(
 /// List the immutable revision history for a versioned artifact (#2367).
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("artifact.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/versions/{path}",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -11307,6 +11362,7 @@ pub async fn list_artifact_versions(
 /// Upload artifact
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("artifact.write")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/artifacts/{path}",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -12208,8 +12264,12 @@ pub(crate) async fn authorize_generic_upload(
     // the promotion service writes through its own path and is unaffected. This
     // applies to all callers including admins.
     if proxy_helpers::promotion_only_blocks_direct_upload(repo.promotion_only, auth.is_admin) {
-        return Err(AppError::Authorization(
-            "Direct uploads are disabled for this repository; publish via promotion".to_string(),
+        return Err(crate::api::authz::shadow_marker::keep_refusal(
+            "promotion_only",
+            AppError::Authorization(
+                "Direct uploads are disabled for this repository; publish via promotion"
+                    .to_string(),
+            ),
         )
         .into_response());
     }
@@ -12745,6 +12805,28 @@ fn resolve_upload_content_type(declared: Option<&str>, path: &str) -> String {
 ///
 /// Accepts a multipart form with a `file` field. The URL path is used as the
 /// artifact path, falling back to the uploaded filename.
+#[utoipa::path(
+    post,
+    operation_id = "upload_artifact_multipart_with_path",
+    extensions(("x-required-permission" = json!("artifact.write")), ("x-resource" = json!("repo:key"))),
+    path = "/{key}/artifacts/{path}",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ("path" = String, Path, description = "Artifact path; the uploaded filename when empty"),
+    ),
+    request_body(content_type = "multipart/form-data", description = "A `file` field holding the artifact"),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 201, description = "Artifact uploaded", body = ArtifactResponse),
+        (status = 400, description = "Invalid artifact path or form", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Not authorized to write to this repository", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Repository not found"),
+        (status = 409, description = "An immutable artifact already exists at this path", body = crate::api::openapi::ErrorResponse),
+    )
+)]
 async fn upload_artifact_multipart_with_path(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -12795,6 +12877,25 @@ async fn upload_artifact_multipart_with_path(
 /// This is what makes the web UI's "Custom path (optional)" field actually
 /// land artifacts at the requested path (#1237). Previously the form field
 /// was silently dropped and only the filename was used.
+#[utoipa::path(
+    post,
+    operation_id = "upload_artifact_multipart",
+    extensions(("x-required-permission" = json!("artifact.write")), ("x-resource" = json!("repo:key"))),
+    path = "/{key}/artifacts",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(("key" = String, Path, description = "Repository key")),
+    request_body(content_type = "multipart/form-data", description = "A `file` field holding the artifact and an optional `path` field (a directory prefix when it ends in `/`)"),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 201, description = "Artifact uploaded", body = ArtifactResponse),
+        (status = 400, description = "Invalid artifact path or form", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Not authorized to write to this repository", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Repository not found"),
+        (status = 409, description = "An immutable artifact already exists at this path", body = crate::api::openapi::ErrorResponse),
+    )
+)]
 async fn upload_artifact_multipart(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -13553,6 +13654,7 @@ async fn generic_route_virtual_refusal(
 /// Download artifact
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("artifact.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/download/{path}",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -14111,6 +14213,7 @@ pub struct DeleteArtifactQuery {
 /// Delete artifact
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("artifact.delete")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/artifacts/{path}",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -14189,8 +14292,11 @@ pub async fn delete_artifact(
         repo.promotion_only,
         auth.is_admin || auth.is_service_account,
     ) {
-        return Err(AppError::Authorization(
-            "Direct deletes are disabled for this release repository; retract via an approver/promotion workflow".to_string(),
+        return Err(crate::api::authz::shadow_marker::keep_refusal(
+            "promotion_only",
+            AppError::Authorization(
+                "Direct deletes are disabled for this release repository; retract via an approver/promotion workflow".to_string(),
+            ),
         ));
     }
 
@@ -14438,6 +14544,7 @@ struct VirtualMemberRow {
 /// List virtual repository members
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/members",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -14584,6 +14691,7 @@ pub(crate) async fn visible_virtual_members(
 /// Add a member to a virtual repository
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/members",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -14667,6 +14775,7 @@ pub async fn add_virtual_member(
 /// Remove a member from a virtual repository
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/members/{member_key}",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -14751,6 +14860,7 @@ pub async fn remove_virtual_member(
 /// in request semantics was ratified in #2899.
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/members",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -15020,6 +15130,7 @@ async fn audit_remote_setting_change(
 /// Set or remove upstream auth for a remote repository
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("repository.credentials.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/upstream-auth",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -15275,6 +15386,7 @@ pub(crate) fn build_egress_proxy_config(
 /// Configure the outbound egress proxy for a remote repository
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("repository.credentials.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/egress-proxy",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -15325,6 +15437,7 @@ pub async fn set_egress_proxy(
 /// Read the outbound egress proxy configuration of a remote repository
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/egress-proxy",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -15358,6 +15471,7 @@ pub async fn get_egress_proxy(
 /// Test connectivity to the upstream URL of a remote repository
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("repository.credentials.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/test-upstream",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -15498,6 +15612,7 @@ pub struct RoutingRulesResponse {
 /// Get routing rules for a repository
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/routing-rules",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -15548,6 +15663,7 @@ pub async fn get_routing_rules(
 /// layout. Rules are evaluated in order and the first match wins.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/routing-rules",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -15619,6 +15735,7 @@ pub async fn set_routing_rules(
 /// Delete all routing rules for a repository
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/routing-rules",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -15734,6 +15851,7 @@ async fn upstream_filter_repo(
 /// Get the upstream filter of a remote repository
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/upstream-filter",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -15795,6 +15913,7 @@ pub async fn get_upstream_filter(
 /// notification converges within 30 s).
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/upstream-filter",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -15832,6 +15951,7 @@ pub async fn set_upstream_filter(
 /// Remove the upstream filter of a remote repository
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/upstream-filter",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -15991,6 +16111,7 @@ async fn audit_conda_allowlist_change(
 /// Get the package allowlist of a virtual conda repository
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/allowlist",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -16043,6 +16164,7 @@ pub async fn get_conda_allowlist(
 /// bytes, 32 subdirs per entry. Changes apply to the next request.
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/allowlist",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -16084,6 +16206,7 @@ pub async fn set_conda_allowlist(
 /// Remove the package allowlist of a virtual conda repository
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/allowlist",
     context_path = "/api/v1/repositories",
     tag = "repositories",
@@ -16136,6 +16259,10 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
     paths(
         repository_capabilities,
         list_repositories,
+        upload_artifact_multipart,
+        upload_artifact_multipart_with_path,
+        super::oci_v2::replicate_oci_blob,
+        super::oci_v2::replicate_oci_manifest,
         create_repository,
         get_repository,
         get_repository_storage,

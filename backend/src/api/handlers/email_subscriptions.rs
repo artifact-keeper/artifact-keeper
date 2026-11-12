@@ -313,6 +313,7 @@ pub(crate) fn validate_recipients(recipients: &[String]) -> Result<()> {
 /// List the email subscriptions configured on a repository.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.notifications.manage")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/email-subscriptions",
     context_path = "/api/v1/repositories",
     tag = "email_subscriptions",
@@ -353,6 +354,7 @@ pub async fn list_subscriptions(
 /// Create an email subscription scoped to a repository.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("repository.notifications.manage")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/email-subscriptions",
     context_path = "/api/v1/repositories",
     tag = "email_subscriptions",
@@ -421,6 +423,7 @@ pub async fn create_subscription(
 /// Delete an email subscription by id.
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("repository.notifications.manage")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/email-subscriptions/{subscription_id}",
     context_path = "/api/v1/repositories",
     tag = "email_subscriptions",

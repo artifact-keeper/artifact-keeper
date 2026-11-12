@@ -34,12 +34,31 @@ use uuid::Uuid;
 use crate::api::authz::catalog::Permission;
 use crate::api::authz::declaration::{Resolver, RouteRequirement};
 use crate::api::authz::registry::{RouteRegistry, API_V1_PREFIX};
-use crate::api::authz::shadow_marker::{self, Recorded};
+use crate::api::authz::shadow_marker::{self, LegacyLevel, Recorded};
 use crate::api::middleware::client_ip::current_verified_client_ip;
 use crate::config::Config;
 use crate::services::iam_decision::provider::SnapshotProvider;
 use crate::services::iam_decision::{decide, Caller, Decision, Principal, RequestContext};
 use crate::services::iam_legacy_projection::{CredentialRef, ScopeRef};
+
+/// The resolver whose resource the handler reports from the request body.
+pub const BODY_PROJECT_RESOLVER: &str = "project:body";
+
+/// What a comparison settled: the legacy outcome, the resource once resolved,
+/// and the new decision when the legacy outcome is known.
+struct Settled {
+    legacy: LegacyOutcome,
+    resource: Option<ScopeRef>,
+    decision: Option<Result<Decision, &'static str>>,
+}
+
+/// The class of a comparison whose legacy outcome is unknown.
+fn classify_unknown(legacy: LegacyOutcome) -> Class {
+    match legacy {
+        LegacyOutcome::Unknown(reason) => Class::Inconclusive(reason),
+        _ => Class::Inconclusive("legacy_unknown"),
+    }
+}
 
 /// Comparisons in flight at once; beyond this a comparison is dropped.
 pub const SHADOW_PERMITS: usize = 64;
@@ -53,21 +72,87 @@ pub const LOG_LIMIT_PER_MINUTE: u32 = 10;
 pub enum LegacyOutcome {
     Permit,
     Refuse,
-    /// The response does not say whether access was granted: an unmarked 404,
-    /// a 429, or a server error.
-    Unknown,
+    /// A refusal the handler keeps after enforcement (object-level rules,
+    /// administrator-only options, a second resource): the route-level
+    /// decision did not make it.
+    KeptRefusal,
+    /// The response does not say whether the declared check passed; the
+    /// reason is a fixed label.
+    Unknown(&'static str),
 }
 
-/// Classify the legacy response. A 404 is a refusal only when a hiding helper
-/// marked it; the same mark on any other status (a list that filtered out
-/// some rows) does not make the request a refusal.
-pub fn legacy_outcome(status: StatusCode, hidden_refusal: bool) -> LegacyOutcome {
+/// What the response alone settles, before the resource is resolved: a 429
+/// or a server error, and a 404 that nothing marked.
+pub fn settled_by_status(status: StatusCode, recorded: &Recorded) -> Option<LegacyOutcome> {
+    let unmarked = recorded.hidden_refusal.is_none() && recorded.kept_refusal.is_none();
+    let settled = status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+        || (status == StatusCode::NOT_FOUND && unmarked);
+    settled.then_some(LegacyOutcome::Unknown("legacy_unknown"))
+}
+
+/// Classify the legacy response for the declared check on `resource`.
+///
+/// * A 404 is a refusal only when a hiding helper marked it for `resource`; a
+///   mark for another repository is a second resource the declaration does
+///   not decide.
+/// * A 401, 403 or 404 with a kept refusal recorded is that kept refusal.
+/// * Any other 4xx is a permit only when a legacy check at the declared level
+///   passed on `resource` before it; otherwise the input or the repository
+///   type was rejected before the check ran.
+/// * Any mark on a success (a list that filtered out some rows) does not make
+///   the request a refusal.
+pub fn legacy_outcome(
+    status: StatusCode,
+    recorded: &Recorded,
+    resource: ScopeRef,
+    needed: LegacyLevel,
+) -> LegacyOutcome {
+    if let Some(settled) = settled_by_status(status, recorded) {
+        return settled;
+    }
+    let repository = match resource {
+        ScopeRef::Repository(id) => Some(id),
+        _ => None,
+    };
+    let hidden_here = repository.is_some() && recorded.hidden_refusal == repository;
+    let refusal = matches!(
+        status,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+    );
     match status {
+        StatusCode::NOT_FOUND if hidden_here => LegacyOutcome::Refuse,
+        _ if refusal && recorded.kept_refusal.is_some() => LegacyOutcome::KeptRefusal,
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => LegacyOutcome::Refuse,
-        StatusCode::NOT_FOUND if hidden_refusal => LegacyOutcome::Refuse,
-        StatusCode::NOT_FOUND | StatusCode::TOO_MANY_REQUESTS => LegacyOutcome::Unknown,
-        s if s.is_server_error() => LegacyOutcome::Unknown,
+        StatusCode::NOT_FOUND => LegacyOutcome::Unknown("secondary_resource"),
+        s if s.is_client_error() => {
+            let passed = repository
+                .and_then(|id| recorded.passed_on(id))
+                .is_some_and(|level| level.satisfies(needed));
+            if passed {
+                LegacyOutcome::Permit
+            } else {
+                LegacyOutcome::Unknown("validation_before_authorization")
+            }
+        }
         _ => LegacyOutcome::Permit,
+    }
+}
+
+/// The legacy check a declared permission corresponds to, for telling a 4xx
+/// after that check from one before it.
+pub fn legacy_level(permission: Permission) -> LegacyLevel {
+    use Permission as P;
+    match permission {
+        p if p.id().ends_with(".read") => LegacyLevel::Read,
+        P::ArtifactWrite
+        | P::ArtifactAnnotate
+        | P::EnvironmentWrite
+        | P::ImageBuildCreate
+        | P::SecurityScan
+        | P::RepositoryLabelManage => LegacyLevel::Write,
+        P::ArtifactDelete => LegacyLevel::Delete,
+        _ => LegacyLevel::Admin,
     }
 }
 
@@ -108,9 +193,14 @@ impl Class {
 pub fn classify(legacy: LegacyOutcome, decision: &Decision) -> Class {
     match (legacy, decision) {
         (_, Decision::Unavailable { .. }) => Class::NewUnavailable,
-        (LegacyOutcome::Unknown, _) => Class::Inconclusive("legacy_unknown"),
+        (LegacyOutcome::Unknown(reason), _) => Class::Inconclusive(reason),
+        (LegacyOutcome::KeptRefusal, Decision::Permit { .. }) => {
+            Class::Inconclusive("handler_check")
+        }
         (LegacyOutcome::Permit, Decision::Permit { .. })
-        | (LegacyOutcome::Refuse, Decision::Refuse { .. }) => Class::Agree,
+        | (LegacyOutcome::Refuse | LegacyOutcome::KeptRefusal, Decision::Refuse { .. }) => {
+            Class::Agree
+        }
         (LegacyOutcome::Permit, Decision::Refuse { .. }) => Class::NewStricter,
         (LegacyOutcome::Refuse, Decision::Permit { .. }) => Class::NewWider,
     }
@@ -325,7 +415,6 @@ impl IamShadow {
         status: StatusCode,
         recorded: Recorded,
     ) -> Comparison {
-        let legacy = legacy_outcome(status, recorded.hidden_refusal);
         let mut comparison = Comparison {
             route: pending.route.clone(),
             method: pending.method.clone(),
@@ -333,18 +422,33 @@ impl IamShadow {
             principal: principal_of(&recorded),
             resource: None,
             legacy_status: status.as_u16(),
-            legacy,
+            legacy: LegacyOutcome::Unknown("legacy_unknown"),
             decision: None,
             class: Class::Inconclusive("legacy_unknown"),
         };
-        if legacy != LegacyOutcome::Unknown {
-            match self.decide_for(&pending, &recorded).await {
-                Ok((resource, decision)) => {
-                    comparison.class = classify(legacy, &decision);
-                    comparison.resource = Some(resource);
-                    comparison.decision = Some(decision);
-                }
-                Err(reason) => comparison.class = Class::Inconclusive(reason),
+        match self.settle(&pending, status, &recorded).await {
+            Err(reason) => comparison.class = Class::Inconclusive(reason),
+            Ok(Settled {
+                legacy,
+                resource,
+                decision,
+            }) => {
+                comparison.legacy = legacy;
+                comparison.resource = resource;
+                comparison.class = match decision {
+                    Some(Ok(decision)) => {
+                        let class = classify(legacy, &decision);
+                        comparison.decision = Some(decision);
+                        class
+                    }
+                    Some(Err(reason)) => Class::Inconclusive(reason),
+                    None => classify_unknown(legacy),
+                };
+            }
+        }
+        if comparison.class == Class::Inconclusive("handler_check") {
+            if let Some(reason) = recorded.kept_refusal {
+                counter!("ak_iam_shadow_kept_refusals_total", "reason" => reason).increment(1);
             }
         }
         self.report(&comparison);
@@ -354,20 +458,67 @@ impl IamShadow {
         comparison
     }
 
-    async fn decide_for(
+    /// The legacy outcome, the resource and, when the legacy outcome is
+    /// known, the new decision. `Err` when the resource cannot be found.
+    async fn settle(
+        &self,
+        pending: &Pending,
+        status: StatusCode,
+        recorded: &Recorded,
+    ) -> Result<Settled, &'static str> {
+        if let Some(legacy) = settled_by_status(status, recorded) {
+            return Ok(Settled {
+                legacy,
+                resource: None,
+                decision: None,
+            });
+        }
+        let resource = self.resource_for(pending, recorded).await?;
+        let legacy = legacy_outcome(status, recorded, resource, legacy_level(pending.permission));
+        let decision = if matches!(legacy, LegacyOutcome::Unknown(_)) {
+            None
+        } else {
+            Some(self.decide_on(pending, recorded, resource).await)
+        };
+        Ok(Settled {
+            legacy,
+            resource: Some(resource),
+            decision,
+        })
+    }
+
+    /// The resource a declaration names: from the path, or for a
+    /// body-resolved declaration the target the handler reported.
+    async fn resource_for(
         &self,
         pending: &Pending,
         recorded: &Recorded,
-    ) -> Result<(ScopeRef, Decision), &'static str> {
+    ) -> Result<ScopeRef, &'static str> {
+        if pending.resolver.id == BODY_PROJECT_RESOLVER {
+            return recorded.target.ok_or("target_not_reported");
+        }
+        resolve(&self.db, pending.resolver, pending.param.as_deref()).await
+    }
+
+    async fn decide_on(
+        &self,
+        pending: &Pending,
+        recorded: &Recorded,
+        resource: ScopeRef,
+    ) -> Result<Decision, &'static str> {
         let caller = caller_of(recorded)?;
-        let resource = resolve(&self.db, pending.resolver, pending.param.as_deref()).await?;
         let snapshot = tokio::time::timeout(self.snapshot_timeout, self.provider.current())
             .await
             .map_err(|_| "snapshot_timeout")?
             .map_err(|_| "snapshot_unavailable")?;
         let ctx = RequestContext::new(pending.client_ip, pending.now);
-        let decision = decide(&snapshot, &caller, pending.permission, resource, &ctx);
-        Ok((resource, decision))
+        Ok(decide(
+            &snapshot,
+            &caller,
+            pending.permission,
+            resource,
+            &ctx,
+        ))
     }
 
     fn report(&self, c: &Comparison) {
@@ -517,29 +668,204 @@ mod tests {
     }
 
     #[test]
-    fn legacy_outcomes_follow_the_final_response() {
+    fn legacy_outcomes_follow_the_final_response_and_the_recorder() {
+        use LegacyLevel as L;
         use LegacyOutcome::*;
+        let (repo, other) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let here = ScopeRef::Repository(repo);
+        let none = Recorded::default();
+        let hidden = |id| Recorded {
+            hidden_refusal: Some(id),
+            ..Recorded::default()
+        };
+        let kept = Recorded {
+            kept_refusal: Some("token_owner"),
+            ..Recorded::default()
+        };
+        let passed = |id, level| Recorded {
+            passed: vec![(id, level)],
+            ..Recorded::default()
+        };
         let cases = [
-            (StatusCode::OK, false, Permit),
-            (StatusCode::NO_CONTENT, false, Permit),
-            (StatusCode::BAD_REQUEST, false, Permit),
-            (StatusCode::UNAUTHORIZED, false, Refuse),
-            (StatusCode::FORBIDDEN, false, Refuse),
-            (StatusCode::NOT_FOUND, true, Refuse),
-            (StatusCode::NOT_FOUND, false, Unknown),
-            (StatusCode::TOO_MANY_REQUESTS, false, Unknown),
-            (StatusCode::INTERNAL_SERVER_ERROR, false, Unknown),
-            (StatusCode::SERVICE_UNAVAILABLE, true, Unknown),
+            (StatusCode::OK, none.clone(), here, L::Admin, Permit),
+            (StatusCode::NO_CONTENT, none.clone(), here, L::Write, Permit),
             // A list that hid some rows still answered.
-            (StatusCode::OK, true, Permit),
+            (StatusCode::OK, hidden(repo), here, L::Read, Permit),
+            (
+                StatusCode::UNAUTHORIZED,
+                none.clone(),
+                here,
+                L::Read,
+                Refuse,
+            ),
+            (StatusCode::FORBIDDEN, none.clone(), here, L::Admin, Refuse),
+            (StatusCode::NOT_FOUND, hidden(repo), here, L::Read, Refuse),
+            // A hidden refusal of the declared repository outranks a kept one.
+            (
+                StatusCode::NOT_FOUND,
+                Recorded {
+                    hidden_refusal: Some(repo),
+                    kept_refusal: Some("x"),
+                    ..Recorded::default()
+                },
+                here,
+                L::Read,
+                Refuse,
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                hidden(other),
+                here,
+                L::Admin,
+                Unknown("secondary_resource"),
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                hidden(repo),
+                ScopeRef::Instance,
+                L::Admin,
+                Unknown("secondary_resource"),
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                none.clone(),
+                here,
+                L::Read,
+                Unknown("legacy_unknown"),
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                kept.clone(),
+                here,
+                L::Admin,
+                KeptRefusal,
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                kept.clone(),
+                here,
+                L::Read,
+                KeptRefusal,
+            ),
+            (
+                StatusCode::CONFLICT,
+                kept.clone(),
+                here,
+                L::Delete,
+                Unknown("validation_before_authorization"),
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                hidden(repo),
+                here,
+                L::Read,
+                Unknown("legacy_unknown"),
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                kept,
+                here,
+                L::Read,
+                Unknown("legacy_unknown"),
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                hidden(repo),
+                here,
+                L::Read,
+                Unknown("legacy_unknown"),
+            ),
+            // A 4xx after the declared check passed is a permit; before it, or
+            // after a weaker one, or on another repository, it says nothing.
+            (
+                StatusCode::BAD_REQUEST,
+                passed(repo, L::Admin),
+                here,
+                L::Admin,
+                Permit,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                passed(repo, L::Admin),
+                here,
+                L::Write,
+                Permit,
+            ),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                passed(repo, L::Write),
+                here,
+                L::Write,
+                Permit,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                passed(repo, L::Write),
+                here,
+                L::Read,
+                Permit,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                passed(repo, L::Read),
+                here,
+                L::Admin,
+                Unknown("validation_before_authorization"),
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                passed(repo, L::Delete),
+                here,
+                L::Write,
+                Unknown("validation_before_authorization"),
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                passed(other, L::Admin),
+                here,
+                L::Admin,
+                Unknown("validation_before_authorization"),
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                none.clone(),
+                ScopeRef::Instance,
+                L::Admin,
+                Unknown("validation_before_authorization"),
+            ),
         ];
-        for (status, marked, expected) in cases {
+        for (status, recorded, resource, needed, expected) in cases {
             assert_eq!(
-                legacy_outcome(status, marked),
+                legacy_outcome(status, &recorded, resource, needed),
                 expected,
-                "{status} {marked}"
+                "{status} {recorded:?} {resource:?} {needed:?}"
             );
         }
+        assert_eq!(
+            settled_by_status(StatusCode::NOT_FOUND, &none),
+            Some(Unknown("legacy_unknown"))
+        );
+        assert_eq!(
+            settled_by_status(StatusCode::NOT_FOUND, &hidden(repo)),
+            None
+        );
+        assert_eq!(settled_by_status(StatusCode::OK, &none), None);
+    }
+
+    #[test]
+    fn every_catalog_permission_has_a_legacy_level() {
+        use LegacyLevel as L;
+        for p in Permission::ALL {
+            let level = legacy_level(*p);
+            if p.id().ends_with(".read") {
+                assert_eq!(level, L::Read, "{p}");
+            }
+        }
+        assert_eq!(legacy_level(Permission::ArtifactWrite), L::Write);
+        assert_eq!(legacy_level(Permission::EnvironmentWrite), L::Write);
+        assert_eq!(legacy_level(Permission::ArtifactDelete), L::Delete);
+        assert_eq!(legacy_level(Permission::RepositoryUpdate), L::Admin);
+        assert_eq!(legacy_level(Permission::RepositoryTokenManage), L::Admin);
     }
 
     #[test]
@@ -552,9 +878,24 @@ mod tests {
             (Refuse, permit(), Class::NewWider),
             (Refuse, refuse(), Class::Agree),
             (Refuse, unavailable(), Class::NewUnavailable),
-            (Unknown, permit(), Class::Inconclusive("legacy_unknown")),
-            (Unknown, refuse(), Class::Inconclusive("legacy_unknown")),
-            (Unknown, unavailable(), Class::NewUnavailable),
+            (
+                Unknown("legacy_unknown"),
+                permit(),
+                Class::Inconclusive("legacy_unknown"),
+            ),
+            (
+                Unknown("secondary_resource"),
+                refuse(),
+                Class::Inconclusive("secondary_resource"),
+            ),
+            (
+                Unknown("legacy_unknown"),
+                unavailable(),
+                Class::NewUnavailable,
+            ),
+            (KeptRefusal, permit(), Class::Inconclusive("handler_check")),
+            (KeptRefusal, refuse(), Class::Agree),
+            (KeptRefusal, unavailable(), Class::NewUnavailable),
         ];
         for (legacy, decision, expected) in cases {
             assert_eq!(
@@ -579,9 +920,9 @@ mod tests {
 
     fn recorded(principal: Option<RecordedPrincipal>, api_token: Option<Uuid>) -> Recorded {
         Recorded {
-            hidden_refusal: false,
             principal,
             api_token,
+            ..Recorded::default()
         }
     }
 
@@ -644,12 +985,23 @@ mod tests {
 
     const STUB: &str = "/api/v1/stub/:case";
 
+    const STUB_BODY: &str = "/api/v1/stub-body/:case";
+    const STUB_PROJECT: Uuid = Uuid::from_u128(0x5eed);
+
     fn stub_registry() -> RouteRegistry {
         let op = serde_json::json!({
             "x-required-permission": "user.read",
             "x-resource": "instance",
         });
-        RouteRegistry::from_operations([("get", "/api/v1/stub/{case}", &op)]).unwrap()
+        let body = serde_json::json!({
+            "x-required-permission": "repository.create",
+            "x-resource": "project:body",
+        });
+        RouteRegistry::from_operations([
+            ("get", "/api/v1/stub/{case}", &op),
+            ("get", "/api/v1/stub-body/{case}", &body),
+        ])
+        .unwrap()
     }
 
     fn snapshot_build(gate: Arc<Semaphore>) -> BuildFn {
@@ -677,16 +1029,37 @@ mod tests {
             "permit" => (headers, "permitted").into_response(),
             "forbidden" => (StatusCode::FORBIDDEN, headers, "no").into_response(),
             "hidden" => {
-                shadow_marker::note_hidden_refusal();
+                shadow_marker::note_hidden_refusal(Uuid::from_u128(1));
                 (StatusCode::NOT_FOUND, headers, "Repository not found").into_response()
             }
+            "kept" => {
+                shadow_marker::note_kept_refusal("stub_rule");
+                (StatusCode::FORBIDDEN, headers, "no").into_response()
+            }
             _ => (StatusCode::INTERNAL_SERVER_ERROR, headers, "boom").into_response(),
+        }
+    }
+
+    /// A handler of a body-resolved declaration: reports the project, the
+    /// instance, or (rejecting the body first) nothing.
+    async fn stub_body(axum::extract::Path(case): axum::extract::Path<String>) -> Response {
+        match case.as_str() {
+            "project" => {
+                shadow_marker::note_target(ScopeRef::Project(STUB_PROJECT));
+                (StatusCode::CREATED, "created").into_response()
+            }
+            "instance" => {
+                shadow_marker::note_target(ScopeRef::Instance);
+                (StatusCode::FORBIDDEN, "no").into_response()
+            }
+            _ => (StatusCode::BAD_REQUEST, "malformed").into_response(),
         }
     }
 
     fn app(shadow: Option<Arc<IamShadow>>) -> Router {
         let inner = Router::new()
             .route("/stub/:case", get(stub))
+            .route("/stub-body/:case", get(stub_body))
             .route("/plain", get(|| async { "plain" }));
         let inner = match shadow {
             Some(shadow) => inner.layer(axum::middleware::from_fn_with_state(
@@ -725,11 +1098,14 @@ mod tests {
         let shadow = Arc::new(shadow_with(Arc::new(Semaphore::new(1))).with_observer(tx));
         let on = app(Some(shadow));
         let off = app(None);
+        // The stub declares an instance resource, so a hidden refusal of a
+        // repository is a second resource.
         let expected = [
             ("permit", LegacyOutcome::Permit),
             ("forbidden", LegacyOutcome::Refuse),
-            ("hidden", LegacyOutcome::Refuse),
-            ("error", LegacyOutcome::Unknown),
+            ("hidden", LegacyOutcome::Unknown("secondary_resource")),
+            ("kept", LegacyOutcome::KeptRefusal),
+            ("error", LegacyOutcome::Unknown("legacy_unknown")),
         ];
         for (case, legacy) in expected {
             let uri = format!("/api/v1/stub/{case}");
@@ -750,6 +1126,32 @@ mod tests {
         call(&on, "/api/v1/stub/permit").await;
         assert_eq!(next_comparison(&mut rx).await.route, STUB);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_body_resolved_declaration_uses_the_reported_target() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let shadow = Arc::new(shadow_with(Arc::new(Semaphore::new(1))).with_observer(tx));
+        let on = app(Some(shadow));
+        let off = app(None);
+        let expected = [
+            ("project", Some(ScopeRef::Project(STUB_PROJECT))),
+            ("instance", Some(ScopeRef::Instance)),
+            ("none", None),
+        ];
+        for (case, resource) in expected {
+            let uri = format!("/api/v1/stub-body/{case}");
+            assert_eq!(call(&on, &uri).await, call(&off, &uri).await, "{case}");
+            let c = next_comparison(&mut rx).await;
+            assert_eq!(c.route, STUB_BODY);
+            assert_eq!(c.permission, Permission::RepositoryCreate);
+            assert_eq!(c.resource, resource, "{case}");
+            if resource.is_none() {
+                assert_eq!(c.class, Class::Inconclusive("target_not_reported"));
+            } else {
+                assert!(c.decision.is_some(), "{case}: {c:?}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -861,7 +1263,15 @@ mod end_to_end {
 
     impl Rig {
         async fn new(pool: PgPool, storage: &std::path::Path) -> Rig {
-            let base = tdh::build_state(pool.clone(), storage.to_str().unwrap());
+            Rig::over(
+                pool.clone(),
+                tdh::build_state(pool, storage.to_str().unwrap()),
+            )
+            .await
+        }
+
+        /// The layer over an existing state.
+        async fn over(pool: PgPool, base: SharedState) -> Rig {
             let provider = Arc::new(SnapshotProvider::for_database(pool.clone()));
             let (tx, comparisons) = tokio::sync::mpsc::unbounded_channel();
             let registry =
@@ -912,6 +1322,44 @@ mod end_to_end {
             assert_eq!(comparison.permission, Permission::RepositoryLabelManage);
             (status, comparison)
         }
+
+        /// Send `request` through the real router as `credential` (none for
+        /// anonymous) and return the status and the comparison of that request.
+        async fn call(
+            &mut self,
+            credential: Option<&str>,
+            mut request: HttpRequest<Body>,
+        ) -> (StatusCode, Comparison) {
+            if let Some(credential) = credential {
+                request
+                    .headers_mut()
+                    .insert("authorization", credential.parse().unwrap());
+            }
+            let app = crate::api::routes::create_router(self.state.clone());
+            let (status, _) = tdh::send(app, request).await;
+            let comparison = tokio::time::timeout(Duration::from_secs(15), self.comparisons.recv())
+                .await
+                .expect("a comparison")
+                .expect("observer open");
+            (status, comparison)
+        }
+    }
+
+    fn json_request(method: &str, uri: String, body: serde_json::Value) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn empty_request(method: &str, uri: String) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
     }
 
     fn is_refusal(c: &Comparison) -> bool {
@@ -1019,5 +1467,621 @@ mod end_to_end {
             .execute(&pool)
             .await;
         tdh::cleanup(&pool, repo, user).await;
+    }
+
+    async fn delete_repository(pool: &PgPool, id: Uuid) {
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn artifact_reads_and_writes_agree() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::publish_repo(&pool, repo).await;
+        let (developer, _) = tdh::create_user(&pool).await;
+        tdh::grant_repo_role(&pool, repo, developer, "developer").await;
+        let mut rig = Rig::new(pool.clone(), &dir).await;
+        let bearer = tdh::bearer_for(&rig.state, developer).await;
+
+        // A developer uploads: both permit.
+        let upload = HttpRequest::put(format!("/api/v1/repositories/{key}/artifacts/a/b.txt"))
+            .body(Body::from("payload"))
+            .unwrap();
+        let (status, c) = rig.call(Some(&bearer), upload).await;
+        assert!(status.is_success(), "{status}");
+        assert_eq!(c.permission, Permission::ArtifactWrite);
+        assert_eq!(
+            (c.legacy, c.class),
+            (LegacyOutcome::Permit, Class::Agree),
+            "{c:?}"
+        );
+
+        // The same developer may not reconfigure the repository: both refuse.
+        let patch = json_request(
+            "PATCH",
+            format!("/api/v1/repositories/{key}"),
+            serde_json::json!({"description": "changed"}),
+        );
+        let (status, c) = rig.call(Some(&bearer), patch).await;
+        assert!(status.is_client_error(), "{status}");
+        assert_eq!(c.permission, Permission::RepositoryUpdate);
+        assert!(is_refusal(&c), "{c:?}");
+        assert_eq!(
+            (c.legacy, c.class),
+            (LegacyOutcome::Refuse, Class::Agree),
+            "{c:?}"
+        );
+
+        // Anyone reads an artifact of a public repository: both permit.
+        let artifact = tdh::artifact_id_at(&pool, repo, "a/b.txt").await;
+        let (status, c) = rig
+            .call(
+                None,
+                empty_request("GET", format!("/api/v1/artifacts/{artifact}")),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(c.principal, Principal::Anonymous);
+        assert_eq!(c.resource, Some(ScopeRef::Repository(repo)));
+        assert_eq!(
+            (c.legacy, c.class),
+            (LegacyOutcome::Permit, Class::Agree),
+            "{c:?}"
+        );
+
+        rig.shutdown.cancel();
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo, developer).await;
+    }
+
+    #[tokio::test]
+    async fn a_project_administrator_creates_a_repository_in_the_project() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (_, _, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (admin, _) = tdh::create_user(&pool).await;
+        let project_key = format!("prj-shadow-{}", Uuid::new_v4().simple());
+        let project: Uuid =
+            sqlx::query_scalar("INSERT INTO projects (key, name) VALUES ($1, $1) RETURNING id")
+                .bind(&project_key)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        tdh::grant_permission(&pool, "user", admin, "project", project, &["admin"]).await;
+        let mut rig = Rig::new(pool.clone(), &dir).await;
+        let bearer = tdh::bearer_for(&rig.state, admin).await;
+
+        let key = format!("shadow-create-{}", Uuid::new_v4().simple());
+        let create = json_request(
+            "POST",
+            "/api/v1/repositories".to_string(),
+            serde_json::json!({
+                "key": key, "name": key, "format": "generic",
+                "repo_type": "local", "project_id": project,
+            }),
+        );
+        let (status, c) = rig.call(Some(&bearer), create).await;
+        assert!(status.is_success(), "{status}");
+        assert_eq!(c.permission, Permission::RepositoryCreate);
+        assert_eq!(c.resource, Some(ScopeRef::Project(project)));
+        assert_eq!(
+            (c.legacy, c.class),
+            (LegacyOutcome::Permit, Class::Agree),
+            "{c:?}"
+        );
+
+        rig.shutdown.cancel();
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&key)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM permissions WHERE target_id = $1")
+            .bind(project)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
+            .bind(project)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, admin).await;
+    }
+
+    #[tokio::test]
+    async fn storage_gc_by_a_non_administrator_agrees() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (owner, _) = tdh::create_user(&pool).await;
+        tdh::grant_repo_admin(&pool, repo, owner).await;
+        let mut rig = Rig::new(pool.clone(), &dir).await;
+        let bearer = tdh::bearer_for(&rig.state, owner).await;
+
+        let gc = json_request(
+            "POST",
+            format!("/api/v1/repositories/{key}/storage-gc"),
+            serde_json::json!({"dry_run": true}),
+        );
+        let (status, c) = rig.call(Some(&bearer), gc).await;
+        assert!(status.is_client_error(), "{status}");
+        assert_eq!(c.permission, Permission::SystemMaintenance);
+        assert!(is_refusal(&c), "{c:?}");
+        assert_eq!(
+            (c.legacy, c.class),
+            (LegacyOutcome::Refuse, Class::Agree),
+            "{c:?}"
+        );
+
+        rig.shutdown.cancel();
+        tdh::cleanup(&pool, repo, owner).await;
+    }
+
+    #[tokio::test]
+    async fn refusals_outside_the_declared_decision_are_inconclusive() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (virt, virt_key, dir) = tdh::create_repo(&pool, "virtual", "generic").await;
+        let (hidden, hidden_key, _) = tdh::create_repo(&pool, "local", "generic").await;
+        let (owner, _) = tdh::create_user(&pool).await;
+        let (reader, _) = tdh::create_user(&pool).await;
+        let (peer, _) = tdh::create_user(&pool).await;
+        tdh::grant_repo_admin(&pool, virt, owner).await;
+        tdh::grant_repo_role(&pool, virt, reader, "reader").await;
+        tdh::grant_repo_role(&pool, virt, peer, "developer").await;
+        let mut rig = Rig::new(pool.clone(), &dir).await;
+        let owner_bearer = tdh::bearer_for(&rig.state, owner).await;
+        let reader_bearer = tdh::bearer_for(&rig.state, reader).await;
+
+        // The member repository is hidden from the caller: the 404 is about
+        // it, not about the virtual repository the declaration names.
+        let add = json_request(
+            "POST",
+            format!("/api/v1/repositories/{virt_key}/members"),
+            serde_json::json!({"member_key": hidden_key}),
+        );
+        let (status, c) = rig.call(Some(&owner_bearer), add).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(c.resource, Some(ScopeRef::Repository(virt)));
+        assert_eq!(c.class, Class::Inconclusive("secondary_resource"), "{c:?}");
+
+        // A reader asks for the conda allowlist of a generic repository: the
+        // type check answers before the administrator check.
+        let allowlist = empty_request("GET", format!("/api/v1/repositories/{virt_key}/allowlist"));
+        let (status, c) = rig.call(Some(&reader_bearer), allowlist).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            c.class,
+            Class::Inconclusive("validation_before_authorization"),
+            "{c:?}"
+        );
+
+        // The owner reads a token another user created: the handler hides it.
+        let auth = crate::services::auth_service::AuthService::new(
+            pool.clone(),
+            Arc::new(rig.state.config.clone()),
+        );
+        let (_, token_id) = auth
+            .generate_api_token(peer, "peer-token", vec!["read:artifacts".into()], None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE api_tokens SET created_by_user_id = $1 WHERE id = $2")
+            .bind(peer)
+            .bind(token_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+            .bind(token_id)
+            .bind(virt)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let read = empty_request(
+            "GET",
+            format!("/api/v1/repositories/{virt_key}/tokens/{token_id}"),
+        );
+        let (status, c) = rig.call(Some(&owner_bearer), read).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(c.legacy, LegacyOutcome::KeptRefusal, "{c:?}");
+        assert!(
+            c.decision.as_ref().is_some_and(Decision::is_permit),
+            "{c:?}"
+        );
+        assert_eq!(c.class, Class::Inconclusive("handler_check"), "{c:?}");
+
+        rig.shutdown.cancel();
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        delete_repository(&pool, hidden).await;
+        tdh::cleanup_user(&pool, reader).await;
+        tdh::cleanup_user(&pool, peer).await;
+        tdh::cleanup(&pool, virt, owner).await;
+    }
+
+    #[tokio::test]
+    async fn a_repository_administrator_decides_an_age_gate_review() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let (owner, _) = tdh::create_user(&pool).await;
+        tdh::grant_repo_admin(&pool, repo, owner).await;
+        let review: Uuid = sqlx::query_scalar(
+            "INSERT INTO age_gate_reviews \
+             (repository_id, package_name, package_version, status) \
+             VALUES ($1, 'shadow-pkg', '1.0.0', 'pending') RETURNING id",
+        )
+        .bind(repo)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let storage = dir.to_string_lossy().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), &storage);
+        let base = tdh::build_state_with_proxy_and_age_gate(pool.clone(), &storage, proxy);
+        let mut rig = Rig::over(pool.clone(), base).await;
+        let bearer = tdh::bearer_for(&rig.state, owner).await;
+
+        let approve = json_request(
+            "POST",
+            format!("/api/v1/repositories/{key}/age-gate/reviews/{review}/approve"),
+            serde_json::json!({}),
+        );
+        let (status, c) = rig.call(Some(&bearer), approve).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(c.permission, Permission::AgeGateReview);
+        assert_eq!(
+            (c.legacy, c.class),
+            (LegacyOutcome::Permit, Class::Agree),
+            "{c:?}"
+        );
+
+        rig.shutdown.cancel();
+        let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE id = $1")
+            .bind(review)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo, owner).await;
+    }
+
+    /// Send `request` through the real router without the layer, inside a
+    /// recorder scope, and return the status and the kept-refusal reason.
+    async fn kept_reason(
+        state: &SharedState,
+        credential: &str,
+        request: HttpRequest<Body>,
+    ) -> (StatusCode, Option<&'static str>) {
+        recorded_reason(state, Some(credential), request).await
+    }
+
+    /// [`kept_reason`], also for an anonymous caller.
+    async fn recorded_reason(
+        state: &SharedState,
+        credential: Option<&str>,
+        mut request: HttpRequest<Body>,
+    ) -> (StatusCode, Option<&'static str>) {
+        if let Some(credential) = credential {
+            request
+                .headers_mut()
+                .insert("authorization", credential.parse().unwrap());
+        }
+        let app = crate::api::routes::create_router(state.clone());
+        let ((status, _), recorded) =
+            crate::api::authz::shadow_marker::scope(tdh::send(app, request)).await;
+        (status, recorded.kept_refusal)
+    }
+
+    async fn new_project(pool: &PgPool) -> Uuid {
+        sqlx::query_scalar("INSERT INTO projects (key, name) VALUES ($1, $1) RETURNING id")
+            .bind(format!("prj-kept-{}", Uuid::new_v4().simple()))
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn delete_project(pool: &PgPool, project: Uuid) {
+        let _ = sqlx::query("DELETE FROM permissions WHERE target_id = $1")
+            .bind(project)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
+            .bind(project)
+            .execute(pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn handler_refusals_carry_their_reason() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (virt, virt_key, _) = tdh::create_repo(&pool, "virtual", "generic").await;
+        let (internal, internal_key, _) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(internal)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (owner, _) = tdh::create_user(&pool).await;
+        let (developer, _) = tdh::create_user(&pool).await;
+        let (reader, _) = tdh::create_user(&pool).await;
+        tdh::grant_repo_admin(&pool, repo, owner).await;
+        tdh::grant_repo_admin(&pool, virt, owner).await;
+        tdh::grant_repo_role(&pool, repo, developer, "developer").await;
+        tdh::grant_repo_role(&pool, repo, reader, "reader").await;
+        let state = tdh::build_state(pool.clone(), dir.to_str().unwrap());
+        let owner_bearer = tdh::bearer_for(&state, owner).await;
+        let developer_bearer = tdh::bearer_for(&state, developer).await;
+        let reader_bearer = tdh::bearer_for(&state, reader).await;
+        let put = |uri: String| HttpRequest::put(uri).body(Body::from("payload")).unwrap();
+
+        // Seed an artifact, then make the repository promotion-only.
+        let (status, reason) = kept_reason(
+            &state,
+            &owner_bearer,
+            put(format!("/api/v1/repositories/{key}/artifacts/kept.txt")),
+        )
+        .await;
+        assert!(status.is_success(), "{status}");
+        assert_eq!(reason, None);
+        sqlx::query("UPDATE repositories SET promotion_only = true WHERE id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await
+            .unwrap();
+        state.repo_cache.write().await.clear();
+        let (status, reason) = kept_reason(
+            &state,
+            &developer_bearer,
+            put(format!("/api/v1/repositories/{key}/artifacts/other.txt")),
+        )
+        .await;
+        assert_eq!(
+            (status, reason),
+            (StatusCode::FORBIDDEN, Some("promotion_only"))
+        );
+        let (status, reason) = kept_reason(
+            &state,
+            &owner_bearer,
+            empty_request(
+                "DELETE",
+                format!("/api/v1/repositories/{key}/artifacts/kept.txt"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            (status, reason),
+            (StatusCode::FORBIDDEN, Some("promotion_only"))
+        );
+
+        // Repository tokens: an administrator-only scope, a scope the caller
+        // cannot delegate, and another member's token.
+        let mint = |scopes: serde_json::Value| {
+            json_request(
+                "POST",
+                format!("/api/v1/repositories/{key}/tokens"),
+                serde_json::json!({"name": "kept", "scopes": scopes}),
+            )
+        };
+        let (status, reason) =
+            kept_reason(&state, &developer_bearer, mint(serde_json::json!(["*"]))).await;
+        assert_eq!(
+            (status, reason),
+            (StatusCode::FORBIDDEN, Some("token_scope"))
+        );
+        let (status, reason) = kept_reason(
+            &state,
+            &reader_bearer,
+            mint(serde_json::json!(["write:artifacts"])),
+        )
+        .await;
+        assert_eq!(
+            (status, reason),
+            (StatusCode::FORBIDDEN, Some("token_scope"))
+        );
+        let auth = crate::services::auth_service::AuthService::new(
+            pool.clone(),
+            Arc::new(state.config.clone()),
+        );
+        let (_, token_id) = auth
+            .generate_api_token(owner, "owner-token", vec!["read:artifacts".into()], None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE api_tokens SET created_by_user_id = $1 WHERE id = $2")
+            .bind(owner)
+            .bind(token_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+            .bind(token_id)
+            .bind(repo)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (status, reason) = kept_reason(
+            &state,
+            &developer_bearer,
+            empty_request(
+                "DELETE",
+                format!("/api/v1/repositories/{key}/tokens/{token_id}"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            (status, reason),
+            (StatusCode::NOT_FOUND, Some("token_owner"))
+        );
+
+        // Replication routes accept peer requests only.
+        let digest = format!("sha256:{}", "0".repeat(64));
+        let (status, reason) = kept_reason(
+            &state,
+            &owner_bearer,
+            put(format!("/api/v1/repositories/{key}/oci/blobs/{digest}")),
+        )
+        .await;
+        assert_eq!(
+            (status, reason),
+            (StatusCode::FORBIDDEN, Some("replication_only"))
+        );
+
+        // An internal member needs a read grant to be attached.
+        let (status, reason) = kept_reason(
+            &state,
+            &owner_bearer,
+            json_request(
+                "POST",
+                format!("/api/v1/repositories/{virt_key}/members"),
+                serde_json::json!({"member_key": internal_key}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            (status, reason),
+            (StatusCode::FORBIDDEN, Some("virtual_member"))
+        );
+
+        // A project administrator: a project they do not administer, and a
+        // non-default storage backend.
+        let mine = new_project(&pool).await;
+        let theirs = new_project(&pool).await;
+        tdh::grant_permission(&pool, "user", owner, "project", mine, &["admin"]).await;
+        let (status, reason) = kept_reason(
+            &state,
+            &owner_bearer,
+            json_request(
+                "PATCH",
+                format!("/api/v1/repositories/{key}"),
+                serde_json::json!({"project_id": theirs}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            (status, reason),
+            (StatusCode::FORBIDDEN, Some("target_project"))
+        );
+        let created = format!("kept-create-{}", Uuid::new_v4().simple());
+        let (status, reason) = kept_reason(
+            &state,
+            &owner_bearer,
+            json_request(
+                "POST",
+                "/api/v1/repositories".to_string(),
+                serde_json::json!({
+                    "key": created, "name": created, "format": "generic",
+                    "repo_type": "local", "project_id": mine,
+                    "storage_backend": "kept-not-the-default",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            (status, reason),
+            (StatusCode::FORBIDDEN, Some("admin_only_option"))
+        );
+
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await;
+        delete_project(&pool, mine).await;
+        delete_project(&pool, theirs).await;
+        delete_repository(&pool, internal).await;
+        delete_repository(&pool, virt).await;
+        tdh::cleanup_user(&pool, developer).await;
+        tdh::cleanup_user(&pool, reader).await;
+        tdh::cleanup(&pool, repo, owner).await;
+    }
+
+    #[tokio::test]
+    async fn mcp_refusals_carry_their_reason() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, key, dir) = tdh::create_repo(&pool, "local", "mcp").await;
+        let (owner, _) = tdh::create_user(&pool).await;
+        let (stranger, _) = tdh::create_user(&pool).await;
+        tdh::grant_repo_admin(&pool, repo, owner).await;
+        let state = tdh::build_state(pool.clone(), dir.to_str().unwrap());
+        let owner_bearer = tdh::bearer_for(&state, owner).await;
+        let stranger_bearer = tdh::bearer_for(&state, stranger).await;
+
+        // Health has no anonymous or grant-free baseline.
+        for credential in [None, Some(stranger_bearer.as_str())] {
+            let (status, reason) = recorded_reason(
+                &state,
+                credential,
+                empty_request(
+                    "GET",
+                    format!("/api/v1/repositories/{key}/mcp/servers/kept/versions/1.0.0/health"),
+                ),
+            )
+            .await;
+            assert_eq!(
+                (status, reason),
+                (StatusCode::NOT_FOUND, Some("grant_required")),
+                "anonymous: {}",
+                credential.is_none()
+            );
+        }
+
+        // Only an instance administrator sets an MCP lock, on update and on
+        // create alike.
+        let (status, reason) = kept_reason(
+            &state,
+            &owner_bearer,
+            json_request(
+                "PATCH",
+                format!("/api/v1/repositories/{key}"),
+                serde_json::json!({"mcp_probe_remotes_locked": true}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            (status, reason),
+            (StatusCode::FORBIDDEN, Some("admin_only_option"))
+        );
+        let project = new_project(&pool).await;
+        tdh::grant_permission(&pool, "user", owner, "project", project, &["admin"]).await;
+        let created = format!("kept-mcp-{}", Uuid::new_v4().simple());
+        let (status, reason) = kept_reason(
+            &state,
+            &owner_bearer,
+            json_request(
+                "POST",
+                "/api/v1/repositories".to_string(),
+                serde_json::json!({
+                    "key": created, "name": created, "format": "mcp",
+                    "repo_type": "local", "project_id": project,
+                    "mcp_probe_remotes_locked": true,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            (status, reason),
+            (StatusCode::FORBIDDEN, Some("admin_only_option"))
+        );
+
+        delete_project(&pool, project).await;
+        tdh::cleanup_user(&pool, stranger).await;
+        tdh::cleanup(&pool, repo, owner).await;
     }
 }

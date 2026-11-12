@@ -299,6 +299,7 @@ struct TokenRow {
 /// List all access tokens configured on a repository.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.token.manage")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/tokens",
     context_path = "/api/v1/repositories",
     tag = "repository_tokens",
@@ -375,6 +376,7 @@ pub async fn list_repo_tokens(
 /// token value is returned only in this response and cannot be retrieved later.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("repository.token.manage")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/tokens",
     context_path = "/api/v1/repositories",
     tag = "repository_tokens",
@@ -414,7 +416,12 @@ pub async fn create_repo_token(
     // `write:users` via this repo-scoped endpoint. See
     // `token_service::ADMIN_ONLY_SCOPES` for the policy list and rationale.
     crate::services::token_service::enforce_admin_only_scopes(&payload.scopes, auth.is_admin)
-        .map_err(AppError::Authorization)?;
+        .map_err(|e| {
+            crate::api::authz::shadow_marker::keep_refusal(
+                "token_scope",
+                AppError::Authorization(e),
+            )
+        })?;
 
     // #2603 G3 — delegation ceiling. Minting a repo-scoped token is an act of
     // DELEGATION: it must not hand out a capability the caller does not itself
@@ -425,7 +432,9 @@ pub async fn create_repo_token(
     // choke-point as the artifact-write paths, so the ceiling is exactly what
     // the holder could do directly. Global admins bypass; read-only scopes need
     // no mutation authority; the admin-class scopes above are already refused.
-    require_delegatable_scopes(&auth, repo.id, &payload.scopes, &state.permission_service).await?;
+    require_delegatable_scopes(&auth, repo.id, &payload.scopes, &state.permission_service)
+        .await
+        .map_err(|e| crate::api::authz::shadow_marker::keep_refusal("token_scope", e))?;
 
     // Delegation ceiling (#2996). `require_delegatable_scopes` above bounds the
     // caller's REPOSITORY authority, but it maps read-family and non-repository
@@ -509,6 +518,7 @@ pub async fn create_repo_token(
 /// Get details of a specific token on a repository.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.token.manage")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/tokens/{token_id}",
     context_path = "/api/v1/repositories",
     tag = "repository_tokens",
@@ -563,8 +573,9 @@ pub async fn get_repo_token(
     // read another member's token. Return the same existence-hiding 404 as a
     // missing token so this does not become an owner-probing oracle.
     if !caller_owns_token(&auth, row.created_by_user_id) {
-        return Err(AppError::NotFound(
-            "Token not found on this repository".to_string(),
+        return Err(crate::api::authz::shadow_marker::keep_refusal(
+            "token_owner",
+            AppError::NotFound("Token not found on this repository".to_string()),
         ));
     }
 
@@ -589,6 +600,7 @@ pub async fn get_repo_token(
 /// immediately stop working for authentication.
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("repository.token.manage")), ("x-resource" = json!("repo:key"))),
     path = "/{key}/tokens/{token_id}",
     context_path = "/api/v1/repositories",
     tag = "repository_tokens",
@@ -645,8 +657,9 @@ pub async fn revoke_repo_token(
     // `revoke_api_token`'s owner filter. Same existence-hiding 404 as a missing
     // token so this is not an owner-probing oracle.
     if !caller_owns_token(&auth, owner.1) {
-        return Err(AppError::NotFound(
-            "Token not found on this repository".to_string(),
+        return Err(crate::api::authz::shadow_marker::keep_refusal(
+            "token_owner",
+            AppError::NotFound("Token not found on this repository".to_string()),
         ));
     }
 

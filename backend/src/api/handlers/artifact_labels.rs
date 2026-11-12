@@ -167,6 +167,7 @@ async fn reevaluate_sync_for_artifact(db: &sqlx::PgPool, artifact_id: Uuid) {
 #[utoipa::path(
     get,
     operation_id = "list_artifact_labels",
+    extensions(("x-required-permission" = json!("artifact.read")), ("x-resource" = json!("artifact:id"))),
     path = "/{id}/labels",
     context_path = "/api/v1/artifacts",
     tag = "artifact-labels",
@@ -204,6 +205,7 @@ async fn list_labels(
 #[utoipa::path(
     put,
     operation_id = "set_artifact_labels",
+    extensions(("x-required-permission" = json!("artifact.annotate")), ("x-resource" = json!("artifact:id"))),
     path = "/{id}/labels",
     context_path = "/api/v1/artifacts",
     tag = "artifact-labels",
@@ -247,6 +249,7 @@ async fn set_labels(
 #[utoipa::path(
     post,
     operation_id = "add_artifact_label",
+    extensions(("x-required-permission" = json!("artifact.annotate")), ("x-resource" = json!("artifact:id"))),
     path = "/{id}/labels/{label_key}",
     context_path = "/api/v1/artifacts",
     tag = "artifact-labels",
@@ -284,6 +287,7 @@ async fn add_label(
 #[utoipa::path(
     delete,
     operation_id = "delete_artifact_label",
+    extensions(("x-required-permission" = json!("artifact.annotate")), ("x-resource" = json!("artifact:id"))),
     path = "/{id}/labels/{label_key}",
     context_path = "/api/v1/artifacts",
     tag = "artifact-labels",
