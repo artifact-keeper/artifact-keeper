@@ -1549,6 +1549,15 @@ jobs:
       - name: Check release-preflight gates block on what they measure
         run: bash scripts/ci/test-release-preflight.sh
 
+      # The end-to-end proof policy for bug fixes (require-e2e-proof.yml and
+      # preflight check 7). It is silent on every non-bug PR, so a fail-open
+      # regression -- a proof line hidden in a comment, a test PR that never
+      # went red, one against the wrong release line, an exemption with no
+      # reason, an unwired tier at the backstop -- would look exactly like a
+      # working check. Stubs `gh`; offline, ~3s.
+      - name: Check the E2E-proof check refuses what it must
+        run: bash scripts/ci/test-check-e2e-proof.sh
+
       # One layer further out again (#3538). The preflight can be right and
       # still not matter: nothing asserted that one had RUN against the commit
       # being tagged. v1.7.5 burned a version number to a check that existed

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT scopes, expires_at FROM api_tokens WHERE token_prefix = $1",
+  "query": "SELECT scopes, expires_at FROM api_tokens WHERE token_prefix = $1 ORDER BY revoked_at IS NOT NULL LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -36,5 +36,5 @@
       true
     ]
   },
-  "hash": "0bec50ede42a2312e93249148ccd4deee5139352942e378366966f8a4955083f"
+  "hash": "a95bac14472d8e66de05ebdc2694ea1f92aa416e0e8e8041c97721fcc3b9958c"
 }
