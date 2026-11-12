@@ -408,19 +408,25 @@ fn connect_db_error(e: sqlx::Error) -> Response {
 }
 
 /// #4422: a storage-quota decision as the Connect error an upload answers:
-/// `507 resource_exhausted` naming the repository or project quota that
-/// refuses it, or `internal` when the check itself failed.
+/// `403 resource_exhausted` naming the repository, project or instance quota
+/// that refuses it, or `internal` when the check itself failed. Connect keeps
+/// its own envelope; the status and message are those of every other quota
+/// refusal.
 #[allow(clippy::result_large_err)]
 fn connect_quota_decision(
-    decision: crate::error::Result<Option<crate::services::repository_service::QuotaScope>>,
+    decision: crate::error::Result<Option<crate::services::repository_service::QuotaDenial>>,
 ) -> Result<(), Response> {
     match decision {
         Ok(None) => Ok(()),
-        Ok(Some(scope)) => Err(connect_error(
-            StatusCode::INSUFFICIENT_STORAGE,
-            "resource_exhausted",
-            scope.exceeded_message(),
-        )),
+        Ok(Some(denial)) => {
+            let refusal = denial.refusal();
+            refusal.record();
+            Err(connect_error(
+                refusal.status(),
+                "resource_exhausted",
+                &refusal.message,
+            ))
+        }
         Err(e) => {
             tracing::error!("storage quota check failed: {e}");
             Err(connect_error(
@@ -2099,11 +2105,16 @@ mod tests {
     /// #4422: a quota decision maps to the Connect error an upload answers.
     #[test]
     fn connect_quota_decision_maps_scopes_4422() {
-        use crate::services::repository_service::QuotaScope;
+        use crate::services::repository_service::{QuotaDenial, QuotaScope};
         assert!(connect_quota_decision(Ok(None)).is_ok());
-        for scope in [QuotaScope::Repository, QuotaScope::Project] {
-            let resp = connect_quota_decision(Ok(Some(scope))).unwrap_err();
-            assert_eq!(resp.status(), StatusCode::INSUFFICIENT_STORAGE);
+        for scope in [
+            QuotaScope::Repository,
+            QuotaScope::Project,
+            QuotaScope::Instance,
+        ] {
+            let resp =
+                connect_quota_decision(Ok(Some(QuotaDenial::new(scope, 10, 10)))).unwrap_err();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         }
         let resp =
             connect_quota_decision(Err(crate::error::AppError::Database("x".into()))).unwrap_err();
@@ -3377,13 +3388,15 @@ mod catalog_registration_tests {
         fx.teardown().await;
 
         let resp: serde_json::Value = serde_json::from_slice(&resp).expect("connect error json");
-        assert_eq!(
-            status,
-            axum::http::StatusCode::INSUFFICIENT_STORAGE,
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{resp}");
+        assert_eq!(resp["code"], "resource_exhausted", "{resp}");
+        assert!(
+            resp["message"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("Repository storage quota exceeded"),
             "{resp}"
         );
-        assert_eq!(resp["code"], "resource_exhausted", "{resp}");
-        assert_eq!(resp["message"], "Repository storage quota exceeded");
         assert_eq!(rows, 0);
     }
 }

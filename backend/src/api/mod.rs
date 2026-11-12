@@ -261,6 +261,16 @@ pub struct AppState {
     /// refreshed with the written value on write, closed when unreadable. Every consumer of "is anonymous access allowed"
     /// asks this instead of `config.guest_access_enabled`.
     pub guest_access_policy: Arc<crate::services::guest_access_policy::GuestAccessPolicy>,
+    /// This replica's view of the monthly download transfer counter
+    /// (`TRANSFER_QUOTA_BYTES`, see [`crate::services::quota`]).
+    pub transfer_meter: Arc<crate::services::quota::TransferMeter>,
+}
+
+/// The quota handles every `AppState` constructor installs: the process-wide
+/// storage-quota settings, and this state's transfer meter.
+fn build_quota_state(db: &PgPool, config: &Config) -> Arc<crate::services::quota::TransferMeter> {
+    crate::services::quota::storage::install(&config.quotas);
+    crate::services::quota::TransferMeter::new(db.clone(), &config.quotas)
 }
 
 /// Build an auth-concurrency semaphore from a config value, or `None` when
@@ -311,6 +321,7 @@ impl AppState {
         let npm_packument_cache = NpmPackumentCache::from_config(&config);
         let npm_attestation_cache = NpmAttestationCache::from_config(&config);
         let guest_access_policy = build_guest_access_policy(&db, &config);
+        let transfer_meter = build_quota_state(&db, &config);
         Self {
             config,
             db,
@@ -340,6 +351,7 @@ impl AppState {
             rpm_repodata_cache: Arc::new(RpmRepodataCache::new()),
             auth_semaphore,
             guest_access_policy,
+            transfer_meter,
         }
     }
 
@@ -363,6 +375,7 @@ impl AppState {
         let npm_packument_cache = NpmPackumentCache::from_config(&config);
         let npm_attestation_cache = NpmAttestationCache::from_config(&config);
         let guest_access_policy = build_guest_access_policy(&db, &config);
+        let transfer_meter = build_quota_state(&db, &config);
         Self {
             config,
             db,
@@ -392,6 +405,7 @@ impl AppState {
             rpm_repodata_cache: Arc::new(RpmRepodataCache::new()),
             auth_semaphore,
             guest_access_policy,
+            transfer_meter,
         }
     }
 

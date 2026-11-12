@@ -808,12 +808,12 @@ impl ArtifactService {
         crate::services::rpm_layout::validate_upload(&self.db, repository_id, path).await?;
         // Check quota (repository quota and, if any, its project's aggregate
         // quota, #2474).
-        if let Some(scope) = self
+        if let Some(denial) = self
             .repo_service
             .quota_preflight(repository_id, size_bytes)
             .await?
         {
-            return Err(scope.into_error());
+            return Err(denial.into_error());
         }
 
         // Both immutability checks live in `enforce_path_immutability` so the
@@ -906,10 +906,10 @@ impl ArtifactService {
             .repo_service
             .check_quota_locked(&mut tx, repository_id, path, size_bytes)
             .await?;
-        if let Some(scope) = admission.denied_by {
+        if let Some(denial) = admission.denied_by {
             // Drop `tx` (rolls back). The content blob is content-addressed;
             // if this upload orphaned it, storage GC reclaims it.
-            return Err(scope.into_error());
+            return Err(denial.into_error());
         }
 
         // Create artifact record.
@@ -5583,8 +5583,8 @@ mod tests {
             .find_map(|r| r.err())
             .expect("exactly one upload must be rejected");
         assert!(
-            matches!(rejected, AppError::QuotaExceeded(_)),
-            "the rejected upload must fail with QuotaExceeded, got {rejected:?}"
+            matches!(&rejected, AppError::QuotaRefused(r) if r.scope == Some("repository")),
+            "the rejected upload must fail with a repository quota refusal, got {rejected:?}"
         );
 
         tdh::cleanup(&pool, repo_id, user_id).await;
