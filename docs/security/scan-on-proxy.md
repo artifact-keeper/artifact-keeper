@@ -305,7 +305,7 @@ An administrator grants the role to a user or a group with
 `DELETE` on the same path, and lists the holders with `GET /api/v1/admin/security-reviewers`.
 A group grant covers every member, and for a group synced from SSO the identity provider
 decides who that is (membership refreshes at each member's login). Service accounts never
-hold the capability, and only an administrator can add members to a group that carries it.
+hold the capability, and only an administrator can add members to, or rename, a group that carries it.
 The grant gives no repository access: a reviewer sees the repository key on each queue row
 and nothing else of a private repository.
 
