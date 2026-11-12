@@ -24,6 +24,19 @@ fn block_unscanned_violated(block_unscanned: bool, scan_state: ScanState) -> boo
     block_unscanned && scan_state.is_unscanned()
 }
 
+/// Whether the `block_uncataloged` gate fires (#4994): the policy sets it and
+/// some scanner's latest completed scan cataloged nothing
+/// ([`crate::services::scan_state::ANY_LATEST_UNCATALOGED_SQL`]).
+pub(crate) fn block_uncataloged_violated(block_uncataloged: bool, uncataloged: bool) -> bool {
+    block_uncataloged && uncataloged
+}
+
+/// The reason `block_uncataloged` gives, shared by the download and promotion
+/// gates.
+pub(crate) const UNCATALOGED_VIOLATION: &str =
+    "no scanner could catalog the artifact (scan_completeness not_cataloged), \
+     so its zero findings mean nothing was assessed";
+
 /// Which post-scan gates apply to an artifact, derived from its `scan_results`
 /// rows.
 #[derive(Debug, PartialEq, Eq)]
@@ -838,7 +851,7 @@ impl PolicyService {
         sqlx::query_as(
             r#"
             SELECT id, name, repository_id, max_severity, block_unscanned,
-                   block_on_fail, is_enabled, min_staging_hours, max_artifact_age_days,
+                   block_on_fail, block_uncataloged, is_enabled, min_staging_hours, max_artifact_age_days,
                    require_signature, predicates, created_at, updated_at
             FROM scan_policies
             WHERE is_enabled = true
@@ -1091,6 +1104,13 @@ impl PolicyService {
                 .map_err(|e| AppError::Database(e.to_string()))?;
         let scan_state = crate::services::scan_state::classify_scan_state(&scan_state_rows);
 
+        // #4994: read only when some applicable policy sets `block_uncataloged`.
+        let uncataloged = if policies.iter().any(|p| p.block_uncataloged) {
+            crate::services::scan_state::any_latest_uncataloged(&self.db, artifact_id).await?
+        } else {
+            false
+        };
+
         // The policies whose scan gates did not already short-circuit this
         // artifact. Only those get their predicate blocks evaluated, which
         // preserves the pre-existing ordering: a `continue` below used to skip
@@ -1111,6 +1131,15 @@ impl PolicyService {
             // Check: block_on_fail
             if policy.block_on_fail && gates.block_on_fail_applies {
                 violations.push(format!("Policy '{}': latest scan failed", policy.name));
+                continue;
+            }
+
+            // Check: block_uncataloged (#4994)
+            if block_uncataloged_violated(policy.block_uncataloged, uncataloged) {
+                violations.push(format!(
+                    "Policy '{}': {}",
+                    policy.name, UNCATALOGED_VIOLATION
+                ));
                 continue;
             }
 
@@ -1384,6 +1413,36 @@ impl PolicyService {
         require_signature: bool,
         predicates: Option<PolicyPredicates>,
     ) -> Result<ScanPolicy> {
+        self.create_policy_with_uncataloged(
+            name,
+            repository_id,
+            max_severity,
+            block_unscanned,
+            block_on_fail,
+            false,
+            min_staging_hours,
+            max_artifact_age_days,
+            require_signature,
+            predicates,
+        )
+        .await
+    }
+
+    /// [`Self::create_policy`] with `block_uncataloged` (#4994).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_policy_with_uncataloged(
+        &self,
+        name: &str,
+        repository_id: Option<Uuid>,
+        max_severity: &str,
+        block_unscanned: bool,
+        block_on_fail: bool,
+        block_uncataloged: bool,
+        min_staging_hours: Option<i32>,
+        max_artifact_age_days: Option<i32>,
+        require_signature: bool,
+        predicates: Option<PolicyPredicates>,
+    ) -> Result<ScanPolicy> {
         // #2320: validate inputs up front so a bad request comes back as a
         // 4xx instead of tripping the DB CHECK / FK constraint and surfacing
         // as an opaque 500 DATABASE_ERROR.
@@ -1403,10 +1462,11 @@ impl PolicyService {
         let policy: ScanPolicy = sqlx::query_as(
             r#"
             INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, block_on_fail,
-                                       min_staging_hours, max_artifact_age_days, require_signature, predicates)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                                       min_staging_hours, max_artifact_age_days, require_signature, predicates,
+                                       block_uncataloged)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING id, name, repository_id, max_severity, block_unscanned,
-                      block_on_fail, is_enabled, min_staging_hours, max_artifact_age_days,
+                      block_on_fail, block_uncataloged, is_enabled, min_staging_hours, max_artifact_age_days,
                       require_signature, predicates, created_at, updated_at
             "#,
         )
@@ -1419,6 +1479,7 @@ impl PolicyService {
         .bind(max_artifact_age_days)
         .bind(require_signature)
         .bind(&predicates)
+        .bind(block_uncataloged)
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1430,7 +1491,7 @@ impl PolicyService {
         let policies: Vec<ScanPolicy> = sqlx::query_as(
             r#"
             SELECT id, name, repository_id, max_severity, block_unscanned,
-                   block_on_fail, is_enabled, min_staging_hours, max_artifact_age_days,
+                   block_on_fail, block_uncataloged, is_enabled, min_staging_hours, max_artifact_age_days,
                    require_signature, predicates, created_at, updated_at
             FROM scan_policies
             ORDER BY created_at DESC
@@ -1447,7 +1508,7 @@ impl PolicyService {
         sqlx::query_as::<_, ScanPolicy>(
             r#"
             SELECT id, name, repository_id, max_severity, block_unscanned,
-                   block_on_fail, is_enabled, min_staging_hours, max_artifact_age_days,
+                   block_on_fail, block_uncataloged, is_enabled, min_staging_hours, max_artifact_age_days,
                    require_signature, predicates, created_at, updated_at
             FROM scan_policies
             WHERE id = $1
@@ -1477,6 +1538,39 @@ impl PolicyService {
         max_severity: Option<&str>,
         block_unscanned: Option<bool>,
         block_on_fail: Option<bool>,
+        is_enabled: Option<bool>,
+        min_staging_hours: Option<i32>,
+        max_artifact_age_days: Option<i32>,
+        require_signature: Option<bool>,
+        predicates: Option<PolicyPredicates>,
+    ) -> Result<ScanPolicy> {
+        self.update_policy_with_uncataloged(
+            id,
+            name,
+            max_severity,
+            block_unscanned,
+            block_on_fail,
+            None,
+            is_enabled,
+            min_staging_hours,
+            max_artifact_age_days,
+            require_signature,
+            predicates,
+        )
+        .await
+    }
+
+    /// [`Self::update_policy`] with `block_uncataloged` (#4994); `None`
+    /// leaves it as it is.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_policy_with_uncataloged(
+        &self,
+        id: Uuid,
+        name: Option<&str>,
+        max_severity: Option<&str>,
+        block_unscanned: Option<bool>,
+        block_on_fail: Option<bool>,
+        block_uncataloged: Option<bool>,
         is_enabled: Option<bool>,
         min_staging_hours: Option<i32>,
         max_artifact_age_days: Option<i32>,
@@ -1520,10 +1614,11 @@ impl PolicyService {
                 max_artifact_age_days = COALESCE($8, max_artifact_age_days),
                 require_signature = COALESCE($9, require_signature),
                 predicates = COALESCE($10, predicates),
+                block_uncataloged = COALESCE($11, block_uncataloged),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING id, name, repository_id, max_severity, block_unscanned,
-                      block_on_fail, is_enabled, min_staging_hours, max_artifact_age_days,
+                      block_on_fail, block_uncataloged, is_enabled, min_staging_hours, max_artifact_age_days,
                       require_signature, predicates, created_at, updated_at
             "#,
         )
@@ -1537,6 +1632,7 @@ impl PolicyService {
         .bind(max_artifact_age_days)
         .bind(require_signature)
         .bind(&predicates)
+        .bind(block_uncataloged)
         .fetch_optional(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
@@ -2382,6 +2478,7 @@ mod tests {
             max_severity: "critical".to_string(),
             block_unscanned: true,
             block_on_fail: true,
+            block_uncataloged: false,
             is_enabled: true,
             min_staging_hours: Some(24),
             max_artifact_age_days: Some(365),
@@ -2408,6 +2505,7 @@ mod tests {
             max_severity: "high".to_string(),
             block_unscanned: false,
             block_on_fail: false,
+            block_uncataloged: false,
             is_enabled: true,
             min_staging_hours: None,
             max_artifact_age_days: None,
@@ -2429,6 +2527,7 @@ mod tests {
             max_severity: "medium".to_string(),
             block_unscanned: true,
             block_on_fail: false,
+            block_uncataloged: false,
             is_enabled: true,
             min_staging_hours: Some(48),
             max_artifact_age_days: None,

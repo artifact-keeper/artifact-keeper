@@ -274,6 +274,151 @@ impl GradeStatus {
     }
 }
 
+/// The weakest repository [`GradeStatus`] a quality gate's score thresholds or
+/// a promotion rule's `min_health_score` accept (#4994).
+///
+/// A repository whose scans failed or cataloged nothing keeps a numeric score
+/// of 100, so a threshold on the score alone passes it. The gate and the rule
+/// therefore also read the repository's grade status and fail closed on
+/// `incomplete` and `unrated` unless they were relaxed:
+///
+/// * `rated` (the default): only a fully assessed repository passes.
+/// * `incomplete`: a `rated` or `incomplete` repository passes; an `unrated`
+///   one (nothing assessed, including no scans at all) does not.
+/// * `any`: the status is not checked and the score alone decides, as before
+///   1.12.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceptedGradeStatus {
+    #[default]
+    Rated,
+    Incomplete,
+    Any,
+}
+
+impl AcceptedGradeStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AcceptedGradeStatus::Rated => "rated",
+            AcceptedGradeStatus::Incomplete => "incomplete",
+            AcceptedGradeStatus::Any => "any",
+        }
+    }
+
+    /// Read the stored value. Anything unexpected reads as the strict
+    /// default, so a bad value can only make a gate stricter.
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "incomplete" => AcceptedGradeStatus::Incomplete,
+            "any" => AcceptedGradeStatus::Any,
+            _ => AcceptedGradeStatus::Rated,
+        }
+    }
+
+    /// Whether a repository in `status` passes.
+    pub fn accepts(self, status: GradeStatus) -> bool {
+        match self {
+            AcceptedGradeStatus::Rated => status == GradeStatus::Rated,
+            AcceptedGradeStatus::Incomplete => status != GradeStatus::Unrated,
+            AcceptedGradeStatus::Any => true,
+        }
+    }
+
+    /// The statuses that pass, for violation messages.
+    pub fn expected(self) -> &'static str {
+        match self {
+            AcceptedGradeStatus::Rated => "rated",
+            AcceptedGradeStatus::Incomplete => "rated or incomplete",
+            AcceptedGradeStatus::Any => "any",
+        }
+    }
+}
+
+/// A repository's grade status and coverage, as the gates read them (#4994).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepoGradeState {
+    pub status: GradeStatus,
+    /// `None` when the repository has no score yet or a 1.11 replica wrote it.
+    pub coverage: Option<ScoreCoverage>,
+}
+
+impl RepoGradeState {
+    /// The state of a repository from its score row; no row is `unrated`
+    /// (nothing was ever assessed).
+    pub fn of(score: Option<&RepoSecurityScore>) -> Self {
+        match score {
+            Some(s) => Self {
+                status: s.status(),
+                coverage: s.coverage(),
+            },
+            None => Self {
+                status: GradeStatus::Unrated,
+                coverage: None,
+            },
+        }
+    }
+
+    /// Why the status falls short of `accepted`, or `None` when it passes.
+    pub fn violation(&self, accepted: AcceptedGradeStatus) -> Option<String> {
+        if accepted.accepts(self.status) {
+            return None;
+        }
+        let detail = match self.coverage {
+            Some(c) => format!(
+                " ({} of {} scanned artifacts assessed: {} failed, {} could not be cataloged, \
+                 {} assessed only in part)",
+                c.cataloged, c.scanned, c.failed, c.uncataloged, c.partial
+            ),
+            None if self.status == GradeStatus::Unrated => {
+                " (nothing in the repository has been assessed)".to_string()
+            }
+            None => String::new(),
+        };
+        Some(format!(
+            "Repository grade status is {}{detail}; this check accepts {}. \
+             GET /api/v1/repositories/{{key}}/security/coverage/artifacts lists the artifacts",
+            self.status.as_str(),
+            accepted.expected()
+        ))
+    }
+}
+
+/// What a repository does with an artifact no scanner could catalog (#4994),
+/// `repositories.uncataloged_policy`.
+///
+/// * `fail` (the default, the behaviour since #4036): the artifact counts
+///   against the grade status (`incomplete`, or `unrated` when nothing else
+///   was assessed).
+/// * `warn`: it is still reported (`coverage.uncataloged`,
+///   `has_uncataloged_scan`, the coverage listing) but counts as assessed for
+///   the grade status, so a generic repository of plain archives can be
+///   `rated`. There is deliberately no `ignore`: an uncataloged artifact is
+///   never silently clean (#4036).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UncatalogedPolicy {
+    #[default]
+    Fail,
+    Warn,
+}
+
+impl UncatalogedPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UncatalogedPolicy::Fail => "fail",
+            UncatalogedPolicy::Warn => "warn",
+        }
+    }
+
+    /// Read the stored value; anything unexpected reads as `fail`.
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "warn" => UncatalogedPolicy::Warn,
+            _ => UncatalogedPolicy::Fail,
+        }
+    }
+}
+
 /// How many of a repository's artifacts were assessed (#4336), by the
 /// latest scan of each scanner for each live artifact.
 ///
@@ -302,6 +447,21 @@ impl ScoreCoverage {
             GradeStatus::Incomplete
         } else {
             GradeStatus::Rated
+        }
+    }
+
+    /// The status under a repository's [`UncatalogedPolicy`] (#4994): under
+    /// `warn` an uncataloged artifact counts as assessed. The counts
+    /// themselves are unchanged, so the coverage still reports it.
+    pub fn grade_status_under(&self, policy: UncatalogedPolicy) -> GradeStatus {
+        match policy {
+            UncatalogedPolicy::Fail => self.grade_status(),
+            UncatalogedPolicy::Warn => ScoreCoverage {
+                cataloged: self.cataloged + self.uncataloged,
+                uncataloged: 0,
+                ..*self
+            }
+            .grade_status(),
         }
     }
 
@@ -608,6 +768,10 @@ pub struct ScanPolicy {
     pub max_severity: String,
     pub block_unscanned: bool,
     pub block_on_fail: bool,
+    /// Refuse an artifact whose latest completed scan of some scanner
+    /// cataloged nothing (`scan_completeness = 'not_cataloged'`, #4036): its
+    /// zero findings mean nothing was assessed (#4994, migration 361).
+    pub block_uncataloged: bool,
     pub is_enabled: bool,
     pub min_staging_hours: Option<i32>,
     pub max_artifact_age_days: Option<i32>,
@@ -1470,6 +1634,105 @@ mod tests {
             assert_eq!(status, GradeStatus::Unrated, "{s}");
             assert!(reason.is_some(), "{s}");
         }
+    }
+
+    #[test]
+    fn accepted_grade_status_accepts_4994() {
+        use AcceptedGradeStatus::*;
+        use GradeStatus::{Incomplete as I, Rated as R, Unrated as U};
+        let table = [
+            (Rated, [true, false, false]),
+            (Incomplete, [true, true, false]),
+            (Any, [true, true, true]),
+        ];
+        for (accepted, expect) in table {
+            assert_eq!(
+                [R, I, U].map(|s| accepted.accepts(s)),
+                expect,
+                "{accepted:?}"
+            );
+            assert_eq!(AcceptedGradeStatus::from_db(accepted.as_str()), accepted);
+        }
+        assert_eq!(
+            AcceptedGradeStatus::default(),
+            Rated,
+            "fail closed by default"
+        );
+        assert_eq!(AcceptedGradeStatus::from_db("bogus"), Rated);
+        assert_eq!(
+            serde_json::to_value(Incomplete).unwrap(),
+            serde_json::json!("incomplete")
+        );
+        assert!(
+            serde_json::from_value::<AcceptedGradeStatus>(serde_json::json!("ignore")).is_err()
+        );
+    }
+
+    #[test]
+    fn repo_grade_state_violation_names_the_counts_4994() {
+        let state = RepoGradeState {
+            status: GradeStatus::Incomplete,
+            coverage: Some(coverage(3, 1, 2, 1)),
+        };
+        let msg = state
+            .violation(AcceptedGradeStatus::Rated)
+            .expect("refused");
+        assert!(msg.contains("grade status is incomplete"), "{msg}");
+        assert!(
+            msg.contains("2 failed, 1 could not be cataloged, 1 assessed only in part"),
+            "{msg}"
+        );
+        assert!(msg.contains("accepts rated"), "{msg}");
+        assert!(state.violation(AcceptedGradeStatus::Incomplete).is_none());
+
+        let none = RepoGradeState::of(None);
+        assert_eq!(none.status, GradeStatus::Unrated);
+        let msg = none
+            .violation(AcceptedGradeStatus::Incomplete)
+            .expect("refused");
+        assert!(
+            msg.contains("nothing in the repository has been assessed"),
+            "{msg}"
+        );
+        assert!(none.violation(AcceptedGradeStatus::Any).is_none());
+    }
+
+    #[test]
+    fn uncataloged_warn_counts_as_assessed_4994() {
+        let only_archives = coverage(0, 0, 0, 2);
+        assert_eq!(
+            only_archives.grade_status_under(UncatalogedPolicy::Fail),
+            GradeStatus::Unrated
+        );
+        assert_eq!(
+            only_archives.grade_status_under(UncatalogedPolicy::Warn),
+            GradeStatus::Rated
+        );
+        let mixed = coverage(1, 0, 0, 1);
+        assert_eq!(
+            mixed.grade_status_under(UncatalogedPolicy::Fail),
+            GradeStatus::Incomplete
+        );
+        assert_eq!(
+            mixed.grade_status_under(UncatalogedPolicy::Warn),
+            GradeStatus::Rated
+        );
+        // warn relaxes only the uncataloged artifacts.
+        assert_eq!(
+            coverage(1, 0, 1, 1).grade_status_under(UncatalogedPolicy::Warn),
+            GradeStatus::Incomplete
+        );
+        assert_eq!(
+            coverage(2, 1, 0, 1).grade_status_under(UncatalogedPolicy::Warn),
+            GradeStatus::Incomplete
+        );
+        assert_eq!(UncatalogedPolicy::default(), UncatalogedPolicy::Fail);
+        assert_eq!(UncatalogedPolicy::from_db("warn"), UncatalogedPolicy::Warn);
+        assert_eq!(
+            UncatalogedPolicy::from_db("ignore"),
+            UncatalogedPolicy::Fail
+        );
+        assert!(serde_json::from_value::<UncatalogedPolicy>(serde_json::json!("ignore")).is_err());
     }
 
     #[test]
