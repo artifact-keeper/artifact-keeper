@@ -250,6 +250,172 @@ async fn a_lapsed_hold_becomes_visible_without_a_write_4173() {
     );
 }
 
+/// #5432: migration 343 reopens a completed backfill, including its saved
+/// cursor, so an existing shard is actually re-encoded without `fn`.
+#[tokio::test]
+async fn reset_backfill_reencodes_a_stored_legacy_shard_5432() {
+    // The migration updates every channel, so it must never run against the
+    // database shared by the other tests in this process.
+    let Some(db) = crate::testing::try_isolated_pool().await else {
+        return;
+    };
+    let pool = db.pool.clone();
+    let (user_id, username) = tdh::create_user(&pool).await;
+    let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", "conda").await;
+    tdh::grant_repo_access(&pool, repo_id, user_id).await;
+    let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+    let fx = tdh::Fixture {
+        pool,
+        user_id,
+        username,
+        repo_id,
+        repo_key,
+        storage_dir,
+        state,
+    };
+    let filename = upload(&fx, "noarch", "fn-compat", "1.0").await;
+    assert_eq!(dirty_count(&fx).await, 0);
+    let original_hash = index_rows(&fx, "noarch").await["fn-compat"]
+        .0
+        .clone()
+        .unwrap();
+    let original = shard_store::stored_shard(&fx.pool, fx.repo_id, "noarch", &original_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    let (status, repodata, _) = get(&fx, "noarch/repodata.json").await;
+    assert_eq!(status, StatusCode::OK);
+    let repodata: serde_json::Value = serde_json::from_slice(&repodata).unwrap();
+
+    // Use the real wire serializer for the record's binary digests and
+    // metadata, then restore just the redundant field an older writer used.
+    #[derive(serde::Serialize)]
+    struct LegacyRecord<'a> {
+        #[serde(flatten)]
+        record: super::ShardRecord<'a>,
+        #[serde(rename = "fn")]
+        filename: &'a str,
+    }
+    #[derive(serde::Serialize)]
+    struct LegacyShard<'a> {
+        packages: BTreeMap<&'a str, LegacyRecord<'a>>,
+        #[serde(rename = "packages.conda")]
+        packages_conda: BTreeMap<&'a str, LegacyRecord<'a>>,
+        removed: Vec<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct DecodedShard {
+        packages: BTreeMap<String, BTreeMap<String, serde::de::IgnoredAny>>,
+    }
+    let legacy = super::serialize_msgpack_zst(&LegacyShard {
+        packages: BTreeMap::from([(
+            filename.as_str(),
+            LegacyRecord {
+                record: super::ShardRecord(repodata["packages"][&filename].as_object().unwrap()),
+                filename: &filename,
+            },
+        )]),
+        packages_conda: BTreeMap::new(),
+        removed: Vec::new(),
+    })
+    .unwrap();
+    let legacy_hash = super::shard_address(&legacy).to_vec();
+    let changed = sqlx::query(
+        "UPDATE conda_shard_index SET shard = $2, shard_hash = $3 \
+          WHERE repository_id = $1 AND subdir = 'noarch' AND package_name = 'fn-compat'",
+    )
+    .bind(fx.repo_id)
+    .bind(&legacy)
+    .bind(&legacy_hash)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+    sqlx::query(
+        "INSERT INTO conda_channel_state (repository_id, backfill_cursor, backfill_done_at) \
+         VALUES ($1, 'zzzz', NOW()) ON CONFLICT (repository_id) DO UPDATE \
+         SET backfill_cursor = 'zzzz', backfill_done_at = NOW()",
+    )
+    .bind(fx.repo_id)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+
+    // A completed backfill leaves the legacy bytes untouched. Read the
+    // stored body directly: the per-request fallback must not hide this bug.
+    assert_eq!(
+        shard_store::backfill_batch(&fx.pool, fx.repo_id)
+            .await
+            .unwrap(),
+        Some(true)
+    );
+    let stored = shard_store::stored_shard(&fx.pool, fx.repo_id, "noarch", &legacy_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored, legacy);
+    let decoded: DecodedShard =
+        rmp_serde::from_slice(&zstd::decode_all(&stored[..]).unwrap()).unwrap();
+    assert!(decoded.packages[&filename].contains_key("fn"));
+
+    let mut tx = fx.pool.begin().await.unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(include_str!(
+        "../../../../migrations/343_conda_shard_filename_compat.sql"
+    )))
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let reset: (Option<String>, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+        "SELECT backfill_cursor, backfill_done_at FROM conda_channel_state WHERE repository_id = $1",
+    )
+    .bind(fx.repo_id)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(reset, (None, None));
+
+    assert_eq!(
+        shard_store::backfill_batch_sized(&fx.pool, fx.repo_id, 1)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    assert_eq!(
+        shard_store::backfill_batch_sized(&fx.pool, fx.repo_id, 1)
+            .await
+            .unwrap(),
+        Some(true)
+    );
+    let rebuilt_hash = index_rows(&fx, "noarch").await["fn-compat"]
+        .0
+        .clone()
+        .unwrap();
+    assert_ne!(rebuilt_hash, legacy_hash);
+    let rebuilt = shard_store::stored_shard(&fx.pool, fx.repo_id, "noarch", &rebuilt_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rebuilt, original,
+        "backfill must reproduce the current writer's complete shard"
+    );
+    let decoded: DecodedShard =
+        rmp_serde::from_slice(&zstd::decode_all(&rebuilt[..]).unwrap()).unwrap();
+    assert_eq!(decoded.packages.len(), 1);
+    let record = &decoded.packages[&filename];
+    assert!(!record.contains_key("fn"));
+    assert!(record.contains_key("sha256"));
+    assert!(record.contains_key("depends"));
+    assert_eq!(dirty_count(&fx).await, 0);
+    assert!(
+        shard_store::subdir_state(&fx.pool, fx.repo_id, "noarch")
+            .await
+            .unwrap()
+            .backfilled
+    );
+}
+
 /// #4173: a repository that held packages before the shard tables existed
 /// is backfilled in bounded batches that resume from a saved cursor; until
 /// it finishes its shard endpoints keep the per-request walk, and the stored
