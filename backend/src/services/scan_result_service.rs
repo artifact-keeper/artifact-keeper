@@ -290,6 +290,21 @@ pub(crate) struct ProxyBlockCandidate {
     pub proxy_scan_action: String,
     pub block_on_policy_violation: bool,
     pub severity_threshold: String,
+    /// The repository's numeric threshold and the verdict's CVSS summary
+    /// (#5263), so the count grades a verdict as the gate does.
+    pub cvss_threshold: Option<f64>,
+    pub max_cvss_score: Option<f64>,
+    pub max_unscored_severity: Option<String>,
+}
+
+impl ProxyBlockCandidate {
+    fn grade(&self) -> crate::services::proxy_scan_service::VerdictGrade {
+        crate::services::proxy_scan_service::VerdictGrade::from_stored(
+            self.max_severity.as_deref(),
+            self.max_cvss_score,
+            self.max_unscored_severity.as_deref(),
+        )
+    }
 }
 
 /// Count the distinct digests that at least one repository's proxy scan gate
@@ -309,7 +324,8 @@ pub(crate) fn count_blocked_proxy_digests(rows: &[ProxyBlockCandidate]) -> i64 {
                 r.block_on_policy_violation,
                 &r.severity_threshold,
                 &r.proxy_scan_action,
-                r.max_severity.as_deref(),
+                r.cvss_threshold,
+                r.grade(),
             )
         })
         .map(|r| r.checksum_sha256.as_str())
@@ -319,25 +335,31 @@ pub(crate) fn count_blocked_proxy_digests(rows: &[ProxyBlockCandidate]) -> i64 {
 
 /// Whether a repository's proxy scan gate refuses a stored `vulnerable`
 /// verdict: the format's proxy path runs the gate (#4582), and the
-/// repository's severity gate blocks the verdict's highest severity
-/// (record-only never does, a verdict below an opted-in threshold serves).
+/// repository's severity gate blocks the verdict's grade (record-only never
+/// does, a verdict below an opted-in severity or CVSS threshold serves).
 /// The one predicate the dashboard count and the blocked listings share
 /// (#4380, #4510, #4777), so they cannot disagree with each other or with the
 /// gate.
+///
+/// `grade` is the verdict row's `max_severity` and CVSS summary
+/// ([`VerdictGrade::from_stored`](crate::services::proxy_scan_service::VerdictGrade::from_stored)),
+/// `cvss_threshold` the repository's numeric threshold (#5263).
 pub(crate) fn proxy_gate_refuses(
     format: &str,
     block_on_policy_violation: bool,
     severity_threshold: &str,
     proxy_scan_action: &str,
-    max_severity: Option<&str>,
+    cvss_threshold: Option<f64>,
+    grade: crate::services::proxy_scan_service::VerdictGrade,
 ) -> bool {
     crate::formats::format_key_enforces_scan_on_proxy(format)
         && crate::services::scan_config_service::proxy_severity_gate_for_row(
             block_on_policy_violation,
             severity_threshold,
             proxy_scan_action,
+            cvss_threshold,
         )
-        .blocks(max_severity.and_then(Severity::from_str_loose))
+        .blocks_grade(grade)
 }
 
 /// Whether a repository's proxy scan gate would refuse a stored `vulnerable`
@@ -350,14 +372,16 @@ pub(crate) fn proxy_gate_would_refuse(
     format: &str,
     block_on_policy_violation: bool,
     severity_threshold: &str,
-    max_severity: Option<&str>,
+    cvss_threshold: Option<f64>,
+    grade: crate::services::proxy_scan_service::VerdictGrade,
 ) -> bool {
     proxy_gate_refuses(
         format,
         block_on_policy_violation,
         severity_threshold,
         crate::services::proxy_scan_service::ProxyScanAction::FailClosed.as_db_str(),
-        max_severity,
+        cvss_threshold,
+        grade,
     )
 }
 
@@ -372,7 +396,8 @@ pub(crate) fn count_would_block_proxy_digests(rows: &[ProxyBlockCandidate]) -> i
                 &r.format,
                 r.block_on_policy_violation,
                 &r.severity_threshold,
-                r.max_severity.as_deref(),
+                r.cvss_threshold,
+                r.grade(),
             )
         })
         .map(|r| r.checksum_sha256.as_str())
@@ -434,6 +459,22 @@ pub struct ProxyBlockedEntry {
     pub block_on_policy_violation: bool,
     pub severity_threshold: String,
     pub proxy_scan_action: String,
+    /// The repository's numeric CVSS threshold, and the verdict's CVSS
+    /// summary it is compared with (#5263).
+    pub cvss_threshold: Option<f64>,
+    pub max_cvss_score: Option<f64>,
+    pub max_unscored_severity: Option<String>,
+}
+
+impl ProxyBlockedEntry {
+    /// What the gate grades this entry's verdict on (#5263).
+    pub fn grade(&self) -> crate::services::proxy_scan_service::VerdictGrade {
+        crate::services::proxy_scan_service::VerdictGrade::from_stored(
+            self.max_severity.as_deref(),
+            self.max_cvss_score,
+            self.max_unscored_severity.as_deref(),
+        )
+    }
 }
 
 /// Where a keyset-paged blocked-proxy listing resumes (#4987): the
@@ -3568,7 +3609,8 @@ impl ScanResultService {
             SELECT DISTINCT psr.checksum_sha256, r.format::text AS format,
                    psr.max_severity,
                    sc.proxy_scan_action, sc.block_on_policy_violation,
-                   sc.severity_threshold
+                   sc.severity_threshold, sc.cvss_threshold,
+                   psr.max_cvss_score, psr.max_unscored_severity
             FROM scan_configs sc
             JOIN repositories r ON r.id = sc.repository_id
             JOIN LATERAL (
@@ -3648,7 +3690,8 @@ impl ScanResultService {
                 r.block_on_policy_violation,
                 &r.severity_threshold,
                 &r.proxy_scan_action,
-                r.max_severity.as_deref(),
+                r.cvss_threshold,
+                r.grade(),
             )
         });
         Ok(rows)
@@ -3688,7 +3731,8 @@ impl ScanResultService {
                     entry.block_on_policy_violation,
                     &entry.severity_threshold,
                     &entry.proxy_scan_action,
-                    entry.max_severity.as_deref(),
+                    entry.cvss_threshold,
+                    entry.grade(),
                 ) {
                     page.entries.push(entry);
                     if page.entries.len() >= limit {
@@ -3722,7 +3766,8 @@ impl ScanResultService {
                 &r.repository_format,
                 r.block_on_policy_violation,
                 &r.severity_threshold,
-                r.max_severity.as_deref(),
+                r.cvss_threshold,
+                r.grade(),
             )
         });
         Ok(rows)
@@ -3811,7 +3856,8 @@ impl ScanResultService {
                    psr.findings_count, psr.critical_count, psr.high_count,
                    psr.medium_count, psr.low_count, psr.scanned_at,
                    sc.block_on_policy_violation, sc.severity_threshold,
-                   sc.proxy_scan_action
+                   sc.proxy_scan_action, sc.cvss_threshold,
+                   psr.max_cvss_score, psr.max_unscored_severity
             FROM scan_configs sc
             JOIN repositories r ON r.id = sc.repository_id
             JOIN LATERAL (
@@ -4223,7 +4269,54 @@ mod tests {
             proxy_scan_action: action.to_string(),
             block_on_policy_violation,
             severity_threshold: threshold.to_string(),
+            cvss_threshold: None,
+            max_cvss_score: None,
+            max_unscored_severity: None,
         }
+    }
+
+    /// #5263: the count grades a verdict on its CVSS summary under a
+    /// repository's numeric threshold, as the gate does: the same digest is
+    /// blocked by the repository whose threshold it reaches and not by the
+    /// one whose threshold it is below, and a verdict with no summary counts
+    /// as blocked under a numeric threshold.
+    #[test]
+    fn test_count_blocked_proxy_digests_follows_a_cvss_threshold() {
+        let candidate =
+            |digest: &str, threshold: Option<f64>, score: Option<f64>| ProxyBlockCandidate {
+                cvss_threshold: threshold,
+                max_cvss_score: score,
+                ..block_candidate(digest, Some("high"), "fail_open", true, "critical")
+            };
+        // Scored 7.5: below 8.0, at or above 7.0.
+        assert_eq!(
+            count_blocked_proxy_digests(&[candidate("a", Some(8.0), Some(7.5))]),
+            0
+        );
+        assert_eq!(
+            count_blocked_proxy_digests(&[
+                candidate("a", Some(8.0), Some(7.5)),
+                candidate("a", Some(7.0), Some(7.5)),
+            ]),
+            1
+        );
+        // No numeric threshold: the `critical` severity threshold serves a
+        // `high`, whatever its score.
+        assert_eq!(
+            count_blocked_proxy_digests(&[candidate("b", None, Some(9.8))]),
+            0
+        );
+        // No CVSS summary on the verdict: not known to be below the number.
+        assert_eq!(
+            count_blocked_proxy_digests(&[candidate("c", Some(8.0), None)]),
+            1
+        );
+        // An unscored `high` is graded by the severity threshold (`critical`).
+        let unscored = ProxyBlockCandidate {
+            max_unscored_severity: Some("high".to_string()),
+            ..candidate("d", Some(8.0), None)
+        };
+        assert_eq!(count_blocked_proxy_digests(&[unscored]), 0);
     }
 
     /// #4380: the dashboard counts a proxied verdict as blocked exactly when
@@ -4275,16 +4368,26 @@ mod tests {
                         None,
                     ] {
                         let ctx = format!("{format} {block} {threshold} {severity:?}");
-                        let would = proxy_gate_would_refuse(format, block, threshold, severity);
+                        let grade = crate::services::proxy_scan_service::VerdictGrade::from_stored(
+                            severity, None, None,
+                        );
+                        let would = proxy_gate_would_refuse(format, block, threshold, None, grade);
                         for action in ["fail_open", "fail_closed"] {
                             assert_eq!(
                                 would,
-                                proxy_gate_refuses(format, block, threshold, action, severity),
+                                proxy_gate_refuses(format, block, threshold, action, None, grade),
                                 "{ctx}: an enforcing repository lists exactly the preview"
                             );
                         }
                         assert!(
-                            !proxy_gate_refuses(format, block, threshold, "record_only", severity),
+                            !proxy_gate_refuses(
+                                format,
+                                block,
+                                threshold,
+                                "record_only",
+                                None,
+                                grade
+                            ),
                             "{ctx}: record-only itself keeps refusing nothing"
                         );
 
@@ -4301,8 +4404,11 @@ mod tests {
                             max_severity: severity.map(str::to_string),
                             scanner_version: Some("v".to_string()),
                             scanned_at: now,
+                            max_cvss_score: None,
+                            max_unscored_severity: None,
                         };
-                        let gate = proxy_severity_gate_for_row(block, threshold, "fail_closed");
+                        let gate =
+                            proxy_severity_gate_for_row(block, threshold, "fail_closed", None);
                         let enforced = crate::formats::format_key_enforces_scan_on_proxy(format);
                         for action in [ProxyScanAction::FailOpen, ProxyScanAction::FailClosed] {
                             assert_eq!(
@@ -4667,6 +4773,7 @@ mod tests {
             source: Some("trivy".to_string()),
             source_url: Some("https://nvd.nist.gov/vuln/detail/CVE-2024-1234".to_string()),
             finding_class: crate::models::security::FindingClass::Vulnerability,
+            cvss: None,
         };
         assert_eq!(finding.severity, Severity::Critical);
         assert_eq!(finding.title, "CVE-2024-1234");
@@ -4685,6 +4792,7 @@ mod tests {
             source: None,
             source_url: None,
             finding_class: crate::models::security::FindingClass::Vulnerability,
+            cvss: None,
         };
         assert_eq!(finding.severity, Severity::Info);
         assert!(finding.description.is_none());
@@ -4706,6 +4814,7 @@ mod tests {
             source: Some("trivy".to_string()),
             source_url: None,
             finding_class: crate::models::security::FindingClass::Vulnerability,
+            cvss: None,
         }
     }
 
@@ -5489,6 +5598,7 @@ mod tests {
                     source: Some(scan_type.to_string()),
                     source_url: None,
                     finding_class: crate::models::security::FindingClass::Vulnerability,
+                    cvss: None,
                 })
                 .collect();
             svc.create_findings(scan.id, artifact_id, &raw)
@@ -5726,6 +5836,7 @@ mod tests {
                     source: Some("test".to_string()),
                     source_url: None,
                     finding_class: crate::models::security::FindingClass::Vulnerability,
+                    cvss: None,
                 }],
             )
             .await
@@ -5849,6 +5960,7 @@ mod tests {
                 source: Some("osv".to_string()),
                 source_url: None,
                 finding_class: class,
+                cvss: None,
             }
         }
 
@@ -8171,6 +8283,7 @@ mod tests {
                     source: Some("trivy".into()),
                     source_url: None,
                     finding_class: crate::models::security::FindingClass::Vulnerability,
+                    cvss: None,
                 })
                 .collect();
 

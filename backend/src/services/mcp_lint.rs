@@ -1795,6 +1795,7 @@ impl StoredFinding {
             source: self.source.clone(),
             source_url: None,
             finding_class: FindingClass::parse(&self.finding_class).unwrap_or(FindingClass::Policy),
+            cvss: None,
         }
     }
 }

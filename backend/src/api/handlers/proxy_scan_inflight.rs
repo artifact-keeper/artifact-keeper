@@ -518,6 +518,8 @@ mod tests {
             medium_count: 0,
             low_count: 0,
             max_severity: None,
+            max_cvss_score: None,
+            max_unscored_severity: None,
             scanner_version: None,
             packages: Vec::new(),
             scan_completeness: None,

@@ -28,7 +28,7 @@ use tracing::{debug, info};
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::models::security::{RawFinding, RawPackage, Severity};
+use crate::models::security::{CvssAssessment, CvssScore, RawFinding, RawPackage, Severity};
 use crate::models::user::User;
 use crate::services::auth_service::AuthService;
 use crate::services::scanner_service::{
@@ -83,16 +83,139 @@ pub struct GrypeVulnerability {
     pub fix: Option<GrypeFix>,
     #[serde(default)]
     pub urls: Option<Vec<String>>,
+    /// The CVSS assessments on the matched advisory record (#5263). Often
+    /// empty for a distro advisory, whose scores sit on the NVD record under
+    /// `relatedVulnerabilities` instead.
+    #[serde(default, deserialize_with = "deserialize_cvss_list")]
+    pub cvss: Vec<GrypeCvss>,
 }
 
-/// A cross-referenced vulnerability id Grype attaches to a primary match.
-/// We only care about the `id` (the alias identifier); the `namespace`
-/// field is captured for completeness but unused.
+/// A cross-referenced vulnerability Grype attaches to a primary match: the
+/// alias `id`, and the CVSS assessments that record carries (#5263). The
+/// `namespace` field is captured for completeness but unused.
 #[derive(Debug, Deserialize)]
 pub struct GrypeRelatedVulnerability {
     pub id: String,
     #[serde(default)]
     pub namespace: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_cvss_list")]
+    pub cvss: Vec<GrypeCvss>,
+}
+
+/// One CVSS assessment on a Grype advisory record (#5263), e.g.
+/// `{"source": "nvd@nist.gov", "type": "Primary", "version": "3.1",
+/// "vector": "CVSS:3.1/AV:N/...", "metrics": {"baseScore": 9.8, ...}}`.
+///
+/// Every field is optional: `source` and `type` are absent from older Grype
+/// releases and from some providers, and an entry with no readable
+/// `baseScore` is skipped, not an error.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GrypeCvss {
+    #[serde(default, deserialize_with = "deserialize_cvss_text")]
+    pub source: Option<String>,
+    /// `Primary` (the advisory database's own analysis) or `Secondary` (the
+    /// CNA's or vendor's).
+    #[serde(default, rename = "type", deserialize_with = "deserialize_cvss_text")]
+    pub assessment_type: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_cvss_text")]
+    pub version: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_cvss_text")]
+    pub vector: Option<String>,
+    #[serde(default)]
+    pub metrics: Option<GrypeCvssMetrics>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GrypeCvssMetrics {
+    #[serde(default, rename = "baseScore")]
+    pub base_score: Option<f64>,
+}
+
+/// Descriptive metadata cannot invalidate a usable base score.
+fn deserialize_cvss_text<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_str().map(str::to_owned))
+}
+
+/// Read a `cvss` array without ever failing the report it is nested in
+/// (#5263). Scores refine a verdict; they must not be able to turn a scan
+/// that completed into a parse failure, as one string-shaped license once did
+/// (see [`GrypeLicense`]). So `null`, a non-array and an entry of an
+/// unexpected shape all read as "no assessment" for that entry, and the
+/// finding is then graded as unscored.
+fn deserialize_cvss_list<'de, D>(deserializer: D) -> std::result::Result<Vec<GrypeCvss>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let serde_json::Value::Array(entries) = serde_json::Value::deserialize(deserializer)? else {
+        return Ok(Vec::new());
+    };
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| serde_json::from_value(entry).ok())
+        .collect())
+}
+
+impl GrypeCvss {
+    /// This entry as a graded assessment, with Grype's primary/secondary
+    /// mark for [`CvssAssessment::prefer`]. `None` when it has no base score
+    /// in `0.0..=10.0`.
+    fn assessment(&self) -> Option<(Option<bool>, CvssAssessment)> {
+        let score = CvssScore::from_f64(self.metrics.as_ref()?.base_score?)?;
+        let primary = self.assessment_type.as_deref().and_then(|t| {
+            match t.trim().to_ascii_lowercase().as_str() {
+                "primary" => Some(true),
+                "secondary" => Some(false),
+                _ => None,
+            }
+        });
+        // Descriptive text only. A NUL byte cannot be stored in a `TEXT`
+        // column and would fail the whole findings batch, so such a value is
+        // dropped; the score it describes is kept.
+        let text = |value: &Option<String>| {
+            value
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty() && !v.contains('\0'))
+                .map(str::to_string)
+        };
+        Some((
+            primary,
+            CvssAssessment {
+                score,
+                version: text(&self.version),
+                vector: text(&self.vector),
+                source: text(&self.source),
+            },
+        ))
+    }
+}
+
+/// The CVSS assessment a Grype match is graded by (#5263).
+///
+/// Which RECORD: the matched advisory record's own assessments when it has
+/// any, since that is the record Grype matched the package against;
+/// otherwise the assessments on its related records taken together (for a
+/// distro advisory, the NVD entry of the same CVE; for a GHSA with no score
+/// of its own, its CVE). Which ASSESSMENT within those: see
+/// [`CvssAssessment::prefer`]. `None` when no record carries a usable score.
+fn preferred_cvss(
+    vulnerability: &GrypeVulnerability,
+    related: &[GrypeRelatedVulnerability],
+) -> Option<CvssAssessment> {
+    CvssAssessment::prefer(vulnerability.cvss.iter().filter_map(GrypeCvss::assessment)).or_else(
+        || {
+            CvssAssessment::prefer(
+                related
+                    .iter()
+                    .flat_map(|r| r.cvss.iter())
+                    .filter_map(GrypeCvss::assessment),
+            )
+        },
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -1680,6 +1803,10 @@ impl GrypeScanner {
                         .as_ref()
                         .and_then(|u| u.first().cloned()),
                     finding_class: crate::models::security::FindingClass::Vulnerability,
+                    // #5263: the score a numeric CVSS threshold grades this
+                    // finding by. `severity` above stays Grype's own label,
+                    // which need not agree with it.
+                    cvss: preferred_cvss(&m.vulnerability, &m.related_vulnerabilities),
                 }
             })
             .collect()
@@ -3647,6 +3774,7 @@ mod tests {
                     urls: Some(vec![
                         "https://nvd.nist.gov/vuln/detail/CVE-2023-99999".to_string()
                     ]),
+                    cvss: Vec::new(),
                 },
                 artifact: GrypeArtifact {
                     name: "vulnerable-pkg".to_string(),
@@ -3700,6 +3828,7 @@ mod tests {
                     description: None,
                     fix: None,
                     urls: None,
+                    cvss: Vec::new(),
                 },
                 artifact: GrypeArtifact {
                     name: "log4j-core".to_string(),
@@ -3741,6 +3870,7 @@ mod tests {
                     description: None,
                     fix: None,
                     urls: None,
+                    cvss: Vec::new(),
                 },
                 artifact: GrypeArtifact {
                     name: "some-lib".to_string(),
@@ -3788,6 +3918,7 @@ mod tests {
                     urls: Some(vec![
                         "https://github.com/advisories/GHSA-jf85-cpcp-j695".to_string()
                     ]),
+                    cvss: Vec::new(),
                 },
                 artifact: GrypeArtifact {
                     name: "lodash".to_string(),
@@ -3799,6 +3930,7 @@ mod tests {
                 related_vulnerabilities: vec![GrypeRelatedVulnerability {
                     id: "CVE-2019-10744".to_string(),
                     namespace: Some("nvd:cpe".to_string()),
+                    cvss: Vec::new(),
                 }],
             }],
         };
@@ -3834,6 +3966,7 @@ mod tests {
                     description: None,
                     fix: None,
                     urls: None,
+                    cvss: Vec::new(),
                 },
                 artifact: GrypeArtifact {
                     name: "log4j-core".to_string(),
@@ -3845,6 +3978,7 @@ mod tests {
                 related_vulnerabilities: vec![GrypeRelatedVulnerability {
                     id: "CVE-2021-45046".to_string(),
                     namespace: Some("nvd:cpe".to_string()),
+                    cvss: Vec::new(),
                 }],
             }],
         };
@@ -3866,6 +4000,7 @@ mod tests {
                 &[GrypeRelatedVulnerability {
                     id: "GHSA-dddd-eeee-ffff".to_string(),
                     namespace: None,
+                    cvss: Vec::new(),
                 }]
             ),
             "GHSA-aaaa-bbbb-cccc",
@@ -4008,6 +4143,7 @@ mod tests {
                     description: None,
                     fix: None,
                     urls: None,
+                    cvss: Vec::new(),
                 },
                 artifact: GrypeArtifact {
                     name: "openssl".to_string(),
@@ -4936,6 +5072,7 @@ mod tests {
                     description: None,
                     fix: None,
                     urls: None,
+                    cvss: Vec::new(),
                 },
                 artifact: GrypeArtifact {
                     name: "log4j-core".to_string(),
@@ -4984,6 +5121,7 @@ mod tests {
                 description: None,
                 fix: None,
                 urls: None,
+                cvss: Vec::new(),
             },
             artifact: GrypeArtifact {
                 name: "lodash".to_string(),
@@ -5025,6 +5163,7 @@ mod tests {
                     description: None,
                     fix: None,
                     urls: None,
+                    cvss: Vec::new(),
                 },
                 artifact: GrypeArtifact {
                     name: "@types/node".to_string(),
@@ -5059,6 +5198,7 @@ mod tests {
                     description: None,
                     fix: None,
                     urls: None,
+                    cvss: Vec::new(),
                 },
                 artifact: GrypeArtifact {
                     name: "".to_string(),
@@ -5087,6 +5227,7 @@ mod tests {
                     description: None,
                     fix: None,
                     urls: None,
+                    cvss: Vec::new(),
                 },
                 artifact: GrypeArtifact {
                     name: "esoteric-pkg".to_string(),
@@ -5245,5 +5386,235 @@ mod tests {
         // Object form -> both fields preserved.
         assert_eq!(licenses[1].value.as_deref(), Some("MIT"));
         assert_eq!(licenses[1].spdx_expression.as_deref(), Some("MIT"));
+    }
+
+    // -----------------------------------------------------------------------
+    // CVSS assessments (#5263)
+    // -----------------------------------------------------------------------
+
+    fn cvss_findings(json: &str) -> Vec<RawFinding> {
+        let report: GrypeReport = serde_json::from_str(json).expect("report must parse");
+        GrypeScanner::convert_findings(&report)
+    }
+
+    #[test]
+    fn cvss_metadata_cannot_discard_a_valid_score() {
+        for metadata in [
+            serde_json::json!({"source": 42}),
+            serde_json::json!({"version": 3.1}),
+            serde_json::json!({"vector": []}),
+            serde_json::json!({"type": {"unexpected": true}}),
+            serde_json::json!({"source": "bad\u{0}text"}),
+        ] {
+            let mut entry = metadata;
+            entry["metrics"] = serde_json::json!({"baseScore": 9.8});
+            let parsed: GrypeCvss = serde_json::from_value(entry).unwrap();
+            let (_, assessment) = parsed.assessment().expect("valid score survives");
+            assert_eq!(assessment.score, CvssScore::from_f64(9.8).unwrap());
+        }
+    }
+
+    /// Grype's wire shape for a match with an NVD assessment on the matched
+    /// record: score, version, vector and source all reach the finding, and
+    /// the severity stays Grype's own label.
+    #[test]
+    fn test_cvss_assessment_is_read_from_the_matched_record() {
+        let findings = cvss_findings(
+            r#"{
+            "matches": [{
+                "vulnerability": {
+                    "id": "CVE-2024-0001",
+                    "severity": "High",
+                    "cvss": [{
+                        "source": "nvd@nist.gov",
+                        "type": "Primary",
+                        "version": "3.1",
+                        "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+                        "metrics": {"baseScore": 7.5, "exploitabilityScore": 3.9, "impactScore": 3.6},
+                        "vendorMetadata": {}
+                    }]
+                },
+                "artifact": {"name": "openssl", "version": "3.0.0", "type": "deb"}
+            }]
+        }"#,
+        );
+        assert_eq!(findings[0].severity, Severity::High);
+        let cvss = findings[0].cvss.as_ref().expect("a scored finding");
+        assert_eq!(cvss.score, CvssScore::from_f64(7.5).unwrap());
+        assert_eq!(cvss.version.as_deref(), Some("3.1"));
+        assert_eq!(
+            cvss.vector.as_deref(),
+            Some("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H")
+        );
+        assert_eq!(cvss.source.as_deref(), Some("nvd@nist.gov"));
+    }
+
+    /// A distro advisory carries no score of its own; the NVD record of the
+    /// same CVE sits under `relatedVulnerabilities`. The finding keeps the
+    /// distro's label and takes the related record's score, which is exactly
+    /// the pair that need not agree.
+    #[test]
+    fn test_cvss_assessment_falls_back_to_related_records() {
+        let findings = cvss_findings(
+            r#"{
+            "matches": [{
+                "vulnerability": {"id": "CVE-2024-0002", "severity": "Low", "cvss": []},
+                "relatedVulnerabilities": [{
+                    "id": "CVE-2024-0002",
+                    "namespace": "nvd:cpe",
+                    "cvss": [{
+                        "source": "nvd@nist.gov",
+                        "type": "Primary",
+                        "version": "3.1",
+                        "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                        "metrics": {"baseScore": 9.8}
+                    }]
+                }],
+                "artifact": {"name": "libfoo", "version": "1.0", "type": "deb"}
+            }]
+        }"#,
+        );
+        assert_eq!(findings[0].severity, Severity::Low);
+        assert_eq!(
+            findings[0].cvss.as_ref().map(|c| c.score),
+            CvssScore::from_f64(9.8)
+        );
+    }
+
+    /// The matched record's own assessment wins over a related record's,
+    /// even a higher one: it is the record the package was matched against.
+    #[test]
+    fn test_cvss_matched_record_takes_precedence_over_related() {
+        let findings = cvss_findings(
+            r#"{
+            "matches": [{
+                "vulnerability": {
+                    "id": "GHSA-aaaa-bbbb-cccc",
+                    "severity": "High",
+                    "cvss": [{"version": "3.1", "metrics": {"baseScore": 7.1}}]
+                },
+                "relatedVulnerabilities": [{
+                    "id": "CVE-2024-0003",
+                    "cvss": [{"type": "Primary", "version": "3.1", "metrics": {"baseScore": 9.1}}]
+                }],
+                "artifact": {"name": "lodash", "version": "4.17.4", "type": "npm"}
+            }]
+        }"#,
+        );
+        assert_eq!(
+            findings[0].cvss.as_ref().map(|c| c.score),
+            CvssScore::from_f64(7.1)
+        );
+    }
+
+    /// Within one record: primary before secondary, then the newest CVSS
+    /// version, then the highest score.
+    #[test]
+    fn test_cvss_precedence_within_a_record() {
+        let pick = |entries: &str| {
+            let json = format!(
+                r#"{{"matches": [{{
+                    "vulnerability": {{"id": "CVE-2024-0004", "severity": "High", "cvss": {entries}}},
+                    "artifact": {{"name": "pkg", "version": "1.0", "type": "npm"}}
+                }}]}}"#
+            );
+            let cvss = cvss_findings(&json)[0].cvss.clone().expect("scored");
+            (cvss.score.as_f64(), cvss.version, cvss.source)
+        };
+
+        // NVD's primary 3.1 analysis wins over the CNA's secondary 4.0.
+        assert_eq!(
+            pick(
+                r#"[
+                {"source": "cna@example.org", "type": "Secondary", "version": "4.0", "metrics": {"baseScore": 9.3}},
+                {"source": "nvd@nist.gov", "type": "Primary", "version": "3.1", "metrics": {"baseScore": 7.5}}
+            ]"#
+            ),
+            (
+                7.5,
+                Some("3.1".to_string()),
+                Some("nvd@nist.gov".to_string())
+            )
+        );
+        // Same assessor: the newest version.
+        assert_eq!(
+            pick(
+                r#"[
+                {"type": "Primary", "version": "2.0", "metrics": {"baseScore": 10.0}},
+                {"type": "Primary", "version": "3.0", "metrics": {"baseScore": 8.8}},
+                {"type": "Primary", "version": "3.1", "metrics": {"baseScore": 8.1}}
+            ]"#
+            )
+            .0,
+            8.1
+        );
+        // Same assessor and version: the highest score.
+        assert_eq!(
+            pick(
+                r#"[
+                {"version": "3.1", "metrics": {"baseScore": 6.5}},
+                {"version": "3.1", "metrics": {"baseScore": 8.2}}
+            ]"#
+            )
+            .0,
+            8.2
+        );
+        // An unmarked assessment ranks between primary and secondary.
+        assert_eq!(
+            pick(
+                r#"[
+                {"type": "Secondary", "version": "3.1", "metrics": {"baseScore": 9.9}},
+                {"version": "3.1", "metrics": {"baseScore": 5.0}}
+            ]"#
+            )
+            .0,
+            5.0
+        );
+    }
+
+    /// No shape of `cvss` fails the report: absent, `null`, a non-array, an
+    /// entry with no metrics, a score off the scale and an entry of the wrong
+    /// shape all leave the finding unscored (or skip that entry), and the
+    /// finding itself is still reported.
+    #[test]
+    fn test_cvss_unusable_entries_never_fail_the_report() {
+        for cvss in [
+            "",
+            r#""cvss": null,"#,
+            r#""cvss": {},"#,
+            r#""cvss": "9.8","#,
+            r#""cvss": [],"#,
+            r#""cvss": [{"version": "3.1"}],"#,
+            r#""cvss": [{"version": "3.1", "metrics": {}}],"#,
+            r#""cvss": [{"version": "3.1", "metrics": {"baseScore": 11.0}}],"#,
+            r#""cvss": [{"version": "3.1", "metrics": {"baseScore": -1}}],"#,
+            r#""cvss": [{"version": 3.1, "metrics": {"baseScore": "high"}}, 7, "x", null],"#,
+        ] {
+            let json = format!(
+                r#"{{"matches": [{{
+                    "vulnerability": {{"id": "CVE-2024-0005", {cvss} "severity": "High"}},
+                    "artifact": {{"name": "pkg", "version": "1.0", "type": "npm"}}
+                }}]}}"#
+            );
+            let findings = cvss_findings(&json);
+            assert_eq!(findings.len(), 1, "{cvss}");
+            assert!(findings[0].cvss.is_none(), "{cvss} must read as unscored");
+        }
+
+        // One bad entry does not hide a good one next to it.
+        let findings = cvss_findings(
+            r#"{"matches": [{
+                "vulnerability": {
+                    "id": "CVE-2024-0006",
+                    "severity": "High",
+                    "cvss": [{"metrics": {"baseScore": 99}}, 42, {"version": "3.1", "metrics": {"baseScore": 8.0}}]
+                },
+                "artifact": {"name": "pkg", "version": "1.0", "type": "npm"}
+            }]}"#,
+        );
+        assert_eq!(
+            findings[0].cvss.as_ref().map(|c| c.score),
+            CvssScore::from_f64(8.0)
+        );
     }
 }

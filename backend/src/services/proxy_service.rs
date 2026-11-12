@@ -6720,14 +6720,14 @@ impl ProxyService {
         repo_ref: RemoteRef<'_>,
     ) -> Result<Option<FastPathScanPolicy>> {
         const BY_KEY: &str = "SELECT r.id, r.format::text, sc.proxy_scan_action, \
-             sc.block_on_policy_violation, sc.severity_threshold \
+             sc.block_on_policy_violation, sc.severity_threshold, sc.cvss_threshold \
              FROM repositories r JOIN scan_configs sc ON sc.repository_id = r.id \
              WHERE r.key = $1 AND r.repo_type = 'remote' AND sc.scan_on_proxy";
         const BY_ID: &str = "SELECT r.id, r.format::text, sc.proxy_scan_action, \
-             sc.block_on_policy_violation, sc.severity_threshold \
+             sc.block_on_policy_violation, sc.severity_threshold, sc.cvss_threshold \
              FROM repositories r JOIN scan_configs sc ON sc.repository_id = r.id \
              WHERE r.id = $1 AND r.repo_type = 'remote' AND sc.scan_on_proxy";
-        let row: Option<(Uuid, String, String, bool, String)> = match repo_ref {
+        let row: Option<(Uuid, String, String, bool, String, Option<f64>)> = match repo_ref {
             RemoteRef::Key(key) => {
                 sqlx::query_as(BY_KEY)
                     .bind(key)
@@ -6750,8 +6750,8 @@ impl ProxyService {
                 "scan-on-proxy configuration is temporarily unreadable".to_string(),
             )
         })?;
-        Ok(
-            row.and_then(|(repository_id, format, action, block, threshold)| {
+        Ok(row.and_then(
+            |(repository_id, format, action, block, threshold, cvss_threshold)| {
                 crate::formats::format_key_enforces_scan_on_proxy(&format).then(|| {
                     FastPathScanPolicy {
                         repository_id,
@@ -6760,12 +6760,15 @@ impl ProxyService {
                         ),
                         severity_gate:
                             crate::services::scan_config_service::proxy_severity_gate_for_row(
-                                block, &threshold, &action,
+                                block,
+                                &threshold,
+                                &action,
+                                cvss_threshold,
                             ),
                     }
                 })
-            }),
-        )
+            },
+        ))
     }
 
     /// Release a held proxy-cache entry (#3912): clear the sidecar's Package

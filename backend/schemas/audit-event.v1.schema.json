@@ -231,7 +231,11 @@
         "scan_on_proxy": { "type": "boolean" },
         "block_on_policy_violation": { "type": "boolean" },
         "severity_threshold": { "type": "string", "enum": ["critical", "high", "medium", "low", "info"] },
-        "proxy_scan_action": { "type": "string", "enum": ["fail_open", "fail_closed", "record_only"] }
+        "proxy_scan_action": { "type": "string", "enum": ["fail_open", "fail_closed", "record_only"] },
+        "cvss_threshold": {
+          "type": ["number", "null"],
+          "description": "Numeric CVSS threshold of the proxy scan gate, 0.0 to 10.0 (#5263); null when the repository has none. Absent on events recorded before the field existed."
+        }
       }
     },
     "PermissionDetails": {

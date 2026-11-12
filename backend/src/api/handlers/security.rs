@@ -694,6 +694,7 @@ impl From<crate::models::security::ScanConfig> for ScanConfigResponse {
             block_on_policy_violation: c.block_on_policy_violation,
             severity_threshold: c.severity_threshold,
             proxy_scan_action: c.proxy_scan_action,
+            cvss_threshold: c.cvss_threshold,
             // Filled in by the handlers that read the lock (#4363).
             instance_locked: false,
             created_at: c.created_at,
@@ -1181,10 +1182,17 @@ pub struct ScanConfigResponse {
     /// SBOM data are recorded but no pull is ever blocked; overrides
     /// `block_on_policy_violation` / `severity_threshold`).
     pub proxy_scan_action: String,
+    /// Numeric CVSS floor for the inline proxy scan gate (#5263); live only
+    /// when `block_on_policy_violation` is set. `null` (the default) keeps
+    /// the gate on severity categories. When set, a finding that carries a
+    /// CVSS base score blocks the pull at or above this number whatever its
+    /// severity label, and a finding with no score is still graded by
+    /// `severity_threshold`.
+    pub cvss_threshold: Option<f64>,
     /// An instance administrator's lock holds this repository's proxy scan
     /// policy (#4363): a repository administrator may tighten it but not
     /// weaken it (turn `scan_on_proxy` off, move `proxy_scan_action` towards
-    /// `record_only`, or loosen the severity threshold).
+    /// `record_only`, or loosen the severity or CVSS threshold).
     pub instance_locked: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -2092,6 +2100,7 @@ fn build_external_findings(
                 source: Some(f.source.unwrap_or_else(|| scanner.to_string())),
                 source_url: f.source_url,
                 finding_class,
+                cvss: None,
             })
         })
         .collect()
@@ -2905,6 +2914,7 @@ fn scan_config_audit_state(
         block_on_policy_violation: c.block_on_policy_violation,
         severity_threshold: c.severity_threshold.clone(),
         proxy_scan_action: c.proxy_scan_action.clone(),
+        cvss_threshold: c.cvss_threshold,
     }
 }
 
@@ -2929,6 +2939,7 @@ fn scan_config_changed_fields(
             "proxy_scan_action",
             a.proxy_scan_action != b.proxy_scan_action,
         ),
+        ("cvss_threshold", a.cvss_threshold != b.cvss_threshold),
     ]
     .into_iter()
     .filter(|(_, changed)| *changed)
@@ -4213,6 +4224,21 @@ pub struct SecurityApiDoc;
 mod tests {
     use super::*;
 
+    #[test]
+    fn flattened_cvss_threshold_preserves_omit_clear_and_set() {
+        for (json, expected) in [
+            (r#"{}"#, None),
+            (
+                r#"{"cvss_threshold": null, "instance_locked": true}"#,
+                Some(None),
+            ),
+            (r#"{"cvss_threshold": 8.0}"#, Some(Some(8.0))),
+        ] {
+            let body: super::UpdateRepoSecurityRequest = serde_json::from_str(json).unwrap();
+            assert_eq!(body.config.cvss_threshold, expected);
+        }
+    }
+
     /// Cross-tenant authz guard (xtenant-write-authz-systemic). The repo-scoped
     /// security endpoints live under the /repositories nest (not gated by
     /// repo_visibility_middleware), so each must enforce the tenant gate itself.
@@ -4591,6 +4617,7 @@ mod tests {
             package_version: Some("0.15.0".to_string()),
             fixed_version: Some("0.15.3".to_string()),
             title: Some("Pallets Werkzeug insecure default".to_string()),
+            cvss: None,
         }
     }
 
@@ -7751,6 +7778,7 @@ mod tests {
                         package_version: Some("0.15.0".to_string()),
                         fixed_version: Some("0.15.3".to_string()),
                         title: Some("insecure default".to_string()),
+                        cvss: None,
                     },
                     crate::models::security::ProxyFinding {
                         cve_id: "CVE-2020-28724".to_string(),
@@ -7759,6 +7787,7 @@ mod tests {
                         package_version: Some("0.15.0".to_string()),
                         fixed_version: None,
                         title: None,
+                        cvss: None,
                     },
                 ],
             )
@@ -8990,6 +9019,8 @@ mod tests {
                             max_severity: None,
                             scanner_version: None,
                             scanned_at: chrono::Utc::now(),
+                            max_cvss_score: None,
+                            max_unscored_severity: None,
                         };
                         if clean_verdict_graded_nothing(&row, pin, cataloged) {
                             want += 1;
@@ -10873,6 +10904,7 @@ mod tests {
             source: Some("grype".to_string()),
             source_url: None,
             finding_class: crate::models::security::FindingClass::Vulnerability,
+            cvss: None,
         };
         svc.create_findings(source.id, prod_artifact, &[raw])
             .await
@@ -11329,6 +11361,7 @@ mod tests {
                 instance_locked: false,
                 created_at: now,
                 updated_at: now,
+                cvss_threshold: None,
             }),
             score: Some(ScoreResponse {
                 id: Uuid::new_v4(),
@@ -11375,6 +11408,7 @@ mod tests {
             instance_locked: false,
             created_at: now,
             updated_at: now,
+            cvss_threshold: None,
         };
         assert!(!resp.scan_enabled);
         assert!(resp.scan_on_proxy);
@@ -12609,6 +12643,7 @@ mod tests {
             source: None,
             source_url: None,
             finding_class: crate::models::security::FindingClass::Vulnerability,
+            cvss: None,
         };
         let counts = tally_severities(&[
             f(Severity::Critical),
@@ -13012,6 +13047,7 @@ mod tests {
             source: Some("acme".to_string()),
             source_url: None,
             finding_class: FindingClass::Vulnerability,
+            cvss: None,
         };
         let svc = ScanResultService::new(fx.pool.clone());
         let failed = svc

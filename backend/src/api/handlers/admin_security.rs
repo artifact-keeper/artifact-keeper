@@ -1374,6 +1374,7 @@ mod tests {
                     package_version: Some("0.15.0".to_string()),
                     fixed_version: Some("0.15.3".to_string()),
                     title: None,
+                    cvss: None,
                 }],
             )
             .await
@@ -1460,6 +1461,7 @@ mod tests {
                     package_version: Some("0.15.0".to_string()),
                     fixed_version: Some("0.15.3".to_string()),
                     title: None,
+                    cvss: None,
                 }],
             )
             .await

@@ -29,7 +29,9 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::models::security::{ProxyFinding, RawFinding, RawPackage, Severity, VulnDbProvenance};
+use crate::models::security::{
+    CvssScore, ProxyFinding, RawFinding, RawPackage, Severity, VulnDbProvenance,
+};
 use crate::models::user::User;
 use crate::services::auth_service::AuthService;
 use crate::services::environment_reeval::{AdvisoryDelta, AdvisoryDeltaSink};
@@ -4725,6 +4727,7 @@ pub(crate) fn convert_trivy_findings(
                     source: Some(source_label.to_string()),
                     source_url: vuln.primary_url.clone(),
                     finding_class: crate::models::security::FindingClass::Vulnerability,
+                    cvss: None,
                 })
         })
         .collect()
@@ -5710,6 +5713,13 @@ pub struct ProxyScanVerdict {
     pub low_count: i32,
     /// Highest severity observed across all findings, for policy comparison.
     pub max_severity: Option<Severity>,
+    /// Highest CVSS base score among all findings that carry
+    /// one (#5263), for a numeric threshold. `None` when none of them does.
+    pub max_cvss_score: Option<CvssScore>,
+    /// Highest severity among findings above `Info` that carry NO CVSS
+    /// score (#5263). A numeric threshold cannot grade those, so it grades
+    /// them by severity. `None` when every such finding is scored.
+    pub max_unscored_severity: Option<Severity>,
     /// Scanner binary + CVE-DB version string (e.g.
     /// `grype-0.83.0+db-2026-08-10`, #3287), for CVE-DB freshness gating of a
     /// reused verdict.
@@ -5750,22 +5760,12 @@ pub struct ProxyScanVerdict {
 }
 
 impl ProxyScanVerdict {
-    /// A vulnerable verdict is any finding ABOVE `Info` (#3243 stage 2).
-    /// Whether that BLOCKS a pull is a policy decision made by the caller
-    /// against the repo's action.
-    ///
-    /// `Info` findings are deliberately excluded: that bucket holds Grype's
-    /// `Negligible` (a CVE the distro has triaged as not worth fixing) and
-    /// explicit `info`/`informational` grades. Counting them made fail-closed
-    /// OCI proxying unusable against ordinary Debian/Ubuntu base images —
-    /// every image carries a long tail of `Negligible` CVEs, each of which
-    /// produced a `vulnerable` verdict and a 403. This matches Harbor, which
-    /// documents `negligible` as never blocking a pull at any threshold. The
-    /// findings are still recorded (`findings_count`, the row, the report);
-    /// they just do not 403 the pull. Before #3243 this was
-    /// `findings_count > 0`, i.e. severity-blind.
+    /// Findings above Info, or any scored finding, need policy evaluation.
+    /// Scored Info findings are persisted as vulnerable so numeric gates can
+    /// evaluate them on cache hits. Categorical gates retain the Info exemption.
     pub fn is_vulnerable(&self) -> bool {
         self.critical_count + self.high_count + self.medium_count + self.low_count > 0
+            || self.max_cvss_score.is_some()
     }
 
     /// The stored `proxy_scan_results.verdict` token for this result.
@@ -5780,6 +5780,18 @@ impl ProxyScanVerdict {
     /// Lowercase token for the highest observed severity (schema-compatible).
     pub fn max_severity_token(&self) -> Option<&'static str> {
         self.max_severity.map(severity_token)
+    }
+
+    /// What the repository's gate grades this verdict on (#5263): the
+    /// highest severity, plus the CVSS summary a numeric threshold needs.
+    /// The same three values are stored on the verdict row, so a cached
+    /// verdict is graded exactly as the scan that produced it was.
+    pub fn grade(&self) -> crate::services::proxy_scan_service::VerdictGrade {
+        crate::services::proxy_scan_service::VerdictGrade {
+            max_severity: self.max_severity,
+            max_cvss_score: self.max_cvss_score,
+            max_unscored_severity: self.max_unscored_severity,
+        }
     }
 }
 
@@ -5981,13 +5993,23 @@ fn dedupe_findings(
         };
 
         match index_of.get(&key) {
-            // Severity is ordered Critical=0 .. Info=4 (see
-            // `aggregate_proxy_verdict`), so `<` means MORE severe — retain
-            // the max, not the first.
-            Some(&idx) if finding.severity < deduped[idx].severity => {
-                deduped[idx] = finding;
+            Some(&idx) => {
+                // #5263: whichever duplicate survives carries the highest
+                // CVSS score either had, for the same reason it carries the
+                // higher severity: a collision must not grade the finding
+                // lower than one of its copies did.
+                let cvss = crate::models::security::CvssAssessment::highest([
+                    deduped[idx].cvss.as_ref(),
+                    finding.cvss.as_ref(),
+                ]);
+                // Severity is ordered Critical=0 .. Info=4 (see
+                // `aggregate_proxy_verdict`), so `<` means MORE severe — retain
+                // the max, not the first.
+                if finding.severity < deduped[idx].severity {
+                    deduped[idx] = finding;
+                }
+                deduped[idx].cvss = cvss;
             }
-            Some(_) => {}
             None => {
                 index_of.insert(key, deduped.len());
                 deduped.push(finding);
@@ -6008,6 +6030,17 @@ pub fn aggregate_proxy_verdict(
     let count = |sev: Severity| findings.iter().filter(|f| f.severity == sev).count() as i32;
     // Severity is ordered Critical=0 .. Info=4, so `min` is the highest.
     let max_severity = findings.iter().map(|f| f.severity).min();
+    // Preserve scored Info findings: numeric policies grade the score regardless
+    // of the label. Only unscored Info keeps the historical exemption.
+    let max_cvss_score = findings
+        .iter()
+        .filter_map(|f| f.cvss.as_ref().map(|c| c.score))
+        .max();
+    let max_unscored_severity = findings
+        .iter()
+        .filter(|f| f.severity != Severity::Info && f.cvss.is_none())
+        .map(|f| f.severity)
+        .min();
     ProxyScanVerdict {
         findings_count: findings.len() as i32,
         critical_count: count(Severity::Critical),
@@ -6015,6 +6048,8 @@ pub fn aggregate_proxy_verdict(
         medium_count: count(Severity::Medium),
         low_count: count(Severity::Low),
         max_severity,
+        max_cvss_score,
+        max_unscored_severity,
         scanner_version,
         // Populated by `run_inline_proxy_scanners_target` after aggregation.
         // Kept out of this signature deliberately: the verdict contract
@@ -6025,6 +6060,22 @@ pub fn aggregate_proxy_verdict(
         findings: Vec::new(),
         components_cataloged: None,
     }
+}
+
+/// Count each vulnerability once, but retain all policy evidence from scanner
+/// assessments. A scored duplicate must not erase an unscored severity fallback.
+fn aggregate_deduped_proxy_verdict(
+    findings: Vec<RawFinding>,
+    ecosystem: Option<ComponentEcosystem>,
+    scanner_version: Option<String>,
+) -> ProxyScanVerdict {
+    let grade = aggregate_proxy_verdict(&findings, None).grade();
+    let findings = dedupe_findings(findings, ecosystem);
+    let mut verdict = aggregate_proxy_verdict(&findings, scanner_version);
+    verdict.max_cvss_score = grade.max_cvss_score;
+    verdict.max_unscored_severity = grade.max_unscored_severity;
+    verdict.findings = retain_proxy_findings(&findings);
+    verdict
 }
 
 /// Project the raw finding list onto the rows `proxy_scan_findings` stores
@@ -6067,6 +6118,7 @@ pub fn retain_proxy_findings(findings: &[RawFinding]) -> Vec<ProxyFinding> {
             package_version: f.affected_version.clone(),
             fixed_version: f.fixed_version.clone(),
             title: (!f.title.trim().is_empty()).then(|| f.title.clone()),
+            cvss: f.cvss.clone(),
         });
     }
     out
@@ -6094,8 +6146,9 @@ pub fn retain_proxy_findings(findings: &[RawFinding]) -> Vec<ProxyFinding> {
 ///    scanner failing (an optional Trivy adapter that is down) still must NOT
 ///    abort the scan — only the CVE engine is load-bearing.
 /// 2. **The CVE engine cataloged something** (#3003), when the caller supplied
-///    an `expected_component`. `is_vulnerable()` counts findings above `Info`,
-///    so an engine that ran but had nothing to grade reports "clean". The one
+///    an `expected_component`. `is_vulnerable()` includes scored findings
+///    and findings above `Info`, so an engine that ran but had nothing to
+///    grade reports "clean". The one
 ///    exception is an ecosystem the engine never catalogs as itself (conda,
 ///    see [`ComponentEcosystem::engine_catalogs_the_package`], #4594): there
 ///    an empty catalog from a completed scan is graded on its findings and
@@ -6200,7 +6253,7 @@ async fn run_inline_proxy_scanners_target(
     }
 
     // #3003: "the CVE engine ran Ok" is still not enough. `is_vulnerable()`
-    // counts findings above `Info`, so an engine that RUNS but catalogs
+    // includes scored findings and findings above `Info`, so an engine that catalogs
     // nothing to grade reports zero findings — indistinguishable from a
     // genuinely clean artifact. That is not a hypothetical: syft/grype do not catalog a bare
     // npm `package/package.json` or an sdist's root `PKG-INFO`, so a real
@@ -6335,7 +6388,6 @@ async fn run_inline_proxy_scanners_target(
     // `prepare_pinned` writes into the workspace root) before counts/severity
     // buckets are computed. See `dedupe_findings` for the mechanism and scope.
     let ecosystem = target.expected_component.map(|c| c.ecosystem);
-    let findings = dedupe_findings(findings, ecosystem);
 
     // Verdict provenance = the CVE-AUTHORITATIVE scanner's version, probed
     // through the SAME function the serve path uses as `current_version`
@@ -6362,14 +6414,11 @@ async fn run_inline_proxy_scanners_target(
         None
     };
 
-    let mut verdict = aggregate_proxy_verdict(&findings, scanner_version);
+    let mut verdict = aggregate_deduped_proxy_verdict(findings, ecosystem, scanner_version);
     // Attach the retained inventory. Deliberately after aggregation so the
     // counts/severity contract is computed from findings alone.
     verdict.packages = dedupe_packages(packages);
     verdict.scan_completeness = scan_completeness;
-    // Same contract as `packages`: attached after aggregation so the counts are
-    // computed from the raw findings and this projection cannot move them.
-    verdict.findings = retain_proxy_findings(&findings);
     // #4594: what the engine cataloged, counted once per distinct
     // `name@version`, so the stored verdict says whether it graded any
     // component or only the file contents.
@@ -9206,6 +9255,7 @@ impl DependencyScanner {
                     source: Some(source),
                     source_url: advisory_match.source_url,
                     finding_class,
+                    cvss: None,
                 });
             }
         }
@@ -12240,6 +12290,7 @@ pub(crate) mod test_helpers {
                             source: Some("grype".to_string()),
                             source_url: None,
                             finding_class: crate::models::security::FindingClass::Vulnerability,
+                            cvss: None,
                         }],
                         ..Default::default()
                     })
@@ -12261,6 +12312,7 @@ pub(crate) mod test_helpers {
                             source: Some("grype".to_string()),
                             source_url: None,
                             finding_class: crate::models::security::FindingClass::Vulnerability,
+                            cvss: None,
                         }],
                     ))
                 }
@@ -17835,6 +17887,7 @@ mod tests {
             source: Some("grype".to_string()),
             source_url: None,
             finding_class: crate::models::security::FindingClass::Vulnerability,
+            cvss: None,
         };
         let package = |name: &str, version: &str| RawPackage {
             name: name.to_string(),
@@ -21652,6 +21705,7 @@ tonic-build = "0.12"
             source: None,
             source_url: None,
             finding_class: crate::models::security::FindingClass::Vulnerability,
+            cvss: None,
         }
     }
 
@@ -21772,6 +21826,154 @@ tonic-build = "0.12"
     }
 
     // -----------------------------------------------------------------------
+    // CVSS summary of a proxy verdict (#5263)
+    // -----------------------------------------------------------------------
+
+    fn scored(severity: Severity, score: Option<f64>) -> RawFinding {
+        RawFinding {
+            cvss: score.map(|s| crate::models::security::CvssAssessment {
+                score: CvssScore::from_f64(s).unwrap(),
+                version: Some("3.1".to_string()),
+                vector: None,
+                source: Some("nvd@nist.gov".to_string()),
+            }),
+            ..make_finding(severity)
+        }
+    }
+
+    /// The summary is the highest score among scored findings and the highest
+    /// severity among unscored findings above `Info`.
+    #[test]
+    fn test_proxy_verdict_cvss_summary() {
+        let verdict = aggregate_proxy_verdict(
+            &[
+                scored(Severity::High, Some(7.5)),
+                scored(Severity::Low, Some(9.8)),
+                scored(Severity::Critical, Some(6.0)),
+                scored(Severity::Medium, None),
+                scored(Severity::Low, None),
+            ],
+            None,
+        );
+        assert_eq!(verdict.max_severity, Some(Severity::Critical));
+        assert_eq!(verdict.max_cvss_score, CvssScore::from_f64(9.8));
+        assert_eq!(verdict.max_unscored_severity, Some(Severity::Medium));
+        assert_eq!(
+            verdict.grade(),
+            crate::services::proxy_scan_service::VerdictGrade {
+                max_severity: Some(Severity::Critical),
+                max_cvss_score: CvssScore::from_f64(9.8),
+                max_unscored_severity: Some(Severity::Medium),
+            }
+        );
+
+        let all_scored = aggregate_proxy_verdict(&[scored(Severity::High, Some(7.5))], None);
+        assert_eq!(all_scored.max_unscored_severity, None);
+        let none_scored = aggregate_proxy_verdict(&[scored(Severity::High, None)], None);
+        assert_eq!(none_scored.max_cvss_score, None);
+        assert_eq!(none_scored.max_unscored_severity, Some(Severity::High));
+    }
+
+    #[test]
+    fn scored_info_is_evaluated_by_numeric_policies() {
+        use crate::services::proxy_scan_service::{CvssGate, ProxySeverityGate as G};
+        let verdict = aggregate_proxy_verdict(&[scored(Severity::Info, Some(9.8))], None);
+        assert!(verdict.is_vulnerable());
+        assert_eq!(verdict.verdict_token(), "vulnerable");
+        assert_eq!(verdict.max_cvss_score, CvssScore::from_f64(9.8));
+        assert_eq!(verdict.max_unscored_severity, None);
+        let numeric = G::Cvss(CvssGate {
+            min_score: CvssScore::from_f64(8.0).unwrap(),
+            unscored_severity: Severity::High,
+            any_severity: None,
+        });
+        assert!(numeric.blocks_grade(verdict.grade()));
+        assert!(!G::BlockOnAny.blocks_grade(verdict.grade()));
+        assert!(!G::Threshold(Severity::Info).blocks_grade(verdict.grade()));
+        assert!(G::stricter(G::BlockOnAny, numeric).blocks_grade(verdict.grade()));
+        assert!(!aggregate_proxy_verdict(&[scored(Severity::Info, None)], None).is_vulnerable());
+    }
+
+    #[test]
+    fn deduplication_preserves_unscored_policy_evidence_in_either_order() {
+        use crate::services::proxy_scan_service::{CvssGate, ProxySeverityGate};
+        let mut unscored = scored(Severity::High, None);
+        unscored.cve_id = Some("CVE-2024-0001".to_string());
+        unscored.affected_component = Some("requests".to_string());
+        unscored.affected_version = Some("2.0.0".to_string());
+        let mut scored_copy = unscored.clone();
+        scored_copy.cvss = scored(Severity::High, Some(7.5)).cvss;
+        let gate = ProxySeverityGate::Cvss(CvssGate {
+            min_score: CvssScore::from_f64(8.0).unwrap(),
+            unscored_severity: Severity::High,
+            any_severity: None,
+        });
+        for findings in [
+            vec![unscored.clone(), scored_copy.clone()],
+            vec![scored_copy.clone(), unscored],
+        ] {
+            let verdict =
+                aggregate_deduped_proxy_verdict(findings, Some(ComponentEcosystem::Python), None);
+            assert_eq!(verdict.findings_count, 1);
+            assert_eq!(verdict.findings.len(), 1);
+            assert_eq!(verdict.max_cvss_score, CvssScore::from_f64(7.5));
+            assert_eq!(verdict.max_unscored_severity, Some(Severity::High));
+            assert!(gate.blocks_grade(verdict.grade()));
+        }
+        let scored_only = aggregate_deduped_proxy_verdict(
+            vec![scored_copy],
+            Some(ComponentEcosystem::Python),
+            None,
+        );
+        assert!(!gate.blocks_grade(scored_only.grade()));
+    }
+
+    /// Duplicates of one vulnerability in one component collapse to the most
+    /// severe copy, and that copy carries the highest score either had,
+    /// whichever order they arrive in.
+    #[test]
+    fn test_dedupe_findings_keeps_the_highest_cvss_score() {
+        let copy = |severity: Severity, score: Option<f64>| RawFinding {
+            cvss: scored(severity, score).cvss,
+            ..dedup_finding(
+                Some("CVE-2024-0001"),
+                Some("requests"),
+                Some("2.0.0"),
+                severity,
+                Some("grype"),
+                "dup",
+            )
+        };
+        for (first, second) in [
+            (copy(Severity::High, None), copy(Severity::Low, Some(9.1))),
+            (copy(Severity::Low, Some(9.1)), copy(Severity::High, None)),
+            (
+                copy(Severity::High, Some(7.0)),
+                copy(Severity::Low, Some(9.1)),
+            ),
+        ] {
+            let deduped = dedupe_findings(vec![first, second], Some(ComponentEcosystem::Python));
+            assert_eq!(deduped.len(), 1);
+            assert_eq!(deduped[0].severity, Severity::High);
+            assert_eq!(
+                deduped[0].cvss.as_ref().map(|c| c.score),
+                CvssScore::from_f64(9.1)
+            );
+        }
+    }
+
+    /// The finding rows shown to an operator carry the assessment the
+    /// verdict was graded by.
+    #[test]
+    fn test_retain_proxy_findings_carries_the_cvss_assessment() {
+        let mut finding = scored(Severity::High, Some(8.8));
+        finding.cve_id = Some("CVE-2024-0002".to_string());
+        let retained = retain_proxy_findings(&[finding.clone()]);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].cvss, finding.cvss);
+    }
+
+    // -----------------------------------------------------------------------
     // dedupe_findings — proxy scan findings_count inflation fix
     //
     // Mechanism under test: `ScanWorkspace::prepare_pinned` catalogs a PyPI
@@ -21800,6 +22002,7 @@ tonic-build = "0.12"
             source: source.map(str::to_string),
             source_url: None,
             finding_class: crate::models::security::FindingClass::Vulnerability,
+            cvss: None,
         }
     }
 
@@ -23083,6 +23286,7 @@ tonic-build = "0.12"
             source: Some("trivy".to_string()),
             source_url: Some("https://trivy.dev/vuln/CVE-2024-0001".to_string()),
             finding_class: crate::models::security::FindingClass::Vulnerability,
+            cvss: None,
         };
         let json = serde_json::to_value(&finding).unwrap();
         assert_eq!(json["severity"], "critical");
@@ -23108,6 +23312,7 @@ tonic-build = "0.12"
             source: None,
             source_url: None,
             finding_class: crate::models::security::FindingClass::Vulnerability,
+            cvss: None,
         };
         let json = serde_json::to_value(&finding).unwrap();
         assert_eq!(json["severity"], "info");
@@ -23153,6 +23358,7 @@ tonic-build = "0.12"
             source: Some("grype".to_string()),
             source_url: Some("https://example.com".to_string()),
             finding_class: crate::models::security::FindingClass::Vulnerability,
+            cvss: None,
         };
         let cloned = finding.clone();
         assert_eq!(cloned.severity, finding.severity);
@@ -27041,6 +27247,7 @@ tonic-build = "0.12"
             source: None,
             source_url: None,
             finding_class: crate::models::security::FindingClass::Vulnerability,
+            cvss: None,
         }];
         let out = ScanOutput::findings_only(findings);
         assert_eq!(out.findings.len(), 1);
@@ -27835,6 +28042,7 @@ tonic-build = "0.12"
                         source: Some("grype".to_string()),
                         source_url: None,
                         finding_class: crate::models::security::FindingClass::Vulnerability,
+                        cvss: None,
                     }])),
                 }
             }
@@ -28314,6 +28522,7 @@ tonic-build = "0.12"
                 source: Some("grype".to_string()),
                 source_url: None,
                 finding_class: crate::models::security::FindingClass::Vulnerability,
+                cvss: None,
             }],
         })];
         let artifact = conda_artifact();
@@ -28375,6 +28584,7 @@ tonic-build = "0.12"
                 source: Some("grype".to_string()),
                 source_url: None,
                 finding_class: crate::models::security::FindingClass::Vulnerability,
+                cvss: None,
             }],
         })];
         let verdict = run_inline_proxy_scanners_target(
@@ -30042,6 +30252,7 @@ tonic-build = "0.12"
             source: Some("grype".to_string()),
             source_url: None,
             finding_class: crate::models::security::FindingClass::Vulnerability,
+            cvss: None,
         };
         // Three catalog entries for the uploaded component (pin + shipped
         // lockfile + staged shrinkwrap) plus one genuine transitive at a
@@ -30126,6 +30337,7 @@ tonic-build = "0.12"
             source: Some("grype".to_string()),
             source_url: None,
             finding_class: crate::models::security::FindingClass::Vulnerability,
+            cvss: None,
         };
 
         let scanner = Arc::new(PinRecordingScanner::new(vec![dup(), dup(), dup()]));
@@ -30258,6 +30470,7 @@ tonic-build = "0.12"
             source: Some("grype".to_string()),
             source_url: None,
             finding_class: crate::models::security::FindingClass::Vulnerability,
+            cvss: None,
         })
         .collect();
 
@@ -30425,6 +30638,7 @@ tonic-build = "0.12"
                 source: Some("grype".to_string()),
                 source_url: None,
                 finding_class: crate::models::security::FindingClass::Vulnerability,
+                cvss: None,
             }],
         });
         let service = scanner_service_with(&fx, scanner.clone());
@@ -31776,6 +31990,7 @@ tonic-build = "0.12"
                 source: Some("test".to_string()),
                 source_url: None,
                 finding_class: crate::models::security::FindingClass::Vulnerability,
+                cvss: None,
             }
         }
 
@@ -33657,6 +33872,7 @@ tonic-build = "0.12"
                 source: Some("osv (conda alias)".to_string()),
                 source_url: None,
                 finding_class: crate::models::security::FindingClass::Vulnerability,
+                cvss: None,
             }
         }
 
@@ -33674,6 +33890,7 @@ tonic-build = "0.12"
                 source: Some("grype".to_string()),
                 source_url: None,
                 finding_class: crate::models::security::FindingClass::Vulnerability,
+                cvss: None,
             }
         }
 

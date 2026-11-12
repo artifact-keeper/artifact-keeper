@@ -322,6 +322,7 @@ fn finding_from(
         source: Some(source.to_string()),
         source_url: None,
         finding_class: FindingClass::Vulnerability,
+        cvss: None,
     }
 }
 
@@ -1743,6 +1744,7 @@ fn external(cve: &str, vendor: &str, severity: Severity, class: FindingClass) ->
         source: Some(vendor.to_string()),
         source_url: None,
         finding_class: class,
+        cvss: None,
     }
 }
 

@@ -249,6 +249,7 @@ impl ModelFinding {
             source: Some(FINDING_SOURCE.to_string()),
             source_url: None,
             finding_class: self.rule.class(),
+            cvss: None,
         }
     }
 }

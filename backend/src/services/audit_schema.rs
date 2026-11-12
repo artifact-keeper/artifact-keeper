@@ -360,6 +360,7 @@ mod tests {
             block_on_policy_violation: false,
             severity_threshold: "high".into(),
             proxy_scan_action: action.into(),
+            cvss_threshold: crate::models::security::CvssScore::from_f64(8.0),
         };
         assert_valid_against(
             "RepositoryDetails",
