@@ -13993,6 +13993,62 @@ mod tests {
         );
     }
 
+    /// #5810: a JAR downloaded through a Virtual whose higher-priority
+    /// Remote member accepts the connection and never answers is served
+    /// from the healthy lower member once the download deadline passes,
+    /// instead of after the upstream read timeout (60 s; the #5621 report
+    /// measured 60.4 s).
+    #[tokio::test]
+    async fn test_virtual_download_passes_hung_member_at_deadline_5810() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::path_regex;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let jar = b"PK\x03\x04 healthy member jar 5810".to_vec();
+        let upstream = MockServer::start().await;
+        Mock::given(path_regex(r"^/ok/com/hung5810/lib/1\.0/lib-1\.0\.jar$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(jar.clone()))
+            .mount(&upstream)
+            .await;
+        let scratch = std::env::temp_dir().join(format!("mvn5810-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).expect("create scratch dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), scratch.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), scratch.to_str().unwrap(), proxy);
+        let hung = tdh::SilentUpstream::start().await;
+        let members = [
+            format!("{}/hung", hung.uri()),
+            format!("{}/ok", upstream.uri()),
+        ];
+        let (_, virtual_key, repos) = metadata_outage_virtual_5621(&pool, &members).await;
+
+        let started = std::time::Instant::now();
+        let (status, body, _) =
+            crate::api::handlers::proxy_helpers::with_virtual_member_download_deadline(
+                Some(Duration::from_secs(2)),
+                tdh::send_with_headers(
+                    tdh::router_anon(router(), state.clone()),
+                    tdh::get(format!("/{virtual_key}/com/hung5810/lib/1.0/lib-1.0.jar")),
+                ),
+            )
+            .await;
+        let elapsed = started.elapsed();
+        for (id, dir) in &repos {
+            tdh::cleanup_member_repo(&pool, *id, dir).await;
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(body.as_ref(), jar.as_slice(), "the healthy member's bytes");
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "the download deadline must bound the wait, not the 60 s read timeout: \
+             took {elapsed:?}"
+        );
+    }
+
     /// #5616: a Remote `maven-metadata.xml` (and its checksum) served under
     /// the `stale-if-error` grace, because the upstream answers 503 after
     /// the cached copy's TTL lapsed, carries `Warning: 110` and

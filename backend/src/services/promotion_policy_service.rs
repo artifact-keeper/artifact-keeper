@@ -322,6 +322,22 @@ fn build_unscanned_violation(state: ScanState) -> PolicyViolation {
     }
 }
 
+/// The `block_uncataloged` violation (#4994): graded `high` like
+/// `block-unscanned`, so it blocks.
+fn build_uncataloged_violation() -> PolicyViolation {
+    PolicyViolation {
+        rule: "block-uncataloged".to_string(),
+        severity: "high".to_string(),
+        message: format!(
+            "Artifact: {}",
+            crate::services::policy_service::UNCATALOGED_VIOLATION
+        ),
+        details: Some(serde_json::json!({
+            "scan_completeness": "not_cataloged",
+        })),
+    }
+}
+
 /// Assemble a [`CveSummary`] from a latest-scan [`ScanRow`] and the open-CVE
 /// id list. Pure (no DB): the severity counts come straight from the scan row
 /// and `open_cves` is carried through verbatim. Kept separate from the SQL
@@ -679,6 +695,25 @@ impl PromotionPolicyService {
                 ));
             }
 
+            // #4994: the same `block_uncataloged` the download gate enforces.
+            if policy.block_uncataloged {
+                let uncataloged =
+                    crate::services::scan_state::any_latest_uncataloged(&self.db, artifact_id)
+                        .await?;
+                if crate::services::policy_service::block_uncataloged_violated(
+                    policy.block_uncataloged,
+                    uncataloged,
+                ) {
+                    let violation = build_uncataloged_violation();
+                    action = escalate_action_by_severity(action, &violation.severity);
+                    violations.push(violation);
+                }
+                applied.push((
+                    "block-uncataloged".to_string(),
+                    "no scanner's latest scan left the artifact uncataloged".to_string(),
+                ));
+            }
+
             self.evaluate_age_and_signature(
                 artifact_id,
                 repository_id,
@@ -1005,7 +1040,7 @@ impl PromotionPolicyService {
     async fn get_scan_policy(&self, repository_id: Uuid) -> Result<Option<ScanPolicyConfig>> {
         let policy: Option<ScanPolicyConfig> = sqlx::query_as(
             r#"
-            SELECT max_severity, block_unscanned, block_on_fail,
+            SELECT max_severity, block_unscanned, block_on_fail, block_uncataloged,
                    min_staging_hours, max_artifact_age_days, require_signature
             FROM scan_policies
             WHERE (repository_id = $1 OR repository_id IS NULL) AND is_enabled = true
@@ -1058,6 +1093,7 @@ struct ScanPolicyConfig {
     max_severity: String,
     block_unscanned: bool,
     block_on_fail: bool,
+    block_uncataloged: bool,
     min_staging_hours: Option<i32>,
     max_artifact_age_days: Option<i32>,
     require_signature: bool,
@@ -2185,6 +2221,7 @@ mod tests {
             max_severity: "high".to_string(),
             block_unscanned: false,
             block_on_fail: true,
+            block_uncataloged: false,
             min_staging_hours: None,
             max_artifact_age_days: None,
             require_signature: false,
@@ -2215,6 +2252,7 @@ mod tests {
             max_severity: "critical".to_string(),
             block_unscanned: false,
             block_on_fail: false,
+            block_uncataloged: false,
             min_staging_hours: None,
             max_artifact_age_days: None,
             require_signature: false,
@@ -2316,6 +2354,7 @@ mod tests {
             max_severity: "medium".to_string(),
             block_unscanned: false,
             block_on_fail: true,
+            block_uncataloged: false,
             min_staging_hours: None,
             max_artifact_age_days: None,
             require_signature: false,
@@ -2526,6 +2565,7 @@ mod tests {
             max_severity: "critical".to_string(),
             block_unscanned: true,
             block_on_fail: false,
+            block_uncataloged: false,
             min_staging_hours: None,
             max_artifact_age_days: None,
             require_signature: false,
