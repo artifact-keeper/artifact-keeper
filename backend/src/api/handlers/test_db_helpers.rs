@@ -1039,13 +1039,22 @@ impl crate::storage::StorageBackend for FallbackProbeStorage {
 /// is where a stopped or full store refuses them.
 pub struct FailingStorage {
     message: String,
+    fail_exists: bool,
 }
 
 impl FailingStorage {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            fail_exists: false,
         }
+    }
+
+    /// `exists` fails with the same error too, as it does against a store
+    /// that is down: the read paths that probe before they read (#5894).
+    pub fn failing_exists(mut self) -> Self {
+        self.fail_exists = true;
+        self
     }
 
     fn fail<T>(&self) -> crate::error::Result<T> {
@@ -1062,6 +1071,9 @@ impl crate::storage::StorageBackend for FailingStorage {
         self.fail()
     }
     async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+        if self.fail_exists {
+            return self.fail();
+        }
         Ok(false)
     }
     async fn delete(&self, _key: &str) -> crate::error::Result<()> {
@@ -1094,12 +1106,22 @@ pub async fn route_repo_to_failing_storage(
     repo_id: Uuid,
     message: &str,
 ) -> SharedState {
+    route_repo_to_storage(pool, state, repo_id, FailingStorage::new(message)).await
+}
+
+/// [`route_repo_to_failing_storage`] with the failing backend given.
+pub async fn route_repo_to_storage(
+    pool: &PgPool,
+    state: &SharedState,
+    repo_id: Uuid,
+    failing: FailingStorage,
+) -> SharedState {
     sqlx::query("UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1")
         .bind(repo_id)
         .execute(pool)
         .await
         .expect("move repository onto the failing backend");
-    let failing: Arc<dyn crate::storage::StorageBackend> = Arc::new(FailingStorage::new(message));
+    let failing: Arc<dyn crate::storage::StorageBackend> = Arc::new(failing);
     let mut backends: std::collections::HashMap<String, Arc<dyn crate::storage::StorageBackend>> =
         std::collections::HashMap::new();
     backends.insert("s3".to_string(), failing);

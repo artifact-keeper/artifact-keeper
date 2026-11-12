@@ -204,6 +204,24 @@ fn oci_internal_error(message: &str) -> Response {
     oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", message)
 }
 
+/// The `503 UNAVAILABLE` (with `Retry-After`) a pull answers when the stored
+/// object it already knows about cannot be read because the storage backend
+/// is unreachable (#5894), or `None` for any other storage error.
+///
+/// The blob and manifest pulls look the object up in the database first and
+/// read it from storage second. A read error used to send them down the
+/// "not stored here" path, which ends in `404 BLOB_UNKNOWN` /
+/// `MANIFEST_UNKNOWN` on a hosted repository: a client reads that as "this
+/// content does not exist" and fails the pull or re-pushes instead of
+/// retrying. Only an outage short-circuits here; a missing object
+/// (`NotFound`) keeps falling through, so a Remote still refetches it from
+/// upstream. The `/v2` envelope ([`oci_storage_envelope`]) turns the tagged
+/// error into the fixed message.
+fn oci_storage_unavailable(err: &crate::error::AppError) -> Option<Response> {
+    (err.storage_failure() == Some(crate::storage::StorageFailure::Unavailable))
+        .then(|| oci_internal_error(&err.to_string()))
+}
+
 fn unauthorized_challenge(base_url: &str) -> Response {
     unauthorized_challenge_with_scope(base_url, None)
 }
@@ -6849,17 +6867,22 @@ async fn handle_head_blob(
                             )
                         }
                     };
-                    if storage.exists(&storage_key).await.unwrap_or(false) {
-                        Response::builder()
+                    match storage.exists(&storage_key).await {
+                        Ok(true) => Response::builder()
                             .status(StatusCode::OK)
                             .header("Docker-Content-Digest", digest)
                             .header(CONTENT_LENGTH, size_bytes.to_string())
                             .header(CONTENT_TYPE, "application/octet-stream")
                             .header("Accept-Ranges", "bytes")
                             .body(Body::empty())
-                            .unwrap()
-                    } else {
-                        oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
+                            .unwrap(),
+                        // #5894: an unreachable store is not an absent blob.
+                        Err(e) => oci_storage_unavailable(&e).unwrap_or_else(|| {
+                            oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
+                        }),
+                        Ok(false) => {
+                            oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
+                        }
                     }
                 }
                 VirtualBlobResolution::Remote {
@@ -7365,6 +7388,13 @@ async fn handle_get_blob(
                     .await;
                 }
                 Err(e) => {
+                    // #5894: the row says the blob is stored here; a store
+                    // that cannot be reached must answer the retryable 503,
+                    // not the 404 BLOB_UNKNOWN the fall-through ends in.
+                    if let Some(resp) = oci_storage_unavailable(&e) {
+                        warn!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "GET blob: storage unavailable: {}", e);
+                        return resp;
+                    }
                     warn!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "GET blob: oci_blobs row found but storage.get_stream failed - will proxy from upstream: {}", e);
                 }
             }
@@ -7430,7 +7460,10 @@ async fn handle_get_blob(
                         }
                         Err(e) => {
                             warn!("Storage error streaming virtual blob {}: {}", digest, e);
-                            oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
+                            // #5894: an unreachable store is not an absent blob.
+                            oci_storage_unavailable(&e).unwrap_or_else(|| {
+                                oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
+                            })
                         }
                     }
                 }
@@ -10713,18 +10746,35 @@ async fn revalidate_expired_remote_tag(
 /// that do not hash to it are refused (on a shared cloud backend the object
 /// is not namespaced per repository). Returns `(digest, content_type,
 /// bytes)`, or `None` to fall through to the proxy paths.
+///
+/// `Err` carries the `503` to answer when the storage backend cannot be
+/// reached (#5894): the manifest is recorded here, so falling through would
+/// end in `404 MANIFEST_UNKNOWN` on a hosted repository and tell the client
+/// the image does not exist. Any other read error (a missing object) still
+/// falls through.
 async fn resolve_local_manifest_from_storage(
     storage: &dyn crate::storage::StorageBackend,
     reference: &str,
     tag_row: Option<(String, String)>,
-) -> Option<(String, String, Bytes)> {
-    let (digest, stored_content_type) = tag_row?;
-    let data = storage.get(&manifest_storage_key(&digest)).await.ok()?;
+) -> Result<Option<(String, String, Bytes)>, Response> {
+    let Some((digest, stored_content_type)) = tag_row else {
+        return Ok(None);
+    };
+    let data = match storage.get(&manifest_storage_key(&digest)).await {
+        Ok(data) => data,
+        Err(e) => {
+            if let Some(resp) = oci_storage_unavailable(&e) {
+                warn!(digest = %digest, "manifest read: storage unavailable: {}", e);
+                return Err(resp);
+            }
+            return Ok(None);
+        }
+    };
     if is_digest_reference(reference) && !verify_digest_or_fall_through(&data, reference) {
-        return None;
+        return Ok(None);
     }
     let content_type = resolve_manifest_content_type(Some(&stored_content_type), &data);
-    Some((digest, content_type, data))
+    Ok(Some((digest, content_type, data)))
 }
 
 /// Build the `200 OK` response for a manifest served from local storage. HEAD
@@ -10952,9 +11002,12 @@ async fn handle_head_manifest(
                 )
             }
         };
-        if let Some((manifest_digest, content_type, data)) =
-            resolve_local_manifest_from_storage(storage.as_ref(), reference, tag_row).await
-        {
+        let resolved =
+            match resolve_local_manifest_from_storage(storage.as_ref(), reference, tag_row).await {
+                Ok(resolved) => resolved,
+                Err(resp) => return resp,
+            };
+        if let Some((manifest_digest, content_type, data)) = resolved {
             // #2912: same gate as the GET path, so a HEAD does not report a
             // quarantined image as available and a client cannot use it to
             // confirm the image exists. #5606: except to a caller who may push
@@ -12541,9 +12594,12 @@ async fn handle_get_manifest(
             }
         };
         let tag_row_digest = tag_row.as_ref().map(|(digest, _)| digest.clone());
-        if let Some((manifest_digest, content_type, data)) =
-            resolve_local_manifest_from_storage(storage.as_ref(), reference, tag_row).await
-        {
+        let resolved =
+            match resolve_local_manifest_from_storage(storage.as_ref(), reference, tag_row).await {
+                Ok(resolved) => resolved,
+                Err(resp) => return resp,
+            };
+        if let Some((manifest_digest, content_type, data)) = resolved {
             // #2912: a quarantined or rejected image must not be pullable. Checked
             // before the bytes are returned and before the pull is counted.
             if let Some(blocked) =
@@ -23239,6 +23295,7 @@ mod oci_manifest_refs_tests {
 #[cfg(test)]
 mod manifest_digest_fallback_tests {
     use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
     use crate::formats::oci::media_types;
     use crate::storage::filesystem::FilesystemStorage;
     use crate::storage::StorageBackend;
@@ -23414,7 +23471,7 @@ mod manifest_digest_fallback_tests {
         // records in `oci_manifests` (#1683): the digest and the row's type.
         let row = Some((digest.clone(), media_types::OCI_INDEX.to_string()));
         let got = resolve_local_manifest_from_storage(&storage, &digest, row).await;
-        let (out_digest, ct, data) = got.expect("a recorded digest must resolve");
+        let (out_digest, ct, data) = got.ok().flatten().expect("a recorded digest must resolve");
         assert_eq!(out_digest, digest);
         assert_eq!(ct, media_types::OCI_INDEX);
         assert_eq!(data.as_ref(), OCI_INDEX);
@@ -23430,7 +23487,7 @@ mod manifest_digest_fallback_tests {
         // content-addressable fallback any more (#1683).
         assert!(resolve_local_manifest_from_storage(&storage, &digest, None)
             .await
-            .is_none());
+            .is_ok_and(|r| r.is_none()));
     }
 
     #[tokio::test]
@@ -23440,7 +23497,7 @@ mod manifest_digest_fallback_tests {
         let row = Some((missing.clone(), media_types::OCI_MANIFEST.to_string()));
         assert!(resolve_local_manifest_from_storage(&storage, &missing, row)
             .await
-            .is_none());
+            .is_ok_and(|r| r.is_none()));
     }
 
     #[tokio::test]
@@ -23458,7 +23515,7 @@ mod manifest_digest_fallback_tests {
         let row = Some((claimed.clone(), media_types::OCI_MANIFEST.to_string()));
         assert!(resolve_local_manifest_from_storage(&storage, &claimed, row)
             .await
-            .is_none());
+            .is_ok_and(|r| r.is_none()));
     }
 
     #[tokio::test]
@@ -23469,6 +23526,8 @@ mod manifest_digest_fallback_tests {
         let (out_digest, ct, data) =
             resolve_local_manifest_from_storage(&storage, "latest", tag_row)
                 .await
+                .ok()
+                .flatten()
                 .expect("tagged manifest must resolve");
         assert_eq!(out_digest, digest);
         assert_eq!(ct, media_types::MANIFEST_V2);
@@ -23484,8 +23543,42 @@ mod manifest_digest_fallback_tests {
         assert!(
             resolve_local_manifest_from_storage(&storage, "latest", tag_row)
                 .await
-                .is_none()
+                .is_ok_and(|r| r.is_none())
         );
+    }
+
+    /// #5894: a manifest the repository records, read while the storage
+    /// backend is unreachable, answers the retryable `503 UNAVAILABLE` (with
+    /// `Retry-After`) instead of falling through to `404 MANIFEST_UNKNOWN`.
+    /// Any other read error still falls through, so a Remote refetches.
+    #[tokio::test]
+    async fn resolve_answers_503_when_storage_is_unreachable_5894() {
+        let digest = compute_sha256(OCI_IMAGE_MANIFEST);
+        let row = || Some((digest.clone(), media_types::OCI_MANIFEST.to_string()));
+
+        let down = tdh::FailingStorage::new(tdh::minio_unreachable_error());
+        let resp = resolve_local_manifest_from_storage(&down, "latest", row())
+            .await
+            .err()
+            .expect("an unreachable store must not fall through");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().contains_key(axum::http::header::RETRY_AFTER));
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("/v2 envelope");
+        assert_eq!(json["errors"][0]["code"], "UNAVAILABLE");
+        assert_eq!(
+            json["errors"][0]["message"],
+            crate::error::STORAGE_UNAVAILABLE_MESSAGE
+        );
+        tdh::assert_no_storage_backend_text("manifest 503", &body);
+
+        // An unclassified storage error is not an outage: fall through.
+        let other = tdh::FailingStorage::new("S3 request failed: access denied");
+        assert!(resolve_local_manifest_from_storage(&other, "latest", row())
+            .await
+            .is_ok_and(|r| r.is_none()));
     }
 }
 
@@ -28116,6 +28209,152 @@ mod oci_blob_upload_streaming_tests {
                 tdh::assert_no_storage_backend_text(&label, &body);
             }
         }
+
+        f.teardown().await;
+    }
+
+    /// #5894: with the object store down, a pull of a blob and a manifest the
+    /// repository holds answers `503 UNAVAILABLE` + `Retry-After`, on GET and
+    /// HEAD alike. Before the fix the blob GET and both manifest verbs read
+    /// the storage error as "not stored here" and answered `404
+    /// BLOB_UNKNOWN` / `MANIFEST_UNKNOWN`, which a client takes as "this
+    /// image does not exist". A blob whose object is really gone still
+    /// answers 404.
+    #[tokio::test]
+    async fn pull_of_stored_content_answers_503_while_storage_is_down_5894() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let repo = f.inner.repo_key.clone();
+        let config = Bytes::from_static(b"{\"architecture\":\"amd64\",\"os\":\"linux\"}");
+        let blob_digest = compute_sha256(&config);
+        let (status, _, body) = send(
+            f.app(),
+            request(
+                Method::POST,
+                format!("/{repo}/image/blobs/uploads/?digest={blob_digest}"),
+                &f.authorization,
+                config.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "blob upload: {body:?}");
+        let manifest = Bytes::from(format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{blob_digest}","size":{}}},"layers":[]}}"#,
+            config.len()
+        ));
+        let mut put = request(
+            Method::PUT,
+            format!("/{repo}/image/manifests/v1"),
+            &f.authorization,
+            manifest.clone(),
+        );
+        put.headers_mut().insert(
+            CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/vnd.oci.image.manifest.v1+json"),
+        );
+        let (status, headers, body) = send(f.app(), put).await;
+        assert_eq!(status, StatusCode::CREATED, "manifest PUT: {body:?}");
+        let manifest_digest = headers
+            .get("Docker-Content-Digest")
+            .and_then(|v| v.to_str().ok())
+            .expect("Docker-Content-Digest")
+            .to_string();
+
+        let pulls = [
+            (Method::GET, format!("/{repo}/image/blobs/{blob_digest}")),
+            (Method::HEAD, format!("/{repo}/image/blobs/{blob_digest}")),
+            (Method::GET, format!("/{repo}/image/manifests/v1")),
+            (Method::HEAD, format!("/{repo}/image/manifests/v1")),
+            (
+                Method::GET,
+                format!("/{repo}/image/manifests/{manifest_digest}"),
+            ),
+        ];
+        // Control: every pull is served while the store works.
+        for (method, uri) in &pulls {
+            let (status, _, _) = send(
+                f.app(),
+                request(method.clone(), uri.clone(), &f.authorization, Bytes::new()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{method} {uri} with storage up");
+        }
+
+        let state = tdh::route_repo_to_storage(
+            &f.inner.pool,
+            &f.inner.state,
+            f.inner.repo_id,
+            tdh::FailingStorage::new(tdh::minio_unreachable_error()).failing_exists(),
+        )
+        .await;
+        let app = router(None).with_state(state);
+        for (method, uri) in &pulls {
+            let label = format!("{method} {uri} with storage down");
+            let (status, headers, body) = send(
+                app.clone(),
+                request(method.clone(), uri.clone(), &f.authorization, Bytes::new()),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{label}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                "{label}: Retry-After"
+            );
+            if *method == Method::GET {
+                let json: serde_json::Value =
+                    serde_json::from_slice(&body).expect("/v2 error envelope");
+                assert_eq!(json["errors"][0]["code"], "UNAVAILABLE", "{label}");
+                assert_eq!(
+                    json["errors"][0]["message"],
+                    crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+                    "{label}"
+                );
+                tdh::assert_no_storage_backend_text(&label, &body);
+            }
+        }
+
+        // A blob whose object is really gone is still unknown: back on the
+        // working store with the object deleted, the GET answers 404.
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 'filesystem', storage_path = $2 \
+             WHERE id = $1",
+        )
+        .bind(f.inner.repo_id)
+        .bind(f.inner.storage_dir.to_string_lossy().into_owned())
+        .execute(&f.inner.pool)
+        .await
+        .expect("back on the working store");
+        let storage_key: String = sqlx::query_scalar(
+            "SELECT storage_key FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(f.inner.repo_id)
+        .bind(&blob_digest)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("blob row");
+        f.storage()
+            .delete(&storage_key)
+            .await
+            .expect("delete object");
+        let (status, _, body) = send(
+            f.app(),
+            request(
+                Method::GET,
+                format!("/{repo}/image/blobs/{blob_digest}"),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body:?}");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("/v2 error envelope");
+        assert_eq!(json["errors"][0]["code"], "BLOB_UNKNOWN");
 
         f.teardown().await;
     }
