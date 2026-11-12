@@ -704,6 +704,7 @@ pub mod signing;
 pub mod smtp;
 pub mod sso;
 pub mod sso_admin;
+pub mod sso_binding;
 pub mod storage_gc;
 pub mod storage_integrity;
 pub mod swift;
