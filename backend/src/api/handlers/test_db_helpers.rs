@@ -2249,8 +2249,10 @@ pub async fn audit_count(pool: &PgPool, resource_id: Uuid, action: &str) -> i64 
     .expect("audit_log count query")
 }
 
-/// Poll [`audit_count`] until it reaches `expected` (or a bounded ~2s budget is
-/// exhausted), returning the last observed value.
+/// Poll [`audit_count`] until it reaches `expected` (or a bounded 10s budget is
+/// exhausted), returning the last observed value. The budget is generous
+/// because a loaded CI runner can take well over a second to drain several
+/// spawned writes (#5882); a passing test returns as soon as they land.
 ///
 /// Since #2522 the fire-and-forget audit emitters (`audit_fire_and_forget`)
 /// SPAWN their INSERT instead of awaiting it, so a test that acts and then reads
@@ -2264,15 +2266,14 @@ pub async fn audit_count_eventually(
     action: &str,
     expected: i64,
 ) -> i64 {
-    let mut last = -1;
-    for _ in 0..100 {
-        last = audit_count(pool, resource_id, action).await;
-        if last >= expected {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let last = audit_count(pool, resource_id, action).await;
+        if last >= expected || tokio::time::Instant::now() >= deadline {
             return last;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    last
 }
 
 /// The newest `audit_log` row recorded for `(resource_id, action)` (#4710).
@@ -2283,7 +2284,7 @@ pub struct AuditRow {
     pub details: serde_json::Value,
 }
 
-/// Poll (~2s, like [`audit_count_eventually`]) for the newest `audit_log` row
+/// Poll (~2s) for the newest `audit_log` row
 /// with this `resource_id` and `action`, panicking when none appears. The
 /// handler-level audit tests use it to assert the actor, target and `details`
 /// a fire-and-forget emitter recorded. Read it BEFORE deleting the acting
