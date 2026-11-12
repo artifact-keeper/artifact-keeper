@@ -145,6 +145,16 @@ pub struct CacheInvalidationHandles {
     /// npm computed-packument cache (#2490). `None` when the cache is
     /// disabled; the event is then a no-op on this replica.
     pub npm_packument_cache: Option<Arc<NpmPackumentCache>>,
+    /// IAM policy snapshot (#4214). `None` when shadow evaluation is off.
+    pub iam_snapshot: Option<Arc<crate::services::iam_decision::provider::SnapshotProvider>>,
+}
+
+impl CacheInvalidationHandles {
+    fn invalidate_iam_snapshot(&self) {
+        if let Some(provider) = self.iam_snapshot.as_ref() {
+            provider.invalidate();
+        }
+    }
 }
 
 /// Parse one notification payload into an [`InvalidationEvent`].
@@ -175,19 +185,24 @@ pub async fn apply_invalidation_event(
     match event {
         InvalidationEvent::ApiTokenRevoked { token_id } => {
             auth_service::mark_api_token_revoked(*token_id);
+            handles.invalidate_iam_snapshot();
         }
         InvalidationEvent::UserApiTokensInvalidated { user_id } => {
             auth_service::invalidate_user_token_cache_entries(*user_id);
+            handles.invalidate_iam_snapshot();
         }
         InvalidationEvent::RepositoryChanged { old_key, new_key } => {
             invalidate_repo_key(&handles.repo_cache, &handles.repo_miss_cache, old_key).await;
             invalidate_repo_key(&handles.repo_cache, &handles.repo_miss_cache, new_key).await;
+            handles.invalidate_iam_snapshot();
         }
         InvalidationEvent::RepositoryDeleted { key } => {
             invalidate_repo_key(&handles.repo_cache, &handles.repo_miss_cache, key).await;
+            handles.invalidate_iam_snapshot();
         }
         InvalidationEvent::PermissionsChanged => {
             handles.permission_service.invalidate_cache();
+            handles.invalidate_iam_snapshot();
         }
         InvalidationEvent::NpmPackumentInvalidated { repo_keys, package } => {
             if let Some(cache) = handles.npm_packument_cache.as_ref() {
@@ -219,6 +234,7 @@ pub async fn conservative_flush_all(handles: &CacheInvalidationHandles) {
     handles.repo_cache.write().await.clear();
     handles.repo_miss_cache.write().await.clear();
     handles.permission_service.invalidate_cache();
+    handles.invalidate_iam_snapshot();
     counter!("ak_cache_invalidation_conservative_flushes_total").increment(1);
     tracing::info!(
         flushed_token_entries,
@@ -564,7 +580,66 @@ mod tests {
             repo_miss_cache: Arc::new(RwLock::new(HashMap::new())),
             permission_service: lazy_permission_service(),
             npm_packument_cache: None,
+            iam_snapshot: None,
         }
+    }
+
+    /// Handles holding an IAM snapshot provider whose builds always succeed.
+    fn handles_with_iam_snapshot() -> (
+        CacheInvalidationHandles,
+        Arc<crate::services::iam_decision::provider::SnapshotProvider>,
+    ) {
+        use crate::services::iam_decision::provider::SnapshotProvider;
+        use crate::services::iam_decision::snapshot::PolicySnapshot;
+        let provider = Arc::new(SnapshotProvider::new(Arc::new(|| {
+            Box::pin(async { Ok(PolicySnapshot::default()) })
+        })));
+        let handles = CacheInvalidationHandles {
+            iam_snapshot: Some(provider.clone()),
+            ..test_handles()
+        };
+        (handles, provider)
+    }
+
+    /// Every authorization event, and a conservative flush, marks the IAM
+    /// snapshot stale; an event that does not touch authorization does not.
+    #[tokio::test]
+    async fn authorization_events_invalidate_the_iam_snapshot() {
+        let (handles, provider) = handles_with_iam_snapshot();
+        let authorization_events = vec![
+            InvalidationEvent::ApiTokenRevoked {
+                token_id: Uuid::new_v4(),
+            },
+            InvalidationEvent::UserApiTokensInvalidated {
+                user_id: Uuid::new_v4(),
+            },
+            InvalidationEvent::RepositoryChanged {
+                old_key: "iam-a".to_string(),
+                new_key: "iam-b".to_string(),
+            },
+            InvalidationEvent::RepositoryDeleted {
+                key: "iam-a".to_string(),
+            },
+            InvalidationEvent::PermissionsChanged,
+        ];
+        for event in authorization_events {
+            let before = provider.generation();
+            apply_invalidation_event(&handles, &event).await;
+            assert_eq!(provider.generation(), before + 1, "{event:?}");
+        }
+        let before = provider.generation();
+        conservative_flush_all(&handles).await;
+        assert_eq!(provider.generation(), before + 1);
+
+        let before = provider.generation();
+        apply_invalidation_event(
+            &handles,
+            &InvalidationEvent::UpstreamFilterChanged {
+                repo_id: Uuid::new_v4(),
+            },
+        )
+        .await;
+        assert_eq!(provider.generation(), before);
     }
 
     /// An in-process packument cache with a generous fresh window, so a

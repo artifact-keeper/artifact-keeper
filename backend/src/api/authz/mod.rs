@@ -10,6 +10,7 @@
 pub mod catalog;
 pub mod declaration;
 pub mod registry;
+pub mod shadow_marker;
 
 // Shared test support: used by tests in several shards, so the module itself is
 // not shard-gated (its own tests are).

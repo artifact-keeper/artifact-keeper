@@ -867,6 +867,12 @@ pub struct Config {
     /// Demo mode: blocks all write operations (POST/PUT/DELETE/PATCH) except auth
     pub demo_mode: bool,
 
+    /// `IAM_SHADOW_EVALUATION` (#4214): when true, every declared `/api/v1`
+    /// route is also decided by the IAM decision function after the response
+    /// and divergences from the legacy outcome are reported. Never changes a
+    /// response. Off by default; only `true` or `1` enable it.
+    pub iam_shadow_evaluation: bool,
+
     /// When true (default), unauthenticated requests are allowed to reach
     /// public repositories and other endpoints that explicitly opt in to
     /// optional auth. When false, every request that hits a route protected
@@ -1785,6 +1791,7 @@ redacted_debug!(Config {
     show opensearch_index_prefix,
     show scan_workspace_path,
     show demo_mode,
+    show iam_shadow_evaluation,
     show guest_access_enabled,
     show guest_access_env_pinned,
     show expose_detailed_health,
@@ -1948,6 +1955,7 @@ impl Default for Config {
             opensearch_index_prefix: String::new(),
             scan_workspace_path: "/tmp/scan-workspace".into(),
             demo_mode: false,
+            iam_shadow_evaluation: false,
             guest_access_enabled: true,
             guest_access_env_pinned: false,
             expose_detailed_health: false,
@@ -2185,6 +2193,10 @@ impl Config {
                 }
             }),
             demo_mode: matches!(env::var("DEMO_MODE").as_deref(), Ok("true" | "1")),
+            iam_shadow_evaluation: matches!(
+                env::var("IAM_SHADOW_EVALUATION").as_deref(),
+                Ok("true" | "1")
+            ),
             // Default to true for zero-impact upgrades; only "false"/"0" disables guests.
             // Any other value (including unset, garbage, or empty) keeps guests enabled.
             // One parse (#867): only `false`/`0` disable guests, as before; the
@@ -4303,6 +4315,44 @@ mod tests {
             env::set_var("DEMO_MODE", v);
         } else {
             env::remove_var("DEMO_MODE");
+        }
+    }
+
+    #[test]
+    fn test_config_iam_shadow_evaluation_is_off_unless_enabled() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("IAM_SHADOW_EVALUATION").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("IAM_SHADOW_EVALUATION");
+        assert!(!Config::from_env().unwrap().iam_shadow_evaluation);
+        assert!(!Config::test_config().iam_shadow_evaluation);
+        for (value, enabled) in [
+            ("true", true),
+            ("1", true),
+            ("false", false),
+            ("yes", false),
+        ] {
+            env::set_var("IAM_SHADOW_EVALUATION", value);
+            assert_eq!(
+                Config::from_env().unwrap().iam_shadow_evaluation,
+                enabled,
+                "{value}"
+            );
+        }
+
+        for (name, saved) in [
+            ("DATABASE_URL", saved_db),
+            ("JWT_SECRET", saved_jwt),
+            ("IAM_SHADOW_EVALUATION", saved_flag),
+        ] {
+            match saved {
+                Some(v) => env::set_var(name, v),
+                None => env::remove_var(name),
+            }
         }
     }
 

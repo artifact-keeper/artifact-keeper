@@ -19626,6 +19626,7 @@ mod tests {
                 opensearch_index_prefix: String::new(),
                 scan_workspace_path: "/tmp/scan".into(),
                 demo_mode: false,
+                iam_shadow_evaluation: false,
                 guest_access_enabled: true,
                 guest_access_env_pinned: false,
                 expose_detailed_health: false,
