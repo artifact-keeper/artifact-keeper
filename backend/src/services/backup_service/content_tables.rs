@@ -118,6 +118,22 @@ pub(super) const CONTENT_TABLES: &[ContentTable] = &[
     table("oci_manifest_refs", Scope::Repository),
     table("oci_manifest_subjects", Scope::Repository),
     table("manifest_blob_refs", Scope::Repository),
+    // #5793: which image names hold which digests, and which repositories
+    // are scoped to them. A blob link only travels with an archived blob,
+    // so a restore never inserts a link to a blob the archive lacks.
+    table("oci_image_manifests", Scope::Repository),
+    ContentTable {
+        name: "oci_image_blobs",
+        scope: Scope::Repository,
+        extra_where: Some(
+            "EXISTS (SELECT 1 FROM oci_blobs b \
+             WHERE b.repository_id = t.repository_id AND b.digest = t.digest \
+               AND b.pending_delete_at IS NULL \
+               AND ($2::timestamptz IS NULL OR b.created_at >= $2))",
+        ),
+        order_by: None,
+    },
+    table("oci_image_scope_backfill", Scope::Repository),
     // Webhooks and the keys their signatures are made with.
     table("webhook_signing_keys", Scope::Global),
     table("webhooks", Scope::RepositoryOrGlobal),
@@ -308,6 +324,10 @@ mod tests {
         assert!(export_sql(find("scan_findings")).contains("t.artifact_id IN (SELECT a.id"));
         assert!(export_sql(find("repository_config")).contains("'repodata_depth'"));
         assert!(export_sql(find("oci_blobs")).contains("pending_delete_at IS NULL"));
+        assert!(export_sql(find("oci_image_blobs")).contains("FROM oci_blobs b"));
+        let at = |n: &str| CONTENT_TABLES.iter().position(|t| t.name == n).unwrap();
+        assert!(at("oci_manifests") < at("oci_image_manifests"));
+        assert!(at("oci_blobs") < at("oci_image_blobs"));
         assert!(export_sql(find("api_token_repositories")).contains("t.repo_id = ANY($1)"));
         assert!(export_sql(find("virtual_repo_members"))
             .contains("t.virtual_repo_id = ANY($1) AND t.member_repo_id = ANY($1)"));
