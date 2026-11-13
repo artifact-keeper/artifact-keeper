@@ -24,6 +24,7 @@ use crate::services::proxy_scan_service::CacheScanGate;
 pub(crate) use crate::services::proxy_service::CachedBody;
 pub use crate::services::proxy_service::StreamingFetchResult;
 use crate::services::proxy_service::{DeferredCommitSlot, DirectUpstreamBody, ProxyService};
+use crate::services::virtual_member_breaker::{fetch_error_trips_breaker, MemberBreaker};
 // Re-export the per-format buffered-metadata byte ceilings (#1608 Phase 4b /
 // #2181) so format handlers select a cap via `proxy_helpers::<CONST>`.
 pub use crate::services::proxy_service::{DEFAULT_METADATA_MAX_BYTES, LARGE_METADATA_MAX_BYTES};
@@ -1804,6 +1805,12 @@ async fn proxy_fetch_streaming_member(
     } else {
         proxy_service.fetch_artifact_streaming(member, path).await
     };
+    // #5810: the member's answer, for its download breaker.
+    proxy_service.member_breaker().record(
+        member.id,
+        &member.key,
+        fetched.as_ref().is_err_and(fetch_error_trips_breaker),
+    );
     streaming_fetch_response(
         fetched,
         &member.key,
@@ -3283,17 +3290,23 @@ pub(crate) struct MemberWalk<'p> {
     /// How long one member may take to produce its outcome before it is
     /// treated as unavailable for this request.
     pub(crate) deadline: Option<std::time::Duration>,
+    /// The members' download breakers (#5810): a member whose breaker is
+    /// open is passed over without calling `upstream`, and a deadline miss
+    /// counts against it. The `upstream` closure records the member's own
+    /// answer ([`MemberBreaker::record`]).
+    pub(crate) breaker: Option<&'p MemberBreaker>,
 }
 
 impl<'p> MemberWalk<'p> {
     /// The walk an artifact download through `proxy_service` makes:
     /// bounded by [`virtual_member_download_deadline`] (no deadline without
     /// a proxy: no member can then reach an upstream).
-    pub(crate) fn download(proxy_service: Option<&ProxyService>, path: &'p str) -> Self {
+    pub(crate) fn download(proxy_service: Option<&'p ProxyService>, path: &'p str) -> Self {
         Self {
             path,
             deadline: proxy_service
                 .and_then(|p| virtual_member_download_deadline(p.upstream_read_timeout())),
+            breaker: proxy_service.map(ProxyService::member_breaker),
         }
     }
 }
@@ -3541,8 +3554,28 @@ where
     let upstream = &upstream;
     // #5810: each member's upstream answer, bounded by the download deadline.
     let bounded = move |member: &'a Repository| {
+        // An open breaker passes the member over without dialling it; the
+        // admission is held across the fetch so an abandoned probe frees
+        // its slot when dropped.
+        let admission = match walk.breaker {
+            Some(breaker) => match breaker.admit(member.id) {
+                Some(admission) => Some(admission),
+                None => {
+                    tracing::debug!(
+                        member = %member.key,
+                        path = %redact_proxy_path_for_diagnostics(walk.path),
+                        "virtual member's download breaker is open; trying the next member"
+                    );
+                    return futures::future::Either::Left(std::future::ready(
+                        MemberResolveOutcome::Unavailable,
+                    ));
+                }
+            },
+            None => None,
+        };
         let fetch = upstream(member);
-        async move {
+        futures::future::Either::Right(async move {
+            let _admission = admission;
             let Some(deadline) = walk.deadline else {
                 return fetch.await;
             };
@@ -3550,10 +3583,13 @@ where
                 Ok(outcome) => outcome,
                 Err(_) => {
                     record_virtual_member_download_deadline_miss(&member.key, walk.path, deadline);
+                    if let Some(breaker) = walk.breaker {
+                        breaker.record(member.id, &member.key, true);
+                    }
                     MemberResolveOutcome::Unavailable
                 }
             }
-        }
+        })
     };
 
     // Pass 2, step 1 — confirm the HIGHEST-priority candidate on its own. If it
@@ -4107,6 +4143,12 @@ where
                         }
                         None => proxy.fetch_artifact_streaming(member, path).await,
                     };
+                    // #5810: the member's answer, for its download breaker.
+                    proxy.member_breaker().record(
+                        member.id,
+                        &member.key,
+                        fetch.as_ref().is_err_and(fetch_error_trips_breaker),
+                    );
                     classify_stream_upstream(fetch, &member.key, path)
                         .map_hit(|result| (result, VirtualServeOrigin::remote(member)))
                 }
@@ -16697,6 +16739,7 @@ mod tests {
         MemberWalk {
             path: "com/example/lib/1.0/lib-1.0.jar",
             deadline: Some(after),
+            breaker: None,
         }
     }
 
@@ -16862,6 +16905,111 @@ mod tests {
             Some(MemberResolveOutcome::Hit(v)) => assert_eq!(v, "mid"),
             other => panic!("expected the middle member's hit, got {other:?}"),
         }
+    }
+
+    /// One download walk over `members` with `breaker`, where member `hung`
+    /// never answers until `healthy_again` is set and every other member
+    /// hits. Returns the outcome, the time it took and how many times the
+    /// hung member was dialled. The `upstream` closure records each answer
+    /// in the breaker as the download closures do.
+    async fn breaker_walk_5810(
+        members: &[Repository],
+        breaker: &MemberBreaker,
+        healthy_again: bool,
+        dialled: &std::sync::atomic::AtomicUsize,
+    ) -> (
+        Option<MemberResolveOutcome<String, String>>,
+        std::time::Duration,
+    ) {
+        use std::sync::atomic::Ordering;
+        let started = tokio::time::Instant::now();
+        let out = resolve_members_two_phase::<String, String, _, _, _, _>(
+            members,
+            |_m| async move { (MemberCacheClass::NeedsUpstream, None) },
+            |m| async move {
+                if m.key == "hung" {
+                    dialled.fetch_add(1, Ordering::SeqCst);
+                    if !healthy_again {
+                        return std::future::pending().await;
+                    }
+                }
+                breaker.record(m.id, &m.key, false);
+                MemberResolveOutcome::Hit(m.key.clone())
+            },
+            MemberWalk {
+                path: "com/example/lib/1.0/lib-1.0.jar",
+                deadline: Some(DEADLINE_5810),
+                breaker: Some(breaker),
+            },
+        )
+        .await;
+        (out, started.elapsed())
+    }
+
+    /// #5810: after `AK_VIRTUAL_MEMBER_BREAKER_FAILURES` deadline misses in
+    /// a row the hung member's breaker opens and the walk skips it without
+    /// dialling, so the lower member serves at once; once the open period
+    /// has passed one probe is admitted, and a healthy answer closes it.
+    #[tokio::test(start_paused = true)]
+    async fn two_phase_breaker_opens_skips_and_recovers_5810() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let open_for = std::time::Duration::from_secs(30);
+        let breaker = MemberBreaker::new(3, open_for);
+        let members = members_5810(&["hung", "ok"]);
+        let dialled = AtomicUsize::new(0);
+
+        for attempt in 1..=3 {
+            let (out, elapsed) = breaker_walk_5810(&members, &breaker, false, &dialled).await;
+            assert!(matches!(out, Some(MemberResolveOutcome::Hit(ref v)) if v == "ok"));
+            assert_eq!(
+                elapsed, DEADLINE_5810,
+                "attempt {attempt} waits the deadline"
+            );
+        }
+        assert_eq!(dialled.load(Ordering::SeqCst), 3);
+
+        let (out, elapsed) = breaker_walk_5810(&members, &breaker, false, &dialled).await;
+        assert!(matches!(out, Some(MemberResolveOutcome::Hit(ref v)) if v == "ok"));
+        assert_eq!(
+            elapsed,
+            std::time::Duration::ZERO,
+            "an open breaker costs nothing"
+        );
+        assert_eq!(
+            dialled.load(Ordering::SeqCst),
+            3,
+            "skipped without dialling"
+        );
+
+        tokio::time::advance(open_for).await;
+        let (out, _) = breaker_walk_5810(&members, &breaker, true, &dialled).await;
+        assert!(
+            matches!(out, Some(MemberResolveOutcome::Hit(ref v)) if v == "hung"),
+            "the half-open probe reaches the member and its answer wins: {out:?}"
+        );
+        assert_eq!(dialled.load(Ordering::SeqCst), 4);
+        let (out, _) = breaker_walk_5810(&members, &breaker, true, &dialled).await;
+        assert!(matches!(out, Some(MemberResolveOutcome::Hit(ref v)) if v == "hung"));
+        assert_eq!(dialled.load(Ordering::SeqCst), 5, "closed again");
+    }
+
+    /// #5810: a half-open probe that misses the deadline opens the breaker
+    /// for another period.
+    #[tokio::test(start_paused = true)]
+    async fn two_phase_breaker_failed_probe_reopens_5810() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let open_for = std::time::Duration::from_secs(30);
+        let breaker = MemberBreaker::new(1, open_for);
+        let members = members_5810(&["hung", "ok"]);
+        let dialled = AtomicUsize::new(0);
+        breaker_walk_5810(&members, &breaker, false, &dialled).await;
+        tokio::time::advance(open_for).await;
+        let (_, elapsed) = breaker_walk_5810(&members, &breaker, false, &dialled).await;
+        assert_eq!(elapsed, DEADLINE_5810, "the probe waited the deadline");
+        assert_eq!(dialled.load(Ordering::SeqCst), 2);
+        let (_, elapsed) = breaker_walk_5810(&members, &breaker, false, &dialled).await;
+        assert_eq!(elapsed, std::time::Duration::ZERO);
+        assert_eq!(dialled.load(Ordering::SeqCst), 2, "open again");
     }
 
     /// #5810: the deadline setting. Unset or garbage is the default, `0`
