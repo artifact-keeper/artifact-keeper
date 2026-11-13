@@ -71,10 +71,11 @@ impl RepoAccess {
 
 /// Which storage quota rejected an upload (#2474).
 ///
-/// A repository's own `quota_bytes` and its project's `quota_bytes` are
-/// enforced independently: an upload must fit under both. The repository
-/// quota is evaluated first, so when both would be exceeded the narrower,
-/// repository-scoped reason is reported.
+/// A repository's own `quota_bytes`, its project's `quota_bytes` and the
+/// instance-wide `STORAGE_QUOTA_BYTES` are enforced independently: an upload
+/// must fit under all of them. The repository quota is evaluated first, then
+/// the project's, then the instance's, so when several would be exceeded the
+/// narrowest reason is reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuotaScope {
     /// The target repository's own `quota_bytes`.
@@ -82,6 +83,8 @@ pub enum QuotaScope {
     /// The aggregate `quota_bytes` of the project the repository belongs to,
     /// summed over every repository assigned to that project.
     Project,
+    /// The instance-wide storage quota (`STORAGE_QUOTA_BYTES`).
+    Instance,
 }
 
 impl QuotaScope {
@@ -90,12 +93,50 @@ impl QuotaScope {
         match self {
             QuotaScope::Repository => "Repository storage quota exceeded",
             QuotaScope::Project => "Project storage quota exceeded",
+            QuotaScope::Instance => "Storage quota reached",
+        }
+    }
+}
+
+/// A storage-quota refusal: the scope that refused the upload, its limit and
+/// the usage it was checked against, and (once known) the repository and
+/// project it names. Rendered by [`Self::refusal`] as a `403` whose body
+/// carries these figures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaDenial {
+    pub scope: QuotaScope,
+    pub limit_bytes: i64,
+    pub used_bytes: i64,
+    /// Key of the repository the upload targets.
+    pub repository: Option<String>,
+    /// Key of the project whose quota refused it (project scope only).
+    pub project: Option<String>,
+}
+
+impl QuotaDenial {
+    pub(crate) fn new(scope: QuotaScope, limit_bytes: i64, used_bytes: i64) -> Self {
+        Self {
+            scope,
+            limit_bytes,
+            used_bytes,
+            repository: None,
+            project: None,
         }
     }
 
-    /// The `507 QUOTA_EXCEEDED` error for a rejection in this scope.
+    /// Client-facing reason for this refusal (the message of its body).
+    pub fn exceeded_message(&self) -> String {
+        self.refusal().message
+    }
+
+    /// The structured refusal this denial answers with.
+    pub fn refusal(&self) -> crate::services::quota::QuotaRefusal {
+        crate::services::quota::QuotaRefusal::from_denial(self)
+    }
+
+    /// The `403` error for this refusal.
     pub fn into_error(self) -> AppError {
-        AppError::QuotaExceeded(self.exceeded_message().to_string())
+        AppError::QuotaRefused(Box::new(self.refusal()))
     }
 }
 
@@ -125,14 +166,14 @@ pub(crate) fn finite_quota(quota_bytes: Option<i64>) -> Option<i64> {
 
 /// Outcome of an atomic, in-transaction quota admission check
 /// ([`RepositoryService::check_quota_locked`]).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct QuotaAdmission {
     /// Whether the upload is permitted under the repository's storage quota
     /// and, when the repository belongs to a project with a finite quota,
     /// under the project's aggregate quota.
     pub allowed: bool,
     /// The quota that rejected the upload; `None` exactly when `allowed`.
-    pub denied_by: Option<QuotaScope>,
+    pub denied_by: Option<QuotaDenial>,
     /// The repository's ledger-tracked usage (`hosted + proxy + oci`
     /// counters from `repository_usage_ledger`, read under the admission
     /// row lock) EXCLUDING the row currently being written at the target
@@ -2859,7 +2900,7 @@ impl RepositoryService {
         &self,
         repo_id: Uuid,
         additional_bytes: i64,
-    ) -> Result<Option<QuotaScope>> {
+    ) -> Result<Option<QuotaDenial>> {
         let repo = self.get_by_id(repo_id).await?;
         let repo_quota = finite_quota(repo.quota_bytes);
         // Only hit the DB for usage when a finite quota is actually set.
@@ -2887,11 +2928,45 @@ impl RepositoryService {
             }
             None => (None, 0),
         };
-        Ok(Self::quota_denial(
+        let denial = match Self::quota_denial(
             QuotaUsage::new(repo_quota, repo_usage),
             QuotaUsage::new(project_quota, project_usage),
             additional_bytes,
-        ))
+        ) {
+            Some(denial) => Some(denial),
+            None => {
+                crate::services::quota::storage::instance_denial(&self.db, additional_bytes).await?
+            }
+        };
+        Ok(match denial {
+            Some(denial) => Some(self.label_denial(repo_id, denial).await),
+            None => None,
+        })
+    }
+
+    /// Name the repository (and, for a project-scope refusal, the project)
+    /// a quota denial refers to. Best effort: a failed lookup leaves the
+    /// names out of the refusal body rather than failing the request.
+    pub(crate) async fn label_denial(&self, repo_id: Uuid, mut denial: QuotaDenial) -> QuotaDenial {
+        let names: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT r.key, p.key FROM repositories r \
+               LEFT JOIN projects p ON p.id = r.project_id \
+              WHERE r.id = $1",
+        )
+        .bind(repo_id)
+        .fetch_optional(&self.db)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::debug!(error = %e, "could not name the repository of a quota refusal");
+            None
+        });
+        if let Some((repo_key, project_key)) = names {
+            denial.repository = Some(repo_key);
+            if denial.scope == QuotaScope::Project {
+                denial.project = project_key;
+            }
+        }
+        denial
     }
 
     /// Unlocked aggregate ledger usage of every repository assigned to
@@ -2952,16 +3027,19 @@ impl RepositoryService {
         repo: QuotaUsage,
         project: QuotaUsage,
         additional_bytes: i64,
-    ) -> Option<QuotaScope> {
+    ) -> Option<QuotaDenial> {
+        let refuse = |scope: QuotaScope, usage: QuotaUsage| {
+            QuotaDenial::new(scope, usage.quota_bytes.unwrap_or(0), usage.used_bytes)
+        };
         // An upload that adds no bytes (a re-push of identical content, a
         // shrinking overwrite) is always admitted, even when usage is already
         // over a quota that was lowered or never enforced (#4422).
         if additional_bytes <= 0 {
             None
         } else if !Self::quota_allows(repo.quota_bytes, repo.used_bytes, additional_bytes) {
-            Some(QuotaScope::Repository)
+            Some(refuse(QuotaScope::Repository, repo))
         } else if !Self::quota_allows(project.quota_bytes, project.used_bytes, additional_bytes) {
-            Some(QuotaScope::Project)
+            Some(refuse(QuotaScope::Project, project))
         } else {
             None
         }
@@ -3071,7 +3149,10 @@ impl RepositoryService {
             None => None,
         };
 
-        if repo_quota.is_none() && project_quota.is_none() {
+        // The instance-wide storage quota applies to every repository, so it
+        // keeps the check alive for repositories without a quota of their own.
+        let instance_quota = crate::services::quota::storage::enabled();
+        if repo_quota.is_none() && project_quota.is_none() && !instance_quota {
             // NULL or a non-positive sentinel at both levels => unlimited:
             // nothing to lock or count.
             return Ok(QuotaAdmission {
@@ -3166,6 +3247,25 @@ impl RepositoryService {
             ),
             new_size - existing_at_path,
         );
+        // The instance quota is read without a lock: two uploads that each
+        // fit can both pass, so the instance total can overshoot by what is in
+        // flight at once (at most the upload limit per concurrent upload),
+        // which is accepted rather than serializing every write instance-wide.
+        let denied_by = match denied_by {
+            Some(denial) => Some(denial),
+            None if instance_quota => {
+                crate::services::quota::storage::instance_denial(
+                    &self.db,
+                    new_size - existing_at_path,
+                )
+                .await?
+            }
+            None => None,
+        };
+        let denied_by = match denied_by {
+            Some(denial) => Some(self.label_denial(repo_id, denial).await),
+            None => None,
+        };
         // No manual charge here: the caller's artifact INSERT (same
         // transaction, made while the row locks taken above are still held)
         // fires migration 182's trigger, which queues the exact delta;
@@ -4741,11 +4841,21 @@ mod tests {
             ),
         ];
         for (label, repo, project, additional, expected) in cases {
-            assert_eq!(
-                RepositoryService::quota_denial(*repo, *project, *additional),
-                *expected,
-                "case {label}"
-            );
+            let denial = RepositoryService::quota_denial(*repo, *project, *additional);
+            assert_eq!(denial.as_ref().map(|d| d.scope), *expected, "case {label}");
+            // The denial carries the limit and usage of the scope that refused.
+            if let Some(d) = denial {
+                let usage = if d.scope == QuotaScope::Repository {
+                    repo
+                } else {
+                    project
+                };
+                assert_eq!(
+                    (Some(d.limit_bytes), d.used_bytes),
+                    (usage.quota_bytes, usage.used_bytes),
+                    "case {label}"
+                );
+            }
         }
     }
 
@@ -4768,9 +4878,16 @@ mod tests {
             QuotaScope::Project.exceeded_message(),
             "Project storage quota exceeded"
         );
+        assert_eq!(
+            QuotaScope::Instance.exceeded_message(),
+            "Storage quota reached"
+        );
+        let mut denial = QuotaDenial::new(QuotaScope::Project, 10, 10);
+        denial.project = Some("team".into());
         assert!(matches!(
-            QuotaScope::Project.into_error(),
-            AppError::QuotaExceeded(msg) if msg == "Project storage quota exceeded"
+            denial.into_error(),
+            AppError::QuotaRefused(r) if r.message.starts_with("Project storage quota exceeded")
+                && r.status() == axum::http::StatusCode::FORBIDDEN
         ));
     }
 
@@ -8790,14 +8907,18 @@ mod tests {
 
             assert!(admit_and_insert(&service, &pool, a, "split/a", 600).await);
             assert_eq!(
-                service.quota_preflight(b, 600).await.expect("preflight"),
+                service
+                    .quota_preflight(b, 600)
+                    .await
+                    .expect("preflight")
+                    .map(|d| d.scope),
                 Some(QuotaScope::Project),
                 "unlocked preflight must see the sibling's bytes"
             );
             assert!(!service.check_quota(b, 600).await.expect("check_quota"));
             let denied = admission(&service, &pool, b, "split/b", 600).await;
             assert!(!denied.allowed);
-            assert_eq!(denied.denied_by, Some(QuotaScope::Project));
+            assert_eq!(denied.denied_by.map(|d| d.scope), Some(QuotaScope::Project));
             assert_eq!(
                 denied.base_usage, None,
                 "no repository quota => no repository usage reported"
@@ -8827,12 +8948,18 @@ mod tests {
 
             assert!(admit_and_insert(&service, &pool, a, "both/a", 700).await);
             let over_repo = admission(&service, &pool, a, "both/a2", 200).await;
-            assert_eq!(over_repo.denied_by, Some(QuotaScope::Repository));
+            assert_eq!(
+                over_repo.denied_by.map(|d| d.scope),
+                Some(QuotaScope::Repository)
+            );
             assert_eq!(over_repo.base_usage, Some(700));
 
             // b is far under its own 800-byte quota, but 700 + 400 > 1000.
             let over_project = admission(&service, &pool, b, "both/b", 400).await;
-            assert_eq!(over_project.denied_by, Some(QuotaScope::Project));
+            assert_eq!(
+                over_project.denied_by.map(|d| d.scope),
+                Some(QuotaScope::Project)
+            );
             assert_eq!(over_project.base_usage, Some(0));
             assert!(admit_and_insert(&service, &pool, b, "both/b", 300).await);
 
@@ -8932,7 +9059,11 @@ mod tests {
 
             // 300 + 200 + 250 = 750 used; 250 more fits, 251 does not.
             assert_eq!(
-                service.quota_preflight(hosted, 251).await.unwrap(),
+                service
+                    .quota_preflight(hosted, 251)
+                    .await
+                    .unwrap()
+                    .map(|d| d.scope),
                 Some(QuotaScope::Project),
                 "preflight must count the unseeded sibling from live sums"
             );
@@ -8940,7 +9071,8 @@ mod tests {
             assert_eq!(
                 admission(&service, &pool, hosted, "h/a", 251)
                     .await
-                    .denied_by,
+                    .denied_by
+                    .map(|d| d.scope),
                 Some(QuotaScope::Project)
             );
             assert!(admit_and_insert(&service, &pool, hosted, "h/a", 200).await);

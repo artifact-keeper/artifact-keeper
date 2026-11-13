@@ -14039,6 +14039,90 @@ mod tests {
         );
     }
 
+    /// #5810: a member answering `5xx` opens its download breaker after
+    /// `AK_VIRTUAL_MEMBER_BREAKER_FAILURES` (3) downloads in a row, and is
+    /// then skipped without being dialled; a member answering `404` is
+    /// dialled on every download, because a `404` never trips it.
+    #[tokio::test]
+    async fn test_virtual_download_breaker_trips_on_5xx_not_404_5810() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::path_regex;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        Mock::given(path_regex("^/down/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+        Mock::given(path_regex("^/miss/"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        Mock::given(path_regex("^/ok/"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"jar-5810".to_vec()))
+            .mount(&upstream)
+            .await;
+        let scratch = std::env::temp_dir().join(format!("mvn5810b-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).expect("create scratch dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), scratch.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), scratch.to_str().unwrap(), proxy);
+        let members = [
+            format!("{}/down", upstream.uri()),
+            format!("{}/miss", upstream.uri()),
+            format!("{}/ok", upstream.uri()),
+        ];
+        let (_, virtual_key, repos) = metadata_outage_virtual_5621(&pool, &members).await;
+
+        let dialled = |prefix: &'static str| {
+            let upstream = &upstream;
+            async move {
+                upstream
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|r| r.url.path().starts_with(prefix))
+                    .count()
+            }
+        };
+        let mut statuses = Vec::new();
+        let mut counts = Vec::new();
+        for n in 1..=5 {
+            let (status, _, _) = tdh::send_with_headers(
+                tdh::router_anon(router(), state.clone()),
+                tdh::get(format!(
+                    "/{virtual_key}/com/breaker5810/lib/{n}.0/lib-{n}.0.jar"
+                )),
+            )
+            .await;
+            statuses.push(status);
+            counts.push((dialled("/down/").await, dialled("/miss/").await));
+        }
+        for (id, dir) in &repos {
+            tdh::cleanup_member_repo(&pool, *id, dir).await;
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+
+        assert!(
+            statuses.iter().all(|s| *s == StatusCode::OK),
+            "the healthy member serves every download: {statuses:?}"
+        );
+        let (down_after_3, miss_after_3) = counts[2];
+        let (down_after_5, miss_after_5) = counts[4];
+        assert!(down_after_3 > 0, "{counts:?}");
+        assert_eq!(
+            down_after_5, down_after_3,
+            "after 3 failures the 5xx member is no longer dialled: {counts:?}"
+        );
+        assert!(
+            miss_after_5 > miss_after_3,
+            "a 404 member is still dialled on every download: {counts:?}"
+        );
+    }
+
     /// #5616: a Remote `maven-metadata.xml` (and its checksum) served under
     /// the `stale-if-error` grace, because the upstream answers 503 after
     /// the cached copy's TTL lapsed, carries `Warning: 110` and
