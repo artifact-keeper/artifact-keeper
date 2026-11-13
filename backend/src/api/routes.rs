@@ -3035,7 +3035,7 @@ mod tests {
             // The four label operations, the 111 repository and artifact
             // operations, the 16 project and group operations, the 128 admin
             // operations, and the 64 identity operations.
-            assert_eq!(declared.len(), 323, "{declared:?}");
+            assert_eq!(declared.len(), 358, "{declared:?}");
             assert!(declared.is_subset(&live), "{declared:?}");
         }
 

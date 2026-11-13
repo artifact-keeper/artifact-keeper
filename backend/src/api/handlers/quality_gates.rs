@@ -510,6 +510,7 @@ async fn get_repo_health(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("monitoring.read")), ("x-resource" = json!("instance"))),
     path = "/health/dashboard",
     context_path = "/api/v1/quality",
     tag = "quality",
@@ -920,6 +921,7 @@ async fn unsuppress_issue(
 
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/gates",
     context_path = "/api/v1/quality",
     tag = "quality",
@@ -940,6 +942,7 @@ async fn list_gates(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("security.policy.manage")), ("x-resource" = json!("instance"))),
     path = "/gates",
     context_path = "/api/v1/quality",
     tag = "quality",
@@ -982,6 +985,7 @@ async fn create_gate(
 
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/gates/{id}",
     context_path = "/api/v1/quality",
     tag = "quality",
@@ -1006,6 +1010,7 @@ async fn get_gate(
 
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("security.policy.manage")), ("x-resource" = json!("instance"))),
     path = "/gates/{id}",
     context_path = "/api/v1/quality",
     tag = "quality",
@@ -1052,6 +1057,7 @@ async fn update_gate(
 
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("security.policy.manage")), ("x-resource" = json!("instance"))),
     path = "/gates/{id}",
     context_path = "/api/v1/quality",
     tag = "quality",

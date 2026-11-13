@@ -342,6 +342,7 @@ impl axum::response::IntoResponse for EnvironmentSbomBody {
 /// at a time (#4670).
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/environment",
     context_path = "/api/v1/sbom",
     tag = "sbom",
@@ -1426,6 +1427,7 @@ pub(crate) fn invalid_cve_id_route_message(cve_id: &str) -> String {
 /// where the given CVE has been detected.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("instance"))),
     path = "/cve/history/by-cve/{cve_id}",
     context_path = "/api/v1/sbom",
     tag = "sbom",
@@ -1606,6 +1608,7 @@ async fn update_cve_status_by_artifact_cve(
 /// Get CVE trends and statistics
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("instance"))),
     path = "/cve/trends",
     context_path = "/api/v1/sbom",
     tag = "sbom",
@@ -1630,6 +1633,7 @@ async fn get_cve_trends(
 /// List all license policies
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/license-policies",
     context_path = "/api/v1/sbom",
     tag = "sbom",
@@ -1657,6 +1661,7 @@ async fn list_license_policies(
 /// Get a license policy by ID
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/license-policies/{id}",
     context_path = "/api/v1/sbom",
     tag = "sbom",
@@ -1686,6 +1691,7 @@ async fn get_license_policy(
 /// Create or update a license policy
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("security.policy.manage")), ("x-resource" = json!("instance"))),
     path = "/license-policies",
     context_path = "/api/v1/sbom",
     tag = "sbom",
@@ -1742,6 +1748,7 @@ async fn upsert_license_policy(
 /// Delete a license policy
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("security.policy.manage")), ("x-resource" = json!("instance"))),
     path = "/license-policies/{id}",
     context_path = "/api/v1/sbom",
     tag = "sbom",

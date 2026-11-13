@@ -29,6 +29,7 @@ pub fn router() -> Router<SharedState> {
 /// Read the CEP-27 attestation trust policy.
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/policy",
     context_path = "/api/v1/attestations",
     tag = "attestations",

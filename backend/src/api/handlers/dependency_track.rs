@@ -124,6 +124,7 @@ fn get_dt_service(
 /// Get Dependency-Track integration status
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("instance"))),
     path = "/status",
     context_path = "/api/v1/dependency-track",
     tag = "security",
@@ -160,6 +161,7 @@ async fn dt_status(State(state): State<SharedState>) -> Result<Json<DtStatusResp
 /// List all Dependency-Track projects
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("instance"))),
     path = "/projects",
     context_path = "/api/v1/dependency-track",
     tag = "security",
@@ -180,6 +182,7 @@ async fn list_projects(
 /// Get project findings by project UUID
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("instance"))),
     path = "/projects/{project_uuid}",
     context_path = "/api/v1/dependency-track",
     tag = "security",
@@ -204,6 +207,7 @@ async fn get_project(
 /// Get vulnerability findings for a project
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("instance"))),
     path = "/projects/{project_uuid}/findings",
     context_path = "/api/v1/dependency-track",
     tag = "security",
@@ -228,6 +232,7 @@ async fn get_project_findings(
 /// Get components for a project
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("instance"))),
     path = "/projects/{project_uuid}/components",
     context_path = "/api/v1/dependency-track",
     tag = "security",
@@ -252,6 +257,7 @@ async fn get_project_components(
 /// Get metrics for a project
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("instance"))),
     path = "/projects/{project_uuid}/metrics",
     context_path = "/api/v1/dependency-track",
     tag = "security",
@@ -276,6 +282,7 @@ async fn get_project_metrics(
 /// Get metrics history for a project
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("instance"))),
     path = "/projects/{project_uuid}/metrics/history",
     context_path = "/api/v1/dependency-track",
     tag = "security",
@@ -304,6 +311,7 @@ async fn get_project_metrics_history(
 /// Get portfolio-level metrics
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("instance"))),
     path = "/metrics/portfolio",
     context_path = "/api/v1/dependency-track",
     tag = "security",
@@ -324,6 +332,7 @@ async fn get_portfolio_metrics(
 /// Get policy violations for a project
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("instance"))),
     path = "/projects/{project_uuid}/violations",
     context_path = "/api/v1/dependency-track",
     tag = "security",
@@ -348,6 +357,7 @@ async fn get_project_violations(
 /// Update analysis (triage) for a finding
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("security.triage")), ("x-resource" = json!("instance"))),
     path = "/analysis",
     context_path = "/api/v1/dependency-track",
     tag = "security",
@@ -380,6 +390,7 @@ async fn update_analysis(
 /// List all policies
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("instance"))),
     path = "/policies",
     context_path = "/api/v1/dependency-track",
     tag = "security",

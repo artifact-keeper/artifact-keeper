@@ -68,10 +68,21 @@ pub fn differences(
     registry: &RouteRegistry,
     prefixes: &[&str],
 ) -> Vec<String> {
+    differences_within(expected, registry, |route| in_scope(prefixes, route))
+}
+
+/// Rows that differ between the table and the registry on the canonical routes
+/// `in_area` accepts, each naming its route. For areas that share a prefix
+/// with another table.
+pub fn differences_within(
+    expected: &BTreeMap<RouteKey, Row>,
+    registry: &RouteRegistry,
+    in_area: impl Fn(&str) -> bool,
+) -> Vec<String> {
     let declared: BTreeMap<RouteKey, Row> = registry
         .declared()
-        .filter(|((_, route), _)| in_scope(prefixes, route))
         .map(|((method, route), req)| ((method.clone(), canonical_route(route)), rendered(req)))
+        .filter(|((_, route), _)| in_area(route))
         .collect();
     let mut out = Vec::new();
     for ((method, route), want) in expected {

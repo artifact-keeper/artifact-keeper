@@ -1122,6 +1122,7 @@ impl From<UpsertScanConfigRequest> for UpdateRepoSecurityRequest {
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("instance"))),
     path = "/dashboard",
     context_path = "/api/v1/security",
     tag = "security",
@@ -1260,6 +1261,7 @@ fn meets_min_severity(
 /// (`PROXY_SCAN_BLOCKED`, keyed by repository and `checksum_sha256`).
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("instance"))),
     path = "/proxy-blocked",
     context_path = "/api/v1/security",
     tag = "security",
@@ -1370,6 +1372,7 @@ async fn list_proxy_blocked(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("instance"))),
     path = "/scores",
     context_path = "/api/v1/security",
     tag = "security",
@@ -1397,6 +1400,7 @@ async fn get_all_scores(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("instance"))),
     path = "/configs",
     context_path = "/api/v1/security",
     tag = "security",
@@ -2285,6 +2289,7 @@ async fn revoke_acknowledgment(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("instance"))),
     path = "/acknowledgements",
     context_path = "/api/v1/security",
     tag = "security",
@@ -2361,6 +2366,7 @@ async fn revoke_acknowledgement_by_id(
 
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/policies",
     context_path = "/api/v1/security",
     tag = "security",
@@ -2381,6 +2387,7 @@ async fn list_policies(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("security.policy.manage")), ("x-resource" = json!("instance"))),
     path = "/policies",
     context_path = "/api/v1/security",
     tag = "security",
@@ -2421,6 +2428,7 @@ async fn create_policy(
 
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/policies/{id}",
     context_path = "/api/v1/security",
     tag = "security",
@@ -2446,6 +2454,7 @@ async fn get_policy(
 
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("security.policy.manage")), ("x-resource" = json!("instance"))),
     path = "/policies/{id}",
     context_path = "/api/v1/security",
     tag = "security",
@@ -2491,6 +2500,7 @@ async fn update_policy(
 
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("security.policy.manage")), ("x-resource" = json!("instance"))),
     path = "/policies/{id}",
     context_path = "/api/v1/security",
     tag = "security",

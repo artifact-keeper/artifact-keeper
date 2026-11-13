@@ -2208,6 +2208,99 @@ mod end_to_end {
     }
 
     #[tokio::test]
+    async fn instance_security_operations_are_compared() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (admin, _) = tdh::create_user(&pool).await;
+        let (plain, _) = tdh::create_user(&pool).await;
+        let (reader, _) = tdh::create_user(&pool).await;
+        sqlx::query("UPDATE users SET is_admin = true WHERE id = $1")
+            .bind(admin)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A global `reader` role assignment reads every repository's findings.
+        sqlx::query(
+            "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+             SELECT $1, id, NULL FROM roles WHERE name = 'reader'",
+        )
+        .bind(reader)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut rig = Rig::new(pool.clone(), &dir).await;
+        let admin_bearer = tdh::bearer_for(&rig.state, admin).await;
+        let plain_bearer = tdh::bearer_for(&rig.state, plain).await;
+        let reader_bearer = tdh::bearer_for(&rig.state, reader).await;
+        let get = |path: &str| empty_request("GET", format!("/api/v1{path}"));
+        let compared = |c: &Comparison, legacy: LegacyOutcome, class: Class| {
+            assert_eq!((c.legacy, c.class), (legacy, class), "{c:?}");
+        };
+
+        // The dashboard: the administrator agrees, a plain user is refused by
+        // both, and a global reader is wider.
+        let (status, c) = rig
+            .call(Some(&admin_bearer), get("/security/dashboard"))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(c.permission, Permission::SecurityRead);
+        assert_eq!(c.resource, Some(ScopeRef::Instance));
+        compared(&c, LegacyOutcome::Permit, Class::Agree);
+        let (status, c) = rig
+            .call(Some(&plain_bearer), get("/security/dashboard"))
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(c.principal.id(), Some(plain));
+        compared(&c, LegacyOutcome::Refuse, Class::Agree);
+        let (status, c) = rig
+            .call(Some(&reader_bearer), get("/security/dashboard"))
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        compared(&c, LegacyOutcome::Refuse, Class::NewWider);
+
+        // Dependency-Track is behind the administrator middleware.
+        let (status, c) = rig
+            .call(Some(&plain_bearer), get("/dependency-track/projects"))
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(c.permission, Permission::SecurityRead);
+        compared(&c, LegacyOutcome::Refuse, Class::Agree);
+
+        // The enumerated tightening: every repository's scan configuration
+        // needs `security.read` on the instance.
+        let (status, c) = rig
+            .call(Some(&plain_bearer), get("/security/configs"))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        compared(&c, LegacyOutcome::Permit, Class::NewStricter);
+        let (status, c) = rig
+            .call(Some(&reader_bearer), get("/security/configs"))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        compared(&c, LegacyOutcome::Permit, Class::Agree);
+
+        // A missing policy after the administrator check is a legacy permit.
+        let missing = format!("/api/v1/security/policies/{}", Uuid::new_v4());
+        let (status, c) = rig
+            .call(Some(&admin_bearer), empty_request("DELETE", missing))
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(c.permission, Permission::SecurityPolicyManage);
+        compared(&c, LegacyOutcome::Permit, Class::Agree);
+
+        rig.shutdown.cancel();
+        let _ = sqlx::query("DELETE FROM role_assignments WHERE user_id = $1")
+            .bind(reader)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, plain).await;
+        tdh::cleanup_user(&pool, reader).await;
+        tdh::cleanup(&pool, repo, admin).await;
+    }
+
+    #[tokio::test]
     async fn storage_gc_by_a_non_administrator_agrees() {
         let Some(pool) = tdh::try_pool().await else {
             return;
