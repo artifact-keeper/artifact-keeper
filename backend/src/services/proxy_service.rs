@@ -5997,6 +5997,9 @@ pub struct ProxyService {
     /// `upstream_timeouts.max_detached_fills` of them. Shared by the clones a
     /// detached fill holds.
     detached_fill_permits: Arc<Semaphore>,
+    /// Per-member download breakers of the virtual walks through this proxy
+    /// (#5810): in memory, per replica, shared by its clones.
+    member_breaker: Arc<crate::services::virtual_member_breaker::MemberBreaker>,
 }
 
 /// How long a [`ProxyService::uncached_serves`] entry is kept. The recorder
@@ -6149,6 +6152,9 @@ impl ProxyService {
             stale_if_error_grace_secs: cache_classifier::STALE_IF_ERROR_GRACE_SECS,
             detached_fill_permits: Arc::new(Semaphore::new(upstream_timeouts.max_detached_fills)),
             upstream_timeouts,
+            member_breaker: Arc::new(
+                crate::services::virtual_member_breaker::MemberBreaker::from_env(),
+            ),
         }
     }
 
@@ -6226,6 +6232,12 @@ impl ProxyService {
     /// #5220), which caps the virtual-member download deadline (#5810).
     pub(crate) fn upstream_read_timeout(&self) -> std::time::Duration {
         self.upstream_timeouts.read()
+    }
+
+    /// The per-member download breakers of the virtual walks through this
+    /// proxy (#5810).
+    pub(crate) fn member_breaker(&self) -> &crate::services::virtual_member_breaker::MemberBreaker {
+        &self.member_breaker
     }
 
     /// Fetch artifact from upstream if not cached or cache expired.

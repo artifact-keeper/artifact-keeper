@@ -5218,6 +5218,9 @@ mod tests {
 
     fn make_test_config() -> Arc<Config> {
         Arc::new(Config {
+            scan_worker_enabled: true,
+            scan_queue_enabled: false,
+            scan_worker_concurrency: None,
             database_url: "postgresql://unused".to_string(),
             bind_address: "0.0.0.0:8080".to_string(),
             log_level: "info".to_string(),
