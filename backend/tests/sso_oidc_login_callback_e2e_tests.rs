@@ -78,7 +78,8 @@ use artifact_keeper_backend::services::auth_config_service::{
 
 use common::sso_support::{
     allow_private_sso_ip, audit_row_eventually, build_state, build_state_with_config,
-    ensure_sso_encryption_key, non_loopback_bind_ip, sso_app, test_config, try_pool,
+    ensure_sso_encryption_key, non_loopback_bind_ip, sso_app, sso_binding_cookie, test_config,
+    try_pool,
 };
 
 // ===========================================================================
@@ -418,6 +419,28 @@ async fn login_state_nonce(pool: &PgPool, provider_id: Uuid) -> (String, String)
     )
 }
 
+/// `POST /exchange` for `code`, with an optional `Cookie` header.
+async fn post_exchange(
+    state: SharedState,
+    code: &str,
+    cookie: Option<&str>,
+) -> axum::response::Response {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/exchange")
+        .header("content-type", "application/json");
+    if let Some(cookie) = cookie {
+        req = req.header("cookie", cookie);
+    }
+    sso_app(state)
+        .oneshot(
+            req.body(Body::from(json!({ "code": code }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("exchange oneshot")
+}
+
 /// Parse `a=b&c=d` (percent-encoded) into a map.
 fn url_decode_query(query: &str) -> HashMap<String, String> {
     query
@@ -433,22 +456,36 @@ fn url_decode_query(query: &str) -> HashMap<String, String> {
         .collect()
 }
 
-/// Drive `GET /oidc/{id}/callback` with the given query string.
+/// Drive `GET /oidc/{id}/callback` with the given query string, from the
+/// browser that started the login: the binding cookie (#5486) for the
+/// query's `state` is sent, as the login response set it.
 async fn do_callback(
     state: SharedState,
     provider_id: Uuid,
     query: &str,
 ) -> axum::response::Response {
-    let app = sso_app(state);
-    app.oneshot(
-        Request::builder()
-            .method("GET")
-            .uri(format!("/oidc/{provider_id}/callback?{query}"))
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await
-    .expect("callback oneshot")
+    let sso_state = url_decode_query(query).remove("state").unwrap_or_default();
+    let cookie = sso_binding_cookie(&state, &sso_state);
+    do_callback_with_cookie(state, provider_id, query, Some(&cookie)).await
+}
+
+/// [`do_callback`] with an explicit `Cookie` header (or none at all).
+async fn do_callback_with_cookie(
+    state: SharedState,
+    provider_id: Uuid,
+    query: &str,
+    cookie: Option<&str>,
+) -> axum::response::Response {
+    let mut req = Request::builder()
+        .method("GET")
+        .uri(format!("/oidc/{provider_id}/callback?{query}"));
+    if let Some(cookie) = cookie {
+        req = req.header("cookie", cookie);
+    }
+    sso_app(state)
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .expect("callback oneshot")
 }
 
 /// Convenience: callback with `code=mock-auth-code&state=<state>`.
@@ -1529,17 +1566,8 @@ async fn test_sso_exchange_reports_configured_expires_in() {
         .remove("code")
         .expect("exchange code on the frontend redirect");
 
-    let resp = sso_app(state)
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/exchange")
-                .header("content-type", "application/json")
-                .body(Body::from(json!({ "code": code }).to_string()))
-                .unwrap(),
-        )
-        .await
-        .expect("exchange oneshot");
+    let cookie = sso_binding_cookie(&state, &sso_state);
+    let resp = post_exchange(state, &code, Some(&cookie)).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
         .await
@@ -1751,16 +1779,22 @@ async fn test_ldap_login_on_disabled_provider_returns_404() {
     let _ = AuthConfigService::delete_ldap(&pool, created.id).await;
 }
 
-/// POST an exchange code to `/exchange`; returns the status, the number of
+/// POST an exchange code to `/exchange` from the browser holding `cookie`
+/// (the login's binding cookie, #5486); returns the status, the number of
 /// `Set-Cookie` headers and the JSON body.
 #[allow(clippy::disallowed_methods)] // streaming-invariant: test exempt — buffering a small JSON body in a test assertion is not an artifact path (#1608)
-async fn exchange_code_for(state: SharedState, code: &str) -> (StatusCode, usize, Value) {
+async fn exchange_code_for(
+    state: SharedState,
+    code: &str,
+    cookie: &str,
+) -> (StatusCode, usize, Value) {
     let resp = sso_app(state)
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/exchange")
                 .header("content-type", "application/json")
+                .header("cookie", cookie)
                 .body(Body::from(json!({ "code": code }).to_string()))
                 .unwrap(),
         )
@@ -1818,7 +1852,8 @@ async fn test_oidc_callback_challenges_a_totp_enrolled_user_5484() {
         let code = url_decode_query(location.split_once('?').map(|(_, q)| q).unwrap_or(""))
             .remove("code")
             .expect("exchange code on the frontend redirect");
-        let exchanged = exchange_code_for(state.clone(), &code).await;
+        let cookie = sso_binding_cookie(&state, &sso_state);
+        let exchanged = exchange_code_for(state.clone(), &code, &cookie).await;
         outcomes.push((status, cookies, exchanged));
     }
     let user_id = get_user(&pool, &external_id).await.map(|u| u.0);
@@ -1922,4 +1957,296 @@ async fn test_oidc_same_sub_at_two_providers_signs_in_two_accounts_5483() {
     delete_user_by_sub(&pool, &sub).await;
     delete_provider(&pool, provider_a).await;
     delete_provider(&pool, provider_b).await;
+}
+
+// ===========================================================================
+// #5486: the login, its callback and its exchange code are bound to the
+// browser that started the login.
+// ===========================================================================
+
+/// `GET /oidc/{id}/login`, returning `(state, nonce, binding cookie as
+/// name=value, full Set-Cookie line)` from the real response.
+async fn login_with_binding_cookie(
+    pool: &PgPool,
+    provider_id: Uuid,
+) -> (String, String, String, String) {
+    login_with_binding_cookie_query(pool, provider_id, "").await
+}
+
+/// [`login_with_binding_cookie`] with a query string on the login URL.
+async fn login_with_binding_cookie_query(
+    pool: &PgPool,
+    provider_id: Uuid,
+    query: &str,
+) -> (String, String, String, String) {
+    let resp = sso_app(build_state(pool.clone()))
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/oidc/{provider_id}/login{query}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("login oneshot");
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    let location = resp.headers()["location"].to_str().unwrap();
+    let mut params = url_decode_query(location.split_once('?').map(|(_, q)| q).unwrap());
+    let set_cookie = resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|c| c.starts_with("ak_sso_bind_"))
+        .expect("the login must set the browser-binding cookie")
+        .to_string();
+    let pair = set_cookie.split(';').next().unwrap().to_string();
+    (
+        params.remove("state").unwrap(),
+        params.remove("nonce").unwrap(),
+        pair,
+        set_cookie,
+    )
+}
+
+fn exchange_code_of(resp: &axum::response::Response) -> String {
+    let location = resp.headers()["location"].to_str().unwrap();
+    url_decode_query(location.split_once('?').map(|(_, q)| q).unwrap_or(""))
+        .remove("code")
+        .expect("exchange code on the frontend redirect")
+}
+
+/// A callback is completed only by the browser that started the login: an
+/// attacker's `code`/`state` sent to a victim's browser (no binding cookie,
+/// or the cookie of the victim's own login) is refused with 401, without
+/// consuming the state. The starting browser then completes it, and a replay
+/// of the consumed state is refused.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + non-loopback IP"]
+async fn test_oidc_callback_requires_the_starting_browser_5486() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let Some(idp) = MockIdp::start().await else {
+        return;
+    };
+    let provider_id = create_provider(&pool, &idp).await;
+
+    let (attacker_state, nonce, attacker_cookie, set_cookie) =
+        login_with_binding_cookie(&pool, provider_id).await;
+    for attr in [
+        "HttpOnly",
+        "SameSite=Lax",
+        "Path=/api/v1/auth/sso",
+        "Max-Age=600",
+    ] {
+        assert!(set_cookie.contains(attr), "{attr} missing: {set_cookie}");
+    }
+    let (_victim_state, _, victim_cookie, _) = login_with_binding_cookie(&pool, provider_id).await;
+
+    let external_id = format!("oidc-sub-5486-{}", Uuid::new_v4().as_simple());
+    idp.mount_token_endpoint(&nonce, json!({ "sub": external_id }))
+        .await;
+    let query = format!(
+        "code=mock-auth-code&state={}",
+        urlencoding::encode(&attacker_state)
+    );
+
+    for (case, cookie) in [
+        ("no binding cookie", None),
+        (
+            "the victim's own login cookie",
+            Some(victim_cookie.as_str()),
+        ),
+    ] {
+        let resp =
+            do_callback_with_cookie(build_state(pool.clone()), provider_id, &query, cookie).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{case}");
+        assert!(
+            resp.headers().get("set-cookie").is_none(),
+            "{case}: no session may be set"
+        );
+    }
+    assert!(
+        get_user(&pool, &external_id).await.is_none(),
+        "a refused callback must not sign anyone in"
+    );
+
+    // The starting browser completes the login with the cookie it was given.
+    let resp = do_callback_with_cookie(
+        build_state(pool.clone()),
+        provider_id,
+        &query,
+        Some(&attacker_cookie),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+
+    // Replaying the consumed state, even from that browser, is refused.
+    let replay = do_callback_with_cookie(
+        build_state(pool.clone()),
+        provider_id,
+        &query,
+        Some(&attacker_cookie),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+
+    delete_user_by_sub(&pool, &external_id).await;
+    delete_provider(&pool, provider_id).await;
+}
+
+/// The exchange code a callback mints is redeemed only by the browser that
+/// started the login: sending a victim to the frontend `/callback?code=` with
+/// an attacker's code no longer installs the attacker's session. Redeeming
+/// clears the binding cookie, and the code stays single-use.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + non-loopback IP"]
+async fn test_sso_exchange_requires_the_starting_browser_5486() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let Some(idp) = MockIdp::start().await else {
+        return;
+    };
+    let provider_id = create_provider(&pool, &idp).await;
+    let (sso_state, nonce, cookie, _) = login_with_binding_cookie(&pool, provider_id).await;
+    let (_, _, other_cookie, _) = login_with_binding_cookie(&pool, provider_id).await;
+    let external_id = format!("oidc-sub-5486x-{}", Uuid::new_v4().as_simple());
+    idp.mount_token_endpoint(&nonce, json!({ "sub": external_id }))
+        .await;
+
+    let resp = do_callback_with_cookie(
+        build_state(pool.clone()),
+        provider_id,
+        &format!(
+            "code=mock-auth-code&state={}",
+            urlencoding::encode(&sso_state)
+        ),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    let code = exchange_code_of(&resp);
+
+    for (case, presented) in [
+        ("no binding cookie", None),
+        ("another login's cookie", Some(other_cookie.as_str())),
+    ] {
+        let resp = post_exchange(build_state(pool.clone()), &code, presented).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{case}");
+        assert!(resp.headers().get("set-cookie").is_none(), "{case}");
+    }
+
+    // The starting browser redeems it (the refusals above did not burn it).
+    let resp = post_exchange(build_state(pool.clone()), &code, Some(&cookie)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let set_cookies: Vec<String> = resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect();
+    let cookie_name = cookie.split('=').next().unwrap();
+    assert!(
+        set_cookies
+            .iter()
+            .any(|c| c.starts_with(&format!("{cookie_name}=;")) && c.contains("Max-Age=0")),
+        "redeeming must clear the binding cookie: {set_cookies:?}"
+    );
+    assert!(set_cookies
+        .iter()
+        .any(|c| c.starts_with("ak_access_token=")));
+
+    let again = post_exchange(build_state(pool.clone()), &code, Some(&cookie)).await;
+    assert_eq!(again.status(), StatusCode::UNAUTHORIZED, "single use");
+
+    delete_user_by_sub(&pool, &external_id).await;
+    delete_provider(&pool, provider_id).await;
+}
+
+/// A command-line login (`?client=cli`, #5486): the client keeps the binding
+/// cookie from the login response and the user finishes at the IdP in a
+/// browser that has no such cookie. The callback accepts that, but sets no
+/// session in the browser: it only shows the exchange code, which the browser
+/// cannot redeem and the client can, with its cookie. So a login started this
+/// way cannot be used to sign a victim's browser in either.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + non-loopback IP"]
+#[allow(clippy::disallowed_methods)] // streaming-invariant: test exempt — buffering a small text/JSON body in a test assertion is not an artifact path (#1608)
+async fn test_oidc_cli_login_shows_a_code_only_the_cli_can_redeem_5486() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let Some(idp) = MockIdp::start().await else {
+        return;
+    };
+    let provider_id = create_provider(&pool, &idp).await;
+
+    let bad = sso_app(build_state(pool.clone()))
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/oidc/{provider_id}/login?client=mobile"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("login oneshot");
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST, "unknown client");
+
+    let (sso_state, nonce, cli_cookie, _) =
+        login_with_binding_cookie_query(&pool, provider_id, "?client=cli").await;
+    assert!(sso_state.starts_with("cli-"), "{sso_state}");
+    let external_id = format!("oidc-sub-5486c-{}", Uuid::new_v4().as_simple());
+    idp.mount_token_endpoint(&nonce, json!({ "sub": external_id }))
+        .await;
+
+    // The browser: no binding cookie at all.
+    let resp = do_callback_with_cookie(
+        build_state(pool.clone()),
+        provider_id,
+        &format!(
+            "code=mock-auth-code&state={}",
+            urlencoding::encode(&sso_state)
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers().get("set-cookie").is_none(),
+        "a command-line login sets no session in the browser"
+    );
+    assert!(resp.headers().get("location").is_none());
+    assert!(resp.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/plain"));
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    let code = body
+        .split_whitespace()
+        .find(|w| w.len() == 64 && w.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or_else(|| panic!("the page shows the exchange code: {body}"))
+        .to_string();
+
+    // The browser (or anyone without the client's cookie) cannot redeem it.
+    let resp = post_exchange(build_state(pool.clone()), &code, None).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // The client redeems it with the cookie from its login response.
+    let resp = post_exchange(build_state(pool.clone()), &code, Some(&cli_cookie)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert!(body["access_token"].as_str().is_some_and(|t| !t.is_empty()));
+
+    delete_user_by_sub(&pool, &external_id).await;
+    delete_provider(&pool, provider_id).await;
 }
