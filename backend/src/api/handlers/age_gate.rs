@@ -97,7 +97,8 @@ pub fn exceptions_router() -> Router<SharedState> {
         .route("/reviews/:id/approve", post(approve_exception))
         .route("/reviews/:id/reject", post(reject_exception))
         .route("/reviews/:id/reopen", post(reopen_exception))
-        .route("/requests", post(request_exception))
+        .route("/requests", get(list_my_requests).post(request_exception))
+        .route("/requests/:id", get(get_my_request))
 }
 
 pub fn repo_config_routes() -> Router<SharedState> {
@@ -238,6 +239,22 @@ pub struct ApproveReviewRequest {
     /// states, never something they reach by leaving a field blank.
     #[serde(default)]
     pub never_expires: bool,
+}
+
+/// A scan exception is bound to the digest of the bytes the gate refused, so
+/// a row filed before any refusal has nothing to bind and would serve nothing.
+/// Refused instead of approved in vain: it becomes grantable once the gate
+/// refuses a pull of it and records the digest
+fn require_scan_digest(gate: Option<&str>, basis_digest: Option<&str>) -> Result<()> {
+    if gate == Some(crate::services::age_gate_service::GATE_SCAN) && basis_digest.is_none() {
+        return Err(AppError::Conflict(
+            "No refused download of this package has been recorded yet, so there are no \
+             bytes to grant this scan exception for. It can be granted once the scan gate \
+             has refused a pull of it"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// A grant MUST carry a reason.
@@ -624,6 +641,7 @@ async fn apply_review_decision(
     let (review, mut details) = match decision {
         ReviewDecision::Approve => {
             require_not_own_request(current.requested_by, auth.user_id, age)?;
+            require_scan_digest(current.gate.as_deref(), current.basis_digest.as_deref())?;
             let reason = if age {
                 reason
             } else {
@@ -679,6 +697,7 @@ async fn list_reviews_scoped(
     state: &SharedState,
     repository_key: Option<&str>,
     gates: Option<Vec<String>>,
+    requester: Option<&AuthExtension>,
     query: &ReviewListQuery,
 ) -> Result<Json<AgeGateReviewListResponse>> {
     let svc = age_gate_service(state)?;
@@ -688,15 +707,16 @@ async fn list_reviews_scoped(
     // can fetch multiple states in one page while keeping pagination totals honest.
     let statuses: Option<Vec<String>> = query.status.as_deref().and_then(parse_status_filter);
 
+    let filter = crate::services::age_gate_service::ReviewFilter {
+        gates: gates.as_deref(),
+        repository_key,
+        statuses: statuses.as_deref(),
+        justified_only: query.justified_only.unwrap_or(false),
+        requested_by: requester.map(|a| a.user_id),
+        repository_ids: requester.and_then(|a| a.allowed_repo_ids.as_allowed_repo_ids()),
+    };
     let (items, total) = svc
-        .list_reviews(
-            gates.as_deref(),
-            repository_key,
-            statuses.as_deref(),
-            query.justified_only.unwrap_or(false),
-            offset,
-            i64::from(per_page),
-        )
+        .list_reviews(&filter, offset, i64::from(per_page))
         .await?;
 
     Ok(Json(AgeGateReviewListResponse {
@@ -744,7 +764,7 @@ pub async fn list_reviews(
     // Instance-wide queue: the optional `repository_key` filter is a
     // convenience, not an authorization boundary.
     let gates = resolve_gates(query.gate.as_deref(), DefaultGates::AgeOnly);
-    list_reviews_scoped(&state, query.repository_key.as_deref(), gates, &query).await
+    list_reviews_scoped(&state, query.repository_key.as_deref(), gates, None, &query).await
 }
 
 /// The `/exceptions` sibling of [`list_reviews`]: an omitted `gate` means every gate, not just `age`
@@ -771,7 +791,7 @@ pub async fn list_exceptions(
 ) -> Result<Json<AgeGateReviewListResponse>> {
     require_security_review(&state.db, &auth).await?;
     let gates = resolve_gates(query.gate.as_deref(), DefaultGates::All);
-    list_reviews_scoped(&state, query.repository_key.as_deref(), gates, &query).await
+    list_reviews_scoped(&state, query.repository_key.as_deref(), gates, None, &query).await
 }
 
 /// What an omitted `gate` parameter means, which differs per mount.
@@ -932,6 +952,7 @@ pub async fn get_exception(
         (status = 200, body = AgeGateReviewResponse),
         (status = 400, description = "A scan or curation grant without a reason, or an invalid expiry"),
         (status = 403, description = "No security_review capability, a narrowed token, or the caller requested this exception"),
+        (status = 409, description = "A scan exception with no refused download recorded yet, so no digest to bind"),
     )
 )]
 pub async fn approve_exception(
@@ -1064,6 +1085,70 @@ pub async fn request_exception(
         )
         .await;
 
+    Ok(Json(review_to_response(review)))
+}
+
+/// The caller's own exception requests, for any authenticated user. A row
+/// shows here while the caller holds its request: a later requester takes it
+/// over, unless it was already granted
+#[utoipa::path(
+    get,
+    path = "/requests",
+    context_path = "/api/v1/exceptions",
+    tag = "age-gate",
+    security(("bearer_auth" = [])),
+    params(
+        ("repository_key" = Option<String>, Query),
+        ("status" = Option<String>, Query),
+        ("gate" = Option<String>, Query),
+        ("page" = Option<u32>, Query),
+        ("per_page" = Option<u32>, Query),
+    ),
+    responses((status = 200, body = AgeGateReviewListResponse))
+)]
+pub async fn list_my_requests(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Query(query): Query<ReviewListQuery>,
+) -> Result<Json<AgeGateReviewListResponse>> {
+    let gates = resolve_gates(query.gate.as_deref(), DefaultGates::All);
+    list_reviews_scoped(
+        &state,
+        query.repository_key.as_deref(),
+        gates,
+        Some(&auth),
+        &query,
+    )
+    .await
+}
+
+/// One of the caller's own requests. Anything else is a 404, so this cannot
+/// probe which review ids exist
+#[utoipa::path(
+    get,
+    path = "/requests/{id}",
+    context_path = "/api/v1/exceptions",
+    tag = "age-gate",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = AgeGateReviewResponse),
+        (status = 404, description = "No request with this id is held by the caller"),
+    )
+)]
+pub async fn get_my_request(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<AgeGateReviewResponse>> {
+    let svc = age_gate_service(&state)?;
+    let review = svc.get_review_by_id(id).await?;
+    if review.requested_by != Some(auth.user_id)
+        || !auth.allowed_repo_ids.grants(review.repository_id)
+    {
+        return Err(AppError::NotFound(
+            "Exception request not found".to_string(),
+        ));
+    }
     Ok(Json(review_to_response(review)))
 }
 
@@ -1275,7 +1360,7 @@ pub async fn list_repo_reviews(
     // be widened to a repository the caller does not administer.
     // Same for `gate`: this queue is the repository's age gate only.
     let gates = Some(vec![crate::services::age_gate_service::GATE_AGE.to_string()]);
-    list_reviews_scoped(&state, Some(&key), gates, &query).await
+    list_reviews_scoped(&state, Some(&key), gates, None, &query).await
 }
 
 #[utoipa::path(
@@ -1368,6 +1453,8 @@ pub async fn decide_repo_review(
         reject_review,
         reopen_review,
         request_exception,
+        list_my_requests,
+        get_my_request,
         get_repo_age_gate,
         update_repo_age_gate,
         list_repo_reviews,
@@ -2435,8 +2522,8 @@ mod tests {
         let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
         let scan_id: Uuid = sqlx::query_scalar(
             "INSERT INTO age_gate_reviews \
-             (gate, repository_id, package_name, package_version, status) \
-             VALUES ('scan', $1, 'left-pad', '1.0.0', 'pending') RETURNING id",
+             (gate, repository_id, package_name, package_version, status, basis_digest) \
+             VALUES ('scan', $1, 'left-pad', '1.0.0', 'pending', 'sha256:aaa') RETURNING id",
         )
         .bind(repo_id)
         .fetch_one(&pool)
@@ -2532,6 +2619,109 @@ mod tests {
             .bind(user_id)
             .execute(&pool)
             .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    /// A requester who is not a reviewer sees their own requests and nothing else
+    #[tokio::test]
+    async fn a_requester_reads_only_their_own_requests_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (other_id, _) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let seed = |package: &'static str, requester: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO age_gate_reviews \
+                     (gate, repository_id, package_name, package_version, status, \
+                      justification, requested_by) \
+                     VALUES ('curation', $1, $2, '*', 'pending', 'needed', $3) RETURNING id",
+                )
+                .bind(repo_id)
+                .bind(package)
+                .bind(requester)
+                .fetch_one(&pool)
+                .await
+                .expect("seed request")
+            }
+        };
+        let mine = seed("left-pad", user_id).await;
+        let theirs = seed("right-pad", other_id).await;
+        let state = gated_state(pool.clone(), &dir);
+        let caller = tdh::make_auth(user_id, &username);
+        let app = || tdh::router_with_auth_ext(exceptions_router(), state.clone(), caller.clone());
+
+        let (status, list) =
+            tdh::send(app(), tdh::get(format!("/requests?repository_key={key}"))).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let list: serde_json::Value = serde_json::from_slice(&list).unwrap();
+        assert_eq!(list["pagination"]["total"], 1);
+        assert_eq!(list["items"][0]["id"], mine.to_string());
+        assert_eq!(list["items"][0]["status"], "pending");
+
+        let (status, _) = tdh::send(app(), tdh::get(format!("/requests/{mine}"))).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let (status, _) = tdh::send(app(), tdh::get(format!("/requests/{theirs}"))).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        // The reviewer queue itself stays closed to them
+        let (status, _) = tdh::send(app(), tdh::get(format!("/reviews/{mine}"))).await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        tdh::cleanup_user(&pool, user_id).await;
+        tdh::cleanup_user(&pool, other_id).await;
+    }
+
+    /// A scan request filed before any refusal has no digest to bind, so it
+    /// cannot be granted until the gate records one
+    #[tokio::test]
+    async fn a_scan_request_without_a_digest_cannot_be_granted_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO age_gate_reviews \
+             (gate, repository_id, package_name, package_version, status, justification) \
+             VALUES ('scan', $1, 'left-pad', '1.0.0', 'pending', 'needed') RETURNING id",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed scan request");
+        let state = gated_state(pool.clone(), &dir);
+        let caller = AuthExtension {
+            user_id,
+            username,
+            ..auth(true)
+        };
+        let app = || tdh::router_with_auth_ext(exceptions_router(), state.clone(), caller.clone());
+        let approve = || {
+            tdh::post(
+                format!("/reviews/{id}/approve"),
+                "application/json",
+                bytes::Bytes::from_static(br#"{"reason":"decided in a test"}"#),
+            )
+        };
+
+        let (status, _) = tdh::send(app(), approve()).await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(review_status(&pool, id).await, "pending");
+
+        sqlx::query("UPDATE age_gate_reviews SET basis_digest = 'sha256:aaa' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("a refusal recorded the digest");
+        let (status, _) = tdh::send(app(), approve()).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(review_status(&pool, id).await, "approved");
+
         tdh::cleanup(&pool, repo_id, user_id).await;
         tdh::cleanup_user(&pool, user_id).await;
     }

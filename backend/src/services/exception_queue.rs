@@ -26,6 +26,13 @@ use crate::services::event_bus::EventBus;
 /// separate requests.
 const REFUSAL_DEBOUNCE_SECS: i64 = 3600;
 
+/// Most auto-filed, undecided rows one gate keeps per repository. Curation
+/// decides before anything is fetched upstream, so on a remote that blocks by
+/// default an anonymous pull of any made-up name is a refusal. Past the cap a
+/// new coordinate is still refused, it just files nothing; coordinates already
+/// in the queue keep counting.
+pub const MAX_ATTEMPTED_PER_REPOSITORY: i64 = 1000;
+
 /// The identity an exception is granted against.
 ///
 /// `digest` is the content digest the refusal was recorded for. Proxy scan
@@ -51,6 +58,9 @@ pub struct ExceptionCoord {
 /// * when the caller supplies a digest, a row whose `basis_digest` is NULL or
 ///   different does NOT match, so republished bytes under the same version
 ///   re-block rather than inheriting the acceptance.
+/// * a curation row for the whole package (`*`) also covers every version, so
+///   the seams that know the version (PyPI) honour a whole-package grant. The
+///   scan gate stays per version, bound to bytes.
 ///
 /// A database error is an error, never a silent `true`: this function can only
 /// ever widen access, so it must not fail open.
@@ -63,7 +73,7 @@ pub async fn exception_allows(db: &PgPool, coord: &ExceptionCoord) -> Result<boo
             WHERE gate = $1
               AND repository_id = $2
               AND package_name = $3
-              AND package_version = $4
+              AND (package_version = $4 OR ($1 = 'curation' AND package_version = '*'))
               AND status = 'approved'
               AND (expires_at IS NULL OR expires_at > NOW())
               AND ($5::text IS NULL OR basis_digest = $5)
@@ -136,7 +146,18 @@ pub async fn record_refusal(
         INSERT INTO age_gate_reviews (
             gate, repository_id, package_name, package_version, status, basis_digest
         )
-        VALUES ($1, $2, $3, $4, 'pending', $5)
+        SELECT $1, $2, $3, $4, 'pending', $5
+        WHERE EXISTS (
+                SELECT 1 FROM age_gate_reviews
+                WHERE gate = $1 AND repository_id = $2
+                  AND package_name = $3 AND package_version = $4
+            )
+           OR (SELECT COUNT(*) FROM (
+                SELECT 1 FROM age_gate_reviews
+                WHERE repository_id = $2 AND status = 'pending'
+                  AND gate = $1 AND justification IS NULL
+                LIMIT $7
+            ) attempted) < $7
         ON CONFLICT (gate, repository_id, package_name, package_version)
         DO UPDATE SET
             request_count = age_gate_reviews.request_count + 1,
@@ -171,12 +192,14 @@ pub async fn record_refusal(
     .bind(&coord.package_version)
     .bind(coord.digest.as_deref())
     .bind(stale_before)
+    .bind(MAX_ATTEMPTED_PER_REPOSITORY)
     .fetch_optional(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
     // No row means the debounce window swallowed the bump, which is the
-    // common case under a dependency-graph burst.
+    // common case under a dependency-graph burst, or the repository is at
+    // its cap of auto-filed rows.
     if let (Some((id, true)), Some(bus)) = (row, event_bus) {
         bus.emit_for_repo(
             &gate_event(Some(coord.gate), "age_gate.queued"),
@@ -1067,6 +1090,180 @@ mod tests {
             "a burst inside the debounce window is one request, not five"
         );
 
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// A whole-package curation exception covers the seams that ask with an
+    /// exact version, and only on the curation gate
+    #[tokio::test]
+    async fn db_a_whole_package_curation_exception_covers_every_version() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO repositories (id, key, name, format, repo_type, storage_path, upstream_url)
+               VALUES ($1, $2, $2, 'pypi', 'remote', '/tmp/ph-exq4', 'https://pypi.org/simple')"#,
+        )
+        .bind(repo_id)
+        .bind(format!("ph-exq4-{repo_id}"))
+        .execute(&pool)
+        .await
+        .expect("seed repo");
+        for gate in [GATE_CURATION, GATE_SCAN] {
+            sqlx::query(
+                "INSERT INTO age_gate_reviews
+                 (gate, repository_id, package_name, package_version, status, expires_at)
+                 VALUES ($1, $2, 'requests', '*', 'approved', NOW() + INTERVAL '1 day')",
+            )
+            .bind(gate)
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("seed whole-package grant");
+        }
+        let asked = |gate: &'static str, version: &str| ExceptionCoord {
+            gate,
+            repository_id: repo_id,
+            package_name: "requests".to_string(),
+            package_version: version.to_string(),
+            digest: None,
+        };
+
+        assert!(exception_allows(&pool, &asked(GATE_CURATION, "2.32.3"))
+            .await
+            .expect("query ok"));
+        assert!(exception_allows(&pool, &asked(GATE_CURATION, "*"))
+            .await
+            .expect("query ok"));
+        assert!(
+            !exception_allows(&pool, &asked(GATE_SCAN, "2.32.3"))
+                .await
+                .expect("query ok"),
+            "a scan exception stays per version"
+        );
+
+        sqlx::query(
+            "UPDATE age_gate_reviews SET expires_at = NOW() - INTERVAL '1 second'
+             WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("expire");
+        assert!(!exception_allows(&pool, &asked(GATE_CURATION, "2.32.3"))
+            .await
+            .expect("query ok"));
+
+        let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// Anonymous pulls of made-up names on a block-by-default remote are all
+    /// refusals, so auto-filing stops at a per-repository cap
+    #[tokio::test]
+    async fn db_record_refusal_stops_filing_new_names_at_the_repository_cap() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO repositories (id, key, name, format, repo_type, storage_path, upstream_url)
+               VALUES ($1, $2, $2, 'pypi', 'remote', '/tmp/ph-exq3', 'https://pypi.org/simple')"#,
+        )
+        .bind(repo_id)
+        .bind(format!("ph-exq3-{repo_id}"))
+        .execute(&pool)
+        .await
+        .expect("seed repo");
+        sqlx::query(
+            "INSERT INTO age_gate_reviews (gate, repository_id, package_name, package_version, status)
+             SELECT $1, $2, 'made-up-' || n, '*', 'pending' FROM generate_series(1, $3) n",
+        )
+        .bind(GATE_CURATION)
+        .bind(repo_id)
+        .bind(MAX_ATTEMPTED_PER_REPOSITORY)
+        .execute(&pool)
+        .await
+        .expect("fill the queue");
+
+        let count = |name: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM age_gate_reviews
+                     WHERE repository_id = $1 AND package_name = $2",
+                )
+                .bind(repo_id)
+                .bind(name)
+                .fetch_one(&pool)
+                .await
+                .expect("count")
+            }
+        };
+        let mut c = coord(None);
+        c.gate = GATE_CURATION;
+        c.repository_id = repo_id;
+        c.package_name = "one-more-made-up".to_string();
+        c.package_version = "*".to_string();
+        record_refusal(&pool, None, &c).await.expect("record");
+        assert_eq!(
+            count("one-more-made-up").await,
+            0,
+            "past the cap nothing new is filed"
+        );
+
+        // A coordinate already queued keeps counting
+        sqlx::query(
+            "UPDATE age_gate_reviews SET last_requested_at = NOW() - INTERVAL '2 hours'
+             WHERE repository_id = $1 AND package_name = 'made-up-1'",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("age the row");
+        c.package_name = "made-up-1".to_string();
+        record_refusal(&pool, None, &c).await.expect("record");
+        let bumped: i32 = sqlx::query_scalar(
+            "SELECT request_count FROM age_gate_reviews
+             WHERE repository_id = $1 AND package_name = 'made-up-1'",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("row");
+        assert_eq!(bumped, 2);
+
+        // A reviewer clearing the queue makes room again
+        sqlx::query(
+            "UPDATE age_gate_reviews SET status = 'rejected'
+             WHERE repository_id = $1 AND package_name = 'made-up-2'",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("reject one");
+        c.package_name = "one-more-made-up".to_string();
+        record_refusal(&pool, None, &c).await.expect("record");
+        assert_eq!(count("one-more-made-up").await, 1);
+
+        let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
         let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(repo_id)
             .execute(&pool)
