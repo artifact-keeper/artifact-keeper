@@ -8,10 +8,12 @@ use uuid::Uuid;
 
 use super::intent::*;
 use super::legacy::*;
-use super::mapping::{permissions_for_actions, role_effective_permissions, LegacyAction};
+use super::mapping::{
+    permissions_for_actions, role_effective_permissions, system_role_permissions, LegacyAction,
+};
 use super::project::{project, ProjectionLimits};
 use super::test_support::*;
-use crate::api::authz::catalog::Permission;
+use crate::api::authz::catalog::{Permission, Scope};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -71,6 +73,32 @@ fn global_roles_do_not_infer_build_permissions() {
     assert!(perms.iter().all(|p| !p.id().starts_with("build.")));
     assert!(perms.contains(&Permission::ArtifactWrite));
     assert_eq!(p.roles.len(), 1);
+}
+
+#[test]
+fn a_global_admin_role_is_every_repository_not_the_instance() {
+    let mut w = World::new();
+    let global = w.user("g");
+    w.assign(global, ROLE_ADMIN, None);
+    let p = w.project_it();
+    let b = bindings_of(&p, SubjectRef::User(global));
+    assert_eq!(b.len(), 1);
+    assert_eq!(b[0].scope, ScopeRef::Instance);
+    assert_ne!(b[0].role, RoleRef::System(SystemRole::Admin));
+    let eff = role_effective_permissions(&b[0].role, b[0].scope);
+    // The owner set in every repository, without builds...
+    let owner: BTreeSet<Permission> = system_role_permissions(SystemRole::Owner)
+        .into_iter()
+        .filter(|p| !p.id().starts_with("build."))
+        .collect();
+    assert_eq!(eff, owner);
+    // ...and no permission that exists only at the instance.
+    assert!(
+        eff.iter().all(|p| p.narrowest_scope() != Scope::Instance),
+        "{eff:?}"
+    );
+    // Repository administration that legacy withheld is reported.
+    assert!(categories(&p).contains(&DiagnosticCategory::OwnerWidening));
 }
 
 #[test]

@@ -462,10 +462,7 @@ pub async fn create_group(
             ));
         }
     }
-    crate::api::authz::shadow_marker::note_passed_on(
-        crate::services::iam_legacy_projection::ScopeRef::Instance,
-        crate::api::authz::shadow_marker::LegacyLevel::Admin,
-    );
+    crate::api::authz::shadow_marker::note_instance_admin_pass();
 
     let group: CreatedGroupRow = sqlx::query_as(
         r#"

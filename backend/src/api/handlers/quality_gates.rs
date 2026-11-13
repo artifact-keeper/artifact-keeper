@@ -740,6 +740,7 @@ async fn list_checks(
 /// `admin_middleware` and a defense-in-depth check here.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("monitoring.read")), ("x-resource" = json!("instance"))),
     path = "/quality-checks",
     context_path = "/api/v1/admin",
     tag = "quality",

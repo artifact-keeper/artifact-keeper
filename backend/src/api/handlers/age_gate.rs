@@ -495,6 +495,7 @@ fn require_remote_repo_for_age_gate(repo_type: &RepositoryType) -> Result<()> {
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("age_gate.review")), ("x-resource" = json!("instance"))),
     path = "/age-gate/reviews",
     context_path = "/api/v1/admin",
     tag = "age-gate",
@@ -522,6 +523,7 @@ pub async fn list_reviews(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("age_gate.review")), ("x-resource" = json!("instance"))),
     path = "/age-gate/reviews/{id}",
     context_path = "/api/v1/admin",
     tag = "age-gate",
@@ -542,6 +544,7 @@ pub async fn get_review(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("age_gate.review")), ("x-resource" = json!("instance"))),
     path = "/age-gate/reviews/{id}/approve",
     context_path = "/api/v1/admin",
     tag = "age-gate",
@@ -569,6 +572,7 @@ pub async fn approve_review(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("age_gate.review")), ("x-resource" = json!("instance"))),
     path = "/age-gate/reviews/{id}/reject",
     context_path = "/api/v1/admin",
     tag = "age-gate",
@@ -596,6 +600,7 @@ pub async fn reject_review(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("age_gate.review")), ("x-resource" = json!("instance"))),
     path = "/age-gate/reviews/{id}/reopen",
     context_path = "/api/v1/admin",
     tag = "age-gate",

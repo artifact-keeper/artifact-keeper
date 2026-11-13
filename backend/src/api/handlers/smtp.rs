@@ -46,6 +46,7 @@ pub struct SmtpTestResponse {
 /// recipient address and reports whether delivery succeeded.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.settings.update")), ("x-resource" = json!("instance"))),
     path = "/test",
     context_path = "/api/v1/admin/smtp",
     tag = "admin",

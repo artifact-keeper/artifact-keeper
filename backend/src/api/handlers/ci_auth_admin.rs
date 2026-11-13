@@ -146,6 +146,7 @@ fn require_admin(auth: &AuthExtension) -> crate::error::Result<()> {
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     // `""` (not `"/"`): the route is served at the bare collection path
     // `/api/v1/admin/ci-oidc`; `path = "/"` published a trailing-slash URL
     // that the router 404s. Mirrors lifecycle.rs.
@@ -173,6 +174,7 @@ pub async fn list_providers(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/admin/ci-oidc",
     tag = "admin",
@@ -197,6 +199,7 @@ pub async fn get_provider(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     // `""` (not `"/"`): see list_providers above.
     path = "",
     context_path = "/api/v1/admin/ci-oidc",
@@ -225,6 +228,7 @@ pub async fn create_provider(
 
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/admin/ci-oidc",
     tag = "admin",
@@ -259,6 +263,7 @@ pub async fn update_provider(
 
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/admin/ci-oidc",
     tag = "admin",
@@ -285,6 +290,7 @@ pub async fn delete_provider(
 
 #[utoipa::path(
     patch,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/toggle",
     context_path = "/api/v1/admin/ci-oidc",
     tag = "admin",
@@ -316,6 +322,7 @@ pub async fn toggle_provider(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/mappings",
     context_path = "/api/v1/admin/ci-oidc",
     tag = "admin",
@@ -340,6 +347,7 @@ pub async fn list_mappings(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/mappings/{mid}",
     context_path = "/api/v1/admin/ci-oidc",
     tag = "admin",
@@ -367,6 +375,7 @@ pub async fn get_mapping(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/mappings",
     context_path = "/api/v1/admin/ci-oidc",
     tag = "admin",
@@ -397,6 +406,7 @@ pub async fn create_mapping(
 
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/mappings/{mid}",
     context_path = "/api/v1/admin/ci-oidc",
     tag = "admin",
@@ -431,6 +441,7 @@ pub async fn update_mapping(
 
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/mappings/{mid}",
     context_path = "/api/v1/admin/ci-oidc",
     tag = "admin",
@@ -460,6 +471,7 @@ pub async fn delete_mapping(
 
 #[utoipa::path(
     patch,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/mappings/{mid}/toggle",
     context_path = "/api/v1/admin/ci-oidc",
     tag = "admin",

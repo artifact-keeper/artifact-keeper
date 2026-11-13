@@ -127,6 +127,7 @@ pub async fn list_active_banners(
 /// List every banner, including disabled, scheduled and expired ones.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("system.settings.read")), ("x-resource" = json!("instance"))),
     path = "",
     context_path = "/api/v1/admin/banners",
     tag = "banners",
@@ -150,6 +151,7 @@ pub async fn list_banners(State(state): State<SharedState>) -> Result<Json<Banne
 /// Read one banner.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("system.settings.read")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/admin/banners",
     tag = "banners",
@@ -174,6 +176,7 @@ pub async fn get_banner(
 /// Create a banner.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.settings.update")), ("x-resource" = json!("instance"))),
     path = "",
     context_path = "/api/v1/admin/banners",
     tag = "banners",
@@ -202,6 +205,7 @@ pub async fn create_banner(
 /// Replace a banner's content, window and enabled flag.
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("system.settings.update")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/admin/banners",
     tag = "banners",
@@ -236,6 +240,7 @@ pub async fn update_banner(
 /// Delete a banner.
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("system.settings.update")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/admin/banners",
     tag = "banners",

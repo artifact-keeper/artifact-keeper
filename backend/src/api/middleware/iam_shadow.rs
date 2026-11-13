@@ -31,7 +31,7 @@ use sqlx::PgPool;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::api::authz::catalog::Permission;
+use crate::api::authz::catalog::{Permission, Scope};
 use crate::api::authz::declaration::{Resolver, RouteRequirement};
 use crate::api::authz::registry::{RouteRegistry, API_V1_PREFIX};
 use crate::api::authz::shadow_marker::{self, LegacyLevel, Recorded};
@@ -91,6 +91,23 @@ pub fn settled_by_status(status: StatusCode, recorded: &Recorded) -> Option<Lega
     settled.then_some(LegacyOutcome::Unknown("legacy_unknown"))
 }
 
+/// An unmarked 404 on an instance-resolved declaration after the instance
+/// check passed: the instance hides nothing, so the object is missing.
+fn missing_after_instance_pass(
+    status: StatusCode,
+    recorded: &Recorded,
+    resource: ScopeRef,
+    needed: LegacyLevel,
+) -> bool {
+    status == StatusCode::NOT_FOUND
+        && resource == ScopeRef::Instance
+        && recorded.hidden_refusal.is_none()
+        && recorded.kept_refusal.is_none()
+        && recorded
+            .passed_on(ScopeRef::Instance)
+            .is_some_and(|level| level.satisfies(needed))
+}
+
 /// Classify the legacy response for the declared check on `resource`.
 ///
 /// * A 404 is a refusal only when a hiding helper marked it for `resource`; a
@@ -108,6 +125,9 @@ pub fn legacy_outcome(
     resource: ScopeRef,
     needed: LegacyLevel,
 ) -> LegacyOutcome {
+    if missing_after_instance_pass(status, recorded, resource, needed) {
+        return LegacyOutcome::Permit;
+    }
     if let Some(settled) = settled_by_status(status, recorded) {
         return settled;
     }
@@ -466,7 +486,10 @@ impl IamShadow {
         status: StatusCode,
         recorded: &Recorded,
     ) -> Result<Settled, &'static str> {
-        if let Some(legacy) = settled_by_status(status, recorded) {
+        // The instance needs no lookup, so its status is settled with the
+        // resource known (`legacy_outcome`), where a pass can count.
+        let looked_up = pending.resolver.scope != Scope::Instance;
+        if let Some(legacy) = settled_by_status(status, recorded).filter(|_| looked_up) {
             return Ok(Settled {
                 legacy,
                 resource: None,
@@ -733,6 +756,36 @@ mod tests {
                 none.clone(),
                 here,
                 L::Read,
+                Unknown("legacy_unknown"),
+            ),
+            // After the instance check, a 404 on the instance is a missing
+            // object; without the pass, or on another resource, it is not.
+            (
+                StatusCode::NOT_FOUND,
+                passed_at(ScopeRef::Instance, L::Admin),
+                ScopeRef::Instance,
+                L::Admin,
+                Permit,
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                none.clone(),
+                ScopeRef::Instance,
+                L::Admin,
+                Unknown("legacy_unknown"),
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                passed_at(ScopeRef::Instance, L::Admin),
+                here,
+                L::Read,
+                Unknown("legacy_unknown"),
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                passed_at(ScopeRef::Instance, L::Admin),
+                project,
+                L::Admin,
                 Unknown("legacy_unknown"),
             ),
             (
@@ -1833,6 +1886,124 @@ mod end_to_end {
         tdh::cleanup_user(&pool, member).await;
         tdh::cleanup_user(&pool, instance_admin).await;
         tdh::cleanup(&pool, repo, manager).await;
+    }
+
+    #[tokio::test]
+    async fn the_admin_area_is_compared() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (admin, _) = tdh::create_user(&pool).await;
+        let (plain, _) = tdh::create_user(&pool).await;
+        let (global, _) = tdh::create_user(&pool).await;
+        sqlx::query("UPDATE users SET is_admin = true WHERE id = $1")
+            .bind(admin)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A global `admin` role assignment: `admin` on every repository in
+        // legacy, never an instance administrator.
+        sqlx::query(
+            "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+             SELECT $1, id, NULL FROM roles WHERE name = 'admin'",
+        )
+        .bind(global)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut rig = Rig::new(pool.clone(), &dir).await;
+        let admin_bearer = tdh::bearer_for(&rig.state, admin).await;
+        let plain_bearer = tdh::bearer_for(&rig.state, plain).await;
+        let global_bearer = tdh::bearer_for(&rig.state, global).await;
+        let auth = crate::services::auth_service::AuthService::new(
+            pool.clone(),
+            Arc::new(rig.state.config.clone()),
+        );
+        let (scoped_token, scoped_id) = auth
+            .generate_api_token(admin, "shadow-admin-scoped", vec!["*".into()], None)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+            .bind(scoped_id)
+            .bind(repo)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let scoped = format!("Bearer {scoped_token}");
+        let get = |path: &str| empty_request("GET", format!("/api/v1/admin{path}"));
+        let compared = |c: &Comparison, legacy: LegacyOutcome, class: Class| {
+            assert_eq!((c.legacy, c.class), (legacy, class), "{c:?}");
+        };
+
+        // The administrator: reads agree, and so do a missing object and an
+        // invalid value after the middleware.
+        let (status, c) = rig.call(Some(&admin_bearer), get("/settings/system")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(c.permission, Permission::SystemSettingsRead);
+        assert_eq!(c.resource, Some(ScopeRef::Instance));
+        compared(&c, LegacyOutcome::Permit, Class::Agree);
+        let (status, c) = rig.call(Some(&admin_bearer), get("/backups")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(c.permission, Permission::SystemBackupManage);
+        compared(&c, LegacyOutcome::Permit, Class::Agree);
+        let missing = format!("/backups/{}", Uuid::new_v4());
+        let (status, c) = rig.call(Some(&admin_bearer), get(&missing)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        compared(&c, LegacyOutcome::Permit, Class::Agree);
+        let invalid = json_request(
+            "PATCH",
+            "/api/v1/admin/settings/system".to_string(),
+            serde_json::json!({}),
+        );
+        let (status, c) = rig.call(Some(&admin_bearer), invalid).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(c.permission, Permission::SystemSettingsUpdate);
+        compared(&c, LegacyOutcome::Permit, Class::Agree);
+
+        // A non-administrator is refused by both, and compared as itself.
+        let (status, c) = rig.call(Some(&plain_bearer), get("/audit")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(c.principal.id(), Some(plain));
+        assert!(is_refusal(&c), "{c:?}");
+        compared(&c, LegacyOutcome::Refuse, Class::Agree);
+
+        // The enumerated tightening: a repository-restricted administrator
+        // token no longer reaches the instance...
+        let (status, c) = rig.call(Some(&scoped), get("/settings/system")).await;
+        assert_eq!(status, StatusCode::OK);
+        compared(&c, LegacyOutcome::Permit, Class::NewStricter);
+        // ...where legacy already refuses it, both agree.
+        let (status, c) = rig.call(Some(&scoped), get("/stats")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        compared(&c, LegacyOutcome::Refuse, Class::Agree);
+
+        // A global `admin` role is `owner` on the instance: the age-gate queue
+        // is the one admin operation it reaches, which legacy refuses.
+        let (status, c) = rig
+            .call(Some(&global_bearer), get("/age-gate/reviews"))
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(c.permission, Permission::AgeGateReview);
+        compared(&c, LegacyOutcome::Refuse, Class::NewWider);
+        let (status, c) = rig
+            .call(Some(&global_bearer), get("/settings/system"))
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        compared(&c, LegacyOutcome::Refuse, Class::Agree);
+
+        rig.shutdown.cancel();
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE id = $1")
+            .bind(scoped_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM role_assignments WHERE user_id = $1")
+            .bind(global)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, plain).await;
+        tdh::cleanup_user(&pool, global).await;
+        tdh::cleanup(&pool, repo, admin).await;
     }
 
     #[tokio::test]

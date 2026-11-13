@@ -40,15 +40,6 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
 }
 
-/// For the IAM shadow comparison (#4214): the instance-administrator check
-/// passed, so a later 4xx is not a refusal.
-fn note_instance_pass() {
-    crate::api::authz::shadow_marker::note_passed_on(
-        crate::services::iam_legacy_projection::ScopeRef::Instance,
-        crate::api::authz::shadow_marker::LegacyLevel::Admin,
-    );
-}
-
 /// Create project routes.
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -449,7 +440,7 @@ pub async fn create_project(
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
     auth.require_admin()?;
-    note_instance_pass();
+    crate::api::authz::shadow_marker::note_instance_admin_pass();
 
     let payload: CreateProjectRequest = serde_json::from_slice(&body)
         .map_err(|e| AppError::Validation(format!("Invalid project payload: {}", e)))?;
@@ -602,7 +593,7 @@ pub async fn delete_project(
     let auth = require_auth(auth)?;
     auth.require_scope("delete")?;
     auth.require_admin()?;
-    note_instance_pass();
+    crate::api::authz::shadow_marker::note_instance_admin_pass();
 
     // One tx: grants + project row go together, so a failure never leaves
     // orphaned project grants that a recreated project id could never match

@@ -86,6 +86,7 @@ pub fn router() -> Router<SharedState> {
 /// `cluster_leader_active`, `cursor` and `last_poll_at` are cluster-wide.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("monitoring.read")), ("x-resource" = json!("instance"))),
     path = "/npm/upstream-feed/status",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -218,6 +219,7 @@ pub struct AuditLogListResponse {
 /// and a defense-in-depth check here (#2366).
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("audit.read")), ("x-resource" = json!("instance"))),
     path = "/audit",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -272,6 +274,7 @@ pub async fn list_audit_logs(
 /// Requires admin privileges.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("system.settings.read")), ("x-resource" = json!("instance"))),
     path = "/storage-backends",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -385,6 +388,7 @@ pub(crate) fn parse_backup_status(s: &str) -> Option<BackupStatus> {
 /// List backups
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("system.backup.manage")), ("x-resource" = json!("instance"))),
     path = "/backups",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -438,6 +442,7 @@ pub async fn list_backups(
 /// Get backup by ID
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("system.backup.manage")), ("x-resource" = json!("instance"))),
     path = "/backups/{id}",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -477,6 +482,7 @@ pub async fn get_backup(
 /// Create backup
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.backup.manage")), ("x-resource" = json!("instance"))),
     path = "/backups",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -537,6 +543,7 @@ pub async fn create_backup(
 /// the cases where no run outcome exists to report at all.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.backup.manage")), ("x-resource" = json!("instance"))),
     path = "/backups/{id}/execute",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -640,6 +647,7 @@ pub struct RestoreResponse {
 /// Restore from backup
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.backup.manage")), ("x-resource" = json!("instance"))),
     path = "/backups/{id}/restore",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -703,6 +711,7 @@ pub async fn restore_backup(
 /// Cancel a running backup
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.backup.manage")), ("x-resource" = json!("instance"))),
     path = "/backups/{id}/cancel",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -732,6 +741,7 @@ pub async fn cancel_backup(
 /// Delete a backup
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("system.backup.manage")), ("x-resource" = json!("instance"))),
     path = "/backups/{id}",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -842,6 +852,7 @@ fn stored_i32(value: &serde_json::Value, default: i32) -> i32 {
 /// Get system settings
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("system.settings.read")), ("x-resource" = json!("instance"))),
     path = "/settings",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -1018,6 +1029,7 @@ fn system_setting_audit_details(key: &str, before: i32, after: i32) -> serde_jso
 /// writes one `SETTING_CHANGED` audit row (#5652).
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.settings.update")), ("x-resource" = json!("instance"))),
     path = "/settings",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -1167,6 +1179,7 @@ async fn build_totp_policy_response(
 /// Read the system-wide 2FA enforcement policy.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("system.settings.read")), ("x-resource" = json!("instance"))),
     path = "/settings/totp-policy",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -1195,6 +1208,7 @@ pub async fn get_totp_policy(
 /// password login, so the administrator making the change keeps their session.
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("system.settings.update")), ("x-resource" = json!("instance"))),
     path = "/settings/totp-policy",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -1422,6 +1436,7 @@ async fn read_guest_access(
 /// navigation entries).
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("system.settings.read")), ("x-resource" = json!("instance"))),
     path = "/settings/system",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -1462,6 +1477,7 @@ pub async fn get_runtime_settings(
 /// list leaves both settings untouched.
 #[utoipa::path(
     patch,
+    extensions(("x-required-permission" = json!("system.settings.update")), ("x-resource" = json!("instance"))),
     path = "/settings/system",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -1631,6 +1647,7 @@ async fn build_token_policy_response(state: &SharedState) -> Result<TokenPolicyR
 /// Read the API token expiration policy.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("system.settings.read")), ("x-resource" = json!("instance"))),
     path = "/settings/token-policy",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -1655,6 +1672,7 @@ pub async fn get_token_policy(
 /// inventory to rotate manually if the security posture requires it.
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("system.settings.update")), ("x-resource" = json!("instance"))),
     path = "/settings/token-policy",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -1748,6 +1766,7 @@ pub struct SystemStats {
 /// Get system statistics
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("monitoring.read")), ("x-resource" = json!("instance"))),
     path = "/stats",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -1950,6 +1969,7 @@ pub struct LedgerBackfillResponse {
 /// repository. Admin only.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.maintenance")), ("x-resource" = json!("instance"))),
     path = "/storage/ledger/backfill",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -2274,6 +2294,7 @@ fn require_download_attribution_admin(auth: &AuthExtension) -> Result<()> {
 /// (#4539). Admin-only: download attribution is sensitive.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("audit.read")), ("x-resource" = json!("instance"))),
     path = "/downloads",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -2298,6 +2319,7 @@ pub async fn list_downloads(
 /// location pull?" (#2365).
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("audit.read")), ("x-resource" = json!("instance"))),
     path = "/downloads/by-ip/{ip}",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -2347,6 +2369,7 @@ pub async fn list_downloads_by_ip(
 /// Downloads performed by one user: "what did this user pull?" (#2365).
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("audit.read")), ("x-resource" = json!("instance"))),
     path = "/downloads/by-user/{user_id}",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -2414,6 +2437,7 @@ fn audit_cleanup_applies(requested: Option<bool>, audit_retention_days: i32) -> 
 /// Run cleanup tasks
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.maintenance")), ("x-resource" = json!("instance"))),
     path = "/cleanup",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -2513,6 +2537,7 @@ pub struct PackagesBackfillResponse {
 /// `repository_key` scopes the walk to one repository.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.maintenance")), ("x-resource" = json!("instance"))),
     path = "/packages/backfill",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -2576,6 +2601,7 @@ pub struct ReindexResponse {
 /// Requires admin privileges and Meilisearch to be configured.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.maintenance")), ("x-resource" = json!("instance"))),
     path = "/reindex",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -2674,6 +2700,7 @@ fn rescan_inflight_semaphore() -> &'static Arc<Semaphore> {
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.maintenance")), ("x-resource" = json!("instance"))),
     path = "/rescan-for-inventory",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -2840,6 +2867,7 @@ pub struct ProxyScanVerdictListResponse {
 /// clear — a lever that spans every repo.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("system.maintenance")), ("x-resource" = json!("instance"))),
     path = "/proxy-scan-verdicts/{digest}",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -2897,6 +2925,7 @@ pub async fn get_proxy_scan_verdicts(
 /// The deletion is audited with the removed rows' verdict summary.
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("system.maintenance")), ("x-resource" = json!("instance"))),
     path = "/proxy-scan-verdicts/{digest}",
     context_path = "/api/v1/admin",
     tag = "admin",

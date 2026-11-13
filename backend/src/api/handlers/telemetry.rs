@@ -49,6 +49,7 @@ pub fn router() -> Router<SharedState> {
 /// GET /api/v1/admin/telemetry/settings
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("monitoring.read")), ("x-resource" = json!("instance"))),
     path = "/settings",
     context_path = "/api/v1/admin/telemetry",
     tag = "telemetry",
@@ -67,6 +68,7 @@ pub async fn get_settings(State(state): State<SharedState>) -> Result<Json<Telem
 /// POST /api/v1/admin/telemetry/settings
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("monitoring.manage")), ("x-resource" = json!("instance"))),
     path = "/settings",
     context_path = "/api/v1/admin/telemetry",
     tag = "telemetry",
@@ -101,6 +103,7 @@ pub struct ListCrashesQuery {
 /// GET /api/v1/admin/telemetry/crashes
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("monitoring.read")), ("x-resource" = json!("instance"))),
     path = "/crashes",
     context_path = "/api/v1/admin/telemetry",
     tag = "telemetry",
@@ -130,6 +133,7 @@ pub async fn list_crashes(
 /// GET /api/v1/admin/telemetry/crashes/pending
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("monitoring.read")), ("x-resource" = json!("instance"))),
     path = "/crashes/pending",
     context_path = "/api/v1/admin/telemetry",
     tag = "telemetry",
@@ -149,6 +153,7 @@ pub async fn list_pending_crashes(
 /// GET /api/v1/admin/telemetry/crashes/:id
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("monitoring.read")), ("x-resource" = json!("instance"))),
     path = "/crashes/{id}",
     context_path = "/api/v1/admin/telemetry",
     tag = "telemetry",
@@ -172,6 +177,7 @@ pub async fn get_crash(
 /// DELETE /api/v1/admin/telemetry/crashes/:id
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("monitoring.manage")), ("x-resource" = json!("instance"))),
     path = "/crashes/{id}",
     context_path = "/api/v1/admin/telemetry",
     tag = "telemetry",
@@ -206,6 +212,7 @@ pub struct SubmitCrashesRequest {
 /// POST /api/v1/admin/telemetry/crashes/submit
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("monitoring.manage")), ("x-resource" = json!("instance"))),
     path = "/crashes/submit",
     context_path = "/api/v1/admin/telemetry",
     tag = "telemetry",

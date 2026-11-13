@@ -124,6 +124,7 @@ fn to_quarantine_response(row: QuarantineHoldRow) -> QuarantineHoldResponse {
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("audit.read")), ("x-resource" = json!("instance"))),
     path = "/holds/summary",
     context_path = "/api/v1/admin",
     tag = "holds",
@@ -145,6 +146,7 @@ pub async fn holds_summary(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("audit.read")), ("x-resource" = json!("instance"))),
     path = "/holds/quarantine",
     context_path = "/api/v1/admin",
     tag = "holds",
@@ -250,6 +252,7 @@ fn to_policy_block_response(b: PolicyBlock) -> PolicyBlockResponse {
 /// recorded, and a hold whose policy no longer refuses does not.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("audit.read")), ("x-resource" = json!("instance"))),
     path = "/holds/policy-blocks",
     context_path = "/api/v1/admin",
     tag = "holds",

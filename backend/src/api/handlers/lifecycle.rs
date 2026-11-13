@@ -75,6 +75,7 @@ pub struct LifecycleCapabilities {
 /// older backends ignore the new fields and interpret missing scope as global.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("retention.policy.manage")), ("x-resource" = json!("instance"))),
     path = "/capabilities",
     context_path = "/api/v1/admin/lifecycle",
     tag = "lifecycle",
@@ -94,6 +95,7 @@ pub async fn capabilities() -> Json<LifecycleCapabilities> {
 
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("retention.policy.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/repositories/{repository_id}",
     context_path = "/api/v1/admin/lifecycle",
     tag = "lifecycle",
@@ -124,6 +126,7 @@ pub async fn attach_repository(
 
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("retention.policy.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/repositories/{repository_id}",
     context_path = "/api/v1/admin/lifecycle",
     tag = "lifecycle",
@@ -160,6 +163,7 @@ pub struct ListPoliciesQuery {
 /// GET /api/v1/admin/lifecycle
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("retention.policy.manage")), ("x-resource" = json!("instance"))),
     path = "",
     context_path = "/api/v1/admin/lifecycle",
     tag = "lifecycle",
@@ -182,6 +186,7 @@ pub async fn list_policies(
 /// POST /api/v1/admin/lifecycle
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("retention.policy.manage")), ("x-resource" = json!("instance"))),
     path = "",
     context_path = "/api/v1/admin/lifecycle",
     tag = "lifecycle",
@@ -206,6 +211,7 @@ pub async fn create_policy(
 /// GET /api/v1/admin/lifecycle/:id
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("retention.policy.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/admin/lifecycle",
     tag = "lifecycle",
@@ -230,6 +236,7 @@ pub async fn get_policy(
 /// PATCH /api/v1/admin/lifecycle/:id
 #[utoipa::path(
     patch,
+    extensions(("x-required-permission" = json!("retention.policy.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/admin/lifecycle",
     tag = "lifecycle",
@@ -258,6 +265,7 @@ pub async fn update_policy(
 /// DELETE /api/v1/admin/lifecycle/:id
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("retention.policy.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/admin/lifecycle",
     tag = "lifecycle",
@@ -283,6 +291,7 @@ pub async fn delete_policy(
 /// POST /api/v1/admin/lifecycle/:id/execute
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("retention.policy.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/execute",
     context_path = "/api/v1/admin/lifecycle",
     tag = "lifecycle",
@@ -312,6 +321,7 @@ pub async fn execute_policy(
 /// POST /api/v1/admin/lifecycle/:id/preview - dry-run
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("retention.policy.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/preview",
     context_path = "/api/v1/admin/lifecycle",
     tag = "lifecycle",
@@ -335,6 +345,7 @@ pub async fn preview_policy(
 /// POST /api/v1/admin/lifecycle/execute-all
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("retention.policy.manage")), ("x-resource" = json!("instance"))),
     path = "/execute-all",
     context_path = "/api/v1/admin/lifecycle",
     tag = "lifecycle",

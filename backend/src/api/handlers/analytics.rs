@@ -56,6 +56,7 @@ pub struct StaleQuery {
 /// GET /api/v1/admin/analytics/storage/trend
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("analytics.read")), ("x-resource" = json!("instance"))),
     path = "/storage/trend",
     context_path = "/api/v1/admin/analytics",
     tag = "analytics",
@@ -78,6 +79,7 @@ pub async fn get_storage_trend(
 /// GET /api/v1/admin/analytics/storage/breakdown
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("analytics.read")), ("x-resource" = json!("instance"))),
     path = "/storage/breakdown",
     context_path = "/api/v1/admin/analytics",
     tag = "analytics",
@@ -97,6 +99,7 @@ pub async fn get_storage_breakdown(
 /// GET /api/v1/admin/analytics/storage/growth
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("analytics.read")), ("x-resource" = json!("instance"))),
     path = "/storage/growth",
     context_path = "/api/v1/admin/analytics",
     tag = "analytics",
@@ -119,6 +122,7 @@ pub async fn get_growth_summary(
 /// GET /api/v1/admin/analytics/artifacts/stale
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("analytics.read")), ("x-resource" = json!("instance"))),
     path = "/artifacts/stale",
     context_path = "/api/v1/admin/analytics",
     tag = "analytics",
@@ -142,6 +146,7 @@ pub async fn get_stale_artifacts(
 /// GET /api/v1/admin/analytics/downloads/trend
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("analytics.read")), ("x-resource" = json!("instance"))),
     path = "/downloads/trend",
     context_path = "/api/v1/admin/analytics",
     tag = "analytics",
@@ -164,6 +169,7 @@ pub async fn get_download_trends(
 /// GET /api/v1/admin/analytics/repositories/{id}/trend
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("analytics.read")), ("x-resource" = json!("instance"))),
     path = "/repositories/{id}/trend",
     context_path = "/api/v1/admin/analytics",
     tag = "analytics",
@@ -190,6 +196,7 @@ pub async fn get_repository_trend(
 /// POST /api/v1/admin/analytics/snapshot - manually trigger a snapshot
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.maintenance")), ("x-resource" = json!("instance"))),
     path = "/snapshot",
     context_path = "/api/v1/admin/analytics",
     tag = "analytics",

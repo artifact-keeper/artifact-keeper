@@ -310,10 +310,22 @@ impl<'a> Projector<'a> {
             let admin = actions.contains(&LegacyAction::Admin);
             let permissions = permissions_for_actions(&actions);
             match a.repository_id {
-                None if admin => {
-                    self.bind_system(subject, SystemRole::Admin, ScopeRef::Instance, None, from)
+                // A global role assignment applies to every repository and
+                // never made anyone an instance administrator, so even `admin`
+                // binds its repository permissions on the instance, not `admin`.
+                None => {
+                    self.bind(subject, &permissions, ScopeRef::Instance, None, from);
+                    if admin {
+                        self.b.diagnostic(
+                            DiagnosticCategory::OwnerWidening,
+                            source,
+                            format!(
+                                "`{}` gains administration of every repository (configuration, deletion, credentials)",
+                                user.username
+                            ),
+                        );
+                    }
                 }
-                None => self.bind(subject, &permissions, ScopeRef::Instance, None, from),
                 Some(repo) => {
                     if !self.repositories.contains_key(&repo) {
                         self.b.diagnostic(

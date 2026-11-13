@@ -1203,6 +1203,7 @@ async fn probe_storage_connectivity(
 /// Renders all registered metrics from the metrics-exporter-prometheus recorder.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("monitoring.read")), ("x-resource" = json!("instance"))),
     path = "/metrics",
     context_path = "/api/v1/admin",
     tag = "health",

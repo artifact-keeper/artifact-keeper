@@ -98,6 +98,7 @@ fn scrub_budget(requested: Option<u64>, default: u64, ceiling: u64) -> u64 {
 /// POST /api/v1/admin/storage-scrub
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.maintenance")), ("x-resource" = json!("instance"))),
     path = "/storage-scrub",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -305,6 +306,7 @@ pub struct ScrubFindingsQuery {
 /// GET /api/v1/admin/storage-scrub/findings
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("system.maintenance")), ("x-resource" = json!("instance"))),
     path = "/storage-scrub/findings",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -360,6 +362,7 @@ pub struct StorageReindexRequest {
 /// never touched.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.maintenance")), ("x-resource" = json!("instance"))),
     path = "/repositories/{key}/reindex-storage",
     context_path = "/api/v1/admin",
     tag = "admin",
@@ -476,6 +479,7 @@ pub struct DebianBackfillRequest {
 /// Idempotent and safe on a live repository.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.maintenance")), ("x-resource" = json!("instance"))),
     path = "/repositories/{key}/backfill-debian",
     context_path = "/api/v1/admin",
     tag = "admin",

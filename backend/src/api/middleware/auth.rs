@@ -2430,6 +2430,9 @@ pub async fn admin_middleware(
         }
     };
 
+    // The IAM shadow comparison (#4214) compares a refused caller as itself,
+    // not as anonymous, so the principal is noted before the decision.
+    crate::api::authz::shadow_marker::note_principal(&auth_ext);
     if !auth_ext.is_admin {
         // Best-effort RBAC-deny audit event (#2366): an authenticated non-admin
         // reaching an admin-only route is exactly the kind of authorization
@@ -2472,6 +2475,7 @@ pub async fn admin_middleware(
         return must_change_password_response();
     }
 
+    crate::api::authz::shadow_marker::note_instance_admin_pass();
     record_request_user(Some(&auth_ext));
     request.extensions_mut().insert(auth_ext);
     next.run(request).await
@@ -11589,6 +11593,17 @@ mod tests {
         auth_service: &AuthService,
         must_change_password: bool,
     ) -> (Uuid, String) {
+        mint_bearer_for_user(pool, auth_service, must_change_password, false).await
+    }
+
+    /// [`mint_bearer_for_flagged_user`] for a user that may be an administrator.
+    #[cfg(test)]
+    async fn mint_bearer_for_user(
+        pool: &sqlx::PgPool,
+        auth_service: &AuthService,
+        must_change_password: bool,
+        is_admin: bool,
+    ) -> (Uuid, String) {
         use crate::api::handlers::test_db_helpers as tdh;
         use crate::models::user::AuthProvider;
 
@@ -11603,13 +11618,14 @@ mod tests {
                                                                 // request with "Token invalidated by credential change" under parallel
                                                                 // test load. Aging the watermark 60s removes the race deterministically.
         sqlx::query(
-            "UPDATE users SET must_change_password = $1, \
+            "UPDATE users SET must_change_password = $1, is_admin = $3, \
              password_changed_at = NOW() - INTERVAL '60 seconds', \
              privileges_changed_at = NOW() - INTERVAL '60 seconds' \
              WHERE id = $2",
         )
         .bind(must_change_password)
         .bind(user_id)
+        .bind(is_admin)
         .execute(pool)
         .await
         .expect("set must_change_password");
@@ -11624,7 +11640,7 @@ mod tests {
             external_id: None,
             display_name: None,
             is_active: true,
-            is_admin: false,
+            is_admin,
             is_service_account: false,
             must_change_password,
             totp_secret: None,
@@ -11644,6 +11660,63 @@ mod tests {
             auth_service.generate_tokens(&user).unwrap().access_token
         );
         (user_id, bearer)
+    }
+
+    /// IAM shadow (#4214): `admin_middleware` records the caller before it
+    /// decides, so a refused non-administrator is compared as itself, and
+    /// records the instance pass only once every gate let the request through.
+    /// DB-backed: no-ops when `DATABASE_URL` is unset.
+    #[tokio::test]
+    async fn admin_middleware_records_the_caller_and_the_instance_pass() {
+        use crate::api::authz::shadow_marker;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::iam_legacy_projection::ScopeRef;
+        use axum::{middleware, routing::any, Router};
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            make_test_config_for_middleware(),
+        ));
+        let call = |bearer: String| {
+            let app = Router::new()
+                .route("/probe", any(|| async { (StatusCode::OK, "admin-ok") }))
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    admin_middleware,
+                ));
+            let request = axum::http::Request::builder()
+                .uri("/probe")
+                .header("Authorization", bearer)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            shadow_marker::scope(async move { app.oneshot(request).await.unwrap().status() })
+        };
+
+        let (user, bearer) = mint_bearer_for_user(&pool, &auth_service, false, false).await;
+        let (status, recorded) = call(bearer).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(recorded.principal.map(|p| p.user_id), Some(user));
+        assert_eq!(recorded.passed_on(ScopeRef::Instance), None);
+
+        let (admin, bearer) = mint_bearer_for_user(&pool, &auth_service, false, true).await;
+        let (status, recorded) = call(bearer).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(recorded.principal.map(|p| p.user_id), Some(admin));
+        assert_eq!(
+            recorded.passed_on(ScopeRef::Instance),
+            Some(shadow_marker::LegacyLevel::Admin)
+        );
+
+        // A pending administrator stops at the forced password change: no pass.
+        let (_, bearer) = mint_bearer_for_user(&pool, &auth_service, true, true).await;
+        let (status, recorded) = call(bearer).await;
+        assert_eq!(status, StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(recorded.passed_on(ScopeRef::Instance), None);
     }
 
     /// Regression for #1818: a principal flagged `must_change_password` is

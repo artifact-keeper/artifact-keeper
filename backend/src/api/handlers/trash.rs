@@ -72,6 +72,7 @@ pub(crate) fn trash_service(state: &SharedState) -> TrashService {
 /// restored.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("system.maintenance")), ("x-resource" = json!("instance"))),
     path = "",
     context_path = "/api/v1/admin/trash",
     tag = "admin",
@@ -109,6 +110,7 @@ pub async fn list_trash(
 /// stored object is already gone.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.maintenance")), ("x-resource" = json!("instance"))),
     path = "/{id}/restore",
     context_path = "/api/v1/admin/trash",
     tag = "admin",
@@ -158,6 +160,7 @@ pub async fn restore_trashed_artifact(
 /// OCI manifests and blobs.
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("system.maintenance")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/admin/trash",
     tag = "admin",

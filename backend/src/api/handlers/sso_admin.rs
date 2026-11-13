@@ -166,6 +166,7 @@ fn sso_audit<'a>(
 /// List all OIDC provider configurations
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/oidc",
     context_path = "/api/v1/admin/sso",
     tag = "sso",
@@ -187,6 +188,7 @@ pub async fn list_oidc(
 /// Get OIDC provider configuration by ID
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/oidc/{id}",
     context_path = "/api/v1/admin/sso",
     tag = "sso",
@@ -213,6 +215,7 @@ pub async fn get_oidc(
 /// Create a new OIDC provider configuration
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/oidc",
     context_path = "/api/v1/admin/sso",
     tag = "sso",
@@ -239,6 +242,7 @@ pub async fn create_oidc(
 /// Update an OIDC provider configuration
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/oidc/{id}",
     context_path = "/api/v1/admin/sso",
     tag = "sso",
@@ -272,6 +276,7 @@ pub async fn update_oidc(
 /// Delete an OIDC provider configuration
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/oidc/{id}",
     context_path = "/api/v1/admin/sso",
     tag = "sso",
@@ -302,6 +307,7 @@ pub async fn delete_oidc(
 /// Toggle an OIDC provider enabled/disabled
 #[utoipa::path(
     patch,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/oidc/{id}/toggle",
     context_path = "/api/v1/admin/sso",
     tag = "sso",
@@ -347,6 +353,7 @@ pub struct OidcManagedGroupResponse {
 /// Pre-provision an OIDC-managed group without creating membership.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/oidc/{provider_id}/groups",
     context_path = "/api/v1/admin/sso",
     tag = "sso",
@@ -420,6 +427,7 @@ pub async fn preprovision_oidc_group(
 /// List all LDAP provider configurations
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/ldap",
     context_path = "/api/v1/admin/sso",
     tag = "sso",
@@ -441,6 +449,7 @@ pub async fn list_ldap(
 /// Get LDAP provider configuration by ID
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/ldap/{id}",
     context_path = "/api/v1/admin/sso",
     tag = "sso",
@@ -467,6 +476,7 @@ pub async fn get_ldap(
 /// Create a new LDAP provider configuration
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/ldap",
     context_path = "/api/v1/admin/sso",
     tag = "sso",
@@ -494,6 +504,7 @@ pub async fn create_ldap(
 /// Update an LDAP provider configuration
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/ldap/{id}",
     context_path = "/api/v1/admin/sso",
     tag = "sso",
@@ -530,6 +541,7 @@ pub async fn update_ldap(
 /// Delete an LDAP provider configuration
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/ldap/{id}",
     context_path = "/api/v1/admin/sso",
     tag = "sso",
@@ -560,6 +572,7 @@ pub async fn delete_ldap(
 /// Toggle an LDAP provider enabled/disabled
 #[utoipa::path(
     patch,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/ldap/{id}/toggle",
     context_path = "/api/v1/admin/sso",
     tag = "sso",
@@ -592,6 +605,7 @@ pub async fn toggle_ldap(
 /// Test an LDAP provider connection
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/ldap/{id}/test",
     context_path = "/api/v1/admin/sso",
     tag = "sso",
@@ -622,6 +636,7 @@ pub async fn test_ldap(
 /// List all SAML provider configurations
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/saml",
     context_path = "/api/v1/admin/sso",
     tag = "sso",
@@ -643,6 +658,7 @@ pub async fn list_saml(
 /// Get SAML provider configuration by ID
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/saml/{id}",
     context_path = "/api/v1/admin/sso",
     tag = "sso",
@@ -669,6 +685,7 @@ pub async fn get_saml(
 /// Create a new SAML provider configuration
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/saml",
     context_path = "/api/v1/admin/sso",
     tag = "sso",
@@ -695,6 +712,7 @@ pub async fn create_saml(
 /// Update a SAML provider configuration
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/saml/{id}",
     context_path = "/api/v1/admin/sso",
     tag = "sso",
@@ -728,6 +746,7 @@ pub async fn update_saml(
 /// Delete a SAML provider configuration
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/saml/{id}",
     context_path = "/api/v1/admin/sso",
     tag = "sso",
@@ -758,6 +777,7 @@ pub async fn delete_saml(
 /// Toggle a SAML provider enabled/disabled
 #[utoipa::path(
     patch,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/saml/{id}/toggle",
     context_path = "/api/v1/admin/sso",
     tag = "sso",
@@ -794,6 +814,7 @@ pub async fn toggle_saml(
 /// List all enabled SSO providers (admin view)
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("identity_provider.manage")), ("x-resource" = json!("instance"))),
     path = "/providers",
     context_path = "/api/v1/admin/sso",
     tag = "sso",

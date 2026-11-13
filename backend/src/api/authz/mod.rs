@@ -19,6 +19,9 @@ pub(crate) mod route_inventory;
 
 // Shared support for the declaration table tests below. It holds no tests, so
 // like `route_inventory` it is not shard-gated.
+#[cfg(ak_test_shard = "services-2")]
+#[cfg(test)]
+mod admin_declarations;
 #[cfg(test)]
 pub(crate) mod declaration_table;
 #[cfg(ak_test_shard = "services-2")]

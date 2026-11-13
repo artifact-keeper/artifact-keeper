@@ -70,6 +70,7 @@ pub struct StorageGcRequest {
 /// POST /api/v1/admin/storage-gc
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.maintenance")), ("x-resource" = json!("instance"))),
     path = "",
     context_path = "/api/v1/admin/storage-gc",
     tag = "admin",
@@ -240,6 +241,7 @@ pub struct OciBlobReportQuery {
 /// garbage-collection sweep is enabled.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("system.maintenance")), ("x-resource" = json!("instance"))),
     path = "/oci-blob-report",
     context_path = "/api/v1/admin/storage-gc",
     tag = "admin",

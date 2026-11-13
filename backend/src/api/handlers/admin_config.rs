@@ -251,6 +251,7 @@ async fn export_repository(
 /// placeholder an import must be given. See `docs/config-as-code.md`.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("system.settings.read")), ("x-resource" = json!("instance"))),
     path = "/export",
     context_path = "/api/v1/admin/config",
     tag = "admin",
@@ -502,6 +503,7 @@ async fn audit_import(
 /// refused until they are given.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.settings.update")), ("x-resource" = json!("instance"))),
     path = "/import",
     context_path = "/api/v1/admin/config",
     tag = "admin",

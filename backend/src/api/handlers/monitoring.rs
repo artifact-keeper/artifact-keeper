@@ -54,6 +54,7 @@ fn clamp_health_log_limit(limit: Option<i64>) -> i64 {
 /// GET /api/v1/admin/monitoring/health-log
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("monitoring.read")), ("x-resource" = json!("instance"))),
     path = "/health-log",
     context_path = "/api/v1/admin/monitoring",
     tag = "monitoring",
@@ -82,6 +83,7 @@ pub async fn get_health_log(
 /// GET /api/v1/admin/monitoring/alerts
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("monitoring.read")), ("x-resource" = json!("instance"))),
     path = "/alerts",
     context_path = "/api/v1/admin/monitoring",
     tag = "monitoring",
@@ -105,6 +107,7 @@ pub struct SuppressRequest {
 /// POST /api/v1/admin/monitoring/alerts/suppress
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("monitoring.manage")), ("x-resource" = json!("instance"))),
     path = "/alerts/suppress",
     context_path = "/api/v1/admin/monitoring",
     tag = "monitoring",
@@ -134,6 +137,7 @@ pub async fn suppress_alert(
 /// POST /api/v1/admin/monitoring/check - manually trigger health checks
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("monitoring.manage")), ("x-resource" = json!("instance"))),
     path = "/check",
     context_path = "/api/v1/admin/monitoring",
     tag = "monitoring",

@@ -1314,6 +1314,7 @@ pub struct SearchReindexResponse {
 /// immediately with a confirmation that the task was started.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.maintenance")), ("x-resource" = json!("instance"))),
     path = "/reindex",
     context_path = "/api/v1/admin/search",
     tag = "admin",

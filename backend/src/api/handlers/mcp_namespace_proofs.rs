@@ -102,6 +102,7 @@ async fn fetch(state: &SharedState, id: Uuid) -> Result<ProofRow> {
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("system.settings.read")), ("x-resource" = json!("instance"))),
     operation_id = "mcp_list_namespace_proofs",
     path = "",
     context_path = "/api/v1/admin/mcp/namespace-proofs",
@@ -130,6 +131,7 @@ async fn list(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("system.settings.read")), ("x-resource" = json!("instance"))),
     operation_id = "mcp_get_namespace_proof",
     path = "/{id}",
     context_path = "/api/v1/admin/mcp/namespace-proofs",
@@ -153,6 +155,7 @@ async fn get_one(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.settings.update")), ("x-resource" = json!("instance"))),
     operation_id = "mcp_create_namespace_proof",
     path = "",
     context_path = "/api/v1/admin/mcp/namespace-proofs",
@@ -189,6 +192,7 @@ async fn create(
 
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("system.settings.update")), ("x-resource" = json!("instance"))),
     operation_id = "mcp_delete_namespace_proof",
     path = "/{id}",
     context_path = "/api/v1/admin/mcp/namespace-proofs",
@@ -221,6 +225,7 @@ async fn remove(
 /// Check the proof now (outbound, SSRF-guarded), record and audit the result.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("system.settings.update")), ("x-resource" = json!("instance"))),
     operation_id = "mcp_verify_namespace_proof",
     path = "/{id}/verify",
     context_path = "/api/v1/admin/mcp/namespace-proofs",

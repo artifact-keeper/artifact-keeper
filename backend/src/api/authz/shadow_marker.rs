@@ -145,6 +145,11 @@ pub fn note_passed_on(resource: ScopeRef, level: LegacyLevel) {
     });
 }
 
+/// Record that the instance-administrator check passed.
+pub fn note_instance_admin_pass() {
+    note_passed_on(ScopeRef::Instance, LegacyLevel::Admin);
+}
+
 /// Record a refusal the handler keeps after enforcement, by a fixed reason;
 /// the first call wins.
 pub fn note_kept_refusal(reason: &'static str) {

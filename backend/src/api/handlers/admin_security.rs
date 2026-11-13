@@ -596,6 +596,7 @@ async fn blast_radius_core(
 /// how exposed the repositories holding those artifacts are (#2364).
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("audit.read")), ("x-resource" = json!("instance"))),
     path = "/cve/{cve_id}/blast-radius",
     context_path = "/api/v1/admin/security",
     tag = "admin",
@@ -630,6 +631,7 @@ pub async fn cve_blast_radius(
 /// CVE flagged it (#2364).
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("audit.read")), ("x-resource" = json!("instance"))),
     path = "/artifact/{artifact_id}/blast-radius",
     context_path = "/api/v1/admin/security",
     tag = "admin",
@@ -981,6 +983,7 @@ const ARTIFACT_AFFECTED_SQL: &str = "SELECT $2::uuid";
 /// actually affects.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("audit.read")), ("x-resource" = json!("instance"))),
     path = "/cve/{cve_id}/accessible-users",
     context_path = "/api/v1/admin/security",
     tag = "admin",
@@ -1045,6 +1048,7 @@ pub async fn cve_accessible_users(
 /// is implied by the artifact.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("audit.read")), ("x-resource" = json!("instance"))),
     path = "/artifact/{artifact_id}/accessible-users",
     context_path = "/api/v1/admin/security",
     tag = "admin",
