@@ -10419,9 +10419,19 @@ impl ProxyService {
         }
     }
 
-    /// Whether `repo` takes a cache fill now (#4660): `false` only while its
-    /// last cap eviction could not get the cache under the cap.
+    /// Whether `repo` takes a cache fill now (#4660): `false` while the
+    /// instance is at its storage quota, or while the repository's last cap
+    /// eviction could not get the cache under the cap.
     async fn cache_fill_admitted(&self, repo: &Repository) -> bool {
+        // At the instance storage quota a Remote still serves what it fetches
+        // upstream; it only stops caching it.
+        if crate::services::quota::storage::at_quota(&self.db).await {
+            tracing::debug!(
+                repository = %repo.key,
+                "instance storage quota reached; serving without caching"
+            );
+            return false;
+        }
         if self.cache_cap.admits_fills(repo.id).await {
             return true;
         }

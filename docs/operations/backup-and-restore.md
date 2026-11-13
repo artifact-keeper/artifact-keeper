@@ -97,12 +97,81 @@ ran. Read `status`, not just the HTTP code:
   - Artifacts that were unreadable at backup time (opt-in partial backups).
   - An archive checked only against its own manifest (captured before
     backups recorded their payload checksum on the backup row, #3373).
+  - Rows that could not be inserted. One message per table gives the count
+    and names each row by its primary key with the database's reason, for
+    example `Failed to restore 2 of 40 row(s) into 'artifacts': id=... (insert
+    or update on table "artifacts" violates foreign key constraint ...)`.
+    The server log has the same table and key at WARN, never the row itself.
 - `excluded` lists the categories the archive does not carry. Whatever the
   `status`, a restore never brings these back.
 
 Rows that already exist on the target server are kept as they are: every
 table restores with `ON CONFLICT DO NOTHING`, so a restore adds what is
 missing and never overwrites a live row, a live setting or a live group.
+
+## Restoring into another server
+
+A restore can target a different server from the one that took the backup,
+for example a fresh install. That server has its own bootstrap `admin` and
+its own seeded roles, each created with a random id. Before inserting any row,
+a restore matches archived users by `username`, roles by `name` and groups by
+`name` against the rows the server already has (#5856). When one exists under
+another id, every archived row that refers to it (a repository's
+`created_by`, an artifact's `uploaded_by`, `user_roles`, `role_assignments`,
+group members, fine-grained `permissions` of a user or group, webhooks, API
+tokens, and so on) is restored pointing at the existing row.
+
+The existing row itself is kept as it is. In particular the target's `admin`
+keeps its own password, and it takes over everything the archived `admin`
+owned, including the archived `admin`'s API tokens. Revoke those after the
+restore if the target's `admin` is not meant to hold them. Archived users
+that do not exist on the target are restored with their archived ids and
+password hashes.
+
+## A restore that stops partway
+
+A restore reads the archive twice. The first pass checks the payload checksum
+and writes nothing. The second writes every artifact and blob object to its
+repository's storage, and only then are the database tables restored
+(#5857). If the second pass stops, because the archive changed after it was
+verified or the store became unreachable, the restore fails before a single
+row is written. The error says how many objects were already written: no row
+refers to them yet, and re-running the restore from an intact archive is
+safe, because it writes every object again and then restores the tables.
+
+## Clean up multipart uploads in the backup bucket
+
+On S3, a backup uploads its archive as a multipart upload. When the backup
+fails, it aborts that upload, but an abort cannot reach a store that is down,
+so an outage during a backup can leave an incomplete upload in the bucket.
+Incomplete uploads are invisible to listings but are billed as storage until
+they are aborted. Add an `AbortIncompleteMultipartUpload` lifecycle rule to
+the bucket that holds the archives (`BACKUP_S3_BUCKET`, or `S3_BUCKET` when
+backups share it) so the store removes them on its own:
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "abort-incomplete-backup-uploads",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "" },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 2 }
+    }
+  ]
+}
+```
+
+```sh
+aws s3api put-bucket-lifecycle-configuration --bucket <backup-bucket> \
+  --lifecycle-configuration file://lifecycle.json
+```
+
+Pick a number of days longer than your longest backup. With
+`BACKUP_S3_PREFIX` set, use it as the rule's `Prefix`. Check that your
+S3-compatible store supports the rule; MinIO instead removes stale incomplete
+uploads on its own (its `api` setting `stale_uploads_expiry`, 24 hours by
+default).
 
 ## Docker/OCI repositories
 

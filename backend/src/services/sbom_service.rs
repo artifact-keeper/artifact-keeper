@@ -6,6 +6,7 @@ use crate::models::sbom::{
     CveHistoryEntry, CveStatus, CveTimelineEntry, CveTrends, LicensePolicy, SbomComponent,
     SbomDocument, SbomFormat, SbomSummary,
 };
+use crate::services::open_findings::{vulnerabilities_cte, FindingScope};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -436,6 +437,144 @@ ORDER BY h.first_detected_at DESC
             )
         )
     });
+
+/// Which artifacts the drill-down covers, matching how the tile was counted.
+fn drilldown_scope(repository_id: Option<Uuid>) -> FindingScope {
+    match repository_id {
+        Some(id) => FindingScope::Repository(id),
+        None => FindingScope::All,
+    }
+}
+
+/// Rows behind a dashboard severity tile, under the one open-findings
+/// definition (#4338): the `vulnerabilities` CTE is the same function the
+/// tiles count with, so a tile and the list behind it cannot drift apart.
+/// Filtering `scan_findings` directly instead would return one row per
+/// scanner per CVE and filter on each row's own severity, which over-counts
+/// and mis-buckets a CVE two scanners graded differently.
+///
+/// Detail columns are looked up after `LIMIT`, so only the rows on the page
+/// pay for them. Acknowledgement details come from `scan_findings_effective`
+/// like the CTE's state does (#5153): the legacy `scan_findings` columns are
+/// frozen and would name a decision the tile no longer counts.
+///
+/// Binds: the scope's repository id when it has one, then severity rank,
+/// acknowledged, limit, offset. NULL rank or ack matches any.
+fn cve_drilldown_sql(scope: FindingScope) -> String {
+    let n = usize::from(!matches!(scope, FindingScope::All));
+    format!(
+        r#"{cte}
+, page AS (
+    SELECT v.artifact_id, v.advisory, v.severity_rank, v.acknowledged,
+           a.path AS artifact_path, a.repository_id,
+           COUNT(*) OVER () AS total
+    FROM vulnerabilities v
+    JOIN artifacts a ON a.id = v.artifact_id
+    WHERE (${rank}::int IS NULL OR v.severity_rank = ${rank})
+      AND (${ack}::bool IS NULL OR v.acknowledged = ${ack})
+    ORDER BY v.severity_rank DESC, a.path, v.advisory, v.artifact_id
+    LIMIT ${limit} OFFSET ${offset}
+)
+SELECT
+    pg.artifact_id,
+    pg.artifact_path,
+    pg.repository_id,
+    pg.advisory AS cve_id,
+    CASE pg.severity_rank
+        WHEN 4 THEN 'critical'
+        WHEN 3 THEN 'high'
+        WHEN 2 THEN 'medium'
+        WHEN 1 THEN 'low'
+        ELSE 'info'
+    END AS severity,
+    pg.acknowledged AS is_acknowledged,
+    pg.total,
+    r.key AS repository_key,
+    d.title,
+    d.affected_component,
+    d.affected_version,
+    d.fixed_version,
+    d.source_url,
+    d.acknowledged_at,
+    d.acknowledged_reason,
+    d.acknowledgement_expires_at,
+    u.username AS acknowledged_by,
+    -- Across every scan, not just the latest, so it survives a rescan.
+    COALESCE(fs.first_seen, d.first_in_latest) AS first_detected_at
+FROM page pg
+JOIN repositories r ON r.id = pg.repository_id
+LEFT JOIN LATERAL (
+    SELECT (ARRAY_AGG(sf.title ORDER BY sf.created_at DESC))[1] AS title,
+           (ARRAY_AGG(sf.affected_component ORDER BY sf.created_at DESC))[1]
+               AS affected_component,
+           (ARRAY_AGG(sf.affected_version ORDER BY sf.created_at DESC))[1]
+               AS affected_version,
+           (ARRAY_AGG(sf.fixed_version ORDER BY sf.created_at DESC))[1]
+               AS fixed_version,
+           (ARRAY_AGG(sf.source_url ORDER BY sf.created_at DESC))[1] AS source_url,
+           (ARRAY_AGG(sf.acknowledged_by ORDER BY sf.acknowledged_at DESC NULLS LAST)
+               FILTER (WHERE sf.is_acknowledged))[1] AS acknowledged_by_id,
+           (ARRAY_AGG(sf.acknowledged_reason ORDER BY sf.acknowledged_at DESC NULLS LAST)
+               FILTER (WHERE sf.is_acknowledged))[1] AS acknowledged_reason,
+           MAX(sf.acknowledged_at) FILTER (WHERE sf.is_acknowledged) AS acknowledged_at,
+           MIN(sf.acknowledgement_expires_at) FILTER (WHERE sf.is_acknowledged)
+               AS acknowledgement_expires_at,
+           MIN(sf.created_at) AS first_in_latest
+    FROM scan_findings_effective sf
+    JOIN latest_scans ls ON ls.id = sf.scan_result_id
+    WHERE sf.artifact_id = pg.artifact_id
+      AND {key} = pg.advisory
+) d ON TRUE
+LEFT JOIN LATERAL (
+    SELECT MIN(sf.created_at) AS first_seen
+    FROM scan_findings sf
+    WHERE sf.artifact_id = pg.artifact_id
+      AND {key} = pg.advisory
+) fs ON TRUE
+LEFT JOIN users u ON u.id = d.acknowledged_by_id
+ORDER BY pg.severity_rank DESC, pg.artifact_path, pg.advisory, pg.artifact_id
+"#,
+        cte = vulnerabilities_cte(scope),
+        key = crate::services::open_findings::ADVISORY_KEY_SQL,
+        rank = n + 1,
+        ack = n + 2,
+        limit = n + 3,
+        offset = n + 4,
+    )
+}
+
+/// `group_by=artifact` roll-up of [`cve_drilldown_sql`]: same CTE, same
+/// filters, same binds, one row per affected artifact. `total` counts
+/// artifacts here, because that is what the page is over.
+fn cve_drilldown_by_artifact_sql(scope: FindingScope) -> String {
+    let n = usize::from(!matches!(scope, FindingScope::All));
+    format!(
+        r#"{cte}
+SELECT
+    v.artifact_id,
+    a.path AS artifact_path,
+    a.repository_id,
+    COUNT(*) FILTER (WHERE v.severity_rank = 4) AS critical,
+    COUNT(*) FILTER (WHERE v.severity_rank = 3) AS high,
+    COUNT(*) FILTER (WHERE v.severity_rank = 2) AS medium,
+    COUNT(*) FILTER (WHERE v.severity_rank = 1) AS low,
+    COUNT(*) AS artifact_total,
+    COUNT(*) OVER () AS total
+FROM vulnerabilities v
+JOIN artifacts a ON a.id = v.artifact_id
+WHERE (${rank}::int IS NULL OR v.severity_rank = ${rank})
+  AND (${ack}::bool IS NULL OR v.acknowledged = ${ack})
+GROUP BY v.artifact_id, a.path, a.repository_id
+ORDER BY critical DESC, high DESC, medium DESC, low DESC, a.path, v.artifact_id
+LIMIT ${limit} OFFSET ${offset}
+"#,
+        cte = vulnerabilities_cte(scope),
+        rank = n + 1,
+        ack = n + 2,
+        limit = n + 3,
+        offset = n + 4,
+    )
+}
 
 /// CVE-history timeline projection (most recent 100 within 30 days), scoped
 /// to one repository. The severity CASE table must stay aligned with the
@@ -1483,6 +1622,118 @@ impl SbomService {
         ))
     }
 
+    /// Page the CVEs a dashboard tile counted.
+    pub async fn list_cve_findings(
+        &self,
+        repository_id: Option<Uuid>,
+        severity_rank: Option<i32>,
+        ack: Option<bool>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(
+        Vec<crate::api::handlers::admin_security::CveFindingRow>,
+        i64,
+    )> {
+        use sqlx::Row;
+        let scope = drilldown_scope(repository_id);
+        let query = sqlx::query(sqlx::AssertSqlSafe(cve_drilldown_sql(scope)));
+        // Same shape as `open_findings::severity_counts`: the scope's id is
+        // $1 when it has one, and the filters shift down when it does not.
+        let query = match repository_id {
+            Some(id) => query.bind(id),
+            None => query,
+        };
+        let rows = query
+            .bind(severity_rank)
+            .bind(ack)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // The window function repeats the pre-limit count on every row.
+        let total: i64 = rows
+            .first()
+            .and_then(|r| r.try_get("total").ok())
+            .unwrap_or(0);
+        let items = rows
+            .iter()
+            .map(|r| crate::api::handlers::admin_security::CveFindingRow {
+                artifact_id: r.get("artifact_id"),
+                artifact_path: r.get("artifact_path"),
+                repository_id: r.get("repository_id"),
+                cve_id: r.get("cve_id"),
+                severity: r.get("severity"),
+                is_acknowledged: r.get("is_acknowledged"),
+                title: r.try_get("title").ok().flatten(),
+                affected_component: r.try_get("affected_component").ok().flatten(),
+                affected_version: r.try_get("affected_version").ok().flatten(),
+                fixed_version: r.try_get("fixed_version").ok().flatten(),
+                source_url: r.try_get("source_url").ok().flatten(),
+                repository_key: r.get("repository_key"),
+                acknowledged_by: r.try_get("acknowledged_by").ok().flatten(),
+                acknowledged_at: r.try_get("acknowledged_at").ok().flatten(),
+                acknowledged_reason: r.try_get("acknowledged_reason").ok().flatten(),
+                acknowledgement_expires_at: r.try_get("acknowledgement_expires_at").ok().flatten(),
+                first_detected_at: r.get("first_detected_at"),
+            })
+            .collect();
+        Ok((items, total))
+    }
+
+    /// Same rows as [`Self::list_cve_findings`], rolled up per artifact.
+    pub async fn list_affected_artifacts(
+        &self,
+        repository_id: Option<Uuid>,
+        severity_rank: Option<i32>,
+        ack: Option<bool>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(
+        Vec<crate::api::handlers::admin_security::AffectedArtifactRow>,
+        i64,
+    )> {
+        use sqlx::Row;
+        let scope = drilldown_scope(repository_id);
+        let query = sqlx::query(sqlx::AssertSqlSafe(cve_drilldown_by_artifact_sql(scope)));
+        // Same shape as `open_findings::severity_counts`: the scope's id is
+        // $1 when it has one, and the filters shift down when it does not.
+        let query = match repository_id {
+            Some(id) => query.bind(id),
+            None => query,
+        };
+        let rows = query
+            .bind(severity_rank)
+            .bind(ack)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let total: i64 = rows
+            .first()
+            .and_then(|r| r.try_get("total").ok())
+            .unwrap_or(0);
+        let artifacts = rows
+            .iter()
+            .map(
+                |r| crate::api::handlers::admin_security::AffectedArtifactRow {
+                    artifact_id: r.get("artifact_id"),
+                    artifact_path: r.get("artifact_path"),
+                    repository_id: r.get("repository_id"),
+                    critical: r.get("critical"),
+                    high: r.get("high"),
+                    medium: r.get("medium"),
+                    low: r.get("low"),
+                    total: r.get("artifact_total"),
+                },
+            )
+            .collect();
+        Ok((artifacts, total))
+    }
+
     // === License Policies ===
 
     /// Get license policy for a repository.
@@ -1877,6 +2128,71 @@ pub struct LicenseCheckResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::finding_acknowledgements::{
+        AckActor, AcknowledgeOptions, FindingAcknowledgementService,
+    };
+
+    /// The drill-down must keep reading the shared `vulnerabilities` CTE
+    /// (#4338). Filtering `scan_findings` directly would return one row per
+    /// scanner per CVE and bucket each row on its own severity, so a rebase
+    /// that "simplifies" the grouping breaks the tile/list agreement in a way
+    /// no test without a database would otherwise catch.
+    #[test]
+    fn drilldown_groups_exactly_as_the_dashboard_counts_do() {
+        for scope in [FindingScope::All, FindingScope::Repository(Uuid::nil())] {
+            let shared = vulnerabilities_cte(scope);
+            for sql in [
+                cve_drilldown_sql(scope),
+                cve_drilldown_by_artifact_sql(scope),
+            ] {
+                assert!(sql.starts_with(&shared), "must build on the shared CTE");
+                // Filtered on the grouped vulnerability, never on a raw
+                // finding row: that is the whole difference.
+                assert!(sql.contains("v.severity_rank = $"));
+                assert!(sql.contains("v.acknowledged = $"));
+            }
+        }
+    }
+
+    /// Both shapes bind the same parameters in the same order, and the
+    /// all-repositories variant shifts them down by the repository bind it
+    /// does not take.
+    #[test]
+    fn drilldown_parameters_line_up_with_the_binds() {
+        for sql in [
+            cve_drilldown_sql(FindingScope::All),
+            cve_drilldown_by_artifact_sql(FindingScope::All),
+        ] {
+            assert!(
+                sql.contains("($1::int IS NULL"),
+                "rank is $1 without a repo"
+            );
+            assert!(sql.contains("($2::bool IS NULL"));
+            assert!(sql.contains("LIMIT $3 OFFSET $4"));
+            assert!(!sql.contains("$5"));
+        }
+        for sql in [
+            cve_drilldown_sql(FindingScope::Repository(Uuid::nil())),
+            cve_drilldown_by_artifact_sql(FindingScope::Repository(Uuid::nil())),
+        ] {
+            assert!(sql.contains("a.repository_id = $1"), "the repo bind is $1");
+            assert!(sql.contains("($2::int IS NULL"));
+            assert!(sql.contains("($3::bool IS NULL"));
+            assert!(sql.contains("LIMIT $4 OFFSET $5"));
+        }
+    }
+
+    /// Every page is a deterministic slice: the sort ends on a key unique per
+    /// row, so two pages cannot repeat or drop one.
+    #[test]
+    fn drilldown_paging_is_stable() {
+        let rows = cve_drilldown_sql(FindingScope::All);
+        assert!(rows.contains(
+            "ORDER BY v.severity_rank DESC, a.path, v.advisory, v.artifact_id\n    LIMIT"
+        ));
+        assert!(cve_drilldown_by_artifact_sql(FindingScope::All)
+            .contains("low DESC, a.path, v.artifact_id\nLIMIT"));
+    }
 
     // -----------------------------------------------------------------------
     // Pure helper functions (moved from module scope — test-only)
@@ -5171,6 +5487,319 @@ mod tests {
 
         teardown(&pool, repo_a).await;
         teardown(&pool, repo_b).await;
+    }
+
+    /// Record a decision the way the API does since #5153.
+    async fn decide(
+        pool: &PgPool,
+        finding_id: Uuid,
+        actor: &AckActor,
+        reason: Option<&str>,
+        expires_at: Option<DateTime<Utc>>,
+    ) {
+        FindingAcknowledgementService::new(pool.clone())
+            .acknowledge_finding(
+                finding_id,
+                actor,
+                reason,
+                AcknowledgeOptions {
+                    expires_at,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("record a decision");
+    }
+
+    /// The drill-down must return exactly what the tile counted.
+    #[tokio::test]
+    async fn cve_drilldown_totals_match_the_dashboard_tiles() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let art_a = seed_artifact(&pool, repo).await;
+        let art_b = seed_artifact(&pool, repo).await;
+        let scan_1 = seed_scan_result(&pool, art_a, repo).await;
+        let scan_2 = seed_scan_result(&pool, art_a, repo).await;
+        let scan_3 = seed_scan_result(&pool, art_b, repo).await;
+        // A second scanner is a second scan type, a same-type rescan would
+        // replace scan_1 under the latest-scan rule (#4338).
+        sqlx::query("UPDATE scan_results SET scan_type = 'grype' WHERE id = $1")
+            .bind(scan_2)
+            .execute(&pool)
+            .await
+            .expect("second scanner");
+
+        // CVE-1: two scanners, critical + high. MAX wins, so it is ONE
+        // critical CVE and must NOT appear under high.
+        // The frozen pre-#5153 flag must count for nothing in the tile or
+        // the list, state and details alike.
+        let legacy = seed_finding(&pool, scan_1, art_a, "CVE-1000-1", "critical").await;
+        seed_finding(&pool, scan_2, art_a, "CVE-1000-1", "high").await;
+        sqlx::query(
+            "UPDATE scan_findings SET is_acknowledged = true, \
+             acknowledged_reason = 'legacy flag' WHERE id = $1",
+        )
+        .bind(legacy)
+        .execute(&pool)
+        .await
+        .expect("set the frozen flag");
+        // CVE-2: one decision on one of two components. BOOL_AND => OPEN.
+        let acked = seed_finding(&pool, scan_1, art_a, "CVE-1000-2", "high").await;
+        let other = seed_finding(&pool, scan_2, art_a, "CVE-1000-2", "high").await;
+        for (id, component) in [(acked, "libfoo"), (other, "libbar")] {
+            sqlx::query("UPDATE scan_findings SET affected_component = $2 WHERE id = $1")
+                .bind(id)
+                .bind(component)
+                .execute(&pool)
+                .await
+                .expect("distinct components");
+        }
+        decide(&pool, acked, &AckActor::system(), None, None).await;
+        // CVE-3: single row, acknowledged.
+        let solo = seed_finding(&pool, scan_3, art_b, "CVE-1000-3", "critical").await;
+        decide(&pool, solo, &AckActor::system(), None, None).await;
+        // CVE-4: two engines, same component: one decision covers both
+        // (#5153), so it is acknowledged in the tile and the list.
+        let shared = seed_finding(&pool, scan_1, art_a, "CVE-1000-4", "high").await;
+        seed_finding(&pool, scan_2, art_a, "CVE-1000-4", "high").await;
+        decide(&pool, shared, &AckActor::system(), None, None).await;
+        // A neighbour repository, so the repo filter and the all-repos query
+        // (a different statement, with one bind fewer) are both exercised.
+        let other_repo = seed_repo(&pool).await;
+        let other_art = seed_artifact(&pool, other_repo).await;
+        let other_scan = seed_scan_result(&pool, other_art, other_repo).await;
+        seed_finding(&pool, other_scan, other_art, "CVE-1000-9", "critical").await;
+
+        let svc = SbomService::new(pool.clone());
+        let trends = svc
+            .get_cve_trends(Some(repo))
+            .await
+            .expect("trends must load");
+
+        // Each tile, against the list behind it.
+        for (rank, ack, expected, label) in [
+            // Severity tiles count open vulnerabilities only (#4338).
+            (Some(4), Some(false), trends.critical_count, "critical"),
+            (Some(3), Some(false), trends.high_count, "high"),
+            (None, Some(false), trends.open_cves, "open"),
+            (None, Some(true), trends.acknowledged_cves, "acknowledged"),
+            (None, None, trends.total_cves, "total"),
+        ] {
+            let (items, total) = svc
+                .list_cve_findings(Some(repo), rank, ack, 100, 0)
+                .await
+                .unwrap_or_else(|e| panic!("{label} drill-down failed: {e}"));
+            assert_eq!(
+                total, expected,
+                "{label}: tile says {expected}, drill-down total says {total}"
+            );
+            assert_eq!(
+                items.len() as i64,
+                expected,
+                "{label}: tile says {expected}, drill-down returned {} rows",
+                items.len()
+            );
+        }
+
+        // The case a naive query gets wrong: CVE-1 is critical, not high.
+        let (high, _) = svc
+            .list_cve_findings(Some(repo), Some(3), None, 100, 0)
+            .await
+            .expect("high drill-down");
+        assert!(
+            high.iter().all(|r| r.cve_id != "CVE-1000-1"),
+            "a CVE whose MAX severity is critical must not be listed under high"
+        );
+
+        // One row per (artifact, advisory): the CVE two scanners reported is
+        // listed once, as critical, and the half-acknowledged one is open.
+        let (all, _) = svc
+            .list_cve_findings(Some(repo), None, None, 100, 0)
+            .await
+            .expect("unfiltered drill-down");
+        for cve in ["CVE-1000-1", "CVE-1000-2", "CVE-1000-3", "CVE-1000-4"] {
+            let hits = all.iter().filter(|r| r.cve_id == cve).count();
+            assert_eq!(hits, 1, "{cve} must be listed exactly once, got {hits}");
+        }
+        let cve_1 = all
+            .iter()
+            .find(|r| r.cve_id == "CVE-1000-1")
+            .expect("the two-scanner CVE must be listed");
+        assert_eq!(
+            cve_1.severity, "critical",
+            "a CVE two scanners graded differently takes the higher severity"
+        );
+        assert!(
+            !cve_1.is_acknowledged && cve_1.acknowledged_reason.is_none(),
+            "the frozen scan_findings flag is not a decision (#5153)"
+        );
+        let cve_2 = all
+            .iter()
+            .find(|r| r.cve_id == "CVE-1000-2")
+            .expect("the half-acknowledged CVE must be listed");
+        assert!(
+            !cve_2.is_acknowledged,
+            "one unacknowledged scanner keeps a CVE open"
+        );
+        for cve in ["CVE-1000-3", "CVE-1000-4"] {
+            assert!(
+                all.iter().any(|r| r.cve_id == cve && r.is_acknowledged),
+                "{cve} is covered by a decision"
+            );
+        }
+
+        // Per-artifact rollup must sum to the same total, with the same
+        // per-severity split.
+        let (artifacts, artifact_total) = svc
+            .list_affected_artifacts(Some(repo), None, None, 100, 0)
+            .await
+            .expect("by-artifact drill-down");
+        let summed: i64 = artifacts.iter().map(|a| a.total).sum();
+        assert_eq!(
+            summed, trends.total_cves,
+            "per-artifact totals must sum to the tile total"
+        );
+        assert_eq!(
+            artifact_total, 2,
+            "the by-artifact total counts artifacts, not CVEs"
+        );
+        let a_row = artifacts
+            .iter()
+            .find(|a| a.artifact_id == art_a)
+            .expect("artifact A must appear");
+        assert_eq!((a_row.critical, a_row.high), (1, 2));
+
+        // The repository filter is the tile's filter: a neighbour repository's
+        // CVE is absent here and present in the instance-wide list.
+        assert!(
+            all.iter().all(|r| r.repository_id == repo),
+            "a repository-filtered list must carry only that repository"
+        );
+        let (neighbour, neighbour_total) = svc
+            .list_cve_findings(Some(other_repo), Some(4), Some(false), 100, 0)
+            .await
+            .expect("neighbour drill-down");
+        assert_eq!(neighbour_total, 1);
+        assert_eq!(neighbour[0].cve_id, "CVE-1000-9");
+        // The all-repositories query is a different statement, one bind
+        // fewer, so it gets its own round trip: it must span both.
+        let (_, every_critical) = svc
+            .list_cve_findings(None, Some(4), Some(false), 1, 0)
+            .await
+            .expect("all-repositories drill-down");
+        assert!(
+            every_critical >= trends.critical_count + neighbour_total,
+            "the instance-wide list must span every repository"
+        );
+
+        // Paging walks the same ordering: disjoint rows, unchanged total.
+        let (first, paged_total) = svc
+            .list_cve_findings(Some(repo), None, None, 1, 0)
+            .await
+            .expect("first page");
+        let (second, _) = svc
+            .list_cve_findings(Some(repo), None, None, 1, 1)
+            .await
+            .expect("second page");
+        assert_eq!(
+            paged_total, trends.total_cves,
+            "total ignores the page size"
+        );
+        assert_eq!((first.len(), second.len()), (1, 1));
+        assert_ne!(
+            (first[0].artifact_id, &first[0].cve_id),
+            (second[0].artifact_id, &second[0].cve_id),
+            "consecutive pages must not repeat a row"
+        );
+        // Past the end is empty, not an error, and still reports the total.
+        let (none, past_total) = svc
+            .list_cve_findings(Some(repo), None, None, 100, 1000)
+            .await
+            .expect("past the last page");
+        assert!(none.is_empty());
+        // Known bound: the window count rides on the rows, so an empty
+        // page past the end reports no total.
+        assert_eq!(past_total, 0);
+
+        teardown(&pool, repo).await;
+        teardown(&pool, other_repo).await;
+    }
+
+    /// First-seen survives a rescan, and the ack shows who and why.
+    #[tokio::test]
+    async fn cve_drilldown_first_seen_and_ack_details() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let art = seed_artifact(&pool, repo).await;
+        let old_scan = seed_scan_result(&pool, art, repo).await;
+        let new_scan = seed_scan_result(&pool, art, repo).await;
+        sqlx::query(
+            "UPDATE scan_results SET completed_at = NOW() - INTERVAL '10 days' WHERE id = $1",
+        )
+        .bind(old_scan)
+        .execute(&pool)
+        .await
+        .expect("age the old scan");
+        let old = seed_finding(&pool, old_scan, art, "CVE-1001-1", "high").await;
+        sqlx::query(
+            "UPDATE scan_findings SET created_at = NOW() - INTERVAL '10 days' WHERE id = $1",
+        )
+        .bind(old)
+        .execute(&pool)
+        .await
+        .expect("age the old finding");
+        let cur = seed_finding(&pool, new_scan, art, "CVE-1001-1", "high").await;
+        // The version is part of a decision's identity, so it is set first.
+        sqlx::query(
+            "UPDATE scan_findings SET affected_version = '1.0.0', fixed_version = '1.0.1' \
+             WHERE id = $1",
+        )
+        .bind(cur)
+        .execute(&pool)
+        .await
+        .expect("versions");
+        let (user, username) = crate::api::handlers::test_db_helpers::create_user(&pool).await;
+        let expires = Utc::now() + chrono::Duration::days(30);
+        decide(
+            &pool,
+            cur,
+            &AckActor::new(user, AccessScope::Admin),
+            Some("not reachable"),
+            Some(expires),
+        )
+        .await;
+
+        let (items, _) = SbomService::new(pool.clone())
+            .list_cve_findings(Some(repo), None, None, 100, 0)
+            .await
+            .expect("drill-down");
+        assert_eq!(items.len(), 1, "the old scan is superseded, one row");
+        let row = &items[0];
+        assert!(
+            row.first_detected_at < chrono::Utc::now() - chrono::Duration::days(9),
+            "first seen must come from the old scan, got {}",
+            row.first_detected_at
+        );
+        assert_eq!(row.acknowledged_by.as_deref(), Some(username.as_str()));
+        assert_eq!(row.acknowledged_reason.as_deref(), Some("not reachable"));
+        assert!(row.acknowledged_at.is_some());
+        assert_eq!(
+            row.acknowledgement_expires_at.map(|t| t.timestamp()),
+            Some(expires.timestamp()),
+            "the decision's expiry is when the row reopens"
+        );
+        assert_eq!(row.affected_version.as_deref(), Some("1.0.0"));
+        assert!(!row.repository_key.is_empty());
+
+        teardown(&pool, repo).await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user)
+            .execute(&pool)
+            .await;
     }
 
     #[tokio::test]

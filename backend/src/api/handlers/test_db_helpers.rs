@@ -666,8 +666,24 @@ pub fn lazy_pool() -> PgPool {
         .expect("lazy pool")
 }
 
+/// Turn the durable scan queue on and run a worker for it. Hold the guard for the
+/// test's duration. Tests using it belong in nextest's `db-serial` group: the
+/// queue claim is unfiltered, so two workers would grade each other's jobs.
+pub fn with_scan_worker(mut state: SharedState) -> (SharedState, tokio_util::sync::DropGuard) {
+    Arc::get_mut(&mut state)
+        .expect("state not shared yet")
+        .config
+        .scan_queue_enabled = true;
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    crate::services::scan_worker::spawn_scan_worker(state.clone(), shutdown.clone());
+    (state, shutdown.drop_guard())
+}
+
 fn cfg(storage_path: &str) -> Config {
     Config {
+        scan_worker_enabled: true,
+        scan_queue_enabled: false,
+        scan_worker_concurrency: None,
         database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
         bind_address: "127.0.0.1:0".into(),
         log_level: "error".into(),
@@ -744,6 +760,7 @@ fn cfg(storage_path: &str) -> Config {
         totp_policy: None,
         api_token_expiry_policy: None,
         max_upload_size_bytes: 10_737_418_240,
+        quotas: Default::default(),
         metrics_port: None,
         grpc_bind_ip: crate::config::DEFAULT_LISTENER_BIND_IP,
         metrics_bind_ip: crate::config::DEFAULT_LISTENER_BIND_IP,
@@ -1039,13 +1056,22 @@ impl crate::storage::StorageBackend for FallbackProbeStorage {
 /// is where a stopped or full store refuses them.
 pub struct FailingStorage {
     message: String,
+    fail_exists: bool,
 }
 
 impl FailingStorage {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            fail_exists: false,
         }
+    }
+
+    /// `exists` fails with the same error too, as it does against a store
+    /// that is down: the read paths that probe before they read (#5894).
+    pub fn failing_exists(mut self) -> Self {
+        self.fail_exists = true;
+        self
     }
 
     fn fail<T>(&self) -> crate::error::Result<T> {
@@ -1062,6 +1088,9 @@ impl crate::storage::StorageBackend for FailingStorage {
         self.fail()
     }
     async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+        if self.fail_exists {
+            return self.fail();
+        }
         Ok(false)
     }
     async fn delete(&self, _key: &str) -> crate::error::Result<()> {
@@ -1094,12 +1123,22 @@ pub async fn route_repo_to_failing_storage(
     repo_id: Uuid,
     message: &str,
 ) -> SharedState {
+    route_repo_to_storage(pool, state, repo_id, FailingStorage::new(message)).await
+}
+
+/// [`route_repo_to_failing_storage`] with the failing backend given.
+pub async fn route_repo_to_storage(
+    pool: &PgPool,
+    state: &SharedState,
+    repo_id: Uuid,
+    failing: FailingStorage,
+) -> SharedState {
     sqlx::query("UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1")
         .bind(repo_id)
         .execute(pool)
         .await
         .expect("move repository onto the failing backend");
-    let failing: Arc<dyn crate::storage::StorageBackend> = Arc::new(FailingStorage::new(message));
+    let failing: Arc<dyn crate::storage::StorageBackend> = Arc::new(failing);
     let mut backends: std::collections::HashMap<String, Arc<dyn crate::storage::StorageBackend>> =
         std::collections::HashMap::new();
     backends.insert("s3".to_string(), failing);
@@ -2249,8 +2288,10 @@ pub async fn audit_count(pool: &PgPool, resource_id: Uuid, action: &str) -> i64 
     .expect("audit_log count query")
 }
 
-/// Poll [`audit_count`] until it reaches `expected` (or a bounded ~2s budget is
-/// exhausted), returning the last observed value.
+/// Poll [`audit_count`] until it reaches `expected` (or a bounded 10s budget is
+/// exhausted), returning the last observed value. The budget is generous
+/// because a loaded CI runner can take well over a second to drain several
+/// spawned writes (#5882); a passing test returns as soon as they land.
 ///
 /// Since #2522 the fire-and-forget audit emitters (`audit_fire_and_forget`)
 /// SPAWN their INSERT instead of awaiting it, so a test that acts and then reads
@@ -2264,15 +2305,14 @@ pub async fn audit_count_eventually(
     action: &str,
     expected: i64,
 ) -> i64 {
-    let mut last = -1;
-    for _ in 0..100 {
-        last = audit_count(pool, resource_id, action).await;
-        if last >= expected {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let last = audit_count(pool, resource_id, action).await;
+        if last >= expected || tokio::time::Instant::now() >= deadline {
             return last;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    last
 }
 
 /// The newest `audit_log` row recorded for `(resource_id, action)` (#4710).
@@ -2283,7 +2323,7 @@ pub struct AuditRow {
     pub details: serde_json::Value,
 }
 
-/// Poll (~2s, like [`audit_count_eventually`]) for the newest `audit_log` row
+/// Poll (~2s) for the newest `audit_log` row
 /// with this `resource_id` and `action`, panicking when none appears. The
 /// handler-level audit tests use it to assert the actor, target and `details`
 /// a fire-and-forget emitter recorded. Read it BEFORE deleting the acting
@@ -4284,6 +4324,80 @@ impl AuthzQueryOutage {
             let _ = tx.rollback().await;
         }
         self.pool.close().await;
+    }
+}
+
+/// A database that cannot answer queries on some tables, for the #5894
+/// regressions: every query through [`Self::pool`] that reads one of
+/// `tables` is cancelled by `statement_timeout` (`canceling statement due to
+/// statement timeout`, the classification a 503 is answered for), while
+/// every other query through it runs normally.
+///
+/// Each table is shadowed, in a schema of its own that only this pool puts
+/// first on its `search_path`, by a view over a function that sleeps before
+/// returning the real rows, so the stall happens even for a lookup that
+/// matches nothing. Other tests and other pools never see the schema, so
+/// unlike a table lock nothing else waits. Returns `None` without a database.
+pub struct TableQueryOutage {
+    pub pool: PgPool,
+    admin: PgPool,
+    schema: String,
+}
+
+impl TableQueryOutage {
+    pub async fn start(admin: &PgPool, tables: &[&str]) -> Option<Self> {
+        use std::str::FromStr;
+        let url = crate::testing::require_db_url()?;
+        let schema = format!("ak_outage_{}", Uuid::new_v4().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(admin)
+            .await
+            .expect("create outage schema");
+        for table in tables {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "CREATE FUNCTION {schema}.stall_{table}() RETURNS SETOF public.{table} \
+                 LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(30); \
+                 RETURN QUERY SELECT * FROM public.{table}; END $$"
+            )))
+            .execute(admin)
+            .await
+            .expect("create stall function");
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "CREATE VIEW {schema}.{table} AS SELECT * FROM {schema}.stall_{table}()"
+            )))
+            .execute(admin)
+            .await
+            .expect("create stall view");
+        }
+        let search_path = format!("{schema},public");
+        let opts = sqlx::postgres::PgConnectOptions::from_str(&url)
+            .expect("parse DATABASE_URL")
+            .options([
+                ("search_path", search_path.as_str()),
+                ("statement_timeout", "1000"),
+            ]);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .connect_with(opts)
+            .await
+            .expect("connect outage pool");
+        Some(Self {
+            pool,
+            admin: admin.clone(),
+            schema,
+        })
+    }
+
+    /// Close the pool and drop the schema.
+    pub async fn end(self) {
+        self.pool.close().await;
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {} CASCADE",
+            self.schema
+        )))
+        .execute(&self.admin)
+        .await;
     }
 }
 

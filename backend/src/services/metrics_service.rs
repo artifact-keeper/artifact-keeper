@@ -39,17 +39,31 @@ pub const HTTP_REQUEST_DURATION_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 
+/// Bucket upper bounds (seconds) for the scan queue wait and scan job duration
+/// histograms. Bucketed for the same reason as the HTTP histogram: every
+/// worker pod reports its own, and only buckets add up across pods. From a
+/// same-process wake-up (100 ms) to a backlog of half an hour.
+pub const SCAN_QUEUE_SECONDS_BUCKETS: &[f64] = &[
+    0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0,
+];
+
 /// The configured (not yet installed) Prometheus builder: bucketed export of
-/// the HTTP latency histogram, defaults for everything else. Split out of
-/// [`init_metrics`] so tests can build a local recorder from the exact
-/// production configuration without installing a process-global one.
+/// the HTTP latency and scan queue histograms, defaults for everything else.
+/// Split out of [`init_metrics`] so tests can build a local recorder from the
+/// exact production configuration without installing a process-global one.
 pub fn prometheus_builder() -> PrometheusBuilder {
-    PrometheusBuilder::new()
+    let builder = PrometheusBuilder::new()
         .set_buckets_for_metric(
             Matcher::Full(HTTP_REQUEST_DURATION_METRIC.to_string()),
             HTTP_REQUEST_DURATION_BUCKETS,
         )
-        .expect("HTTP_REQUEST_DURATION_BUCKETS is a non-empty constant")
+        .expect("HTTP_REQUEST_DURATION_BUCKETS is a non-empty constant");
+    ["ak_scan_queue_wait_seconds", "ak_scan_job_duration_seconds"]
+        .into_iter()
+        .fold(builder, |b, name| {
+            b.set_buckets_for_metric(Matcher::Full(name.to_string()), SCAN_QUEUE_SECONDS_BUCKETS)
+                .expect("SCAN_QUEUE_SECONDS_BUCKETS is a non-empty constant")
+        })
 }
 
 /// Initialize the Prometheus metrics recorder and return the handle for rendering.
@@ -566,6 +580,72 @@ pub fn record_security_scan(scanner: &str, success: bool, duration_secs: f64) {
         .record(duration_secs);
 }
 
+/// Scan queue depth, the worker Deployment's scaling signal. Pair it with
+/// [`record_scan_queue_oldest_pending`]: depth alone cannot tell a draining
+/// queue from a wedged one.
+pub fn record_scan_queue_depth(kind: &str, state: &str, jobs: f64) {
+    gauge!(
+        "ak_scan_queue_depth",
+        "kind" => kind.to_string(),
+        "state" => state.to_string()
+    )
+    .set(jobs);
+}
+
+/// Seconds the oldest DUE pending job of this kind has waited.
+pub fn record_scan_queue_oldest_pending(kind: &str, secs: f64) {
+    gauge!(
+        "ak_scan_queue_oldest_pending_seconds",
+        "kind" => kind.to_string()
+    )
+    .set(secs);
+}
+
+/// How long one job actually WAITED before a worker picked it up
+/// (`created_at` -> claim).
+///
+/// Distinct from [`record_scan_queue_oldest_pending`], which is a max: the
+/// backlog age tells you the worst case, this tells you the distribution. A
+/// single poison job stuck behind its backoff pins the gauge high while p50
+/// stays healthy, and only the histogram separates those two situations.
+pub fn record_scan_queue_wait(kind: &str, secs: f64) {
+    histogram!("ak_scan_queue_wait_seconds", "kind" => kind.to_string()).record(secs);
+}
+
+/// Live consumers of the queue: distinct workers currently holding a claim
+/// that has not lapsed.
+///
+/// Cluster-wide, read from the queue table, so EVERY replica publishes the
+/// same number. Aggregate with `max()` or `avg()` in a dashboard, never
+/// `sum()`, which would multiply it by the replica count.
+pub fn record_scan_queue_consumers(consumers: f64) {
+    gauge!("ak_scan_queue_consumers").set(consumers);
+}
+
+/// This worker's own extraction-slot occupancy and ceiling.
+///
+/// Per-pod on purpose, unlike [`record_scan_queue_consumers`]: `sum()` across
+/// pods gives the cluster capacity, and the per-pod series also shows an
+/// imbalance where one replica is saturated while another idles. Occupancy at
+/// capacity for a sustained period is the signal to scale the worker out.
+pub fn record_scan_worker_slots(in_flight: f64, capacity: f64) {
+    gauge!("ak_scan_worker_slots_in_flight").set(in_flight);
+    gauge!("ak_scan_worker_slots_capacity").set(capacity);
+}
+
+/// Outcome and cost of one drained job. Separate from [`record_security_scan`],
+/// which is labelled by *scanner*: putting `proxy_file` in that series would
+/// read as a scanner name on every dashboard.
+pub fn record_scan_job(kind: &str, outcome: &str, duration_secs: f64) {
+    counter!(
+        "ak_scan_jobs_total",
+        "kind" => kind.to_string(),
+        "outcome" => outcome.to_string()
+    )
+    .increment(1);
+    histogram!("ak_scan_job_duration_seconds", "kind" => kind.to_string()).record(duration_secs);
+}
+
 /// Record a scanner backend health-check failure. Distinct from
 /// `record_security_scan` so dashboards can separate "Trivy was down" from
 /// "scan ran and failed mid-execution". `reason` is "unreachable" (network
@@ -1029,10 +1109,37 @@ mod tests {
         ));
     }
 
+    /// The scan queue dashboard reads `_bucket` across worker pods. As a
+    /// summary each pod would export its own quantiles, which do not add up.
+    #[test]
+    fn test_scan_queue_histograms_export_as_buckets() {
+        let rendered = render_with_production_recorder(|| {
+            record_scan_queue_wait("proxy_file", 42.0);
+            record_scan_job("proxy_file", "completed", 0.3);
+        });
+        for name in ["ak_scan_queue_wait_seconds", "ak_scan_job_duration_seconds"] {
+            assert!(
+                rendered.contains(&format!("# TYPE {name} histogram")),
+                "{name} is not a histogram, got:\n{rendered}"
+            );
+        }
+        assert!(!rendered.contains("quantile="), "got:\n{rendered}");
+        assert!(
+            rendered.contains("ak_scan_queue_wait_seconds_bucket{kind=\"proxy_file\",le=\"60\"} 1")
+        );
+        assert!(
+            rendered.contains("ak_scan_queue_wait_seconds_bucket{kind=\"proxy_file\",le=\"30\"} 0")
+        );
+        assert!(rendered
+            .contains("ak_scan_job_duration_seconds_bucket{kind=\"proxy_file\",le=\"0.5\"} 1"));
+        let b = SCAN_QUEUE_SECONDS_BUCKETS;
+        assert!(b.windows(2).all(|w| w[0] < w[1]));
+    }
+
     #[test]
     fn test_unbucketed_histograms_keep_summary_export() {
-        // Buckets are scoped to the HTTP latency metric only; every other
-        // histogram keeps its existing exposition shape.
+        // Buckets are scoped to the metrics `prometheus_builder` names; every
+        // other histogram keeps its existing exposition shape.
         let rendered = render_with_production_recorder(|| {
             record_artifact_upload("my-repo", "maven", 1024);
         });
@@ -1199,6 +1306,17 @@ mod tests {
     #[test]
     fn test_record_artifact_downloads_does_not_panic() {
         record_artifact_downloads("my-repo", "npm", 3);
+    }
+
+    #[test]
+    fn test_scan_queue_scaling_metrics_do_not_panic() {
+        record_scan_queue_wait("proxy_file", 12.5);
+        record_scan_queue_wait("hosted_artifact", 0.0);
+        record_scan_queue_consumers(3.0);
+        record_scan_worker_slots(2.0, 4.0);
+        // The zero-capacity case a pod reports before it has started: the
+        // dashboard guards the divide with clamp_min, this guards the emit.
+        record_scan_worker_slots(0.0, 0.0);
     }
 
     #[test]

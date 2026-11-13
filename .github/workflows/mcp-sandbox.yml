@@ -7,8 +7,10 @@ name: MCP Sandbox
 # also checks that the runner refuses to start a guest without a sandbox
 # runtime (none, or runc), that an internal
 # guest network has no way out, that a guest on its own network reaches the
-# forwarder but not another guest (#5447), and that the reference
-# deployment files (deploy/mcp-introspector) parse.
+# forwarder but not another guest (#5447), that npm/PyPI sources outside AK
+# and malformed OCI references are refused before a guest starts (#5446,
+# #5448), and that the reference deployment files (deploy/mcp-introspector)
+# parse.
 # docs/security/mcp-sandbox.md, "Continuous integration".
 #
 # Not covered here (deployment checks, see that page): npm and PyPI guests,
@@ -128,6 +130,19 @@ jobs:
           test "$kernel" != "kernel: $(uname -sr)"
           # The guest container is removed after the run, not only its client.
           test -z "$(docker ps -aq --filter label=com.artifactkeeper.mcp-sandbox)"
+
+      # #5446 and #5448 end to end: the shipped binary, with the real runner
+      # under gVisor, refuses an npm/PyPI source outside this AK instance and
+      # a malformed or source-changing OCI reference BEFORE any guest starts
+      # (no container create event during any case). The probe job above is
+      # the control, proving a guest that is allowed does start and is seen.
+      # The renderer's own cases are the unit tests registry_forms_are_refused
+      # and oci_spec_refuses_malformed_references_and_source_overrides.
+      - name: Registry-form and malformed OCI sources are refused before a guest starts (#5446, #5448)
+        run: |
+          BIN=./target/debug/ak-mcp-introspector ENGINE=docker RUNTIME=runsc \
+            CONTROL_JOB="$RUNNER_TEMP/job.json" \
+            sh deploy/mcp-introspector/sandbox-check/source-refusal-check.sh
 
       - name: No sandbox runtime, no guest
         env:
