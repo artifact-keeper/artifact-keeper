@@ -1195,6 +1195,21 @@ pub struct Config {
     /// Env var: `STUCK_SCAN_REAP_LIMIT`. Default: 1000. PR #1212 audit M1.
     pub stuck_scan_reap_limit: i64,
 
+    /// Run proxy file scans and `POST /security/scan` from the durable Postgres
+    /// queue rather than in this process (#5231's in-flight table and a spawned task).
+    /// Env var: `SCAN_QUEUE_ENABLED`. Default: false.
+    pub scan_queue_enabled: bool,
+
+    /// Whether this instance drains the durable queue when it is enabled. A fleet
+    /// sets it `false` on the API pods and runs a worker Deployment of the same image.
+    /// Env var: `SCAN_WORKER_ENABLED`. Default: true.
+    pub scan_worker_enabled: bool,
+
+    /// Scan jobs this instance runs concurrently. `None` matches
+    /// `MAX_CONCURRENT_SCAN_EXTRACTIONS`. Raise both together on worker pods.
+    /// Env var: `SCAN_WORKER_CONCURRENCY`. Default: unset.
+    pub scan_worker_concurrency: Option<usize>,
+
     /// Maximum upload size in bytes for artifact uploads.
     /// Defaults to 10 GB (10737418240 bytes). Set to 0 to disable the limit.
     pub max_upload_size_bytes: u64,
@@ -1935,6 +1950,8 @@ redacted_debug!(Config {
     show upload_progress_window_secs,
     show upload_min_progress_bytes,
     show upload_max_in_flight_per_principal,
+    show scan_queue_enabled,
+    show scan_worker_enabled,
     show rate_limit_enabled,
     show rate_limit_auth_per_window,
     show rate_limit_api_per_window,
@@ -2073,6 +2090,9 @@ impl Default for Config {
             stuck_scan_threshold_secs: 1800,
             stuck_scan_check_interval_secs: 600,
             stuck_scan_reap_limit: 1000,
+            scan_queue_enabled: false,
+            scan_worker_enabled: true,
+            scan_worker_concurrency: None,
             max_upload_size_bytes: 10_737_418_240,
             quotas: QuotaSettings::default(),
             allow_local_admin_login: false,
@@ -2419,6 +2439,14 @@ impl Config {
                     "STUCK_SCAN_REAP_LIMIT",
                     1000,
                 )),
+            scan_queue_enabled: parse_opt_in_flag(env::var("SCAN_QUEUE_ENABLED").ok().as_deref()),
+            scan_worker_enabled: parse_opt_out_flag(
+                env::var("SCAN_WORKER_ENABLED").ok().as_deref(),
+            ),
+            scan_worker_concurrency: env::var("SCAN_WORKER_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|n| *n > 0),
             max_upload_size_bytes: env_parse("MAX_UPLOAD_SIZE", 10_737_418_240_u64),
             quotas: QuotaSettings::from_env(),
             allow_local_admin_login: matches!(

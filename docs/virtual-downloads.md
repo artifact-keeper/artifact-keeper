@@ -49,6 +49,27 @@ An OCI blob is requested by its digest. Any member's copy is the same bytes:
 the client verifies the digest, and the proxy cache keeps only bytes that
 match it. The deadline applies there in the same way.
 
+## The member breaker
+
+A Remote member that keeps failing would cost every download one deadline
+before the next member serves. After `AK_VIRTUAL_MEMBER_BREAKER_FAILURES`
+(default `3`) failures in a row, the member's breaker opens. For
+`AK_VIRTUAL_MEMBER_BREAKER_OPEN_SECS` (default `30`) downloads pass over the
+member without dialling it, as if it were unavailable. Then one download is
+let through as a probe. If the member answers, the breaker closes. If it
+fails, the breaker opens for another period.
+
+- A failure is a missed download deadline, a connect or transport error, or
+  an upstream `5xx`. An answer of any kind (`200`, `404`, `401`, `403`, ...)
+  closes the breaker and resets the count. A `408`, `425` or `429` neither
+  trips nor resets it.
+- For OCI blobs only a missed deadline trips the breaker.
+- The state is kept in memory on each replica. Each replica learns on its own
+  that a member is down, and a restart closes every breaker.
+- `AK_VIRTUAL_MEMBER_BREAKER_OPEN_SECS=0` disables the breaker.
+- `ak_virtual_member_breaker_open{member}` is `1` while a member's breaker is
+  open and `0` once it closes. Opening is logged at `WARN`, closing at `INFO`.
+
 ## Upgrade note
 
 Before this release a download through a virtual repository waited for the

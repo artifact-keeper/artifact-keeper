@@ -60,6 +60,34 @@ pub fn router() -> Router<SharedState> {
         )
         // Drill-down behind the dashboard severity tiles.
         .route("/findings", get(list_cve_findings))
+        // The live scan queue behind the Scan Queue page.
+        .route("/scan-queue", get(get_scan_queue))
+}
+
+/// Outstanding scan jobs plus the queue depth behind them.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ScanQueueResponse {
+    /// `SCAN_QUEUE_ENABLED` on this instance. Off, scans run in-process and the
+    /// queue only holds what was left from when it was on.
+    pub enabled: bool,
+    /// One page of live jobs, running first, then what is due soonest at the
+    /// highest priority band.
+    pub items: Vec<crate::services::scan_queue::ScanQueueJobRow>,
+    /// Job count per `(kind, state)`, with the oldest due job's age.
+    pub depth: Vec<crate::services::scan_queue::ScanQueueDepth>,
+    /// Jobs matching the filter, across all pages.
+    pub total: i64,
+}
+
+/// Query for [`get_scan_queue`].
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ScanQueueQuery {
+    /// `pending` | `running` | `failed`.
+    pub state: Option<String>,
+    /// `proxy_file` | `hosted_artifact`.
+    pub kind: Option<String>,
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
 }
 
 /// Default page size for the downloaders listing.
@@ -1093,6 +1121,66 @@ pub async fn artifact_accessible_users(
     ))
 }
 
+/// `400` for a state or kind no queue row can have.
+fn validate_scan_queue_filters(state: Option<&str>, kind: Option<&str>) -> Result<()> {
+    if let Some(s) = state.filter(|s| !matches!(*s, "pending" | "running" | "failed")) {
+        return Err(AppError::Validation(format!(
+            "unknown state {s:?}; a completed job is deleted, so only pending, running and \
+             failed exist"
+        )));
+    }
+    if let Some(k) = kind.filter(|k| crate::services::scan_queue::ScanJobKind::from_db(k).is_none())
+    {
+        return Err(AppError::Validation(format!("unknown kind {k:?}")));
+    }
+    Ok(())
+}
+
+/// Live scan-queue view. Only pending, running and failed rows exist.
+#[utoipa::path(
+    get,
+    path = "/scan-queue",
+    context_path = "/api/v1/admin/security",
+    tag = "admin",
+    params(ScanQueueQuery),
+    responses(
+        (status = 200, description = "Outstanding scan jobs and queue depth", body = ScanQueueResponse),
+        (status = 400, description = "Unknown state or kind"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin privileges required, or a repository-scoped token")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_scan_queue(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Query(query): Query<ScanQueueQuery>,
+) -> Result<Json<ScanQueueResponse>> {
+    // Rows name repositories and cache paths across the whole instance, so a
+    // repository-scoped admin token must not read them (#4273, #4550).
+    auth.require_unscoped_admin("the instance-wide scan queue")?;
+    validate_scan_queue_filters(query.state.as_deref(), query.kind.as_deref())?;
+    let (offset, per_page, _, _) = blast_page_bounds(query.page, query.per_page);
+
+    let queue = crate::services::scan_queue::ScanQueue::new(state.db.clone());
+    let (items, total) = queue
+        .list_jobs(
+            query.state.as_deref(),
+            query.kind.as_deref(),
+            per_page,
+            offset,
+        )
+        .await?;
+    let depth = queue.depth().await?;
+
+    Ok(Json(ScanQueueResponse {
+        enabled: state.config.scan_queue_enabled,
+        items,
+        depth,
+        total,
+    }))
+}
+
 // === CVE drill-down behind the dashboard tiles ===
 
 /// Query for [`list_cve_findings`]. Omitting every filter lists every counted
@@ -1281,6 +1369,7 @@ pub async fn list_cve_findings(
         artifact_blast_radius,
         cve_accessible_users,
         artifact_accessible_users,
+        get_scan_queue,
         list_cve_findings,
     ),
     components(schemas(
@@ -1293,6 +1382,9 @@ pub async fn list_cve_findings(
         AccessibleUsersResponse,
         RepoExposure,
         AccessibleUser,
+        ScanQueueResponse,
+        crate::services::scan_queue::ScanQueueJobRow,
+        crate::services::scan_queue::ScanQueueDepth,
         CveFindingRow,
         AffectedArtifactRow,
         ListCveFindingsResponse,
@@ -1349,6 +1441,21 @@ mod tests {
             group_by_artifact(Some("cve")).expect_err("unknown group_by"),
             AppError::Validation(_)
         ));
+    }
+
+    #[test]
+    fn scan_queue_filters_accept_only_states_and_kinds_a_row_can_have() {
+        for state in ["pending", "running", "failed"] {
+            assert!(validate_scan_queue_filters(Some(state), None).is_ok());
+        }
+        for kind in ["proxy_file", "hosted_artifact"] {
+            assert!(validate_scan_queue_filters(None, Some(kind)).is_ok());
+        }
+        assert!(validate_scan_queue_filters(None, None).is_ok());
+        // A completed job is deleted, so `completed` can never match a row.
+        assert!(validate_scan_queue_filters(Some("completed"), None).is_err());
+        assert!(validate_scan_queue_filters(None, Some("proxy_oci")).is_err());
+        assert!(validate_scan_queue_filters(Some("pending'; --"), None).is_err());
     }
 
     #[test]
@@ -2418,11 +2525,29 @@ mod tests {
 }
 
 /// Through the real router: the `/admin` nest's `admin_middleware` and the
-/// handler's unscoped-admin gate, for every credential shape (#4550).
+/// handler's unscoped-admin gate, for every credential shape (#4550). The scan
+/// queue lists rows of every repository (their ids and proxy-cache paths), so it
+/// takes the same gate as the other instance-wide admin listings.
 #[cfg(ak_test_shard = "router")]
 #[cfg(test)]
 mod router_tests {
     use crate::api::handlers::test_db_helpers as tdh;
+
+    #[tokio::test]
+    async fn scan_queue_refuses_anonymous_non_admin_and_repo_scoped_admin_tokens() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        tdh::assert_admin_routes_refuse_repo_scoped_tokens(
+            &fx,
+            &[
+                "/api/v1/admin/security/scan-queue",
+                "/api/v1/admin/security/scan-queue?state=failed&kind=proxy_file",
+            ],
+        )
+        .await;
+        fx.teardown().await;
+    }
 
     #[tokio::test]
     async fn findings_refuse_anonymous_non_admin_and_repo_scoped_admin_tokens() {
