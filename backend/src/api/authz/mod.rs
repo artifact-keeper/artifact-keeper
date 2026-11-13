@@ -29,6 +29,9 @@ pub(crate) mod declaration_table;
 mod identity_declarations;
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
+mod integration_declarations;
+#[cfg(ak_test_shard = "services-2")]
+#[cfg(test)]
 mod project_group_declarations;
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]

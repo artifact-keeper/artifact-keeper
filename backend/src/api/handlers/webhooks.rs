@@ -219,6 +219,7 @@ async fn authorize_webhook_access(
     // `search::intersect_token_scope` already hold, which this surface simply
     // never read `allowed_repo_ids` to enforce.
     if !webhook_within_token_scope(&auth.allowed_repo_ids, repository_id) {
+        mark_webhook_access(repository_id, false);
         return Err(AppError::NotFound("Webhook not found".to_string()));
     }
 
@@ -244,16 +245,33 @@ async fn authorize_webhook_access(
         false
     };
 
-    if webhook_access_allowed(
+    let allowed = webhook_access_allowed(
         auth.is_admin,
         auth.user_id,
         created_by,
         repository_id,
         repo_accessible,
-    ) {
+    );
+    mark_webhook_access(repository_id, allowed);
+    if allowed {
         Ok(())
     } else {
         Err(AppError::NotFound("Webhook not found".to_string()))
+    }
+}
+
+/// For the IAM shadow comparison (#4214): a repository webhook's access check
+/// is a read pass on its repository, or an existence-hiding refusal for it.
+/// An instance-wide webhook names no repository, so it is not marked.
+fn mark_webhook_access(repository_id: Option<Uuid>, allowed: bool) {
+    use crate::api::authz::shadow_marker;
+    let Some(repository_id) = repository_id else {
+        return;
+    };
+    if allowed {
+        shadow_marker::note_passed(repository_id, shadow_marker::LegacyLevel::Read);
+    } else {
+        shadow_marker::note_hidden_refusal(repository_id);
     }
 }
 
@@ -498,6 +516,7 @@ pub struct WebhookListResponse {
 /// List webhooks
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "",
     context_path = "/api/v1/webhooks",
     tag = "webhooks",
@@ -701,6 +720,7 @@ pub async fn list_webhooks(
 /// `secret_digest`, never the raw secret.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("repository.notifications.manage")), ("x-resource" = json!("webhook:body"))),
     path = "",
     context_path = "/api/v1/webhooks",
     tag = "webhooks",
@@ -723,6 +743,12 @@ pub async fn create_webhook(
     // authenticated user should do. Require admin BEFORE URL validation, secret
     // generation, or any DB write, and record the RBAC-deny. Read/list webhook
     // handlers are unchanged (non-admin owners keep their existing read access).
+    crate::api::authz::shadow_marker::note_target(match payload.repository_id {
+        Some(repository) => {
+            crate::services::iam_legacy_projection::ScopeRef::Repository(repository)
+        }
+        None => crate::services::iam_legacy_projection::ScopeRef::Instance,
+    });
     crate::services::audit_service::enforce_admin_audited(
         auth.is_admin,
         state.db.clone(),
@@ -960,6 +986,7 @@ fn signing_key_error_to_app(e: SigningKeyError) -> AppError {
 /// it is not, the key set is empty.
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "/jwks",
     context_path = "/api/v1/webhooks",
     tag = "webhooks",
@@ -990,6 +1017,7 @@ const JWKS_CACHE_CONTROL: &str = "public, max-age=300";
 /// Get webhook by ID
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.notifications.manage")), ("x-resource" = json!("webhook:id"))),
     path = "/{id}",
     context_path = "/api/v1/webhooks",
     tag = "webhooks",
@@ -1055,6 +1083,7 @@ pub async fn get_webhook(
 /// Delete webhook
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("repository.notifications.manage")), ("x-resource" = json!("webhook:id"))),
     path = "/{id}",
     context_path = "/api/v1/webhooks",
     tag = "webhooks",
@@ -1193,6 +1222,7 @@ async fn set_webhook_enabled(state: &SharedState, id: Uuid, enabled: bool) -> Re
 /// Enable webhook
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("repository.notifications.manage")), ("x-resource" = json!("webhook:id"))),
     path = "/{id}/enable",
     context_path = "/api/v1/webhooks",
     tag = "webhooks",
@@ -1227,6 +1257,7 @@ pub async fn enable_webhook(
 /// Disable webhook
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("repository.notifications.manage")), ("x-resource" = json!("webhook:id"))),
     path = "/{id}/disable",
     context_path = "/api/v1/webhooks",
     tag = "webhooks",
@@ -1269,6 +1300,7 @@ pub struct TestWebhookResponse {
 /// Test webhook by sending a test payload
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("repository.notifications.manage")), ("x-resource" = json!("webhook:id"))),
     path = "/{id}/test",
     context_path = "/api/v1/webhooks",
     tag = "webhooks",
@@ -1405,6 +1437,7 @@ pub struct DeliveryListResponse {
 /// List webhook deliveries
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.notifications.manage")), ("x-resource" = json!("webhook:id"))),
     path = "/{id}/deliveries",
     context_path = "/api/v1/webhooks",
     tag = "webhooks",
@@ -1490,6 +1523,7 @@ pub async fn list_deliveries(
 /// Redeliver a failed webhook
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("repository.notifications.manage")), ("x-resource" = json!("webhook:id"))),
     path = "/{id}/deliveries/{delivery_id}/redeliver",
     context_path = "/api/v1/webhooks",
     tag = "webhooks",
@@ -1670,6 +1704,7 @@ fn rotation_guard_allows(
 /// `{"error": "rotation_already_in_progress", "expires_at": "<RFC3339>"}`.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("repository.notifications.manage")), ("x-resource" = json!("webhook:id"))),
     path = "/{id}/rotate-secret",
     context_path = "/api/v1/webhooks",
     tag = "webhooks",
@@ -4637,6 +4672,61 @@ mod tests {
                     .execute(pool)
                     .await
                     .ok();
+            }
+        }
+
+        /// The access check marks what the shadow comparison reads: a read
+        /// pass or a hidden refusal on a repository webhook's repository, and
+        /// nothing for a missing or an instance-wide webhook.
+        #[tokio::test]
+        async fn webhook_access_marks_its_outcome() {
+            use crate::api::authz::shadow_marker::{scope, LegacyLevel};
+            use crate::services::iam_legacy_projection::ScopeRef;
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let reader = create_user(&pool, false).await;
+            let stranger = create_user(&pool, false).await;
+            let repo = create_repo(&pool).await;
+            let state = tdh::build_state(pool.clone(), "/tmp");
+            grant_repo_access(&pool, reader, repo).await;
+            let repo_wh = insert_webhook(&pool, None, Some(repo)).await;
+            let global_wh = insert_webhook(&pool, None, None).await;
+            let mut scoped_away = auth_for(reader, false);
+            scoped_away.allowed_repo_ids =
+                crate::models::access_scope::AccessScope::Restricted(vec![Uuid::new_v4()]);
+            let check = |auth: AuthExtension, id: Uuid| {
+                let state = state.clone();
+                async move { scope(authorize_webhook_access(&state, &auth, id)).await }
+            };
+
+            let (admitted, on_pass) = check(auth_for(reader, false), repo_wh).await;
+            let (hidden, on_stranger) = check(auth_for(stranger, false), repo_wh).await;
+            let (scoped, on_token) = check(scoped_away, repo_wh).await;
+            let (missing, on_missing) = check(auth_for(reader, false), Uuid::new_v4()).await;
+            let (global, on_global) = check(auth_for(stranger, false), global_wh).await;
+            cleanup(&pool, &[repo], &[reader, stranger]).await;
+            sqlx::query("DELETE FROM webhooks WHERE id = $1")
+                .bind(global_wh)
+                .execute(&pool)
+                .await
+                .ok();
+
+            assert!(admitted.is_ok(), "{admitted:?}");
+            assert_eq!(
+                on_pass.passed_on(ScopeRef::Repository(repo)),
+                Some(LegacyLevel::Read)
+            );
+            assert_eq!(on_pass.hidden_refusal, None);
+            for (res, rec) in [(hidden, on_stranger), (scoped, on_token)] {
+                assert!(is_not_found(&res), "{res:?}");
+                assert_eq!(rec.hidden_refusal, Some(repo));
+                assert!(rec.passed.is_empty());
+            }
+            for (res, rec) in [(missing, on_missing), (global, on_global)] {
+                assert!(is_not_found(&res), "{res:?}");
+                assert_eq!(rec.hidden_refusal, None);
+                assert!(rec.passed.is_empty());
             }
         }
 

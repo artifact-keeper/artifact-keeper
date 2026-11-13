@@ -230,6 +230,7 @@ pub struct SystemConfigResponse {
 /// fingerprinted by an unauthenticated attacker.
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "/config",
     context_path = "/api/v1/system",
     tag = "system",

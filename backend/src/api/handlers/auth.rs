@@ -136,6 +136,7 @@ pub struct SetupStatusResponse {
 /// Returns whether initial setup (password change) is required.
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "/status",
     context_path = "/api/v1/setup",
     tag = "auth",

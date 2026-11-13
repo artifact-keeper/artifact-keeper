@@ -119,6 +119,16 @@ pub const RESOLVERS: &[Resolver] = &[
         id: "quality_issue:id",
         scope: Scope::Repository,
     },
+    // A webhook resolves to its repository, or to the instance when it has
+    // none; creation names the repository in the body.
+    Resolver {
+        id: "webhook:id",
+        scope: Scope::Repository,
+    },
+    Resolver {
+        id: "webhook:body",
+        scope: Scope::Repository,
+    },
 ];
 
 impl Resolver {

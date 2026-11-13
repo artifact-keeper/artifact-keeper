@@ -389,6 +389,7 @@ fn not_implemented(what: &str, phase: &str) -> Response {
 /// Describe the bundle format this server reads and writes.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/format",
     context_path = "/api/v1/bundles",
     tag = "bundles",
@@ -405,6 +406,7 @@ async fn get_bundle_format() -> Json<BundleFormatResponse> {
 /// Validate a bundle `manifest.json` without importing anything.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/manifest/validate",
     context_path = "/api/v1/bundles",
     tag = "bundles",
@@ -422,6 +424,7 @@ async fn validate_bundle_manifest(body: Bytes) -> Json<ManifestValidationReport>
 /// Export repositories into a bundle (not implemented yet: PR2 of #2464).
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/exports",
     context_path = "/api/v1/bundles",
     tag = "bundles",
@@ -444,6 +447,7 @@ async fn create_bundle_export(Json(req): Json<CreateBundleExportRequest>) -> Res
 /// Import a bundle (not implemented yet: PR3 of #2464).
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/imports",
     context_path = "/api/v1/bundles",
     tag = "bundles",
@@ -468,6 +472,7 @@ const BUNDLE_JOB_COLUMNS: &str = "id, direction, status, bundle_id, manifest_sch
 /// List bundle jobs, newest first.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/jobs",
     context_path = "/api/v1/bundles",
     tag = "bundles",
@@ -517,6 +522,7 @@ async fn fetch_job(state: &SharedState, id: Uuid) -> Result<BundleJob> {
 /// Get one bundle job.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/jobs/{id}",
     context_path = "/api/v1/bundles",
     tag = "bundles",
@@ -538,6 +544,7 @@ async fn get_bundle_job(
 /// List the artifact records of a bundle job.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/jobs/{id}/items",
     context_path = "/api/v1/bundles",
     tag = "bundles",

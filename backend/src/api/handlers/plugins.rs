@@ -157,6 +157,7 @@ fn parse_type(s: &str) -> Option<PluginType> {
 /// List installed plugins
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "",
     context_path = "/api/v1/plugins",
     tag = "plugins",
@@ -229,6 +230,7 @@ struct PluginManifest {
 /// Install plugin from uploaded package
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("plugin.manage")), ("x-resource" = json!("instance"))),
     path = "",
     context_path = "/api/v1/plugins",
     tag = "plugins",
@@ -328,6 +330,7 @@ pub async fn install_plugin(
 /// Get plugin details
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/{id}",
     context_path = "/api/v1/plugins",
     tag = "plugins",
@@ -379,6 +382,7 @@ pub async fn get_plugin(
 /// Uninstall plugin
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("plugin.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/plugins",
     tag = "plugins",
@@ -411,6 +415,7 @@ pub async fn uninstall_plugin(
 /// Enable plugin
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("plugin.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/enable",
     context_path = "/api/v1/plugins",
     tag = "plugins",
@@ -459,6 +464,7 @@ pub async fn enable_plugin(
 /// Disable plugin
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("plugin.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/disable",
     context_path = "/api/v1/plugins",
     tag = "plugins",
@@ -514,6 +520,7 @@ pub struct PluginConfigResponse {
 /// Get plugin configuration
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("plugin.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/config",
     context_path = "/api/v1/plugins",
     tag = "plugins",
@@ -567,6 +574,7 @@ pub struct UpdatePluginConfigRequest {
 /// Update plugin configuration
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("plugin.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/config",
     context_path = "/api/v1/plugins",
     tag = "plugins",
@@ -684,6 +692,7 @@ pub struct PluginInstallResponse {
 /// Install a plugin from a Git repository (T021)
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("plugin.manage")), ("x-resource" = json!("instance"))),
     path = "/install/git",
     context_path = "/api/v1/plugins",
     tag = "plugins",
@@ -714,6 +723,7 @@ pub async fn install_from_git(
 /// Install a plugin from a ZIP file (T034)
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("plugin.manage")), ("x-resource" = json!("instance"))),
     path = "/install/zip",
     context_path = "/api/v1/plugins",
     tag = "plugins",
@@ -767,6 +777,7 @@ pub async fn install_from_zip(
 /// Get plugin events (T026)
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/{id}/events",
     context_path = "/api/v1/plugins",
     tag = "plugins",
@@ -798,6 +809,7 @@ pub struct EventsQuery {
 /// Reload a plugin (hot-reload) (T048)
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("plugin.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/reload",
     context_path = "/api/v1/plugins",
     tag = "plugins",
@@ -889,6 +901,7 @@ pub struct ListFormatsQuery {
 /// List all format handlers (T039)
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "",
     context_path = "/api/v1/formats",
     tag = "plugins",
@@ -922,6 +935,7 @@ pub async fn list_format_handlers(
 /// Get a format handler by key (T040)
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "/{format_key}",
     context_path = "/api/v1/formats",
     tag = "plugins",
@@ -947,6 +961,7 @@ pub async fn get_format_handler(
 /// Enable a format handler (T041)
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("format.manage")), ("x-resource" = json!("instance"))),
     path = "/{format_key}/enable",
     context_path = "/api/v1/formats",
     tag = "plugins",
@@ -973,6 +988,7 @@ pub async fn enable_format_handler(
 /// Disable a format handler (T042)
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("format.manage")), ("x-resource" = json!("instance"))),
     path = "/{format_key}/disable",
     context_path = "/api/v1/formats",
     tag = "plugins",
@@ -1037,6 +1053,7 @@ pub struct TestMetadata {
 /// Test a format handler with sample content (T062)
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("format.manage")), ("x-resource" = json!("instance"))),
     path = "/{format_key}/test",
     context_path = "/api/v1/formats",
     tag = "plugins",
@@ -1127,6 +1144,7 @@ pub(crate) const LOCAL_INSTALL_NOT_IMPLEMENTED: &str =
 /// The path is no longer touched.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("plugin.manage")), ("x-resource" = json!("instance"))),
     path = "/install/local",
     context_path = "/api/v1/plugins",
     tag = "plugins",

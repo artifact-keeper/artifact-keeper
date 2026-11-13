@@ -606,6 +606,7 @@ fn spawn_migration_worker(
 /// List all source connections for the current user
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/connections",
     context_path = "/api/v1/migrations",
     tag = "migration",
@@ -655,6 +656,7 @@ async fn list_connections(
 /// Create a new source connection
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/connections",
     context_path = "/api/v1/migrations",
     tag = "migration",
@@ -707,6 +709,7 @@ async fn create_connection(
 /// Get a specific source connection
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/connections/{id}",
     context_path = "/api/v1/migrations",
     tag = "migration",
@@ -732,6 +735,7 @@ async fn get_connection(
 /// Delete a source connection
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/connections/{id}",
     context_path = "/api/v1/migrations",
     tag = "migration",
@@ -791,6 +795,7 @@ async fn delete_connection(
 /// Test connection to Artifactory
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/connections/{id}/test",
     context_path = "/api/v1/migrations",
     tag = "migration",
@@ -960,6 +965,7 @@ fn create_artifactory_client(
 /// List repositories from Artifactory source
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/connections/{id}/repositories",
     context_path = "/api/v1/migrations",
     tag = "migration",
@@ -1015,6 +1021,7 @@ async fn list_source_repositories(
 /// List migration jobs
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "",
     context_path = "/api/v1/migrations",
     tag = "migration",
@@ -1151,6 +1158,7 @@ fn map_create_migration_error(err: sqlx::Error) -> AppError {
 /// Create a new migration job
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "",
     context_path = "/api/v1/migrations",
     tag = "migration",
@@ -1213,6 +1221,7 @@ async fn create_migration(
 /// Get a specific migration job
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/migrations",
     tag = "migration",
@@ -1238,6 +1247,7 @@ async fn get_migration(
 /// Delete a migration job
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/migrations",
     tag = "migration",
@@ -1277,6 +1287,7 @@ async fn delete_migration(
 /// Start a migration job
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/start",
     context_path = "/api/v1/migrations",
     tag = "migration",
@@ -1333,6 +1344,7 @@ async fn start_migration(
 /// Pause a migration job
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/pause",
     context_path = "/api/v1/migrations",
     tag = "migration",
@@ -1370,6 +1382,7 @@ async fn pause_migration(
 /// Resume a paused migration job
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/resume",
     context_path = "/api/v1/migrations",
     tag = "migration",
@@ -1423,6 +1436,7 @@ async fn resume_migration(
 /// Cancel a migration job
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/cancel",
     context_path = "/api/v1/migrations",
     tag = "migration",
@@ -1473,6 +1487,7 @@ async fn cancel_migration(
 /// Stream migration progress via Server-Sent Events
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/stream",
     context_path = "/api/v1/migrations",
     tag = "migration",
@@ -1570,6 +1585,7 @@ async fn stream_migration_progress(
 /// List migration items for a job
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/items",
     context_path = "/api/v1/migrations",
     tag = "migration",
@@ -1692,6 +1708,7 @@ async fn fetch_migration_report(
 /// Get migration report
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/report",
     context_path = "/api/v1/migrations",
     tag = "migration",
@@ -1757,6 +1774,7 @@ async fn get_migration_report(
 /// Run pre-migration assessment
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/assess",
     context_path = "/api/v1/migrations",
     tag = "migration",
@@ -1835,6 +1853,7 @@ async fn run_assessment(
 /// Get assessment results
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("migration.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/assessment",
     context_path = "/api/v1/migrations",
     tag = "migration",

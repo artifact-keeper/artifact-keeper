@@ -106,6 +106,7 @@ pub struct BannerListResponse {
 /// List the banners active right now.
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "",
     context_path = "/api/v1/banners",
     tag = "banners",

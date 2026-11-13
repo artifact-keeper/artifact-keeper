@@ -688,23 +688,10 @@ pub async fn resolve(
             )
             .await
         }
-        // An acknowledgement with no repository applies to every one.
-        "acknowledgement" => {
-            let id = uuid()?;
-            let row: Result<Option<Option<Uuid>>, _> = sqlx::query_scalar(
-                "SELECT repository_id FROM finding_acknowledgements WHERE id = $1",
-            )
-            .bind(id)
-            .fetch_optional(db)
-            .await;
-            found(row.map(|r| r.map(|repo| repo.unwrap_or(Uuid::nil())))).map(|repo| {
-                if repo.is_nil() {
-                    ScopeRef::Instance
-                } else {
-                    ScopeRef::Repository(repo)
-                }
-            })
-        }
+        // An acknowledgement or a webhook with no repository applies to
+        // every one.
+        "acknowledgement" => repository_or_instance(db, uuid()?, ACKNOWLEDGEMENT_REPOSITORY).await,
+        "webhook" => repository_or_instance(db, uuid()?, WEBHOOK_REPOSITORY).await,
         // CVE history by artifact or by CVE id, as the handler reads the path.
         "cve_subject" => {
             let raw = param.ok_or("missing_parameter")?;
@@ -728,6 +715,26 @@ pub async fn resolve(
 }
 
 const ARTIFACT_REPOSITORY: &str = "SELECT repository_id FROM artifacts WHERE id = $1";
+const ACKNOWLEDGEMENT_REPOSITORY: &str =
+    "SELECT repository_id FROM finding_acknowledgements WHERE id = $1";
+const WEBHOOK_REPOSITORY: &str = "SELECT repository_id FROM webhooks WHERE id = $1";
+
+/// The repository in a nullable `repository_id` column, or the instance when
+/// it is null.
+async fn repository_or_instance(
+    db: &PgPool,
+    id: Uuid,
+    sql: &'static str,
+) -> Result<ScopeRef, &'static str> {
+    let row: Result<Option<Option<Uuid>>, sqlx::Error> =
+        sqlx::query_scalar(sql).bind(id).fetch_optional(db).await;
+    match row {
+        Ok(Some(Some(repository))) => Ok(ScopeRef::Repository(repository)),
+        Ok(Some(None)) => Ok(ScopeRef::Instance),
+        Ok(None) => Err("resource_not_found"),
+        Err(_) => Err("resolver_error"),
+    }
+}
 
 /// The middleware. Passes undeclared routes through untouched; for a declared
 /// one it records the legacy path, returns the response unchanged, and only
@@ -2706,6 +2713,167 @@ mod end_to_end {
         tdh::cleanup_user(&pool, plain).await;
         tdh::cleanup(&pool, repo, owner).await;
         tdh::cleanup_user(&pool, admin).await;
+    }
+
+    /// A webhook of `repo`, or an instance-wide one for `None`.
+    async fn insert_webhook(pool: &PgPool, repo: Option<Uuid>) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO webhooks (name, url, events, is_enabled, repository_id) \
+             VALUES ('shadow', 'http://198.51.100.7/hook', ARRAY['artifact_uploaded'], true, $1) \
+             RETURNING id",
+        )
+        .bind(repo)
+        .fetch_one(pool)
+        .await
+        .expect("insert a webhook")
+    }
+
+    #[tokio::test]
+    async fn a_webhook_resolves_to_its_repository_or_the_instance() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let hook = insert_webhook(&pool, Some(repo)).await;
+        let global = insert_webhook(&pool, None).await;
+        let resolver = Resolver::lookup("webhook:id").unwrap();
+        let resolve_as = |param: String| {
+            let pool = pool.clone();
+            async move { resolve(&pool, resolver, Some(&param)).await }
+        };
+        let here = resolve_as(hook.to_string()).await;
+        let instance = resolve_as(global.to_string()).await;
+        let missing = resolve_as(Uuid::new_v4().to_string()).await;
+        let malformed = resolve_as("hook".into()).await;
+        let _ = sqlx::query("DELETE FROM webhooks WHERE id = ANY($1)")
+            .bind(vec![hook, global])
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await;
+        assert_eq!(here, Ok(ScopeRef::Repository(repo)));
+        assert_eq!(instance, Ok(ScopeRef::Instance));
+        assert_eq!(missing, Err("resource_not_found"));
+        assert_eq!(malformed, Err("malformed_parameter"));
+    }
+
+    #[tokio::test]
+    async fn integration_operations_are_compared() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (admin, _) = tdh::create_user(&pool).await;
+        let (plain, _) = tdh::create_user(&pool).await;
+        let (reader, _) = tdh::create_user(&pool).await;
+        let (owner, _) = tdh::create_user(&pool).await;
+        sqlx::query("UPDATE users SET is_admin = true WHERE id = $1")
+            .bind(admin)
+            .execute(&pool)
+            .await
+            .unwrap();
+        tdh::grant_repo_role(&pool, repo, reader, "reader").await;
+        tdh::grant_repo_role(&pool, repo, owner, "repository-owner").await;
+        let hook = insert_webhook(&pool, Some(repo)).await;
+        let global = insert_webhook(&pool, None).await;
+        let mut rig = Rig::new(pool.clone(), &dir).await;
+        let admin_bearer = tdh::bearer_for(&rig.state, admin).await;
+        let plain_bearer = tdh::bearer_for(&rig.state, plain).await;
+        let reader_bearer = tdh::bearer_for(&rig.state, reader).await;
+        let owner_bearer = tdh::bearer_for(&rig.state, owner).await;
+        let get = |path: String| empty_request("GET", format!("/api/v1{path}"));
+        let post = |path: String| empty_request("POST", format!("/api/v1{path}"));
+        let compared = |c: &Comparison, legacy: LegacyOutcome, class: Class| {
+            assert_eq!((c.legacy, c.class), (legacy, class), "{c:?}");
+        };
+        let here = Some(ScopeRef::Repository(repo));
+
+        // Migrations are the instance administrator's.
+        let (status, c) = rig
+            .call(Some(&admin_bearer), get("/migrations".into()))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(c.permission, Permission::MigrationManage);
+        assert_eq!(c.resource, Some(ScopeRef::Instance));
+        compared(&c, LegacyOutcome::Permit, Class::Agree);
+
+        // Plugin management: a plain user is refused by both.
+        let (status, c) = rig
+            .call(
+                Some(&plain_bearer),
+                post(format!("/plugins/{}/enable", Uuid::new_v4())),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(c.permission, Permission::PluginManage);
+        compared(&c, LegacyOutcome::Refuse, Class::Agree);
+
+        // A repository reader reads its webhook today; the model refuses.
+        let (status, c) = rig
+            .call(Some(&reader_bearer), get(format!("/webhooks/{hook}")))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(c.permission, Permission::RepositoryNotificationsManage);
+        assert_eq!(c.resource, here);
+        compared(&c, LegacyOutcome::Permit, Class::NewStricter);
+
+        // A stranger to the private repository is refused by both.
+        let (status, c) = rig
+            .call(Some(&plain_bearer), get(format!("/webhooks/{hook}")))
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(c.resource, here);
+        compared(&c, LegacyOutcome::Refuse, Class::Agree);
+
+        // The repository owner manages its webhooks under the model.
+        let (status, c) = rig
+            .call(
+                Some(&owner_bearer),
+                post(format!("/webhooks/{hook}/disable")),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(c.resource, here);
+        compared(&c, LegacyOutcome::Refuse, Class::NewWider);
+
+        // Creating a webhook is decided on the repository the body names.
+        let create = json_request(
+            "POST",
+            "/api/v1/webhooks".into(),
+            serde_json::json!({
+                "name": "shadow",
+                "url": "http://198.51.100.7/hook",
+                "events": ["artifact_uploaded"],
+                "repository_id": repo,
+            }),
+        );
+        let (status, c) = rig.call(Some(&plain_bearer), create).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(c.resource, here);
+        compared(&c, LegacyOutcome::Refuse, Class::Agree);
+
+        // An instance-wide webhook is decided on the instance.
+        let (status, c) = rig
+            .call(
+                Some(&admin_bearer),
+                post(format!("/webhooks/{global}/disable")),
+            )
+            .await;
+        assert!(status.is_success(), "{status}");
+        assert_eq!(c.resource, Some(ScopeRef::Instance));
+        compared(&c, LegacyOutcome::Permit, Class::Agree);
+
+        rig.shutdown.cancel();
+        let _ = sqlx::query("DELETE FROM webhooks WHERE id = ANY($1)")
+            .bind(vec![hook, global])
+            .execute(&pool)
+            .await;
+        for user in [plain, reader, owner] {
+            tdh::cleanup_user(&pool, user).await;
+        }
+        tdh::cleanup(&pool, repo, admin).await;
     }
 
     #[tokio::test]
