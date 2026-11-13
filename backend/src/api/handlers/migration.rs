@@ -70,6 +70,7 @@ fn migration_encryption_key() -> Result<String> {
 use crate::services::migration_service::MigrationService;
 use crate::services::migration_worker::{ConflictResolution, MigrationWorker, WorkerConfig};
 use crate::services::nexus_client::{NexusAuth, NexusClient, NexusClientConfig};
+use crate::services::proxy_service::redact_url_for_diagnostics;
 use crate::services::source_registry::SourceRegistry;
 
 use crate::api::validation::validate_outbound_url;
@@ -210,6 +211,20 @@ fn validate_connection_auth_type(auth_type: &str) -> Result<()> {
             ALLOWED_CONNECTION_AUTH_TYPES.join(", ")
         )))
     }
+}
+
+/// Nexus has no API-key auth, a Nexus user token is a name code and pass code
+/// pair sent as Basic credentials
+const NEXUS_BASIC_AUTH_ONLY: &str = "Nexus source connections support auth_type basic_auth only, \
+     enter a Nexus user token as its name code (username) and pass code (password)";
+
+/// Reject an `auth_type` the source client cannot use, so a Nexus connection
+/// never stores a token that would be dropped for empty Basic credentials
+fn validate_connection_source_auth(source_type: &str, auth_type: &str) -> Result<()> {
+    if source_type == "nexus" && auth_type != "basic_auth" {
+        return Err(AppError::Validation(NEXUS_BASIC_AUTH_ONLY.into()));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -670,8 +685,10 @@ async fn create_connection(
     Extension(auth): Extension<AuthExtension>,
     Json(req): Json<CreateConnectionRequest>,
 ) -> Result<(StatusCode, Json<ConnectionResponse>)> {
+    // The clients append paths to the base URL, so a trailing slash became `//` and a 404
+    let url = req.url.trim().trim_end_matches('/');
     // Validate URL to prevent SSRF when migration fetches from this source
-    validate_outbound_url(&req.url, "Migration source URL")?;
+    validate_outbound_url(url, "Migration source URL")?;
 
     // Validate auth_type against the values permitted by the
     // `source_connections_auth_type_check` CHECK constraint (migration
@@ -679,6 +696,8 @@ async fn create_connection(
     // INSERT and surfaced the constraint violation as an opaque HTTP 500
     // DATABASE_ERROR instead of a clear 400.
     validate_connection_auth_type(&req.auth_type)?;
+    let source_type = req.source_type.as_deref().unwrap_or("artifactory");
+    validate_connection_source_auth(source_type, &req.auth_type)?;
 
     // Encrypt credentials before storing
     let credentials_json = serde_json::to_string(&req.credentials)?;
@@ -693,10 +712,10 @@ async fn create_connection(
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING {SOURCE_CONNECTION_COLUMNS}"
     )))
     .bind(&req.name)
-    .bind(&req.url)
+    .bind(url)
     .bind(&req.auth_type)
     .bind(&credentials_enc)
-    .bind(req.source_type.as_deref().unwrap_or("artifactory"))
+    .bind(source_type)
     .bind(auth.user_id)
     .fetch_one(&state.db)
     .await?;
@@ -788,7 +807,7 @@ async fn delete_connection(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Test connection to Artifactory
+/// Test a source connection
 #[utoipa::path(
     post,
     path = "/connections/{id}/test",
@@ -810,6 +829,13 @@ async fn test_connection(
     Path(id): Path<Uuid>,
 ) -> Result<Json<ConnectionTestResult>> {
     let connection = load_connection_owned(&state, &auth, id).await?;
+    let source = match connection.source_type.as_str() {
+        "nexus" => "Nexus",
+        _ => "Artifactory",
+    };
+    let url = redact_url_for_diagnostics(&connection.url)
+        .trim_end_matches('/')
+        .to_string();
 
     // Create source registry client
     let client = match create_source_client(&connection, None) {
@@ -817,7 +843,7 @@ async fn test_connection(
         Err(e) => {
             return Ok(Json(ConnectionTestResult {
                 success: false,
-                message: format!("Failed to create client: {}", e),
+                message: format!("Failed to create client for {source}: {e}"),
                 artifactory_version: None,
                 license_type: None,
             }));
@@ -847,13 +873,13 @@ async fn test_connection(
         }
         Ok(false) => ConnectionTestResult {
             success: false,
-            message: "Artifactory ping returned unsuccessful response".into(),
+            message: format!("{source} ping to {url} returned an unsuccessful response"),
             artifactory_version: None,
             license_type: None,
         },
         Err(e) => ConnectionTestResult {
             success: false,
-            message: format!("Connection failed: {}", e),
+            message: format!("{source} connection to {url} failed: {e}"),
             artifactory_version: None,
             license_type: None,
         },
@@ -881,23 +907,15 @@ fn create_source_client(
 ) -> std::result::Result<Arc<dyn SourceRegistry>, String> {
     match connection.source_type.as_str() {
         "nexus" => {
-            // Mirrors `migration_encryption_key`: fall back to the dev
-            // passphrase if the env var is unset so we can decrypt rows
-            // written by `create_connection` under the same fallback.
-            let encryption_key = migration_encryption_key()
-                .map_err(|e| format!("Failed to load encryption key: {}", e))?;
-            let credentials_json =
-                decrypt_credentials(&connection.credentials_enc, &encryption_key)
-                    .map_err(|e| format!("Failed to decrypt credentials: {}", e))?;
-            let creds: ConnectionCredentials = serde_json::from_str(&credentials_json)
-                .map_err(|e| format!("Failed to parse credentials: {}", e))?;
-
+            let (username, password) = match connection.auth_type.as_str() {
+                "basic_auth" => basic_auth_credentials(connection_credentials(connection)?)?,
+                // rows stored before create_connection refused this pair
+                "api_token" => return Err(NEXUS_BASIC_AUTH_ONLY.to_string()),
+                other => return Err(format!("Unknown auth type: {}", other)),
+            };
             let config = NexusClientConfig {
                 base_url: connection.url.clone(),
-                auth: NexusAuth {
-                    username: creds.username.unwrap_or_default(),
-                    password: creds.password.unwrap_or_default(),
-                },
+                auth: NexusAuth { username, password },
                 cancel_token: cancel.cloned().unwrap_or_default(),
                 ..Default::default()
             };
@@ -913,21 +931,39 @@ fn create_source_client(
     }
 }
 
-/// Helper to create an Artifactory client from a connection row
-fn create_artifactory_client(
+/// Decrypt a connection row's credentials. Mirrors `migration_encryption_key`'s
+/// fallback so connections persisted under the built-in dev passphrase remain
+/// decryptable
+fn connection_credentials(
     connection: &SourceConnectionRow,
-) -> std::result::Result<ArtifactoryClient, String> {
-    // Decrypt credentials. Mirrors `migration_encryption_key`'s fallback
-    // so connections persisted under the built-in dev passphrase remain
-    // decryptable from this code path too.
+) -> std::result::Result<ConnectionCredentials, String> {
     let encryption_key =
         migration_encryption_key().map_err(|e| format!("Failed to load encryption key: {}", e))?;
 
     let credentials_json = decrypt_credentials(&connection.credentials_enc, &encryption_key)
         .map_err(|e| format!("Failed to decrypt credentials: {}", e))?;
 
-    let creds: ConnectionCredentials = serde_json::from_str(&credentials_json)
-        .map_err(|e| format!("Failed to parse credentials: {}", e))?;
+    serde_json::from_str(&credentials_json)
+        .map_err(|e| format!("Failed to parse credentials: {}", e))
+}
+
+fn basic_auth_credentials(
+    creds: ConnectionCredentials,
+) -> std::result::Result<(String, String), String> {
+    let username = creds
+        .username
+        .ok_or_else(|| "Username missing from credentials".to_string())?;
+    let password = creds
+        .password
+        .ok_or_else(|| "Password missing from credentials".to_string())?;
+    Ok((username, password))
+}
+
+/// Helper to create an Artifactory client from a connection row
+fn create_artifactory_client(
+    connection: &SourceConnectionRow,
+) -> std::result::Result<ArtifactoryClient, String> {
+    let creds = connection_credentials(connection)?;
 
     let auth = match connection.auth_type.as_str() {
         "api_token" => {
@@ -937,12 +973,7 @@ fn create_artifactory_client(
             ArtifactoryAuth::ApiToken(token)
         }
         "basic_auth" => {
-            let username = creds
-                .username
-                .ok_or_else(|| "Username missing from credentials".to_string())?;
-            let password = creds
-                .password
-                .ok_or_else(|| "Password missing from credentials".to_string())?;
+            let (username, password) = basic_auth_credentials(creds)?;
             ArtifactoryAuth::BasicAuth { username, password }
         }
         other => return Err(format!("Unknown auth type: {}", other)),
@@ -3571,6 +3602,200 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "bad source config must map to 400, not 500"
         );
+
+        cleanup_user(&pool, marco).await;
+    }
+
+    fn nexus_row(url: &str, auth_type: &str, creds: serde_json::Value) -> SourceConnectionRow {
+        let key = migration_encryption_key().unwrap();
+        SourceConnectionRow {
+            id: Uuid::new_v4(),
+            name: "nexus".into(),
+            url: url.into(),
+            auth_type: auth_type.into(),
+            credentials_enc: encrypt_credentials(&creds.to_string(), &key),
+            source_type: "nexus".into(),
+            created_at: chrono::Utc::now(),
+            created_by: None,
+            verified_at: None,
+        }
+    }
+
+    #[test]
+    fn test_nexus_source_client_refuses_api_token_5479() {
+        let row = nexus_row(
+            "https://nexus.example.com",
+            "api_token",
+            serde_json::json!({"token": "t"}),
+        );
+        let err = create_source_client(&row, None)
+            .err()
+            .expect("an api_token Nexus row must not build a client with empty Basic creds");
+        assert!(err.contains("basic_auth"), "{err}");
+
+        let row = nexus_row(
+            "https://nexus.example.com",
+            "basic_auth",
+            serde_json::json!({"password": "p"}),
+        );
+        let err = create_source_client(&row, None)
+            .err()
+            .expect("username is required");
+        assert!(err.contains("Username missing"), "{err}");
+    }
+
+    async fn post_connection(
+        state: SharedState,
+        auth: AuthExtension,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let (status, body) = tdh::send(
+            app_as(state, auth),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/connections")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        (status, serde_json::from_slice(&body).unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn test_create_nexus_connection_trims_url_and_refuses_api_token_5479() {
+        let Some(pool) = tdh::try_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (marco, marco_name) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        let (status, v) = post_connection(
+            state.clone(),
+            tdh::make_auth(marco, &marco_name),
+            serde_json::json!({
+                "name": format!("nexus-token-{}", Uuid::new_v4()),
+                "url": "https://nexus.example.com",
+                "auth_type": "api_token",
+                "credentials": {"token": "t"},
+                "source_type": "nexus",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert!(v.to_string().contains("basic_auth"), "{v}");
+
+        let (status, v) = post_connection(
+            state,
+            tdh::make_auth(marco, &marco_name),
+            serde_json::json!({
+                "name": format!("nexus-slash-{}", Uuid::new_v4()),
+                "url": "https://nexus.example.com/ ",
+                "auth_type": "basic_auth",
+                "credentials": {"username": "u", "password": "p"},
+                "source_type": "nexus",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{v}");
+        assert_eq!(v["url"], "https://nexus.example.com");
+
+        cleanup_user(&pool, marco).await;
+    }
+
+    async fn test_seeded_connection(
+        pool: &sqlx::PgPool,
+        owner: (Uuid, &str),
+        row: SourceConnectionRow,
+    ) -> serde_json::Value {
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type, created_by) \
+             VALUES ($1, $2, $3, $4, 'nexus', $5) RETURNING id",
+        )
+        .bind(format!("nexus-test-{}", Uuid::new_v4()))
+        .bind(&row.url)
+        .bind(&row.auth_type)
+        .bind(&row.credentials_enc)
+        .bind(owner.0)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let (status, body) = tdh::send(
+            app_as(
+                tdh::build_state(pool.clone(), "/tmp"),
+                tdh::make_auth(owner.0, owner.1),
+            ),
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/connections/{id}/test"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_nexus_connection_test_names_nexus_and_hides_userinfo_5479() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (marco, marco_name) = tdh::create_user(&pool).await;
+        let creds = serde_json::json!({"username": "u", "password": "p"});
+
+        let up = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/status/writable"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&up)
+            .await;
+        let url = format!("{}/", up.uri());
+        let v = test_seeded_connection(
+            &pool,
+            (marco, &marco_name),
+            nexus_row(&url, "basic_auth", creds.clone()),
+        )
+        .await;
+        assert_eq!(
+            v["success"], true,
+            "a trailing slash must not break the test: {v}"
+        );
+
+        let down = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&down)
+            .await;
+        let url = down.uri().replacen("://", "://admin:s3cret@", 1);
+        let v = test_seeded_connection(
+            &pool,
+            (marco, &marco_name),
+            nexus_row(&url, "basic_auth", creds),
+        )
+        .await;
+        let message = v["message"].as_str().unwrap();
+        assert_eq!(v["success"], false);
+        assert!(message.starts_with("Nexus ping to "), "{message}");
+        assert!(message.contains(&down.uri()), "{message}");
+        assert!(
+            !message.contains("s3cret") && !message.contains("admin@"),
+            "{message}"
+        );
+
+        let v = test_seeded_connection(
+            &pool,
+            (marco, &marco_name),
+            nexus_row(&url, "api_token", serde_json::json!({"token": "t"})),
+        )
+        .await;
+        assert_eq!(v["success"], false);
+        assert!(v["message"].as_str().unwrap().contains("basic_auth"), "{v}");
 
         cleanup_user(&pool, marco).await;
     }

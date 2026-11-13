@@ -24,6 +24,7 @@ use crate::services::proxy_scan_service::CacheScanGate;
 pub(crate) use crate::services::proxy_service::CachedBody;
 pub use crate::services::proxy_service::StreamingFetchResult;
 use crate::services::proxy_service::{DeferredCommitSlot, DirectUpstreamBody, ProxyService};
+use crate::services::virtual_member_breaker::{fetch_error_trips_breaker, MemberBreaker};
 // Re-export the per-format buffered-metadata byte ceilings (#1608 Phase 4b /
 // #2181) so format handlers select a cap via `proxy_helpers::<CONST>`.
 pub use crate::services::proxy_service::{DEFAULT_METADATA_MAX_BYTES, LARGE_METADATA_MAX_BYTES};
@@ -1804,6 +1805,12 @@ async fn proxy_fetch_streaming_member(
     } else {
         proxy_service.fetch_artifact_streaming(member, path).await
     };
+    // #5810: the member's answer, for its download breaker.
+    proxy_service.member_breaker().record(
+        member.id,
+        &member.key,
+        fetched.as_ref().is_err_and(fetch_error_trips_breaker),
+    );
     streaming_fetch_response(
         fetched,
         &member.key,
@@ -3283,17 +3290,23 @@ pub(crate) struct MemberWalk<'p> {
     /// How long one member may take to produce its outcome before it is
     /// treated as unavailable for this request.
     pub(crate) deadline: Option<std::time::Duration>,
+    /// The members' download breakers (#5810): a member whose breaker is
+    /// open is passed over without calling `upstream`, and a deadline miss
+    /// counts against it. The `upstream` closure records the member's own
+    /// answer ([`MemberBreaker::record`]).
+    pub(crate) breaker: Option<&'p MemberBreaker>,
 }
 
 impl<'p> MemberWalk<'p> {
     /// The walk an artifact download through `proxy_service` makes:
     /// bounded by [`virtual_member_download_deadline`] (no deadline without
     /// a proxy: no member can then reach an upstream).
-    pub(crate) fn download(proxy_service: Option<&ProxyService>, path: &'p str) -> Self {
+    pub(crate) fn download(proxy_service: Option<&'p ProxyService>, path: &'p str) -> Self {
         Self {
             path,
             deadline: proxy_service
                 .and_then(|p| virtual_member_download_deadline(p.upstream_read_timeout())),
+            breaker: proxy_service.map(ProxyService::member_breaker),
         }
     }
 }
@@ -3541,8 +3554,28 @@ where
     let upstream = &upstream;
     // #5810: each member's upstream answer, bounded by the download deadline.
     let bounded = move |member: &'a Repository| {
+        // An open breaker passes the member over without dialling it; the
+        // admission is held across the fetch so an abandoned probe frees
+        // its slot when dropped.
+        let admission = match walk.breaker {
+            Some(breaker) => match breaker.admit(member.id) {
+                Some(admission) => Some(admission),
+                None => {
+                    tracing::debug!(
+                        member = %member.key,
+                        path = %redact_proxy_path_for_diagnostics(walk.path),
+                        "virtual member's download breaker is open; trying the next member"
+                    );
+                    return futures::future::Either::Left(std::future::ready(
+                        MemberResolveOutcome::Unavailable,
+                    ));
+                }
+            },
+            None => None,
+        };
         let fetch = upstream(member);
-        async move {
+        futures::future::Either::Right(async move {
+            let _admission = admission;
             let Some(deadline) = walk.deadline else {
                 return fetch.await;
             };
@@ -3550,10 +3583,13 @@ where
                 Ok(outcome) => outcome,
                 Err(_) => {
                     record_virtual_member_download_deadline_miss(&member.key, walk.path, deadline);
+                    if let Some(breaker) = walk.breaker {
+                        breaker.record(member.id, &member.key, true);
+                    }
                     MemberResolveOutcome::Unavailable
                 }
             }
-        }
+        })
     };
 
     // Pass 2, step 1 — confirm the HIGHEST-priority candidate on its own. If it
@@ -4107,6 +4143,12 @@ where
                         }
                         None => proxy.fetch_artifact_streaming(member, path).await,
                     };
+                    // #5810: the member's answer, for its download breaker.
+                    proxy.member_breaker().record(
+                        member.id,
+                        &member.key,
+                        fetch.as_ref().is_err_and(fetch_error_trips_breaker),
+                    );
                     classify_stream_upstream(fetch, &member.key, path)
                         .map_hit(|result| (result, VirtualServeOrigin::remote(member)))
                 }
@@ -6978,7 +7020,12 @@ pub async fn local_fetch_or_redirect(
                 try_presigned_redirect(storage.as_ref(), &artifact.storage_key, true, expiry).await
             }
         };
-        if let Some(redirect) = redirect {
+        if let Some(mut redirect) = redirect {
+            // The transfer quota counts the object when the URL is issued.
+            crate::services::quota::http::tag_presigned_download(
+                &mut redirect,
+                artifact.size_bytes,
+            );
             return Ok(redirect);
         }
     }
@@ -7053,7 +7100,20 @@ pub async fn try_hosted_blob_redirect(
     let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
     // `try_presigned_redirect` additionally verifies `supports_redirect()` and
     // returns `None` for filesystem backends or on a signing error.
-    let redirect = try_presigned_redirect(storage, storage_key, true, expiry).await?;
+    let mut redirect = try_presigned_redirect(storage, storage_key, true, expiry).await?;
+    // The transfer quota counts the object when the URL is issued.
+    if state.transfer_meter.enabled() {
+        let size: Option<i64> =
+            sqlx::query_scalar("SELECT size_bytes FROM artifacts WHERE id = $1")
+                .bind(artifact_id)
+                .fetch_optional(&state.db)
+                .await
+                .ok()
+                .flatten();
+        if let Some(size) = size {
+            crate::services::quota::http::tag_presigned_download(&mut redirect, size);
+        }
+    }
     // Count-at-redirect (#2260): record BEFORE handing back the 302, matching the
     // generic download handler. A body-less redirect otherwise never counts.
     // Only GETs reach here (HEAD returned above), so the recorder's `ctx.is_head`
@@ -9741,6 +9801,8 @@ async fn gate_stored_bytes<K: crate::api::handlers::proxy_scan_archive::ArchiveK
         repo.id,
         filename,
         &digest,
+        // A stored row is not a proxy-cache object, so it scans on the serve path.
+        None,
         synthetic,
         bytes,
         policy.action,
@@ -10078,7 +10140,7 @@ pub async fn evaluate_curation<'a>(
     if let Some(eval) = eval {
         if eval.action == "block" {
             // A rule said no; the exception queue is where a human can say
-            // otherwise (migration 375). Unlike the scan gate there is no
+            // otherwise (migration 381). Unlike the scan gate there is no
             // digest at this seam, so the exception is keyed on the coordinate
             // alone. npm and OCI pass no version here at all (a tarball
             // filename cannot be split unambiguously, and a manifest is
@@ -11230,9 +11292,7 @@ async fn wait_for_file_scan(
     expected: Option<&crate::services::scanner_service::ExpectedComponent>,
 ) -> std::result::Result<crate::services::scanner_service::ProxyScanVerdict, ProxyScanInconclusive>
 {
-    use crate::api::handlers::proxy_scan_inflight::{
-        answer_within, wait_for_verdict, ScanIntent, REQUEST_ANSWER_BY,
-    };
+    use crate::api::handlers::proxy_scan_inflight::{wait_for_verdict, ScanIntent};
     if state.scanner_service.is_none() {
         return Err(ProxyScanInconclusive::NoScanner);
     }
@@ -11248,17 +11308,11 @@ async fn wait_for_file_scan(
     )
     .map_err(|_| ProxyScanInconclusive::BudgetExceeded)?
     .expect("a caller that waits gets a waiter");
-    // On a route with no request timeout, or called from outside one, the
-    // configured timeout is all there is to go on.
-    let answer_by = REQUEST_ANSWER_BY.try_with(|by| *by).ok().or_else(|| {
-        answer_within(state.config.global_request_timeout_secs)
-            .map(|within| tokio::time::Instant::now() + within)
-    });
     let result = wait_for_verdict(
         waiter,
         crate::services::scanner_service::PROXY_SCAN_INLINE_BUDGET,
         std::time::Duration::from_secs(state.config.proxy_scan_queue_wait_secs.max(1)),
-        answer_by,
+        request_answer_by(state),
     )
     .await;
     if matches!(result, Err(ProxyScanInconclusive::BudgetExceeded)) {
@@ -11269,6 +11323,29 @@ async fn wait_for_file_scan(
         );
     }
     result
+}
+
+/// When this request has to be answered by.
+fn request_answer_by(state: &crate::api::SharedState) -> Option<tokio::time::Instant> {
+    use crate::api::handlers::proxy_scan_inflight::{answer_within, REQUEST_ANSWER_BY};
+    // On a route with no request timeout, or called from outside one, the
+    // configured timeout is all there is to go on.
+    REQUEST_ANSWER_BY.try_with(|by| *by).ok().or_else(|| {
+        answer_within(state.config.global_request_timeout_secs)
+            .map(|within| tokio::time::Instant::now() + within)
+    })
+}
+
+/// How long a fail-closed request waits on its durable job: as long as it would
+/// wait on an in-process scan (#5231), the queue wait plus the scan budget, and
+/// never past [`request_answer_by`].
+fn queued_scan_wait(state: &crate::api::SharedState) -> std::time::Duration {
+    let wait = std::time::Duration::from_secs(state.config.proxy_scan_queue_wait_secs.max(1))
+        + crate::services::scanner_service::PROXY_SCAN_INLINE_BUDGET;
+    match request_answer_by(state) {
+        Some(by) => wait.min(by.saturating_duration_since(tokio::time::Instant::now())),
+        None => wait,
+    }
 }
 
 /// [`proxy_scan_and_record`] for the on-demand rescan of cached bytes (#3396).
@@ -12063,12 +12140,223 @@ async fn scan_deny_unless_excepted(
     ProxyScanServeOutcome::Deny(refusal.render(filename, request_url.as_deref()))
 }
 
+/// Poll interval for a parked fail-closed request, and its ceiling. A flat 1s put
+/// a second under every first pull even when a same-process worker had finished.
+const VERDICT_POLL_MIN: std::time::Duration = std::time::Duration::from_millis(100);
+const VERDICT_POLL_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Wait for a CONCLUSIVE verdict, or time out. Only a row written after
+/// `stored_at` (the row the gate just refused, if any) that pertains to this
+/// request counts, and `decide_serve` is re-run on it: "a row exists" would
+/// serve the stale, foreign or graded-nothing row the gate just refused.
+///
+/// A plain poll, not `pg_notify` plus a `PgListener`: N waiters cost N queries
+/// a second, which is cheap next to N held scan permits.
+async fn await_conclusive_verdict(
+    state: &crate::api::SharedState,
+    pss: &crate::services::proxy_scan_service::ProxyScanService,
+    digest: &str,
+    action: crate::services::proxy_scan_service::ProxyScanAction,
+    identity: &ProxyScanIdentity,
+    stored_at: Option<DateTime<Utc>>,
+    budget: std::time::Duration,
+) -> std::result::Result<crate::services::scanner_service::ProxyScanVerdict, ProxyScanInconclusive>
+{
+    use crate::services::proxy_scan_service::{decide_serve, ServeDecision};
+
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut interval = VERDICT_POLL_MIN;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(ProxyScanInconclusive::BudgetExceeded);
+        }
+        // Never sleep past the deadline, or the router timeout turns it into an
+        // undifferentiated 503.
+        tokio::time::sleep(interval.min(deadline - now)).await;
+        interval = (interval * 2).min(VERDICT_POLL_MAX);
+
+        let row = pss
+            .lookup_verdict_with_pin(digest, PROXY_SCAN_TYPE)
+            .await
+            .ok()
+            .flatten()
+            .filter(|(row, pin, _)| {
+                stored_at.is_none_or(|at| row.scanned_at > at)
+                    && stored_verdict_pertains(pin.as_deref(), &row.verdict, identity)
+            })
+            .map(|(row, _, _)| row);
+        let live_version = match (&row, state.scanner_service.as_deref()) {
+            (Some(_), Some(scanner)) => scanner.cve_scanner_version().await,
+            _ => None,
+        };
+        match decide_serve(
+            row.as_ref(),
+            live_version.as_deref(),
+            action,
+            crate::services::scanner_service::DEDUP_TTL_DAYS as i64,
+            Utc::now(),
+        ) {
+            // `decide_serve` only reaches these with a row present, the `None`
+            // arm is defensive and takes the strict answer.
+            ServeDecision::ServeCached | ServeDecision::BlockCached => {
+                return match row.as_ref() {
+                    Some(r) => verdict_from_stored_row(r),
+                    None => Err(ProxyScanInconclusive::ScanFailed),
+                };
+            }
+            // Absent, stale, or graded by a version that no longer matches.
+            ServeDecision::ScanInline | ServeDecision::ServePendingScanAsync => continue,
+        }
+    }
+}
+
+/// The proxy-cache object a scan in `mode` can be queued against. Only plain
+/// [`ProxyScanMode::File`] is: an OCI image is reassembled from staged blobs,
+/// and the worker scans as plain File, so catalog-requiring scans stay inline.
+/// So does an OS package pin, whose release context a job does not carry.
+/// And a body of `len` bytes no worker would run: an empty one is never cached
+/// (#1618) and one over the scan cap is refused unread
+fn queued_scan_ref<'a>(
+    mode: &ProxyScanMode,
+    cache_path: Option<&'a str>,
+    expected: Option<&crate::services::scanner_service::ExpectedComponent>,
+    len: usize,
+) -> Option<&'a str> {
+    if expected.is_some_and(|e| e.os.is_some())
+        || !(1..=crate::services::scanner_service::PROXY_SCAN_MAX_BYTES).contains(&len)
+    {
+        return None;
+    }
+    match mode {
+        ProxyScanMode::File => cache_path,
+        ProxyScanMode::FileRequiringCatalog | ProxyScanMode::OciImage(_) => None,
+    }
+}
+
+/// Rebuild a verdict from a worker's row. Inconclusive on shapes it cannot vouch
+/// for: a stored `error`, or `vulnerable` with counts that disagree.
+pub(crate) fn verdict_from_stored_row(
+    row: &crate::services::proxy_scan_service::ProxyScanRow,
+) -> std::result::Result<crate::services::scanner_service::ProxyScanVerdict, ProxyScanInconclusive>
+{
+    use crate::services::proxy_scan_service::{VERDICT_ERROR, VERDICT_VULNERABLE};
+
+    if row.verdict == VERDICT_ERROR {
+        return Err(ProxyScanInconclusive::ScanFailed);
+    }
+    let graded = row.critical_count + row.high_count + row.medium_count + row.low_count > 0;
+    if row.verdict == VERDICT_VULNERABLE && !graded {
+        return Err(ProxyScanInconclusive::ScanFailed);
+    }
+    Ok(crate::services::scanner_service::ProxyScanVerdict {
+        findings_count: row.findings_count,
+        critical_count: row.critical_count,
+        high_count: row.high_count,
+        medium_count: row.medium_count,
+        low_count: row.low_count,
+        max_severity: row
+            .max_severity
+            .as_deref()
+            .and_then(crate::models::security::Severity::from_str_loose),
+        scanner_version: row.scanner_version.clone(),
+        packages: Vec::new(),
+        scan_completeness: None,
+        findings: Vec::new(),
+        components_cataloged: None,
+    })
+}
+
+/// Whether a worker could read these bytes from the object a job would
+/// reference. Only fail-closed asks, since only it parks a client on the
+/// verdict. A fresh fill is not cached until the gate serves it (#4514), and a
+/// cached object holding other bytes would grade those, so both read as "no",
+/// as do errors.
+async fn proxy_cached_object_is_readable(
+    state: &crate::api::SharedState,
+    repo_id: Uuid,
+    cache_path: &str,
+    digest: &str,
+) -> bool {
+    match crate::services::proxy_catalog::find_cached_entry(&state.db, repo_id, cache_path).await {
+        Ok(Some(entry)) => entry.checksum_sha256.as_deref() == Some(digest),
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(
+                repo_id = %repo_id, path = %cache_path, error = %e,
+                "could not confirm the proxy cache entry for a scan job"
+            );
+            false
+        }
+    }
+}
+
+/// Fail-open digests queued in the last minute: a burst on one digest upserts the
+/// same `scan_queue` row per hit, each waiter holding a pool connection on its lock.
+static RECENT_BACKFILL_ENQUEUES: once_cell::sync::Lazy<moka::future::Cache<(Uuid, String), ()>> =
+    once_cell::sync::Lazy::new(|| {
+        moka::future::Cache::builder()
+            .max_capacity(100_000)
+            .time_to_live(std::time::Duration::from_secs(60))
+            .build()
+    });
+
+/// `true` for the first fail-open hit on `(repo_id, digest)` per minute per process.
+async fn claim_backfill_enqueue(repo_id: Uuid, digest: &str) -> bool {
+    RECENT_BACKFILL_ENQUEUES
+        .entry((repo_id, digest.to_string()))
+        .or_insert(())
+        .await
+        .is_fresh()
+}
+
+/// Queue a scan of the just-cached object. `false` means no verdict is coming.
+async fn enqueue_proxy_file_scan(
+    state: &crate::api::SharedState,
+    repo_id: Uuid,
+    cache_path: &str,
+    digest: &str,
+    size_bytes: i64,
+    expected: Option<&crate::services::scanner_service::ExpectedComponent>,
+    priority: i16,
+) -> bool {
+    let queue = crate::services::scan_queue::ScanQueue::new(state.db.clone());
+    match queue
+        .enqueue_proxy_file(
+            repo_id, cache_path, digest, None, size_bytes, expected, priority,
+        )
+        .await
+    {
+        Ok(true) => true,
+        // Already queued: the existing job produces the verdict, so parking is fine.
+        Ok(false) => {
+            tracing::debug!(
+                repo_id = %repo_id, digest = %digest,
+                "proxy scan already queued for these bytes"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                repo_id = %repo_id, digest = %digest, error = %e,
+                "failed to queue proxy scan"
+            );
+            false
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn gate_proxy_scan_serve(
     state: &crate::api::SharedState,
     repo_id: Uuid,
     filename: &str,
     digest: &str,
+    // Proxy-cache path these bytes were written under. The queued scan reads
+    // the object back from here rather than carrying the bytes, which is what
+    // keeps a burst off the heap. `None` when the bytes are not a proxy-cache
+    // object (a stored row), which scans on the serve path as before.
+    cache_path: Option<&str>,
     synthetic: crate::models::artifact::Artifact,
     bytes: &Bytes,
     action: crate::services::proxy_scan_service::ProxyScanAction,
@@ -12081,6 +12369,7 @@ pub(crate) async fn gate_proxy_scan_serve(
         repo_id,
         filename,
         digest,
+        cache_path,
         synthetic,
         bytes,
         action,
@@ -12133,6 +12422,7 @@ async fn decide_proxy_scan_serve(
     repo_id: Uuid,
     filename: &str,
     digest: &str,
+    cache_path: Option<&str>,
     synthetic: crate::models::artifact::Artifact,
     bytes: &Bytes,
     action: crate::services::proxy_scan_service::ProxyScanAction,
@@ -12147,34 +12437,34 @@ async fn decide_proxy_scan_serve(
     // not this request's verdict; see [`stored_verdict_pertains`]. Under
     // fail-closed a clean verdict that graded nothing is not reused for any
     // identity either; see [`stored_clean_graded_nothing`] (part of #3396).
-    let row = pss
+    let stored = pss
         .lookup_verdict_with_pin(digest, PROXY_SCAN_TYPE)
         .await
         .ok()
-        .flatten()
-        .and_then(|(row, pin, cataloged)| {
-            let pertains = stored_verdict_pertains(pin.as_deref(), &row.verdict, &identity);
-            if !pertains {
-                tracing::info!(
-                    repo_id = %repo_id, file = %filename, digest = %digest,
-                    stored_pin = ?pin,
-                    "stored proxy verdict was graded as another coordinate; not reused"
-                );
-                return None;
-            }
-            if action.is_fail_closed()
-                && stored_clean_graded_nothing(&row, pin.as_deref(), cataloged)
-            {
-                tracing::info!(
-                    repo_id = %repo_id, file = %filename, digest = %digest,
-                    components_cataloged = ?cataloged,
-                    "stored clean proxy verdict graded no components and carries no pin; \
-                     not reused under fail-closed, scanning"
-                );
-                return None;
-            }
-            Some(row)
-        });
+        .flatten();
+    // A parked fail-closed pull only takes a row written after this one.
+    let stored_at = stored.as_ref().map(|(row, _, _)| row.scanned_at);
+    let row = stored.and_then(|(row, pin, cataloged)| {
+        let pertains = stored_verdict_pertains(pin.as_deref(), &row.verdict, &identity);
+        if !pertains {
+            tracing::info!(
+                repo_id = %repo_id, file = %filename, digest = %digest,
+                stored_pin = ?pin,
+                "stored proxy verdict was graded as another coordinate; not reused"
+            );
+            return None;
+        }
+        if action.is_fail_closed() && stored_clean_graded_nothing(&row, pin.as_deref(), cataloged) {
+            tracing::info!(
+                repo_id = %repo_id, file = %filename, digest = %digest,
+                components_cataloged = ?cataloged,
+                "stored clean proxy verdict graded no components and carries no pin; \
+                 not reused under fail-closed, scanning"
+            );
+            return None;
+        }
+        Some(row)
+    });
     // #2976: compare the verdict's stored provenance against the LIVE
     // CVE-scanner version (VersionCache-backed — a memory read on the hot
     // path, never a per-download subprocess). Only probed when a row exists,
@@ -12247,7 +12537,37 @@ async fn decide_proxy_scan_serve(
                 ProxyScanIdentity::Established(e) => Some(e),
                 ProxyScanIdentity::NotApplicable => None,
             };
-            let result = if matches!(mode, ProxyScanMode::File) {
+            // Nothing cached means no worker can ever produce a verdict, so
+            // that pull takes the in-process path rather than park and 423.
+            let queued = match queued_scan_ref(&mode, cache_path, expected, bytes.len()) {
+                Some(cache_path) if state.config.scan_queue_enabled => {
+                    proxy_cached_object_is_readable(state, repo_id, cache_path, digest).await
+                        && enqueue_proxy_file_scan(
+                            state,
+                            repo_id,
+                            cache_path,
+                            digest,
+                            bytes.len() as i64,
+                            expected,
+                            crate::services::scan_queue::PRIORITY_CLIENT_WAITING,
+                        )
+                        .await
+                }
+                _ => false,
+            };
+            let result = if queued {
+                // Parks a task, not a scan permit, so a burst of first pulls is cheap.
+                await_conclusive_verdict(
+                    state,
+                    &pss,
+                    digest,
+                    action,
+                    &identity,
+                    stored_at,
+                    queued_scan_wait(state),
+                )
+                .await
+            } else if matches!(mode, ProxyScanMode::File) {
                 wait_for_file_scan(state, repo_id, digest, synthetic, bytes, expected).await
             } else {
                 let budget = proxy_scan_mode_budget(&mode);
@@ -12328,6 +12648,30 @@ async fn decide_proxy_scan_serve(
                 ProxyScanIdentity::Established(e) => Some(e),
                 ProxyScanIdentity::NotApplicable => None,
             };
+            // No cache probe here: nobody waits on the verdict, and this is the
+            // hot path. A dangling reference shows up as a failed job. A digest
+            // claimed in the last minute is already queued, and an enqueue that
+            // fails falls through to the in-process scan, as do bytes no job can
+            // run (same digest, same length, so every later pull of them too)
+            if let Some(cache_path) =
+                queued_scan_ref(&mode, cache_path, expected.as_ref(), bytes.len())
+                    .filter(|_| state.config.scan_queue_enabled)
+            {
+                if !claim_backfill_enqueue(repo_id, digest).await
+                    || enqueue_proxy_file_scan(
+                        state,
+                        repo_id,
+                        cache_path,
+                        digest,
+                        bytes.len() as i64,
+                        expected.as_ref(),
+                        crate::services::scan_queue::PRIORITY_BACKFILL,
+                    )
+                    .await
+                {
+                    return ProxyScanServeOutcome::Serve(ProxyScanServed::Pending);
+                }
+            }
             if matches!(mode, ProxyScanMode::File) {
                 // #5231: the scan outlives this response and gets its turn,
                 // however long the queue. There is no request to fail if there is
@@ -12628,6 +12972,15 @@ pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
     file.after_buffered_fetch(state, req, &bytes, &digest)
         .await?;
 
+    // Only a fail-closed `423` drops a fill, so with the durable queue on any
+    // other action commits it now, where the job queued for it can read it back
+    let pending = match pending {
+        Some(pending) if state.config.scan_queue_enabled && !req.action.is_fail_closed() => {
+            proxy.publish_deferred(pending).await;
+            None
+        }
+        pending => pending,
+    };
     let identity = gate_identity(file, req, &bytes, &digest);
     let synthetic = F::synthetic_artifact(req.repo_id, req.filename, &digest, bytes.len() as i64);
     match gate_proxy_scan_serve(
@@ -12635,6 +12988,7 @@ pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
         req.repo_id,
         req.filename,
         &digest,
+        Some(req.cache_path),
         synthetic,
         &bytes,
         req.action,
@@ -14047,6 +14401,111 @@ mod scanned_proxy_file_tests {
         fx.teardown().await;
     }
 
+    async fn queued_jobs(fx: &tdh::Fixture) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_queue WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("count scan jobs")
+    }
+
+    /// With the queue on, fail-open never queues a job no worker can run: an
+    /// empty body is never cached, and a cache hit over the scan cap is refused
+    /// unread. Each was queued again on every pull, then failed. A normal file
+    /// still queues. No worker runs here, so the job stays to be counted
+    #[tokio::test]
+    async fn fail_open_skips_scan_jobs_for_empty_and_over_cap_bytes_queued() {
+        use crate::services::scanner_service::PROXY_SCAN_MAX_BYTES;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let bytes = format!("fake-scanq-skip-{}", Uuid::new_v4()).into_bytes();
+        let Some((fx, mut state, proxy, upstream)) = rig(Some(bytes)).await else {
+            return;
+        };
+        Arc::get_mut(&mut state)
+            .expect("state not shared yet")
+            .config
+            .scan_queue_enabled = true;
+        Mock::given(method("GET"))
+            .and(path("/files/empty-1.0.fake"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&upstream)
+            .await;
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+
+        let mut empty = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailOpen);
+        empty.source_path = "files/empty-1.0.fake";
+        empty.cache_path = "files/empty-1.0.fake";
+        empty.filename = "empty-1.0.fake";
+        let mut empty_headers = Vec::new();
+        for _ in 0..2 {
+            let resp = serve_scanned_proxy_file(&state, &proxy, &empty, &file).await;
+            empty_headers.push(resp.map(|r| r.headers()["X-AK-Scan"].clone()));
+        }
+        let after_empty = queued_jobs(&fx).await;
+
+        // Zeroed and never read, so no 200 MiB is touched
+        let over = Bytes::from(vec![0u8; PROXY_SCAN_MAX_BYTES + 1]);
+        let over_digest = format!("scanq-skip-over-{}", Uuid::new_v4());
+        let mut over_outcomes = Vec::new();
+        for _ in 0..2 {
+            let synthetic = FakeFormat::synthetic_artifact(
+                fx.repo_id,
+                "over-1.0.fake",
+                &over_digest,
+                over.len() as i64,
+            );
+            let outcome = gate_proxy_scan_serve(
+                &state,
+                fx.repo_id,
+                "over-1.0.fake",
+                &over_digest,
+                Some("files/over-1.0.fake"),
+                synthetic,
+                &over,
+                ProxyScanAction::FailOpen,
+                ProxySeverityGate::BlockOnAny,
+                ProxyScanIdentity::NotApplicable,
+                ProxyScanMode::File,
+            )
+            .await;
+            over_outcomes.push(matches!(
+                outcome,
+                ProxyScanServeOutcome::Serve(ProxyScanServed::Pending)
+            ));
+        }
+        let after_over = queued_jobs(&fx).await;
+
+        let normal = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailOpen);
+        let normal = serve_scanned_proxy_file(&state, &proxy, &normal, &file)
+            .await
+            .map(|r| r.headers()["X-AK-Scan"].clone());
+        let after_normal = queued_jobs(&fx).await;
+        fx.teardown().await;
+
+        for header in empty_headers {
+            let header = header.unwrap_or_else(|r| panic!("empty pull withheld: {}", r.status()));
+            assert_eq!(
+                header, "pending",
+                "the empty body reached the fail-open arm"
+            );
+        }
+        assert_eq!(
+            after_empty, 0,
+            "an empty body is never cached, no job can read it"
+        );
+        assert_eq!(over_outcomes, [true, true], "over-cap bytes serve pending");
+        assert_eq!(after_over, 0, "the worker refuses over-cap bytes unread");
+        let normal = normal.unwrap_or_else(|r| panic!("normal pull withheld: {}", r.status()));
+        assert_eq!(normal, "pending");
+        assert_eq!(
+            after_normal, 1,
+            "a normal fail-open pull still queues its scan"
+        );
+    }
+
     /// An upstream miss is passed through as-is (a virtual member walk falls
     /// through to the next member on it) and never reaches the format hooks.
     #[tokio::test]
@@ -14209,6 +14668,17 @@ mod scanned_proxy_file_tests {
     /// its findings, and the next pull is served `recorded` instead of 403.
     #[tokio::test]
     async fn record_only_records_findings_from_the_async_scan_and_keeps_serving() {
+        record_only_async_scan_records_findings(false).await;
+    }
+
+    /// The same with the durable scan queue on: the scan is a job a worker
+    /// drains, reading back the fill the wrapper committed before the gate.
+    #[tokio::test]
+    async fn record_only_records_findings_from_the_async_scan_and_keeps_serving_queued() {
+        record_only_async_scan_records_findings(true).await;
+    }
+
+    async fn record_only_async_scan_records_findings(queued: bool) {
         use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
         let bytes = format!("fake-3645-async-{}", Uuid::new_v4()).into_bytes();
         let digest = sha256_hex(&Bytes::from(bytes.clone()));
@@ -14224,6 +14694,12 @@ mod scanned_proxy_file_tests {
                 MockCveRescan::Vulnerable,
             ))],
         );
+        let (state, _worker) = if queued {
+            let (state, worker) = tdh::with_scan_worker(state);
+            (state, Some(worker))
+        } else {
+            (state, None)
+        };
         set_scan_config(&fx, true, "low", "record_only").await;
         let base = upstream.uri();
         let file = FakeFormat::default();
@@ -14366,6 +14842,59 @@ mod scanned_proxy_file_tests {
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    use crate::services::proxy_scan_service::ProxyScanRow;
+
+    #[tokio::test]
+    async fn backfill_enqueue_is_claimed_once_per_repo_and_digest() {
+        let repo = Uuid::new_v4();
+        assert!(claim_backfill_enqueue(repo, "d1").await);
+        assert!(!claim_backfill_enqueue(repo, "d1").await);
+        assert!(claim_backfill_enqueue(repo, "d2").await);
+        assert!(claim_backfill_enqueue(Uuid::new_v4(), "d1").await);
+    }
+
+    #[test]
+    fn only_a_plain_file_scan_without_an_os_pin_is_queued() {
+        use crate::services::scanner_service::{
+            ComponentEcosystem, ExpectedComponent, OsPackageContext, OsRelease,
+        };
+        let npm = ExpectedComponent::new(ComponentEcosystem::Npm, "minimist", "1.2.5");
+        let mut apk = ExpectedComponent::new(ComponentEcosystem::Alpine, "libdtf", "1.0-r0");
+        apk.os = Some(OsPackageContext {
+            release: OsRelease::new("alpine", "3.19").expect("a known release"),
+            arch: "x86_64".to_string(),
+            source: None,
+        });
+        let path = Some("pkg/pkg-1.0.tgz");
+        assert_eq!(
+            queued_scan_ref(&ProxyScanMode::File, path, Some(&npm), 1),
+            path
+        );
+        assert_eq!(queued_scan_ref(&ProxyScanMode::File, path, None, 1), path);
+        assert_eq!(
+            queued_scan_ref(&ProxyScanMode::File, None, Some(&npm), 1),
+            None
+        );
+        assert_eq!(
+            queued_scan_ref(&ProxyScanMode::File, path, Some(&apk), 1),
+            None
+        );
+        assert_eq!(
+            queued_scan_ref(&ProxyScanMode::FileRequiringCatalog, path, None, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn only_a_body_a_worker_can_run_is_queued() {
+        use crate::services::scanner_service::PROXY_SCAN_MAX_BYTES;
+        let path = Some("pkg/pkg-1.0.tgz");
+        let queued = |len| queued_scan_ref(&ProxyScanMode::File, path, None, len);
+        assert_eq!(queued(0), None, "an empty body is never cached");
+        assert_eq!(queued(PROXY_SCAN_MAX_BYTES), path);
+        assert_eq!(queued(PROXY_SCAN_MAX_BYTES + 1), None, "over the scan cap");
+    }
 
     #[test]
     fn apply_stale_markers_sets_warning_and_since_when_stale() {
@@ -14800,6 +15329,95 @@ mod tests {
         );
     }
 
+    // ── the queued-scan verdict conversion (fail-closed wait) ──
+
+    fn verdict_row(verdict: &str, critical: i32, max_severity: Option<&str>) -> ProxyScanRow {
+        ProxyScanRow {
+            checksum_sha256: "deadbeef".to_string(),
+            scan_type: PROXY_SCAN_TYPE.to_string(),
+            verdict: verdict.to_string(),
+            findings_count: critical,
+            critical_count: critical,
+            high_count: 0,
+            medium_count: 0,
+            low_count: 0,
+            max_severity: max_severity.map(str::to_string),
+            scanner_version: Some("grype-0.117.0+db-2026-09-01".to_string()),
+            scanned_at: Utc::now(),
+        }
+    }
+
+    /// A stored `error` verdict must come back INCONCLUSIVE, never clean. Its
+    /// counts are all zero, so trusting them would make a fail-closed pull
+    /// serve bytes whose scan actually failed, the one thing that action
+    /// exists to prevent.
+    #[test]
+    fn stored_error_verdict_is_inconclusive_not_clean() {
+        let row = verdict_row(crate::services::proxy_scan_service::VERDICT_ERROR, 0, None);
+        assert!(matches!(
+            verdict_from_stored_row(&row),
+            Err(ProxyScanInconclusive::ScanFailed)
+        ));
+    }
+
+    /// A row whose token says `vulnerable` while its counts say nothing was
+    /// graded is self-contradictory. `is_vulnerable()` derives from the counts,
+    /// so returning it as a verdict would read as `clean` and serve.
+    #[test]
+    fn vulnerable_row_with_no_graded_findings_is_inconclusive() {
+        let row = verdict_row(
+            crate::services::proxy_scan_service::VERDICT_VULNERABLE,
+            0,
+            Some("critical"),
+        );
+        assert!(matches!(
+            verdict_from_stored_row(&row),
+            Err(ProxyScanInconclusive::ScanFailed)
+        ));
+    }
+
+    /// The ordinary paths: a clean row converts to a non-vulnerable verdict, a
+    /// graded vulnerable row keeps both its counts and its severity so the
+    /// repo's threshold gate can still be applied to it.
+    #[test]
+    fn clean_and_graded_rows_convert_faithfully() {
+        let clean = verdict_row(crate::services::proxy_scan_service::VERDICT_CLEAN, 0, None);
+        let verdict = verdict_from_stored_row(&clean).expect("clean converts");
+        assert!(!verdict.is_vulnerable());
+
+        let bad = verdict_row(
+            crate::services::proxy_scan_service::VERDICT_VULNERABLE,
+            2,
+            Some("critical"),
+        );
+        let verdict = verdict_from_stored_row(&bad).expect("graded vulnerable converts");
+        assert!(verdict.is_vulnerable());
+        assert_eq!(verdict.critical_count, 2);
+        assert_eq!(
+            verdict.max_severity,
+            Some(crate::models::security::Severity::Critical)
+        );
+    }
+
+    /// A graded vulnerable row whose stored severity is absent or unparseable
+    /// must still convert with `max_severity: None`, because the gate treats an
+    /// ungraded severity as blocking under any threshold. Losing the `None`
+    /// here (e.g. defaulting it to something low) would release exactly the
+    /// verdicts that cannot prove they are below the bar.
+    #[test]
+    fn unparseable_stored_severity_converts_to_none_not_a_default() {
+        for stored in [None, Some("not-a-severity")] {
+            let row = verdict_row(
+                crate::services::proxy_scan_service::VERDICT_VULNERABLE,
+                1,
+                stored,
+            );
+            let verdict = verdict_from_stored_row(&row).expect("converts");
+            assert!(verdict.is_vulnerable());
+            assert_eq!(verdict.max_severity, None, "stored severity {stored:?}");
+        }
+    }
+
     /// Scanner applicability and archive extraction are driven by the
     /// FILENAME, so a rescan that derives the wrong one does not fail — it
     /// silently catalogs nothing and records a clean verdict. Every shape a
@@ -15084,6 +15702,7 @@ mod tests {
             repo_id,
             "pkg-1.0.tgz",
             &digest,
+            Some("pkg/pkg-1.0.tgz"),
             synthetic,
             &bytes,
             action,
@@ -15109,6 +15728,7 @@ mod tests {
             repo_id,
             "pkg.zip",
             digest,
+            None,
             synthetic,
             &bytes,
             crate::services::proxy_scan_service::ProxyScanAction::FailOpen,
@@ -16525,6 +17145,7 @@ mod tests {
         MemberWalk {
             path: "com/example/lib/1.0/lib-1.0.jar",
             deadline: Some(after),
+            breaker: None,
         }
     }
 
@@ -16690,6 +17311,111 @@ mod tests {
             Some(MemberResolveOutcome::Hit(v)) => assert_eq!(v, "mid"),
             other => panic!("expected the middle member's hit, got {other:?}"),
         }
+    }
+
+    /// One download walk over `members` with `breaker`, where member `hung`
+    /// never answers until `healthy_again` is set and every other member
+    /// hits. Returns the outcome, the time it took and how many times the
+    /// hung member was dialled. The `upstream` closure records each answer
+    /// in the breaker as the download closures do.
+    async fn breaker_walk_5810(
+        members: &[Repository],
+        breaker: &MemberBreaker,
+        healthy_again: bool,
+        dialled: &std::sync::atomic::AtomicUsize,
+    ) -> (
+        Option<MemberResolveOutcome<String, String>>,
+        std::time::Duration,
+    ) {
+        use std::sync::atomic::Ordering;
+        let started = tokio::time::Instant::now();
+        let out = resolve_members_two_phase::<String, String, _, _, _, _>(
+            members,
+            |_m| async move { (MemberCacheClass::NeedsUpstream, None) },
+            |m| async move {
+                if m.key == "hung" {
+                    dialled.fetch_add(1, Ordering::SeqCst);
+                    if !healthy_again {
+                        return std::future::pending().await;
+                    }
+                }
+                breaker.record(m.id, &m.key, false);
+                MemberResolveOutcome::Hit(m.key.clone())
+            },
+            MemberWalk {
+                path: "com/example/lib/1.0/lib-1.0.jar",
+                deadline: Some(DEADLINE_5810),
+                breaker: Some(breaker),
+            },
+        )
+        .await;
+        (out, started.elapsed())
+    }
+
+    /// #5810: after `AK_VIRTUAL_MEMBER_BREAKER_FAILURES` deadline misses in
+    /// a row the hung member's breaker opens and the walk skips it without
+    /// dialling, so the lower member serves at once; once the open period
+    /// has passed one probe is admitted, and a healthy answer closes it.
+    #[tokio::test(start_paused = true)]
+    async fn two_phase_breaker_opens_skips_and_recovers_5810() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let open_for = std::time::Duration::from_secs(30);
+        let breaker = MemberBreaker::new(3, open_for);
+        let members = members_5810(&["hung", "ok"]);
+        let dialled = AtomicUsize::new(0);
+
+        for attempt in 1..=3 {
+            let (out, elapsed) = breaker_walk_5810(&members, &breaker, false, &dialled).await;
+            assert!(matches!(out, Some(MemberResolveOutcome::Hit(ref v)) if v == "ok"));
+            assert_eq!(
+                elapsed, DEADLINE_5810,
+                "attempt {attempt} waits the deadline"
+            );
+        }
+        assert_eq!(dialled.load(Ordering::SeqCst), 3);
+
+        let (out, elapsed) = breaker_walk_5810(&members, &breaker, false, &dialled).await;
+        assert!(matches!(out, Some(MemberResolveOutcome::Hit(ref v)) if v == "ok"));
+        assert_eq!(
+            elapsed,
+            std::time::Duration::ZERO,
+            "an open breaker costs nothing"
+        );
+        assert_eq!(
+            dialled.load(Ordering::SeqCst),
+            3,
+            "skipped without dialling"
+        );
+
+        tokio::time::advance(open_for).await;
+        let (out, _) = breaker_walk_5810(&members, &breaker, true, &dialled).await;
+        assert!(
+            matches!(out, Some(MemberResolveOutcome::Hit(ref v)) if v == "hung"),
+            "the half-open probe reaches the member and its answer wins: {out:?}"
+        );
+        assert_eq!(dialled.load(Ordering::SeqCst), 4);
+        let (out, _) = breaker_walk_5810(&members, &breaker, true, &dialled).await;
+        assert!(matches!(out, Some(MemberResolveOutcome::Hit(ref v)) if v == "hung"));
+        assert_eq!(dialled.load(Ordering::SeqCst), 5, "closed again");
+    }
+
+    /// #5810: a half-open probe that misses the deadline opens the breaker
+    /// for another period.
+    #[tokio::test(start_paused = true)]
+    async fn two_phase_breaker_failed_probe_reopens_5810() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let open_for = std::time::Duration::from_secs(30);
+        let breaker = MemberBreaker::new(1, open_for);
+        let members = members_5810(&["hung", "ok"]);
+        let dialled = AtomicUsize::new(0);
+        breaker_walk_5810(&members, &breaker, false, &dialled).await;
+        tokio::time::advance(open_for).await;
+        let (_, elapsed) = breaker_walk_5810(&members, &breaker, false, &dialled).await;
+        assert_eq!(elapsed, DEADLINE_5810, "the probe waited the deadline");
+        assert_eq!(dialled.load(Ordering::SeqCst), 2);
+        let (_, elapsed) = breaker_walk_5810(&members, &breaker, false, &dialled).await;
+        assert_eq!(elapsed, std::time::Duration::ZERO);
+        assert_eq!(dialled.load(Ordering::SeqCst), 2, "open again");
     }
 
     /// #5810: the deadline setting. Unset or garbage is the default, `0`
@@ -20383,6 +21109,9 @@ mod tests {
 
         fn test_config(storage_path: &str) -> Config {
             Config {
+                scan_worker_enabled: true,
+                scan_queue_enabled: false,
+                scan_worker_concurrency: None,
                 database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
                 bind_address: "127.0.0.1:0".into(),
                 log_level: "error".into(),
@@ -20459,6 +21188,7 @@ mod tests {
                 totp_policy: None,
                 api_token_expiry_policy: None,
                 max_upload_size_bytes: 10_737_418_240,
+                quotas: Default::default(),
                 metrics_port: None,
                 grpc_bind_ip: crate::config::DEFAULT_LISTENER_BIND_IP,
                 metrics_bind_ip: crate::config::DEFAULT_LISTENER_BIND_IP,
@@ -26983,7 +27713,7 @@ mod tests {
     }
 
     /// A curation block is auto-filed on the exception queue, and an approved,
-    /// unexpired exception releases it (migration 375).
+    /// unexpired exception releases it (migration 381).
     #[tokio::test]
     async fn test_curation_block_files_and_honours_an_exception() {
         use crate::services::age_gate_service::GATE_CURATION;
@@ -28342,15 +29072,10 @@ mod proxy_download_recording_tests {
     #[test]
     fn virtual_member_authorization_is_fallible_on_every_client_facing_path() {
         // Call sites that may still flatten, as (file, enclosing function),
-        // each with the reason. `oci_v2`'s blob/manifest walk reaches the
-        // helper through its own `authorized_virtual_members`, whose `Option`
-        // return already means "stop the walk" and whose `None` is
-        // load-bearing for the virtual negative cache; making the
-        // authorization failure distinguishable there is a signature change
-        // across both resolvers and their handlers. Scoped to that one
-        // function (#5504), so a new flattening call elsewhere in `oci_v2.rs`
-        // is caught like any other.
-        const EXEMPT: &[(&str, &str)] = &[("oci_v2.rs", "authorized_virtual_members")];
+        // each with the reason. Empty: `oci_v2`'s blob/manifest walk, the last
+        // exemption (#5504), now authorizes through the fallible form and
+        // answers a failed query as 503 (#5894).
+        const EXEMPT: &[(&str, &str)] = &[];
 
         let mut flattening: Vec<(&str, String)> = Vec::new();
         for (file, src) in SERVE_SOURCES {

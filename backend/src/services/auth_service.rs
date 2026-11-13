@@ -3504,12 +3504,12 @@ impl AuthService {
         // parallel requests in a single build.
         if let Ok(cache) = self.token_cache.read() {
             if let Some((entry, cached_at)) = cache.get(&cache_key) {
-                if cached_at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS {
-                    // Even on cache hit, reject if the token has since been
-                    // revoked (Bug #1) or has expired (Bug #2).
-                    if is_api_token_revoked_in_cache(entry.token_id) {
-                        return Err(AppError::Unauthorized("Token has been revoked".to_string()));
-                    }
+                // A revoked entry (Bug #1) goes back to the DB: a re-minted
+                // token may carry the same caller-supplied value.
+                if cached_at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS
+                    && !is_api_token_revoked_in_cache(entry.token_id)
+                {
+                    // Reject if the token has since expired (Bug #2).
                     if let Some(exp) = entry.expires_at {
                         if exp < Utc::now() {
                             return Err(AppError::Authentication("API token expired".to_string()));
@@ -3563,7 +3563,8 @@ impl AuthService {
         };
 
         // Find token by prefix (includes revoked_at and last_used_at for
-        // revocation check and debounced usage tracking).
+        // revocation check and debounced usage tracking). Live row first, a
+        // revoked one can share the prefix of a re-minted supplied value.
         let stored_token_opt = sqlx::query!(
             r#"
             SELECT at.id, at.token_hash, at.user_id, at.scopes, at.expires_at,
@@ -3571,6 +3572,8 @@ impl AuthService {
                    at.repository_restricted
             FROM api_tokens at
             WHERE at.token_prefix = $1
+            ORDER BY at.revoked_at IS NOT NULL
+            LIMIT 1
             "#,
             prefix
         )
@@ -3748,6 +3751,21 @@ impl AuthService {
         scopes: Vec<String>,
         expires_in_days: Option<i64>,
     ) -> Result<MintedApiToken> {
+        self.generate_api_token_with_value(user_id, name, scopes, expires_in_days, None)
+            .await
+    }
+
+    /// [`Self::generate_api_token_with_policy`] with an optional caller-chosen
+    /// token value, so the secret can live in an external store (Vault) and
+    /// rotate there. Stored hashed like a generated one.
+    pub async fn generate_api_token_with_value(
+        &self,
+        user_id: Uuid,
+        name: &str,
+        scopes: Vec<String>,
+        expires_in_days: Option<i64>,
+        value: Option<String>,
+    ) -> Result<MintedApiToken> {
         if scopes.len() > 50 {
             return Err(AppError::Validation("Too many scopes (max 50)".to_string()));
         }
@@ -3766,12 +3784,31 @@ impl AuthService {
         crate::services::token_service::validate_scopes_pure(&scopes)
             .map_err(AppError::Validation)?;
 
-        // Generate random token
-        let token = format!(
-            "{}_{}",
-            &Uuid::new_v4().to_string()[..8],
-            Uuid::new_v4().to_string().replace("-", "")
-        );
+        let token = match value {
+            Some(value) => {
+                validate_supplied_token(&value)?;
+                // Lookup is by prefix, so two live tokens must never share one.
+                let taken: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM api_tokens WHERE token_prefix = $1 AND revoked_at IS NULL)",
+                )
+                .bind(&value[..8])
+                .fetch_one(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+                if taken {
+                    return Err(AppError::Conflict(
+                        "token starts with the same 8 characters as a live token, use another value"
+                            .to_string(),
+                    ));
+                }
+                value
+            }
+            None => format!(
+                "{}_{}",
+                &Uuid::new_v4().to_string()[..8],
+                Uuid::new_v4().to_string().replace("-", "")
+            ),
+        };
         let prefix = &token[..8];
         let token_hash = Self::hash_password(&token).await?;
 
@@ -4677,6 +4714,38 @@ fn check_token_validation_result(
     Ok(())
 }
 
+/// A supplied value must have the shape of a generated token, since
+/// `validate_api_token` refuses anything else before the lookup (#5640).
+///
+/// The shape alone accepts `00000000_000…0`, so the secret part must also use
+/// at least [`SUPPLIED_TOKEN_MIN_DISTINCT_DIGITS`] different hex digits. A
+/// random 32-digit value falls under that with probability around 1e-8, so
+/// this refuses only hand-typed or patterned values, not real random ones.
+pub(crate) fn validate_supplied_token(token: &str) -> Result<()> {
+    if !is_api_token_shape(token) {
+        return Err(AppError::Validation(
+            "token must be 8 hex digits, '_' and 32 hex digits, the shape of a generated token"
+                .to_string(),
+        ));
+    }
+    let distinct = token.as_bytes()[9..]
+        .iter()
+        .map(u8::to_ascii_lowercase)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    if distinct < SUPPLIED_TOKEN_MIN_DISTINCT_DIGITS {
+        return Err(AppError::Validation(
+            "token secret looks hand-made (too few different hex digits); supply a random value"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Minimum number of different hex digits in the 32-digit secret of a
+/// caller-supplied token (#5864).
+pub(crate) const SUPPLIED_TOKEN_MIN_DISTINCT_DIGITS: usize = 8;
+
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
@@ -5149,6 +5218,9 @@ mod tests {
 
     fn make_test_config() -> Arc<Config> {
         Arc::new(Config {
+            scan_worker_enabled: true,
+            scan_queue_enabled: false,
+            scan_worker_concurrency: None,
             database_url: "postgresql://unused".to_string(),
             bind_address: "0.0.0.0:8080".to_string(),
             log_level: "info".to_string(),
@@ -5218,6 +5290,7 @@ mod tests {
             stuck_scan_check_interval_secs: 600,
             stuck_scan_reap_limit: 1000,
             max_upload_size_bytes: 10_737_418_240,
+            quotas: Default::default(),
             allow_local_admin_login: false,
             sso_disable_admin_break_glass: false,
             oidc_silent_sso_enabled: true,
@@ -6531,6 +6604,28 @@ mod tests {
             "Expected revocation error, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_validate_supplied_token() {
+        assert!(validate_supplied_token("0123abcd_0123456789abcdef0123456789abcdef").is_ok());
+        assert!(validate_supplied_token("0123ABCD_0123456789ABCDEF0123456789ABCDEF").is_ok());
+        for bad in [
+            "a".repeat(41),
+            // Right shape, but a patterned secret.
+            format!("0123abcd_{}", "0".repeat(32)),
+            format!("0123abcd_{}", &"0123456".repeat(5)[..32]),
+            format!("0123abcd-{}", "f".repeat(32)),
+            format!("0123abcd_{}", "f".repeat(31)),
+            format!("0123abcd_{}", "f".repeat(33)),
+            format!("0123abcg_{}", "f".repeat(32)),
+            format!("0123abcd_{}é", "f".repeat(31)),
+        ] {
+            assert!(
+                matches!(validate_supplied_token(&bad), Err(AppError::Validation(_))),
+                "{bad:?} should be refused"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -332,6 +332,7 @@ pub(crate) fn classify_fetch_error(e: &AppError) -> ItemOutcome {
         AppError::Authorization(m) | AppError::Conflict(m) | AppError::QuotaExceeded(m) => {
             ItemOutcome::Refused(m.clone())
         }
+        AppError::QuotaRefused(refusal) => ItemOutcome::Refused(refusal.message.clone()),
         AppError::Validation(m) => ItemOutcome::Refused(format!("invalid path: {m}")),
         AppError::NotFound(_) => ItemOutcome::Failed {
             status: Some(404),
@@ -1119,6 +1120,9 @@ mod tests {
         assert!(refused(AppError::Authorization("policy".into())));
         assert!(refused(AppError::Conflict("held".into())));
         assert!(refused(AppError::QuotaExceeded("quota".into())));
+        assert!(refused(AppError::QuotaRefused(Box::new(
+            crate::services::quota::QuotaRefusal::instance_storage(1, 1, None)
+        ))));
         assert!(refused(AppError::Validation("..".into())));
         let status = |e: AppError| match classify_fetch_error(&e) {
             ItemOutcome::Failed { status, .. } => status,

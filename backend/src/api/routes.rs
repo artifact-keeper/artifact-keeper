@@ -142,6 +142,18 @@ pub fn create_router(state: SharedState) -> Router {
         // URLs; making those URLs prefix-aware is tracked as a follow-up.
         .nest("/lxc", handlers::incus::router())
         .merge(wasm_proxy_routes)
+        // Instance quotas (storage, upload size, download transfer): an
+        // upload is refused before its body is read, a download is counted
+        // and refused at the transfer limit. Inside the visibility
+        // middleware, so an unauthenticated caller still gets its 401 first.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::services::quota::http::upload_admission,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.transfer_meter.clone(),
+            crate::services::quota::http::transfer_meter,
+        ))
         // Per-principal in-flight upload cap (GHSA-9f9r-c4w8-rjv9). Layered
         // inside the visibility middleware so it sees the caller's identity.
         .layer(middleware::from_fn_with_state(
@@ -258,7 +270,15 @@ pub fn create_router(state: SharedState) -> Router {
         // interactive logins the login bucket allows.
         .nest(
             "/v2",
-            handlers::oci_v2::router(Some(token_exchange_rate_limit_state)),
+            handlers::oci_v2::router(Some(token_exchange_rate_limit_state))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::services::quota::http::upload_admission,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    state.transfer_meter.clone(),
+                    crate::services::quota::http::transfer_meter,
+                )),
         )
         // #5253: the MCP registry's credential exchange (`/mcp/{repo}/v0/auth/*`);
         // the OIDC assertion in the body is the credential, so it sits outside
@@ -272,6 +292,14 @@ pub fn create_router(state: SharedState) -> Router {
     // uploads on routes that lack an explicit limit. Individual format handlers
     // set their own limits where appropriate (e.g. 512 MB for most formats).
     router = router.layer(DefaultBodyLimit::disable());
+
+    // Quota refusals in the route's native envelope (OCI on `/v2`, npm's
+    // `error` on `/npm`), and a body limit's plain-text 413 as the JSON
+    // upload-size refusal.
+    router = router.layer(middleware::from_fn_with_state(
+        state.config.max_upload_size_bytes,
+        crate::services::quota::http::quota_envelope,
+    ));
 
     // Apply guest-access guard (issue #850). When guest access is disabled,
     // unauthenticated requests are rejected with 401 (with an allowlist for
@@ -1178,6 +1206,12 @@ fn api_v1_routes(
                 // `GET /repositories/{key}/download/{path}` is NOT merged
                 // here: it is nested separately below with its own
                 // authentication layer (#4654).
+                // Artifact uploads are refused over a quota or the size
+                // limit before the body is read.
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::services::quota::http::upload_admission,
+                ))
                 // Inside the auth layer below, so it sees the caller
                 // (GHSA-9f9r-c4w8-rjv9).
                 .layer(middleware::from_fn_with_state(
@@ -1215,6 +1249,10 @@ fn api_v1_routes(
         .nest(
             "/repositories",
             handlers::repositories::download_router()
+                .layer(middleware::from_fn_with_state(
+                    state.transfer_meter.clone(),
+                    crate::services::quota::http::transfer_meter,
+                ))
                 .layer(middleware::from_fn_with_state(
                     presign_rate_limit_state,
                     rate_limit_by_ip_middleware,
@@ -1727,6 +1765,10 @@ fn api_v1_routes(
         .nest(
             "/uploads",
             handlers::upload::router()
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::services::quota::http::upload_admission,
+                ))
                 // Inside the auth layer, so it sees the caller
                 // (GHSA-9f9r-c4w8-rjv9).
                 .layer(middleware::from_fn_with_state(
