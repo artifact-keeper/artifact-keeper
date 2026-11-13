@@ -58,6 +58,9 @@ pub struct ExceptionCoord {
 /// * when the caller supplies a digest, a row whose `basis_digest` is NULL or
 ///   different does NOT match, so republished bytes under the same version
 ///   re-block rather than inheriting the acceptance.
+/// * a curation row for the whole package (`*`) also covers every version, so
+///   the seams that know the version (PyPI) honour a whole-package grant. The
+///   scan gate stays per version, bound to bytes.
 ///
 /// A database error is an error, never a silent `true`: this function can only
 /// ever widen access, so it must not fail open.
@@ -70,7 +73,7 @@ pub async fn exception_allows(db: &PgPool, coord: &ExceptionCoord) -> Result<boo
             WHERE gate = $1
               AND repository_id = $2
               AND package_name = $3
-              AND package_version = $4
+              AND (package_version = $4 OR ($1 = 'curation' AND package_version = '*'))
               AND status = 'approved'
               AND (expires_at IS NULL OR expires_at > NOW())
               AND ($5::text IS NULL OR basis_digest = $5)
@@ -1087,6 +1090,80 @@ mod tests {
             "a burst inside the debounce window is one request, not five"
         );
 
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// A whole-package curation exception covers the seams that ask with an
+    /// exact version, and only on the curation gate
+    #[tokio::test]
+    async fn db_a_whole_package_curation_exception_covers_every_version() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO repositories (id, key, name, format, repo_type, storage_path, upstream_url)
+               VALUES ($1, $2, $2, 'pypi', 'remote', '/tmp/ph-exq4', 'https://pypi.org/simple')"#,
+        )
+        .bind(repo_id)
+        .bind(format!("ph-exq4-{repo_id}"))
+        .execute(&pool)
+        .await
+        .expect("seed repo");
+        for gate in [GATE_CURATION, GATE_SCAN] {
+            sqlx::query(
+                "INSERT INTO age_gate_reviews
+                 (gate, repository_id, package_name, package_version, status, expires_at)
+                 VALUES ($1, $2, 'requests', '*', 'approved', NOW() + INTERVAL '1 day')",
+            )
+            .bind(gate)
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("seed whole-package grant");
+        }
+        let asked = |gate: &'static str, version: &str| ExceptionCoord {
+            gate,
+            repository_id: repo_id,
+            package_name: "requests".to_string(),
+            package_version: version.to_string(),
+            digest: None,
+        };
+
+        assert!(exception_allows(&pool, &asked(GATE_CURATION, "2.32.3"))
+            .await
+            .expect("query ok"));
+        assert!(exception_allows(&pool, &asked(GATE_CURATION, "*"))
+            .await
+            .expect("query ok"));
+        assert!(
+            !exception_allows(&pool, &asked(GATE_SCAN, "2.32.3"))
+                .await
+                .expect("query ok"),
+            "a scan exception stays per version"
+        );
+
+        sqlx::query(
+            "UPDATE age_gate_reviews SET expires_at = NOW() - INTERVAL '1 second'
+             WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("expire");
+        assert!(!exception_allows(&pool, &asked(GATE_CURATION, "2.32.3"))
+            .await
+            .expect("query ok"));
+
+        let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
         let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(repo_id)
             .execute(&pool)
