@@ -10146,7 +10146,8 @@ pub async fn evaluate_curation<'a>(
             // filename cannot be split unambiguously, and a manifest is
             // content-addressed), so they collapse to the whole-package
             // coordinate `*`, which is also the only granularity a curation
-            // `allow` rule can express for them.
+            // `allow` rule can express for them. A `*` grant also covers the
+            // seams that do pass a version (PyPI), see `exception_allows`.
             let coord = crate::services::exception_queue::ExceptionCoord {
                 gate: crate::services::age_gate_service::GATE_CURATION,
                 repository_id: target.id,
