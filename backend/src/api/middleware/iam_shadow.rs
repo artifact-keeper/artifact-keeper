@@ -35,17 +35,24 @@ use crate::api::authz::catalog::{Permission, Scope};
 use crate::api::authz::declaration::{Resolver, RouteRequirement};
 use crate::api::authz::registry::{RouteRegistry, API_V1_PREFIX};
 use crate::api::authz::shadow_marker::{self, LegacyLevel, Recorded};
+use crate::api::handlers::sbom::{classify_cve_history_path, CveHistoryPath};
 use crate::api::middleware::client_ip::current_verified_client_ip;
 use crate::config::Config;
 use crate::services::iam_decision::provider::SnapshotProvider;
 use crate::services::iam_decision::{decide, Caller, Decision, Principal, RequestContext};
 use crate::services::iam_legacy_projection::{CredentialRef, ScopeRef};
 
-/// The resolver whose resource the handler reports from the request body.
-pub const BODY_PROJECT_RESOLVER: &str = "project:body";
+/// The parameter of a resolver whose resource the handler reports from the
+/// request body, for any kind (`project:body`, `repository:body`).
+pub const BODY_PARAMETER: &str = ":body";
 /// The resolver naming a user in the path; the operation is self-service when
 /// that user is the caller.
 pub const USER_RESOLVER: &str = "user:id";
+
+/// Whether the declaration's resource is the target the handler reports.
+fn is_body_resolved(pending: &Pending) -> bool {
+    pending.resolver.id.ends_with(BODY_PARAMETER)
+}
 
 /// Whether a request is self-service: it names the caller through
 /// [`USER_RESOLVER`]. Self-service needs no permission, so it is not compared.
@@ -162,9 +169,12 @@ pub fn legacy_outcome(
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => LegacyOutcome::Refuse,
         StatusCode::NOT_FOUND => LegacyOutcome::Unknown("secondary_resource"),
         s if s.is_client_error() => {
+            // An instance administrator passes every legacy check, so an
+            // instance pass at `Admin` counts on any resource.
             let passed = recorded
                 .passed_on(resource)
-                .is_some_and(|level| level.satisfies(needed));
+                .is_some_and(|level| level.satisfies(needed))
+                || recorded.passed_on(ScopeRef::Instance) == Some(LegacyLevel::Admin);
             if passed {
                 LegacyOutcome::Permit
             } else {
@@ -505,6 +515,11 @@ impl IamShadow {
         if is_self_service(pending, recorded) {
             return Err("self_service");
         }
+        // Without a reported target there is nothing to decide on, whatever
+        // the response says.
+        if is_body_resolved(pending) && recorded.target.is_none() {
+            return Err("target_not_reported");
+        }
         // The instance needs no lookup, so its status is settled with the
         // resource known (`legacy_outcome`), where a pass can count.
         let looked_up = pending.resolver.scope != Scope::Instance;
@@ -536,7 +551,7 @@ impl IamShadow {
         pending: &Pending,
         recorded: &Recorded,
     ) -> Result<ScopeRef, &'static str> {
-        if pending.resolver.id == BODY_PROJECT_RESOLVER {
+        if is_body_resolved(pending) {
             return recorded.target.ok_or("target_not_reported");
         }
         resolve(&self.db, pending.resolver, pending.param.as_deref()).await
@@ -628,9 +643,16 @@ pub async fn resolve(
         Ok(None) => Err("resource_not_found"),
         Err(_) => Err("resolver_error"),
     };
-    match resolver.id {
+    // The repository holding the object an id names, by one query.
+    let repository_of = |sql: &'static str| async move {
+        let id = uuid()?;
+        let row = sqlx::query_scalar(sql).bind(id).fetch_optional(db).await;
+        found(row).map(ScopeRef::Repository)
+    };
+    let (kind, _) = resolver.id.split_once(':').unwrap_or((resolver.id, ""));
+    match kind {
         "instance" => Ok(ScopeRef::Instance),
-        "repo:key" => {
+        "repo" => {
             let key = param.ok_or("missing_parameter")?;
             let row = sqlx::query_scalar("SELECT id FROM repositories WHERE key = $1")
                 .bind(key)
@@ -638,20 +660,74 @@ pub async fn resolve(
                 .await;
             found(row).map(ScopeRef::Repository)
         }
-        "artifact:id" => {
-            let id = uuid()?;
-            let row = sqlx::query_scalar("SELECT repository_id FROM artifacts WHERE id = $1")
-                .bind(id)
-                .fetch_optional(db)
-                .await;
-            found(row).map(ScopeRef::Repository)
+        "repository" => repository_of("SELECT id FROM repositories WHERE id = $1").await,
+        "artifact" => repository_of(ARTIFACT_REPOSITORY).await,
+        "scan" => repository_of("SELECT repository_id FROM scan_results WHERE id = $1").await,
+        "finding" => {
+            repository_of(
+                "SELECT s.repository_id FROM scan_findings f \
+                 JOIN scan_results s ON s.id = f.scan_result_id WHERE f.id = $1",
+            )
+            .await
         }
-        "project:id" => uuid().map(ScopeRef::Project),
-        USER_RESOLVER => uuid().map(|_| ScopeRef::Instance),
-        "group:id" => uuid().map(ScopeRef::Group),
+        "sbom" => repository_of("SELECT repository_id FROM sbom_documents WHERE id = $1").await,
+        "cve_entry" => {
+            repository_of(
+                "SELECT a.repository_id FROM cve_history h \
+                 JOIN artifacts a ON a.id = h.artifact_id WHERE h.id = $1",
+            )
+            .await
+        }
+        "quality_check" => {
+            repository_of("SELECT repository_id FROM quality_check_results WHERE id = $1").await
+        }
+        "quality_issue" => {
+            repository_of(
+                "SELECT c.repository_id FROM quality_check_issues i \
+                 JOIN quality_check_results c ON c.id = i.check_result_id WHERE i.id = $1",
+            )
+            .await
+        }
+        // An acknowledgement with no repository applies to every one.
+        "acknowledgement" => {
+            let id = uuid()?;
+            let row: Result<Option<Option<Uuid>>, _> = sqlx::query_scalar(
+                "SELECT repository_id FROM finding_acknowledgements WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(db)
+            .await;
+            found(row.map(|r| r.map(|repo| repo.unwrap_or(Uuid::nil())))).map(|repo| {
+                if repo.is_nil() {
+                    ScopeRef::Instance
+                } else {
+                    ScopeRef::Repository(repo)
+                }
+            })
+        }
+        // CVE history by artifact or by CVE id, as the handler reads the path.
+        "cve_subject" => {
+            let raw = param.ok_or("missing_parameter")?;
+            match classify_cve_history_path(raw) {
+                CveHistoryPath::Artifact(id) => {
+                    let row = sqlx::query_scalar(ARTIFACT_REPOSITORY)
+                        .bind(id)
+                        .fetch_optional(db)
+                        .await;
+                    found(row).map(ScopeRef::Repository)
+                }
+                CveHistoryPath::Cve(_) => Ok(ScopeRef::Instance),
+                CveHistoryPath::Invalid => Err("malformed_parameter"),
+            }
+        }
+        "project" => uuid().map(ScopeRef::Project),
+        "user" => uuid().map(|_| ScopeRef::Instance),
+        "group" => uuid().map(ScopeRef::Group),
         _ => Err("unknown_resolver"),
     }
 }
+
+const ARTIFACT_REPOSITORY: &str = "SELECT repository_id FROM artifacts WHERE id = $1";
 
 /// The middleware. Passes undeclared routes through untouched; for a declared
 /// one it records the legacy path, returns the response unchanged, and only
@@ -941,6 +1017,29 @@ mod tests {
                 StatusCode::BAD_REQUEST,
                 none.clone(),
                 ScopeRef::Instance,
+                L::Admin,
+                Unknown("validation_before_authorization"),
+            ),
+            // An instance administrator passes every check: a client error
+            // after that pass is a permit on any resource.
+            (
+                StatusCode::CONFLICT,
+                passed_at(ScopeRef::Instance, L::Admin),
+                here,
+                L::Admin,
+                Permit,
+            ),
+            (
+                StatusCode::CONFLICT,
+                passed_at(ScopeRef::Instance, L::Read),
+                here,
+                L::Read,
+                Unknown("validation_before_authorization"),
+            ),
+            (
+                StatusCode::CONFLICT,
+                none.clone(),
+                here,
                 L::Admin,
                 Unknown("validation_before_authorization"),
             ),
@@ -2298,6 +2397,315 @@ mod end_to_end {
         tdh::cleanup_user(&pool, plain).await;
         tdh::cleanup_user(&pool, reader).await;
         tdh::cleanup(&pool, repo, admin).await;
+    }
+
+    /// An artifact row in `repo`, with no stored content.
+    async fn insert_artifact(pool: &PgPool, repo: Uuid) -> Uuid {
+        let path = format!("objects/{}.bin", Uuid::new_v4());
+        sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key) \
+             VALUES ($1, $2, 'object.bin', 1, repeat('0', 64), 'application/octet-stream', $2) \
+             RETURNING id",
+        )
+        .bind(repo)
+        .bind(path)
+        .fetch_one(pool)
+        .await
+        .expect("insert an artifact")
+    }
+
+    /// One object of each security kind in `repo`, by resolver kind.
+    async fn insert_security_objects(
+        pool: &PgPool,
+        repo: Uuid,
+        artifact: Uuid,
+    ) -> Vec<(&'static str, Uuid)> {
+        let one = |sql: &'static str| async move {
+            sqlx::query_scalar::<_, Uuid>(sql)
+                .bind(repo)
+                .bind(artifact)
+                .fetch_one(pool)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        };
+        let scan = one(
+            "INSERT INTO scan_results (repository_id, artifact_id, scan_type) \
+             VALUES ($1, $2, 'dependency') RETURNING id",
+        )
+        .await;
+        let finding: Uuid = sqlx::query_scalar(
+            "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title) \
+             VALUES ($1, $2, 'high', 'shadow') RETURNING id",
+        )
+        .bind(scan)
+        .bind(artifact)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let sbom = one(
+            "INSERT INTO sbom_documents (repository_id, artifact_id, format, format_version, \
+             content, content_hash) VALUES ($1, $2, 'cyclonedx', '1.5', '{}', 'h') RETURNING id",
+        )
+        .await;
+        let cve = one("INSERT INTO cve_history (artifact_id, cve_id) \
+             SELECT $2::uuid, 'CVE-2024-0001' WHERE $1::uuid IS NOT NULL RETURNING id")
+        .await;
+        let check = one(
+            "INSERT INTO quality_check_results (repository_id, artifact_id, check_type) \
+             VALUES ($1, $2, 'metadata') RETURNING id",
+        )
+        .await;
+        let issue: Uuid = sqlx::query_scalar(
+            "INSERT INTO quality_check_issues (check_result_id, artifact_id, severity, category, title) \
+             VALUES ($1, $2, 'low', 'metadata', 'shadow') RETURNING id",
+        )
+        .bind(check)
+        .bind(artifact)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let ack = one(ACKNOWLEDGEMENT).await;
+        vec![
+            ("artifact:artifact_id", artifact),
+            ("scan:id", scan),
+            ("finding:id", finding),
+            ("sbom:id", sbom),
+            ("cve_entry:id", cve),
+            ("cve_subject:id", artifact),
+            ("quality_check:id", check),
+            ("quality_issue:id", issue),
+            ("acknowledgement:id", ack),
+        ]
+    }
+
+    const ACKNOWLEDGEMENT: &str =
+        "INSERT INTO finding_acknowledgements (repository_id, lineage_id, checksum_sha256, \
+         finding_class, advisory_key, component_key, component_version_key, max_severity_rank, \
+         created_via) \
+         SELECT $1::uuid, gen_random_uuid(), repeat('0', 64), 'vulnerability', \
+                'CVE-' || $2::text, 'c', 'v', 1, 'api' RETURNING id";
+
+    #[tokio::test]
+    async fn security_objects_resolve_to_their_repository() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let artifact = insert_artifact(&pool, repo).await;
+        let objects = insert_security_objects(&pool, repo, artifact).await;
+        let global: Uuid = sqlx::query_scalar(ACKNOWLEDGEMENT)
+            .bind(None::<Uuid>)
+            .bind(Uuid::new_v4())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let resolve_as = |id: &str, param: String| {
+            let pool = pool.clone();
+            let resolver = Resolver::lookup(id).unwrap_or_else(|| panic!("{id} registered"));
+            async move { resolve(&pool, resolver, Some(&param)).await }
+        };
+        let here = Ok(ScopeRef::Repository(repo));
+        for (id, object) in &objects {
+            assert_eq!(resolve_as(id, object.to_string()).await, here, "{id}");
+            assert_eq!(
+                resolve_as(id, Uuid::new_v4().to_string()).await,
+                Err("resource_not_found"),
+                "{id} missing"
+            );
+            assert_eq!(
+                resolve_as(id, "not-a-uuid".into()).await,
+                Err("malformed_parameter"),
+                "{id} malformed"
+            );
+        }
+        assert_eq!(
+            resolve_as("repository:repo_id", repo.to_string()).await,
+            here
+        );
+        assert_eq!(
+            resolve_as("repository:repo_id", Uuid::new_v4().to_string()).await,
+            Err("resource_not_found")
+        );
+        assert_eq!(resolve_as("repo:repo_key", key.clone()).await, here);
+        assert_eq!(resolve_as("repo:key", key).await, here);
+        assert_eq!(
+            resolve_as("acknowledgement:id", global.to_string()).await,
+            Ok(ScopeRef::Instance)
+        );
+        assert_eq!(
+            resolve_as("cve_subject:id", "CVE-2024-0001".into()).await,
+            Ok(ScopeRef::Instance)
+        );
+        assert_eq!(
+            resolve_as("cve_subject:id", "ghsa-abcd-efgh-ijkl".into()).await,
+            Ok(ScopeRef::Instance)
+        );
+
+        let _ =
+            sqlx::query("DELETE FROM finding_acknowledgements WHERE id = $1 OR repository_id = $2")
+                .bind(global)
+                .bind(repo)
+                .execute(&pool)
+                .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn security_object_operations_are_compared() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (other, _, _) = tdh::create_repo(&pool, "local", "generic").await;
+        let artifact = insert_artifact(&pool, repo).await;
+        let elsewhere = insert_artifact(&pool, other).await;
+        let (admin, _) = tdh::create_user(&pool).await;
+        let (plain, _) = tdh::create_user(&pool).await;
+        let (owner, _) = tdh::create_user(&pool).await;
+        sqlx::query("UPDATE users SET is_admin = true WHERE id = $1")
+            .bind(admin)
+            .execute(&pool)
+            .await
+            .unwrap();
+        tdh::grant_repo_role(&pool, repo, owner, "repository-owner").await;
+        let mut rig = Rig::new(pool.clone(), &dir).await;
+        let admin_bearer = tdh::bearer_for(&rig.state, admin).await;
+        let plain_bearer = tdh::bearer_for(&rig.state, plain).await;
+        let owner_bearer = tdh::bearer_for(&rig.state, owner).await;
+        let auth = crate::services::auth_service::AuthService::new(
+            pool.clone(),
+            Arc::new(rig.state.config.clone()),
+        );
+        let (scoped_token, scoped_id) = auth
+            .generate_api_token(admin, "shadow-security-scoped", vec!["*".into()], None)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+            .bind(scoped_id)
+            .bind(repo)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let scoped = format!("Bearer {scoped_token}");
+        let get = |path: String| empty_request("GET", format!("/api/v1{path}"));
+        let post = |path: String| empty_request("POST", format!("/api/v1{path}"));
+        let compared = |c: &Comparison, legacy: LegacyOutcome, class: Class| {
+            assert_eq!((c.legacy, c.class), (legacy, class), "{c:?}");
+        };
+        let here = Some(ScopeRef::Repository(repo));
+
+        // A private repository's artifact health: both refuse, on its
+        // repository. The handler looks the score up before the visibility
+        // check, so the artifact needs one.
+        sqlx::query("INSERT INTO artifact_health_scores (artifact_id) VALUES ($1)")
+            .bind(artifact)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (status, c) = rig
+            .call(
+                Some(&plain_bearer),
+                get(format!("/quality/health/artifacts/{artifact}")),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(c.permission, Permission::SecurityRead);
+        assert_eq!(c.resource, here);
+        compared(&c, LegacyOutcome::Refuse, Class::Agree);
+
+        // CVE history of the same artifact: the SBOM helper marks its refusal.
+        let (status, c) = rig
+            .call(
+                Some(&plain_bearer),
+                get(format!("/sbom/cve/history/{artifact}")),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(c.resource, here);
+        compared(&c, LegacyOutcome::Refuse, Class::Agree);
+
+        // CVE history by CVE id is decided on the instance.
+        let (status, c) = rig
+            .call(
+                Some(&plain_bearer),
+                get("/sbom/cve/history/CVE-2024-0001".into()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(c.resource, Some(ScopeRef::Instance));
+        compared(&c, LegacyOutcome::Permit, Class::NewStricter);
+
+        // Signing keys need signing key management.
+        let (status, c) = rig
+            .call(Some(&plain_bearer), get("/signing/keys".into()))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(c.permission, Permission::SigningKeyManage);
+        compared(&c, LegacyOutcome::Permit, Class::NewStricter);
+
+        // A repository owner triggering a scan: refused today, permitted by
+        // the model on the repository the body names.
+        let scan = json_request(
+            "POST",
+            "/api/v1/security/scan".into(),
+            serde_json::json!({ "artifact_id": artifact }),
+        );
+        let (status, c) = rig.call(Some(&owner_bearer), scan).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(c.permission, Permission::SecurityScan);
+        assert_eq!(c.resource, here);
+        compared(&c, LegacyOutcome::Refuse, Class::NewWider);
+
+        // A scan of a missing artifact reports no target.
+        let missing = json_request(
+            "POST",
+            "/api/v1/security/scan".into(),
+            serde_json::json!({ "artifact_id": Uuid::new_v4() }),
+        );
+        let (_, c) = rig.call(Some(&owner_bearer), missing).await;
+        assert_eq!(c.class, Class::Inconclusive("target_not_reported"));
+
+        // Releasing an artifact that is not quarantined: a client error after
+        // the administrator check is a permit.
+        let (status, c) = rig
+            .call(
+                Some(&admin_bearer),
+                post(format!("/quarantine/{artifact}/release")),
+            )
+            .await;
+        assert!(status.is_client_error(), "{status}");
+        assert_eq!(c.permission, Permission::SecurityQuarantine);
+        assert_eq!(c.resource, here);
+        compared(&c, LegacyOutcome::Permit, Class::Agree);
+
+        // The same administrator's token restricted to the first repository
+        // stays out of the other one.
+        let (status, c) = rig
+            .call(
+                Some(&scoped),
+                post(format!("/quarantine/{elsewhere}/release")),
+            )
+            .await;
+        assert!(status.is_client_error(), "{status}");
+        assert_eq!(c.resource, Some(ScopeRef::Repository(other)));
+        compared(&c, LegacyOutcome::Permit, Class::NewStricter);
+
+        rig.shutdown.cancel();
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE id = $1")
+            .bind(scoped_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(other)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, plain).await;
+        tdh::cleanup(&pool, repo, owner).await;
+        tdh::cleanup_user(&pool, admin).await;
     }
 
     #[tokio::test]

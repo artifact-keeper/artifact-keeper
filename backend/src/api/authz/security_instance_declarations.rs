@@ -70,7 +70,7 @@ const SHARED_PREFIX_ROUTES: [&str; 15] = [
 ];
 
 /// Whether a canonical route belongs to this table.
-fn in_area(route: &str) -> bool {
+pub(super) fn in_area(route: &str) -> bool {
     SHARED_PREFIX_ROUTES.contains(&route)
         || PREFIXES
             .iter()

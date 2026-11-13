@@ -68,6 +68,57 @@ pub const RESOLVERS: &[Resolver] = &[
         id: "user:id",
         scope: Scope::Instance,
     },
+    // Security objects, each resolved to the repository that holds it.
+    Resolver {
+        id: "artifact:artifact_id",
+        scope: Scope::Repository,
+    },
+    Resolver {
+        id: "repository:repo_id",
+        scope: Scope::Repository,
+    },
+    Resolver {
+        id: "repo:repo_key",
+        scope: Scope::Repository,
+    },
+    Resolver {
+        id: "repository:body",
+        scope: Scope::Repository,
+    },
+    Resolver {
+        id: "scan:id",
+        scope: Scope::Repository,
+    },
+    Resolver {
+        id: "finding:id",
+        scope: Scope::Repository,
+    },
+    // A global acknowledgement (no repository) resolves to the instance.
+    Resolver {
+        id: "acknowledgement:id",
+        scope: Scope::Repository,
+    },
+    Resolver {
+        id: "sbom:id",
+        scope: Scope::Repository,
+    },
+    Resolver {
+        id: "cve_entry:id",
+        scope: Scope::Repository,
+    },
+    // An artifact id resolves to its repository; a CVE id to the instance.
+    Resolver {
+        id: "cve_subject:id",
+        scope: Scope::Repository,
+    },
+    Resolver {
+        id: "quality_check:id",
+        scope: Scope::Repository,
+    },
+    Resolver {
+        id: "quality_issue:id",
+        scope: Scope::Repository,
+    },
 ];
 
 impl Resolver {

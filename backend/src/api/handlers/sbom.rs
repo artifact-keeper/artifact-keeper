@@ -766,6 +766,7 @@ fn default_action() -> String {
 /// Generate an SBOM for an artifact
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("security.scan")), ("x-resource" = json!("repository:body"))),
     path = "",
     context_path = "/api/v1/sbom",
     tag = "sbom",
@@ -789,6 +790,12 @@ async fn generate_sbom(
     // READ half of the decision only: its action parameter selects the denial
     // shape and never runs the per-action permission check (GHSA-ww52-pmcg-f53c),
     // so the repository `write` action is enforced separately below.
+    crate::api::authz::shadow_marker::note_repository_target(
+        &state.db,
+        Some(body.artifact_id),
+        None,
+    )
+    .await;
     check_artifact_visibility(&Some(auth.clone()), body.artifact_id, &state.db, "write").await?;
 
     let service = SbomService::new(state.db.clone());
@@ -854,6 +861,7 @@ async fn generate_sbom(
 /// List SBOMs with optional filters
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "",
     context_path = "/api/v1/sbom",
     tag = "sbom",
@@ -968,6 +976,7 @@ async fn list_sboms(
 /// Get SBOM by ID with full content
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("sbom:id"))),
     path = "/{id}",
     context_path = "/api/v1/sbom",
     tag = "sbom",
@@ -1009,6 +1018,7 @@ async fn get_sbom(
 /// Get SBOM by artifact ID
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("artifact:artifact_id"))),
     path = "/by-artifact/{artifact_id}",
     context_path = "/api/v1/sbom",
     tag = "sbom",
@@ -1058,6 +1068,7 @@ async fn get_sbom_by_artifact(
 /// Delete an SBOM
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("artifact.delete")), ("x-resource" = json!("sbom:id"))),
     path = "/{id}",
     context_path = "/api/v1/sbom",
     tag = "sbom",
@@ -1086,6 +1097,7 @@ async fn delete_sbom(
 /// Get components of an SBOM
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("sbom:id"))),
     path = "/{id}/components",
     context_path = "/api/v1/sbom",
     tag = "sbom",
@@ -1127,6 +1139,7 @@ async fn get_sbom_components(
 /// `test-sbom-convert.sh` 2.5.a / 2.5.b.)
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("security.scan")), ("x-resource" = json!("sbom:id"))),
     path = "/{id}/convert",
     context_path = "/api/v1/sbom",
     tag = "sbom",
@@ -1340,6 +1353,7 @@ pub(crate) fn invalid_cve_history_path_message(id: &str) -> String {
 /// unable to look up history by CVE.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("cve_subject:id"))),
     path = "/cve/history/{id}",
     context_path = "/api/v1/sbom",
     tag = "sbom",
@@ -1384,6 +1398,7 @@ async fn get_cve_history(
 /// `scan_findings` projections.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("artifact:artifact_id"))),
     path = "/cve/history/by-artifact/{artifact_id}",
     context_path = "/api/v1/sbom",
     tag = "sbom",
@@ -1458,6 +1473,7 @@ async fn get_cve_history_by_cve(
 /// Update CVE status
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("security.triage")), ("x-resource" = json!("cve_entry:id"))),
     path = "/cve/status/{id}",
     context_path = "/api/v1/sbom",
     tag = "sbom",
@@ -1547,6 +1563,7 @@ async fn update_cve_status(
 /// `POST /cve/status/{id}` route.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("security.triage")), ("x-resource" = json!("artifact:artifact_id"))),
     path = "/cve/status/by-artifact/{artifact_id}/by-cve/{cve_id}",
     context_path = "/api/v1/sbom",
     tag = "sbom",
@@ -1778,6 +1795,7 @@ async fn delete_license_policy(
 /// Check license compliance against policies
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/check-compliance",
     context_path = "/api/v1/sbom",
     tag = "sbom",
@@ -2224,8 +2242,15 @@ async fn require_repo_visibility(
     repo: Option<(Uuid, RepositoryVisibility)>,
     missing_msg: &'static str,
 ) -> Result<()> {
-    // Token-scope + existence (the pure, unit-tested decision).
-    require_repo_access(auth, repo.map(|(id, _)| id), missing_msg)?;
+    use crate::api::authz::shadow_marker;
+    // Token-scope + existence (the pure, unit-tested decision). A token-scope
+    // refusal hides a repository that exists; a missing one stays unmarked.
+    if let Err(e) = require_repo_access(auth, repo.map(|(id, _)| id), missing_msg) {
+        if let Some((repo_id, _)) = repo {
+            shadow_marker::note_hidden_refusal(repo_id);
+        }
+        return Err(e);
+    }
     let (repo_id, visibility) = repo.expect("require_repo_access rejects None repo");
     if !visibility.allows_authenticated_read() && !auth.is_admin {
         let repo_service = crate::services::repository_service::RepositoryService::new(db.clone());
@@ -2243,9 +2268,11 @@ async fn require_repo_visibility(
             )
             .await?
         {
+            shadow_marker::note_hidden_refusal(repo_id);
             return Err(AppError::NotFound(missing_msg.into()));
         }
     }
+    shadow_marker::note_passed(repo_id, shadow_marker::LegacyLevel::Read);
     Ok(())
 }
 
@@ -4951,6 +4978,62 @@ package:
             "non-admin CVE-status write must be 403, got {:?}",
             res.err()
         );
+    }
+
+    /// The visibility helper marks what the shadow comparison reads: a read
+    /// pass when it admits, a hidden refusal for a membership or token-scope
+    /// 404 on a repository that exists, and nothing for a missing object.
+    #[tokio::test]
+    async fn test_require_repo_visibility_marks_its_outcome_db() {
+        use crate::api::authz::shadow_marker::{scope, LegacyLevel};
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::iam_legacy_projection::ScopeRef;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let repo = Some((fx.repo_id, RepositoryVisibility::Private));
+        let (outsider, outname) = tdh::create_user(&fx.pool).await;
+        let member = tdh::make_auth(fx.user_id, &fx.username);
+        let stranger = tdh::make_auth(outsider, &outname);
+        let mut scoped_away = tdh::make_auth(fx.user_id, &fx.username);
+        scoped_away.allowed_repo_ids = AccessScope::Restricted(vec![Uuid::new_v4()]);
+
+        let (admitted, on_pass) = scope(super::require_repo_visibility(
+            &fx.pool, &member, repo, "gone",
+        ))
+        .await;
+        let (hidden, on_membership) = scope(super::require_repo_visibility(
+            &fx.pool, &stranger, repo, "gone",
+        ))
+        .await;
+        let (scoped, on_token) = scope(super::require_repo_visibility(
+            &fx.pool,
+            &scoped_away,
+            repo,
+            "gone",
+        ))
+        .await;
+        let (missing, on_missing) = scope(super::require_repo_visibility(
+            &fx.pool, &member, None, "gone",
+        ))
+        .await;
+        tdh::cleanup_user(&fx.pool, outsider).await;
+        fx.teardown().await;
+
+        assert!(admitted.is_ok(), "{:?}", admitted.err());
+        assert_eq!(
+            on_pass.passed_on(ScopeRef::Repository(fx.repo_id)),
+            Some(LegacyLevel::Read)
+        );
+        assert_eq!(on_pass.hidden_refusal, None);
+        for (res, rec) in [(hidden, on_membership), (scoped, on_token)] {
+            assert!(matches!(res, Err(AppError::NotFound(_))), "{:?}", res.err());
+            assert_eq!(rec.hidden_refusal, Some(fx.repo_id));
+            assert!(rec.passed.is_empty());
+        }
+        assert!(matches!(missing, Err(AppError::NotFound(_))));
+        assert_eq!(on_missing.hidden_refusal, None);
+        assert!(on_missing.passed.is_empty());
     }
 
     // --- require_repo_access upgrade (ensure_artifact_repo_access) ---------

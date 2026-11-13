@@ -144,6 +144,7 @@ impl QuarantineActionResponse {
 /// Get quarantine status for an artifact
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("artifact:artifact_id"))),
     path = "/{artifact_id}",
     context_path = "/api/v1/quarantine",
     tag = "quarantine",
@@ -271,6 +272,7 @@ pub(crate) async fn caller_passes_reason_gate(
 /// Quarantine an artifact immediately (admin only)
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("security.quarantine")), ("x-resource" = json!("artifact:artifact_id"))),
     path = "/{artifact_id}/quarantine",
     context_path = "/api/v1/quarantine",
     operation_id = "quarantine_artifact_now",
@@ -341,6 +343,7 @@ pub async fn quarantine_artifact(
 /// Release an artifact from quarantine (admin only)
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("security.quarantine")), ("x-resource" = json!("artifact:artifact_id"))),
     path = "/{artifact_id}/release",
     context_path = "/api/v1/quarantine",
     tag = "quarantine",
@@ -421,6 +424,7 @@ pub async fn release_artifact(
 /// the cache sidecar's hold and stamps the catalog row's release.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("security.quarantine")), ("x-resource" = json!("repo:repo_key"))),
     path = "/proxy-cache/{repo_key}/release",
     context_path = "/api/v1/quarantine",
     operation_id = "release_proxy_cache_entry",
@@ -499,6 +503,7 @@ pub async fn release_proxy_cache_entry(
 /// Reject a quarantined artifact (admin only)
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("security.quarantine")), ("x-resource" = json!("artifact:artifact_id"))),
     path = "/{artifact_id}/reject",
     context_path = "/api/v1/quarantine",
     operation_id = "reject_quarantined_artifact",

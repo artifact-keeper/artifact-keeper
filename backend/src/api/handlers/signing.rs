@@ -131,6 +131,7 @@ pub struct VerifyTrustAttestationPayload {
 /// List all signing keys, optionally filtered by repository.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("signing.key.manage")), ("x-resource" = json!("instance"))),
     path = "/keys",
     context_path = "/api/v1/signing",
     tag = "signing",
@@ -157,6 +158,7 @@ async fn list_keys(
 /// Create a new signing key.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("signing.key.manage")), ("x-resource" = json!("instance"))),
     path = "/keys",
     context_path = "/api/v1/signing",
     tag = "signing",
@@ -299,6 +301,7 @@ fn key_needing_capability_check(
 /// Get a signing key by ID.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("signing.key.manage")), ("x-resource" = json!("instance"))),
     path = "/keys/{key_id}",
     context_path = "/api/v1/signing",
     tag = "signing",
@@ -325,6 +328,7 @@ async fn get_key(
 /// Delete a signing key.
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("signing.key.manage")), ("x-resource" = json!("instance"))),
     path = "/keys/{key_id}",
     context_path = "/api/v1/signing",
     tag = "signing",
@@ -352,6 +356,7 @@ async fn delete_key(
 /// Revoke (deactivate) a signing key.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("signing.key.manage")), ("x-resource" = json!("instance"))),
     path = "/keys/{key_id}/revoke",
     context_path = "/api/v1/signing",
     tag = "signing",
@@ -397,6 +402,7 @@ async fn revoke_key(
 /// overlap immediately.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("signing.key.manage")), ("x-resource" = json!("instance"))),
     path = "/keys/{key_id}/rotate",
     context_path = "/api/v1/signing",
     tag = "signing",
@@ -436,6 +442,7 @@ async fn rotate_key(
 /// Get the public key in PEM format (for client import).
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("signing.key.manage")), ("x-resource" = json!("instance"))),
     path = "/keys/{key_id}/public",
     context_path = "/api/v1/signing",
     tag = "signing",
@@ -460,6 +467,7 @@ async fn get_public_key(
 /// Get the stored trust attestation for a signing key, if any.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("signing.key.manage")), ("x-resource" = json!("instance"))),
     path = "/keys/{key_id}/trust-attestation",
     context_path = "/api/v1/signing",
     tag = "signing",
@@ -487,6 +495,7 @@ async fn get_key_trust_attestation(
 /// Challenge payload an external issuer key must sign.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("signing.key.manage")), ("x-resource" = json!("instance"))),
     path = "/keys/{key_id}/trust-attestation/challenge",
     context_path = "/api/v1/signing",
     tag = "signing",
@@ -523,6 +532,7 @@ async fn get_key_trust_attestation_challenge(
 /// not that the issuer is a pinned trust anchor (#2462).
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("signing.key.manage")), ("x-resource" = json!("instance"))),
     path = "/keys/{key_id}/trust-attestation/verify",
     context_path = "/api/v1/signing",
     tag = "signing",
@@ -574,6 +584,7 @@ async fn verify_key_trust_attestation(
 /// Get signing configuration for a repository.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repository:repo_id"))),
     path = "/repositories/{repo_id}/config",
     context_path = "/api/v1/signing",
     tag = "signing",
@@ -623,6 +634,7 @@ async fn get_repo_signing_config(
 /// Update signing configuration for a repository.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repository:repo_id"))),
     path = "/repositories/{repo_id}/config",
     context_path = "/api/v1/signing",
     tag = "signing",
@@ -679,6 +691,7 @@ async fn update_repo_signing_config(
 /// Get the public key for a repository (convenience endpoint).
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("artifact.read")), ("x-resource" = json!("repository:repo_id"))),
     path = "/repositories/{repo_id}/public-key",
     context_path = "/api/v1/signing",
     tag = "signing",
@@ -732,6 +745,7 @@ pub struct SignArtifactResponse {
 /// cannot be signed and therefore stay fail-closed under `require_signature`.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("artifact.sign")), ("x-resource" = json!("artifact:artifact_id"))),
     path = "/api/v1/signing/artifacts/{artifact_id}/sign",
     tag = "signing",
     params(

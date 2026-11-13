@@ -1432,6 +1432,7 @@ async fn list_scan_configs(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("security.scan")), ("x-resource" = json!("repository:body"))),
     path = "/scan",
     context_path = "/api/v1/security",
     tag = "security",
@@ -1457,6 +1458,12 @@ async fn trigger_scan(
     //
     // Chosen default: global admin. If a future policy decides repo-write should
     // suffice for a single-artifact scan, narrow this deliberately with a test.
+    crate::api::authz::shadow_marker::note_repository_target(
+        &state.db,
+        body.artifact_id,
+        body.repository_id,
+    )
+    .await;
     crate::services::audit_service::enforce_admin_audited(
         auth.is_admin,
         state.db.clone(),
@@ -1572,6 +1579,7 @@ async fn trigger_scan(
 
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/scans",
     context_path = "/api/v1/security",
     tag = "security",
@@ -1642,6 +1650,7 @@ async fn list_scans(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("scan:id"))),
     path = "/scans/{id}",
     context_path = "/api/v1/security",
     tag = "security",
@@ -1776,6 +1785,7 @@ async fn list_scans_served(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("scan:id"))),
     path = "/scans/{id}/findings",
     context_path = "/api/v1/security",
     tag = "security",
@@ -2078,6 +2088,7 @@ fn ingest_audit_summary(findings: &[crate::models::security::RawFinding]) -> Ing
 /// responses, and `recalculate_score` runs before this returns.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("security.findings.ingest")), ("x-resource" = json!("repository:body"))),
     path = "/findings/external",
     context_path = "/api/v1/security",
     tag = "security",
@@ -2103,6 +2114,12 @@ async fn ingest_external_findings(
     // additionally stops a broad API token from writing verdicts just because
     // it can publish artifacts — scopes: None (interactive/UI login) is
     // action-unrestricted and passes.
+    crate::api::authz::shadow_marker::note_repository_target(
+        &state.db,
+        Some(body.artifact_id),
+        None,
+    )
+    .await;
     auth.require_admin()?;
     auth.require_scope(INGEST_FINDINGS_SCOPE)?;
 
@@ -2212,6 +2229,7 @@ async fn ingest_external_findings(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("security.triage")), ("x-resource" = json!("finding:id"))),
     path = "/findings/{id}/acknowledge",
     context_path = "/api/v1/security",
     tag = "security",
@@ -2251,6 +2269,7 @@ async fn acknowledge_finding(
 
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("security.triage")), ("x-resource" = json!("finding:id"))),
     path = "/findings/{id}/acknowledge",
     context_path = "/api/v1/security",
     tag = "security",
@@ -2332,6 +2351,7 @@ async fn list_acknowledgements(
 
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("security.triage")), ("x-resource" = json!("acknowledgement:id"))),
     path = "/acknowledgements/{id}",
     context_path = "/api/v1/security",
     tag = "security",
@@ -2747,6 +2767,7 @@ fn scan_config_change_audit(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("artifact:artifact_id"))),
     path = "/artifacts/{artifact_id}/scans",
     context_path = "/api/v1/security",
     tag = "security",

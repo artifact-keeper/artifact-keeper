@@ -389,6 +389,7 @@ impl From<crate::models::quality::QualityGateViolation> for GateViolationRespons
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("artifact:artifact_id"))),
     path = "/health/artifacts/{artifact_id}",
     context_path = "/api/v1/quality",
     tag = "quality",
@@ -456,6 +457,7 @@ async fn get_artifact_health(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("repo:key"))),
     path = "/health/repositories/{key}",
     context_path = "/api/v1/quality",
     tag = "quality",
@@ -617,6 +619,7 @@ async fn get_health_dashboard(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("security.scan")), ("x-resource" = json!("repository:body"))),
     path = "/checks/trigger",
     context_path = "/api/v1/quality",
     tag = "quality",
@@ -632,6 +635,12 @@ async fn trigger_checks(
     Extension(auth): Extension<AuthExtension>,
     Json(body): Json<TriggerChecksRequest>,
 ) -> Result<Json<TriggerChecksResponse>> {
+    crate::api::authz::shadow_marker::note_repository_target(
+        &state.db,
+        body.artifact_id,
+        body.repository_id,
+    )
+    .await;
     auth.require_admin()?;
     if let Some(artifact_id) = body.artifact_id {
         let db = state.db.clone();
@@ -684,6 +693,7 @@ async fn trigger_checks(
 
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/checks",
     context_path = "/api/v1/quality",
     tag = "quality",
@@ -790,6 +800,7 @@ pub fn admin_router() -> Router<SharedState> {
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("quality_check:id"))),
     path = "/checks/{id}",
     context_path = "/api/v1/quality",
     tag = "quality",
@@ -819,6 +830,7 @@ async fn get_check(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("security.read")), ("x-resource" = json!("quality_check:id"))),
     path = "/checks/{id}/issues",
     context_path = "/api/v1/quality",
     tag = "quality",
@@ -866,6 +878,7 @@ async fn require_check_artifact_servable(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("security.triage")), ("x-resource" = json!("quality_issue:id"))),
     path = "/issues/{id}/suppress",
     context_path = "/api/v1/quality",
     tag = "quality",
@@ -896,6 +909,7 @@ async fn suppress_issue(
 
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("security.triage")), ("x-resource" = json!("quality_issue:id"))),
     path = "/issues/{id}/suppress",
     context_path = "/api/v1/quality",
     tag = "quality",
@@ -1086,6 +1100,7 @@ async fn delete_gate(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("security.scan")), ("x-resource" = json!("artifact:artifact_id"))),
     path = "/gates/evaluate/{artifact_id}",
     context_path = "/api/v1/quality",
     tag = "quality",

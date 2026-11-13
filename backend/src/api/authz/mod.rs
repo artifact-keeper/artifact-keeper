@@ -36,3 +36,6 @@ mod repository_declarations;
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod security_instance_declarations;
+#[cfg(ak_test_shard = "services-2")]
+#[cfg(test)]
+mod security_object_declarations;

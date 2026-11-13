@@ -183,6 +183,32 @@ pub fn note_target(target: ScopeRef) {
     let _ = RECORDER.try_with(|r| r.target.set(Some(target)));
 }
 
+/// Record the repository a body-resolved security operation acts on: the
+/// repository of `artifact_id` when one is named, else `repository_id`. An
+/// artifact that does not exist reports nothing. Reads the database only
+/// inside a [`scope`].
+pub async fn note_repository_target(
+    db: &sqlx::PgPool,
+    artifact_id: Option<Uuid>,
+    repository_id: Option<Uuid>,
+) {
+    if RECORDER.try_with(|_| ()).is_err() {
+        return;
+    }
+    let repository = match artifact_id {
+        Some(id) => sqlx::query_scalar("SELECT repository_id FROM artifacts WHERE id = $1")
+            .bind(id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten(),
+        None => repository_id,
+    };
+    if let Some(repository) = repository {
+        note_target(ScopeRef::Repository(repository));
+    }
+}
+
 /// Record the principal the authentication middleware resolved; the last call
 /// wins.
 pub fn note_principal(ext: &AuthExtension) {
