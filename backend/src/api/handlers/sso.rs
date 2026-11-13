@@ -23,7 +23,8 @@ use crate::api::extractors::{
     forwarded_headers_trusted, request_base_url_from_request, request_base_url_ignoring_forwarded,
     request_scheme_is_https, trusted_external_url, Json,
 };
-use crate::api::handlers::auth::set_auth_cookies;
+use crate::api::handlers::auth::{secure_flag, set_auth_cookies};
+use crate::api::handlers::sso_binding;
 use crate::api::validation::validate_outbound_sso_url;
 
 use crate::api::SharedState;
@@ -54,6 +55,48 @@ pub fn router() -> Router<SharedState> {
         .route("/saml/:id/login", get(saml_login))
         .route("/saml/:id/acs", post(saml_acs))
         .route("/exchange", post(exchange_code))
+        .route("/complete", get(sso_complete))
+}
+
+/// Whether the SSO browser-binding cookie gets `Secure` (#5486): the same
+/// decision as the auth cookies it leads to.
+fn binding_cookie_secure(client_is_https: bool) -> bool {
+    !secure_flag(client_is_https).is_empty()
+}
+
+/// Require the binding cookie of the login for `sso_state` (#5486) before the
+/// state is consumed, auditing and counting a refusal like any other failed
+/// SSO sign-in. Returns the binding value for the exchange code and how to
+/// hand that code over: a browser login's session goes on the redirect to
+/// `/callback`; a command-line login's code is only shown (see
+/// [`sso_binding::callback_binding`]).
+async fn require_callback_binding(
+    state: &SharedState,
+    headers: &HeaderMap,
+    sso_state: &str,
+    provider: &str,
+) -> Result<(String, FederatedHandoff)> {
+    match sso_binding::callback_binding(headers, &state.config.jwt_secret, sso_state) {
+        Ok((binding, sso_binding::LoginClient::Browser)) => Ok((
+            binding,
+            FederatedHandoff::Callback {
+                client_is_https: request_scheme_is_https(headers),
+            },
+        )),
+        Ok((binding, sso_binding::LoginClient::Cli)) => Ok((binding, FederatedHandoff::Cli)),
+        Err(e) => {
+            record_sso_auth_failure(&e, AuthFailureReason::InvalidToken);
+            audit_federated_login(
+                state,
+                AuditAction::LoginFailed,
+                None,
+                provider,
+                serde_json::json!({ "reason": "sso_browser_binding" }),
+            )
+            .await;
+            Err(e)
+        }
+    }
 }
 
 /// The LDAP username/password login, `POST /ldap/:id/login` (#5485).
@@ -176,6 +219,19 @@ pub struct OidcLoginQuery {
     /// IdP's login page. Any other value is rejected so the login redirect
     /// cannot be steered into unexpected IdP behaviours.
     prompt: Option<String>,
+    /// `cli` when a command-line client starts the login (#5486): the client
+    /// keeps the binding cookie from this response and sends it on
+    /// `/exchange`, and the callback shows the exchange code instead of
+    /// signing the browser in. Omit it for a browser login.
+    client: Option<String>,
+}
+
+/// Query of `GET /saml/{id}/login`.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct SamlLoginQuery {
+    /// `cli` when a command-line client starts the login (#5486); see the
+    /// OIDC login's `client`.
+    client: Option<String>,
 }
 
 /// Resolve the `prompt` value the login redirect forwards to the IdP.
@@ -274,11 +330,13 @@ pub async fn oidc_login(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Query(query): Query<OidcLoginQuery>,
+    headers: HeaderMap,
     base_url: OidcBaseUrl,
-) -> Result<Redirect> {
+) -> Result<Response> {
     // 0. Validate the optional prompt before any session/state is created so
     //    a rejected request leaves nothing behind.
     let prompt = resolve_login_prompt(query.prompt.as_deref())?;
+    let client = sso_binding::LoginClient::from_query(query.client.as_deref())?;
 
     // 1. Get decrypted OIDC config
     let (row, _client_secret) = AuthConfigService::get_oidc_decrypted(&state.db, id).await?;
@@ -292,11 +350,15 @@ pub async fn oidc_login(
         None
     };
 
-    let session = AuthConfigService::create_sso_session_with_pkce(
+    let session = AuthConfigService::create_sso_session_with_pkce_state_prefix(
         &state.db,
         "oidc",
         id,
         pkce_verifier.clone(),
+        match client {
+            sso_binding::LoginClient::Browser => "",
+            sso_binding::LoginClient::Cli => sso_binding::CLI_OIDC_STATE_PREFIX,
+        },
     )
     .await?;
     let state_str = session.state;
@@ -351,7 +413,17 @@ pub async fn oidc_login(
         auth_url.push_str(prompt);
     }
 
-    Ok(Redirect::temporary(&auth_url))
+    // 8. Bind the login to this browser (#5486): the callback is refused
+    //    without this cookie, so a state minted here cannot be completed in
+    //    another browser.
+    let mut response = Redirect::temporary(&auth_url).into_response();
+    sso_binding::set_binding_cookie(
+        response.headers_mut(),
+        &state.config.jwt_secret,
+        &state_str,
+        binding_cookie_secure(request_scheme_is_https(&headers)),
+    );
+    Ok(response)
 }
 
 /// The space-separated `scope` sent on both the authorization request and the
@@ -554,8 +626,9 @@ async fn finish_silent_denied(state: &SharedState, sso_state: Option<&str>) -> R
     ),
     responses(
         (status = 307, description = "Redirect to frontend with exchange code, or to /callback?silent_denied=1 when a prompt=none probe found no IdP session"),
+        (status = 200, description = "A login started with client=cli: a text/plain page showing the exchange code; no session is set in the browser", content_type = "text/plain"),
         (status = 400, description = "Invalid callback parameters", body = crate::api::openapi::ErrorResponse),
-        (status = 401, description = "IdP error or invalid/expired SSO state", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "IdP error, invalid/expired SSO state, or a login not started in this browser (#5486)", body = crate::api::openapi::ErrorResponse),
         (status = 502, description = "The IdP's token response carried no id_token (code OIDC_NO_ID_TOKEN)", body = crate::api::openapi::ErrorResponse),
     )
 )]
@@ -566,7 +639,6 @@ pub async fn oidc_callback(
     headers: HeaderMap,
     base_url: OidcBaseUrl,
 ) -> Result<Response> {
-    let client_is_https = request_scheme_is_https(&headers);
     // Resolve parameter shape BEFORE hitting the session store. Empty state or
     // code is a malformed callback (400), an IdP error redirect is a 401, not a
     // CSRF failure. See `resolve_oidc_callback` doc comment.
@@ -585,6 +657,10 @@ pub async fn oidc_callback(
     // /oidc/{B}/callback so the PKCE code_verifier and code travel to
     // provider B's token endpoint. We derive provider_id from the session
     // (the authoritative side) and reject if the URL path disagrees.
+    //
+    // #5486: and the state must have been minted for THIS browser, checked
+    // before the state is consumed.
+    let (binding, handoff) = require_callback_binding(&state, &headers, &sso_state, "oidc").await?;
     let session = AuthConfigService::validate_sso_session(&state.db, &sso_state)
         .await
         .inspect_err(|e| record_sso_auth_failure(e, AuthFailureReason::InvalidToken))?;
@@ -600,7 +676,8 @@ pub async fn oidc_callback(
         session.nonce,
         session.pkce_code_verifier,
         base_url,
-        client_is_https,
+        binding,
+        handoff,
     )
     .await
 }
@@ -617,7 +694,6 @@ pub async fn oidc_callback_generic(
     headers: HeaderMap,
     base_url: OidcBaseUrl,
 ) -> Result<Response> {
-    let client_is_https = request_scheme_is_https(&headers);
     // Resolve parameter shape BEFORE hitting the session store. See
     // `resolve_oidc_callback` doc comment.
     let (auth_code, sso_state) = match resolve_oidc_callback(&params)? {
@@ -627,7 +703,9 @@ pub async fn oidc_callback_generic(
         }
     };
 
-    // Validate SSO session and resolve the provider from the stored state
+    // The state must have been minted for this browser (#5486), then the SSO
+    // session is consumed and resolves the provider.
+    let (binding, handoff) = require_callback_binding(&state, &headers, &sso_state, "oidc").await?;
     let session = AuthConfigService::validate_sso_session(&state.db, &sso_state)
         .await
         .inspect_err(|e| record_sso_auth_failure(e, AuthFailureReason::InvalidToken))?;
@@ -638,13 +716,17 @@ pub async fn oidc_callback_generic(
         session.nonce,
         session.pkce_code_verifier,
         base_url,
-        client_is_https,
+        binding,
+        handoff,
     )
     .await
 }
 
 /// Shared OIDC callback logic used by both the provider-specific and generic
-/// callback handlers. Assumes the SSO session has already been validated.
+/// callback handlers. Assumes the SSO session has already been validated and
+/// its browser binding (#5486) checked; `binding` is carried into the
+/// exchange code.
+#[allow(clippy::too_many_arguments)]
 async fn oidc_callback_inner(
     state: SharedState,
     provider_id: Uuid,
@@ -652,7 +734,8 @@ async fn oidc_callback_inner(
     session_nonce: Option<String>,
     pkce_code_verifier: Option<String>,
     base_url: OidcBaseUrl,
-    client_is_https: bool,
+    binding: String,
+    handoff: FederatedHandoff,
 ) -> Result<Response> {
     // 1. Get decrypted OIDC config
     let (row, client_secret) =
@@ -854,14 +937,16 @@ async fn oidc_callback_inner(
         }
     }
 
-    // 8. TOTP step if enrolled (#5484), audit, exchange code, cookies.
+    // 8. TOTP step if enrolled (#5484), audit, exchange code bound to this
+    //    browser's login (#5486), cookies.
     complete_federated_login(
         &state,
         &auth_service,
         &user,
         &tokens,
         "oidc",
-        client_is_https,
+        &binding,
+        handoff,
     )
     .await
 }
@@ -1139,17 +1224,22 @@ async fn resolve_saml_config(db: &sqlx::PgPool, segment: &str) -> Result<(SamlCo
     context_path = "/api/v1/auth/sso",
     tag = "sso",
     params(
-        ("id" = String, Path, description = "SAML provider configuration ID (UUID) or slug")
+        ("id" = String, Path, description = "SAML provider configuration ID (UUID) or slug"),
+        SamlLoginQuery,
     ),
     responses(
         (status = 307, description = "Redirect to SAML IdP SSO endpoint"),
+        (status = 400, description = "Unsupported client value", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "SAML provider not found", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn saml_login(
     State(state): State<SharedState>,
     Path(segment): Path<String>,
-) -> Result<Redirect> {
+    Query(query): Query<SamlLoginQuery>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let client = sso_binding::LoginClient::from_query(query.client.as_deref())?;
     // Get SAML config from DB, by UUID or by slug (#2583).
     let (row, segment) = resolve_saml_config(&state.db, &segment).await?;
     let id = row.id;
@@ -1172,7 +1262,12 @@ pub async fn saml_login(
     let saml_svc = saml_service_from_row(state.db.clone(), &row, &acs_url, expected_acs.as_deref());
 
     // Generate AuthnRequest
-    let authn_request = saml_svc.create_authn_request()?;
+    let authn_request = match client {
+        sso_binding::LoginClient::Browser => saml_svc.create_authn_request()?,
+        sso_binding::LoginClient::Cli => {
+            saml_svc.create_authn_request_with_id_prefix(sso_binding::CLI_SAML_REQUEST_PREFIX)?
+        }
+    };
 
     // Persist the AuthnRequest ID as a single-use SSO session so the ACS
     // callback can require + consume a matching `InResponseTo` (replay +
@@ -1185,7 +1280,17 @@ pub async fn saml_login(
     )
     .await?;
 
-    Ok(Redirect::temporary(&authn_request.redirect_url))
+    // Bind the login to this browser (#5486). The ACS POST arrives
+    // cross-site, so the cookie is checked at the same-site completion step
+    // (`/complete`) the ACS redirects to.
+    let mut response = Redirect::temporary(&authn_request.redirect_url).into_response();
+    sso_binding::set_binding_cookie(
+        response.headers_mut(),
+        &state.config.jwt_secret,
+        &authn_request.request_id,
+        binding_cookie_secure(request_scheme_is_https(&headers)),
+    );
+    Ok(response)
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1207,17 +1312,16 @@ pub struct SamlAcsForm {
         ("id" = String, Path, description = "SAML provider configuration ID (UUID) or slug")
     ),
     responses(
-        (status = 307, description = "Redirect to frontend with exchange code"),
+        (status = 303, description = "Redirect to /api/v1/auth/sso/complete with an exchange code bound to the browser that started the login"),
+        (status = 200, description = "A login started with client=cli: a text/plain page showing the exchange code; no session is set in the browser", content_type = "text/plain"),
         (status = 400, description = "Invalid SAML response", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn saml_acs(
     State(state): State<SharedState>,
     Path(segment): Path<String>,
-    headers: HeaderMap,
     axum::extract::Form(form): axum::extract::Form<SamlAcsForm>,
 ) -> Result<Response> {
-    let client_is_https = request_scheme_is_https(&headers);
     // Get SAML config from DB, by UUID or by slug (#2583). The assertion is
     // bound below to the ACS URL derived from this same resolved segment, so
     // an assertion issued for one spelling is not accepted at the other.
@@ -1242,7 +1346,7 @@ pub async fn saml_acs(
     // expired, etc. — the Phase 2 checks from #2040) is a failed login; emit
     // LoginFailed for audit parity without altering that validation logic
     // (#1617 Phase 1).
-    let saml_user = match saml_svc.authenticate(&form.saml_response).await {
+    let (saml_user, request_id) = match saml_svc.authenticate_request(&form.saml_response).await {
         Ok(u) => u,
         Err(e) => {
             record_sso_auth_failure(&e, AuthFailureReason::InvalidToken);
@@ -1302,16 +1406,85 @@ pub async fn saml_acs(
         }
     }
 
-    // TOTP step if enrolled (#5484), audit, exchange code, cookies.
+    // TOTP step if enrolled (#5484), audit, and an exchange code bound to the
+    // browser that started this login (#5486). The ACS POST is cross-site, so
+    // it carries no `SameSite=Lax` cookie and its response sets no session:
+    // the browser is sent (303, as a GET) to the same-site completion step,
+    // which checks the binding cookie and only then sets the session cookies.
+    //
+    // A command-line login (`?client=cli`) has its cookie in the client, not
+    // in this browser: the code is only shown, for the client to redeem.
+    let binding = sso_binding::binding_value(&state.config.jwt_secret, &request_id);
+    let handoff = match sso_binding::LoginClient::of_state(&request_id) {
+        sso_binding::LoginClient::Browser => FederatedHandoff::SamlComplete,
+        sso_binding::LoginClient::Cli => FederatedHandoff::Cli,
+    };
     complete_federated_login(
         &state,
         &auth_service,
         &user,
         &tokens,
         "saml",
-        client_is_https,
+        &binding,
+        handoff,
     )
     .await
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct SsoCompleteQuery {
+    code: String,
+}
+
+/// Complete a SAML sign-in in the browser that started it (#5486)
+///
+/// The ACS answers the IdP's cross-site POST with a 303 here. This top-level
+/// GET carries the `SameSite=Lax` binding cookie set by `saml_login`; the
+/// exchange code must have been minted for it. The session cookies are set on
+/// the redirect to the frontend `/callback` (#1405), which still POSTs the
+/// code to `/exchange` (the code is not consumed here).
+#[utoipa::path(
+    get,
+    path = "/complete",
+    context_path = "/api/v1/auth/sso",
+    tag = "sso",
+    params(SsoCompleteQuery),
+    responses(
+        (status = 307, description = "Redirect to the frontend /callback with the exchange code and session cookies"),
+        (status = 401, description = "The exchange code is unknown, expired, or was not issued to this browser", body = crate::api::openapi::ErrorResponse),
+    )
+)]
+pub async fn sso_complete(
+    State(state): State<SharedState>,
+    Query(query): Query<SsoCompleteQuery>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let client_is_https = request_scheme_is_https(&headers);
+    sso_binding::require_exchange_binding(&headers, &state.config.jwt_secret, &query.code)
+        .inspect_err(|e| record_sso_auth_failure(e, AuthFailureReason::InvalidToken))?;
+    let (access_token, refresh_token) =
+        AuthConfigService::peek_exchange_code(&state.db, &query.code)
+            .await
+            .inspect_err(|e| record_sso_auth_failure(e, AuthFailureReason::InvalidToken))?;
+    // A TOTP pending code (#5484) holds no session: hand it to `/callback`
+    // as is, without cookies. (The ACS sends those there directly; this only
+    // keeps a hand-made `/complete` link from setting a pending token as the
+    // session.)
+    if refresh_token.is_empty() {
+        return Ok(Redirect::temporary(&build_frontend_callback_url(&query.code)).into_response());
+    }
+    let expires_in = access_token_expires_in(
+        &access_token,
+        chrono::Utc::now().timestamp(),
+        (state.config.jwt_access_token_expiry_minutes.max(0) as u64) * 60,
+    );
+    build_sso_callback_redirect(
+        &build_frontend_callback_url(&query.code),
+        &access_token,
+        &refresh_token,
+        expires_in,
+        client_is_https,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1374,6 +1547,7 @@ pub(crate) fn access_token_expires_in(access_token: &str, now: i64, fallback_sec
     responses(
         (status = 200, description = "Token exchange successful", body = ExchangeCodeResponse),
         (status = 400, description = "Invalid or expired exchange code", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "The exchange code was not issued to the browser or command-line client presenting it: its ak_sso_bind_* cookie is missing (#5486)", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn exchange_code(
@@ -1382,6 +1556,11 @@ pub async fn exchange_code(
     Json(req): Json<ExchangeCodeRequest>,
 ) -> Result<Response> {
     let client_is_https = request_scheme_is_https(&headers);
+    // #5486: only the browser the code was issued to may redeem it. Checked
+    // before the code is consumed, so another browser cannot burn it.
+    let binding =
+        sso_binding::require_exchange_binding(&headers, &state.config.jwt_secret, &req.code)
+            .inspect_err(|e| record_sso_auth_failure(e, AuthFailureReason::InvalidToken))?;
     let (access_token, refresh_token) = AuthConfigService::exchange_code(&state.db, &req.code)
         .await
         .inspect_err(|e| record_sso_auth_failure(e, AuthFailureReason::InvalidToken))?;
@@ -1428,6 +1607,12 @@ pub async fn exchange_code(
         expires_in,
         client_is_https,
     );
+    // The login is complete: drop its binding cookie.
+    sso_binding::clear_binding_cookie(
+        response.headers_mut(),
+        &binding,
+        binding_cookie_secure(client_is_https),
+    );
     Ok(response)
 }
 
@@ -1440,6 +1625,7 @@ pub async fn exchange_code(
         ldap_login,
         saml_login,
         saml_acs,
+        sso_complete,
         exchange_code,
     ),
     components(schemas(
@@ -1456,6 +1642,51 @@ pub struct SsoApiDoc;
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// How [`complete_federated_login`] hands the exchange code to the browser
+/// (#5486).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FederatedHandoff {
+    /// OIDC callback: a top-level GET from the IdP that carries the binding
+    /// cookie, already checked. The session cookies go on the redirect to
+    /// `/callback` (#1405).
+    Callback { client_is_https: bool },
+    /// SAML ACS: a cross-site POST that carries no `SameSite=Lax` cookie. No
+    /// session is set; a 303 sends the browser to the same-site
+    /// `/api/v1/auth/sso/complete`, which checks the binding first.
+    SamlComplete,
+    /// A login a command-line client started (`?client=cli`): the binding
+    /// cookie is in the client, so this browser gets no session, only a page
+    /// showing the exchange code to enter in the client, which redeems it
+    /// with its cookie.
+    Cli,
+}
+
+/// The page a command-line login (#5486) ends on in the browser: the exchange
+/// code to enter in the client. Plain text (nothing to inject into), never
+/// cached, and not leaked in a `Referer`.
+fn cli_code_page(exchange_code: &str) -> Response {
+    let body = format!(
+        "Sign-in complete. Return to the command line and enter this code:\n\n\
+         {exchange_code}\n\n\
+         It works only for the command-line session that started this sign-in, \
+         once, and expires in 60 seconds.\n"
+    );
+    (
+        axum::http::StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+            (axum::http::header::REFERRER_POLICY, "no-referrer"),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 /// Finish an OIDC callback or SAML ACS for a user the IdP authenticated.
 ///
 /// An account that enrolled TOTP in Artifact Keeper stops at the TOTP step
@@ -1467,7 +1698,9 @@ pub struct SsoApiDoc;
 /// redeem at `POST /api/v1/auth/totp/verify` (which writes the `LOGIN` audit
 /// row). Otherwise the login is audited and the browser is sent to the
 /// frontend `/callback` with a short-lived exchange code, never raw tokens in
-/// the URL.
+/// the URL. Every code is bound to `binding`, the browser that started the
+/// login (#5486), and a SAML ACS goes through `/complete` first (see
+/// [`FederatedHandoff`]).
 ///
 /// The session cookies are set on the redirect itself (closes #1405). Without
 /// this, the browser arrives at `/callback?code=...` with no auth cookie set.
@@ -1487,14 +1720,26 @@ async fn complete_federated_login(
     user: &crate::models::user::User,
     tokens: &crate::services::auth_service::TokenPair,
     provider: &str,
-    client_is_https: bool,
+    binding: &str,
+    handoff: FederatedHandoff,
 ) -> Result<Response> {
+    let secret = &state.config.jwt_secret;
     if auth_service.password_only_refusal(user).await?
         == Some(crate::services::auth_service::PasswordOnlyRefusal::SecondFactorRequired)
     {
         let totp_token = auth_service.generate_totp_pending_token(user)?;
-        let code = AuthConfigService::create_exchange_code(&state.db, &totp_token, "").await?;
-        return Ok(Redirect::temporary(&build_frontend_callback_url(&code)).into_response());
+        // Bound like any other code (#5486): only the starting browser can
+        // collect the TOTP challenge at `/exchange`.
+        let code = sso_binding::mint_exchange_code(secret, binding);
+        AuthConfigService::store_exchange_code(&state.db, &code, &totp_token, "").await?;
+        let url = build_frontend_callback_url(&code);
+        return Ok(match handoff {
+            FederatedHandoff::Callback { .. } => Redirect::temporary(&url).into_response(),
+            // 303: the browser re-requests with GET, never re-POSTing the
+            // assertion to the web UI.
+            FederatedHandoff::SamlComplete => Redirect::to(&url).into_response(),
+            FederatedHandoff::Cli => cli_code_page(&code),
+        });
     }
 
     audit_federated_login(
@@ -1506,19 +1751,27 @@ async fn complete_federated_login(
     )
     .await;
 
-    let exchange_code = AuthConfigService::create_exchange_code(
+    let exchange_code = sso_binding::mint_exchange_code(secret, binding);
+    AuthConfigService::store_exchange_code(
         &state.db,
+        &exchange_code,
         &tokens.access_token,
         &tokens.refresh_token,
     )
     .await?;
-    build_sso_callback_redirect(
-        &build_frontend_callback_url(&exchange_code),
-        &tokens.access_token,
-        &tokens.refresh_token,
-        tokens.expires_in,
-        client_is_https,
-    )
+    match handoff {
+        FederatedHandoff::Callback { client_is_https } => build_sso_callback_redirect(
+            &build_frontend_callback_url(&exchange_code),
+            &tokens.access_token,
+            &tokens.refresh_token,
+            tokens.expires_in,
+            client_is_https,
+        ),
+        FederatedHandoff::SamlComplete => {
+            Ok(Redirect::to(&build_sso_complete_url(&exchange_code)).into_response())
+        }
+        FederatedHandoff::Cli => Ok(cli_code_page(&exchange_code)),
+    }
 }
 
 /// Build the frontend callback URL for the SSO exchange code flow.
@@ -1528,6 +1781,14 @@ async fn complete_federated_login(
 /// and passed as a query parameter so the frontend can exchange it for tokens.
 pub(crate) fn build_frontend_callback_url(exchange_code: &str) -> String {
     format!("/callback?code={}", urlencoding::encode(exchange_code))
+}
+
+/// The same-site completion step a SAML ACS redirects to (#5486).
+pub(crate) fn build_sso_complete_url(exchange_code: &str) -> String {
+    format!(
+        "/api/v1/auth/sso/complete?code={}",
+        urlencoding::encode(exchange_code)
+    )
 }
 
 /// Build a 307 redirect to the frontend `/callback` page that also carries
@@ -4361,7 +4622,8 @@ mod tests {
     /// challenge and no cookies. An account without TOTP gets its session as
     /// before.
     mod federated_totp_5484 {
-        use super::super::{complete_federated_login, router};
+        use super::super::{complete_federated_login, router, FederatedHandoff};
+        use crate::api::handlers::sso_binding;
         use crate::api::handlers::test_db_helpers as tdh;
         use crate::services::auth_service::AuthService;
         use axum::http::{Request, StatusCode};
@@ -4400,13 +4662,28 @@ mod tests {
             let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
             let svc = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
 
+            // The browser that started the login (#5486).
+            let (cookie_name, binding) =
+                sso_binding::binding_cookie(&state.config.jwt_secret, "state-5484");
+            let cookie = format!("{cookie_name}={binding}");
+
             let mut results = Vec::new();
             for totp in [false, true] {
                 let user = seed(&pool, totp).await;
                 let tokens = svc.generate_tokens(&user).expect("tokens");
-                let resp = complete_federated_login(&state, &svc, &user, &tokens, "oidc", false)
-                    .await
-                    .expect("completion");
+                let resp = complete_federated_login(
+                    &state,
+                    &svc,
+                    &user,
+                    &tokens,
+                    "oidc",
+                    &binding,
+                    FederatedHandoff::Callback {
+                        client_is_https: false,
+                    },
+                )
+                .await
+                .expect("completion");
                 let status = resp.status();
                 let cookies = resp.headers().get_all("set-cookie").iter().count();
                 let location = resp.headers()["location"].to_str().unwrap().to_string();
@@ -4419,6 +4696,7 @@ mod tests {
                         .method("POST")
                         .uri("/exchange")
                         .header("content-type", "application/json")
+                        .header("cookie", &cookie)
                         .body(axum::body::Body::from(
                             serde_json::json!({ "code": code }).to_string(),
                         ))
@@ -4454,6 +4732,257 @@ mod tests {
                 .validate_totp_pending_token(body["totp_token"].as_str().expect("totp_token"))
                 .expect("pending token");
             assert_eq!(claims.sub, *user_id);
+        }
+
+        /// #5486: from the SAML ACS (a cross-site POST) neither outcome sets
+        /// a session. A TOTP account is sent (303) straight to `/callback`;
+        /// any other account to the same-site `/complete` step, which checks
+        /// the binding cookie. Both codes are bound to the starting browser.
+        #[tokio::test]
+        async fn complete_federated_login_from_the_saml_acs_sets_no_session_5486() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let dir = std::env::temp_dir().join(format!("fed-5486-{}", Uuid::new_v4()));
+            let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+            let svc = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+            let (cookie_name, binding) =
+                sso_binding::binding_cookie(&state.config.jwt_secret, "request-5486");
+            let cookie = format!("{cookie_name}={binding}");
+
+            for (totp, prefix) in [
+                (false, "/api/v1/auth/sso/complete?code="),
+                (true, "/callback?code="),
+            ] {
+                let user = seed(&pool, totp).await;
+                let tokens = svc.generate_tokens(&user).expect("tokens");
+                let resp = complete_federated_login(
+                    &state,
+                    &svc,
+                    &user,
+                    &tokens,
+                    "saml",
+                    &binding,
+                    FederatedHandoff::SamlComplete,
+                )
+                .await
+                .expect("completion");
+                let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                    .bind(user.id)
+                    .execute(&pool)
+                    .await;
+                assert_eq!(resp.status(), StatusCode::SEE_OTHER, "totp={totp}");
+                assert_eq!(resp.headers().get_all("set-cookie").iter().count(), 0);
+                let location = resp.headers()["location"].to_str().unwrap();
+                let code = urlencoding::decode(
+                    location
+                        .strip_prefix(prefix)
+                        .unwrap_or_else(|| panic!("totp={totp}: unexpected location {location}")),
+                )
+                .unwrap()
+                .into_owned();
+
+                let mut with_cookie = axum::http::HeaderMap::new();
+                with_cookie.insert("cookie", cookie.parse().unwrap());
+                assert!(sso_binding::require_exchange_binding(
+                    &with_cookie,
+                    &state.config.jwt_secret,
+                    &code
+                )
+                .is_ok());
+                assert!(sso_binding::require_exchange_binding(
+                    &axum::http::HeaderMap::new(),
+                    &state.config.jwt_secret,
+                    &code
+                )
+                .is_err());
+            }
+        }
+
+        /// #5486: a command-line login (`client=cli`) ends in the browser on a
+        /// plain-text page with the exchange code, sets no cookies there, and
+        /// the code is redeemable only with the client's binding cookie. Both
+        /// the TOTP and the non-TOTP outcome.
+        #[tokio::test]
+        #[allow(clippy::disallowed_methods)] // streaming-invariant: test exempt — buffering a small text body in a test assertion is not an artifact path (#1608)
+        async fn complete_federated_login_for_a_cli_login_only_shows_the_code_5486() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let dir = std::env::temp_dir().join(format!("fed-5486c-{}", Uuid::new_v4()));
+            let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+            let svc = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+            let cli_state = format!("{}abc", sso_binding::CLI_OIDC_STATE_PREFIX);
+            let (cookie_name, binding) =
+                sso_binding::binding_cookie(&state.config.jwt_secret, &cli_state);
+            let cookie = format!("{cookie_name}={binding}");
+
+            for totp in [false, true] {
+                let user = seed(&pool, totp).await;
+                let tokens = svc.generate_tokens(&user).expect("tokens");
+                let (status, body, headers) = {
+                    let resp = complete_federated_login(
+                        &state,
+                        &svc,
+                        &user,
+                        &tokens,
+                        "oidc",
+                        &binding,
+                        FederatedHandoff::Cli,
+                    )
+                    .await
+                    .expect("completion");
+                    let status = resp.status();
+                    let headers = resp.headers().clone();
+                    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                        .await
+                        .expect("body");
+                    (status, String::from_utf8(body.to_vec()).unwrap(), headers)
+                };
+                let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                    .bind(user.id)
+                    .execute(&pool)
+                    .await;
+                assert_eq!(status, StatusCode::OK, "totp={totp}");
+                assert_eq!(headers.get_all("set-cookie").iter().count(), 0);
+                assert!(headers.get("location").is_none());
+                assert!(headers["content-type"]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("text/plain"));
+                assert_eq!(headers["cache-control"], "no-store");
+                assert_eq!(headers["referrer-policy"], "no-referrer");
+                let code = body
+                    .split_whitespace()
+                    .find(|w| w.len() == 64 && w.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .unwrap_or_else(|| panic!("the page shows the code: {body}"))
+                    .to_string();
+
+                let mut with_cookie = axum::http::HeaderMap::new();
+                with_cookie.insert("cookie", cookie.parse().unwrap());
+                assert!(sso_binding::require_exchange_binding(
+                    &with_cookie,
+                    &state.config.jwt_secret,
+                    &code
+                )
+                .is_ok());
+                assert!(sso_binding::require_exchange_binding(
+                    &axum::http::HeaderMap::new(),
+                    &state.config.jwt_secret,
+                    &code
+                )
+                .is_err());
+            }
+        }
+
+        /// #5486: `GET /complete` (the SAML same-site step) sets the session
+        /// only in the browser holding the binding cookie, never consumes the
+        /// code, and never sets a TOTP-pending code as a session.
+        #[tokio::test]
+        async fn sso_complete_sets_the_session_only_in_the_starting_browser_5486() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let dir = std::env::temp_dir().join(format!("fed-5486s-{}", Uuid::new_v4()));
+            let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+            let secret = state.config.jwt_secret.clone();
+            let (cookie_name, binding) = sso_binding::binding_cookie(&secret, "_id-5486s");
+            let cookie = format!("{cookie_name}={binding}");
+            let (other_name, other) = sso_binding::binding_cookie(&secret, "_id-other");
+            let other = format!("{other_name}={other}");
+
+            let get = |uri: String, cookie: Option<String>| {
+                let app = router().with_state(state.clone());
+                async move {
+                    let mut req = Request::builder().method("GET").uri(uri);
+                    if let Some(c) = cookie {
+                        req = req.header("cookie", c);
+                    }
+                    tdh::send_with_headers(app, req.body(axum::body::Body::empty()).unwrap()).await
+                }
+            };
+
+            // A session code.
+            let code = sso_binding::mint_exchange_code(&secret, &binding);
+            crate::services::auth_config_service::AuthConfigService::store_exchange_code(
+                &pool,
+                &code,
+                "access-5486",
+                "refresh-5486",
+            )
+            .await
+            .expect("store code");
+            let uri = format!("/complete?code={code}");
+            for presented in [None, Some(other.clone())] {
+                let (status, _, headers) = get(uri.clone(), presented.clone()).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{presented:?}");
+                assert!(headers.get("set-cookie").is_none());
+            }
+            let (status, _, headers) = get(uri.clone(), Some(cookie.clone())).await;
+            assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+            assert_eq!(headers["location"], format!("/callback?code={code}"));
+            assert!(headers
+                .get_all("set-cookie")
+                .iter()
+                .any(|c| c.to_str().unwrap().starts_with("ak_access_token=")));
+            // Not consumed: the web UI still redeems it at `/exchange`.
+            let (status, _, _) = get(uri, Some(cookie.clone())).await;
+            assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+
+            // A TOTP-pending code (#5484): no session, just the hand-off.
+            let pending = sso_binding::mint_exchange_code(&secret, &binding);
+            crate::services::auth_config_service::AuthConfigService::store_exchange_code(
+                &pool,
+                &pending,
+                "pending-token-5486",
+                "",
+            )
+            .await
+            .expect("store pending code");
+            let (status, _, headers) =
+                get(format!("/complete?code={pending}"), Some(cookie.clone())).await;
+            assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+            assert_eq!(headers["location"], format!("/callback?code={pending}"));
+            assert!(headers.get("set-cookie").is_none());
+
+            // An unknown (but well-bound) code.
+            let unknown = sso_binding::mint_exchange_code(&secret, &binding);
+            let (status, _, _) = get(format!("/complete?code={unknown}"), Some(cookie)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+            for c in [&code, &pending] {
+                let _ = sqlx::query("DELETE FROM sso_exchange_codes WHERE code = $1")
+                    .bind(c)
+                    .execute(&pool)
+                    .await;
+            }
+        }
+
+        /// #5486: an unknown `client` on either login URL is refused before
+        /// anything is looked up or created.
+        #[tokio::test]
+        async fn login_refuses_an_unknown_client_5486() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let dir = std::env::temp_dir().join(format!("fed-5486q-{}", Uuid::new_v4()));
+            let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+            let id = Uuid::new_v4();
+            for uri in [
+                format!("/oidc/{id}/login?client=mobile"),
+                format!("/saml/{id}/login?client=mobile"),
+            ] {
+                let (status, _) = tdh::send(
+                    router().with_state(state.clone()),
+                    Request::builder()
+                        .method("GET")
+                        .uri(&uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            }
         }
     }
 
