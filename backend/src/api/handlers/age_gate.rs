@@ -241,6 +241,22 @@ pub struct ApproveReviewRequest {
     pub never_expires: bool,
 }
 
+/// A scan exception is bound to the digest of the bytes the gate refused, so
+/// a row filed before any refusal has nothing to bind and would serve nothing.
+/// Refused instead of approved in vain: it becomes grantable once the gate
+/// refuses a pull of it and records the digest
+fn require_scan_digest(gate: Option<&str>, basis_digest: Option<&str>) -> Result<()> {
+    if gate == Some(crate::services::age_gate_service::GATE_SCAN) && basis_digest.is_none() {
+        return Err(AppError::Conflict(
+            "No refused download of this package has been recorded yet, so there are no \
+             bytes to grant this scan exception for. It can be granted once the scan gate \
+             has refused a pull of it"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// A grant MUST carry a reason.
 ///
 /// Releasing a package a gate refused is the one action here that widens what
@@ -625,6 +641,7 @@ async fn apply_review_decision(
     let (review, mut details) = match decision {
         ReviewDecision::Approve => {
             require_not_own_request(current.requested_by, auth.user_id, age)?;
+            require_scan_digest(current.gate.as_deref(), current.basis_digest.as_deref())?;
             let reason = if age {
                 reason
             } else {
@@ -935,6 +952,7 @@ pub async fn get_exception(
         (status = 200, body = AgeGateReviewResponse),
         (status = 400, description = "A scan or curation grant without a reason, or an invalid expiry"),
         (status = 403, description = "No security_review capability, a narrowed token, or the caller requested this exception"),
+        (status = 409, description = "A scan exception with no refused download recorded yet, so no digest to bind"),
     )
 )]
 pub async fn approve_exception(
@@ -2504,8 +2522,8 @@ mod tests {
         let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
         let scan_id: Uuid = sqlx::query_scalar(
             "INSERT INTO age_gate_reviews \
-             (gate, repository_id, package_name, package_version, status) \
-             VALUES ('scan', $1, 'left-pad', '1.0.0', 'pending') RETURNING id",
+             (gate, repository_id, package_name, package_version, status, basis_digest) \
+             VALUES ('scan', $1, 'left-pad', '1.0.0', 'pending', 'sha256:aaa') RETURNING id",
         )
         .bind(repo_id)
         .fetch_one(&pool)
@@ -2656,6 +2674,56 @@ mod tests {
         tdh::cleanup(&pool, repo_id, user_id).await;
         tdh::cleanup_user(&pool, user_id).await;
         tdh::cleanup_user(&pool, other_id).await;
+    }
+
+    /// A scan request filed before any refusal has no digest to bind, so it
+    /// cannot be granted until the gate records one
+    #[tokio::test]
+    async fn a_scan_request_without_a_digest_cannot_be_granted_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO age_gate_reviews \
+             (gate, repository_id, package_name, package_version, status, justification) \
+             VALUES ('scan', $1, 'left-pad', '1.0.0', 'pending', 'needed') RETURNING id",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed scan request");
+        let state = gated_state(pool.clone(), &dir);
+        let caller = AuthExtension {
+            user_id,
+            username,
+            ..auth(true)
+        };
+        let app = || tdh::router_with_auth_ext(exceptions_router(), state.clone(), caller.clone());
+        let approve = || {
+            tdh::post(
+                format!("/reviews/{id}/approve"),
+                "application/json",
+                bytes::Bytes::from_static(br#"{"reason":"decided in a test"}"#),
+            )
+        };
+
+        let (status, _) = tdh::send(app(), approve()).await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(review_status(&pool, id).await, "pending");
+
+        sqlx::query("UPDATE age_gate_reviews SET basis_digest = 'sha256:aaa' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("a refusal recorded the digest");
+        let (status, _) = tdh::send(app(), approve()).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(review_status(&pool, id).await, "approved");
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        tdh::cleanup_user(&pool, user_id).await;
     }
 
     /// A token restricted to repository A is refused on repository B even
