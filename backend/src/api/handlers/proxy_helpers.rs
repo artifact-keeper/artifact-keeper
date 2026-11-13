@@ -29332,7 +29332,7 @@ mod tests {
     }
 
     /// A curation block is auto-filed on the exception queue, and an approved,
-    /// unexpired exception releases it (migration 375).
+    /// unexpired exception releases it (migration 381).
     #[tokio::test]
     async fn test_curation_block_files_and_honours_an_exception() {
         use crate::services::age_gate_service::GATE_CURATION;
