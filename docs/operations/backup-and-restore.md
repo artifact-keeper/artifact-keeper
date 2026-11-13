@@ -132,6 +132,51 @@ restore if the target's `admin` is not meant to hold them. Archived users
 that do not exist on the target are restored with their archived ids and
 password hashes.
 
+## A restore that stops partway
+
+A restore reads the archive twice. The first pass checks the payload checksum
+and writes nothing. The second writes every artifact and blob object to its
+repository's storage, and only then are the database tables restored
+(#5857). If the second pass stops, because the archive changed after it was
+verified or the store became unreachable, the restore fails before a single
+row is written. The error says how many objects were already written: no row
+refers to them yet, and re-running the restore from an intact archive is
+safe, because it writes every object again and then restores the tables.
+
+## Clean up multipart uploads in the backup bucket
+
+On S3, a backup uploads its archive as a multipart upload. When the backup
+fails, it aborts that upload, but an abort cannot reach a store that is down,
+so an outage during a backup can leave an incomplete upload in the bucket.
+Incomplete uploads are invisible to listings but are billed as storage until
+they are aborted. Add an `AbortIncompleteMultipartUpload` lifecycle rule to
+the bucket that holds the archives (`BACKUP_S3_BUCKET`, or `S3_BUCKET` when
+backups share it) so the store removes them on its own:
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "abort-incomplete-backup-uploads",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "" },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 2 }
+    }
+  ]
+}
+```
+
+```sh
+aws s3api put-bucket-lifecycle-configuration --bucket <backup-bucket> \
+  --lifecycle-configuration file://lifecycle.json
+```
+
+Pick a number of days longer than your longest backup. With
+`BACKUP_S3_PREFIX` set, use it as the rule's `Prefix`. Check that your
+S3-compatible store supports the rule; MinIO instead removes stale incomplete
+uploads on its own (its `api` setting `stale_uploads_expiry`, 24 hours by
+default).
+
 ## Docker/OCI repositories
 
 A full backup carries each in-scope image: its manifest rows and bytes, its

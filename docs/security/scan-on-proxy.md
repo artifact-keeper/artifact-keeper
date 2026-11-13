@@ -66,7 +66,8 @@ For each proxied package file of an enforced format:
    verdict blocks at once and a reusable `clean` verdict serves at once, both
    without scanning again.
 4. Otherwise the bytes are scanned, inline or in the background depending on
-   the action, and the verdict is stored.
+   the action, and the verdict is stored. With the durable scan queue on, a
+   worker scans them: see [The durable scan queue](#the-durable-scan-queue).
 5. The download is recorded and the bytes are served with an `X-AK-Scan`
    header, or the pull is refused.
 
@@ -468,6 +469,71 @@ routes, or lower `AK_PROXY_SCAN_QUEUE_WAIT_SECS` so that the wait plus the 30-se
 budget fits inside it. A lower wait refuses more of a first install on a small host;
 see [the OCI timeouts page](../operations/oci-reverse-proxy-timeouts.md) for how to
 set the timeout on each proxy.
+
+## The durable scan queue
+
+The in-flight table above belongs to one backend process: a restart loses what
+it holds, a retry on another replica scans again, and the CVE engine runs on the
+pods that serve requests. `SCAN_QUEUE_ENABLED=true` (default `false`) moves
+proxy file scans and `POST /api/v1/security/scan` to a `scan_queue` table in
+Postgres instead. A worker claims a job, scans it and records the verdict, and a
+job outlives the pod that queued it. Left off, nothing on this page changes.
+
+A job carries a reference to the proxy-cached object (repository, cache path,
+digest, and the identity the request asserted), never the bytes, so a backlog
+costs rows rather than memory.
+
+- **`fail_open` and `record_only`** serve at once with `X-AK-Scan: pending` and
+  queue the scan. The fresh fill is written to the proxy cache before the gate,
+  so the worker can read it back.
+- **`fail_closed`**, for bytes already in the proxy cache whose verdict is
+  missing, expired or graded by an older scanner, queues the scan at a higher
+  priority and waits for its verdict as long as it would wait on the in-flight
+  table: `AK_PROXY_SCAN_QUEUE_WAIT_SECS` plus the 30-second budget, and never
+  past three quarters of `GLOBAL_REQUEST_TIMEOUT_SECS`. The wait holds a task,
+  not a scan permit. Past it the pull is `423`, and the job goes on for the
+  retry. It only takes a verdict recorded after the one the gate refused, for
+  this request's coordinate, with the freshness rule applied again.
+- A `fail_closed` fresh fill is not in the proxy cache until the gate serves
+  it, so it goes through the in-flight table as above, as does a pull whose
+  cached object is missing or holds other bytes.
+- OCI image scans, rescans that must catalog a component, OS packages (whose
+  release context a job does not carry) and a Remote's own stored rows are not
+  queued either: none is one cached object a job can reference with everything
+  the scan needs.
+- Nor is an empty body (the proxy cache never stores one) or one over the scan
+  cap (a worker refuses it unread). Both take the in-flight table, as with the
+  queue off
+- A job is tried three times with backoff. A worker that dies mid-scan loses its
+  claim when the lease lapses, and the attempt counts. A completed job is
+  deleted, since the verdict row is the record. A job that failed for good is
+  kept for seven days so its error can be read.
+
+`GET /api/v1/admin/security/scan-queue` (admin only, and refused to a
+repository-scoped token, since it lists every repository's jobs) lists the outstanding jobs
+and the depth per kind and state. Hosted scans share the queue at the lowest
+priority, so a rescan of a whole repository cannot starve a waiting pull.
+
+**Running the worker separately.** With the queue on, `SCAN_WORKER_ENABLED`
+(default `true`) has each instance drain it. In a multi-replica deployment set
+it `false` on the API pods and run the same image with it on as a scan worker.
+The worker has to read what an API pod wrote: object storage, or a filesystem
+volume both can mount. `SCAN_WORKER_CONCURRENCY` sets how many jobs one worker
+runs at once and defaults to `MAX_CONCURRENT_SCAN_EXTRACTIONS`. Each job takes
+an extraction permit, so raise the two together.
+
+The worker publishes `ak_scan_queue_depth`,
+`ak_scan_queue_oldest_pending_seconds`, `ak_scan_queue_wait_seconds`,
+`ak_scan_queue_consumers`, `ak_scan_worker_slots_in_flight`,
+`ak_scan_worker_slots_capacity`, `ak_scan_jobs_total` and
+`ak_scan_job_duration_seconds`. Depth with no consumers means nothing drains the
+queue, depth with the slots at capacity means add workers. Every worker reads
+the same table, so take `max()` of the depth, oldest-pending and consumers
+gauges across pods, never `sum()`. The slots are per pod and do add up, and the
+wait and duration histograms export buckets, so `histogram_quantile()` works
+across workers. The in-flight
+table's `ak_proxy_scan_queue_refused_total` and `ak_proxy_scan_abandoned_total`
+still count the pulls that take that path.
 
 ## Verdicts and freshness
 
