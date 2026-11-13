@@ -112,7 +112,7 @@ pub struct UpdateServiceAccountRequest {
 
 /// Unknown fields are refused (400) rather than dropped (#4226): a misspelled
 /// `repo_selector` used to mint an unrestricted token.
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateTokenRequest {
     pub name: String,
@@ -127,6 +127,28 @@ pub struct CreateTokenRequest {
     /// automatically.
     #[schema(value_type = Option<Object>)]
     pub repo_selector: Option<serde_json::Value>,
+    /// Use this value instead of generating one, so the secret can be kept and
+    /// rotated in an external store. Same shape as a generated token (8 hex
+    /// digits, `_`, 32 hex digits), the first 8 must not match a live token
+    /// (409). Stored hashed.
+    #[schema(write_only)]
+    pub token: Option<String>,
+}
+
+/// Hand-written so a caller-supplied `token` never reaches a log line through
+/// `{:?}` (#5864).
+impl std::fmt::Debug for CreateTokenRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateTokenRequest")
+            .field("name", &self.name)
+            .field("scopes", &self.scopes)
+            .field("expires_in_days", &self.expires_in_days)
+            .field("description", &self.description)
+            .field("repository_ids", &self.repository_ids)
+            .field("repo_selector", &self.repo_selector)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -640,6 +662,7 @@ pub async fn list_tokens(
         (status = 400, description = "Unknown field, or a repo_selector / repository_ids that does not restrict"),
         (status = 403, description = "Not admin, or a repository restriction the presenting credential may not delegate"),
         (status = 404, description = "Service account not found"),
+        (status = 409, description = "Supplied token shares its 8-character prefix with a live token"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -684,7 +707,13 @@ pub async fn create_token(
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let minted = auth_service
-        .generate_api_token_with_policy(id, &payload.name, payload.scopes, payload.expires_in_days)
+        .generate_api_token_with_value(
+            id,
+            &payload.name,
+            payload.scopes,
+            payload.expires_in_days,
+            payload.token,
+        )
         .await?;
     let token_id = minted.id;
 
@@ -973,6 +1002,23 @@ pub struct ServiceAccountsApiDoc;
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    /// A caller-supplied secret must not reach a log line through `{:?}`.
+    #[test]
+    fn create_token_request_debug_redacts_a_supplied_token() {
+        let secret = "0123abcd_0123456789abcdef0123456789abcdef";
+        let req: CreateTokenRequest = serde_json::from_value(serde_json::json!({
+            "name": "vault",
+            "scopes": ["read:artifacts"],
+            "token": secret,
+        }))
+        .expect("parse");
+        let shown = format!("{req:?}");
+        assert!(!shown.contains(secret), "{shown}");
+        assert!(!shown.contains("0123456789abcdef"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+        assert!(shown.contains("vault"), "{shown}");
+    }
 
     #[tokio::test]
     async fn scope_analysis_and_token_rows_flag_invalid_or_deleted_restrictions() {
@@ -2593,6 +2639,84 @@ mod audit_db_tests {
 
         let _ = sqlx::query("DELETE FROM api_tokens WHERE id = ANY($1)")
             .bind([old_token_id, replacement_token_id])
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = ANY($1)")
+            .bind([sa.id, admin_id])
+            .execute(&pool)
+            .await;
+    }
+
+    /// A supplied value authenticates, cannot be held by two live tokens, and
+    /// still authenticates when re-minted after the first token is revoked
+    /// (Terraform replacing the token with the value kept in Vault).
+    #[tokio::test]
+    async fn service_account_token_with_supplied_value_survives_reissue() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let mut auth = tdh::make_auth(admin_id, &admin_name);
+        auth.is_admin = true;
+        let sa = ServiceAccountService::new(pool.clone())
+            .create(&format!("supplied-{}", Uuid::new_v4()), None)
+            .await
+            .expect("create service account");
+
+        let value = format!(
+            "{}_{}",
+            &Uuid::new_v4().simple().to_string()[..8],
+            Uuid::new_v4().simple()
+        );
+        let mint = |state: SharedState| {
+            let body = json!({ "name": "vault", "scopes": ["read:artifacts"], "token": value })
+                .to_string();
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{}/tokens", sa.id))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            tdh::send(build_app(state, auth.clone()), req)
+        };
+
+        let (status, body) = mint(state.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["token"], value.as_str());
+        let first_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+        let (status, _) = mint(state.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a live token holds the prefix"
+        );
+
+        let auth_service = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+        let validated = auth_service.validate_api_token(&value).await.unwrap();
+        assert_eq!(validated.user.id, sa.id);
+
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/{}/tokens/{first_id}", sa.id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = tdh::send(build_app(state.clone(), auth.clone()), req).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, body) = mint(state.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let second_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+        // Same AuthService, so the cached (now revoked) entry is exercised too.
+        let validated = auth_service.validate_api_token(&value).await;
+        assert!(validated.is_ok(), "re-minted value refused: {validated:?}");
+
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE id = ANY($1)")
+            .bind([first_id, second_id])
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE id = ANY($1)")

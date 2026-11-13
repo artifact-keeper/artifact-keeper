@@ -243,6 +243,13 @@ async fn index_cksum_at(
     name_lower: &str,
     version: &str,
 ) -> Option<String> {
+    // a published cksum never changes, so a stale cached index can only miss, never mislead
+    let cache_key = format!("{repo_key}:{name_lower}");
+    if let Some(cached) = index_cache_get(&state.index_cache, &cache_key).await {
+        if let Some(cksum) = cksum_for_version(&cached, version) {
+            return Some(cksum);
+        }
+    }
     let proxy = state.proxy_service.as_ref()?;
     let index_path = cargo_sparse_index_path_upstream(name_lower);
     let (content, _content_type) = proxy_helpers::proxy_fetch_capped(
@@ -641,7 +648,7 @@ async fn cargo_age_gate_params(
     state: &SharedState,
     repo: &RepoInfo,
 ) -> Result<Option<crate::services::age_gate_service::AgeGateRepoParams>, Response> {
-    use crate::services::age_gate_service::{resolve_repo_params, AgeGateService};
+    use crate::services::age_gate_service::resolve_repo_params;
 
     if repo.repo_type != "remote" {
         return Ok(None);
@@ -649,6 +656,16 @@ async fn cargo_age_gate_params(
     let params = resolve_repo_params(&state.db, repo.id)
         .await
         .map_err(|e| e.into_response())?;
+    enforceable_age_gate(params)
+}
+
+/// `None` when the gate is off, an error when it is on but cannot be enforced.
+#[allow(clippy::result_large_err)]
+fn enforceable_age_gate(
+    params: crate::services::age_gate_service::AgeGateRepoParams,
+) -> Result<Option<crate::services::age_gate_service::AgeGateRepoParams>, Response> {
+    use crate::services::age_gate_service::AgeGateService;
+
     if !AgeGateService::gating_requested(&params) {
         return Ok(None);
     }
@@ -2008,18 +2025,16 @@ async fn download(
     )?;
 
     // Curation enforcement (#2930): block a curated crate before it is resolved
-    // locally or proxied from upstream. The cargo handler's private `RepoInfo`
-    // does not carry the curation columns, so use the by-id lookup variant
-    // (no-op / no query for hosted repos and when curation is off).
-    proxy_helpers::enforce_curation_lookup(
-        &state.db,
-        repo.id,
-        &repo_key,
-        &repo.repo_type,
-        &name_lower,
-        Some(&version),
-    )
-    .await?;
+    // locally or proxied from upstream. One `repositories` read carries both the
+    // curation and the age-gate columns; hosted repos need neither.
+    let full = if matches!(repo.repo_type.as_str(), "remote" | "virtual") {
+        Some(proxy_helpers::resolve_repo_by_key(&state.db, &repo_key, &["cargo"], "a Cargo").await?)
+    } else {
+        None
+    };
+    if let Some(full) = &full {
+        proxy_helpers::enforce_curation(&state.db, full, &name_lower, Some(&version)).await?;
+    }
 
     // Age gate (#3480). This runs BEFORE the `artifacts` lookup, the proxy
     // cache, and any upstream stream: a Remote Cargo repository's `artifacts`
@@ -2028,7 +2043,13 @@ async fn download(
     // servable from a warm row either. `Some(cksum)` also carries the
     // verification digest the gated lookup already proved from the upstream
     // index, so an allowed serve does not fetch it twice.
-    let gated_cksum = match cargo_age_gate_params(&state, &repo).await? {
+    let age_gate = match &full {
+        Some(full) if full.repo_type == "remote" => {
+            enforceable_age_gate(proxy_helpers::age_gate_params(full))?
+        }
+        _ => None,
+    };
+    let gated_cksum = match age_gate {
         Some(params) => Some(
             enforce_cargo_download_age_gate(
                 &state,
@@ -3680,6 +3701,83 @@ fn cargo_sparse_index_path_upstream(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The body of the crate `download` handler, for the structural pin below.
+    fn download_handler_body() -> &'static str {
+        let src = include_str!("cargo.rs");
+        let marker = "GET /cargo/{repo_key}/api/v1/crates/{name}/{version}/download";
+        let at = src
+            .find(marker)
+            .expect("the download route banner must exist");
+        let start = src[at..]
+            .find("async fn download(")
+            .expect("download must exist")
+            + at;
+        let end = src[start + 1..]
+            .find("\nasync fn ")
+            .map(|p| start + 1 + p)
+            .unwrap_or(src.len());
+        &src[start..end]
+    }
+
+    /// A crate download must read the `repositories` row ONCE.
+    ///
+    /// Curation and the age gate are both decided from columns on that row,
+    /// and each used to look it up for itself: `enforce_curation_lookup` by id
+    /// and `cargo_age_gate_params` through `resolve_repo_params`. That is two
+    /// round trips per download on a remote repository, for one row neither
+    /// consumer mutates. One read now carries both, and a hosted repository
+    /// pays neither because it needs neither.
+    #[test]
+    fn the_crate_download_reads_the_repository_row_once() {
+        let body = download_handler_body();
+        assert_eq!(
+            body.matches("resolve_repo_by_key(").count(),
+            1,
+            "the download path must resolve the repository row exactly once"
+        );
+        assert!(
+            !body.contains("enforce_curation_lookup("),
+            "curation must read the columns off the row already in hand"
+        );
+        assert!(
+            !body.contains("cargo_age_gate_params("),
+            "the age gate must read the columns off the row already in hand"
+        );
+        assert!(
+            body.contains("\"remote\" | \"virtual\""),
+            "a hosted repository needs neither gate and must not pay the read"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_cksum_reads_the_cached_index_first() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+            .expect("lazy pool");
+        let dir = std::env::temp_dir().join(format!("cksum-cache-{}", uuid::Uuid::new_v4()));
+        let state = crate::api::handlers::test_db_helpers::build_state(pool, dir.to_str().unwrap());
+        let sha = "a".repeat(64);
+        index_cache_set(
+            &state.index_cache,
+            "crates:serde".to_string(),
+            Bytes::from(format!("{{\"vers\":\"1.0.0\",\"cksum\":\"{sha}\"}}\n")),
+        )
+        .await;
+        // the upstream is unreachable, so only the cache can answer
+        let at = |v: &'static str| {
+            index_cksum_at(
+                &state,
+                uuid::Uuid::nil(),
+                "crates",
+                "http://127.0.0.1:1",
+                "serde",
+                v,
+            )
+        };
+        assert_eq!(at("1.0.0").await, Some(sha));
+        assert_eq!(at("2.0.0").await, None);
+    }
 
     // -----------------------------------------------------------------------
     // Test helpers
@@ -7151,11 +7249,7 @@ mod catalog_registration_tests {
         fx.teardown().await;
 
         let body = String::from_utf8_lossy(&body);
-        assert_eq!(
-            status,
-            axum::http::StatusCode::INSUFFICIENT_STORAGE,
-            "{body}"
-        );
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
         assert!(body.contains("Repository storage quota exceeded"), "{body}");
         assert_eq!(rows, 0, "a refused publish must leave no artifact row");
     }

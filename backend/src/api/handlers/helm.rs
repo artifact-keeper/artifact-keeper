@@ -2628,7 +2628,7 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         let (status, body) = upload_parts(&f, parts).await;
         assert_eq!(
             status,
-            StatusCode::INSUFFICIENT_STORAGE,
+            StatusCode::FORBIDDEN,
             "{}",
             String::from_utf8_lossy(&body)
         );

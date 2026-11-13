@@ -1523,6 +1523,39 @@ async fn list_scan_configs(
 // Scan operations
 // ---------------------------------------------------------------------------
 
+/// Queue a hosted scan whose placeholders are committed, so the work survives
+/// this pod. The response message says when a running job already owns the
+/// artifact: its worker took its own placeholders at claim time, and the ones
+/// just allocated stay for the stuck-scan janitor.
+async fn enqueue_hosted_scan(
+    state: &SharedState,
+    artifact_id: Uuid,
+    prepared_map: &std::collections::HashMap<String, Uuid>,
+    bypass_dedup: bool,
+) -> Result<String> {
+    let prepared = serde_json::to_value(prepared_map)
+        .map_err(|e| AppError::Internal(format!("could not encode the prepared scan map: {e}")))?;
+    let owns_the_job = crate::services::scan_queue::ScanQueue::new(state.db.clone())
+        .enqueue_hosted_artifact(
+            artifact_id,
+            &prepared,
+            bypass_dedup,
+            crate::services::scan_queue::PRIORITY_HOSTED,
+        )
+        .await?;
+    if owns_the_job {
+        return Ok(crate::services::scanner_service::build_artifact_scan_message(artifact_id));
+    }
+    tracing::warn!(
+        artifact_id = %artifact_id,
+        "a scan of this artifact is already running; the placeholders just \
+         allocated for this request will not be finalized by it"
+    );
+    Ok(format!(
+        "A scan of artifact {artifact_id} is already running; this request did not start a new one"
+    ))
+}
+
 #[utoipa::path(
     post,
     path = "/scan",
@@ -1613,6 +1646,15 @@ async fn trigger_scan(
         let scan_result_ids = crate::services::scanner_service::extract_scan_result_ids(&prepared);
         let prepared_map = crate::services::scanner_service::prepared_pairs_to_map(prepared);
 
+        if state.config.scan_queue_enabled {
+            let message =
+                enqueue_hosted_scan(&state, artifact_id, &prepared_map, bypass_dedup).await?;
+            return Ok(Json(TriggerScanResponse {
+                message,
+                artifacts_queued: 1,
+                scan_result_ids,
+            }));
+        }
         let scanner_for_spawn = scanner.clone();
         tokio::spawn(async move {
             if let Err(e) = scanner_for_spawn
@@ -5556,6 +5598,26 @@ mod tests {
         action: crate::services::proxy_scan_service::ProxyScanAction,
         identity: crate::api::handlers::proxy_helpers::ProxyScanIdentity,
     ) -> String {
+        gate_cached_pull_3396(
+            state, fx, filename, None, version, digest, content, action, identity,
+        )
+        .await
+    }
+
+    /// [`gate_pull_3396`] for bytes proxy-cached at `cache_path`, which the
+    /// durable scan queue can read back.
+    #[allow(clippy::too_many_arguments)]
+    async fn gate_cached_pull_3396(
+        state: &SharedState,
+        fx: &ProxyScanFixture,
+        filename: &str,
+        cache_path: Option<&str>,
+        version: Option<&str>,
+        digest: &str,
+        content: &bytes::Bytes,
+        action: crate::services::proxy_scan_service::ProxyScanAction,
+        identity: crate::api::handlers::proxy_helpers::ProxyScanIdentity,
+    ) -> String {
         use crate::api::handlers::proxy_helpers::{
             gate_proxy_scan_serve, proxy_synthetic_artifact, ProxyScanMode, ProxyScanServeOutcome,
         };
@@ -5572,6 +5634,7 @@ mod tests {
             fx.repo_id,
             filename,
             digest,
+            cache_path,
             synthetic,
             content,
             action,
@@ -7083,6 +7146,17 @@ mod tests {
     /// reusing the stored verdict without scanning.
     #[tokio::test]
     async fn not_applicable_pull_does_not_reuse_a_no_pin_clean_that_graded_nothing_3396() {
+        no_pin_clean_that_graded_nothing_is_rescanned_3396(false).await;
+    }
+
+    /// The same through the durable scan queue: the fail_closed pull parks on
+    /// the job a worker drains, and takes the verdict it records.
+    #[tokio::test]
+    async fn not_applicable_pull_does_not_reuse_a_no_pin_clean_that_graded_nothing_3396_queued() {
+        no_pin_clean_that_graded_nothing_is_rescanned_3396(true).await;
+    }
+
+    async fn no_pin_clean_that_graded_nothing_is_rescanned_3396(queued: bool) {
         use crate::api::handlers::test_db_helpers as tdh;
         use std::sync::atomic::Ordering;
 
@@ -7112,11 +7186,18 @@ mod tests {
             let (scanner, scans) = vulnerable_counting_scanner_3396();
             let state =
                 scanner_state_with(&fx, vec![scanner], &path, content.clone(), |_| {}).await;
+            let (state, worker) = if queued {
+                let (state, worker) = tdh::with_scan_worker(state);
+                (state, Some(worker))
+            } else {
+                (state, None)
+            };
             let pull = |action| {
-                gate_pull_3396(
+                gate_cached_pull_3396(
                     &state,
                     &fx,
                     "blob.bin",
+                    Some(path.as_str()),
                     None,
                     &digest,
                     &content,
@@ -7128,6 +7209,7 @@ mod tests {
             let scans_after_open = scans.load(Ordering::SeqCst);
             let closed =
                 pull(crate::services::proxy_scan_service::ProxyScanAction::FailClosed).await;
+            drop(worker);
             outcomes.push((
                 cataloged,
                 open,
@@ -8573,6 +8655,7 @@ mod tests {
             repo_id,
             "p-1.tgz",
             digest,
+            None,
             synthetic,
             &bytes,
             action,
