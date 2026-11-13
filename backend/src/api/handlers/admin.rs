@@ -1807,6 +1807,15 @@ pub struct SystemStats {
     /// the bytes here therefore do NOT compose the same way — only the count
     /// is disjoint.
     pub proxy_storage_bytes: i64,
+    /// The instance storage quota against `total_storage_bytes`
+    /// (`STORAGE_QUOTA_BYTES`; `enabled: false` when unset).
+    pub storage_quota: crate::services::quota::StorageQuotaStatus,
+    /// This month's download transfer against `TRANSFER_QUOTA_BYTES`.
+    pub transfer_quota: crate::services::quota::TransferQuotaStatus,
+    /// `MAX_UPLOAD_SIZE` in bytes (`0` = no limit).
+    pub max_upload_bytes: u64,
+    /// `QUOTA_HELP_URL`, when configured.
+    pub quota_help_url: Option<String>,
 }
 
 /// Get system statistics
@@ -1833,7 +1842,14 @@ pub async fn get_system_stats(
         .acquire()
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-    collect_system_stats(&mut conn).await.map(Json)
+    let mut stats = collect_system_stats(&mut conn).await?;
+    drop(conn);
+    let quotas = crate::services::quota::QuotaOverview::collect(&state).await?;
+    stats.storage_quota = quotas.storage_quota;
+    stats.transfer_quota = quotas.transfer_quota;
+    stats.max_upload_bytes = quotas.max_upload_bytes;
+    stats.quota_help_url = quotas.quota_help_url;
+    Ok(Json(stats))
 }
 
 /// The queries behind [`get_system_stats`], run over one connection.
@@ -1930,6 +1946,11 @@ async fn collect_system_stats(conn: &mut sqlx::PgConnection) -> Result<SystemSta
         pending_sync_tasks: pending_sync_count,
         proxy_artifact_count: proxy_count,
         proxy_storage_bytes: storage_totals.proxy,
+        // Filled in by `get_system_stats`, which holds the configuration.
+        storage_quota: crate::services::quota::StorageQuotaStatus::unset(storage_totals.total),
+        transfer_quota: crate::services::quota::TransferQuotaStatus::unset(),
+        max_upload_bytes: 0,
+        quota_help_url: None,
     })
 }
 
@@ -4189,8 +4210,19 @@ mod tests {
             pending_sync_tasks: 0,
             proxy_artifact_count: 12,
             proxy_storage_bytes: 2_000_000,
+            storage_quota: crate::services::quota::StorageQuotaStatus::unset(1_000_000_000),
+            transfer_quota: crate::services::quota::TransferQuotaStatus::unset(),
+            max_upload_bytes: 1024,
+            quota_help_url: None,
         };
         let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["storage_quota"]["enabled"], false);
+        assert_eq!(json["storage_quota"]["state"], "ok");
+        assert_eq!(json["storage_quota"]["used_bytes"], 1_000_000_000i64);
+        assert!(json["storage_quota"]["quota_bytes"].is_null());
+        assert_eq!(json["transfer_quota"]["state"], "ok");
+        assert_eq!(json["max_upload_bytes"], 1024);
+        assert!(json["quota_help_url"].is_null());
         assert_eq!(json["total_repositories"], 10);
         assert_eq!(json["total_artifacts"], 500);
         assert_eq!(json["total_storage_bytes"], 1_000_000_000i64);

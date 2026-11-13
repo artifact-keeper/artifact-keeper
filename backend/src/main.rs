@@ -1237,6 +1237,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         runtime_shutdown_token.clone(),
     );
 
+    // Instance quotas: add this replica's download transfer count to the
+    // shared monthly counter, and keep the quota gauges current.
+    let _transfer_quota_flusher = state.transfer_meter.spawn_flusher();
+    if state.config.quotas.storage_quota_bytes > 0 || state.config.quotas.transfer_quota_bytes > 0 {
+        tracing::info!(
+            storage_quota_bytes = state.config.quotas.storage_quota_bytes,
+            transfer_quota_bytes = state.config.quotas.transfer_quota_bytes,
+            transfer_grace_percent = state.config.quotas.transfer_grace_percent,
+            "instance quotas enabled"
+        );
+    }
+
     // #4311: resume repository delete jobs that are pending or whose replica
     // died mid-delete (their claim lapsed).
     artifact_keeper_backend::api::handlers::repositories::spawn_repository_delete_resumer(
@@ -1286,6 +1298,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         state.event_bus.clone(),
         advisory_client.clone(),
         state.proxy_service.clone(),
+    );
+
+    // Drains the durable scan queue (migration 362) when SCAN_QUEUE_ENABLED and
+    // SCAN_WORKER_ENABLED are both on, before the listeners bind
+    artifact_keeper_backend::services::scan_worker::spawn_scan_worker(
+        state.clone(),
+        runtime_shutdown_token.clone(),
     );
 
     // Keep a handle for the gRPC server before the sync worker consumes db_pool

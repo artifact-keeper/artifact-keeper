@@ -806,7 +806,7 @@ pub(crate) fn extract_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&
 /// cookie `Secure` (which the browser then won't resend over that HTTP
 /// connection) — self-defeating, not a privilege escalation. Operators
 /// terminating TLS at a proxy MUST have the proxy overwrite `X-Forwarded-Proto`.
-fn secure_flag(client_is_https: bool) -> &'static str {
+pub(crate) fn secure_flag(client_is_https: bool) -> &'static str {
     let is_development = std::env::var("ENVIRONMENT").unwrap_or_default() == "development";
     let enforce_https = matches!(
         std::env::var("AK_ENFORCE_HTTPS")
