@@ -2288,10 +2288,27 @@ pub async fn audit_count(pool: &PgPool, resource_id: Uuid, action: &str) -> i64 
     .expect("audit_log count query")
 }
 
-/// Poll [`audit_count`] until it reaches `expected` (or a bounded 10s budget is
-/// exhausted), returning the last observed value. The budget is generous
-/// because a loaded CI runner can take well over a second to drain several
-/// spawned writes (#5882); a passing test returns as soon as they land.
+/// Run `probe` every 20 ms until `done` accepts its result or a 10s budget is
+/// exhausted, returning the last result. The budget is generous because a
+/// loaded CI runner can take well over a second to drain several spawned
+/// writes (#5882, #5922); a passing test returns as soon as they land.
+async fn poll_until<T, F, Fut>(mut probe: F, done: impl Fn(&T) -> bool) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let last = probe().await;
+        if done(&last) || tokio::time::Instant::now() >= deadline {
+            return last;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Poll [`audit_count`] until it reaches `expected` (or the [`poll_until`]
+/// budget is exhausted), returning the last observed value.
 ///
 /// Since #2522 the fire-and-forget audit emitters (`audit_fire_and_forget`)
 /// SPAWN their INSERT instead of awaiting it, so a test that acts and then reads
@@ -2305,14 +2322,11 @@ pub async fn audit_count_eventually(
     action: &str,
     expected: i64,
 ) -> i64 {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let last = audit_count(pool, resource_id, action).await;
-        if last >= expected || tokio::time::Instant::now() >= deadline {
-            return last;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    poll_until(
+        || audit_count(pool, resource_id, action),
+        |n| *n >= expected,
+    )
+    .await
 }
 
 /// The newest `audit_log` row recorded for `(resource_id, action)` (#4710).
@@ -2323,32 +2337,33 @@ pub struct AuditRow {
     pub details: serde_json::Value,
 }
 
-/// Poll (~2s) for the newest `audit_log` row
-/// with this `resource_id` and `action`, panicking when none appears. The
-/// handler-level audit tests use it to assert the actor, target and `details`
-/// a fire-and-forget emitter recorded. Read it BEFORE deleting the acting
-/// user: `audit_log.user_id` is `ON DELETE SET NULL`.
+/// The newest `audit_log` row with this `resource_id` and `action`, if any.
+pub async fn audit_row(pool: &PgPool, resource_id: Uuid, action: &str) -> Option<AuditRow> {
+    let row: Option<(Option<Uuid>, String, Option<serde_json::Value>)> = sqlx::query_as(
+        "SELECT user_id, resource_type, details FROM audit_log \
+         WHERE resource_id = $1 AND action = $2 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(resource_id)
+    .bind(action)
+    .fetch_optional(pool)
+    .await
+    .expect("audit_log row query");
+    row.map(|(user_id, resource_type, details)| AuditRow {
+        user_id,
+        resource_type,
+        details: details.unwrap_or(serde_json::Value::Null),
+    })
+}
+
+/// Poll [`audit_row`] (within the [`poll_until`] budget) for the newest
+/// `audit_log` row with this `resource_id` and `action`, panicking when none
+/// appears. The handler-level audit tests use it to assert the actor, target
+/// and `details` a fire-and-forget emitter recorded. Read it BEFORE deleting
+/// the acting user: `audit_log.user_id` is `ON DELETE SET NULL`.
 pub async fn audit_row_eventually(pool: &PgPool, resource_id: Uuid, action: &str) -> AuditRow {
-    for _ in 0..100 {
-        let row: Option<(Option<Uuid>, String, Option<serde_json::Value>)> = sqlx::query_as(
-            "SELECT user_id, resource_type, details FROM audit_log \
-             WHERE resource_id = $1 AND action = $2 ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(resource_id)
-        .bind(action)
-        .fetch_optional(pool)
+    poll_until(|| audit_row(pool, resource_id, action), Option::is_some)
         .await
-        .expect("audit_log row query");
-        if let Some((user_id, resource_type, details)) = row {
-            return AuditRow {
-                user_id,
-                resource_type,
-                details: details.unwrap_or(serde_json::Value::Null),
-            };
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    panic!("no {action} audit row for resource {resource_id}");
+        .unwrap_or_else(|| panic!("no {action} audit row for resource {resource_id}"))
 }
 
 /// Count `download_statistics` rows for `artifact_id`.
@@ -2360,22 +2375,14 @@ pub async fn download_count(pool: &PgPool, artifact_id: Uuid) -> i64 {
         .expect("download_statistics count query")
 }
 
-/// Poll [`download_count`] until it reaches `expected` (or a bounded ~2s budget
-/// is exhausted), returning the last observed value.
+/// Poll [`download_count`] until it reaches `expected` (or the [`poll_until`]
+/// budget is exhausted), returning the last observed value.
 ///
 /// Since #2522 `record_download` SPAWNS the `download_statistics` INSERT off the
 /// synchronous download hot path, so a test that serves a body and then reads
 /// the count must tolerate the detached write's async timing.
 pub async fn download_count_eventually(pool: &PgPool, artifact_id: Uuid, expected: i64) -> i64 {
-    let mut last = -1;
-    for _ in 0..100 {
-        last = download_count(pool, artifact_id).await;
-        if last >= expected {
-            return last;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    last
+    poll_until(|| download_count(pool, artifact_id), |n| *n >= expected).await
 }
 
 /// Delete a test user plus the auth-related rows the audit/2FA test modules
@@ -4788,5 +4795,46 @@ mod admin_gate {
             all(StatusCode::FORBIDDEN),
             "repo-scoped admin JWT {routes:?}"
         );
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod poll_tests {
+    use super::*;
+
+    /// #5922: a row written after the old fixed ~2s window is still found
+    #[tokio::test]
+    async fn audit_row_eventually_waits_for_a_row_that_lands_late_5922() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let resource_id = Uuid::new_v4();
+        let writer = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                sqlx::query(
+                    "INSERT INTO audit_log (action, resource_type, resource_id, details, correlation_id) \
+                     VALUES ('POLL_TEST_LATE_ROW', 'test', $1, '{\"late\": true}', $2)",
+                )
+                .bind(resource_id)
+                .bind(Uuid::new_v4().to_string())
+                .execute(&pool)
+                .await
+                .expect("insert late audit row");
+            }
+        });
+
+        let row = audit_row_eventually(&pool, resource_id, "POLL_TEST_LATE_ROW").await;
+        writer.await.expect("late writer");
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(resource_id)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(row.user_id, None);
+        assert_eq!(row.resource_type, "test");
+        assert_eq!(row.details["late"], true);
     }
 }
