@@ -823,6 +823,20 @@ fn invalidate_decision_memos(repository_id: Uuid) {
     crate::api::handlers::vscode::invalidate_gallery_age_gate_memo(repository_id);
 }
 
+/// Which queue rows [`AgeGateService::list_reviews`] returns. Every `None`
+/// (and `justified_only: false`) means no filter on that field.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReviewFilter<'a> {
+    pub gates: Option<&'a [String]>,
+    pub repository_key: Option<&'a str>,
+    pub statuses: Option<&'a [String]>,
+    pub justified_only: bool,
+    /// Only rows this user currently holds the request on
+    pub requested_by: Option<Uuid>,
+    /// Only rows in these repositories (a repository-restricted token's ceiling)
+    pub repository_ids: Option<&'a [Uuid]>,
+}
+
 pub struct AgeGateService {
     db: PgPool,
     event_bus: Arc<EventBus>,
@@ -1436,13 +1450,18 @@ impl AgeGateService {
     /// signal rather than a request queue.
     pub async fn list_reviews(
         &self,
-        gates: Option<&[String]>,
-        repository_key: Option<&str>,
-        statuses: Option<&[String]>,
-        justified_only: bool,
+        filter: &ReviewFilter<'_>,
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<AgeGateReview>, i64)> {
+        let ReviewFilter {
+            gates,
+            repository_key,
+            statuses,
+            justified_only,
+            requested_by,
+            repository_ids,
+        } = *filter;
         // Non-macro (was `query_scalar!`) so adding the gate/justification
         // filters needs no `.sqlx` offline-metadata regeneration.
         let total: i64 = sqlx::query_scalar::<_, i64>(
@@ -1454,12 +1473,16 @@ impl AgeGateService {
               AND ($2::text IS NULL OR repo.key = $2)
               AND ($3::text[] IS NULL OR r.status = ANY($3))
               AND (NOT $4 OR r.justification IS NOT NULL)
+              AND ($5::uuid IS NULL OR r.requested_by = $5)
+              AND ($6::uuid[] IS NULL OR r.repository_id = ANY($6))
             "#,
         )
         .bind(gates)
         .bind(repository_key)
         .bind(statuses)
         .bind(justified_only)
+        .bind(requested_by)
+        .bind(repository_ids)
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1489,14 +1512,18 @@ impl AgeGateService {
               AND ($2::text IS NULL OR repo.key = $2)
               AND ($3::text[] IS NULL OR r.status = ANY($3))
               AND (NOT $4 OR r.justification IS NOT NULL)
+              AND ($5::uuid IS NULL OR r.requested_by = $5)
+              AND ($6::uuid[] IS NULL OR r.repository_id = ANY($6))
             ORDER BY r.last_requested_at DESC
-            OFFSET $5 LIMIT $6
+            OFFSET $7 LIMIT $8
             "#,
         )
         .bind(gates)
         .bind(repository_key)
         .bind(statuses)
         .bind(justified_only)
+        .bind(requested_by)
+        .bind(repository_ids)
         .bind(offset)
         .bind(limit)
         .fetch_all(&self.db)
@@ -3540,10 +3567,12 @@ mod tests {
         assert_eq!(pending.repository_key.as_deref(), Some(repo_key.as_str()));
         let (items, total) = svc
             .list_reviews(
-                Some(&[GATE_AGE.to_string()]),
-                Some(&repo_key),
-                Some(&["pending".to_string()]),
-                false,
+                &ReviewFilter {
+                    gates: Some(&[GATE_AGE.to_string()]),
+                    repository_key: Some(&repo_key),
+                    statuses: Some(&["pending".to_string()]),
+                    ..Default::default()
+                },
                 0,
                 10,
             )

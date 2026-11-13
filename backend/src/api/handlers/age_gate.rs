@@ -97,7 +97,8 @@ pub fn exceptions_router() -> Router<SharedState> {
         .route("/reviews/:id/approve", post(approve_exception))
         .route("/reviews/:id/reject", post(reject_exception))
         .route("/reviews/:id/reopen", post(reopen_exception))
-        .route("/requests", post(request_exception))
+        .route("/requests", get(list_my_requests).post(request_exception))
+        .route("/requests/:id", get(get_my_request))
 }
 
 pub fn repo_config_routes() -> Router<SharedState> {
@@ -679,6 +680,7 @@ async fn list_reviews_scoped(
     state: &SharedState,
     repository_key: Option<&str>,
     gates: Option<Vec<String>>,
+    requester: Option<&AuthExtension>,
     query: &ReviewListQuery,
 ) -> Result<Json<AgeGateReviewListResponse>> {
     let svc = age_gate_service(state)?;
@@ -688,15 +690,16 @@ async fn list_reviews_scoped(
     // can fetch multiple states in one page while keeping pagination totals honest.
     let statuses: Option<Vec<String>> = query.status.as_deref().and_then(parse_status_filter);
 
+    let filter = crate::services::age_gate_service::ReviewFilter {
+        gates: gates.as_deref(),
+        repository_key,
+        statuses: statuses.as_deref(),
+        justified_only: query.justified_only.unwrap_or(false),
+        requested_by: requester.map(|a| a.user_id),
+        repository_ids: requester.and_then(|a| a.allowed_repo_ids.as_allowed_repo_ids()),
+    };
     let (items, total) = svc
-        .list_reviews(
-            gates.as_deref(),
-            repository_key,
-            statuses.as_deref(),
-            query.justified_only.unwrap_or(false),
-            offset,
-            i64::from(per_page),
-        )
+        .list_reviews(&filter, offset, i64::from(per_page))
         .await?;
 
     Ok(Json(AgeGateReviewListResponse {
@@ -744,7 +747,7 @@ pub async fn list_reviews(
     // Instance-wide queue: the optional `repository_key` filter is a
     // convenience, not an authorization boundary.
     let gates = resolve_gates(query.gate.as_deref(), DefaultGates::AgeOnly);
-    list_reviews_scoped(&state, query.repository_key.as_deref(), gates, &query).await
+    list_reviews_scoped(&state, query.repository_key.as_deref(), gates, None, &query).await
 }
 
 /// The `/exceptions` sibling of [`list_reviews`]: an omitted `gate` means every gate, not just `age`
@@ -771,7 +774,7 @@ pub async fn list_exceptions(
 ) -> Result<Json<AgeGateReviewListResponse>> {
     require_security_review(&state.db, &auth).await?;
     let gates = resolve_gates(query.gate.as_deref(), DefaultGates::All);
-    list_reviews_scoped(&state, query.repository_key.as_deref(), gates, &query).await
+    list_reviews_scoped(&state, query.repository_key.as_deref(), gates, None, &query).await
 }
 
 /// What an omitted `gate` parameter means, which differs per mount.
@@ -1067,6 +1070,70 @@ pub async fn request_exception(
     Ok(Json(review_to_response(review)))
 }
 
+/// The caller's own exception requests, for any authenticated user. A row
+/// shows here while the caller holds its request: a later requester takes it
+/// over, unless it was already granted
+#[utoipa::path(
+    get,
+    path = "/requests",
+    context_path = "/api/v1/exceptions",
+    tag = "age-gate",
+    security(("bearer_auth" = [])),
+    params(
+        ("repository_key" = Option<String>, Query),
+        ("status" = Option<String>, Query),
+        ("gate" = Option<String>, Query),
+        ("page" = Option<u32>, Query),
+        ("per_page" = Option<u32>, Query),
+    ),
+    responses((status = 200, body = AgeGateReviewListResponse))
+)]
+pub async fn list_my_requests(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Query(query): Query<ReviewListQuery>,
+) -> Result<Json<AgeGateReviewListResponse>> {
+    let gates = resolve_gates(query.gate.as_deref(), DefaultGates::All);
+    list_reviews_scoped(
+        &state,
+        query.repository_key.as_deref(),
+        gates,
+        Some(&auth),
+        &query,
+    )
+    .await
+}
+
+/// One of the caller's own requests. Anything else is a 404, so this cannot
+/// probe which review ids exist
+#[utoipa::path(
+    get,
+    path = "/requests/{id}",
+    context_path = "/api/v1/exceptions",
+    tag = "age-gate",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = AgeGateReviewResponse),
+        (status = 404, description = "No request with this id is held by the caller"),
+    )
+)]
+pub async fn get_my_request(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<AgeGateReviewResponse>> {
+    let svc = age_gate_service(&state)?;
+    let review = svc.get_review_by_id(id).await?;
+    if review.requested_by != Some(auth.user_id)
+        || !auth.allowed_repo_ids.grants(review.repository_id)
+    {
+        return Err(AppError::NotFound(
+            "Exception request not found".to_string(),
+        ));
+    }
+    Ok(Json(review_to_response(review)))
+}
+
 #[utoipa::path(
     get,
     path = "/{key}/age-gate",
@@ -1275,7 +1342,7 @@ pub async fn list_repo_reviews(
     // be widened to a repository the caller does not administer.
     // Same for `gate`: this queue is the repository's age gate only.
     let gates = Some(vec![crate::services::age_gate_service::GATE_AGE.to_string()]);
-    list_reviews_scoped(&state, Some(&key), gates, &query).await
+    list_reviews_scoped(&state, Some(&key), gates, None, &query).await
 }
 
 #[utoipa::path(
@@ -1368,6 +1435,8 @@ pub async fn decide_repo_review(
         reject_review,
         reopen_review,
         request_exception,
+        list_my_requests,
+        get_my_request,
         get_repo_age_gate,
         update_repo_age_gate,
         list_repo_reviews,
@@ -2534,6 +2603,59 @@ mod tests {
             .await;
         tdh::cleanup(&pool, repo_id, user_id).await;
         tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    /// A requester who is not a reviewer sees their own requests and nothing else
+    #[tokio::test]
+    async fn a_requester_reads_only_their_own_requests_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (other_id, _) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let seed = |package: &'static str, requester: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO age_gate_reviews \
+                     (gate, repository_id, package_name, package_version, status, \
+                      justification, requested_by) \
+                     VALUES ('curation', $1, $2, '*', 'pending', 'needed', $3) RETURNING id",
+                )
+                .bind(repo_id)
+                .bind(package)
+                .bind(requester)
+                .fetch_one(&pool)
+                .await
+                .expect("seed request")
+            }
+        };
+        let mine = seed("left-pad", user_id).await;
+        let theirs = seed("right-pad", other_id).await;
+        let state = gated_state(pool.clone(), &dir);
+        let caller = tdh::make_auth(user_id, &username);
+        let app = || tdh::router_with_auth_ext(exceptions_router(), state.clone(), caller.clone());
+
+        let (status, list) =
+            tdh::send(app(), tdh::get(format!("/requests?repository_key={key}"))).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let list: serde_json::Value = serde_json::from_slice(&list).unwrap();
+        assert_eq!(list["pagination"]["total"], 1);
+        assert_eq!(list["items"][0]["id"], mine.to_string());
+        assert_eq!(list["items"][0]["status"], "pending");
+
+        let (status, _) = tdh::send(app(), tdh::get(format!("/requests/{mine}"))).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let (status, _) = tdh::send(app(), tdh::get(format!("/requests/{theirs}"))).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        // The reviewer queue itself stays closed to them
+        let (status, _) = tdh::send(app(), tdh::get(format!("/reviews/{mine}"))).await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        tdh::cleanup_user(&pool, user_id).await;
+        tdh::cleanup_user(&pool, other_id).await;
     }
 
     /// A token restricted to repository A is refused on repository B even
