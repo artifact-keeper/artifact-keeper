@@ -43,6 +43,7 @@ use std::time::Duration;
 use hyper_util::client::proxy::matcher::{Intercept, Matcher};
 
 use crate::api::validation::{self, BlockReason, HostVerdict, OutboundUrlContext};
+use crate::services::ssrf_dns::first_set_env;
 
 /// Longest a proxied destination's lookup may take before it is refused.
 pub(crate) const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -116,16 +117,6 @@ fn system_lookup() -> Lookup {
     })
 }
 
-/// The first of `names` that is set, as `hyper-util` reads the proxy
-/// variables: an upper-case variable that is set, even to the empty string,
-/// hides the lower-case one.
-fn first_env(names: [&str; 2]) -> String {
-    names
-        .iter()
-        .find_map(|name| std::env::var(name).ok())
-        .unwrap_or_default()
-}
-
 /// The environment proxy of one guarded client and the destination check it
 /// applies (see the module docs).
 #[derive(Clone)]
@@ -152,7 +143,7 @@ impl EnvProxyGuard {
     pub(crate) fn with_lookup(ctx: OutboundUrlContext, lookup: Lookup) -> Self {
         // The matcher ignores every variable in a CGI process.
         let cgi = std::env::var_os("REQUEST_METHOD").is_some();
-        let set = |names| !cgi && !first_env(names).trim().is_empty();
+        let set = |names| !cgi && !first_set_env(names).trim().is_empty();
         let all = set(["ALL_PROXY", "all_proxy"]);
         let plain_http = all || set(["HTTP_PROXY", "http_proxy"]);
         Self {
