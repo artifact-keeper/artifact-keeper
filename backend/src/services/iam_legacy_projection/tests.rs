@@ -9,7 +9,8 @@ use uuid::Uuid;
 use super::intent::*;
 use super::legacy::*;
 use super::mapping::{
-    permissions_for_actions, role_effective_permissions, system_role_permissions, LegacyAction,
+    permissions_for_actions, role_effective_permissions, scope_ceiling, system_role_permissions,
+    LegacyAction, ScopeCeiling,
 };
 use super::project::{project, ProjectionLimits};
 use super::test_support::*;
@@ -405,6 +406,42 @@ fn admin_scope_is_unrestricted_and_unknown_scopes_are_reported() {
     }
     let p = w.project_it();
     assert!(categories(&p).contains(&DiagnosticCategory::UnsupportedAction));
+}
+
+#[test]
+fn user_scopes_limit_a_token_to_nothing_and_are_known() {
+    let mut w = World::new();
+    let admin = w.admin("root");
+    let users_only = w.id();
+    let with_write = w.id();
+    for (id, scopes) in [
+        (users_only, vec!["write:users", "read:users"]),
+        (with_write, vec!["write", "write:users"]),
+    ] {
+        w.state.tokens.push(LegacyToken {
+            id,
+            user_id: admin,
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            allowed_repo_ids: None,
+            repo_selector: None,
+        });
+    }
+    let p = w.project_it();
+    let ceiling = |token: Uuid| {
+        p.ceilings
+            .iter()
+            .find(|c| c.item.credential == CredentialRef::Token(token))
+            .unwrap()
+            .item
+            .permissions
+            .clone()
+    };
+    assert_eq!(ceiling(users_only), Some(BTreeSet::new()));
+    let Some(ScopeCeiling::Permissions(write)) = scope_ceiling("write") else {
+        panic!()
+    };
+    assert_eq!(ceiling(with_write), Some(write));
+    assert!(!categories(&p).contains(&DiagnosticCategory::UnsupportedAction));
 }
 
 #[test]

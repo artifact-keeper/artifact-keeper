@@ -43,6 +43,22 @@ use crate::services::iam_legacy_projection::{CredentialRef, ScopeRef};
 
 /// The resolver whose resource the handler reports from the request body.
 pub const BODY_PROJECT_RESOLVER: &str = "project:body";
+/// The resolver naming a user in the path; the operation is self-service when
+/// that user is the caller.
+pub const USER_RESOLVER: &str = "user:id";
+
+/// Whether a request is self-service: it names the caller through
+/// [`USER_RESOLVER`]. Self-service needs no permission, so it is not compared.
+pub fn is_self_service(pending: &Pending, recorded: &Recorded) -> bool {
+    pending.resolver.id == USER_RESOLVER
+        && recorded.principal.is_some_and(|p| {
+            pending
+                .param
+                .as_deref()
+                .and_then(|v| v.parse::<Uuid>().ok())
+                == Some(p.user_id)
+        })
+}
 
 /// What a comparison settled: the legacy outcome, the resource once resolved,
 /// and the new decision when the legacy outcome is known.
@@ -486,6 +502,9 @@ impl IamShadow {
         status: StatusCode,
         recorded: &Recorded,
     ) -> Result<Settled, &'static str> {
+        if is_self_service(pending, recorded) {
+            return Err("self_service");
+        }
         // The instance needs no lookup, so its status is settled with the
         // resource known (`legacy_outcome`), where a pass can count.
         let looked_up = pending.resolver.scope != Scope::Instance;
@@ -628,6 +647,7 @@ pub async fn resolve(
             found(row).map(ScopeRef::Repository)
         }
         "project:id" => uuid().map(ScopeRef::Project),
+        USER_RESOLVER => uuid().map(|_| ScopeRef::Instance),
         "group:id" => uuid().map(ScopeRef::Group),
         _ => Err("unknown_resolver"),
     }
@@ -1060,6 +1080,54 @@ mod tests {
             caller_of(&recorded(Some(principal(false, false, true)), None)),
             Err("unattributed_credential")
         );
+    }
+
+    #[tokio::test]
+    async fn a_named_user_is_the_instance_unless_it_is_the_caller() {
+        let shadow = shadow_with(Arc::new(Semaphore::new(1)));
+        let caller = principal(false, false, false);
+        let pending = |param: &str| Pending {
+            method: "GET".into(),
+            route: "/api/v1/users/{id}".into(),
+            permission: Permission::UserRead,
+            resolver: Resolver::lookup(USER_RESOLVER).unwrap(),
+            param: Some(param.into()),
+            client_ip: None,
+            now: Utc::now(),
+        };
+        let compare = |param: String| {
+            let shadow = &shadow;
+            async move {
+                shadow
+                    .compare(
+                        pending(&param),
+                        StatusCode::FORBIDDEN,
+                        recorded(Some(caller), None),
+                    )
+                    .await
+            }
+        };
+
+        let own = compare(caller.user_id.to_string()).await;
+        assert_eq!(own.class, Class::Inconclusive("self_service"));
+        assert!(!own.class.is_divergence());
+
+        let other = compare(Uuid::from_u128(8).to_string()).await;
+        assert_eq!(other.resource, Some(ScopeRef::Instance));
+        assert_eq!(other.class, Class::Agree);
+
+        let malformed = compare("me".into()).await;
+        assert_eq!(malformed.class, Class::Inconclusive("malformed_parameter"));
+
+        // Anonymous names nobody: never self-service.
+        let anonymous = shadow
+            .compare(
+                pending(&caller.user_id.to_string()),
+                StatusCode::UNAUTHORIZED,
+                Recorded::default(),
+            )
+            .await;
+        assert_eq!(anonymous.class, Class::Agree);
     }
 
     #[test]
@@ -2003,6 +2071,139 @@ mod end_to_end {
             .await;
         tdh::cleanup_user(&pool, plain).await;
         tdh::cleanup_user(&pool, global).await;
+        tdh::cleanup(&pool, repo, admin).await;
+    }
+
+    #[tokio::test]
+    async fn identity_administration_is_compared() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (admin, _) = tdh::create_user(&pool).await;
+        let (plain, _) = tdh::create_user(&pool).await;
+        let (manager, _) = tdh::create_user(&pool).await;
+        sqlx::query("UPDATE users SET is_admin = true WHERE id = $1")
+            .bind(admin)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A project administrator holds `iam.manage` on that project only.
+        let project = new_project(&pool).await;
+        tdh::grant_permission(&pool, "user", manager, "project", project, &["admin"]).await;
+        let mut rig = Rig::new(pool.clone(), &dir).await;
+        let admin_bearer = tdh::bearer_for(&rig.state, admin).await;
+        let plain_bearer = tdh::bearer_for(&rig.state, plain).await;
+        let manager_bearer = tdh::bearer_for(&rig.state, manager).await;
+        let auth = crate::services::auth_service::AuthService::new(
+            pool.clone(),
+            Arc::new(rig.state.config.clone()),
+        );
+        let (users_token, users_id) = auth
+            .generate_api_token(
+                admin,
+                "shadow-write-users",
+                vec!["write:users".into()],
+                None,
+            )
+            .await
+            .unwrap();
+        let users_only = format!("Bearer {users_token}");
+        let compared = |c: &Comparison, legacy: LegacyOutcome, class: Class| {
+            assert_eq!((c.legacy, c.class), (legacy, class), "{c:?}");
+        };
+
+        // Service accounts: the administrator agrees, a missing account
+        // included; a non-administrator is refused by both, as itself.
+        let (status, c) = rig
+            .call(
+                Some(&admin_bearer),
+                empty_request("GET", "/api/v1/service-accounts".into()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(c.permission, Permission::ServiceAccountManage);
+        compared(&c, LegacyOutcome::Permit, Class::Agree);
+        let missing = format!("/api/v1/service-accounts/{}", Uuid::new_v4());
+        let (status, c) = rig
+            .call(Some(&admin_bearer), empty_request("GET", missing))
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        compared(&c, LegacyOutcome::Permit, Class::Agree);
+        let (status, c) = rig
+            .call(
+                Some(&plain_bearer),
+                empty_request("GET", "/api/v1/service-accounts".into()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(c.principal.id(), Some(plain));
+        compared(&c, LegacyOutcome::Refuse, Class::Agree);
+
+        // A named user: another user's tokens through the administrator
+        // branch, and a refused non-administrator, on the instance.
+        let (status, c) = rig
+            .call(
+                Some(&admin_bearer),
+                empty_request("GET", format!("/api/v1/users/{plain}/tokens")),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(c.permission, Permission::UserCredentialsManage);
+        assert_eq!(c.resource, Some(ScopeRef::Instance));
+        compared(&c, LegacyOutcome::Permit, Class::Agree);
+        let (status, c) = rig
+            .call(
+                Some(&plain_bearer),
+                empty_request("GET", format!("/api/v1/users/{admin}")),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        compared(&c, LegacyOutcome::Refuse, Class::Agree);
+        // The caller's own id is self-service: not compared.
+        let own = json_request(
+            "POST",
+            format!("/api/v1/users/{plain}/password"),
+            serde_json::json!({}),
+        );
+        let (_, c) = rig.call(Some(&plain_bearer), own).await;
+        assert_eq!(c.class, Class::Inconclusive("self_service"));
+
+        // An administrator's `write:users` token administers no user.
+        let create = json_request(
+            "POST",
+            "/api/v1/users".into(),
+            serde_json::json!({"username": format!("shadow-{}", Uuid::new_v4()), "email": "s@example.com"}),
+        );
+        let (status, c) = rig.call(Some(&users_only), create).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(c.permission, Permission::UserManage);
+        compared(&c, LegacyOutcome::Refuse, Class::Agree);
+
+        // The access API: a project administrator is refused by both; an
+        // administrator's invalid grant is rejected after the check.
+        let (status, c) = rig
+            .call(
+                Some(&manager_bearer),
+                empty_request("GET", "/api/v1/permissions".into()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(c.permission, Permission::IamManage);
+        compared(&c, LegacyOutcome::Refuse, Class::Agree);
+        let invalid = json_request("POST", "/api/v1/permissions".into(), serde_json::json!({}));
+        let (status, c) = rig.call(Some(&admin_bearer), invalid).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        compared(&c, LegacyOutcome::Permit, Class::Agree);
+
+        rig.shutdown.cancel();
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE id = $1")
+            .bind(users_id)
+            .execute(&pool)
+            .await;
+        delete_project(&pool, project).await;
+        tdh::cleanup_user(&pool, plain).await;
+        tdh::cleanup_user(&pool, manager).await;
         tdh::cleanup(&pool, repo, admin).await;
     }
 

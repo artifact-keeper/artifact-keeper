@@ -149,6 +149,7 @@ fn validate_oidc_fetch_url(url: &str, label: &str) -> Result<()> {
 /// List all enabled SSO providers
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "/providers",
     context_path = "/api/v1/auth/sso",
     tag = "sso",
@@ -257,6 +258,7 @@ fn saml_service_from_row(
 /// Initiate OIDC login redirect
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "/oidc/{id}/login",
     context_path = "/api/v1/auth/sso",
     tag = "sso",
@@ -545,6 +547,7 @@ async fn finish_silent_denied(state: &SharedState, sso_state: Option<&str>) -> R
 /// Handle OIDC authorization callback
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "/oidc/{id}/callback",
     context_path = "/api/v1/auth/sso",
     tag = "sso",
@@ -611,6 +614,21 @@ pub async fn oidc_callback(
 /// URI like `/api/v1/auth/sso/oidc/callback`. This handler resolves the
 /// correct provider from the `state` query parameter, which maps back to the
 /// SSO session that was created during the login redirect.
+#[utoipa::path(
+    get,
+    extensions(("x-auth-requirement" = json!("public"))),
+    path = "/oidc/callback",
+    context_path = "/api/v1/auth/sso",
+    tag = "sso",
+    operation_id = "oidc_callback_generic",
+    params(OidcCallbackQuery),
+    responses(
+        (status = 307, description = "Redirect to frontend with exchange code, or to /callback?silent_denied=1 when a prompt=none probe found no IdP session"),
+        (status = 400, description = "Invalid callback parameters", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "IdP error or invalid/expired SSO state", body = crate::api::openapi::ErrorResponse),
+        (status = 502, description = "The IdP's token response carried no id_token (code OIDC_NO_ID_TOKEN)", body = crate::api::openapi::ErrorResponse),
+    )
+)]
 pub async fn oidc_callback_generic(
     State(state): State<SharedState>,
     Query(params): Query<OidcCallbackQuery>,
@@ -877,6 +895,7 @@ pub struct LdapLoginRequest {
 /// Authenticate via LDAP
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "/ldap/{id}/login",
     context_path = "/api/v1/auth/sso",
     tag = "sso",
@@ -1132,6 +1151,7 @@ async fn resolve_saml_config(db: &sqlx::PgPool, segment: &str) -> Result<(SamlCo
 /// Initiate SAML login redirect
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "/saml/{id}/login",
     context_path = "/api/v1/auth/sso",
     tag = "sso",
@@ -1197,6 +1217,7 @@ pub struct SamlAcsForm {
 /// Handle SAML Assertion Consumer Service (ACS) callback
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "/saml/{id}/acs",
     context_path = "/api/v1/auth/sso",
     tag = "sso",
@@ -1363,6 +1384,7 @@ pub(crate) fn access_token_expires_in(access_token: &str, now: i64, fallback_sec
 /// Exchange a short-lived code for access and refresh tokens
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "/exchange",
     context_path = "/api/v1/auth/sso",
     tag = "sso",
@@ -1433,6 +1455,7 @@ pub async fn exchange_code(
         list_providers,
         oidc_login,
         oidc_callback,
+        oidc_callback_generic,
         ldap_login,
         saml_login,
         saml_acs,

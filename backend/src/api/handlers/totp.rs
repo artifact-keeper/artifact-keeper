@@ -247,6 +247,7 @@ pub struct TotpSetupResponse {
 /// Generate a new TOTP secret and QR code URL for the authenticated user
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/setup",
     context_path = "/api/v1/auth/totp",
     tag = "auth",
@@ -278,6 +279,7 @@ pub struct TotpEnableResponse {
 /// Enable TOTP by verifying the initial code and generating backup codes
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/enable",
     context_path = "/api/v1/auth/totp",
     tag = "auth",
@@ -377,6 +379,7 @@ pub struct TotpVerifyRequest {
 /// Verify TOTP code during login (exchanges totp_token + code for full auth tokens)
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "/verify",
     context_path = "/api/v1/auth/totp",
     tag = "auth",
@@ -703,6 +706,7 @@ pub struct TotpEnrollCompleteResponse {
 /// Begin policy-required TOTP enrollment using a login-issued enrollment ticket.
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "/enroll/setup",
     context_path = "/api/v1/auth/totp",
     tag = "auth",
@@ -730,6 +734,7 @@ pub async fn enroll_setup(
 /// Complete policy-required TOTP enrollment and receive a session.
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "/enroll/complete",
     context_path = "/api/v1/auth/totp",
     tag = "auth",
@@ -831,6 +836,7 @@ pub struct TotpDisableRequest {
 /// Disable TOTP for the authenticated user (requires password and current TOTP code)
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/disable",
     context_path = "/api/v1/auth/totp",
     tag = "auth",

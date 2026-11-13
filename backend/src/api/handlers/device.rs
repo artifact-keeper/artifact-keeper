@@ -684,6 +684,7 @@ fn client_ip(
 /// POST /api/v1/auth/device/code — start a device authorization (RFC 8628 §3.1).
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "/api/v1/auth/device/code",
     request_body(content = DeviceCodeRequest, content_type = "application/x-www-form-urlencoded"),
     responses(
@@ -796,6 +797,7 @@ pub async fn create_device_code(
 /// after approval receives the tokens and consumes the code.
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "/api/v1/auth/device/token",
     request_body(content = DeviceTokenForm, content_type = "application/x-www-form-urlencoded"),
     responses(
@@ -1288,6 +1290,7 @@ fn approver_is_admin(auth: &AuthExtension, user: &User) -> bool {
 /// Wrong codes count against the failed-attempt budgets.
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/api/v1/auth/device/verify",
     request_body = UserCodeRequest,
     responses(
@@ -1361,6 +1364,7 @@ pub async fn verify_user_code(
 /// when none of the requested scopes can be granted.
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/api/v1/auth/device/approve",
     request_body = UserCodeRequest,
     responses(
@@ -1488,6 +1492,7 @@ pub async fn approve_device(
 /// The device's next poll receives `access_denied`.
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/api/v1/auth/device/deny",
     request_body = UserCodeRequest,
     responses(

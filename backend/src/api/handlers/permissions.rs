@@ -239,6 +239,7 @@ pub struct PermissionListResponse {
 /// List permissions
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("iam.manage")), ("x-resource" = json!("instance"))),
     path = "",
     context_path = "/api/v1/permissions",
     tag = "permissions",
@@ -424,6 +425,7 @@ async fn validate_mcp_namespace_target(
 /// Create a permission
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("iam.manage")), ("x-resource" = json!("instance"))),
     path = "",
     context_path = "/api/v1/permissions",
     tag = "permissions",
@@ -568,6 +570,7 @@ pub async fn create_permission(
 /// Get a permission by ID
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("iam.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/permissions",
     tag = "permissions",
@@ -616,6 +619,7 @@ pub async fn get_permission(
 /// Update a permission
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("iam.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/permissions",
     tag = "permissions",
@@ -742,6 +746,7 @@ pub async fn update_permission(
 /// Delete a permission
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("iam.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/permissions",
     tag = "permissions",

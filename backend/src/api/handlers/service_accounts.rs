@@ -319,6 +319,7 @@ pub(crate) fn build_token_info_response(
 /// List all service accounts
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("service_account.manage")), ("x-resource" = json!("instance"))),
     path = "",
     context_path = "/api/v1/service-accounts",
     tag = "service_accounts",
@@ -345,6 +346,7 @@ pub async fn list_service_accounts(
 /// Create a new service account
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("service_account.manage")), ("x-resource" = json!("instance"))),
     path = "",
     context_path = "/api/v1/service-accounts",
     tag = "service_accounts",
@@ -387,6 +389,7 @@ pub async fn create_service_account(
 /// Get a service account by ID
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("service_account.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/service-accounts",
     tag = "service_accounts",
@@ -420,6 +423,7 @@ pub async fn get_service_account(
 /// Update a service account
 #[utoipa::path(
     patch,
+    extensions(("x-required-permission" = json!("service_account.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/service-accounts",
     tag = "service_accounts",
@@ -473,6 +477,7 @@ pub async fn update_service_account(
 /// Delete a service account
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("service_account.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/service-accounts",
     tag = "service_accounts",
@@ -510,6 +515,7 @@ pub async fn delete_service_account(
 /// List tokens for a service account
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("service_account.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/tokens",
     context_path = "/api/v1/service-accounts",
     tag = "service_accounts",
@@ -630,6 +636,7 @@ pub async fn list_tokens(
 /// Create a token for a service account
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("service_account.token.create")), ("x-resource" = json!("instance"))),
     path = "/{id}/tokens",
     context_path = "/api/v1/service-accounts",
     tag = "service_accounts",
@@ -762,6 +769,7 @@ pub async fn create_token(
 /// attaching them to a token.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("service_account.manage")), ("x-resource" = json!("instance"))),
     path = "/repo-selector/preview",
     context_path = "/api/v1/service-accounts",
     tag = "service_accounts",
@@ -823,6 +831,7 @@ pub async fn preview_repo_selector(
 /// Which members of a virtual repository this token cannot reach, and why
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("service_account.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/tokens/{token_id}/scope-analysis",
     context_path = "/api/v1/service-accounts",
     tag = "service_accounts",
@@ -883,6 +892,7 @@ pub async fn token_scope_analysis(
 /// Revoke a token from a service account
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("service_account.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/tokens/{token_id}",
     context_path = "/api/v1/service-accounts",
     tag = "service_accounts",

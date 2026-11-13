@@ -269,6 +269,7 @@ async fn enforce_local_login_sso_policy(
 /// Login with credentials
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "/login",
     context_path = "/api/v1/auth",
     tag = "auth",
@@ -468,6 +469,7 @@ fn presenting_session_family(
 /// Logout current session
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "/logout",
     context_path = "/api/v1/auth",
     tag = "auth",
@@ -534,6 +536,7 @@ pub async fn logout(
 /// Refresh access token
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "/refresh",
     context_path = "/api/v1/auth",
     tag = "auth",
@@ -577,6 +580,7 @@ pub async fn refresh_token(
 /// Get current user info
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/me",
     context_path = "/api/v1/auth",
     tag = "auth",
@@ -658,6 +662,7 @@ pub struct CreateApiTokenResponse {
 /// Create a new API token for the current user
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/tokens",
     context_path = "/api/v1/auth",
     tag = "auth",
@@ -854,6 +859,7 @@ fn clear_auth_cookies(headers: &mut HeaderMap, client_is_https: bool) {
 /// Revoke an API token
 #[utoipa::path(
     delete,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/tokens/{token_id}",
     context_path = "/api/v1/auth",
     tag = "auth",
@@ -1046,6 +1052,7 @@ fn validate_and_normalize_resource_path(input: &str) -> std::result::Result<Stri
 /// log the URL that contains it.
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/ticket",
     context_path = "/api/v1/auth",
     tag = "auth",

@@ -243,6 +243,7 @@ pub(crate) fn user_to_response(user: User) -> AdminUserResponse {
 /// List users
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("user.read")), ("x-resource" = json!("instance"))),
     path = "",
     context_path = "/api/v1/users",
     tag = "users",
@@ -344,6 +345,7 @@ pub async fn list_users(
 /// Create user
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("user.manage")), ("x-resource" = json!("instance"))),
     path = "",
     context_path = "/api/v1/users",
     tag = "users",
@@ -447,6 +449,7 @@ pub async fn create_user(
 /// Get user details
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("user.read")), ("x-resource" = json!("user:id"))),
     path = "/{id}",
     context_path = "/api/v1/users",
     tag = "users",
@@ -523,6 +526,7 @@ async fn is_admin_change_requested(
 /// Update user
 #[utoipa::path(
     patch,
+    extensions(("x-required-permission" = json!("user.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/users",
     tag = "users",
@@ -706,6 +710,7 @@ fn map_user_delete_error(e: sqlx::Error) -> AppError {
 /// Delete user
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("user.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/users",
     tag = "users",
@@ -803,6 +808,7 @@ pub struct RoleListResponse {
 /// latter.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("iam.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/roles",
     context_path = "/api/v1/users",
     tag = "users",
@@ -920,6 +926,7 @@ fn assign_role_deprecation_headers() -> [(HeaderName, HeaderValue); 2] {
 #[deprecated(note = "user_roles grants no repository access; use POST /api/v1/permissions (#3522)")]
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("iam.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/roles",
     context_path = "/api/v1/users",
     tag = "users",
@@ -984,6 +991,7 @@ pub async fn assign_role(
 /// Revoke role from user
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("iam.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/roles/{role_id}",
     context_path = "/api/v1/users",
     tag = "users",
@@ -1080,6 +1088,7 @@ pub struct ApiTokenListResponse {
 /// List user's API tokens
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("user.credentials.manage")), ("x-resource" = json!("user:id"))),
     path = "/{id}/tokens",
     context_path = "/api/v1/users",
     tag = "users",
@@ -1141,6 +1150,7 @@ async fn list_user_tokens_inner(
 /// Create API token
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("user.credentials.manage")), ("x-resource" = json!("user:id"))),
     path = "/{id}/tokens",
     context_path = "/api/v1/users",
     tag = "users",
@@ -1233,6 +1243,7 @@ async fn create_api_token_inner(
 /// Revoke API token
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("user.credentials.manage")), ("x-resource" = json!("user:id"))),
     path = "/{id}/tokens/{token_id}",
     context_path = "/api/v1/users",
     tag = "users",
@@ -1294,6 +1305,7 @@ pub struct ChangePasswordRequest {
 /// Change user password
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("user.credentials.manage")), ("x-resource" = json!("user:id"))),
     path = "/{id}/password",
     context_path = "/api/v1/users",
     tag = "users",
@@ -1497,6 +1509,7 @@ pub struct ResetPasswordResponse {
 /// Generates a new temporary password and sets must_change_password=true
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("user.credentials.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/password/reset",
     context_path = "/api/v1/users",
     tag = "users",
@@ -1720,6 +1733,7 @@ pub struct ForcePasswordChangeResponse {
 /// user is prompted immediately on their next login.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("user.credentials.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/force-password-change",
     context_path = "/api/v1/users",
     tag = "users",
@@ -1808,6 +1822,7 @@ pub async fn force_password_change(
 /// Get the authenticated caller's own user record.
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/me",
     context_path = "/api/v1/users",
     tag = "users",
@@ -1828,6 +1843,7 @@ pub async fn get_current_user_record(
 /// List the authenticated caller's own API tokens.
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/me/tokens",
     context_path = "/api/v1/users",
     tag = "users",
@@ -1851,6 +1867,7 @@ pub async fn list_current_user_tokens(
 /// `write:users` tokens via this alias any more than via `/users/:id/tokens`.
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/me/tokens",
     context_path = "/api/v1/users",
     tag = "users",
@@ -1874,6 +1891,7 @@ pub async fn create_current_user_api_token(
 /// Revoke one of the authenticated caller's own API tokens.
 #[utoipa::path(
     delete,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/me/tokens/{token_id}",
     context_path = "/api/v1/users",
     tag = "users",
@@ -1902,6 +1920,7 @@ pub async fn revoke_current_user_api_token(
 /// `self_password_router` so it inherits the password-change rate limit (#1026).
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/me/password",
     context_path = "/api/v1/users",
     tag = "users",

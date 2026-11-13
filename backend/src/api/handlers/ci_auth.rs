@@ -125,6 +125,7 @@ pub struct CiTokenResponse {
 /// (#3548). Send `{"provider_id": "<uuid>"}` to name a provider explicitly.
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("public"))),
     path = "/token",
     context_path = "/api/v1/auth/ci",
     tag = "auth",

@@ -158,7 +158,7 @@ const EXEMPT: [Permission; 1] = [Permission::AgeGateReview];
 /// Every permission a principal other than an instance administrator can hold
 /// on the instance after the upgrade: through a global role assignment, the
 /// instance-level sentinel, or a token scope that confers capability.
-fn non_administrator_instance_permissions() -> BTreeSet<Permission> {
+pub(super) fn non_administrator_instance_permissions() -> BTreeSet<Permission> {
     let mut held: BTreeSet<Permission> = [
         LegacyAction::Read,
         LegacyAction::Write,

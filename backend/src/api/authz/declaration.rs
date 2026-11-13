@@ -62,6 +62,12 @@ pub const RESOLVERS: &[Resolver] = &[
         id: "instance",
         scope: Scope::Instance,
     },
+    // A user named in the path: the instance for anyone but that user, for
+    // whom the operation is self-service.
+    Resolver {
+        id: "user:id",
+        scope: Scope::Instance,
+    },
 ];
 
 impl Resolver {

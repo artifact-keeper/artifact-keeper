@@ -7,6 +7,7 @@ use axum::{
 };
 use serde::Deserialize;
 use std::sync::Arc;
+use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
@@ -32,7 +33,7 @@ pub fn router() -> Router<SharedState> {
 /// Unknown fields are refused (400) rather than dropped (#4226): this endpoint
 /// takes no repository restriction, and a client sending one must learn that
 /// instead of receiving a broader token than it asked for.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateAccessTokenRequest {
     pub name: String,
@@ -41,6 +42,18 @@ pub struct CreateAccessTokenRequest {
 }
 
 /// List the authenticated user's API tokens.
+#[utoipa::path(
+    get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
+    path = "/access-tokens",
+    context_path = "/api/v1/profile",
+    tag = "users",
+    operation_id = "list_profile_access_tokens",
+    responses(
+        (status = 200, description = "List of the caller's API tokens", body = ApiTokenListResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn list_access_tokens(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -75,6 +88,21 @@ async fn list_access_tokens(
 }
 
 /// Create an API token for the authenticated user.
+#[utoipa::path(
+    post,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
+    path = "/access-tokens",
+    context_path = "/api/v1/profile",
+    tag = "users",
+    operation_id = "create_profile_access_token",
+    request_body = CreateAccessTokenRequest,
+    responses(
+        (status = 200, description = "API token created successfully", body = ApiTokenCreatedResponse),
+        (status = 400, description = "Unknown field in the request body", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Requested scopes exceed what the caller may mint", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn create_access_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -153,6 +181,21 @@ async fn create_access_token(
 }
 
 /// Revoke an API token belonging to the authenticated user.
+#[utoipa::path(
+    delete,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
+    path = "/access-tokens/{token_id}",
+    context_path = "/api/v1/profile",
+    tag = "users",
+    operation_id = "revoke_profile_access_token",
+    params(
+        ("token_id" = Uuid, Path, description = "API token ID"),
+    ),
+    responses(
+        (status = 200, description = "API token revoked successfully"),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn revoke_access_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -177,6 +220,13 @@ async fn revoke_access_token(
 
     Ok(())
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(list_access_tokens, create_access_token, revoke_access_token),
+    components(schemas(CreateAccessTokenRequest))
+)]
+pub struct ProfileApiDoc;
 
 #[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]

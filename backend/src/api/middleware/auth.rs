@@ -306,9 +306,11 @@ impl AuthExtension {
         self
     }
 
-    /// Return a 403 Forbidden error if the caller is not an admin.
+    /// Return a 403 Forbidden error if the caller is not an admin. A pass is
+    /// the instance-administrator check, recorded for the shadow comparison.
     pub fn require_admin(&self) -> crate::error::Result<()> {
         if self.is_admin {
+            crate::api::authz::shadow_marker::note_instance_admin_pass();
             Ok(())
         } else {
             Err(AppError::Authorization("Admin access required".to_string()))
@@ -347,7 +349,11 @@ impl AuthExtension {
         target_user_id: Uuid,
         deny_msg: &str,
     ) -> crate::error::Result<()> {
-        if self.user_id == target_user_id || self.is_admin {
+        if self.user_id == target_user_id {
+            Ok(())
+        } else if self.is_admin {
+            // Admitted as an administrator, not as the subject.
+            crate::api::authz::shadow_marker::note_instance_admin_pass();
             Ok(())
         } else {
             Err(AppError::Authorization(deny_msg.to_string()))
@@ -6578,6 +6584,44 @@ mod tests {
         let ext = self_or_admin_fixture(me, true);
         // Admin acting on their own resource: allowed (both conditions true).
         assert!(ext.require_self_or_admin(me, "denied").is_ok());
+    }
+
+    /// IAM shadow (#4214): the in-handler administrator checks record the
+    /// instance pass only when they admit an administrator; admitting the
+    /// subject themselves, or refusing, records none.
+    #[tokio::test]
+    async fn administrator_checks_record_the_instance_pass_only_for_an_administrator() {
+        use crate::api::authz::shadow_marker::{self, LegacyLevel};
+        use crate::services::iam_legacy_projection::ScopeRef;
+
+        let me = Uuid::new_v4();
+        let passed = |ext: AuthExtension, check: fn(&AuthExtension, Uuid) -> bool| async move {
+            let (ok, recorded) = shadow_marker::scope(async move { check(&ext, me) }).await;
+            (ok, recorded.passed_on(ScopeRef::Instance))
+        };
+        let admin_check: fn(&AuthExtension, Uuid) -> bool = |e, _| e.require_admin().is_ok();
+        let self_check: fn(&AuthExtension, Uuid) -> bool =
+            |e, target| e.require_self_or_admin(target, "denied").is_ok();
+
+        let pass = Some(LegacyLevel::Admin);
+        let admin = || self_or_admin_fixture(Uuid::new_v4(), true);
+        let plain = || self_or_admin_fixture(Uuid::new_v4(), false);
+        assert_eq!(passed(admin(), admin_check).await, (true, pass));
+        assert_eq!(passed(plain(), admin_check).await, (false, None));
+        assert_eq!(passed(admin(), self_check).await, (true, pass));
+        assert_eq!(passed(plain(), self_check).await, (false, None));
+        // The subject themselves, administrator or not: no instance pass.
+        for is_admin in [false, true] {
+            assert_eq!(
+                passed(self_or_admin_fixture(me, is_admin), self_check).await,
+                (true, None)
+            );
+        }
+        let refused = plain().require_admin().unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            AppError::Authorization("Admin access required".into()).to_string()
+        );
     }
 
     // -----------------------------------------------------------------------

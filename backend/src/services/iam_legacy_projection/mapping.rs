@@ -287,7 +287,9 @@ pub fn scope_ceiling(scope: &str) -> Option<ScopeCeiling> {
         "write:artifacts" => set(&[P::ArtifactWrite, P::ArtifactAnnotate]),
         "write:repositories" => set(&[P::RepositoryUpdate, P::RepositoryNotificationsManage]),
         "write:findings" => set(&[P::SecurityFindingsIngest]),
-        "write:users" => set(&[P::UserManage]),
+        // No legacy check reads either scope, and a token holding only them is
+        // not an administrator: they leave the token its owner's self-service.
+        "write:users" | "read:users" => BTreeSet::new(),
         "delete" => all().filter(|p| p.id().ends_with(".delete")).collect(),
         "delete:artifacts" => set(&[P::ArtifactDelete]),
         "promote:artifacts" => all().filter(|p| p.id().starts_with("promotion.")).collect(),
@@ -471,6 +473,13 @@ mod tests {
         assert!(!write.contains(&P::ArtifactRead) && !write.contains(&P::ArtifactDelete));
         assert!(!write.contains(&P::IamManage) && !write.contains(&P::SystemSettingsUpdate));
         assert_eq!(scope_ceiling("nonsense"), None);
+        for users in ["write:users", "read:users"] {
+            assert_eq!(
+                scope_ceiling(users),
+                Some(ScopeCeiling::Permissions(BTreeSet::new())),
+                "{users}"
+            );
+        }
     }
 
     #[test]

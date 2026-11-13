@@ -151,6 +151,7 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
             handlers::package_analysis::PackageAnalysisApiDoc::openapi(),
         ),
         ("users", handlers::users::UsersApiDoc::openapi()),
+        ("profile", handlers::profile::ProfileApiDoc::openapi()),
         ("groups", handlers::groups::GroupsApiDoc::openapi()),
         ("packages", handlers::packages::PackagesApiDoc::openapi()),
         ("search", handlers::search::SearchApiDoc::openapi()),
