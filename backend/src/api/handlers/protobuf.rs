@@ -206,12 +206,14 @@ async fn resolve_owner_ref(
             r#"SELECT name
             FROM artifacts
             WHERE repository_id = $1
-              AND name LIKE $2 || '/%'
+              AND name LIKE $2 || '/%' ESCAPE '\'
               AND is_deleted = false
             LIMIT 1"#,
         )
         .bind(repo.id)
-        .bind(name)
+        // `_` and `%` are legal in an owner name and would otherwise match
+        // the modules of other owners.
+        .bind(super::escape_like_literal(name))
         .fetch_optional(&state.db)
         .await
         .map_err(connect_db_error)?;
@@ -1769,6 +1771,29 @@ async fn upload(
         }
         let commit_digest = compute_commit_digest(&decoded_files);
 
+        // Resolve the b5 before anything is stored. A dependency is recorded
+        // by the commit id the CLI sent, and the digest the CLI verifies this
+        // commit against covers every dependency's own b5, which this
+        // repository holds only for the modules it hosts itself (#5066).
+        let dep_names = extract_dep_names(&content.dep_refs);
+        let b5 = resolve_push_b5(&state, &repo, &decoded_files, &dep_names).await?;
+        // Over the CLI's codec a commit without a b5 is one every later
+        // request would refuse, so it is refused here, before its bundle is
+        // stored, labelled or queued for sync. The JSON codec records bare
+        // module names and keeps storing such a commit, with the dependencies
+        // that went unresolved named in its metadata.
+        if let (true, B5Outcome::UnresolvedDeps(deps)) = (codec.is_proto(), &b5) {
+            return Err(connect_unresolved_deps(&module_name, deps));
+        }
+        let protobuf_metadata = build_protobuf_metadata(
+            &module_name,
+            &commit_digest,
+            content.files.len(),
+            &dep_names,
+            &ids::commit(&module_name, &commit_digest),
+            &b5,
+        );
+
         // Check for duplicate (idempotent)
         let existing = sqlx::query(
             r#"SELECT id, name, version, created_at, updated_at, uploaded_by, checksum_sha256
@@ -1793,6 +1818,11 @@ async fn upload(
         })?;
 
         if let Some(existing_row) = existing {
+            // A commit pushed before #5066 has none of the ids or the b5 a
+            // dependency reference resolves through, so without this it could
+            // never be depended on: pushing it again is how it gains them.
+            backfill_commit_metadata(&state, existing_row.get("id"), &protobuf_metadata).await?;
+
             let commit = build_commit_info_from_row(&existing_row);
             result_commits.push(commit);
 
@@ -1896,9 +1926,13 @@ async fn upload(
                 crate::api::handlers::db_err_message(&e),
             )
         })?;
-        tx.commit().await.map_err(connect_db_error)?;
-
         let artifact_id: uuid::Uuid = row.get("id");
+
+        // In the same transaction as the row: the ids and the b5 recorded here
+        // are what every reference by id and every dependency on this commit
+        // resolves through, so a commit stored without them is a broken one.
+        upsert_commit_metadata(&mut *tx, artifact_id, &protobuf_metadata).await?;
+        tx.commit().await.map_err(connect_db_error)?;
 
         crate::services::quarantine_service::apply_upload_hold_hosted(
             &state.db,
@@ -1912,47 +1946,6 @@ async fn upload(
             repo.id,
             artifact_id,
         )
-        .await;
-
-        // Build metadata including dependency refs
-        let dep_names = extract_dep_names(&content.dep_refs);
-
-        // The digest the CLI verifies this commit against covers every
-        // dependency's own b5, which this repository holds only for the
-        // modules it hosts itself (#5066). Recording which dependencies went
-        // unresolved beats recording a digest computed from an incomplete set.
-        let mut dep_digests = Vec::with_capacity(dep_names.len());
-        let mut unresolved_deps = Vec::new();
-        for dep in &dep_names {
-            match dep_b5(&state, &repo, dep).await? {
-                Some(digest) => dep_digests.push(digest),
-                None => unresolved_deps.push(dep.clone()),
-            }
-        }
-        let b5 = if unresolved_deps.is_empty() {
-            B5Outcome::Resolved(wire::b5_digest(&decoded_files, &dep_digests))
-        } else {
-            B5Outcome::UnresolvedDeps(unresolved_deps)
-        };
-
-        let protobuf_metadata = build_protobuf_metadata(
-            &module_name,
-            &commit_digest,
-            content.files.len(),
-            &dep_names,
-            &ids::commit(&module_name, &commit_digest),
-            &b5,
-        );
-
-        // Store metadata
-        let _ = sqlx::query(
-            r#"INSERT INTO artifact_metadata (artifact_id, format, metadata)
-            VALUES ($1, 'protobuf', $2)
-            ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2"#,
-        )
-        .bind(artifact_id)
-        .bind(&protobuf_metadata)
-        .execute(&state.db)
         .await;
 
         // Update labels (default to "main" if none provided)
@@ -3284,14 +3277,7 @@ async fn commit_b5(
         })
         .unwrap_or_default();
 
-    let mut dep_digests = Vec::with_capacity(dep_names.len());
-    let mut unresolved = Vec::new();
-    for dep in &dep_names {
-        match dep_b5(state, repo, dep).await? {
-            Some(digest) => dep_digests.push(digest),
-            None => unresolved.push(dep.clone()),
-        }
-    }
+    let (dep_digests, unresolved) = resolve_dep_b5s(state, repo, &dep_names).await?;
     if !unresolved.is_empty() {
         return Err(connect_unresolved_deps(module_name, &unresolved));
     }
@@ -3350,6 +3336,113 @@ async fn dep_b5(
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
         }))
+}
+
+/// Each dependency's recorded b5, split into the digests found and the
+/// dependencies this repository holds none for.
+async fn resolve_dep_b5s(
+    state: &SharedState,
+    repo: &RepoInfo,
+    deps: &[String],
+) -> Result<(Vec<String>, Vec<String>), Response> {
+    let mut digests = Vec::with_capacity(deps.len());
+    let mut unresolved = Vec::new();
+    for dep in deps {
+        match dep_b5(state, repo, dep).await? {
+            Some(digest) => digests.push(digest),
+            None => unresolved.push(dep.clone()),
+        }
+    }
+    Ok((digests, unresolved))
+}
+
+/// The b5 a commit being pushed is given. Naming the dependencies that went
+/// unresolved beats recording a digest computed from an incomplete set.
+async fn resolve_push_b5(
+    state: &SharedState,
+    repo: &RepoInfo,
+    files: &[(String, Vec<u8>)],
+    deps: &[String],
+) -> Result<B5Outcome, Response> {
+    let (digests, unresolved) = resolve_dep_b5s(state, repo, deps).await?;
+    Ok(if unresolved.is_empty() {
+        B5Outcome::Resolved(wire::b5_digest(files, &digests))
+    } else {
+        B5Outcome::UnresolvedDeps(unresolved)
+    })
+}
+
+/// Bring a stored commit's metadata up to what a push records now, when the
+/// same commit is pushed again.
+async fn backfill_commit_metadata(
+    state: &SharedState,
+    artifact_id: uuid::Uuid,
+    fresh: &serde_json::Value,
+) -> Result<(), Response> {
+    let stored: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT metadata FROM artifact_metadata WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(connect_db_error)?;
+    let Some(merged) = merge_backfilled_metadata(stored.as_ref(), fresh) else {
+        return Ok(());
+    };
+    upsert_commit_metadata(&state.db, artifact_id, &merged).await
+}
+
+/// Record a commit's protobuf metadata, replacing what was there.
+async fn upsert_commit_metadata<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    artifact_id: uuid::Uuid,
+    metadata: &serde_json::Value,
+) -> Result<(), Response> {
+    sqlx::query(
+        r#"INSERT INTO artifact_metadata (artifact_id, format, metadata)
+        VALUES ($1, 'protobuf', $2)
+        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2"#,
+    )
+    .bind(artifact_id)
+    .bind(metadata)
+    .execute(executor)
+    .await
+    .map_err(connect_db_error)?;
+    Ok(())
+}
+
+/// The stored metadata with what `fresh` adds, or `None` when it adds nothing.
+///
+/// What is already recorded wins, key by key: a re-push only fills in what an
+/// older push did not record. The exception is a b5 the stored commit lacks.
+/// The digest is composed from the dependencies, so it is taken together with
+/// the dependency list it was composed from, and the `b5UnresolvedDeps` it
+/// replaces is dropped -- a digest beside a dependency list it was not
+/// computed from would let `GetGraph` and the digest disagree.
+fn merge_backfilled_metadata(
+    stored: Option<&serde_json::Value>,
+    fresh: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let fresh_object = fresh.as_object()?;
+    let Some(stored_object) = stored.and_then(|s| s.as_object()) else {
+        return Some(fresh.clone());
+    };
+    let stored_has_b5 = stored_object.contains_key("b5Digest");
+    let mut merged = stored_object.clone();
+    for (key, value) in fresh_object {
+        // A JSON re-push of a commit the CLI pushed names its dependencies
+        // unresolved; the b5 already recorded says otherwise.
+        if stored_has_b5 && key == "b5UnresolvedDeps" {
+            continue;
+        }
+        merged.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+    if !stored_has_b5 && fresh_object.contains_key("b5Digest") {
+        if let Some(deps) = fresh_object.get("dependencies") {
+            merged.insert("dependencies".to_string(), deps.clone());
+        }
+        merged.remove("b5UnresolvedDeps");
+    }
+    (&merged != stored_object).then_some(serde_json::Value::Object(merged))
 }
 
 /// Base64 bundle entries as the raw path/content pairs the digest hashes.
@@ -4931,38 +5024,9 @@ mod tests {
         contents: &[u8],
         dep_commit_ids: Vec<String>,
     ) -> pb1::Commit {
-        use crate::api::handlers::test_db_helpers as tdh;
         use prost::Message;
 
-        let request = pb1::UploadRequest {
-            contents: vec![pb1::upload_request::Content {
-                module_ref: Some(pb1::ModuleRef {
-                    value: Some(pb1::module_ref::Value::Name(pb1::module_ref::Name {
-                        owner: owner.to_string(),
-                        module: module.to_string(),
-                    })),
-                }),
-                files: vec![pb1::File {
-                    path: format!("{owner}/{module}/v1/api.proto"),
-                    content: contents.to_vec(),
-                }],
-                scoped_label_refs: Vec::new(),
-                source_control_url: String::new(),
-            }],
-            dep_commit_ids,
-        };
-        let (status, resp) = tdh::send(
-            fx.router_with_auth(super::router()),
-            tdh::post(
-                format!(
-                    "/{}/buf.registry.module.v1.UploadService/Upload",
-                    fx.repo_key
-                ),
-                "application/proto",
-                bytes::Bytes::from(request.encode_to_vec()),
-            ),
-        )
-        .await;
+        let (status, resp) = send_proto_upload(fx, owner, module, contents, dep_commit_ids).await;
         assert!(
             status.is_success(),
             "binary upload of {owner}/{module} failed: {status} {}",
@@ -5149,6 +5213,273 @@ mod tests {
         assert_eq!(stored, 0, "a refused push must store nothing");
 
         fx.teardown().await;
+    }
+
+    /// Sends one binary v1 upload and returns the status and body unchecked.
+    #[cfg(test)]
+    async fn send_proto_upload(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        owner: &str,
+        module: &str,
+        contents: &[u8],
+        dep_commit_ids: Vec<String>,
+    ) -> (StatusCode, bytes::Bytes) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use prost::Message;
+
+        let request = pb1::UploadRequest {
+            contents: vec![pb1::upload_request::Content {
+                module_ref: Some(pb1::ModuleRef {
+                    value: Some(pb1::module_ref::Value::Name(pb1::module_ref::Name {
+                        owner: owner.to_string(),
+                        module: module.to_string(),
+                    })),
+                }),
+                files: vec![pb1::File {
+                    path: format!("{owner}/{module}/v1/api.proto"),
+                    content: contents.to_vec(),
+                }],
+                scoped_label_refs: Vec::new(),
+                source_control_url: String::new(),
+            }],
+            dep_commit_ids,
+        };
+        tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1.UploadService/Upload",
+                    fx.repo_key
+                ),
+                "application/proto",
+                bytes::Bytes::from(request.encode_to_vec()),
+            ),
+        )
+        .await
+    }
+
+    /// The rows a push of `module` left: commits and the label index alike.
+    #[cfg(test)]
+    async fn module_rows(fx: &crate::api::handlers::test_db_helpers::Fixture, module: &str) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM artifacts WHERE repository_id = $1 AND name = $2")
+            .bind(fx.repo_id)
+            .bind(module)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("count the module's rows")
+    }
+
+    /// A dependency this repository holds no b5 for is refused before the
+    /// commit's bundle is stored: no commit row, no label index, nothing for
+    /// a push peer to replicate. It used to be stored, labelled and queued,
+    /// and only the reply failed.
+    #[tokio::test]
+    async fn a_push_with_an_unresolved_dependency_stores_nothing_5074() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let unknown = ids::commit("elsewhere/dep", "never-pushed-here");
+        let (status, resp) = send_proto_upload(
+            &fx,
+            "acme",
+            "orphan",
+            b"syntax = \"proto3\";\n",
+            vec![unknown.clone()],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let json: serde_json::Value = serde_json::from_slice(&resp).expect("a Connect error body");
+        assert_eq!(json["code"], "failed_precondition");
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&unknown),
+            "the refusal names the dependency: {json}"
+        );
+        assert_eq!(
+            module_rows(&fx, "acme/orphan").await,
+            0,
+            "a refused push must store nothing"
+        );
+
+        fx.teardown().await;
+    }
+
+    /// A commit pushed before #5066 carries none of `commitId`, `moduleId`,
+    /// `ownerId` or `b5Digest`, so nothing can depend on it. Pushing the same
+    /// commit again is the idempotent path, and it is where those are filled
+    /// in; without that, such a commit could never be a dependency.
+    #[tokio::test]
+    async fn a_repush_backfills_the_ids_of_an_old_shape_commit_5074() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let base =
+            push_proto_module(&fx, "acme", "legacy", b"syntax = \"proto3\";\n", Vec::new()).await;
+
+        // What a pre-#5066 push recorded.
+        sqlx::query(
+            "UPDATE artifact_metadata m SET metadata = m.metadata \
+                 - 'commitId' - 'moduleId' - 'ownerId' - 'b5Digest' \
+             FROM artifacts a \
+             WHERE a.id = m.artifact_id AND a.repository_id = $1 AND a.name = 'acme/legacy'",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("strip the metadata to its old shape");
+
+        let (status, _) = send_proto_upload(
+            &fx,
+            "acme",
+            "dependent",
+            b"syntax = \"proto3\";\n",
+            vec![base.id.clone()],
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "the old-shape commit cannot be resolved as a dependency yet"
+        );
+
+        let again =
+            push_proto_module(&fx, "acme", "legacy", b"syntax = \"proto3\";\n", Vec::new()).await;
+        assert_eq!(again.id, base.id, "the same commit, pushed again");
+
+        let metadata: serde_json::Value = sqlx::query_scalar(
+            "SELECT m.metadata FROM artifact_metadata m JOIN artifacts a ON a.id = m.artifact_id \
+             WHERE a.repository_id = $1 AND a.name = 'acme/legacy' AND a.version <> '_labels'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("the commit's metadata");
+        assert_eq!(metadata["commitId"], base.id);
+        assert_eq!(metadata["moduleId"], ids::module("acme/legacy"));
+        assert_eq!(metadata["ownerId"], ids::owner("acme"));
+        assert!(metadata["b5Digest"].is_string(), "b5 recorded: {metadata}");
+
+        let (status, resp) = send_proto_upload(
+            &fx,
+            "acme",
+            "dependent",
+            b"syntax = \"proto3\";\n",
+            vec![base.id.clone()],
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "the backfilled commit resolves as a dependency: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        fx.teardown().await;
+    }
+
+    /// `_` and `%` are legal in an owner name, and in a `LIKE` pattern they are
+    /// wildcards: unescaped, `GetOwners` for `a_me` answered for `acme`.
+    #[tokio::test]
+    async fn an_owner_name_is_matched_literally_5074() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        push_json_module(&fx, "acme", "payments", b"syntax = \"proto3\";\n").await;
+
+        let get_owner = |name: &'static str| {
+            let body = serde_json::json!({ "ownerRefs": [{ "name": name }] });
+            tdh::send(
+                fx.router_with_auth(super::router()),
+                tdh::post(
+                    format!(
+                        "/{}/buf.registry.owner.v1.OwnerService/GetOwners",
+                        fx.repo_key
+                    ),
+                    "application/json",
+                    bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+                ),
+            )
+        };
+
+        let (status, _) = get_owner("acme").await;
+        assert!(status.is_success(), "the real owner resolves: {status}");
+        for wildcard in ["a_me", "%", "ac%"] {
+            let (status, resp) = get_owner(wildcard).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{wildcard} must not match acme: {}",
+                String::from_utf8_lossy(&resp)
+            );
+        }
+
+        fx.teardown().await;
+    }
+
+    #[test]
+    fn backfill_fills_only_what_the_stored_commit_lacks() {
+        let stored = serde_json::json!({
+            "module": "acme/a", "commitDigest": "d", "fileCount": 1, "dependencies": [],
+        });
+        let fresh = serde_json::json!({
+            "module": "acme/a", "commitDigest": "d", "fileCount": 9, "dependencies": [],
+            "commitId": "c", "moduleId": "m", "ownerId": "o", "b5Digest": "b5:00",
+        });
+        let merged = merge_backfilled_metadata(Some(&stored), &fresh).expect("ids added");
+        assert_eq!(merged["fileCount"], 1, "what is recorded wins");
+        assert_eq!(merged["commitId"], "c");
+        assert_eq!(merged["moduleId"], "m");
+        assert_eq!(merged["ownerId"], "o");
+        assert_eq!(merged["b5Digest"], "b5:00");
+
+        assert!(
+            merge_backfilled_metadata(Some(&merged), &fresh).is_none(),
+            "nothing to add the second time"
+        );
+    }
+
+    #[test]
+    fn backfill_takes_a_new_b5_with_the_dependencies_it_was_composed_from() {
+        let stored = serde_json::json!({
+            "module": "acme/a", "dependencies": ["acme/base"],
+            "b5UnresolvedDeps": ["acme/base"],
+        });
+        let fresh = serde_json::json!({
+            "module": "acme/a", "dependencies": ["c0ffee"], "b5Digest": "b5:00",
+        });
+        let merged = merge_backfilled_metadata(Some(&stored), &fresh).expect("b5 added");
+        assert_eq!(merged["b5Digest"], "b5:00");
+        assert_eq!(merged["dependencies"], serde_json::json!(["c0ffee"]));
+        assert!(merged.get("b5UnresolvedDeps").is_none());
+    }
+
+    #[test]
+    fn backfill_keeps_a_recorded_b5_over_a_json_repush() {
+        let stored = serde_json::json!({
+            "module": "acme/a", "dependencies": ["c0ffee"], "b5Digest": "b5:00",
+            "commitId": "c", "moduleId": "m", "ownerId": "o",
+        });
+        let fresh = serde_json::json!({
+            "module": "acme/a", "dependencies": ["acme/base"],
+            "b5UnresolvedDeps": ["acme/base"],
+            "commitId": "c", "moduleId": "m", "ownerId": "o",
+        });
+        assert!(merge_backfilled_metadata(Some(&stored), &fresh).is_none());
+    }
+
+    #[test]
+    fn backfill_writes_the_fresh_metadata_when_none_is_stored() {
+        let fresh = serde_json::json!({ "module": "acme/a", "commitId": "c" });
+        assert_eq!(merge_backfilled_metadata(None, &fresh), Some(fresh.clone()));
+        assert!(merge_backfilled_metadata(None, &serde_json::json!([])).is_none());
     }
 
     /// #4725: a `buf push` to a hosted repository must queue a push sync task
