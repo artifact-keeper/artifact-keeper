@@ -152,6 +152,16 @@ const STALE_DIGESTS_SQL: &str = r#"
         ) l
         WHERE a.is_deleted = false
           AND (l.vuln_db_published_at IS NULL OR l.vuln_db_published_at < b.built_at)
+          -- A scan of this row is already queued (an upload, a push, a
+          -- `POST /security/scan`): it grades against the current database,
+          -- and a rescan beside it would add a second result for one update.
+          AND NOT EXISTS (
+            SELECT 1 FROM scan_queue q
+            WHERE q.state IN ('pending', 'running')
+              AND ((q.kind IN ('hosted_upload', 'hosted_artifact') AND q.artifact_id = a.id)
+                OR (q.kind = 'hosted_image' AND q.repository_id = a.repository_id
+                    AND q.digest = a.checksum_sha256))
+          )
     )
     SELECT s.digest
     FROM stale s
@@ -901,6 +911,47 @@ mod tests {
         assert!(
             builds.contains(&("image".to_string(), trivy_at)),
             "{builds:?}"
+        );
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(r)
+            .execute(&pool)
+            .await
+            .unwrap();
+        reset(&pool).await;
+    }
+
+    /// 1.12.0 stress run: a rescan selected while the artifact's own upload
+    /// scan was still queued gave it two results for one update. A stale
+    /// artifact with a pending `hosted_upload` (or `hosted_image`) job is not
+    /// selected; once that job is gone it is.
+    #[tokio::test]
+    async fn an_artifact_with_a_queued_scan_is_not_selected() {
+        let Some(pool) = try_pool().await else { return };
+        reset(&pool).await;
+        let r = repo(&pool).await;
+        let (up, img) = (digest('u'), digest('v'));
+        let up_id = scanned(&pool, r, &up, "2026-11-01T00:00:00Z").await;
+        scanned(&pool, r, &img, "2026-11-01T00:00:00Z").await;
+        let q = crate::services::scan_queue::ScanQueue::new(pool.clone());
+        q.enqueue_hosted_upload(up_id, crate::services::scan_queue::PRIORITY_HOSTED)
+            .await
+            .expect("upload job");
+        q.enqueue_hosted_image(r, &img, crate::services::scan_queue::PRIORITY_HOSTED)
+            .await
+            .expect("image job");
+
+        let builds = vec![("malware".to_string(), at("2026-11-10T00:00:00Z"))];
+        assert_eq!(enqueue_rescans(&pool, &builds, 100).await.expect("tick"), 0);
+
+        sqlx::query("DELETE FROM scan_queue")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            enqueue_rescans(&pool, &builds, 100).await.expect("after"),
+            2,
+            "with the jobs gone both are stale and selected"
         );
 
         sqlx::query("DELETE FROM repositories WHERE id = $1")
