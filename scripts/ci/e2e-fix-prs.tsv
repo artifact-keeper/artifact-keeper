@@ -1,0 +1,5 @@
+# Issues whose fix landed in a different PR from the one GitHub records as closing them.
+# Read by `scripts/ci/check-e2e-proof.py milestone`: the PRs named here replace the
+# issue's closing references when the backstop looks for a proof line or an exemption.
+# Columns, tab-separated: issue, PR number(s) (comma-separated), reason.
+5461	5433	The atomic completion landed in #5433 (commit bc1c433a, from #5389); #5530 says Closes #5461 but only added the concurrent regression test, which passes on main before it.

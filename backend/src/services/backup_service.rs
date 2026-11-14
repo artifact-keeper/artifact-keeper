@@ -15,7 +15,7 @@ use sqlx::PgPool;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use tar::{Archive, Builder};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio_util::io::{ReaderStream, StreamReader, SyncIoBridge};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -443,7 +443,9 @@ const RESTORE_TABLE_ORDER: &[&str] = &[
     "api_tokens",
 ];
 
-/// Entries queued for the archive writer, each an open stream, not its bytes
+/// Entries queued for the archive writer. An artifact's stream is opened only
+/// once the writer has written everything queued before it (#5858), so a
+/// queued entry never spends its S3 bulk timeout waiting behind another.
 const ARCHIVE_QUEUE_DEPTH: usize = 2;
 
 const ARCHIVE_CHUNK: usize = 256 * 1024;
@@ -540,10 +542,13 @@ impl<R: Read> Read for EntryBody<'_, R> {
     }
 }
 
-/// Runs on a blocking thread, a channel closed before the seal means the backup failed
+/// Runs on a blocking thread, a channel closed before the seal means the backup failed.
+/// `written` counts the entries already in the archive, which is how the feeder
+/// knows the writer is ready for the next artifact (#5858).
 fn write_archive(
     mut pieces: mpsc::Receiver<ArchivePiece>,
     out: impl Write,
+    written: watch::Sender<u64>,
 ) -> Result<BackupManifest> {
     let mut tar = Builder::new(GzEncoder::new(out, Compression::default()));
     let mut summary = PayloadSummary::default();
@@ -559,6 +564,7 @@ fn write_archive(
                     name: &entry.name,
                 };
                 append_tar_entry(&mut tar, &entry.path, entry.size, body)?;
+                written.send_modify(|n| *n += 1);
             }
             ArchivePiece::Seal(mut manifest) => {
                 (manifest.total_size_bytes, manifest.checksum) = summary.finish();
@@ -1340,6 +1346,8 @@ struct ArchiveArtifactOwners {
     owners: std::collections::HashMap<String, Vec<Uuid>>,
     /// Repository id -> the storage location the archive recorded for it.
     archived_locations: std::collections::HashMap<Uuid, StorageLocation>,
+    /// Repository id -> the key the archive recorded for it.
+    archived_keys: std::collections::HashMap<Uuid, String>,
 }
 
 /// Read [`ArchiveArtifactOwners`] out of extracted archive entries.
@@ -1374,6 +1382,9 @@ fn archive_artifact_owners(entries: &[(std::path::PathBuf, Vec<u8>)]) -> Archive
                         path: path.to_string(),
                     },
                 );
+                if let Some(key) = row.get("key").and_then(serde_json::Value::as_str) {
+                    owners.archived_keys.insert(id, key.to_string());
+                }
             }
         }
     }
@@ -1587,6 +1598,90 @@ fn validated_restore_rows(table: &str, content: &[u8]) -> Result<Vec<serde_json:
         )));
     }
     Ok(serde_json::from_slice(content)?)
+}
+
+/// What restoring one table's rows did (#5856).
+#[derive(Debug, Default)]
+struct TableRestore {
+    /// Rows in the archive.
+    rows: usize,
+    /// Rows inserted. A row that already exists is skipped, not counted.
+    restored: usize,
+    /// One `key (error)` line per row that failed.
+    failed: Vec<String>,
+}
+
+/// The primary key columns of `table`, empty when it has none or the catalog
+/// cannot be read (the row is then named by its position).
+async fn primary_key_columns(conn: &mut sqlx::PgConnection, table: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT a.attname::text FROM pg_index i \
+         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+         WHERE i.indrelid = to_regclass($1) AND i.indisprimary \
+         ORDER BY array_position(i.indkey::int2[], a.attnum)",
+    )
+    .bind(table)
+    .fetch_all(conn)
+    .await
+    .unwrap_or_default()
+}
+
+/// Name an archived row by its primary key, never by its contents (#5856).
+fn row_label(row: &serde_json::Value, primary_key: &[String], index: usize) -> String {
+    let parts: Vec<String> = primary_key
+        .iter()
+        .filter_map(|column| {
+            let value = row.get(column)?;
+            let value = match value {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                _ => return None,
+            };
+            Some(format!("{column}={value}"))
+        })
+        .collect();
+    if parts.is_empty() || parts.len() != primary_key.len() {
+        format!("row {}", index + 1)
+    } else {
+        parts.join(",")
+    }
+}
+
+/// Why a row failed, without the values PostgreSQL quotes for a data
+/// exception (`invalid input syntax for type uuid: "..."`), which could be
+/// the row's secret (#5856). Integrity violations name only the constraint.
+fn row_error(error: &sqlx::Error) -> String {
+    match error {
+        sqlx::Error::Database(db) => match db.code() {
+            Some(code) if code.starts_with("22") => {
+                format!("a value does not fit its column (SQLSTATE {code})")
+            }
+            _ => db.message().to_string(),
+        },
+        _ => "database error".to_string(),
+    }
+}
+
+/// The error of a restore whose object pass stopped (#5857), saying what was
+/// written: the objects before the failure, and no database rows, since the
+/// tables are restored only after every object is.
+fn object_pass_failed(error: AppError, objects_written: i32) -> AppError {
+    let note = format!(
+        "No database rows were restored. {objects_written} artifact object(s) were written to \
+         storage before the restore stopped; no row refers to them yet. Re-running the restore \
+         from an intact archive is safe: it writes every object again, then restores the tables."
+    );
+    match error {
+        AppError::Validation(m) => AppError::Validation(format!("{m}. {note}")),
+        AppError::Storage(m) => AppError::Storage(format!("{m}. {note}")),
+        AppError::Internal(m) => AppError::Internal(format!("{m}. {note}")),
+        AppError::NotFound(m) => AppError::NotFound(format!("{m}. {note}")),
+        AppError::Database(m) => AppError::Database(format!("{m}. {note}")),
+        other => {
+            tracing::warn!(error = %other, "restore stopped in its object pass. {note}");
+            other
+        }
+    }
 }
 
 /// A backend that cannot report the length without reading gets that one object buffered
@@ -2021,8 +2116,9 @@ impl BackupService {
         let (pieces, pieces_rx) = mpsc::channel(ARCHIVE_QUEUE_DEPTH);
         let (sink, pipe) = tokio::io::duplex(ARCHIVE_CHUNK);
         let (sealed_tx, sealed_rx) = oneshot::channel();
+        let (entries_written, writer_progress) = watch::channel(0);
         let writer = tokio::task::spawn_blocking(move || {
-            let written = write_archive(pieces_rx, SyncIoBridge::new(sink));
+            let written = write_archive(pieces_rx, SyncIoBridge::new(sink), entries_written);
             let _ = sealed_tx.send(written.is_ok());
             written
         });
@@ -2030,7 +2126,7 @@ impl BackupService {
             .archive_storage
             .put_stream(&storage_path, sealed_archive_stream(pipe, sealed_rx));
         let feed = self.feed_archive(
-            pieces,
+            (pieces, writer_progress),
             &backup,
             &table_names,
             table_data,
@@ -2149,11 +2245,17 @@ impl BackupService {
     }
 
     /// An artifact that cannot be opened is left out and recorded (#3170), one that
-    /// fails partway fails the backup since its header is already written
+    /// fails partway fails the backup since its header is already written.
+    ///
+    /// Each artifact is opened only when the writer has written every entry
+    /// sent before it (#5858). `S3_BULK_TIMEOUT_SECS` runs from the moment a
+    /// GET starts, so a stream opened early and left queued behind a large or
+    /// slow entry would lose part of its time limit before a byte of it was
+    /// read.
     #[allow(clippy::too_many_arguments)]
     async fn feed_archive(
         &self,
-        pieces: mpsc::Sender<ArchivePiece>,
+        (pieces, mut writer_progress): (mpsc::Sender<ArchivePiece>, watch::Receiver<u64>),
         backup: &Backup,
         table_names: &[&str],
         table_data: Vec<(String, Vec<u8>)>,
@@ -2163,6 +2265,7 @@ impl BackupService {
     ) -> Result<(i64, Vec<(String, String)>)> {
         let mut artifact_count: i64 = 0;
         let mut unreadable: Vec<(String, String)> = Vec::new();
+        let mut sent: u64 = 0;
         // A failed send means the writer stopped, it or the upload reports why
         for (name, json_bytes) in table_data {
             let entry = ArchiveEntry {
@@ -2174,9 +2277,18 @@ impl BackupService {
             if pieces.send(ArchivePiece::Entry(entry)).await.is_err() {
                 return Ok((artifact_count, unreadable));
             }
+            sent += 1;
         }
         for artifact in artifacts {
             ensure_backup_not_cancelled(cancel)?;
+            // A writer that stopped drops its progress sender; it or the upload reports why
+            if writer_progress
+                .wait_for(|written| *written >= sent)
+                .await
+                .is_err()
+            {
+                return Ok((artifact_count, unreadable));
+            }
             let (size, body) = match self.open_artifact(&artifact).await {
                 Ok(opened) => opened,
                 Err(e) => {
@@ -2200,6 +2312,7 @@ impl BackupService {
             if pieces.send(ArchivePiece::Entry(entry)).await.is_err() {
                 return Ok((artifact_count, unreadable));
             }
+            sent += 1;
             artifact_count += 1;
         }
 
@@ -2379,13 +2492,21 @@ impl BackupService {
     /// Resolve where a restore writes each archived artifact key (#5053).
     ///
     /// Every repository that owns the key in the archive gets a copy. Each
-    /// owner's location comes from the LIVE `repositories` row, read after the
-    /// tables are restored: with `ON CONFLICT DO NOTHING` an existing
-    /// repository keeps its own `storage_path`, and a new host may mount
-    /// `STORAGE_PATH` elsewhere, so the path recorded in the archive can be
-    /// stale. Only when no live row exists is the archived location used, and
-    /// then only after [`validate_archived_location`] accepts it. An owner
-    /// whose location is refused is reported in `result.errors` and skipped.
+    /// owner's location comes from the LIVE `repositories` row when there is
+    /// one: with `ON CONFLICT DO NOTHING` an existing repository keeps its own
+    /// `storage_path`, and a new host may mount `STORAGE_PATH` elsewhere, so
+    /// the path recorded in the archive can be stale.
+    ///
+    /// The objects are restored before the tables (#5857), so a repository the
+    /// archive brings back has no live row yet. When `restores_rows` and no
+    /// live repository holds its key, the table pass that follows inserts the
+    /// archived row, so its archived location is the location that row will
+    /// name and is used as is, exactly as the live row was used when the
+    /// tables went first. Otherwise (a bytes-only restore, or a key a live
+    /// repository already holds, whose row will be skipped) the archived
+    /// location is used only after [`validate_archived_location`] accepts it.
+    /// An owner whose location is refused is reported in `result.errors` and
+    /// skipped.
     ///
     /// Keys absent from the returned map have no owner with a known location
     /// (e.g. a legacy archive without the rows) and keep the global-handle
@@ -2394,9 +2515,10 @@ impl BackupService {
         &self,
         registry: &StorageRegistry,
         owners: ArchiveArtifactOwners,
+        restores_rows: bool,
         result: &mut RestoreResult,
     ) -> Result<std::collections::HashMap<String, Vec<StorageLocation>>> {
-        use std::collections::HashMap;
+        use std::collections::{HashMap, HashSet};
 
         let mut repository_ids: Vec<Uuid> = owners.owners.values().flatten().copied().collect();
         repository_ids.sort_unstable();
@@ -2412,6 +2534,24 @@ impl BackupService {
             .into_iter()
             .map(|(id, backend, path)| (id, StorageLocation { backend, path }))
             .collect();
+        // Archived keys a live repository already holds: those rows are
+        // skipped by the table pass.
+        let wanted_keys: Vec<&str> = repository_ids
+            .iter()
+            .filter(|id| !repository_locations.contains_key(id))
+            .filter_map(|id| owners.archived_keys.get(id).map(String::as_str))
+            .collect();
+        let taken_keys: HashSet<String> = if restores_rows && !wanted_keys.is_empty() {
+            sqlx::query_scalar("SELECT key FROM repositories WHERE key = ANY($1)")
+                .bind(&wanted_keys)
+                .fetch_all(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .into_iter()
+                .collect()
+        } else {
+            HashSet::new()
+        };
 
         let mut refused: Vec<Uuid> = Vec::new();
         for id in repository_ids {
@@ -2421,6 +2561,15 @@ impl BackupService {
             let Some(archived) = owners.archived_locations.get(&id) else {
                 continue;
             };
+            let inserted_by_this_restore = restores_rows
+                && owners
+                    .archived_keys
+                    .get(&id)
+                    .is_some_and(|key| !taken_keys.contains(key));
+            if inserted_by_this_restore {
+                repository_locations.insert(id, archived.clone());
+                continue;
+            }
             match validate_archived_location(archived, registry.filesystem_bucket_root()) {
                 Ok(()) => {
                     repository_locations.insert(id, archived.clone());
@@ -2787,6 +2936,41 @@ impl BackupService {
             }
         }
 
+        // A depth-bearing archive whose layout conflicts with a live
+        // repository is refused before a single object is written.
+        if options.restore_database {
+            let mut conn = self.db.acquire().await?;
+            validate_restore_layouts(&mut conn, &layouts, false).await?;
+        }
+
+        // Artifact files are restored first and the tables after them
+        // (#5857). If this pass stops (the archive changed after it was
+        // verified, the store went away), no row has been written yet: the
+        // server is never left with rows whose bytes did not arrive, and a
+        // re-run rewrites the objects already written and then restores the
+        // tables. The archive's own artifact rows say which repositories own
+        // each key, and each owner's repository row (the live one, or else the
+        // archived one) says where its bytes go, so filesystem repositories get
+        // their bytes back under their own storage path instead of the global
+        // root, and a key shared by several repositories is restored to every
+        // one of them (#5053). Legacy archives with no such rows, and services
+        // without a registry, keep the historical global-handle behavior.
+        if options.restore_artifacts {
+            if let Err(e) = self
+                .restore_objects(
+                    storage_path,
+                    &entries,
+                    &scanned.artifact_digests,
+                    (limits, archive_len),
+                    options.restore_database,
+                    &mut result,
+                )
+                .await
+            {
+                return Err(object_pass_failed(e, result.artifacts_restored));
+            }
+        }
+
         // Restore database tables in dependency order. There is deliberately
         // no catch-all pass for other `database/*.json` entries:
         // RESTORE_TABLE_ORDER already covers every table in
@@ -2835,90 +3019,96 @@ impl BackupService {
             }
         }
 
-        // Restore artifact files. The archive's own artifact rows say which
-        // repositories own each key, and each owner's live repository row says
-        // where its bytes go, so filesystem repositories get their bytes back
-        // under their own storage path instead of the global root, and a key
-        // shared by several repositories is restored to every one of them
-        // (#5053). Legacy archives with no such rows, and services without a
-        // registry, keep the historical global-handle behavior.
-        if options.restore_artifacts {
-            let artifact_locations = match &self.storage_registry {
-                Some(registry) => {
-                    self.resolve_restore_locations(
-                        registry,
-                        archive_artifact_owners(&entries),
-                        &mut result,
-                    )
-                    .await?
-                }
-                None => std::collections::HashMap::new(),
-            };
-            // Pass two streams each artifact from the archive to its locations
-            if !scanned.artifact_digests.is_empty() {
-                let compressed = self.archive_storage.get_stream(storage_path).await?;
-                let digests = scanned.artifact_digests;
-                let (tx, mut restored) = mpsc::channel(1);
-                let reader = tokio::task::spawn_blocking(move || {
-                    let compressed = blocking_reader(compressed);
-                    stream_artifact_entries(compressed, limits, archive_len, &digests, tx)
-                });
-                while let Some(RestoreEntry { storage_key, body }) = restored.recv().await {
-                    let (Some(registry), Some(locations)) =
-                        (&self.storage_registry, artifact_locations.get(&storage_key))
-                    else {
-                        match self.storage.put_stream(&storage_key, body).await {
-                            Ok(_) => result.artifacts_restored += 1,
-                            Err(e) => result
-                                .errors
-                                .push(format!("Failed to restore {}: {}", storage_key, e)),
-                        }
-                        continue;
-                    };
-                    // Every owner was refused above (and reported there).
-                    if locations.is_empty() {
-                        continue;
-                    }
-                    let mut body = Some(body);
-                    let mut copy_from = None;
-                    let mut restored_everywhere = true;
-                    for location in locations {
-                        let write = match registry.backend_for(location) {
-                            Ok(backend) => {
-                                restore_to(backend, &storage_key, body.take(), copy_from.as_ref())
-                                    .await
-                            }
-                            Err(e) => Err(e),
-                        };
-                        match write {
-                            Ok(backend) => {
-                                copy_from.get_or_insert(backend);
-                            }
-                            Err(e) => {
-                                restored_everywhere = false;
-                                result.errors.push(format!(
-                                    "Failed to restore {} to {} '{}': {}",
-                                    storage_key, location.backend, location.path, e
-                                ));
-                            }
-                        }
-                    }
-                    if restored_everywhere {
-                        result.artifacts_restored += 1;
-                    }
-                }
-                reader
-                    .await
-                    .map_err(|e| AppError::Internal(format!("restore write pass: {e}")))??;
-            }
-        }
-
         // Any error above means part of the archive, or part of what the
         // operator may have expected it to hold, did not come back (#5654).
         if !result.errors.is_empty() {
             result.status = RestoreStatus::Partial;
         }
         Ok(result)
+    }
+
+    /// Restore pass two: stream every archived object to the locations
+    /// [`Self::resolve_restore_locations`] gives it. A per-object write
+    /// failure is collected into `result`; an archive that differs from what
+    /// pass one verified, or that cannot be read, ends the pass with an error.
+    async fn restore_objects(
+        &self,
+        storage_path: &str,
+        entries: &[(std::path::PathBuf, Vec<u8>)],
+        artifact_digests: &[[u8; 32]],
+        (limits, archive_len): (ExtractLimits, u64),
+        restores_rows: bool,
+        result: &mut RestoreResult,
+    ) -> Result<()> {
+        let artifact_locations = match &self.storage_registry {
+            Some(registry) => {
+                self.resolve_restore_locations(
+                    registry,
+                    archive_artifact_owners(entries),
+                    restores_rows,
+                    result,
+                )
+                .await?
+            }
+            None => std::collections::HashMap::new(),
+        };
+        // Pass two streams each artifact from the archive to its locations
+        if !artifact_digests.is_empty() {
+            let compressed = self.archive_storage.get_stream(storage_path).await?;
+            let digests = artifact_digests.to_vec();
+            let (tx, mut restored) = mpsc::channel(1);
+            let reader = tokio::task::spawn_blocking(move || {
+                let compressed = blocking_reader(compressed);
+                stream_artifact_entries(compressed, limits, archive_len, &digests, tx)
+            });
+            while let Some(RestoreEntry { storage_key, body }) = restored.recv().await {
+                let (Some(registry), Some(locations)) =
+                    (&self.storage_registry, artifact_locations.get(&storage_key))
+                else {
+                    match self.storage.put_stream(&storage_key, body).await {
+                        Ok(_) => result.artifacts_restored += 1,
+                        Err(e) => result
+                            .errors
+                            .push(format!("Failed to restore {}: {}", storage_key, e)),
+                    }
+                    continue;
+                };
+                // Every owner was refused above (and reported there).
+                if locations.is_empty() {
+                    continue;
+                }
+                let mut body = Some(body);
+                let mut copy_from = None;
+                let mut restored_everywhere = true;
+                for location in locations {
+                    let write = match registry.backend_for(location) {
+                        Ok(backend) => {
+                            restore_to(backend, &storage_key, body.take(), copy_from.as_ref()).await
+                        }
+                        Err(e) => Err(e),
+                    };
+                    match write {
+                        Ok(backend) => {
+                            copy_from.get_or_insert(backend);
+                        }
+                        Err(e) => {
+                            restored_everywhere = false;
+                            result.errors.push(format!(
+                                "Failed to restore {} to {} '{}': {}",
+                                storage_key, location.backend, location.path, e
+                            ));
+                        }
+                    }
+                }
+                if restored_everywhere {
+                    result.artifacts_restored += 1;
+                }
+            }
+            reader
+                .await
+                .map_err(|e| AppError::Internal(format!("restore write pass: {e}")))??;
+        }
+        Ok(())
     }
 
     /// Parse `manifest.json` out of already-extracted archive entries.
@@ -3039,6 +3229,11 @@ impl BackupService {
     /// `conn`. `strict` (a depth-bearing archive, `conn` inside one
     /// transaction) turns any failure into an error; otherwise failures are
     /// collected into `result` and the restore continues.
+    ///
+    /// Archived user, role and group ids that exist here under another id
+    /// are mapped onto the live rows first (#5856), so a restore into a
+    /// server with its own bootstrap admin and seeded roles keeps the rows
+    /// that refer to them.
     async fn restore_tables(
         conn: &mut sqlx::PgConnection,
         entries: &[(std::path::PathBuf, Vec<u8>)],
@@ -3046,6 +3241,12 @@ impl BackupService {
         strict: bool,
         result: &mut RestoreResult,
     ) -> Result<()> {
+        let remap = IdentityRemap::build(&mut *conn, |table| {
+            backup_table(entries, table)
+                .map(|content| validated_restore_rows(table, content))
+                .transpose()
+        })
+        .await?;
         for table_name in RESTORE_TABLE_ORDER
             .iter()
             .copied()
@@ -3054,10 +3255,25 @@ impl BackupService {
             let Some(content) = backup_table(entries, table_name) else {
                 continue;
             };
-            match Self::restore_table_in(&mut *conn, table_name, content, strict).await {
-                Ok(rows) => {
-                    tracing::info!("Restored {} rows into table '{}'", rows, table_name);
+            match Self::restore_table_in(&mut *conn, table_name, content, strict, &remap).await {
+                Ok(table) => {
+                    tracing::info!(
+                        "Restored {} rows into table '{}'",
+                        table.restored,
+                        table_name
+                    );
                     result.tables_restored.push(table_name.to_string());
+                    // Every row that did not go in is part of the archive that
+                    // did not come back, so the restore cannot be `completed`.
+                    if !table.failed.is_empty() {
+                        result.errors.push(format!(
+                            "Failed to restore {} of {} row(s) into '{}': {}",
+                            table.failed.len(),
+                            table.rows,
+                            table_name,
+                            capped_list(&table.failed, 5)
+                        ));
+                    }
                 }
                 Err(e) => {
                     if strict
@@ -3084,13 +3300,13 @@ impl BackupService {
     /// Restore a single database table from JSON data.
     /// Uses jsonb_populate_record for proper type coercion.
     #[cfg(test)]
-    async fn restore_table(&self, table: &str, content: &[u8]) -> Result<usize> {
+    async fn restore_table(&self, table: &str, content: &[u8]) -> Result<TableRestore> {
         // Validate (allowlist, JSON) before touching the pool.
         if validated_restore_rows(table, content)?.is_empty() {
-            return Ok(0);
+            return Ok(TableRestore::default());
         }
         let mut conn = self.db.acquire().await?;
-        Self::restore_table_in(&mut conn, table, content, false).await
+        Self::restore_table_in(&mut conn, table, content, false, &IdentityRemap::default()).await
     }
 
     async fn restore_table_in(
@@ -3098,44 +3314,53 @@ impl BackupService {
         table: &str,
         content: &[u8],
         strict: bool,
-    ) -> Result<usize> {
-        let rows = validated_restore_rows(table, content)?;
-        let mut restored = 0usize;
+        remap: &IdentityRemap,
+    ) -> Result<TableRestore> {
+        let mut rows = validated_restore_rows(table, content)?;
+        let mut outcome = TableRestore {
+            rows: rows.len(),
+            ..TableRestore::default()
+        };
+        // Read only once a row fails, to name it by its key.
+        let mut primary_key: Option<Vec<String>> = None;
 
-        for row in &rows {
-            // Use jsonb_populate_record to let Postgres handle type coercion
-            let query = format!(
-                "INSERT INTO {table} SELECT * FROM jsonb_populate_record(NULL::{table}, $1) ON CONFLICT DO NOTHING"
-            );
-
-            let insert = sqlx::query(sqlx::AssertSqlSafe(&*query)).bind(row);
+        // Use jsonb_populate_record to let Postgres handle type coercion
+        let query = format!(
+            "INSERT INTO {table} SELECT * FROM jsonb_populate_record(NULL::{table}, $1) ON CONFLICT DO NOTHING"
+        );
+        for (index, row) in rows.iter_mut().enumerate() {
+            remap.apply(table, row);
+            let insert = sqlx::query(sqlx::AssertSqlSafe(&*query)).bind(&*row);
             if strict {
                 // `conn` is the restore's one transaction and any failure
                 // aborts all of it, so a per-row savepoint would only add a
                 // subtransaction per row.
-                restored += insert.execute(&mut *conn).await?.rows_affected() as usize;
+                outcome.restored += insert.execute(&mut *conn).await?.rows_affected() as usize;
                 continue;
             }
             // `conn` is not in a transaction: each row commits on its own.
             match insert.execute(&mut *conn).await {
                 Ok(result) => {
-                    restored += result.rows_affected() as usize;
+                    outcome.restored += result.rows_affected() as usize;
                 }
                 Err(e) => {
                     if crate::services::rpm_layout::database_error(&e.to_string()).is_some() {
                         return Err(e.into());
                     }
-                    tracing::warn!(
-                        "Failed to restore row in '{}': {} (row: {})",
-                        table,
-                        e,
-                        serde_json::to_string(row).unwrap_or_default()
-                    );
+                    if primary_key.is_none() {
+                        primary_key = Some(primary_key_columns(&mut *conn, table).await);
+                    }
+                    let key = row_label(row, primary_key.as_deref().unwrap_or_default(), index);
+                    let error = row_error(&e);
+                    // The row itself can hold token hashes or encrypted
+                    // secrets, so only its key is logged (#5856).
+                    tracing::warn!(table, row = %key, error = %error, "Failed to restore row");
+                    outcome.failed.push(format!("{key} ({error})"));
                 }
             }
         }
 
-        Ok(restored)
+        Ok(outcome)
     }
 
     /// Delete a backup
@@ -3314,6 +3539,20 @@ impl std::fmt::Display for RestoreStatus {
 }
 
 mod content_tables;
+mod identity_remap;
+use identity_remap::IdentityRemap;
+
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod restore_identity_tests;
+
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod archive_feed_tests;
+
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod object_pass_tests;
 
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
@@ -4137,7 +4376,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(ARCHIVE_QUEUE_DEPTH);
         let writer = tokio::task::spawn_blocking(move || {
             let mut out = Vec::new();
-            let written = write_archive(rx, &mut out);
+            let written = write_archive(rx, &mut out, watch::channel(0).0);
             (written, out)
         });
         for piece in pieces {
@@ -4633,7 +4872,8 @@ mod tests {
             service
                 .restore_table("users", b"[]")
                 .await
-                .expect("allowlisted table passes validation"),
+                .expect("allowlisted table passes validation")
+                .rows,
             0
         );
     }

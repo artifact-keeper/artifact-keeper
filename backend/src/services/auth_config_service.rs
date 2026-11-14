@@ -1973,8 +1973,28 @@ impl AuthConfigService {
         provider_id: Uuid,
         pkce_code_verifier: Option<String>,
     ) -> Result<SsoSession> {
+        Self::create_sso_session_with_pkce_state_prefix(
+            pool,
+            provider_type,
+            provider_id,
+            pkce_code_verifier,
+            "",
+        )
+        .await
+    }
+
+    /// [`Self::create_sso_session_with_pkce`] with a fixed prefix on the
+    /// random `state`. A command-line login (#5486) is marked this way
+    /// (`sso_binding::CLI_OIDC_STATE_PREFIX`).
+    pub async fn create_sso_session_with_pkce_state_prefix(
+        pool: &PgPool,
+        provider_type: &str,
+        provider_id: Uuid,
+        pkce_code_verifier: Option<String>,
+        state_prefix: &str,
+    ) -> Result<SsoSession> {
         let id = Uuid::new_v4();
-        let state = Uuid::new_v4().to_string();
+        let state = format!("{state_prefix}{}", Uuid::new_v4());
         let nonce = Uuid::new_v4().to_string();
 
         let session = sqlx::query_as::<_, SsoSession>(
@@ -2093,21 +2113,47 @@ impl AuthConfigService {
             Uuid::new_v4().to_string().replace('-', ""),
             Uuid::new_v4().to_string().replace('-', ""),
         );
+        Self::store_exchange_code(pool, &code, access_token, refresh_token).await?;
+        Ok(code)
+    }
 
+    /// Store `code` as a short-lived, single-use exchange code for the given
+    /// tokens. The SSO callbacks mint a browser-bound code
+    /// (`sso_binding::mint_exchange_code`, #5486) and store it here.
+    pub async fn store_exchange_code(
+        pool: &PgPool,
+        code: &str,
+        access_token: &str,
+        refresh_token: &str,
+    ) -> Result<()> {
         sqlx::query(
             r#"
             INSERT INTO sso_exchange_codes (code, access_token, refresh_token)
             VALUES ($1, $2, $3)
             "#,
         )
-        .bind(&code)
+        .bind(code)
         .bind(access_token)
         .bind(refresh_token)
         .execute(pool)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to create exchange code: {e}")))?;
+        Ok(())
+    }
 
-        Ok(code)
+    /// Read the tokens behind a live exchange code without consuming it: the
+    /// SAML completion step (#5486) sets the session cookies from them, and
+    /// the frontend still redeems the code at `/exchange`.
+    pub async fn peek_exchange_code(pool: &PgPool, code: &str) -> Result<(String, String)> {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT access_token, refresh_token FROM sso_exchange_codes \
+             WHERE code = $1 AND expires_at > NOW()",
+        )
+        .bind(code)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to read exchange code: {e}")))?
+        .ok_or_else(|| AppError::Authentication("Invalid or expired exchange code".to_string()))
     }
 
     /// Consume a single-use exchange code and return the associated tokens.

@@ -24,7 +24,39 @@ use crate::services::hidden_nav_items;
 /// Mounted under `/system` behind `optional_auth_middleware` so the handler
 /// receives an `Option<AuthExtension>` and can decide how much to disclose.
 pub fn router() -> Router<SharedState> {
-    Router::new().route("/config", get(get_system_config))
+    Router::new()
+        .route("/config", get(get_system_config))
+        .route("/quota", get(get_system_quota))
+}
+
+/// Instance quota usage: storage, this month's download transfer, the upload
+/// size limit and the help link. Any authenticated user may read it, so the
+/// web UI can warn every user before an upload or a download is refused; an
+/// anonymous caller gets `401` (and, with guest access disabled, the guest
+/// guard answers before this handler runs).
+#[utoipa::path(
+    get,
+    path = "/quota",
+    context_path = "/api/v1/system",
+    tag = "system",
+    responses(
+        (status = 200, description = "Instance quota usage", body = crate::services::quota::QuotaOverview),
+        (status = 401, description = "Authentication required"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_system_quota(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+) -> crate::error::Result<Json<crate::services::quota::QuotaOverview>> {
+    if auth.is_none() {
+        return Err(crate::error::AppError::Unauthorized(
+            "Authentication required".to_string(),
+        ));
+    }
+    Ok(Json(
+        crate::services::quota::QuotaOverview::collect(&state).await?,
+    ))
 }
 
 /// Fine-grained permissions enforcement status.
@@ -364,8 +396,13 @@ pub async fn get_system_config(
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(get_system_config),
+    paths(get_system_config, get_system_quota),
     components(schemas(
+        crate::services::quota::QuotaOverview,
+        crate::services::quota::StorageQuotaStatus,
+        crate::services::quota::TransferQuotaStatus,
+        crate::services::quota::storage::StorageState,
+        crate::services::quota::transfer::TransferState,
         SystemConfigResponse,
         ScannersConfig,
         AuthConfig,
