@@ -163,6 +163,19 @@ fn hydrate_select(from_clause: &str) -> String {
     )
 }
 
+/// A rule is live only while its principal row exists (#5608).
+///
+/// `permissions` carries no foreign key on its polymorphic principal pair, so
+/// rows left by a principal deleted before migration 364 would otherwise
+/// resolve to `principal_name: null` and clutter the admin listing.
+/// `anonymous` names no table row by design and is always live. Kept as one
+/// predicate so the page and its total cannot disagree about which rows exist.
+const LIVE_PRINCIPAL_PREDICATE: &str = "(p.principal_type = 'anonymous'
+    OR (p.principal_type IN ('user', 'service_account')
+        AND EXISTS (SELECT 1 FROM users live_user WHERE live_user.id = p.principal_id))
+    OR (p.principal_type = 'group'
+        AND EXISTS (SELECT 1 FROM groups live_group WHERE live_group.id = p.principal_id)))";
+
 /// Map an error from the create/update write statements.
 ///
 /// A unique violation on `permissions(principal_type, principal_id,
@@ -298,10 +311,12 @@ pub async fn list_permissions(
           AND ($2::uuid IS NULL OR p.principal_id = $2)
           AND ($3::text IS NULL OR p.target_type = $3)
           AND ($4::uuid IS NULL OR p.target_id = $4)
+          AND {}
         ORDER BY p.created_at DESC
         OFFSET $5
         LIMIT $6",
-        hydrate_select("permissions p")
+        hydrate_select("permissions p"),
+        LIVE_PRINCIPAL_PREDICATE
     )))
     .bind(&query.principal_type)
     .bind(query.principal_id)
@@ -313,16 +328,18 @@ pub async fn list_permissions(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let total: i64 = sqlx::query_scalar(
+    let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(&*format!(
         r#"
         SELECT COUNT(*)
-        FROM permissions
-        WHERE ($1::text IS NULL OR principal_type = $1)
-          AND ($2::uuid IS NULL OR principal_id = $2)
-          AND ($3::text IS NULL OR target_type = $3)
-          AND ($4::uuid IS NULL OR target_id = $4)
+        FROM permissions p
+        WHERE ($1::text IS NULL OR p.principal_type = $1)
+          AND ($2::uuid IS NULL OR p.principal_id = $2)
+          AND ($3::text IS NULL OR p.target_type = $3)
+          AND ($4::uuid IS NULL OR p.target_id = $4)
+          AND {}
         "#,
-    )
+        LIVE_PRINCIPAL_PREDICATE
+    )))
     .bind(&query.principal_type)
     .bind(query.principal_id)
     .bind(&query.target_type)
@@ -1177,6 +1194,73 @@ mod tests {
         assert_eq!(fetched_legacy["target_name"], repo_name);
 
         cleanup_permission_fixtures(&pool, repo_id, admin_id, &[service_account_id], &[]).await;
+    }
+
+    /// #5608: a rule whose principal row no longer exists is omitted from the
+    /// admin listing and its total, instead of appearing as
+    /// `principal_name: null`. `anonymous` names no row by design and stays.
+    #[tokio::test]
+    async fn list_permissions_hides_rules_with_deleted_principals_5608() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (repository_owner_id, _) = tdh::create_user(&pool).await;
+        let (live_group_id, _) = tdh::create_group(&pool).await;
+        let (repo_id, _repo_name, _storage_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let auth = tdh::admin_auth(admin_id, &admin_name);
+
+        let live_user_rule =
+            seed_permission(&pool, "user", repository_owner_id, "repository", repo_id).await;
+        let live_group_rule =
+            seed_permission(&pool, "group", live_group_id, "repository", repo_id).await;
+        let anonymous_rule =
+            seed_permission(&pool, "anonymous", Uuid::nil(), "repository", repo_id).await;
+        // Pre-migration leftovers: the principal ids refer to no row, so no
+        // trigger can have removed these rules.
+        let orphan_user_rule =
+            seed_permission(&pool, "user", Uuid::new_v4(), "repository", repo_id).await;
+        let orphan_group_rule =
+            seed_permission(&pool, "group", Uuid::new_v4(), "repository", repo_id).await;
+
+        let listed = response_json(
+            state,
+            auth,
+            tdh::get(format!("/?target_id={repo_id}&per_page=100")),
+        )
+        .await;
+        let ids: Vec<Uuid> = listed["items"]
+            .as_array()
+            .expect("permission items")
+            .iter()
+            .map(|item| serde_json::from_value(item["id"].clone()).expect("permission id"))
+            .collect();
+
+        cleanup_permission_fixtures(
+            &pool,
+            repo_id,
+            admin_id,
+            &[repository_owner_id],
+            &[live_group_id],
+        )
+        .await;
+
+        assert!(ids.contains(&live_user_rule), "live user rule missing");
+        assert!(ids.contains(&live_group_rule), "live group rule missing");
+        assert!(ids.contains(&anonymous_rule), "anonymous rule missing");
+        assert!(
+            !ids.contains(&orphan_user_rule),
+            "a deleted user's rule must not be listed (#5608)"
+        );
+        assert!(
+            !ids.contains(&orphan_group_rule),
+            "a deleted group's rule must not be listed (#5608)"
+        );
+        assert_eq!(
+            listed["pagination"]["total"], 3,
+            "the total must apply the same principal filter as the page"
+        );
     }
 
     /// #4710: create, update and delete of a permission rule each write one

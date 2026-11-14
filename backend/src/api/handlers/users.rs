@@ -3454,6 +3454,47 @@ mod router_split_tests {
         delete_user_row(&pool, target_id).await;
     }
 
+    /// #5608: deleting a user removes the fine-grained permission rules that
+    /// name it. Pre-fix the rows survived the DELETE (no FK on the polymorphic
+    /// principal pair) and showed up as `principal_name: null`.
+    #[tokio::test]
+    async fn delete_user_removes_its_permission_rules_5608() {
+        let Some((pool, state, admin_id, admin_name)) = setup().await else {
+            return;
+        };
+        let (target_id, _) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_name, storage_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        tdh::grant_permission(&pool, "user", target_id, "repository", repo_id, &["read"]).await;
+        let app = build_admin_app(state, tdh::admin_auth(admin_id, &admin_name));
+
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/{}", target_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM permissions WHERE principal_id = $1")
+                .bind(target_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count the deleted user's rules");
+
+        tdh::cleanup(&pool, repo_id, admin_id).await;
+        let _ = std::fs::remove_dir_all(storage_dir);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "delete_user failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            remaining, 0,
+            "deleting a user must remove its permission rules (#5608)"
+        );
+    }
+
     // ── password_router: change_password reachable for self ───────────
 
     /// Pre-#1257 `change_password` (`POST /:id/password`) was blocked by
