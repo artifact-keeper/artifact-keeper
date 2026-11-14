@@ -1571,9 +1571,16 @@ fn index_bytes_response(bytes: Bytes, content_type: Option<&str>) -> Response {
 /// Pass a document from a Remote repo's upstream through verbatim.
 ///
 /// Used for the specs indexes (#4280), the Compact Index and the quick
-/// gemspecs. Specs indexes and the Compact Index `versions` file from
+/// gemspecs (#5686). Specs indexes and the Compact Index `versions` file from
 /// rubygems.org exceed [`DEFAULT_METADATA_MAX_BYTES`] (8 MiB), so those
 /// fetches pass [`LARGE_METADATA_MAX_BYTES`].
+///
+/// The body is the upstream (or cached) bytes as they arrived, so the
+/// upstream `Content-Encoding` is re-declared when present (RFC 9110 §8.4,
+/// #3149/#3260): a mirror that serves `versions` or `info/*` with a coding
+/// must not reach Bundler labelled as plain bytes, or its MD5 check of the
+/// `info/{name}` body fails. A body served under the `stale-if-error` grace
+/// carries the stale markers (#4581), as the Virtual paths already do.
 async fn proxy_remote_document(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1590,18 +1597,32 @@ async fn proxy_remote_document(
         )
             .into_response());
     };
-    let (content, content_type, _permit) = proxy_helpers::proxy_fetch_capped_budgeted(
-        proxy,
-        repo.id,
-        &repo.key,
-        upstream,
-        path,
-        max_bytes,
-        RepositoryFormat::Rubygems,
+    match proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
+        proxy, repo.id, &repo.key, upstream, path, max_bytes,
     )
-    .await?;
-    let content_type = content_type.as_deref().unwrap_or(default_content_type);
-    Ok(index_bytes_response(content, Some(content_type)))
+    .await?
+    {
+        // `_budget_permit` stays held until the response is built, as the
+        // pre-#5686 `proxy_fetch_capped_budgeted` permit did.
+        proxy_helpers::CappedMetadataGet::Buffered {
+            content,
+            content_type,
+            content_encoding,
+            stale_since,
+            budget_permit: _budget_permit,
+        } => Ok(proxy_helpers::forward_verbatim_metadata(
+            content,
+            content_type,
+            default_content_type,
+            content_encoding,
+            stale_since,
+        )),
+        // No streaming fallback for these documents: the same 502 the
+        // buffered helper rendered for an over-cap document.
+        proxy_helpers::CappedMetadataGet::OverCap => {
+            Err((StatusCode::BAD_GATEWAY, "Failed to fetch from upstream").into_response())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2943,6 +2964,109 @@ mod db_cov_tests {
         for (uri, status) in got {
             assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{uri}");
         }
+    }
+
+    /// A Remote passes its upstream bytes through without decoding them, so
+    /// an upstream `Content-Encoding` must be re-declared (#3149, #3260). A
+    /// mirror that serves `info/{name}` gzip-coded would otherwise reach
+    /// Bundler as plain bytes, and its MD5 check against `versions` fails.
+    /// The same holds for every document `proxy_remote_document` forwards:
+    /// the Compact Index, the quick gemspecs and the specs indexes.
+    #[tokio::test]
+    async fn test_rubygems_remote_documents_keep_upstream_content_encoding() {
+        use wiremock::matchers::{method, path as exact_path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "rubygems").await else {
+            return;
+        };
+        let upstream = wiremock::MockServer::start().await;
+        let coded_info = super::gzip_compress(INFO_DOC).expect("gzip info");
+        let coded_versions = super::gzip_compress(VERSIONS_DOC).expect("gzip versions");
+        let coded_spec = super::gzip_compress(QUICK_SPEC).expect("gzip spec");
+        let coded_specs_index = super::gzip_compress(b"\x04\x08[\x00").expect("gzip index");
+        let coded: Vec<(&str, &str, Vec<u8>)> = vec![
+            (
+                "/info/rexml",
+                "text/plain; charset=utf-8",
+                coded_info.clone(),
+            ),
+            (
+                "/versions",
+                "text/plain; charset=utf-8",
+                coded_versions.clone(),
+            ),
+            (
+                "/quick/Marshal.4.8/rexml-3.4.4.gemspec.rz",
+                "application/octet-stream",
+                coded_spec.clone(),
+            ),
+            (
+                "/specs.4.8.gz",
+                "application/octet-stream",
+                coded_specs_index.clone(),
+            ),
+        ];
+        for (p, ct, body) in &coded {
+            Mock::given(method("GET"))
+                .and(exact_path(*p))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(body.clone())
+                        .insert_header("content-type", *ct)
+                        .insert_header("content-encoding", "gzip"),
+                )
+                .mount(&upstream)
+                .await;
+        }
+        // A plain upstream document must not gain a coding it never had.
+        mount_doc(&upstream, "/names", "text/plain; charset=utf-8", NAMES_DOC).await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+
+        let k = fx.repo_key.clone();
+        let mut got = Vec::new();
+        for (p, ct, body) in &coded {
+            let uri = format!("/{k}{p}");
+            let app = tdh::router_anon(super::router(), state.clone());
+            let resp = tdh::send_with_headers(app, tdh::get(uri.clone())).await;
+            got.push((uri, *ct, body.clone(), resp));
+        }
+        let app = tdh::router_anon(super::router(), state.clone());
+        let plain = tdh::send_with_headers(app, tdh::get(format!("/{k}/names"))).await;
+        fx.teardown().await;
+
+        for (uri, ct, want, (status, body, headers)) in got {
+            assert_eq!(status, axum::http::StatusCode::OK, "{uri}");
+            assert_eq!(
+                &body[..],
+                &want[..],
+                "{uri} must be the coded upstream bytes"
+            );
+            assert_eq!(
+                headers
+                    .get("content-encoding")
+                    .and_then(|v| v.to_str().ok()),
+                Some("gzip"),
+                "{uri} must re-declare the upstream Content-Encoding"
+            );
+            assert_eq!(
+                headers.get("content-length").and_then(|v| v.to_str().ok()),
+                Some(want.len().to_string().as_str()),
+                "{uri}: Content-Length is the coded length"
+            );
+            assert_eq!(
+                headers.get("content-type").and_then(|v| v.to_str().ok()),
+                Some(ct),
+                "{uri} keeps the upstream Content-Type"
+            );
+        }
+        let (status, body, headers) = plain;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(&body[..], NAMES_DOC);
+        assert!(
+            headers.get("content-encoding").is_none(),
+            "a plain upstream document must not be labelled as coded"
+        );
     }
 
     /// Seed `.gem` artifacts `(name, version)` into `repo`.
