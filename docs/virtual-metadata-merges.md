@@ -13,7 +13,7 @@ upstream through the proxy cache, bounded by a per-member deadline.
 |---|---|
 | A document | Merged. |
 | `404`, or another permanent `4xx` (`401`, `403`, `451`, ...) | A miss. The member contributes nothing and the merge is complete. This matches the artifact walk. |
-| Unavailable: an upstream `5xx`, a transport failure or connect timeout, a retryable `408`/`425`/`429`, or no answer within the member deadline | The member is left out. The merge of the members that answered is served as a **partial** response (below). |
+| Unavailable: an upstream `5xx`, a transport failure or connect timeout, a retryable `408`/`425`/`429`, or no answer within the member deadline | The member is left out. The merge of the members that answered is served as a **partial** response (below). Maven `maven-metadata.xml` and `.meta/prefixes.txt` are strict by default and answer the retryable `503` instead; see [Maven virtual metadata](#maven-virtual-metadata). |
 | A document that cannot be read: it does not parse, does not decode, or exceeds the member size ceiling (conda) | **Strict** by default: `502` naming the member. Partial when the virtual opted in with `virtual_metadata_partial` (below). |
 
 When no member contributed (there is no hosted member, and no Remote member
@@ -56,11 +56,26 @@ Artifact downloads through a virtual repository have a separate deadline,
 `AK_VIRTUAL_MEMBER_DOWNLOAD_DEADLINE_SECS`. See
 [virtual downloads](virtual-downloads.md).
 
+## Maven virtual metadata
+
+The Maven `maven-metadata.xml` merge (GA, plugin-prefix and SNAPSHOT
+version-level documents, plus their checksums) and the `.meta/prefixes.txt`
+union are strict by default: when any member was unavailable, the answer is
+the retryable `503` with `Retry-After`, even if other members answered. A
+merged `<versions>` list without that member makes Maven pick the wrong
+`latest`/`release` and resolve a version range without its versions, and a
+partial prefix allowlist makes Resolver skip everything behind the missing
+member. Set `virtual_metadata_partial` on the virtual repository to serve the
+merge of the answering members instead, marked partial and uncacheable
+(#5777).
+
 ## `virtual_metadata_partial`
 
-Set on a virtual repository through the repository API. The setting controls
-only the strict case: a member that answered with a document that cannot be
-read.
+Set on a virtual repository through the repository API. For the formats whose
+unavailable-member merges are already partial, the setting controls only the
+strict case: a member that answered with a document that cannot be read. For
+Maven virtual metadata it also selects strict versus partial for an
+unavailable member (see [Maven virtual metadata](#maven-virtual-metadata)).
 
 ```bash
 curl -X PUT "$AK/api/v1/repositories/<virtual-key>" \

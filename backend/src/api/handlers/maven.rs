@@ -2598,13 +2598,17 @@ async fn download(
             // unconditionally. Deliberate (the generated-wins direction is
             // the safe one, #3382 review finding 10), not a bug to "fix" by
             // making the stored sidecar readable again.
-            let content = serve_maven_prefixes_bytes(&state, &repo, auth.as_ref()).await?;
-            let checksum = compute_checksum(&content, checksum_type);
-            return Ok(Response::builder()
+            let document = serve_maven_prefixes_bytes(&state, &repo, auth.as_ref()).await?;
+            let checksum = compute_checksum(&document.content, checksum_type);
+            let mut response = Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_TYPE, "text/plain")
                 .body(Body::from(checksum))
-                .unwrap());
+                .unwrap();
+            // The checksum describes the body the prefixes route serves, so
+            // it carries the same partial marks (#5777).
+            document.partial.mark(&mut response);
+            return Ok(response);
         }
     }
 
@@ -2629,18 +2633,20 @@ async fn download(
     // convention) letting clients/groups skip members that can't contain a
     // given groupId.
     if MavenHandler::is_prefixes_file(&path) {
-        let content = serve_maven_prefixes_bytes(&state, &repo, auth.as_ref()).await?;
+        let document = serve_maven_prefixes_bytes(&state, &repo, auth.as_ref()).await?;
         // A virtual repo's merge (and a private hosted repo's inventory) is
         // caller-dependent, so a shared cache must not store the `public`
         // response for a credentialed request (#3382 review finding 10;
         // #3406's `negotiated_cache_control`).
-        return Ok(cache_headers::cacheable_response_with(
-            content.to_vec(),
+        let mut response = cache_headers::cacheable_response_with(
+            document.content.to_vec(),
             "text/plain",
             &headers,
             cache_headers::negotiated_cache_control(&headers),
             None,
-        ));
+        );
+        document.partial.mark(&mut response);
+        return Ok(response);
     }
 
     // 3. Check if this is a checksum request for a stored file
@@ -3066,6 +3072,24 @@ fn virtual_metadata_not_found(member_unavailable: bool) -> Response {
     }
 }
 
+/// The answer for a Maven Virtual metadata merge that is ready to serve
+/// (#5777): a virtual without `virtual_metadata_partial` is strict, so a
+/// member that could not answer makes the request a retryable 503 even when
+/// other members did answer. A merged `<versions>` list without that member
+/// is not the complete document clients treat a 200 as (Maven picks the wrong
+/// `latest`/`release` from it). An opted-in virtual serves the partial merge,
+/// which [`MetadataMarks::apply`] marks partial and uncacheable.
+fn serve_maven_virtual_merge(
+    xml: Bytes,
+    marks: MetadataMarks,
+    allow_partial: bool,
+) -> Result<(Bytes, MetadataMarks), Response> {
+    if marks.is_partial() && !allow_partial {
+        return Err(proxy_helpers::member_unavailable_response());
+    }
+    Ok((xml, marks))
+}
+
 /// Fetch a single Remote virtual member's Maven metadata document at `path`
 /// from upstream (via the proxy cache), as a UTF-8 string. A non-Remote
 /// member or a miss is [`MemberMetadata::Miss`]; a member whose upstream
@@ -3266,6 +3290,11 @@ async fn fetch_maven_metadata_bytes(
     // Virtual repos: merge metadata from all members.
     if repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+        // #5777: a merge with an unavailable member is strict (retryable 503)
+        // unless the virtual opted into partial merges, as for the other
+        // formats' merges.
+        let allow_partial =
+            proxy_helpers::virtual_metadata_partial_allowed(&state.db, repo.id).await;
 
         // Whether the GA-level merge may be shared through the process-wide
         // cache (#3323). The merge is built from the members THIS caller may
@@ -3401,7 +3430,7 @@ async fn fetch_maven_metadata_bytes(
             };
 
             if let Some(xml) = ga_merge {
-                return Ok((xml, marks));
+                return serve_maven_virtual_merge(xml, marks, allow_partial);
             }
 
             // Group-level plugin-prefix metadata (#1595). A path like
@@ -3439,7 +3468,7 @@ async fn fetch_maven_metadata_bytes(
             }
 
             if let Some(xml) = crate::formats::maven::merge_plugin_prefix_metadata(&member_docs) {
-                return Ok((Bytes::from(xml), marks));
+                return serve_maven_virtual_merge(Bytes::from(xml), marks, allow_partial);
             }
         }
 
@@ -3498,7 +3527,7 @@ async fn fetch_maven_metadata_bytes(
                 if let Some(xml) =
                     generate_snapshot_metadata_xml(&group_id, &artifact_id, &version, &all_entries)
                 {
-                    return Ok((Bytes::from(xml), marks));
+                    return serve_maven_virtual_merge(Bytes::from(xml), marks, allow_partial);
                 }
             }
         }
@@ -3704,6 +3733,24 @@ impl CachedPrefixes {
     }
 }
 
+/// A `.meta/prefixes.txt` body and the members a partial virtual union left
+/// out (#5777). A complete document has no missing members and may be cached.
+struct PrefixesDocument {
+    content: Bytes,
+    partial: proxy_helpers::PartialMerge,
+}
+
+impl PrefixesDocument {
+    /// A complete document (a Remote or Local/Staging repo's, or a Virtual
+    /// whose every member answered).
+    fn complete(content: Bytes) -> Self {
+        Self {
+            content,
+            partial: proxy_helpers::PartialMerge::default(),
+        }
+    }
+}
+
 const MAVEN_PREFIXES_CACHE_TTL: Duration = Duration::from_secs(60);
 const MAVEN_PREFIXES_CACHE_CAPACITY: u64 = 4_000;
 
@@ -3735,7 +3782,7 @@ async fn fetch_maven_prefixes_bytes(
     state: &SharedState,
     repo: &RepoInfo,
     auth: Option<&AuthExtension>,
-) -> Result<Bytes, Response> {
+) -> Result<PrefixesDocument, Response> {
     let cacheable = proxy_helpers::virtual_aggregate_cacheable(
         &state.db,
         repo.id,
@@ -3745,18 +3792,26 @@ async fn fetch_maven_prefixes_bytes(
 
     if cacheable {
         if let Some(cached) = MAVEN_PREFIXES_CACHE.get(&repo.id).await {
-            return (*cached).clone().into_result();
+            return (*cached)
+                .clone()
+                .into_result()
+                .map(PrefixesDocument::complete);
         }
     }
 
     match fetch_maven_prefixes_bytes_uncached(state, repo, auth).await {
-        Ok(bytes) => {
-            if cacheable {
+        Ok(document) => {
+            // A partial union must never be cached as the complete one
+            // (#5777), and the next request asks the missing members again.
+            if cacheable && document.partial.missing().is_none() {
                 MAVEN_PREFIXES_CACHE
-                    .insert(repo.id, Arc::new(CachedPrefixes::Ok(bytes.clone())))
+                    .insert(
+                        repo.id,
+                        Arc::new(CachedPrefixes::Ok(document.content.clone())),
+                    )
                     .await;
             }
-            Ok(bytes)
+            Ok(document)
         }
         Err(PrefixesError::NotFound(msg)) => {
             if cacheable {
@@ -3774,19 +3829,24 @@ async fn fetch_maven_prefixes_bytes(
 
 /// Remote repos proxy the file from upstream verbatim; Virtual repos merge
 /// the union of members' prefixes (Local/Staging members generated from
-/// stored groupIds, Remote members proxied) and refuse to publish a partial
-/// union (#3382 review findings 2/3); Local/Staging repos generate it from
-/// their own stored groupIds. An unrecognized `repo_type` fails closed
-/// (finding 4) instead of falling through to the hosted generator. A
-/// COMPLETE-but-empty set (a hosted repo with no artifacts yet, or a virtual
-/// whose members all confirmably contributed nothing) is 404 as well, since a
-/// header-only file denies every path (#5668); see
+/// stored groupIds, Remote members proxied); Local/Staging repos generate it
+/// from their own stored groupIds. An unrecognized `repo_type` fails closed
+/// (finding 4) instead of falling through to the hosted generator.
+///
+/// A Virtual union with an unavailable member is strict by default (#5777):
+/// the request answers a retryable 503 naming the failure as unavailable,
+/// because a partial allowlist makes Resolver skip everything behind the
+/// missing member. A virtual that opted into `virtual_metadata_partial`
+/// serves the union of the members that answered, marked partial and
+/// uncacheable. A COMPLETE-but-empty set (a hosted repo with no artifacts yet,
+/// or a virtual whose members all confirmably contributed nothing) is 404,
+/// since a header-only file denies every path (#5668); see
 /// [`prefixes_or_not_published`].
 async fn fetch_maven_prefixes_bytes_uncached(
     state: &SharedState,
     repo: &RepoInfo,
     auth: Option<&AuthExtension>,
-) -> Result<Bytes, PrefixesError> {
+) -> Result<PrefixesDocument, PrefixesError> {
     match RepositoryType::from_db_str(&repo.repo_type) {
         Some(RepositoryType::Remote) => {
             if let (Some(ref upstream_url), Some(ref proxy)) =
@@ -3803,7 +3863,7 @@ async fn fetch_maven_prefixes_bytes_uncached(
                 )
                 .await
                 .map_err(PrefixesError::Proxied)?;
-                return Ok(content);
+                return Ok(PrefixesDocument::complete(content));
             }
             Err(PrefixesError::NotFound(
                 "Prefix file not available".to_string(),
@@ -3813,11 +3873,14 @@ async fn fetch_maven_prefixes_bytes_uncached(
             let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id)
                 .await
                 .map_err(PrefixesError::Proxied)?;
+            let allow_partial =
+                proxy_helpers::virtual_metadata_partial_allowed(&state.db, repo.id).await;
 
             let mut prefixes: Vec<String> = Vec::new();
+            let mut missing: Vec<String> = Vec::new();
             for chunk in members.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
                 let batch = futures::future::join_all(chunk.iter().map(|member| async {
-                    match member.repo_type {
+                    let result = match member.repo_type {
                         RepositoryType::Remote => fetch_remote_member_prefixes(state, member)
                             .await
                             .map_err(PrefixesError::Proxied),
@@ -3839,25 +3902,52 @@ async fn fetch_maven_prefixes_bytes_uncached(
                             .await
                             .map(Some)
                             .map_err(|e| PrefixesError::Db(e.to_string())),
-                    }
+                    };
+                    (member.key.as_str(), result)
                 }))
                 .await;
-                for result in batch {
-                    // A member that ERRORED (unknown/timeout/`@ unsupported`)
-                    // already returned `Err` above and bailed the whole merge
-                    // via `?` — this loop only ever sees confirmed
-                    // contributions, including a confirmed-empty one, so an
-                    // empty `prefixes` here means the union is COMPLETE and
-                    // genuinely has nothing, not that it's incomplete.
-                    if let Some(lines) = result? {
-                        prefixes.extend(lines);
+                for (member, result) in batch {
+                    match result {
+                        Ok(Some(lines)) => prefixes.extend(lines),
+                        // A member answering a permanent 404 publishes no
+                        // prefixes file and contributes nothing.
+                        Ok(None) => {}
+                        // A database failure is the virtual's own failure,
+                        // never a member's: it stays fatal and uncached.
+                        Err(PrefixesError::Db(msg)) => return Err(PrefixesError::Db(msg)),
+                        // A member that could not answer (an upstream 5xx, a
+                        // transport failure or timeout, a body that is not a
+                        // prefix file) leaves the union unknowable. Strict by
+                        // default (#5777); left out only when the virtual
+                        // opted into partial merges.
+                        Err(_) => {
+                            if !allow_partial {
+                                return Err(PrefixesError::Proxied(
+                                    proxy_helpers::member_unavailable_response(),
+                                ));
+                            }
+                            missing.push(member.to_string());
+                        }
                     }
                 }
+            }
+            // Nothing to serve and a member unavailable: "no prefix file" is
+            // unknowable, so a client must retry rather than cache the 404
+            // that disables its filtering.
+            if prefixes.is_empty() && !missing.is_empty() {
+                return Err(PrefixesError::Proxied(
+                    proxy_helpers::member_unavailable_response(),
+                ));
             }
             // A complete-but-empty union is 404 too (#5668): a header-only
             // file is an allowlist with nothing on it, see
             // `prefixes_or_not_published`.
-            prefixes_or_not_published(prefixes)
+            Ok(PrefixesDocument {
+                content: prefixes_or_not_published(prefixes)?,
+                partial: proxy_helpers::PartialMerge::of_members(
+                    missing.iter().map(String::as_str),
+                ),
+            })
         }
         Some(RepositoryType::Local) | Some(RepositoryType::Staging) => {
             let prefixes = collect_local_group_prefixes(&state.db, repo.id)
@@ -3865,7 +3955,7 @@ async fn fetch_maven_prefixes_bytes_uncached(
                 .map_err(|e| PrefixesError::Db(e.to_string()))?;
             // A hosted repo's set is always complete (there's no "unknown
             // member" case), but an empty one is still 404 (#5668).
-            prefixes_or_not_published(prefixes)
+            prefixes_or_not_published(prefixes).map(PrefixesDocument::complete)
         }
         None => Err(PrefixesError::NotFound(
             "Repository type not recognized".to_string(),
@@ -3902,7 +3992,7 @@ async fn serve_maven_prefixes_bytes(
     state: &SharedState,
     repo: &RepoInfo,
     auth: Option<&AuthExtension>,
-) -> Result<Bytes, Response> {
+) -> Result<PrefixesDocument, Response> {
     fetch_maven_prefixes_bytes(state, repo, auth)
         .await
         .map_err(|mut resp| {
@@ -11404,7 +11494,8 @@ mod tests {
     async fn test_virtual_prefixes_bails_when_a_member_errors() {
         // An upstream 503 (or timeout) is UNKNOWN, not "publishes nothing" —
         // the virtual must not serve a partial union as an authoritative 200
-        // (#3382 review finding 2).
+        // (#3382 review finding 2). It answers the retryable 503, not the
+        // 404 that disables the client's prefix filtering (#5777).
         use crate::api::handlers::test_db_helpers as tdh;
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -11433,6 +11524,15 @@ mod tests {
         let router = tdh::router_with_auth(super::router(), state.clone(), auth);
 
         let (status, _body) = tdh::send(
+            router.clone(),
+            tdh::get(format!("/{}/.meta/prefixes.txt", virtual_key)),
+        )
+        .await;
+        // Even opted in, a union with no contributing member leaves "no
+        // prefix file" unknowable: the answer stays the retryable 503 rather
+        // than a 404 or an empty allowlist (#5777).
+        allow_partial_maven_merges_5777(&pool, virtual_id).await;
+        let (partial_status, _body) = tdh::send(
             router,
             tdh::get(format!("/{}/.meta/prefixes.txt", virtual_key)),
         )
@@ -11451,10 +11551,121 @@ mod tests {
         tdh::cleanup_user(&pool, user_id).await;
         let _ = std::fs::remove_dir_all(&dir);
 
-        assert_ne!(
+        assert_eq!(
             status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an unavailable member must answer the retryable 503, not a partial-union 200"
+        );
+        assert_eq!(
+            partial_status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an opted-in union with nothing to serve must still answer 503, never an empty 200"
+        );
+    }
+
+    /// #5777: a Virtual whose higher-priority Remote member is down and whose
+    /// local member publishes a groupId is strict by default: the prefix
+    /// allowlist would deny everything behind the down member, so the answer
+    /// is the retryable 503. With `virtual_metadata_partial`, the union of the
+    /// members that answered is served, marked partial and uncacheable.
+    #[tokio::test]
+    async fn test_virtual_prefixes_partial_opt_in_serves_partial_union_5777() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*\.meta/prefixes\.txt$"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&mock)
+            .await;
+
+        let (remote_id, remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&pool, "maven", &mock.uri()).await;
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (local_id, _local_key, local_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        insert_maven_artifact_row(&pool, local_id, user_id, "com.acme.partial5777", "lib").await;
+        tdh::link_virtual_member(&pool, virtual_id, local_id, 1).await;
+        tdh::publish_repo(&pool, local_id).await;
+        tdh::publish_repo(&pool, virtual_id).await;
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), local_dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), local_dir.to_str().unwrap(), proxy);
+        let router = tdh::router_anon(super::router(), state.clone());
+
+        let (strict_status, strict_body, strict_headers) = tdh::send_with_headers(
+            router.clone(),
+            tdh::get(format!("/{virtual_key}/.meta/prefixes.txt")),
+        )
+        .await;
+        allow_partial_maven_merges_5777(&pool, virtual_id).await;
+        let (partial_status, partial_body, partial_headers) = tdh::send_with_headers(
+            router,
+            tdh::get(format!("/{virtual_key}/.meta/prefixes.txt")),
+        )
+        .await;
+        let cached = MAVEN_PREFIXES_CACHE.get(&virtual_id).await;
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await;
+        for id in [virtual_id, remote_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        tdh::cleanup_member_repo(&pool, local_id, &local_dir).await;
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&local_dir);
+
+        assert_eq!(
+            strict_status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "strict by default: {}",
+            String::from_utf8_lossy(&strict_body)
+        );
+        assert_eq!(
+            strict_headers
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some(crate::error::RETRY_AFTER_SECS_ON_503),
+            "the strict 503 must carry Retry-After"
+        );
+        assert_eq!(
+            partial_status,
             StatusCode::OK,
-            "an unavailable member must not produce a partial-union 200"
+            "opted in: {}",
+            String::from_utf8_lossy(&partial_body)
+        );
+        assert!(
+            String::from_utf8_lossy(&partial_body).contains("/com/acme/partial5777"),
+            "the answering member's prefixes are served: {}",
+            String::from_utf8_lossy(&partial_body)
+        );
+        assert_eq!(
+            partial_headers
+                .get(crate::api::handlers::proxy_helpers::PARTIAL_MEMBERS_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(remote_key.as_str()),
+            "the response names the member it lacks"
+        );
+        assert_eq!(
+            partial_headers
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        assert!(partial_headers.get(axum::http::header::ETAG).is_none());
+        assert!(
+            cached.is_none(),
+            "a partial union must not be cached (#5777)"
         );
     }
 
@@ -13684,6 +13895,20 @@ mod tests {
         (virtual_id, virtual_key, repos)
     }
 
+    /// Opt `virtual_id` into serving a Maven virtual merge that lacked an
+    /// unavailable member (#5777).
+    async fn allow_partial_maven_merges_5777(pool: &sqlx::PgPool, virtual_id: uuid::Uuid) {
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, 'true') \
+             ON CONFLICT (repository_id, key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(virtual_id)
+        .bind(crate::api::handlers::proxy_helpers::VIRTUAL_METADATA_PARTIAL_CONFIG_KEY)
+        .execute(pool)
+        .await
+        .expect("opt the virtual into partial metadata merges");
+    }
+
     /// #5673: the plugin-prefix second pass of a Virtual GA metadata merge
     /// re-fetched every Remote member, including ones the first pass had
     /// just found unavailable, so an outage cost twice the upstream connect
@@ -13751,13 +13976,16 @@ mod tests {
         assert!(miss >= 1, "the answering member is still asked");
     }
 
-    /// #5621: GET `maven-metadata.xml` (and its checksum sidecars) through a
-    /// Virtual whose members all could not answer (an upstream 503, a refused
-    /// connection) must answer a retryable 503 with `Retry-After`, never the
-    /// `404 Metadata not found` Maven and Gradle cache as "no versions"; and
-    /// the empty merge must not be cached, so the next request after the
-    /// members recover is served. Members that all answer a permanent 404
-    /// keep the definitive 404; one healthy member is merged as before.
+    /// #5621, #5777: GET `maven-metadata.xml` (and its checksum sidecars)
+    /// through a Virtual whose members all could not answer (an upstream 503,
+    /// a refused connection) must answer a retryable 503 with `Retry-After`,
+    /// never the `404 Metadata not found` Maven and Gradle cache as "no
+    /// versions"; and the empty merge must not be cached, so the next request
+    /// after the members recover is served. Members that all answer a
+    /// permanent 404 keep the definitive 404. A virtual without
+    /// `virtual_metadata_partial` is strict: one unavailable member makes the
+    /// request a 503 even when a healthy member answered, because a merged
+    /// `<versions>` list without it is not the complete document.
     #[tokio::test]
     async fn test_virtual_metadata_member_outage_answers_503_not_404_5621() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -13857,15 +14085,20 @@ mod tests {
                     StatusCode::NOT_FOUND,
                     "{case} {suffix}: a genuine miss stays 404: {body}"
                 ),
-                _ => {
-                    assert_eq!(*status, StatusCode::OK, "{case} {suffix}: {body}");
-                    if suffix.is_empty() {
-                        assert!(
-                            body.contains("<version>2.0.0</version>"),
-                            "{case}: the healthy member's versions are served: {body}"
-                        );
-                    }
+                "unavailable + healthy" => {
+                    assert_eq!(
+                        *status,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "{case} {suffix}: strict by default, so a partial merge must answer \
+                         503 rather than a 200 clients treat as complete: {body}"
+                    );
+                    assert_eq!(
+                        retry_after.as_deref(),
+                        Some(crate::error::RETRY_AFTER_SECS_ON_503),
+                        "{case} {suffix}: the 503 must carry Retry-After"
+                    );
                 }
+                _ => unreachable!("every case is asserted above"),
             }
         }
         assert_eq!(
@@ -13875,12 +14108,110 @@ mod tests {
         );
     }
 
+    /// #5777: with `virtual_metadata_partial` set, a Virtual whose higher
+    /// priority member is down serves the healthy member's metadata and its
+    /// checksums, marked partial and uncacheable, instead of the strict 503.
+    /// The merge is not kept in the virtual metadata cache, so the next
+    /// request asks the missing member again.
+    #[tokio::test]
+    async fn test_virtual_metadata_partial_opt_in_serves_partial_merge_5777() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::path_regex;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream_meta = generate_metadata_xml(
+            "com.partial5777",
+            "lib",
+            &["2.0.0".to_string()],
+            "2.0.0",
+            Some("2.0.0"),
+            "20240101000000",
+        );
+        let upstream = MockServer::start().await;
+        Mock::given(path_regex("^/down/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+        Mock::given(path_regex("^/ok/.*maven-metadata\\.xml$"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(upstream_meta))
+            .mount(&upstream)
+            .await;
+        let scratch = std::env::temp_dir().join(format!("mvn5777p-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).expect("create scratch dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), scratch.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), scratch.to_str().unwrap(), proxy);
+        let members = [
+            format!("{}/down", upstream.uri()),
+            format!("{}/ok", upstream.uri()),
+        ];
+        let (virtual_id, virtual_key, repos) = metadata_outage_virtual_5621(&pool, &members).await;
+        let down_key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+            .bind(repos[1].0)
+            .fetch_one(&pool)
+            .await
+            .expect("down member key");
+        allow_partial_maven_merges_5777(&pool, virtual_id).await;
+
+        let mut answers = Vec::new();
+        for suffix in ["", ".sha1"] {
+            answers.push((
+                suffix,
+                tdh::send_with_headers(
+                    tdh::router_anon(router(), state.clone()),
+                    tdh::get(format!(
+                        "/{virtual_key}/com/partial5777/lib/maven-metadata.xml{suffix}"
+                    )),
+                )
+                .await,
+            ));
+        }
+        let key = (virtual_id, "com.partial5777".to_string(), "lib".to_string());
+        let cached = VIRTUAL_MAVEN_METADATA_CACHE.get(&key).await;
+        for (id, dir) in &repos {
+            tdh::cleanup_member_repo(&pool, *id, dir).await;
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+
+        for (suffix, (status, body, headers)) in &answers {
+            let body = String::from_utf8_lossy(body);
+            assert_eq!(*status, StatusCode::OK, "{suffix}: {body}");
+            if suffix.is_empty() {
+                assert!(
+                    body.contains("<version>2.0.0</version>"),
+                    "the healthy member's versions are served: {body}"
+                );
+            }
+            assert_eq!(
+                headers
+                    .get(crate::api::handlers::proxy_helpers::PARTIAL_MEMBERS_HEADER)
+                    .and_then(|v| v.to_str().ok()),
+                Some(down_key.as_str()),
+                "{suffix}: the response names the member it lacks"
+            );
+            assert_eq!(
+                headers
+                    .get(axum::http::header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store"),
+                "{suffix}"
+            );
+            assert!(headers.get(axum::http::header::ETAG).is_none(), "{suffix}");
+        }
+        assert_eq!(
+            cached, None,
+            "a merge built without an unavailable member must not be cached (#5621, #5777)"
+        );
+    }
+
     /// #5621: a Remote member that misses the member deadline in front of a
-    /// healthy one used to fail the whole merge with 502. It is left out: the
-    /// healthy member's versions are served for the metadata and its
-    /// checksums, marked partial and uncacheable, and the merge is not kept
-    /// in the virtual metadata cache, so the next request asks the member
-    /// again.
+    /// healthy one used to fail the whole merge with 502. With
+    /// `virtual_metadata_partial` set (#5777), it is left out: the healthy
+    /// member's versions are served for the metadata and its checksums,
+    /// marked partial and uncacheable, and the merge is not kept in the
+    /// virtual metadata cache, so the next request asks the member again.
     #[tokio::test]
     async fn test_virtual_metadata_stalled_member_is_left_out_5621() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -13920,6 +14251,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("hung member key");
+        allow_partial_maven_merges_5777(&pool, virtual_id).await;
 
         let started = std::time::Instant::now();
         let mut answers = Vec::new();
