@@ -5661,8 +5661,13 @@ async fn serve_tarball(
         // (no regression). The shared `resolve_virtual_download_from_members` is
         // deliberately left untouched so maven/hex and other formats are
         // unaffected.
+        // #5810: the virtual's member-fallback policy. In strict mode a
+        // scanning member that could not answer cuts the walk there: only the
+        // members ranked above it may still serve, else the answer is 503.
+        let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
+        let mut strict_cut = None;
         if let Some(proxy) = proxy_for_virtual {
-            for member in &members {
+            for (rank, member) in members.iter().enumerate() {
                 if member.repo_type != RepositoryType::Remote {
                     continue;
                 }
@@ -5714,6 +5719,12 @@ async fn serve_tarball(
                         {
                             return Err(resp);
                         }
+                        if fallback.is_strict()
+                            && proxy_helpers::is_member_unavailable_response(&resp)
+                        {
+                            strict_cut = Some(rank);
+                            break;
+                        }
                         debug!(
                             member_key = %member.key,
                             status = %status,
@@ -5724,6 +5735,10 @@ async fn serve_tarball(
                 }
             }
         }
+        let members = match strict_cut {
+            Some(cut) => members[..cut].to_vec(),
+            None => members,
+        };
 
         // #3785: a Remote member whose upstream publishes tarballs outside the
         // registry-standard `/-/` layout (GitHub Packages' `/download/…`) is
@@ -5740,6 +5755,7 @@ async fn serve_tarball(
                 .await;
         let result = proxy_helpers::resolve_virtual_download_from_members_with_fetch_urls(
             members,
+            fallback,
             proxy_for_virtual,
             &upstream_path,
             &member_fetch_urls,
@@ -5755,7 +5771,14 @@ async fn serve_tarball(
                 }
             },
         )
-        .await?;
+        .await
+        .map_err(|resp| match strict_cut {
+            // Nothing above the unavailable scanning member served (#5810).
+            Some(_) if !proxy_helpers::is_member_policy_block_response(&resp) => {
+                proxy_helpers::member_unavailable_response()
+            }
+            _ => resp,
+        })?;
 
         // Always serve npm virtual-repo tarballs as `application/gzip`,
         // overriding whatever content type the proxy-cache sidecar recorded
@@ -12850,6 +12873,107 @@ mod tests {
         assert_eq!(&body_bytes[..], tarball_bytes.as_ref());
 
         cleanup().await;
+    }
+
+    /// #5159: a `popularity` rule's name checks run on the npm Remote
+    /// tarball path. A homoglyph of the seed package `lodash` (Cyrillic `о`)
+    /// is refused before any upstream fetch; `lodash` itself is served.
+    #[tokio::test]
+    async fn test_remote_tarball_popularity_rule_blocks_homoglyph_5159() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        let homoglyph = "l\u{043e}dash";
+        let seed_bytes = b"\x1f\x8b\x08lodash-5159";
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/lodash/-/lodash-4.17.21.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(seed_bytes.as_ref()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        // The Remote tarball path consults the packument first; its content
+        // does not matter here.
+        Mock::given(method("GET"))
+            .and(path("/lodash"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+        // Any other upstream request (the homoglyph's) is a failure.
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .with_priority(10)
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, curation_enabled = true, \
+             curation_default_action = 'allow' WHERE id = $2",
+        )
+        .bind(mock_server.uri())
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("point at mock upstream and enable curation");
+        sqlx::query(
+            "INSERT INTO curation_rules (staging_repo_id, package_pattern, version_constraint, \
+             architecture, action, priority, reason, rule_type, config, created_by) \
+             VALUES ($1, '*', '*', '*', 'block', 100, '#5159', 'popularity', $2, $3)",
+        )
+        .bind(fx.repo_id)
+        .bind(serde_json::json!({"block_typosquat": true, "download_name_checks": true}))
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert popularity rule");
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        let encoded = urlencoding::encode(homoglyph);
+        let (blocked_status, blocked_body) = tdh::send(
+            tdh::router_anon(router(), state.clone()),
+            tdh::get(format!(
+                "/{}/{encoded}/-/{encoded}-4.17.21.tgz",
+                fx.repo_key
+            )),
+        )
+        .await;
+        let (seed_status, seed_body) = tdh::send(
+            tdh::router_anon(router(), state),
+            tdh::get(format!("/{}/lodash/-/lodash-4.17.21.tgz", fx.repo_key)),
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM curation_rules WHERE staging_repo_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        assert_eq!(blocked_status, StatusCode::FORBIDDEN);
+        let blocked: serde_json::Value = serde_json::from_slice(&blocked_body).unwrap();
+        assert_eq!(blocked["error"], "curation_blocked");
+        assert_eq!(blocked["package"], homoglyph);
+        assert!(
+            blocked["reason"].as_str().unwrap().contains("'lodash'"),
+            "{blocked}"
+        );
+        assert_eq!(seed_status, StatusCode::OK);
+        assert_eq!(&seed_body[..], seed_bytes.as_ref());
+        // Dropping the server verifies the `.expect` counts.
+        drop(mock_server);
     }
 
     /// #5504: the shared virtual artifact walk reads a member's upstream 5xx

@@ -16,7 +16,7 @@ missed or is unavailable.
 |---|---|
 | The artifact | Served, unless a higher-priority member is still within its deadline. |
 | `404`, or another permanent `4xx` (`401`, `403`, `451`, ...) | A miss. The next member is tried. |
-| Unavailable: an upstream `5xx`, a transport failure or timeout, or nothing within the download deadline (below) | The next member is tried. When no member serves, the answer is `503 Service Unavailable` with `Retry-After`, not `404`. |
+| Unavailable: an upstream `5xx`, a transport failure or timeout, nothing within the download deadline, or an open member breaker (below) | The next member is tried. When no member serves, the answer is `503 Service Unavailable` with `Retry-After`, not `404`. With [strict member fallback](#strict-member-fallback), the `503` is answered at once. |
 | A Package Age Policy hold, a quarantine or scan-policy block | Terminal: the block is returned and no lower member is tried. |
 
 ## The download deadline
@@ -51,8 +51,8 @@ match it. The deadline applies there in the same way.
 
 ## The member breaker
 
-A Remote member that keeps failing would cost every download one deadline
-before the next member serves. After `AK_VIRTUAL_MEMBER_BREAKER_FAILURES`
+A Remote member that keeps failing would hold up every download for one
+deadline before the next member serves. After `AK_VIRTUAL_MEMBER_BREAKER_FAILURES`
 (default `3`) failures in a row, the member's breaker opens. For
 `AK_VIRTUAL_MEMBER_BREAKER_OPEN_SECS` (default `30`) downloads pass over the
 member without dialling it, as if it were unavailable. Then one download is
@@ -70,6 +70,69 @@ fails, the breaker opens for another period.
 - `ak_virtual_member_breaker_open{member}` is `1` while a member's breaker is
   open and `0` once it closes. Opening is logged at `WARN`, closing at `INFO`.
 
+## Strict member fallback
+
+By default (`available`), a download passes over an unavailable member and
+serves the next member's copy. Some virtuals must not do that: when two
+members can hold different content at the same coordinates, the lower
+member's copy is a different artifact, not a fallback. Set
+`virtual_member_fallback` to `strict` on such a virtual repository through the
+repository API:
+
+```bash
+curl -X PATCH "$AK/api/v1/repositories/<virtual-key>" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"virtual_member_fallback": "strict"}'
+```
+
+The value can also be sent when the virtual is created
+(`POST /api/v1/repositories`). `GET /api/v1/repositories/<key>` and the
+repository listing report it as `virtual_member_fallback` on virtual
+repositories: `available` when never set. The field is omitted for other
+repository types, and setting it on one is refused with `400`. Any value
+other than `available` or `strict` is refused with `400`.
+
+In strict mode, the first member in priority order that is unavailable ends
+the download with `503 Service Unavailable` and `Retry-After`. No lower
+member's copy is served. The client retries, and the download succeeds once
+that member answers again.
+
+- A `404` or another permanent `4xx` is still a miss: the next member is
+  tried.
+- A member that serves, and a Package Age Policy hold or a quarantine or scan
+  block, behave as they do by default.
+- Only the members ranked above the one that serves matter. A member ranked
+  below it is never waited for.
+- With the [download deadline](#the-download-deadline), a hung member adds
+  the deadline (20 s by default) to the download, which then answers `503`.
+- With the [member breaker](#the-member-breaker) open, the download answers
+  `503` at once, without dialling the member, until the breaker lets a probe
+  through.
+- With nested virtual repositories, the setting of the virtual named in the
+  request governs the whole walk, including the members of nested virtuals.
+- Metadata merges are not affected. They have their own policy,
+  [`virtual_metadata_partial`](virtual-metadata-merges.md#virtual_metadata_partial).
+- Docker/OCI manifest pulls by tag follow the setting too: while a
+  higher-priority member is unavailable (an upstream `5xx`, a transport
+  failure or timeout, or a database or storage fault on that member's
+  lookup), the pull answers `503 UNAVAILABLE` with `Retry-After` instead of
+  the lower member's tag. A `404`, an upstream refusing the Remote's
+  credentials, and a token service refusing an anonymous token request
+  (`401`/`403`) are still misses. Anything else the upstream fetch reports
+  without a permanent status counts as unavailable, a manifest over the size
+  cap included. Manifest pulls take no download deadline and no
+  member breaker: a hung member's upstream holds the pull for the upstream
+  read timeout. A Remote member whose cached tag is past its TTL and whose
+  upstream does not answer still serves its cached copy, as a direct pull of
+  that member does.
+- An OCI blob, and a manifest pulled by digest, are requested by their
+  digest, so no member can hold different bytes for them. Those pulls are
+  not affected.
+- The setting is read once per download. If the read fails, the download
+  uses `available` and logs a `WARN`. A Docker/OCI manifest pull reads it
+  only once a member turns out to be unavailable, and treats a failed read
+  the same way.
+
 ## Upgrade note
 
 Before this release a download through a virtual repository waited for the
@@ -84,7 +147,9 @@ the next member's copy.
 - If two members can hold *different* content at the same coordinates (an
   internal mirror that republishes a version under a public name, for
   example), a lower member's copy can now be served while the higher member
-  is unresponsive. Give each Remote member an
+  is unresponsive. Set the virtual to
+  [strict member fallback](#strict-member-fallback) so it answers `503`
+  instead, or give each Remote member an
   [upstream filter](upstream-filter.md) so only the member meant to serve a
   path is asked for it.
 

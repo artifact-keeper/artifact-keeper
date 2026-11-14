@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#5945]
+---
+- **The wait for the scanner-adapter to become ready is configurable, so the adapter can be started on demand** (#5945). `SCANNER_ADAPTER_READY_TIMEOUT_SECS` sets the total time the backend waits for `/probe/ready` before an image scan, and before a filesystem scan through the adapter. Within it the backend keeps probing, 5 s per attempt with a backoff from 500 ms capped at 5 s, so an adapter scaled to zero behind a proxy that holds the first request while a pod starts can be waited for. When the budget runs out the scan fails closed as before, and the error and log line say whether the adapter was unreachable or not ready and how long it was waited for. Values over 3600 are clamped to 3600. Inline proxy scans, the OCI proxy gate and proxy rescans keep the fixed gate, since their scanners share a 30 s or 120 s budget. Unset, the gate is the earlier one unchanged: three attempts 500 ms apart, at most about 16 s, with the same messages and the same `ak_scanner_health_check_failures_total` counts.
