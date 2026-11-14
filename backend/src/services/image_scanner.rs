@@ -755,7 +755,7 @@ impl ImageScanner {
         let status = resp.status();
         // Harbor returns 202 Accepted; tolerate any 2xx with a parseable id.
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
+            let text = crate::services::scanner_adapter_client::adapter_error_text(resp).await;
             return Err(AppError::BadGateway(format!(
                 "Scanner adapter returned {} on scan submit: {}",
                 status, text
@@ -846,7 +846,7 @@ impl ImageScanner {
             // resubmits once or twice when the id was lost (#5657).
             let pending = status == reqwest::StatusCode::FOUND;
             if !pending {
-                let text = resp.text().await.unwrap_or_default();
+                let text = crate::services::scanner_adapter_client::adapter_error_text(resp).await;
                 return Err(AdapterAttemptError {
                     resubmit: AdapterResubmit::classify(status, &text),
                     error: AppError::BadGateway(format!(
@@ -1662,7 +1662,11 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/api/v1/scan"))
-            .respond_with(ResponseTemplate::new(401).set_body_string("invalid bearer token"))
+            // A proxy that reflects the credential back in its 401 body.
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_string(format!("invalid bearer token {ADAPTER_TOKEN_5948}")),
+            )
             .mount(&server)
             .await;
 
@@ -1678,6 +1682,10 @@ mod tests {
 
         let msg = err.to_string();
         assert!(msg.contains("401"), "{msg}");
+        assert!(
+            msg.contains(crate::services::scanner_adapter_client::ADAPTER_UNAUTHORIZED_TEXT),
+            "{msg}"
+        );
         assert!(
             !msg.contains(ADAPTER_TOKEN_5948),
             "token leaked into the error: {msg}"

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -216,15 +217,133 @@ func TestScanTokenAndTokensFileCombine(t *testing.T) {
 	}
 }
 
-// A configured tokens file that cannot be read fails closed: no token is
-// accepted, the routes are not left open.
-func TestScanTokensFileMissingFailsClosed(t *testing.T) {
-	ts := newScanAuthServer(t, func(c *Config) { c.ScanTokensFile = filepath.Join(t.TempDir(), "absent") })
-	if got := scanAuthCall(t, http.MethodPost, ts.URL+"/api/v1/scan", "application/json", scanAuthImageBody(t), ""); got != http.StatusUnauthorized {
-		t.Errorf("scan with an unreadable tokens file = %d, want 401", got)
+// A configured tokens file that cannot be read, or holds no token, fails
+// closed: no presented token is accepted, the routes are not left open.
+func TestScanTokensFileMissingOrEmptyFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	empty := filepath.Join(dir, "empty")
+	comments := filepath.Join(dir, "comments")
+	writeTokens(t, empty, "", time.Now().Add(-time.Hour))
+	writeTokens(t, comments, "\ufeff# no tokens yet\n\n   # still none\n", time.Now().Add(-time.Hour))
+	for name, file := range map[string]string{
+		"missing":       filepath.Join(dir, "absent"),
+		"empty":         empty,
+		"comments only": comments,
+	} {
+		ts := newScanAuthServer(t, func(c *Config) { c.ScanTokensFile = file })
+		for _, auth := range []string{"", "Bearer anything", "Bearer #", "Bearer "} {
+			if got := scanAuthCall(t, http.MethodPost, ts.URL+"/api/v1/scan", "application/json", scanAuthImageBody(t), auth); got != http.StatusUnauthorized {
+				t.Errorf("%s tokens file, scan with %q = %d, want 401", name, auth, got)
+			}
+			if got := scanAuthCall(t, http.MethodGet, ts.URL+"/api/v1/scan/nope/report", "", nil, auth); got != http.StatusUnauthorized {
+				t.Errorf("%s tokens file, report with %q = %d, want 401", name, auth, got)
+			}
+		}
+		if got := scanAuthCall(t, http.MethodGet, ts.URL+"/probe/healthy", "", nil, ""); got != http.StatusOK {
+			t.Errorf("%s tokens file: probe = %d, want 200", name, got)
+		}
 	}
-	if got := scanAuthCall(t, http.MethodGet, ts.URL+"/probe/healthy", "", nil, ""); got != http.StatusOK {
-		t.Errorf("probe = %d, want 200", got)
+}
+
+// fakeClock is an injectable clock for scanAuth.
+type fakeClock struct{ t time.Time }
+
+func (c *fakeClock) now() time.Time          { return c.t }
+func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
+
+func newFileAuth(t *testing.T, path string) (*scanAuth, *fakeClock) {
+	t.Helper()
+	clock := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	a := newScanAuth(&Config{ScanTokensFile: path})
+	a.now = clock.now
+	return a, clock
+}
+
+// Deleting the tokens file revokes its tokens once the grace has passed; a
+// file that comes back within the grace (an atomic swap) never interrupts.
+func TestScanTokensFileDeletionRevokesAfterGrace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tokens")
+	writeTokens(t, path, "tok-a\n", time.Now().Add(-time.Hour))
+	a, clock := newFileAuth(t, path)
+	if !a.allowed("tok-a") {
+		t.Fatal("token from the file not accepted")
+	}
+
+	// A swap: gone for a moment, back with a new token.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if !a.allowed("tok-a") {
+		t.Error("token rejected at once when the file vanished (mid-swap)")
+	}
+	clock.advance(tokensFileGrace / 2)
+	if !a.allowed("tok-a") {
+		t.Error("token rejected within the grace")
+	}
+	writeTokens(t, path, "tok-b\n", time.Now().Add(-time.Minute))
+	if a.allowed("tok-a") || !a.allowed("tok-b") {
+		t.Error("the swapped-in file was not picked up")
+	}
+
+	// A revocation: the file stays gone past the grace.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if !a.allowed("tok-b") {
+		t.Error("token rejected at once when the file vanished")
+	}
+	clock.advance(tokensFileGrace - time.Second)
+	if !a.allowed("tok-b") {
+		t.Error("token rejected before the grace ran out")
+	}
+	clock.advance(time.Second)
+	if a.allowed("tok-b") {
+		t.Error("token still accepted after the file was gone for the grace")
+	}
+	clock.advance(time.Hour)
+	if a.allowed("tok-b") || a.allowed("") {
+		t.Error("token accepted again with the file still gone")
+	}
+
+	// It comes back: its tokens apply again.
+	writeTokens(t, path, "tok-c\n", time.Now().Add(-time.Second))
+	if !a.allowed("tok-c") || a.allowed("tok-b") {
+		t.Error("the restored file was not picked up")
+	}
+}
+
+// A file that becomes unreadable (here: a line over the 1 MiB limit) is a
+// read failure, not an empty set: the last set holds for the grace.
+func TestScanTokensFileOverlongLineKeepsLastSetForGrace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tokens")
+	writeTokens(t, path, "tok-a\n", time.Now().Add(-time.Hour))
+	a, clock := newFileAuth(t, path)
+	if !a.allowed("tok-a") {
+		t.Fatal("token from the file not accepted")
+	}
+	writeTokens(t, path, "tok-b\n"+strings.Repeat("x", 2<<20)+"\n", time.Now().Add(-time.Minute))
+	if !a.allowed("tok-a") {
+		t.Error("an unparseable rewrite dropped the last good set at once")
+	}
+	if a.allowed("tok-b") {
+		t.Error("tokens from an unparseable file were accepted")
+	}
+	clock.advance(tokensFileGrace)
+	if a.allowed("tok-a") {
+		t.Error("last good set outlived the grace")
+	}
+}
+
+// A leading UTF-8 BOM is not part of the first token.
+func TestScanTokensFileStripsBOM(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tokens")
+	writeTokens(t, path, "\ufefftok-a\r\ntok-b\n", time.Now().Add(-time.Hour))
+	a, _ := newFileAuth(t, path)
+	if !a.allowed("tok-a") || !a.allowed("tok-b") {
+		t.Error("tokens after a BOM / CRLF not accepted")
+	}
+	if a.allowed("\ufefftok-a") {
+		t.Error("the BOM became part of the token")
 	}
 }
 

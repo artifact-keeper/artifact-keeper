@@ -403,6 +403,22 @@ impl AdapterAuth {
     }
 }
 
+/// Body text of a non-success adapter response, for an error message. A 401
+/// gets a fixed text instead of whatever the adapter (or a proxy in front of
+/// it) sent back, so a reflected credential can never reach a scan error
+/// (#5948).
+pub(crate) async fn adapter_error_text(resp: reqwest::Response) -> String {
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return ADAPTER_UNAUTHORIZED_TEXT.to_string();
+    }
+    resp.text().await.unwrap_or_default()
+}
+
+/// What a scan error says when the adapter answers 401.
+pub(crate) const ADAPTER_UNAUTHORIZED_TEXT: &str =
+    "the scanner-adapter refused the request; check that TRIVY_ADAPTER_TOKEN matches \
+     the adapter's SCANNER_SCAN_TOKEN or a line of its SCANNER_SCAN_TOKENS_FILE";
+
 /// Which engine a trivy-based filesystem scanner drives: the legacy local CLI
 /// (back-compat for deployments that bundle `trivy` and set `TRIVY_URL`) or
 /// the scanner-adapter's HTTP filesystem endpoint (#2363).
@@ -662,7 +678,7 @@ impl ScannerAdapterFsClient {
             return Err(self.unavailable("adapter answered 503 on submit"));
         }
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
+            let text = adapter_error_text(resp).await;
             return Err(AppError::Internal(format!(
                 "Scanner-adapter rejected the filesystem scan submit with {}: {}",
                 status, text
@@ -733,7 +749,7 @@ impl ScannerAdapterFsClient {
                 });
             }
             if status != reqwest::StatusCode::FOUND {
-                let text = resp.text().await.unwrap_or_default();
+                let text = adapter_error_text(resp).await;
                 return Err(AdapterAttemptError {
                     resubmit: AdapterResubmit::classify(status, &text),
                     error: AppError::Internal(format!(
@@ -968,7 +984,7 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/api/v1/filesystem/scan"))
-            .respond_with(ResponseTemplate::new(401).set_body_string("invalid bearer token"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("invalid token wrong-one"))
             .mount(&server)
             .await;
         let err = ScannerAdapterFsClient::with_auth(server.uri(), AdapterAuth::bearer("wrong-one"))
@@ -977,6 +993,7 @@ mod tests {
             .expect_err("a refused token fails the fs scan");
         let msg = err.to_string();
         assert!(msg.contains("401"), "{msg}");
+        assert!(msg.contains(ADAPTER_UNAUTHORIZED_TEXT), "{msg}");
         assert!(!msg.contains("wrong-one"), "{msg}");
 
         let err = ScannerAdapterFsClient::with_auth(
