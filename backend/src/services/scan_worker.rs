@@ -81,6 +81,9 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
         .max(1);
     let queue = ScanQueue::new(state.db.clone());
     let permits = Arc::new(Semaphore::new(concurrency));
+    // #5947: rescans take at most half the slots (one on a single-slot
+    // worker), so a hosted or waiting job always finds one free.
+    let rescan_permits = Arc::new(Semaphore::new(rescan_slots(concurrency)));
     let identity = WorkerIdentity::for_process().as_str().to_string();
 
     tracing::info!(
@@ -95,6 +98,8 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
         // Start due, so a pod that comes up after a crash recovers the dead
         // pod's claims on its first pass instead of 30s in.
         let mut next_sweep = tokio::time::Instant::now();
+        let mut next_rescan = tokio::time::Instant::now();
+        let rescan_tick_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         loop {
             // The tick is a floor: a same-process enqueue wakes us immediately.
@@ -166,6 +171,22 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
                 }
             }
 
+            // Its own task: the selection and the `grype db status` probe
+            // must never hold up claiming a job a client is waiting on.
+            if state.config.scan_rescan_max_per_day > 0
+                && now >= next_rescan
+                && !rescan_tick_running.swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                next_rescan = now + crate::services::scan_rescan::RESCAN_TICK;
+                let state = state.clone();
+                // Cleared on drop, so a panicking tick cannot wedge the flag.
+                let running = TickRunning(Arc::clone(&rescan_tick_running));
+                tokio::spawn(async move {
+                    let _running = running;
+                    rescan_tick(&state).await;
+                });
+            }
+
             // A claimed job is invisible to other replicas, so over-claiming
             // parks work here while an idle pod polls an empty queue.
             let available = permits.available_permits();
@@ -173,8 +194,11 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
                 continue;
             }
 
+            // No rescan slot free: leave rescans pending rather than claim
+            // them only to hand them back (which also skews their wait).
+            let skip_rescans = rescan_permits.available_permits() == 0;
             let claimed = match queue
-                .claim(available as i64, &identity, CLAIM_TTL_SECS)
+                .claim_filtered(available as i64, &identity, CLAIM_TTL_SECS, skip_rescans)
                 .await
             {
                 Ok(jobs) => jobs,
@@ -189,12 +213,25 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
                 // it stopped waiting. Recorded before the permit check so a
                 // job released back for saturation still reports the wait it
                 // really incurred.
+                // A rescan beyond the free rescan slots (more claimed in one
+                // batch than are free) goes straight back, before its wait is
+                // recorded: it has not stopped waiting.
+                let rescan_permit = if job.job_kind() == Some(ScanJobKind::Rescan) {
+                    match Arc::clone(&rescan_permits).try_acquire_owned() {
+                        Ok(p) => Some(p),
+                        Err(_) => {
+                            let _ = queue.release(job.id, job.claim_token()).await;
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let waited = (Utc::now() - job.created_at).num_milliseconds();
                 crate::services::metrics_service::record_scan_queue_wait(
                     &job.kind,
                     waited as f64 / 1000.0,
                 );
-
                 let permit = match Arc::clone(&permits).try_acquire_owned() {
                     Ok(p) => p,
                     // `release`, not `fail`: saturation is about this pod, not the job.
@@ -207,6 +244,7 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
                 let queue = queue.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
+                    let _rescan_permit = rescan_permit;
                     run_claimed_job(state, queue, job).await;
                 });
             }
@@ -223,6 +261,20 @@ pub fn state_with_worker_scanner(
     let mut worker_state = (**state).clone();
     worker_state.set_scanner_service(scanner);
     Arc::new(worker_state)
+}
+
+/// Clears the rescan-tick overlap flag when dropped, panic included.
+struct TickRunning(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for TickRunning {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Slots rescans may hold at once: half of `concurrency`, at least one.
+fn rescan_slots(concurrency: usize) -> usize {
+    (concurrency / 2).max(1)
 }
 
 /// Run one claimed job under a heartbeat, then finalize token-guarded.
@@ -304,6 +356,9 @@ async fn execute(state: &SharedState, job: &ScanJob) -> Result<(), JobFailure> {
         Some(ScanJobKind::HostedArtifact) => scan_hosted_artifact(state, job).await,
         Some(ScanJobKind::HostedUpload) => scan_hosted_upload(state, job).await,
         Some(ScanJobKind::HostedImage) => scan_hosted_image(state, job).await,
+        Some(ScanJobKind::Rescan) => {
+            crate::services::scan_queue::in_background(rescan_digest(state, job)).await
+        }
         // A kind written by a newer replica. Not `failed`: that would discard
         // work the other half of the fleet can run.
         None => Err(JobFailure::Retryable(format!(
@@ -492,6 +547,87 @@ async fn scan_hosted_image(state: &SharedState, job: &ScanJob) -> Result<(), Job
     }
 }
 
+/// Rescan one digest after a vulnerability-database update (#5947): every live
+/// artifact row holding it, oldest first. The first scans fresh and the rest
+/// reuse that result, since each only takes a verdict graded after the job
+/// started. Earlier `scan_results` rows stay as they are.
+async fn rescan_digest(state: &SharedState, job: &ScanJob) -> Result<(), JobFailure> {
+    use crate::services::scan_rescan;
+    let digest = job
+        .digest
+        .as_deref()
+        .ok_or_else(|| JobFailure::Terminal("rescan job has no digest".to_string()))?;
+    let scanner = state
+        .scanner_service
+        .as_ref()
+        .ok_or_else(|| JobFailure::Retryable("no scanner service configured".to_string()))?;
+    let since = scan_rescan::db_now(&state.db)
+        .await
+        .map_err(|e| JobFailure::Retryable(format!("clock read failed: {e}")))?;
+    let rows = scan_rescan::artifacts_with_digest(&state.db, digest)
+        .await
+        .map_err(|e| JobFailure::Retryable(format!("artifact lookup failed: {e}")))?;
+    let scan_types = scan_rescan::rescan_scan_types(&state.db)
+        .await
+        .map_err(|e| JobFailure::Retryable(format!("build lookup failed: {e}")))?;
+    let mut first_error = None;
+    for artifact_id in rows {
+        match scanner
+            .rescan_artifact_graded_since(artifact_id, since, &scan_types)
+            .await
+        {
+            Ok(()) | Err(crate::error::AppError::NotFound(_)) => {}
+            Err(e) => {
+                tracing::warn!(
+                    artifact_id = %artifact_id, digest = %digest, error = %e,
+                    "rescan failed for one artifact row"
+                );
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    match first_error {
+        None => Ok(()),
+        Some(e) => Err(JobFailure::Retryable(format!("rescan failed: {e}"))),
+    }
+}
+
+/// One rescan selection pass (#5947), on the worker's sweep. Off with
+/// `SCAN_RESCAN_MAX_PER_DAY=0`, the default.
+async fn rescan_tick(state: &SharedState) {
+    use crate::services::scan_rescan;
+    let max = state.config.scan_rescan_max_per_day;
+    let Some(scanner) = state.scanner_service.as_ref() else {
+        return;
+    };
+    if max == 0 {
+        return;
+    }
+    let observed = match scan_rescan::observed_builds(&state.db).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read recent vulnerability-database builds");
+            Vec::new()
+        }
+    };
+    let seen = scan_rescan::merge_builds(scanner.current_vuln_db_builds().await, observed);
+    let builds = match scan_rescan::refresh_builds(&state.db, &seen).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not record vulnerability-database builds");
+            return;
+        }
+    };
+    match scan_rescan::enqueue_rescans(&state.db, &builds, max).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            digests = n,
+            "queued rescans after a vulnerability-database update"
+        ),
+        Err(e) => tracing::warn!(error = %e, "rescan selection failed"),
+    }
+}
+
 /// `NoScanner` is instance-level and the next two per-attempt, so those retry.
 /// `RequestPinned` names a coordinate a job cannot carry, retrying can't help
 fn classify_inconclusive(
@@ -514,7 +650,7 @@ fn classify_inconclusive(
     }
 }
 
-const QUEUE_KINDS: [ScanJobKind; 4] = ScanJobKind::ALL;
+const QUEUE_KINDS: [ScanJobKind; 5] = ScanJobKind::ALL;
 const QUEUE_STATES: [&str; 3] = ["pending", "running", "failed"];
 
 /// `(kind, state, jobs)` depths and `(kind, seconds)` oldest-pending ages
@@ -559,7 +695,7 @@ mod tests {
                 oldest_pending_secs: oldest,
             };
         let (depths, oldest) = queue_gauges(&[row("proxy_file", "pending", 442, Some(49.0))]);
-        assert_eq!(depths.len(), 12);
+        assert_eq!(depths.len(), 15);
         assert!(depths.contains(&("proxy_file", "pending", 442.0)));
         assert!(depths.contains(&("proxy_file", "running", 0.0)));
         assert!(depths.contains(&("hosted_artifact", "pending", 0.0)));
@@ -571,13 +707,38 @@ mod tests {
                 ("proxy_file", 49.0),
                 ("hosted_artifact", 0.0),
                 ("hosted_upload", 0.0),
-                ("hosted_image", 0.0)
+                ("hosted_image", 0.0),
+                ("rescan", 0.0)
             ]
         );
 
         let (depths, oldest) = queue_gauges(&[]);
         assert!(depths.iter().all(|(_, _, jobs)| *jobs == 0.0), "{depths:?}");
         assert!(oldest.iter().all(|(_, age)| *age == 0.0), "{oldest:?}");
+    }
+
+    /// #5947 review: rescans never hold more than half the slots, so a hosted
+    /// or waiting job can always start; a single-slot worker still drains them.
+    #[test]
+    fn rescans_hold_at_most_half_the_slots() {
+        assert_eq!(rescan_slots(1), 1);
+        assert_eq!(rescan_slots(2), 1);
+        assert_eq!(rescan_slots(4), 2);
+        assert_eq!(rescan_slots(9), 4);
+    }
+
+    /// #5947 review: a rescan tick that panics must not leave the overlap
+    /// flag set, or no later tick would ever run.
+    #[tokio::test]
+    async fn a_panicking_rescan_tick_clears_its_flag() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let guard = TickRunning(Arc::clone(&flag));
+        let task = tokio::spawn(async move {
+            let _running = guard;
+            panic!("tick failed");
+        });
+        assert!(task.await.is_err(), "the tick panicked");
+        assert!(!flag.load(std::sync::atomic::Ordering::Acquire));
     }
 
     /// Never claim more than we hold permits for.

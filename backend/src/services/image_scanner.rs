@@ -653,10 +653,16 @@ impl ImageScanner {
             }
         }
 
-        serde_json::json!({
+        let mut body = serde_json::json!({
             "registry": registry,
             "artifact": artifact_obj,
-        })
+        });
+        // #5947: a DB-update rescan asks the adapter for its background band.
+        if crate::services::scan_queue::in_background_band() {
+            let (key, value) = crate::services::scan_queue::BACKGROUND_PRIORITY_FIELD;
+            body[key] = serde_json::Value::String(value.to_string());
+        }
+        body
     }
 
     /// Number of `/probe/ready` attempts before declaring the adapter down.
@@ -2088,6 +2094,28 @@ mod tests {
             matches!(result, Err(AppError::BadGateway(_))),
             "scan_target must fail-closed when the adapter is unreachable"
         );
+    }
+
+    /// #5947: a background-band scan (a DB-update rescan) adds
+    /// `priority: background` to the request; any other scan sends no
+    /// `priority`, so an interactive request is byte-for-byte as before.
+    #[tokio::test]
+    async fn test_build_scan_request_priority_only_in_the_background_band() {
+        let artifact = AdapterScanArtifact {
+            repository: "docker-local/library/nginx".to_string(),
+            reference: AdapterReference::Tag("latest".to_string()),
+        };
+        let build = || {
+            ImageScanner::build_scan_request(
+                "http://localhost:8080",
+                None,
+                &artifact,
+                "application/vnd.oci.image.manifest.v1+json",
+            )
+        };
+        assert!(build().get("priority").is_none(), "interactive: no field");
+        let body = crate::services::scan_queue::in_background(async { build() }).await;
+        assert_eq!(body["priority"], "background");
     }
 
     /// The Harbor scan request carries the `registry.authorization` bearer when
