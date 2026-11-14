@@ -25,6 +25,11 @@
 //! All read routes are also available with URL path token authentication:
 //!   GET  /conda/t/{token}/{repo_key}/...                     - Token-authenticated access
 //!   GET  /t/{token}/conda/{repo_key}/...                     - rattler/pixi `--conda-token` layout
+//!
+//! Classic conda cannot carry the `_` in an Artifact Keeper token (its URL
+//! token regex is `[a-zA-Z0-9-]*`), so on these routes it writes the token
+//! without the separator; both spellings are accepted (#5642). See
+//! [`token_router`] for the full caveat.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
@@ -780,6 +785,16 @@ fn privatize_cache_control(headers: &mut HeaderMap) {
 /// This is configured in `.condarc` as:
 ///   channels:
 ///     - https://host/conda/t/<TOKEN>/my-channel
+///
+/// **Classic conda:** its URL-token regex, `re.search(r"/t/([a-zA-Z0-9-]*)",
+/// url)` (`conda/common/url.py`), has no `_` in its alphabet, so it stops at
+/// the separator inside an Artifact Keeper token (`<8 hex>_<32 hex>`), drops
+/// the rest of the credential into the channel path and the read 401s
+/// (#5642). Classic conda users must write the token **without** the
+/// separator, `<8 hex><32 hex>`; the route accepts that spelling and restores
+/// the canonical form before validation. micromamba and rattler/pixi handle
+/// the canonical spelling as-is. A client that can only attach a header (or
+/// that prefers Basic) uses the canonical token unchanged.
 pub fn token_router() -> Router<SharedState> {
     token_routes("")
 }
@@ -24419,6 +24434,77 @@ mod rattler_token_layout_tests {
             assert_eq!(package_status, StatusCode::OK, "{package_path}");
             assert_eq!(&package_body[..], &content[..]);
             assert_eq!(shard_status, StatusCode::OK, "{prefix} shard");
+        }
+    }
+
+    /// #5642: classic conda reads a channel token with
+    /// `re.search(r"/t/([a-zA-Z0-9-]*)", url)`, whose alphabet has no `_`, so
+    /// it cannot carry the canonical `<8 hex>_<32 hex>` spelling: it stops at
+    /// the separator, drops the rest of the credential into the channel path
+    /// and the read 401s. A classic-conda user writes the token without the
+    /// separator, and the token channel must resolve it to the same private
+    /// channel. The canonical spelling keeps working.
+    #[tokio::test]
+    async fn conda_token_url_accepts_the_separator_less_spelling_5642() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+        let filename = "pkg-1.0-0.tar.bz2";
+        let path = format!("noarch/{filename}");
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &format!("conda/{}/{path}", fx.repo_id),
+            &path,
+            "pkg",
+            "1.0",
+            "application/x-tar",
+            Bytes::from_static(b"fake-conda-package-bytes"),
+            fx.user_id,
+        )
+        .await;
+        let auth_service = AuthService::new(fx.pool.clone(), Arc::new(fx.state.config.clone()));
+        let (token, _id) = auth_service
+            .generate_api_token(
+                fx.user_id,
+                "conda-5642",
+                vec!["read:artifacts".to_string()],
+                None,
+            )
+            .await
+            .expect("mint API token");
+        let conda_token = format!("{}{}", &token[..8], &token[9..]);
+        assert!(!conda_token.contains('_'));
+
+        let app = crate::api::routes::create_router(fx.state.clone());
+        let key = fx.repo_key.clone();
+        let mut results = Vec::new();
+        for credential in [&token, &conda_token] {
+            // The `.condarc` layout and rattler's `--conda-token` layout both
+            // carry the credential in the path.
+            for uri in [
+                format!("/conda/t/{credential}/{key}/noarch/repodata.json"),
+                format!("/t/{credential}/conda/{key}/noarch/repodata.json"),
+            ] {
+                let response = tdh::send(app.clone(), tdh::get(uri.clone())).await;
+                results.push((uri, response));
+            }
+        }
+        fx.teardown().await;
+
+        for (uri, (status, body)) in results {
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{}: {}",
+                uri.replace(&token, "<token>")
+                    .replace(&conda_token, "<token>"),
+                String::from_utf8_lossy(&body)
+            );
+            let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(doc["packages"].get(filename).is_some(), "{doc}");
         }
     }
 }
