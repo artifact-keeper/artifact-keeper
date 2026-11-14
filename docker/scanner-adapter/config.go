@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"log"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -177,7 +179,7 @@ func LoadConfig() *Config {
 		FsMaxUploadBytes:    getenvInt64("SCANNER_FS_MAX_UPLOAD_BYTES", 64*1024*1024*1024),
 		JobTTL:              getenvDuration("SCANNER_JOB_TTL", 30*time.Minute),
 		MaxConcurrentScans:  getenvIntNonNeg("SCANNER_MAX_CONCURRENT_SCANS", 4),
-		MaxImageBytes:       getenvInt64NonNeg("SCANNER_MAX_IMAGE_BYTES", 0),
+		MaxImageBytes:       getenvBytes("SCANNER_MAX_IMAGE_BYTES", 0),
 		LogLevel:            getenv("SCANNER_LOG_LEVEL", "info"),
 		ScannerVersion:      os.Getenv("SCANNER_SCANNER_VERSION"),
 		TrivyServer:         strings.TrimRight(strings.TrimSpace(os.Getenv("SCANNER_TRIVY_SERVER")), "/"),
@@ -285,15 +287,51 @@ func getenvIntNonNeg(key string, def int) int {
 	return n
 }
 
-// getenvInt64NonNeg parses a non-negative int64, allowing 0 (unlike
-// getenvInt64). Used for byte limits where 0 = "no bound".
-func getenvInt64NonNeg(key string, def int64) int64 {
+// byteSuffixes are the size suffixes getenvBytes accepts, as in Kubernetes
+// quantities: binary Ki/Mi/Gi/Ti and decimal K/M/G/T.
+var byteSuffixes = []struct {
+	suffix string
+	mult   int64
+}{
+	{"Ki", 1 << 10}, {"Mi", 1 << 20}, {"Gi", 1 << 30}, {"Ti", 1 << 40},
+	{"K", 1e3}, {"M", 1e6}, {"G", 1e9}, {"T", 1e12},
+}
+
+// parseByteSize parses a non-negative byte count: plain digits, or digits
+// with one of byteSuffixes (e.g. "4Gi", "500M").
+func parseByteSize(v string) (int64, error) {
+	v = strings.TrimSpace(v)
+	mult := int64(1)
+	for _, s := range byteSuffixes {
+		if strings.HasSuffix(v, s.suffix) {
+			v, mult = strings.TrimSpace(strings.TrimSuffix(v, s.suffix)), s.mult
+			break
+		}
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("not a byte count (digits, optionally with Ki/Mi/Gi/Ti or K/M/G/T)")
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("must not be negative")
+	}
+	if n > math.MaxInt64/mult {
+		return 0, fmt.Errorf("overflows int64")
+	}
+	return n * mult, nil
+}
+
+// getenvBytes reads a byte limit where 0 means "no bound". An unparsable
+// value is logged and def is used, so a typo is visible rather than quietly
+// meaning no limit.
+func getenvBytes(key string, def int64) int64 {
 	v := os.Getenv(key)
-	if v == "" {
+	if strings.TrimSpace(v) == "" {
 		return def
 	}
-	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
-	if err != nil || n < 0 {
+	n, err := parseByteSize(v)
+	if err != nil {
+		log.Printf("WARNING: %s=%q is ignored (%v); using %d", key, v, err, def)
 		return def
 	}
 	return n

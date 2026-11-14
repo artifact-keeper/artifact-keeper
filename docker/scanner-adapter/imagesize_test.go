@@ -3,10 +3,11 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
-	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -139,16 +140,13 @@ func TestImageUnderLimitIsScanned(t *testing.T) {
 }
 
 // TestImageIndexIsMeasuredOnThePlatformManifest: for an index the check
-// measures the linux/<adapter arch> image, not the index or another platform.
+// measures the image trivy scans, linux/amd64 (trivy gets no --platform),
+// whatever the adapter's own architecture, not the index or another entry.
 func TestImageIndexIsMeasuredOnThePlatformManifest(t *testing.T) {
-	other := "arm64"
-	if runtime.GOARCH == "arm64" {
-		other = "amd64"
-	}
 	index := fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[
-	  {"mediaType":%q,"digest":"sha256:small","size":10,"platform":{"os":"linux","architecture":%q}},
-	  {"mediaType":%q,"digest":"sha256:large","size":10,"platform":{"os":"linux","architecture":%q}}]}`,
-		ociIndexMimeType, ociManifestMimeType, other, ociManifestMimeType, runtime.GOARCH)
+	  {"mediaType":%q,"digest":"sha256:small","size":10,"platform":{"os":"linux","architecture":"arm64"}},
+	  {"mediaType":%q,"digest":"sha256:large","size":10,"platform":{"os":"linux","architecture":"amd64"}}]}`,
+		ociIndexMimeType, ociManifestMimeType, ociManifestMimeType)
 	reg := &fakeRegistry{
 		token: "tok",
 		manifests: map[string]string{
@@ -167,7 +165,50 @@ func TestImageIndexIsMeasuredOnThePlatformManifest(t *testing.T) {
 	id := submitScan(t, ts.URL, sizeReq(registry.URL, "multi"))
 	status, _, body := pollReportFull(t, ts.URL, id)
 	if status != http.StatusUnprocessableEntity || !bytes.Contains(body, []byte("5001 bytes")) {
-		t.Fatalf("status = %d body=%s, want 422 measuring the linux/%s image (5001 bytes)", status, body, runtime.GOARCH)
+		t.Fatalf("status = %d body=%s, want 422 measuring the linux/amd64 image (5001 bytes)", status, body)
+	}
+}
+
+// TestImageSizeHungOrClosedRegistryFailsOpen: a registry that never answers,
+// or a closed port, makes the check give up within its timeout and the scan
+// proceeds (trivy runs and the report is 200).
+func TestImageSizeHungOrClosedRegistryFailsOpen(t *testing.T) {
+	old := imageSizeCheckTimeout
+	imageSizeCheckTimeout = 300 * time.Millisecond
+	defer func() { imageSizeCheckTimeout = old }()
+
+	unblock := make(chan struct{})
+	hung := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-unblock:
+		}
+	}))
+	defer hung.Close()
+	defer close(unblock)
+
+	closedLn := httptest.NewServer(http.NotFoundHandler())
+	closedURL := closedLn.URL
+	closedLn.Close() // nothing listens on this port any more
+
+	for name, url := range map[string]string{"hung": hung.URL, "closed port": closedURL} {
+		ts := newTestServerWithConfig(t, succeedStub(t), t.TempDir(), func(c *Config) { c.MaxImageBytes = 1000 })
+		start := time.Now()
+		id := submitScan(t, ts.URL, sizeReq(url, "v1"))
+		status, body := pollReport(t, ts.URL, id)
+		ts.Close()
+		if status != http.StatusOK {
+			t.Fatalf("%s registry: status %d, want 200 (the check must fail open); body=%s", name, status, body)
+		}
+		if el := time.Since(start); el > 5*time.Second {
+			t.Errorf("%s registry: scan took %s, the size check must give up at its timeout", name, el)
+		}
+	}
+}
+
+func TestImageSizeCheckTimeoutIsShort(t *testing.T) {
+	if imageSizeCheckTimeout > 10*time.Second {
+		t.Fatalf("size check timeout %s, want at most 10s so it does not eat the backend's poll budget", imageSizeCheckTimeout)
 	}
 }
 
@@ -202,19 +243,23 @@ func TestPickPlatform(t *testing.T) {
 		return registryDescriptor{Digest: digest, Platform: &registryPlatform{OS: os, Architecture: arch}}
 	}
 	ms := []registryDescriptor{
-		{Digest: "sha256:att"}, // attestation: no platform
+		d("sha256:att", "unknown", "unknown"), // buildx attestation
 		d("sha256:win", "windows", "amd64"),
-		d("sha256:amd", "linux", "amd64"),
 		d("sha256:arm", "linux", "arm64"),
+		d("sha256:amd", "linux", "amd64"),
 	}
-	if got := pickPlatform(ms, "arm64"); got != "sha256:arm" {
-		t.Errorf("arm64 adapter picked %q", got)
+	// trivy (no --platform) scans linux/amd64, whatever the adapter's arch.
+	if got := pickPlatform(ms); got != "sha256:amd" {
+		t.Errorf("picked %q, want linux/amd64", got)
 	}
-	if got := pickPlatform(ms, "s390x"); got != "sha256:amd" {
-		t.Errorf("unlisted arch should fall back to linux/amd64, got %q", got)
+	if got := pickPlatform(ms[:3]); got != "" {
+		t.Errorf("no linux/amd64 entry should pick nothing, got %q", got)
 	}
-	if got := pickPlatform(ms[:2], "amd64"); got != "" {
-		t.Errorf("no linux entry should pick nothing, got %q", got)
+	// go-containerregistry treats an entry without a platform as linux/amd64
+	// and takes the first match.
+	noPlat := []registryDescriptor{{Digest: "sha256:bare"}, d("sha256:amd", "linux", "amd64")}
+	if got := pickPlatform(noPlat); got != "sha256:bare" {
+		t.Errorf("an entry without a platform counts as linux/amd64, got %q", got)
 	}
 }
 
@@ -241,6 +286,11 @@ func TestManifestBaseURLs(t *testing.T) {
 		{"https://reg", true, []string{"https://reg"}},
 		{"reg:5000", true, []string{"https://reg:5000", "http://reg:5000"}},
 		{"reg:5000", false, []string{"https://reg:5000"}},
+		// The scheme is matched after trimming and ignoring case, so these
+		// never fall through to https (#5909 review).
+		{" http://reg:8080 ", true, []string{"http://reg:8080"}},
+		{"HTTP://reg:8080/", false, []string{"http://reg:8080"}},
+		{"HttpS://reg", true, []string{"https://reg"}},
 	}
 	for _, c := range cases {
 		if got := manifestBaseURLs(c.url, c.insecure); !reflect.DeepEqual(got, c.want) {
@@ -261,6 +311,30 @@ func TestLoadConfigMaxImageBytes(t *testing.T) {
 	t.Setenv("SCANNER_MAX_IMAGE_BYTES", "-5")
 	if got := LoadConfig().MaxImageBytes; got != 0 {
 		t.Errorf("negative = %d, want the default 0", got)
+	}
+	for v, want := range map[string]int64{"4Gi": 4 << 30, "512Mi": 512 << 20, "64Ki": 64 << 10, "2G": 2e9, "500M": 500e6, "8K": 8000, " 3 Gi ": 3 << 30, "0": 0} {
+		t.Setenv("SCANNER_MAX_IMAGE_BYTES", v)
+		if got := LoadConfig().MaxImageBytes; got != want {
+			t.Errorf("%q = %d, want %d", v, got, want)
+		}
+	}
+}
+
+// TestBadMaxImageBytesIsLogged: a value that does not parse is ignored with a
+// warning naming the variable, never silently.
+func TestBadMaxImageBytesIsLogged(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+	for _, v := range []string{"4GB", "lots", "4.5Gi", "-1Gi", "9999999999Ti"} {
+		buf.Reset()
+		t.Setenv("SCANNER_MAX_IMAGE_BYTES", v)
+		if got := LoadConfig().MaxImageBytes; got != 0 {
+			t.Errorf("%q = %d, want the default 0", v, got)
+		}
+		if !strings.Contains(buf.String(), "SCANNER_MAX_IMAGE_BYTES") || !strings.Contains(buf.String(), "WARNING") {
+			t.Errorf("%q: no warning logged: %q", v, buf.String())
+		}
 	}
 }
 
