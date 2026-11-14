@@ -1948,7 +1948,7 @@ mod tests {
                 .await
                 .unwrap();
             let repo = match created {
-                Ok(r) => r.0,
+                Ok((_, _, r)) => r.0,
                 Err(e) => {
                     assert_eq!(n, 0, "a refused create left a repository behind");
                     return Err(e);
