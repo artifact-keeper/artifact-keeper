@@ -45,7 +45,16 @@ type FsScanResult struct {
 //     regular files carrying package DBs / lockfiles);
 //   - the stream is size-bounded upstream by http.MaxBytesReader, and since
 //     the tar is uncompressed the extracted tree cannot exceed the body cap.
+//
+// It extracts everything, as before #5943; the handler calls
+// untarWorkspaceOpts so registry partition mode can drop a root .git.
 func untarWorkspace(r io.Reader, dst string) error {
+	return untarWorkspaceOpts(r, dst, false)
+}
+
+// untarWorkspaceOpts is untarWorkspace; with dropRootGit (registry partition
+// mode, #5943) a root .git is not extracted.
+func untarWorkspaceOpts(r io.Reader, dst string, dropRootGit bool) error {
 	tr := tar.NewReader(r)
 	for {
 		hdr, err := tr.Next()
@@ -59,6 +68,17 @@ func untarWorkspace(r io.Reader, dst string) error {
 		name := filepath.Clean(hdr.Name)
 		if filepath.IsAbs(name) || name == ".." || strings.HasPrefix(name, ".."+string(os.PathSeparator)) {
 			return fmt.Errorf("tar entry %q escapes the workspace", hdr.Name)
+		}
+		// In registry partition mode a root .git (directory or gitdir file)
+		// is not extracted (#5943).
+		// trivy reads it to decide whether the workspace is a clean git
+		// repository, and for one it keys the analysis by the HEAD commit and
+		// reuses a cached analysis (on a trivy server, one any client stored)
+		// instead of analyzing the files. Without it every filesystem scan is
+		// analyzed from the uploaded files. trivy skips **/.git when scanning,
+		// so no finding comes from it.
+		if dropRootGit && isRootGit(name) {
+			continue
 		}
 		target := filepath.Join(dst, name)
 
@@ -89,4 +109,11 @@ func untarWorkspace(r io.Reader, dst string) error {
 			continue
 		}
 	}
+}
+
+// isRootGit reports whether a cleaned tar entry name is the workspace's root
+// .git or something under it.
+func isRootGit(name string) bool {
+	first, _, _ := strings.Cut(filepath.ToSlash(name), "/")
+	return first == ".git"
 }
