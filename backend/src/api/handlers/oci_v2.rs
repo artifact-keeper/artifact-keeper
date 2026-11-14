@@ -200,6 +200,16 @@ fn carries_storage_backend_text(message: &str) -> bool {
     message.contains("<?xml") || message.contains("<Error>") || message.contains("caused by:")
 }
 
+/// The `503 UNAVAILABLE` (with `Retry-After`) a strict virtual's tag pull
+/// answers when a higher-priority member could not answer (#5810).
+fn oci_member_unavailable() -> Response {
+    oci_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "UNAVAILABLE",
+        "A repository member is temporarily unavailable, retry shortly",
+    )
+}
+
 fn oci_internal_error(message: &str) -> Response {
     oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", message)
 }
@@ -4383,6 +4393,18 @@ pub type VirtualManifestResolution = (
 /// in [`try_resolve_virtual_blob`], a member that serves the manifest wins;
 /// only a walk that found nothing answers the failure (`Err`, the `/v2` 503
 /// or a 500), and it is never negative-cached.
+///
+/// Strict member fallback (#5810): when the virtual is
+/// [`proxy_helpers::VirtualMemberFallback::Strict`], a pull by TAG ends at
+/// the first member, in priority order, that could not answer: an upstream
+/// `5xx`, a transport failure or timeout, or a database or storage fault on
+/// the member's own lookup. The pull answers that fault (`503 UNAVAILABLE`
+/// with `Retry-After` for an upstream one) instead of a lower member's tag,
+/// which in a virtual whose members hold different images under one tag is
+/// a different image. A `404` (or an upstream refusing the Remote's
+/// credentials) is still a miss. A pull by digest is addressed by content,
+/// as a blob pull is, and keeps walking. The setting is read only once a
+/// member is unavailable, so a walk that meets none makes no extra lookup.
 async fn try_resolve_virtual_manifest(
     state: &SharedState,
     auth: Option<&crate::api::middleware::auth::AuthExtension>,
@@ -4405,6 +4427,9 @@ async fn try_resolve_virtual_manifest(
         return Ok(None);
     };
     let mut lookup_failed: Option<Response> = None;
+    // #5810: whether the virtual's fallback setting has been read; it is read
+    // at most once, when the first member is unavailable.
+    let mut fallback_checked = false;
 
     // #3836: set when any member left the question unanswered (a throttled or
     // failing upstream, or a digest mismatch we refused to serve). A walk that
@@ -4427,6 +4452,10 @@ async fn try_resolve_virtual_manifest(
         // The member in its own context (id/key/upstream/storage) with the
         // pull's image name, for the Remote-path helpers below (#3023).
         let member_repo = oci_repo_info_from_member(member, image_name);
+        // #5810: this member's own lookup failures, kept apart from earlier
+        // members' so a strict walk can tell whether THIS member answered.
+        let earlier_failure = lookup_failed.take();
+        let mut upstream_unavailable = false;
         let (local, refetched) = if is_digest_ref {
             // #1683: a hosted member resolves a digest exactly as a direct
             // pull of the member does ([`resolve_hosted_digest`]: its
@@ -4553,6 +4582,7 @@ async fn try_resolve_virtual_manifest(
             )
             .await;
             indeterminate |= outcome.is_indeterminate();
+            upstream_unavailable = matches!(outcome, UpstreamFetchOutcome::Unavailable);
             if let Some((content, content_type)) = outcome.into_fetched() {
                 // #1348 round 1, concern #3 (CRITICAL):
                 // When the manifest reference is itself a digest
@@ -4590,11 +4620,29 @@ async fn try_resolve_virtual_manifest(
                         // not "no member serves this key", so it must not be
                         // recorded as one.
                         indeterminate = true;
-                        continue;
                     }
                 }
             }
         }
+
+        let member_failure = lookup_failed.take();
+        if (member_failure.is_some() || upstream_unavailable) && !is_digest_ref && !fallback_checked
+        {
+            fallback_checked = true;
+            if proxy_helpers::virtual_member_fallback(&state.db, repo_id)
+                .await
+                .is_strict()
+            {
+                tracing::warn!(
+                    member = %member.key,
+                    image = %image_name,
+                    reference = %reference,
+                    "virtual member could not answer; strict member fallback ends the walk"
+                );
+                return Err(member_failure.unwrap_or_else(oci_member_unavailable));
+            }
+        }
+        lookup_failed = earlier_failure.or(member_failure);
     }
 
     if let Some(resp) = lookup_failed {
@@ -5220,6 +5268,11 @@ enum UpstreamFetchOutcome {
     /// of those say anything about whether the object exists, so a walk that
     /// saw one must NEVER be recorded as a negative (#3836).
     Indeterminate,
+    /// [`Self::Indeterminate`] because the member could not answer at all
+    /// (#5504's [`proxy_helpers::MemberUnavailable`]: an upstream 5xx, a
+    /// transport failure or timeout), the case strict member fallback
+    /// (#5810) ends a virtual tag walk on.
+    Unavailable,
     /// The upstream refused the Remote's credentials: its OCI token service
     /// (#4453), or the registry itself on the request when credentials were
     /// sent (#4518). As indeterminate as [`Self::Indeterminate`], but the
@@ -5241,7 +5294,9 @@ impl UpstreamFetchOutcome {
     fn is_indeterminate(&self) -> bool {
         matches!(
             self,
-            UpstreamFetchOutcome::Indeterminate | UpstreamFetchOutcome::UpstreamAuthFailed
+            UpstreamFetchOutcome::Indeterminate
+                | UpstreamFetchOutcome::Unavailable
+                | UpstreamFetchOutcome::UpstreamAuthFailed
         )
     }
 
@@ -5317,6 +5372,9 @@ async fn try_upstream_fetch_with_accept(
         Err(error) if upstream_error_is_definitive_miss(&error) => UpstreamFetchOutcome::Missing,
         Err(error) if proxy_helpers::is_upstream_auth_failure(&error) => {
             UpstreamFetchOutcome::UpstreamAuthFailed
+        }
+        Err(error) if proxy_helpers::is_member_unavailable_response(&error) => {
+            UpstreamFetchOutcome::Unavailable
         }
         Err(_) => UpstreamFetchOutcome::Indeterminate,
     }
@@ -52707,5 +52765,158 @@ mod oci_push_replication_4790_tests {
         );
         assert_eq!(promotion_status, StatusCode::FORBIDDEN, "promotion-only");
         assert_eq!(held_blobs, 0, "a refused write stores nothing");
+    }
+}
+
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod virtual_manifest_strict_fallback_5810 {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn insert_repo(pool: &sqlx::PgPool, repo_type: &str, upstream_url: Option<&str>) -> Uuid {
+        let id = Uuid::new_v4();
+        let key = format!("oci-5810-{repo_type}-{}", &id.to_string()[..8]);
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url, is_public) \
+             VALUES ($1, $2, $2, $3, '{repo_type}', 'docker'::repository_format, $4, true)"
+        )))
+        .bind(id)
+        .bind(&key)
+        .bind(format!("/tmp/oci-5810-{id}"))
+        .bind(upstream_url)
+        .execute(pool)
+        .await
+        .expect("insert repository");
+        id
+    }
+
+    async fn mount(server: &MockServer, reference: &str, response: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v2/myimage/manifests/{reference}")))
+            .respond_with(response)
+            .mount(server)
+            .await;
+    }
+
+    fn manifest(body: &[u8]) -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "application/vnd.oci.image.manifest.v1+json")
+            .set_body_bytes(body.to_vec())
+    }
+
+    /// Two Remote members hold different images under `:latest`. While the
+    /// higher one answers `503`, a pull by tag through a strict virtual
+    /// answers `503 UNAVAILABLE` with `Retry-After` instead of the lower
+    /// member's image; the default (`available`) serves the lower member.
+    /// A `404` from the higher member is still a miss, and a pull by digest
+    /// still walks on (the bytes are checked against the digest).
+    ///
+    /// FAILS BEFORE THE FIX: the strict pull of `:latest` served member B's
+    /// image.
+    #[tokio::test]
+    async fn a_strict_virtual_tag_pull_does_not_serve_a_lower_member_while_a_higher_one_is_unavailable_5810(
+    ) {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let body_b =
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","member":"b-5810"}"#;
+        let digest_b = compute_sha256(body_b);
+
+        let server_a = MockServer::start().await;
+        mount(&server_a, "latest", ResponseTemplate::new(503)).await;
+        mount(&server_a, &digest_b, ResponseTemplate::new(503)).await;
+        mount(&server_a, "gone", ResponseTemplate::new(404)).await;
+        let server_b = MockServer::start().await;
+        for reference in ["latest", "gone", digest_b.as_str()] {
+            mount(&server_b, reference, manifest(body_b)).await;
+        }
+
+        let tmp = std::env::temp_dir().join(format!("oci-5810-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+        let member_a = insert_repo(&pool, "remote", Some(&server_a.uri())).await;
+        let member_b = insert_repo(&pool, "remote", Some(&server_b.uri())).await;
+        let virt = insert_repo(&pool, "virtual", None).await;
+        for (member, priority) in [(member_a, 1), (member_b, 2)] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(virt)
+            .bind(member)
+            .bind(priority)
+            .execute(&pool)
+            .await
+            .expect("link member");
+        }
+
+        async fn pull(
+            state: &SharedState,
+            virt: Uuid,
+            reference: &str,
+        ) -> Result<Option<VirtualManifestResolution>, Response> {
+            virtual_negative_cache_clear();
+            try_resolve_virtual_manifest(state, None, virt, "myimage", reference, None).await
+        }
+
+        // Control: `available` (unset) serves member B's image.
+        let served = pull(&state, virt, "latest")
+            .await
+            .expect("available walk")
+            .expect("member B serves");
+        assert_eq!(served.3.id, member_b);
+
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, 'strict')",
+        )
+        .bind(virt)
+        .bind(proxy_helpers::VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY)
+        .execute(&pool)
+        .await
+        .expect("set strict");
+
+        let strict_latest = pull(&state, virt, "latest").await;
+        let strict_gone = pull(&state, virt, "gone").await;
+        let strict_digest = pull(&state, virt, &digest_b).await;
+
+        for id in [virt, member_a, member_b] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let resp = match strict_latest {
+            Err(resp) => resp,
+            Ok(Some(found)) => panic!("strict served member {} for :latest", found.3.key),
+            Ok(None) => panic!("strict answered a miss for :latest"),
+        };
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().contains_key(axum::http::header::RETRY_AFTER));
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("/v2 envelope");
+        assert_eq!(json["errors"][0]["code"], "UNAVAILABLE");
+
+        let gone = strict_gone
+            .expect("a 404 is a miss")
+            .expect("member B serves after A's 404");
+        assert_eq!(gone.3.id, member_b);
+        let by_digest = strict_digest
+            .expect("a digest pull walks on")
+            .expect("member B serves the digest");
+        assert_eq!(
+            (by_digest.0.as_str(), by_digest.3.id),
+            (digest_b.as_str(), member_b)
+        );
     }
 }
