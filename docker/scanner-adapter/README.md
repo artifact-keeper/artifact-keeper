@@ -88,6 +88,38 @@ failed on the cache lock, so neither ends as a failed scan. While the old pod
 is gone and the new one not yet answering, the backend keeps polling for up
 to two minutes instead of failing on the gap.
 
+## Authenticating the scan routes (adapter >= 1.7.0)
+
+By default anything that can reach the adapter can submit a scan, which makes
+it pull and analyze an image of the caller's choosing (in client mode, into
+its cache partition on the trivy server; see "Trust" above). Network isolation
+is the only defence then, and it is hard to keep once the adapter sits behind
+a shared proxy or load balancer, or serves several Artifact Keeper instances.
+A bearer token closes that:
+
+| Variable | Effect |
+|---|---|
+| `SCANNER_SCAN_TOKEN` | When set, `POST /api/v1/scan`, `POST /api/v1/filesystem/scan` and both report routes require `Authorization: Bearer <token>` (compared in constant time) and answer `401` otherwise. Unset (default): those routes are open, as before. |
+| `SCANNER_SCAN_TOKENS_FILE` | Path to a file with one token per line (blank lines and lines starting with `#` are ignored); any of them is accepted, alongside `SCANNER_SCAN_TOKEN` if both are set. The file is re-read when its modification time or size changes, so a mounted Secret can add or drop a token without a restart. A file that is empty or holds only comments accepts no token from it. If the file cannot be read (deleted, unreadable, a line over 1 MiB), the last set read stays valid for at most 60 s, which covers an atomic swap of a mounted Secret, and is then dropped, so deleting the file revokes its tokens. A leading UTF-8 BOM is ignored. In every case the routes fail closed. |
+
+`/probe/ready`, `/probe/healthy` and `GET /api/v1/metadata` stay open either
+way. The scan token is separate from `SCANNER_ADAPTER_TOKEN` (the
+vulnerability-DB import credential below), so the two rotate independently;
+neither is accepted in place of the other. Giving each Artifact Keeper
+instance its own line in the tokens file lets one adapter serve several of
+them and revoke one without touching the others.
+
+On the backend, set `TRIVY_ADAPTER_TOKEN` (or `TRIVY_ADAPTER_TOKEN_FILE`, a
+path to a mounted secret) to the same value. It is sent on every adapter
+request, image and filesystem scans alike, and never logged. The Harbor scan
+request's `registry.authorization` remains the separate credential the
+adapter uses to pull the image.
+
+To rotate the backend's token without a failed scan: add the new token as a
+line of `SCANNER_SCAN_TOKENS_FILE` (picked up without a restart), point
+`TRIVY_ADAPTER_TOKEN` / `TRIVY_ADAPTER_TOKEN_FILE` at it and restart the
+backend (it reads the token at startup), then remove the old line.
+
 ## Offline use and vulnerability-DB import (adapter >= 1.7.0)
 
 For a disconnected install, set one switch:
