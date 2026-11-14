@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -55,12 +56,12 @@ func TestStaticModeUsesOnePartitionForEveryRegistry(t *testing.T) {
 	cfg.CachePartitionMode = partitionModeStatic
 	cfg.CachePartition = "fleet-1"
 	for _, u := range []string{"http://a.example:8080", "https://b.example", ""} {
-		if got := cfg.imagePartition(u); got != "fleet-1" {
-			t.Errorf("static imagePartition(%q) = %q, want the configured value", u, got)
+		if got := cfg.imagePartition(trimRegistryHost(u)); got != "fleet-1" {
+			t.Errorf("static imagePartition(trimRegistryHost(%q)) = %q, want the configured value", u, got)
 		}
 	}
 	cfg.CachePartition = ""
-	if got := cfg.imagePartition("http://a.example"); got != "" {
+	if got := cfg.imagePartition(trimRegistryHost("http://a.example")); got != "" {
 		t.Errorf("static mode without a partition must add none, got %q", got)
 	}
 }
@@ -81,7 +82,7 @@ func TestRegistryModeTwoHostsNeverSharePartition(t *testing.T) {
 		}
 		seen := map[string]string{}
 		for _, h := range hosts {
-			dirs := skipDirsOf(s.buildArgs(h+"/repo:tag", cfg.imagePartition(h)))
+			dirs := skipDirsOf(s.buildArgs(h+"/repo:tag", cfg.imagePartition(trimRegistryHost(h))))
 			if len(dirs) != 1 {
 				t.Fatalf("prefix %q, %s: want exactly one partition entry, got %v", prefix, h, dirs)
 			}
@@ -97,7 +98,7 @@ func TestRegistryModeTwoHostsNeverSharePartition(t *testing.T) {
 // scheme or a trailing slash (or in other letter case) maps to one entry.
 func TestRegistryModeSameHostSamePartition(t *testing.T) {
 	cfg := registryModeConfig("fleet-1")
-	want := cachePartitionDir(cfg.imagePartition("ak-one.example:8080"))
+	want := cachePartitionDir(cfg.imagePartition(trimRegistryHost("ak-one.example:8080")))
 	for _, u := range []string{
 		"ak-one.example:8080",
 		"ak-one.example:8080/",
@@ -105,7 +106,7 @@ func TestRegistryModeSameHostSamePartition(t *testing.T) {
 		"https://ak-one.example:8080/",
 		" http://AK-One.Example:8080 ",
 	} {
-		if got := cachePartitionDir(cfg.imagePartition(u)); got != want {
+		if got := cachePartitionDir(cfg.imagePartition(trimRegistryHost(u))); got != want {
 			t.Errorf("%q -> %s, want %s", u, got, want)
 		}
 	}
@@ -114,9 +115,9 @@ func TestRegistryModeSameHostSamePartition(t *testing.T) {
 // TestRegistryModePrefixKeepsFleetsApart: the operator-set value stays a
 // prefix, so two adapter fleets scanning the same registry host do not share.
 func TestRegistryModePrefixKeepsFleetsApart(t *testing.T) {
-	a := registryModeConfig("fleet-1").imagePartition("http://ak.example")
-	b := registryModeConfig("fleet-2").imagePartition("http://ak.example")
-	none := registryModeConfig("").imagePartition("http://ak.example")
+	a := registryModeConfig("fleet-1").imagePartition(trimRegistryHost("http://ak.example"))
+	b := registryModeConfig("fleet-2").imagePartition(trimRegistryHost("http://ak.example"))
+	none := registryModeConfig("").imagePartition(trimRegistryHost("http://ak.example"))
 	if a == b || a == none || b == none {
 		t.Fatalf("prefixes must separate partitions: %q %q %q", a, b, none)
 	}
@@ -187,7 +188,7 @@ func TestRegistryModePartitionReachesTrivyPerRequest(t *testing.T) {
 		t.Fatalf("want %d trivy runs, got %d: %q", len(hosts), len(runs), raw)
 	}
 	for i, h := range hosts {
-		want := "--skip-dirs " + cachePartitionDir(cfg.imagePartition(h)) + " "
+		want := "--skip-dirs " + cachePartitionDir(cfg.imagePartition(trimRegistryHost(h))) + " "
 		if !strings.Contains(runs[i], want) {
 			t.Errorf("run %d (%s) lacks its partition %q: %s", i, h, want, runs[i])
 		}
@@ -320,28 +321,134 @@ func TestCompatOldStyleRequestStaticModeUnchanged(t *testing.T) {
 		}
 		// buildArgs in static mode equals the pre-change argument list.
 		before := NewScanner(cfg).buildArgs("ref", cfg.CachePartition)
-		if after := NewScanner(cfg).buildArgs("ref", cfg.imagePartition("http://any.example")); strings.Join(before, " ") != strings.Join(after, " ") {
+		if after := NewScanner(cfg).buildArgs("ref", cfg.imagePartition(trimRegistryHost("http://any.example"))); strings.Join(before, " ") != strings.Join(after, " ") {
 			t.Errorf("static mode must not depend on the registry: %v vs %v", before, after)
 		}
 	}
 }
 
-// TestCompatRegistryModeNoHostFallsBackToStaticPartition: a request without
-// a registry host carries no per-request partition and gets the configured
-// SCANNER_TRIVY_CACHE_PARTITION, as today.
-func TestCompatRegistryModeNoHostFallsBackToStaticPartition(t *testing.T) {
-	for _, u := range []string{"", "  ", "http://", "https:///"} {
-		if got := registryModeConfig("fleet-1").imagePartition(u); got != "fleet-1" {
-			t.Errorf("registry mode, url %q: partition %q, want the configured fleet-1", u, got)
+// TestRegistryModeRefusesRequestWithoutHost: in registry mode a request
+// whose registry.url has no host gets 400 instead of the shared prefix
+// partition; static mode accepts it as before.
+func TestRegistryModeRefusesRequestWithoutHost(t *testing.T) {
+	for _, mode := range []string{partitionModeRegistry, partitionModeStatic} {
+		cfg := LoadConfig()
+		cfg.CachePartitionMode = mode
+		cfg.CachePartition = "fleet-1"
+		cfg.TrivyPath = argsRecordingStub(t, filepath.Join(t.TempDir(), "args"))
+		cfg.CacheDir = t.TempDir()
+		srv := NewServer(cfg)
+		srv.MarkReady()
+		ts := httptest.NewServer(srv.Handler())
+		for _, u := range []string{"", "  ", "http://", "https:///"} {
+			body, _ := json.Marshal(ScanRequest{Registry: RegistryRef{URL: u}, Artifact: ArtifactRef{Repository: "app", Tag: "1"}})
+			resp, err := http.Post(ts.URL+"/api/v1/scan", "application/json", bytes.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			want := http.StatusAccepted
+			if mode == partitionModeRegistry {
+				want = http.StatusBadRequest
+			}
+			if resp.StatusCode != want {
+				t.Errorf("%s mode, url %q: status %d, want %d", mode, u, resp.StatusCode, want)
+			}
 		}
-		if got := registryModeConfig("").imagePartition(u); got != "" {
-			t.Errorf("registry mode, no prefix, url %q: partition %q, want none", u, got)
+		ts.Close()
+	}
+}
+
+// TestRegistryModeRejectsSeparatorInPrefix: "|" separates the prefix from
+// the host, so registry mode refuses a prefix containing it; static mode
+// keeps accepting any value.
+func TestRegistryModeRejectsSeparatorInPrefix(t *testing.T) {
+	if err := registryModeConfig("a|b").Validate(); err == nil {
+		t.Error(`registry mode must refuse a "|" in SCANNER_TRIVY_CACHE_PARTITION`)
+	}
+	cfg := LoadConfig()
+	cfg.CachePartitionMode = partitionModeStatic
+	cfg.CachePartition = "a|b"
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("static mode must keep accepting any partition: %v", err)
+	}
+}
+
+func TestHostIsIPLiteral(t *testing.T) {
+	for host, want := range map[string]bool{
+		"10.0.0.5:8080":          true,
+		"10.0.0.5":               true,
+		"[fd00::1]:8080":         true,
+		"fd00::1":                true,
+		"ak.example:8080":        false,
+		"ak-backend.ns.svc:8080": false,
+		"":                       false,
+	} {
+		if got := hostIsIPLiteral(host); got != want {
+			t.Errorf("hostIsIPLiteral(%q) = %v, want %v", host, got, want)
 		}
 	}
 }
 
-// TestCompatMetadataShapeUnchanged: /api/v1/metadata keeps its scanner and
-// capabilities fields; properties is the spec's optional map.
+// TestRegistryModeWarnsOnceForIPHost: an IP-literal registry host is logged
+// once (a recycled pod IP would share the partition), never refused.
+func TestRegistryModeWarnsOnceForIPHost(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+	s := NewScanner(registryModeConfig("fleet-1"))
+	s.warnIPPartition("10.0.0.5:8080")
+	s.warnIPPartition("10.0.0.5:8080")
+	s.warnIPPartition("ak.example:8080")
+	if n := strings.Count(buf.String(), "bare IP address"); n != 1 {
+		t.Fatalf("want one warning, got %d: %s", n, buf.String())
+	}
+	buf.Reset()
+	NewScanner(LoadConfig()).warnIPPartition("10.0.0.5:8080") // static mode
+	if buf.Len() != 0 {
+		t.Fatalf("static mode must not warn: %s", buf.String())
+	}
+}
+
+// gitProbeStub is a trivy stub for filesystem scans that records whether
+// the workspace it was handed (its last argument) has a root .git.
+func gitProbeStub(t *testing.T, probeFile string) string {
+	return writeStub(t, "#!/bin/sh\n"+stubVersion+`
+for a in "$@"; do dir="$a"; done
+if [ -e "$dir/.git" ]; then echo has-git >> '`+probeFile+`'; else echo no-git >> '`+probeFile+`'; fi
+echo '{"Results":[]}'
+`)
+}
+
+// TestRegistryModeFsScanNeverSeesRootGit drives a filesystem upload through
+// the HTTP handler: in registry mode trivy never sees the upload's root
+// .git; in static mode it does, as before.
+func TestRegistryModeFsScanNeverSeesRootGit(t *testing.T) {
+	for mode, want := range map[string]string{partitionModeRegistry: "no-git", partitionModeStatic: "has-git"} {
+		probe := filepath.Join(t.TempDir(), "probe")
+		cfg := LoadConfig()
+		cfg.CachePartitionMode = mode
+		cfg.TrivyPath = gitProbeStub(t, probe)
+		cfg.CacheDir = t.TempDir()
+		srv := NewServer(cfg)
+		srv.MarkReady()
+		ts := httptest.NewServer(srv.Handler())
+		id := submitFsScan(t, ts.URL, tarOf(t, map[string]string{".git/HEAD": "ref: refs/heads/main\n", "package-lock.json": "{}"}))
+		code, body := pollFsReport(t, ts.URL, id)
+		ts.Close()
+		if code != http.StatusOK {
+			t.Fatalf("%s mode fs scan: %d %s", mode, code, body)
+		}
+		got, _ := os.ReadFile(probe)
+		if strings.TrimSpace(string(got)) != want {
+			t.Errorf("%s mode: trivy saw %q, want %q", mode, strings.TrimSpace(string(got)), want)
+		}
+	}
+}
+
+// TestCompatMetadataShapeUnchanged: with no new config /api/v1/metadata is
+// exactly what it was (no properties); registry mode adds the optional
+// properties map from the Harbor spec.
 func TestCompatMetadataShapeUnchanged(t *testing.T) {
 	cfg := LoadConfig()
 	cfg.ScannerVersion = "0.71.2"
@@ -351,15 +458,8 @@ func TestCompatMetadataShapeUnchanged(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &meta); err != nil {
 		t.Fatal(err)
 	}
-	for _, k := range []string{"scanner", "capabilities", "properties"} {
-		if _, ok := meta[k]; !ok {
-			t.Errorf("metadata lacks %q: %s", k, rec.Body.String())
-		}
-	}
-	var props map[string]string
-	_ = json.Unmarshal(meta["properties"], &props)
-	if props[cachePartitionModeProperty] != partitionModeStatic {
-		t.Errorf("default mode property = %q", props[cachePartitionModeProperty])
+	if len(meta) != 2 || meta["scanner"] == nil || meta["capabilities"] == nil {
+		t.Errorf("static-mode metadata must keep exactly scanner and capabilities: %s", rec.Body.String())
 	}
 }
 

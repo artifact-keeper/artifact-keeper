@@ -201,6 +201,12 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("SCANNER_TRIVY_CACHE_PARTITION_MODE=%q: must be %q or %q", c.CachePartitionMode, partitionModeStatic, partitionModeRegistry)
 	}
+	// In registry mode "|" separates the prefix from the host, so a prefix
+	// containing it could spell another prefix's partition. Static mode
+	// keeps accepting any value, as before.
+	if c.CachePartitionMode == partitionModeRegistry && strings.Contains(c.CachePartition, "|") {
+		return fmt.Errorf("SCANNER_TRIVY_CACHE_PARTITION must not contain %q in registry partition mode", "|")
+	}
 	return nil
 }
 

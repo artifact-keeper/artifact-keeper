@@ -128,9 +128,11 @@ func (s *Server) handleMetadata(w http.ResponseWriter, _ *http.Request) {
 			ConsumesMimeTypes: []string{ociManifestMimeType, dockerManifestMimeType},
 			ProducesMimeTypes: []string{reportMimeType},
 		}},
-		Properties: map[string]string{
-			cachePartitionModeProperty: s.cfg.CachePartitionMode,
-		},
+	}
+	// Only registry mode adds the property, so with no new config the
+	// document is exactly what it was.
+	if s.cfg.CachePartitionMode == partitionModeRegistry {
+		meta.Properties = map[string]string{cachePartitionModeProperty: s.cfg.CachePartitionMode}
 	}
 	writeJSON(w, http.StatusOK, meta)
 }
@@ -145,6 +147,13 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Artifact.Repository == "" {
 		http.Error(w, "artifact.repository is required", http.StatusBadRequest)
+		return
+	}
+	// Registry partition mode derives the partition from the registry host,
+	// so a request without one is refused rather than given the shared
+	// prefix partition (#5943).
+	if s.cfg.CachePartitionMode == partitionModeRegistry && trimRegistryHost(req.Registry.URL) == "" {
+		http.Error(w, "registry.url with a host is required in registry partition mode", http.StatusBadRequest)
 		return
 	}
 	hasTag := req.Artifact.Tag != ""

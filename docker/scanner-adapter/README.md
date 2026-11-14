@@ -79,12 +79,19 @@ scan instead (#5943):
   kept. `http://ak.example:8080/` and `ak.example:8080` share a partition;
   `ak.example:8080` and `ak.example:8081` do not.
 - Two registry hosts never share layer analysis, so a scan for one instance
-  never reuses analysis cached by another instance's scan. Each instance needs
-  its own registry host (the backend sends the URL the adapter pulls from:
-  `TRIVY_ADAPTER_REGISTRY_URL`, or the address it derives). Instances behind
-  one shared host name would share a partition, as they share a registry.
+  never reuses analysis cached by another instance's scan.
+- **Each instance must set a stable, unique `TRIVY_ADAPTER_REGISTRY_URL`**
+  (a service DNS name such as `http://ak-backend.<namespace>.svc:8080`) in
+  this mode. Without it the backend advertises `http://<pod IP>:8080`, and
+  cached analysis has no expiry on the trivy server: when that pod IP is later
+  given to another instance's backend, the second instance would read the
+  first one's partition, including anything planted in it. The adapter logs
+  a warning (once per host) when a registry-mode partition is keyed by a bare
+  IPv4 or IPv6 address; it still scans. Instances behind one shared host name
+  share a partition, as they share a registry.
 - The operator-set value stays a prefix, so two adapter fleets scanning the
-  same host still stay apart. It may be empty in this mode.
+  same host still stay apart. It may be empty in this mode, and must not
+  contain `|` (the separator; the adapter refuses to start).
 - The partition applies in standalone mode too: trivy keys the local on-disk
   cache the same way.
 - Filesystem scans carry no registry and keep the static partition. In this
@@ -92,14 +99,14 @@ scan instead (#5943):
   the only case in which trivy reuses a cached filesystem analysis (keyed by
   the HEAD commit the `.git` claims), so there is nothing to partition. trivy
   skips `.git` when scanning, so no finding changes.
-- A request with no registry host (an empty `registry.url`) falls back to
-  `SCANNER_TRIVY_CACHE_PARTITION`.
+- A scan request with no registry host (an empty or scheme-only
+  `registry.url`) is refused with `400` in this mode.
 - Switching modes changes every image-layer cache key once, so the first
   scans afterwards re-analyze their layers.
 
-The startup log and `GET /api/v1/metadata`
-(`properties."env.SCANNER_TRIVY_CACHE_PARTITION_MODE"`) report the mode, never
-a partition value. The startup log no longer prints the static partition's
+The startup log reports the mode, and in `registry` mode `GET /api/v1/metadata`
+adds `properties."env.SCANNER_TRIVY_CACHE_PARTITION_MODE"`; neither ever shows
+a partition value. In `static` mode the metadata document is unchanged. The startup log no longer prints the static partition's
 `--skip-dirs` hash either.
 
 Upgrading changes nothing unless the mode is set: the default `static` mode

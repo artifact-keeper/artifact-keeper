@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,6 +36,8 @@ type Scanner struct {
 	// scans already default to the memory backend, and client mode uses the
 	// trivy server's cache, so neither takes it.
 	imageCacheMu sync.Mutex
+	// ipWarned records the registry hosts warnIPPartition already logged.
+	ipWarned sync.Map
 }
 
 // NewScanner constructs a Scanner bound to cfg.
@@ -46,7 +49,7 @@ func NewScanner(cfg *Config) *Scanner {
 // it can be used as the host prefix of a trivy image reference. Single source
 // of truth for host normalization (referenced by buildRef + tests).
 func trimRegistryHost(registryURL string) string {
-	host := registryURL
+	host := strings.TrimSpace(registryURL)
 	host = strings.TrimPrefix(host, "http://")
 	host = strings.TrimPrefix(host, "https://")
 	host = strings.TrimRight(host, "/")
@@ -148,35 +151,60 @@ func (c *Config) clientArgs(partition string) []string {
 }
 
 // imagePartition returns the analysis-cache partition of an image scan
-// pulled from registryURL (#5943). Static mode: CachePartition for every
-// scan. Registry mode: CachePartition + "|" + the normalized registry host,
-// so two registry hosts never share a partition, the same host always maps
-// to the same one whatever scheme or trailing slash the URL carries, and the
-// operator-set value still keeps two adapter fleets apart. The partition
-// also applies to the standalone on-disk cache (trivy keys it the same way).
+// whose registry host is host, as trimRegistryHost returns it for the
+// request's registry.url: the same value the pull reference and the pull
+// credential are built from (#5943). Static mode: CachePartition for every
+// scan. Registry mode: CachePartition + "|" + the host lowercased, so two
+// registry hosts never share a partition, the same host always maps to the
+// same one whatever scheme, trailing slash or letter case the URL carries,
+// and the operator-set value still keeps two adapter fleets apart. The
+// partition also applies to the standalone on-disk cache (trivy keys it the
+// same way).
 //
 // The host is the one trivy pulls from: a forged layer analysis can only be
 // planted under a host's partition by an image served from that host.
 //
-// A request with no registry host (an empty registry.url, which no Artifact
-// Keeper backend sends) carries nothing to derive a partition from and falls
-// back to CachePartition, exactly as in static mode.
-func (c *Config) imagePartition(registryURL string) string {
+// handleScan refuses a registry-mode request without a host, so the empty
+// case below is only a safe default for direct callers.
+func (c *Config) imagePartition(host string) string {
 	if c.CachePartitionMode != partitionModeRegistry {
 		return c.CachePartition
 	}
-	host := partitionHost(registryURL)
-	if host == "" {
+	key := partitionHostKey(host)
+	if key == "" {
 		return c.CachePartition
 	}
-	return c.CachePartition + "|" + host
+	return c.CachePartition + "|" + key
 }
 
-// partitionHost normalizes a registry URL to the host key of a registry-mode
-// partition: trimRegistryHost (scheme and trailing slash dropped, port kept)
-// and lowercased, since host names are case-insensitive.
-func partitionHost(registryURL string) string {
-	return strings.ToLower(trimRegistryHost(strings.TrimSpace(registryURL)))
+// partitionHostKey is the registry-mode partition key of a host returned by
+// trimRegistryHost: lowercased, since host names are case-insensitive.
+func partitionHostKey(host string) string { return strings.ToLower(host) }
+
+// hostIsIPLiteral reports whether a registry host (port optional) is a bare
+// IPv4 or IPv6 address rather than a name.
+func hostIsIPLiteral(host string) bool {
+	h := host
+	if hp, _, err := net.SplitHostPort(host); err == nil {
+		h = hp
+	}
+	h = strings.TrimSuffix(strings.TrimPrefix(h, "["), "]")
+	return net.ParseIP(h) != nil
+}
+
+// warnIPPartition logs, once per host, that a registry-mode partition is
+// keyed by a bare IP address. A backend without TRIVY_ADAPTER_REGISTRY_URL
+// advertises its pod IP, and a recycled IP would hand another instance the
+// first one's cached analysis (the cache has no expiry). Warns, never
+// refuses: the scan itself is unaffected.
+func (s *Scanner) warnIPPartition(host string) {
+	if s.cfg.CachePartitionMode != partitionModeRegistry || !hostIsIPLiteral(host) {
+		return
+	}
+	if _, seen := s.ipWarned.LoadOrStore(partitionHostKey(host), true); seen {
+		return
+	}
+	log.Printf("WARNING: registry partition mode: registry host %s is a bare IP address; if that address is later reused by another Artifact Keeper instance it would share this partition's cached analysis. Give each instance a stable, unique TRIVY_ADAPTER_REGISTRY_URL (a service DNS name)", host)
 }
 
 // fsPartition returns the analysis-cache partition of a filesystem scan:
@@ -380,7 +408,8 @@ func DownloadDB(ctx context.Context, cfg *Config) error {
 // non-zero exit or parse failure is an error (the caller marks the job Failed
 // and the report endpoint 500s — fail-closed, never a silent empty report).
 func (s *Scanner) Scan(ctx context.Context, req *ScanRequest) (*HarborScanReport, error) {
-	imageRef, err := buildRef(req.Registry.URL, req.Artifact.Repository, req.Artifact.Tag, req.Artifact.Digest)
+	host := trimRegistryHost(req.Registry.URL)
+	imageRef, err := buildRef(host, req.Artifact.Repository, req.Artifact.Tag, req.Artifact.Digest)
 	if err != nil {
 		return nil, err
 	}
@@ -409,7 +438,8 @@ func (s *Scanner) Scan(ctx context.Context, req *ScanRequest) (*HarborScanReport
 			defer s.imageCacheMu.Unlock()
 		}
 	}
-	partition := s.cfg.imagePartition(req.Registry.URL)
+	s.warnIPPartition(host)
+	partition := s.cfg.imagePartition(host)
 	stdout, stderr, localDB, err := s.runImageScan(ctx, imageRef, partition, cred.env, memoryCache)
 	if err != nil && !memoryCache && trivyCacheLocked(stderr) {
 		// The lock is held outside this process (another adapter replica or
