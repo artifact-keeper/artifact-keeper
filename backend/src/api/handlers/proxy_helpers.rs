@@ -10882,18 +10882,28 @@ enum ScanTimeoutOutcome<E> {
     TimedOut,
 }
 
-async fn run_scan_within_budget<T, E>(
+/// Race `scan_fut` against `budget`, under the fixed adapter readiness gate.
+///
+/// Not an `async fn`: the scan future is moved to the heap when this is
+/// called, so the future returned here, and the future of every download
+/// handler that awaits it, holds a pointer to it instead of the scan future
+/// itself, wrapped twice. Held inline, the wrapped scan future pushed the
+/// scan-on-proxy download paths over a 2 MiB thread stack in debug builds.
+fn run_scan_within_budget<T, E>(
     budget: std::time::Duration,
     scan_fut: impl std::future::Future<Output = std::result::Result<T, E>>,
-) -> std::result::Result<T, ScanTimeoutOutcome<E>> {
+) -> impl std::future::Future<Output = std::result::Result<T, ScanTimeoutOutcome<E>>> {
     // The scanners share `budget`; a scanner-adapter that is still starting
     // gets the fixed readiness gate here, not SCANNER_ADAPTER_READY_TIMEOUT_SECS
     // (#5945), so it cannot spend the whole budget.
-    let scan_fut = crate::services::scanner_adapter_client::with_fixed_ready_gate(scan_fut);
-    match tokio::time::timeout(budget, scan_fut).await {
-        Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => Err(ScanTimeoutOutcome::Failed(e)),
-        Err(_) => Err(ScanTimeoutOutcome::TimedOut),
+    let scan_fut =
+        Box::pin(crate::services::scanner_adapter_client::with_fixed_ready_gate(scan_fut));
+    async move {
+        match tokio::time::timeout(budget, scan_fut).await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(ScanTimeoutOutcome::Failed(e)),
+            Err(_) => Err(ScanTimeoutOutcome::TimedOut),
+        }
     }
 }
 
@@ -15200,6 +15210,27 @@ mod tests {
             "the scan must end on its own, not on the inline budget"
         );
         assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    /// The future [`run_scan_within_budget`] returns holds the scan future
+    /// behind a pointer, however large the scan future is. Held inline (and
+    /// copied once more by the readiness-gate wrapper), the scan future grew
+    /// every scan-on-proxy download handler's future, and their debug-build
+    /// poll frames overflowed a 2 MiB test thread stack.
+    #[test]
+    fn run_scan_within_budget_keeps_the_scan_future_off_its_own_future() {
+        let big = [0u8; 64 * 1024];
+        let scan_fut = async move {
+            tokio::task::yield_now().await;
+            Ok::<usize, ()>(big.iter().map(|b| usize::from(*b)).sum())
+        };
+        assert!(std::mem::size_of_val(&scan_fut) >= 64 * 1024);
+        let fut = run_scan_within_budget(std::time::Duration::from_secs(5), scan_fut);
+        assert!(
+            std::mem::size_of_val(&fut) < 1024,
+            "the scan future is held inline: {} bytes",
+            std::mem::size_of_val(&fut)
+        );
     }
 
     #[tokio::test]

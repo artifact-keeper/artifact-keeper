@@ -350,8 +350,15 @@ tokio::task_local! {
 
 /// Run `fut` with the fixed readiness gate, whatever
 /// [`ADAPTER_READY_TIMEOUT_ENV`] says (see [`FIXED_READY_GATE`]).
-pub(crate) async fn with_fixed_ready_gate<F: std::future::Future>(fut: F) -> F::Output {
-    FIXED_READY_GATE.scope((), fut).await
+///
+/// A plain function, not an `async fn`: an `async fn` would keep its own
+/// copy of `fut` next to the scope future's, and the proxy scan future this
+/// wraps is large enough that every extra copy shows up on the stack of each
+/// download handler above it.
+pub(crate) fn with_fixed_ready_gate<F: std::future::Future>(
+    fut: F,
+) -> tokio::task::futures::TaskLocalFuture<(), F> {
+    FIXED_READY_GATE.scope((), fut)
 }
 
 /// The readiness wait a gate uses now: `configured`, or the fixed gate
