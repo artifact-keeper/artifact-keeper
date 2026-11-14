@@ -39,9 +39,10 @@ tokio::task_local! {
 }
 
 /// Run `fut` in the background priority band (#5947): a scan nobody waits on.
-/// Scanner clients can read [`in_background_band`] and pass it on, for example
-/// as [`BACKGROUND_PRIORITY_HEADER`], to a scanner adapter that schedules such
-/// work behind interactive scans. A scanner that ignores it scans as usual.
+/// The scanner-adapter clients read [`in_background_band`] and ask the adapter
+/// to schedule the scan behind interactive ones: [`BACKGROUND_PRIORITY_FIELD`]
+/// in an image scan request, [`BACKGROUND_PRIORITY_HEADER`] on a filesystem
+/// upload. An adapter that does not know either ignores it and scans as usual.
 pub async fn in_background<F: std::future::Future>(fut: F) -> F::Output {
     BACKGROUND_BAND.scope((), fut).await
 }
@@ -52,9 +53,13 @@ pub fn in_background_band() -> bool {
     BACKGROUND_BAND.try_with(|_| ()).is_ok()
 }
 
-/// Header (and value) a scanner-adapter client may send for a background-band
-/// scan. Not sent by any client yet; an adapter that does not know it ignores it.
-pub const BACKGROUND_PRIORITY_HEADER: (&str, &str) = ("X-AK-Scan-Priority", "background");
+/// `(key, value)` added to the body of an adapter image scan request for a
+/// background-band scan. Absent means interactive.
+pub const BACKGROUND_PRIORITY_FIELD: (&str, &str) = ("priority", "background");
+
+/// `(name, value)` sent on an adapter filesystem upload for a background-band
+/// scan. Absent means interactive.
+pub const BACKGROUND_PRIORITY_HEADER: (&str, &str) = ("X-Scan-Priority", "background");
 
 /// Claim extension for one job. Binds `$1 = id`, `$2 = token`, `$3 = ttl`.
 pub const RENEW_CLAIM_SQL: &str = r#"
