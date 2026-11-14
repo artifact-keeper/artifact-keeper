@@ -1056,6 +1056,7 @@ pub(crate) fn parse_format_str(s: &str) -> Option<RepositoryFormat> {
         "vagrant" => Some(RepositoryFormat::Vagrant),
         "opkg" => Some(RepositoryFormat::Opkg),
         "pacman" => Some(RepositoryFormat::Pacman),
+        "homebrew" => Some(RepositoryFormat::Homebrew),
         "mcp" => Some(RepositoryFormat::Mcp),
         "p2" => Some(RepositoryFormat::P2),
         "bazel" => Some(RepositoryFormat::Bazel),
