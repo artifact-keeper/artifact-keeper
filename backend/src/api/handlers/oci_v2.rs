@@ -4408,8 +4408,10 @@ pub type VirtualManifestResolution = (
 /// terminal here: a manifest over the buffered size cap, or another
 /// status-less `BadGateway`. A pull by digest is addressed by content, as a
 /// blob pull is, and keeps walking. The setting is read only once a member
-/// is unavailable, so a walk that meets none makes no extra lookup; if that
-/// read fails, the pull fails closed and answers `503`.
+/// is unavailable, so a walk that meets none makes no extra lookup. If that
+/// read fails, the walk goes on as `available` and logs a `WARN`, as every
+/// format's download does: a virtual that never set the option must behave
+/// exactly as before #5810 whatever `repository_config` does.
 async fn try_resolve_virtual_manifest(
     state: &SharedState,
     auth: Option<&crate::api::middleware::auth::AuthExtension>,
@@ -4634,23 +4636,12 @@ async fn try_resolve_virtual_manifest(
         if (member_failure.is_some() || upstream_unavailable) && !is_digest_ref && !fallback_checked
         {
             fallback_checked = true;
-            // Fails closed: with a member already unavailable and the setting
-            // unreadable, a lower member's tag may be the wrong image, so the
-            // pull answers the retryable 503 instead.
-            let strict = match proxy_helpers::try_virtual_member_fallback(&state.db, repo_id).await
+            // A failed read is `available` (with a WARN), so a virtual that
+            // never set the option is unchanged by #5810.
+            if proxy_helpers::virtual_member_fallback(&state.db, repo_id)
+                .await
+                .is_strict()
             {
-                Ok(fallback) => fallback.is_strict(),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        virtual_repo_id = %repo_id,
-                        "reading {} failed while a member is unavailable; answering 503",
-                        proxy_helpers::VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY
-                    );
-                    true
-                }
-            };
-            if strict {
                 tracing::warn!(
                     member = %member.key,
                     image = %image_name,
@@ -53045,7 +53036,8 @@ mod virtual_manifest_strict_fallback_5810 {
     /// A Local member whose tag lookup fails (the database times out) is
     /// unavailable: a strict virtual answers that `503` instead of the lower
     /// Remote member's tag, which the default mode serves. With the setting
-    /// itself unreadable, the pull fails closed and answers `503` too.
+    /// itself unreadable too, the walk reads it as `available`: a default
+    /// virtual is served exactly as before #5810, and so is a strict one.
     #[tokio::test]
     async fn a_strict_virtual_stops_at_a_local_member_whose_lookup_fails_5810() {
         let Some(pool) = tdh::try_pool().await else {
@@ -53085,23 +53077,28 @@ mod virtual_manifest_strict_fallback_5810 {
 
         let default_mode = pull_through(&pool, &tmp, &["oci_tags"], available).await;
         let strict_mode = pull_through(&pool, &tmp, &["oci_tags"], strict).await;
-        let unreadable =
+        let default_unreadable =
+            pull_through(&pool, &tmp, &["oci_tags", "repository_config"], available).await;
+        let strict_unreadable =
             pull_through(&pool, &tmp, &["oci_tags", "repository_config"], strict).await;
         delete_repos(&pool, &[available, strict, local, member_b]).await;
         let _ = std::fs::remove_dir_all(&tmp);
 
-        let served = default_mode
-            .expect("available walks on")
-            .expect("member B serves");
-        assert_eq!(served.3.id, member_b);
-        for (label, pulled) in [("strict", strict_mode), ("setting unreadable", unreadable)] {
+        for (label, pulled) in [
+            ("default", default_mode),
+            ("default, setting unreadable", default_unreadable),
+            ("strict, setting unreadable", strict_unreadable),
+        ] {
             match pulled {
-                Err(resp) => {
-                    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{label}")
-                }
-                Ok(Some(found)) => panic!("{label}: served member {}", found.3.key),
+                Ok(Some(found)) => assert_eq!(found.3.id, member_b, "{label}"),
                 Ok(None) => panic!("{label}: answered a miss"),
+                Err(resp) => panic!("{label}: answered {}", resp.status()),
             }
+        }
+        match strict_mode {
+            Err(resp) => assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE),
+            Ok(Some(found)) => panic!("strict: served member {}", found.3.key),
+            Ok(None) => panic!("strict: answered a miss"),
         }
     }
 

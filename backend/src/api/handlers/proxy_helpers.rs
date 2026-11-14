@@ -4989,34 +4989,22 @@ impl VirtualMemberFallback {
 /// [`VirtualMemberFallback::Available`] with a `WARN`, the behaviour every
 /// virtual had before the setting existed.
 pub async fn virtual_member_fallback(db: &PgPool, virtual_repo_id: Uuid) -> VirtualMemberFallback {
-    try_virtual_member_fallback(db, virtual_repo_id)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(
-                error = %e,
-                virtual_repo_id = %virtual_repo_id,
-                "reading {VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY} failed; using available"
-            );
-            VirtualMemberFallback::Available
-        })
-}
-
-/// [`virtual_member_fallback`] that reports a failed read instead of
-/// reading it as [`VirtualMemberFallback::Available`], for a caller that
-/// fails closed (the OCI manifest walk, which reads the setting only once a
-/// member is already unavailable).
-pub async fn try_virtual_member_fallback(
-    db: &PgPool,
-    virtual_repo_id: Uuid,
-) -> Result<VirtualMemberFallback, sqlx::Error> {
     let value: Option<String> = sqlx::query_scalar(
         "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
     )
     .bind(virtual_repo_id)
     .bind(VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY)
     .fetch_optional(db)
-    .await?;
-    Ok(VirtualMemberFallback::from_stored(value.as_deref()))
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(
+            error = %e,
+            virtual_repo_id = %virtual_repo_id,
+            "reading {VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY} failed; using available"
+        );
+        None
+    });
+    VirtualMemberFallback::from_stored(value.as_deref())
 }
 
 /// Mark a degraded merged response: name the missing members, forbid caching

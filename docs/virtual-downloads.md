@@ -130,8 +130,8 @@ that member answers again.
   not affected.
 - The setting is read once per download. If the read fails, the download
   uses `available` and logs a `WARN`. A Docker/OCI manifest pull reads it
-  only once a member turns out to be unavailable, and if that read fails the
-  pull answers `503` rather than risk serving a lower member's tag.
+  only once a member turns out to be unavailable, and treats a failed read
+  the same way.
 
 ## Upgrade note
 
