@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -346,6 +347,8 @@ func TestRegistryModeRefusesRequestWithoutHost(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			var sr ScanResponse
+			_ = json.NewDecoder(resp.Body).Decode(&sr)
 			resp.Body.Close()
 			want := http.StatusAccepted
 			if mode == partitionModeRegistry {
@@ -353,6 +356,11 @@ func TestRegistryModeRefusesRequestWithoutHost(t *testing.T) {
 			}
 			if resp.StatusCode != want {
 				t.Errorf("%s mode, url %q: status %d, want %d", mode, u, resp.StatusCode, want)
+			}
+			if resp.StatusCode == http.StatusAccepted {
+				// Let the accepted job finish here, so it does not log
+				// into a later test's capture.
+				pollReport(t, ts.URL, sr.ID)
 			}
 		}
 		ts.Close()
@@ -393,8 +401,8 @@ func TestHostIsIPLiteral(t *testing.T) {
 // TestRegistryModeWarnsOnceForIPHost: an IP-literal registry host is logged
 // once (a recycled pod IP would share the partition), never refused.
 func TestRegistryModeWarnsOnceForIPHost(t *testing.T) {
-	var buf bytes.Buffer
-	log.SetOutput(&buf)
+	buf := &syncBuffer{}
+	log.SetOutput(buf)
 	defer log.SetOutput(os.Stderr)
 	s := NewScanner(registryModeConfig("fleet-1"))
 	s.warnIPPartition("10.0.0.5:8080")
@@ -405,7 +413,7 @@ func TestRegistryModeWarnsOnceForIPHost(t *testing.T) {
 	}
 	buf.Reset()
 	NewScanner(LoadConfig()).warnIPPartition("10.0.0.5:8080") // static mode
-	if buf.Len() != 0 {
+	if strings.Contains(buf.String(), "bare IP address") {
 		t.Fatalf("static mode must not warn: %s", buf.String())
 	}
 }
@@ -472,5 +480,39 @@ func TestCompatStaticModeKeepsRootGit(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dst, ".git", "HEAD")); err != nil {
 		t.Fatalf("static mode must extract a root .git as before: %v", err)
+	}
+}
+
+// syncBuffer is a log capture safe to use while other goroutines log.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *syncBuffer) Reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf.Reset()
+}
+
+func TestPartitionModeWhitespaceIsStatic(t *testing.T) {
+	for _, v := range []string{"", "   ", "\t"} {
+		t.Setenv("SCANNER_TRIVY_CACHE_PARTITION_MODE", v)
+		cfg := LoadConfig()
+		if cfg.CachePartitionMode != partitionModeStatic || cfg.Validate() != nil {
+			t.Errorf("mode %q must be static, got %q", v, cfg.CachePartitionMode)
+		}
 	}
 }

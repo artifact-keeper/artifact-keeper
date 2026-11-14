@@ -45,6 +45,9 @@ type FsScanResult struct {
 //     regular files carrying package DBs / lockfiles);
 //   - the stream is size-bounded upstream by http.MaxBytesReader, and since
 //     the tar is uncompressed the extracted tree cannot exceed the body cap.
+//
+// It extracts everything, as before #5943; the handler calls
+// untarWorkspaceOpts so registry partition mode can drop a root .git.
 func untarWorkspace(r io.Reader, dst string) error {
 	return untarWorkspaceOpts(r, dst, false)
 }

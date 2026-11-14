@@ -27,11 +27,11 @@ What the server shares and what it does not, per trivy's client/server design:
   and for **image** scans the per-layer analysis cache. A client asks the
   server which layer keys are missing and only downloads and analyzes those;
   a layer another client already analyzed is neither pulled nor re-analyzed.
-- Not shared: **filesystem** scans always analyze locally, so they share the
-  DB and nothing else. (trivy consults the server's cache for a workspace that
-  is a clean git repository, keyed by its HEAD commit; in `registry`
-  partition mode the adapter does not extract a root `.git` from an uploaded
-  workspace, so it never sees one.) The Java DB, needed to analyze JAR files, is downloaded on the
+- Not shared, mostly: **filesystem** scans analyze locally and share the DB.
+  The one exception is a workspace that is a clean git repository: trivy then
+  keys its analysis by the HEAD commit and reuses a cached analysis from the
+  server. In `registry` partition mode the adapter does not extract a root
+  `.git` from an uploaded workspace, so that never happens. The Java DB, needed to analyze JAR files, is downloaded on the
   client when a JAR is analyzed, so `SCANNER_TRIVY_CACHE_DIR` still needs room
   for it.
 - Trust: an image layer's cache key is derived from the diff ID the image's
@@ -106,8 +106,9 @@ scan instead (#5943):
 
 The startup log reports the mode, and in `registry` mode `GET /api/v1/metadata`
 adds `properties."env.SCANNER_TRIVY_CACHE_PARTITION_MODE"`; neither ever shows
-a partition value. In `static` mode the metadata document is unchanged. The startup log no longer prints the static partition's
-`--skip-dirs` hash either.
+a partition value. In `static` mode the metadata document is unchanged.
+The startup log no longer prints the static partition's `--skip-dirs` hash
+either.
 
 Upgrading changes nothing unless the mode is set: the default `static` mode
 uses `SCANNER_TRIVY_CACHE_PARTITION` exactly as before.

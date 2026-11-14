@@ -165,7 +165,7 @@ func LoadConfig() *Config {
 		ScannerVersion:      os.Getenv("SCANNER_SCANNER_VERSION"),
 		TrivyServer:         strings.TrimRight(strings.TrimSpace(os.Getenv("SCANNER_TRIVY_SERVER")), "/"),
 		CachePartition:      strings.TrimSpace(os.Getenv("SCANNER_TRIVY_CACHE_PARTITION")),
-		CachePartitionMode:  strings.ToLower(strings.TrimSpace(getenv("SCANNER_TRIVY_CACHE_PARTITION_MODE", partitionModeStatic))),
+		CachePartitionMode:  partitionModeFromEnv(os.Getenv("SCANNER_TRIVY_CACHE_PARTITION_MODE")),
 		TrivyServerInsecure: getenvBool("SCANNER_TRIVY_SERVER_INSECURE", false),
 		Offline:             getenvBool("SCANNER_OFFLINE", false),
 		DBSchemaVersion:     getenvIntNonNeg("SCANNER_TRIVY_DB_SCHEMA_VERSION", 2),
@@ -190,6 +190,17 @@ const (
 	partitionModeStatic   = "static"
 	partitionModeRegistry = "registry"
 )
+
+// partitionModeFromEnv normalizes SCANNER_TRIVY_CACHE_PARTITION_MODE: unset,
+// empty or only whitespace is static (the default); anything else is
+// lowercased for Validate.
+func partitionModeFromEnv(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	if v == "" {
+		return partitionModeStatic
+	}
+	return v
+}
 
 // Validate reports a configuration the adapter must not start with. An
 // unknown partition mode is refused rather than read as static: falling back

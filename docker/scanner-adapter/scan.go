@@ -58,9 +58,12 @@ func trimRegistryHost(registryURL string) string {
 
 // buildRef assembles a fully-qualified trivy image reference from the Harbor
 // request fields. It enforces the #1483 rule: a digest reference is joined with
-// `@`, a tag with `:`, and exactly one of the two must be present.
-func buildRef(registryURL, repository, tag, digest string) (string, error) {
-	host := trimRegistryHost(registryURL)
+// `@`, a tag with `:`, and exactly one of the two must be present. host is
+// used as given: callers pass trimRegistryHost(registry.url), the same value
+// the partition and the pull credential are derived from, so the three can
+// never disagree (trimming twice would turn "https://http://x" into "x" for
+// the pull only).
+func buildRef(host, repository, tag, digest string) (string, error) {
 	if repository == "" {
 		return "", fmt.Errorf("repository is required")
 	}

@@ -74,8 +74,9 @@ type HarborVulnerability struct {
 type ScannerMetadata struct {
 	Scanner      HarborScannerInfo   `json:"scanner"`
 	Capabilities []ScannerCapability `json:"capabilities"`
-	// Properties is the spec's free-form string map. It reports settings,
-	// never their values when those are secrets or partition names.
+	// Properties is the spec's optional free-form string map. It names
+	// settings such as the partition mode; it never carries a secret or a
+	// partition value.
 	Properties map[string]string `json:"properties,omitempty"`
 }
 

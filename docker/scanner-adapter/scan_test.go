@@ -21,7 +21,7 @@ func TestTrimRegistryHost(t *testing.T) {
 }
 
 func TestBuildRefTag(t *testing.T) {
-	ref, err := buildRef("http://backend:8080", "docker-local/library/nginx", "1.20", "")
+	ref, err := buildRef(trimRegistryHost("http://backend:8080"), "docker-local/library/nginx", "1.20", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -32,7 +32,7 @@ func TestBuildRefTag(t *testing.T) {
 
 func TestBuildRefDigestUsesAtSeparator(t *testing.T) {
 	digest := "sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b"
-	ref, err := buildRef("http://backend:8080", "oci-prod/org/app", "", digest)
+	ref, err := buildRef(trimRegistryHost("http://backend:8080"), "oci-prod/org/app", "", digest)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -43,10 +43,10 @@ func TestBuildRefDigestUsesAtSeparator(t *testing.T) {
 }
 
 func TestBuildRefErrors(t *testing.T) {
-	if _, err := buildRef("http://backend:8080", "", "1.20", ""); err == nil {
+	if _, err := buildRef(trimRegistryHost("http://backend:8080"), "", "1.20", ""); err == nil {
 		t.Error("expected error for empty repository")
 	}
-	if _, err := buildRef("http://backend:8080", "repo", "", ""); err == nil {
+	if _, err := buildRef(trimRegistryHost("http://backend:8080"), "repo", "", ""); err == nil {
 		t.Error("expected error when neither tag nor digest present")
 	}
 }
@@ -293,5 +293,18 @@ func TestNewIDUnique(t *testing.T) {
 			t.Fatalf("duplicate id %q", id)
 		}
 		seen[id] = true
+	}
+}
+
+// TestBuildRefTakesHostAsGiven: the host is trimmed once, by the caller, so
+// the pull reference names the same host as the partition and credential.
+func TestBuildRefTakesHostAsGiven(t *testing.T) {
+	host := trimRegistryHost("https://http://x")
+	if host != "http://x" {
+		t.Fatalf("trimRegistryHost = %q", host)
+	}
+	ref, err := buildRef(host, "repo", "1", "")
+	if err != nil || ref != "http://x/repo:1" {
+		t.Fatalf("buildRef = %q, %v; want the host as given", ref, err)
 	}
 }
