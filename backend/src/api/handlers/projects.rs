@@ -2455,12 +2455,13 @@ mod tests {
             key: &str,
             project: Option<Uuid>,
         ) -> Result<RJson<crate::api::handlers::repositories::RepositoryResponse>> {
-            crate::api::handlers::repositories::create_repository(
+            let (_, _, created) = crate::api::handlers::repositories::create_repository(
                 State(f.state.clone()),
                 Extension(Some(auth.clone())),
                 repo_body(key, project),
             )
-            .await
+            .await?;
+            Ok(created)
         }
 
         async fn update_repo_with(
