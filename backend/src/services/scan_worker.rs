@@ -214,6 +214,17 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
     });
 }
 
+/// `state` with the worker's own scanner set (`SCAN_WORKER_TRIVY_ADAPTER_URL`,
+/// #5946), for [`spawn_scan_worker`]. Request handlers keep the original.
+pub fn state_with_worker_scanner(
+    state: &SharedState,
+    scanner: Arc<crate::services::scanner_service::ScannerService>,
+) -> SharedState {
+    let mut worker_state = (**state).clone();
+    worker_state.set_scanner_service(scanner);
+    Arc::new(worker_state)
+}
+
 /// Run one claimed job under a heartbeat, then finalize token-guarded.
 async fn run_claimed_job(state: SharedState, queue: ScanQueue, job: Claimed<ScanJob>) {
     let job_id = job.id;
@@ -291,6 +302,8 @@ async fn execute(state: &SharedState, job: &ScanJob) -> Result<(), JobFailure> {
     match job.job_kind() {
         Some(ScanJobKind::ProxyFile) => scan_proxy_file(state, job).await,
         Some(ScanJobKind::HostedArtifact) => scan_hosted_artifact(state, job).await,
+        Some(ScanJobKind::HostedUpload) => scan_hosted_upload(state, job).await,
+        Some(ScanJobKind::HostedImage) => scan_hosted_image(state, job).await,
         // A kind written by a newer replica. Not `failed`: that would discard
         // work the other half of the fleet can run.
         None => Err(JobFailure::Retryable(format!(
@@ -408,6 +421,77 @@ async fn scan_hosted_artifact(state: &SharedState, job: &ScanJob) -> Result<(), 
         .map_err(|e| JobFailure::Retryable(format!("hosted scan failed: {e}")))
 }
 
+/// Run a queued `scan_on_upload` (#5946) exactly as the in-process trigger
+/// does: [`ScannerService::scan_artifact`], which honours the repository's
+/// scan config at run time.
+///
+/// [`ScannerService::scan_artifact`]: crate::services::scanner_service::ScannerService::scan_artifact
+async fn scan_hosted_upload(state: &SharedState, job: &ScanJob) -> Result<(), JobFailure> {
+    let artifact_id = job
+        .artifact_id
+        .ok_or_else(|| JobFailure::Terminal("hosted_upload job has no artifact_id".to_string()))?;
+    let scanner = state
+        .scanner_service
+        .as_ref()
+        .ok_or_else(|| JobFailure::Retryable("no scanner service configured".to_string()))?;
+    match scanner.scan_artifact(artifact_id).await {
+        // Deleted since the upload: nothing is left to grade.
+        Ok(()) | Err(crate::error::AppError::NotFound(_)) => Ok(()),
+        Err(e) => Err(JobFailure::Retryable(format!("upload scan failed: {e}"))),
+    }
+}
+
+/// Scan a pushed OCI manifest (#5946): each manifest row in the repository
+/// with the job's digest, through [`ScannerService::scan_artifact`] as the
+/// in-process trigger does, so the adapter image scan and grype run as today.
+///
+/// That is every tag of the manifest in the repository, not only the one whose
+/// push queued the job (the job is keyed by digest, so pushes of several tags
+/// share it). A tag already scanned for these bytes is a no-op or a reuse
+/// through the scan dedup, so only the first row needs a scan.
+///
+/// [`ScannerService::scan_artifact`]: crate::services::scanner_service::ScannerService::scan_artifact
+async fn scan_hosted_image(state: &SharedState, job: &ScanJob) -> Result<(), JobFailure> {
+    let repo_id = job
+        .repository_id
+        .ok_or_else(|| JobFailure::Terminal("hosted_image job has no repository_id".to_string()))?;
+    let digest = job
+        .digest
+        .as_deref()
+        .ok_or_else(|| JobFailure::Terminal("hosted_image job has no digest".to_string()))?;
+    let scanner = state
+        .scanner_service
+        .as_ref()
+        .ok_or_else(|| JobFailure::Retryable("no scanner service configured".to_string()))?;
+
+    let rows: Vec<uuid::Uuid> =
+        sqlx::query_scalar(crate::services::scan_queue::HOSTED_IMAGE_ROWS_SQL)
+            .bind(repo_id)
+            .bind(digest)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| JobFailure::Retryable(format!("manifest lookup failed: {e}")))?;
+
+    // No row: the image was deleted since the push, nothing to grade.
+    let mut first_error = None;
+    for artifact_id in rows {
+        match scanner.scan_artifact(artifact_id).await {
+            Ok(()) | Err(crate::error::AppError::NotFound(_)) => {}
+            Err(e) => {
+                tracing::warn!(
+                    artifact_id = %artifact_id, repo_id = %repo_id, digest = %digest, error = %e,
+                    "queued image scan failed for one manifest row"
+                );
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    match first_error {
+        None => Ok(()),
+        Some(e) => Err(JobFailure::Retryable(format!("image scan failed: {e}"))),
+    }
+}
+
 /// `NoScanner` is instance-level and the next two per-attempt, so those retry.
 /// `RequestPinned` names a coordinate a job cannot carry, retrying can't help
 fn classify_inconclusive(
@@ -430,7 +514,7 @@ fn classify_inconclusive(
     }
 }
 
-const QUEUE_KINDS: [ScanJobKind; 2] = [ScanJobKind::ProxyFile, ScanJobKind::HostedArtifact];
+const QUEUE_KINDS: [ScanJobKind; 4] = ScanJobKind::ALL;
 const QUEUE_STATES: [&str; 3] = ["pending", "running", "failed"];
 
 /// `(kind, state, jobs)` depths and `(kind, seconds)` oldest-pending ages
@@ -475,11 +559,21 @@ mod tests {
                 oldest_pending_secs: oldest,
             };
         let (depths, oldest) = queue_gauges(&[row("proxy_file", "pending", 442, Some(49.0))]);
-        assert_eq!(depths.len(), 6);
+        assert_eq!(depths.len(), 12);
         assert!(depths.contains(&("proxy_file", "pending", 442.0)));
         assert!(depths.contains(&("proxy_file", "running", 0.0)));
         assert!(depths.contains(&("hosted_artifact", "pending", 0.0)));
-        assert_eq!(oldest, vec![("proxy_file", 49.0), ("hosted_artifact", 0.0)]);
+        assert!(depths.contains(&("hosted_upload", "pending", 0.0)));
+        assert!(depths.contains(&("hosted_image", "failed", 0.0)));
+        assert_eq!(
+            oldest,
+            vec![
+                ("proxy_file", 49.0),
+                ("hosted_artifact", 0.0),
+                ("hosted_upload", 0.0),
+                ("hosted_image", 0.0)
+            ]
+        );
 
         let (depths, oldest) = queue_gauges(&[]);
         assert!(depths.iter().all(|(_, _, jobs)| *jobs == 0.0), "{depths:?}");
