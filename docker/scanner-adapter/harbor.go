@@ -20,6 +20,9 @@ const (
 type ScanRequest struct {
 	Registry RegistryRef `json:"registry"`
 	Artifact ArtifactRef `json:"artifact"`
+	// Priority is the scan's band (#5944): "interactive" (default when
+	// empty) or "background". An AK extension to the Harbor request.
+	Priority string `json:"priority,omitempty"`
 }
 
 // RegistryRef identifies the registry the adapter should pull from.
