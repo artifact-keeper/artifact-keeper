@@ -3937,8 +3937,8 @@ async fn virtual_member_download(
         surface,
         ctx,
     };
-    let unscanned_run = |run: Vec<crate::models::repository::Repository>| {
-        walk_unscanned_nuget_members(&walk, run, &local_fetch)
+    let unscanned_run = |run: Vec<crate::models::repository::Repository>, fallback| {
+        walk_unscanned_nuget_members(&walk, run, fallback, &local_fetch)
     };
 
     if let Some(proxy) = state.proxy_service.as_deref() {
@@ -3960,7 +3960,9 @@ async fn virtual_member_download(
         }
     }
 
-    unscanned_run(members)
+    // #5810: no member scans; the virtual's member-fallback policy.
+    let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo_id).await;
+    unscanned_run(members, fallback)
         .await
         .unwrap_or_else(|| Err(proxy_helpers::member_miss_response()))
 }
@@ -4031,6 +4033,7 @@ impl NugetMemberWalk<'_> {
 async fn walk_unscanned_nuget_members<F, Fut>(
     walk: &NugetMemberWalk<'_>,
     members: Vec<crate::models::repository::Repository>,
+    fallback: proxy_helpers::VirtualMemberFallback,
     local_fetch: &F,
 ) -> Option<Result<Response, Response>>
 where
@@ -4051,8 +4054,17 @@ where
             ) else {
                 continue;
             };
-            if let Ok(resp) = walk.remote_download(proxy, member, None).await {
-                return Some(Ok(resp));
+            match walk.remote_download(proxy, member, None).await {
+                Ok(resp) => return Some(Ok(resp)),
+                // #5810: in strict mode a member that could not answer ends
+                // the walk instead of letting a lower member serve.
+                Err(resp)
+                    if fallback.is_strict()
+                        && proxy_helpers::is_member_unavailable_response(&resp) =>
+                {
+                    return Some(Err(proxy_helpers::member_unavailable_response()));
+                }
+                Err(_) => {}
             }
             continue;
         }
@@ -4064,6 +4076,7 @@ where
         // the resolver never reaches its proxy leg.
         match proxy_helpers::resolve_virtual_download_from_members(
             members[run_start..idx].to_vec(),
+            fallback,
             None,
             walk.upstream_path,
             None,
