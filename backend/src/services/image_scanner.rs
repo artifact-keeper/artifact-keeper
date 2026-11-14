@@ -9,8 +9,9 @@ use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::user::User;
 use crate::services::auth_service::AuthService;
 use crate::services::scanner_adapter_client::{
-    adapter_status_is_unreachable, with_adapter_resubmits, AdapterAttemptError, AdapterAuth,
-    AdapterPollClock, AdapterResubmit,
+    adapter_status_is_unreachable, initial_adapter_ready_wait, log_adapter_ready_outcome,
+    probe_adapter_ready, wait_until_adapter_ready, with_adapter_resubmits, AdapterAttemptError,
+    AdapterAuth, AdapterPollClock, AdapterReadyWait, AdapterResubmit,
 };
 use crate::services::scanner_service::{ScanOutput, ScanTarget, Scanner};
 
@@ -460,6 +461,9 @@ async fn adapter_visible_registry_url(adapter_url: &str) -> Option<String> {
 pub struct ImageScanner {
     /// Base URL of the Harbor scanner adapter, e.g. `http://trivy:8090`.
     adapter_url: String,
+    /// How long to wait for `/probe/ready` before each scan submission
+    /// (#5945, `SCANNER_ADAPTER_READY_TIMEOUT_SECS`).
+    ready_wait: AdapterReadyWait,
     http: reqwest::Client,
     /// Dedicated client with redirects disabled so a `302 Found` "report not
     /// ready" response from the adapter is observed rather than followed.
@@ -495,6 +499,7 @@ impl ImageScanner {
     pub(crate) fn with_auth(adapter_url: String, auth: AdapterAuth) -> Self {
         Self {
             adapter_url,
+            ready_wait: initial_adapter_ready_wait(),
             http: auth
                 .apply(crate::services::http_client::internal_service_client_builder())
                 .timeout(std::time::Duration::from_secs(300))
@@ -512,6 +517,13 @@ impl ImageScanner {
             last_scanner_version: Mutex::new(None),
             adapter_auth: auth,
         }
+    }
+
+    /// Override the readiness wait (tests).
+    #[cfg(test)]
+    pub(crate) fn with_ready_wait(mut self, wait: AdapterReadyWait) -> Self {
+        self.ready_wait = wait;
+        self
     }
 
     /// Attach a token minter so private-repo image pulls carry a short-lived
@@ -659,14 +671,6 @@ impl ImageScanner {
         })
     }
 
-    /// Number of `/probe/ready` attempts before declaring the adapter down.
-    /// Mirrors the previous trivy `/healthz` gate (#888): three attempts with
-    /// backoff absorbs a short pod restart without permanently failing
-    /// in-flight scans.
-    const HEALTH_CHECK_ATTEMPTS: u32 = 3;
-    const HEALTH_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-    const HEALTH_CHECK_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
-
     /// Total wall-clock budget for polling the report. Kept under the 300s
     /// client timeout so we surface a descriptive BadGateway rather than a
     /// raw reqwest timeout.
@@ -675,10 +679,14 @@ impl ImageScanner {
     /// `Refresh-After` header.
     const REPORT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-    /// Adapter readiness gate. Returns `Ok(())` when `/probe/ready` responds
-    /// 2xx, otherwise `Err(AppError::BadGateway)` after retries so the
-    /// orchestrator marks the scan FAILED rather than silently completing with
-    /// zero findings (#888 / #2088).
+    /// Adapter readiness gate. Returns `Ok(())` once `/probe/ready` responds
+    /// 2xx, otherwise `Err(AppError::BadGateway)` so the orchestrator marks
+    /// the scan FAILED rather than silently completing with zero findings
+    /// (#888 / #2088). Three attempts with 500 ms between them, or, with
+    /// `SCANNER_ADAPTER_READY_TIMEOUT_SECS` set, as many as fit in that
+    /// budget (#5945). Every failed attempt counts
+    /// `ak_scanner_health_check_failures_total{scanner="trivy"}` with reason
+    /// `unreachable` or `unhealthy`, as before.
     async fn check_adapter_health(&self) -> Result<()> {
         if let Some(why) = self.adapter_auth.unusable() {
             return Err(AppError::BadGateway(format!(
@@ -687,62 +695,50 @@ impl ImageScanner {
             )));
         }
         let url = format!("{}/probe/ready", self.adapter_url);
-        let mut last_err: Option<AppError> = None;
-
-        for attempt in 1..=Self::HEALTH_CHECK_ATTEMPTS {
-            let result = self
-                .http
-                .get(&url)
-                .timeout(Self::HEALTH_CHECK_TIMEOUT)
-                .send()
-                .await;
-
-            match result {
-                Ok(resp) if resp.status().is_success() => return Ok(()),
-                Ok(resp) => {
-                    let msg = format!(
-                        "Scanner adapter at {} is not ready: HTTP {}",
-                        self.adapter_url,
-                        resp.status()
-                    );
-                    crate::services::metrics_service::record_scanner_health_check_failure(
-                        "trivy",
-                        "unhealthy",
-                    );
+        let wait = crate::services::scanner_adapter_client::effective_ready_wait(self.ready_wait);
+        let fixed = wait == AdapterReadyWait::Fixed;
+        let started = tokio::time::Instant::now();
+        let outcome = wait_until_adapter_ready(
+            wait,
+            |t| probe_adapter_ready(&self.http, &url, t),
+            |attempt, kind, detail| {
+                crate::services::metrics_service::record_scanner_health_check_failure(
+                    "trivy",
+                    kind.metric_reason(),
+                );
+                let msg = format!(
+                    "Scanner adapter at {} is {}: {}",
+                    self.adapter_url,
+                    kind.describe(),
+                    detail
+                );
+                if fixed {
                     warn!(
                         "Scanner adapter /probe/ready attempt {} failed: {}",
                         attempt, msg
                     );
-                    last_err = Some(AppError::BadGateway(msg));
-                }
-                Err(e) => {
-                    let msg = format!(
-                        "Scanner adapter at {} is unreachable: {}",
-                        self.adapter_url, e
-                    );
-                    crate::services::metrics_service::record_scanner_health_check_failure(
-                        "trivy",
-                        "unreachable",
-                    );
-                    warn!(
+                } else {
+                    tracing::debug!(
                         "Scanner adapter /probe/ready attempt {} failed: {}",
-                        attempt, msg
+                        attempt,
+                        msg
                     );
-                    last_err = Some(AppError::BadGateway(msg));
                 }
-            }
-
-            if attempt < Self::HEALTH_CHECK_ATTEMPTS {
-                tokio::time::sleep(Self::HEALTH_CHECK_BACKOFF).await;
-            }
+            },
+        )
+        .await;
+        if !fixed {
+            log_adapter_ready_outcome(&self.adapter_url, started, &outcome);
         }
-
-        Err(last_err.unwrap_or_else(|| {
+        outcome.map(|_| ()).map_err(|f| {
             AppError::BadGateway(format!(
-                "Scanner adapter at {} readiness check failed",
-                self.adapter_url
+                "Scanner adapter at {} is {}{}: {}",
+                self.adapter_url,
+                f.kind.describe(),
+                f.budget_note(),
+                f.detail
             ))
-        }))
+        })
     }
 
     /// Submit a scan request and return the adapter-assigned scan id.
@@ -1560,6 +1556,131 @@ mod tests {
             "scan() must Err when the adapter is unreachable, not Ok(empty)"
         );
         assert!(matches!(result.unwrap_err(), AppError::BadGateway(_)));
+    }
+
+    /// Mount an adapter whose `/probe/ready` answers 503 `not_ready_for`
+    /// times before it turns ready, plus a submit and an empty report.
+    async fn mount_slow_starting_adapter(server: &wiremock::MockServer, not_ready_for: u64) {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("GET"))
+            .and(path("/probe/ready"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(not_ready_for)
+            .mount(server)
+            .await;
+        mount_ready_and_submit(server, "scan-slow").await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/v1/scan/.+/report$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "scanner": {"name": "Trivy", "version": "0.71.2"},
+                "vulnerabilities": []
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// #5945: an adapter that is still starting when the scan arrives is
+    /// waited for within the readiness budget, and the scan completes.
+    #[tokio::test]
+    async fn test_adapter_scan_waits_for_slow_start_within_budget() {
+        let server = wiremock::MockServer::start().await;
+        // Two 503s: 0.5 s + 1 s of backoff before the third probe succeeds.
+        mount_slow_starting_adapter(&server, 2).await;
+        let out = ImageScanner::new(server.uri())
+            .with_ready_wait(AdapterReadyWait::Budget(std::time::Duration::from_secs(10)))
+            .scan(&oci_image_artifact(), None, &Bytes::new())
+            .await
+            .expect("a slow start inside the budget must not fail the scan");
+        assert!(out.findings.is_empty());
+    }
+
+    /// #5945: the same slow start with a budget shorter than it fails the
+    /// scan closed, and the error says the adapter answered but was not
+    /// ready (not that it was unreachable).
+    #[tokio::test]
+    async fn test_adapter_scan_fails_closed_when_start_outlasts_budget() {
+        let server = wiremock::MockServer::start().await;
+        mount_slow_starting_adapter(&server, 100).await;
+        let started = std::time::Instant::now();
+        let err = ImageScanner::new(server.uri())
+            .with_ready_wait(AdapterReadyWait::Budget(std::time::Duration::from_secs(1)))
+            .scan(&oci_image_artifact(), None, &Bytes::new())
+            .await
+            .expect_err("an adapter not ready within the budget must fail the scan");
+        let elapsed = started.elapsed();
+        match err {
+            AppError::BadGateway(msg) => {
+                assert!(msg.contains("is not ready after waiting 1s"), "{msg}");
+                assert!(!msg.contains("unreachable"), "{msg}");
+            }
+            other => panic!("expected BadGateway, got {other:?}"),
+        }
+        assert!(
+            elapsed >= std::time::Duration::from_millis(950),
+            "gave up before the budget: {elapsed:?}"
+        );
+        // Resubmits run the gate again only for lost jobs, never for this.
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "gave up long after the budget: {elapsed:?}"
+        );
+    }
+
+    /// #5945 compatibility: with `SCANNER_ADAPTER_READY_TIMEOUT_SECS` unset
+    /// the gate makes the same three probes and fails with the same text.
+    #[tokio::test]
+    async fn test_adapter_fixed_gate_unchanged() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/probe/ready"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let started = std::time::Instant::now();
+        let err = ImageScanner::new(server.uri())
+            .with_ready_wait(AdapterReadyWait::Fixed)
+            .scan(&oci_image_artifact(), None, &Bytes::new())
+            .await
+            .expect_err("not ready must fail closed");
+        let elapsed = started.elapsed();
+        match err {
+            AppError::BadGateway(msg) => assert_eq!(
+                msg,
+                format!(
+                    "Scanner adapter at {} is not ready: HTTP 503 Service Unavailable",
+                    server.uri()
+                )
+            ),
+            other => panic!("expected BadGateway, got {other:?}"),
+        }
+        // Two 500 ms pauses between three quick answers.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(950),
+            "{elapsed:?}"
+        );
+        assert!(elapsed < std::time::Duration::from_secs(4), "{elapsed:?}");
+    }
+
+    /// #5945: an adapter nobody answers for is reported as unreachable.
+    #[tokio::test]
+    async fn test_adapter_unreachable_error_names_unreachable() {
+        let err = ImageScanner::new("http://127.0.0.1:1".to_string())
+            .with_ready_wait(AdapterReadyWait::Budget(std::time::Duration::from_secs(1)))
+            .scan(&oci_image_artifact(), None, &Bytes::new())
+            .await
+            .expect_err("an unreachable adapter must fail the scan");
+        match err {
+            AppError::BadGateway(msg) => {
+                assert!(msg.contains("is unreachable after waiting 1s"), "{msg}")
+            }
+            other => panic!("expected BadGateway, got {other:?}"),
+        }
     }
 
     const ADAPTER_TOKEN_5948: &str = "tok-5948-image-0123456789";
