@@ -3156,6 +3156,19 @@ async fn get_scoped_metadata(
 ) -> Result<Response, Response> {
     let scope = normalize_package_name(&scope);
     let package = normalize_package_name(&package);
+    if let Some((scope_part, name_part)) = encoded_scoped_version_parts(&scope) {
+        let full_name = build_scoped_package_name(scope_part, name_part);
+        validate_package_name(&full_name)?;
+        return get_package_version_metadata(
+            &state,
+            auth.as_ref(),
+            &repo_key,
+            &full_name,
+            &package,
+            base_url.as_str(),
+        )
+        .await;
+    }
     let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
     get_package_metadata_cached(
@@ -7760,6 +7773,15 @@ fn build_npm_storage_key(
     scheme.write_key(storage_backend, "npm", repo_id, artifact_path)
 }
 
+/// Split the decoded scope of an encoded scoped version request (#5790)
+///
+/// `GET /{repo}/@scope%2fname/{version}` matches the scoped packument route
+/// with the decoded scope `scope/name` and the version as the package,
+/// so this returns `(scope, name)` for that shape and `None` for a plain `@scope/name`
+fn encoded_scoped_version_parts(decoded_scope: &str) -> Option<(&str, &str)> {
+    decoded_scope.split_once('/')
+}
+
 /// Build a scoped package name from scope and package.
 fn build_scoped_package_name(scope: &str, package: &str) -> String {
     format!("@{}/{}", scope, package)
@@ -11445,6 +11467,19 @@ mod tests {
             build_scoped_package_name("vue", "compiler-core"),
             "@vue/compiler-core"
         );
+    }
+
+    #[test]
+    fn test_encoded_scoped_version_parts_5790() {
+        assert_eq!(
+            encoded_scoped_version_parts("acme/lib"),
+            Some(("acme", "lib"))
+        );
+        assert_eq!(encoded_scoped_version_parts("acme"), None);
+        let (scope, name) = encoded_scoped_version_parts("acme/lib/x").unwrap();
+        assert!(validate_package_name(&build_scoped_package_name(scope, name)).is_err());
+        let (scope, name) = encoded_scoped_version_parts("../lib").unwrap();
+        assert!(validate_package_name(&build_scoped_package_name(scope, name)).is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -18199,6 +18234,50 @@ mod db_cov_tests {
             let app = fx.router_with_auth(super::router());
             let _ = tdh::send(app, tdh::get(uri)).await;
         }
+        fx.teardown().await;
+    }
+
+    /// #5790: `@scope%2fname/<version>` is a version document, not a 400
+    #[tokio::test]
+    async fn test_encoded_scoped_version_metadata_5790() {
+        use axum::http::{HeaderMap, StatusCode};
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let published = super::publish_package(
+            &fx.state,
+            Some(tdh::make_auth(fx.user_id, &fx.username)),
+            &fx.repo_key,
+            "@acme/lib",
+            &HeaderMap::new(),
+            publish_body("@acme/lib", "1.0.0"),
+        )
+        .await;
+        assert!(published.is_ok(), "publish must succeed");
+
+        let k = fx.repo_key.clone();
+        for uri in [
+            format!("/{k}/@acme%2flib/1.0.0"),
+            format!("/{k}/@acme%2Flib/latest"),
+            format!("/{k}/@acme/lib/1.0.0"),
+        ] {
+            let app = fx.router_with_auth(super::router());
+            let (status, body) = tdh::send(app, tdh::get(uri.clone())).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{uri}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let doc: serde_json::Value = serde_json::from_slice(&body).expect("version json");
+            assert_eq!(doc["name"], "@acme/lib", "{uri}");
+            assert_eq!(doc["version"], "1.0.0", "{uri}");
+        }
+
+        let app = fx.router_with_auth(super::router());
+        let (status, _) = tdh::send(app, tdh::get(format!("/{k}/@acme%2flib%2fx/1.0.0"))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         fx.teardown().await;
     }
 
