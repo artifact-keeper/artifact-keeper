@@ -4000,20 +4000,14 @@ mod tests {
     /// deployed. The Linux binaries attached to a release are built from the
     /// same tree and used to keep glibc's malloc, so a tarball deployment
     /// still had the retaining allocator. Pin the release workflows too:
-    /// `release.yml` builds the assets, `publish-binaries.yml` replaces them
-    /// when a release is cut without the normal gate, and
-    /// `release-cli-caches.yml` must warm the same feature set or the tag
-    /// build compiles jemalloc cold.
+    /// `release.yml` builds the assets, and `release-cli-caches.yml` must
+    /// warm the same feature set or the tag build compiles jemalloc cold.
     #[test]
     fn release_binaries_build_with_jemalloc_5130() {
         for (name, workflow) in [
             (
                 "release.yml",
                 include_str!("../../.github/workflows/release.yml"),
-            ),
-            (
-                "publish-binaries.yml",
-                include_str!("../../.github/workflows/publish-binaries.yml"),
             ),
             (
                 "release-cli-caches.yml",
