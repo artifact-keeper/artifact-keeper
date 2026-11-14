@@ -1248,6 +1248,12 @@ pub struct CreateRepositoryRequest {
     /// read (#4192); see `UpdateRepositoryRequest.virtual_metadata_partial`.
     /// Refused (400) on any other repository type.
     pub virtual_metadata_partial: Option<bool>,
+    /// Virtual repositories only: whether an artifact download may fall back
+    /// to a lower-priority member while a higher-priority one is unavailable
+    /// (#5810); see `UpdateRepositoryRequest.virtual_member_fallback`.
+    /// Refused (400) on any other repository type.
+    #[schema(nullable = false)]
+    pub virtual_member_fallback: Option<proxy_helpers::VirtualMemberFallback>,
     /// Remote repositories only: the upstream mode the repository is born
     /// with (#5402), `online` (the default) or `cache_only`. The same value
     /// `PUT /api/v1/repositories/{key}/upstream-mode` sets, stored before any
@@ -1516,6 +1522,19 @@ pub struct UpdateRepositoryRequest {
     /// `repository_config` under `virtual_metadata_partial`; read back in
     /// `RepositoryResponse.virtual_metadata_partial`.
     pub virtual_metadata_partial: Option<bool>,
+    /// Virtual repositories only (#5810): what an artifact download does when
+    /// a higher-priority Remote member is unavailable (an upstream 5xx, a
+    /// transport failure or timeout, a missed download deadline, an open
+    /// member breaker). `available` (the default) serves the next member in
+    /// priority order; `strict` answers 503 with `Retry-After` instead, so a
+    /// lower member's copy is never served in place of a higher member's.
+    /// A 404 is a miss under both. Metadata merges are not affected (see
+    /// `virtual_metadata_partial`). Stored in `repository_config` under
+    /// `virtual_member_fallback`; read back in
+    /// `RepositoryResponse.virtual_member_fallback`. Refused (400) on any
+    /// other repository type.
+    #[schema(nullable = false)]
+    pub virtual_member_fallback: Option<proxy_helpers::VirtualMemberFallback>,
     /// Assign this repository to a project (#2472), or take it out of one
     /// (#4026). Three-way semantics via `Option<Option<Uuid>>`: omit the field
     /// to leave the assignment unchanged; send `null` to clear it; send a
@@ -1769,6 +1788,13 @@ pub struct RepositoryResponse {
     /// other type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub virtual_metadata_partial: Option<bool>,
+    /// Virtual repositories only (#5810): the member-fallback mode of the
+    /// virtual's artifact downloads; see
+    /// `UpdateRepositoryRequest.virtual_member_fallback`. Always present on a
+    /// virtual repository (`available` when never set), omitted on every
+    /// other type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub virtual_member_fallback: Option<proxy_helpers::VirtualMemberFallback>,
     /// Custom User-Agent used for outbound HTTP requests to the upstream,
     /// read back from `repository_config`. `None` when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2300,6 +2326,7 @@ fn repo_to_response(
         quarantine_enabled: None,
         quarantine_duration_minutes: None,
         virtual_metadata_partial: None,
+        virtual_member_fallback: None,
         custom_user_agent: None,
         apt_origin: None,
         apt_label: None,
@@ -2360,10 +2387,12 @@ async fn with_quarantine_settings(
     response
 }
 
-/// Populate `RepositoryResponse.virtual_metadata_partial` (#5621): the stored
-/// opt-in on a virtual repository, read exactly as the merges read it, so
-/// `false` when unset; left `None` on every other type.
-async fn with_virtual_metadata_partial(
+/// Populate a virtual repository's own settings on `RepositoryResponse`:
+/// `virtual_metadata_partial` (#5621), the stored opt-in read exactly as the
+/// merges read it (`false` when unset), and `virtual_member_fallback`
+/// (#5810), read exactly as the download walks read it (`available` when
+/// unset). Both are left `None` on every other type.
+async fn with_virtual_settings(
     db: &sqlx::PgPool,
     repo_id: Uuid,
     mut response: RepositoryResponse,
@@ -2371,6 +2400,8 @@ async fn with_virtual_metadata_partial(
     if response.repo_type == RepositoryType::Virtual.as_str() {
         response.virtual_metadata_partial =
             Some(proxy_helpers::virtual_metadata_partial_allowed(db, repo_id).await);
+        response.virtual_member_fallback =
+            Some(proxy_helpers::virtual_member_fallback(db, repo_id).await);
     }
     response
 }
@@ -4644,24 +4675,35 @@ pub async fn list_repositories(
         }
     }
 
-    // #5621: the virtuals' partial-merge opt-in, batched like the rows above.
+    // #5621: the virtuals' partial-merge opt-in, and (#5810) their member
+    // fallback, batched like the rows above.
     let mut partial_opt_in: std::collections::HashMap<Uuid, bool> =
         std::collections::HashMap::new();
+    let mut member_fallback: std::collections::HashMap<Uuid, proxy_helpers::VirtualMemberFallback> =
+        std::collections::HashMap::new();
     if !repo_ids.is_empty() {
-        for (id, value) in sqlx::query_as::<_, (Uuid, Option<String>)>(
-            "SELECT repository_id, value FROM repository_config \
-             WHERE repository_id = ANY($1) AND key = $2",
+        for (id, key, value) in sqlx::query_as::<_, (Uuid, String, Option<String>)>(
+            "SELECT repository_id, key, value FROM repository_config \
+             WHERE repository_id = ANY($1) AND key IN ($2, $3)",
         )
         .bind(&repo_ids)
         .bind(proxy_helpers::VIRTUAL_METADATA_PARTIAL_CONFIG_KEY)
+        .bind(proxy_helpers::VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY)
         .fetch_all(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         {
-            partial_opt_in.insert(
-                id,
-                proxy_helpers::virtual_metadata_partial_opted_in(value.as_deref()),
-            );
+            if key == proxy_helpers::VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY {
+                member_fallback.insert(
+                    id,
+                    proxy_helpers::VirtualMemberFallback::from_stored(value.as_deref()),
+                );
+            } else {
+                partial_opt_in.insert(
+                    id,
+                    proxy_helpers::virtual_metadata_partial_opted_in(value.as_deref()),
+                );
+            }
         }
     }
 
@@ -4686,6 +4728,8 @@ pub async fn list_repositories(
             if resp.repo_type == RepositoryType::Virtual.as_str() {
                 resp.virtual_metadata_partial =
                     Some(partial_opt_in.get(&resp.id).copied().unwrap_or(false));
+                resp.virtual_member_fallback =
+                    Some(member_fallback.get(&resp.id).copied().unwrap_or_default());
             }
             resp
         })
@@ -5332,7 +5376,7 @@ pub async fn create_repository(
     // Echo the stored quarantine settings (#5324), read back exactly as GET
     // and PATCH do.
     let response = with_quarantine_settings(&state.db, repo_id, response).await;
-    let mut response = with_virtual_metadata_partial(&state.db, repo_id, response).await;
+    let mut response = with_virtual_settings(&state.db, repo_id, response).await;
     if let Some(ref at) = payload.upstream_auth_type {
         response.upstream_auth_type = Some(at.clone());
         response.upstream_auth_configured = true;
@@ -5428,7 +5472,7 @@ pub async fn get_repository(
     response.upstream_auth_configured = auth_type.is_some();
     response.upstream_auth_type = auth_type;
     let response = with_quarantine_settings(&state.db, repo_id, response).await;
-    let response = with_virtual_metadata_partial(&state.db, repo_id, response).await;
+    let response = with_virtual_settings(&state.db, repo_id, response).await;
     let response = with_custom_user_agent(&state.db, repo_id, response).await;
     let response = if is_apt_hosted {
         with_apt_settings(&state.db, repo_id, response).await
@@ -5959,7 +6003,8 @@ pub async fn get_repository_storage_tree(
 }
 
 /// The `repository_config` settings that create and update accept with the
-/// same rules (#5324): the quarantine period and `virtual_metadata_partial`.
+/// same rules (#5324): the quarantine period, `virtual_metadata_partial` and
+/// (#5810) `virtual_member_fallback`.
 ///
 /// They used to exist only on `UpdateRepositoryRequest`, so a create that
 /// carried them answered 200 and stored nothing: a repository created with
@@ -5971,6 +6016,7 @@ struct SharedRepoConfigSettings {
     quarantine_enabled: Option<bool>,
     quarantine_duration_minutes: Option<i64>,
     virtual_metadata_partial: Option<bool>,
+    virtual_member_fallback: Option<proxy_helpers::VirtualMemberFallback>,
 }
 
 impl SharedRepoConfigSettings {
@@ -5985,6 +6031,11 @@ impl SharedRepoConfigSettings {
         if self.virtual_metadata_partial.is_some() && *repo_type != RepositoryType::Virtual {
             return Err(AppError::Validation(
                 "virtual_metadata_partial is only valid for virtual repositories".to_string(),
+            ));
+        }
+        if self.virtual_member_fallback.is_some() && *repo_type != RepositoryType::Virtual {
+            return Err(AppError::Validation(
+                "virtual_member_fallback is only valid for virtual repositories".to_string(),
             ));
         }
         if self.quarantine_duration_minutes.is_some_and(|d| d < 0) {
@@ -6004,6 +6055,15 @@ impl SharedRepoConfigSettings {
         }
         if let Some(allow) = self.virtual_metadata_partial {
             upsert_repo_config(db, repo_id, "virtual_metadata_partial", bool_str(allow)).await?;
+        }
+        if let Some(fallback) = self.virtual_member_fallback {
+            upsert_repo_config(
+                db,
+                repo_id,
+                proxy_helpers::VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY,
+                fallback.as_str(),
+            )
+            .await?;
         }
         if let Some(duration) = self.quarantine_duration_minutes {
             upsert_repo_config(
@@ -6029,6 +6089,7 @@ impl From<&UpdateRepositoryRequest> for SharedRepoConfigSettings {
             quarantine_enabled: payload.quarantine_enabled,
             quarantine_duration_minutes: payload.quarantine_duration_minutes,
             virtual_metadata_partial: payload.virtual_metadata_partial,
+            virtual_member_fallback: payload.virtual_member_fallback,
         }
     }
 }
@@ -6039,6 +6100,7 @@ impl From<&CreateRepositoryRequest> for SharedRepoConfigSettings {
             quarantine_enabled: payload.quarantine_enabled,
             quarantine_duration_minutes: payload.quarantine_duration_minutes,
             virtual_metadata_partial: payload.virtual_metadata_partial,
+            virtual_member_fallback: payload.virtual_member_fallback,
         }
     }
 }
@@ -6819,7 +6881,7 @@ pub async fn update_repository(
         repo.repo_type.is_hosted() && matches!(repo.format, RepositoryFormat::Debian);
     let response = repo_to_display_response(repo, storage_used);
     let response = with_quarantine_settings(&state.db, repo_id, response).await;
-    let mut response = with_virtual_metadata_partial(&state.db, repo_id, response).await;
+    let mut response = with_virtual_settings(&state.db, repo_id, response).await;
     if let Some(ref ua) = payload.custom_user_agent {
         response.custom_user_agent = if ua.is_empty() {
             None
@@ -11134,8 +11196,11 @@ pub async fn get_artifact_metadata(
         // #4989: a HEAD never polls the member's body, so it reads nothing to
         // verify, as on the download route's Virtual arm.
         let verify_member = !dl_ctx.is_head;
+        // #5810: the virtual's member-fallback policy.
+        let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
         let result = proxy_helpers::resolve_virtual_download_from_members(
             members,
+            fallback,
             proxy_for_virtual,
             &path,
             Some(&dl_ctx),
@@ -13987,8 +14052,11 @@ pub async fn download_artifact(
             // #4989: a HEAD never polls the member's body, so it reads nothing
             // to verify, as a HEAD answered from the artifact row does (#4323).
             let verify_member = !is_head;
+            // #5810: the virtual's member-fallback policy.
+            let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
             let result = match proxy_helpers::resolve_virtual_download_from_members(
                 members,
+                fallback,
                 proxy_for_virtual,
                 &path,
                 Some(&dl_ctx),
@@ -16202,6 +16270,7 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         SetUpstreamModeRequest,
         UpstreamModeResponse,
         UpstreamMode,
+        proxy_helpers::VirtualMemberFallback,
         SetStaleIfErrorGraceRequest,
         StaleIfErrorGraceResponse,
         SetNpmScopePolicyRequest,
@@ -19925,6 +19994,7 @@ mod tests {
             quarantine_enabled: None,
             quarantine_duration_minutes: None,
             virtual_metadata_partial: None,
+            virtual_member_fallback: None,
             custom_user_agent: None,
             project_id: None,
             apt_origin: None,
@@ -19989,6 +20059,7 @@ mod tests {
             quarantine_enabled: None,
             quarantine_duration_minutes: None,
             virtual_metadata_partial: None,
+            virtual_member_fallback: None,
             custom_user_agent: None,
             project_id: None,
             apt_origin: None,
@@ -21440,6 +21511,7 @@ mod tests {
             quarantine_enabled: Some(true),
             quarantine_duration_minutes: Some(525600),
             virtual_metadata_partial: None,
+            virtual_member_fallback: None,
             custom_user_agent: None,
             project_id: None,
             apt_origin: None,
@@ -36040,6 +36112,7 @@ mod tests {
             (Remote, Generic, r#"{"custom_user_agent":"ua/1.0"}"#),
             (Remote, Generic, r#"{"custom_user_agent":""}"#),
             (Virtual, Generic, r#"{"virtual_metadata_partial":true}"#),
+            (Virtual, Generic, r#"{"virtual_member_fallback":"strict"}"#),
             (Staging, Generic, r#"{"release_repository_key":"rel"}"#),
             (Local, Generic, r#"{"release_repository_key":""}"#),
             (
@@ -36062,6 +36135,11 @@ mod tests {
             (Local, Generic, r#"{"custom_user_agent":""}"#),
             (Remote, Generic, r#"{"custom_user_agent":"bad\r\nua"}"#),
             (Local, Generic, r#"{"virtual_metadata_partial":false}"#),
+            (
+                Remote,
+                Generic,
+                r#"{"virtual_member_fallback":"available"}"#,
+            ),
             (Local, Generic, r#"{"release_repository_key":"rel"}"#),
             (Local, Generic, r#"{"quarantine_duration_minutes":-1}"#),
             (Virtual, Generic, r#"{"quarantine_enabled":true}"#),
@@ -36571,7 +36649,7 @@ mod tests {
             "a virtual that never set it reads false"
         );
         assert_eq!(echo.virtual_metadata_partial, Some(true), "PUT echoes it");
-        assert_eq!(after, Some(true), "GET reads back what PUT stored");
+        assert_eq!(after, Some(true), "GET reads back what PATCH stored");
         assert_eq!(in_list, Some(true), "the listing reports it too");
         assert_eq!(local, None);
         assert_eq!(local_in_list, None);
@@ -36579,6 +36657,215 @@ mod tests {
             !local_json.contains("virtual_metadata_partial"),
             "omitted on a non-virtual repository: {local_json}"
         );
+    }
+
+    /// DB-backed (#5810): `virtual_member_fallback` set on create and on
+    /// PATCH reads back through the echo, GET and the listing; a virtual that
+    /// never set it reads `available`, a non-virtual omits the field and
+    /// refuses it with a 400, and an unknown value is refused.
+    #[tokio::test]
+    async fn test_virtual_member_fallback_set_and_read_back_5810_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, Query, State};
+        use proxy_helpers::VirtualMemberFallback::{Available, Strict};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (local_id, local_key, storage_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (unset_id, unset_key, _udir) = tdh::create_repo(&pool, "virtual", "maven").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let admin = || Extension(Some(admin_auth(user_id, &username)));
+        let read = |key: String| {
+            let state = state.clone();
+            let auth = admin();
+            async move {
+                get_repository(State(state), auth, Path(key))
+                    .await
+                    .expect("GET repository")
+                    .0
+                    .virtual_member_fallback
+            }
+        };
+        let listed = |key: String| {
+            let state = state.clone();
+            let auth = admin();
+            async move {
+                let query = ListRepositoriesQuery {
+                    page: Some(1),
+                    per_page: Some(100),
+                    format: None,
+                    repo_type: None,
+                    q: Some(key.clone()),
+                    project: None,
+                };
+                list_repositories(State(state), auth, Query(query))
+                    .await
+                    .expect("list repositories")
+                    .0
+                    .items
+                    .into_iter()
+                    .find(|r| r.key == key)
+                    .expect("the repository is listed")
+                    .virtual_member_fallback
+            }
+        };
+        let put = |key: String, json: &'static str| {
+            let state = state.clone();
+            let auth = admin();
+            async move {
+                update_repository(
+                    State(state),
+                    auth,
+                    Path(key),
+                    Json(serde_json::from_str::<UpdateRepositoryRequest>(json).expect("payload")),
+                )
+                .await
+            }
+        };
+
+        // Created strict.
+        let strict_key = format!("v5810-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            admin(),
+            make_create_request(
+                &strict_key,
+                "strict virtual",
+                "maven",
+                serde_json::json!({"repo_type": "virtual", "virtual_member_fallback": "strict"}),
+            ),
+        )
+        .await
+        .expect("a virtual is created strict");
+        let created_get = read(strict_key.clone()).await;
+        let created_listed = listed(strict_key.clone()).await;
+        // Back to available through PATCH.
+        let Json(echo) = put(
+            strict_key.clone(),
+            r#"{"virtual_member_fallback":"available"}"#,
+        )
+        .await
+        .expect("a virtual accepts virtual_member_fallback");
+        let after_get = read(strict_key.clone()).await;
+        let after_listed = listed(strict_key.clone()).await;
+        let Json(echo_strict) = put(unset_key.clone(), r#"{"virtual_member_fallback":"strict"}"#)
+            .await
+            .expect("a virtual accepts strict on PATCH");
+        // Defaults and non-virtuals.
+        let (fresh_id, fresh_key, _fdir) = tdh::create_repo(&pool, "virtual", "maven").await;
+        let fresh_get = read(fresh_key.clone()).await;
+        let fresh_listed = listed(fresh_key.clone()).await;
+        let local_get = read(local_key.clone()).await;
+        let local_json = serde_json::to_string(
+            &get_repository(State(state.clone()), admin(), Path(local_key.clone()))
+                .await
+                .expect("GET local")
+                .0,
+        )
+        .expect("serialize");
+        let local_put = put(local_key.clone(), r#"{"virtual_member_fallback":"strict"}"#).await;
+        let local_stored: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+        )
+        .bind(local_id)
+        .bind(proxy_helpers::VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY)
+        .fetch_optional(&pool)
+        .await
+        .expect("query repository_config");
+        let bogus_key = format!("v5810b-{}", Uuid::new_v4().simple());
+        let bogus_create = create_repository(
+            State(state.clone()),
+            admin(),
+            make_create_request(
+                &bogus_key,
+                "bogus virtual",
+                "maven",
+                serde_json::json!({"repo_type": "virtual", "virtual_member_fallback": "sometimes"}),
+            ),
+        )
+        .await;
+
+        for id in [created.id, unset_id, fresh_id, local_id] {
+            tdh::cleanup(&pool, id, user_id).await;
+        }
+
+        assert_eq!(
+            created.virtual_member_fallback,
+            Some(Strict),
+            "create echoes it"
+        );
+        assert_eq!(created_get, Some(Strict), "GET reads what create stored");
+        assert_eq!(created_listed, Some(Strict), "the listing reports it");
+        assert_eq!(
+            echo.virtual_member_fallback,
+            Some(Available),
+            "PATCH echoes it"
+        );
+        assert_eq!(after_get, Some(Available));
+        assert_eq!(after_listed, Some(Available));
+        assert_eq!(echo_strict.virtual_member_fallback, Some(Strict));
+        assert_eq!(fresh_get, Some(Available), "never set reads available");
+        assert_eq!(fresh_listed, Some(Available));
+        assert_eq!(local_get, None);
+        assert!(
+            !local_json.contains("virtual_member_fallback"),
+            "omitted on a non-virtual repository: {local_json}"
+        );
+        assert_eq!(
+            local_put
+                .expect_err("a local repository refuses virtual_member_fallback")
+                .into_response()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(local_stored, None, "nothing stored on the refused PATCH");
+        assert_eq!(
+            bogus_create
+                .expect_err("an unknown value is refused on create")
+                .into_response()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// #5810: an unknown `virtual_member_fallback` on PATCH is refused by the
+    /// JSON extractor (400 `VALIDATION_ERROR`, #1368) before the handler
+    /// runs, and the two known values parse.
+    #[tokio::test]
+    async fn test_update_refuses_unknown_virtual_member_fallback_5810() {
+        use axum::extract::FromRequest;
+        let request = |body: &'static str| {
+            axum::http::Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/repositories/v")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        };
+        let rejection = Json::<UpdateRepositoryRequest>::from_request(
+            request(r#"{"virtual_member_fallback":"sometimes"}"#),
+            &(),
+        )
+        .await
+        .expect_err("an unknown value is refused");
+        assert_eq!(rejection.into_response().status(), StatusCode::BAD_REQUEST);
+        for (body, want) in [
+            (
+                r#"{"virtual_member_fallback":"strict"}"#,
+                proxy_helpers::VirtualMemberFallback::Strict,
+            ),
+            (
+                r#"{"virtual_member_fallback":"available"}"#,
+                proxy_helpers::VirtualMemberFallback::Available,
+            ),
+        ] {
+            let Json(parsed) = Json::<UpdateRepositoryRequest>::from_request(request(body), &())
+                .await
+                .expect("a known value parses");
+            assert_eq!(parsed.virtual_member_fallback, Some(want));
+        }
     }
 
     /// DB-backed: the hosted types are untouched — enabling quarantine on a
@@ -36909,6 +37196,20 @@ mod tests {
                 "helm",
                 serde_json::json!(true),
                 Refused("virtual_metadata_partial"),
+            ),
+            (
+                "virtual_member_fallback",
+                "virtual",
+                "helm",
+                serde_json::json!("strict"),
+                Stored("virtual_member_fallback", "strict"),
+            ),
+            (
+                "virtual_member_fallback",
+                "local",
+                "helm",
+                serde_json::json!("strict"),
+                Refused("virtual_member_fallback"),
             ),
             (
                 "release_repository_key",
@@ -37313,6 +37614,7 @@ mod tests {
             quarantine_enabled: None,
             quarantine_duration_minutes: None,
             virtual_metadata_partial: None,
+            virtual_member_fallback: None,
             custom_user_agent: None,
             project_id: None,
             apt_origin: None,

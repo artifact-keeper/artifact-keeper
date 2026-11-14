@@ -2853,6 +2853,9 @@ async fn download(
             // is a miss (#5504): an S3-hosted member answers 403 for a key it
             // does not hold, and retrying a 503 for that never ends.
             let mut member_failed = false;
+            // #5810: in strict mode a Remote member that could not answer
+            // ends the walk here: a lower member's checksum is not served.
+            let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
             for member in &members {
                 if member.repo_type == RepositoryType::Remote {
                     if local_owns {
@@ -2891,8 +2894,15 @@ async fn download(
                                     .unwrap());
                             }
                             Err(resp) => {
-                                member_failed |=
+                                let unavailable =
                                     proxy_helpers::is_member_unavailable_response(&resp);
+                                if unavailable && fallback.is_strict() {
+                                    // An age refusal above keeps precedence (#4702).
+                                    return Err(age_refusal.unwrap_or_else(
+                                        proxy_helpers::member_unavailable_response,
+                                    ));
+                                }
+                                member_failed |= unavailable;
                             }
                         }
                     }
@@ -4453,10 +4463,12 @@ async fn serve_artifact(
                     // policy block ends the walk where any other failure moves
                     // on to the next member.
                     let local_fetch = &local_fetch;
-                    let resolve_run = |run: Vec<crate::models::repository::Repository>| async move {
+                    let resolve_run = |run: Vec<crate::models::repository::Repository>,
+                                       fallback| async move {
                         let members = run.clone();
                         match proxy_helpers::resolve_virtual_download_from_members_with_origin(
                             run,
+                            fallback,
                             proxy_for_virtual,
                             path,
                             Some(ctx),
@@ -4510,9 +4522,13 @@ async fn serve_artifact(
                     }
                 }
 
+                // #5810: the virtual's member-fallback policy (the scan walk
+                // above reads its own only when it walks).
+                let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
                 let resolved_from = members.clone();
                 let served = match proxy_helpers::resolve_virtual_download_from_members_with_origin(
                     members,
+                    fallback,
                     proxy_for_virtual,
                     path,
                     Some(ctx),
@@ -14036,6 +14052,171 @@ mod tests {
             elapsed < Duration::from_secs(30),
             "the download deadline must bound the wait, not the 60 s read timeout: \
              took {elapsed:?}"
+        );
+    }
+
+    /// Set the Virtual's `virtual_member_fallback` (#5810) the way the
+    /// repository API stores it.
+    async fn set_member_fallback_5810(pool: &sqlx::PgPool, virtual_id: uuid::Uuid, mode: &str) {
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3) \
+             ON CONFLICT (repository_id, key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(virtual_id)
+        .bind(crate::api::handlers::proxy_helpers::VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY)
+        .bind(mode)
+        .execute(pool)
+        .await
+        .expect("store virtual_member_fallback");
+    }
+
+    /// #5810: a JAR through a Virtual `[503 member, healthy member]` set to
+    /// `virtual_member_fallback = strict` answers the retryable 503 with
+    /// `Retry-After`, and the healthy member's bytes are not served (it is
+    /// not even asked); the same Virtual set to `available` serves them.
+    #[tokio::test]
+    async fn test_virtual_download_strict_fallback_answers_503_5810() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::path_regex;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let jar = b"PK\x03\x04 healthy member jar strict 5810".to_vec();
+        let upstream = MockServer::start().await;
+        Mock::given(path_regex("^/down/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+        Mock::given(path_regex(r"^/ok/com/strict5810/lib/1\.0/lib-1\.0\.jar$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(jar.clone()))
+            .mount(&upstream)
+            .await;
+        let scratch = std::env::temp_dir().join(format!("mvn5810s-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).expect("create scratch dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), scratch.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), scratch.to_str().unwrap(), proxy);
+        let members = [
+            format!("{}/down", upstream.uri()),
+            format!("{}/ok", upstream.uri()),
+        ];
+        let (virtual_id, virtual_key, repos) = metadata_outage_virtual_5621(&pool, &members).await;
+        let jar_path = format!("/{virtual_key}/com/strict5810/lib/1.0/lib-1.0.jar");
+        let ok_dialled = || {
+            let upstream = &upstream;
+            async move {
+                upstream
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|r| r.url.path().starts_with("/ok/"))
+                    .count()
+            }
+        };
+
+        set_member_fallback_5810(&pool, virtual_id, "strict").await;
+        let (strict_status, strict_body, strict_headers) = tdh::send_with_headers(
+            tdh::router_anon(router(), state.clone()),
+            tdh::get(jar_path.clone()),
+        )
+        .await;
+        let ok_dialled_strict = ok_dialled().await;
+
+        set_member_fallback_5810(&pool, virtual_id, "available").await;
+        let (available_status, available_body, _) = tdh::send_with_headers(
+            tdh::router_anon(router(), state.clone()),
+            tdh::get(jar_path),
+        )
+        .await;
+        for (id, dir) in &repos {
+            tdh::cleanup_member_repo(&pool, *id, dir).await;
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+
+        assert_eq!(
+            strict_status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "strict: {}",
+            String::from_utf8_lossy(&strict_body)
+        );
+        assert!(
+            strict_headers.contains_key(axum::http::header::RETRY_AFTER),
+            "the strict 503 is retryable: {strict_headers:?}"
+        );
+        assert_ne!(
+            strict_body.as_ref(),
+            jar.as_slice(),
+            "strict: the lower member's bytes are not served"
+        );
+        assert_eq!(
+            ok_dialled_strict, 0,
+            "strict: the lower member is not asked"
+        );
+        assert_eq!(
+            available_status,
+            StatusCode::OK,
+            "available: {}",
+            String::from_utf8_lossy(&available_body)
+        );
+        assert_eq!(available_body.as_ref(), jar.as_slice());
+    }
+
+    /// #5810: in strict mode a hung higher member adds the download
+    /// deadline and then answers 503, never the lower member's JAR.
+    #[tokio::test]
+    async fn test_virtual_download_strict_fallback_hung_member_503_at_deadline_5810() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::path_regex;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        Mock::given(path_regex("^/ok/"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"jar-strict-5810".to_vec()))
+            .mount(&upstream)
+            .await;
+        let scratch = std::env::temp_dir().join(format!("mvn5810h-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).expect("create scratch dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), scratch.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), scratch.to_str().unwrap(), proxy);
+        let hung = tdh::SilentUpstream::start().await;
+        let members = [
+            format!("{}/hung", hung.uri()),
+            format!("{}/ok", upstream.uri()),
+        ];
+        let (virtual_id, virtual_key, repos) = metadata_outage_virtual_5621(&pool, &members).await;
+        set_member_fallback_5810(&pool, virtual_id, "strict").await;
+
+        let started = std::time::Instant::now();
+        let (status, body, headers) =
+            crate::api::handlers::proxy_helpers::with_virtual_member_download_deadline(
+                Some(Duration::from_secs(2)),
+                tdh::send_with_headers(
+                    tdh::router_anon(router(), state.clone()),
+                    tdh::get(format!("/{virtual_key}/com/hung5810s/lib/1.0/lib-1.0.jar")),
+                ),
+            )
+            .await;
+        let elapsed = started.elapsed();
+        for (id, dir) in &repos {
+            tdh::cleanup_member_repo(&pool, *id, dir).await;
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(headers.contains_key(axum::http::header::RETRY_AFTER));
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "the deadline bounds the wait: took {elapsed:?}"
         );
     }
 

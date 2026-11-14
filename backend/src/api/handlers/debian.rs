@@ -3956,8 +3956,11 @@ async fn flat_virtual(
             return served;
         }
         let members = allowed.into_iter().map(|(m, _, _)| m).collect();
+        // #5810: no member scans; the virtual's member-fallback policy.
+        let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
         let result = proxy_helpers::resolve_virtual_download_from_members(
             members,
+            fallback,
             Some(proxy),
             &path,
             Some(ctx),
@@ -4191,8 +4194,10 @@ async fn pool_download(
                 let db = state.db.clone();
                 let upstream_path = format!("pool/{}/{}", component, path);
                 let artifact_path_clone = artifact_path.clone();
+                let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
                 let result = proxy_helpers::resolve_virtual_download_from_members(
                     allowed_members,
+                    fallback,
                     state.proxy_service.as_deref(),
                     &upstream_path,
                     Some(&ctx),
