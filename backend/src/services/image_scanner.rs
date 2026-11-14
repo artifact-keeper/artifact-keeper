@@ -9,8 +9,8 @@ use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::user::User;
 use crate::services::auth_service::AuthService;
 use crate::services::scanner_adapter_client::{
-    adapter_status_is_unreachable, with_adapter_resubmits, AdapterAttemptError, AdapterPollClock,
-    AdapterResubmit,
+    adapter_status_is_unreachable, with_adapter_resubmits, AdapterAttemptError, AdapterAuth,
+    AdapterPollClock, AdapterResubmit,
 };
 use crate::services::scanner_service::{ScanOutput, ScanTarget, Scanner};
 
@@ -480,17 +480,28 @@ pub struct ImageScanner {
     /// scan (e.g. `trivy-0.71.2`). The in-image `trivy --version` probe is
     /// gone (#2059), so this is the only available provenance.
     last_scanner_version: Mutex<Option<String>>,
+    /// Bearer token sent on every adapter request (#5948); an unusable one
+    /// fails every scan at the readiness gate.
+    adapter_auth: AdapterAuth,
 }
 
 impl ImageScanner {
     pub fn new(adapter_url: String) -> Self {
+        Self::with_auth(adapter_url, AdapterAuth::from_env())
+    }
+
+    /// Build a scanner that authenticates to the adapter with `auth`
+    /// (#5948, `TRIVY_ADAPTER_TOKEN`).
+    pub(crate) fn with_auth(adapter_url: String, auth: AdapterAuth) -> Self {
         Self {
             adapter_url,
-            http: crate::services::http_client::internal_service_client_builder()
+            http: auth
+                .apply(crate::services::http_client::internal_service_client_builder())
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .unwrap_or_default(),
-            poll_http: crate::services::http_client::internal_service_client_builder()
+            poll_http: auth
+                .apply(crate::services::http_client::internal_service_client_builder())
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -499,6 +510,7 @@ impl ImageScanner {
             scan_identity: None,
             scan_token_ttl_seconds: 300,
             last_scanner_version: Mutex::new(None),
+            adapter_auth: auth,
         }
     }
 
@@ -668,6 +680,12 @@ impl ImageScanner {
     /// orchestrator marks the scan FAILED rather than silently completing with
     /// zero findings (#888 / #2088).
     async fn check_adapter_health(&self) -> Result<()> {
+        if let Some(why) = self.adapter_auth.unusable() {
+            return Err(AppError::BadGateway(format!(
+                "Scanner adapter at {} cannot be called: {}",
+                self.adapter_url, why
+            )));
+        }
         let url = format!("{}/probe/ready", self.adapter_url);
         let mut last_err: Option<AppError> = None;
 
@@ -737,7 +755,7 @@ impl ImageScanner {
         let status = resp.status();
         // Harbor returns 202 Accepted; tolerate any 2xx with a parseable id.
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
+            let text = crate::services::scanner_adapter_client::adapter_error_text(resp).await;
             return Err(AppError::BadGateway(format!(
                 "Scanner adapter returned {} on scan submit: {}",
                 status, text
@@ -828,7 +846,7 @@ impl ImageScanner {
             // resubmits once or twice when the id was lost (#5657).
             let pending = status == reqwest::StatusCode::FOUND;
             if !pending {
-                let text = resp.text().await.unwrap_or_default();
+                let text = crate::services::scanner_adapter_client::adapter_error_text(resp).await;
                 return Err(AdapterAttemptError {
                     resubmit: AdapterResubmit::classify(status, &text),
                     error: AppError::BadGateway(format!(
@@ -1542,6 +1560,171 @@ mod tests {
             "scan() must Err when the adapter is unreachable, not Ok(empty)"
         );
         assert!(matches!(result.unwrap_err(), AppError::BadGateway(_)));
+    }
+
+    const ADAPTER_TOKEN_5948: &str = "tok-5948-image-0123456789";
+
+    /// #5948: with `TRIVY_ADAPTER_TOKEN` configured, the probe, the submit
+    /// and every report poll carry `Authorization: Bearer <token>`; an
+    /// adapter that insists on it (mocks match only with the header) scans.
+    #[tokio::test]
+    async fn test_adapter_requests_carry_bearer_token() {
+        use wiremock::matchers::{header, method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let bearer = format!("Bearer {ADAPTER_TOKEN_5948}");
+        Mock::given(method("GET"))
+            .and(path("/probe/ready"))
+            .and(header("authorization", bearer.as_str()))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/scan"))
+            .and(header("authorization", bearer.as_str()))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({"id": "s1"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/v1/scan/.+/report$"))
+            .and(header("authorization", bearer.as_str()))
+            .respond_with(ResponseTemplate::new(302).insert_header("Refresh-After", "0"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/v1/scan/.+/report$"))
+            .and(header("authorization", bearer.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "scanner": {"name": "Trivy", "version": "0.71.2"},
+                "vulnerabilities": []
+            })))
+            .mount(&server)
+            .await;
+
+        ImageScanner::with_auth(server.uri(), AdapterAuth::bearer(ADAPTER_TOKEN_5948))
+            .scan(&oci_image_artifact(), None, &Bytes::new())
+            .await
+            .expect("an authenticated scan must complete");
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests.len() >= 4,
+            "probe, submit, two polls: {}",
+            requests.len()
+        );
+        for r in &requests {
+            assert_eq!(
+                r.headers.get("authorization").and_then(|v| v.to_str().ok()),
+                Some(bearer.as_str()),
+                "{} {}",
+                r.method,
+                r.url
+            );
+        }
+    }
+
+    /// #5948: unset keeps today's behaviour, no `Authorization` header.
+    #[tokio::test]
+    async fn test_adapter_requests_without_token_carry_no_header() {
+        let server = wiremock::MockServer::start().await;
+        mount_ready_and_submit(&server, "s-open").await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path_regex(r"^/api/v1/scan/.+/report$"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"vulnerabilities": []})),
+            )
+            .mount(&server)
+            .await;
+        ImageScanner::with_auth(server.uri(), AdapterAuth::None)
+            .scan(&oci_image_artifact(), None, &Bytes::new())
+            .await
+            .expect("scan");
+        for r in server.received_requests().await.unwrap() {
+            assert!(r.headers.get("authorization").is_none(), "{}", r.url);
+        }
+    }
+
+    /// #5948: an adapter that refuses the token fails the scan closed, and
+    /// the token appears neither in the error nor in any log line.
+    #[tokio::test]
+    async fn test_adapter_token_never_in_errors_or_logs() {
+        use crate::api::handlers::test_db_helpers::LogCapture;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/probe/ready"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/scan"))
+            // A proxy that reflects the credential back in its 401 body.
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_string(format!("invalid bearer token {ADAPTER_TOKEN_5948}")),
+            )
+            .mount(&server)
+            .await;
+
+        let logs = LogCapture::default();
+        let guard = logs.install(tracing::Level::TRACE);
+        let scanner =
+            ImageScanner::with_auth(server.uri(), AdapterAuth::bearer(ADAPTER_TOKEN_5948));
+        let err = scanner
+            .scan(&oci_image_artifact(), None, &Bytes::new())
+            .await
+            .expect_err("a refused token must fail the scan");
+        drop(guard);
+
+        let msg = err.to_string();
+        assert!(msg.contains("401"), "{msg}");
+        assert!(
+            msg.contains(crate::services::scanner_adapter_client::ADAPTER_UNAUTHORIZED_TEXT),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains(ADAPTER_TOKEN_5948),
+            "token leaked into the error: {msg}"
+        );
+        let dbg = format!("{err:?} {:?}", scanner.adapter_auth);
+        assert!(
+            !dbg.contains(ADAPTER_TOKEN_5948),
+            "token leaked into Debug: {dbg}"
+        );
+        let text = logs.text();
+        assert!(
+            text.contains("Starting adapter image scan"),
+            "control line missing, capture saw nothing: {text}"
+        );
+        assert!(
+            !text.contains(ADAPTER_TOKEN_5948),
+            "token leaked into logs: {text}"
+        );
+    }
+
+    /// #5948: a configured but unusable token (unreadable
+    /// `TRIVY_ADAPTER_TOKEN_FILE`) fails the scan closed without sending an
+    /// unauthenticated request.
+    #[tokio::test]
+    async fn test_unusable_adapter_token_fails_closed_without_request() {
+        let server = wiremock::MockServer::start().await;
+        mount_ready_and_submit(&server, "never").await;
+        let auth = AdapterAuth::Unusable(
+            "TRIVY_ADAPTER_TOKEN_FILE points at /run/secrets/x, but the file is empty".into(),
+        );
+        let err = ImageScanner::with_auth(server.uri(), auth)
+            .scan(&oci_image_artifact(), None, &Bytes::new())
+            .await
+            .expect_err("must fail closed");
+        match err {
+            AppError::BadGateway(msg) => assert!(msg.contains("TRIVY_ADAPTER_TOKEN_FILE"), "{msg}"),
+            other => panic!("expected BadGateway, got {other:?}"),
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     /// A non-2xx submit response must fail the scan.
