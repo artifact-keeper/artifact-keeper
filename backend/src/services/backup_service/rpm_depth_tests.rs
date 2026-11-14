@@ -39,57 +39,15 @@ async fn archive(
     artifacts: &serde_json::Value,
     contents: &[(String, Vec<u8>)],
 ) -> Uuid {
-    let job = service
-        .create(CreateBackupRequest {
-            backup_type: BackupType::Full,
-            repository_ids: None,
-            exclude_repository_ids: None,
-            since: None,
-            created_by: None,
-            name: None,
-        })
-        .await
-        .unwrap();
-    let repos = serde_json::to_vec(repositories).unwrap();
-    let artifacts = serde_json::to_vec(artifacts).unwrap();
-    let tables = [
-        ("repositories", repos.as_slice()),
-        ("artifacts", artifacts.as_slice()),
-    ];
-    let contents: Vec<_> = contents
-        .iter()
-        .map(|(key, bytes)| (key.as_str(), bytes.as_slice()))
-        .collect();
-    let (size, checksum) = payload_summary(tables.iter().copied().chain(contents.iter().copied()));
-    let manifest = BackupManifest {
-        version: "1.0".into(),
-        backup_id: job.id,
-        backup_type: BackupType::Full,
-        created_at: Utc::now(),
-        database_tables: vec!["repositories".into(), "artifacts".into()],
-        artifact_count: contents.len() as i64,
-        artifacts_unreadable: 0,
-        total_size_bytes: size,
-        checksum: checksum.clone(),
-    };
-    let tar =
-        build_backup_tar(&tables, &contents, &serde_json::to_vec(&manifest).unwrap()).unwrap();
-    let length = tar.len() as i64;
-    service
-        .archive_storage
-        .put(job.storage_path.as_ref().unwrap(), Bytes::from(tar))
-        .await
-        .unwrap();
-    sqlx::query(
-        "UPDATE backups SET status='completed',size_bytes=$2,payload_checksum=$3 WHERE id=$1",
+    super::restore_identity_tests::archive_tables(
+        service,
+        &[
+            ("repositories", repositories.clone()),
+            ("artifacts", artifacts.clone()),
+        ],
+        contents,
     )
-    .bind(job.id)
-    .bind(length)
-    .bind(checksum)
-    .execute(&service.db)
     .await
-    .unwrap();
-    job.id
 }
 
 #[tokio::test]
@@ -372,10 +330,17 @@ async fn strict_restore_adds_no_subtransaction_per_row_4216() {
         .collect();
     let content = serde_json::to_vec(&rows).unwrap();
     let mut tx = f.pool.begin().await.unwrap();
-    let restored = BackupService::restore_table_in(&mut tx, "repositories", &content, true)
-        .await
-        .unwrap();
-    assert_eq!(restored, rows.len());
+    let restored = BackupService::restore_table_in(
+        &mut tx,
+        "repositories",
+        &content,
+        true,
+        &IdentityRemap::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.restored, rows.len());
+    assert!(restored.failed.is_empty());
     sqlx::query("SELECT pg_stat_clear_snapshot()")
         .execute(&mut *tx)
         .await

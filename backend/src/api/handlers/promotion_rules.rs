@@ -17,6 +17,7 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::Result;
 use crate::models::promotion::PromotionRule;
+use crate::models::security::AcceptedGradeStatus;
 use crate::services::promotion_rule_service::{
     CreatePromotionRuleInput, PromotionRuleService, RuleEvaluationResult, UpdatePromotionRuleInput,
 };
@@ -69,6 +70,15 @@ pub struct CreateRuleRequest {
     // when the caller explicitly opts in.
     #[serde(default)]
     pub auto_promote: bool,
+    /// The weakest grade status of the source repository `min_health_score`
+    /// accepts (#4994): `rated` (default: a repository whose scans failed,
+    /// cataloged nothing or assessed only in part fails the rule whatever the
+    /// score), `incomplete` (only a repository with nothing assessed fails)
+    /// or `any` (the score alone decides, the behaviour before 1.12). Not
+    /// checked when `min_health_score` is unset.
+    #[serde(default)]
+    #[schema(default = "rated")]
+    pub accepted_grade_status: AcceptedGradeStatus,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -82,6 +92,9 @@ pub struct UpdateRuleRequest {
     pub max_artifact_age_days: Option<i32>,
     pub min_health_score: Option<i32>,
     pub auto_promote: Option<bool>,
+    /// See [`CreateRuleRequest::accepted_grade_status`]; omitted leaves it as is.
+    #[serde(default)]
+    pub accepted_grade_status: Option<AcceptedGradeStatus>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -98,6 +111,13 @@ pub struct PromotionRuleResponse {
     pub max_artifact_age_days: Option<i32>,
     pub min_health_score: Option<i32>,
     pub auto_promote: bool,
+    /// The weakest grade status of the source repository `min_health_score`
+    /// accepts (#4994): `rated` (default: a repository whose scans failed,
+    /// cataloged nothing or assessed only in part fails the rule whatever the
+    /// score), `incomplete` (only a repository with nothing assessed fails)
+    /// or `any` (the score alone decides, the behaviour before 1.12). Not
+    /// checked when `min_health_score` is unset.
+    pub accepted_grade_status: AcceptedGradeStatus,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -182,6 +202,7 @@ fn rule_to_response(rule: PromotionRule) -> PromotionRuleResponse {
         max_artifact_age_days: rule.max_artifact_age_days,
         min_health_score: rule.min_health_score,
         auto_promote: rule.auto_promote,
+        accepted_grade_status: AcceptedGradeStatus::from_db(&rule.accepted_grade_status),
         created_at: rule.created_at,
         updated_at: rule.updated_at,
     }
@@ -270,6 +291,7 @@ async fn create_rule(
         max_artifact_age_days: body.max_artifact_age_days,
         min_health_score: body.min_health_score,
         auto_promote: body.auto_promote,
+        accepted_grade_status: body.accepted_grade_status,
     };
     let rule = service.create(input).await?;
     Ok(Json(rule_to_response(rule)))
@@ -344,6 +366,7 @@ async fn update_rule(
         max_artifact_age_days: body.max_artifact_age_days,
         min_health_score: body.min_health_score,
         auto_promote: body.auto_promote,
+        accepted_grade_status: body.accepted_grade_status,
     };
     let rule = service.update(id, input).await?;
     Ok(Json(rule_to_response(rule)))
@@ -476,6 +499,7 @@ async fn evaluate_rule(
         RuleEvaluationResponse,
         BulkEvaluationResponse,
         ArtifactEvalEntry,
+        AcceptedGradeStatus,
     )),
     tags((name = "promotion", description = "Staging-to-release artifact promotion"))
 )]
@@ -577,6 +601,7 @@ mod tests {
             max_artifact_age_days: None,
             min_health_score: Some(75),
             auto_promote: true,
+            accepted_grade_status: AcceptedGradeStatus::Rated,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -602,6 +627,7 @@ mod tests {
             max_artifact_age_days: None,
             min_health_score: None,
             auto_promote: true,
+            accepted_grade_status: AcceptedGradeStatus::Rated,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -619,6 +645,7 @@ mod tests {
             "max_artifact_age_days",
             "min_health_score",
             "auto_promote",
+            "accepted_grade_status",
             "created_at",
             "updated_at",
         ] {
@@ -629,7 +656,7 @@ mod tests {
             );
         }
         let obj = json.as_object().unwrap();
-        assert_eq!(obj.len(), 14, "PromotionRuleResponse should have 14 fields");
+        assert_eq!(obj.len(), 15, "PromotionRuleResponse should have 15 fields");
     }
 
     #[test]
@@ -699,6 +726,7 @@ mod tests {
             max_artifact_age_days: None,
             min_health_score: None,
             auto_promote: true,
+            accepted_grade_status: "rated".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

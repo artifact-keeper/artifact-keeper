@@ -142,6 +142,18 @@ pub fn create_router(state: SharedState) -> Router {
         // URLs; making those URLs prefix-aware is tracked as a follow-up.
         .nest("/lxc", handlers::incus::router())
         .merge(wasm_proxy_routes)
+        // Instance quotas (storage, upload size, download transfer): an
+        // upload is refused before its body is read, a download is counted
+        // and refused at the transfer limit. Inside the visibility
+        // middleware, so an unauthenticated caller still gets its 401 first.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::services::quota::http::upload_admission,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.transfer_meter.clone(),
+            crate::services::quota::http::transfer_meter,
+        ))
         // Per-principal in-flight upload cap (GHSA-9f9r-c4w8-rjv9). Layered
         // inside the visibility middleware so it sees the caller's identity.
         .layer(middleware::from_fn_with_state(
@@ -222,6 +234,12 @@ pub fn create_router(state: SharedState) -> Router {
     let token_exchange_rate_limit_state =
         build_token_exchange_rate_limit_state(&login_rate_limit_state, &state.config);
     crate::services::ldap_basic_auth::install_rate_limit(token_exchange_rate_limit_state.clone());
+    // HTTP Basic `username:password` on the format routes and the management
+    // API (#5485): failed verifications are budgeted per (username, IP), and
+    // the timing pad draws on the login endpoint's per-IP failure budget.
+    crate::api::middleware::rate_limit::install_basic_password_budget(
+        build_basic_password_rate_limit_state(&login_rate_limit_state, &state.config),
+    );
 
     let mut router = router
         // API v1 routes
@@ -252,7 +270,15 @@ pub fn create_router(state: SharedState) -> Router {
         // interactive logins the login bucket allows.
         .nest(
             "/v2",
-            handlers::oci_v2::router(Some(token_exchange_rate_limit_state)),
+            handlers::oci_v2::router(Some(token_exchange_rate_limit_state))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::services::quota::http::upload_admission,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    state.transfer_meter.clone(),
+                    crate::services::quota::http::transfer_meter,
+                )),
         )
         // #5253: the MCP registry's credential exchange (`/mcp/{repo}/v0/auth/*`);
         // the OIDC assertion in the body is the credential, so it sits outside
@@ -266,6 +292,14 @@ pub fn create_router(state: SharedState) -> Router {
     // uploads on routes that lack an explicit limit. Individual format handlers
     // set their own limits where appropriate (e.g. 512 MB for most formats).
     router = router.layer(DefaultBodyLimit::disable());
+
+    // Quota refusals in the route's native envelope (OCI on `/v2`, npm's
+    // `error` on `/npm`), and a body limit's plain-text 413 as the JSON
+    // upload-size refusal.
+    router = router.layer(middleware::from_fn_with_state(
+        state.config.max_upload_size_bytes,
+        crate::services::quota::http::quota_envelope,
+    ));
 
     // Apply guest-access guard (issue #850). When guest access is disabled,
     // unauthenticated requests are rejected with 401 (with an allowlist for
@@ -653,12 +687,31 @@ fn build_token_exchange_rate_limit_state(
     login: &LoginRateLimitState,
     config: &crate::config::Config,
 ) -> LoginRateLimitState {
+    let mut state = login_state_with_own_bucket(login, config, "token");
+    // Its own once-per-window audit memory (#4677), so a `/v2/token` refusal
+    // is not swallowed by a login refusal from the same address.
+    state.audit = login
+        .audit
+        .as_ref()
+        .map(|audit| Arc::new(audit.for_another_surface()));
+    state
+}
+
+/// `login` with its per-(username, IP) bucket replaced by a fresh one named
+/// `name`, holding [`TOKEN_EXCHANGE_PER_WINDOW_ENV`] units per
+/// `rate_limit_login_window_secs`, with its expired entries swept every
+/// minute. The global backstop and the per-IP failed-login budget stay shared.
+fn login_state_with_own_bucket(
+    login: &LoginRateLimitState,
+    config: &crate::config::Config,
+    name: &'static str,
+) -> LoginRateLimitState {
     let limiter = Arc::new(
         RateLimiter::new(
             token_exchange_per_window(std::env::var(TOKEN_EXCHANGE_PER_WINDOW_ENV).ok().as_deref()),
             config.rate_limit_login_window_secs,
         )
-        .named("token"),
+        .named(name),
     );
     {
         let cleanup = Arc::clone(&limiter);
@@ -672,12 +725,28 @@ fn build_token_exchange_rate_limit_state(
     }
     let mut state = login.clone();
     state.inner.limiter = limiter;
-    // Its own once-per-window audit memory (#4677), so a `/v2/token` refusal
-    // is not swallowed by a login refusal from the same address.
-    state.audit = login
-        .audit
-        .as_ref()
-        .map(|audit| Arc::new(audit.for_another_surface()));
+    state
+}
+
+/// The Basic-password budget (#5485, see
+/// `rate_limit::BasicPasswordBudget`): the login state with its
+/// per-(username, IP) bucket swapped for one that counts only FAILED Basic
+/// password verifications, sized like the `/v2/token` bucket
+/// ([`TOKEN_EXCHANGE_PER_WINDOW_ENV`]) over `rate_limit_login_window_secs`.
+///
+/// A separate bucket, not the login one: package managers retry a rejected
+/// credential many times per build, and ten failures per fifteen minutes would
+/// keep a user who fixed a stale password in `.netrc` locked out of the web
+/// login too. The per-IP failed-login budget that gates the timing pad stays
+/// SHARED with `/api/v1/auth/login` and `/v2/token`.
+fn build_basic_password_rate_limit_state(
+    login: &LoginRateLimitState,
+    config: &crate::config::Config,
+) -> LoginRateLimitState {
+    let mut state = login_state_with_own_bucket(login, config, "basic_password");
+    // Refusals here are not login-endpoint refusals; they are counted in
+    // `ak_rate_limit_rejections_total{limiter="basic_password"}` instead.
+    state.audit = None;
     state
 }
 
@@ -959,6 +1028,16 @@ fn api_v1_routes(
         .nest(
             "/auth",
             handlers::auth::login_router().layer(middleware::from_fn_with_state(
+                login_rate_limit_state.clone(),
+                login_rate_limit_middleware,
+            )),
+        )
+        // LDAP password login (#5485): the same login limiter as /auth/login
+        // (per-(username, IP) bucket, global backstop, per-IP failed-login
+        // budget), so a guess against either spends the other's budget.
+        .nest(
+            "/auth/sso",
+            handlers::sso::ldap_login_router().layer(middleware::from_fn_with_state(
                 login_rate_limit_state,
                 login_rate_limit_middleware,
             )),
@@ -1127,6 +1206,12 @@ fn api_v1_routes(
                 // `GET /repositories/{key}/download/{path}` is NOT merged
                 // here: it is nested separately below with its own
                 // authentication layer (#4654).
+                // Artifact uploads are refused over a quota or the size
+                // limit before the body is read.
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::services::quota::http::upload_admission,
+                ))
                 // Inside the auth layer below, so it sees the caller
                 // (GHSA-9f9r-c4w8-rjv9).
                 .layer(middleware::from_fn_with_state(
@@ -1164,6 +1249,10 @@ fn api_v1_routes(
         .nest(
             "/repositories",
             handlers::repositories::download_router()
+                .layer(middleware::from_fn_with_state(
+                    state.transfer_meter.clone(),
+                    crate::services::quota::http::transfer_meter,
+                ))
                 .layer(middleware::from_fn_with_state(
                     presign_rate_limit_state,
                     rate_limit_by_ip_middleware,
@@ -1664,6 +1753,10 @@ fn api_v1_routes(
         .nest(
             "/uploads",
             handlers::upload::router()
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::services::quota::http::upload_admission,
+                ))
                 // Inside the auth layer, so it sees the caller
                 // (GHSA-9f9r-c4w8-rjv9).
                 .layer(middleware::from_fn_with_state(
@@ -1844,6 +1937,54 @@ mod tests {
             incus_count >= 2,
             "expected handlers::incus::router() to be referenced at least \
              twice (once for /incus, once for /lxc); found {incus_count}"
+        );
+    }
+
+    /// #5485: `POST /api/v1/auth/sso/ldap/:id/login` verifies a directory
+    /// password, so it sits behind the same per-(username, IP) login limiter
+    /// as `/api/v1/auth/login`. Before the fix it had only the API-wide
+    /// limiter, and the eleventh guess in a window still reached the
+    /// directory. Driven through the production router.
+    #[tokio::test]
+    async fn ldap_login_is_behind_the_login_rate_limiter_5485() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool, "/tmp/ldap-login-limiter-5485");
+        let per_window = state.config.rate_limit_login_per_window;
+        assert!(state.config.rate_limit_enabled && per_window > 0);
+        let app = super::create_router(state);
+        // An unknown provider: the handler answers 404 before any bind, so
+        // the test needs no directory.
+        let uri = format!("/api/v1/auth/sso/ldap/{}/login", uuid::Uuid::new_v4());
+        let username = format!("ldap-5485-{}", uuid::Uuid::new_v4().simple());
+        let attempt = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri(uri.as_str())
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "203.0.113.55")
+                .body(Body::from(format!(
+                    r#"{{"username":"{username}","password":"guess"}}"#
+                )))
+                .unwrap()
+        };
+
+        for n in 0..per_window {
+            let (status, _) = tdh::send(app.clone(), attempt()).await;
+            assert_ne!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "attempt {n} is inside the login budget"
+            );
+        }
+        let (status, _) = tdh::send(app.clone(), attempt()).await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the LDAP login must be refused once the per-(username, IP) login budget is spent"
         );
     }
 

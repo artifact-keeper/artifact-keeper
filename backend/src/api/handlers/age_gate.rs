@@ -9,7 +9,9 @@ use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::dto::Pagination;
-use crate::api::handlers::repositories::{require_repo_admin, require_repo_write_access};
+use crate::api::handlers::repositories::{
+    hide_write_denial_from_non_readers, require_repo_admin, require_repo_write_access,
+};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -262,7 +264,11 @@ async fn authorize_repo_age_gate(
     let service = RepoSvc::new(state.db.clone());
     let repo = service.get_by_key(key).await?;
     require_repo_write_access(auth, &repo, &service).await?;
-    require_repo_admin(auth, repo.id, &state.permission_service).await?;
+    // #5645: an admin refusal to a caller who cannot read the repository (a
+    // publish-only grantee) is the unknown-key 404, like the write gate's own
+    // refusals (#5458).
+    let admin = require_repo_admin(auth, repo.id, &state.permission_service).await;
+    hide_write_denial_from_non_readers(admin, auth, &repo, &service).await?;
     Ok(repo)
 }
 

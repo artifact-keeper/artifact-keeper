@@ -523,7 +523,15 @@ async fn push_gem(
     )
     .await?;
 
-    let storage_key = format!("rubygems/{}/{}/{}", gem_name, gem_version, filename);
+    // Repo-scoped on a shared cloud namespace (#5662), so two repositories
+    // holding the same gem version do not collide on one key; reads go
+    // through the row's storage_key, so legacy flat-key rows keep serving.
+    let storage_key = crate::storage::StorageKeyScheme::from_env().write_key(
+        &repo.storage_backend,
+        "rubygems",
+        repo.id,
+        &format!("{}/{}/{}", gem_name, gem_version, filename),
+    );
     proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, body.clone()).await?;
 
     // Build metadata JSON
@@ -574,6 +582,7 @@ async fn push_gem(
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         "rubygems",
         gem_name,
@@ -2588,6 +2597,28 @@ mod tests {
         header.set_cksum();
         builder.append(&header, &metadata_gz[..]).unwrap();
         builder.into_inner().unwrap()
+    }
+
+    /// #5662: the same gem version pushes into two RubyGems repositories on a
+    /// shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_gem_pushes_to_two_cloud_repositories_5662() {
+        let gem = build_test_gem("shared5662", "1.0.0");
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "rubygems",
+            key_prefix: "rubygems",
+            router: super::router,
+            publish: &|key| {
+                vec![tdh::post(
+                    format!("/{key}/api/v1/gems"),
+                    "application/octet-stream",
+                    Bytes::from(gem.clone()),
+                )]
+            },
+            download: &|key| tdh::get(format!("/{key}/gems/shared5662-1.0.0.gem")),
+            expected: &gem,
+        })
+        .await;
     }
 
     /// #4645: a pushed gem whose NAME contains a hyphen-digit segment

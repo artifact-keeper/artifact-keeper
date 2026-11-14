@@ -71,7 +71,8 @@ tag (`v2/<name>/manifests/<tag>`) and a digest row
 (`v2/<name>/manifests/sha256:<hex>`, written by an MCP pin, a push by digest
 or a Remote pull). Since #5457 every read of a manifest (the native pull and
 HEAD, hosted and through a Virtual, the MCP backing gate, the generic
-`/download` route and the tree content read) checks every live row of the
+`/download` and `/general` routes, hosted and through a Virtual (#5619), and
+the tree content read) checks every live row of the
 digest in that repository, whatever the image name. If any row is held or
 rejected, every reference to the digest is refused.
 
@@ -85,6 +86,18 @@ own upload hold if the repository has one. A moved scan-policy hold is
 recorded as `admin`. The digest row has no scan of its own, so acknowledging
 findings cannot release it, and an administrator releases it instead.
 
+A hold that an administrator or the scanner decides on a tag row binds to the
+digest the row named when the hold was decided (#5646). When a push moves the
+tag to another image before the hold is written, the hold goes to the old
+digest's digest row instead (created if needed), and the new image is not
+changed. The quarantine and reject actions then answer with
+`held_artifact_id`, `held_digest` and `moved_to_digest`. They also accept an
+optional `expected_digest` (`sha256:<hex>`) naming the image the operator saw,
+so a tag that moved before the request was sent is handled the same way. When
+the old digest has no row left (it was deleted by digest), they answer `409`
+and change nothing. A scan verdict on the old image that would hold it is
+recorded as `admin`, like a moved hold.
+
 What this means for operators:
 
 - Releasing or rejecting acts on one row. To serve a held image again, release
@@ -96,6 +109,13 @@ What this means for operators:
 - Only manifests are gated. Layers and other blobs are content-addressed and
   shared between images, so a client that already knows a blob digest can
   still fetch it (as since #2912).
+- Replacing a held tag with a fixed image works with a plain `docker push`
+  (#5606). A caller who may push to the repository (write permission, and a
+  token with `write:artifacts`) is answered the held manifest's and blobs'
+  headers on `HEAD`, which docker checks before it uploads. The answer has no
+  body. `GET` of the held bytes stays refused for every caller, pull-only
+  callers are refused `HEAD` too, and the held image stays refused by digest
+  after the push.
 
 ## Queues
 
@@ -123,7 +143,11 @@ What this means for operators:
   the queue pages by cursor rather than by page number: pass `next_cursor`
   back as `cursor` until it is `null`. Each page evaluates a bounded number
   of hosted artifacts (`evaluated` in the response) and may hold fewer than
-  `per_page` items while still returning a cursor.
+  `per_page` items while still returning a cursor. The proxy half resumes
+  after the last cached path a page examined (by repository key, path and
+  digest), so a path that drops out of the queue between two pages does not
+  make the next page skip one. A cursor written by an earlier release is
+  refused with `400`; start the listing again.
 
 ## Acknowledging a finding
 

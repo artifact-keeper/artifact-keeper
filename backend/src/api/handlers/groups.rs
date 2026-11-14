@@ -14,7 +14,56 @@ use crate::api::dto::Pagination;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::audit_service::{
+    audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+};
 use crate::services::permission_service::{SYSTEM_SENTINEL_ID, SYSTEM_TARGET_TYPE};
+
+/// Write a group audit row (#5653): the acting principal, the group as the
+/// resource, and `details`. Fire-and-forget, so an audit-table outage never
+/// fails the change itself.
+async fn audit_group(
+    state: &SharedState,
+    auth: &AuthExtension,
+    action: AuditAction,
+    group_id: Uuid,
+    group_name: &str,
+    details: serde_json::Value,
+) {
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::for_principal(action, ResourceType::Group, auth)
+            .resource(group_id)
+            .resource_name(group_name)
+            .details(details),
+    )
+    .await;
+}
+
+/// `details` of a membership row: the users whose membership actually changed.
+fn group_members_audit_details(
+    group_id: Uuid,
+    group_name: &str,
+    users: &[Uuid],
+) -> serde_json::Value {
+    serde_json::json!({
+        "group_id": group_id,
+        "group_name": group_name,
+        "user_ids": users,
+        "count": users.len(),
+    })
+}
+
+/// The group's name for an audit row; the id when it cannot be read.
+async fn group_name_for_audit(db: &sqlx::PgPool, id: Uuid) -> String {
+    sqlx::query_scalar::<_, String>("SELECT name FROM groups WHERE id = $1")
+        .bind(id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| id.to_string())
+}
 
 /// Require that the request is authenticated, returning an error if not.
 fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
@@ -408,6 +457,19 @@ pub async fn create_group(
     })?;
 
     state.event_bus.emit("group.created", group.id, None);
+    audit_group(
+        &state,
+        &auth,
+        AuditAction::GroupCreated,
+        group.id,
+        &group.name,
+        serde_json::json!({
+            "group_id": group.id,
+            "name": group.name,
+            "description": group.description,
+        }),
+    )
+    .await;
 
     Ok(Json(GroupResponse {
         id: group.id,
@@ -587,6 +649,13 @@ pub async fn update_group(
         }
     }
 
+    let before: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT name, description FROM groups WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
     let group: CreatedGroupRow = sqlx::query_as(
         r#"
         UPDATE groups
@@ -611,6 +680,20 @@ pub async fn update_group(
             .unwrap_or(0);
 
     state.event_bus.emit("group.updated", group.id, None);
+    let (before_name, before_description) = before.unwrap_or_default();
+    audit_group(
+        &state,
+        &auth,
+        AuditAction::GroupUpdated,
+        group.id,
+        &group.name,
+        serde_json::json!({
+            "group_id": group.id,
+            "before": { "name": before_name, "description": before_description },
+            "after": { "name": group.name, "description": group.description },
+        }),
+    )
+    .await;
 
     Ok(Json(GroupResponse {
         id: group.id,
@@ -663,17 +746,38 @@ pub async fn delete_group(
         }
     }
 
-    let result = sqlx::query("DELETE FROM groups WHERE id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+    let member_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_group_members WHERE group_id = $1")
+            .bind(id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(0);
+    let deleted: Option<(String, Option<String>)> =
+        sqlx::query_as("DELETE FROM groups WHERE id = $1 RETURNING name, external_source")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
-    if result.rows_affected() == 0 {
+    let Some((name, external_source)) = deleted else {
         return Err(AppError::NotFound("Group not found".to_string()));
-    }
+    };
 
     state.event_bus.emit("group.deleted", id, None);
+    audit_group(
+        &state,
+        &auth,
+        AuditAction::GroupDeleted,
+        id,
+        &name,
+        serde_json::json!({
+            "group_id": id,
+            "name": name,
+            "external_source": external_source,
+            "member_count": member_count,
+        }),
+    )
+    .await;
 
     Ok(())
 }
@@ -789,8 +893,9 @@ pub async fn add_members(
 
     ensure_membership_editable(&state.db, id).await?;
 
+    let mut added = Vec::new();
     for user_id in payload.user_ids {
-        sqlx::query(
+        let inserted = sqlx::query(
             r#"
             INSERT INTO user_group_members (user_id, group_id)
             VALUES ($1, $2)
@@ -802,9 +907,24 @@ pub async fn add_members(
         .execute(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+        if inserted.rows_affected() > 0 {
+            added.push(user_id);
+        }
     }
 
     state.event_bus.emit("group.member_added", id, None);
+    if !added.is_empty() {
+        let name = group_name_for_audit(&state.db, id).await;
+        audit_group(
+            &state,
+            &auth,
+            AuditAction::GroupMembersAdded,
+            id,
+            &name,
+            group_members_audit_details(id, &name, &added),
+        )
+        .await;
+    }
 
     Ok(())
 }
@@ -853,16 +973,33 @@ pub async fn remove_members(
 
     ensure_membership_editable(&state.db, id).await?;
 
+    let mut removed = Vec::new();
     for user_id in payload.user_ids {
-        sqlx::query("DELETE FROM user_group_members WHERE user_id = $1 AND group_id = $2")
-            .bind(user_id)
-            .bind(id)
-            .execute(&state.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+        let deleted =
+            sqlx::query("DELETE FROM user_group_members WHERE user_id = $1 AND group_id = $2")
+                .bind(user_id)
+                .bind(id)
+                .execute(&state.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        if deleted.rows_affected() > 0 {
+            removed.push(user_id);
+        }
     }
 
     state.event_bus.emit("group.member_removed", id, None);
+    if !removed.is_empty() {
+        let name = group_name_for_audit(&state.db, id).await;
+        audit_group(
+            &state,
+            &auth,
+            AuditAction::GroupMembersRemoved,
+            id,
+            &name,
+            group_members_audit_details(id, &name, &removed),
+        )
+        .await;
+    }
 
     Ok(())
 }
@@ -2445,5 +2582,158 @@ mod tests {
             tdh::cleanup_user(&pool, id).await;
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #5653 (DB-backed, through the routes): group create, update, member
+    /// add, member remove and delete each write one audit row naming the
+    /// acting admin and the group; a membership row lists only the users whose
+    /// membership changed, and a request that changes nothing writes none.
+    #[tokio::test]
+    async fn test_group_changes_are_audited_db_5653() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-grp-audit-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (m1, _) = tdh::create_user(&pool).await;
+        let (m2, _) = tdh::create_user(&pool).await;
+        let admin = tdh::admin_auth(admin_id, &admin_name);
+        let app = || tdh::router_with_auth_ext(router(), state.clone(), admin.clone());
+        let req = |method: &str, uri: String, body: serde_json::Value| {
+            axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        let name = format!("ph-grp-audit-{}", Uuid::new_v4());
+
+        let (status, body) = tdh::send(
+            app(),
+            req("POST", "/".into(), serde_json::json!({ "name": name })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let group: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+        let renamed = format!("{name}-renamed");
+        let (status, _) = tdh::send(
+            app(),
+            req(
+                "PUT",
+                format!("/{group}"),
+                serde_json::json!({ "name": renamed }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let members = serde_json::json!({ "user_ids": [m1, m2] });
+        assert_eq!(
+            tdh::send(
+                app(),
+                req("POST", format!("/{group}/members"), members.clone())
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        // Already members: nothing changes, nothing is audited.
+        assert_eq!(
+            tdh::send(app(), req("POST", format!("/{group}/members"), members))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let (status, _) = tdh::send(
+            app(),
+            req(
+                "DELETE",
+                format!("/{group}/members"),
+                serde_json::json!({ "user_ids": [m1] }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = tdh::send(
+            app(),
+            req("DELETE", format!("/{group}"), serde_json::Value::Null),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The audit writes are detached; give them a moment.
+        let db = &pool;
+        let fetch = || async move {
+            sqlx::query_as::<_, (String, Option<Uuid>, String, serde_json::Value)>(
+                "SELECT action, resource_id, resource_type, details FROM audit_log \
+                  WHERE user_id = $1 ORDER BY action",
+            )
+            .bind(admin_id)
+            .fetch_all(db)
+            .await
+            .unwrap()
+        };
+        for _ in 0..50 {
+            if fetch().await.len() >= 5 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // Long enough for a stray sixth row (the no-op add) to land.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let rows = fetch().await;
+        let _ = sqlx::query("DELETE FROM audit_log WHERE user_id = $1")
+            .bind(admin_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM groups WHERE id = $1")
+            .bind(group)
+            .execute(&pool)
+            .await;
+        for id in [admin_id, m1, m2] {
+            tdh::cleanup_user(&pool, id).await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Sorted by action name.
+        let actions: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(
+            actions,
+            vec![
+                "GROUP_CREATED",
+                "GROUP_DELETED",
+                "GROUP_MEMBERS_ADDED",
+                "GROUP_MEMBERS_REMOVED",
+                "GROUP_UPDATED",
+            ],
+            "{rows:?}"
+        );
+        for (action, resource_id, resource_type, _) in &rows {
+            assert_eq!(*resource_id, Some(group), "{action}");
+            assert_eq!(resource_type, "group", "{action}");
+        }
+        let detail = |action: &str| rows.iter().find(|r| r.0 == action).unwrap().3.clone();
+        let mut added: Vec<String> = detail("GROUP_MEMBERS_ADDED")["user_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        added.sort();
+        let mut expected = vec![m1.to_string(), m2.to_string()];
+        expected.sort();
+        assert_eq!(added, expected);
+        assert_eq!(
+            detail("GROUP_MEMBERS_REMOVED")["user_ids"],
+            serde_json::json!([m1])
+        );
+        assert_eq!(detail("GROUP_UPDATED")["before"]["name"], name);
+        assert_eq!(detail("GROUP_UPDATED")["after"]["name"], renamed);
+        assert_eq!(detail("GROUP_DELETED")["member_count"], 1);
     }
 }

@@ -1680,7 +1680,15 @@ async fn upload_module(
     let archive = sniff_staged_module_archive(local.path()).await?;
 
     let artifact_path = build_module_artifact_path(&namespace, &name, &provider, &version);
-    let storage_key = build_module_storage_key(&namespace, &name, &provider, &version);
+    let storage_key = build_module_storage_key(
+        crate::storage::StorageKeyScheme::from_env(),
+        &repo.storage_backend,
+        repo.id,
+        &namespace,
+        &name,
+        &provider,
+        &version,
+    );
 
     // GHSA-vcq6-8hxw-4q67: URL segments are spliced into the path verbatim;
     // reject traversal at ingest.
@@ -1772,6 +1780,7 @@ async fn upload_module(
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         "terraform",
         &module_name,
@@ -2455,7 +2464,15 @@ async fn upload_provider(
         }
     };
 
-    let storage_key = build_provider_storage_key(&namespace, &type_name, &version, &platform);
+    let storage_key = build_provider_storage_key(
+        crate::storage::StorageKeyScheme::from_env(),
+        &repo.storage_backend,
+        repo.id,
+        &namespace,
+        &type_name,
+        &version,
+        &platform,
+    );
 
     // Store the file, from local scratch or by copying the object the
     // repository's backend already staged. `put_staged_body` runs the
@@ -2548,6 +2565,7 @@ async fn upload_provider(
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         "terraform",
         &provider_name,
@@ -3550,23 +3568,52 @@ fn build_provider_name(namespace: &str, type_name: &str) -> String {
 }
 
 /// Build the storage key for a Terraform module.
-fn build_module_storage_key(namespace: &str, name: &str, provider: &str, version: &str) -> String {
-    format!(
-        "terraform/modules/{}/{}/{}/{}.tar.gz",
-        namespace, name, provider, version
+///
+/// Repo-scoped on a shared cloud namespace (#5662), so two repositories
+/// holding the same module version do not collide on one key; reads go
+/// through the row's storage_key, so legacy flat-key rows keep serving.
+fn build_module_storage_key(
+    scheme: crate::storage::StorageKeyScheme,
+    storage_backend: &str,
+    repo_id: uuid::Uuid,
+    namespace: &str,
+    name: &str,
+    provider: &str,
+    version: &str,
+) -> String {
+    scheme.write_key(
+        storage_backend,
+        "terraform",
+        repo_id,
+        &format!(
+            "modules/{}/{}/{}/{}.tar.gz",
+            namespace, name, provider, version
+        ),
     )
 }
 
 /// Build the storage key for a Terraform provider.
+///
+/// Repo-scoped on a shared cloud namespace (#5662), so two repositories
+/// holding the same provider build do not collide on one key; reads go
+/// through the row's storage_key, so legacy flat-key rows keep serving.
 fn build_provider_storage_key(
+    scheme: crate::storage::StorageKeyScheme,
+    storage_backend: &str,
+    repo_id: uuid::Uuid,
     namespace: &str,
     type_name: &str,
     version: &str,
     platform: &str,
 ) -> String {
-    format!(
-        "terraform/providers/{}/{}/{}/terraform-provider-{}_{}.zip",
-        namespace, type_name, version, type_name, platform
+    scheme.write_key(
+        storage_backend,
+        "terraform",
+        repo_id,
+        &format!(
+            "providers/{}/{}/{}/terraform-provider-{}_{}.zip",
+            namespace, type_name, version, type_name, platform
+        ),
     )
 }
 
@@ -4951,10 +4998,34 @@ mod tests {
     // build_module_storage_key / build_provider_storage_key
     // -----------------------------------------------------------------------
 
+    fn fs_module_key(namespace: &str, name: &str, provider: &str, version: &str) -> String {
+        build_module_storage_key(
+            crate::storage::StorageKeyScheme::RepoScoped,
+            "filesystem",
+            uuid::Uuid::new_v4(),
+            namespace,
+            name,
+            provider,
+            version,
+        )
+    }
+
+    fn fs_provider_key(namespace: &str, type_name: &str, version: &str, platform: &str) -> String {
+        build_provider_storage_key(
+            crate::storage::StorageKeyScheme::RepoScoped,
+            "filesystem",
+            uuid::Uuid::new_v4(),
+            namespace,
+            type_name,
+            version,
+            platform,
+        )
+    }
+
     #[test]
     fn test_build_module_storage_key() {
         assert_eq!(
-            build_module_storage_key("hashicorp", "consul", "aws", "0.1.0"),
+            fs_module_key("hashicorp", "consul", "aws", "0.1.0"),
             "terraform/modules/hashicorp/consul/aws/0.1.0.tar.gz"
         );
     }
@@ -4962,9 +5033,61 @@ mod tests {
     #[test]
     fn test_build_provider_storage_key() {
         assert_eq!(
-            build_provider_storage_key("hashicorp", "aws", "5.0.0", "linux_amd64"),
+            fs_provider_key("hashicorp", "aws", "5.0.0", "linux_amd64"),
             "terraform/providers/hashicorp/aws/5.0.0/terraform-provider-aws_linux_amd64.zip"
         );
+    }
+
+    #[test]
+    fn terraform_storage_key_is_repo_scoped_on_cloud_5662() {
+        use crate::storage::StorageKeyScheme;
+        let repo_id = uuid::Uuid::new_v4();
+        let module = |scheme, backend| {
+            build_module_storage_key(
+                scheme,
+                backend,
+                repo_id,
+                "hashicorp",
+                "consul",
+                "aws",
+                "0.1.0",
+            )
+        };
+        let provider = |scheme, backend| {
+            build_provider_storage_key(
+                scheme,
+                backend,
+                repo_id,
+                "hashicorp",
+                "aws",
+                "5.0.0",
+                "linux_amd64",
+            )
+        };
+        let module_path = "modules/hashicorp/consul/aws/0.1.0.tar.gz";
+        let provider_path = "providers/hashicorp/aws/5.0.0/terraform-provider-aws_linux_amd64.zip";
+        for backend in ["s3", "gcs", "azure"] {
+            assert_eq!(
+                module(StorageKeyScheme::RepoScoped, backend),
+                format!("terraform/{repo_id}/{module_path}"),
+                "{backend}"
+            );
+            assert_eq!(
+                provider(StorageKeyScheme::RepoScoped, backend),
+                format!("terraform/{repo_id}/{provider_path}"),
+                "{backend}"
+            );
+            assert_eq!(
+                module(StorageKeyScheme::Flat, backend),
+                format!("terraform/{module_path}"),
+                "{backend}"
+            );
+            assert_eq!(
+                provider(StorageKeyScheme::Flat, backend),
+                format!("terraform/{provider_path}"),
+                "{backend}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -7111,6 +7234,55 @@ mod catalog_registration_tests {
 
     fn mounted() -> Router<SharedState> {
         Router::new().nest(super::MOUNT_PREFIX, super::router())
+    }
+
+    /// #5662: the same module version uploads into two Terraform registries
+    /// on a shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_module_publishes_to_two_cloud_repositories_5662() {
+        let archive = b"PK\x03\x04one module two registries carry (#5662)";
+        let coord = "v1/modules/acme/shared5662/aws/1.0.0";
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "terraform",
+            key_prefix: "terraform",
+            router: mounted,
+            publish: &|key| {
+                vec![tdh::put(
+                    format!("{}/{key}/{coord}", super::MOUNT_PREFIX),
+                    bytes::Bytes::from_static(archive),
+                )]
+            },
+            download: &|key| tdh::get(format!("{}/{key}/{coord}/archive", super::MOUNT_PREFIX)),
+            expected: archive,
+        })
+        .await;
+    }
+
+    /// #5662: the same provider build uploads into two Terraform registries
+    /// on a shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_provider_publishes_to_two_cloud_repositories_5662() {
+        let zip = b"PK\x03\x04one provider two registries carry (#5662)";
+        let coord = "v1/providers/acme/shared5662/1.0.0";
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "terraform",
+            key_prefix: "terraform",
+            router: mounted,
+            publish: &|key| {
+                vec![tdh::put(
+                    format!("{}/{key}/{coord}/linux/amd64", super::MOUNT_PREFIX),
+                    bytes::Bytes::from_static(zip),
+                )]
+            },
+            download: &|key| {
+                tdh::get(format!(
+                    "{}/{key}/{coord}/binary/linux/amd64",
+                    super::MOUNT_PREFIX
+                ))
+            },
+            expected: zip,
+        })
+        .await;
     }
 
     /// A module upload must register the catalog row under the registry

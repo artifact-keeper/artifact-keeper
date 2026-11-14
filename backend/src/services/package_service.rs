@@ -296,9 +296,10 @@ pub struct LatestRefresh {
 /// conditional on the version read, so a concurrent publish wins.
 ///
 /// The row is found by `(repository_id, name)` (the `packages` unique key) and
-/// its versions by `package_id`, both indexed. Formats whose catalog name is
-/// not the artifact name (Maven's `groupId:artifactId`) find no row and are
-/// covered by the read-side backstop instead.
+/// its versions by `package_id`, both indexed. `name` is the CATALOG name:
+/// callers holding an artifact row map it with [`catalog_package_name`] (or
+/// call [`refresh_package_latest_for_artifact`]), since Maven's catalog name is
+/// `groupId:artifactId`, not the artifact name (#5676).
 pub async fn refresh_package_latest(
     db: &PgPool,
     repository_id: Uuid,
@@ -361,6 +362,49 @@ pub async fn refresh_package_latest(
     .rows_affected()
         > 0;
     Ok(out)
+}
+
+/// The catalog package name the artifact row `(path, name)` of a `format`
+/// repository registers under (#5676).
+///
+/// The artifact name for every format but the ones whose publish path
+/// catalogues parsed coordinates the row does not carry: Maven/Gradle
+/// (`groupId:artifactId`, #2723) and SBT (`org/module`). Same derivation as
+/// the catalog backfill ([`backfill_catalog_coordinates`]); a path that does
+/// not parse (a Maven sidecar) falls back to the artifact name, which finds
+/// no catalog row.
+pub fn catalog_package_name(format: &str, path: &str, name: &str) -> String {
+    match format {
+        "maven" | "gradle" | "sbt" => backfill_catalog_coordinates(format, path, name, Some("_"))
+            .map(|(catalog, _)| catalog)
+            .unwrap_or_else(|| name.to_string()),
+        _ => name.to_string(),
+    }
+}
+
+/// The format (`repository_format` as text) of repository `repository_id`,
+/// `None` when it is gone.
+pub async fn repository_format(db: &PgPool, repository_id: Uuid) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar("SELECT format::text FROM repositories WHERE id = $1")
+        .bind(repository_id)
+        .fetch_optional(db)
+        .await
+}
+
+/// [`refresh_package_latest`] for the catalog row the artifact `(path, name)`
+/// registers under (#5676): what a trash restore calls, so a restored Maven
+/// version moves its `groupId:artifactId` row's Latest back up.
+pub async fn refresh_package_latest_for_artifact(
+    db: &PgPool,
+    repository_id: Uuid,
+    name: &str,
+    path: &str,
+) -> sqlx::Result<LatestRefresh> {
+    let Some(format) = repository_format(db, repository_id).await? else {
+        return Ok(LatestRefresh::default());
+    };
+    let catalog = catalog_package_name(&format, path, name);
+    refresh_package_latest(db, repository_id, &catalog).await
 }
 
 /// Drop the catalog rows left behind by a HARD-deleted artifact (#3660).
@@ -442,6 +486,27 @@ pub async fn prune_catalog_for_purged_artifact(
 // Hosted publish registration (#3659)
 // ---------------------------------------------------------------------------
 
+/// The `artifacts` row a hosted publish has just written, as its handler
+/// already holds it: the id its INSERT returned and the `uploaded_by` it bound.
+///
+/// This is everything the `artifact.uploaded` event needs, so the registration
+/// below never reads the row back (#5573).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishedArtifact {
+    pub id: Uuid,
+    pub uploaded_by: Option<Uuid>,
+}
+
+impl PublishedArtifact {
+    /// The row `id` written with `uploaded_by = uploaded_by`.
+    pub fn new(id: Uuid, uploaded_by: Uuid) -> Self {
+        Self {
+            id,
+            uploaded_by: Some(uploaded_by),
+        }
+    }
+}
+
 /// Fire-and-forget catalog registration for a hosted publish (#3659), plus the
 /// `artifact.uploaded` domain event that publish owes its subscribers (#3411).
 ///
@@ -449,11 +514,12 @@ pub async fn prune_catalog_for_purged_artifact(
 /// `artifacts` INSERT: keyed on the format's own coordinates (never the
 /// filename), tagged with the format in `metadata`, and unable to fail the
 /// publish — [`PackageService::try_create_or_update_from_artifact`] swallows
-/// and logs.
+/// and logs. `published` is the row that INSERT wrote.
 #[allow(clippy::too_many_arguments)]
 pub async fn register_published_package(
     db: &PgPool,
     event_bus: &Arc<EventBus>,
+    published: PublishedArtifact,
     repository_id: Uuid,
     format: &str,
     name: &str,
@@ -465,6 +531,7 @@ pub async fn register_published_package(
     register_published_package_with_metadata(
         db,
         event_bus,
+        published,
         repository_id,
         name,
         version,
@@ -488,10 +555,31 @@ pub async fn register_published_package(
 /// `ArtifactService::finalize_upload` already emits — keep calling
 /// [`PackageService::try_create_or_update_from_artifact`] directly and stay
 /// silent. See #3411.
+///
+/// Before this existed the event had exactly one producer,
+/// `ArtifactService::finalize_upload`, which only the generic upload API goes
+/// through: a `cargo publish`, `npm publish` or `docker push` fired no webhook
+/// and no email subscription at all. Hanging the emit off the shared catalog
+/// registration gives every hosted format handler the producer it lacked,
+/// without ~20 per-handler emit sites to keep in step.
+///
+/// The event carries `published` exactly as `finalize_upload`'s does: the
+/// artifact id as the entity and its uploader as the actor. It used to resolve
+/// the row by `(repository_id, checksum_sha256)` instead, a query no index
+/// serves that became the largest database cost of a busy hosted Maven
+/// repository's publishing, and that named the wrong row when another live
+/// file in the repository had the same content (#5573).
+///
+/// Only `artifact.uploaded`, never `artifact.created`: both names collapse
+/// onto the single `artifact_uploaded` subscription in
+/// `webhook_producer::map_event_type` and `email_dispatcher`, so emitting both
+/// would double-deliver. `.created` stays an accepted alias on the consuming
+/// side only.
 #[allow(clippy::too_many_arguments)]
 pub async fn register_published_package_with_metadata(
     db: &PgPool,
     event_bus: &Arc<EventBus>,
+    published: PublishedArtifact,
     repository_id: Uuid,
     name: &str,
     version: &str,
@@ -512,74 +600,12 @@ pub async fn register_published_package_with_metadata(
         )
         .await;
 
-    emit_artifact_uploaded(db, event_bus, repository_id, name, version, checksum_sha256).await;
-}
-
-/// Publish `artifact.uploaded` for one freshly published asset (#3411).
-///
-/// Before this existed the event had exactly one producer,
-/// `ArtifactService::finalize_upload`, which only the generic upload API goes
-/// through: a `cargo publish`, `npm publish` or `docker push` fired no webhook
-/// and no email subscription at all. Hanging the emit off the shared catalog
-/// registration gives every hosted format handler the producer it lacked,
-/// without ~20 per-handler emit sites to keep in step.
-///
-/// Fire-and-forget in the same sense the rest of the publish tail is:
-/// `EventBus::publish` is a non-blocking broadcast send that drops the event
-/// when nobody is subscribed, and the artifact lookup below degrades to the
-/// package coordinate rather than failing. Nothing here can fail the publish.
-///
-/// The lookup is the one round trip this costs: `DomainEvent` carries an
-/// `entity_id` and an actor, and the shared registration is handed neither, so
-/// the artifacts row the handler INSERTed immediately before is resolved by its
-/// `(repository_id, checksum_sha256)` — the same pair the catalog liveness join
-/// uses — to reproduce exactly what `finalize_upload`'s event carries.
-async fn emit_artifact_uploaded(
-    db: &PgPool,
-    event_bus: &Arc<EventBus>,
-    repository_id: Uuid,
-    name: &str,
-    version: &str,
-    checksum_sha256: &str,
-) {
-    let row: Option<(Uuid, Option<Uuid>)> = sqlx::query_as(
-        r#"
-        SELECT id, uploaded_by
-          FROM artifacts
-         WHERE repository_id = $1
-           AND checksum_sha256 = $2
-           AND is_deleted = false
-         ORDER BY created_at DESC
-         LIMIT 1
-        "#,
-    )
-    .bind(repository_id)
-    .bind(checksum_sha256)
-    .fetch_optional(db)
-    .await
-    .unwrap_or_else(|e| {
-        warn!("Failed to resolve artifact for artifact.uploaded event: {e}");
-        None
-    });
-
-    // A format whose publish writes no `artifacts` row (or writes it after the
-    // catalog) still fires the event — the coordinate identifies the asset well
-    // enough for a subscriber to act on, and a missing event is the bug being
-    // fixed.
-    let (entity_id, actor) = match row {
-        Some((artifact_id, uploaded_by)) => (
-            artifact_id.to_string(),
-            uploaded_by.map(|id| id.to_string()),
-        ),
-        None => (format!("{name}@{version}"), None),
-    };
-
-    // Only `artifact.uploaded`, never `artifact.created`: both names collapse
-    // onto the single `artifact_uploaded` subscription in
-    // `webhook_producer::map_event_type` and `email_dispatcher`, so emitting
-    // both would double-deliver. `.created` stays an accepted alias on the
-    // consuming side only.
-    event_bus.emit_for_repo("artifact.uploaded", entity_id, repository_id, actor);
+    event_bus.emit_for_repo(
+        "artifact.uploaded",
+        published.id,
+        repository_id,
+        published.uploaded_by.map(|id| id.to_string()),
+    );
 }
 
 /// Service for managing package and package_version records.
@@ -1285,6 +1311,34 @@ mod tests {
                  hosted publish entry point, which emits artifact.uploaded (#3411)"
             );
         }
+    }
+
+    /// #5573: the hosted publish registration emits `artifact.uploaded` from
+    /// the row its caller passes and never reads `artifacts` back. The read
+    /// it used to do, `(repository_id, checksum_sha256)` ordered by
+    /// `created_at`, has no fitting index and was the largest database cost
+    /// of a busy Maven repository's publishing.
+    #[test]
+    fn hosted_publish_registration_does_not_query_artifacts() {
+        let src = include_str!("package_service.rs");
+        let start = src
+            .find("pub async fn register_published_package(")
+            .expect("registration entry point exists");
+        let end = src
+            .find("/// Service for managing package and package_version records.")
+            .expect("PackageService follows the registration");
+        let registration = &src[start..end];
+        for needle in ["FROM artifacts", "sqlx::query"] {
+            assert!(
+                !registration.contains(needle),
+                "the publish registration must not query the database for the event \
+                 (found `{needle}`); the caller passes the row it wrote (#5573)"
+            );
+        }
+        assert!(
+            registration.contains("\"artifact.uploaded\"") && registration.contains("published.id"),
+            "the registration emits artifact.uploaded for the row it was handed"
+        );
     }
 
     // -----------------------------------------------------------------------

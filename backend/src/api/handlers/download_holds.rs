@@ -1028,6 +1028,65 @@ mod policy_blocks_4510_tests {
         );
     }
 
+    /// #4987: the proxy half pages by keyset. A cached path that drops out
+    /// between two pages (its verdict cleared, its cache row evicted) does
+    /// not shift the next page past an entry it has not shown, as the offset
+    /// cursor did; every remaining block is visited once, then the hosted
+    /// half follows.
+    #[tokio::test]
+    async fn proxy_blocks_page_by_keyset_4987() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, key, dir) = proxy_repo(&pool, "fail_open").await;
+        let paths = ["a/-/a-1.0.0.tgz", "b/-/b-1.0.0.tgz", "c/-/c-1.0.0.tgz"];
+        let mut digests = Vec::new();
+        for path in paths {
+            let digest = format!("{:064x}", Uuid::new_v4().as_u128());
+            cache_row(&pool, repo, &key, path, &digest).await;
+            verdict(&pool, &digest, "critical").await;
+            digests.push(digest);
+        }
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let first = page(&state, &key, None, 1).await;
+        // The first entry drops out before the second page is read.
+        let _ =
+            sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1 AND path = $2")
+                .bind(repo)
+                .bind(paths[0])
+                .execute(&pool)
+                .await;
+        let second = page(&state, &key, first.next_cursor.clone(), 1).await;
+        let third = page(&state, &key, second.next_cursor.clone(), 1).await;
+        let fourth = page(&state, &key, third.next_cursor.clone(), 1).await;
+        let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = ANY($1)")
+            .bind(&digests)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(dir);
+
+        let path_of = |p: &PolicyBlockListResponse| {
+            p.items.iter().map(|i| i.path.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(path_of(&first), [paths[0]]);
+        assert_eq!(
+            path_of(&second),
+            [paths[1]],
+            "the next unseen entry, not one past it"
+        );
+        assert_eq!(path_of(&third), [paths[2]]);
+        assert!(third.next_cursor.is_some(), "a full page always resumes");
+        assert!(fourth.items.is_empty());
+        assert_eq!(
+            fourth.next_cursor, None,
+            "proxy and hosted halves exhausted"
+        );
+    }
+
     /// The quarantine queue reports `hold_source` and filters on it.
     #[tokio::test]
     async fn quarantine_queue_reports_and_filters_hold_source() {
@@ -1085,7 +1144,13 @@ mod policy_blocks_4510_tests {
     fn policy_block_cursor_round_trips_and_rejects_garbage() {
         let now = chrono::DateTime::from_timestamp_micros(1_700_000_000_123_456).unwrap();
         for c in [
-            PolicyBlockCursor::Proxy { offset: 7 },
+            PolicyBlockCursor::Proxy {
+                after: crate::services::scan_result_service::ProxyBlockedKey {
+                    repository_key: "npm.remote-1".into(),
+                    path: "@scope/left-pad/-/left-pad-1.0.0.tgz".into(),
+                    checksum_sha256: "ab".repeat(32),
+                },
+            },
             PolicyBlockCursor::Hosted {
                 created_at: now,
                 id: Uuid::new_v4(),
@@ -1093,7 +1158,18 @@ mod policy_blocks_4510_tests {
         ] {
             assert_eq!(PolicyBlockCursor::parse(&c.encode()).unwrap(), c);
         }
-        for bad in ["", "x.1", "p.-1", "h.1", "h.abc.def", "p.1.2"] {
+        // `p.7` is the offset form of earlier releases (#4987).
+        for bad in [
+            "",
+            "x.1",
+            "p.7",
+            "p.-1",
+            "h.1",
+            "h.abc.def",
+            "p.1.2",
+            "p.a.b.c.d",
+            "p.!.a.a",
+        ] {
             assert!(PolicyBlockCursor::parse(bad).is_err(), "{bad}");
         }
     }

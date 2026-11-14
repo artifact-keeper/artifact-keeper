@@ -66,7 +66,8 @@ For each proxied package file of an enforced format:
    verdict blocks at once and a reusable `clean` verdict serves at once, both
    without scanning again.
 4. Otherwise the bytes are scanned, inline or in the background depending on
-   the action, and the verdict is stored.
+   the action, and the verdict is stored. With the durable scan queue on, a
+   worker scans them: see [The durable scan queue](#the-durable-scan-queue).
 5. The download is recorded and the bytes are served with an `X-AK-Scan`
    header, or the pull is refused.
 
@@ -79,6 +80,7 @@ Responses:
 | Vulnerable, record-only | `200` | `X-AK-Scan: recorded` |
 | Vulnerable and blocked by the policy | `403` | `{"error": "scan_blocked", "file": ...}` |
 | No conclusive verdict under fail-closed | `423` | `{"error": "scan_pending", "file": ...}`; retry later |
+| Scan still queued or running under fail-closed, npm tarball routes | `503` | The same `scan_pending` body with `Retry-After: 5`; see [Clients that do not retry a `423`](#clients-that-do-not-retry-a-423) |
 | Scan configuration unreadable (database fault) | `503` | Retry later; never served unscanned |
 | Requested through the generic download route instead of the format route | `403` | `{"error": "scan_on_proxy_route_required", "file": ..., "handler": ...}`; see [The generic download route](#the-generic-download-route) |
 
@@ -278,9 +280,13 @@ as "scanning off" (#4365).
   digest and principal per minute; see
   [audit events](../audit-events.md#proxy-scan-refusals).
 
-Refusals answered outside the shared gate are not audited yet: a conda
-attestation sidecar of a blocked package, the NuGet digest-pinned row repair
-path, and OCI image pulls.
+The refusals answered outside the shared gate from a stored verdict write the
+same entry and count in `ak_proxy_scan_verdicts_total` the same way: a conda
+`.sigs` attestation sidecar of a blocked package (the entry names the sidecar
+and the package's digest), the NuGet digest-pinned row repair, and an OCI blob
+pull of a blocked image (the entry names `<image>@<blob digest>`). OCI
+manifest pulls go through the shared gate. A Docker schema1 manifest refused
+under scan-on-proxy has no verdict and writes no entry.
 
 ## Previewing enforcement
 
@@ -397,6 +403,29 @@ its verdict: the file is served, or `403` if the verdict blocks it. A
 is recorded for the same bytes while a scan runs, that one stands, and requests
 waiting on the scan get `423`, then that verdict on their retry.
 
+#### Clients that do not retry a `423`
+
+npm retries a `503` but not a `423`. The npm tarball routes
+(`/npm/{key}/{package}/-/{file}`, scoped or not, Remote and Virtual) answer `503` with `Retry-After: 5` and the same `scan_pending` body
+when the refusal is one a retry resolves:
+
+| Why the request was refused | npm tarball routes | Every other route |
+| --- | --- | --- |
+| The scan was still queued or running at one of the limits above, or there was no room to start it | `503`, `Retry-After: 5` | `423` |
+| No scanner, a scan that failed, a file over the 200 MiB cap | `423` | `423` |
+| What the bytes are served as cannot be established | `423` (`scan_identity_unestablished`) | `423` |
+
+The gate is the same either way: no byte is served without a verdict, and a
+verdict that blocks is `403` on the retry. npm asks three times in all with its
+default settings (`fetch-retries` 2), 10 seconds after the first refusal and 60
+seconds after the second, and each attempt waits on the scan as above. The
+first retry arrives while a queued scan still has its place. An install that is
+refused three times fails with `503`, not `423`.
+
+These responses are `5xx`, so they count in whatever watches the server error
+rate; the gate's own metrics still label them `inconclusive` / `locked`. Other
+formats' routes are unchanged.
+
 The table of scans belongs to one backend process:
 
 - A retry that reaches another replica starts a second scan there. Both record a
@@ -430,7 +459,7 @@ what sits in front of the backend needs to allow for it:
 | In front of the backend | Default | What happens past it |
 | --- | --- | --- |
 | nginx, ingress-nginx `proxy_read_timeout` | 60 s | The client gets `504`. The scan carries on for the retry. |
-| npm `fetch-timeout` | 300 s | No effect at these limits. npm retries a `504` but not a `423`. |
+| npm `fetch-timeout` | 300 s | No effect at these limits. npm retries a `504`, and the `503` its tarball routes answer for a scan still in flight, but not a `423`. |
 | pip `--timeout` | 15 s | pip retries, joining the scan. |
 | cargo `http.timeout` | 30 s | cargo retries, joining the scan. |
 | apt `Acquire::http::Timeout` | 120 s | No effect at these limits. |
@@ -440,6 +469,71 @@ routes, or lower `AK_PROXY_SCAN_QUEUE_WAIT_SECS` so that the wait plus the 30-se
 budget fits inside it. A lower wait refuses more of a first install on a small host;
 see [the OCI timeouts page](../operations/oci-reverse-proxy-timeouts.md) for how to
 set the timeout on each proxy.
+
+## The durable scan queue
+
+The in-flight table above belongs to one backend process: a restart loses what
+it holds, a retry on another replica scans again, and the CVE engine runs on the
+pods that serve requests. `SCAN_QUEUE_ENABLED=true` (default `false`) moves
+proxy file scans and `POST /api/v1/security/scan` to a `scan_queue` table in
+Postgres instead. A worker claims a job, scans it and records the verdict, and a
+job outlives the pod that queued it. Left off, nothing on this page changes.
+
+A job carries a reference to the proxy-cached object (repository, cache path,
+digest, and the identity the request asserted), never the bytes, so a backlog
+costs rows rather than memory.
+
+- **`fail_open` and `record_only`** serve at once with `X-AK-Scan: pending` and
+  queue the scan. The fresh fill is written to the proxy cache before the gate,
+  so the worker can read it back.
+- **`fail_closed`**, for bytes already in the proxy cache whose verdict is
+  missing, expired or graded by an older scanner, queues the scan at a higher
+  priority and waits for its verdict as long as it would wait on the in-flight
+  table: `AK_PROXY_SCAN_QUEUE_WAIT_SECS` plus the 30-second budget, and never
+  past three quarters of `GLOBAL_REQUEST_TIMEOUT_SECS`. The wait holds a task,
+  not a scan permit. Past it the pull is `423`, and the job goes on for the
+  retry. It only takes a verdict recorded after the one the gate refused, for
+  this request's coordinate, with the freshness rule applied again.
+- A `fail_closed` fresh fill is not in the proxy cache until the gate serves
+  it, so it goes through the in-flight table as above, as does a pull whose
+  cached object is missing or holds other bytes.
+- OCI image scans, rescans that must catalog a component, OS packages (whose
+  release context a job does not carry) and a Remote's own stored rows are not
+  queued either: none is one cached object a job can reference with everything
+  the scan needs.
+- Nor is an empty body (the proxy cache never stores one) or one over the scan
+  cap (a worker refuses it unread). Both take the in-flight table, as with the
+  queue off
+- A job is tried three times with backoff. A worker that dies mid-scan loses its
+  claim when the lease lapses, and the attempt counts. A completed job is
+  deleted, since the verdict row is the record. A job that failed for good is
+  kept for seven days so its error can be read.
+
+`GET /api/v1/admin/security/scan-queue` (admin only, and refused to a
+repository-scoped token, since it lists every repository's jobs) lists the outstanding jobs
+and the depth per kind and state. Hosted scans share the queue at the lowest
+priority, so a rescan of a whole repository cannot starve a waiting pull.
+
+**Running the worker separately.** With the queue on, `SCAN_WORKER_ENABLED`
+(default `true`) has each instance drain it. In a multi-replica deployment set
+it `false` on the API pods and run the same image with it on as a scan worker.
+The worker has to read what an API pod wrote: object storage, or a filesystem
+volume both can mount. `SCAN_WORKER_CONCURRENCY` sets how many jobs one worker
+runs at once and defaults to `MAX_CONCURRENT_SCAN_EXTRACTIONS`. Each job takes
+an extraction permit, so raise the two together.
+
+The worker publishes `ak_scan_queue_depth`,
+`ak_scan_queue_oldest_pending_seconds`, `ak_scan_queue_wait_seconds`,
+`ak_scan_queue_consumers`, `ak_scan_worker_slots_in_flight`,
+`ak_scan_worker_slots_capacity`, `ak_scan_jobs_total` and
+`ak_scan_job_duration_seconds`. Depth with no consumers means nothing drains the
+queue, depth with the slots at capacity means add workers. Every worker reads
+the same table, so take `max()` of the depth, oldest-pending and consumers
+gauges across pods, never `sum()`. The slots are per pod and do add up, and the
+wait and duration histograms export buckets, so `histogram_quantile()` works
+across workers. The in-flight
+table's `ak_proxy_scan_queue_refused_total` and `ak_proxy_scan_abandoned_total`
+still count the pulls that take that path.
 
 ## Verdicts and freshness
 
@@ -612,7 +706,7 @@ repository that scans on proxy:
 | --- | --- | --- |
 | `GET /api/v1/repositories/{key}/artifacts` | The files the proxy cache holds, rebuilt from the proxy-cache catalog: path, size, when it was cached, download count. Each item has a synthetic id and `analyzable: false`. | None. It serves no bytes and does not read verdicts, so a cached file is listed whatever its verdict. |
 | `GET /api/v1/repositories/{key}/artifacts/*path` | The metadata (JSON) of an `artifacts` row at that path; `404` when there is none. It never reads the proxy cache or the upstream. | None. It serves no bytes. |
-| `GET /api/v1/repositories/{key}/download/*path` | A file the cache or the upstream would supply: `403` `scan_on_proxy_route_required` (see [The generic download route](#the-generic-download-route)). An `artifacts` row: its bytes from storage. | Refuses proxied files; serves rows without a scan. |
+| `GET /api/v1/repositories/{key}/download/*path` | `403` `scan_on_proxy_route_required` (see [The generic download route](#the-generic-download-route)), for a file the cache or the upstream would supply and for an `artifacts` row alike (#5076). | Refuses proxied files and rows. |
 | The format route (`/go/{key}/...`, `/gems/{key}/...`, ...) | An `artifacts` row: its bytes from storage, through the gate. Otherwise the file through the gate. | Gates proxied files and rows. |
 
 The reasoning:
@@ -636,8 +730,11 @@ The reasoning:
   proxied file of that format is, so a row whose archive declares another
   package or version, cannot be read, or holds two entries at one path is
   withheld under `fail_closed` exactly as the proxied file would be. The
-  generic download route still serves a row without a scan. See
-  [Known gaps](#known-gaps).
+  package routes of Go, RubyGems, Composer, Pub, Conan, CocoaPods and Swift
+  (#4514) and of NuGet, Debian `pool/`, RPM and Alpine (#5076) do this; see
+  [Known gaps](#known-gaps) for the rest. The generic download route cannot
+  grade a row, so it refuses it with the same `403`
+  `scan_on_proxy_route_required` as a proxied file (#5076).
 
 For a Virtual repository, `GET .../artifacts/*path` serves a member's bytes
 through the member walk, so it takes the same refusal as the generic download
@@ -721,18 +818,21 @@ have no core proxy path to gate.
 - **Package rows in a Remote repository.** A Remote can hold `artifacts`
   rows of its own (from replication, from a publish into the remote, or
   recorded before proxied content stopped being stored as rows).
-  - Go, RubyGems, Composer, Pub, Conan, CocoaPods and Swift: the format
-    route serves such a row through the gate (see
-    [The artifacts routes](#the-artifacts-routes)).
-  - NuGet, Debian, RPM and Alpine, and the rows of the other enforced
-    formats: the format route still serves a row whose blob is present from
-    storage without the gate. For NuGet, if the blob has gone missing and
-    the row records a SHA-256, the re-fetched bytes are held to that digest
-    instead of being scanned, and a stored `vulnerable` verdict for that
-    digest refuses the pull (`403`); a row with no digest is re-fetched
-    through the gate.
-  - Every enforced format: the generic download route serves a row from
-    storage without the gate.
+  - Go, RubyGems, Composer, Pub, Conan, CocoaPods, Swift (#4514), NuGet,
+    Debian `pool/`, RPM and Alpine (#5076): the format route serves such a
+    row through the gate (see [The artifacts routes](#the-artifacts-routes)).
+    For NuGet, if the blob has gone missing and the row records a SHA-256,
+    the re-fetched bytes are held to that digest instead of being scanned,
+    and a stored `vulnerable` verdict for that digest refuses the pull
+    (`403`); a row with no digest is re-fetched through the gate.
+  - The other enforced formats: the format route still serves a row whose
+    blob is present from storage without the gate.
+  - Every enforced format: the generic download route refuses the row
+    (`403` `scan_on_proxy_route_required`, #5076).
+  - Through a Virtual, a Remote member's rows are never read like a hosted
+    member's: a Remote member is resolved through its proxy cache, and a
+    Remote with no `upstream_url` cannot exist (the `check_upstream_url`
+    constraint) and would be skipped by the member walk anyway (#5076).
 - **Conda packages graded on file contents.** A conda package the scanner
   catalogs nothing for is graded on its findings alone and recorded with
   `components_cataloged: 0` (#4594). A clean result there means the scanner

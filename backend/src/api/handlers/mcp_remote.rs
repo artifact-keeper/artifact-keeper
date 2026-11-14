@@ -2598,8 +2598,71 @@ mod tests {
         };
         let shared = serve_shared(&env).await;
         env.sync_at(&env.fx.repo_key.clone()).await;
+        squat_shared_key(&mut env, &shared).await;
+
+        let (s, b) = env.approve_at(&env.fx.repo_key.clone(), SHARED).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{b}");
+        assert!(
+            b["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("already owned by another repository"),
+            "{b}"
+        );
+        assert!(env.listed_at(&env.fx.repo_key.clone()).await.is_empty());
+        assert_eq!(env.server_row_key(env.fx.repo_id).await, None);
+        // The decision stands and the next sync retries the ingest.
+        assert_eq!(env.item(SHARED).await["status"], "approved");
+        env.teardown().await;
+    }
+
+    /// #5675: a seed whose pin is approved but cannot be stored reports
+    /// "approved, but not ingested yet" with the storage error, as a
+    /// deferred ingest does, instead of the bare storage error.
+    #[tokio::test]
+    async fn seed_keeps_the_approved_context_on_a_store_error_5675() {
+        let Some((mut env, _mem)) = Env::new_cloud().await else {
+            return;
+        };
+        let shared = serve_shared(&env).await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v0.1/servers/{}/versions/1.0.0",
+                urlencoding::encode(SHARED)
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(shared.clone()))
+            .mount(&env.upstream)
+            .await;
+        squat_shared_key(&mut env, &shared).await;
+        let body = serde_json::json!({"servers": [{"name": SHARED, "version": "1.0.0"}]});
+        let (s, b) = env.admin("POST", "/seed", Some(body)).await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+        let job = settled_seed(&env, b["statusUrl"].as_str().unwrap()).await;
+        let item = &job["items"][0];
+        assert_eq!(item["state"], "failed", "{job}");
+        let reason = item["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.starts_with("approved, but not ingested yet (storage: "),
+            "{job}"
+        );
+        assert!(
+            reason.contains("already owned by another repository"),
+            "{job}"
+        );
+        assert!(reason.ends_with("the next sync retries it"), "{job}");
+        // The pin itself stands (the "approved" wording is only given when
+        // the re-read item holds the approved pin).
+        let item = env.item(SHARED).await;
+        assert!(item.to_string().contains("approved"), "{item}");
+        env.teardown().await;
+    }
+
+    /// Make the exact key this test's repository writes [`SHARED`]@1.0.0
+    /// under owned by a row of a second Remote, so the store is refused by
+    /// the cross-repository write guard.
+    async fn squat_shared_key(env: &mut Env, shared: &serde_json::Value) {
         let admitted = crate::services::mcp_remote::admit_upstream(
-            &crate::services::mcp_remote::parse_entry(&shared).expect("entry"),
+            &crate::services::mcp_remote::parse_entry(shared).expect("entry"),
         )
         .expect("admitted");
         let key = crate::formats::mcp::storage_key(
@@ -2624,20 +2687,5 @@ mod tests {
         .execute(&env.fx.pool)
         .await
         .unwrap();
-
-        let (s, b) = env.approve_at(&env.fx.repo_key.clone(), SHARED).await;
-        assert_eq!(s, StatusCode::CONFLICT, "{b}");
-        assert!(
-            b["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("already owned by another repository"),
-            "{b}"
-        );
-        assert!(env.listed_at(&env.fx.repo_key.clone()).await.is_empty());
-        assert_eq!(env.server_row_key(env.fx.repo_id).await, None);
-        // The decision stands and the next sync retries the ingest.
-        assert_eq!(env.item(SHARED).await["status"], "approved");
-        env.teardown().await;
     }
 }

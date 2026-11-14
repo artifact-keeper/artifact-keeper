@@ -301,6 +301,14 @@ pub fn webhook_client() -> reqwest::Client {
 /// Requests carry `User-Agent: artifact-keeper/<version>`
 /// ([`SSO_USER_AGENT`]): web application firewalls in front of identity
 /// providers commonly refuse requests without one (#5036).
+///
+/// Every request is bounded by [`SSO_CONNECT_TIMEOUT`] and
+/// [`SSO_REQUEST_TIMEOUT`] (#5485). Without them a stalled identity provider
+/// (accepting the TCP connection and then never answering) held each SSO
+/// login, callback and token exchange open until the global request timeout,
+/// and a burst of logins tied up that many connections and tasks. A
+/// per-request `RequestBuilder::timeout` still overrides the total for the
+/// callers that want a tighter bound.
 pub fn sso_client_builder() -> ClientBuilder {
     log_proxy_env();
 
@@ -316,7 +324,19 @@ pub fn sso_client_builder() -> ClientBuilder {
     );
 
     apply_custom_ca_cert(builder)
+        .connect_timeout(SSO_CONNECT_TIMEOUT)
+        .timeout(SSO_REQUEST_TIMEOUT)
 }
+
+/// Connect timeout of the SSO/OIDC-fetch client (#5485); the same 10 s the
+/// large-object and proxy clients use.
+pub const SSO_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Total per-request timeout of the SSO/OIDC-fetch client (#5485): connect,
+/// headers and body of one discovery, token, JWKS or userinfo call. Identity
+/// providers answer these in well under a second; 30 s leaves room for a slow
+/// one while staying far below the global request timeout.
+pub const SSO_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The `User-Agent` the SSO/OIDC-fetch client sends (#5036).
 pub const SSO_USER_AGENT: &str = DEFAULT_USER_AGENT;
@@ -730,6 +750,7 @@ mod tests {
     use super::{
         base_client_builder, default_client, internal_service_client_builder,
         large_object_client_builder, sso_client_builder, webhook_client_builder,
+        SSO_CONNECT_TIMEOUT, SSO_REQUEST_TIMEOUT,
     };
     use std::io::Write;
     use std::time::Duration;
@@ -1134,6 +1155,24 @@ mod tests {
             accept_result.is_err(),
             "internal client must never connect to a loopback listener: {accept_result:?}"
         );
+    }
+
+    /// #5485: the SSO client carries both a connect and a total timeout, so
+    /// a stalled identity provider cannot pin a login until the global
+    /// request timeout. `ClientBuilder`'s `Debug` lists only the timeouts that
+    /// were set, which is what this reads.
+    #[test]
+    fn test_sso_client_builder_sets_connect_and_request_timeouts_5485() {
+        let debug = format!("{:?}", sso_client_builder());
+        assert!(
+            debug.contains(&format!("connect_timeout: {SSO_CONNECT_TIMEOUT:?}")),
+            "SSO client has no connect timeout: {debug}"
+        );
+        assert!(
+            debug.contains(&format!(" timeout: {SSO_REQUEST_TIMEOUT:?}")),
+            "SSO client has no request timeout: {debug}"
+        );
+        assert!(SSO_CONNECT_TIMEOUT <= SSO_REQUEST_TIMEOUT);
     }
 
     #[test]

@@ -2089,13 +2089,17 @@ impl GrypeScanner {
         // returned for clean artifacts (no matches) preserves the original
         // findings-only semantic, with `extract_dependencies_for_artifact`
         // falling through to Trivy's inventory.
-        Ok(ScanOutput {
+        let mut output = ScanOutput {
             findings,
             packages,
             scan_completeness: completeness_for(truncated),
             cataloged,
             vuln_db: None,
-        })
+        };
+        // #5236: what grype reported for an Alpine subpackage pin's synthetic
+        // origin record belongs to the subpackage.
+        crate::services::scanner_service::fold_apk_origin_record(&mut output, pin);
+        Ok(output)
     }
 
     async fn scan_target_inner(
@@ -4190,6 +4194,87 @@ mod tests {
                 p
             );
         }
+    }
+
+    /// #5236, END-TO-END against the REAL grype binary: an Alpine subpackage
+    /// pin (`libcurl`, origin `curl`) is graded against its origin's NVD CPE
+    /// matches. With the one-record installed db grype 0.121.3 matched
+    /// nothing for `libcurl 8.14.1-r4` (its only CPE is `libcurl:libcurl`,
+    /// which the origin rewrite turns into `curl:curl`, not NVD's
+    /// `haxx:curl`) and 40 advisories for `curl`. Every finding names the
+    /// served package, and the synthetic origin record is in neither the
+    /// inventory nor the catalog.
+    ///
+    /// Skips when grype is not installed or has no vulnerability database,
+    /// like the other end-to-end tests here.
+    #[tokio::test]
+    async fn e2e_alpine_subpackage_is_graded_with_its_origin_cpes_5236() {
+        use crate::services::scanner_service::{
+            ComponentEcosystem, ExpectedComponent, OsPackageContext, OsRelease,
+        };
+        if std::process::Command::new("grype")
+            .arg("version")
+            .output()
+            .is_err()
+        {
+            eprintln!("grype not installed; skipping the Alpine subpackage test");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = GrypeScanner::new(dir.path().to_string_lossy().to_string());
+        let artifact = make_artifact("libcurl-8.14.1-r4.apk", "application/octet-stream");
+        let pin = ExpectedComponent::os_package(
+            ComponentEcosystem::Alpine,
+            "libcurl",
+            "8.14.1-r4",
+            OsPackageContext {
+                release: OsRelease::new("alpine", "3.22").expect("alpine 3.22"),
+                arch: "x86_64".to_string(),
+                source: Some("curl".to_string()),
+            },
+        )
+        .expect("pin");
+        let content = Bytes::from_static(b"\x1f\x8b(apk body)");
+
+        let output = match scanner
+            .scan_file_pinned(&artifact, &content, Some(&pin))
+            .await
+        {
+            Ok(output) => output,
+            Err(e) => {
+                eprintln!("grype present but the scan could not run ({e}); skipping");
+                return;
+            }
+        };
+
+        let cpe_cves: std::collections::BTreeSet<&str> = output
+            .findings
+            .iter()
+            .filter_map(|f| f.cve_id.as_deref())
+            .collect();
+        assert!(
+            cpe_cves.len() >= 10,
+            "libcurl 8.14.1-r4 must be graded against curl's NVD advisories; got {:?}",
+            output.findings
+        );
+        for f in &output.findings {
+            assert_eq!(
+                f.affected_component.as_deref(),
+                Some("libcurl"),
+                "a finding against the synthetic origin record names the served package: {f:?}"
+            );
+        }
+        assert!(
+            output.packages.iter().all(|p| p.name != "curl"),
+            "the synthetic origin record is not inventory: {:?}",
+            output.packages
+        );
+        let cataloged = output.cataloged.expect("grype reports its catalog");
+        assert!(
+            cataloged.iter().any(|c| c.name == "libcurl"),
+            "{cataloged:?}"
+        );
+        assert!(cataloged.iter().all(|c| c.name != "curl"), "{cataloged:?}");
     }
 
     /// #5262: syft rejects an exclusion that does not start with `./`, `*/`

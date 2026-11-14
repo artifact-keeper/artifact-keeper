@@ -1049,11 +1049,27 @@ fn validate_package_name(name: &str) -> Result<(), Response> {
                 "Scoped package name must have exactly one '/'",
             ));
         }
+        // #5725: a scope or package part that is a dot segment (`@./x`,
+        // `@scope/.`, also reached as `%2e`) would yield a storage key the
+        // filesystem backend normalises onto another package's key.
+        if rest.split('/').any(crate::formats::npm::is_dot_segment) {
+            return Err(map_status(
+                StatusCode::BAD_REQUEST,
+                "Package name contains a '.' path segment",
+            ));
+        }
     }
     if name.starts_with('.') || name.starts_with('_') {
         return Err(map_status(
             StatusCode::BAD_REQUEST,
             "Package name cannot start with '.' or '_'",
+        ));
+    }
+    // #5725: npm refuses these names outright.
+    if crate::formats::npm::is_npm_blocked_name(name) {
+        return Err(map_status(
+            StatusCode::BAD_REQUEST,
+            "Package name is not allowed",
         ));
     }
     Ok(())
@@ -1878,14 +1894,15 @@ fn filter_bulk_advisory_request(body: &[u8], policy: &NpmScopePolicy) -> Option<
 
 /// Filter a bulk-advisories response (`{name: [advisories]}`) against the
 /// policy — defence in depth in case upstream returns advisories for names that
-/// were not requested. Parse failure yields an empty object (fail-closed).
-fn filter_bulk_advisory_response(bytes: &[u8], policy: &NpmScopePolicy) -> String {
+/// were not requested. `None` when the body is not an object: the caller reports
+/// the audit as failed rather than as clean (#5631).
+fn filter_bulk_advisory_response(bytes: &[u8], policy: &NpmScopePolicy) -> Option<String> {
     match serde_json::from_slice::<serde_json::Value>(bytes) {
         Ok(serde_json::Value::Object(obj)) => {
             let (filtered, _) = filter_pkg_name_map(&obj, policy);
-            serde_json::Value::Object(filtered).to_string()
+            Some(serde_json::Value::Object(filtered).to_string())
         }
-        _ => serde_json::Value::Object(serde_json::Map::new()).to_string(),
+        _ => None,
     }
 }
 
@@ -1914,7 +1931,7 @@ fn filter_quick_audit_request(body: &[u8], policy: &NpmScopePolicy) -> Option<(B
 
 /// Filter a quick-audit response: keep only `advisories` whose `module_name`
 /// the policy allows. Returns the re-serialised body; `None` when the body is
-/// not an object (caller falls back to the empty audit report).
+/// not an object (the caller reports the audit as failed, #5631).
 fn filter_quick_audit_response(bytes: &[u8], policy: &NpmScopePolicy) -> Option<String> {
     let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     let obj = value.as_object_mut()?;
@@ -2190,100 +2207,317 @@ fn empty_scoped_meta_body(meta_path: &str) -> Bytes {
     }
 }
 
-/// Forward an npm audit POST request to the configured upstream registry.
+/// Wall-clock bound on one npm audit POST to one Remote's upstream (#5631).
 ///
-/// Used by Remote repos to proxy advisory and audit calls to npmjs.org (or
-/// whichever upstream is configured) so `npm audit` works for cached/mirrored
-/// dependencies. The full client body is forwarded verbatim. On any upstream
-/// transport failure (timeout, DNS, TLS, etc.) the helper returns an empty
-/// well-formed response so the audit degrades gracefully instead of failing
-/// the client command. See issue #1400.
-/// POST an npm audit body upstream and return the raw 2xx JSON bytes plus the
-/// upstream content-type. Returns `None` on a non-success status or any
-/// transport/read error, mirroring the empty-fallback semantics of
-/// [`proxy_npm_audit_post`]. Split out so the scope-policy path (#2424) can
-/// post-filter the response before serving it.
-#[allow(clippy::disallowed_methods)] // the exempt call is marked inline below (#1608)
-async fn npm_audit_upstream_json(
-    upstream_url: &str,
-    path: &str,
-    body: Bytes,
-) -> Option<(String, Bytes)> {
-    let base = upstream_url.trim_end_matches('/');
-    let url = format!("{}{}", base, path);
-    let client = crate::services::http_client::default_client();
-    let req = client
-        .post(&url)
-        .header(CONTENT_TYPE, "application/json")
-        .body(body);
+/// The audit runs inside `npm install` as well as `npm audit`, so a stalled
+/// upstream must not hold the client for the shared client's full read
+/// timeout. On expiry the Remote counts as unreachable.
+const NPM_AUDIT_UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-    let resp = match send_upstream(req).await {
-        Ok(r) => r,
-        Err(err) => {
-            debug!(
-                target: "npm_audit",
-                upstream = %crate::services::proxy_service::redact_url_for_diagnostics(&url),
-                error = %err,
-                "failed to reach npm audit upstream; serving empty advisories"
-            );
-            return None;
+/// Byte ceiling on an upstream audit answer (advisory JSON, not an artifact).
+const MAX_AUDIT_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Which of the two npm audit APIs a request is for (#1400, #5631).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NpmAuditApi {
+    /// `POST /-/npm/v1/security/advisories/bulk` (npm >= 7).
+    Bulk,
+    /// `POST /-/npm/v1/security/audits/quick` (npm 6, some yarn versions).
+    Quick,
+}
+
+impl NpmAuditApi {
+    /// The wire path relative to the upstream root, as sent and as the
+    /// upstream filter matches it.
+    fn upstream_path(self) -> &'static str {
+        match self {
+            NpmAuditApi::Bulk => "-/npm/v1/security/advisories/bulk",
+            NpmAuditApi::Quick => "-/npm/v1/security/audits/quick",
         }
-    };
-    let status = resp.status();
-    let content_type = resp
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
-        .to_string();
-    // STREAMING-EXEMPT: capped metadata read (upstream npm audit advisory JSON, not an artifact blob); bounded to <=16 MiB via axum::body::to_bytes so a hostile/broken upstream cannot OOM us; over-cap degrades to empty advisories; tracked under #1608
-    match axum::body::to_bytes(Body::from_stream(resp.bytes_stream()), 16 * 1024 * 1024).await {
-        Ok(bytes) => {
-            if !status.is_success() {
-                debug!(
-                    target: "npm_audit",
-                    upstream = %crate::services::proxy_service::redact_url_for_diagnostics(&url),
-                    status = %status,
-                    "npm audit upstream returned non-success; serving empty advisories"
-                );
-                return None;
-            }
-            Some((content_type, bytes))
+    }
+
+    /// The empty answer for a request with no in-scope package (#2424).
+    fn empty_response(self) -> Response {
+        match self {
+            NpmAuditApi::Bulk => empty_advisories_bulk_response(),
+            NpmAuditApi::Quick => empty_audits_quick_response(),
         }
-        Err(err) => {
-            debug!(
-                target: "npm_audit",
-                upstream = %crate::services::proxy_service::redact_url_for_diagnostics(&url),
-                error = %err,
-                "failed to read npm audit upstream body; serving empty advisories"
-            );
-            None
+    }
+
+    fn filter_request(self, body: &[u8], policy: &NpmScopePolicy) -> Option<(Bytes, bool)> {
+        match self {
+            NpmAuditApi::Bulk => filter_bulk_advisory_request(body, policy),
+            NpmAuditApi::Quick => filter_quick_audit_request(body, policy),
+        }
+    }
+
+    fn filter_response(self, bytes: &[u8], policy: &NpmScopePolicy) -> Option<String> {
+        match self {
+            NpmAuditApi::Bulk => filter_bulk_advisory_response(bytes, policy),
+            NpmAuditApi::Quick => filter_quick_audit_response(bytes, policy),
         }
     }
 }
 
-/// Forward an npm audit POST request to the configured upstream registry.
+/// How one Remote answered an npm audit request (#5631).
+#[derive(Debug)]
+enum RemoteAuditOutcome {
+    /// The audit was performed: the upstream's answer, or the empty answer
+    /// for a request none of whose packages the Remote's scope policy serves.
+    Answered(Response),
+    /// This Remote cannot perform the audit without contacting anything: no
+    /// upstream URL, an upstream filter or cache-only mode that refuses the
+    /// audit path, an origin policy that refuses the upstream, or an upstream
+    /// that does not implement the audit API (`404`/`405`/`410`/`501`).
+    NotAvailable(String),
+    /// The upstream was contacted and failed (transport error, timeout, `5xx`,
+    /// an unparseable or over-cap answer). A retry may succeed.
+    Failed(String),
+}
+
+/// Perform an npm audit against the upstream of Remote `remote` (#5631).
 ///
-/// Used by Remote repos to proxy advisory and audit calls to npmjs.org (or
-/// whichever upstream is configured) so `npm audit` works for cached/mirrored
-/// dependencies. The full client body is forwarded verbatim. On any upstream
-/// transport failure (timeout, DNS, TLS, etc.) the helper returns an empty
-/// well-formed response so the audit degrades gracefully instead of failing
-/// the client command. See issue #1400.
-async fn proxy_npm_audit_post(
-    upstream_url: &str,
-    path: &str,
+/// Goes through [`ProxyService::post_json_uncached_capped`], so the Remote's
+/// configured upstream credentials, egress proxy, custom User-Agent and
+/// outbound address policy apply exactly as on its artifact fetches, and
+/// nothing is cached. The Remote's npm scope policy (#2424) filters the
+/// request and the answer.
+///
+/// [`ProxyService::post_json_uncached_capped`]: crate::services::proxy_service::ProxyService::post_json_uncached_capped
+async fn remote_npm_audit(
+    state: &SharedState,
+    remote: &crate::models::repository::Repository,
+    api: NpmAuditApi,
     body: Bytes,
-    empty_fallback: fn() -> Response,
-) -> Response {
-    match npm_audit_upstream_json(upstream_url, path, body).await {
-        Some((content_type, bytes)) => Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, content_type)
-            .body(Body::from(bytes))
-            .unwrap_or_else(|_| empty_fallback()),
-        None => empty_fallback(),
+) -> Result<RemoteAuditOutcome, Response> {
+    let Some(ref upstream_url) = remote.upstream_url else {
+        return Ok(RemoteAuditOutcome::NotAvailable(format!(
+            "remote repository '{}' has no upstream URL",
+            remote.key
+        )));
+    };
+    let path = api.upstream_path();
+    // #840 / #5282: a refused path never reaches the upstream. Checked here as
+    // well as inside the proxy service so the refusal is told apart from an
+    // upstream 404.
+    if !crate::services::upstream_filter::upstream_allows(
+        &state.db,
+        remote.id,
+        &remote.key,
+        upstream_url,
+        path,
+    )
+    .await
+    .map_err(IntoResponse::into_response)?
+    {
+        return Ok(RemoteAuditOutcome::NotAvailable(format!(
+            "the upstream filter or cache-only mode of remote repository '{}' refuses the \
+             audit path",
+            remote.key
+        )));
     }
+    let policy = fetch_npm_scope_policy(&state.db, remote.id)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    let body = if policy.is_active() {
+        // Active policy (#2424): never ask upstream about out-of-scope names.
+        let Some((filtered, kept)) = api.filter_request(&body, &policy) else {
+            return Ok(RemoteAuditOutcome::Answered(audit_request_error(
+                StatusCode::BAD_REQUEST,
+                "audit request body is not a JSON object",
+            )));
+        };
+        if !kept {
+            return Ok(RemoteAuditOutcome::Answered(api.empty_response()));
+        }
+        filtered
+    } else {
+        body
+    };
+    let Some(proxy) = state.proxy_service.as_ref() else {
+        return Ok(RemoteAuditOutcome::Failed(
+            "the proxy service is not configured".to_string(),
+        ));
+    };
+    let sent = tokio::time::timeout(
+        NPM_AUDIT_UPSTREAM_TIMEOUT,
+        proxy.post_json_uncached_capped(remote, path, body, MAX_AUDIT_RESPONSE_BYTES),
+    )
+    .await;
+    let (bytes, content_type) = match sent {
+        Ok(Ok(answer)) => answer,
+        Ok(Err(err)) => {
+            debug!(
+                target: "npm_audit",
+                repo_key = %remote.key,
+                error = %err,
+                "npm audit upstream request failed"
+            );
+            return Ok(classify_audit_upstream_error(&remote.key, &err));
+        }
+        Err(_) => {
+            return Ok(RemoteAuditOutcome::Failed(format!(
+                "the upstream of remote repository '{}' did not answer within {}s",
+                remote.key,
+                NPM_AUDIT_UPSTREAM_TIMEOUT.as_secs()
+            )));
+        }
+    };
+    if !policy.is_active() {
+        // Unset/inactive policy: verbatim proxy (#1400).
+        return Ok(RemoteAuditOutcome::Answered(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    CONTENT_TYPE,
+                    content_type.unwrap_or_else(|| "application/json".to_string()),
+                )
+                .body(Body::from(bytes))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        ));
+    }
+    Ok(match api.filter_response(&bytes, &policy) {
+        Some(filtered) => RemoteAuditOutcome::Answered(build_json_metadata_response(filtered)),
+        None => RemoteAuditOutcome::Failed(format!(
+            "the upstream of remote repository '{}' answered the audit with a body that is \
+             not a JSON object",
+            remote.key
+        )),
+    })
+}
+
+/// Sort a failed upstream audit POST into "this upstream has no audit API"
+/// and "the upstream failed" (#5631).
+fn classify_audit_upstream_error(repo_key: &str, err: &AppError) -> RemoteAuditOutcome {
+    if let AppError::Authorization(_) = err {
+        // #4506: an applicable scan policy refuses this Remote's origin.
+        return RemoteAuditOutcome::NotAvailable(format!(
+            "a scan policy refuses the upstream origin of remote repository '{repo_key}'"
+        ));
+    }
+    let status = crate::services::proxy_service::upstream_error_status(err);
+    let not_implemented = matches!(err, AppError::NotFound(_))
+        || matches!(
+            status,
+            Some(StatusCode::NOT_FOUND)
+                | Some(StatusCode::METHOD_NOT_ALLOWED)
+                | Some(StatusCode::GONE)
+                | Some(StatusCode::NOT_IMPLEMENTED)
+        );
+    if not_implemented {
+        RemoteAuditOutcome::NotAvailable(format!(
+            "the upstream of remote repository '{repo_key}' does not serve the npm audit API"
+        ))
+    } else {
+        RemoteAuditOutcome::Failed(match status {
+            Some(status) => {
+                format!("the upstream of remote repository '{repo_key}' answered {status}")
+            }
+            None => format!("the upstream of remote repository '{repo_key}' could not be reached"),
+        })
+    }
+}
+
+/// Answer an npm audit request on any repository type (#5631).
+///
+/// * Remote: performed against its own upstream.
+/// * Virtual: performed against the first Remote member, in resolution order
+///   and among the members this caller may read (#3323), whose upstream
+///   answers the audit API. Members that cannot answer are skipped.
+/// * Local / Staging: hold no advisory data.
+///
+/// When nothing answers, the reply is an error, never an empty advisory set:
+/// npm renders `{}` as "found 0 vulnerabilities", a false all-clear (#3644,
+/// #5631). `503` when an upstream was contacted and failed (a retry may
+/// succeed), otherwise `501` saying audits are not available through this
+/// repository.
+async fn npm_audit(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo_key: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+    api: NpmAuditApi,
+) -> Result<Response, Response> {
+    // npm gzips these POSTs; decode before anything inspects or forwards them (#3644).
+    let body = decode_audit_request_body(headers, body)?;
+    let repo = resolve_npm_repo(&state.db, repo_key).await?;
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut unavailable: Vec<String> = Vec::new();
+    if repo.repo_type == RepositoryType::Remote {
+        let outcome = match repo.upstream_url {
+            Some(ref upstream_url) => {
+                let remote = proxy_helpers::build_remote_repo_with_format(
+                    repo.id,
+                    &repo.key,
+                    upstream_url,
+                    RepositoryFormat::Npm,
+                );
+                remote_npm_audit(state, &remote, api, body).await?
+            }
+            None => RemoteAuditOutcome::NotAvailable(format!(
+                "remote repository '{repo_key}' has no upstream URL"
+            )),
+        };
+        match outcome {
+            RemoteAuditOutcome::Answered(resp) => return Ok(resp),
+            RemoteAuditOutcome::NotAvailable(reason) => unavailable.push(reason),
+            RemoteAuditOutcome::Failed(reason) => failures.push(reason),
+        }
+    } else if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+        for member in members
+            .iter()
+            .filter(|m| m.repo_type == RepositoryType::Remote)
+        {
+            match remote_npm_audit(state, member, api, body.clone()).await? {
+                RemoteAuditOutcome::Answered(resp) => return Ok(resp),
+                RemoteAuditOutcome::NotAvailable(reason) => unavailable.push(reason),
+                RemoteAuditOutcome::Failed(reason) => failures.push(reason),
+            }
+        }
+        if unavailable.is_empty() && failures.is_empty() {
+            unavailable.push(format!(
+                "virtual repository '{repo_key}' has no Remote member"
+            ));
+        }
+    } else {
+        unavailable.push(format!(
+            "'{repo_key}' is a hosted repository and holds no advisory data; audit through a \
+             Remote or Virtual repository that proxies a registry with the npm audit API"
+        ));
+    }
+    Err(npm_audit_unavailable(repo_key, &failures, &unavailable))
+}
+
+/// The error answer of an npm audit nothing could perform (#5631).
+fn npm_audit_unavailable(repo_key: &str, failures: &[String], unavailable: &[String]) -> Response {
+    let (status, lead) = if failures.is_empty() {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            format!("npm audit is not available through repository '{repo_key}'"),
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "npm audit could not be performed through repository '{repo_key}': upstream \
+                 unavailable"
+            ),
+        )
+    };
+    let reasons: Vec<&str> = failures
+        .iter()
+        .chain(unavailable)
+        .map(String::as_str)
+        .collect();
+    let message = if reasons.is_empty() {
+        lead
+    } else {
+        format!("{lead}: {}", reasons.join("; "))
+    };
+    audit_request_error(status, &message)
 }
 
 // ---------------------------------------------------------------------------
@@ -2844,145 +3078,49 @@ fn npm_meta_fetch_path(meta_path: &str, query: Option<&str>) -> String {
     }
 }
 
-/// Whether the upstream filter of a Remote admits an npm audit POST to
-/// `path` (#840).
-async fn npm_audit_upstream_allowed(
-    state: &SharedState,
-    repo_id: uuid::Uuid,
-    repo_key: &str,
-    upstream_url: &str,
-    path: &str,
-) -> Result<bool, Response> {
-    crate::services::upstream_filter::upstream_allows(
-        &state.db,
-        repo_id,
-        repo_key,
-        upstream_url,
-        path,
-    )
-    .await
-    .map_err(IntoResponse::into_response)
-}
-
 /// Handler for `POST /npm/{repo_key}/-/npm/v1/security/advisories/bulk`.
 ///
 /// This endpoint is used by `npm audit` (npm >= 7) to look up known security
-/// advisories for the dependency graph. Remote repositories forward the
-/// request to the configured upstream registry. Local, Staging, and Virtual
-/// repositories return an empty advisory map so `npm audit` reports zero
-/// vulnerabilities instead of failing with a 404. See issue #1400.
+/// advisories for the dependency graph. See [`npm_audit`] for how each
+/// repository type answers (#1400, #5631).
 async fn security_advisories_bulk(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    const PATH: &str = "/-/npm/v1/security/advisories/bulk";
-    // npm gzips this POST; decode before anything inspects or forwards it (#3644).
-    let body = decode_audit_request_body(&headers, body)?;
-    let repo = resolve_npm_repo(&state.db, &repo_key).await?;
-
-    if repo.repo_type == RepositoryType::Remote {
-        if let Some(ref upstream_url) = repo.upstream_url {
-            // #840: a path the Remote's upstream filter refuses is never sent
-            // upstream; the audit answers as for a repository with none.
-            if !npm_audit_upstream_allowed(&state, repo.id, &repo_key, upstream_url, PATH).await? {
-                return Ok(empty_advisories_bulk_response());
-            }
-            let policy = fetch_npm_scope_policy(&state.db, repo.id)
-                .await
-                .map_err(IntoResponse::into_response)?;
-            // Unset/inactive policy: verbatim proxy (byte-identical, #1400).
-            if !policy.is_active() {
-                return Ok(proxy_npm_audit_post(
-                    upstream_url,
-                    PATH,
-                    body,
-                    empty_advisories_bulk_response,
-                )
-                .await);
-            }
-            // Active policy (#2424): drop out-of-scope package names from the
-            // request so upstream is never queried about them, then filter the
-            // response as defence in depth. Unparseable body ⇒ fail closed.
-            let Some((filtered_body, kept)) = filter_bulk_advisory_request(&body, &policy) else {
-                return Ok(empty_advisories_bulk_response());
-            };
-            if !kept {
-                return Ok(empty_advisories_bulk_response());
-            }
-            return Ok(
-                match npm_audit_upstream_json(upstream_url, PATH, filtered_body).await {
-                    Some((_ct, bytes)) => {
-                        build_json_metadata_response(filter_bulk_advisory_response(&bytes, &policy))
-                    }
-                    None => empty_advisories_bulk_response(),
-                },
-            );
-        }
-    }
-
-    Ok(empty_advisories_bulk_response())
+    npm_audit(
+        &state,
+        auth.as_ref(),
+        &repo_key,
+        &headers,
+        body,
+        NpmAuditApi::Bulk,
+    )
+    .await
 }
 
 /// Handler for `POST /npm/{repo_key}/-/npm/v1/security/audits/quick`.
 ///
 /// Legacy npm audit endpoint (npm v6) and the path some yarn versions use.
-/// Same Remote-proxy / empty-fallback behaviour as the bulk endpoint above.
-/// See issue #1400.
+/// Answered as the bulk endpoint above (#1400, #5631).
 async fn security_audits_quick(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    const PATH: &str = "/-/npm/v1/security/audits/quick";
-    // npm gzips this POST; decode before anything inspects or forwards it (#3644).
-    let body = decode_audit_request_body(&headers, body)?;
-    let repo = resolve_npm_repo(&state.db, &repo_key).await?;
-
-    if repo.repo_type == RepositoryType::Remote {
-        if let Some(ref upstream_url) = repo.upstream_url {
-            // #840: a path the Remote's upstream filter refuses is never sent
-            // upstream; the audit answers as for a repository with none.
-            if !npm_audit_upstream_allowed(&state, repo.id, &repo_key, upstream_url, PATH).await? {
-                return Ok(empty_audits_quick_response());
-            }
-            let policy = fetch_npm_scope_policy(&state.db, repo.id)
-                .await
-                .map_err(IntoResponse::into_response)?;
-            // Unset/inactive policy: verbatim proxy (byte-identical, #1400).
-            if !policy.is_active() {
-                return Ok(proxy_npm_audit_post(
-                    upstream_url,
-                    PATH,
-                    body,
-                    empty_audits_quick_response,
-                )
-                .await);
-            }
-            // Active policy (#2424): strip out-of-scope names from the request's
-            // requires/dependencies, then filter the response's advisories by
-            // module_name. Unparseable body ⇒ fail closed.
-            let Some((filtered_body, kept)) = filter_quick_audit_request(&body, &policy) else {
-                return Ok(empty_audits_quick_response());
-            };
-            if !kept {
-                return Ok(empty_audits_quick_response());
-            }
-            return Ok(
-                match npm_audit_upstream_json(upstream_url, PATH, filtered_body).await {
-                    Some((_ct, bytes)) => match filter_quick_audit_response(&bytes, &policy) {
-                        Some(filtered) => build_json_metadata_response(filtered),
-                        None => empty_audits_quick_response(),
-                    },
-                    None => empty_audits_quick_response(),
-                },
-            );
-        }
-    }
-
-    Ok(empty_audits_quick_response())
+    npm_audit(
+        &state,
+        auth.as_ref(),
+        &repo_key,
+        &headers,
+        body,
+        NpmAuditApi::Quick,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -3066,7 +3204,15 @@ async fn get_scoped_version_metadata(
     if let Some((scope_part, name_part)) = encoded_scoped_tarball_parts(&scope, &package) {
         let full_name = build_scoped_package_name(scope_part, name_part);
         validate_package_name(&full_name)?;
-        return serve_tarball(&state, auth.as_ref(), &repo_key, &full_name, &version, &ctx).await;
+        return serve_tarball_to_client(
+            &state,
+            auth.as_ref(),
+            &repo_key,
+            &full_name,
+            &version,
+            &ctx,
+        )
+        .await;
     }
     let package = normalize_package_name(&package);
     let full_name = build_scoped_package_name(&scope, &package);
@@ -3218,15 +3364,21 @@ fn merge_packument_into(acc: &mut serde_json::Value, next: serde_json::Value) {
 /// Choose the `latest` dist-tag for a set of versions when none is recorded.
 ///
 /// Per npm convention `latest` should be the highest **non-prerelease** semver,
-/// never auto-set to a prerelease by recency. We compare on the numeric
-/// `major.minor.patch` core (build metadata and prerelease suffixes are
-/// stripped); a version carrying a `-prerelease` suffix is excluded from the
-/// stable candidates. Falls back to the highest version overall when every
-/// version is a prerelease, and to the last (most-recently-created) version
-/// when nothing parses as semver. Returns `None` only for an empty input.
+/// never auto-set to a prerelease by recency. Versions are compared by SemVer
+/// precedence (build metadata ignored), so among pre-releases of one release
+/// `1.0.0-rc.1` outranks `1.0.0-alpha` whatever order they were published in.
+/// A version that is not strict SemVer but has a numeric `major[.minor[.patch]]`
+/// core still takes part, ranked by that core. Falls back to the highest
+/// version overall when every version is a prerelease, and to the last
+/// (most-recently-created) version when nothing parses. Ties go to the
+/// later-listed version. Returns `None` only for an empty input.
 fn derive_latest_version(versions: &[String]) -> Option<String> {
-    // Parse into (major, minor, patch, is_prerelease); `None` if not semver-ish.
-    fn parse(v: &str) -> Option<(u64, u64, u64, bool)> {
+    // `(precedence key, is_prerelease)`; `None` if not semver-ish.
+    fn parse(v: &str) -> Option<(semver::Version, bool)> {
+        if let Ok(strict) = semver::Version::parse(v) {
+            let is_pre = !strict.pre.is_empty();
+            return Some((strict, is_pre));
+        }
         let core = v.split('+').next().unwrap_or(v); // drop +build metadata
         let (mmp, is_pre) = match core.split_once('-') {
             Some((head, _pre)) => (head, true),
@@ -3236,27 +3388,24 @@ fn derive_latest_version(versions: &[String]) -> Option<String> {
         let major = parts.next()?.parse::<u64>().ok()?;
         let minor = parts.next().unwrap_or("0").parse::<u64>().ok()?;
         let patch = parts.next().unwrap_or("0").parse::<u64>().ok()?;
-        Some((major, minor, patch, is_pre))
+        Some((semver::Version::new(major, minor, patch), is_pre))
     }
 
-    let mut best_stable: Option<(&String, (u64, u64, u64))> = None;
-    let mut best_any: Option<(&String, (u64, u64, u64))> = None;
-    for v in versions {
-        if let Some((major, minor, patch, is_pre)) = parse(v) {
-            let key = (major, minor, patch);
-            // Prefer the later-listed (more recent) version on ties.
-            if best_any.as_ref().is_none_or(|(_, k)| key >= *k) {
-                best_any = Some((v, key));
-            }
-            if !is_pre && best_stable.as_ref().is_none_or(|(_, k)| key >= *k) {
-                best_stable = Some((v, key));
-            }
-        }
-    }
+    let parsed: Vec<(&String, semver::Version, bool)> = versions
+        .iter()
+        .filter_map(|v| parse(v).map(|(key, is_pre)| (v, key, is_pre)))
+        .collect();
+    // `max_by` keeps the last of equal elements: the later-listed version.
+    let best = |stable_only: bool| {
+        parsed
+            .iter()
+            .filter(|(_, _, is_pre)| !(stable_only && *is_pre))
+            .max_by(|a, b| a.1.cmp_precedence(&b.1))
+            .map(|(v, _, _)| (*v).clone())
+    };
 
-    best_stable
-        .map(|(v, _)| v.clone())
-        .or_else(|| best_any.map(|(v, _)| v.clone()))
+    best(true)
+        .or_else(|| best(false))
         .or_else(|| versions.last().cloned())
 }
 
@@ -3373,21 +3522,17 @@ fn npm_name_shape(package_name: &str) -> NpmNameShape<'_> {
 
 /// Validate an npm scope literal (`@scope`) for the policy allow-list.
 ///
-/// npm scope names follow the same character rules as package names: ASCII
-/// lowercase letters, digits, `-`, `_` and `.`, not starting with `.` or `_`,
-/// and at most 214 characters. Callers normalise to lowercase before
-/// validating, so uppercase input is accepted but stored case-folded.
+/// Uses the scope rule of [`crate::formats::npm::is_valid_npm_name`], so every
+/// scope a valid name can carry can also be allow-listed (#5725): ASCII
+/// lowercase letters, digits, `-`, `_`, `.` and `~` (any of them may lead),
+/// never exactly `.` or `..`, and at most 214 characters. Callers normalise to
+/// lowercase before validating, so uppercase input is accepted but stored
+/// case-folded.
 pub(crate) fn is_valid_npm_scope(scope: &str) -> bool {
     let Some(rest) = scope.strip_prefix('@') else {
         return false;
     };
-    !rest.is_empty()
-        && rest.len() <= 214
-        && !rest.starts_with('.')
-        && !rest.starts_with('_')
-        && rest
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
+    rest.len() <= 214 && crate::formats::npm::is_valid_npm_scope_segment(rest)
 }
 
 /// Per-repository npm name-namespace policy (#2327).
@@ -3642,15 +3787,29 @@ pub(crate) async fn fetch_npm_virtual_isolate(
 /// `package_name`, i.e. every Remote member must be withheld for this name on
 /// both legs (#3767). The ownership query only runs when the toggle is on, so
 /// a virtual without isolate mode pays one indexed config lookup.
+/// `non_remote_ids` are the Virtual's non-Remote leaves
+/// ([`proxy_helpers::non_remote_leaf_ids`]).
 async fn npm_virtual_isolates_name(
     db: &PgPool,
     virtual_repo_id: uuid::Uuid,
+    non_remote_ids: &[uuid::Uuid],
     package_name: &str,
 ) -> Result<bool, Response> {
     let isolate = fetch_npm_virtual_isolate(db, virtual_repo_id)
         .await
         .map_err(IntoResponse::into_response)?;
-    npm_virtual_owner_isolates(db, virtual_repo_id, package_name, isolate).await
+    if !isolate {
+        return Ok(false);
+    }
+    proxy_helpers::non_remote_ids_own_name_version(
+        db,
+        virtual_repo_id,
+        non_remote_ids,
+        package_name,
+        None,
+        "npm",
+    )
+    .await
 }
 
 /// [`npm_virtual_isolates_name`] for a caller that already read the toggle
@@ -3786,14 +3945,21 @@ async fn get_package_metadata(
     }
 
     let dist_tags = fetch_npm_dist_tags(&state.db, repo.id, package_name).await;
-    build_npm_metadata_response(
+    let mut packument = build_npm_metadata_value(
         &meta_artifacts,
         package_name,
         base_url,
         repo_key,
         &dist_tags,
-        want_abbreviated,
-    )
+    );
+    // The revision `npm unpublish` reads from `GET /{pkg}?write=true` and
+    // sends back as `-rev/{_rev}` (#5403). The abbreviated document carries
+    // no `_rev`, as on the npm registry.
+    if !want_abbreviated {
+        let rows = fetch_npm_package_rows(&state.db, repo.id, package_name).await?;
+        packument["_rev"] = serde_json::Value::String(npm_package_rev(&rows));
+    }
+    Ok(respond_with_packument(packument, want_abbreviated))
 }
 
 /// Fetch the full packument and extract a single version's metadata.
@@ -4798,7 +4964,7 @@ async fn download_tarball(
 ) -> Result<Response, Response> {
     let package = normalize_package_name(&package);
     validate_package_name(&package)?;
-    serve_tarball(&state, auth.as_ref(), &repo_key, &package, &filename, &ctx).await
+    serve_tarball_to_client(&state, auth.as_ref(), &repo_key, &package, &filename, &ctx).await
 }
 
 async fn download_scoped_tarball(
@@ -4811,7 +4977,7 @@ async fn download_scoped_tarball(
     let package = normalize_package_name(&package);
     let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
-    serve_tarball(
+    serve_tarball_to_client(
         &state,
         auth.as_ref(),
         &repo_key,
@@ -4820,6 +4986,29 @@ async fn download_scoped_tarball(
         &ctx,
     )
     .await
+}
+
+/// [`serve_tarball`] as the tarball routes answer it (#5273).
+///
+/// npm fails an install on a `423` and retries a `503`. Under
+/// `fail_closed`, a tarball whose scan is still queued or running when the
+/// request stops waiting is refused `423 scan_pending`, and a retry joins
+/// that scan or finds its verdict, so a first install failed on a refusal a
+/// retry would have resolved. That refusal goes to the client as `503` with
+/// `Retry-After`. A `423` no retry resolves is left as it is, and so is
+/// everything else. [`serve_tarball`] itself keeps answering `423`: its
+/// Virtual walk ends on that status.
+async fn serve_tarball_to_client(
+    state: &SharedState,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
+    repo_key: &str,
+    package_name: &str,
+    filename: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    serve_tarball(state, auth, repo_key, package_name, filename, ctx)
+        .await
+        .map_err(proxy_helpers::scan_pending_as_retryable_503)
 }
 
 /// Fetch an npm tarball from a virtual member's local storage, matching
@@ -4924,9 +5113,31 @@ pub(crate) enum NpmVirtualOwnership {
 ///   priority-aware (`OwnedAtPriority` / `NotOwned`);
 /// - it does not: the name-only fail-safe (`OwnedNameOnly` / `NotOwned`);
 /// - the name fails `is_valid_npm_name`: the check is skipped (`NotOwned`).
+#[cfg(test)]
 async fn resolve_npm_virtual_ownership(
     db: &PgPool,
     virtual_repo_id: uuid::Uuid,
+    package_name: &str,
+    filename: &str,
+) -> Result<NpmVirtualOwnership, Response> {
+    let expansion = proxy_helpers::fetch_virtual_expansion(db, virtual_repo_id).await?;
+    resolve_npm_virtual_ownership_among(
+        db,
+        virtual_repo_id,
+        &proxy_helpers::non_remote_leaf_ids(&expansion.members),
+        package_name,
+        filename,
+    )
+    .await
+}
+
+/// [`resolve_npm_virtual_ownership`] over the non-Remote leaves of an
+/// expansion the caller already holds, so the guard expands the Virtual once
+/// (#5537).
+async fn resolve_npm_virtual_ownership_among(
+    db: &PgPool,
+    virtual_repo_id: uuid::Uuid,
+    non_remote_ids: &[uuid::Uuid],
     package_name: &str,
     filename: &str,
 ) -> Result<NpmVirtualOwnership, Response> {
@@ -4937,7 +5148,7 @@ async fn resolve_npm_virtual_ownership(
     // that check rejects (uppercase, e.g. `MyPackage`), and the packument leg
     // isolates them case-insensitively, so skipping here would let the
     // tarball leg serve upstream for a name the packument hides.
-    if npm_virtual_isolates_name(db, virtual_repo_id, package_name).await? {
+    if npm_virtual_isolates_name(db, virtual_repo_id, non_remote_ids, package_name).await? {
         return Ok(NpmVirtualOwnership::OwnedNameOnly);
     }
     if !crate::formats::npm::is_valid_npm_name(package_name) {
@@ -4946,18 +5157,29 @@ async fn resolve_npm_virtual_ownership(
     let Some(version) = npm_version_from_tarball_filename(package_name, filename) else {
         // Fail-safe (#3646): no readable version, so fall back to the
         // name-only guard rather than fan out on a shape we cannot read.
-        let owns_name =
-            proxy_helpers::virtual_non_remote_owns_name(db, virtual_repo_id, package_name, "npm")
-                .await?;
+        let owns_name = proxy_helpers::non_remote_ids_own_name_version(
+            db,
+            virtual_repo_id,
+            non_remote_ids,
+            package_name,
+            None,
+            "npm",
+        )
+        .await?;
         return Ok(if owns_name {
             NpmVirtualOwnership::OwnedNameOnly
         } else {
             NpmVirtualOwnership::NotOwned
         });
     };
-    let owner_min_priority =
-        proxy_helpers::npm_virtual_owner_min_priority(db, virtual_repo_id, package_name, &version)
-            .await?;
+    let owner_min_priority = proxy_helpers::npm_virtual_owner_min_priority(
+        db,
+        virtual_repo_id,
+        non_remote_ids,
+        package_name,
+        &version,
+    )
+    .await?;
     Ok(match owner_min_priority {
         Some(min_priority) => NpmVirtualOwnership::OwnedAtPriority(min_priority),
         None => NpmVirtualOwnership::NotOwned,
@@ -4999,10 +5221,16 @@ async fn resolve_npm_virtual_ownership(
 /// the exact tarball URL (a pinned lockfile) cannot stream an out-of-scope
 /// `@scope/pkg` through a Remote member. Non-Remote members are always
 /// eligible.
+///
+/// `leaves` is the Virtual's unfiltered leaf expansion, which the owner
+/// guard and the member ranks are read from, and `members` the set that may
+/// serve (the caller's view of `leaves`): the caller expands the Virtual once
+/// for the whole decision (#5537).
 #[allow(clippy::result_large_err)]
 pub(crate) async fn npm_virtual_eligible_members(
     db: &PgPool,
     virtual_repo_id: uuid::Uuid,
+    leaves: &[proxy_helpers::ExpandedMember],
     members: Vec<crate::models::repository::Repository>,
     package_name: &str,
     filename: &str,
@@ -5013,8 +5241,14 @@ pub(crate) async fn npm_virtual_eligible_members(
     ),
     Response,
 > {
-    let ownership =
-        resolve_npm_virtual_ownership(db, virtual_repo_id, package_name, filename).await?;
+    let ownership = resolve_npm_virtual_ownership_among(
+        db,
+        virtual_repo_id,
+        &proxy_helpers::non_remote_leaf_ids(leaves),
+        package_name,
+        filename,
+    )
+    .await?;
     let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
     let scope_policies = fetch_npm_scope_policies(db, &member_ids)
         .await
@@ -5025,10 +5259,7 @@ pub(crate) async fn npm_virtual_eligible_members(
         .collect();
     let members = match ownership {
         NpmVirtualOwnership::OwnedAtPriority(owner_min_priority) => {
-            // The priorities map is fetched only when an owner exists — one
-            // indexed query on exactly the requests the guard engages on.
-            let member_priorities =
-                proxy_helpers::fetch_virtual_member_priorities(db, virtual_repo_id).await?;
+            let member_priorities = proxy_helpers::virtual_member_ranks(leaves);
             members
                 .into_iter()
                 .filter(|m| {
@@ -5305,15 +5536,22 @@ async fn serve_tarball(
 
         // The supply-chain shadowing guard (#1217, #3646, #3955) and the
         // per-member scope policy (#2424): see `npm_virtual_eligible_members`.
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        let expansion = proxy_helpers::fetch_virtual_expansion(&state.db, repo.id).await?;
+        let members = expansion.members.iter().map(|m| m.repo.clone()).collect();
         // #3178: authorize the member set against the CALLER before any
         // format-specific filtering, so a member this caller could not read
         // directly can never reach the byte resolver.
         let members =
             proxy_helpers::try_authorize_virtual_members(&state.db, auth, repo.id, members).await?;
-        let (ownership, members) =
-            npm_virtual_eligible_members(&state.db, repo.id, members, package_name, filename)
-                .await?;
+        let (ownership, members) = npm_virtual_eligible_members(
+            &state.db,
+            repo.id,
+            &expansion.members,
+            members,
+            package_name,
+            filename,
+        )
+        .await?;
 
         // Passing `None` to the resolver when the guard suppresses every
         // Remote member is the load-bearing security primitive: see
@@ -5579,6 +5817,16 @@ async fn serve_tarball(
         .get_stream(&artifact.storage_key)
         .await
         .map_err(map_storage_err)?;
+    // #4989: verify the stored bytes against the row (#4323).
+    let stream = crate::storage::verify::verify_row_serve(
+        stream,
+        &artifact.checksum_sha256,
+        &artifact.path,
+        artifact.size_bytes,
+        ctx.is_head,
+        || format!("{repo_key}/{}", artifact.path),
+    )
+    .await?;
 
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, ctx).await;
@@ -6236,6 +6484,18 @@ fn extract_version_tarball(
     })
 }
 
+/// Lock-name namespace of the hosted npm publish lock (#5399).
+const NPM_PUBLISH_LOCK_NAMESPACE: &str = "npm-publish";
+
+/// The 409 a publish of an already-published `name@version` answers.
+fn npm_version_exists(package_name: &str, version: &str) -> Response {
+    AppError::Conflict(format!(
+        "Version {} of {} already exists",
+        version, package_name
+    ))
+    .into_response()
+}
+
 /// Store a single npm version: check duplicates, write to storage, insert DB
 /// records, and update the package_versions table.
 #[allow(clippy::too_many_arguments)]
@@ -6266,12 +6526,10 @@ async fn store_npm_version(
     .await
     .map_err(map_db_err)?;
 
+    // Unlocked fast path; the authoritative check runs under the publish lock
+    // below (#5399).
     if existing.is_some() {
-        return Err(AppError::Conflict(format!(
-            "Version {} of {} already exists",
-            ver.version, package_name
-        ))
-        .into_response());
+        return Err(npm_version_exists(package_name, &ver.version));
     }
 
     super::cleanup_soft_deleted_artifact_checked(
@@ -6300,9 +6558,9 @@ async fn store_npm_version(
     )
     .await?;
 
-    // Store the tarball. On a shared cloud namespace the key is repo-scoped
-    // (#4293), so the guard below only ever refuses a key another repository
-    // could own on the legacy flat scheme (`STORAGE_KEY_SCHEME=flat`).
+    // On a shared cloud namespace the key is repo-scoped (#4293), so the guard
+    // below only ever refuses a key another repository could own on the
+    // legacy flat scheme (`STORAGE_KEY_SCHEME=flat`).
     let storage_key = build_npm_storage_key(
         crate::storage::StorageKeyScheme::from_env(),
         &location.backend,
@@ -6311,66 +6569,128 @@ async fn store_npm_version(
     );
     proxy_helpers::guard_cross_repo_write(state, repo_id, &location.backend, &storage_key).await?;
     let storage = state.storage_for_repo_or_500(location)?;
-    storage
-        .put(&storage_key, Bytes::from(ver.tarball_bytes.clone()))
-        .await
-        .map_err(map_storage_err)?;
 
-    // Atomic quota admission, in the same transaction as the INSERT so
-    // concurrent publishes into the repository (or any sibling repository of
-    // a capped project) cannot jointly over-admit. A denial here is only
-    // reachable when a concurrent upload consumed the headroom after the
-    // preflight above.
-    let mut tx = super::publish_quota::begin_admitted_publish(
-        &state.db,
-        repo_id,
-        &artifact_path,
-        size_bytes,
-    )
-    .await?;
-
-    // Insert artifact record
-    let artifact_id = sqlx::query_scalar!(
-        r#"
-        INSERT INTO artifacts (
-            repository_id, path, name, version, size_bytes,
-            checksum_sha256, content_type, storage_key, uploaded_by
+    // #5399: every publish of one `name@version` writes the same
+    // path-derived key, so the duplicate check above cannot decide a race.
+    // The storage write runs INSIDE the publishing transaction, after
+    // `lock_publish_key`: concurrent publishes of one version serialise here,
+    // and a loser sees the winner's committed row under the lock BEFORE its
+    // write and answers 409 without touching the winner's object. Every
+    // failure after the write rolls the row back and runs
+    // `discard_unreferenced_publish_object`, which takes the same lock and
+    // removes the object only when no committed row names it.
+    let published: Result<uuid::Uuid, Response> = async {
+        let mut tx = state.db.begin().await.map_err(map_db_err)?;
+        super::publish_lock::lock_publish_key(
+            &mut tx,
+            NPM_PUBLISH_LOCK_NAMESPACE,
+            repo_id,
+            &location.backend,
+            &storage_key,
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING id
-        "#,
-        repo_id,
-        artifact_path,
-        package_name,
-        ver.version,
-        size_bytes,
-        ver.sha256,
-        "application/gzip",
-        storage_key,
-        user_id,
-    )
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(map_db_err)?;
+        .await
+        .map_err(map_db_err)?;
+        let taken: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false)",
+        )
+        .bind(repo_id)
+        .bind(&artifact_path)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+        if taken {
+            return Err(npm_version_exists(package_name, &ver.version));
+        }
 
-    // Store metadata
-    let npm_metadata = serde_json::json!({
-        "name": package_name,
-        "version": ver.version,
-        "version_data": ver.version_data,
-    });
+        // Write while holding only this key's publish lock. The
+        // repository-wide locks this transaction takes next (the quota
+        // admission's ledger and project rows, and the usage-ledger row the
+        // `artifacts` insert trigger updates) are acquired after the write, so
+        // a slow object write never stalls other publishes into the same
+        // repository or project (the ordering of #4892).
+        storage
+            .put(&storage_key, Bytes::from(ver.tarball_bytes.clone()))
+            .await
+            .map_err(map_storage_err)?;
 
-    sqlx::query(
-        "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
-         VALUES ($1, 'npm', $2) \
-         ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2",
-    )
-    .bind(artifact_id)
-    .bind(&npm_metadata)
-    .execute(&mut *tx)
-    .await
-    .map_err(map_db_err)?;
-    tx.commit().await.map_err(map_db_err)?;
+        // Atomic quota admission, in the same transaction as the INSERT so
+        // concurrent publishes into the repository (or any sibling repository
+        // of a capped project) cannot jointly over-admit. A denial here is
+        // only reachable when a concurrent upload consumed the headroom after
+        // the preflight above.
+        super::publish_quota::admit_publish_in_tx(
+            &mut tx,
+            &state.db,
+            repo_id,
+            &artifact_path,
+            size_bytes,
+        )
+        .await?;
+
+        // `ON CONFLICT DO NOTHING` returns no row when a writer that does not
+        // take the publish lock committed this path first: answer the same
+        // 409 as the locked check rather than the 500 a bare unique violation
+        // on `artifacts (repository_id, path)` raised.
+        let artifact_id: uuid::Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO artifacts (
+                repository_id, path, name, version, size_bytes,
+                checksum_sha256, content_type, storage_key, uploaded_by
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (repository_id, path) DO NOTHING
+            RETURNING id
+            "#,
+        )
+        .bind(repo_id)
+        .bind(&artifact_path)
+        .bind(package_name)
+        .bind(&ver.version)
+        .bind(size_bytes)
+        .bind(&ver.sha256)
+        .bind("application/gzip")
+        .bind(&storage_key)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_db_err)?
+        .ok_or_else(|| npm_version_exists(package_name, &ver.version))?;
+
+        let npm_metadata = serde_json::json!({
+            "name": package_name,
+            "version": ver.version,
+            "version_data": ver.version_data,
+        });
+        sqlx::query(
+            "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+             VALUES ($1, 'npm', $2) \
+             ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2",
+        )
+        .bind(artifact_id)
+        .bind(&npm_metadata)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+        tx.commit().await.map_err(map_db_err)?;
+        Ok(artifact_id)
+    }
+    .await;
+    let artifact_id = match published {
+        Ok(id) => id,
+        Err(response) => {
+            super::publish_lock::discard_unreferenced_publish_object(
+                &state.db,
+                &storage,
+                NPM_PUBLISH_LOCK_NAMESPACE,
+                repo_id,
+                &location.backend,
+                &storage_key,
+            )
+            .await;
+            return Err(response);
+        }
+    };
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo_id, artifact_id)
         .await;
@@ -6393,6 +6713,7 @@ async fn store_npm_version(
     crate::services::package_service::register_published_package_with_metadata(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo_id,
         package_name,
         &ver.version,
@@ -6778,8 +7099,13 @@ async fn dist_tags_delete(
 // `DELETE /{pkg}/-rev/{_rev}`. It reads a 404 on any of them as "already
 // gone", so these must exist or an unpublish silently does nothing.
 //
-// This registry keeps no packument revisions and serves no `_rev`, so the
-// client sends `-rev/undefined`; any `{rev}` is accepted.
+// The hosted full packument carries a `_rev` derived from the package's live
+// rows ([`npm_package_rev`], #5403). A packument rewrite or whole-package
+// unpublish whose `{rev}` no longer matches answers 409, so an unpublish
+// computed from an old packument cannot remove a version published after the
+// client read it. See [`check_npm_unpublish_rev`] for clients that send no
+// revision (`-rev/undefined`). The tarball delete names its one file and is
+// not checked.
 
 /// One live artifact row of an npm package, as unpublish sees it.
 struct NpmPackageRow {
@@ -6850,6 +7176,53 @@ async fn fetch_npm_package_rows(
             path: r.get("path"),
         })
         .collect())
+}
+
+/// The `_rev` of a hosted npm package: `<live row count>-<digest>`, the digest
+/// a SHA-256 over the sorted ids of its live artifact rows (#5403). Any
+/// publish, unpublish or delete of the package changes it.
+fn npm_package_rev(rows: &[NpmPackageRow]) -> String {
+    use sha2::Digest;
+    let mut ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.id).collect();
+    ids.sort();
+    let mut hasher = sha2::Sha256::new();
+    for id in &ids {
+        hasher.update(id.as_bytes());
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    format!("{}-{}", ids.len(), &digest[..32])
+}
+
+/// The `{rev}` a client sends when its packument carried no `_rev` (one read
+/// before #5403, or a hand-rolled client).
+const NPM_REV_UNDEFINED: &str = "undefined";
+
+/// Refuse an unpublish computed from a packument that is no longer current
+/// (#5403): 409 unless `rev` is the package's [`npm_package_rev`] over the
+/// same `rows` the unpublish acts on.
+///
+/// A client without a revision (`-rev/undefined`) is let through only when
+/// `removed_versions` is `None` (the whole-package unpublish, which removes
+/// everything either way) or exactly one version, which is what
+/// `npm unpublish <pkg>@<version>` removes; a rewrite that would remove more
+/// is the over-delete a concurrent publish causes and answers 409 too.
+#[allow(clippy::result_large_err)]
+fn check_npm_unpublish_rev(
+    rows: &[NpmPackageRow],
+    rev: &str,
+    removed_versions: Option<usize>,
+) -> Result<(), Response> {
+    let current = npm_package_rev(rows);
+    let accepted =
+        rev == current || (rev == NPM_REV_UNDEFINED && removed_versions.is_none_or(|n| n == 1));
+    if accepted {
+        return Ok(());
+    }
+    Err(AppError::Conflict(format!(
+        "the package changed since its packument was read (revision {rev} is not \
+         the current {current}); fetch it again with ?write=true and retry"
+    ))
+    .into_response())
 }
 
 /// The versions a `PUT /{pkg}/-rev/{rev}` packument keeps.
@@ -6977,6 +7350,7 @@ async fn unpublish_versions_for(
     auth: Option<&AuthExtension>,
     repo_key: &str,
     package: &str,
+    rev: &str,
     body: &[u8],
 ) -> Result<Response, Response> {
     let repo = resolve_npm_unpublish_target(state, auth, repo_key).await?;
@@ -6994,6 +7368,13 @@ async fn unpublish_versions_for(
         )
         .into_response());
     }
+    // `removed` comes from the same `rows` the revision is checked over, so a
+    // version published after this read is neither checked nor removed.
+    let removed_versions: std::collections::HashSet<&str> = removed
+        .iter()
+        .filter_map(|r| r.version.as_deref())
+        .collect();
+    check_npm_unpublish_rev(&rows, rev, Some(removed_versions.len()))?;
     unpublish_npm_rows(state, auth, &repo, package, &removed).await?;
     Ok(npm_ok_response())
 }
@@ -7004,12 +7385,14 @@ async fn unpublish_package_for(
     auth: Option<&AuthExtension>,
     repo_key: &str,
     package: &str,
+    rev: &str,
 ) -> Result<Response, Response> {
     let repo = resolve_npm_unpublish_target(state, auth, repo_key).await?;
     let rows = fetch_npm_package_rows(&state.db, repo.id, package).await?;
     if rows.is_empty() {
         return Err(npm_package_not_found(package));
     }
+    check_npm_unpublish_rev(&rows, rev, None)?;
     let all: Vec<&NpmPackageRow> = rows.iter().collect();
     unpublish_npm_rows(state, auth, &repo, package, &all).await?;
     let _ = sqlx::query("DELETE FROM npm_dist_tags WHERE repository_id = $1 AND name = $2")
@@ -7081,58 +7464,58 @@ fn encoded_scoped_unpublish_name(scope: &str, rev_segment: &str) -> Result<Strin
 async fn unpublish_versions(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
-    Path((repo_key, package, _rev)): Path<(String, String, String)>,
+    Path((repo_key, package, rev)): Path<(String, String, String)>,
     body: Bytes,
 ) -> Result<Response, Response> {
     let package = unscoped_unpublish_name(&package)?;
-    unpublish_versions_for(&state, auth.as_ref(), &repo_key, &package, &body).await
+    unpublish_versions_for(&state, auth.as_ref(), &repo_key, &package, &rev, &body).await
 }
 
 async fn unpublish_scoped_versions(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
-    Path((repo_key, scope, package, _rev)): Path<(String, String, String, String)>,
+    Path((repo_key, scope, package, rev)): Path<(String, String, String, String)>,
     body: Bytes,
 ) -> Result<Response, Response> {
     let package = scoped_unpublish_name(&scope, &package)?;
-    unpublish_versions_for(&state, auth.as_ref(), &repo_key, &package, &body).await
+    unpublish_versions_for(&state, auth.as_ref(), &repo_key, &package, &rev, &body).await
 }
 
 async fn unpublish_encoded_scoped_versions(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
-    Path((repo_key, scope, rev_segment, _rev)): Path<(String, String, String, String)>,
+    Path((repo_key, scope, rev_segment, rev)): Path<(String, String, String, String)>,
     body: Bytes,
 ) -> Result<Response, Response> {
     let package = encoded_scoped_unpublish_name(&scope, &rev_segment)?;
-    unpublish_versions_for(&state, auth.as_ref(), &repo_key, &package, &body).await
+    unpublish_versions_for(&state, auth.as_ref(), &repo_key, &package, &rev, &body).await
 }
 
 async fn unpublish_package(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
-    Path((repo_key, package, _rev)): Path<(String, String, String)>,
+    Path((repo_key, package, rev)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
     let package = unscoped_unpublish_name(&package)?;
-    unpublish_package_for(&state, auth.as_ref(), &repo_key, &package).await
+    unpublish_package_for(&state, auth.as_ref(), &repo_key, &package, &rev).await
 }
 
 async fn unpublish_scoped_package(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
-    Path((repo_key, scope, package, _rev)): Path<(String, String, String, String)>,
+    Path((repo_key, scope, package, rev)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     let package = scoped_unpublish_name(&scope, &package)?;
-    unpublish_package_for(&state, auth.as_ref(), &repo_key, &package).await
+    unpublish_package_for(&state, auth.as_ref(), &repo_key, &package, &rev).await
 }
 
 async fn unpublish_encoded_scoped_package(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
-    Path((repo_key, scope, rev_segment, _rev)): Path<(String, String, String, String)>,
+    Path((repo_key, scope, rev_segment, rev)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     let package = encoded_scoped_unpublish_name(&scope, &rev_segment)?;
-    unpublish_package_for(&state, auth.as_ref(), &repo_key, &package).await
+    unpublish_package_for(&state, auth.as_ref(), &repo_key, &package, &rev).await
 }
 
 async fn unpublish_tarball(
@@ -7668,7 +8051,7 @@ mod tests {
     fn bulk_advisory_response_filters_names() {
         let p = policy_with_patterns(&[], Some(false), &["lodash*"]);
         let body = br#"{"lodash":[{"id":1}],"express":[{"id":2}]}"#;
-        let out = filter_bulk_advisory_response(body, &p);
+        let out = filter_bulk_advisory_response(body, &p).expect("object");
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v.get("lodash").is_some());
         assert!(v.get("express").is_none());
@@ -8179,8 +8562,13 @@ mod tests {
         assert!(!is_valid_npm_scope("types"));
         assert!(!is_valid_npm_scope("@"));
         assert!(!is_valid_npm_scope("@Types")); // callers lowercase first
-        assert!(!is_valid_npm_scope("@.hidden"));
-        assert!(!is_valid_npm_scope("@_private"));
+                                                // #5725: npm allows a scope to start with `.`, `_`, `-` or `~`.
+        for scope in ["@.hidden", "@_private", "@-dash", "@~tilde"] {
+            assert!(is_valid_npm_scope(scope), "{scope}");
+        }
+        assert!(!is_valid_npm_scope("@."));
+        assert!(!is_valid_npm_scope("@.."));
+        assert!(!is_valid_npm_scope("@a b"));
         assert!(!is_valid_npm_scope("@sc/ope"));
         assert!(!is_valid_npm_scope(&format!("@{}", "a".repeat(215))));
     }
@@ -9337,6 +9725,17 @@ mod tests {
         crate::api::handlers::test_db_helpers::Fixture,
         Vec<crate::models::repository::Repository>,
     )> {
+        setup_ownership_rig_owning("fail-safe-pkg").await
+    }
+
+    /// [`setup_3955_ownership_rig`] with the hosted member owning
+    /// `package@1.0.0` instead of `fail-safe-pkg@1.0.0`.
+    async fn setup_ownership_rig_owning(
+        package: &str,
+    ) -> Option<(
+        crate::api::handlers::test_db_helpers::Fixture,
+        Vec<crate::models::repository::Repository>,
+    )> {
         use crate::api::handlers::test_db_helpers as tdh;
 
         let fx = tdh::Fixture::setup("virtual", "npm").await?;
@@ -9355,17 +9754,18 @@ mod tests {
             .expect("attach member");
         }
         let local_repo = tdh::make_repo_info(local_id, &local_key, &local_dir, "local", None);
-        let artifact_path = "fail-safe-pkg/1.0.0/fail-safe-pkg-1.0.0.tgz";
+        let basename = package.rsplit('/').next().unwrap_or(package);
+        let artifact_path = format!("{package}/1.0.0/{basename}-1.0.0.tgz");
         tdh::seed_artifact(
             &fx.state,
             &fx.pool,
             &local_repo,
             &format!("npm/{artifact_path}"),
-            artifact_path,
-            "fail-safe-pkg",
+            &artifact_path,
+            package,
             "1.0.0",
             "application/gzip",
-            Bytes::from_static(b"tgz:fail-safe-pkg-1.0.0"),
+            Bytes::from(format!("tgz:{package}-1.0.0")),
             fx.user_id,
         )
         .await;
@@ -9492,6 +9892,66 @@ mod tests {
                 matches!(invalid, NpmVirtualOwnership::NotOwned),
                 "an invalid npm name must skip the ownership check ({filename}), got {invalid:?}"
             );
+        }
+    }
+
+    /// #5725: a hosted `@_scope/x` (a name npm accepts) withholds the Remote
+    /// tarball. `is_valid_npm_name` used to reject a scope starting with `_`,
+    /// `.` or `~`, so the guard skipped the ownership check (`NotOwned`) and
+    /// the Remote member stayed eligible: it could shadow the hosted bytes.
+    /// Runs the same member filter and proxy decision `serve_tarball` does.
+    #[tokio::test]
+    async fn test_tarball_ownership_npm_scoped_shapes_withhold_proxy_5725() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        for package in ["@_scope/x", "@.scope/x", "@~scope/x", "@scope/_x"] {
+            let Some((fx, members)) = setup_ownership_rig_owning(package).await else {
+                return;
+            };
+            let expansion = proxy_helpers::fetch_virtual_expansion(&fx.pool, fx.repo_id)
+                .await
+                .expect("virtual expansion");
+            let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+            let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+            let basename = package.rsplit('/').next().unwrap();
+            let mut outcomes = Vec::new();
+            for filename in [format!("{basename}-1.0.0.tgz"), format!("{basename}.tgz")] {
+                let (ownership, eligible) = npm_virtual_eligible_members(
+                    &fx.pool,
+                    fx.repo_id,
+                    &expansion.members,
+                    members.clone(),
+                    package,
+                    &filename,
+                )
+                .await
+                .expect("eligible members");
+                let remote_eligible = eligible
+                    .iter()
+                    .any(|m| m.repo_type == RepositoryType::Remote);
+                let proxied =
+                    npm_virtual_resolver_proxy(ownership, &eligible, Some(proxy.as_ref()))
+                        .is_some();
+                outcomes.push((filename, ownership, remote_eligible && proxied));
+            }
+            fx.teardown().await;
+
+            assert!(
+                matches!(outcomes[0].1, NpmVirtualOwnership::OwnedAtPriority(1)),
+                "{package}: the hosted owner must be found, got {:?}",
+                outcomes[0].1
+            );
+            assert!(
+                matches!(outcomes[1].1, NpmVirtualOwnership::OwnedNameOnly),
+                "{package}: the name-only fail-safe must engage, got {:?}",
+                outcomes[1].1
+            );
+            for (filename, _, remote_can_serve) in &outcomes {
+                assert!(
+                    !remote_can_serve,
+                    "{package} ({filename}): no Remote member may serve the hosted tarball"
+                );
+            }
         }
     }
 
@@ -11035,6 +11495,93 @@ mod tests {
         assert!(validate_package_name(&name).is_ok());
     }
 
+    /// #5725: a scope or package part that is `.` or `..` would give a
+    /// storage key the filesystem backend normalises onto another package's
+    /// key, and npm refuses `node_modules` / `favicon.ico` outright.
+    #[test]
+    fn test_validate_npm_package_name_rejects_dot_segments_and_blocked_5725() {
+        for name in [
+            "@./x",
+            "@../x",
+            "@scope/.",
+            "@scope/..",
+            "@./.",
+            "node_modules",
+            "favicon.ico",
+            "Node_Modules",
+            "FAVICON.ICO",
+        ] {
+            assert!(validate_package_name(name).is_err(), "{name}");
+        }
+        for name in [
+            "@_s/x",
+            "@.s/x",
+            "@~s/x",
+            "@s/_x",
+            "@s/x.",
+            "@scope/node_modules",
+            "http",
+            "buffer",
+        ] {
+            assert!(validate_package_name(name).is_ok(), "{name}");
+        }
+    }
+
+    /// #5725: the dot-segment and blocked-name rejections hold on the real
+    /// routes, including the percent-encoded spellings the router decodes
+    /// into the path parameters. Validation runs before any database access,
+    /// so a lazily connecting pool is enough.
+    #[tokio::test]
+    async fn test_routes_reject_dot_segment_and_blocked_names_5725() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let dir = std::env::temp_dir().join(format!("ak-npm-5725-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let state = tdh::build_state(tdh::lazy_pool(), dir.to_str().unwrap());
+        let gets = [
+            "/npm/repo/@scope/%2e",
+            "/npm/repo/@scope/%2E",
+            "/npm/repo/@scope/%2e%2e",
+            "/npm/repo/@%2e/x",
+            "/npm/repo/@%2e%2e/x",
+            "/npm/repo/@scope%2f%2e",
+            "/npm/repo/@scope/%2e/1.0.0",
+            "/npm/repo/@scope/%2e/-/x-1.0.0.tgz",
+            "/npm/repo/@%2e/x/-/x-1.0.0.tgz",
+            "/npm/repo/node_modules",
+            "/npm/repo/favicon.ico",
+            "/npm/repo/NODE_MODULES/1.0.0",
+            "/npm/repo/node_modules/-/node_modules-1.0.0.tgz",
+        ];
+        let mut results = Vec::new();
+        for uri in gets {
+            let (status, _) = tdh::send(
+                tdh::router_anon(npm_mounted_router(), state.clone()),
+                tdh::get(uri.to_string()),
+            )
+            .await;
+            results.push((uri, status));
+        }
+        for uri in [
+            "/npm/repo/@scope/%2e",
+            "/npm/repo/@%2e/x",
+            "/npm/repo/node_modules",
+        ] {
+            let (status, _) = tdh::send(
+                tdh::router_anon(npm_mounted_router(), state.clone()),
+                tdh::put_json(uri.to_string(), Bytes::from_static(b"{}")),
+            )
+            .await;
+            results.push((uri, status));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let wrong: Vec<_> = results
+            .iter()
+            .filter(|(_, status)| *status != StatusCode::BAD_REQUEST)
+            .collect();
+        assert!(wrong.is_empty(), "every request must be a 400: {wrong:?}");
+    }
+
     #[tokio::test]
     async fn test_publish_unscoped_non_ascii_names_rejected() {
         for raw_name in ["nｕmpy", "n%EF%BD%95mpy"] {
@@ -12465,6 +13012,41 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn test_advertised_tarball_filename_npm_scoped_shapes_5725() {
+        let up = Some("https://npm.pkg.github.com");
+        for (name, expected) in [
+            ("@_scope/x", "x-1.2.3.tgz"),
+            ("@.scope/x", "x-1.2.3.tgz"),
+            ("@~scope/x", "x-1.2.3.tgz"),
+            ("@scope/_x", "_x-1.2.3.tgz"),
+        ] {
+            assert_eq!(
+                npm_advertised_tarball_filename(
+                    "https://npm.pkg.github.com/download/@scope/x/1.2.3/abc",
+                    name,
+                    "1.2.3",
+                    up
+                )
+                .as_deref(),
+                Some(expected),
+                "{name}"
+            );
+        }
+        for name in ["@./x", "@scope/.", "node_modules"] {
+            assert_eq!(
+                npm_advertised_tarball_filename(
+                    "https://npm.pkg.github.com/download/x/1.2.3/abc",
+                    name,
+                    "1.2.3",
+                    up
+                ),
+                None,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -13998,51 +14580,152 @@ mod tests {
         }
     }
 
-    /// Integration: a Hosted (Local) npm repo must serve `npm audit` with an
-    /// empty advisories object instead of returning 404. Without this, npm
-    /// audit fails the entire CI build. Tests the full router path so the
-    /// route table actually includes the new endpoint.
+    /// The two audit endpoints and a request body each accepts.
+    const AUDIT_ENDPOINTS_5631: [(&str, &str); 2] = [
+        (
+            "-/npm/v1/security/advisories/bulk",
+            r#"{"express":["4.17.0"]}"#,
+        ),
+        (
+            "-/npm/v1/security/audits/quick",
+            r#"{"name":"app","version":"1.0.0","requires":{"express":"^4.17.0"},"dependencies":{"express":{"version":"4.17.0"}}}"#,
+        ),
+    ];
+
+    /// POST one audit request through the router.
+    async fn post_audit_5631(
+        state: &crate::api::SharedState,
+        repo_key: &str,
+        endpoint: &str,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let app = tdh::router_anon(super::router(), state.clone());
+        let req = tdh::post(
+            format!("/{repo_key}/{endpoint}"),
+            "application/json",
+            Bytes::from(body.to_string()),
+        );
+        let (status, bytes) = tdh::send(app, req).await;
+        let parsed = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            panic!(
+                "audit answer must be JSON, got {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        });
+        (status, parsed)
+    }
+
+    /// The audit answer of a request nothing could perform (#5631): an error
+    /// status with an `error` message, never an advisory set.
+    fn assert_audit_refused_5631(
+        status: StatusCode,
+        body: &serde_json::Value,
+        expected: StatusCode,
+        context: &str,
+    ) {
+        assert_eq!(status, expected, "{context}: {body}");
+        assert_ne!(
+            body,
+            &serde_json::json!({}),
+            "{context}: never the empty map"
+        );
+        assert!(
+            body.get("advisories").is_none(),
+            "{context}: never an advisory report: {body}"
+        );
+        let message = body["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("npm audit"),
+            "{context}: the error says audits are unavailable: {body}"
+        );
+    }
+
+    /// Attach a new `repo_type` npm repository to virtual `virtual_id` at
+    /// `priority`, public, with `upstream` as its upstream URL.
+    async fn attach_audit_member_5631(
+        pool: &sqlx::PgPool,
+        virtual_id: uuid::Uuid,
+        repo_type: &str,
+        upstream: Option<&str>,
+        priority: i32,
+    ) -> uuid::Uuid {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let (member_id, _key, dir) = tdh::create_repo(pool, repo_type, "npm").await;
+        let _ = std::fs::remove_dir_all(dir);
+        sqlx::query("UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2")
+            .bind(upstream)
+            .bind(member_id)
+            .execute(pool)
+            .await
+            .expect("configure member");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(virtual_id)
+        .bind(member_id)
+        .bind(priority)
+        .execute(pool)
+        .await
+        .expect("attach member");
+        member_id
+    }
+
+    async fn drop_audit_members_5631(pool: &sqlx::PgPool, members: &[uuid::Uuid]) {
+        for member_id in members {
+            for sql in [
+                "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
+                "DELETE FROM repository_config WHERE repository_id = $1",
+                "DELETE FROM repositories WHERE id = $1",
+            ] {
+                let _ = sqlx::query(sql).bind(member_id).execute(pool).await;
+            }
+        }
+    }
+
+    /// State with a proxy service, as production runs: the audit forward goes
+    /// through it so a Remote's credentials and egress settings apply.
+    fn audit_state_5631(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+    ) -> crate::api::SharedState {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        tdh::build_state_with_proxy(fx.pool.clone(), &storage, proxy)
+    }
+
+    /// #5631: a hosted npm repository holds no advisory data, so both audit
+    /// endpoints answer `501` saying audits are not available through it.
+    /// Before, they answered `{}` / a zero-vulnerability report with `200`,
+    /// which npm prints as "found 0 vulnerabilities".
     #[tokio::test]
-    async fn test_local_repo_advisories_bulk_returns_empty_object() {
+    async fn test_hosted_repo_audit_answers_501_not_an_empty_report_5631() {
         use crate::api::handlers::test_db_helpers as tdh;
 
         let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
             return;
         };
-
-        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
-        let app = tdh::router_anon(super::router(), state);
-
-        let uri = format!("/{}/-/npm/v1/security/advisories/bulk", fx.repo_key);
-        let body = serde_json::json!({
-            "express": ["4.17.0"],
-        })
-        .to_string();
-        let req = tdh::post(uri, "application/json", Bytes::from(body));
-        let (status, bytes) = tdh::send(app, req).await;
-
-        let cleanup_pool = fx.pool.clone();
-        let cleanup_repo = fx.repo_id;
-        let cleanup_user = fx.user_id;
-        let cleanup_dir = fx.storage_dir.clone();
-        let cleanup = || async move {
-            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
-            let _ = std::fs::remove_dir_all(&cleanup_dir);
-        };
-
-        if status != StatusCode::OK {
-            cleanup().await;
-            panic!("Local npm repo must answer audit with 200, got {status}");
+        let state = audit_state_5631(&fx);
+        let mut answers = Vec::new();
+        for (endpoint, body) in AUDIT_ENDPOINTS_5631 {
+            answers.push((
+                endpoint,
+                post_audit_5631(&state, &fx.repo_key, endpoint, body).await,
+            ));
         }
+        fx.teardown().await;
 
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("response must be JSON");
-        assert!(
-            parsed.is_object() && parsed.as_object().unwrap().is_empty(),
-            "Local repo audit must return empty object, got {parsed:?}"
-        );
-
-        cleanup().await;
+        for (endpoint, (status, body)) in answers {
+            assert_audit_refused_5631(status, &body, StatusCode::NOT_IMPLEMENTED, endpoint);
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("hosted repository"),
+                "{endpoint}: {body}"
+            );
+        }
     }
 
     /// Integration: a Remote npm repo must forward the audit POST body
@@ -14074,8 +14757,8 @@ mod tests {
         });
         let client_request = serde_json::json!({"express": ["4.17.0"]});
 
-        // The audit passthrough goes through `send_upstream` (#4455): without
-        // `traceparent` the mock does not match and the test fails.
+        // The audit passthrough goes through the upstream send path (#4455):
+        // without `traceparent` the mock does not match and the test fails.
         let _otel = crate::testing::otel::trace_upstream_sends();
         Mock::given(method("POST"))
             .and(path("/-/npm/v1/security/advisories/bulk"))
@@ -14096,56 +14779,34 @@ mod tests {
             .await
             .expect("update upstream_url");
 
-        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
-        let app = tdh::router_anon(super::router(), state);
+        let state = audit_state_5631(&fx);
+        let (status, parsed) = post_audit_5631(
+            &state,
+            &fx.repo_key,
+            "-/npm/v1/security/advisories/bulk",
+            &client_request.to_string(),
+        )
+        .await;
+        fx.teardown().await;
 
-        let uri = format!("/{}/-/npm/v1/security/advisories/bulk", fx.repo_key);
-        let req = tdh::post(
-            uri,
-            "application/json",
-            Bytes::from(client_request.to_string()),
-        );
-        let (status, bytes) = tdh::send(app, req).await;
-
-        let cleanup_pool = fx.pool.clone();
-        let cleanup_repo = fx.repo_id;
-        let cleanup_user = fx.user_id;
-        let cleanup_dir = fx.storage_dir.clone();
-        let cleanup = || async move {
-            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
-            let _ = std::fs::remove_dir_all(&cleanup_dir);
-        };
-
-        if status != StatusCode::OK {
-            cleanup().await;
-            panic!("Remote npm repo must proxy audit to upstream with 200, got {status}");
-        }
-
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("response must be JSON");
+        assert_eq!(status, StatusCode::OK, "{parsed}");
         assert_eq!(
             parsed, upstream_response,
             "Remote audit response must be the upstream payload verbatim"
         );
-
-        cleanup().await;
     }
 
-    /// Integration: a Remote npm repo whose upstream is unreachable must
-    /// degrade gracefully and return an empty advisories object so the
-    /// developer's `npm audit` command still exits cleanly. This is the
-    /// fallback contract callers depend on when the upstream is offline.
+    /// #5631: a Remote whose upstream is unreachable answers `503`, not the
+    /// empty advisory set it answered before (#1400's graceful degradation
+    /// reported an audit that never ran as "found 0 vulnerabilities").
     #[tokio::test]
-    async fn test_remote_repo_advisories_bulk_falls_back_when_upstream_down() {
+    async fn test_remote_repo_audit_answers_503_when_upstream_down_5631() {
         use crate::api::handlers::test_db_helpers as tdh;
 
         let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
             return;
         };
-
-        // Point at a localhost port that nothing is listening on. This is
-        // SSRF-safe through default_client because the request itself never
-        // completes; we just need a guaranteed connection failure.
+        // Nothing listens on port 1: a guaranteed connection failure.
         sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
             .bind("http://127.0.0.1:1")
             .bind(fx.repo_id)
@@ -14153,42 +14814,371 @@ mod tests {
             .await
             .expect("update upstream_url");
 
-        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
-        let app = tdh::router_anon(super::router(), state);
+        let state = audit_state_5631(&fx);
+        let mut answers = Vec::new();
+        for (endpoint, body) in AUDIT_ENDPOINTS_5631 {
+            answers.push((
+                endpoint,
+                post_audit_5631(&state, &fx.repo_key, endpoint, body).await,
+            ));
+        }
+        fx.teardown().await;
 
-        let uri = format!("/{}/-/npm/v1/security/advisories/bulk", fx.repo_key);
-        let req = tdh::post(
-            uri,
-            "application/json",
-            Bytes::from(r#"{"express":["4.17.0"]}"#.as_bytes().to_vec()),
-        );
-        let (status, bytes) = tdh::send(app, req).await;
+        for (endpoint, (status, body)) in answers {
+            assert_audit_refused_5631(status, &body, StatusCode::SERVICE_UNAVAILABLE, endpoint);
+        }
+    }
 
-        let cleanup_pool = fx.pool.clone();
-        let cleanup_repo = fx.repo_id;
-        let cleanup_user = fx.user_id;
-        let cleanup_dir = fx.storage_dir.clone();
-        let cleanup = || async move {
-            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
-            let _ = std::fs::remove_dir_all(&cleanup_dir);
+    /// #5631: `npm audit` through a Virtual is answered by its Remote member,
+    /// with that member's upstream credentials. A Local member holds no
+    /// advisories and a Remote member whose upstream lacks the audit API
+    /// (`404`) are skipped; the first member that answers wins and its body is
+    /// served verbatim. Before, every Virtual answered `{}`.
+    #[tokio::test]
+    async fn test_virtual_audit_forwards_to_npmjs_remote_member_5631() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
         };
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("public virtual");
 
-        if status != StatusCode::OK {
-            cleanup().await;
-            panic!(
-                "Remote npm repo must degrade to empty advisories on upstream \
-                 failure, got {status}"
-            );
+        // A registry without the audit API (a plain mirror).
+        let mirror = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(2)
+            .mount(&mirror)
+            .await;
+
+        let npmjs = MockServer::start().await;
+        let bulk_answer = serde_json::json!({
+            "express": [{"id": 1096820, "severity": "high", "vulnerable_versions": "<4.19.2"}]
+        });
+        let quick_answer = serde_json::json!({
+            "actions": [],
+            "advisories": {"1096820": {"module_name": "express", "severity": "high"}},
+            "muted": [],
+            "metadata": {"vulnerabilities": {"info": 0, "low": 0, "moderate": 0, "high": 1, "critical": 0}}
+        });
+        for ((endpoint, body), answer) in AUDIT_ENDPOINTS_5631
+            .iter()
+            .zip([bulk_answer.clone(), quick_answer.clone()])
+        {
+            let request: serde_json::Value = serde_json::from_str(body).unwrap();
+            let mock = Mock::given(method("POST"))
+                .and(path(format!("/{endpoint}")))
+                .and(body_json(request));
+            let mock = if std::env::var("JWT_SECRET").is_ok()
+                || std::env::var("SSO_ENCRYPTION_KEY").is_ok()
+            {
+                mock.and(header("authorization", "Bearer npm-audit-token-5631"))
+            } else {
+                mock
+            };
+            mock.respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(answer),
+            )
+            .expect(1)
+            .mount(&npmjs)
+            .await;
         }
 
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("response must be JSON");
-        assert!(
-            parsed.is_object() && parsed.as_object().unwrap().is_empty(),
-            "fallback response must be an empty object, got {parsed:?}"
-        );
+        let members = vec![
+            attach_audit_member_5631(&fx.pool, fx.repo_id, "local", None, 1).await,
+            attach_audit_member_5631(&fx.pool, fx.repo_id, "remote", Some(&mirror.uri()), 2).await,
+            attach_audit_member_5631(&fx.pool, fx.repo_id, "remote", Some(&npmjs.uri()), 3).await,
+        ];
+        // `save_upstream_auth` needs an encryption key; with one configured the
+        // npmjs mock only answers a request carrying the member's token.
+        if std::env::var("JWT_SECRET").is_ok() || std::env::var("SSO_ENCRYPTION_KEY").is_ok() {
+            let creds = crate::services::upstream_auth::build_credentials_json(
+                &crate::services::upstream_auth::UpstreamAuthType::Bearer {
+                    token: "npm-audit-token-5631".to_string(),
+                },
+            );
+            crate::services::upstream_auth::save_upstream_auth(
+                &fx.pool, members[2], "bearer", &creds,
+            )
+            .await
+            .expect("save upstream auth");
+        }
 
-        cleanup().await;
+        let state = audit_state_5631(&fx);
+        let mut answers = Vec::new();
+        for (endpoint, body) in AUDIT_ENDPOINTS_5631 {
+            answers.push(post_audit_5631(&state, &fx.repo_key, endpoint, body).await);
+        }
+        drop_audit_members_5631(&fx.pool, &members).await;
+        fx.teardown().await;
+
+        assert_eq!(answers[0], (StatusCode::OK, bulk_answer), "bulk audit");
+        assert_eq!(answers[1], (StatusCode::OK, quick_answer), "quick audit");
+        // wiremock verifies on drop: the mirror was asked (and skipped) once
+        // per endpoint, the npmjs member answered each endpoint once.
+    }
+
+    /// #5631: a Virtual with no member that can perform an audit answers `501`
+    /// saying audits are not available through it, never `{}`. Covers a
+    /// Virtual with no members and one whose only members are a Local and a
+    /// Remote whose upstream filter refuses the audit path.
+    #[tokio::test]
+    async fn test_virtual_audit_without_capable_member_answers_501_5631() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::upstream_filter::{save_upstream_filter, UpstreamFilter};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("public virtual");
+        let state = audit_state_5631(&fx);
+
+        let mut empty_virtual = Vec::new();
+        for (endpoint, body) in AUDIT_ENDPOINTS_5631 {
+            empty_virtual.push((
+                endpoint,
+                post_audit_5631(&state, &fx.repo_key, endpoint, body).await,
+            ));
+        }
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"leaked":[]}"#))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        let members = vec![
+            attach_audit_member_5631(&fx.pool, fx.repo_id, "local", None, 1).await,
+            attach_audit_member_5631(&fx.pool, fx.repo_id, "remote", Some(&upstream.uri()), 2)
+                .await,
+        ];
+        save_upstream_filter(
+            &fx.pool,
+            members[1],
+            &UpstreamFilter {
+                include_patterns: vec![],
+                exclude_patterns: vec!["^-/npm/v1/security/".to_string()],
+            },
+        )
+        .await
+        .expect("save filter");
+        crate::services::upstream_filter::invalidate_cached_filter(members[1]).await;
+
+        let mut no_capable = Vec::new();
+        for (endpoint, body) in AUDIT_ENDPOINTS_5631 {
+            no_capable.push((
+                endpoint,
+                post_audit_5631(&state, &fx.repo_key, endpoint, body).await,
+            ));
+        }
+        drop_audit_members_5631(&fx.pool, &members).await;
+        fx.teardown().await;
+
+        for (endpoint, (status, body)) in empty_virtual {
+            assert_audit_refused_5631(status, &body, StatusCode::NOT_IMPLEMENTED, endpoint);
+            assert!(
+                body["error"].as_str().unwrap().contains("no Remote member"),
+                "{endpoint}: {body}"
+            );
+        }
+        for (endpoint, (status, body)) in no_capable {
+            assert_audit_refused_5631(status, &body, StatusCode::NOT_IMPLEMENTED, endpoint);
+            assert!(
+                body["error"].as_str().unwrap().contains("upstream filter"),
+                "{endpoint}: {body}"
+            );
+        }
+    }
+
+    /// #5631: when the Virtual's only capable member is unreachable the audit
+    /// answers `503` (a retry may succeed), not `{}`.
+    #[tokio::test]
+    async fn test_virtual_audit_member_unreachable_answers_503_5631() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("public virtual");
+        let members = vec![
+            attach_audit_member_5631(
+                &fx.pool,
+                fx.repo_id,
+                "remote",
+                Some("http://127.0.0.1:1"),
+                1,
+            )
+            .await,
+        ];
+        let state = audit_state_5631(&fx);
+        let mut answers = Vec::new();
+        for (endpoint, body) in AUDIT_ENDPOINTS_5631 {
+            answers.push((
+                endpoint,
+                post_audit_5631(&state, &fx.repo_key, endpoint, body).await,
+            ));
+        }
+        drop_audit_members_5631(&fx.pool, &members).await;
+        fx.teardown().await;
+
+        for (endpoint, (status, body)) in answers {
+            assert_audit_refused_5631(status, &body, StatusCode::SERVICE_UNAVAILABLE, endpoint);
+        }
+    }
+
+    /// #2424 through the #5631 path: a Remote member's scope policy filters
+    /// the forwarded audit. Out-of-scope names never reach the upstream, the
+    /// answer is filtered as defence in depth, a request with no in-scope
+    /// package is the empty answer without upstream contact, and a body that
+    /// is not a JSON object is a `400`, not `{}`.
+    #[tokio::test]
+    async fn test_virtual_audit_applies_member_scope_policy_5631() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("public virtual");
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/-/npm/v1/security/advisories/bulk"))
+            .and(body_json(serde_json::json!({"@types/node": ["18.0.0"]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "@types/node": [{"id": 1}],
+                "express": [{"id": 2}]
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/-/npm/v1/security/audits/quick"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let members = vec![
+            attach_audit_member_5631(&fx.pool, fx.repo_id, "remote", Some(&upstream.uri()), 1)
+                .await,
+        ];
+        for (key, value) in [
+            (NPM_ALLOWED_SCOPES_KEY, "[\"@types\"]"),
+            (NPM_ALLOW_UNSCOPED_KEY, "false"),
+        ] {
+            sqlx::query(
+                "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3)",
+            )
+            .bind(members[0])
+            .bind(key)
+            .bind(value)
+            .execute(&fx.pool)
+            .await
+            .expect("store member policy");
+        }
+        let state = audit_state_5631(&fx);
+        let bulk = "-/npm/v1/security/advisories/bulk";
+        let quick = "-/npm/v1/security/audits/quick";
+        let mixed = post_audit_5631(
+            &state,
+            &fx.repo_key,
+            bulk,
+            r#"{"@types/node":["18.0.0"],"express":["4.17.0"]}"#,
+        )
+        .await;
+        let none_in_scope =
+            post_audit_5631(&state, &fx.repo_key, bulk, r#"{"express":["4.17.0"]}"#).await;
+        let not_an_object = post_audit_5631(&state, &fx.repo_key, bulk, "[]").await;
+        let quick_non_object = post_audit_5631(
+            &state,
+            &fx.repo_key,
+            quick,
+            r#"{"requires":{"@types/node":"^18"},"dependencies":{"@types/node":{"version":"18.0.0"}}}"#,
+        )
+        .await;
+        drop_audit_members_5631(&fx.pool, &members).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            mixed,
+            (
+                StatusCode::OK,
+                serde_json::json!({"@types/node": [{"id": 1}]})
+            ),
+            "only the in-scope name is asked about and answered"
+        );
+        assert_eq!(
+            none_in_scope,
+            (StatusCode::OK, serde_json::json!({})),
+            "nothing in scope: the repository serves none of the packages"
+        );
+        assert_eq!(
+            not_an_object.0,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            not_an_object.1
+        );
+        assert_audit_refused_5631(
+            quick_non_object.0,
+            &quick_non_object.1,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an upstream answer that is not an object fails the audit",
+        );
+    }
+
+    /// #5631: the request-side helpers never yield an empty advisory set on
+    /// their own; an upstream answer that is not a JSON object fails the audit.
+    #[test]
+    fn test_audit_response_filters_reject_non_object_answers_5631() {
+        let p = policy_with_patterns(&[], Some(false), &["lodash*"]);
+        for api in [super::NpmAuditApi::Bulk, super::NpmAuditApi::Quick] {
+            assert!(api.filter_response(b"not json", &p).is_none(), "{api:?}");
+            assert!(api.filter_response(b"[]", &p).is_none(), "{api:?}");
+        }
+        let failed = super::npm_audit_unavailable("r", &["boom".to_string()], &[]);
+        assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let unavailable = super::npm_audit_unavailable("r", &[], &["nope".to_string()]);
+        assert_eq!(unavailable.status(), StatusCode::NOT_IMPLEMENTED);
+        let err = AppError::BadGateway(
+            "Upstream returned error status 405 Method Not Allowed: https://u".to_string(),
+        );
+        assert!(matches!(
+            super::classify_audit_upstream_error("r", &err),
+            super::RemoteAuditOutcome::NotAvailable(_)
+        ));
+        let err = AppError::ServiceUnavailable(
+            "Upstream returned error status 502 Bad Gateway: https://u".to_string(),
+        );
+        assert!(matches!(
+            super::classify_audit_upstream_error("r", &err),
+            super::RemoteAuditOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            super::classify_audit_upstream_error("r", &AppError::Authorization("x".into())),
+            super::RemoteAuditOutcome::NotAvailable(_)
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -14249,6 +15239,62 @@ mod tests {
     #[test]
     fn test_derive_latest_empty_is_none() {
         assert_eq!(derive_latest_version(&[]), None);
+    }
+
+    /// `derive_latest_version` against npm's `semver` (reference fixture):
+    /// the highest stable version, or the highest version overall when every
+    /// one is a pre-release.
+    #[test]
+    fn derive_latest_version_follows_semver_precedence() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../test_fixtures/reference/npm.json"))
+                .unwrap();
+        let versions: Vec<(String, u64, bool)> = fixture["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["valid"].as_bool().unwrap())
+            .map(|r| {
+                (
+                    r["version"].as_str().unwrap().to_string(),
+                    r["rank"].as_u64().unwrap(),
+                    r["prerelease"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        let mut wrong = 0;
+        let mut total = 0;
+        let mut examples: Vec<String> = Vec::new();
+        // Deterministic windows of 4 over a stride, in both directions.
+        for start in 0..versions.len().saturating_sub(4) {
+            for stride in [1usize, 7, 13] {
+                let mut set: Vec<&(String, u64, bool)> = (0..4)
+                    .map(|k| &versions[(start + k * stride) % versions.len()])
+                    .collect();
+                for _ in 0..2 {
+                    set.reverse();
+                    total += 1;
+                    let input: Vec<String> = set.iter().map(|v| v.0.clone()).collect();
+                    let stable_best = set.iter().filter(|v| !v.2).map(|v| v.1).max();
+                    let best_rank =
+                        stable_best.unwrap_or_else(|| set.iter().map(|v| v.1).max().unwrap());
+                    let got = derive_latest_version(&input).unwrap();
+                    let got_rank = set.iter().find(|v| v.0 == got).unwrap().1;
+                    if got_rank != best_rank {
+                        wrong += 1;
+                        if examples.len() < 10 {
+                            examples.push(format!("latest of {input:?} = {got:?}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            wrong,
+            0,
+            "{wrong} of {total} sets disagree with semver:\n{}",
+            examples.join("\n")
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -15507,10 +16553,10 @@ mod tests {
             (status, String::from_utf8_lossy(&body).into_owned())
         };
         let (status, body) = quota_body(second.expect_err("over the project cap")).await;
-        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(body.contains("Project storage quota exceeded"), "{body}");
         let (status, body) = quota_body(sibling.expect_err("sibling shares the cap")).await;
-        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(body.contains("Project storage quota exceeded"), "{body}");
         assert_eq!(member_versions, vec!["1.0.0".to_string()]);
         assert_eq!(sibling_rows, 0, "a rejected publish must not land");
@@ -15969,8 +17015,8 @@ mod tests {
     }
 
     /// #840: a Remote's upstream filter covers the `/-/` meta passthrough and
-    /// npm audit. A refused search is a 404 and an excluded audit answers the
-    /// empty advisories body, both without contacting the upstream; a path the
+    /// npm audit. A refused search is a 404 and an excluded audit answers 501
+    /// (#5631), both without contacting the upstream; a path the
     /// filter admits is still proxied. Before, neither passthrough consulted
     /// the filter.
     #[tokio::test]
@@ -16055,11 +17101,15 @@ mod tests {
             StatusCode::NOT_FOUND,
             "a refused search is a 404"
         );
-        assert_eq!(audit_status, StatusCode::OK);
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&audit_body).unwrap(),
-            serde_json::json!({}),
-            "an excluded audit answers the empty advisories body, not the upstream's"
+        // #5631: an excluded audit says audits are unavailable here rather
+        // than answering the empty advisories body.
+        assert_eq!(audit_status, StatusCode::NOT_IMPLEMENTED);
+        let audit_body: serde_json::Value = serde_json::from_slice(&audit_body).unwrap();
+        assert!(
+            audit_body["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("upstream filter")),
+            "an excluded audit names the refusal, not the upstream's answer: {audit_body}"
         );
         assert_eq!(after_refused, 0, "refused paths never reach the upstream");
         assert_eq!(
@@ -19075,6 +20125,362 @@ mod proxy_scan_block_tests {
         }
     }
 
+    /// #5273: a tarball whose scan is still running when the request stops
+    /// waiting is refused with a status npm retries. The tarball routes answer
+    /// `503` with `Retry-After` and the `scan_pending` body, where they
+    /// answered a `423` that fails `npm install`; `serve_tarball` underneath
+    /// still answers the `423` its Virtual walk ends on. The scan outlasts both
+    /// requests in real time: no paused clock next to a database pool.
+    #[tokio::test]
+    async fn test_tarball_route_answers_a_pending_scan_503_with_retry_after_5273() {
+        use crate::api::handlers::proxy_scan_inflight::REQUEST_ANSWER_BY;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball = honest_tgz("slowscan-widget", "1.0.0");
+        let digest = sha256_hex(&tarball);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "slowscan-widget",
+            "slowscan-widget-1.0.0.tgz",
+            &tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_scan_state_with_leaf_scanners(
+            &fx,
+            &storage_path,
+            vec![std::sync::Arc::new(VersionedCveScanner::new(
+                Some("grype-0.84.0-test"),
+                MockCveRescan::Hang(std::time::Duration::from_secs(120)),
+            ))],
+        );
+        let auth = tdh::admin_auth_ext();
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        let answer_in = std::time::Duration::from_secs(1);
+
+        // What the client is sent.
+        let routed = REQUEST_ANSWER_BY
+            .scope(
+                tokio::time::Instant::now() + answer_in,
+                super::serve_tarball_to_client(
+                    &state,
+                    auth.as_ref(),
+                    &fx.repo_key,
+                    "slowscan-widget",
+                    "slowscan-widget-1.0.0.tgz",
+                    &ctx,
+                ),
+            )
+            .await;
+        // What the handler underneath answers, on a retry that joins the scan.
+        let inner = REQUEST_ANSWER_BY
+            .scope(
+                tokio::time::Instant::now() + answer_in,
+                super::serve_tarball(
+                    &state,
+                    auth.as_ref(),
+                    &fx.repo_key,
+                    "slowscan-widget",
+                    "slowscan-widget-1.0.0.tgz",
+                    &ctx,
+                ),
+            )
+            .await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        let routed = match routed {
+            Ok(r) => panic!(
+                "a tarball with no verdict must not be served under fail_closed, got {}",
+                r.status()
+            ),
+            Err(resp) => resp,
+        };
+        assert_eq!(
+            routed.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "npm retries a 503 and gives up on a 423"
+        );
+        let retry_after = proxy_helpers::SCAN_PENDING_RETRY_AFTER_SECS.to_string();
+        assert_eq!(
+            routed.headers()[axum::http::header::RETRY_AFTER],
+            retry_after.as_str()
+        );
+        let body = axum::body::to_bytes(routed.into_body(), 16 * 1024)
+            .await
+            .expect("scan_pending body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("scan_pending JSON");
+        assert_eq!(json["error"], "scan_pending");
+        assert_eq!(json["file"], "slowscan-widget-1.0.0.tgz");
+
+        let inner = match inner {
+            Ok(r) => panic!("the retry must wait on the scan too, got {}", r.status()),
+            Err(resp) => resp,
+        };
+        assert_eq!(inner.status(), StatusCode::LOCKED);
+        assert!(inner.headers().get("Retry-After").is_none());
+    }
+
+    /// Native-client tests are optional locally, but must not skip in CI.
+    fn npm_available() -> bool {
+        let available = std::process::Command::new("npm")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        let required = std::env::var("AK_TESTS_REQUIRE_NPM").is_ok_and(|v| !v.is_empty());
+        assert!(
+            available || !required,
+            "AK_TESTS_REQUIRE_NPM is set but npm is unavailable"
+        );
+        available
+    }
+
+    /// Exercise the real npm client against the download handler, including a
+    /// Virtual member that must not fall through while its scan is pending.
+    /// The first request has no remaining wait budget; later requests can wait
+    /// for the same background scan. No paused clock runs beside the DB pool.
+    async fn npm_install_retries_pending_scan(blocked: bool) {
+        use crate::api::handlers::proxy_scan_inflight::REQUEST_ANSWER_BY;
+        use std::sync::{atomic::Ordering, Arc, Mutex};
+        use std::time::Duration;
+
+        if !npm_available() {
+            eprintln!("skipping: npm not available");
+            return;
+        }
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = if blocked {
+            "retry-blocked"
+        } else {
+            "retry-clean"
+        };
+        let filename = format!("{package}-1.0.0.tgz");
+        let tarball = honest_tgz(package, "1.0.0");
+        let digest = sha256_hex(&tarball);
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(&upstream, package, &filename, &tarball, None).await;
+        let fallback = wiremock::MockServer::start().await;
+        mount_tarball_upstream(&fallback, package, &filename, &tarball, Some(0)).await;
+        let (first, _, first_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "npm", &upstream.uri(), 1).await;
+        let (second, _, second_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "npm", &fallback.uri(), 2).await;
+        enable_proxy_scan(&fx.pool, first, "fail_closed").await;
+
+        let outcome = if blocked {
+            &MockCveRescan::CatalogedVulnerable("retry-blocked", "1.0.0")
+        } else {
+            &MockCveRescan::Cataloged("retry-clean", "1.0.0")
+        };
+        let (scanner, scans) = VersionedCveScanner::counting(
+            Some("grype-0.84.0-test"),
+            MockCveRescan::HangThen(Duration::from_secs(1), outcome),
+        );
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state =
+            tdh::build_scan_state_with_leaf_scanners(&fx, &storage_path, vec![Arc::new(scanner)]);
+        // Keep the scan queued until the first refusal is captured, even on
+        // a slow CI runner. The retry then waits for its actual verdict.
+        let permits = crate::services::scanner_service::test_helpers::hold_all_scan_permits().await;
+        let permits = Arc::new(Mutex::new(Some(permits)));
+        let responses = Arc::new(Mutex::new(Vec::new()));
+        let observed = responses.clone();
+        let repo_key = fx.repo_key.clone();
+        let route = format!("/npm/{repo_key}/{package}/-/{filename}");
+        let app = axum::Router::new().route(
+            &route,
+            axum::routing::get(move || {
+                let state = state.clone();
+                let repo_key = repo_key.clone();
+                let filename = filename.clone();
+                let observed = observed.clone();
+                let permits = permits.clone();
+                async move {
+                    let first_request = observed.lock().unwrap().is_empty();
+                    let budget = if first_request {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_secs(15)
+                    };
+                    let result = REQUEST_ANSWER_BY
+                        .scope(
+                            tokio::time::Instant::now() + budget,
+                            super::download_tarball(
+                                State(state),
+                                Extension(tdh::admin_auth_ext()),
+                                Path((repo_key, package.to_string(), filename)),
+                                Default::default(),
+                            ),
+                        )
+                        .await;
+                    let resp = match result {
+                        Ok(resp) | Err(resp) => resp,
+                    };
+                    let (parts, body) = resp.into_parts();
+                    let body = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                    observed.lock().unwrap().push((
+                        parts.status,
+                        parts.headers.get(axum::http::header::RETRY_AFTER).cloned(),
+                        body.clone(),
+                    ));
+                    if first_request {
+                        drop(permits.lock().unwrap().take());
+                    }
+                    Response::from_parts(parts, axum::body::Body::from(body))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let install_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            install_dir.path().join("package.json"),
+            r#"{"name":"retry-probe","version":"1.0.0","private":true}"#,
+        )
+        .unwrap();
+        let output = tokio::time::timeout(
+            Duration::from_secs(45),
+            tokio::process::Command::new("npm")
+                .args([
+                    "install",
+                    "--ignore-scripts",
+                    "--no-audit",
+                    "--no-fund",
+                    "--fetch-retries=2",
+                    "--fetch-retry-mintimeout=10",
+                    "--fetch-retry-maxtimeout=20",
+                    "--fetch-timeout=20000",
+                    "--cache",
+                ])
+                .arg(install_dir.path().join("cache"))
+                .arg(format!("http://{address}{route}"))
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .current_dir(install_dir.path())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        fallback.verify().await;
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        cleanup_npm_member(&fx.pool, first, &first_dir).await;
+        cleanup_npm_member(&fx.pool, second, &second_dir).await;
+        fx.teardown().await;
+
+        let output = output
+            .expect("npm install timed out")
+            .expect("npm is required for #5273");
+        assert_eq!(
+            output.status.success(),
+            !blocked,
+            "npm stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            install_dir
+                .path()
+                .join("node_modules")
+                .join(package)
+                .join("package.json")
+                .exists(),
+            !blocked
+        );
+        let responses = responses.lock().unwrap();
+        assert!(responses.len() >= 2, "the same install must retry");
+        assert_eq!(responses[0].0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(responses[0].1.as_ref().unwrap(), "5");
+        let pending: serde_json::Value = serde_json::from_slice(&responses[0].2).unwrap();
+        assert_eq!(pending["error"], "scan_pending");
+        let final_status = if blocked {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::OK
+        };
+        for (status, _, body) in responses.iter().skip(1) {
+            assert_eq!(*status, final_status);
+            if blocked {
+                let denied: serde_json::Value = serde_json::from_slice(body).unwrap();
+                assert_eq!(denied["error"], "scan_blocked");
+            } else {
+                assert_eq!(body, &tarball);
+            }
+        }
+        assert_eq!(scans.load(Ordering::SeqCst), 1, "retries reuse the scan");
+    }
+
+    #[tokio::test]
+    async fn test_npm_install_retries_pending_virtual_scan_then_installs_5273() {
+        npm_install_retries_pending_scan(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_npm_install_retries_pending_virtual_scan_then_blocks_5273() {
+        npm_install_retries_pending_scan(true).await;
+    }
+
+    /// #5273: a refusal no retry resolves stays `423` on the tarball routes.
+    /// With no scanner on the state the scan is inconclusive for good, and a
+    /// `503` would only make npm ask twice more before failing the same way.
+    #[tokio::test]
+    async fn test_tarball_route_keeps_423_for_a_scan_that_cannot_run_5273() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball = honest_tgz("noscanner-widget", "1.0.0");
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "noscanner-widget",
+            "noscanner-widget-1.0.0.tgz",
+            &tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result = super::serve_tarball_to_client(
+            &state,
+            tdh::admin_auth_ext().as_ref(),
+            &fx.repo_key,
+            "noscanner-widget",
+            "noscanner-widget-1.0.0.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        let resp = match result {
+            Ok(r) => panic!(
+                "fail-closed must never serve unscanned bytes, got {}",
+                r.status()
+            ),
+            Err(resp) => resp,
+        };
+        assert_eq!(resp.status(), StatusCode::LOCKED);
+        assert!(resp.headers().get("Retry-After").is_none());
+    }
+
     /// Fail-open first pull serves LOUDLY: 200 with `X-AK-Scan: pending`, the
     /// digest header, and byte-identical content.
     #[tokio::test]
@@ -20606,15 +22012,28 @@ mod unpublish_4025_tests {
 
     /// What libnpmpublish sends for `npm unpublish <pkg>@<version>`: the
     /// `?write=true` packument with the version (and every dist-tag pointing
-    /// at it) removed, PUT to `/{pkg}/-rev/{_rev}`. This registry sends no
-    /// `_rev`, so the client's URL carries `undefined`.
+    /// at it) removed, PUT to `/{pkg}/-rev/{_rev}` (#5403: the packument's
+    /// own `_rev`).
     async fn npm_unpublish_version(
         fx: &tdh::Fixture,
         app: axum::Router,
         uri_name: &str,
         version: &str,
     ) -> (StatusCode, bytes::Bytes) {
-        let (_, mut pkg) = packument(fx, uri_name).await;
+        let (_, pkg) = packument(fx, uri_name).await;
+        let rev = pkg["_rev"].as_str().unwrap_or("undefined").to_string();
+        put_packument_without(app, fx, uri_name, pkg, version, &rev).await
+    }
+
+    /// `PUT /{pkg}/-rev/{rev}` with `pkg` minus `version` and its dist-tags.
+    async fn put_packument_without(
+        app: axum::Router,
+        fx: &tdh::Fixture,
+        uri_name: &str,
+        mut pkg: serde_json::Value,
+        version: &str,
+        rev: &str,
+    ) -> (StatusCode, bytes::Bytes) {
         pkg["versions"].as_object_mut().unwrap().remove(version);
         let tags = pkg["dist-tags"].as_object_mut().unwrap();
         tags.retain(|_, v| v.as_str() != Some(version));
@@ -20622,11 +22041,113 @@ mod unpublish_4025_tests {
             app,
             request(
                 "PUT",
-                format!("/{}/{}/-rev/undefined", fx.repo_key, uri_name),
+                format!("/{}/{}/-rev/{rev}", fx.repo_key, uri_name),
                 bytes::Bytes::from(serde_json::to_vec(&pkg).unwrap()),
             ),
         )
         .await
+    }
+
+    /// #5403: the revision changes with every publish and unpublish, and
+    /// only the current one (or, for a client without one, a removal of
+    /// exactly one version) passes.
+    #[test]
+    fn test_npm_unpublish_rev_check_5403() {
+        let row = |v: &str| super::NpmPackageRow {
+            id: uuid::Uuid::new_v4(),
+            version: Some(v.to_string()),
+            path: String::new(),
+        };
+        let mut rows = vec![row("1.0.0"), row("1.1.0")];
+        let rev_a = super::npm_package_rev(&rows);
+        assert!(rev_a.starts_with("2-"), "{rev_a}");
+        rows.reverse();
+        assert_eq!(
+            super::npm_package_rev(&rows),
+            rev_a,
+            "row order is irrelevant"
+        );
+        rows.push(row("2.0.0"));
+        let rev_b = super::npm_package_rev(&rows);
+        assert_ne!(rev_a, rev_b);
+
+        assert!(super::check_npm_unpublish_rev(&rows, &rev_b, Some(1)).is_ok());
+        assert!(super::check_npm_unpublish_rev(&rows, &rev_b, None).is_ok());
+        for (rev, removed) in [
+            (rev_a.as_str(), Some(1)),
+            (rev_a.as_str(), None),
+            ("3-deadbeef", Some(1)),
+            ("undefined", Some(2)),
+        ] {
+            let err = super::check_npm_unpublish_rev(&rows, rev, removed).unwrap_err();
+            assert_eq!(err.status(), StatusCode::CONFLICT, "{rev} {removed:?}");
+        }
+        assert!(super::check_npm_unpublish_rev(&rows, "undefined", Some(1)).is_ok());
+        assert!(super::check_npm_unpublish_rev(&rows, "undefined", None).is_ok());
+    }
+
+    /// #5403: `npm unpublish` reads the packument, then rewrites it. A
+    /// version published in between used to be missing from the rewrite and
+    /// was unpublished with the one the client asked for (200 both times).
+    /// Now the stale `-rev` answers 409 for the version rewrite, the
+    /// whole-package unpublish and a revision-less rewrite that would remove
+    /// two versions, and every version survives; a retry from a fresh read
+    /// removes only the version asked for.
+    #[tokio::test]
+    async fn test_npm_unpublish_with_stale_rev_cannot_remove_newer_version_5403() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        make_owner(&fx).await;
+        let pkg = "unpub-rev-race";
+        publish(&fx, pkg, pkg, "1.0.0").await;
+        let (_, read_a) = packument(&fx, pkg).await;
+        let rev_a = read_a["_rev"].as_str().expect("served _rev").to_string();
+        publish(&fx, pkg, pkg, "1.1.0").await;
+        let (_, read_b) = packument(&fx, pkg).await;
+        let rev_b = read_b["_rev"].as_str().expect("served _rev").to_string();
+        // Published after the client read `read_b`.
+        publish(&fx, pkg, pkg, "2.0.0").await;
+
+        let (stale_delete, _) = tdh::send(
+            owner_router(&fx),
+            request(
+                "DELETE",
+                format!("/{}/{pkg}/-rev/{rev_a}", fx.repo_key),
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+        let (stale_put, stale_body) =
+            put_packument_without(owner_router(&fx), &fx, pkg, read_b.clone(), "1.0.0", &rev_b)
+                .await;
+        let (legacy_put, _) =
+            put_packument_without(owner_router(&fx), &fx, pkg, read_b, "1.0.0", "undefined").await;
+        let (_, after_stale) = packument(&fx, pkg).await;
+        let (fresh, _) = npm_unpublish_version(&fx, owner_router(&fx), pkg, "1.0.0").await;
+        let (_, after_fresh) = packument(&fx, pkg).await;
+        fx.teardown().await;
+
+        assert_ne!(rev_a, rev_b, "a publish moves the revision");
+        assert_eq!(stale_delete, StatusCode::CONFLICT);
+        assert_eq!(
+            stale_put,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&stale_body)
+        );
+        assert_eq!(
+            legacy_put,
+            StatusCode::CONFLICT,
+            "a revision-less rewrite that would remove two versions"
+        );
+        assert_eq!(
+            version_keys(&after_stale),
+            vec!["1.0.0", "1.1.0", "2.0.0"],
+            "nothing was removed by the stale requests"
+        );
+        assert_eq!(fresh, StatusCode::OK);
+        assert_eq!(version_keys(&after_fresh), vec!["1.1.0", "2.0.0"]);
     }
 
     fn version_keys(pkg: &serde_json::Value) -> Vec<String> {
@@ -22019,5 +23540,386 @@ mod delete_cleanup_5604_tests {
         assert_eq!(after.1, vec!["1.1.0", "1.0.0"]);
         assert_eq!(stored, "1.1.0");
         assert_eq!(tags["latest"], "1.1.0");
+    }
+
+    /// Run a live `max_age_days` policy over the fixture repository that
+    /// removes everything older than 30 days.
+    async fn run_retention(fx: &tdh::Fixture) -> i64 {
+        use crate::services::lifecycle_service::{CreateLifecyclePolicyRequest, LifecycleService};
+        let service = LifecycleService::new(fx.pool.clone());
+        let policy = service
+            .create_policy(CreateLifecyclePolicyRequest {
+                applies_to_all: false,
+                repository_ids: None,
+                repository_id: Some(fx.repo_id),
+                name: format!("retention-{}", fx.repo_id.simple()),
+                description: None,
+                policy_type: "max_age_days".to_string(),
+                config: serde_json::json!({"days": 30}),
+                priority: None,
+                cron_schedule: None,
+                enabled: None,
+            })
+            .await
+            .expect("create policy");
+        let result = service
+            .execute_policy(policy.id, false)
+            .await
+            .expect("execute policy");
+        let _ = sqlx::query("DELETE FROM lifecycle_policies WHERE id = $1")
+            .bind(policy.id)
+            .execute(&fx.pool)
+            .await;
+        result.artifacts_removed
+    }
+
+    /// Age every artifact of `pkg@version` past the retention window.
+    async fn age(fx: &tdh::Fixture, pkg: &str, version: &str) {
+        sqlx::query(
+            "UPDATE artifacts SET created_at = NOW() - INTERVAL '60 days' \
+             WHERE repository_id = $1 AND name = $2 AND version = $3",
+        )
+        .bind(fx.repo_id)
+        .bind(pkg)
+        .bind(version)
+        .execute(&fx.pool)
+        .await
+        .expect("age artifact");
+    }
+
+    /// #5676: a retention (lifecycle) delete of the tagged newest version
+    /// drops the dist-tags naming it and moves the catalog's Latest, exactly
+    /// as the per-artifact deletes do (#5604, #5632). Before, the sweeps'
+    /// bulk soft-delete skipped `finish_delete`, so the stored `latest` kept
+    /// naming the removed version (ETARGET for npm) and the catalog row kept
+    /// it as Latest.
+    #[tokio::test]
+    async fn retention_delete_moves_dist_tags_and_catalog_latest_5676() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let pkg = "retention-tags";
+        publish(&fx, pkg, "1.0.0").await;
+        publish(&fx, pkg, "1.1.0").await;
+        publish(&fx, pkg, "2.0.0").await;
+        tag(&fx, pkg, "latest", "2.0.0").await;
+        tag(&fx, pkg, "beta", "2.0.0").await;
+        tag(&fx, pkg, "stable", "1.1.0").await;
+        age(&fx, pkg, "2.0.0").await;
+
+        let removed = run_retention(&fx).await;
+        let stored = stored_tags(&fx, pkg).await;
+        let tags = dist_tags(&fx, pkg).await;
+        let stored_latest = stored_catalog_latest(&fx, pkg).await;
+        let listed = catalog(&fx, pkg).await;
+        fx.teardown().await;
+
+        assert_eq!(removed, 1, "the policy removes 2.0.0 only");
+        assert_eq!(
+            stored,
+            serde_json::json!({ "stable": "1.1.0" }),
+            "every stored tag naming the swept version is dropped; others are kept"
+        );
+        assert_eq!(
+            tags["latest"], "1.1.0",
+            "latest is derived from what is left"
+        );
+        assert!(tags.get("beta").is_none());
+        assert_eq!(
+            stored_latest, "1.1.0",
+            "the stored catalog row is recomputed"
+        );
+        assert_eq!(listed.0, "1.1.0");
+        assert_eq!(listed.1, vec!["1.1.0", "1.0.0"]);
+    }
+}
+
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod publish_race_5399_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+    use base64::Engine;
+    use sha2::Digest;
+    use tower::ServiceExt;
+
+    const PUBLISHERS: usize = 10;
+
+    fn sha_hex(bytes: &[u8]) -> String {
+        format!("{:x}", sha2::Sha256::digest(bytes))
+    }
+
+    /// The standard `npm publish` JSON document for one version, carrying
+    /// `tarball` as the base64 attachment and its SHA-512 as
+    /// `versions[version].dist.integrity`, as the npm CLI sends it.
+    fn publish_body(pkg: &str, version: &str, tarball: &[u8]) -> bytes::Bytes {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let integrity = format!("sha512-{}", b64.encode(sha2::Sha512::digest(tarball)));
+        bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "name": pkg,
+                "dist-tags": { "latest": version },
+                "versions": { version: {
+                    "name": pkg,
+                    "version": version,
+                    "dist": { "integrity": integrity },
+                } },
+                "_attachments": { format!("{pkg}-{version}.tgz"): {
+                    "content_type": "application/octet-stream",
+                    "data": b64.encode(tarball),
+                    "length": tarball.len(),
+                } },
+            }))
+            .unwrap(),
+        )
+    }
+
+    /// #5399: ten concurrent `PUT /npm/<repo>/<pkg>` publishes of one version,
+    /// each with a different tarball. An `AFTER INSERT` trigger parks the first
+    /// publish right after its `artifacts` insert, inside its publishing
+    /// transaction, and the non-transactional sequence tells the test when to
+    /// release the other nine. Before the fix the other nine passed the
+    /// unlocked duplicate check, wrote their own bytes over the winner's
+    /// object at the shared path-derived key, then lost the unique insert
+    /// with a 500: the committed row named bytes that were not in storage
+    /// (`EINTEGRITY`). Now the parked publish holds the per-key lock, the
+    /// other nine wait, see its row and answer 409 without writing, and
+    /// storage holds the winner's tarball.
+    #[tokio::test]
+    async fn test_concurrent_publishes_of_one_version_keep_winner_tarball_5399() {
+        let Some(pool) = crate::testing::try_pool_with(24).await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "npm").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let router =
+            tdh::router_with_auth(super::router(), state, tdh::admin_auth(user_id, &username));
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let pkg = format!("race-5399-{}", &suffix[..12]);
+        let version = "1.0.0";
+        let tarballs: Vec<Vec<u8>> = (0..PUBLISHERS)
+            .map(|i| format!("tgz-{pkg}-{version}-publisher-{i}-{suffix}").into_bytes())
+            .collect();
+        let seq = format!("ak_test_race_seq_{suffix}");
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SEQUENCE {seq}")))
+            .execute(&pool)
+            .await
+            .expect("create sequence");
+        let drop_sql = tdh::install_artifact_row_fault(
+            &pool,
+            &suffix,
+            &sha_hex(&tarballs[0]),
+            "AFTER",
+            &format!("PERFORM nextval('{seq}'); PERFORM pg_sleep(4);"),
+        )
+        .await;
+
+        let put = |tarball: &[u8]| {
+            tokio::spawn(router.clone().oneshot(tdh::put_json(
+                format!("/{repo_key}/{pkg}"),
+                publish_body(&pkg, version, tarball),
+            )))
+        };
+        let mut handles = vec![put(&tarballs[0])];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let parked: bool =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT is_called FROM {seq}")))
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read race sequence");
+            if parked {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first publish never reached its artifacts insert"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        handles.extend(tarballs[1..].iter().map(|t| put(t)));
+        let mut statuses = Vec::new();
+        for h in handles {
+            statuses.push(h.await.expect("join").expect("publish").status());
+        }
+
+        for stmt in drop_sql.split("; ") {
+            sqlx::query(sqlx::AssertSqlSafe(stmt.to_string()))
+                .execute(&pool)
+                .await
+                .expect("drop fault");
+        }
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SEQUENCE IF EXISTS {seq}"
+        )))
+        .execute(&pool)
+        .await;
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT checksum_sha256, storage_key FROM artifacts \
+             WHERE repository_id = $1 AND name = $2 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .bind(&pkg)
+        .fetch_all(&pool)
+        .await
+        .expect("read rows");
+        let stored = rows
+            .first()
+            .and_then(|(_, key)| mem.objects.lock().unwrap().get(key).cloned());
+        let (meta_status, meta_body) = tdh::send(
+            router.clone(),
+            tdh::get(format!("/{repo_key}/{pkg}/{version}")),
+        )
+        .await;
+        let (tgz_status, served) = tdh::send(
+            router.clone(),
+            tdh::get(format!("/{repo_key}/{pkg}/-/{pkg}-{version}.tgz")),
+        )
+        .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        let row_sha = rows.first().map(|(sha, _)| sha.clone());
+        let stored_sha = stored.as_deref().map(sha_hex);
+        let winner_sha = sha_hex(&tarballs[0]);
+        // One assertion over the whole outcome, so a failure shows every
+        // status and both checksums at once.
+        assert!(
+            statuses[0].is_success()
+                && statuses[1..].iter().all(|s| *s == StatusCode::CONFLICT)
+                && rows.len() == 1
+                && row_sha.as_deref() == Some(winner_sha.as_str())
+                && stored_sha == row_sha,
+            "want the parked first publish to win and the other {} to get 409, with \
+             storage holding the committed row's bytes; got statuses {statuses:?}, \
+             {} live row(s), row sha256 {row_sha:?}, stored sha256 {stored_sha:?}, \
+             winner sha256 {winner_sha}",
+            PUBLISHERS - 1,
+            rows.len(),
+        );
+
+        assert_eq!(meta_status, StatusCode::OK);
+        let meta: serde_json::Value = serde_json::from_slice(&meta_body).unwrap();
+        let integrity = meta["dist"]["integrity"].as_str().expect("dist.integrity");
+        assert_eq!(tgz_status, StatusCode::OK);
+        let b64 = base64::engine::general_purpose::STANDARD;
+        assert_eq!(
+            integrity,
+            format!("sha256-{}", b64.encode(sha2::Sha256::digest(&served))),
+            "served tarball matches the advertised dist.integrity"
+        );
+        assert_eq!(
+            &served[..],
+            &tarballs[0][..],
+            "served bytes are the winner's"
+        );
+        assert_eq!(
+            format!("sha512-{}", b64.encode(sha2::Sha512::digest(&served))),
+            format!("sha512-{}", b64.encode(sha2::Sha512::digest(&tarballs[0]))),
+            "served bytes match the winner's client-side dist.integrity"
+        );
+    }
+
+    /// A publish that fails after its write removes the object it wrote when no
+    /// committed row names it, and keeps an object a committed row names.
+    #[tokio::test]
+    async fn test_discard_unreferenced_publish_object_keeps_published_bytes_5399() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _repo_key, _dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (_state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let storage: std::sync::Arc<dyn crate::storage::StorageBackend> = mem.clone();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let orphan = format!("npm/{repo_id}/orphan-{suffix}.tgz");
+        let live = format!("npm/{repo_id}/live-{suffix}.tgz");
+        for key in [&orphan, &live] {
+            storage
+                .put(key, bytes::Bytes::from_static(b"tgz"))
+                .await
+                .expect("seed object");
+        }
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key, uploaded_by) \
+             VALUES ($1, $2, 'live', '1.0.0', 3, $3, 'application/gzip', $4, $5)",
+        )
+        .bind(repo_id)
+        .bind(format!("live/1.0.0/live-{suffix}.tgz"))
+        .bind(sha_hex(b"tgz"))
+        .bind(&live)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("seed live row");
+
+        for key in [&orphan, &live] {
+            crate::api::handlers::publish_lock::discard_unreferenced_publish_object(
+                &pool,
+                &storage,
+                super::NPM_PUBLISH_LOCK_NAMESPACE,
+                repo_id,
+                "s3",
+                key,
+            )
+            .await;
+        }
+        let objects = mem.objects.lock().unwrap().clone();
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        assert!(
+            !objects.contains_key(&orphan),
+            "the unreferenced object is removed"
+        );
+        assert!(
+            objects.contains_key(&live),
+            "a committed row's object is kept"
+        );
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod hosted_serve_verification_4989_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+
+    /// #4989 (#4323 remainder): the hosted npm tarball download verifies the stored bytes against the
+    /// row. A corrupt object is the 502 `STORED_OBJECT_INTEGRITY` with none of
+    /// its bytes, not a 200 under the checksum it was uploaded with.
+    #[tokio::test]
+    async fn hosted_download_refuses_a_corrupt_object_4989() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        tdh::seed_corrupt_artifact(
+            &fx,
+            "v4989/-/v4989-1.0.0.tgz",
+            "v4989",
+            "1.0.0",
+            "application/gzip",
+            b"stored bytes 4989",
+            b"stored bytes 498X",
+        )
+        .await;
+        let key = fx.repo_key.clone();
+        let send = |req| tdh::send(fx.router_with_auth(super::router()), req);
+        let (get_0, body_0) = send(tdh::get(format!("/{key}/v4989/-/v4989-1.0.0.tgz"))).await;
+        let (head_0, _) = send(tdh::head(format!("/{key}/v4989/-/v4989-1.0.0.tgz"))).await;
+        fx.teardown().await;
+        tdh::assert_integrity_refusal(get_0, &body_0, b"stored bytes 498X");
+        assert_eq!(head_0, StatusCode::OK, "a HEAD reads and verifies nothing");
     }
 }

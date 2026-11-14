@@ -678,6 +678,92 @@ impl ProxyUpstreamSettings {
     }
 }
 
+/// Instance-wide quotas for operators who need a hard ceiling on what the
+/// instance stores and serves, for example on metered object storage or
+/// metered egress. Every value is optional; a quota of `0` (the default) is
+/// off.
+///
+/// * `STORAGE_QUOTA_BYTES`: total bytes the instance may store (the
+///   `total_storage_bytes` figure of `GET /api/v1/admin/stats`). At the
+///   quota every write that would store more bytes is refused with `403
+///   STORAGE_QUOTA_EXCEEDED`; downloads, deletes, listing, sign-in and
+///   settings keep working. `STORAGE_QUOTA_WARN_PERCENT` (default 80) is the
+///   warning threshold.
+/// * `TRANSFER_QUOTA_BYTES`: artifact download bytes per calendar month
+///   (UTC). `TRANSFER_QUOTA_GRACE_PERCENT` (default 0) extends the hard
+///   limit above the quota; once usage reaches the hard limit artifact
+///   downloads answer `429 TRANSFER_QUOTA_EXCEEDED` with `Retry-After` until
+///   the next month starts. `TRANSFER_QUOTA_WARN_PERCENT` (default 80) is
+///   the warning threshold.
+/// * `QUOTA_HELP_URL`: an optional `http(s)` link added to every quota
+///   refusal and shown in the web UI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuotaSettings {
+    /// `STORAGE_QUOTA_BYTES`; `0` = off.
+    pub storage_quota_bytes: u64,
+    /// `STORAGE_QUOTA_WARN_PERCENT`, clamped to 1..=100. Default 80.
+    pub storage_warn_percent: u8,
+    /// `TRANSFER_QUOTA_BYTES`; `0` = off.
+    pub transfer_quota_bytes: u64,
+    /// `TRANSFER_QUOTA_WARN_PERCENT`, clamped to 1..=100. Default 80.
+    pub transfer_warn_percent: u8,
+    /// `TRANSFER_QUOTA_GRACE_PERCENT`, clamped to 0..=1000. Default 0.
+    pub transfer_grace_percent: u32,
+    /// `QUOTA_HELP_URL`, kept only when it is an `http://` or `https://` URL.
+    pub help_url: Option<String>,
+}
+
+impl Default for QuotaSettings {
+    fn default() -> Self {
+        Self {
+            storage_quota_bytes: 0,
+            storage_warn_percent: 80,
+            transfer_quota_bytes: 0,
+            transfer_warn_percent: 80,
+            transfer_grace_percent: 0,
+            help_url: None,
+        }
+    }
+}
+
+impl QuotaSettings {
+    fn from_env() -> Self {
+        let d = Self::default();
+        Self {
+            storage_quota_bytes: env_parse("STORAGE_QUOTA_BYTES", d.storage_quota_bytes),
+            storage_warn_percent: env_parse("STORAGE_QUOTA_WARN_PERCENT", d.storage_warn_percent)
+                .clamp(1, 100),
+            transfer_quota_bytes: env_parse("TRANSFER_QUOTA_BYTES", d.transfer_quota_bytes),
+            transfer_warn_percent: env_parse(
+                "TRANSFER_QUOTA_WARN_PERCENT",
+                d.transfer_warn_percent,
+            )
+            .clamp(1, 100),
+            transfer_grace_percent: env_parse(
+                "TRANSFER_QUOTA_GRACE_PERCENT",
+                d.transfer_grace_percent,
+            )
+            .min(1000),
+            help_url: Self::parse_help_url(env::var("QUOTA_HELP_URL").ok().as_deref()),
+        }
+    }
+
+    /// `QUOTA_HELP_URL` when it is a non-empty `http(s)` URL, else `None`.
+    pub(crate) fn parse_help_url(raw: Option<&str>) -> Option<String> {
+        let value = raw?.trim();
+        if value.is_empty() {
+            return None;
+        }
+        match url::Url::parse(value) {
+            Ok(url) if matches!(url.scheme(), "http" | "https") => Some(value.to_string()),
+            _ => {
+                tracing::warn!("QUOTA_HELP_URL is not an http(s) URL; ignoring it");
+                None
+            }
+        }
+    }
+}
+
 /// Which upstream requests write an `UPSTREAM_FETCHED` audit row (#5286).
 /// Env `AUDIT_UPSTREAM_FETCHES`: `off` (the default), `errors` (failed
 /// requests only: `not_found`, `error`, `timeout`) or `all` (every request,
@@ -1109,9 +1195,28 @@ pub struct Config {
     /// Env var: `STUCK_SCAN_REAP_LIMIT`. Default: 1000. PR #1212 audit M1.
     pub stuck_scan_reap_limit: i64,
 
+    /// Run proxy file scans and `POST /security/scan` from the durable Postgres
+    /// queue rather than in this process (#5231's in-flight table and a spawned task).
+    /// Env var: `SCAN_QUEUE_ENABLED`. Default: false.
+    pub scan_queue_enabled: bool,
+
+    /// Whether this instance drains the durable queue when it is enabled. A fleet
+    /// sets it `false` on the API pods and runs a worker Deployment of the same image.
+    /// Env var: `SCAN_WORKER_ENABLED`. Default: true.
+    pub scan_worker_enabled: bool,
+
+    /// Scan jobs this instance runs concurrently. `None` matches
+    /// `MAX_CONCURRENT_SCAN_EXTRACTIONS`. Raise both together on worker pods.
+    /// Env var: `SCAN_WORKER_CONCURRENCY`. Default: unset.
+    pub scan_worker_concurrency: Option<usize>,
+
     /// Maximum upload size in bytes for artifact uploads.
     /// Defaults to 10 GB (10737418240 bytes). Set to 0 to disable the limit.
     pub max_upload_size_bytes: u64,
+
+    /// Instance-wide storage and monthly download-transfer quotas; see
+    /// [`QuotaSettings`]. Every quota is off unless its variable is set.
+    pub quotas: QuotaSettings,
 
     /// When true, the built-in admin account can log in with local credentials
     /// even when SSO providers are configured. Intended as a break-glass
@@ -1819,6 +1924,7 @@ redacted_debug!(Config {
     show stuck_scan_check_interval_secs,
     show stuck_scan_reap_limit,
     show max_upload_size_bytes,
+    show quotas,
     show allow_local_admin_login,
     show sso_disable_admin_break_glass,
     show oidc_silent_sso_enabled,
@@ -1844,6 +1950,8 @@ redacted_debug!(Config {
     show upload_progress_window_secs,
     show upload_min_progress_bytes,
     show upload_max_in_flight_per_principal,
+    show scan_queue_enabled,
+    show scan_worker_enabled,
     show rate_limit_enabled,
     show rate_limit_auth_per_window,
     show rate_limit_api_per_window,
@@ -1982,7 +2090,11 @@ impl Default for Config {
             stuck_scan_threshold_secs: 1800,
             stuck_scan_check_interval_secs: 600,
             stuck_scan_reap_limit: 1000,
+            scan_queue_enabled: false,
+            scan_worker_enabled: true,
+            scan_worker_concurrency: None,
             max_upload_size_bytes: 10_737_418_240,
+            quotas: QuotaSettings::default(),
             allow_local_admin_login: false,
             sso_disable_admin_break_glass: false,
             oidc_silent_sso_enabled: true,
@@ -2327,7 +2439,16 @@ impl Config {
                     "STUCK_SCAN_REAP_LIMIT",
                     1000,
                 )),
+            scan_queue_enabled: parse_opt_in_flag(env::var("SCAN_QUEUE_ENABLED").ok().as_deref()),
+            scan_worker_enabled: parse_opt_out_flag(
+                env::var("SCAN_WORKER_ENABLED").ok().as_deref(),
+            ),
+            scan_worker_concurrency: env::var("SCAN_WORKER_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|n| *n > 0),
             max_upload_size_bytes: env_parse("MAX_UPLOAD_SIZE", 10_737_418_240_u64),
+            quotas: QuotaSettings::from_env(),
             allow_local_admin_login: matches!(
                 env::var("ALLOW_LOCAL_ADMIN_LOGIN").as_deref(),
                 Ok("true" | "1")

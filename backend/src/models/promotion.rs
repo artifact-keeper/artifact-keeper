@@ -21,6 +21,10 @@ pub struct PromotionRule {
     pub max_artifact_age_days: Option<i32>,
     pub min_health_score: Option<i32>,
     pub auto_promote: bool,
+    /// `rated`, `incomplete` or `any` (#4994, migration 361): the weakest
+    /// grade status of the source repository `min_health_score` accepts.
+    /// Read through [`crate::models::security::AcceptedGradeStatus::from_db`].
+    pub accepted_grade_status: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

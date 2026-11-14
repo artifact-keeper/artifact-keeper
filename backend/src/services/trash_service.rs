@@ -431,10 +431,11 @@ impl TrashService {
         // The inverse of the delete hook (#5632): the restored version may be
         // the newest live one again, so the catalog's Latest goes back to it.
         // Best-effort: the restore itself is already committed.
-        if let Err(e) = crate::services::package_service::refresh_package_latest(
+        if let Err(e) = crate::services::package_service::refresh_package_latest_for_artifact(
             &self.db,
             candidate.row.repository_id,
             &candidate.row.name,
+            &candidate.row.path,
         )
         .await
         {
@@ -1101,11 +1102,15 @@ pub(crate) mod tests {
         );
     }
 
-    /// #5624: a delete left by a purged artifact is addressed by path only;
-    /// restoring a later artifact at that path still cancels it for the
-    /// peers the restore re-pushes to.
+    /// #5699: a delete left by a purged artifact is addressed by path only,
+    /// and restoring a later artifact at that path used to cancel it for the
+    /// peers the restore re-pushes to, on the premise that the push replaces
+    /// the peer's copy. It does not (the peer refuses a push onto its live
+    /// copy with `409` immutable), so the peer kept the purged bytes. A
+    /// restore now cancels only the restored artifact's own delete; the
+    /// purged predecessor's delete stays queued and the push waits for it.
     #[tokio::test]
-    async fn restore_cancels_a_purged_predecessors_delete_by_path_5624() {
+    async fn restore_keeps_a_purged_predecessors_delete_5699() {
         let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
             return;
         };
@@ -1116,8 +1121,17 @@ pub(crate) mod tests {
         let first = seed_trashed(&fx, &path, true).await;
         let purged = svc.purge(first).await;
         let second = seed_trashed(&fx, &path, true).await;
+        seed_sync_task(&fx, peer, second, "delete", "pending").await;
         let restored = svc.restore(second).await;
-        let deletes = peer_deletes(&fx, peer).await;
+        let predecessor = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT status::TEXT, error_message FROM sync_tasks \
+             WHERE peer_instance_id = $1 AND task_type = 'delete' AND artifact_id IS NULL",
+        )
+        .bind(peer)
+        .fetch_optional(&fx.pool)
+        .await
+        .expect("predecessor delete");
+        let own = sync_task_state(&fx, peer, second, "delete").await;
         let push = sync_task_state(&fx, peer, second, "push").await;
         let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
             .bind(peer)
@@ -1128,14 +1142,18 @@ pub(crate) mod tests {
         assert!(purged.is_ok(), "{purged:?}");
         assert!(restored.is_ok(), "{restored:?}");
         assert_eq!(
-            deletes,
-            vec![(
-                None,
+            predecessor,
+            Some(("pending".to_string(), None)),
+            "#5699: the purged artifact's delete must stay queued: the restore's \
+             push cannot replace the purged bytes on the peer"
+        );
+        assert_eq!(
+            own,
+            Some((
                 "cancelled".to_string(),
-                Some(fx.repo_key.clone()),
-                Some(path)
-            )],
-            "the purged artifact's delete must not take the restored one off the peer"
+                Some("superseded by artifact restore".to_string())
+            )),
+            "the restored artifact's own delete is still superseded"
         );
         assert_eq!(push.map(|(s, _)| s).as_deref(), Some("pending"));
     }
@@ -1221,5 +1239,129 @@ pub(crate) mod tests {
         assert!(matches!(missing, Err(AppError::NotFound(_))), "{missing:?}");
         assert!(both_left, "a refused purge must change nothing");
         assert!(live_object_left);
+    }
+
+    /// #5676: the catalog-Latest hook finds a Maven row by its catalog name
+    /// (`groupId:artifactId`), not the artifact name (`artifactId`), in both
+    /// directions: a retention sweep of the newest version moves the stored
+    /// Latest down, and a trash restore of it moves Latest back up. Before,
+    /// the sweep never reached the hook and the restore looked up `widget`,
+    /// found no row, and left Latest where the delete put it.
+    #[tokio::test]
+    async fn maven_catalog_latest_follows_retention_delete_and_restore_5676() {
+        use crate::services::lifecycle_service::{CreateLifecyclePolicyRequest, LifecycleService};
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let mut ids = Vec::new();
+        for (version, checksum, age_days) in [("1.0", "a1", 0), ("2.0", "b2", 60)] {
+            let path = format!("com/acme/widget/{version}/widget-{version}.jar");
+            put_object(&fx, &path).await;
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                     checksum_sha256, content_type, storage_key, uploaded_by, created_at) \
+                 VALUES ($1, $2, 'widget', $3, 7, $4, 'application/java-archive', $2, $5, \
+                         NOW() - make_interval(days => $6)) \
+                 RETURNING id",
+            )
+            .bind(fx.repo_id)
+            .bind(&path)
+            .bind(version)
+            .bind(checksum)
+            .bind(fx.user_id)
+            .bind(age_days)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("insert maven artifact");
+            ids.push(id);
+        }
+        let package_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO packages (repository_id, name, version, size_bytes) \
+             VALUES ($1, 'com.acme:widget', '2.0', 7) RETURNING id",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("insert catalog row");
+        for (version, checksum) in [("1.0", "a1"), ("2.0", "b2")] {
+            sqlx::query(
+                "INSERT INTO package_versions (package_id, version, size_bytes, checksum_sha256) \
+                 VALUES ($1, $2, 7, $3)",
+            )
+            .bind(package_id)
+            .bind(version)
+            .bind(checksum)
+            .execute(&fx.pool)
+            .await
+            .expect("insert catalog version");
+        }
+        let stored_latest = || async {
+            sqlx::query_scalar::<_, String>("SELECT version FROM packages WHERE id = $1")
+                .bind(package_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("read catalog latest")
+        };
+
+        let lifecycle = LifecycleService::new(fx.pool.clone());
+        let policy = lifecycle
+            .create_policy(CreateLifecyclePolicyRequest {
+                applies_to_all: false,
+                repository_ids: None,
+                repository_id: Some(fx.repo_id),
+                name: format!("retention-{}", fx.repo_id.simple()),
+                description: None,
+                policy_type: "max_age_days".to_string(),
+                config: serde_json::json!({"days": 30}),
+                priority: None,
+                cron_schedule: None,
+                enabled: None,
+            })
+            .await
+            .expect("create policy");
+        let removed = lifecycle
+            .execute_policy(policy.id, false)
+            .await
+            .expect("execute policy")
+            .artifacts_removed;
+        let after_sweep = stored_latest().await;
+        let restored = service(&fx, 0).restore(ids[1]).await;
+        let after_restore = stored_latest().await;
+        let _ = sqlx::query("DELETE FROM lifecycle_policies WHERE id = $1")
+            .bind(policy.id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(removed, 1, "the sweep removes 2.0 only");
+        assert_eq!(after_sweep, "1.0", "Latest moves off the swept version");
+        restored.expect("restore 2.0");
+        assert_eq!(
+            after_restore, "2.0",
+            "Latest goes back to the restored version"
+        );
+    }
+
+    #[test]
+    fn catalog_package_name_maps_maven_and_sbt_coordinates_5676() {
+        use crate::services::package_service::catalog_package_name;
+        assert_eq!(
+            catalog_package_name("maven", "com/acme/widget/1.0/widget-1.0.jar", "widget"),
+            "com.acme:widget"
+        );
+        assert_eq!(
+            catalog_package_name("gradle", "com/acme/widget/1.0/widget-1.0.pom", "widget"),
+            "com.acme:widget"
+        );
+        // A path that does not parse keeps the artifact name.
+        assert_eq!(
+            catalog_package_name("maven", "com/acme/widget/maven-metadata.xml", "widget"),
+            "widget"
+        );
+        assert_eq!(
+            catalog_package_name("npm", "left-pad/1.0.0/left-pad-1.0.0.tgz", "left-pad"),
+            "left-pad"
+        );
     }
 }

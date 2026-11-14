@@ -13,12 +13,13 @@ use uuid::Uuid;
 use crate::api::extractors::Json as BodyJson;
 use crate::api::handlers::artifacts::check_artifact_visibility;
 use crate::api::handlers::repositories::{
-    require_repo_action, require_repo_admin, require_repo_write_access, require_visible,
+    hide_write_denial_from_non_readers, require_repo_action, require_repo_admin,
+    require_repo_write_access, require_visible,
 };
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
-use crate::models::security::ScanResult;
+use crate::models::security::{ScanResult, UncatalogedPolicy};
 use crate::services::audit_export::details as audit_details;
 use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 use crate::services::finding_acknowledgements::{
@@ -94,6 +95,15 @@ pub fn repo_security_router() -> Router<SharedState> {
             get(get_repo_security).put(update_repo_security),
         )
         .route("/:key/security/scans", get(list_repo_scans))
+        // #4994: the uncataloged policy and the artifacts behind `coverage`.
+        .route(
+            "/:key/security/uncataloged-policy",
+            axum::routing::put(set_uncataloged_policy),
+        )
+        .route(
+            "/:key/security/coverage/artifacts",
+            get(list_repo_coverage_artifacts),
+        )
         .route("/:key/security/proxy-scans", get(get_repo_proxy_scans))
         .route(
             "/:key/security/proxy-scans/rescan",
@@ -638,6 +648,7 @@ impl From<crate::models::security::ScanPolicy> for PolicyResponse {
             max_severity: p.max_severity,
             block_unscanned: p.block_unscanned,
             block_on_fail: p.block_on_fail,
+            block_uncataloged: p.block_uncataloged,
             is_enabled: p.is_enabled,
             min_staging_hours: p.min_staging_hours,
             max_artifact_age_days: p.max_artifact_age_days,
@@ -987,6 +998,12 @@ pub struct CreatePolicyRequest {
     #[serde(default = "default_block_unscanned")]
     pub block_unscanned: bool,
     pub block_on_fail: bool,
+    /// Refuse an artifact whose latest completed scan of some scanner
+    /// cataloged nothing (`scan_completeness = not_cataloged`): its zero
+    /// findings mean nothing was assessed, not clean (#4994). Default `false`.
+    #[serde(default)]
+    #[schema(default = false)]
+    pub block_uncataloged: bool,
     pub min_staging_hours: Option<i32>,
     pub max_artifact_age_days: Option<i32>,
     #[serde(default)]
@@ -1022,6 +1039,9 @@ pub struct UpdatePolicyRequest {
     pub block_unscanned: Option<bool>,
     #[serde(default)]
     pub block_on_fail: Option<bool>,
+    /// See [`CreatePolicyRequest::block_uncataloged`]; omitted leaves it as is.
+    #[serde(default)]
+    pub block_uncataloged: Option<bool>,
     #[serde(default)]
     pub is_enabled: Option<bool>,
     #[serde(default)]
@@ -1045,6 +1065,8 @@ pub struct PolicyResponse {
     pub max_severity: String,
     pub block_unscanned: bool,
     pub block_on_fail: bool,
+    /// Whether the policy refuses an artifact no scanner could catalog (#4994).
+    pub block_uncataloged: bool,
     pub is_enabled: bool,
     pub min_staging_hours: Option<i32>,
     pub max_artifact_age_days: Option<i32>,
@@ -1058,6 +1080,82 @@ pub struct PolicyResponse {
 pub struct RepoSecurityResponse {
     pub config: Option<ScanConfigResponse>,
     pub score: Option<ScoreResponse>,
+    /// What an artifact no scanner could catalog does to the grade status
+    /// (#4994): `fail` (default) or `warn`. Set with
+    /// `PUT /api/v1/repositories/{key}/security/uncataloged-policy`.
+    pub uncataloged_policy: UncatalogedPolicy,
+}
+
+/// Body of `PUT /api/v1/repositories/{key}/security/uncataloged-policy`.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct UncatalogedPolicyRequest {
+    /// `fail`: an artifact no scanner could catalog makes the repository
+    /// `incomplete` (or `unrated` when nothing else was assessed), as since
+    /// #4036. `warn`: it stays in `coverage.uncataloged` and
+    /// `has_uncataloged_scan` but counts as assessed, so a repository of
+    /// plain archives can be `rated`. There is no `ignore`.
+    pub uncataloged_policy: UncatalogedPolicy,
+}
+
+/// Response of `PUT /api/v1/repositories/{key}/security/uncataloged-policy`:
+/// the policy and the score recalculated under it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UncatalogedPolicyResponse {
+    pub uncataloged_policy: UncatalogedPolicy,
+    pub score: ScoreResponse,
+}
+
+/// Query of `GET /api/v1/repositories/{key}/security/coverage/artifacts`.
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct CoverageArtifactsQuery {
+    /// Comma-separated coverage statuses to list: `failed`, `uncataloged`,
+    /// `partial`, `cataloged`, `unscanned`. Default
+    /// `failed,uncataloged,partial`, the artifacts that keep the repository
+    /// from `rated`.
+    pub status: Option<String>,
+    /// Page size, default 100, at most 1000.
+    pub limit: Option<i64>,
+    /// Rows to skip, default 0.
+    pub offset: Option<i64>,
+}
+
+/// One artifact behind a repository's coverage counts (#4994).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CoverageArtifactResponse {
+    pub artifact_id: Uuid,
+    pub name: String,
+    pub version: Option<String>,
+    pub path: String,
+    pub coverage_status: crate::services::scan_result_service::CoverageStatus,
+    /// The latest scan of each scanner for the artifact.
+    pub scans: Vec<crate::services::scan_result_service::CoverageScan>,
+}
+
+/// Live count of the repository's artifacts in each coverage status.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CoverageStatusCounts {
+    pub failed: i64,
+    pub uncataloged: i64,
+    pub partial: i64,
+    pub cataloged: i64,
+    pub unscanned: i64,
+}
+
+/// Response of `GET /api/v1/repositories/{key}/security/coverage/artifacts`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CoverageArtifactsResponse {
+    pub repository_id: Uuid,
+    /// Computed now, from the same latest scans as the score's `coverage`;
+    /// `failed + uncataloged + partial + cataloged` is `coverage.scanned`
+    /// and adding `unscanned` gives `coverage.artifacts`, as of the next
+    /// recalculation.
+    pub counts: CoverageStatusCounts,
+    /// Artifacts matching `status` (all pages).
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+    pub items: Vec<CoverageArtifactResponse>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1425,6 +1523,39 @@ async fn list_scan_configs(
 // Scan operations
 // ---------------------------------------------------------------------------
 
+/// Queue a hosted scan whose placeholders are committed, so the work survives
+/// this pod. The response message says when a running job already owns the
+/// artifact: its worker took its own placeholders at claim time, and the ones
+/// just allocated stay for the stuck-scan janitor.
+async fn enqueue_hosted_scan(
+    state: &SharedState,
+    artifact_id: Uuid,
+    prepared_map: &std::collections::HashMap<String, Uuid>,
+    bypass_dedup: bool,
+) -> Result<String> {
+    let prepared = serde_json::to_value(prepared_map)
+        .map_err(|e| AppError::Internal(format!("could not encode the prepared scan map: {e}")))?;
+    let owns_the_job = crate::services::scan_queue::ScanQueue::new(state.db.clone())
+        .enqueue_hosted_artifact(
+            artifact_id,
+            &prepared,
+            bypass_dedup,
+            crate::services::scan_queue::PRIORITY_HOSTED,
+        )
+        .await?;
+    if owns_the_job {
+        return Ok(crate::services::scanner_service::build_artifact_scan_message(artifact_id));
+    }
+    tracing::warn!(
+        artifact_id = %artifact_id,
+        "a scan of this artifact is already running; the placeholders just \
+         allocated for this request will not be finalized by it"
+    );
+    Ok(format!(
+        "A scan of artifact {artifact_id} is already running; this request did not start a new one"
+    ))
+}
+
 #[utoipa::path(
     post,
     path = "/scan",
@@ -1515,6 +1646,15 @@ async fn trigger_scan(
         let scan_result_ids = crate::services::scanner_service::extract_scan_result_ids(&prepared);
         let prepared_map = crate::services::scanner_service::prepared_pairs_to_map(prepared);
 
+        if state.config.scan_queue_enabled {
+            let message =
+                enqueue_hosted_scan(&state, artifact_id, &prepared_map, bypass_dedup).await?;
+            return Ok(Json(TriggerScanResponse {
+                message,
+                artifacts_queued: 1,
+                scan_result_ids,
+            }));
+        }
         let scanner_for_spawn = scanner.clone();
         tokio::spawn(async move {
             if let Err(e) = scanner_for_spawn
@@ -2400,12 +2540,13 @@ async fn create_policy(
     auth.require_admin()?;
     let svc = PolicyService::new(state.db.clone());
     let p = svc
-        .create_policy(
+        .create_policy_with_uncataloged(
             &body.name,
             body.repository_id,
             &body.max_severity,
             body.block_unscanned,
             body.block_on_fail,
+            body.block_uncataloged,
             body.min_staging_hours,
             body.max_artifact_age_days,
             body.require_signature,
@@ -2469,12 +2610,13 @@ async fn update_policy(
     // PUT is partial-update friendly: any field client omits is left at its
     // current DB value via COALESCE in the service layer. See #1374.
     let p = svc
-        .update_policy(
+        .update_policy_with_uncataloged(
             id,
             body.name.as_deref(),
             body.max_severity.as_deref(),
             body.block_unscanned,
             body.block_on_fail,
+            body.block_uncataloged,
             body.is_enabled,
             body.min_staging_hours,
             body.max_artifact_age_days,
@@ -2557,10 +2699,167 @@ async fn get_repo_security(
         Some(_) => config_svc.instance_locked(repo).await?,
         None => false,
     };
+    let uncataloged_policy = read_uncataloged_policy(&state.db, repo).await?;
 
     Ok(Json(RepoSecurityResponse {
         config: config.map(|c| ScanConfigResponse::from(c).with_lock(instance_locked)),
         score: score.map(ScoreResponse::from),
+        uncataloged_policy,
+    }))
+}
+
+/// A repository's `uncataloged_policy` (#4994).
+async fn read_uncataloged_policy(db: &PgPool, repository_id: Uuid) -> Result<UncatalogedPolicy> {
+    let value: Option<String> =
+        sqlx::query_scalar("SELECT uncataloged_policy FROM repositories WHERE id = $1")
+            .bind(repository_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(value
+        .as_deref()
+        .map(UncatalogedPolicy::from_db)
+        .unwrap_or_default())
+}
+
+#[utoipa::path(
+    put,
+    path = "/{key}/security/uncataloged-policy",
+    context_path = "/api/v1/repositories",
+    tag = "security",
+    params(
+        ("key" = String, Path, description = "Repository key")
+    ),
+    request_body = UncatalogedPolicyRequest,
+    responses(
+        (status = 200, description = "Policy set; the score is recalculated under it", body = UncatalogedPolicyResponse),
+        (status = 401, description = "Authentication required", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Instance administrator required, or the token lacks write:repositories", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
+        (status = 422, description = "uncataloged_policy is not fail or warn", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn set_uncataloged_policy(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(body): Json<UncatalogedPolicyRequest>,
+) -> Result<Json<UncatalogedPolicyResponse>> {
+    let auth =
+        auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
+    auth.require_scope("write:repositories")?;
+    // `warn` relaxes every quality gate and promotion rule that fails closed
+    // on the grade status (#4994), and those are instance-admin controls, so
+    // this is one too.
+    auth.require_admin()?;
+    let repo = RepositoryService::new(state.db.clone())
+        .get_by_key(&key)
+        .await?;
+    let previous: Option<String> = sqlx::query_scalar(
+        "WITH old AS (SELECT uncataloged_policy FROM repositories WHERE id = $1) \
+         UPDATE repositories SET uncataloged_policy = $2 WHERE id = $1 \
+         RETURNING (SELECT uncataloged_policy FROM old)",
+    )
+    .bind(repo.id)
+    .bind(body.uncataloged_policy.as_str())
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    let previous = previous
+        .as_deref()
+        .map(UncatalogedPolicy::from_db)
+        .unwrap_or_default();
+
+    if previous != body.uncataloged_policy {
+        let entry = AuditEntry::new(AuditAction::RepositoryUpdated, ResourceType::Repository)
+            .user(auth.user_id)
+            .resource(repo.id)
+            .actor_name(auth.username.clone())
+            .resource_name(repo.key.clone())
+            .details(serde_json::json!({
+                "key": repo.key,
+                "uncataloged_policy": body.uncataloged_policy.as_str(),
+                "previous_uncataloged_policy": previous.as_str(),
+            }));
+        if let Err(e) = AuditService::new(state.db.clone()).log(entry).await {
+            tracing::warn!(
+                repo = %repo.key, error = %e,
+                "failed to record the uncataloged-policy change audit entry"
+            );
+        }
+    }
+
+    // The gates read the stored status, so recalculate it under the new
+    // policy now rather than at the next scan.
+    let score = ScanResultService::new(state.db.clone())
+        .recalculate_score(repo.id)
+        .await?;
+    Ok(Json(UncatalogedPolicyResponse {
+        uncataloged_policy: body.uncataloged_policy,
+        score: ScoreResponse::from(score),
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/{key}/security/coverage/artifacts",
+    context_path = "/api/v1/repositories",
+    tag = "security",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        CoverageArtifactsQuery,
+    ),
+    responses(
+        (status = 200, description = "The artifacts behind the repository's coverage counts", body = CoverageArtifactsResponse),
+        (status = 400, description = "Unknown status in the filter", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Authentication required", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn list_repo_coverage_artifacts(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Query(query): Query<CoverageArtifactsQuery>,
+) -> Result<Json<CoverageArtifactsResponse>> {
+    use crate::services::scan_result_service::{list_coverage_artifacts, CoverageStatus};
+    let auth =
+        auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
+    let repo_service = RepositoryService::new(state.db.clone());
+    let repo = repo_service.get_by_key(&key).await?;
+    require_visible(&repo, &Some(auth), &repo_service).await?;
+
+    let statuses = CoverageStatus::parse_filter(query.status.as_deref())?;
+    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    let offset = query.offset.unwrap_or(0).max(0);
+    let listing = list_coverage_artifacts(&state.db, repo.id, &statuses, limit, offset).await?;
+    let count = |s: CoverageStatus| listing.counts.get(s.as_str()).copied().unwrap_or(0);
+    Ok(Json(CoverageArtifactsResponse {
+        repository_id: repo.id,
+        counts: CoverageStatusCounts {
+            failed: count(CoverageStatus::Failed),
+            uncataloged: count(CoverageStatus::Uncataloged),
+            partial: count(CoverageStatus::Partial),
+            cataloged: count(CoverageStatus::Cataloged),
+            unscanned: count(CoverageStatus::Unscanned),
+        },
+        total: listing.total,
+        limit,
+        offset,
+        items: listing
+            .items
+            .into_iter()
+            .map(|a| CoverageArtifactResponse {
+                artifact_id: a.artifact_id,
+                name: a.name,
+                version: a.version,
+                path: a.path,
+                coverage_status: a.coverage_status,
+                scans: a.scans,
+            })
+            .collect(),
     }))
 }
 
@@ -2604,7 +2903,10 @@ async fn update_repo_security(
     // repository administration, not artifact publishing. Same admin tier and
     // fail-closed gate as the configuration subresources fixed in #2745
     // (#2603 sibling, #2750).
-    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    // #5645: refused to a caller who cannot read the repository (a
+    // publish-only or delete-only grantee), it is the unknown-key 404.
+    let admin = require_repo_admin(&auth, repo.id, &state.permission_service).await;
+    hide_write_denial_from_non_readers(admin, &auth, &repo, &repo_service).await?;
     let svc = ScanConfigService::new(state.db.clone());
     // #3645: the previous row is read in the same transaction as the write,
     // so the audited "before" is exactly what this write replaced. #4363: the
@@ -3601,6 +3903,14 @@ fn rescan_inconclusive_response(
             code: "RESCAN_SCAN_FAILED".to_string(),
             message: "The scan failed. The stored verdict is unchanged.".to_string(),
         },
+        // #5628: no retry can succeed, so no `Retry-After` either (below).
+        ProxyScanInconclusive::RequestPinned => ErrorResponse {
+            code: "RESCAN_REQUEST_PINNED".to_string(),
+            message: "This verdict was graded against the release or coordinate the \
+                      request named; a rescan cannot re-grade it. Pull the package \
+                      through the proxy to re-grade it. The stored verdict is unchanged."
+                .to_string(),
+        },
         ProxyScanInconclusive::BudgetExceeded => {
             // The ACTUAL budget this request ran under, which is derived from
             // the configured global request timeout (#3455 review, F2) -- not
@@ -3619,6 +3929,8 @@ fn rescan_inconclusive_response(
     };
     let mut resp = (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(error)).into_response();
 
+    let retry_after =
+        retry_after.filter(|_| !matches!(reason, ProxyScanInconclusive::RequestPinned));
     if let Some(remaining) = retry_after {
         let secs = retry_after_delay_seconds(remaining);
         let value = axum::http::HeaderValue::from_str(&secs.to_string())
@@ -3677,10 +3989,16 @@ pub struct ProxyRescanResponse {
             `NO_SCANNER_CONFIGURED` (no scanner is configured for this instance), \
             `RESCAN_SCAN_FAILED` (the scan ran and errored, cataloged nothing \
             gradeable in an object it could not pin, or cataloged fewer \
-            components than a stored vulnerable verdict was graded on), or \
+            components than a stored vulnerable verdict was graded on), \
+            `RESCAN_REQUEST_PINNED` (the stored vulnerable verdict was graded \
+            against the release or coordinate the request named -- a `.deb`, \
+            `.rpm` or `.apk` of a release, a Go, Composer or Conan coordinate -- \
+            and the rescan, which cannot name it, did not find the package at \
+            least as severe; a rescan cannot re-grade it, so pull the package \
+            through the proxy to re-grade it; never carries `Retry-After`), or \
             `RESCAN_BUDGET_EXCEEDED` (the scan did not finish inside its budget). \
-            `Retry-After` is set only when cooldown time actually remains. \
-            The stored verdict is unchanged in every case.", body = crate::api::openapi::ErrorResponse),
+            `Retry-After` is set only when cooldown time actually remains and a \
+            retry can succeed. The stored verdict is unchanged in every case.", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -3702,7 +4020,10 @@ async fn rescan_proxy_cached_path(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
-    require_repo_action(&auth, repo.id, "write", &state.permission_service).await?;
+    // #5645: refused to a caller who cannot read the repository (a
+    // publish-only or delete-only grantee), it is the unknown-key 404.
+    let write = require_repo_action(&auth, repo.id, "write", &state.permission_service).await;
+    hide_write_denial_from_non_readers(write, &auth, &repo, &repo_service).await?;
 
     let path = body.path.trim().to_string();
     if path.is_empty() {
@@ -3795,9 +4116,10 @@ async fn rescan_proxy_cached_path(
     let budget = crate::services::scanner_service::proxy_rescan_budget(
         state.config.global_request_timeout_secs,
     );
-    // A `clean` result does not replace a stored `vulnerable` verdict graded
-    // on more components than this rescan cataloged (see
-    // `rescan_may_replace_stored_verdict`); that is inconclusive too.
+    // A rescan does not overrule a stored blocking verdict it graded less of
+    // (a `clean` on fewer components, or a request-pinned verdict it did not
+    // find at least as severe, #5628; see `rescan_replacement`); that is
+    // inconclusive too.
     let verdict = match crate::api::handlers::proxy_helpers::proxy_rescan_and_record(
         &state, repo.id, &digest, &synthetic, &bytes, &mode, budget,
     )
@@ -3817,7 +4139,9 @@ async fn rescan_proxy_cached_path(
                 // pre-#3455 window (#3455 review, F5): the common case here
                 // is a misconfigured scanner erroring instantly, and a full
                 // 120s lockout per attempt makes that debug loop 4x worse.
-                ProxyScanInconclusive::ScanFailed => {
+                // A scan that ran but cannot overrule a request-pinned verdict
+                // (#5628) spent the same scanner time as a failed one.
+                ProxyScanInconclusive::ScanFailed | ProxyScanInconclusive::RequestPinned => {
                     shorten_rescan_slot(repo.id, PROXY_RESCAN_FAILURE_COOLDOWN)
                 }
                 // By definition consumed (up to) the whole budget: the claim
@@ -3871,6 +4195,8 @@ async fn rescan_proxy_cached_path(
         delete_policy,
         get_repo_security,
         update_repo_security,
+        set_uncataloged_policy,
+        list_repo_coverage_artifacts,
         list_artifact_scans,
         list_repo_scans,
         get_repo_proxy_scans,
@@ -3903,6 +4229,14 @@ async fn rescan_proxy_cached_path(
         UpdatePolicyRequest,
         PolicyResponse,
         RepoSecurityResponse,
+        UncatalogedPolicyRequest,
+        UncatalogedPolicyResponse,
+        UncatalogedPolicy,
+        CoverageArtifactsResponse,
+        CoverageArtifactResponse,
+        CoverageStatusCounts,
+        crate::services::scan_result_service::CoverageStatus,
+        crate::services::scan_result_service::CoverageScan,
         ScanConfigResponse,
         UpdateRepoSecurityRequest,
         crate::services::scan_config_service::UpsertScanConfigRequest,
@@ -5264,6 +5598,26 @@ mod tests {
         action: crate::services::proxy_scan_service::ProxyScanAction,
         identity: crate::api::handlers::proxy_helpers::ProxyScanIdentity,
     ) -> String {
+        gate_cached_pull_3396(
+            state, fx, filename, None, version, digest, content, action, identity,
+        )
+        .await
+    }
+
+    /// [`gate_pull_3396`] for bytes proxy-cached at `cache_path`, which the
+    /// durable scan queue can read back.
+    #[allow(clippy::too_many_arguments)]
+    async fn gate_cached_pull_3396(
+        state: &SharedState,
+        fx: &ProxyScanFixture,
+        filename: &str,
+        cache_path: Option<&str>,
+        version: Option<&str>,
+        digest: &str,
+        content: &bytes::Bytes,
+        action: crate::services::proxy_scan_service::ProxyScanAction,
+        identity: crate::api::handlers::proxy_helpers::ProxyScanIdentity,
+    ) -> String {
         use crate::api::handlers::proxy_helpers::{
             gate_proxy_scan_serve, proxy_synthetic_artifact, ProxyScanMode, ProxyScanServeOutcome,
         };
@@ -5280,6 +5634,7 @@ mod tests {
             fx.repo_id,
             filename,
             digest,
+            cache_path,
             synthetic,
             content,
             action,
@@ -6276,6 +6631,265 @@ mod tests {
         assert_eq!(stored_b, PROXY_STATE_CLEAN);
     }
 
+    /// #5628: a Debian or RPM Remote holds a `vulnerable` verdict graded as
+    /// the package of a release (`rpm|…|rhel:9`, `debian|…|debian:12`). A
+    /// rescan cannot pin the release, so the engine catalogs the package's
+    /// own header (one component, as many as the stored verdict) and, with no
+    /// release feed to match it against, finds nothing. That `clean` must not
+    /// replace the verdict: the rescan is inconclusive (503
+    /// `RESCAN_REQUEST_PINNED`, with no `Retry-After`, since no retry can
+    /// succeed), the stored verdict and its pin stand, and a fail_closed pull
+    /// of the pinned package is still refused (403).
+    #[tokio::test]
+    async fn rescan_without_the_release_pin_keeps_a_vulnerable_os_package_verdict_5628() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+        use crate::services::scanner_service::{
+            ComponentEcosystem, ExpectedComponent, OsPackageContext, OsRelease,
+        };
+
+        let pool = match tdh::try_pool().await {
+            Some(pool) => pool,
+            None if std::env::var_os("CI").is_some() => {
+                panic!("this CI regression requires Postgres; refusing to skip it")
+            }
+            None => return,
+        };
+        let cases = [
+            (
+                "rpm",
+                ComponentEcosystem::Rpm,
+                "9/BaseOS/x86_64/os/Packages/o/openssl-libs-3.0.7-17.el9_2.x86_64.rpm",
+                "openssl-libs-3.0.7-17.el9_2.x86_64.rpm",
+                "openssl-libs",
+                "1:3.0.7-17.el9_2",
+                ("rhel", "9"),
+            ),
+            (
+                "debian",
+                ComponentEcosystem::Debian,
+                "pool/main/o/openssl/openssl_3.0.11-1~deb12u2_amd64.deb",
+                "openssl_3.0.11-1~deb12u2_amd64.deb",
+                "openssl",
+                "3.0.11-1~deb12u2",
+                ("debian", "12"),
+            ),
+        ];
+        let mut outcomes = Vec::new();
+        for (format, ecosystem, path, filename, name, version, (id, release)) in cases {
+            let fx = ProxyScanFixture::with_format(pool.clone(), format).await;
+            let pin = ExpectedComponent::os_package(
+                ecosystem,
+                name,
+                version,
+                OsPackageContext {
+                    release: OsRelease::new(id, release).expect("a release with a feed"),
+                    arch: "x86_64".to_string(),
+                    source: None,
+                },
+            )
+            .expect("an OS package pin");
+            let content = bytes::Bytes::from(format!("{format} package {}", Uuid::new_v4()));
+            let digest = seed_cached_verdict_3396(
+                &fx,
+                path,
+                &content,
+                None,
+                PROXY_STATE_VULNERABLE,
+                Some(1),
+                Some(&pin.pin_identity()),
+            )
+            .await;
+            // Cataloged as itself, nothing found: what the engine reports for
+            // a lone package with no release to grade it against.
+            let scanner = std::sync::Arc::new(VersionedCveScanner::new(
+                Some("grype-test"),
+                MockCveRescan::Cataloged("openssl", "3.0.7"),
+            ))
+                as std::sync::Arc<dyn crate::services::scanner_service::Scanner>;
+            let state = scanner_state_with(&fx, vec![scanner], path, content.clone(), |_| {}).await;
+
+            let resp = call_rescan(state.clone(), &fx, path)
+                .await
+                .expect("a rescan answers with a built response");
+            let status = resp.status();
+            let retry_after = resp.headers().get(axum::http::header::RETRY_AFTER).cloned();
+            let body = json_body(resp).await;
+            let stored = crate::services::proxy_scan_service::ProxyScanService::new(pool.clone())
+                .lookup_verdict_with_pin(
+                    &digest,
+                    crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE,
+                )
+                .await
+                .expect("read the stored verdict")
+                .expect("a stored verdict");
+            let pull = gate_pull_3396(
+                &state,
+                &fx,
+                filename,
+                None,
+                &digest,
+                &content,
+                crate::services::proxy_scan_service::ProxyScanAction::FailClosed,
+                crate::api::handlers::proxy_helpers::ProxyScanIdentity::Established(pin.clone()),
+            )
+            .await;
+
+            release_rescan_slot(fx.repo_id);
+            fx.cleanup(&[digest]).await;
+            outcomes.push((
+                format,
+                status,
+                retry_after,
+                body,
+                stored,
+                pin.pin_identity(),
+                pull,
+            ));
+        }
+
+        for (format, status, retry_after, body, (row, stored_pin, cataloged), pin, pull) in outcomes
+        {
+            assert_eq!(
+                status,
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "{format}: an unpinned clean rescan must be inconclusive: {body}"
+            );
+            assert_eq!(
+                body["code"],
+                serde_json::json!("RESCAN_REQUEST_PINNED"),
+                "{format}"
+            );
+            assert_eq!(
+                retry_after, None,
+                "{format}: a retry cannot succeed, so none is advertised"
+            );
+            assert_eq!(
+                (row.verdict.as_str(), stored_pin.as_deref(), cataloged),
+                (PROXY_STATE_VULNERABLE, Some(pin.as_str()), Some(1)),
+                "{format}: the stored verdict and its pin must stand"
+            );
+            assert_eq!(pull, "403", "{format}: the pinned pull is still refused");
+        }
+    }
+
+    /// #5628 review: an unpinned rescan that finds a release-pinned `critical`
+    /// package vulnerable at a LOWER severity (`high`) must not replace it
+    /// either. Recorded, it would have dropped the pin and the severity, and
+    /// an opted-in severity threshold above `high` would then serve the
+    /// package. It is inconclusive (503 `RESCAN_REQUEST_PINNED`), and the
+    /// `critical` verdict and its pin stand. A rescan that finds the package
+    /// at least as severe (stored `high`, rescan `high`) is recorded, under
+    /// the stored pin.
+    #[tokio::test]
+    async fn rescan_at_a_lower_severity_keeps_a_release_pinned_verdict_and_its_pin_5628() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+        use crate::services::scanner_service::{
+            ComponentEcosystem, ExpectedComponent, OsPackageContext, OsRelease,
+        };
+
+        let pool = match tdh::try_pool().await {
+            Some(pool) => pool,
+            None if std::env::var_os("CI").is_some() => {
+                panic!("this CI regression requires Postgres; refusing to skip it")
+            }
+            None => return,
+        };
+        let fx = ProxyScanFixture::with_format(pool.clone(), "rpm").await;
+        let pin = ExpectedComponent::os_package(
+            ComponentEcosystem::Rpm,
+            "openssl-libs",
+            "1:3.0.7-17.el9_2",
+            OsPackageContext {
+                release: OsRelease::new("rhel", "9").expect("a release with a feed"),
+                arch: "x86_64".to_string(),
+                source: None,
+            },
+        )
+        .expect("an OS package pin")
+        .pin_identity();
+        let pss = crate::services::proxy_scan_service::ProxyScanService::new(pool.clone());
+        let mut digests = Vec::new();
+        let mut outcomes = Vec::new();
+        for (n, stored_severity) in ["critical", "high"].into_iter().enumerate() {
+            let path = format!("Packages/o/openssl-libs-3.0.7-17.el9_2.{n}.x86_64.rpm");
+            let content = bytes::Bytes::from(format!("rpm package {}", Uuid::new_v4()));
+            let digest = seed_cached_verdict_3396(
+                &fx,
+                &path,
+                &content,
+                None,
+                PROXY_STATE_VULNERABLE,
+                Some(1),
+                Some(&pin),
+            )
+            .await;
+            sqlx::query(
+                "UPDATE proxy_scan_results SET max_severity = $2 WHERE checksum_sha256 = $1",
+            )
+            .bind(&digest)
+            .bind(stored_severity)
+            .execute(&pool)
+            .await
+            .expect("set the stored severity");
+            // One `High` finding, cataloged as itself.
+            let scanner = std::sync::Arc::new(VersionedCveScanner::new(
+                Some("grype-test"),
+                MockCveRescan::CatalogedVulnerable("openssl-libs", "3.0.7"),
+            ))
+                as std::sync::Arc<dyn crate::services::scanner_service::Scanner>;
+            let state =
+                scanner_state_with(&fx, vec![scanner], &path, content.clone(), |_| {}).await;
+            let resp = call_rescan(state, &fx, &path)
+                .await
+                .expect("a rescan answers with a built response");
+            let status = resp.status();
+            let body = json_body(resp).await;
+            let (row, stored_pin, _) = pss
+                .lookup_verdict_with_pin(
+                    &digest,
+                    crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE,
+                )
+                .await
+                .expect("read the stored verdict")
+                .expect("a stored verdict");
+            release_rescan_slot(fx.repo_id);
+            outcomes.push((stored_severity, status, body, row, stored_pin));
+            digests.push(digest);
+        }
+        fx.cleanup(&digests).await;
+
+        let (_, status, body, row, stored_pin) = &outcomes[0];
+        assert_eq!(
+            *status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{body}"
+        );
+        assert_eq!(body["code"], serde_json::json!("RESCAN_REQUEST_PINNED"));
+        assert_eq!(
+            (
+                row.verdict.as_str(),
+                row.max_severity.as_deref(),
+                stored_pin.as_deref()
+            ),
+            (PROXY_STATE_VULNERABLE, Some("critical"), Some(pin.as_str())),
+            "a lower-severity rescan must keep the critical verdict and its pin"
+        );
+
+        let (_, status, body, row, stored_pin) = &outcomes[1];
+        assert_eq!(*status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(
+            (
+                row.verdict.as_str(),
+                row.max_severity.as_deref(),
+                stored_pin.as_deref()
+            ),
+            (PROXY_STATE_VULNERABLE, Some("high"), Some(pin.as_str())),
+            "an at-least-as-severe rescan is recorded under the stored pin"
+        );
+    }
+
     /// A CVE-authoritative scanner that does not apply to the rescanned
     /// object, as the bundled engine does not apply to a manifest it cannot
     /// build an image reference for.
@@ -6532,6 +7146,17 @@ mod tests {
     /// reusing the stored verdict without scanning.
     #[tokio::test]
     async fn not_applicable_pull_does_not_reuse_a_no_pin_clean_that_graded_nothing_3396() {
+        no_pin_clean_that_graded_nothing_is_rescanned_3396(false).await;
+    }
+
+    /// The same through the durable scan queue: the fail_closed pull parks on
+    /// the job a worker drains, and takes the verdict it records.
+    #[tokio::test]
+    async fn not_applicable_pull_does_not_reuse_a_no_pin_clean_that_graded_nothing_3396_queued() {
+        no_pin_clean_that_graded_nothing_is_rescanned_3396(true).await;
+    }
+
+    async fn no_pin_clean_that_graded_nothing_is_rescanned_3396(queued: bool) {
         use crate::api::handlers::test_db_helpers as tdh;
         use std::sync::atomic::Ordering;
 
@@ -6561,11 +7186,18 @@ mod tests {
             let (scanner, scans) = vulnerable_counting_scanner_3396();
             let state =
                 scanner_state_with(&fx, vec![scanner], &path, content.clone(), |_| {}).await;
+            let (state, worker) = if queued {
+                let (state, worker) = tdh::with_scan_worker(state);
+                (state, Some(worker))
+            } else {
+                (state, None)
+            };
             let pull = |action| {
-                gate_pull_3396(
+                gate_cached_pull_3396(
                     &state,
                     &fx,
                     "blob.bin",
+                    Some(path.as_str()),
                     None,
                     &digest,
                     &content,
@@ -6577,6 +7209,7 @@ mod tests {
             let scans_after_open = scans.load(Ordering::SeqCst);
             let closed =
                 pull(crate::services::proxy_scan_service::ProxyScanAction::FailClosed).await;
+            drop(worker);
             outcomes.push((
                 cataloged,
                 open,
@@ -7632,6 +8265,131 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #4994: only an instance administrator sets a repository's
+    /// uncataloged policy (`warn` relaxes every gate that fails closed on the
+    /// grade status); the write recalculates the score under it, and the
+    /// coverage listing names the artifact behind `coverage.uncataloged`.
+    #[tokio::test]
+    async fn uncataloged_policy_and_coverage_listing_db_4994() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_admin(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let artifact_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, checksum_sha256, \
+                content_type, storage_key) \
+             VALUES ($1, $2, 'docs.tar.gz', 'docs/docs.tar.gz', 1, repeat('a', 64), \
+                'application/gzip', 'docs/docs.tar.gz')",
+        )
+        .bind(artifact_id)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("artifact");
+        sqlx::query(
+            "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
+                completed_at, scan_completeness, scan_completeness_reason) \
+             VALUES ($1, $2, 'dependency', 'completed', NOW(), 'not_cataloged', 'no catalog')",
+        )
+        .bind(artifact_id)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("scan");
+
+        let body = || {
+            Json(UncatalogedPolicyRequest {
+                uncataloged_policy: UncatalogedPolicy::Warn,
+            })
+        };
+        // A repository administrator is not enough.
+        let denied = set_uncataloged_policy(
+            State(state.clone()),
+            Extension(Some(tdh::make_auth(user_id, &username))),
+            Path(key.clone()),
+            body(),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "{denied:?}"
+        );
+        let stored: String =
+            sqlx::query_scalar("SELECT uncataloged_policy FROM repositories WHERE id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, "fail", "the default, unchanged by a refused write");
+
+        let admin = tdh::admin_auth(Uuid::new_v4(), "root");
+        let ok = set_uncataloged_policy(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(key.clone()),
+            body(),
+        )
+        .await
+        .expect("instance admin sets warn")
+        .0;
+        assert_eq!(ok.uncataloged_policy, UncatalogedPolicy::Warn);
+        assert_eq!(ok.score.grade_status, "rated", "recalculated under warn");
+        assert!(ok.score.has_uncataloged_scan);
+        assert_eq!(ok.score.coverage.as_ref().map(|c| c.uncataloged), Some(1));
+
+        let got = get_repo_security(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(key.clone()),
+        )
+        .await
+        .expect("get")
+        .0;
+        assert_eq!(got.uncataloged_policy, UncatalogedPolicy::Warn);
+
+        let listing = list_repo_coverage_artifacts(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(key.clone()),
+            Query(CoverageArtifactsQuery::default()),
+        )
+        .await
+        .expect("list")
+        .0;
+        assert_eq!((listing.total, listing.counts.uncataloged), (1, 1));
+        assert_eq!(listing.items[0].artifact_id, artifact_id);
+        assert_eq!(
+            listing.items[0].scans[0].reason.as_deref(),
+            Some("no catalog")
+        );
+        let json = serde_json::to_value(&listing).unwrap();
+        assert_eq!(json["items"][0]["coverage_status"], "uncataloged");
+
+        let bad = list_repo_coverage_artifacts(
+            State(state.clone()),
+            Extension(Some(admin)),
+            Path(key.clone()),
+            Query(CoverageArtifactsQuery {
+                status: Some("ignore".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert!(matches!(bad, Err(AppError::Validation(_))), "{bad:?}");
+
+        let _ = sqlx::query("DELETE FROM repo_security_scores WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// GHSA-gvhj-8vg9-358g: a user holding `repository:admin` who presents an
     /// API token minted with only `read:artifacts` must NOT be able to change
     /// the repository's scan configuration. The four sibling
@@ -7897,6 +8655,7 @@ mod tests {
             repo_id,
             "p-1.tgz",
             digest,
+            None,
             synthetic,
             &bytes,
             action,
@@ -9902,6 +10661,7 @@ mod tests {
             max_severity: "critical".to_string(),
             block_unscanned: true,
             block_on_fail: true,
+            block_uncataloged: false,
             is_enabled: false,
             min_staging_hours: None,
             max_artifact_age_days: None,
@@ -10630,6 +11390,7 @@ mod tests {
         let resp = RepoSecurityResponse {
             config: None,
             score: None,
+            uncataloged_policy: UncatalogedPolicy::Fail,
         };
         assert!(resp.config.is_none());
         assert!(resp.score.is_none());
@@ -10670,6 +11431,7 @@ mod tests {
                 has_failed_scan: false,
                 has_uncataloged_scan: false,
             }),
+            uncataloged_policy: UncatalogedPolicy::Warn,
         };
         assert!(resp.config.is_some());
         assert!(resp.score.is_some());
@@ -10843,6 +11605,7 @@ mod tests {
             max_severity: "high".to_string(),
             block_unscanned: true,
             block_on_fail: false,
+            block_uncataloged: false,
             is_enabled: true,
             min_staging_hours: Some(12),
             max_artifact_age_days: None,
@@ -12088,6 +12851,93 @@ mod tests {
         assert_eq!(rows[1].2, 1);
         assert_eq!(rows[1].3, 1);
         assert_eq!(stored_findings, 3, "2 + 1 findings across both submissions");
+    }
+
+    /// #5564: an external verdict's `scanner_version` used to be written into
+    /// `scan_results.scanner_version VARCHAR(50)`, so a longer vendor build id
+    /// answered 500 `DATABASE_ERROR`. It is `TEXT` now and must be stored
+    /// whole. A finding the schema still refuses (an over-long `cve_id`)
+    /// stays a 400 `VALIDATION_ERROR`, not a 500, and writes no scan row.
+    #[tokio::test]
+    async fn test_ingest_external_findings_stores_long_scanner_version_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let app = tdh::router_with_auth_ext(
+            router(),
+            fx.state.clone(),
+            tdh::admin_auth(fx.user_id, &fx.username),
+        );
+        let post = |body: serde_json::Value| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/findings/external")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        let long_version = format!("acme-scanner-{}", "v".repeat(120));
+        let (status, body) = tdh::send(
+            app.clone(),
+            post(serde_json::json!({
+                "artifact_id": art,
+                "scanner": "acme",
+                "scanner_version": long_version.clone(),
+                "findings": [{
+                    "severity": "high",
+                    "title": "backdoor",
+                    "cve_id": "CVE-2024-3094",
+                }],
+            })),
+        )
+        .await;
+        let overlong_id = format!("VENDOR-ADVISORY-{}", "1".repeat(30));
+        let (bad_status, bad_body) = tdh::send(
+            app,
+            post(serde_json::json!({
+                "artifact_id": art,
+                "scanner": "acme",
+                "findings": [{
+                    "severity": "high",
+                    "title": "backdoor",
+                    "cve_id": overlong_id,
+                }],
+            })),
+        )
+        .await;
+        let stored: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status, scanner_version FROM scan_results WHERE artifact_id = $1",
+        )
+        .bind(art)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("read the ingested scan back");
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "a long scanner version must be accepted, got {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            stored.len(),
+            1,
+            "the refused submission must write no scan row"
+        );
+        assert_eq!(stored[0].0, "completed");
+        assert_eq!(stored[0].1.as_deref(), Some(long_version.as_str()));
+        assert_eq!(
+            bad_status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "an over-long cve_id stays a 400, got {}",
+            String::from_utf8_lossy(&bad_body)
+        );
+        assert!(String::from_utf8_lossy(&bad_body).contains("VALIDATION_ERROR"));
     }
 
     #[tokio::test]

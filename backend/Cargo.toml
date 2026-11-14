@@ -276,6 +276,10 @@ prost-build.workspace = true
 
 [dev-dependencies]
 tokio-test = "0.4"
+# Property tests for the pure decision cores (version comparators, scan-state
+# classification, routing rules): state a law, let proptest hunt the
+# counterexample and shrink it.
+proptest = "1"
 # setrlimit(RLIMIT_FSIZE) in the filesystem storage tests, to make a write
 # fail on demand (#4646). Already in the tree transitively.
 libc = "0.2"

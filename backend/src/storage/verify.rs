@@ -578,6 +578,24 @@ pub async fn verify_stored_body(
         })
 }
 
+/// [`verify_stored_body`] for a format route serving a row of its own
+/// (#4989). A HEAD (`is_head`) never polls the body, so it reads and
+/// verifies nothing, as a HEAD answered from the artifact row does on the
+/// generic route (#4323).
+pub async fn verify_row_serve(
+    body: BoxStream<'static, Result<Bytes>>,
+    recorded_sha256: &str,
+    path: &str,
+    size_bytes: i64,
+    is_head: bool,
+    label: impl FnOnce() -> String,
+) -> std::result::Result<BoxStream<'static, Result<Bytes>>, axum::response::Response> {
+    if is_head {
+        return Ok(body);
+    }
+    verify_stored_body(body, recorded_sha256, path, size_bytes, label).await
+}
+
 /// Buffered sibling of [`verify_stored_body`] for a body already in memory.
 #[allow(clippy::result_large_err)]
 pub fn verify_stored_bytes(

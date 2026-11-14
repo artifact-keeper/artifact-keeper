@@ -42,6 +42,7 @@
         "custom_user_agent": { "type": "string" },
         "curation_enabled": { "type": "boolean" },
         "curation_default_action": { "enum": ["allow", "review"] },
+        "curation_source_repository_key": { "type": "string", "minLength": 1 },
         "members": {
           "type": "array",
           "items": {

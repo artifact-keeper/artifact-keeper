@@ -25,6 +25,14 @@ the rest of this page governs. Operators who need longer interactive sessions
 can raise `JWT_ACCESS_TOKEN_EXPIRY_MINUTES`; the legacy `JWT_EXPIRATION_SECS`
 does not affect any token lifetime.
 
+Prefer `Authorization: Bearer <api_token>` wherever the client supports it.
+Package clients that can only send Basic auth (Maven `settings.xml`, pixi/conda,
+an npm `.npmrc` `_auth`) may use `username:<api_token>` on the package routes.
+A Basic password that exactly matches the token shape (41 bytes, `_` at byte 8,
+hex elsewhere) is checked only as a token. It costs no password hash and never
+counts as a failed login against the account. The management API (`/api/v1`)
+refuses it as a Basic password (#5640).
+
 ## What the policy governs — and what it never touches
 
 The policy is enforced at **mint time only**, inside the single choke-point

@@ -1520,13 +1520,7 @@ async fn get_mod_file(
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, ctx).await;
@@ -2123,12 +2117,21 @@ async fn upload_zip(
             .into_response());
     }
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
-
     // Compute SHA256
     let mut hasher = Sha256::new();
     hasher.update(&body);
     let checksum = format!("{:x}", hasher.finalize());
+
+    // A deleted release comes back with the same bytes only (#4812)
+    super::cleanup_soft_deleted_artifact_checked(
+        &state.db,
+        &RepositoryFormat::Go,
+        repo.id,
+        &artifact_path,
+        &checksum,
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
 
     let size_bytes = body.len() as i64;
     super::publish_quota::preflight_publish_quota(
@@ -2138,7 +2141,12 @@ async fn upload_zip(
         size_bytes,
     )
     .await?;
-    let storage_key = build_go_zip_storage_key(module, version);
+    let storage_key = go_storage_key(
+        crate::storage::StorageKeyScheme::from_env(),
+        &repo.storage_backend,
+        repo.id,
+        &artifact_path,
+    );
     proxy_helpers::guard_cross_repo_write(state, repo.id, &repo.storage_backend, &storage_key)
         .await?;
 
@@ -2146,13 +2154,10 @@ async fn upload_zip(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            crate::api::handlers::storage_err_message(&e),
-        )
-            .into_response()
-    })?;
+    storage
+        .put(&storage_key, body)
+        .await
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     // Insert artifact record
     let mut tx = super::publish_quota::begin_admitted_publish(
@@ -2218,6 +2223,7 @@ async fn upload_zip(
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         "go",
         module,
@@ -2292,12 +2298,21 @@ async fn upload_mod(
             .into_response());
     }
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
-
     // Compute SHA256
     let mut hasher = Sha256::new();
     hasher.update(&body);
     let checksum = format!("{:x}", hasher.finalize());
+
+    // A deleted release comes back with the same bytes only (#4812)
+    super::cleanup_soft_deleted_artifact_checked(
+        &state.db,
+        &RepositoryFormat::Go,
+        repo.id,
+        &artifact_path,
+        &checksum,
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
 
     let size_bytes = body.len() as i64;
     super::publish_quota::preflight_publish_quota(
@@ -2307,7 +2322,12 @@ async fn upload_mod(
         size_bytes,
     )
     .await?;
-    let storage_key = build_go_mod_storage_key(module, version);
+    let storage_key = go_storage_key(
+        crate::storage::StorageKeyScheme::from_env(),
+        &repo.storage_backend,
+        repo.id,
+        &artifact_path,
+    );
     proxy_helpers::guard_cross_repo_write(state, repo.id, &repo.storage_backend, &storage_key)
         .await?;
 
@@ -2315,13 +2335,10 @@ async fn upload_mod(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            crate::api::handlers::storage_err_message(&e),
-        )
-            .into_response()
-    })?;
+    storage
+        .put(&storage_key, body)
+        .await
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     // Insert artifact record
     let mut tx = super::publish_quota::begin_admitted_publish(
@@ -2448,22 +2465,29 @@ fn build_go_zip_artifact_path(module: &str, version: &str) -> String {
     format!("{}/{}/{}.zip", encoded_module, version, version)
 }
 
-/// Build the storage key for a Go module zip.
-fn build_go_zip_storage_key(module: &str, version: &str) -> String {
-    let encoded_module = encode_module_path(module);
-    format!("go/{}/{}/{}.zip", encoded_module, version, version)
+/// The storage key a hosted module file (zip or go.mod) at `artifact_path`
+/// is written to.
+///
+/// On a shared cloud namespace (S3/GCS/Azure) this is the repo-scoped
+/// `go/{repository_id}/{artifact_path}` of the #2624 scheme, so two
+/// repositories holding the same module version write two objects; the flat
+/// `go/{artifact_path}` key they used to share made the second repository's
+/// upload fail the cross-repository write guard with 409 (#5662). Filesystem
+/// backends and `STORAGE_KEY_SCHEME=flat` keep the flat key. Existing files
+/// keep serving: every read resolves the `storage_key` its row recorded.
+fn go_storage_key(
+    scheme: crate::storage::StorageKeyScheme,
+    storage_backend: &str,
+    repo_id: uuid::Uuid,
+    artifact_path: &str,
+) -> String {
+    scheme.write_key(storage_backend, "go", repo_id, artifact_path)
 }
 
 /// Build the artifact path for a Go go.mod file.
 fn build_go_mod_artifact_path(module: &str, version: &str) -> String {
     let encoded_module = encode_module_path(module);
     format!("{}/{}/go.mod", encoded_module, version)
-}
-
-/// Build the storage key for a Go go.mod file.
-fn build_go_mod_storage_key(module: &str, version: &str) -> String {
-    let encoded_module = encode_module_path(module);
-    format!("go/{}/{}/go.mod", encoded_module, version)
 }
 
 /// Build Go module metadata JSON for storage.
@@ -3050,6 +3074,45 @@ mod tests {
     // -----------------------------------------------------------------------
     // build_go_zip_storage_key
     // -----------------------------------------------------------------------
+
+    /// The key a hosted upload writes on a filesystem backend.
+    fn build_go_zip_storage_key(module: &str, version: &str) -> String {
+        on_filesystem(&build_go_zip_artifact_path(module, version))
+    }
+
+    fn build_go_mod_storage_key(module: &str, version: &str) -> String {
+        on_filesystem(&build_go_mod_artifact_path(module, version))
+    }
+
+    fn on_filesystem(artifact_path: &str) -> String {
+        go_storage_key(
+            crate::storage::StorageKeyScheme::RepoScoped,
+            "filesystem",
+            uuid::Uuid::new_v4(),
+            artifact_path,
+        )
+    }
+
+    /// #5662: a shared cloud namespace gets the repo-scoped key, and the
+    /// `STORAGE_KEY_SCHEME=flat` opt-out keeps the legacy shared key.
+    #[test]
+    fn go_storage_key_is_repo_scoped_on_cloud_5662() {
+        use crate::storage::StorageKeyScheme;
+        let path = build_go_zip_artifact_path("github.com/user/repo", "v1.0.0");
+        let repo_id = uuid::Uuid::new_v4();
+        for backend in ["s3", "gcs", "azure"] {
+            assert_eq!(
+                go_storage_key(StorageKeyScheme::RepoScoped, backend, repo_id, &path),
+                format!("go/{repo_id}/github.com/user/repo/v1.0.0/v1.0.0.zip"),
+                "{backend}"
+            );
+            assert_eq!(
+                go_storage_key(StorageKeyScheme::Flat, backend, repo_id, &path),
+                "go/github.com/user/repo/v1.0.0/v1.0.0.zip",
+                "{backend}"
+            );
+        }
+    }
 
     #[test]
     fn test_build_go_zip_storage_key_simple() {
@@ -3987,6 +4050,90 @@ mod tests {
         rig.cleanup(&fx.pool).await;
         fx.teardown().await;
     }
+
+    /// #5685: a `.zip` or `.mod` publish (`upload_zip` / `upload_mod`'s
+    /// `storage.put`) against a store that is down answers `503` with
+    /// `Retry-After`, and against one that is full `507` without it; the
+    /// `.mod` download of a stored module (`get_mod_file`'s `get_stream`)
+    /// answers the same way. The body is the fixed message, with no backend
+    /// text or storage-class marker. All three answered a hard-coded 500.
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: buffering small error bodies in test assertions is not an artifact path (#1608)
+    #[tokio::test]
+    async fn put_and_mod_get_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        let Some(fx) = tdh::Fixture::setup("local", "go").await else {
+            return;
+        };
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                format!("/{}/example.com/outage5685/@v/v1.0.0.mod", fx.repo_key),
+                bytes::Bytes::from_static(b"module example.com/outage5685\n"),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "go.mod publish while storage works: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        for (message, want, expected) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&fx.pool, &fx.state, fx.repo_id, &message).await;
+            let requests = [
+                (
+                    "PUT .zip",
+                    tdh::put(
+                        format!("/{}/example.com/outage5685/@v/v2.0.0.zip", fx.repo_key),
+                        bytes::Bytes::from_static(b"not-really-a-zip-5685"),
+                    ),
+                ),
+                (
+                    "PUT .mod",
+                    tdh::put(
+                        format!("/{}/example.com/outage5685/@v/v2.0.0.mod", fx.repo_key),
+                        bytes::Bytes::from_static(b"module example.com/outage5685\n"),
+                    ),
+                ),
+                (
+                    "GET .mod",
+                    tdh::get(format!(
+                        "/{}/example.com/outage5685/@v/v1.0.0.mod",
+                        fx.repo_key
+                    )),
+                ),
+            ];
+            for (label, req) in requests {
+                let app = tdh::router_with_auth(
+                    super::router(),
+                    state.clone(),
+                    tdh::make_auth(fx.user_id, &fx.username),
+                );
+                let (status, body, headers) = tdh::send_with_headers(app, req).await;
+                assert_eq!(status, want, "{label}: {}", String::from_utf8_lossy(&body));
+                assert_eq!(
+                    headers.contains_key(axum::http::header::RETRY_AFTER),
+                    want == StatusCode::SERVICE_UNAVAILABLE,
+                    "{label}: Retry-After only on the 503"
+                );
+                tdh::assert_no_storage_backend_text(&format!("goproxy {label}"), &body);
+                assert_eq!(&body[..], expected.as_bytes(), "{label}: fixed message");
+            }
+        }
+        fx.teardown().await;
+    }
 }
 
 /// #833 — Virtual repository COLLATION for the goproxy `@v/list` document.
@@ -4395,6 +4542,33 @@ mod virtual_collation_tests {
 mod catalog_registration_tests {
     use crate::api::handlers::test_db_helpers as tdh;
 
+    /// #5662: the same module version uploads into two Go repositories on a
+    /// shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_module_uploads_to_two_cloud_repositories_5662() {
+        const ZIP: &[u8] = b"one module zip two proxies carry (#5662)";
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "go",
+            key_prefix: "go",
+            router: super::router,
+            publish: &|key| {
+                vec![
+                    tdh::put(
+                        format!("/{key}/example.com/shared/@v/v1.0.0.mod"),
+                        bytes::Bytes::from_static(b"module example.com/shared\n"),
+                    ),
+                    tdh::put(
+                        format!("/{key}/example.com/shared/@v/v1.0.0.zip"),
+                        bytes::Bytes::from_static(ZIP),
+                    ),
+                ]
+            },
+            download: &|key| tdh::get(format!("/{key}/example.com/shared/@v/v1.0.0.zip")),
+            expected: ZIP,
+        })
+        .await;
+    }
+
     /// A module zip upload must register the catalog row under the module
     /// path and version.
     #[tokio::test]
@@ -4545,6 +4719,132 @@ mod catalog_registration_tests {
                 "scan_on_upload={on_upload}: {scans} scans"
             );
         }
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod republish_4812_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+
+    /// #4812: once a release is deleted its version comes back with the same
+    /// bytes only, a zip or go.mod with other bytes is 409
+    #[tokio::test]
+    async fn deleted_module_comes_back_with_the_same_bytes_only_4812() {
+        let Some(fx) = tdh::Fixture::setup("local", "go").await else {
+            return;
+        };
+        let put = |leaf: &str, body: &'static str| {
+            let app = fx.router_with_auth(super::router());
+            let uri = format!("/{}/example.com/again/@v/{leaf}", fx.repo_key);
+            async move {
+                tdh::send(app, tdh::put(uri, bytes::Bytes::from(body)))
+                    .await
+                    .0
+            }
+        };
+        let mut got = Vec::new();
+        for (leaf, stored, same, other) in [
+            ("v1.0.0.zip", "v1.0.0.zip", "zip A", "zip B"),
+            (
+                "v1.0.0.mod",
+                "go.mod",
+                "module example.com/again\n",
+                "module example.com/again\n\n// changed\n",
+            ),
+        ] {
+            let first = put(leaf, same).await;
+            let deleted = crate::api::handlers::repositories::delete_artifact(
+                axum::extract::State(fx.state.clone()),
+                axum::Extension(Some(tdh::admin_auth(fx.user_id, &fx.username))),
+                axum::extract::Path((
+                    fx.repo_key.clone(),
+                    format!("example.com/again/v1.0.0/{stored}"),
+                )),
+                axum::extract::Query(Default::default()),
+                axum::http::HeaderMap::new(),
+            )
+            .await;
+            let changed = put(leaf, other).await;
+            let restored = put(leaf, same).await;
+            got.push((leaf, first, deleted.is_ok(), changed, restored));
+        }
+        fx.teardown().await;
+        for (leaf, first, deleted, changed, restored) in got {
+            assert!(first.is_success(), "{leaf}: {first}");
+            assert!(deleted, "{leaf}: the admin delete lands");
+            assert_eq!(changed, StatusCode::CONFLICT, "{leaf}: other bytes");
+            assert!(restored.is_success(), "{leaf}: same bytes: {restored}");
+        }
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod release_delete_5626_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// A published module is a release: a repository owner who isn't an admin
+    /// gets 409 deleting its zip or go.mod by the stored path
+    #[tokio::test]
+    async fn published_module_delete_needs_an_admin_5626() {
+        let Some(fx) = tdh::Fixture::setup("local", "go").await else {
+            return;
+        };
+        tdh::grant_repo_role(&fx.pool, fx.repo_id, fx.user_id, "repository-owner").await;
+        for (leaf, body) in [
+            ("v1.2.3.zip", "zip bytes"),
+            ("v1.2.3.mod", "module example.com/kept\n"),
+        ] {
+            let (status, out) = tdh::send(
+                fx.router_with_auth(super::router()),
+                tdh::put(
+                    format!("/{}/example.com/kept/@v/{leaf}", fx.repo_key),
+                    bytes::Bytes::from(body),
+                ),
+            )
+            .await;
+            assert!(
+                status.is_success(),
+                "{leaf}: {}",
+                String::from_utf8_lossy(&out)
+            );
+        }
+        let paths = [
+            "example.com/kept/v1.2.3/v1.2.3.zip",
+            "example.com/kept/v1.2.3/go.mod",
+        ];
+        let mut got = Vec::new();
+        for path in paths {
+            got.push(
+                crate::api::handlers::repositories::delete_artifact(
+                    axum::extract::State(fx.state.clone()),
+                    axum::Extension(Some(tdh::make_auth(fx.user_id, &fx.username))),
+                    axum::extract::Path((fx.repo_key.clone(), path.to_string())),
+                    axum::extract::Query(Default::default()),
+                    axum::http::HeaderMap::new(),
+                )
+                .await,
+            );
+        }
+        let live: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifacts \
+             WHERE repository_id = $1 AND path = ANY($2) AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .bind(&paths[..])
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+        fx.teardown().await;
+        for r in &got {
+            assert!(
+                matches!(r, Err(crate::error::AppError::Conflict(_))),
+                "{r:?}"
+            );
+        }
+        assert_eq!(live, 2, "both files stay published");
     }
 }
 

@@ -243,6 +243,13 @@ async fn index_cksum_at(
     name_lower: &str,
     version: &str,
 ) -> Option<String> {
+    // a published cksum never changes, so a stale cached index can only miss, never mislead
+    let cache_key = format!("{repo_key}:{name_lower}");
+    if let Some(cached) = index_cache_get(&state.index_cache, &cache_key).await {
+        if let Some(cksum) = cksum_for_version(&cached, version) {
+            return Some(cksum);
+        }
+    }
     let proxy = state.proxy_service.as_ref()?;
     let index_path = cargo_sparse_index_path_upstream(name_lower);
     let (content, _content_type) = proxy_helpers::proxy_fetch_capped(
@@ -641,7 +648,7 @@ async fn cargo_age_gate_params(
     state: &SharedState,
     repo: &RepoInfo,
 ) -> Result<Option<crate::services::age_gate_service::AgeGateRepoParams>, Response> {
-    use crate::services::age_gate_service::{resolve_repo_params, AgeGateService};
+    use crate::services::age_gate_service::resolve_repo_params;
 
     if repo.repo_type != "remote" {
         return Ok(None);
@@ -649,6 +656,16 @@ async fn cargo_age_gate_params(
     let params = resolve_repo_params(&state.db, repo.id)
         .await
         .map_err(|e| e.into_response())?;
+    enforceable_age_gate(params)
+}
+
+/// `None` when the gate is off, an error when it is on but cannot be enforced.
+#[allow(clippy::result_large_err)]
+fn enforceable_age_gate(
+    params: crate::services::age_gate_service::AgeGateRepoParams,
+) -> Result<Option<crate::services::age_gate_service::AgeGateRepoParams>, Response> {
+    use crate::services::age_gate_service::AgeGateService;
+
     if !AgeGateService::gating_requested(&params) {
         return Ok(None);
     }
@@ -1715,6 +1732,28 @@ async fn check_duplicate_crate(
     Ok(())
 }
 
+/// The storage key a new `.crate` file is written to, for the
+/// `{name}/{version}/{name}-{version}.crate` artifact path.
+///
+/// On a shared cloud namespace (S3/GCS/Azure) this is the repo-scoped
+/// `cargo/{repository_id}/{artifact_path}` of the #2624 scheme, so two
+/// repositories publishing the same crate version (a staging and a
+/// production registry, two teams vendoring one crate) write two objects.
+/// The flat `cargo/{artifact_path}` key every repository used to share made
+/// the second repository's publish fail the cross-repository write guard
+/// with 409 "already owned by another repository" (#5609). Filesystem
+/// backends (one directory per repository) and `STORAGE_KEY_SCHEME=flat`
+/// keep the flat key. Existing crates are untouched: every download resolves
+/// the object through the `storage_key` its artifact row recorded.
+fn crate_storage_key(
+    scheme: crate::storage::StorageKeyScheme,
+    storage_backend: &str,
+    repo_id: uuid::Uuid,
+    artifact_path: &str,
+) -> String {
+    scheme.write_key(storage_backend, "cargo", repo_id, artifact_path)
+}
+
 /// Store the .crate file and insert artifact + metadata records into the database.
 #[allow(clippy::too_many_arguments)]
 async fn store_crate_artifact(
@@ -1743,7 +1782,12 @@ async fn store_crate_artifact(
     let artifact_path = format!("{}/{}/{}", name_lower, crate_version, filename);
     crate::services::upload_service::validate_artifact_path(&artifact_path)
         .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
-    let storage_key = format!("cargo/{}/{}/{}", name_lower, crate_version, filename);
+    let storage_key = crate_storage_key(
+        crate::storage::StorageKeyScheme::from_env(),
+        &repo.storage_backend,
+        repo.id,
+        &artifact_path,
+    );
     super::publish_quota::preflight_publish_quota(
         &state.db,
         repo.id,
@@ -1831,6 +1875,7 @@ async fn store_crate_artifact(
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         "cargo",
         name_lower,
@@ -1980,18 +2025,16 @@ async fn download(
     )?;
 
     // Curation enforcement (#2930): block a curated crate before it is resolved
-    // locally or proxied from upstream. The cargo handler's private `RepoInfo`
-    // does not carry the curation columns, so use the by-id lookup variant
-    // (no-op / no query for hosted repos and when curation is off).
-    proxy_helpers::enforce_curation_lookup(
-        &state.db,
-        repo.id,
-        &repo_key,
-        &repo.repo_type,
-        &name_lower,
-        Some(&version),
-    )
-    .await?;
+    // locally or proxied from upstream. One `repositories` read carries both the
+    // curation and the age-gate columns; hosted repos need neither.
+    let full = if matches!(repo.repo_type.as_str(), "remote" | "virtual") {
+        Some(proxy_helpers::resolve_repo_by_key(&state.db, &repo_key, &["cargo"], "a Cargo").await?)
+    } else {
+        None
+    };
+    if let Some(full) = &full {
+        proxy_helpers::enforce_curation(&state.db, full, &name_lower, Some(&version)).await?;
+    }
 
     // Age gate (#3480). This runs BEFORE the `artifacts` lookup, the proxy
     // cache, and any upstream stream: a Remote Cargo repository's `artifacts`
@@ -2000,7 +2043,13 @@ async fn download(
     // servable from a warm row either. `Some(cksum)` also carries the
     // verification digest the gated lookup already proved from the upstream
     // index, so an allowed serve does not fetch it twice.
-    let gated_cksum = match cargo_age_gate_params(&state, &repo).await? {
+    let age_gate = match &full {
+        Some(full) if full.repo_type == "remote" => {
+            enforceable_age_gate(proxy_helpers::age_gate_params(full))?
+        }
+        _ => None,
+    };
+    let gated_cksum = match age_gate {
         Some(params) => Some(
             enforce_cargo_download_age_gate(
                 &state,
@@ -2374,15 +2423,25 @@ async fn download(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
+    let filename = format!("{}-{}.crate", name_lower, version);
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
         .map_err(map_storage_err)?;
+    // #4989: verify the stored bytes against the row (#4323). The row's path
+    // is not selected here; the crate file name names it in the log.
+    let stream = crate::storage::verify::verify_row_serve(
+        stream,
+        &artifact.checksum_sha256,
+        &filename,
+        artifact.size_bytes,
+        ctx.is_head,
+        || format!("{repo_key}/{filename}"),
+    )
+    .await?;
 
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
-
-    let filename = format!("{}-{}.crate", name_lower, version);
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -3614,6 +3673,83 @@ fn cargo_sparse_index_path_upstream(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The body of the crate `download` handler, for the structural pin below.
+    fn download_handler_body() -> &'static str {
+        let src = include_str!("cargo.rs");
+        let marker = "GET /cargo/{repo_key}/api/v1/crates/{name}/{version}/download";
+        let at = src
+            .find(marker)
+            .expect("the download route banner must exist");
+        let start = src[at..]
+            .find("async fn download(")
+            .expect("download must exist")
+            + at;
+        let end = src[start + 1..]
+            .find("\nasync fn ")
+            .map(|p| start + 1 + p)
+            .unwrap_or(src.len());
+        &src[start..end]
+    }
+
+    /// A crate download must read the `repositories` row ONCE.
+    ///
+    /// Curation and the age gate are both decided from columns on that row,
+    /// and each used to look it up for itself: `enforce_curation_lookup` by id
+    /// and `cargo_age_gate_params` through `resolve_repo_params`. That is two
+    /// round trips per download on a remote repository, for one row neither
+    /// consumer mutates. One read now carries both, and a hosted repository
+    /// pays neither because it needs neither.
+    #[test]
+    fn the_crate_download_reads_the_repository_row_once() {
+        let body = download_handler_body();
+        assert_eq!(
+            body.matches("resolve_repo_by_key(").count(),
+            1,
+            "the download path must resolve the repository row exactly once"
+        );
+        assert!(
+            !body.contains("enforce_curation_lookup("),
+            "curation must read the columns off the row already in hand"
+        );
+        assert!(
+            !body.contains("cargo_age_gate_params("),
+            "the age gate must read the columns off the row already in hand"
+        );
+        assert!(
+            body.contains("\"remote\" | \"virtual\""),
+            "a hosted repository needs neither gate and must not pay the read"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_cksum_reads_the_cached_index_first() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+            .expect("lazy pool");
+        let dir = std::env::temp_dir().join(format!("cksum-cache-{}", uuid::Uuid::new_v4()));
+        let state = crate::api::handlers::test_db_helpers::build_state(pool, dir.to_str().unwrap());
+        let sha = "a".repeat(64);
+        index_cache_set(
+            &state.index_cache,
+            "crates:serde".to_string(),
+            Bytes::from(format!("{{\"vers\":\"1.0.0\",\"cksum\":\"{sha}\"}}\n")),
+        )
+        .await;
+        // the upstream is unreachable, so only the cache can answer
+        let at = |v: &'static str| {
+            index_cksum_at(
+                &state,
+                uuid::Uuid::nil(),
+                "crates",
+                "http://127.0.0.1:1",
+                "serde",
+                v,
+            )
+        };
+        assert_eq!(at("1.0.0").await, Some(sha));
+        assert_eq!(at("2.0.0").await, None);
+    }
 
     // -----------------------------------------------------------------------
     // Test helpers
@@ -5610,8 +5746,14 @@ mod tests {
         format!("{}-{}.crate", name, version)
     }
 
+    /// The key `store_crate_artifact` writes on a filesystem backend.
     fn build_crate_storage_key(name: &str, version: &str, filename: &str) -> String {
-        format!("cargo/{}/{}/{}", name, version, filename)
+        super::crate_storage_key(
+            crate::storage::StorageKeyScheme::RepoScoped,
+            "filesystem",
+            uuid::Uuid::new_v4(),
+            &build_crate_artifact_path(name, version, filename),
+        )
     }
 
     fn build_crate_artifact_path(name: &str, version: &str, filename: &str) -> String {
@@ -5636,6 +5778,27 @@ mod tests {
         let filename = build_crate_filename("serde", "1.0.0");
         let key = build_crate_storage_key("serde", "1.0.0", &filename);
         assert_eq!(key, "cargo/serde/1.0.0/serde-1.0.0.crate");
+    }
+
+    /// #5609: a shared cloud namespace gets the repo-scoped key, and the
+    /// `STORAGE_KEY_SCHEME=flat` opt-out keeps the legacy shared key.
+    #[test]
+    fn test_crate_storage_key_is_repo_scoped_on_cloud_5609() {
+        use crate::storage::StorageKeyScheme;
+        let path = "serde/1.0.0/serde-1.0.0.crate";
+        let repo_id = uuid::Uuid::new_v4();
+        for backend in ["s3", "gcs", "azure"] {
+            assert_eq!(
+                super::crate_storage_key(StorageKeyScheme::RepoScoped, backend, repo_id, path),
+                format!("cargo/{repo_id}/{path}"),
+                "{backend}"
+            );
+            assert_eq!(
+                super::crate_storage_key(StorageKeyScheme::Flat, backend, repo_id, path),
+                format!("cargo/{path}"),
+                "{backend}"
+            );
+        }
     }
 
     #[test]
@@ -7058,11 +7221,7 @@ mod catalog_registration_tests {
         fx.teardown().await;
 
         let body = String::from_utf8_lossy(&body);
-        assert_eq!(
-            status,
-            axum::http::StatusCode::INSUFFICIENT_STORAGE,
-            "{body}"
-        );
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
         assert!(body.contains("Repository storage quota exceeded"), "{body}");
         assert_eq!(rows, 0, "a refused publish must leave no artifact row");
     }
@@ -7124,6 +7283,222 @@ mod catalog_registration_tests {
                 .to_string(),
             "the event must identify the artifact row the publish just wrote"
         );
+    }
+}
+
+/// #5609: crate files are repository-scoped on shared cloud storage.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod repo_scoped_keys_5609 {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::api::SharedState;
+    use crate::storage::StorageBackend;
+    use axum::http::StatusCode;
+    use bytes::Bytes;
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    const CRATE: &[u8] = b"one crate version two registries both carry (#5609)";
+
+    fn publish_body(name: &str, version: &str) -> Bytes {
+        let metadata = serde_json::json!({"name": name, "vers": version});
+        let json = serde_json::to_vec(&metadata).unwrap();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&json);
+        payload.extend_from_slice(&(CRATE.len() as u32).to_le_bytes());
+        payload.extend_from_slice(CRATE);
+        Bytes::from(payload)
+    }
+
+    async fn cloud_cargo_repo(pool: &PgPool, user_id: Uuid) -> (Uuid, String, std::path::PathBuf) {
+        let (repo_id, repo_key, dir) = tdh::create_repo(pool, "local", "cargo").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("set cloud backend");
+        tdh::grant_repo_access(pool, repo_id, user_id).await;
+        (repo_id, repo_key, dir)
+    }
+
+    struct Rig {
+        pool: PgPool,
+        state: SharedState,
+        mem: std::sync::Arc<tdh::MemStorage>,
+        auth: crate::api::middleware::auth::AuthExtension,
+        user_id: Uuid,
+    }
+
+    impl Rig {
+        async fn setup() -> Option<Self> {
+            let pool = tdh::try_pool().await?;
+            let (user_id, username) = tdh::create_user(&pool).await;
+            let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+            let auth = tdh::make_auth(user_id, &username);
+            Some(Self {
+                pool,
+                state,
+                mem,
+                auth,
+                user_id,
+            })
+        }
+
+        async fn publish(&self, repo_key: &str, name: &str, version: &str) -> (StatusCode, Bytes) {
+            tdh::send(
+                tdh::router_with_auth(super::router(), self.state.clone(), self.auth.clone()),
+                tdh::put(
+                    format!("/{repo_key}/api/v1/crates/new"),
+                    publish_body(name, version),
+                ),
+            )
+            .await
+        }
+
+        async fn download(&self, repo_key: &str, name: &str, version: &str) -> (StatusCode, Bytes) {
+            tdh::send(
+                tdh::router_with_auth(super::router(), self.state.clone(), self.auth.clone()),
+                tdh::get(format!(
+                    "/{repo_key}/api/v1/crates/{name}/{version}/download"
+                )),
+            )
+            .await
+        }
+
+        async fn row_key(&self, repo_id: Uuid) -> Option<String> {
+            sqlx::query_scalar(
+                "SELECT storage_key FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+            )
+            .bind(repo_id)
+            .fetch_optional(&self.pool)
+            .await
+            .expect("row key")
+        }
+
+        fn objects(&self) -> Vec<String> {
+            self.mem.objects.lock().unwrap().keys().cloned().collect()
+        }
+
+        async fn teardown(&self, repos: &[(Uuid, String, std::path::PathBuf)]) {
+            for (repo_id, _, dir) in repos {
+                tdh::cleanup_member_repo(&self.pool, *repo_id, dir).await;
+            }
+            tdh::cleanup_user(&self.pool, self.user_id).await;
+        }
+    }
+
+    /// The same crate version publishes into two Cargo registries on a
+    /// shared cloud namespace, and each serves its own copy. On main the
+    /// second registry's publish answered 409 "already owned by another
+    /// repository; refusing cross-repository overwrite".
+    #[tokio::test]
+    async fn same_crate_version_publishes_to_two_cloud_registries_5609() {
+        let Some(rig) = Rig::setup().await else {
+            return;
+        };
+        let name = format!("hal-motor-{}", Uuid::new_v4().simple());
+        let mut repos = Vec::new();
+        for _ in 0..2 {
+            repos.push(cloud_cargo_repo(&rig.pool, rig.user_id).await);
+        }
+
+        let mut outcomes = Vec::new();
+        for (repo_id, repo_key, _) in &repos {
+            let published = rig.publish(repo_key, &name, "0.3.1").await;
+            let fetched = rig.download(repo_key, &name, "0.3.1").await;
+            outcomes.push((*repo_id, published, fetched, rig.row_key(*repo_id).await));
+        }
+        let objects = rig.objects();
+        rig.teardown(&repos).await;
+
+        let path = format!("{name}/0.3.1/{name}-0.3.1.crate");
+        for (repo_id, published, fetched, key) in outcomes {
+            assert_eq!(
+                published.0,
+                StatusCode::OK,
+                "publish into registry {repo_id} must be accepted: {}",
+                String::from_utf8_lossy(&published.1)
+            );
+            assert_eq!(fetched.0, StatusCode::OK, "download from {repo_id}");
+            assert_eq!(&fetched.1[..], CRATE);
+            let expected = format!("cargo/{repo_id}/{path}");
+            assert_eq!(key.as_deref(), Some(expected.as_str()));
+            assert!(objects.contains(&expected), "{expected} must be written");
+        }
+        assert!(
+            !objects.contains(&format!("cargo/{path}")),
+            "the legacy flat key must not be written on a cloud backend: {objects:?}"
+        );
+    }
+
+    /// Existing data keeps serving and no longer blocks other registries: a
+    /// crate whose row records the legacy flat `cargo/{name}/...` key still
+    /// downloads from its registry, and a second registry can publish the
+    /// same version (on main: 409, the flat key was the first registry's).
+    #[tokio::test]
+    async fn legacy_flat_key_crate_still_downloads_and_does_not_block_5609() {
+        let Some(rig) = Rig::setup().await else {
+            return;
+        };
+        let name = format!("legacy-crate-{}", Uuid::new_v4().simple());
+        let legacy = cloud_cargo_repo(&rig.pool, rig.user_id).await;
+        let other = cloud_cargo_repo(&rig.pool, rig.user_id).await;
+        let path = format!("{name}/1.0.0/{name}-1.0.0.crate");
+        let legacy_key = format!("cargo/{path}");
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, '1.0.0', $4, $5, 'application/x-tar', $6)",
+        )
+        .bind(legacy.0)
+        .bind(&path)
+        .bind(&name)
+        .bind(b"legacy crate".len() as i64)
+        .bind(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+            b"legacy crate",
+        )))
+        .bind(&legacy_key)
+        .execute(&rig.pool)
+        .await
+        .expect("seed legacy row");
+        rig.mem
+            .put(&legacy_key, Bytes::from_static(b"legacy crate"))
+            .await
+            .expect("seed legacy object");
+
+        let legacy_fetch = rig.download(&legacy.1, &name, "1.0.0").await;
+        let other_publish = rig.publish(&other.1, &name, "1.0.0").await;
+        let other_fetch = rig.download(&other.1, &name, "1.0.0").await;
+        let legacy_fetch_after = rig.download(&legacy.1, &name, "1.0.0").await;
+        let legacy_row = rig.row_key(legacy.0).await;
+        let other_row = rig.row_key(other.0).await;
+        let repos = [legacy, other];
+        rig.teardown(&repos).await;
+
+        assert_eq!(
+            legacy_fetch.0,
+            StatusCode::OK,
+            "legacy-key crate must download"
+        );
+        assert_eq!(&legacy_fetch.1[..], b"legacy crate");
+        assert_eq!(
+            other_publish.0,
+            StatusCode::OK,
+            "a second registry must publish the version a legacy row holds: {}",
+            String::from_utf8_lossy(&other_publish.1)
+        );
+        assert_eq!(other_fetch.0, StatusCode::OK);
+        assert_eq!(&other_fetch.1[..], CRATE);
+        assert_eq!(
+            &legacy_fetch_after.1[..],
+            b"legacy crate",
+            "the legacy object must not be overwritten"
+        );
+        assert_eq!(legacy_row, Some(legacy_key));
+        assert_eq!(other_row, Some(format!("cargo/{}/{path}", repos[1].0)));
     }
 }
 
@@ -10023,5 +10398,45 @@ mod duplicate_entry_tests {
             ("demo-1.0.0/src/lib.rs", b""),
         ]);
         assert!(established(&check(&single).1));
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod hosted_serve_verification_4989_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+
+    /// #4989 (#4323 remainder): the hosted crate download verifies the stored bytes against the
+    /// row. A corrupt object is the 502 `STORED_OBJECT_INTEGRITY` with none of
+    /// its bytes, not a 200 under the checksum it was uploaded with.
+    #[tokio::test]
+    async fn hosted_download_refuses_a_corrupt_object_4989() {
+        let Some(fx) = tdh::Fixture::setup("local", "cargo").await else {
+            return;
+        };
+        tdh::seed_corrupt_artifact(
+            &fx,
+            "v4989/1.0.0/v4989-1.0.0.crate",
+            "v4989",
+            "1.0.0",
+            "application/x-tar",
+            b"stored bytes 4989",
+            b"stored bytes 498X",
+        )
+        .await;
+        let key = fx.repo_key.clone();
+        let send = |req| tdh::send(fx.router_with_auth(super::router()), req);
+        let (get_0, body_0) = send(tdh::get(format!(
+            "/{key}/api/v1/crates/v4989/1.0.0/download"
+        )))
+        .await;
+        let (head_0, _) = send(tdh::head(format!(
+            "/{key}/api/v1/crates/v4989/1.0.0/download"
+        )))
+        .await;
+        fx.teardown().await;
+        tdh::assert_integrity_refusal(get_0, &body_0, b"stored bytes 498X");
+        assert_eq!(head_0, StatusCode::OK, "a HEAD reads and verifies nothing");
     }
 }

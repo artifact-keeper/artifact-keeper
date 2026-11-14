@@ -18,8 +18,11 @@
 //! dependency is added.
 //!
 //! Regression cases covered:
-//!   - happy path: valid signed assertion → 307 to `/callback?code=…`, auth
-//!     cookies set, user provisioned with mapped username/email/groups.
+//!   - happy path: valid signed assertion → 303 to the same-site completion
+//!     step `/api/v1/auth/sso/complete?code=…` with no session cookies yet
+//!     (#5486), user provisioned with mapped username/email/groups.
+//!   - browser binding (#5486): the completion step and `/exchange` accept the
+//!     code only with the binding cookie `GET /saml/{id}/login` set.
 //!   - signature invalid → 401 (tampered digest, and a different signing key
 //!     not matching the provider cert).
 //!   - InResponseTo single-use replay / CSRF (locks in #2040): unsolicited (no
@@ -75,8 +78,8 @@ use artifact_keeper_backend::services::auth_config_service::{
 
 use common::sso_support::{
     audit_row_eventually, base64_standard, build_state, ensure_sso_encryption_key,
-    saml_idp_cert_pem, sign_saml_document, sign_saml_document_with_key, sso_app, try_pool,
-    SamlResponseSpec,
+    saml_idp_cert_pem, sign_saml_document, sign_saml_document_with_key, sso_app,
+    sso_binding_cookie, try_pool, SamlResponseSpec,
 };
 
 // ===========================================================================
@@ -251,8 +254,8 @@ async fn test_saml_acs_happy_path() {
 
     assert_eq!(
         resp.status(),
-        StatusCode::TEMPORARY_REDIRECT,
-        "a valid signed assertion must 307 to the frontend"
+        StatusCode::SEE_OTHER,
+        "a valid signed assertion must 303 to the completion step"
     );
     let location = resp
         .headers()
@@ -260,12 +263,13 @@ async fn test_saml_acs_happy_path() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
     assert!(
-        location.starts_with("/callback?code="),
-        "must redirect to frontend /callback with an exchange code, got {location}"
+        location.starts_with("/api/v1/auth/sso/complete?code="),
+        "must redirect to the same-site completion step with an exchange code, got {location}"
     );
-    assert!(
-        resp.headers().get_all("set-cookie").iter().count() > 0,
-        "the ACS redirect must set auth cookies (#1405)"
+    assert_eq!(
+        resp.headers().get_all("set-cookie").iter().count(),
+        0,
+        "the cross-site ACS POST must not set a session (#5486): the completion step does"
     );
 
     let user = get_saml_user(&pool, &name_id)
@@ -396,7 +400,7 @@ async fn test_saml_acs_replay_and_unsolicited_rejected() {
     let first = post_acs(build_state(pool.clone()), provider_id, &signed).await;
     assert_eq!(
         first.status(),
-        StatusCode::TEMPORARY_REDIRECT,
+        StatusCode::SEE_OTHER,
         "the first use of a valid response must succeed"
     );
     let second = post_acs(build_state(pool.clone()), provider_id, &signed).await;
@@ -442,7 +446,7 @@ async fn test_saml_acs_destination_recipient_binding() {
         let resp = post_acs(build_state(pool.clone()), provider_id, &ok.signed_b64()).await;
         assert_eq!(
             resp.status(),
-            StatusCode::TEMPORARY_REDIRECT,
+            StatusCode::SEE_OTHER,
             "matching Destination/Recipient must be accepted (use_absolute={use_absolute})"
         );
         delete_saml_user(&pool, &name_id_ok).await;
@@ -493,7 +497,7 @@ async fn test_saml_acs_admin_group_mapping() {
         &admin_spec.signed_b64(),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     let (_, _, _, is_admin) = get_saml_user(&pool, &name_id_admin)
         .await
         .expect("admin user provisioned");
@@ -510,7 +514,7 @@ async fn test_saml_acs_admin_group_mapping() {
         &plain_spec.signed_b64(),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     let (_, _, _, is_admin) = get_saml_user(&pool, &name_id_plain)
         .await
         .expect("plain user provisioned");
@@ -603,7 +607,7 @@ async fn test_saml_acs_group_membership_sync_and_isolation() {
     let mut spec = happy_spec(&request_id, &name_id);
     spec.groups = vec![eng.clone(), ops.clone()];
     let resp = post_acs(build_state(pool.clone()), provider_id, &spec.signed_b64()).await;
-    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
 
     let (user_id, _, _, _) = get_saml_user(&pool, &name_id).await.expect("provisioned");
     let eng_id = group_id_by_name(&pool, &eng)
@@ -660,7 +664,7 @@ async fn test_saml_acs_group_membership_sync_and_isolation() {
     let mut spec2 = happy_spec(&request_id2, &name_id);
     spec2.groups = vec![eng.clone()];
     let resp = post_acs(build_state(pool.clone()), provider_id, &spec2.signed_b64()).await;
-    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
 
     assert!(
         user_is_in_group(&pool, user_id, eng_id).await,
@@ -707,7 +711,7 @@ async fn test_saml_acs_group_sync_disabled_by_default() {
     let resp = post_acs(build_state(pool.clone()), provider_id, &spec.signed_b64()).await;
     assert_eq!(
         resp.status(),
-        StatusCode::TEMPORARY_REDIRECT,
+        StatusCode::SEE_OTHER,
         "login itself must still succeed with the flag off"
     );
 
@@ -771,7 +775,7 @@ async fn test_saml_acs_out_of_subtree_groups_confer_no_membership() {
 
     assert_eq!(
         resp.status(),
-        StatusCode::TEMPORARY_REDIRECT,
+        StatusCode::SEE_OTHER,
         "a valid signature with an out-of-subtree groups attribute must still authenticate"
     );
 
@@ -821,7 +825,7 @@ async fn test_saml_acs_emits_audit_records() {
         &happy_spec(&request_id, &name_id).signed_b64(),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
 
     let (user_id, _, _, _) = get_saml_user(&pool, &name_id).await.expect("provisioned");
     // Poll: the LOGIN row is written by a detached task (#2905), so it is not
@@ -930,7 +934,7 @@ async fn test_saml_login_then_acs_full_flow() {
     .await;
     assert_eq!(
         resp.status(),
-        StatusCode::TEMPORARY_REDIRECT,
+        StatusCode::SEE_OTHER,
         "the ACS callback for the login's own request_id must succeed"
     );
     assert!(
@@ -1068,7 +1072,7 @@ async fn test_saml_acs_xsw_attribute_before_assertion_not_admin() {
 
     assert_eq!(
         resp.status(),
-        StatusCode::TEMPORARY_REDIRECT,
+        StatusCode::SEE_OTHER,
         "a valid signature with an out-of-subtree attribute must still authenticate"
     );
     let (_, _, _, is_admin) = get_saml_user(&pool, &name_id)
@@ -1109,7 +1113,7 @@ async fn test_saml_acs_xsw_attribute_after_assertion_not_admin() {
     let payload = spec.attribute_xsw_b64(&["ak-admins"], false);
     let resp = post_acs(build_state(pool.clone()), provider_id, &payload).await;
 
-    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     let (_, _, _, is_admin) = get_saml_user(&pool, &name_id)
         .await
         .expect("the signed subject must still provision");
@@ -1156,7 +1160,7 @@ async fn test_saml_acs_ds_object_groups_injection_not_admin() {
 
     assert_eq!(
         resp.status(),
-        StatusCode::TEMPORARY_REDIRECT,
+        StatusCode::SEE_OTHER,
         "a valid signature with an in-<ds:Signature> <ds:Object> attribute must still authenticate"
     );
     let (_, _, _, is_admin) = get_saml_user(&pool, &name_id)
@@ -1195,7 +1199,7 @@ async fn test_saml_acs_comment_split_nameid_uses_full_value() {
 
     assert_eq!(
         resp.status(),
-        StatusCode::TEMPORARY_REDIRECT,
+        StatusCode::SEE_OTHER,
         "a comment-split (but validly signed) NameID must authenticate"
     );
 
@@ -1249,7 +1253,7 @@ async fn test_saml_acs_signed_values_with_escaped_characters_are_kept() {
     );
 
     let resp = post_acs(build_state(pool.clone()), provider_id, &spec.signed_b64()).await;
-    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
 
     let (_, _, _, is_admin) = get_saml_user(&pool, &name_id)
         .await
@@ -1332,7 +1336,7 @@ async fn test_saml_acs_resolves_provider_by_slug() {
 
     assert_eq!(
         resp.status(),
-        StatusCode::TEMPORARY_REDIRECT,
+        StatusCode::SEE_OTHER,
         "an assertion POSTed to the slug ACS URL must authenticate"
     );
     assert!(
@@ -1411,7 +1415,7 @@ async fn test_saml_acs_slug_binding_follows_the_requested_segment() {
     let resp = post_acs_at(build_state(pool.clone()), &slug, &ok.signed_b64()).await;
     assert_eq!(
         resp.status(),
-        StatusCode::TEMPORARY_REDIRECT,
+        StatusCode::SEE_OTHER,
         "a Destination/Recipient matching the slug ACS URL must be accepted there"
     );
     delete_saml_user(&pool, &name_ok).await;
@@ -1524,7 +1528,7 @@ async fn test_saml_login_then_acs_by_slug_full_flow() {
     let resp = post_acs_at(build_state(pool.clone()), &slug, &spec.signed_b64()).await;
     assert_eq!(
         resp.status(),
-        StatusCode::TEMPORARY_REDIRECT,
+        StatusCode::SEE_OTHER,
         "the slug ACS callback for the slug login's own request_id must succeed"
     );
     assert!(
@@ -1572,10 +1576,416 @@ async fn test_saml_acs_uuid_addressing_unchanged_without_a_slug() {
     let resp = post_acs(build_state(pool.clone()), provider_id, &spec.signed_b64()).await;
     assert_eq!(
         resp.status(),
-        StatusCode::TEMPORARY_REDIRECT,
+        StatusCode::SEE_OTHER,
         "a slug-less configuration must keep authenticating at its UUID ACS URL"
     );
     assert!(get_saml_user(&pool, &name_id).await.is_some());
+
+    delete_saml_user(&pool, &name_id).await;
+    delete_saml_provider(&pool, provider_id).await;
+}
+
+/// #5482: a disabled SAML provider neither starts a login nor accepts an
+/// assertion at its ACS, whether addressed by UUID or by slug — including for
+/// a login that was already pending when the operator disabled it.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn test_saml_disabled_provider_cannot_log_in() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let slug = fresh_slug("disabled");
+    let provider_id = create_saml_provider(
+        &pool,
+        SamlProviderOpts {
+            slug: Some(slug.clone()),
+            ..SamlProviderOpts::default()
+        },
+    )
+    .await;
+    let pending: Vec<String> = vec![
+        seed_session(&pool, provider_id).await,
+        seed_session(&pool, provider_id).await,
+    ];
+    AuthConfigService::toggle_saml(
+        &pool,
+        provider_id,
+        artifact_keeper_backend::services::auth_config_service::ToggleRequest { enabled: false },
+    )
+    .await
+    .expect("disable saml provider");
+
+    for (segment, request_id) in [provider_id.to_string(), slug.clone()]
+        .into_iter()
+        .zip(pending)
+    {
+        let login = sso_app(build_state(pool.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/saml/{segment}/login"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("login oneshot");
+        assert_eq!(login.status(), StatusCode::NOT_FOUND, "login at {segment}");
+
+        let name_id = format!("saml-5482-{}", Uuid::new_v4().as_simple());
+        let resp = post_acs_at(
+            build_state(pool.clone()),
+            &segment,
+            &happy_spec(&request_id, &name_id).signed_b64(),
+        )
+        .await;
+        let provisioned = get_saml_user(&pool, &name_id).await.is_some();
+        delete_saml_user(&pool, &name_id).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "ACS at {segment}");
+        assert!(!provisioned, "ACS at {segment}: no account");
+    }
+
+    delete_saml_provider(&pool, provider_id).await;
+}
+
+/// #5484: a SAML user who enrolled TOTP in Artifact Keeper used to get a
+/// session from the ACS with no second factor. Now no step sets cookies and
+/// the exchange code answers with the TOTP challenge and no session. The
+/// first ACS, before enrolment, is the control: its session comes from the
+/// same-site `/complete` step (#5486).
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+#[allow(clippy::disallowed_methods)] // streaming-invariant: test exempt — buffering a small JSON body in a test assertion is not an artifact path (#1608)
+async fn test_saml_acs_challenges_a_totp_enrolled_user_5484() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let provider_id = create_saml_provider(&pool, SamlProviderOpts::default()).await;
+    let name_id = format!("saml-5484-{}", Uuid::new_v4().as_simple());
+
+    let mut outcomes = Vec::new();
+    for enrolled in [false, true] {
+        if enrolled {
+            sqlx::query(
+                "UPDATE users SET totp_enabled = true, totp_secret = 'JBSWY3DPEHPK3PXP' \
+                 WHERE external_id = $1 AND auth_provider = 'saml'",
+            )
+            .bind(&name_id)
+            .execute(&pool)
+            .await
+            .expect("enrol totp");
+        }
+        let request_id = seed_session(&pool, provider_id).await;
+        let state = build_state(pool.clone());
+        // The browser that started this login (#5486).
+        let cookie = sso_binding_cookie(&state, &request_id);
+        let acs = post_acs(
+            state.clone(),
+            provider_id,
+            &happy_spec(&request_id, &name_id).signed_b64(),
+        )
+        .await;
+        // The cross-site ACS POST never sets a session (#5486).
+        assert_eq!(acs.status(), StatusCode::SEE_OTHER, "enrolled={enrolled}");
+        assert_eq!(acs.headers().get_all("set-cookie").iter().count(), 0);
+        let mut location = acs.headers()["location"].to_str().unwrap().to_string();
+        // Without TOTP the ACS goes through the same-site completion step,
+        // which sets the session on its redirect to the frontend; with TOTP
+        // it goes straight to the frontend with the challenge.
+        let mut status = acs.status();
+        let mut cookies = 0;
+        if location.starts_with("/api/v1/auth/sso/complete?") {
+            // The test router serves the SSO routes at its root.
+            let path = location.trim_start_matches("/api/v1/auth/sso");
+            let complete = get_with_cookie(state.clone(), path, Some(&cookie)).await;
+            status = complete.status();
+            cookies = complete.headers().get_all("set-cookie").iter().count();
+            location = complete.headers()["location"].to_str().unwrap().to_string();
+        }
+        let code = location
+            .strip_prefix("/callback?code=")
+            .map(|c| urlencoding::decode(c).unwrap().into_owned())
+            .expect("exchange code on the frontend redirect");
+        let ex = sso_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/exchange")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(serde_json::json!({ "code": code }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("exchange oneshot");
+        let ex_status = ex.status();
+        let ex_cookies = ex.headers().get_all("set-cookie").iter().count();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(ex.into_body(), 64 * 1024)
+                .await
+                .expect("body"),
+        )
+        .expect("json");
+        outcomes.push((status, cookies, ex_status, ex_cookies, body));
+    }
+    let user_id = get_saml_user(&pool, &name_id).await.map(|u| u.0);
+    delete_saml_user(&pool, &name_id).await;
+    delete_saml_provider(&pool, provider_id).await;
+
+    let (status, cookies, ex_status, ex_cookies, body) = &outcomes[0];
+    assert_eq!(
+        *status,
+        StatusCode::TEMPORARY_REDIRECT,
+        "control: /complete redirects to the frontend"
+    );
+    assert!(*cookies > 0, "control: /complete sets session cookies");
+    assert_eq!(*ex_status, StatusCode::OK);
+    assert!(*ex_cookies > 0);
+    assert!(body.get("totp_required").is_none(), "{body}");
+
+    let (status, cookies, ex_status, ex_cookies, body) = &outcomes[1];
+    assert_eq!(
+        *status,
+        StatusCode::SEE_OTHER,
+        "TOTP: the ACS sends the browser straight to the frontend"
+    );
+    assert_eq!(*cookies, 0, "no session cookies before the second factor");
+    assert_eq!(*ex_status, StatusCode::OK, "{body}");
+    assert_eq!(*ex_cookies, 0);
+    assert_eq!(body["totp_required"], true, "{body}");
+    assert_eq!(body["access_token"], "", "{body}");
+    let claims = artifact_keeper_backend::services::auth_service::AuthService::new(
+        pool.clone(),
+        std::sync::Arc::new(common::sso_support::test_config()),
+    )
+    .validate_totp_pending_token(body["totp_token"].as_str().expect("totp_token"))
+    .expect("a TOTP pending token for /auth/totp/verify");
+    assert_eq!(Some(claims.sub), user_id);
+}
+
+/// `GET` a public SSO route with an optional `Cookie` header.
+async fn get_with_cookie(
+    state: SharedState,
+    uri: &str,
+    cookie: Option<&str>,
+) -> axum::response::Response {
+    let mut req = Request::builder().method("GET").uri(uri);
+    if let Some(cookie) = cookie {
+        req = req.header("cookie", cookie);
+    }
+    sso_app(state)
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .expect("oneshot")
+}
+
+/// #5486: a SAML sign-in completes only in the browser that started it. The
+/// ACS answers the IdP's cross-site POST with a 303 to the same-site
+/// completion step and sets no session; the completion step and `/exchange`
+/// accept the code only with the binding cookie `GET /saml/{id}/login` set.
+/// Before the fix the ACS set the session on its response to any POST, so an
+/// attacker could auto-submit their own signed response from a victim's
+/// browser and sign the victim in to the attacker's account.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn test_saml_sign_in_completes_only_in_the_starting_browser_5486() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let provider_id = create_saml_provider(&pool, SamlProviderOpts::default()).await;
+
+    let login = get_with_cookie(
+        build_state(pool.clone()),
+        &format!("/saml/{provider_id}/login"),
+        None,
+    )
+    .await;
+    assert_eq!(login.status(), StatusCode::TEMPORARY_REDIRECT);
+    let set_cookie = login
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|c| c.starts_with("ak_sso_bind_"))
+        .expect("the SAML login must set the browser-binding cookie")
+        .to_string();
+    for attr in [
+        "HttpOnly",
+        "SameSite=Lax",
+        "Path=/api/v1/auth/sso",
+        "Max-Age=600",
+    ] {
+        assert!(set_cookie.contains(attr), "{attr} missing: {set_cookie}");
+    }
+    let cookie = set_cookie.split(';').next().unwrap().to_string();
+    let request_id: String = sqlx::query_scalar(
+        "SELECT state FROM sso_sessions \
+         WHERE provider_id = $1 AND provider_type = 'saml' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(provider_id)
+    .fetch_one(&pool)
+    .await
+    .expect("pending sso session state");
+    let state = build_state(pool.clone());
+    assert_eq!(
+        cookie,
+        sso_binding_cookie(&state, &request_id),
+        "the cookie binds this AuthnRequest"
+    );
+
+    let name_id = format!("saml-5486-{}", Uuid::new_v4().as_simple());
+    let acs = post_acs(
+        build_state(pool.clone()),
+        provider_id,
+        &happy_spec(&request_id, &name_id).signed_b64(),
+    )
+    .await;
+    assert_eq!(acs.status(), StatusCode::SEE_OTHER);
+    assert_eq!(acs.headers().get_all("set-cookie").iter().count(), 0);
+    let complete = acs.headers()["location"].to_str().unwrap().to_string();
+    let code = complete
+        .strip_prefix("/api/v1/auth/sso/complete?code=")
+        .unwrap_or_else(|| panic!("ACS must redirect to the completion step, got {complete}"))
+        .to_string();
+    let complete = complete.trim_start_matches("/api/v1/auth/sso").to_string();
+
+    // Another browser (no cookie, or the cookie of a different login).
+    let other = sso_binding_cookie(&state, "_another-request");
+    for (case, presented) in [("no cookie", None), ("another login", Some(other.as_str()))] {
+        let resp = get_with_cookie(build_state(pool.clone()), &complete, presented).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{case}");
+        assert!(resp.headers().get("set-cookie").is_none(), "{case}");
+    }
+
+    // The starting browser: session cookies on the redirect to the frontend.
+    let resp = get_with_cookie(build_state(pool.clone()), &complete, Some(&cookie)).await;
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        resp.headers()["location"].to_str().unwrap(),
+        format!("/callback?code={code}")
+    );
+    assert!(resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .any(|c| c.to_str().unwrap().starts_with("ak_access_token=")));
+
+    // `/exchange` likewise needs the cookie, and then redeems the code once.
+    let exchange = |presented: Option<String>| {
+        let state = build_state(pool.clone());
+        let code = code.clone();
+        async move {
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/exchange")
+                .header("content-type", "application/json");
+            if let Some(cookie) = presented {
+                req = req.header("cookie", cookie);
+            }
+            sso_app(state)
+                .oneshot(
+                    req.body(Body::from(format!(r#"{{"code":"{code}"}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .expect("exchange oneshot")
+                .status()
+        }
+    };
+    assert_eq!(exchange(None).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(exchange(Some(cookie.clone())).await, StatusCode::OK);
+    assert_eq!(exchange(Some(cookie)).await, StatusCode::UNAUTHORIZED);
+
+    delete_saml_user(&pool, &name_id).await;
+    delete_saml_provider(&pool, provider_id).await;
+}
+
+/// #5486: a SAML login a command-line client starts (`?client=cli`). Its
+/// AuthnRequest id carries the command-line prefix and the client keeps the
+/// binding cookie. The ACS (in a browser without that cookie) sets no session
+/// and does not redirect: it shows the exchange code, which only the client's
+/// cookie redeems.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+#[allow(clippy::disallowed_methods)] // streaming-invariant: test exempt — buffering a small text body in a test assertion is not an artifact path (#1608)
+async fn test_saml_cli_login_shows_a_code_only_the_cli_can_redeem_5486() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let provider_id = create_saml_provider(&pool, SamlProviderOpts::default()).await;
+
+    let login = get_with_cookie(
+        build_state(pool.clone()),
+        &format!("/saml/{provider_id}/login?client=cli"),
+        None,
+    )
+    .await;
+    assert_eq!(login.status(), StatusCode::TEMPORARY_REDIRECT);
+    let cli_cookie = login
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|c| c.starts_with("ak_sso_bind_"))
+        .expect("the login response carries the binding cookie for the client")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let request_id: String = sqlx::query_scalar(
+        "SELECT state FROM sso_sessions \
+         WHERE provider_id = $1 AND provider_type = 'saml' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(provider_id)
+    .fetch_one(&pool)
+    .await
+    .expect("pending sso session state");
+    assert!(request_id.starts_with("_cli-"), "{request_id}");
+
+    let name_id = format!("saml-5486c-{}", Uuid::new_v4().as_simple());
+    let acs = post_acs(
+        build_state(pool.clone()),
+        provider_id,
+        &happy_spec(&request_id, &name_id).signed_b64(),
+    )
+    .await;
+    assert_eq!(acs.status(), StatusCode::OK);
+    assert_eq!(acs.headers().get_all("set-cookie").iter().count(), 0);
+    assert!(acs.headers().get("location").is_none());
+    let body = axum::body::to_bytes(acs.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    let code = body
+        .split_whitespace()
+        .find(|w| w.len() == 64 && w.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or_else(|| panic!("the page shows the exchange code: {body}"))
+        .to_string();
+
+    let exchange = |presented: Option<String>| {
+        let state = build_state(pool.clone());
+        let code = code.clone();
+        async move {
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/exchange")
+                .header("content-type", "application/json");
+            if let Some(cookie) = presented {
+                req = req.header("cookie", cookie);
+            }
+            sso_app(state)
+                .oneshot(
+                    req.body(Body::from(format!(r#"{{"code":"{code}"}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .expect("exchange oneshot")
+                .status()
+        }
+    };
+    assert_eq!(exchange(None).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(exchange(Some(cli_cookie)).await, StatusCode::OK);
 
     delete_saml_user(&pool, &name_id).await;
     delete_saml_provider(&pool, provider_id).await;

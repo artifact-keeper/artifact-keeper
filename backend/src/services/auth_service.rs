@@ -44,6 +44,63 @@ pub struct FederatedCredentials {
     /// (issue #2057, honours the OIDC "Auto Create Users" switch). Providers
     /// without an explicit toggle (LDAP/SAML) pass `true` to preserve behaviour.
     pub auto_create_users: bool,
+    /// The provider configuration (`oidc_configs` / `saml_configs` /
+    /// `ldap_configs` id) the login came through (#5483). The account is
+    /// matched on `(auth_provider, auth_provider_id, external_id)`, so the
+    /// same subject at another provider of the same type is another account.
+    /// `None` keeps the type-wide match, for CI service accounts, whose
+    /// `external_id` already names their provider.
+    pub provider_id: Option<Uuid>,
+}
+
+/// Audit `reason` for a federated sign-in refused because the account
+/// predates provider binding and its provider is not known (#5483).
+pub const FEDERATED_ACCOUNT_UNLINKED: &str = "federated_account_unlinked";
+
+/// Which account a federated sign-in resolves to (#5483).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FederatedAccountMatch {
+    /// The account bound to this provider (or, with no provider, the
+    /// type-wide match).
+    Existing(Uuid),
+    /// Only an account whose provider is unknown has this subject: it may
+    /// belong to another provider of the same type, so it is not claimed and
+    /// no second account is created beside it.
+    Unlinked(Uuid),
+    /// No account has this subject at this provider.
+    New,
+}
+
+/// Pick the account for a federated sign-in from the accounts that carry its
+/// `(auth_provider, external_id)`, given as `(user id, auth_provider_id)`.
+fn match_federated_account(
+    candidates: &[(Uuid, Option<Uuid>)],
+    provider_id: Option<Uuid>,
+) -> FederatedAccountMatch {
+    let Some(provider_id) = provider_id else {
+        return candidates
+            .first()
+            .map_or(FederatedAccountMatch::New, |(id, _)| {
+                FederatedAccountMatch::Existing(*id)
+            });
+    };
+    if let Some((id, _)) = candidates.iter().find(|(_, p)| *p == Some(provider_id)) {
+        return FederatedAccountMatch::Existing(*id);
+    }
+    match candidates.iter().find(|(_, p)| p.is_none()) {
+        Some((id, _)) => FederatedAccountMatch::Unlinked(*id),
+        None => FederatedAccountMatch::New,
+    }
+}
+
+/// The 403 for [`FederatedAccountMatch::Unlinked`].
+fn federated_account_unlinked_error() -> AppError {
+    AppError::Authorization(
+        "This account was created before sign-ins were bound to a single identity \
+         provider, and more than one provider of this type could have created it. \
+         Ask an administrator to link the account to its identity provider."
+            .to_string(),
+    )
 }
 
 /// Decide whether a federated login is allowed to proceed given the provider's
@@ -1192,6 +1249,13 @@ pub fn install_global_auth_semaphore(sem: Option<Arc<Semaphore>>) {
     let _ = GLOBAL_AUTH_SEMAPHORE.set(sem);
 }
 
+/// The installed process-wide auth cap, so a test can tell whether the cap it
+/// asked [`install_global_auth_semaphore`] for is the one in force (#5633).
+#[cfg(test)]
+pub(crate) fn installed_global_auth_semaphore() -> Option<Arc<Semaphore>> {
+    GLOBAL_AUTH_SEMAPHORE.get().and_then(|cell| cell.clone())
+}
+
 /// How long to wait for a bcrypt-permit before giving up and shedding to
 /// 503. A short queue tolerance turns "burst of 50 concurrent basic-auth
 /// requests" (every CI package-manager invocation) into a survivable
@@ -1252,6 +1316,30 @@ async fn acquire_permit_from(
             "Authentication service is at capacity, retry shortly".to_string(),
         )),
     }
+}
+
+/// Run one bcrypt operation on the blocking pool while holding a permit from
+/// the process-wide auth-concurrency cap for exactly as long as it runs.
+///
+/// The permit is moved INTO the blocking closure (#5485). Held in the async
+/// frame instead, it was released as soon as the request future was dropped
+/// (client disconnect, HTTP/2 `RST_STREAM`, a request timeout), while the
+/// detached blocking task kept computing bcrypt. A client that sent a request
+/// and cancelled it straight away could then keep any number of bcrypt jobs in
+/// flight, and `AUTH_MAX_CONCURRENCY` no longer bounded the CPU work it exists
+/// to bound. The permit now drops when the closure returns or unwinds.
+async fn run_bcrypt_under_permit<T, F>(work: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = acquire_auth_permit_for_bcrypt().await?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))?
 }
 
 /// Legacy non-blocking variant retained for tests and callers that need a
@@ -1429,10 +1517,9 @@ pub enum TimingPad {
 pub enum AuthEntry {
     /// The shared credential primitive, [`AuthService::authenticate`].
     ///
-    /// The API middleware tries it *before* the API-token path on every
-    /// Basic-auth package-manager request (`middleware/auth.rs`,
-    /// `oci_v2.rs`, `conda.rs`). A user who authenticates `cargo`/`pip` as
-    /// `username:<api-token>` therefore takes a rejection arm on **every**
+    /// Some handlers still try it *before* their API-token path
+    /// (`oci_v2.rs`, `conda.rs`). A user who authenticates as
+    /// `username:<api-token>` there takes a rejection arm on **every**
     /// request, and an SSO-only deployment takes the federated arm on every
     /// request. So this entry point neither pads (a cost-12 bcrypt in front of
     /// traffic that never reaches the login form, halving the auth-permit
@@ -1441,6 +1528,32 @@ pub enum AuthEntry {
     /// target and level, and would let any anonymous caller write
     /// attacker-chosen text to the log). `origin/main` did neither here.
     Shared,
+    /// HTTP Basic `username:password` in the auth middleware,
+    /// [`AuthService::authenticate_basic_with_reason`] (#5640).
+    ///
+    /// The middleware resolves an issued-token-shaped password (API token,
+    /// JWT) as a token and never sends it here, so with LDAP Basic-auth
+    /// passthrough off only something meant to be a local password reaches
+    /// this entry, and a wrong one is the only way it fails. That makes the
+    /// pad cheap enough to run: an unknown username, a federated account and
+    /// a hashless account each pay the same single bcrypt as a wrong password
+    /// against a real account, so the package-manager Basic surface no longer
+    /// answers an unknown username measurably faster than a known one. It is
+    /// not budgeted per IP like [`Self::Login`]: an anonymous caller can
+    /// already buy one bcrypt per request by sending any wrong password for
+    /// any real account, so the pad adds no amplification.
+    ///
+    /// The caller passes [`TimingPad::Off`] while the passthrough is enabled.
+    /// Then a directory user's correct password takes the federated (or
+    /// no-local-row) arm on **every** request on its way to the passthrough,
+    /// and padding it would put a cost-12 bcrypt and an auth permit in front
+    /// of each one, cache hits included; the directory round-trip dominates
+    /// that surface's timing anyway. Does not log, for the same reason as
+    /// [`Self::Shared`].
+    Basic {
+        /// Whether the hashless arms run the dummy-hash verify.
+        pad: TimingPad,
+    },
     /// The unauthenticated `POST /api/v1/auth/login` endpoint — the one
     /// surface where the enumeration oracle is reachable.
     ///
@@ -1458,6 +1571,7 @@ impl AuthEntry {
     fn pad(self) -> TimingPad {
         match self {
             Self::Shared => TimingPad::Off,
+            Self::Basic { pad } => pad,
             Self::Login { pad } => pad,
         }
     }
@@ -1468,6 +1582,22 @@ impl AuthEntry {
     /// the log once an attacker exhausts the budget would hide the sweep.
     fn logs_rejections(self) -> bool {
         matches!(self, Self::Login { .. })
+    }
+
+    /// Whether a wrong password for `password` counts against the account's
+    /// lockout (`failed_login_attempts` / `locked_until` /
+    /// `last_failed_login_at`).
+    ///
+    /// A secret shaped like a credential Artifact Keeper issues (an API token
+    /// or a JWT) is a token that failed, not a password guess: a Maven
+    /// `settings.xml` or `.npmrc` carrying `user:<api_token>` used to bump the
+    /// counter on every request (1793 writes in 30 min, #5640) and keep the
+    /// account flagged as locked while the token went on working. So on the
+    /// machine-to-machine entries such a secret is never recorded. The login
+    /// endpoint is unchanged: a human typing at the form keeps the policy
+    /// exactly as it was.
+    fn records_failure_for(self, password: &str) -> bool {
+        matches!(self, Self::Login { .. }) || !looks_like_issued_token(password)
     }
 }
 
@@ -1535,6 +1665,81 @@ impl From<AppError> for LoginFailure {
     }
 }
 
+/// Outcome of the local-login policy decision in [`local_login_gate`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LocalLoginGate {
+    /// Local login may proceed.
+    Allow,
+    /// Local login is rejected because SSO is enforced for this user.
+    RejectSso,
+}
+
+/// Decide whether a *verified* local credential may complete login.
+///
+/// Evaluated AFTER `AuthService::authenticate` succeeds, so `user_is_admin`
+/// is a proven property of the caller, not a claim from the request. When any
+/// SSO provider is enabled (issue #213) non-admin local login stays disabled,
+/// but a verified admin retains a break-glass recovery path by default so a
+/// misconfigured SSO provider can be repaired in-band (issue #443). The
+/// legacy `ALLOW_LOCAL_ADMIN_LOGIN` flag (`allow_local_admin_login`) is kept
+/// as a back-compat input; it only ever applied to the admin account and must
+/// never broaden access for non-admin users.
+///
+/// A deployment that wants strict "SSO-only, no exceptions" enforcement can
+/// opt in via `SSO_DISABLE_ADMIN_BREAK_GLASS` (`disable_admin_break_glass`,
+/// #2018): when set, even the verified-admin break-glass is rejected while SSO
+/// is enabled. The flag defaults to `false`, so the historical break-glass
+/// behaviour is unchanged for existing deployments.
+pub(crate) fn local_login_gate(
+    sso_enabled: bool,
+    user_is_admin: bool,
+    allow_local_admin_login: bool,
+    disable_admin_break_glass: bool,
+) -> LocalLoginGate {
+    match (
+        sso_enabled,
+        user_is_admin,
+        allow_local_admin_login,
+        disable_admin_break_glass,
+    ) {
+        // No SSO providers enabled: local login is unchanged for everyone.
+        (false, _, _, _) => LocalLoginGate::Allow,
+        // Opt-in strict SSO-only (#2018): the admin break-glass is disabled,
+        // so even a verified admin must use SSO. This is the stricter posture
+        // and takes precedence over the legacy allow-local-admin flag.
+        (true, true, _, true) => LocalLoginGate::RejectSso,
+        // Verified-admin break-glass (default; supersedes the legacy flag,
+        // which only ever allowed the admin account).
+        (true, true, _, false) => LocalLoginGate::Allow,
+        // Non-admins must use SSO; neither flag ever broadens them.
+        (true, false, _, _) => LocalLoginGate::RejectSso,
+    }
+}
+
+/// Why a verified password alone may not establish a principal (#5484).
+///
+/// `POST /api/v1/auth/login` turns either case into the next step of an
+/// interactive login (a TOTP challenge or enrolment ticket, or "use SSO").
+/// The password-only surfaces that cannot run that step (HTTP Basic on the
+/// management API, LDAP login) must refuse instead of skipping it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordOnlyRefusal {
+    /// The account has TOTP enrolled, or the TOTP policy requires it to enrol.
+    SecondFactorRequired,
+    /// Local login is disabled for this account because SSO is configured.
+    SsoRequired,
+}
+
+impl PasswordOnlyRefusal {
+    /// Stable identifier for logs and audit details.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SecondFactorRequired => "second_factor_required",
+            Self::SsoRequired => "local_login_disabled_sso",
+        }
+    }
+}
+
 /// Authentication service
 pub struct AuthService {
     db: PgPool,
@@ -1553,6 +1758,62 @@ pub struct AuthService {
 }
 
 impl AuthService {
+    /// Whether `user`, whose password has just been verified, may be signed
+    /// in on a surface that has nothing but that password (#5484).
+    ///
+    /// Applies the two policies `POST /api/v1/auth/login` enforces after the
+    /// password check: the TOTP gate ([`totp_policy::totp_login_requirement`],
+    /// which covers an enrolled account and one the enforcement policy
+    /// requires to enrol) and, for local accounts, the SSO-only local-login
+    /// gate ([`local_login_gate`]). `Ok(None)` means the password suffices.
+    ///
+    /// The enrolled-TOTP case answers without a query; the policy and the
+    /// SSO lookups are one primary-key read and one small table scan.
+    ///
+    /// [`totp_policy::totp_login_requirement`]: crate::services::totp_policy::totp_login_requirement
+    pub async fn password_only_refusal(&self, user: &User) -> Result<Option<PasswordOnlyRefusal>> {
+        use crate::services::totp_policy;
+
+        let subject = totp_policy::TotpSubject {
+            auth_provider: user.auth_provider,
+            is_admin: user.is_admin,
+            is_service_account: user.is_service_account,
+            totp_enabled: user.totp_enabled,
+        };
+        let policy = if user.totp_enabled {
+            // An enrolled account is challenged whatever the policy says.
+            totp_policy::TotpPolicy::Disabled
+        } else {
+            totp_policy::effective_policy(&self.db, self.config.totp_policy)
+                .await
+                .0
+        };
+        if totp_policy::totp_login_requirement(policy, subject)
+            != totp_policy::TotpLoginRequirement::NotRequired
+        {
+            return Ok(Some(PasswordOnlyRefusal::SecondFactorRequired));
+        }
+
+        if user.auth_provider == AuthProvider::Local {
+            let sso_enabled =
+                !crate::services::auth_config_service::AuthConfigService::list_enabled_providers(
+                    &self.db,
+                )
+                .await?
+                .is_empty();
+            if local_login_gate(
+                sso_enabled,
+                user.is_admin,
+                self.config.allow_local_admin_login,
+                self.config.sso_disable_admin_break_glass,
+            ) == LocalLoginGate::RejectSso
+            {
+                return Ok(Some(PasswordOnlyRefusal::SsoRequired));
+            }
+        }
+        Ok(None)
+    }
+
     /// Create a new authentication service
     pub fn new(db: PgPool, config: Arc<Config>) -> Self {
         let secret = config.jwt_secret.clone();
@@ -1738,6 +1999,22 @@ impl AuthService {
             .await
     }
 
+    /// HTTP Basic `username:password` for the auth middleware (#5640).
+    ///
+    /// [`Self::authenticate_with_reason`] plus, with [`TimingPad::On`], the
+    /// bcrypt timing pad on every rejection arm, so an unknown username costs
+    /// the same as a wrong password against a real account. See
+    /// [`AuthEntry::Basic`] for when the caller turns it off.
+    pub async fn authenticate_basic_with_reason(
+        &self,
+        username: &str,
+        password: &str,
+        pad: TimingPad,
+    ) -> std::result::Result<(User, TokenPair), LoginFailure> {
+        self.authenticate_inner(username, password, AuthEntry::Basic { pad })
+            .await
+    }
+
     async fn authenticate_inner(
         &self,
         username: &str,
@@ -1806,10 +2083,9 @@ impl AuthService {
         }
 
         // ONE `verify_password` for every arm that reaches here. An arm with
-        // no stored hash of its own substitutes `dummy_bcrypt_hash()` — the
-        // same substitution `validate_api_token` uses — so the code path, the
-        // error type and the status are identical by construction rather than
-        // by inspection. The shared `?` is the point: `verify_password` yields
+        // no stored hash of its own substitutes `dummy_bcrypt_hash()`, so the
+        // code path, the error type and the status are identical by
+        // construction rather than by inspection. The shared `?` is the point: `verify_password` yields
         // `ServiceUnavailable` when the auth semaphore is saturated, and
         // swallowing that on the padded arms only would answer 401 for an
         // absent username while a real account answered 503 — a one-request
@@ -1827,6 +2103,16 @@ impl AuthService {
         // `rejection` is `None`, which the match above produces only for a
         // present, active, local row that has a password hash.
         let user = user.expect("a login with no rejection has a user row");
+
+        if !password_matches && !entry.records_failure_for(password) {
+            // An issued-token-shaped secret that is not this account's
+            // password: reject without touching the lockout columns (#5640).
+            return Err(Self::reject_login(
+                username,
+                LoginRejection::InvalidPassword,
+                entry,
+            ));
+        }
 
         if !password_matches {
             // Record failed attempt
@@ -3148,14 +3434,12 @@ impl AuthService {
         // Hold a process-wide auth-concurrency permit while bcrypt runs so
         // hash() also participates in the load-shed cap (signup, password
         // change, API-token creation all call this).
-        let _permit = acquire_auth_permit_for_bcrypt().await?;
         let pwd = password.to_string();
-        tokio::task::spawn_blocking(move || {
+        run_bcrypt_under_permit(move || {
             hash(&pwd, bcrypt_cost())
                 .map_err(|e| AppError::Internal(format!("Password hashing failed: {}", e)))
         })
         .await
-        .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))?
     }
 
     /// Verify a password against a hash
@@ -3168,15 +3452,13 @@ impl AuthService {
     pub async fn verify_password(password: &str, hash: &str) -> Result<bool> {
         #[cfg(test)]
         bcrypt_verify_counter().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let _permit = acquire_auth_permit_for_bcrypt().await?;
         let pwd = password.to_string();
         let h = hash.to_string();
-        tokio::task::spawn_blocking(move || {
+        run_bcrypt_under_permit(move || {
             verify(&pwd, &h)
                 .map_err(|e| AppError::Internal(format!("Password verification failed: {}", e)))
         })
         .await
-        .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))?
     }
 
     /// Returns a dummy bcrypt hash generated once at runtime, at the same cost
@@ -3222,12 +3504,12 @@ impl AuthService {
         // parallel requests in a single build.
         if let Ok(cache) = self.token_cache.read() {
             if let Some((entry, cached_at)) = cache.get(&cache_key) {
-                if cached_at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS {
-                    // Even on cache hit, reject if the token has since been
-                    // revoked (Bug #1) or has expired (Bug #2).
-                    if is_api_token_revoked_in_cache(entry.token_id) {
-                        return Err(AppError::Unauthorized("Token has been revoked".to_string()));
-                    }
+                // A revoked entry (Bug #1) goes back to the DB: a re-minted
+                // token may carry the same caller-supplied value.
+                if cached_at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS
+                    && !is_api_token_revoked_in_cache(entry.token_id)
+                {
+                    // Reject if the token has since expired (Bug #2).
                     if let Some(exp) = entry.expires_at {
                         if exp < Utc::now() {
                             return Err(AppError::Authentication("API token expired".to_string()));
@@ -3244,23 +3526,45 @@ impl AuthService {
                             "User account is deactivated".to_string(),
                         ));
                     }
+                    // #4987: audit rows written for this request name the token.
+                    crate::api::middleware::request_span::record_api_token(entry.token_id);
                     return Ok(entry.validation.clone());
                 }
             }
         }
 
         // API tokens have format: prefix_secret
-        // We store hash of full token and prefix for lookup
-        let dummy = Self::dummy_bcrypt_hash();
+        // We store hash of full token and prefix for lookup.
+        //
+        // Every rejection that can be decided without the secret is decided
+        // BEFORE the bcrypt verify, so it never takes a permit from the
+        // process-wide auth-concurrency cap (#5633). A burst of expired JWTs,
+        // garbage, or dead API tokens used to run one cost-12 bcrypt each
+        // (against `dummy_bcrypt_hash()` when nothing matched), saturate the
+        // cap, and answer `503 Authentication service is at capacity` instead
+        // of 401 — which clients retry, turning one expired credential into a
+        // retry storm.
+        //
+        // Nothing secret leaks by answering these early. The token shape is
+        // public. The `token_prefix` is a non-secret lookup key: it is shown
+        // in every token listing, and knowing that a prefix exists, or is
+        // revoked or expired, gets an attacker no closer to the 128-bit
+        // secret that follows it. Revocation was already reported before the
+        // hash comparison (`check_token_validation_result`). Only a live row
+        // whose prefix matches pays for the bcrypt, and that comparison is
+        // the one that genuinely needs the secret.
+        if !is_api_token_shape(token) {
+            return Err(AppError::Authentication("Invalid API token".to_string()));
+        }
         let Some(prefix) = Self::api_token_prefix(token) else {
-            // Too short, or byte 8 is not a char boundary (#5525). Still
-            // must burn bcrypt time to avoid leaking token length info.
-            let _ = Self::verify_password(token, dummy).await;
+            // Unreachable for a token-shaped (ASCII) credential; kept so the
+            // #5525 boundary guard stays the single slicing point.
             return Err(AppError::Authentication("Invalid API token".to_string()));
         };
 
         // Find token by prefix (includes revoked_at and last_used_at for
-        // revocation check and debounced usage tracking).
+        // revocation check and debounced usage tracking). Live row first, a
+        // revoked one can share the prefix of a re-minted supplied value.
         let stored_token_opt = sqlx::query!(
             r#"
             SELECT at.id, at.token_hash, at.user_id, at.scopes, at.expires_at,
@@ -3268,6 +3572,8 @@ impl AuthService {
                    at.repository_restricted
             FROM api_tokens at
             WHERE at.token_prefix = $1
+            ORDER BY at.revoked_at IS NOT NULL
+            LIMIT 1
             "#,
             prefix
         )
@@ -3275,30 +3581,30 @@ impl AuthService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        // Extract verification inputs. When no token was found, use a dummy
-        // hash so that bcrypt still runs and all code paths take equal time.
-        let (hash_to_verify, token_exists, is_revoked) = match &stored_token_opt {
-            Some(t) => (t.token_hash.clone(), true, t.revoked_at.is_some()),
-            None => (dummy.to_string(), false, false),
-        };
-
-        // Always run bcrypt verification regardless of token existence.
-        // This is the constant-time core of the fix: an attacker cannot
-        // distinguish "prefix not found" from "wrong secret" by timing.
-        let hash_matches = Self::verify_password(token, &hash_to_verify).await?;
-
-        // Check results only after bcrypt has completed
-        check_token_validation_result(token_exists, is_revoked, hash_matches)?;
-
-        // Unwrap is safe: token_exists is true only when stored_token_opt is Some
+        // Unknown prefix or revoked row: rejected without bcrypt (see above).
+        // `hash_matches = true` here only means "not yet compared"; the
+        // comparison itself runs below for a live row.
+        check_token_validation_result(
+            stored_token_opt.is_some(),
+            stored_token_opt
+                .as_ref()
+                .is_some_and(|t| t.revoked_at.is_some()),
+            true,
+        )?;
+        // Unwrap is safe: `check_token_validation_result` refused `None`.
         let stored_token = stored_token_opt.unwrap();
 
-        // Check expiration
+        // Check expiration, also before bcrypt.
         if let Some(expires_at) = stored_token.expires_at {
             if expires_at < Utc::now() {
                 return Err(AppError::Authentication("API token expired".to_string()));
             }
         }
+
+        // The only arm that needs the secret: a live, unexpired row whose
+        // prefix matches.
+        let hash_matches = Self::verify_password(token, &stored_token.token_hash).await?;
+        check_token_validation_result(true, false, hash_matches)?;
 
         // Debounced usage analytics: only update last_used_at if it has been
         // more than 5 minutes since the last recorded use (or never used).
@@ -3412,6 +3718,7 @@ impl AuthService {
             cache.insert(cache_key, (entry, Instant::now()));
         }
 
+        crate::api::middleware::request_span::record_api_token(stored_token.id);
         Ok(validation)
     }
 
@@ -3444,6 +3751,21 @@ impl AuthService {
         scopes: Vec<String>,
         expires_in_days: Option<i64>,
     ) -> Result<MintedApiToken> {
+        self.generate_api_token_with_value(user_id, name, scopes, expires_in_days, None)
+            .await
+    }
+
+    /// [`Self::generate_api_token_with_policy`] with an optional caller-chosen
+    /// token value, so the secret can live in an external store (Vault) and
+    /// rotate there. Stored hashed like a generated one.
+    pub async fn generate_api_token_with_value(
+        &self,
+        user_id: Uuid,
+        name: &str,
+        scopes: Vec<String>,
+        expires_in_days: Option<i64>,
+        value: Option<String>,
+    ) -> Result<MintedApiToken> {
         if scopes.len() > 50 {
             return Err(AppError::Validation("Too many scopes (max 50)".to_string()));
         }
@@ -3462,12 +3784,31 @@ impl AuthService {
         crate::services::token_service::validate_scopes_pure(&scopes)
             .map_err(AppError::Validation)?;
 
-        // Generate random token
-        let token = format!(
-            "{}_{}",
-            &Uuid::new_v4().to_string()[..8],
-            Uuid::new_v4().to_string().replace("-", "")
-        );
+        let token = match value {
+            Some(value) => {
+                validate_supplied_token(&value)?;
+                // Lookup is by prefix, so two live tokens must never share one.
+                let taken: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM api_tokens WHERE token_prefix = $1 AND revoked_at IS NULL)",
+                )
+                .bind(&value[..8])
+                .fetch_one(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+                if taken {
+                    return Err(AppError::Conflict(
+                        "token starts with the same 8 characters as a live token, use another value"
+                            .to_string(),
+                    ));
+                }
+                value
+            }
+            None => format!(
+                "{}_{}",
+                &Uuid::new_v4().to_string()[..8],
+                Uuid::new_v4().to_string().replace("-", "")
+            ),
+        };
         let prefix = &token[..8];
         let token_hash = Self::hash_password(&token).await?;
 
@@ -3841,33 +4182,37 @@ impl AuthService {
             credentials.required_admin_group.as_deref(),
         );
 
-        // Check if user exists by external_id
-        let existing_user = sqlx::query_as!(
-            User,
-            r#"
-            SELECT
-                id, username, email, password_hash, display_name,
-                auth_provider as "auth_provider: AuthProvider",
-                external_id, is_admin, is_active, is_service_account, must_change_password,
-                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
-                failed_login_attempts, locked_until, last_failed_login_at,
-                password_changed_at, last_login_at, created_at, updated_at
-            FROM users
-            WHERE external_id = $1 AND auth_provider = $2
-            "#,
-            credentials.external_id,
-            provider as AuthProvider
+        // Find the account by subject, then by the provider it is bound to
+        // (#5483): the same subject at another provider of this type is a
+        // different account. Runtime query: `auth_provider_id` is not part of
+        // the `.sqlx` cache.
+        let candidates: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+            "SELECT id, auth_provider_id FROM users \
+             WHERE external_id = $1 AND auth_provider = $2 \
+             ORDER BY created_at, id",
         )
-        .fetch_optional(&self.db)
+        .bind(&credentials.external_id)
+        .bind(provider)
+        .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let existing_user = match match_federated_account(&candidates, credentials.provider_id) {
+            FederatedAccountMatch::Existing(id) => Some(id),
+            FederatedAccountMatch::New => None,
+            FederatedAccountMatch::Unlinked(user_id) => {
+                self.audit_unlinked_federated_account(provider, credentials, user_id)
+                    .await;
+                return Err(federated_account_unlinked_error());
+            }
+        };
 
         // #2057: honour the provider's "Auto Create Users" switch. A brand-new
         // federated principal may only be provisioned when auto-create is on;
         // otherwise the login is rejected rather than silently creating a user.
         guard_federated_provisioning(existing_user.is_some(), credentials.auto_create_users)?;
 
-        let user = if let Some(existing) = existing_user {
+        let user = if let Some(existing_id) = existing_user {
             // Update existing user with latest information from provider.
             //
             // A CI service account keeps its `is_active` (#4031): it is
@@ -3903,7 +4248,7 @@ impl AuthService {
                     password_changed_at, last_login_at, created_at, updated_at
                 "#,
             )
-            .bind(existing.id)
+            .bind(existing_id)
             .bind(&credentials.username)
             .bind(&credentials.email)
             .bind(credentials.display_name.as_deref())
@@ -3912,30 +4257,33 @@ impl AuthService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?
         } else {
-            // Create new user from federated credentials
-            sqlx::query_as!(
-                User,
+            // Create new user from federated credentials, bound to the
+            // provider it came through (#5483). Runtime query for the same
+            // `.sqlx` reason as the UPDATE above.
+            sqlx::query_as::<_, User>(
                 r#"
                 INSERT INTO users (
                     username, email, display_name, auth_provider,
-                    external_id, is_admin, is_active, is_service_account, must_change_password
+                    external_id, is_admin, is_active, is_service_account, must_change_password,
+                    auth_provider_id
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, true, false, false)
+                VALUES ($1, $2, $3, $4, $5, $6, true, false, false, $7)
                 RETURNING
                     id, username, email, password_hash, display_name,
-                    auth_provider as "auth_provider: AuthProvider",
+                    auth_provider,
                     external_id, is_admin, is_active, is_service_account, must_change_password,
                     totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                     failed_login_attempts, locked_until, last_failed_login_at,
                     password_changed_at, last_login_at, created_at, updated_at
                 "#,
-                credentials.username,
-                credentials.email,
-                credentials.display_name,
-                provider as AuthProvider,
-                credentials.external_id,
-                role_mapping.is_admin.unwrap_or(false)
             )
+            .bind(&credentials.username)
+            .bind(&credentials.email)
+            .bind(credentials.display_name.as_deref())
+            .bind(provider)
+            .bind(&credentials.external_id)
+            .bind(role_mapping.is_admin.unwrap_or(false))
+            .bind(credentials.provider_id)
             .fetch_one(&self.db)
             .await
             .map_err(|e| {
@@ -3958,6 +4306,40 @@ impl AuthService {
         self.apply_role_mapping(user.id, &role_mapping).await?;
 
         Ok(user)
+    }
+
+    /// Record a federated sign-in refused because the only account with its
+    /// subject is not bound to a provider (#5483), naming the account and
+    /// the provider the sign-in came through so an administrator can link it.
+    async fn audit_unlinked_federated_account(
+        &self,
+        provider: AuthProvider,
+        credentials: &FederatedCredentials,
+        user_id: Uuid,
+    ) {
+        use crate::services::audit_service::{
+            audit_fire_and_forget, federated_login_details, AuditAction, AuditEntry, ResourceType,
+        };
+        tracing::warn!(
+            user_id = %user_id,
+            provider = ?provider,
+            provider_id = ?credentials.provider_id,
+            "Refused a federated sign-in: the account is not linked to an identity provider (#5483)"
+        );
+        let provider_label = format!("{provider:?}").to_ascii_lowercase();
+        let entry = AuditEntry::new(AuditAction::LoginFailed, ResourceType::User)
+            .resource(user_id)
+            .actor_name(credentials.username.clone())
+            .details(federated_login_details(
+                &provider_label,
+                serde_json::json!({
+                    "username": credentials.username,
+                    "reason": FEDERATED_ACCOUNT_UNLINKED,
+                    "provider_id": credentials.provider_id,
+                }),
+            ))
+            .with_request_client_ip();
+        audit_fire_and_forget(self.db.clone(), entry).await;
     }
 
     /// Deactivate users who no longer exist in the federated provider.
@@ -4273,6 +4655,45 @@ pub(crate) fn should_debounce_usage_update(last_used_at: Option<DateTime<Utc>>) 
     }
 }
 
+/// `<8 hex>_<32 hex>`: the shape of every API token Artifact Keeper mints
+/// (see [`AuthService::generate_api_token_with_policy`]: the first 8 hex digits
+/// of a UUID, `_`, then a dash-less UUID).
+///
+/// A pure, credential-independent check, so a caller may branch on it before
+/// any database lookup or bcrypt work without leaking anything: the shape is
+/// public (#5640).
+pub(crate) fn is_api_token_shape(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 41
+        && bytes[8] == b'_'
+        && bytes[..8].iter().all(u8::is_ascii_hexdigit)
+        && bytes[9..].iter().all(u8::is_ascii_hexdigit)
+}
+
+/// Three non-empty base64url segments with a JSON header: a compact JWS.
+pub(crate) fn is_jwt_shape(value: &str) -> bool {
+    let mut segments = value.split('.');
+    let (Some(header), Some(payload), Some(signature), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return false;
+    };
+    let base64url = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    header.starts_with("eyJ") && base64url(header) && base64url(payload) && base64url(signature)
+}
+
+/// Whether a Basic password is a credential Artifact Keeper itself issues.
+pub(crate) fn looks_like_issued_token(password: &str) -> bool {
+    is_api_token_shape(password) || is_jwt_shape(password)
+}
+
 /// Evaluate token validation state after bcrypt verification has completed.
 /// Separated from the async method so all branches can be unit-tested
 /// without a database.
@@ -4292,6 +4713,38 @@ fn check_token_validation_result(
     }
     Ok(())
 }
+
+/// A supplied value must have the shape of a generated token, since
+/// `validate_api_token` refuses anything else before the lookup (#5640).
+///
+/// The shape alone accepts `00000000_000…0`, so the secret part must also use
+/// at least [`SUPPLIED_TOKEN_MIN_DISTINCT_DIGITS`] different hex digits. A
+/// random 32-digit value falls under that with probability around 1e-8, so
+/// this refuses only hand-typed or patterned values, not real random ones.
+pub(crate) fn validate_supplied_token(token: &str) -> Result<()> {
+    if !is_api_token_shape(token) {
+        return Err(AppError::Validation(
+            "token must be 8 hex digits, '_' and 32 hex digits, the shape of a generated token"
+                .to_string(),
+        ));
+    }
+    let distinct = token.as_bytes()[9..]
+        .iter()
+        .map(u8::to_ascii_lowercase)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    if distinct < SUPPLIED_TOKEN_MIN_DISTINCT_DIGITS {
+        return Err(AppError::Validation(
+            "token secret looks hand-made (too few different hex digits); supply a random value"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Minimum number of different hex digits in the 32-digit secret of a
+/// caller-supplied token (#5864).
+pub(crate) const SUPPLIED_TOKEN_MIN_DISTINCT_DIGITS: usize = 8;
 
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
@@ -4579,6 +5032,61 @@ mod tests {
     // failure shape in the stress-tests behind #1437.
     // -----------------------------------------------------------------------
 
+    /// #5485: cancelling a request mid-bcrypt must not hand its permit back
+    /// while the blocking verify is still running. Before the fix the permit
+    /// lived in the async frame, so dropping the future released it at once
+    /// and `AUTH_MAX_CONCURRENCY` stopped bounding the bcrypt work in flight.
+    ///
+    /// Installs a one-slot cap; nextest's process-per-test isolation keeps
+    /// the `OnceLock` private to this test.
+    #[tokio::test]
+    async fn cancelled_verify_holds_its_permit_until_bcrypt_ends_5485() {
+        let sem = Arc::new(Semaphore::new(1));
+        install_global_auth_semaphore(Some(sem.clone()));
+        let installed = installed_global_auth_semaphore().expect("a cap is installed");
+        assert!(
+            Arc::ptr_eq(&installed, &sem),
+            "another cap was installed first in this process"
+        );
+        // A production-cost hash (hundreds of ms of bcrypt), computed here
+        // without a permit, so the verify is certainly still running when the
+        // future is dropped a few milliseconds after it started.
+        let slow_hash = bcrypt::hash("the-real-password", 12).expect("hash");
+
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(5),
+            AuthService::verify_password("a-wrong-guess", &slow_hash),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the verify must still be running at 5 ms"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "the cancelled verify's bcrypt is still running, so its permit must still be held"
+        );
+
+        // The permit comes back once the detached bcrypt finishes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while sem.available_permits() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the permit was never released after the blocking verify ended"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(sem.available_permits(), 1);
+
+        // And a normal, uncancelled verify still releases it on completion.
+        let fast_hash = bcrypt::hash("pw", 4).expect("hash");
+        assert!(AuthService::verify_password("pw", &fast_hash)
+            .await
+            .expect("verify"));
+        assert_eq!(sem.available_permits(), 1);
+    }
+
     #[tokio::test]
     async fn test_acquire_permit_fast_path_does_not_wait() {
         let sem = Arc::new(Semaphore::new(2));
@@ -4710,6 +5218,9 @@ mod tests {
 
     fn make_test_config() -> Arc<Config> {
         Arc::new(Config {
+            scan_worker_enabled: true,
+            scan_queue_enabled: false,
+            scan_worker_concurrency: None,
             database_url: "postgresql://unused".to_string(),
             bind_address: "0.0.0.0:8080".to_string(),
             log_level: "info".to_string(),
@@ -4779,6 +5290,7 @@ mod tests {
             stuck_scan_check_interval_secs: 600,
             stuck_scan_reap_limit: 1000,
             max_upload_size_bytes: 10_737_418_240,
+            quotas: Default::default(),
             allow_local_admin_login: false,
             sso_disable_admin_break_glass: false,
             oidc_silent_sso_enabled: true,
@@ -5622,6 +6134,7 @@ mod tests {
             groups: vec!["devs".to_string(), "admin".to_string()],
             required_admin_group: None,
             auto_create_users: true,
+            provider_id: None,
         };
         let debug = format!("{:?}", creds);
         assert!(debug.contains("feduser"));
@@ -6029,8 +6542,8 @@ mod tests {
     /// The timing pad must be generated at the *same* cost as real hashes.
     ///
     /// bcrypt reads its work factor from the hash being verified, so a dummy
-    /// at a different cost would make the "token prefix not found" path take
-    /// visibly different wall-clock time from the "wrong secret" path — the
+    /// at a different cost would make the "unknown username" path take
+    /// visibly different wall-clock time from the "wrong password" path — the
     /// exact side channel `dummy_bcrypt_hash` exists to close (#3407 must not
     /// regress the constant-time property it piggybacks on).
     #[test]
@@ -6039,7 +6552,7 @@ mod tests {
             cost_of(AuthService::dummy_bcrypt_hash()),
             bcrypt_cost(),
             "dummy timing pad must track bcrypt_cost(), else the \
-             constant-time rejection path leaks token existence by timing"
+             constant-time rejection path leaks username existence by timing"
         );
     }
 
@@ -6091,6 +6604,28 @@ mod tests {
             "Expected revocation error, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_validate_supplied_token() {
+        assert!(validate_supplied_token("0123abcd_0123456789abcdef0123456789abcdef").is_ok());
+        assert!(validate_supplied_token("0123ABCD_0123456789ABCDEF0123456789ABCDEF").is_ok());
+        for bad in [
+            "a".repeat(41),
+            // Right shape, but a patterned secret.
+            format!("0123abcd_{}", "0".repeat(32)),
+            format!("0123abcd_{}", &"0123456".repeat(5)[..32]),
+            format!("0123abcd-{}", "f".repeat(32)),
+            format!("0123abcd_{}", "f".repeat(31)),
+            format!("0123abcd_{}", "f".repeat(33)),
+            format!("0123abcg_{}", "f".repeat(32)),
+            format!("0123abcd_{}é", "f".repeat(31)),
+        ] {
+            assert!(
+                matches!(validate_supplied_token(&bad), Err(AppError::Validation(_))),
+                "{bad:?} should be refused"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -7628,6 +8163,7 @@ mod tests {
             groups: vec!["ci".to_string()],
             required_admin_group: None,
             auto_create_users: true,
+            provider_id: None,
         };
         let expected_scope = Some(vec![Uuid::new_v4(), Uuid::new_v4()]);
 
@@ -7699,6 +8235,7 @@ mod tests {
             groups: Vec::new(),
             required_admin_group: None,
             auto_create_users: true,
+            provider_id: None,
         };
 
         let result = service
@@ -7749,6 +8286,7 @@ mod tests {
             groups: vec!["ci".to_string()],
             required_admin_group: None,
             auto_create_users: true,
+            provider_id: None,
         };
 
         let (user, tokens) = service
@@ -7772,6 +8310,359 @@ mod tests {
         let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user.id)
             .execute(&pool)
             .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #5483: federated accounts are bound to the provider that created them.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn match_federated_account_binds_to_the_provider_5483() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let (user_a, user_b, legacy) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        use FederatedAccountMatch::*;
+
+        assert_eq!(match_federated_account(&[], Some(a)), New);
+        assert_eq!(
+            match_federated_account(&[(user_a, Some(a))], Some(a)),
+            Existing(user_a)
+        );
+        // The same subject at another provider of the type is not this account.
+        assert_eq!(match_federated_account(&[(user_a, Some(a))], Some(b)), New);
+        assert_eq!(
+            match_federated_account(&[(user_a, Some(a)), (user_b, Some(b))], Some(b)),
+            Existing(user_b)
+        );
+        // An unattributed account is never claimed, nor duplicated.
+        assert_eq!(
+            match_federated_account(&[(legacy, None)], Some(a)),
+            Unlinked(legacy)
+        );
+        assert_eq!(
+            match_federated_account(&[(legacy, None), (user_a, Some(a))], Some(a)),
+            Existing(user_a)
+        );
+        // No provider (CI service accounts): the type-wide match, unchanged.
+        assert_eq!(
+            match_federated_account(&[(legacy, None)], None),
+            Existing(legacy)
+        );
+        assert_eq!(match_federated_account(&[], None), New);
+    }
+
+    fn fed_creds_5483(sub: &str, username: &str, provider_id: Uuid) -> FederatedCredentials {
+        FederatedCredentials {
+            external_id: sub.to_string(),
+            username: username.to_string(),
+            email: format!("{username}@test.local"),
+            display_name: None,
+            groups: Vec::new(),
+            required_admin_group: None,
+            auto_create_users: true,
+            provider_id: Some(provider_id),
+        }
+    }
+
+    async fn delete_users_by_external_id_5483(pool: &sqlx::PgPool, external_id: &str) {
+        for sql in [
+            "DELETE FROM refresh_token_jti WHERE user_id IN \
+             (SELECT id FROM users WHERE external_id = $1)",
+            "DELETE FROM user_roles WHERE user_id IN \
+             (SELECT id FROM users WHERE external_id = $1)",
+        ] {
+            let _ = sqlx::query(sql).bind(external_id).execute(pool).await;
+        }
+        let _ = sqlx::query("DELETE FROM users WHERE external_id = $1")
+            .bind(external_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// Two providers of one type that issue the same subject (two GitLab
+    /// instances numbering users from one, the default `emailAddress`
+    /// NameID, the same DN in two directories): the second provider's user
+    /// gets its own account and the first provider's account is left alone.
+    /// Covers OIDC, SAML and LDAP.
+    #[tokio::test]
+    async fn test_same_subject_at_two_providers_is_two_accounts_5483() {
+        let Some(pool) = crate::testing::try_pool_with(4).await else {
+            return;
+        };
+        let service = AuthService::new(pool.clone(), make_test_config());
+        for kind in [AuthProvider::Oidc, AuthProvider::Saml, AuthProvider::Ldap] {
+            let (provider_a, provider_b) = (Uuid::new_v4(), Uuid::new_v4());
+            let suffix = &Uuid::new_v4().simple().to_string()[..12];
+            let sub = format!("5483-sub-{suffix}");
+
+            let victim = service
+                .sync_federated_user(
+                    kind,
+                    &fed_creds_5483(&sub, &format!("victim_{suffix}"), provider_a),
+                )
+                .await
+                .expect("first provider provisions its user");
+            sqlx::query("UPDATE users SET is_admin = true WHERE id = $1")
+                .bind(victim.id)
+                .execute(&pool)
+                .await
+                .expect("make the victim an admin");
+
+            let other = service
+                .sync_federated_user(
+                    kind,
+                    &fed_creds_5483(&sub, &format!("intruder_{suffix}"), provider_b),
+                )
+                .await
+                .expect("second provider provisions its own user");
+            assert_ne!(
+                other.id, victim.id,
+                "{kind:?}: same subject at another provider took over"
+            );
+            assert!(
+                !other.is_admin,
+                "{kind:?}: the new account must not inherit is_admin"
+            );
+
+            let (username, email, bound): (String, String, Option<Uuid>) =
+                sqlx::query_as("SELECT username, email, auth_provider_id FROM users WHERE id = $1")
+                    .bind(victim.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read victim");
+            assert_eq!(username, format!("victim_{suffix}"), "{kind:?}");
+            assert_eq!(email, format!("victim_{suffix}@test.local"), "{kind:?}");
+            assert_eq!(bound, Some(provider_a), "{kind:?}");
+
+            // Each provider keeps resolving to its own account.
+            let again = service
+                .sync_federated_user(
+                    kind,
+                    &fed_creds_5483(&sub, &format!("victim_{suffix}"), provider_a),
+                )
+                .await
+                .expect("first provider signs in again");
+            assert_eq!(again.id, victim.id, "{kind:?}");
+            let again_b = service
+                .sync_federated_user(
+                    kind,
+                    &fed_creds_5483(&sub, &format!("intruder_{suffix}"), provider_b),
+                )
+                .await
+                .expect("second provider signs in again");
+            assert_eq!(again_b.id, other.id, "{kind:?}");
+
+            delete_users_by_external_id_5483(&pool, &sub).await;
+        }
+    }
+
+    /// An account from before provider binding, when the upgrade could not
+    /// tell which provider created it: refused (403, audited), neither
+    /// claimed nor duplicated, until an administrator links it.
+    #[tokio::test]
+    async fn test_unlinked_federated_account_is_refused_until_linked_5483() {
+        let Some(pool) = crate::testing::try_pool_with(4).await else {
+            return;
+        };
+        let service = AuthService::new(pool.clone(), make_test_config());
+        let provider = Uuid::new_v4();
+        let suffix = &Uuid::new_v4().simple().to_string()[..12];
+        let sub = format!("5483-legacy-{suffix}");
+        let username = format!("legacy_{suffix}");
+        let legacy_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO users (username, email, auth_provider, external_id, is_admin) \
+             VALUES ($1, $2, 'saml', $3, true) RETURNING id",
+        )
+        .bind(&username)
+        .bind(format!("{username}@test.local"))
+        .bind(&sub)
+        .fetch_one(&pool)
+        .await
+        .expect("seed an unattributed SAML account");
+
+        let mut creds = fed_creds_5483(&sub, &format!("claimant_{suffix}"), provider);
+        creds.email = format!("claimant_{suffix}@test.local");
+        let err = service
+            .authenticate_federated(AuthProvider::Saml, creds.clone())
+            .await
+            .expect_err("an unattributed account must not be signed in to");
+        assert!(
+            matches!(&err, AppError::Authorization(m) if m.contains("link the account")),
+            "{err:?}"
+        );
+
+        let rows: Vec<(Uuid, String, Option<Uuid>)> = sqlx::query_as(
+            "SELECT id, username, auth_provider_id FROM users WHERE external_id = $1",
+        )
+        .bind(&sub)
+        .fetch_all(&pool)
+        .await
+        .expect("read accounts");
+        assert_eq!(
+            rows,
+            vec![(legacy_id, username.clone(), None)],
+            "the legacy account must be untouched and no second account created"
+        );
+
+        let mut audited = false;
+        for _ in 0..100 {
+            audited = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM audit_log \
+                 WHERE action = 'LOGIN_FAILED' AND resource_id = $1 \
+                   AND details->>'reason' = $2 AND details->>'provider' = 'saml')",
+            )
+            .bind(legacy_id)
+            .bind(FEDERATED_ACCOUNT_UNLINKED)
+            .fetch_one(&pool)
+            .await
+            .expect("read audit");
+            if audited {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(audited, "the refusal must leave a LOGIN_FAILED audit row");
+
+        // The administrator's relink from the upgrade notes.
+        sqlx::query("UPDATE users SET auth_provider_id = $1 WHERE id = $2")
+            .bind(provider)
+            .bind(legacy_id)
+            .execute(&pool)
+            .await
+            .expect("relink");
+        let (user, _) = service
+            .authenticate_federated(AuthProvider::Saml, creds)
+            .await
+            .expect("a linked account signs in");
+        assert_eq!(user.id, legacy_id);
+
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(legacy_id)
+            .execute(&pool)
+            .await;
+        delete_users_by_external_id_5483(&pool, &sub).await;
+    }
+
+    const PROVIDER_ID_MIGRATION: &str =
+        include_str!("../../migrations/350_users_auth_provider_id.sql");
+
+    /// Migration 350 against a private copy of the tables it reads (a
+    /// schema first on `search_path`, rolled back), so the provider counts
+    /// are this test's alone: attribution only where certain, and a second
+    /// run changes nothing.
+    #[tokio::test]
+    async fn test_provider_id_migration_backfill_is_conservative_and_idempotent_5483() {
+        let Some(pool) = crate::testing::try_pool_with(4).await else {
+            return;
+        };
+        let mut tx = pool.begin().await.expect("begin");
+        sqlx::raw_sql(
+            "CREATE SCHEMA m5483; SET LOCAL search_path = m5483, public; \
+             CREATE TABLE m5483.oidc_configs (id UUID PRIMARY KEY); \
+             CREATE TABLE m5483.saml_configs (id UUID PRIMARY KEY); \
+             CREATE TABLE m5483.ldap_configs (id UUID PRIMARY KEY); \
+             CREATE TABLE m5483.users (id UUID PRIMARY KEY, \
+                 auth_provider public.auth_provider NOT NULL, external_id TEXT, \
+                 ldap_provider_id UUID);",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("private tables");
+
+        let (oidc, saml_1, saml_2, ldap_1, ldap_2) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        for (sql, id) in [
+            ("INSERT INTO m5483.oidc_configs (id) VALUES ($1)", oidc),
+            ("INSERT INTO m5483.saml_configs (id) VALUES ($1)", saml_1),
+            ("INSERT INTO m5483.saml_configs (id) VALUES ($1)", saml_2),
+            ("INSERT INTO m5483.ldap_configs (id) VALUES ($1)", ldap_1),
+            ("INSERT INTO m5483.ldap_configs (id) VALUES ($1)", ldap_2),
+        ] {
+            sqlx::query(sql)
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .expect("seed provider");
+        }
+        // (user, auth_provider, external_id, ldap_provider_id, expected)
+        type Case<'a> = (Uuid, &'a str, Option<&'a str>, Option<Uuid>, Option<Uuid>);
+        let cases: Vec<Case> = vec![
+            // The only OIDC provider: attributed to it.
+            (Uuid::new_v4(), "oidc", Some("sub-1"), None, Some(oidc)),
+            // Two SAML providers: ambiguous, left unbound.
+            (Uuid::new_v4(), "saml", Some("ceo@corp.example"), None, None),
+            // LDAP with a recorded provider: that provider.
+            (
+                Uuid::new_v4(),
+                "ldap",
+                Some("uid=a"),
+                Some(ldap_2),
+                Some(ldap_2),
+            ),
+            // LDAP without one, two providers: unbound.
+            (Uuid::new_v4(), "ldap", Some("uid=b"), None, None),
+            // Local and CI accounts are never touched.
+            (Uuid::new_v4(), "local", None, None, None),
+            (Uuid::new_v4(), "ci", Some("ci:p:m"), None, None),
+        ];
+        for (id, kind, external_id, ldap_provider_id, _) in &cases {
+            sqlx::query(
+                "INSERT INTO m5483.users (id, auth_provider, external_id, ldap_provider_id) \
+                 VALUES ($1, $2::text::public.auth_provider, $3, $4)",
+            )
+            .bind(id)
+            .bind(kind)
+            .bind(external_id)
+            .bind(ldap_provider_id)
+            .execute(&mut *tx)
+            .await
+            .expect("seed user");
+        }
+
+        async fn read(conn: &mut sqlx::PgConnection, ids: &[Uuid]) -> Vec<Option<Uuid>> {
+            let mut out = Vec::new();
+            for id in ids {
+                let bound: Option<Uuid> =
+                    sqlx::query_scalar("SELECT auth_provider_id FROM m5483.users WHERE id = $1")
+                        .bind(id)
+                        .fetch_one(&mut *conn)
+                        .await
+                        .expect("read backfill");
+                out.push(bound);
+            }
+            out
+        }
+        let ids: Vec<Uuid> = cases.iter().map(|c| c.0).collect();
+        let expected: Vec<Option<Uuid>> = cases.iter().map(|c| c.4).collect();
+
+        sqlx::raw_sql(PROVIDER_ID_MIGRATION)
+            .execute(&mut *tx)
+            .await
+            .expect("migration 350 applies");
+        assert_eq!(read(&mut tx, &ids).await, expected);
+
+        // A rerun (or a boot that finds it half-applied) changes nothing,
+        // and never overwrites an administrator's link.
+        let relinked = cases[1].0;
+        sqlx::query("UPDATE m5483.users SET auth_provider_id = $1 WHERE id = $2")
+            .bind(saml_2)
+            .bind(relinked)
+            .execute(&mut *tx)
+            .await
+            .expect("admin relink");
+        sqlx::raw_sql(PROVIDER_ID_MIGRATION)
+            .execute(&mut *tx)
+            .await
+            .expect("migration 350 reapplies");
+        let mut expected_after = expected.clone();
+        expected_after[1] = Some(saml_2);
+        assert_eq!(read(&mut tx, &ids).await, expected_after);
+
+        tx.rollback().await.expect("rollback");
     }
 
     // -----------------------------------------------------------------------
@@ -10984,5 +11875,48 @@ mod tests {
         assert!(!SESSION_SIGNED_OUT_MESSAGE
             .to_ascii_lowercase()
             .contains("expired"));
+    }
+
+    /// #4987: a verified API token is recorded on the request in flight, on
+    /// the first validation and on a cache hit alike, so an audit row written
+    /// for the request (`PROXY_SCAN_BLOCKED`) can name the token.
+    #[tokio::test]
+    async fn test_4987_validated_api_token_is_recorded_on_the_request() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::request_span::{recorded_api_token, with_request_span};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _uname) = tdh::create_user(&pool).await;
+        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+        let (token, token_id) = svc
+            .generate_api_token(user_id, "audit-4987", vec!["read:artifacts".into()], None)
+            .await
+            .expect("mint API token");
+
+        let (svc_ref, token_ref) = (&svc, token.as_str());
+        let seen = || {
+            with_request_span(tracing::Span::none(), async move {
+                assert_eq!(recorded_api_token(), None, "nothing before auth");
+                svc_ref
+                    .validate_api_token(token_ref)
+                    .await
+                    .expect("validates");
+                recorded_api_token()
+            })
+        };
+        let first = seen().await;
+        let cached = seen().await;
+        let refused = with_request_span(tracing::Span::none(), async {
+            let _ = svc.validate_api_token("ak_nottoken_garbage").await;
+            recorded_api_token()
+        })
+        .await;
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert_eq!(first, Some(token_id), "cache miss");
+        assert_eq!(cached, Some(token_id), "cache hit");
+        assert_eq!(refused, None, "a refused token records nothing");
     }
 }

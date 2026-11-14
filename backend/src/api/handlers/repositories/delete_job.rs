@@ -105,7 +105,11 @@ pub struct RepositoryDeleteJobResponse {
     pub id: Uuid,
     /// Always `repository_delete`.
     pub job_type: String,
-    /// `pending`, `running`, `completed` or `failed`.
+    /// `pending`, `running`, `completed`, `completed_with_errors` or
+    /// `failed`. `completed_with_errors` (#5655): the repository and its rows
+    /// are gone, but `failed_items` stored objects could not be deleted; they
+    /// stay journaled and storage GC retries them. `error_summary` names the
+    /// count and the first keys. Treat it as terminal.
     pub status: String,
     /// The step the job is in: `queued`, `collect`, `delete_rows`, `purge`,
     /// `cleanup` or `done`.
@@ -117,7 +121,8 @@ pub struct RepositoryDeleteJobResponse {
     pub total_items: i32,
     /// Artifact rows deleted so far.
     pub completed_items: i32,
-    /// Stored objects whose delete failed; storage GC retries them.
+    /// Stored objects whose delete failed; they stay journaled and storage GC
+    /// retries them.
     pub failed_items: i32,
     /// Stored objects kept because another repository still references them.
     pub skipped_items: i32,
@@ -149,7 +154,7 @@ impl From<RepositoryDeleteJobRow> for RepositoryDeleteJobResponse {
             status_url: status_url(row.id),
             id: row.id,
             job_type: "repository_delete".to_string(),
-            status: row.status,
+            status: reported_status(&row.status, row.failed_items).to_string(),
             phase: row.phase,
             repository_id: row.repository_id,
             repository_key: row.repository_key,
@@ -166,6 +171,33 @@ impl From<RepositoryDeleteJobRow> for RepositoryDeleteJobResponse {
             error_summary: row.error_summary,
         }
     }
+}
+
+/// The status a job reports (#5655): a job that finished with object deletes
+/// that failed is `completed_with_errors`, not `completed`. Derived from the
+/// stored `completed` and `failed_items`, so the stored status set (and its
+/// CHECK constraint) is unchanged.
+pub(crate) fn reported_status(status: &str, failed_items: i32) -> &str {
+    match status {
+        "completed" if failed_items > 0 => "completed_with_errors",
+        other => other,
+    }
+}
+
+/// How many failed keys `error_summary` names.
+const FAILED_KEYS_REPORTED: usize = 5;
+
+/// `error_summary` of a job that completed with `failed` object deletes
+/// (#5655), naming the first `keys` this run saw fail.
+fn failed_purge_summary(failed: i32, keys: &[String]) -> String {
+    let mut summary = format!(
+        "{failed} stored object(s) could not be deleted; they stay journaled and storage GC \
+         retries them"
+    );
+    if !keys.is_empty() {
+        summary.push_str(&format!("; first failed keys: {}", keys.join(", ")));
+    }
+    summary
 }
 
 pub(crate) fn status_url(job_id: Uuid) -> String {
@@ -444,21 +476,38 @@ pub(crate) async fn run_claimable(state: &SharedState, job_id: Option<Uuid>) -> 
         job.token,
         CLAIM_TTL_SECS,
     );
-    let outcome = run(state, &job, &lost).await;
+    let mut failed_keys = Vec::new();
+    let outcome = run(state, &job, &lost, &mut failed_keys).await;
     drop(renewal);
     match outcome {
         Ok(()) => {
-            finish(&state.db, &job, "completed", None).await;
+            let failed: i32 =
+                sqlx::query_scalar("SELECT failed_items FROM repository_delete_jobs WHERE id = $1")
+                    .bind(job_id)
+                    .fetch_one(&state.db)
+                    .await
+                    .unwrap_or(0);
+            let summary = (failed > 0).then(|| failed_purge_summary(failed, &failed_keys));
+            finish(&state.db, &job, "completed", summary.as_deref()).await;
             state.event_bus.emit_repository_event(
                 "repository.deleted",
                 job.row.repository_id,
                 None,
             );
-            tracing::info!(
-                job_id = %job_id,
-                repository_key = %job.row.repository_key,
-                "Repository delete job completed"
-            );
+            if failed > 0 {
+                tracing::warn!(
+                    job_id = %job_id,
+                    repository_key = %job.row.repository_key,
+                    failed_items = failed,
+                    "Repository delete job completed with object deletes that failed; storage GC retries them"
+                );
+            } else {
+                tracing::info!(
+                    job_id = %job_id,
+                    repository_key = %job.row.repository_key,
+                    "Repository delete job completed"
+                );
+            }
         }
         Err(Stop::LeaseLost) => {
             tracing::warn!(job_id = %job_id, "repository delete job lost its claim; another replica continues it");
@@ -513,6 +562,7 @@ async fn run(
     state: &SharedState,
     job: &ClaimedJob,
     lost: &CancellationToken,
+    failed_keys: &mut Vec<String>,
 ) -> std::result::Result<(), Stop> {
     let start = phase_index(&job.row.phase);
     let next = |phase: &'static str| async move {
@@ -534,7 +584,7 @@ async fn run(
     check(lost)?;
     if start <= phase_index("purge") {
         next("purge").await?;
-        purge(state, job, lost).await?;
+        purge(state, job, lost, failed_keys).await?;
     }
     check(lost)?;
     next("cleanup").await?;
@@ -702,6 +752,7 @@ async fn purge(
     state: &SharedState,
     job: &ClaimedJob,
     lost: &CancellationToken,
+    failed_keys: &mut Vec<String>,
 ) -> std::result::Result<(), Stop> {
     let location = job.row.location();
     let storage = state.storage_for_repo(&location).map_err(Stop::Failed)?;
@@ -742,7 +793,12 @@ async fn purge(
             {
                 PurgeOutcome::Deleted => {}
                 PurgeOutcome::Kept => kept += 1,
-                PurgeOutcome::Failed => failed += 1,
+                PurgeOutcome::Failed => {
+                    failed += 1;
+                    if failed_keys.len() < FAILED_KEYS_REPORTED {
+                        failed_keys.push(key.clone());
+                    }
+                }
             }
         }
         add_counts(&state.db, job, 0, 0, failed, kept).await?;
@@ -1421,7 +1477,9 @@ mod tests {
             .unwrap();
         assert_eq!(b.storage_key, key, "B deduplicates against A's object");
 
-        assert!(purge(&state, &claimed, &lost).await.is_ok());
+        assert!(purge(&state, &claimed, &lost, &mut Vec::new())
+            .await
+            .is_ok());
         finish(&pool, &claimed, "completed", None).await;
         let (kept, own_left) = {
             let objects = mem.objects.lock().unwrap();
@@ -1596,6 +1654,140 @@ mod tests {
             Some(Some(fx.repo_id)),
             "the manifest object is a waiting GC candidate after the delete"
         );
+    }
+
+    /// A store whose deletes fail except for the keys in `ok` (#5655): the
+    /// stand-in for an object store that goes down mid-purge.
+    struct DeleteFailingStorage {
+        ok: std::collections::HashSet<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for DeleteFailingStorage {
+        async fn put(&self, _key: &str, _content: bytes::Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<bytes::Bytes> {
+            Err(AppError::NotFound(key.to_string()))
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn put_stream(
+            &self,
+            _key: &str,
+            _stream: futures::stream::BoxStream<'static, Result<bytes::Bytes>>,
+        ) -> Result<crate::storage::PutStreamResult> {
+            Err(AppError::Storage("connection refused".to_string()))
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            if self.ok.contains(key) {
+                Ok(())
+            } else {
+                Err(AppError::Storage("connection refused".to_string()))
+            }
+        }
+    }
+
+    /// #5655: a job whose object deletes failed (7 of 8, a storage outage)
+    /// reports `completed_with_errors` with the count and the first failed
+    /// keys, not `completed`; the failed keys stay journaled for storage GC.
+    #[tokio::test]
+    async fn a_job_with_failed_object_deletes_reports_completed_with_errors_5655() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        seed(&fx, 8, 0).await;
+        let keys: Vec<String> = sqlx::query_scalar(
+            "SELECT storage_key FROM artifacts WHERE repository_id = $1 ORDER BY storage_key",
+        )
+        .bind(fx.repo_id)
+        .fetch_all(&fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(keys.len(), 8);
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        let failing: std::sync::Arc<dyn StorageBackend> =
+            std::sync::Arc::new(DeleteFailingStorage {
+                ok: std::iter::once(keys[0].clone()).collect(),
+            });
+        let mut next = (*fx.state).clone();
+        next.storage_registry = std::sync::Arc::new(crate::storage::StorageRegistry::new(
+            std::iter::once(("s3".to_string(), failing)).collect(),
+            "s3".to_string(),
+        ));
+        let state: SharedState = std::sync::Arc::new(next);
+        let repo = state
+            .create_repository_service()
+            .get_by_id(fx.repo_id)
+            .await
+            .unwrap();
+        let (job, _) = enqueue(&fx.pool, &repo, fx.user_id).await.unwrap();
+        let done = run_to_completion(&state, job.id).await;
+        let status_app = tdh::router_with_auth(super::router(), state.clone(), admin(&fx));
+        let (status, body) = tdh::send(status_app, tdh::get(format!("/{}", job.id))).await;
+        let polled: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let journaled: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_gc_candidates \
+              WHERE source_repository_id = $1 AND storage_key = ANY($2)",
+        )
+        .bind(fx.repo_id)
+        .bind(&keys)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+        let _ = sqlx::query("DELETE FROM oci_gc_candidates WHERE source_repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repository_delete_jobs WHERE id = $1")
+            .bind(job.id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(done.failed_items, 7, "{done:?}");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(polled["status"], "completed_with_errors", "{polled}");
+        assert_eq!(polled["failed_items"], 7);
+        assert_eq!(polled["phase"], "done");
+        let summary = polled["error_summary"].as_str().unwrap_or_default();
+        assert!(summary.starts_with("7 stored object(s)"), "{summary}");
+        // The first FAILED_KEYS_REPORTED failed keys, in purge (journal) order,
+        // which is not the keys' sort order: check membership, not position.
+        let listed: Vec<&str> = summary
+            .split_once("first failed keys: ")
+            .map(|(_, list)| list.split(", ").collect())
+            .unwrap_or_default();
+        assert_eq!(listed.len(), FAILED_KEYS_REPORTED, "{summary}");
+        for key in &listed {
+            assert!(
+                keys[1..].iter().any(|k| k == key),
+                "{key} is not one of the failed keys: {summary}"
+            );
+        }
+        assert!(
+            !summary.contains(&keys[0]),
+            "not the deleted one: {summary}"
+        );
+        assert_eq!(
+            journaled, 7,
+            "the failed keys stay journaled for storage GC"
+        );
+    }
+
+    #[test]
+    fn reported_status_marks_a_completion_with_failed_deletes_5655() {
+        assert_eq!(reported_status("completed", 0), "completed");
+        assert_eq!(reported_status("completed", 3), "completed_with_errors");
+        assert_eq!(reported_status("running", 3), "running");
+        assert_eq!(reported_status("failed", 3), "failed");
     }
 
     /// The status endpoint shows a job only to its requester and to admins.

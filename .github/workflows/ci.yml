@@ -745,6 +745,16 @@ jobs:
       - name: Assert the pinned Rust toolchain is in force
         run: ./scripts/ci/check-toolchain-pin.sh --active
 
+      # #5273 drives npm through a pending scan and its eventual verdict.
+      - uses: actions/setup-node@v7.1.0
+        if: matrix.shard == 'handlers-1'
+        with:
+          node-version: '22'
+
+      - name: Install npm regression client
+        if: matrix.shard == 'handlers-1'
+        run: npm install --global npm@10.9.9
+
       - name: Install cargo-llvm-cov, cargo-nextest and sqlx-cli
         uses: taiki-e/install-action@v2
         with:
@@ -843,9 +853,10 @@ jobs:
         env:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
           AK_TESTS_REQUIRE_DB: "1"
-          # The squashfs tests fail instead of skipping where the tools are
-          # installed (see the protoc step).
+          # External-tool tests must not skip in the legs that install
+          # their required tools.
           AK_TESTS_REQUIRE_SQUASHFS: ${{ matrix.shard == 'services-1' && '1' || '' }}
+          AK_TESTS_REQUIRE_NPM: ${{ matrix.shard == 'handlers-1' && '1' || '' }}
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: |
           source <(cargo llvm-cov show-env --sh)
@@ -1537,6 +1548,15 @@ jobs:
       # stays offline.
       - name: Check release-preflight gates block on what they measure
         run: bash scripts/ci/test-release-preflight.sh
+
+      # The end-to-end proof policy for bug fixes (require-e2e-proof.yml and
+      # preflight check 7). It is silent on every non-bug PR, so a fail-open
+      # regression -- a proof line hidden in a comment, a test PR that never
+      # went red, one against the wrong release line, an exemption with no
+      # reason, an unwired tier at the backstop -- would look exactly like a
+      # working check. Stubs `gh`; offline, ~3s.
+      - name: Check the E2E-proof check refuses what it must
+        run: bash scripts/ci/test-check-e2e-proof.sh
 
       # One layer further out again (#3538). The preflight can be right and
       # still not matter: nothing asserted that one had RUN against the commit

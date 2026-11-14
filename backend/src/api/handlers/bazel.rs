@@ -550,8 +550,23 @@ async fn virtual_metadata(
 // ---------------------------------------------------------------------------
 
 /// Storage key for a published file, unique per content.
-fn storage_key_for(artifact_path: &str, sha256: &str) -> String {
-    format!("bazel/{}/{}", sha256, artifact_path)
+///
+/// Repo-scoped on a shared cloud namespace (#5662), so two repositories
+/// publishing the same bytes at the same path do not collide on one key;
+/// reads go through the row's storage_key, so legacy flat-key rows keep serving.
+fn storage_key_for(
+    scheme: crate::storage::StorageKeyScheme,
+    storage_backend: &str,
+    repo_id: Uuid,
+    artifact_path: &str,
+    sha256: &str,
+) -> String {
+    scheme.write_key(
+        storage_backend,
+        "bazel",
+        repo_id,
+        &format!("{}/{}", sha256, artifact_path),
+    )
 }
 
 /// Validate an uploaded file's body for the registry file it is published as.
@@ -620,7 +635,13 @@ async fn put_file(
 
     // Content-addressed key: a concurrent PUT of different bytes to the same
     // path cannot overwrite the blob the winning row points at.
-    let storage_key = storage_key_for(&artifact_path, &checksum);
+    let storage_key = storage_key_for(
+        crate::storage::StorageKeyScheme::from_env(),
+        &repo.storage_backend,
+        repo.id,
+        &artifact_path,
+        &checksum,
+    );
     proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, body.clone()).await?;
 
     let inserted = proxy_helpers::insert_artifact(
@@ -667,6 +688,7 @@ async fn put_file(
         crate::services::package_service::register_published_package(
             &state.db,
             &state.event_bus,
+            crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
             repo.id,
             "bazel",
             &name,
@@ -878,6 +900,30 @@ mod tests {
     }
 
     #[test]
+    fn bazel_storage_key_is_repo_scoped_on_cloud_5662() {
+        use crate::storage::StorageKeyScheme;
+        let repo_id = Uuid::new_v4();
+        let path = "modules/a/1.0/MODULE.bazel";
+        let key = |scheme, backend| storage_key_for(scheme, backend, repo_id, path, "abc");
+        for backend in ["s3", "gcs", "azure"] {
+            assert_eq!(
+                key(StorageKeyScheme::RepoScoped, backend),
+                format!("bazel/{repo_id}/abc/{path}"),
+                "{backend}"
+            );
+            assert_eq!(
+                key(StorageKeyScheme::Flat, backend),
+                format!("bazel/abc/{path}"),
+                "{backend}"
+            );
+        }
+        assert_eq!(
+            key(StorageKeyScheme::RepoScoped, "filesystem"),
+            format!("bazel/abc/{path}")
+        );
+    }
+
+    #[test]
     fn validate_upload_rules() {
         assert!(validate_upload("MODULE.bazel", b"").is_err());
         assert!(validate_upload("source.json", b"{not json").is_err());
@@ -899,6 +945,90 @@ mod tests {
         tdh::send(app, tdh::put(uri, Bytes::from_static(body)))
             .await
             .0
+    }
+
+    /// #5649 / #5650 review: a publish through `put_artifact_bytes` against a
+    /// store that is down answers `503 STORAGE_UNAVAILABLE` with
+    /// `Retry-After`, and against one that is full `507`, with no backend
+    /// text and no storage-class marker token in the body. The download of a
+    /// published module (`serve_local_artifact`) answers the outage the same
+    /// way: it went through `internal_error`, which answered 500 with the raw
+    /// error, marker token included.
+    #[tokio::test]
+    async fn put_maps_storage_outage_and_full_without_echoing_the_error_5649() {
+        let Some(f) = tdh::Fixture::setup("local", "bazel").await else {
+            return;
+        };
+        let published = "modules/served5649/1.0.0/MODULE.bazel";
+        assert_eq!(
+            put_as_member(&f, published, b"module(name = \"served5649\")").await,
+            StatusCode::CREATED,
+            "publish while storage works"
+        );
+        for (message, want) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&f.pool, &f.state, f.repo_id, &message).await;
+            let app = tdh::router_with_auth(
+                super::router(),
+                state.clone(),
+                tdh::make_auth(f.user_id, &f.username),
+            );
+            let (status, body, headers) = tdh::send_with_headers(
+                app,
+                tdh::put(
+                    format!("/{}/modules/outage5649/1.0.0/MODULE.bazel", f.repo_key),
+                    Bytes::from_static(b"module(name = \"outage5649\")"),
+                ),
+            )
+            .await;
+            assert_eq!(status, want, "{}", String::from_utf8_lossy(&body));
+            assert!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                "both the 503 and the full-disk 507 carry Retry-After"
+            );
+            tdh::assert_no_storage_backend_text("bazel PUT", &body);
+
+            if want == StatusCode::SERVICE_UNAVAILABLE {
+                let app = tdh::router_with_auth(
+                    super::router(),
+                    state.clone(),
+                    tdh::make_auth(f.user_id, &f.username),
+                );
+                let (status, body, headers) =
+                    tdh::send_with_headers(app, tdh::get(format!("/{}/{published}", f.repo_key)))
+                        .await;
+                assert_eq!(status, want, "GET: {}", String::from_utf8_lossy(&body));
+                assert!(headers.contains_key(axum::http::header::RETRY_AFTER));
+                tdh::assert_no_storage_backend_text("bazel GET", &body);
+            }
+        }
+        f.teardown().await;
+    }
+
+    /// #5662: the same module file publishes into two Bazel registries on a
+    /// shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_module_file_publishes_to_two_cloud_repositories_5662() {
+        let body = b"module(name = \"shared5662\", version = \"1.0.0\")";
+        let path = "modules/shared5662/1.0.0/MODULE.bazel";
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "bazel",
+            key_prefix: "bazel",
+            router: super::router,
+            publish: &|key| vec![tdh::put(format!("/{key}/{path}"), Bytes::from_static(body))],
+            download: &|key| tdh::get(format!("/{key}/{path}")),
+            expected: body,
+        })
+        .await;
     }
 
     async fn fetch(app: Router, uri: String) -> (StatusCode, Bytes) {
@@ -1390,4 +1520,11 @@ mod tests {
         tdh::cleanup_member_repo(&f.pool, virtual_id, &vdir).await;
         f.teardown().await;
     }
+
+    // -- property test: the listing comparator is a total order ---------------
+
+    crate::testing::props::total_order_proptest!(
+        compare_versions_is_a_total_order,
+        compare_versions
+    );
 }

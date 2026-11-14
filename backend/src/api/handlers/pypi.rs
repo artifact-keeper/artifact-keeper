@@ -3410,6 +3410,26 @@ async fn serve_file(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
+    // The row's own stored object, verified against the row (#4323, #4989).
+    let stored_row = || async {
+        let stream = storage
+            .get_stream(&artifact.storage_key)
+            .await
+            .map_err(map_storage_err)?;
+        crate::storage::verify::verify_row_serve(
+            stream,
+            &artifact.checksum_sha256,
+            &artifact.path,
+            artifact.size_bytes,
+            ctx.is_head,
+            || format!("{repo_key}/{}", artifact.path),
+        )
+        .await
+        .map(|s| {
+            s.map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
+                .boxed()
+        })
+    };
     let stream = if repo.repo_type == RepositoryType::Remote {
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
@@ -3456,20 +3476,10 @@ async fn serve_file(
             )
             .await?
         } else {
-            storage
-                .get_stream(&artifact.storage_key)
-                .await
-                .map_err(map_storage_err)?
-                .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
-                .boxed()
+            stored_row().await?
         }
     } else {
-        storage
-            .get_stream(&artifact.storage_key)
-            .await
-            .map_err(map_storage_err)?
-            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
-            .boxed()
+        stored_row().await?
     };
 
     // Record download statistics for locally-stored artifacts only.
@@ -24510,5 +24520,39 @@ mod age_gate_upstream_evidence_tests {
 
         assert!(filtered.contains("gated-1.0.0"), "{filtered}");
         assert!(!filtered.contains("gated-2.0.0"), "{filtered}");
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod hosted_serve_verification_4989_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+
+    /// #4989 (#4323 remainder): the hosted PyPI file download verifies the stored bytes against the
+    /// row. A corrupt object is the 502 `STORED_OBJECT_INTEGRITY` with none of
+    /// its bytes, not a 200 under the checksum it was uploaded with.
+    #[tokio::test]
+    async fn hosted_download_refuses_a_corrupt_object_4989() {
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        tdh::seed_corrupt_artifact(
+            &fx,
+            "v4989/1.0/v4989-1.0.tar.gz",
+            "v4989",
+            "1.0",
+            "application/gzip",
+            b"stored bytes 4989",
+            b"stored bytes 498X",
+        )
+        .await;
+        let key = fx.repo_key.clone();
+        let send = |req| tdh::send(fx.router_with_auth(super::router()), req);
+        let (get_0, body_0) = send(tdh::get(format!("/{key}/simple/v4989/v4989-1.0.tar.gz"))).await;
+        let (head_0, _) = send(tdh::head(format!("/{key}/simple/v4989/v4989-1.0.tar.gz"))).await;
+        fx.teardown().await;
+        tdh::assert_integrity_refusal(get_0, &body_0, b"stored bytes 498X");
+        assert_eq!(head_0, StatusCode::OK, "a HEAD reads and verifies nothing");
     }
 }

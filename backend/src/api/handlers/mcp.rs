@@ -138,7 +138,8 @@ pub async fn mcp_surface_guard(
     let retry_after = resp.headers().get(header::RETRY_AFTER).cloned();
     let mut out = ensure_problem(resp).await;
     if let Some(v) = retry_after {
-        out.headers_mut().entry(header::RETRY_AFTER).or_insert(v);
+        // The middleware's own value beats the re-rendered default.
+        out.headers_mut().insert(header::RETRY_AFTER, v);
     }
     let status = out.status();
     if read {
@@ -257,9 +258,21 @@ pub fn problem(status: u16, code: &str, detail: &str, extra: serde_json::Value) 
     refusal_bytes(status, serde_json::to_vec(&body).unwrap_or_default())
 }
 
+/// The `Retry-After` (seconds) a `503` of this surface carries when the
+/// refusal set none of its own (`mcp_gate_unavailable`, #5637), so a client
+/// backs off instead of retrying at once.
+pub const RETRY_AFTER_SECS: &str = "5";
+
 pub(crate) fn refusal_bytes(status: u16, body: Vec<u8>) -> Response {
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    with_refusal_headers((status, body).into_response())
+    let mut resp = with_refusal_headers((status, body).into_response());
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        resp.headers_mut().insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_static(RETRY_AFTER_SECS),
+        );
+    }
+    resp
 }
 
 /// The unknown-name answer, byte for byte the reader-only refusal.
@@ -2170,21 +2183,53 @@ pub(super) async fn refuse_case_only_twin_in(
     repo_id: Uuid,
     name: &str,
 ) -> Result<(), Response> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('mcp-name-ci'), hashtext($1))")
-        .bind(format!(
-            "mcp-name-ci/{repo_id}/{}",
-            super::mcp_virtual::OwnedNames::key(name)
-        ))
-        .execute(&mut *tx)
-        .await
-        .map_err(internal)?;
-    match case_twin_of(&mut *tx, repo_id, name)
+    match locked_case_twin_of(tx, repo_id, name)
         .await
         .map_err(internal)?
     {
         Some(existing) => Err(name_case_conflict(name, existing)),
         None => Ok(()),
     }
+}
+
+/// [`case_twin_of`] under the case-insensitive name lock of `repo_id`, held
+/// until the caller's transaction ends: the check every writer that stores
+/// a new server name in a hosted registry runs before its insert (publish,
+/// and promotion since #5435), so no two of them can store twins
+/// concurrently.
+pub(super) async fn locked_case_twin_of(
+    tx: &mut sqlx::PgConnection,
+    repo_id: Uuid,
+    name: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('mcp-name-ci'), hashtext($1))")
+        .bind(format!(
+            "mcp-name-ci/{repo_id}/{}",
+            super::mcp_virtual::OwnedNames::key(name)
+        ))
+        .execute(&mut *tx)
+        .await?;
+    case_twin_of(&mut *tx, repo_id, name).await
+}
+
+/// The other spellings of `name` the registry `repo_id` has recorded (its
+/// case-only twins), whether or not `name` itself is recorded: what a peer
+/// replication that stored `name` is audited with (#5435).
+pub(super) async fn case_twins_of(
+    db: &PgPool,
+    repo_id: Uuid,
+    name: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT t.name FROM mcp_version_tombstones t \
+         WHERE t.repository_id = $1 AND lower(t.name) = $2 AND t.name <> $3 \
+         ORDER BY t.name LIMIT 20",
+    )
+    .bind(repo_id)
+    .bind(super::mcp_virtual::OwnedNames::key(name))
+    .bind(name)
+    .fetch_all(db)
+    .await
 }
 
 /// Insert the server.json row, its metadata and the OCI retention holds in
@@ -2584,6 +2629,7 @@ async fn publish_server(
     crate::services::package_service::register_published_package_with_metadata(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, ext.user_id),
         repo.id,
         &server.name,
         &server.version,
@@ -3906,6 +3952,18 @@ mod tests {
 
     async fn seed_oci(env: &mut Env) -> (RepoInfo, String) {
         let oci = env.repo("local", "docker").await;
+        let digest = seed_oci_image(env, &oci).await;
+        env.config(
+            mcp_packages::REPOS_KEY,
+            &serde_json::json!({"oci": oci.key}).to_string(),
+        )
+        .await;
+        (oci, digest)
+    }
+
+    /// Store `acme/mcp:1.2` (an index over two platform children) in `oci`
+    /// as a push or a pull writes it; returns the index digest.
+    async fn seed_oci_image(env: &Env, oci: &RepoInfo) -> String {
         let body = index_body('a');
         let digest = format!("sha256:{}", fmt::sha256_hex(&body));
         let key = crate::api::handlers::oci_v2::manifest_storage_key(&digest);
@@ -3921,7 +3979,7 @@ mod tests {
         tdh::seed_artifact_with_checksum(
             &env.fx.state,
             &env.fx.pool,
-            &oci,
+            oci,
             "test-seed/oci-manifest-row",
             "v2/acme/mcp/manifests/1.2",
             "acme/mcp",
@@ -3938,7 +3996,7 @@ mod tests {
             tdh::seed_artifact_with_checksum(
                 &env.fx.state,
                 &env.fx.pool,
-                &oci,
+                oci,
                 &format!("test-seed/oci-child-{child}"),
                 &format!("v2/acme/mcp/manifests/sha256:{hex}"),
                 "acme/mcp",
@@ -3950,12 +4008,7 @@ mod tests {
             )
             .await;
         }
-        env.config(
-            mcp_packages::REPOS_KEY,
-            &serde_json::json!({"oci": oci.key}).to_string(),
-        )
-        .await;
-        (oci, digest)
+        digest
     }
 
     fn oci_doc(identifier: &str) -> serde_json::Value {
@@ -4025,6 +4078,280 @@ mod tests {
         assert_eq!(
             (s, json(&b)["error"].as_str()),
             (StatusCode::NOT_FOUND, Some("mcp_backing_artifact_blocked"))
+        );
+        env.teardown().await;
+    }
+
+    /// #5518: behind a Virtual `oci` backing repository the image host is
+    /// checked against the member whose manifest wins, as the artifact path
+    /// checks the winning row (#5515). A Virtual over a Remote proxying
+    /// `ghcr.io` and a Local member: `evil.example/acme/mcp:1.2` was pinned to
+    /// the `ghcr.io` image of the same path; it is refused under either
+    /// policy while the Remote member wins, `ghcr.io/acme/mcp:1.2` still
+    /// pins through it, and with the Local member winning a foreign host is
+    /// refused under `own-repos` and pinned with the warning under `open`.
+    #[tokio::test]
+    async fn virtual_oci_backing_checks_the_winning_members_host_5518() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let ghcr = env.repo("remote", "docker").await;
+        sqlx::query("UPDATE repositories SET upstream_url = 'https://ghcr.io' WHERE id = $1")
+            .bind(ghcr.id)
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        let local = env.repo("local", "docker").await;
+        let virt = env.repo("virtual", "docker").await;
+        tdh::link_virtual_member(&env.fx.pool, virt.id, ghcr.id, 1).await;
+        tdh::link_virtual_member(&env.fx.pool, virt.id, local.id, 2).await;
+        let digest = seed_oci_image(&env, &ghcr).await;
+        assert_eq!(seed_oci_image(&env, &local).await, digest);
+        env.config(
+            mcp_packages::REPOS_KEY,
+            &serde_json::json!({"oci": virt.key}).to_string(),
+        )
+        .await;
+        let publish = |name: &str, identifier: &str| {
+            let mut d = oci_doc(identifier);
+            d["name"] = name.into();
+            d
+        };
+
+        // The Remote member wins: a foreign host is refused under both
+        // policies, and nothing is stored.
+        for policy in ["own-repos", "open"] {
+            env.config(mcp_packages::POLICY_KEY, policy).await;
+            let name = format!("com.acme/evil-{policy}");
+            let (s, b) = env
+                .publish(&publish(&name, "evil.example/acme/mcp:1.2"))
+                .await;
+            assert_eq!(
+                (s, b["error"].as_str()),
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Some("mcp_external_registry")
+                ),
+                "{policy}: {b}"
+            );
+            assert!(
+                b["detail"].as_str().unwrap().contains(&ghcr.key),
+                "{policy}: {b}"
+            );
+            let stored: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(env.fx.repo_id)
+            .bind(fmt::storage_path(&name, "1.0.0"))
+            .fetch_optional(&env.fx.pool)
+            .await
+            .unwrap();
+            assert_eq!(stored, None, "{policy}");
+        }
+
+        // An image no member holds is not filled through a Remote of another
+        // upstream (it was queued as a `202` fill of the `ghcr.io` image).
+        let (s, b) = env
+            .publish(&publish(
+                "com.acme/evil-fill",
+                "evil.example/acme/absent:1.0",
+            ))
+            .await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some("mcp_external_registry")
+            ),
+            "{b}"
+        );
+
+        // The Remote's own upstream still pins through it, unwarned.
+        env.config(mcp_packages::POLICY_KEY, "own-repos").await;
+        let (s, b) = env
+            .publish(&publish("com.acme/ghcr", "ghcr.io/acme/mcp:1.2"))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let pins = stored_pins(&env, "com.acme/ghcr", "1.0.0").await;
+        assert_eq!(pins[0]["resolved"]["repositoryId"], ghcr.id.to_string());
+        assert_eq!(pins[0]["resolved"]["digest"], digest.as_str());
+        assert!(
+            pins[0]["resolved"]["warnings"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "{pins}"
+        );
+
+        // The Local member wins: a foreign host is external under
+        // `own-repos` and foreign coordinates under `open`.
+        sqlx::query("UPDATE virtual_repo_members SET priority = 3 WHERE member_repo_id = $1")
+            .bind(ghcr.id)
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        let (s, b) = env
+            .publish(&publish("com.acme/local-own", "evil.example/acme/mcp:1.2"))
+            .await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some("mcp_external_registry")
+            ),
+            "{b}"
+        );
+        env.config(mcp_packages::POLICY_KEY, "open").await;
+        let (s, b) = env
+            .publish(&publish("com.acme/local-open", "evil.example/acme/mcp:1.2"))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let pins = stored_pins(&env, "com.acme/local-open", "1.0.0").await;
+        assert_eq!(pins[0]["resolved"]["repositoryId"], local.id.to_string());
+        assert_eq!(
+            pins[0]["resolved"]["warnings"],
+            serde_json::json!([mcp_packages::FOREIGN_COORDINATES_WARNING])
+        );
+        env.teardown().await;
+    }
+
+    /// #5593: the backing gate of an introspection completion
+    /// ([`mcp_packages::held_backing_package`]) re-reads its rows under the
+    /// `FOR SHARE` locks. The interleaving is forced: a tag move (the
+    /// tag-path row rewritten in place to other bytes, its rejection moved
+    /// onto a digest-path row the gate has not seen) is held open, the
+    /// gate starts and is observed blocked on it (`pg_blocking_pids`), and
+    /// only then does the move commit. The gate's first read predates the
+    /// move; before the fix its lock returned the rewritten, clean tag row
+    /// and the version passed while the pinned digest was rejected.
+    #[tokio::test]
+    async fn held_backing_package_rereads_rows_moved_before_the_lock_5593() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let (oci, digest) = seed_oci(&mut env).await;
+        let identifier = format!("localhost/{}/acme/mcp:1.2", oci.key);
+        let (s, b) = env.publish(&oci_doc(&identifier)).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let pool = &env.fx.pool;
+        let meta: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM artifact_metadata WHERE artifact_id = $1")
+                .bind(env.server_artifact("com.acme/img", "1.0.0").await)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let stored = StoredVersion::from_metadata(&meta).unwrap();
+        let label = stored.pins[0].label();
+
+        // Before the move only the tag-path row carries the pinned index,
+        // rejected; the digest-path row is not live yet.
+        let hex = fmt::sha256_hex(&index_body('a'));
+        let tag_row: Uuid = sqlx::query_scalar(
+            "UPDATE artifacts SET quarantine_status = 'rejected', quarantine_source = 'scan_policy' \
+             WHERE repository_id = $1 AND path = 'v2/acme/mcp/manifests/1.2' RETURNING id",
+        )
+        .bind(oci.id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let digest_path = format!("v2/acme/mcp/manifests/{digest}");
+        let digest_row: Option<Uuid> = sqlx::query_scalar(
+            "UPDATE artifacts SET is_deleted = true WHERE repository_id = $1 AND path = $2 \
+             RETURNING id",
+        )
+        .bind(oci.id)
+        .bind(&digest_path)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        let digest_row = match digest_row {
+            Some(id) => id,
+            None => {
+                tdh::seed_artifact_with_checksum(
+                    &env.fx.state,
+                    pool,
+                    &oci,
+                    "test-seed/oci-digest-row",
+                    &digest_path,
+                    "acme/mcp",
+                    &digest,
+                    INDEX_MT,
+                    Bytes::from_static(b"{}"),
+                    env.fx.user_id,
+                    &hex,
+                )
+                .await
+            }
+        };
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+            .bind(digest_row)
+            .execute(pool)
+            .await
+            .unwrap();
+        let mut probe = pool.acquire().await.unwrap();
+        assert_eq!(
+            mcp_packages::held_backing_package(&mut probe, &stored)
+                .await
+                .unwrap(),
+            Some(label.clone()),
+            "control: the rejected tag row holds the version"
+        );
+        drop(probe);
+
+        // The tag move, held open.
+        let mut mover = pool.begin().await.unwrap();
+        let mover_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *mover)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE artifacts SET checksum_sha256 = $2, quarantine_status = NULL, \
+             quarantine_source = NULL WHERE id = $1",
+        )
+        .bind(tag_row)
+        .bind("c".repeat(64))
+        .execute(&mut *mover)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE artifacts SET is_deleted = false, quarantine_status = 'rejected', \
+             quarantine_source = 'scan_policy' WHERE id = $1",
+        )
+        .bind(digest_row)
+        .execute(&mut *mover)
+        .await
+        .unwrap();
+
+        let mut gate_tx = pool.begin().await.unwrap();
+        let commit_once_blocked = async {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut blocked = false;
+            while std::time::Instant::now() < deadline {
+                blocked = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                     WHERE $1 = ANY(pg_blocking_pids(pid)))",
+                )
+                .bind(mover_pid)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                if blocked {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            mover.commit().await.unwrap();
+            blocked
+        };
+        let (held, blocked) = tokio::join!(
+            mcp_packages::held_backing_package(&mut gate_tx, &stored),
+            commit_once_blocked
+        );
+        assert!(blocked, "precondition: the gate waited on the tag move");
+        gate_tx.rollback().await.unwrap();
+        assert_eq!(
+            held.unwrap(),
+            Some(label),
+            "the rejection moved onto the digest-path row still holds the version"
         );
         env.teardown().await;
     }
@@ -6475,7 +6802,9 @@ mod tests {
             &serde_json::json!({"oci": virt.key}).to_string(),
         )
         .await;
-        let mut d = oci_doc("ghcr.io/acme/one:1.0");
+        // Named on the Virtual: a hosted member serves no other host's image
+        // under `own-repos` (#5518).
+        let mut d = oci_doc(&format!("localhost/{}/acme/one:1.0", virt.key));
         d["name"] = "com.acme/one".into();
         let (s, b) = env.publish(&d).await;
         assert_eq!(s, StatusCode::OK, "{b}");
@@ -7386,6 +7715,243 @@ mod tests {
         hold_committed_during_a_tag_move_is_carried(Refusal::Scanner).await;
     }
 
+    /// #5619: the generic download through a Virtual OCI repository gates a
+    /// member's manifest row with every alias of its digest, as the hosted
+    /// generic download and `/v2` do. D1 is pushed as `1.0` and pinned (so it
+    /// also has a digest-path row); the digest row alone is refused, and the
+    /// clean tag row must not serve D1 through the Virtual, on HEAD or GET,
+    /// by tag or by digest.
+    async fn virtual_generic_download_gates_every_alias(how: Refusal) {
+        let Some(rig) = AliasRig::new().await else {
+            return;
+        };
+        let d1 = rig.push("generic").await;
+        rig.publish("1.0.0").await;
+        let send = |method: &'static str, key: String, reference: String| {
+            let router = rig
+                .env
+                .fx
+                .router_with_auth(crate::api::handlers::repositories::download_router());
+            async move {
+                let req = Request::builder()
+                    .method(method)
+                    .uri(format!(
+                        "/{key}/download/v2/{ALIAS_IMAGE}/manifests/{reference}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap();
+                tdh::send(router, req).await.0
+            }
+        };
+        assert_eq!(
+            send("HEAD", rig.oci_virtual.key.clone(), "1.0".into()).await,
+            StatusCode::OK,
+            "control: the Virtual answers for D1 before any refusal"
+        );
+        rig.refuse(rig.row_id(&d1).await, how).await;
+        assert_eq!(
+            rig.hold_at("1.0").await.and_then(|h| h.0),
+            None,
+            "precondition: the tag row itself is clean"
+        );
+        let refused = match how {
+            Refusal::Manual => StatusCode::CONFLICT,
+            Refusal::Scanner => StatusCode::FORBIDDEN,
+        };
+        for method in ["HEAD", "GET"] {
+            for reference in ["1.0", d1.as_str()] {
+                assert_eq!(
+                    send(method, rig.docker.key.clone(), reference.to_string()).await,
+                    refused,
+                    "hosted {method} {reference}"
+                );
+                assert_eq!(
+                    send(method, rig.oci_virtual.key.clone(), reference.to_string()).await,
+                    refused,
+                    "Virtual {method} {reference}"
+                );
+            }
+        }
+        rig.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn virtual_generic_download_refuses_a_quarantined_digest_5619() {
+        virtual_generic_download_gates_every_alias(Refusal::Manual).await;
+    }
+
+    #[tokio::test]
+    async fn virtual_generic_download_refuses_a_rejected_digest_5619() {
+        virtual_generic_download_gates_every_alias(Refusal::Scanner).await;
+    }
+
+    /// One admin quarantine-API call (`action` `quarantine` / `reject`) on
+    /// `artifact_id`: status and JSON body.
+    async fn admin_hold(
+        rig: &AliasRig,
+        artifact_id: Uuid,
+        action: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let (s, b) = tdh::send(
+            tdh::router_with_auth(
+                crate::api::handlers::quarantine::router(),
+                rig.env.fx.state.clone(),
+                tdh::admin_auth(rig.env.fx.user_id, &rig.env.fx.username),
+            ),
+            tdh::post(
+                format!("/{artifact_id}/{action}"),
+                "application/json",
+                Bytes::from(body.to_string()),
+            ),
+        )
+        .await;
+        (s, serde_json::from_slice(&b).unwrap_or_default())
+    }
+
+    /// #5646: an administrator's quarantine whose `UPDATE` waits on the row
+    /// lock of a push that is moving the tag D1 -> D2 holds D1 (the image the
+    /// tag named when the request read it), not D2. The interleaving is the
+    /// reverse of #5618's: the move's upsert runs in an open transaction (so
+    /// it holds the tag row's lock), the quarantine starts and is observed
+    /// blocked on that transaction, and only then does the move commit.
+    #[tokio::test]
+    async fn quarantine_landing_after_a_tag_move_holds_the_digest_it_read_5646() {
+        let Some(rig) = AliasRig::new().await else {
+            return;
+        };
+        let d1 = rig.push("seen").await;
+        let tag_row = rig.row_id("1.0").await;
+        let pool = &rig.env.fx.pool;
+        let d2 = format!("sha256:{}", "e".repeat(64));
+
+        let mut push = pool.begin().await.unwrap();
+        let push_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *push)
+            .await
+            .unwrap();
+        crate::api::handlers::oci_v2::upsert_manifest_artifact(
+            &mut *push,
+            rig.docker.id,
+            ALIAS_IMAGE,
+            "1.0",
+            &d2,
+            ALIAS_MT,
+            &crate::api::handlers::oci_v2::manifest_storage_key(&d2),
+            10,
+            Some(rig.env.fx.user_id),
+            None,
+        )
+        .await
+        .unwrap();
+        let commit_once_blocked = async {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut blocked = false;
+            while std::time::Instant::now() < deadline {
+                blocked = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                     WHERE $1 = ANY(pg_blocking_pids(pid)))",
+                )
+                .bind(push_pid)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                if blocked {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            push.commit().await.unwrap();
+            blocked
+        };
+        let ((status, body), blocked) = tokio::join!(
+            admin_hold(
+                &rig,
+                tag_row,
+                "quarantine",
+                serde_json::json!({"reason": "admin hold"})
+            ),
+            commit_once_blocked
+        );
+        assert!(blocked, "precondition: the quarantine waited on the move");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["held_digest"], d1.as_str(), "{body}");
+        assert_eq!(body["moved_to_digest"], d2.as_str(), "{body}");
+
+        assert_eq!(
+            rig.rows_of(&d1).await,
+            vec![(
+                format!("v2/{ALIAS_IMAGE}/manifests/{d1}"),
+                Some("quarantined".to_string())
+            )],
+            "D1 is held through its digest row"
+        );
+        assert_eq!(
+            rig.hold_at("1.0").await.map(|h| h.0),
+            Some(None),
+            "the tag row, which names D2, is not held"
+        );
+        assert_eq!(
+            rig.native(&rig.docker.key, &d1).await,
+            StatusCode::CONFLICT,
+            "D1 is refused by digest"
+        );
+        rig.teardown().await;
+    }
+
+    /// #5646: a rejection that names the digest the operator saw
+    /// (`expected_digest`) after the tag moved to an image under its own
+    /// upload hold rejects the old image, never the new one; the answer names
+    /// both digests.
+    #[tokio::test]
+    async fn rejection_with_an_expected_digest_after_a_tag_move_rejects_it_5646() {
+        let Some(rig) = AliasRig::new().await else {
+            return;
+        };
+        let d1 = rig.push("seen").await;
+        let tag_row = rig.row_id("1.0").await;
+        let (s, b) = admin_hold(&rig, tag_row, "quarantine", serde_json::json!({})).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let d2 = rig.push("next").await;
+        assert_eq!(rig.row_id("1.0").await, tag_row);
+        // D2's own upload hold, which the rejection of D1 must not touch.
+        rig.set_hold("1.0", "quarantined", "NOW() + INTERVAL '1 hour'", "upload")
+            .await;
+
+        let (status, body) = admin_hold(
+            &rig,
+            tag_row,
+            "reject",
+            serde_json::json!({"reason": "critical", "expected_digest": d1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["new_status"], "rejected", "{body}");
+        assert_eq!(body["held_digest"], d1.as_str(), "{body}");
+        assert_eq!(body["moved_to_digest"], d2.as_str(), "{body}");
+        assert_eq!(
+            rig.rows_of(&d1).await,
+            vec![(
+                format!("v2/{ALIAS_IMAGE}/manifests/{d1}"),
+                Some("rejected".to_string())
+            )],
+        );
+        assert_eq!(
+            rig.hold_at("1.0").await.map(|h| (h.0, h.1)),
+            Some((Some("quarantined".to_string()), true)),
+            "D2's timed upload hold is untouched"
+        );
+        let (s, b) = admin_hold(
+            &rig,
+            tag_row,
+            "quarantine",
+            serde_json::json!({"expected_digest": "sha256:nothex"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        rig.teardown().await;
+    }
+
     /// `isLatest` is the newest servable version on every read, and
     /// `version=latest` picks the newest before `updated_since` filters.
     #[tokio::test]
@@ -7992,6 +8558,21 @@ mod tests {
                 "/mcp/r/v0.1/hidden",
                 get(|| async { StatusCode::NOT_FOUND }),
             )
+            .route(
+                "/mcp/r/v0.1/busy",
+                get(move || plain(StatusCode::SERVICE_UNAVAILABLE)),
+            )
+            .route(
+                "/mcp/r/v0.1/gate",
+                get(|| async {
+                    problem(
+                        503,
+                        "mcp_gate_unavailable",
+                        "gates could not be evaluated",
+                        serde_json::json!({}),
+                    )
+                }),
+            )
             .route("/npm/r/x", get(move || plain(StatusCode::UNAUTHORIZED)))
             .layer(axum::middleware::from_fn(mcp_surface_guard));
         let send = |uri: &str| {
@@ -8014,6 +8595,16 @@ mod tests {
         assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
         assert_refusal_headers(&h);
         assert_eq!(json(&b)["error"], "mcp_rate_limited");
+        assert_eq!(h[header::RETRY_AFTER], "7");
+        // #5637: the router's own 503 (`mcp_gate_unavailable`) carries a
+        // `Retry-After`; a middleware 503 keeps its own value.
+        let (s, b, h) = send("/mcp/r/v0.1/gate").await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json(&b)["error"], "mcp_gate_unavailable");
+        assert_eq!(h[header::RETRY_AFTER], RETRY_AFTER_SECS);
+        let (s, b, h) = send("/mcp/r/v0.1/busy").await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json(&b)["error"], "mcp_unavailable");
         assert_eq!(h[header::RETRY_AFTER], "7");
         let (_, _, h) = send("/npm/r/x").await;
         assert_eq!(h[header::CONTENT_TYPE], "text/plain; charset=utf-8");
@@ -8795,6 +9386,67 @@ mod tests {
         }
     }
 
+    /// #5536: a Virtual's route drops the members a caller cannot read. With
+    /// a lower member holding the same coordinate (other bytes), a reader of
+    /// the Virtual who cannot read the pinned member is served the lower
+    /// member's copy, so once the pinned member is not readable by every
+    /// reader of the Virtual the version is held (`gate: shadowed`) and a
+    /// new pin of the coordinate is refused (`422 mcp_package_shadowed`).
+    /// Granting that reader the pinned member serves it again. PyPI is not
+    /// affected: every hosted file of the version is already part of its pin.
+    #[tokio::test]
+    async fn pinned_member_hidden_from_a_virtual_reader_shadows_5536() {
+        for case in SHADOW_CASES.iter().filter(|c| c.ty != "pypi") {
+            let ty = case.ty;
+            let Some(mut env) = Env::new().await else {
+                return;
+            };
+            let (virt, m) = env.shadow_virtual(ty, &[("local", 1), ("local", 2)]).await;
+            let a = env.publish_pkg(case, &m[0], b"approved A", None).await;
+            env.publish_pkg(case, &m[1], b"lower B", None).await;
+            let (s, b) = env.publish_shadow_server(case).await;
+            assert_eq!(s, StatusCode::OK, "{ty}: {b}");
+            assert_eq!(env.pinned_sha().await, a.sha256, "{ty}");
+            assert_eq!(
+                env.view().await,
+                View::Served,
+                "{ty}: every reader of the Virtual reads the pinned member"
+            );
+
+            let (reader, _) = tdh::create_user(&env.fx.pool).await;
+            tdh::grant_repo_role(&env.fx.pool, virt.id, reader, "reader").await;
+            assert_eq!(env.view().await, shadowed(), "{ty}");
+            let (s, b) = env
+                .publish(&doc(
+                    "com.acme/shadow",
+                    "1.0.1",
+                    serde_json::json!({"packages": [{"registryType": ty,
+                        "identifier": case.name, "version": case.pinned,
+                        "transport": {"type": "stdio"}}]}),
+                ))
+                .await;
+            assert_eq!(
+                (s, b["error"].as_str()),
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Some("mcp_package_shadowed")
+                ),
+                "{ty}: {b}"
+            );
+            let detail = b["detail"].as_str().unwrap_or_default();
+            assert!(
+                detail.contains(&m[0].key) && detail.contains(&m[1].key),
+                "{ty}: {detail}"
+            );
+
+            tdh::grant_repo_role(&env.fx.pool, m[0].id, reader, "reader").await;
+            assert_eq!(env.view().await, View::Served, "{ty}");
+            let pool = env.fx.pool.clone();
+            env.teardown().await;
+            tdh::cleanup_user(&pool, reader).await;
+        }
+    }
+
     /// #5456 quarantine orders, each in a clean fixture: the MCP read and the
     /// advertised native download agree on every order.
     #[tokio::test]
@@ -8982,18 +9634,12 @@ mod tests {
         .await
         .unwrap();
         let a = env.publish_pkg(case, &m[0], b"approved A", None).await;
-        let (remote, _, up) = env.upstream_member(case, &virt, 1, b"upstream B").await;
+        let (remote, remote_key, up) = env.upstream_member(case, &virt, 1, b"upstream B").await;
         let (s, b) = env.publish_shadow_server(case).await;
         assert_eq!(s, StatusCode::OK, "{b}");
-        sqlx::query(
-            "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, metadata_key, \
-             size_bytes, checksum_sha256) VALUES ($1, '@acme/echo/-/echo-1.0.0.tgz', 'k', 'm', 1, $2)",
-        )
-        .bind(remote)
-        .bind("b".repeat(64))
-        .execute(&env.fx.pool)
-        .await
-        .unwrap();
+        // The Remote caches the name through its own route (#5537: a real
+        // pull, not a seeded row).
+        pull_through(&env, case, &up, remote, &remote_key, b"upstream B").await;
         assert_eq!(env.view().await, View::Served);
         assert_eq!(
             sf::native_get_with_state(
@@ -9019,36 +9665,83 @@ mod tests {
             return;
         };
         let (virt, m) = env.shadow_virtual("cargo", &[("local", 2)]).await;
-        let (remote, _, _up) = env.upstream_member(case, &virt, 1, b"upstream A").await;
-        seed_crate_cache(&env.fx.pool, remote).await;
+        let (remote, remote_key, up) = env.upstream_member(case, &virt, 1, b"upstream A").await;
+        pull_through(&env, case, &up, remote, &remote_key, b"upstream A").await;
         let (s, b) = env.publish_shadow_server(case).await;
         assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(env.pinned_sha().await, fmt::sha256_hex(b"upstream A"));
         assert_eq!(env.view().await, View::Served);
-        env.publish_pkg(case, &m[0], b"hosted B", None).await;
+        let tail = sf::download_tail("cargo", case.name, case.published, None);
+        let through_virtual = format!("/{}{tail}", virt.key);
+        assert_eq!(
+            sf::native_get_with_state(&up.state, &env.fx, "cargo", &through_virtual).await,
+            (StatusCode::OK, Some(fmt::sha256_hex(b"upstream A"))),
+            "the Virtual serves the pinned upstream crate"
+        );
+        let hosted = env.publish_pkg(case, &m[0], b"hosted B", None).await;
         assert_eq!(env.view().await, shadowed());
+        assert_eq!(
+            sf::native_get_with_state(&up.state, &env.fx, "cargo", &through_virtual).await,
+            (StatusCode::OK, Some(hosted.sha256)),
+            "why it is held: the owner guard now serves the hosted crate"
+        );
         env.teardown().await;
     }
 
-    /// Seed `remote`'s proxy cache with the case's crate (`acme-echo@1.0.0`).
-    async fn seed_crate_cache(pool: &sqlx::PgPool, remote: Uuid) {
-        sqlx::query(
-            "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, metadata_key, \
-             size_bytes, checksum_sha256) VALUES ($1, 'api/v1/crates/acme-echo/1.0.0/download', \
-             'k', 'm', 1, $2)",
-        )
-        .bind(remote)
-        .bind("a".repeat(64))
-        .execute(pool)
-        .await
-        .unwrap();
+    /// Pull `case` through Remote `remote_key`'s own native route on the mock
+    /// upstream's state, so its proxy cache holds the package exactly as a
+    /// client's pull leaves it, and require the upstream's bytes and a cache
+    /// row (#5537).
+    async fn pull_through(
+        env: &Env,
+        case: &ShadowCase,
+        up: &sf::MockUpstream,
+        remote: Uuid,
+        remote_key: &str,
+        body: &[u8],
+    ) {
+        let tail = sf::download_tail(case.ty, case.name, case.published, None);
+        assert_eq!(
+            sf::native_get_with_state(&up.state, &env.fx, case.ty, &format!("/{remote_key}{tail}"))
+                .await,
+            (StatusCode::OK, Some(fmt::sha256_hex(body))),
+            "{}: pull through the Remote",
+            case.ty
+        );
+        wait_cached(&env.fx.pool, case, remote).await;
     }
 
-    /// #5456: the asynchronous fill applies the same cache-pin refusal as the
-    /// synchronous publish. A crate the Remote member caches after the publish
-    /// was accepted (`202`), while a hosted member of the Virtual now holds
-    /// the same `name@version` (so the owner guard serves the hosted crate),
-    /// fails the job with `mcp_package_shadowed` instead of resolving into a
-    /// version that is held for ever.
+    /// Wait for Remote `remote`'s proxy-cache catalog to record `case`'s
+    /// file where an MCP pin looks for it: the streaming fill writes the row
+    /// once the client stream has ended, from its own task (and the index
+    /// documents the route fetched first may be recorded before it).
+    async fn wait_cached(pool: &sqlx::PgPool, case: &ShadowCase, remote: Uuid) {
+        for _ in 0..100 {
+            let entry = crate::services::mcp_resolver::cached_entry(
+                pool,
+                remote,
+                case.ty,
+                case.name,
+                case.pinned,
+            )
+            .await
+            .unwrap();
+            if entry.is_some() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("{}: the pull through the Remote was never cached", case.ty);
+    }
+
+    /// #5456: the asynchronous fill never resolves into a version that is
+    /// held for ever. A crate the Remote member caches after the publish was
+    /// accepted (`202`), while a hosted member of the Virtual now holds the
+    /// same `name@version` (so the owner guard serves the hosted crate),
+    /// fails the job: the fill target is recomputed from the walk (#5537),
+    /// which no longer serves the crate from the Remote recorded at publish,
+    /// so the job fails `mcp_package_not_found` ("publish again", which then
+    /// pins the hosted crate) instead of pinning the Remote's cache.
     #[tokio::test]
     async fn async_fill_refuses_a_shadowed_cache_pin_5456() {
         let case = &SHADOW_CASES[3];
@@ -9056,12 +9749,12 @@ mod tests {
             return;
         };
         let (virt, m) = env.shadow_virtual("cargo", &[("local", 2)]).await;
-        let (remote, _, up) = env.upstream_member(case, &virt, 1, b"upstream A").await;
+        let (remote, remote_key, up) = env.upstream_member(case, &virt, 1, b"upstream A").await;
         let (s, b) = env.publish_shadow_server(case).await;
         assert_eq!(s, StatusCode::ACCEPTED, "nothing cached or hosted yet: {b}");
         let id = env.server_artifact("com.acme/shadow", "1.0.0").await;
         env.publish_pkg(case, &m[0], b"hosted B", None).await;
-        seed_crate_cache(&env.fx.pool, remote).await;
+        pull_through(&env, case, &up, remote, &remote_key, b"upstream A").await;
         assert!(crate::services::mcp_resolver::run_job(&up.state, id).await);
         let res: serde_json::Value = sqlx::query_scalar(
             "SELECT COALESCE(metadata->'resolution', 'null'::jsonb) FROM artifact_metadata \
@@ -9072,7 +9765,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(res["state"], "failed", "{res}");
-        assert_eq!(res["error"]["error"], "mcp_package_shadowed", "{res}");
+        assert_eq!(res["error"]["error"], "mcp_package_not_found", "{res}");
+        assert!(
+            res["error"]["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("no longer fills through")),
+            "{res}"
+        );
         env.teardown().await;
     }
 
@@ -9086,8 +9785,8 @@ mod tests {
             return;
         };
         let (virt, _) = env.shadow_virtual("cargo", &[("local", 2)]).await;
-        let (remote, _, _up) = env.upstream_member(case, &virt, 1, b"upstream A").await;
-        seed_crate_cache(&env.fx.pool, remote).await;
+        let (remote, remote_key, up) = env.upstream_member(case, &virt, 1, b"upstream A").await;
+        pull_through(&env, case, &up, remote, &remote_key, b"upstream A").await;
         let (s, b) = env.publish_shadow_server(case).await;
         assert_eq!(s, StatusCode::OK, "{b}");
         assert_eq!(env.view().await, View::Served);
@@ -9164,6 +9863,26 @@ mod tests {
             "served for acme-echo's file name"
         );
         env.soft_delete(&other.artifact_ids).await;
+        assert_eq!(env.view().await, View::Served);
+
+        // #5537: a legacy egg named for the project, uploaded under another.
+        let egg = sf::publish_native(
+            &env.fx,
+            "pypi",
+            &m[1].key,
+            m[1].id,
+            "zzz",
+            "1.0",
+            b"zzz egg",
+            Some("acme_echo-1.0-py3.12.egg"),
+        )
+        .await;
+        assert_eq!(
+            env.view().await,
+            shadowed(),
+            "served for acme-echo's legacy egg"
+        );
+        env.soft_delete(&egg.artifact_ids).await;
         assert_eq!(env.view().await, View::Served);
 
         // One pinned file gone (the other still gated and served).
@@ -9250,5 +9969,138 @@ mod tests {
             .unwrap();
         assert_eq!(env.view().await, shadowed(), "the pinned member left");
         env.teardown().await;
+    }
+
+    /// #5537: a missing package is filled through the Remote the Virtual's
+    /// route serves it from, here a Remote inside a nested Virtual ranked
+    /// above a direct Remote member, and the asynchronous fill then resolves
+    /// the version from that Remote's real pull.
+    #[tokio::test]
+    async fn async_fill_goes_through_the_walks_remote_5537() {
+        let case = &SHADOW_CASES[0];
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let (virt, _) = env.shadow_virtual("npm", &[]).await;
+        let nested = env.repo("virtual", "npm").await;
+        tdh::link_virtual_member(&env.fx.pool, virt.id, nested.id, 1).await;
+        let (walked_id, walked, up) = env
+            .upstream_member(case, &nested, 1, b"walked upstream")
+            .await;
+        let (direct, direct_key, direct_dir) = tdh::attach_remote_member(
+            &env.fx.pool,
+            virt.id,
+            "npm",
+            "https://direct-remote.invalid",
+            2,
+        )
+        .await;
+        env.extra_repos.push((direct, direct_dir));
+        tdh::grant_repo_role(&env.fx.pool, direct, env.fx.user_id, "reader").await;
+
+        let (s, b) = env.publish_shadow_server(case).await;
+        assert_eq!(s, StatusCode::ACCEPTED, "nothing cached yet: {b}");
+        let id = env.server_artifact("com.acme/shadow", "1.0.0").await;
+        let resolution = || async {
+            sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT COALESCE(metadata->'resolution', 'null'::jsonb) FROM artifact_metadata \
+                 WHERE artifact_id = $1",
+            )
+            .bind(id)
+            .fetch_one(&env.fx.pool)
+            .await
+            .unwrap()
+        };
+        let res = resolution().await;
+        assert_eq!(
+            res["pending"][0]["fillRepository"], walked,
+            "the walk serves from '{walked}', not the direct '{direct_key}': {res}"
+        );
+        assert!(crate::services::mcp_resolver::run_job(&up.state, id).await);
+        // The fill's cache row commits after its stream ends; the job looks
+        // again on its next attempt, as the background resolver would.
+        wait_cached(&env.fx.pool, case, walked_id).await;
+        if resolution().await["state"] == "resolving" {
+            assert!(crate::services::mcp_resolver::run_job(&up.state, id).await);
+        }
+        let res = resolution().await;
+        assert_eq!(res["state"], "resolved", "{res}");
+        assert_eq!(env.pinned_sha().await, fmt::sha256_hex(b"walked upstream"));
+        assert_eq!(env.view().await, View::Served);
+        env.teardown().await;
+    }
+
+    /// #5537: PyPI is per file, so a Remote member ranked BELOW the Local
+    /// that holds the version still refuses the publish: it can serve the
+    /// version's other distributions from its upstream.
+    #[tokio::test]
+    async fn pypi_remote_ranked_below_the_local_is_refused_5537() {
+        let case = &SHADOW_CASES[1];
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let (virt, m) = env.shadow_virtual("pypi", &[("local", 1)]).await;
+        env.publish_pkg(case, &m[0], b"sdist A", None).await;
+        let (below, below_key, below_dir) = tdh::attach_remote_member(
+            &env.fx.pool,
+            virt.id,
+            "pypi",
+            "https://pypi-below.invalid",
+            2,
+        )
+        .await;
+        env.extra_repos.push((below, below_dir));
+        let (s, b) = env.publish_shadow_server(case).await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some("mcp_package_shadowed")
+            ),
+            "{b}"
+        );
+        let detail = b["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains(&below_key) && detail.contains(&m[0].key),
+            "{detail}"
+        );
+        env.teardown().await;
+    }
+
+    /// #5537: the serve model expands the Virtual once per coordinate,
+    /// whatever its format's guard reads (npm's isolate check and
+    /// priority-aware owner guard, Cargo's exact-version owner guard), and so
+    /// does the fill target.
+    #[tokio::test]
+    async fn serve_model_expands_the_virtual_once_5537() {
+        use crate::api::handlers::proxy_helpers::virtual_expansion_count;
+        use crate::services::mcp_virtual_serve::{fill_remote, serve_model, Winner};
+        for case in [&SHADOW_CASES[0], &SHADOW_CASES[3]] {
+            let ty = case.ty;
+            let Some(mut env) = Env::new().await else {
+                return;
+            };
+            let (virt, m) = env.shadow_virtual(ty, &[("local", 1)]).await;
+            env.publish_pkg(case, &m[0], b"hosted A", None).await;
+            let (remote, _, remote_dir) =
+                tdh::attach_remote_member(&env.fx.pool, virt.id, ty, "https://up.invalid", 2).await;
+            env.extra_repos.push((remote, remote_dir));
+
+            let before = virtual_expansion_count();
+            let model = serve_model(&env.fx.pool, virt.id, ty, case.name, case.pinned)
+                .await
+                .unwrap();
+            assert_eq!(virtual_expansion_count() - before, 1, "{ty}: serve_model");
+            assert!(
+                matches!(&model.winner, Some(Winner::Hosted { key, .. }) if *key == m[0].key),
+                "{ty}: {model:?}"
+            );
+            let before = virtual_expansion_count();
+            fill_remote(&env.fx.pool, virt.id, ty, case.name, Some(case.pinned))
+                .await
+                .unwrap();
+            assert_eq!(virtual_expansion_count() - before, 1, "{ty}: fill_remote");
+            env.teardown().await;
+        }
     }
 }

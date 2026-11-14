@@ -88,11 +88,35 @@ use crate::models::quality::{
     ArtifactHealthScore, ComponentScores, QualityCheckIssue, QualityCheckOutput,
     QualityCheckResult, QualityGate, QualityGateEvaluation, QualityGateViolation, RepoHealthScore,
 };
-use crate::models::security::Grade;
+use crate::models::security::{AcceptedGradeStatus, Grade, RepoGradeState};
 use crate::services::helm_lint_checker::HelmLintChecker;
 use crate::services::metadata_checker::MetadataCompletenessChecker;
 use crate::storage::filesystem::FilesystemStorage;
 use crate::storage::{StorageBackend, StorageLocation, StorageRegistry};
+
+/// Whether a gate checks the repository grade status (#4994): it sets a
+/// threshold that reads the repository security score (`min_security_score`,
+/// or `min_health_score`, which weighs it in) and was not relaxed to `any`.
+pub(crate) fn gate_checks_grade_status(gate: &QualityGate) -> bool {
+    (gate.min_security_score.is_some() || gate.min_health_score.is_some())
+        && AcceptedGradeStatus::from_db(&gate.accepted_grade_status) != AcceptedGradeStatus::Any
+}
+
+/// The `grade_status` violation of a gate for a repository in `state`, if any.
+pub(crate) fn grade_status_violation_for(
+    gate: &QualityGate,
+    state: &RepoGradeState,
+) -> Option<QualityGateViolation> {
+    let accepted = AcceptedGradeStatus::from_db(&gate.accepted_grade_status);
+    state
+        .violation(accepted)
+        .map(|message| QualityGateViolation {
+            rule: "grade_status".to_string(),
+            expected: accepted.expected().to_string(),
+            actual: state.status.as_str().to_string(),
+            message,
+        })
+}
 
 pub struct CreateQualityGateInput {
     pub repository_id: Option<Uuid>,
@@ -109,6 +133,8 @@ pub struct CreateQualityGateInput {
     pub enforce_on_promotion: bool,
     pub enforce_on_download: bool,
     pub action: String,
+    /// #4994: the weakest repository grade status the score thresholds accept.
+    pub accepted_grade_status: AcceptedGradeStatus,
 }
 
 pub struct UpdateQualityGateInput {
@@ -126,6 +152,7 @@ pub struct UpdateQualityGateInput {
     pub enforce_on_download: Option<bool>,
     pub action: Option<String>,
     pub is_enabled: Option<bool>,
+    pub accepted_grade_status: Option<AcceptedGradeStatus>,
 }
 
 const WEIGHT_SECURITY: i32 = 40;
@@ -615,7 +642,7 @@ impl QualityCheckService {
                    min_health_score, min_security_score, min_quality_score, min_metadata_score,
                    max_critical_issues, max_high_issues, max_medium_issues,
                    required_checks, enforce_on_promotion, enforce_on_download,
-                   action, is_enabled, created_at, updated_at
+                   action, is_enabled, accepted_grade_status, created_at, updated_at
             FROM quality_gates
             WHERE is_enabled = true AND (repository_id = $1 OR repository_id IS NULL)
             ORDER BY repository_id NULLS LAST
@@ -704,6 +731,18 @@ impl QualityCheckService {
             gate.max_medium_issues,
             health.total_issues,
         );
+
+        // #4994: the score thresholds read the repository security score,
+        // which stays 100 when its scans failed or cataloged nothing; check
+        // the repository's grade status too, failing closed by default.
+        if gate_checks_grade_status(&gate) {
+            let state = crate::services::scan_result_service::repo_grade_state_of_artifact(
+                &self.db,
+                artifact_id,
+            )
+            .await?;
+            violations.extend(grade_status_violation_for(&gate, &state));
+        }
 
         // Check required_checks: verify each check_type exists in completed results
         if !gate.required_checks.is_empty() {
@@ -1218,7 +1257,7 @@ impl QualityCheckService {
                            min_health_score, min_security_score, min_quality_score, min_metadata_score,
                            max_critical_issues, max_high_issues, max_medium_issues,
                            required_checks, enforce_on_promotion, enforce_on_download,
-                           action, is_enabled, created_at, updated_at
+                           action, is_enabled, accepted_grade_status, created_at, updated_at
                     FROM quality_gates
                     WHERE repository_id = $1 OR repository_id IS NULL
                     ORDER BY repository_id NULLS LAST, name
@@ -1236,7 +1275,7 @@ impl QualityCheckService {
                            min_health_score, min_security_score, min_quality_score, min_metadata_score,
                            max_critical_issues, max_high_issues, max_medium_issues,
                            required_checks, enforce_on_promotion, enforce_on_download,
-                           action, is_enabled, created_at, updated_at
+                           action, is_enabled, accepted_grade_status, created_at, updated_at
                     FROM quality_gates
                     ORDER BY repository_id NULLS LAST, name
                     "#,
@@ -1256,7 +1295,7 @@ impl QualityCheckService {
                    min_health_score, min_security_score, min_quality_score, min_metadata_score,
                    max_critical_issues, max_high_issues, max_medium_issues,
                    required_checks, enforce_on_promotion, enforce_on_download,
-                   action, is_enabled, created_at, updated_at
+                   action, is_enabled, accepted_grade_status, created_at, updated_at
             FROM quality_gates
             WHERE id = $1
             "#,
@@ -1277,13 +1316,13 @@ impl QualityCheckService {
                 min_health_score, min_security_score, min_quality_score, min_metadata_score,
                 max_critical_issues, max_high_issues, max_medium_issues,
                 required_checks, enforce_on_promotion, enforce_on_download,
-                action, is_enabled
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, true)
+                action, is_enabled, accepted_grade_status
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, true, $15)
             RETURNING id, repository_id, name, description,
                       min_health_score, min_security_score, min_quality_score, min_metadata_score,
                       max_critical_issues, max_high_issues, max_medium_issues,
                       required_checks, enforce_on_promotion, enforce_on_download,
-                      action, is_enabled, created_at, updated_at
+                      action, is_enabled, accepted_grade_status, created_at, updated_at
             "#,
         )
         .bind(gate.repository_id)
@@ -1300,6 +1339,7 @@ impl QualityCheckService {
         .bind(gate.enforce_on_promotion)
         .bind(gate.enforce_on_download)
         .bind(&gate.action)
+        .bind(gate.accepted_grade_status.as_str())
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))
@@ -1332,6 +1372,9 @@ impl QualityCheckService {
             .unwrap_or(existing.enforce_on_download);
         let action = input.action.unwrap_or(existing.action);
         let is_enabled = input.is_enabled.unwrap_or(existing.is_enabled);
+        let accepted_grade_status = input
+            .accepted_grade_status
+            .unwrap_or_else(|| AcceptedGradeStatus::from_db(&existing.accepted_grade_status));
 
         sqlx::query_as(
             r#"
@@ -1350,13 +1393,14 @@ impl QualityCheckService {
                 enforce_on_download = $13,
                 action = $14,
                 is_enabled = $15,
+                accepted_grade_status = $16,
                 updated_at = NOW()
             WHERE id = $1
             RETURNING id, repository_id, name, description,
                       min_health_score, min_security_score, min_quality_score, min_metadata_score,
                       max_critical_issues, max_high_issues, max_medium_issues,
                       required_checks, enforce_on_promotion, enforce_on_download,
-                      action, is_enabled, created_at, updated_at
+                      action, is_enabled, accepted_grade_status, created_at, updated_at
             "#,
         )
         .bind(gate_id)
@@ -1374,6 +1418,7 @@ impl QualityCheckService {
         .bind(enforce_on_download)
         .bind(&action)
         .bind(is_enabled)
+        .bind(accepted_grade_status.as_str())
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))
@@ -2248,6 +2293,7 @@ mod tests {
             enforce_on_promotion: true,
             enforce_on_download: false,
             action: "block".to_string(),
+            accepted_grade_status: AcceptedGradeStatus::Rated,
         };
         assert_eq!(input.name, "test-gate");
         assert_eq!(input.min_health_score, Some(80));
@@ -2273,6 +2319,7 @@ mod tests {
             enforce_on_promotion: false,
             enforce_on_download: false,
             action: "warn".to_string(),
+            accepted_grade_status: AcceptedGradeStatus::Rated,
         };
         assert!(input.repository_id.is_none());
         assert!(input.required_checks.is_empty());
@@ -2296,6 +2343,7 @@ mod tests {
             enforce_on_download: None,
             action: None,
             is_enabled: None,
+            accepted_grade_status: None,
         };
         assert!(input.name.is_none());
         assert!(input.is_enabled.is_none());
@@ -2318,6 +2366,7 @@ mod tests {
             enforce_on_download: None,
             action: None,
             is_enabled: Some(false),
+            accepted_grade_status: None,
         };
         assert_eq!(input.name.as_deref(), Some("updated-name"));
         assert_eq!(input.min_health_score, Some(90));

@@ -29,6 +29,8 @@ use sqlx::PgPool;
 
 #[cfg(test)]
 pub(crate) mod otel;
+#[cfg(test)]
+pub(crate) mod props;
 
 /// Environment variable that marks the database as **required**. When set to a
 /// truthy value, a missing `DATABASE_URL` or a connect failure becomes a hard

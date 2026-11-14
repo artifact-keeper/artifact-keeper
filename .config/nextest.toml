@@ -117,18 +117,33 @@
 # `recompute_path_stats` directly and assert on what it wrote, to the matching
 # filter below.
 #
+# `services::trash_service::tests` and the sync worker's
+# `restore_after_purge_leaves_the_peer_with_the_restored_bytes_5699` are in
+# the group because they need a soft-deleted row to survive until their own
+# `restore` / `purge` call, and `StorageGcService::run_gc` hard-deletes EVERY
+# unreferenced soft-deleted row in the shared database (trash retention 0).
+# A GC test's instance-wide pass that landed in that window reaped the row:
+# the restore answered `NotFound` and the push task lost its `artifact_id`
+# (`X2 push: RowNotFound`, #5880).
+#
 # `services::upload_service::tests` is in the group because
 # `UploadService::cleanup_expired` purges EVERY queued staging orphan and
 # every terminal session's staged chunks in the shared database, not only the
 # calling test's. Run in parallel, one test's reaper pass deleted another
 # test's deliberately-kept chunk between its failed delete and its assertion
 # (`refused_chunk_whose_delete_fails_is_queued_for_the_reaper`).
+#
+# Tests that run a scan worker (`tdh::with_scan_worker`) end in `_queued` and
+# are in too: two workers would grade each other's jobs.
+# `scan_queue::tests` is in for the same reason: `ScanQueue::claim` and
+# `recover_expired_claims` are unfiltered by design (a worker takes whatever
+# is due), so two of those tests running at once steal each other's jobs.
 
 [test-groups]
 db-serial = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'test(cleanup_stuck_scans) | test(storage_gc_service::tests) | test(api::handlers::storage_gc::tests) | test(completion_digest_mismatch_delete_failure_is_recoverable_by_storage_gc) | test(sync_worker::tests::expired_sync_task_claims_recover_and_fence_stale_owner) | test(sync_worker::tests::legacy_in_progress_sync_task_without_claim_metadata_recovers) | test(oci_migration_reindex::tests::test_run_repair) | test(rest_delete_index_unwind_rolls_back_when_soft_delete_fails_db) | test(middleware::setup::tests) | test(provision_admin_user_does_not_arm_gate_for_inactive_admin) | test(storage_stats_service::db_tests) | test(scheduler_service::tests::storage_gc_tick_follow_on) | test(scheduler_service::tests::test_storage_gc_tick_follow_on) | test(/^api::handlers::repositories::tests::storage_tree_.*_db$/) | test(/::ci_rekey_/) | test(services::upload_service::tests) | test(storage_scrub_service::db_tests) | test(services::artifact_service::gc_commit_guard_tests) | test(complete_waits_out_a_gc_delete_lease_then_refuses_retryably_4980)'
+filter = 'test(scan_queue::tests) | test(/_queued$/) | test(cleanup_stuck_scans) | test(storage_gc_service::tests) | test(api::handlers::storage_gc::tests) | test(completion_digest_mismatch_delete_failure_is_recoverable_by_storage_gc) | test(sync_worker::tests::expired_sync_task_claims_recover_and_fence_stale_owner) | test(sync_worker::tests::legacy_in_progress_sync_task_without_claim_metadata_recovers) | test(oci_migration_reindex::tests::test_run_repair) | test(rest_delete_index_unwind_rolls_back_when_soft_delete_fails_db) | test(middleware::setup::tests) | test(provision_admin_user_does_not_arm_gate_for_inactive_admin) | test(storage_stats_service::db_tests) | test(scheduler_service::tests::storage_gc_tick_follow_on) | test(scheduler_service::tests::test_storage_gc_tick_follow_on) | test(/^api::handlers::repositories::tests::storage_tree_.*_db$/) | test(/::ci_rekey_/) | test(services::upload_service::tests) | test(storage_scrub_service::db_tests) | test(services::artifact_service::gc_commit_guard_tests) | test(complete_waits_out_a_gc_delete_lease_then_refuses_retryably_4980) | test(services::trash_service::tests) | test(=services::sync_worker::tests::restore_after_purge_leaves_the_peer_with_the_restored_bytes_5699)'
 test-group = 'db-serial'
 
 # MCP introspection jobs (#5253) are claimed from one instance-wide queue
@@ -154,3 +169,31 @@ test-group = 'db-serial'
 [[profile.default.overrides]]
 filter = 'kind(test)'
 test-group = 'db-serial'
+
+# Per-test timeout (#5241). Without one, a test that hangs (a deadlocked test
+# lock, an await on a mock that never answers) holds its leg until the job's
+# `timeout-minutes` cancels it: the shard burns its full 60 minutes and the
+# cancelled job's log never names the test. With `terminate-after`, nextest
+# kills the hung test, reports it as `TIMEOUT` by name, and the rest of the
+# leg runs on (`--no-fail-fast`).
+#
+# The bound is per test (not per leg) and applies to every invocation of the
+# default profile: the unit-test shards, both integration-test steps, and
+# local runs. Values come from the slowest legitimate tests in three green
+# `main` CI runs (2026-11-10, instrumented coverage builds on hosted
+# runners): outside `signing_service` nothing passes 66s
+# (`grouped_listing_keyset_tests` ~63s, `scanner_service`
+# `incus_construction_switch_is_enforced_by_remote_oci_producer` ~61s), so 5
+# minutes is ~4.5x headroom. Each `SLOW` line still prints every 60s.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# `signing_service` generates RSA/GPG keys in an unoptimized, instrumented
+# build: `rotate_many_times_never_overflows_name_column` took 217-303s and
+# `rotate_leaves_no_none_window_under_concurrent_poll` 124-149s in the same
+# runs. 15 minutes keeps ~3x headroom over the worst observed and still fails
+# a hung signing test well inside the 60-minute leg. Raise this (or move the
+# test here) rather than the default when a new test is legitimately slow.
+[[profile.default.overrides]]
+filter = 'test(/^services::signing_service::tests::/)'
+slow-timeout = { period = "60s", terminate-after = 15 }

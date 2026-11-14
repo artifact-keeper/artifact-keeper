@@ -34,8 +34,9 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use super::{
-    generic_remote_fetch_target, generic_route_remote_decision, require_auth, require_repo_admin,
-    require_repo_write_access, require_visible, GenericRouteProxyServe,
+    generic_remote_fetch_target, generic_route_remote_decision, hide_write_denial_from_non_readers,
+    require_auth, require_repo_admin, require_repo_write_access, require_visible,
+    GenericRouteProxyServe,
 };
 use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::AuthExtension;
@@ -331,6 +332,7 @@ pub(crate) fn classify_fetch_error(e: &AppError) -> ItemOutcome {
         AppError::Authorization(m) | AppError::Conflict(m) | AppError::QuotaExceeded(m) => {
             ItemOutcome::Refused(m.clone())
         }
+        AppError::QuotaRefused(refusal) => ItemOutcome::Refused(refusal.message.clone()),
         AppError::Validation(m) => ItemOutcome::Refused(format!("invalid path: {m}")),
         AppError::NotFound(_) => ItemOutcome::Failed {
             status: Some(404),
@@ -388,8 +390,10 @@ pub async fn start_cache_seed(
     let repo = service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &service).await?;
     // Seeding drives upstream fetches into the cache: the same supply-chain
-    // tier as `cache/invalidate` and `cache-ttl`.
-    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    // tier as `cache/invalidate` and `cache-ttl`. Refused to a caller who
+    // cannot read the repository, it is the unknown-key 404 (#5645).
+    let admin = require_repo_admin(&auth, repo.id, &state.permission_service).await;
+    hide_write_denial_from_non_readers(admin, &auth, &repo, &service).await?;
     require_seedable(&repo)?;
     if state.proxy_service.is_none() {
         return Err(AppError::ServiceUnavailable(
@@ -1116,6 +1120,9 @@ mod tests {
         assert!(refused(AppError::Authorization("policy".into())));
         assert!(refused(AppError::Conflict("held".into())));
         assert!(refused(AppError::QuotaExceeded("quota".into())));
+        assert!(refused(AppError::QuotaRefused(Box::new(
+            crate::services::quota::QuotaRefusal::instance_storage(1, 1, None)
+        ))));
         assert!(refused(AppError::Validation("..".into())));
         let status = |e: AppError| match classify_fetch_error(&e) {
             ItemOutcome::Failed { status, .. } => status,
