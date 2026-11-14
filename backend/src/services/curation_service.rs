@@ -177,10 +177,11 @@ impl CurationService {
     /// * `pattern` rules match exactly as [`Self::evaluate_rules`] does with
     ///   PEP 503 folding and an optional version, so a pattern-only rule set
     ///   decides as it always has.
-    /// * `popularity` rules run
-    ///   [`crate::services::curation::popularity::evaluate_name_only`]
+    /// * `popularity` rules that opt in with `"download_name_checks": true`
+    ///   run [`crate::services::curation::popularity::evaluate_name_only`]
     ///   (#5159): the local typo-squat, homoglyph and affix checks against
-    ///   the popular list. The download-count threshold needs pypistats or
+    ///   the popular list. A rule without the key is skipped, as it was
+    ///   before #5274, so existing rules change no download on upgrade. The download-count threshold needs pypistats or
     ///   the npm downloads API and stays on the staging sync. A rule with no
     ///   lexical signal, or a `format` with no popularity ecosystem (or none
     ///   given), has no effect and evaluation continues.
@@ -228,6 +229,12 @@ impl CurationService {
                     }
                 }
                 "popularity" => {
+                    // Opt-in per rule (#5274): a rule without
+                    // `download_name_checks: true` is skipped here exactly as
+                    // before, so upgrading changes no download.
+                    if !crate::services::curation::popularity::checks_downloads(&rule.config) {
+                        continue;
+                    }
                     let Some(format) = format else { continue };
                     match crate::services::curation::popularity::evaluate_name_only(
                         &rule.config,
@@ -2035,8 +2042,57 @@ mod tests {
     /// Cyrillic `о` (U+043E) for the first `o` of the npm seed name `lodash`.
     const LODASH_HOMOGLYPH: &str = "l\u{043e}dash";
 
+    /// A `popularity` rule that opts into the download checks (#5274).
     fn blocking_popularity_rule() -> CurationRule {
-        typed_rule("popularity", serde_json::json!({"block_typosquat": true}))
+        typed_rule(
+            "popularity",
+            serde_json::json!({"block_typosquat": true, "download_name_checks": true}),
+        )
+    }
+
+    #[test]
+    fn test_proxy_rules_skip_popularity_rules_that_do_not_opt_in_5274() {
+        // Upgrade safety: rules written before #5274 have no
+        // `download_name_checks` key. Downloads must decide exactly as
+        // before, where typed rules were never consulted.
+        let pattern_block = make_rule("reqeusts", "*", "*", "block");
+        for config in [
+            serde_json::json!({}),
+            serde_json::json!({"block_typosquat": true}),
+            serde_json::json!({"block_typosquat": true, "download_name_checks": false}),
+        ] {
+            let popularity = typed_rule("popularity", config.clone());
+            for (name, format) in [
+                (LODASH_HOMOGLYPH, "npm"),
+                ("preact", "npm"),
+                ("reqeusts", "pypi"),
+                ("c1ick", "pypi"),
+            ] {
+                let with_rule = vec![popularity.clone(), pattern_block.clone()];
+                let without = vec![pattern_block.clone()];
+                for default in ["allow", "review"] {
+                    let got = CurationService::evaluate_proxy_rules(
+                        &with_rule,
+                        default,
+                        Some(format),
+                        name,
+                        None,
+                    );
+                    let before = CurationService::evaluate_rules(
+                        &without, default, name, None, None, true, false,
+                    );
+                    assert_eq!(
+                        (got.action.as_str(), got.rule_id, got.reason.as_str()),
+                        (
+                            before.action.as_str(),
+                            before.rule_id,
+                            before.reason.as_str()
+                        ),
+                        "{config} {name} {default}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2089,7 +2145,10 @@ mod tests {
 
     #[test]
     fn test_proxy_rules_popularity_flag_maps_to_review() {
-        let rule = typed_rule("popularity", serde_json::json!({}));
+        let rule = typed_rule(
+            "popularity",
+            serde_json::json!({"download_name_checks": true}),
+        );
         let eval = CurationService::evaluate_proxy_rules(
             std::slice::from_ref(&rule),
             "allow",

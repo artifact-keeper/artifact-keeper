@@ -126,6 +126,39 @@ pub fn confusable_skeleton(name: &str) -> String {
     skeleton.to_lowercase()
 }
 
+/// Most popular-list entries a process memoizes the skeleton of. Rules use the
+/// built-in seed lists (35 names each) or short custom lists, so this bound
+/// is only a guard against an unbounded custom list growing the cache.
+const POPULAR_SKELETON_CACHE_MAX: usize = 4096;
+
+/// [`confusable_skeleton`] of a popular-list entry, memoized for the process.
+///
+/// The detectors below compare a candidate against EVERY popular entry, and
+/// the skeleton (NFKC plus the UTS #39 table lookups) dominates their cost.
+/// Popular lists barely change, so their skeletons are computed once instead
+/// of on every evaluation. This matters on Remote and Virtual downloads,
+/// which run the name checks inline (#5274). The skeleton is a pure function
+/// of the name, so a cached value is always correct; once the cache is full,
+/// new entries are computed without being stored.
+fn popular_skeleton(name: &str) -> String {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, RwLock};
+    static CACHE: LazyLock<RwLock<HashMap<String, String>>> =
+        LazyLock::new(|| RwLock::new(HashMap::new()));
+    if let Ok(cache) = CACHE.read() {
+        if let Some(hit) = cache.get(name) {
+            return hit.clone();
+        }
+    }
+    let skeleton = confusable_skeleton(name);
+    if let Ok(mut cache) = CACHE.write() {
+        if cache.len() < POPULAR_SKELETON_CACHE_MAX {
+            cache.insert(name.to_string(), skeleton.clone());
+        }
+    }
+    skeleton
+}
+
 /// Return `Some(target)` when `name` is a Unicode-confusable (homoglyph)
 /// impersonation of a popular package: its confusable skeleton collides with
 /// a popular name's skeleton while the raw (case-folded) names differ, and
@@ -145,7 +178,7 @@ pub fn is_homoglyph_squat(name: &str, popular: &[String]) -> Option<String> {
     let name_skeleton = confusable_skeleton(name);
     popular
         .iter()
-        .find(|p| confusable_skeleton(p) == name_skeleton)
+        .find(|p| popular_skeleton(p) == name_skeleton)
         .cloned()
 }
 
@@ -256,7 +289,7 @@ pub fn is_affix_squat(name: &str, popular: &[String]) -> Option<String> {
     // to list order.
     let mut best: Option<(String, usize)> = None;
     for candidate in popular {
-        let base_key = confusable_skeleton(candidate);
+        let base_key = popular_skeleton(candidate);
         if base_key.is_empty() || name_key == base_key {
             // Whole-name skeleton collision is the homoglyph signal's job.
             continue;
@@ -288,7 +321,7 @@ pub fn nearest_popular_skeleton(name: &str, popular: &[String]) -> Option<(Strin
     let name_key = confusable_skeleton(name);
     let mut best: Option<(String, usize)> = None;
     for candidate in popular {
-        let d = damerau_levenshtein(&name_key, &confusable_skeleton(candidate));
+        let d = damerau_levenshtein(&name_key, &popular_skeleton(candidate));
         match &best {
             Some((_, best_d)) if *best_d <= d => {}
             _ => best = Some((candidate.clone(), d)),
@@ -464,6 +497,27 @@ mod tests {
         let popular = strings(&["requests", "request"]);
         assert_eq!(is_typosquat("request", &popular, 2), None);
         assert_eq!(is_typosquat("requests", &popular, 2), None);
+    }
+
+    #[test]
+    fn popular_skeleton_cache_matches_the_skeleton_5274() {
+        // Twice each: the second call is served from the cache.
+        for _ in 0..2 {
+            for name in [
+                "numpy",
+                "n\u{ff55}mpy",
+                "p\u{0430}ndas",
+                "NumPy",
+                "\u{fb01}le",
+                "",
+            ] {
+                assert_eq!(
+                    popular_skeleton(name),
+                    confusable_skeleton(name),
+                    "{name:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -12903,7 +12903,7 @@ mod tests {
              VALUES ($1, '*', '*', '*', 'block', 100, '#5159', 'popularity', $2, $3)",
         )
         .bind(fx.repo_id)
-        .bind(serde_json::json!({"block_typosquat": true}))
+        .bind(serde_json::json!({"block_typosquat": true, "download_name_checks": true}))
         .bind(fx.user_id)
         .execute(&fx.pool)
         .await

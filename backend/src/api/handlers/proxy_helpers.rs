@@ -10086,7 +10086,8 @@ impl<'a> From<&'a RepoInfo> for CurationTarget<'a> {
 ///
 /// `pattern` rules are consulted here (via
 /// [`CurationService::evaluate_pep503_package`]), and so are the name-only
-/// checks of `popularity` rules on npm and PyPI repositories (#5159): the
+/// checks of `popularity` rules that opt in with `download_name_checks: true`
+/// on npm and PyPI repositories (#5159, #5274): the
 /// typo-squat, homoglyph and affix comparisons against the popular list,
 /// which need no network call. The download-count threshold and
 /// `publisher_trust` rules still run only on the staging sync. A `popularity`
@@ -27450,7 +27451,9 @@ mod tests {
             return;
         };
         let (user_id, repo_id, key) = seed_curated_repo(&pool, "remote", true, None).await;
-        insert_popularity_rule(
+        // Upgrade safety (#5274): a rule written before the download checks
+        // existed has no `download_name_checks` key and changes nothing here.
+        let rule_id = insert_popularity_rule(
             &pool,
             repo_id,
             user_id,
@@ -27458,6 +27461,13 @@ mod tests {
         )
         .await;
         let repo = repo_info_for(repo_id, &key, "remote", true);
+        let before_opt_in = evaluate_curation(&pool, &repo, LODASH_HOMOGLYPH, None).await;
+        sqlx::query("UPDATE curation_rules SET config = config || $2 WHERE id = $1")
+            .bind(rule_id)
+            .bind(serde_json::json!({"download_name_checks": true}))
+            .execute(&pool)
+            .await
+            .expect("opt the rule into download checks");
 
         let blocked = evaluate_curation(&pool, &repo, LODASH_HOMOGLYPH, None).await;
         let resp = enforce_curation(&pool, &repo, LODASH_HOMOGLYPH, None).await;
@@ -27467,6 +27477,10 @@ mod tests {
             enforce_curation_lookup(&pool, repo_id, &key, "remote", LODASH_HOMOGLYPH, None).await;
         curation_cleanup(&pool, repo_id, user_id).await;
 
+        assert!(
+            before_opt_in.is_ok(),
+            "a rule without download_name_checks must not touch downloads"
+        );
         let block = blocked.expect_err("a homoglyph of a seed package must be refused");
         assert_eq!(block.package, LODASH_HOMOGLYPH);
         assert!(block.reason.contains("'lodash'"), "{}", block.reason);
@@ -27491,7 +27505,13 @@ mod tests {
         };
         let (user_id, repo_id, key) = seed_curated_repo(&pool, "remote", true, None).await;
         // Default config: a typo-squat is flagged, not blocked.
-        insert_popularity_rule(&pool, repo_id, user_id, serde_json::json!({})).await;
+        insert_popularity_rule(
+            &pool,
+            repo_id,
+            user_id,
+            serde_json::json!({"download_name_checks": true}),
+        )
+        .await;
         let repo = repo_info_for(repo_id, &key, "remote", true);
         let flagged = enforce_curation(&pool, &repo, LODASH_HOMOGLYPH, None).await;
 
@@ -27499,7 +27519,7 @@ mod tests {
         // has no effect.
         sqlx::query("UPDATE curation_rules SET config = $2 WHERE staging_repo_id = $1")
             .bind(repo_id)
-            .bind(serde_json::json!({"block_typosquat": true}))
+            .bind(serde_json::json!({"block_typosquat": true, "download_name_checks": true}))
             .execute(&pool)
             .await
             .expect("escalate rule");

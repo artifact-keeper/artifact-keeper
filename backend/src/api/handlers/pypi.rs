@@ -17732,7 +17732,7 @@ mod tests {
              RETURNING id",
         )
         .bind(member_id)
-        .bind(serde_json::json!({"block_typosquat": true}))
+        .bind(serde_json::json!({"block_typosquat": true, "download_name_checks": true}))
         .bind(fx.user_id)
         .fetch_one(&fx.pool)
         .await

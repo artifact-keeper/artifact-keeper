@@ -52,7 +52,10 @@
 //! outcome wins (Block > Flag) and the reasons are combined.
 //!
 //! Remote and Virtual downloads (#5159) run only the lexical half, through
-//! [`evaluate_name_only`]: no download-count lookup happens on that path.
+//! [`evaluate_name_only`], and only for a rule that opts in with
+//! `"download_name_checks": true` ([`checks_downloads`]); a rule without it
+//! is not evaluated on downloads at all. No download-count lookup happens on
+//! that path.
 //! There, `block_typosquat` blocks only homoglyph and mixed-script matches.
 //! Edit-distance and affix matches only flag, because a download has no
 //! review step to absorb their false positives: edit distance 2 from the
@@ -73,6 +76,24 @@ use super::typosquat::{
 /// never cost a lookup.
 pub fn applies_to(format: &str) -> bool {
     ecosystem_for_format(format).is_some()
+}
+
+/// Config key that opts a `popularity` rule into the name checks on Remote
+/// and Virtual downloads (#5274). Off unless set to `true`.
+pub const DOWNLOAD_NAME_CHECKS_KEY: &str = "download_name_checks";
+
+/// Whether a `popularity` rule's config opts into [`evaluate_name_only`] on
+/// Remote and Virtual downloads (#5274).
+///
+/// Off by default, so a rule written before the download checks existed
+/// (including one with `block_typosquat: true`) keeps its old behaviour
+/// after an upgrade: it runs only in the staging sync, and downloads are
+/// served exactly as before. Only a JSON `true` opts in.
+pub fn checks_downloads(config: &serde_json::Value) -> bool {
+    config
+        .get(DOWNLOAD_NAME_CHECKS_KEY)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Default lexical distance for typo-squat matching.
@@ -102,6 +123,7 @@ const DEFAULT_AFFIX_MAX_DOWNLOADS: u64 = 1_000;
 ///   "action": "flag",
 ///   "block_unknown": false,
 ///   "block_typosquat": false,
+///   "download_name_checks": false,
 ///   "popular_packages": ["requests", "..."]
 /// }
 /// ```
@@ -125,6 +147,10 @@ const DEFAULT_AFFIX_MAX_DOWNLOADS: u64 = 1_000;
 ///   regardless of `action`. Off by default because lexical proximity has
 ///   false positives by construction. Applies uniformly to all lexical
 ///   signals: edit distance, homoglyph/mixed-script, and affix (#2956).
+///
+/// `download_name_checks` (default `false`) does not affect this function:
+/// it opts the rule into [`evaluate_name_only`] on Remote and Virtual
+/// downloads (#5274); see [`checks_downloads`].
 ///
 /// The #2956 sub-toggles (`homoglyph_check`, `affix_check`, both default
 /// `true`) sit under the `typosquat_check` master toggle: turning
@@ -229,6 +255,10 @@ pub async fn evaluate(
 }
 
 /// The name-only half of [`evaluate`], for the proxy download path (#5159).
+///
+/// The proxy path calls this only for a rule that opts in with
+/// `"download_name_checks": true` ([`checks_downloads`]); this function does
+/// not check the key itself.
 ///
 /// A Remote or Virtual download cannot afford a download-count lookup, so
 /// this runs only the lexical checks, which compare the name against the
@@ -892,6 +922,24 @@ mod tests {
     /// Cyrillic `о` (U+043E) for the first `o` of `lodash`: pixel-identical,
     /// one edit away, and mixed-script.
     const LODASH_HOMOGLYPH: &str = "l\u{043e}dash";
+
+    #[test]
+    fn download_name_checks_are_opt_in_5274() {
+        // Upgrade safety: a rule written before #5274, even one that blocks
+        // typo-squats in the staging sync, does not opt into downloads.
+        for cfg in [
+            serde_json::json!({}),
+            serde_json::json!({"block_typosquat": true}),
+            serde_json::json!({"download_name_checks": false}),
+            serde_json::json!({"download_name_checks": "true"}),
+            serde_json::json!({"download_name_checks": 1}),
+        ] {
+            assert!(!checks_downloads(&cfg), "{cfg}");
+        }
+        assert!(checks_downloads(
+            &serde_json::json!({"download_name_checks": true})
+        ));
+    }
 
     #[test]
     fn name_only_blocks_homoglyph_with_block_typosquat() {

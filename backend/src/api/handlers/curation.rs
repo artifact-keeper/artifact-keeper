@@ -192,8 +192,9 @@ pub struct RuleResponse {
     /// Only create and update return them, and the field is omitted when
     /// empty. Today the only warning is that part of a typed rule does
     /// nothing on Remote and Virtual downloads (#5159): a `publisher_trust`
-    /// rule, or the `min_downloads` threshold of a `popularity` rule, when
-    /// the rule is global or attached to a Remote or Virtual repository.
+    /// rule, a `popularity` rule without `download_name_checks: true`, or
+    /// the `min_downloads` threshold of a `popularity` rule, when the rule
+    /// is global or attached to a Remote or Virtual repository.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
@@ -214,7 +215,9 @@ enum RuleReach {
 /// evaluate, or `None` when the whole rule runs there (#5159).
 ///
 /// The proxy path runs `pattern` rules and the name checks of `popularity`
-/// rules. A `publisher_trust` rule needs the registry metadata (and for
+/// rules that opt in with `download_name_checks: true` (#5274). A
+/// `popularity` rule without that key is not evaluated on downloads at all.
+/// A `publisher_trust` rule needs the registry metadata (and for
 /// attestations a Rekor round-trip), and the `min_downloads` threshold
 /// needs a download-count lookup, so both run only in the staging sync.
 /// `min_downloads` is read the way the evaluator reads it: anything but a
@@ -224,6 +227,10 @@ fn proxy_inert_part(rule_type: &str, config: &serde_json::Value) -> Option<&'sta
         "publisher_trust" => {
             Some("publisher_trust rules are not evaluated on Remote or Virtual downloads")
         }
+        "popularity" if !crate::services::curation::popularity::checks_downloads(config) => Some(
+            "a popularity rule runs its name checks on Remote or Virtual downloads only with \
+                 \"download_name_checks\": true; without it the rule is not evaluated there",
+        ),
         "popularity"
             if config
                 .get("min_downloads")
@@ -1899,14 +1906,23 @@ mod tests {
         // Name checks only (or a threshold the evaluator reads as off): the
         // whole rule runs on downloads.
         for config in [
-            serde_json::json!({}),
-            serde_json::json!({"min_downloads": 0, "block_typosquat": true}),
-            serde_json::json!({"min_downloads": "500"}),
+            serde_json::json!({"download_name_checks": true}),
+            serde_json::json!({"min_downloads": 0, "block_typosquat": true, "download_name_checks": true}),
+            serde_json::json!({"min_downloads": "500", "download_name_checks": true}),
         ] {
             assert!(
                 proxy_inert_part("popularity", &config).is_none(),
                 "{config}"
             );
+        }
+        // #5274: without the opt-in the whole rule is inert on downloads.
+        for config in [
+            serde_json::json!({}),
+            serde_json::json!({"block_typosquat": true}),
+            serde_json::json!({"download_name_checks": false}),
+        ] {
+            let part = proxy_inert_part("popularity", &config).expect("not opted in");
+            assert!(part.contains("download_name_checks"), "{config}: {part}");
         }
         assert!(proxy_inert_part("pattern", &serde_json::json!({})).is_none());
     }
@@ -1923,7 +1939,7 @@ mod tests {
         );
         assert!(global.contains("#5159"), "{global}");
 
-        let threshold = serde_json::json!({"min_downloads": 500});
+        let threshold = serde_json::json!({"min_downloads": 500, "download_name_checks": true});
         let proxy = proxy_inert_warning("popularity", &threshold, true, RuleReach::ProxyRepo)
             .expect("a threshold on a Remote/Virtual rule warns");
         assert!(proxy.contains("min_downloads"), "{proxy}");
@@ -1942,7 +1958,7 @@ mod tests {
         assert_eq!(
             proxy_inert_warning(
                 "popularity",
-                &serde_json::json!({"block_typosquat": true}),
+                &serde_json::json!({"block_typosquat": true, "download_name_checks": true}),
                 true,
                 RuleReach::ProxyRepo
             ),
@@ -2019,12 +2035,18 @@ mod tests {
                      .0
             }
         };
-        let threshold = serde_json::json!({"min_downloads": 500});
-        let name_only = serde_json::json!({"block_typosquat": true});
+        let threshold = serde_json::json!({"min_downloads": 500, "download_name_checks": true});
+        let name_only = serde_json::json!({"block_typosquat": true, "download_name_checks": true});
 
         let on_remote = create(Some(remote), "popularity", threshold.clone()).await;
         let name_checks = create(Some(remote), "popularity", name_only.clone()).await;
         let on_staging = create(Some(staging), "popularity", threshold.clone()).await;
+        let not_opted_in = create(
+            Some(remote),
+            "popularity",
+            serde_json::json!({"block_typosquat": true}),
+        )
+        .await;
         let global_pt = create(
             None,
             "publisher_trust",
@@ -2045,6 +2067,13 @@ mod tests {
             name_checks.warnings
         );
         assert!(on_staging.warnings.is_empty(), "{:?}", on_staging.warnings);
+        assert_eq!(
+            not_opted_in.warnings.len(),
+            1,
+            "{:?}",
+            not_opted_in.warnings
+        );
+        assert!(not_opted_in.warnings[0].contains("download_name_checks"));
         assert_eq!(global_pt.warnings.len(), 1, "{:?}", global_pt.warnings);
         assert!(global_pt.warnings[0].contains("publisher_trust"));
 
