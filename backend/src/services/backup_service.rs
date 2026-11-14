@@ -414,6 +414,28 @@ const ALLOWED_EXPORT_TABLES: &[&str] = &[
     "permission_grants",
 ];
 
+/// The `repositories` export. Only the non-secret RPM repodata depth is
+/// added, and only when positive. It lives in a checksum-covered payload, not
+/// the mutable manifest.
+const REPOSITORIES_EXPORT_SQL: &str =
+    "SELECT to_jsonb(t) || CASE WHEN ak_rpm_repodata_depth(id) > 0 \
+     THEN jsonb_build_object('repodata_depth', ak_rpm_repodata_depth(id)) \
+     ELSE '{}'::jsonb END FROM repositories t";
+
+/// The scoped `repositories` export (#5884): [`REPOSITORIES_EXPORT_SQL`] with
+/// a curation source or target outside the scope (`$1`) written as NULL, as
+/// `virtual_repo_members` leaves out a membership whose member is out of
+/// scope. The caller appends the `WHERE` clause.
+const REPOSITORIES_SCOPED_EXPORT_SQL: &str =
+    "SELECT to_jsonb(t) || CASE WHEN ak_rpm_repodata_depth(id) > 0 \
+     THEN jsonb_build_object('repodata_depth', ak_rpm_repodata_depth(id)) \
+     ELSE '{}'::jsonb END || jsonb_build_object( \
+       'curation_source_repo_id', \
+       CASE WHEN t.curation_source_repo_id = ANY($1) THEN t.curation_source_repo_id END, \
+       'curation_target_repo_id', \
+       CASE WHEN t.curation_target_repo_id = ANY($1) THEN t.curation_target_repo_id END) \
+     FROM repositories t";
+
 /// Validate that a table name is in the export allowlist.
 fn validate_export_table(table: &str) -> Result<()> {
     if !ALLOWED_EXPORT_TABLES.contains(&table) {
@@ -2043,12 +2065,6 @@ impl BackupService {
             "permission_grants",
         ];
 
-        // Resolve which repositories this backup covers (#2772). `None` means
-        // "every repository" and preserves the historical, unfiltered dump.
-        let repository_filter = self
-            .effective_repository_filter(backup.metadata.as_ref())
-            .await?;
-
         // Optional "changes since" cutoff (#2789). When present only artifacts
         // modified at-or-after this timestamp are dumped, so an incremental
         // backup can capture just the delta from a given date to now. `None`
@@ -2056,22 +2072,18 @@ impl BackupService {
         let since_filter = parse_since_filter(backup.metadata.as_ref());
 
         // Layout and artifact rows must describe the same database snapshot.
-        let mut snapshot = self.db.begin().await?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-            .execute(&mut *snapshot)
-            .await?;
+        let (mut snapshot, repository_filter) =
+            Self::open_export_snapshot(&self.db, backup.metadata.as_ref()).await?;
         let mut table_data: Vec<(String, Vec<u8>)> = Vec::new();
         for table in &table_names {
             ensure_backup_not_cancelled(cancel)?;
-            // The `artifacts` table is the only per-repository table exported,
-            // so when a repository filter is in effect an excluded repository's
-            // artifact rows are kept out of the dump too (not just its bytes).
-            let json_data = if *table == "artifacts" {
-                Self::export_artifacts(&mut snapshot, repository_filter.as_deref(), since_filter)
-                    .await?
-            } else {
-                Self::export_table(&mut snapshot, table).await?
-            };
+            let json_data = Self::export_core_table(
+                &mut snapshot,
+                table,
+                repository_filter.as_deref(),
+                since_filter,
+            )
+            .await?;
             let json_bytes = serde_json::to_vec_pretty(&json_data)?;
             table_data.push((table.to_string(), json_bytes));
         }
@@ -2336,17 +2348,57 @@ impl BackupService {
         Ok((artifact_count, unreadable))
     }
 
+    /// Export one core table limited to the backup's scope (#5884). The
+    /// repository filter keeps `repositories` to the repositories in scope,
+    /// and `artifacts` and `download_statistics` to the artifacts in scope
+    /// (repository filter and `since` cutoff), so a scoped archive never
+    /// brings back a repository it does not cover or a statistics row whose
+    /// artifact it does not carry. Every other core table is server-wide and
+    /// exported whole. Without a filter or cutoff this is [`Self::export_table`].
+    ///
+    /// A scoped `repositories` row whose curation source or target is out of
+    /// scope has that column written as NULL: the archive does not carry the
+    /// referenced repository, so restoring the reference would fail its
+    /// foreign key once that repository is gone.
+    async fn export_core_table(
+        conn: &mut sqlx::PgConnection,
+        table: &str,
+        repository_filter: Option<&[Uuid]>,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<serde_json::Value> {
+        let repo_ids: Option<Vec<Uuid>> = repository_filter.map(|r| r.to_vec());
+        // The scoped arms name their table literally; every other table is
+        // validated by `export_table`.
+        let query = match table {
+            "artifacts" => return Self::export_artifacts(conn, repository_filter, since).await,
+            "repositories" if repo_ids.is_some() => {
+                // `$2` is bound for every query; this keeps it typed.
+                format!(
+                    "{REPOSITORIES_SCOPED_EXPORT_SQL} WHERE t.id = ANY($1) \
+                     AND ($2::timestamptz IS NULL OR TRUE)"
+                )
+            }
+            "download_statistics" if repo_ids.is_some() || since.is_some() => format!(
+                "SELECT row_to_json(t) FROM download_statistics t WHERE t.artifact_id IN ({})",
+                content_tables::ARTIFACTS_IN_SCOPE
+            ),
+            _ => return Self::export_table(conn, table).await,
+        };
+        let rows: Vec<serde_json::Value> = sqlx::query_scalar(sqlx::AssertSqlSafe(&*query))
+            .bind(repo_ids)
+            .bind(since)
+            .fetch_all(conn)
+            .await
+            .map_err(|e| AppError::Database(format!("export {table}: {e}")))?;
+        Ok(serde_json::Value::Array(rows))
+    }
+
     async fn export_table(conn: &mut sqlx::PgConnection, table: &str) -> Result<serde_json::Value> {
         validate_export_table(table)?;
 
         // Export table data as JSON array
         let query = if table == "repositories" {
-            // Only this non-secret key is exported, and only when positive.
-            // It lives in a checksum-covered payload, not the mutable manifest.
-            "SELECT to_jsonb(t) || CASE WHEN ak_rpm_repodata_depth(id) > 0 \
-             THEN jsonb_build_object('repodata_depth', ak_rpm_repodata_depth(id)) \
-             ELSE '{}'::jsonb END FROM repositories t"
-                .to_string()
+            REPOSITORIES_EXPORT_SQL.to_string()
         } else {
             format!("SELECT row_to_json(t) FROM {} t", table)
         };
@@ -2367,8 +2419,27 @@ impl BackupService {
     /// exclusions), so full backups keep dumping every repository exactly as
     /// before. The complete repository set is only queried for the exclude-only
     /// case, where it is needed to compute "everything except the excluded ids".
+    /// Open the backup's `REPEATABLE READ, READ ONLY` snapshot and resolve
+    /// its repository filter inside it (#5884), so an exclude-only filter
+    /// lists exactly the repositories the snapshot's rows are read from. The
+    /// filter's query, when it runs, is the snapshot's first.
+    async fn open_export_snapshot(
+        db: &PgPool,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<(
+        sqlx::Transaction<'static, sqlx::Postgres>,
+        Option<Vec<Uuid>>,
+    )> {
+        let mut snapshot = db.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *snapshot)
+            .await?;
+        let repository_filter = Self::effective_repository_filter(&mut snapshot, metadata).await?;
+        Ok((snapshot, repository_filter))
+    }
+
     async fn effective_repository_filter(
-        &self,
+        conn: &mut sqlx::PgConnection,
         metadata: Option<&serde_json::Value>,
     ) -> Result<Option<Vec<Uuid>>> {
         let include_filter: Option<Vec<Uuid>> = metadata
@@ -2384,7 +2455,7 @@ impl BackupService {
                 .is_some_and(|ex: &Vec<Uuid>| !ex.is_empty());
         let all_repository_ids: Vec<Uuid> = if needs_all_repositories {
             sqlx::query_scalar("SELECT id FROM repositories")
-                .fetch_all(&self.db)
+                .fetch_all(conn)
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?
         } else {
@@ -3557,6 +3628,10 @@ mod object_pass_tests;
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod rpm_depth_tests;
+
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod scope_tests;
 
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
