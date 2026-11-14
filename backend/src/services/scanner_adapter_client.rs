@@ -664,10 +664,16 @@ impl ScannerAdapterFsClient {
     /// not a valid accepted job is fail-closed `Internal`.
     async fn submit(&self, tar: bytes::Bytes) -> Result<String> {
         let url = format!("{}/api/v1/filesystem/scan", self.adapter_url);
-        let resp = self
+        let mut req = self
             .http
             .post(&url)
-            .header(reqwest::header::CONTENT_TYPE, "application/x-tar")
+            .header(reqwest::header::CONTENT_TYPE, "application/x-tar");
+        // #5947: a DB-update rescan asks the adapter for its background band.
+        if crate::services::scan_queue::in_background_band() {
+            let (name, value) = crate::services::scan_queue::BACKGROUND_PRIORITY_HEADER;
+            req = req.header(name, value);
+        }
+        let resp = req
             .body(tar)
             .send()
             .await
@@ -1062,6 +1068,39 @@ mod tests {
                 .map(|p| p.version),
             Some("trivy-db-v2".to_string())
         );
+    }
+
+    /// #5947: a background-band upload carries `X-Scan-Priority: background`;
+    /// an ordinary one carries no priority header.
+    #[tokio::test]
+    async fn test_fs_upload_priority_header_only_in_the_background_band() {
+        let body = serde_json::json!({ "report": {"Results": []} });
+        for background in [false, true] {
+            let server = MockServer::start().await;
+            mount_fs_scan_success(&server, "fs-prio", body.clone()).await;
+            let client = ScannerAdapterFsClient::new(server.uri());
+            let scan = client.scan_workspace_tar(tiny_tar());
+            if background {
+                crate::services::scan_queue::in_background(scan)
+                    .await
+                    .expect("scan");
+            } else {
+                scan.await.expect("scan");
+            }
+            let requests = server.received_requests().await.unwrap_or_default();
+            let submit = requests
+                .iter()
+                .find(|r| r.method == wiremock::http::Method::POST)
+                .expect("an upload");
+            assert_eq!(
+                submit
+                    .headers
+                    .get("x-scan-priority")
+                    .and_then(|v| v.to_str().ok()),
+                background.then_some("background"),
+                "background={background}"
+            );
+        }
     }
 
     /// An unreachable adapter is an availability state: the scan must degrade
