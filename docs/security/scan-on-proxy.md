@@ -542,8 +542,12 @@ adapter next to the worker must accept them.
 whose latest completed scan used an older database build than the one the
 scanner reports now: Grype's from `grype db status`, or for a scanner that
 reports its database only with a scan (the scanner adapter's Trivy), the newest
-build a scan recorded. Each scan type's last-known build is kept, so a quiet
-spell with no scans does not hide it. A latest scan with no recorded build
+build a scan recorded. Each scan type's last-known build is kept in
+`scan_vuln_db_builds`, so a quiet spell with no scans does not hide it. A build
+never moves backwards there; to forget one (for example after rolling a
+scanner's database back on purpose), delete its row,
+`DELETE FROM scan_vuln_db_builds WHERE scan_type = 'grype';`, and the next pass
+records the build the scanner reports now. A latest scan with no recorded build
 counts as older. Each such content digest, in a repository with scanning on,
 becomes one `rescan` job at the lowest priority, below hosted scans, so every
 other job is claimed first. The worker scans the digest once, with the scanners

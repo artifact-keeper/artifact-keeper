@@ -179,10 +179,11 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
             {
                 next_rescan = now + crate::services::scan_rescan::RESCAN_TICK;
                 let state = state.clone();
-                let running = Arc::clone(&rescan_tick_running);
+                // Cleared on drop, so a panicking tick cannot wedge the flag.
+                let running = TickRunning(Arc::clone(&rescan_tick_running));
                 tokio::spawn(async move {
+                    let _running = running;
                     rescan_tick(&state).await;
-                    running.store(false, std::sync::atomic::Ordering::Release);
                 });
             }
 
@@ -193,8 +194,11 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
                 continue;
             }
 
+            // No rescan slot free: leave rescans pending rather than claim
+            // them only to hand them back (which also skews their wait).
+            let skip_rescans = rescan_permits.available_permits() == 0;
             let claimed = match queue
-                .claim(available as i64, &identity, CLAIM_TTL_SECS)
+                .claim_filtered(available as i64, &identity, CLAIM_TTL_SECS, skip_rescans)
                 .await
             {
                 Ok(jobs) => jobs,
@@ -209,12 +213,9 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
                 // it stopped waiting. Recorded before the permit check so a
                 // job released back for saturation still reports the wait it
                 // really incurred.
-                let waited = (Utc::now() - job.created_at).num_milliseconds();
-                crate::services::metrics_service::record_scan_queue_wait(
-                    &job.kind,
-                    waited as f64 / 1000.0,
-                );
-
+                // A rescan beyond the free rescan slots (more claimed in one
+                // batch than are free) goes straight back, before its wait is
+                // recorded: it has not stopped waiting.
                 let rescan_permit = if job.job_kind() == Some(ScanJobKind::Rescan) {
                     match Arc::clone(&rescan_permits).try_acquire_owned() {
                         Ok(p) => Some(p),
@@ -226,6 +227,11 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
                 } else {
                     None
                 };
+                let waited = (Utc::now() - job.created_at).num_milliseconds();
+                crate::services::metrics_service::record_scan_queue_wait(
+                    &job.kind,
+                    waited as f64 / 1000.0,
+                );
                 let permit = match Arc::clone(&permits).try_acquire_owned() {
                     Ok(p) => p,
                     // `release`, not `fail`: saturation is about this pod, not the job.
@@ -255,6 +261,15 @@ pub fn state_with_worker_scanner(
     let mut worker_state = (**state).clone();
     worker_state.set_scanner_service(scanner);
     Arc::new(worker_state)
+}
+
+/// Clears the rescan-tick overlap flag when dropped, panic included.
+struct TickRunning(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for TickRunning {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Slots rescans may hold at once: half of `concurrency`, at least one.
@@ -710,6 +725,20 @@ mod tests {
         assert_eq!(rescan_slots(2), 1);
         assert_eq!(rescan_slots(4), 2);
         assert_eq!(rescan_slots(9), 4);
+    }
+
+    /// #5947 review: a rescan tick that panics must not leave the overlap
+    /// flag set, or no later tick would ever run.
+    #[tokio::test]
+    async fn a_panicking_rescan_tick_clears_its_flag() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let guard = TickRunning(Arc::clone(&flag));
+        let task = tokio::spawn(async move {
+            let _running = guard;
+            panic!("tick failed");
+        });
+        assert!(task.await.is_err(), "the tick panicked");
+        assert!(!flag.load(std::sync::atomic::Ordering::Acquire));
     }
 
     /// Never claim more than we hold permits for.

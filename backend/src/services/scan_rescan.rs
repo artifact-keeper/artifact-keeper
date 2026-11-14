@@ -162,8 +162,10 @@ const STALE_DIGESTS_SQL: &str = r#"
         SELECT 1 FROM scan_rescan_ledger r
         WHERE r.digest = s.digest AND r.builds_key = $3
     )
-      -- Already queued (an earlier key's pass still pending): it will grade
-      -- against the newest database when it runs, so do not charge it again.
+      -- Already queued by an earlier key's pass: a pending job grades
+      -- against whatever database is current when it runs, so it is not
+      -- charged again. A running one grades against the database it started
+      -- with; once it completes, a later tick finds it stale again if so.
       AND NOT EXISTS (
         SELECT 1 FROM scan_queue q
         WHERE q.kind = 'rescan' AND q.digest = s.digest
@@ -259,8 +261,17 @@ pub async fn enqueue_rescans(db: &PgPool, builds: &[Build], max_per_day: u64) ->
     }
 
     // A short page means nothing else is stale for these builds: skip the
-    // selection until a database moves again.
-    if (digests.len() as i64) < limit {
+    // selection until a database moves again. Not while a rescan is still
+    // queued or running, though: one that started on an older database may
+    // leave its digest stale for this key, and must be found again.
+    let active: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM scan_queue \
+         WHERE kind = 'rescan' AND state IN ('pending', 'running'))",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    if (digests.len() as i64) < limit && queued.is_empty() && !active {
         sqlx::query(
             "INSERT INTO scan_rescan_state (id, exhausted_key, updated_at) VALUES (true, $1, NOW()) \
              ON CONFLICT (id) DO UPDATE SET exhausted_key = EXCLUDED.exhausted_key, \
@@ -755,6 +766,56 @@ mod tests {
             rescan_scan_types(&pool).await.expect("types"),
             vec!["image"]
         );
+        reset(&pool).await;
+    }
+
+    /// #5947 review: only an artifact's NEWEST completed scan decides. An
+    /// artifact rescanned on the new build after an older stale scan is not
+    /// queued; with the selection reading the oldest row it would be.
+    #[tokio::test]
+    async fn only_the_newest_scan_of_an_artifact_decides() {
+        let Some(pool) = try_pool().await else { return };
+        reset(&pool).await;
+        let r = repo(&pool).await;
+        let d = digest('k');
+        let id = scanned(&pool, r, &d, "2026-11-01T00:00:00Z").await;
+        // Make the seeded (stale) row the older one, then add a newer row
+        // graded on the current build.
+        sqlx::query(
+            "UPDATE scan_results SET completed_at = NOW() - INTERVAL '2 hours' \
+             WHERE artifact_id = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
+             checksum_sha256, completed_at, vuln_db_version, vuln_db_published_at) \
+             VALUES ($1, $2, 'malware', 'completed', $3, NOW() - INTERVAL '1 hour', \
+                     'probe-db', $4)",
+        )
+        .bind(id)
+        .bind(r)
+        .bind(&d)
+        .bind(at("2026-11-10T00:00:00Z"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let builds = vec![("malware".to_string(), at("2026-11-10T00:00:00Z"))];
+        assert_eq!(
+            enqueue_rescans(&pool, &builds, 100).await.expect("tick"),
+            0,
+            "the newest scan is on the current build"
+        );
+        assert!(rescan_digests(&pool).await.is_empty());
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(r)
+            .execute(&pool)
+            .await
+            .unwrap();
         reset(&pool).await;
     }
 

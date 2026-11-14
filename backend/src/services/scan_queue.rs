@@ -444,6 +444,20 @@ impl ScanQueue {
         claimed_by: &str,
         claim_ttl_secs: f64,
     ) -> Result<Vec<Claimed<ScanJob>>> {
+        self.claim_filtered(limit, claimed_by, claim_ttl_secs, false)
+            .await
+    }
+
+    /// [`Self::claim`], leaving `rescan` jobs pending when `skip_rescans` is
+    /// set: a worker whose rescan slots are full (#5947) does not claim one
+    /// just to hand it back.
+    pub async fn claim_filtered(
+        &self,
+        limit: i64,
+        claimed_by: &str,
+        claim_ttl_secs: f64,
+        skip_rescans: bool,
+    ) -> Result<Vec<Claimed<ScanJob>>> {
         use sqlx::{FromRow, Row};
 
         let rows = sqlx::query(
@@ -453,6 +467,7 @@ impl ScanQueue {
                 FROM scan_queue q
                 WHERE q.state = 'pending'
                   AND q.next_attempt_at <= NOW()
+                  AND NOT ($4::boolean AND q.kind = 'rescan')
                 ORDER BY q.priority DESC, q.created_at ASC
                 LIMIT $1
                 FOR UPDATE OF q SKIP LOCKED
@@ -484,6 +499,7 @@ impl ScanQueue {
         .bind(limit)
         .bind(claimed_by)
         .bind(claim_ttl_secs)
+        .bind(skip_rescans)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1918,6 +1934,48 @@ mod tests {
         assert_eq!(next.digest.as_deref(), Some("late01"));
         assert_eq!(next.kind, "hosted_image");
 
+        sqlx::query("DELETE FROM scan_queue")
+            .execute(&pool)
+            .await
+            .unwrap();
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #5947 review: a worker with its rescan slots full claims around the
+    /// rescans, leaving them pending, instead of claiming one to release it.
+    #[tokio::test]
+    async fn a_claim_can_leave_rescans_pending() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        enqueue_rescan(&pool, "skip01").await;
+        q.enqueue_hosted_image(repo, "keep01", PRIORITY_HOSTED)
+            .await
+            .expect("hosted");
+        let got = q
+            .claim_filtered(10, "w", CLAIM_TTL_SECS, true)
+            .await
+            .expect("claim");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind, "hosted_image");
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM scan_queue WHERE digest = 'skip01'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "pending", "the rescan was never claimed");
+        let attempts: i32 =
+            sqlx::query_scalar("SELECT attempts FROM scan_queue WHERE digest = 'skip01'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 0);
+        let later = q
+            .claim_filtered(10, "w", CLAIM_TTL_SECS, false)
+            .await
+            .expect("claim");
+        assert_eq!(later.len(), 1);
+        assert_eq!(later[0].kind, "rescan");
         sqlx::query("DELETE FROM scan_queue")
             .execute(&pool)
             .await
