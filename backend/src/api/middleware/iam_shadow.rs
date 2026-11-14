@@ -2760,6 +2760,69 @@ mod end_to_end {
     }
 
     #[tokio::test]
+    async fn an_administrators_narrow_token_is_not_an_administrator() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (_, _, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (admin, _) = tdh::create_user(&pool).await;
+        sqlx::query("UPDATE users SET is_admin = true WHERE id = $1")
+            .bind(admin)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut rig = Rig::new(pool.clone(), &dir).await;
+        let auth = crate::services::auth_service::AuthService::new(
+            pool.clone(),
+            Arc::new(rig.state.config.clone()),
+        );
+        let mut narrow = Vec::new();
+        for scope in ["write", "read"] {
+            let (token, id) = auth
+                .generate_api_token(admin, &format!("narrow-{scope}"), vec!["*".into()], None)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE api_tokens SET scopes = ARRAY[$2] WHERE id = $1")
+                .bind(id)
+                .bind(scope)
+                .execute(&pool)
+                .await
+                .unwrap();
+            narrow.push((scope, token));
+        }
+        for (scope, token) in &narrow {
+            for (method, path) in [
+                ("GET", "/api/v1/migrations".to_string()),
+                ("POST", format!("/api/v1/plugins/{}/enable", Uuid::new_v4())),
+            ] {
+                let (status, c) = rig
+                    .call(Some(token), empty_request(method, path.clone()))
+                    .await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{scope} {path}");
+                assert_eq!(c.legacy, LegacyOutcome::Refuse, "{scope} {path}: {c:?}");
+                assert_eq!(c.class, Class::Agree, "{scope} {path}: {c:?}");
+            }
+        }
+        // The same administrator's unrestricted token administers in both.
+        let (wide, _) = auth
+            .generate_api_token(admin, "wide", vec!["*".into()], None)
+            .await
+            .unwrap();
+        let (status, c) = rig
+            .call(
+                Some(&wide),
+                empty_request("GET", "/api/v1/migrations".into()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            (c.legacy, c.class),
+            (LegacyOutcome::Permit, Class::Agree),
+            "{c:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn integration_operations_are_compared() {
         let Some(pool) = tdh::try_pool().await else {
             return;
