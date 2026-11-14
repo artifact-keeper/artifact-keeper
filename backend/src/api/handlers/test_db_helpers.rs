@@ -4541,6 +4541,19 @@ pub struct TableQueryOutage {
 
 impl TableQueryOutage {
     pub async fn start(admin: &PgPool, tables: &[&str]) -> Option<Self> {
+        Self::start_with(admin, tables, true).await
+    }
+
+    /// The write-only variant (#5901): reads of `tables` through
+    /// [`Self::pool`] answer the real rows at once, while every `INSERT`,
+    /// `UPDATE` or `DELETE` on them fails (`cannot insert into view`: the
+    /// shadow is a view with `OFFSET`, which PostgreSQL never updates through).
+    /// That reaches a write that follows a read of the same table.
+    pub async fn start_read_only(admin: &PgPool, tables: &[&str]) -> Option<Self> {
+        Self::start_with(admin, tables, false).await
+    }
+
+    async fn start_with(admin: &PgPool, tables: &[&str], stall_reads: bool) -> Option<Self> {
         use std::str::FromStr;
         let url = crate::testing::require_db_url()?;
         let schema = format!("ak_outage_{}", Uuid::new_v4().simple());
@@ -4549,6 +4562,15 @@ impl TableQueryOutage {
             .await
             .expect("create outage schema");
         for table in tables {
+            if !stall_reads {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "CREATE VIEW {schema}.{table} AS SELECT * FROM public.{table} OFFSET 0"
+                )))
+                .execute(admin)
+                .await
+                .expect("create read-only view");
+                continue;
+            }
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "CREATE FUNCTION {schema}.stall_{table}() RETURNS SETOF public.{table} \
                  LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(30); \

@@ -102,6 +102,7 @@ fn oci_error_detail(
     detail: Option<serde_json::Value>,
 ) -> Response {
     let (status, code, message) = oci_storage_envelope(status, code, message);
+    let (status, message) = oci_database_envelope(status, &message);
     let message: &str = &message;
     // The database sites pass `db_status(&e)` with `INTERNAL_ERROR`; when
     // that status is a 503 (saturated pool, unreachable database) the error is
@@ -191,6 +192,62 @@ fn oci_storage_envelope<'a>(
     }
 }
 
+/// The status and message a `/v2` 5xx answers with once database error text
+/// is taken out of it (#5901), the backstop for any site that still hands
+/// [`oci_error`] a database error's own `Display` (sites should call
+/// [`oci_db_error`]). That text names tables, columns, constraints and the
+/// rejected values, so a 5xx whose message renders a database error answers
+/// the sanitised [`crate::api::handlers::db_err_message`] instead, which also
+/// logs the original. A plain 500 becomes `db_status`'s 503 when the error is
+/// an unavailable database. Client errors are left alone.
+fn oci_database_envelope(
+    status: StatusCode,
+    message: &str,
+) -> (StatusCode, std::borrow::Cow<'_, str>) {
+    if !status.is_server_error() || !carries_database_error_text(message) {
+        return (status, message.into());
+    }
+    let status = if status == StatusCode::INTERNAL_SERVER_ERROR {
+        crate::api::handlers::db_status(message)
+    } else {
+        status
+    };
+    (status, crate::api::handlers::db_err_message(message).into())
+}
+
+/// Whether a message renders a database error: `AppError::Database` /
+/// `AppError::Sqlx` (`Database error: …`) or one of `sqlx::Error`'s own
+/// renderings.
+fn carries_database_error_text(message: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "Database error: ",
+        "error returned from database",
+        "error communicating with database",
+        "error with configuration",
+        "error occurred while attempting to establish a TLS connection",
+        "encountered unexpected or invalid data",
+        "no rows returned by a query",
+        "no column found for name",
+        "column index out of bounds",
+        "error occurred while decoding",
+        "error occurred while encoding",
+        "pool timed out while waiting for an open connection",
+        "attempted to acquire a connection on a closed pool",
+        "attempted to communicate with a crashed background worker",
+        "error in Any driver mapping",
+        "attempted to call begin_with at non-zero transaction depth",
+        "got unexpected connection status after attempting to begin transaction",
+    ];
+    MARKERS.iter().any(|m| message.contains(m)) || renders_type_not_found(message)
+}
+
+/// `sqlx::Error::TypeNotFound`'s rendering, `type named <name> not found`.
+fn renders_type_not_found(message: &str) -> bool {
+    message
+        .split_once("type named ")
+        .is_some_and(|(_, rest)| rest.contains(" not found"))
+}
+
 /// Whether an OCI error message carries an object store's own error text:
 /// its XML error document, or the raw error the S3 backend appends after
 /// `caused by:` (which names the endpoint's answer verbatim). Messages
@@ -229,11 +286,20 @@ fn oci_storage_unavailable(err: &crate::error::AppError) -> Option<Response> {
 /// `404` a swallowed error used to end in: "no row" is a definitive answer
 /// a client acts on, a lookup that did not run is not. The message is the
 /// sanitised one, never the sqlx text.
+///
+/// Several call sites hand over an `AppError` that may instead carry a
+/// classified storage failure (#5649/#5650); that one keeps its marker so
+/// [`oci_storage_envelope`] still answers its own 503/507 with the fixed
+/// storage message (#5901).
 fn oci_db_error<E: std::fmt::Display + ?Sized>(e: &E) -> Response {
+    let raw = e.to_string();
+    if crate::storage::StorageFailure::from_message(&raw).is_some() {
+        return oci_internal_error(&raw);
+    }
     oci_error(
-        crate::api::handlers::db_status(e),
+        crate::api::handlers::db_status(&raw),
         "INTERNAL_ERROR",
-        crate::api::handlers::db_err_message(e),
+        crate::api::handlers::db_err_message(&raw),
     )
 }
 
@@ -1774,7 +1840,7 @@ async fn register_oci_upload_cleanup_key(
         Ok::<_, sqlx::Error>(Some(id))
     }
     .await
-    .map_err(|e| oci_internal_error(&e.to_string()))?;
+    .map_err(|e| oci_db_error(&e))?;
 
     registered.ok_or_else(|| {
         warn!(
@@ -1807,7 +1873,7 @@ async fn mark_oci_upload_cleanup_key_committed(
     .bind(storage_key)
     .execute(db)
     .await
-    .map_err(|e| oci_internal_error(&e.to_string()))?;
+    .map_err(|e| oci_db_error(&e))?;
 
     // The journal row is always registered before the storage write it tracks,
     // so a 0-row update means the register/mark pairing was broken (row deleted
@@ -2192,13 +2258,7 @@ async fn claim_oci_upload_session_for_completion(
     .bind(OCI_UPLOAD_COMPLETION_LEASE_STALE_SECS as f64)
     .fetch_optional(db)
     .await
-    .map_err(|e| {
-        oci_error(
-            crate::api::handlers::db_status(&e),
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        )
-    })?;
+    .map_err(|e| oci_db_error(&e))?;
 
     row.map(|row| decode_claimed_upload_session_row(row, repository_id))
         .transpose()
@@ -2361,13 +2421,7 @@ async fn fetch_oci_upload_session(
     .bind(repository_id)
     .fetch_optional(db)
     .await
-    .map_err(|e| {
-        oci_error(
-            crate::api::handlers::db_status(&e),
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        )
-    })?;
+    .map_err(|e| oci_db_error(&e))?;
 
     row.map(|row| decode_upload_session_row(row, repository_id))
         .transpose()
@@ -2391,13 +2445,7 @@ async fn fetch_oci_upload_parts(
     .bind(session_id)
     .fetch_all(db)
     .await
-    .map_err(|e| {
-        oci_error(
-            crate::api::handlers::db_status(&e),
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        )
-    })?;
+    .map_err(|e| oci_db_error(&e))?;
 
     let mut parts = Vec::with_capacity(rows.len());
     for row in rows {
@@ -2472,7 +2520,7 @@ async fn reset_oci_upload_session_state(
             error = %e,
             "Failed to reset OCI upload session state after completion error"
         );
-        oci_internal_error(&e.to_string())
+        oci_db_error(&e)
     })?;
 
     if result.rows_affected() != 1 {
@@ -2539,30 +2587,16 @@ async fn recover_committed_patch_after_commit_error(
     .bind(UploadSessionState::Open.as_str())
     .fetch_optional(db)
     .await
-    .map_err(|e| {
-        oci_error(
-            crate::api::handlers::db_status(&e),
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        )
-    })?;
+    .map_err(|e| oci_db_error(&e))?;
 
     let Some(row) = row else {
         return Ok(false);
     };
 
-    let bytes_received: i64 = row.try_get("bytes_received").map_err(|e| {
-        oci_internal_error(&format!(
-            "failed to decode recovered upload session bytes_received: {}",
-            e
-        ))
-    })?;
-    let part_size: i64 = row.try_get("size_bytes").map_err(|e| {
-        oci_internal_error(&format!(
-            "failed to decode recovered upload part size: {}",
-            e
-        ))
-    })?;
+    let bytes_received: i64 = row
+        .try_get("bytes_received")
+        .map_err(|e| oci_db_error(&e))?;
+    let part_size: i64 = row.try_get("size_bytes").map_err(|e| oci_db_error(&e))?;
     if bytes_received < 0 || part_size < 0 {
         return Err(oci_internal_error(
             "recovered OCI upload session contains negative byte counts",
@@ -2619,26 +2653,12 @@ async fn recover_committed_completion_after_commit_error(
     .bind(expected_storage_key)
     .fetch_one(db)
     .await
-    .map_err(|e| {
-        oci_error(
-            crate::api::handlers::db_status(&e),
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        )
-    })?;
+    .map_err(|e| oci_db_error(&e))?;
 
-    let session_exists: bool = row.try_get("session_exists").map_err(|e| {
-        oci_internal_error(&format!(
-            "failed to decode recovered completion session state: {}",
-            e
-        ))
-    })?;
-    let blob_exists: bool = row.try_get("blob_exists").map_err(|e| {
-        oci_internal_error(&format!(
-            "failed to decode recovered completion blob state: {}",
-            e
-        ))
-    })?;
+    let session_exists: bool = row
+        .try_get("session_exists")
+        .map_err(|e| oci_db_error(&e))?;
+    let blob_exists: bool = row.try_get("blob_exists").map_err(|e| oci_db_error(&e))?;
 
     if !session_exists && blob_exists {
         return Ok(true);
@@ -8054,11 +8074,7 @@ async fn handle_start_upload(
                     "monolithic blob commit begin failed",
                 )
                 .await;
-                return oci_error(
-                    crate::api::handlers::db_status(&e.to_string()),
-                    "INTERNAL_ERROR",
-                    &e.to_string(),
-                );
+                return oci_db_error(&e);
             }
         };
 
@@ -8104,11 +8120,7 @@ async fn handle_start_upload(
                     "monolithic blob cleanup-journal guard failed",
                 )
                 .await;
-                return oci_error(
-                    crate::api::handlers::db_status(&e.to_string()),
-                    "INTERNAL_ERROR",
-                    &e.to_string(),
-                );
+                return oci_db_error(&e);
             }
         }
 
@@ -8146,11 +8158,7 @@ async fn handle_start_upload(
             let _ = blob_tx.rollback().await;
             delete_storage_key_best_effort(&storage, &temp_key, "monolithic blob row insert failed")
                 .await;
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            );
+            return oci_db_error(&e);
         }
 
         // #5793: the blob was uploaded under this image, so it resolves
@@ -8167,11 +8175,7 @@ async fn handle_start_upload(
             let _ = blob_tx.rollback().await;
             delete_storage_key_best_effort(&storage, &temp_key, "monolithic blob link failed")
                 .await;
-            return oci_error(
-                crate::api::handlers::db_status(&e.to_string()),
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            );
+            return oci_db_error(&e);
         }
 
         // Commit publishes the `oci_blobs` row and the journal-row removal
@@ -8179,11 +8183,7 @@ async fn handle_start_upload(
         if let Err(e) = blob_tx.commit().await {
             delete_storage_key_best_effort(&storage, &temp_key, "monolithic blob commit failed")
                 .await;
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            );
+            return oci_db_error(&e);
         }
 
         delete_storage_key_best_effort(&storage, &temp_key, "monolithic upload completed").await;
@@ -8257,11 +8257,7 @@ async fn handle_start_upload(
         Err(e) => {
             delete_storage_key_best_effort(&storage, &temp_key, "upload session begin failed")
                 .await;
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            );
+            return oci_db_error(&e);
         }
     };
     if let Err(e) = sqlx::query(
@@ -8277,7 +8273,7 @@ async fn handle_start_upload(
     .await
     {
         delete_storage_key_best_effort(&storage, &temp_key, "upload session insert failed").await;
-        return oci_error(crate::api::handlers::db_status(&e.to_string()), "INTERNAL_ERROR", &e.to_string());
+        return oci_db_error(&e);
     }
     if let Some(part_digest) = computed_digest.as_ref() {
         // `computed_digest` is Some exactly when bytes_received > 0, i.e. a real
@@ -8294,7 +8290,7 @@ async fn handle_start_upload(
         {
             delete_storage_key_best_effort(&storage, &temp_key, "initial upload part insert failed")
                 .await;
-            return oci_error(crate::api::handlers::db_status(&e.to_string()), "INTERNAL_ERROR", &e.to_string());
+            return oci_db_error(&e);
         }
     }
     if let Err(e) = tx.commit().await {
@@ -8303,11 +8299,7 @@ async fn handle_start_upload(
             storage_key = %temp_key,
             "OCI upload session commit failed after storage write; leaving temp object for scheduled OCI upload cleanup because COMMIT outcome may be ambiguous"
         );
-        return oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        );
+        return oci_db_error(&e);
     }
 
     info!(
@@ -8468,11 +8460,7 @@ async fn handle_patch_upload(
         Err(e) => {
             delete_storage_key_best_effort(&storage, &part_key, "PATCH transaction begin failed")
                 .await;
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            );
+            return oci_db_error(&e);
         }
     };
 
@@ -8491,7 +8479,7 @@ async fn handle_patch_upload(
         {
             delete_storage_key_best_effort(&storage, &part_key, "legacy first part backfill failed")
                 .await;
-            return oci_error(crate::api::handlers::db_status(&e.to_string()), "INTERNAL_ERROR", &e.to_string());
+            return oci_db_error(&e);
         }
     }
 
@@ -8510,7 +8498,7 @@ async fn handle_patch_upload(
         if is_pg_unique_violation(&e) {
             return upload_session_conflict("upload session changed while PATCH body was streaming");
         }
-        return oci_error(crate::api::handlers::db_status(&e.to_string()), "INTERNAL_ERROR", &e.to_string());
+        return oci_db_error(&e);
     }
 
     let update_result = match sqlx::query(
@@ -8528,7 +8516,7 @@ async fn handle_patch_upload(
         Ok(result) => result,
         Err(e) => {
             delete_storage_key_best_effort(&storage, &part_key, "PATCH session update failed").await;
-            return oci_error(crate::api::handlers::db_status(&e.to_string()), "INTERNAL_ERROR", &e.to_string());
+            return oci_db_error(&e);
         }
     };
     if update_result.rows_affected() != 1 {
@@ -8571,11 +8559,7 @@ async fn handle_patch_upload(
             }
             Err(resp) => return resp,
         }
-        return oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        );
+        return oci_db_error(&e);
     }
 
     upload_patch_accepted_response(image_name, session_id, new_bytes)
@@ -8664,19 +8648,11 @@ async fn handle_cancel_upload(
                     "BLOB_UPLOAD_UNKNOWN",
                     "upload session not found",
                 ),
-                Err(e) => oci_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "INTERNAL_ERROR",
-                    &e.to_string(),
-                ),
+                Err(e) => oci_db_error(&e),
             };
         }
         Err(e) => {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            );
+            return oci_db_error(&e);
         }
     };
     let storage_temp_key = match session_row.try_get::<String, _>("storage_temp_key") {
@@ -8710,11 +8686,7 @@ async fn handle_cancel_upload(
             {
                 return reset_resp;
             }
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            );
+            return oci_db_error(&e);
         }
     };
     let mut cleanup_keys = Vec::with_capacity(part_rows.len() + 1);
@@ -8773,11 +8745,7 @@ async fn handle_cancel_upload(
             {
                 return reset_resp;
             }
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            );
+            return oci_db_error(&e);
         }
     };
     if deleted != 1 {
@@ -9169,13 +9137,7 @@ async fn oci_blob_is_published(
     .bind(digest)
     .fetch_one(db)
     .await
-    .map_err(|e| {
-        oci_error(
-            crate::api::handlers::db_status(&e),
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        )
-    })
+    .map_err(|e| oci_db_error(&e))
 }
 
 /// Take the completion lease, or settle a PUT that duplicates a completion
@@ -10135,11 +10097,7 @@ async fn complete_claimed_oci_upload(job: OciUploadCompletionJob) -> Response {
             {
                 return reset_resp;
             }
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            );
+            return oci_db_error(&e);
         }
     };
     // #3187: take the blob key's cleanup-journal row under `FOR UPDATE` inside
@@ -10211,11 +10169,7 @@ async fn complete_claimed_oci_upload(job: OciUploadCompletionJob) -> Response {
             {
                 return reset_resp;
             }
-            return oci_error(
-                crate::api::handlers::db_status(&e.to_string()),
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            );
+            return oci_db_error(&e);
         }
     }
     // #4422: storage-quota admission in the transaction that commits the row;
@@ -10286,11 +10240,7 @@ async fn complete_claimed_oci_upload(job: OciUploadCompletionJob) -> Response {
         {
             return reset_resp;
         }
-        return oci_error(
-            crate::api::handlers::db_status(&e.to_string()),
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        );
+        return oci_db_error(&e);
     }
 
     let deleted = match sqlx::query(
@@ -10324,7 +10274,7 @@ async fn complete_claimed_oci_upload(job: OciUploadCompletionJob) -> Response {
             {
                 return reset_resp;
             }
-            return oci_error(crate::api::handlers::db_status(&e.to_string()), "INTERNAL_ERROR", &e.to_string());
+            return oci_db_error(&e);
         }
     };
     if deleted != 1 {
@@ -10418,11 +10368,7 @@ async fn complete_claimed_oci_upload(job: OciUploadCompletionJob) -> Response {
             }
             Err(resp) => return resp,
         }
-        return oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        );
+        return oci_db_error(&e);
     }
 
     // The `oci_blobs` row committed durably. The blob key's journal row was
@@ -13536,11 +13482,7 @@ pub async fn replicate_oci_blob(
     let bytes = match tokio::fs::read(staged.path()).await {
         Ok(b) => b,
         Err(e) => {
-            return oci_error(
-                crate::api::handlers::db_status(&e),
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            )
+            return oci_internal_error(crate::api::handlers::storage_err_message(&e));
         }
     };
     let size_bytes = bytes.len() as i64;
@@ -13558,13 +13500,7 @@ pub async fn replicate_oci_blob(
     // resurrects a blob the GC had marked, mirroring the native upsert.
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
-        Err(e) => {
-            return oci_error(
-                crate::api::handlers::db_status(&e),
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            )
-        }
+        Err(e) => return oci_db_error(&e),
     };
     if let Some(refusal) =
         oci_blob_quota_refusal(&mut tx, &state.db, repo.id, &digest, size_bytes).await
@@ -13588,18 +13524,10 @@ pub async fn replicate_oci_blob(
     .await
     {
         let _ = tx.rollback().await;
-        return oci_error(
-            crate::api::handlers::db_status(&e),
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        );
+        return oci_db_error(&e);
     }
     if let Err(e) = tx.commit().await {
-        return oci_error(
-            crate::api::handlers::db_status(&e),
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        );
+        return oci_db_error(&e);
     }
 
     Response::builder()
@@ -14933,13 +14861,7 @@ async fn handle_referrers(
         .await
     {
         Ok(rows) => rows,
-        Err(e) => {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            )
-        }
+        Err(e) => return oci_db_error(&e),
     };
     // #5793: on a hosted repository a referrer is listed under `<name>` only
     // when it resolves under that image, as a pull of it by digest would.
@@ -14949,13 +14871,7 @@ async fn handle_referrers(
             match resolve_hosted_digest(state, &repo, &row.manifest_digest).await {
                 Ok(Some(_)) => scoped.push(row),
                 Ok(None) => {}
-                Err(e) => {
-                    return oci_error(
-                        crate::api::handlers::db_status(&e.to_string()),
-                        "INTERNAL_ERROR",
-                        &e.to_string(),
-                    )
-                }
+                Err(e) => return oci_db_error(&e),
             }
         }
         scoped
@@ -28652,6 +28568,473 @@ mod oci_blob_upload_streaming_tests {
             .execute(&pool)
             .await;
         f.teardown().await;
+    }
+
+    /// #5901: a push whose database work fails answers the sanitised
+    /// message, never the database's own text (table, column and constraint
+    /// names, rejected values): 503 UNAVAILABLE + Retry-After for a database
+    /// that cannot answer in time, 500 "Database operation failed" for any
+    /// other database error. Covers the upload start, the chunked PATCH and
+    /// the completing PUT.
+    ///
+    /// Through [`tdh::TableQueryOutage`]'s pool a read of
+    /// `oci_upload_sessions` hits `statement_timeout` (an unavailable
+    /// database), and a write to it fails because the shadow is a read-only
+    /// view (`cannot insert into view`, an ordinary database error).
+    #[tokio::test]
+    async fn push_database_errors_answer_the_sanitised_message_5901() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let pool = f.inner.pool.clone();
+        let repo = f.inner.repo_key.clone();
+        let content = Bytes::from_static(b"oci layer 5901");
+        let digest = compute_sha256(&content);
+
+        // Two sessions opened while the database works.
+        let mut sessions = Vec::new();
+        for _ in 0..2 {
+            let (status, headers, body) = send(
+                f.app(),
+                request(
+                    Method::POST,
+                    format!("/{repo}/image/blobs/uploads/"),
+                    &f.authorization,
+                    Bytes::new(),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::ACCEPTED, "start upload: {body:?}");
+            sessions.push(
+                headers
+                    .get("Docker-Upload-UUID")
+                    .and_then(|v| v.to_str().ok())
+                    .expect("Docker-Upload-UUID")
+                    .to_string(),
+            );
+        }
+
+        let outage = tdh::TableQueryOutage::start(&pool, &["oci_upload_sessions"])
+            .await
+            .expect("outage pool");
+        let mut state = (*f.inner.state).clone();
+        state.db = outage.pool.clone();
+        let app = router(None).with_state(Arc::new(state));
+
+        let start = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{repo}/image/blobs/uploads/"),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        let patch = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{repo}/image/blobs/uploads/{}", sessions[0]),
+                &f.authorization,
+                content.clone(),
+            ),
+        )
+        .await;
+        let complete = send(
+            app.clone(),
+            request(
+                Method::PUT,
+                format!(
+                    "/{repo}/image/blobs/uploads/{}?digest={digest}",
+                    sessions[1]
+                ),
+                &f.authorization,
+                content.clone(),
+            ),
+        )
+        .await;
+        outage.end().await;
+
+        for (label, (status, headers, body)) in [
+            ("upload start", start),
+            ("chunked PATCH", patch),
+            ("completing PUT", complete),
+        ] {
+            let text = String::from_utf8_lossy(&body).into_owned();
+            assert!(status.is_server_error(), "{label}: {status} {text}");
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).expect("/v2 error envelope");
+            let message = json["errors"][0]["message"].as_str().unwrap_or_default();
+            if status == StatusCode::SERVICE_UNAVAILABLE {
+                assert_eq!(json["errors"][0]["code"], "UNAVAILABLE", "{label}: {text}");
+                assert_eq!(
+                    message, "Database is temporarily unavailable, retry shortly",
+                    "{label}"
+                );
+                assert!(
+                    headers.contains_key(axum::http::header::RETRY_AFTER),
+                    "{label}: Retry-After"
+                );
+            } else {
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{label}: {text}");
+                assert_eq!(message, "Database operation failed", "{label}");
+            }
+            for leak in [
+                "oci_upload_sessions",
+                "error returned from database",
+                "statement timeout",
+                "Database error:",
+                "view",
+            ] {
+                assert!(!text.contains(leak), "{label} leaks {leak:?}: {text}");
+            }
+        }
+
+        f.teardown().await;
+    }
+
+    /// The app on `pool` instead of the fixture's own pool.
+    fn app_on_pool_5901(f: &OciUploadFixture, pool: &sqlx::PgPool) -> Router {
+        let mut state = (*f.inner.state).clone();
+        state.db = pool.clone();
+        router(None).with_state(Arc::new(state))
+    }
+
+    /// Open an upload session while the database works, its first part
+    /// `body` (none when empty).
+    async fn open_upload_session_5901(f: &OciUploadFixture, body: Bytes) -> String {
+        let repo = &f.inner.repo_key;
+        let (status, headers, resp) = send(
+            f.app(),
+            request(
+                Method::POST,
+                format!("/{repo}/image/blobs/uploads/"),
+                &f.authorization,
+                body,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "start upload: {resp:?}");
+        headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .expect("Docker-Upload-UUID")
+            .to_string()
+    }
+
+    /// A `/v2` database failure answers `expected` with the sanitised message
+    /// and none of the database's own text (#5901).
+    fn assert_sanitised_db_error_5901(
+        label: &str,
+        (status, headers, body): (StatusCode, HeaderMap, Bytes),
+        expected: StatusCode,
+    ) {
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert_eq!(status, expected, "{label}: {text}");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("/v2 error envelope");
+        let message = json["errors"][0]["message"].as_str().unwrap_or_default();
+        if expected == StatusCode::SERVICE_UNAVAILABLE {
+            assert_eq!(json["errors"][0]["code"], "UNAVAILABLE", "{label}: {text}");
+            assert_eq!(
+                message, "Database is temporarily unavailable, retry shortly",
+                "{label}"
+            );
+            assert!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                "{label}: Retry-After"
+            );
+        } else {
+            assert_eq!(message, "Database operation failed", "{label}: {text}");
+        }
+        for leak in [
+            "oci_",
+            "error returned from database",
+            "statement timeout",
+            "Database error:",
+            "view",
+        ] {
+            assert!(!text.contains(leak), "{label} leaks {leak:?}: {text}");
+        }
+    }
+
+    /// #5901: the push and upload writes that follow a read of the same table
+    /// answer the sanitised message too: the chunked PATCH's part insert, its
+    /// legacy first-part backfill and its session update, a POST's first-part
+    /// insert, the monolithic POST's `oci_blobs` insert and image link, the
+    /// completing PUT's `oci_blobs` insert, and the cancel's session claim and
+    /// part listing.
+    ///
+    /// [`tdh::TableQueryOutage::start_read_only`] lets reads of a table through
+    /// and fails every write to it (an ordinary database error, 500);
+    /// [`tdh::TableQueryOutage::start`] stalls its reads into
+    /// `statement_timeout` (an unavailable database, 503 + Retry-After).
+    #[tokio::test]
+    async fn push_writes_after_reads_answer_the_sanitised_message_5901() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let pool = f.inner.pool.clone();
+        let repo = f.inner.repo_key.clone();
+        let chunk = Bytes::from_static(b"oci 5901 chunk");
+
+        let s_patch = open_upload_session_5901(&f, Bytes::new()).await;
+        let s_legacy =
+            open_upload_session_5901(&f, Bytes::from_static(b"oci 5901 legacy first part")).await;
+        // A session from before migration 117: bytes received but no part row.
+        sqlx::query("DELETE FROM oci_upload_parts WHERE upload_session_id = $1")
+            .bind(Uuid::parse_str(&s_legacy).expect("session id"))
+            .execute(&pool)
+            .await
+            .expect("drop the legacy session's part row");
+        let s_update = open_upload_session_5901(&f, Bytes::new()).await;
+        let s_cancel = open_upload_session_5901(&f, Bytes::new()).await;
+        let s_complete = open_upload_session_5901(&f, Bytes::new()).await;
+
+        let patch = |app: Router, session: String, body: Bytes| {
+            let req = request(
+                Method::PATCH,
+                format!("/{repo}/image/blobs/uploads/{session}"),
+                &f.authorization,
+                body,
+            );
+            send(app, req)
+        };
+        let cancel = |app: Router, session: String| {
+            let req = request(
+                Method::DELETE,
+                format!("/{repo}/image/blobs/uploads/{session}"),
+                &f.authorization,
+                Bytes::new(),
+            );
+            send(app, req)
+        };
+        let monolithic = |app: Router, body: Bytes| {
+            let digest = compute_sha256(&body);
+            let req = request(
+                Method::POST,
+                format!("/{repo}/image/blobs/uploads/?digest={digest}"),
+                &f.authorization,
+                body,
+            );
+            send(app, req)
+        };
+
+        // Part writes fail, part reads answer.
+        let outage = tdh::TableQueryOutage::start_read_only(&pool, &["oci_upload_parts"])
+            .await
+            .expect("outage pool");
+        let app = app_on_pool_5901(&f, &outage.pool);
+        let part_insert = patch(app.clone(), s_patch.clone(), chunk.clone()).await;
+        let backfill = patch(app.clone(), s_legacy.clone(), chunk.clone()).await;
+        let first_part = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{repo}/image/blobs/uploads/"),
+                &f.authorization,
+                Bytes::from_static(b"oci 5901 first part"),
+            ),
+        )
+        .await;
+        outage.end().await;
+
+        // Session writes fail, session reads answer.
+        let outage = tdh::TableQueryOutage::start_read_only(&pool, &["oci_upload_sessions"])
+            .await
+            .expect("outage pool");
+        let app = app_on_pool_5901(&f, &outage.pool);
+        let session_update = patch(app.clone(), s_update.clone(), chunk.clone()).await;
+        let cancel_claim = cancel(app.clone(), s_cancel.clone()).await;
+        outage.end().await;
+
+        // Part reads stall: the cancel claims the session, cannot list its
+        // parts, and hands the session back.
+        let outage = tdh::TableQueryOutage::start(&pool, &["oci_upload_parts"])
+            .await
+            .expect("outage pool");
+        let app = app_on_pool_5901(&f, &outage.pool);
+        let cancel_parts = cancel(app.clone(), s_cancel.clone()).await;
+        outage.end().await;
+        let cancel_state: String =
+            sqlx::query_scalar("SELECT state FROM oci_upload_sessions WHERE id = $1")
+                .bind(Uuid::parse_str(&s_cancel).expect("session id"))
+                .fetch_one(&pool)
+                .await
+                .expect("cancelled session is still there");
+
+        // Blob row writes fail, blob reads (quota admission) answer.
+        let outage = tdh::TableQueryOutage::start_read_only(&pool, &["oci_blobs"])
+            .await
+            .expect("outage pool");
+        let app = app_on_pool_5901(&f, &outage.pool);
+        let blob_insert = monolithic(app.clone(), Bytes::from_static(b"oci 5901 mono row")).await;
+        let complete_content = Bytes::from_static(b"oci 5901 completing put");
+        let complete_digest = compute_sha256(&complete_content);
+        let complete = send(
+            app.clone(),
+            request(
+                Method::PUT,
+                format!("/{repo}/image/blobs/uploads/{s_complete}?digest={complete_digest}"),
+                &f.authorization,
+                complete_content,
+            ),
+        )
+        .await;
+        outage.end().await;
+
+        // The image link fails after the blob row is written.
+        let outage = tdh::TableQueryOutage::start_read_only(&pool, &["oci_image_blobs"])
+            .await
+            .expect("outage pool");
+        let app = app_on_pool_5901(&f, &outage.pool);
+        let blob_link = monolithic(app.clone(), Bytes::from_static(b"oci 5901 mono link")).await;
+        outage.end().await;
+
+        let blobs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_blobs WHERE repository_id = $1")
+                .bind(f.inner.repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count blobs");
+        f.teardown().await;
+
+        let failed = StatusCode::INTERNAL_SERVER_ERROR;
+        for (label, resp, expected) in [
+            ("PATCH part insert", part_insert, failed),
+            ("PATCH legacy first-part backfill", backfill, failed),
+            ("POST first-part insert", first_part, failed),
+            ("PATCH session update", session_update, failed),
+            ("cancel session claim", cancel_claim, failed),
+            (
+                "cancel part listing",
+                cancel_parts,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            ("monolithic blob insert", blob_insert, failed),
+            ("completing PUT blob insert", complete, failed),
+            ("monolithic image link", blob_link, failed),
+        ] {
+            assert_sanitised_db_error_5901(label, resp, expected);
+        }
+        assert_eq!(
+            cancel_state, "open",
+            "a cancel that cannot list the parts hands the session back"
+        );
+        assert_eq!(blobs, 0, "no failed push publishes a blob row");
+    }
+
+    /// #5901: a referrers listing whose query cannot run answers the
+    /// sanitised 503, not the database's text.
+    #[tokio::test]
+    async fn referrers_database_outage_answers_the_sanitised_message_5901() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let pool = f.inner.pool.clone();
+        let repo = f.inner.repo_key.clone();
+        let outage =
+            tdh::TableQueryOutage::start(&pool, &["oci_manifests", "oci_manifest_subjects"])
+                .await
+                .expect("outage pool");
+        let subject = compute_sha256(b"oci 5901 referrers subject");
+        let resp = send(
+            app_on_pool_5901(&f, &outage.pool),
+            request(
+                Method::GET,
+                format!("/{repo}/image/referrers/{subject}"),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        outage.end().await;
+        f.teardown().await;
+        assert_sanitised_db_error_5901("referrers", resp, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// #5901: the sqlx-core 0.9 renderings the backstop recognises beyond
+    /// `Database error: …` and `error returned from database`, each through
+    /// the envelope, plus the 5xx-other-than-500 path that keeps its status.
+    #[test]
+    fn carries_database_error_text_knows_the_sqlx_renderings_5901() {
+        for err in [
+            sqlx::Error::TypeNotFound {
+                type_name: "oci_upload_state".into(),
+            },
+            sqlx::Error::AnyDriverError("unsupported type oci_upload_state".into()),
+            sqlx::Error::BeginFailed,
+            sqlx::Error::InvalidSavePointStatement,
+            sqlx::Error::RowNotFound,
+            sqlx::Error::PoolClosed,
+        ] {
+            let text = err.to_string();
+            assert!(carries_database_error_text(&text), "{text}");
+            let (status, message) = oci_database_envelope(StatusCode::INTERNAL_SERVER_ERROR, &text);
+            assert!(status.is_server_error(), "{text}");
+            assert!(
+                !message.contains("oci_upload_state") && message != text,
+                "{text} -> {message}"
+            );
+        }
+        for plain in [
+            "manifest not found",
+            "image type named in the request is unsupported",
+            "upload session not found",
+        ] {
+            assert!(!carries_database_error_text(plain), "{plain}");
+        }
+        // A 5xx other than 500 keeps its status; only the message changes.
+        let (status, message) = oci_database_envelope(
+            StatusCode::BAD_GATEWAY,
+            "Database error: error returned from database: relation \"oci_blobs\"",
+        );
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(message, "Database operation failed");
+    }
+
+    /// #5901: the `/v2` envelope's backstop takes a database error's own text
+    /// out of any 5xx (and answers 503 for an unavailable database on a plain
+    /// 500), keeps 4xx messages and a classified storage failure as they are.
+    #[test]
+    fn oci_database_envelope_sanitises_database_text_on_5xx_only_5901() {
+        let unique = AppError::Database(
+            "error returned from database: duplicate key value violates unique constraint \"oci_blobs_pkey\""
+                .into(),
+        )
+        .to_string();
+        let (status, message) = oci_database_envelope(StatusCode::INTERNAL_SERVER_ERROR, &unique);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "Database operation failed");
+
+        let pool = sqlx::Error::PoolTimedOut.to_string();
+        let (status, message) = oci_database_envelope(StatusCode::INTERNAL_SERVER_ERROR, &pool);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!message.contains("pool timed out"), "{message}");
+
+        let (status, message) = oci_database_envelope(StatusCode::BAD_REQUEST, &unique);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(message, unique);
+
+        let plain = "upload part 2 is 10 bytes short";
+        let (_, message) = oci_database_envelope(StatusCode::INTERNAL_SERVER_ERROR, plain);
+        assert_eq!(message, plain);
+
+        // `oci_db_error` keeps a classified storage failure's own answer.
+        let down = AppError::Storage(tdh::minio_unreachable_error());
+        assert_eq!(
+            oci_db_error(&down).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let full = AppError::Storage(tdh::minio_quota_exceeded_error());
+        assert_eq!(
+            oci_db_error(&full).status(),
+            StatusCode::INSUFFICIENT_STORAGE
+        );
+        assert_eq!(
+            oci_db_error(&unique).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     /// The `/v2` envelope keeps client errors as written and never lets a
@@ -52778,6 +53161,53 @@ mod oci_push_replication_4790_tests {
             queued.is_empty(),
             "a replicated write must not be queued for this node's peers: {queued:?}"
         );
+    }
+
+    /// #5901: a replicated blob whose `oci_blobs` row cannot be written
+    /// answers the sanitised 500, not the database's text, and records no row.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test assertion buffers a bounded error body, not an artifact path (#1608)
+    async fn oci_replication_blob_row_failure_answers_the_sanitised_message_5901() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let body = b"replicated-blob-5901";
+        let digest = format!("sha256:{}", sha256_hex(body));
+        let outage = tdh::TableQueryOutage::start_read_only(&fx.pool, &["oci_blobs"])
+            .await
+            .expect("outage pool");
+        let mut state = (*fx.state).clone();
+        state.db = outage.pool.clone();
+        let resp = replicate_oci_blob(
+            State(Arc::new(state)),
+            Extension(Some(tdh::make_auth(fx.user_id, &fx.username))),
+            Path((fx.repo_key.clone(), digest)),
+            replication_headers(&[]),
+            Body::from(body.to_vec()),
+        )
+        .await;
+        outage.end().await;
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("response body");
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_blobs WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count blobs");
+        cleanup_oci_rows(&fx).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
+        assert!(text.contains("Database operation failed"), "{text}");
+        for leak in ["oci_blobs", "view", "error returned from database"] {
+            assert!(!text.contains(leak), "leaks {leak:?}: {text}");
+        }
+        assert_eq!(rows, 0, "no row for a failed replication write");
     }
 
     /// A replication write names its repository by key, and the generic
