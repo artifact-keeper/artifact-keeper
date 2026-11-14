@@ -463,8 +463,10 @@ fn copy_part_ranges(size: u64, part_size: u64) -> Vec<(u64, u64)> {
 /// copy failed with `NoSuchKey` while a small object's single-request
 /// `CopyObject` succeeded.
 fn s3_copy_source_value(bucket: &str, full_key: &str) -> String {
+    // A raw header, not an `ObjectPath`, so an empty segment would reach S3
     let encoded: Vec<String> = stored_key_form(full_key)
         .split('/')
+        .filter(|segment| !segment.is_empty())
         .map(|segment| urlencoding::encode(segment).into_owned())
         .collect();
     format!("{}/{}", bucket, encoded.join("/"))
@@ -901,7 +903,10 @@ impl S3Config {
         let endpoint = std::env::var("S3_ENDPOINT").ok();
         let public_endpoint =
             public_endpoint_from_env("S3_PUBLIC_ENDPOINT", EndpointPath::Forbidden)?;
-        let prefix = std::env::var("S3_PREFIX").ok();
+        // An empty or slash-only `S3_PREFIX` means no prefix
+        let prefix = std::env::var("S3_PREFIX")
+            .ok()
+            .filter(|p| !p.trim_matches('/').is_empty());
         if let Some(p) = prefix.as_deref() {
             if s3_prefix_collides_with_reserved_namespace(p) {
                 tracing::warn!(
@@ -1417,6 +1422,10 @@ fn s3_failure_class(err: &object_store::Error) -> Option<crate::storage::Storage
 pub(crate) fn classify_s3_error(err: &object_store::Error) -> String {
     let full = err.to_string();
     let l = full.to_lowercase();
+    // object_store prints its retry settings (`retry_timeout: 15s`) on every
+    // retried error, so that text says nothing about why the request failed
+    // and must not make a reset connection read as a timeout (#5858).
+    let cause = l.replace("retry_timeout", "");
     // The raw text is kept for searchability, minus any request URL (#3954):
     // object_store embeds the endpoint, bucket and key URL in generic and
     // retry errors, and this message now reaches INFO logs and exported span
@@ -1454,10 +1463,20 @@ pub(crate) fn classify_s3_error(err: &object_store::Error) -> String {
     {
         "S3 network unreachable. No route from the container to the \
          endpoint. Likely a NetworkPolicy, firewall, or egress rule."
-    } else if l.contains("timeout") || l.contains("timed out") {
+    } else if cause.contains("timeout") || cause.contains("timed out") {
         "S3 connection timed out. Endpoint dropped packets or is behind \
          a stalled proxy. If you use a custom CA, also confirm S3_CA_CERT_PATH \
          is set so TLS does not fall back to system trust."
+    } else if cause.contains("connection reset")
+        || cause.contains("broken pipe")
+        || cause.contains("connection closed")
+        || cause.contains("unexpected eof")
+        || cause.contains("error sending request")
+    {
+        "S3 connection reset. The endpoint, or a load balancer or proxy in \
+         front of it, closed the connection before the request completed. \
+         Check the endpoint's health and logs, and the idle and request \
+         timeouts of any proxy in between."
     } else if l.contains("403") || l.contains("access denied") || l.contains("forbidden") {
         "S3 access denied (403). Credentials are reaching the endpoint \
          but lack permission on the bucket. Confirm S3_BUCKET, the IAM \
@@ -4572,6 +4591,61 @@ mod tests {
 
     // --- S3Config from_env tests ---
 
+    /// `S3_PREFIX=""` must not put a leading slash into the raw
+    /// `x-amz-copy-source` header. Reads and writes survive `Some("")` because
+    /// `ObjectPath::from` normalizes the key, the copy header does not, so a
+    /// server-side copy asked for `bucket//ab/cd/ef` and got `NoSuchKey`.
+    #[test]
+    fn copy_source_value_survives_an_empty_but_present_prefix() {
+        assert_eq!(
+            s3_copy_source_value("artifacts", &make_full_key(Some(""), "ab/cd/ef")),
+            "artifacts/ab/cd/ef",
+            "an empty prefix must not become a leading slash in the copy source"
+        );
+        assert_eq!(
+            s3_copy_source_value("artifacts", &make_full_key(None, "ab/cd/ef")),
+            "artifacts/ab/cd/ef"
+        );
+        assert_eq!(
+            s3_copy_source_value("artifacts", &make_full_key(Some("team-a"), "ab/cd/ef")),
+            "artifacts/team-a/ab/cd/ef"
+        );
+    }
+
+    /// `S3_PREFIX=""` means "no prefix", so it must not reach the backend as
+    /// `Some("")` at all.
+    #[test]
+    fn an_empty_s3_prefix_env_var_reads_as_no_prefix() {
+        let orig_bucket = std::env::var("S3_BUCKET").ok();
+        let orig_prefix = std::env::var("S3_PREFIX").ok();
+        std::env::set_var("S3_BUCKET", "empty-prefix-bucket");
+
+        for raw in ["", "/", "//"] {
+            std::env::set_var("S3_PREFIX", raw);
+            let config = S3Config::from_env().expect("from_env succeeds");
+            assert_eq!(
+                config.prefix, None,
+                "S3_PREFIX={raw:?} must be treated as unset, not as Some(\"\")"
+            );
+        }
+
+        std::env::set_var("S3_PREFIX", "team-a");
+        assert_eq!(
+            S3Config::from_env().expect("from_env succeeds").prefix,
+            Some("team-a".to_string()),
+            "a real prefix must still survive"
+        );
+
+        match orig_prefix {
+            Some(v) => std::env::set_var("S3_PREFIX", v),
+            None => std::env::remove_var("S3_PREFIX"),
+        }
+        match orig_bucket {
+            Some(v) => std::env::set_var("S3_BUCKET", v),
+            None => std::env::remove_var("S3_BUCKET"),
+        }
+    }
+
     #[test]
     fn test_s3_config_from_env_missing_bucket() {
         let original = std::env::var("S3_BUCKET").ok();
@@ -7477,6 +7551,87 @@ mod tests {
         );
     }
 
+    /// #5862: a backend whose prefix is `Some("")` (what `S3_PREFIX=""` used to
+    /// produce) still names a single-slash source in its `UploadPartCopy`.
+    ///
+    /// The fixture models S3 the way it behaves for a doubled slash: only the
+    /// plain `bucket/key` source resolves, `bucket//key` answers `NoSuchKey`.
+    #[tokio::test]
+    async fn test_large_copy_with_an_empty_prefix_names_a_single_slash_source_5862() {
+        use wiremock::matchers::{header, method, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let size = 5_u64 * 1024 * 1024 * 1024 + 1;
+        let source = "ab/cd/ef0123";
+        let dest = "ab/cd/ef0123-copy";
+        let expected_source = "test-bucket/ab/cd/ef0123";
+
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", size.to_string())
+                    .insert_header("last-modified", "Fri, 07 Aug 2026 18:09:54 GMT")
+                    .insert_header("ETag", "\"large-source\""),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(query_param_is_missing("uploadId"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>copy-upload-id</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(query_param("uploadId", "copy-upload-id"))
+            .and(header("x-amz-copy-source", expected_source))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CopyPartResult><ETag>&#34;part-copy-etag&#34;</ETag></CopyPartResult>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(query_param("uploadId", "copy-upload-id"))
+            .respond_with(ResponseTemplate::new(404).set_body_string(
+                "<Error><Code>NoSuchKey</Code><Message>The specified key does not \
+                 exist.</Message></Error>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(query_param("uploadId", "copy-upload-id"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"complete-copy\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+
+        let mut backend = mock_s3_backend(&server.uri(), false).await;
+        backend.prefix = Some(String::new());
+        S3Backend::copy(&backend, source, dest)
+            .await
+            .unwrap_or_else(|e| panic!("#5862: the copy must name '{expected_source}': {e}"));
+
+        let sources: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|r| {
+                r.headers
+                    .get("x-amz-copy-source")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            })
+            .collect();
+        assert!(!sources.is_empty(), "#5862: no part copy was sent");
+        assert!(
+            sources.iter().all(|s| s == expected_source),
+            "#5862: every part copy must name '{expected_source}', got {sources:?}"
+        );
+    }
+
     /// The integrity half of #3164: with the old restream shape, `dest` was
     /// already fully published (multipart upload completed) before any
     /// verification could run. With server-side part copies the publish point
@@ -7870,6 +8025,29 @@ mod tests {
             msg.contains("S3_CA_CERT_PATH"),
             "should mention CA fallback hint for timeout: {msg}"
         );
+    }
+
+    /// A reset connection is not a timeout, even though object_store prints
+    /// its `retry_timeout` setting on every retried error (#5858).
+    #[test]
+    fn test_classify_reset_connection_is_not_a_timeout_5858() {
+        let e = generic_err(
+            "Error performing HEAD <url> in 3.27s, after 10 retries, max_retries: 10, \
+             retry_timeout: 15s  - HTTP error: error sending request",
+        );
+        let msg = classify_s3_error(&e);
+        assert!(msg.starts_with("S3 connection reset"), "got: {msg}");
+        assert!(!msg.contains("timed out"), "got: {msg}");
+
+        let e = generic_err("connection reset by peer (os error 104)");
+        assert!(classify_s3_error(&e).starts_with("S3 connection reset"));
+
+        // A real timeout behind the same retry text is still a timeout.
+        let e = generic_err(
+            "Error performing GET <url> after 3 retries, retry_timeout: 15s - \
+             HTTP error: error sending request: operation timed out",
+        );
+        assert!(classify_s3_error(&e).starts_with("S3 connection timed out"));
     }
 
     #[test]

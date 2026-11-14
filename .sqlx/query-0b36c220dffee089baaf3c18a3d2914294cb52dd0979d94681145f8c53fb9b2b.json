@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT at.id, at.token_hash, at.user_id, at.scopes, at.expires_at,\n                   at.repo_selector, at.revoked_at, at.last_used_at,\n                   at.repository_restricted\n            FROM api_tokens at\n            WHERE at.token_prefix = $1\n            ",
+  "query": "\n            SELECT at.id, at.token_hash, at.user_id, at.scopes, at.expires_at,\n                   at.repo_selector, at.revoked_at, at.last_used_at,\n                   at.repository_restricted\n            FROM api_tokens at\n            WHERE at.token_prefix = $1\n            ORDER BY at.revoked_at IS NOT NULL\n            LIMIT 1\n            ",
   "describe": {
     "columns": [
       {
@@ -120,5 +120,5 @@
       false
     ]
   },
-  "hash": "a3bfe452cfc2e6c243a9578e493f0116f812790879be47eae165cd6b72b2bc01"
+  "hash": "0b36c220dffee089baaf3c18a3d2914294cb52dd0979d94681145f8c53fb9b2b"
 }

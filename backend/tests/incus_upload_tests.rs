@@ -30,6 +30,9 @@ use artifact_keeper_backend::services::auth_service::AuthService;
 
 fn test_config(storage_path: &str) -> Config {
     Config {
+        scan_worker_enabled: true,
+        scan_queue_enabled: false,
+        scan_worker_concurrency: None,
         database_url: std::env::var("DATABASE_URL").unwrap(),
         bind_address: "127.0.0.1:0".into(),
         log_level: "error".into(),
@@ -108,6 +111,7 @@ fn test_config(storage_path: &str) -> Config {
         totp_policy: None,
         api_token_expiry_policy: None,
         max_upload_size_bytes: 10_737_418_240,
+        quotas: Default::default(),
         metrics_port: None,
         grpc_bind_ip: artifact_keeper_backend::config::DEFAULT_LISTENER_BIND_IP,
         metrics_bind_ip: artifact_keeper_backend::config::DEFAULT_LISTENER_BIND_IP,
