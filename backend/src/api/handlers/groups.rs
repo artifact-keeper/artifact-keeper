@@ -656,6 +656,20 @@ pub async fn update_group(
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
+    // An SSO group is matched to the identity provider's group by name, so
+    // renaming a group that holds a global role would hand that role to every
+    // member of whichever IdP group carries the new name at their next login
+    if !auth.is_admin
+        && before
+            .as_ref()
+            .is_some_and(|(name, _)| *name != payload.name)
+        && group_holds_global_role(&state.db, id).await?
+    {
+        return Err(AppError::Authorization(
+            "Only an administrator can rename a group that holds a global role".to_string(),
+        ));
+    }
+
     let group: CreatedGroupRow = sqlx::query_as(
         r#"
         UPDATE groups
@@ -800,6 +814,18 @@ fn check_membership_editable(external_source: Option<Option<String>>) -> Result<
 }
 
 /// Look up a group's `external_source` and enforce [`check_membership_editable`].
+/// Does this group carry an instance-wide role (`group_global_roles`, migration
+/// 382)? Such a group confers that role on every member, so only an admin may
+/// add members to it or rename it.
+async fn group_holds_global_role(db: &sqlx::PgPool, id: Uuid) -> Result<bool> {
+    Ok(
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM group_global_roles WHERE group_id = $1)")
+            .bind(id)
+            .fetch_one(db)
+            .await?,
+    )
+}
+
 async fn ensure_membership_editable(db: &sqlx::PgPool, id: Uuid) -> Result<()> {
     let external_source =
         sqlx::query_scalar::<_, Option<String>>("SELECT external_source FROM groups WHERE id = $1")
@@ -887,6 +913,13 @@ pub async fn add_members(
         if !has_perm {
             return Err(AppError::Authorization(
                 "Insufficient permissions to manage group membership".to_string(),
+            ));
+        }
+        // A delegated group admin must not hand out a global role (security reviewer) by adding members
+        if group_holds_global_role(&state.db, id).await? {
+            return Err(AppError::Authorization(
+                "Only an administrator can add members to a group that holds a global role"
+                    .to_string(),
             ));
         }
     }

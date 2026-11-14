@@ -25,6 +25,49 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     auth.ok_or_else(|| AppError::Unauthorized("Authentication required".to_string()))
 }
 
+/// The global capability that lets a non-admin decide package exceptions.
+pub const CAP_SECURITY_REVIEW: &str = "security_review";
+
+/// Gate a reviewer action on admin OR the `security_review` capability.
+///
+/// Admin is checked first and without a query, so the existing admin-only
+/// surfaces keep costing exactly what they cost before. The capability lookup
+/// happens here, per call, rather than in `auth_middleware`: these endpoints
+/// are low-traffic, and resolving it in middleware would put a second authz
+/// query on every proxy pull to serve a handful of reviewer routes.
+async fn require_security_review(db: &sqlx::PgPool, auth: &AuthExtension) -> Result<()> {
+    // The queue spans every repository, so a repository-restricted credential
+    // never reads or decides it, not even an admin's (#4273, #4550). Checked
+    // ahead of the admin shortcut for that reason.
+    if matches!(
+        auth.allowed_repo_ids,
+        crate::models::access_scope::AccessScope::Restricted(_)
+    ) {
+        return Err(AppError::Authorization(
+            "Repository-scoped tokens cannot read or decide package exceptions".to_string(),
+        ));
+    }
+    if auth.is_admin {
+        return Ok(());
+    }
+    // A scoped token never wields the capability
+    if auth.scopes.is_some() {
+        return Err(AppError::Authorization(
+            "Security review requires an unrestricted credential".to_string(),
+        ));
+    }
+    let svc = crate::services::permission_service::PermissionService::new(db.clone());
+    if svc
+        .has_global_capability(auth.user_id, CAP_SECURITY_REVIEW)
+        .await?
+    {
+        return Ok(());
+    }
+    Err(AppError::Authorization(
+        "Security reviewer access required".to_string(),
+    ))
+}
+
 /// Parse a comma-separated `status` query value into a trimmed, non-empty list.
 /// Returns `None` when no concrete status is present so the filter is disabled.
 fn parse_status_filter(raw: &str) -> Option<Vec<String>> {
@@ -44,6 +87,18 @@ pub fn admin_router() -> Router<SharedState> {
         .route("/reviews/:id/approve", post(approve_review))
         .route("/reviews/:id/reject", post(reject_review))
         .route("/reviews/:id/reopen", post(reopen_review))
+}
+
+/// The `/api/v1/exceptions` mount, behind plain auth: each handler checks the capability itself
+pub fn exceptions_router() -> Router<SharedState> {
+    Router::new()
+        .route("/reviews", get(list_exceptions))
+        .route("/reviews/:id", get(get_exception))
+        .route("/reviews/:id/approve", post(approve_exception))
+        .route("/reviews/:id/reject", post(reject_exception))
+        .route("/reviews/:id/reopen", post(reopen_exception))
+        .route("/requests", get(list_my_requests).post(request_exception))
+        .route("/requests/:id", get(get_my_request))
 }
 
 pub fn repo_config_routes() -> Router<SharedState> {
@@ -77,6 +132,14 @@ pub fn repo_review_routes() -> Router<SharedState> {
 pub struct ReviewListQuery {
     pub repository_key: Option<String>,
     pub status: Option<String>,
+    /// Comma-separated gates (`age,scan,curation`). What an OMITTED value
+    /// means depends on the mount: `age` only under `/admin/age-gate` (that
+    /// page's original contract), every gate under `/exceptions`.
+    pub gate: Option<String>,
+    /// `true` restricts the list to rows a human justified, the reviewer's
+    /// default view. Omitted/`false` also shows every refused pull the gates
+    /// auto-filed, which is demand signal rather than a request.
+    pub justified_only: Option<bool>,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
 }
@@ -105,8 +168,42 @@ pub struct AgeGateReviewResponse {
     pub instance_locked: bool,
     pub reviewed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub review_reason: Option<String>,
+    /// Who filed the justification. `None` on an auto-filed row.
+    pub requested_by: Option<Uuid>,
+    /// The requester's username, `None` on an auto-filed row or a deleted account.
+    pub requested_by_username: Option<String>,
     pub request_count: i32,
     pub last_requested_at: chrono::DateTime<chrono::Utc>,
+    /// When a granted exception lapses. `null` = never expires.
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The requester's stated reason, if a human filed one.
+    pub justification: Option<String>,
+    /// `requested` when a human justified this, `attempted` when the row only
+    /// exists because a pull was refused. Derived from `justification` rather
+    /// than stored, so the two can never disagree.
+    pub origin: &'static str,
+    /// Which gate refused it: `age`, `scan` or `curation`. Without this the
+    /// `/exceptions` queue can filter by gate but cannot label a row, so a
+    /// mixed queue renders as one undifferentiated list. A NULL column reads
+    /// as `age`, the only gate that predates the column.
+    pub gate: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateExceptionRequest {
+    /// Repository the package is being pulled from.
+    pub repository_key: String,
+    /// Which gate is (or will be) refusing it: `age`, `scan` or `curation`.
+    pub gate: String,
+    pub package_name: String,
+    /// Omitted means the whole package. npm and OCI curation blocks carry no
+    /// version at their seam, so `*` is the only coordinate that can match
+    /// there.
+    #[serde(default)]
+    pub package_version: Option<String>,
+    /// Why this package is needed. Required: it is what distinguishes a
+    /// request from a refused pull the gate filed on its own.
+    pub justification: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -118,6 +215,109 @@ pub struct AgeGateReviewListResponse {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ReviewActionRequest {
     pub reason: Option<String>,
+}
+
+/// How long a granted exception lasts when the reviewer does not say.
+pub const DEFAULT_EXPIRY_DAYS: u32 = 90;
+
+/// Upper bound on an explicit window, mirroring `age_gate_min_age_days`'s
+/// range. Not a cap on the *power* to grant forever, `never_expires` is the
+/// sanctioned way to do that, and it is a separate, visible choice.
+const MAX_EXPIRY_DAYS: u32 = 3650;
+
+/// Approve carries an expiry; reject and reopen clear it, so they keep using
+/// the plain [`ReviewActionRequest`] rather than accepting a field they would
+/// silently ignore.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ApproveReviewRequest {
+    pub reason: Option<String>,
+    /// Days until the exception lapses. Omitted = [`DEFAULT_EXPIRY_DAYS`], or never on the age gate
+    #[serde(default)]
+    pub expires_in_days: Option<u32>,
+    /// Grant it permanently. Mutually exclusive with `expires_in_days`, and
+    /// separate from it on purpose: "forever" should be something a reviewer
+    /// states, never something they reach by leaving a field blank.
+    #[serde(default)]
+    pub never_expires: bool,
+}
+
+/// A scan exception is bound to the digest of the bytes the gate refused, so
+/// a row filed before any refusal has nothing to bind and would serve nothing.
+/// Refused instead of approved in vain: it becomes grantable once the gate
+/// refuses a pull of it and records the digest
+fn require_scan_digest(gate: Option<&str>, basis_digest: Option<&str>) -> Result<()> {
+    if gate == Some(crate::services::age_gate_service::GATE_SCAN) && basis_digest.is_none() {
+        return Err(AppError::Conflict(
+            "No refused download of this package has been recorded yet, so there are no \
+             bytes to grant this scan exception for. It can be granted once the scan gate \
+             has refused a pull of it"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// A grant MUST carry a reason.
+///
+/// Releasing a package a gate refused is the one action here that widens what
+/// the estate will serve, and the queue's whole purpose is attributable risk
+/// acceptance: an approval with no recorded "why" is an audit row that cannot
+/// answer the only question anyone asks of it later. Enforced server-side
+/// because the UI is not a control -- the same route is reachable from a
+/// script, the SDK and curl. Refusing and reopening are deliberately NOT
+/// bound by this: both leave the package withheld.
+fn require_grant_reason(reason: Option<&str>) -> Result<&str> {
+    match reason.map(str::trim) {
+        Some(r) if !r.is_empty() => Ok(r),
+        _ => Err(AppError::Validation(
+            "A reason is required to grant an exception".to_string(),
+        )),
+    }
+}
+
+/// Separation of duties on a scan or curation grant: whoever filed the
+/// justification on the row cannot be the one who grants it, admins included,
+/// like promotion approvals (`approval_separation_of_duties_ok`). The age gate
+/// keeps its old contract, an admin could always approve any age row.
+///
+/// `requested_by` is the latest requester, so this stops the plain "ask and
+/// grant it yourself" case. It does not stop a reviewer granting an auto-filed
+/// row for a pull they made, which needs no request at all.
+fn require_not_own_request(requested_by: Option<Uuid>, actor: Uuid, age: bool) -> Result<()> {
+    if !age && requested_by == Some(actor) {
+        return Err(AppError::Authorization(
+            "Separation of duties: you cannot grant an exception you requested. \
+             A different reviewer must decide it."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the request's expiry choice into a concrete instant.
+///
+/// Pure, so the default / bounds / mutual-exclusion rules are testable without
+/// a DB or a clock. `Ok(None)` means never expires.
+fn resolve_expiry(
+    expires_in_days: Option<u32>,
+    never_expires: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    if never_expires {
+        if expires_in_days.is_some() {
+            return Err(AppError::Validation(
+                "expires_in_days and never_expires are mutually exclusive".to_string(),
+            ));
+        }
+        return Ok(None);
+    }
+    let days = expires_in_days.unwrap_or(DEFAULT_EXPIRY_DAYS);
+    if days == 0 || days > MAX_EXPIRY_DAYS {
+        return Err(AppError::Validation(format!(
+            "expires_in_days must be between 1 and {MAX_EXPIRY_DAYS}, or set never_expires"
+        )));
+    }
+    Ok(Some(now + chrono::Duration::days(i64::from(days))))
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -165,8 +365,20 @@ fn review_to_response(review: AgeGateReview) -> AgeGateReviewResponse {
         instance_locked: review.instance_locked,
         reviewed_at: review.reviewed_at,
         review_reason: review.review_reason,
+        requested_by: review.requested_by,
+        requested_by_username: review.requested_by_username,
         request_count: review.request_count,
         last_requested_at: review.last_requested_at,
+        expires_at: review.expires_at,
+        gate: review
+            .gate
+            .unwrap_or_else(|| crate::services::age_gate_service::GATE_AGE.to_string()),
+        origin: if review.justification.is_some() {
+            "requested"
+        } else {
+            "attempted"
+        },
+        justification: review.justification,
     }
 }
 
@@ -183,9 +395,13 @@ fn age_gate_service(
 fn build_review_audit_details(review: &AgeGateReview, reason: Option<&str>) -> serde_json::Value {
     serde_json::json!({
         "review_id": review.id,
+        "gate": review.gate,
         "package": review.package_name,
         "version": review.package_version,
         "reason": reason,
+        // The acceptance window is the substance of the decision, so it belongs
+        // in the audit trail. `null` here means granted permanently.
+        "expires_at": review.expires_at,
     })
 }
 
@@ -377,7 +593,13 @@ async fn load_review_in_scope(
 ) -> Result<AgeGateReview> {
     let review = svc.get_review_by_id(id).await?;
     match scope {
-        Some(repo_id) if review.repository_id != repo_id => {
+        // A repository admin operates its own AGE gate. Scan and curation
+        // exceptions share the table but are decided by a security reviewer,
+        // so they are as invisible here as another repository's reviews.
+        Some(repo_id)
+            if review.repository_id != repo_id
+                || !crate::services::age_gate_service::is_age_gate(review.gate.as_deref()) =>
+        {
             Err(AppError::NotFound("Age gate review not found".to_string()))
         }
         _ => Ok(review),
@@ -395,10 +617,21 @@ async fn apply_review_decision(
     id: Uuid,
     decision: ReviewDecision,
     reason: Option<&str>,
+    (expires_in_days, never_expires): (Option<u32>, bool),
     scope: Option<Uuid>,
 ) -> Result<Json<AgeGateReviewResponse>> {
+    // Reject and reopen clear any expiry, so an expiry on them is refused
+    // rather than silently ignored.
+    if decision != ReviewDecision::Approve && (expires_in_days.is_some() || never_expires) {
+        return Err(AppError::Validation(
+            "An expiry applies only to approve".to_string(),
+        ));
+    }
     let svc = age_gate_service(state)?;
-    let was_locked = load_review_in_scope(&svc, id, scope).await?.instance_locked;
+    let current = load_review_in_scope(&svc, id, scope).await?;
+    let was_locked = current.instance_locked;
+    // An age approval keeps its old contract: reason optional, no expiry unless asked for
+    let age = crate::services::age_gate_service::is_age_gate(current.gate.as_deref());
 
     // The actor's TIER, not the route, decides what it may relax: an instance
     // admin acting through a repository route is still an instance admin, and
@@ -407,7 +640,18 @@ async fn apply_review_decision(
     let tier = ActorTier::of(auth.is_admin);
     let (review, mut details) = match decision {
         ReviewDecision::Approve => {
-            let review = svc.approve_as(id, auth.user_id, tier, reason).await?;
+            require_not_own_request(current.requested_by, auth.user_id, age)?;
+            require_scan_digest(current.gate.as_deref(), current.basis_digest.as_deref())?;
+            let reason = if age {
+                reason
+            } else {
+                Some(require_grant_reason(reason)?)
+            };
+            let never = never_expires || (age && expires_in_days.is_none());
+            let expires_at = resolve_expiry(expires_in_days, never, chrono::Utc::now())?;
+            let review = svc
+                .approve_as(id, auth.user_id, tier, reason, expires_at)
+                .await?;
             let details = build_review_audit_details(&review, reason);
             (review, details)
         }
@@ -452,6 +696,8 @@ async fn apply_review_decision(
 async fn list_reviews_scoped(
     state: &SharedState,
     repository_key: Option<&str>,
+    gates: Option<Vec<String>>,
+    requester: Option<&AuthExtension>,
     query: &ReviewListQuery,
 ) -> Result<Json<AgeGateReviewListResponse>> {
     let svc = age_gate_service(state)?;
@@ -461,13 +707,16 @@ async fn list_reviews_scoped(
     // can fetch multiple states in one page while keeping pagination totals honest.
     let statuses: Option<Vec<String>> = query.status.as_deref().and_then(parse_status_filter);
 
+    let filter = crate::services::age_gate_service::ReviewFilter {
+        gates: gates.as_deref(),
+        repository_key,
+        statuses: statuses.as_deref(),
+        justified_only: query.justified_only.unwrap_or(false),
+        requested_by: requester.map(|a| a.user_id),
+        repository_ids: requester.and_then(|a| a.allowed_repo_ids.as_allowed_repo_ids()),
+    };
     let (items, total) = svc
-        .list_reviews(
-            repository_key,
-            statuses.as_deref(),
-            offset,
-            i64::from(per_page),
-        )
+        .list_reviews(&filter, offset, i64::from(per_page))
         .await?;
 
     Ok(Json(AgeGateReviewListResponse {
@@ -495,6 +744,8 @@ fn require_remote_repo_for_age_gate(repo_type: &RepositoryType) -> Result<()> {
     params(
         ("repository_key" = Option<String>, Query),
         ("status" = Option<String>, Query),
+        ("gate" = Option<String>, Query),
+        ("justified_only" = Option<bool>, Query),
         ("page" = Option<u32>, Query),
         ("per_page" = Option<u32>, Query),
     ),
@@ -505,12 +756,69 @@ pub async fn list_reviews(
     Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ReviewListQuery>,
 ) -> Result<Json<AgeGateReviewListResponse>> {
-    // Belt-and-suspenders with the `/admin` `admin_middleware`: gate in-handler
-    // too, for parity with approve/reject and the codebase's double-guard posture.
-    auth.require_admin()?;
+    // Belt-and-suspenders with the `/admin` `admin_middleware` on this mount,
+    // and load-bearing on the `/exceptions` mount, which sits under plain
+    // `auth_middleware`: there this call is the ONLY thing standing between an
+    // authenticated non-reviewer and the queue.
+    require_security_review(&state.db, &auth).await?;
     // Instance-wide queue: the optional `repository_key` filter is a
     // convenience, not an authorization boundary.
-    list_reviews_scoped(&state, query.repository_key.as_deref(), &query).await
+    let gates = resolve_gates(query.gate.as_deref(), DefaultGates::AgeOnly);
+    list_reviews_scoped(&state, query.repository_key.as_deref(), gates, None, &query).await
+}
+
+/// The `/exceptions` sibling of [`list_reviews`]: an omitted `gate` means every gate, not just `age`
+#[utoipa::path(
+    get,
+    path = "/reviews",
+    context_path = "/api/v1/exceptions",
+    tag = "age-gate",
+    security(("bearer_auth" = [])),
+    params(
+        ("repository_key" = Option<String>, Query),
+        ("status" = Option<String>, Query),
+        ("gate" = Option<String>, Query),
+        ("justified_only" = Option<bool>, Query),
+        ("page" = Option<u32>, Query),
+        ("per_page" = Option<u32>, Query),
+    ),
+    responses((status = 200, body = AgeGateReviewListResponse))
+)]
+pub async fn list_exceptions(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Query(query): Query<ReviewListQuery>,
+) -> Result<Json<AgeGateReviewListResponse>> {
+    require_security_review(&state.db, &auth).await?;
+    let gates = resolve_gates(query.gate.as_deref(), DefaultGates::All);
+    list_reviews_scoped(&state, query.repository_key.as_deref(), gates, None, &query).await
+}
+
+/// What an omitted `gate` parameter means, which differs per mount.
+///
+/// The legacy `/admin/age-gate/reviews` page sends no `gate` and renders an
+/// age-specific view (publish dates, "min N days"). Letting an omitted
+/// parameter mean "every gate" there would put scan and curation rows into a
+/// queue titled Age Gate the moment those gates start blocking, an existing
+/// page changing behaviour because a different feature shipped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DefaultGates {
+    AgeOnly,
+    All,
+}
+
+/// Resolve the effective gate filter. An explicit `gate` always wins; only
+/// what an OMITTED one means differs per mount. `None` means every gate.
+fn resolve_gates(explicit: Option<&str>, default_gates: DefaultGates) -> Option<Vec<String>> {
+    if let Some(parsed) = explicit.and_then(parse_status_filter) {
+        return Some(parsed);
+    }
+    match default_gates {
+        DefaultGates::AgeOnly => {
+            Some(vec![crate::services::age_gate_service::GATE_AGE.to_string()])
+        }
+        DefaultGates::All => None,
+    }
 }
 
 #[utoipa::path(
@@ -526,8 +834,8 @@ pub async fn get_review(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<AgeGateReviewResponse>> {
-    // Belt-and-suspenders with the `/admin` `admin_middleware` (see list_reviews).
-    auth.require_admin()?;
+    // Load-bearing under the `/exceptions` mount (see `list_reviews`).
+    require_security_review(&state.db, &auth).await?;
     let svc = age_gate_service(&state)?;
     let review = svc.get_review_by_id(id).await?;
     Ok(Json(review_to_response(review)))
@@ -539,22 +847,23 @@ pub async fn get_review(
     context_path = "/api/v1/admin",
     tag = "age-gate",
     security(("bearer_auth" = [])),
-    request_body = ReviewActionRequest,
+    request_body = ApproveReviewRequest,
     responses((status = 200, body = AgeGateReviewResponse))
 )]
 pub async fn approve_review(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
-    Json(body): Json<ReviewActionRequest>,
+    Json(body): Json<ApproveReviewRequest>,
 ) -> Result<Json<AgeGateReviewResponse>> {
-    auth.require_admin()?;
+    require_security_review(&state.db, &auth).await?;
     apply_review_decision(
         &state,
         &auth,
         id,
         ReviewDecision::Approve,
         body.reason.as_deref(),
+        (body.expires_in_days, body.never_expires),
         None,
     )
     .await
@@ -575,13 +884,14 @@ pub async fn reject_review(
     Path(id): Path<Uuid>,
     Json(body): Json<ReviewActionRequest>,
 ) -> Result<Json<AgeGateReviewResponse>> {
-    auth.require_admin()?;
+    require_security_review(&state.db, &auth).await?;
     apply_review_decision(
         &state,
         &auth,
         id,
         ReviewDecision::Reject,
         body.reason.as_deref(),
+        (None, false),
         None,
     )
     .await
@@ -602,16 +912,244 @@ pub async fn reopen_review(
     Path(id): Path<Uuid>,
     Json(body): Json<ReviewActionRequest>,
 ) -> Result<Json<AgeGateReviewResponse>> {
-    auth.require_admin()?;
+    require_security_review(&state.db, &auth).await?;
     apply_review_decision(
         &state,
         &auth,
         id,
         ReviewDecision::Reopen,
         body.reason.as_deref(),
+        (None, false),
         None,
     )
     .await
+}
+
+#[utoipa::path(
+    get,
+    path = "/reviews/{id}",
+    context_path = "/api/v1/exceptions",
+    tag = "age-gate",
+    security(("bearer_auth" = [])),
+    responses((status = 200, body = AgeGateReviewResponse))
+)]
+pub async fn get_exception(
+    state: State<SharedState>,
+    auth: Extension<AuthExtension>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<AgeGateReviewResponse>> {
+    get_review(state, auth, Path(id)).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/reviews/{id}/approve",
+    context_path = "/api/v1/exceptions",
+    tag = "age-gate",
+    security(("bearer_auth" = [])),
+    request_body = ApproveReviewRequest,
+    responses(
+        (status = 200, body = AgeGateReviewResponse),
+        (status = 400, description = "A scan or curation grant without a reason, or an invalid expiry"),
+        (status = 403, description = "No security_review capability, a narrowed token, or the caller requested this exception"),
+        (status = 409, description = "A scan exception with no refused download recorded yet, so no digest to bind"),
+    )
+)]
+pub async fn approve_exception(
+    state: State<SharedState>,
+    auth: Extension<AuthExtension>,
+    Path(id): Path<Uuid>,
+    body: Json<ApproveReviewRequest>,
+) -> Result<Json<AgeGateReviewResponse>> {
+    approve_review(state, auth, Path(id), body).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/reviews/{id}/reject",
+    context_path = "/api/v1/exceptions",
+    tag = "age-gate",
+    security(("bearer_auth" = [])),
+    request_body = ReviewActionRequest,
+    responses((status = 200, body = AgeGateReviewResponse))
+)]
+pub async fn reject_exception(
+    state: State<SharedState>,
+    auth: Extension<AuthExtension>,
+    Path(id): Path<Uuid>,
+    body: Json<ReviewActionRequest>,
+) -> Result<Json<AgeGateReviewResponse>> {
+    reject_review(state, auth, Path(id), body).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/reviews/{id}/reopen",
+    context_path = "/api/v1/exceptions",
+    tag = "age-gate",
+    security(("bearer_auth" = [])),
+    request_body = ReviewActionRequest,
+    responses((status = 200, body = AgeGateReviewResponse))
+)]
+pub async fn reopen_exception(
+    state: State<SharedState>,
+    auth: Extension<AuthExtension>,
+    Path(id): Path<Uuid>,
+    body: Json<ReviewActionRequest>,
+) -> Result<Json<AgeGateReviewResponse>> {
+    reopen_review(state, auth, Path(id), body).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/requests",
+    context_path = "/api/v1/exceptions",
+    tag = "age-gate",
+    security(("bearer_auth" = [])),
+    request_body = CreateExceptionRequest,
+    responses(
+        (status = 200, body = AgeGateReviewResponse),
+        (status = 400, description = "Unknown gate, or a missing or oversized field"),
+        (status = 404, description = "Repository not found or not visible to the caller"),
+        (status = 409, description = "The caller already has the maximum number of open requests"),
+    )
+)]
+pub async fn request_exception(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Json(body): Json<CreateExceptionRequest>,
+) -> Result<Json<AgeGateReviewResponse>> {
+    use crate::services::exception_queue;
+
+    // Any authenticated user may ask. The guards below are what keep that from
+    // being an unbounded row-insert primitive:
+    //   * the repository must be VISIBLE to the caller, so this cannot be used
+    //     to enumerate private repositories or file against them;
+    //   * the gate name must be real, or the row would sit in a queue no seam
+    //     ever consults;
+    //   * the coordinate and justification are length-bounded.
+    let gate = crate::services::age_gate_service::parse_gate(&body.gate)?;
+    let version = body.package_version.as_deref().unwrap_or("*");
+    exception_queue::validate_request(&body.package_name, version, &body.justification)?;
+
+    let repo = RepoSvc::new(state.db.clone())
+        .get_by_key(&body.repository_key)
+        .await?;
+    crate::api::handlers::repositories::require_repo_id_visible(
+        &state.db,
+        &auth,
+        repo.id,
+        "Repository not found",
+    )
+    .await?;
+
+    let coord = exception_queue::ExceptionCoord {
+        gate,
+        repository_id: repo.id,
+        package_name: body.package_name.trim().to_string(),
+        package_version: version.trim().to_string(),
+        // A requester never supplies a digest: on the scan gate the binding is
+        // evidence recorded by the seam when it refused specific bytes, not
+        // something the person asking gets to choose.
+        digest: None,
+    };
+
+    exception_queue::require_open_request_budget(&state.db, auth.user_id, &coord).await?;
+
+    let id = exception_queue::file_request(
+        &state.db,
+        Some(&state.event_bus),
+        &coord,
+        auth.user_id,
+        &body.justification,
+    )
+    .await?;
+
+    let svc = age_gate_service(&state)?;
+    let review = svc.get_review_by_id(id).await?;
+
+    let audit = AuditService::new(state.db.clone());
+    let _ = audit
+        .log(
+            AuditEntry::new(AuditAction::ExceptionRequested, ResourceType::Repository)
+                .user(auth.user_id)
+                .resource(repo.id)
+                .details(serde_json::json!({
+                    "review_id": id,
+                    "gate": gate,
+                    "package": coord.package_name,
+                    "version": coord.package_version,
+                    // The row keeps only the latest requester's reason, so the audit keeps each one
+                    "justification": body.justification.trim(),
+                })),
+        )
+        .await;
+
+    Ok(Json(review_to_response(review)))
+}
+
+/// The caller's own exception requests, for any authenticated user. A row
+/// shows here while the caller holds its request: a later requester takes it
+/// over, unless it was already granted
+#[utoipa::path(
+    get,
+    path = "/requests",
+    context_path = "/api/v1/exceptions",
+    tag = "age-gate",
+    security(("bearer_auth" = [])),
+    params(
+        ("repository_key" = Option<String>, Query),
+        ("status" = Option<String>, Query),
+        ("gate" = Option<String>, Query),
+        ("page" = Option<u32>, Query),
+        ("per_page" = Option<u32>, Query),
+    ),
+    responses((status = 200, body = AgeGateReviewListResponse))
+)]
+pub async fn list_my_requests(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Query(query): Query<ReviewListQuery>,
+) -> Result<Json<AgeGateReviewListResponse>> {
+    let gates = resolve_gates(query.gate.as_deref(), DefaultGates::All);
+    list_reviews_scoped(
+        &state,
+        query.repository_key.as_deref(),
+        gates,
+        Some(&auth),
+        &query,
+    )
+    .await
+}
+
+/// One of the caller's own requests. Anything else is a 404, so this cannot
+/// probe which review ids exist
+#[utoipa::path(
+    get,
+    path = "/requests/{id}",
+    context_path = "/api/v1/exceptions",
+    tag = "age-gate",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = AgeGateReviewResponse),
+        (status = 404, description = "No request with this id is held by the caller"),
+    )
+)]
+pub async fn get_my_request(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<AgeGateReviewResponse>> {
+    let svc = age_gate_service(&state)?;
+    let review = svc.get_review_by_id(id).await?;
+    if review.requested_by != Some(auth.user_id)
+        || !auth.allowed_repo_ids.grants(review.repository_id)
+    {
+        return Err(AppError::NotFound(
+            "Exception request not found".to_string(),
+        ));
+    }
+    Ok(Json(review_to_response(review)))
 }
 
 #[utoipa::path(
@@ -820,7 +1358,9 @@ pub async fn list_repo_reviews(
     // The filter comes from the authorized path segment. Any `repository_key`
     // in the query string is ignored rather than honoured, so this route cannot
     // be widened to a repository the caller does not administer.
-    list_reviews_scoped(&state, Some(&key), &query).await
+    // Same for `gate`: this queue is the repository's age gate only.
+    let gates = Some(vec![crate::services::age_gate_service::GATE_AGE.to_string()]);
+    list_reviews_scoped(&state, Some(&key), gates, None, &query).await
 }
 
 #[utoipa::path(
@@ -863,7 +1403,7 @@ pub async fn get_repo_review(
         ("id" = Uuid, Path, description = "Review id"),
         ("decision" = ReviewDecision, Path, description = "`approve`, `reject` or `reopen`"),
     ),
-    request_body = ReviewActionRequest,
+    request_body = ApproveReviewRequest,
     responses(
         (status = 200, body = AgeGateReviewResponse),
         (status = 400, description = "Unknown decision"),
@@ -876,11 +1416,13 @@ pub async fn get_repo_review(
 /// One route rather than three: the decisions differ only in which
 /// `ReviewDecision` they apply, and the typed path segment keeps the URLs
 /// identical to the instance-admin routes (`.../{id}/approve` and so on).
+/// The body is the approve body; its expiry fields are refused on the other
+/// two decisions.
 pub async fn decide_repo_review(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, id, decision)): Path<(String, Uuid, ReviewDecision)>,
-    Json(body): Json<ReviewActionRequest>,
+    Json(body): Json<ApproveReviewRequest>,
 ) -> Result<Json<AgeGateReviewResponse>> {
     let auth = require_auth(auth)?;
     auth.require_scope("write:repositories")?;
@@ -891,6 +1433,7 @@ pub async fn decide_repo_review(
         id,
         decision,
         body.reason.as_deref(),
+        (body.expires_in_days, body.never_expires),
         Some(repo.id),
     )
     .await
@@ -900,10 +1443,18 @@ pub async fn decide_repo_review(
 #[openapi(
     paths(
         list_reviews,
+        list_exceptions,
+        get_exception,
+        approve_exception,
+        reject_exception,
+        reopen_exception,
         get_review,
         approve_review,
         reject_review,
         reopen_review,
+        request_exception,
+        list_my_requests,
+        get_my_request,
         get_repo_age_gate,
         update_repo_age_gate,
         list_repo_reviews,
@@ -914,6 +1465,8 @@ pub async fn decide_repo_review(
         AgeGateReviewResponse,
         AgeGateReviewListResponse,
         ReviewActionRequest,
+        ApproveReviewRequest,
+        CreateExceptionRequest,
         AgeGateConfigResponse,
         UpdateAgeGateConfigRequest,
         ReviewListQuery,
@@ -1048,7 +1601,179 @@ mod tests {
             reviewed_by_username: None,
             reviewed_by_is_service_account: None,
             instance_locked: false,
+            gate: Some("age".to_string()),
+            justification: None,
+            requested_by: None,
+            requested_by_username: None,
+            expires_at: None,
+            basis_digest: None,
         }
+    }
+
+    #[test]
+    fn both_mounts_build_without_a_route_collision() {
+        // a duplicate path+method panics at router construction, so this is a startup check
+        let _admin = admin_router();
+        let _exceptions = exceptions_router();
+    }
+
+    #[test]
+    fn each_mount_keeps_its_own_gate_default() {
+        // The legacy Age Gate page sends no `gate` and renders an age-specific
+        // view. If an omitted value meant "every gate" there, scan and
+        // curation rows would appear in it the moment those gates start
+        // blocking: an existing page changing because a different feature
+        // shipped.
+        assert_eq!(
+            resolve_gates(None, DefaultGates::AgeOnly).as_deref(),
+            Some(&["age".to_string()][..])
+        );
+        assert_eq!(
+            resolve_gates(None, DefaultGates::All),
+            None,
+            "the unified queue defaults to every gate"
+        );
+        // An explicit value wins on either mount, so the age-gate page can
+        // still ask for something else and the queue can narrow.
+        assert_eq!(
+            resolve_gates(Some("scan,curation"), DefaultGates::AgeOnly).as_deref(),
+            Some(&["scan".to_string(), "curation".to_string()][..])
+        );
+        // A blank or comma-only value is not an explicit choice.
+        assert_eq!(
+            resolve_gates(Some(" , "), DefaultGates::AgeOnly).as_deref(),
+            Some(&["age".to_string()][..])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_narrowed_token_never_wields_security_review() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::lazy_pool();
+        let mut auth = tdh::make_auth(Uuid::new_v4(), "reviewer");
+        auth.scopes = Some(vec!["read:artifacts".to_string()]);
+        assert!(matches!(
+            require_security_review(&pool, &auth).await,
+            Err(AppError::Authorization(_))
+        ));
+        auth.scopes = None;
+        auth.allowed_repo_ids =
+            crate::models::access_scope::AccessScope::Restricted(vec![Uuid::new_v4()]);
+        assert!(matches!(
+            require_security_review(&pool, &auth).await,
+            Err(AppError::Authorization(_))
+        ));
+    }
+
+    /// The queue spans every repository, so a repo-restricted admin token is refused too
+    #[tokio::test]
+    async fn a_repo_restricted_admin_token_cannot_reach_the_queue() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::lazy_pool();
+        let mut auth = tdh::make_auth(Uuid::new_v4(), "admin");
+        auth.is_admin = true;
+        assert!(require_security_review(&pool, &auth).await.is_ok());
+        auth.allowed_repo_ids =
+            crate::models::access_scope::AccessScope::Restricted(vec![Uuid::new_v4()]);
+        assert!(matches!(
+            require_security_review(&pool, &auth).await,
+            Err(AppError::Authorization(_))
+        ));
+    }
+
+    #[test]
+    fn a_requester_never_grants_their_own_exception() {
+        let me = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        assert!(require_not_own_request(Some(me), me, false).is_err());
+        assert!(require_not_own_request(Some(other), me, false).is_ok());
+        assert!(require_not_own_request(None, me, false).is_ok());
+        // The age gate keeps its contract: an admin could always approve any age row
+        assert!(require_not_own_request(Some(me), me, true).is_ok());
+    }
+
+    #[test]
+    fn resolve_expiry_defaults_to_ninety_days() {
+        let now = Utc::now();
+        let at = resolve_expiry(None, false, now).expect("default is valid");
+        assert_eq!(
+            at,
+            Some(now + chrono::Duration::days(i64::from(DEFAULT_EXPIRY_DAYS)))
+        );
+    }
+
+    #[test]
+    fn resolve_expiry_honours_explicit_window_and_never() {
+        let now = Utc::now();
+        assert_eq!(
+            resolve_expiry(Some(7), false, now).expect("7 days is valid"),
+            Some(now + chrono::Duration::days(7))
+        );
+        assert_eq!(
+            resolve_expiry(None, true, now).expect("never is valid"),
+            None,
+            "never_expires means no instant at all, not a far-future one"
+        );
+    }
+
+    #[test]
+    fn a_grant_requires_a_non_blank_reason() {
+        assert!(require_grant_reason(None).is_err());
+        assert!(require_grant_reason(Some("")).is_err());
+        assert!(require_grant_reason(Some("   ")).is_err());
+        // Trimmed on the way through, so the audit row never stores padding.
+        assert_eq!(
+            require_grant_reason(Some("  vendor confirmed the release  ")).unwrap(),
+            "vendor confirmed the release"
+        );
+    }
+
+    #[test]
+    fn resolve_expiry_rejects_contradictions_and_out_of_range() {
+        let now = Utc::now();
+        // Saying both is ambiguous, so it is refused rather than one silently
+        // winning.
+        assert!(resolve_expiry(Some(30), true, now).is_err());
+        assert!(resolve_expiry(Some(0), false, now).is_err());
+        assert!(resolve_expiry(Some(3651), false, now).is_err());
+        assert!(resolve_expiry(Some(3650), false, now).is_ok());
+    }
+
+    #[test]
+    fn review_to_response_derives_origin_from_justification() {
+        let attempted = review_to_response(sample_review("react", "18.0.0", "pending"));
+        assert_eq!(
+            attempted.origin, "attempted",
+            "a row nobody justified is demand signal, not a request"
+        );
+
+        let mut justified = sample_review("react", "18.0.0", "pending");
+        justified.justification = Some("needed for the build".to_string());
+        let requested = review_to_response(justified);
+        assert_eq!(requested.origin, "requested");
+        assert_eq!(
+            requested.justification.as_deref(),
+            Some("needed for the build")
+        );
+    }
+
+    #[test]
+    fn build_review_audit_details_records_the_acceptance_window() {
+        let mut review = sample_review("react", "18.0.0", "approved");
+        let until = Utc::now();
+        review.expires_at = Some(until);
+        review.gate = Some("scan".to_string());
+        let details = build_review_audit_details(&review, Some("accepted"));
+        assert_eq!(details["expires_at"], serde_json::json!(until));
+        assert_eq!(
+            details["gate"], "scan",
+            "an auditor tells a scan exception from an age approval"
+        );
+
+        // Permanent acceptance is recorded as an explicit null, so the audit
+        // record distinguishes "forever" from "field not written".
+        let permanent = sample_review("react", "18.0.0", "approved");
+        assert!(build_review_audit_details(&permanent, None)["expires_at"].is_null());
     }
 
     #[test]
@@ -1731,6 +2456,271 @@ mod tests {
             );
         }
         assert_eq!(review_status(&pool, review_id).await, "pending");
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    /// The repository-scoped queue is the repository's AGE gate. A scan or
+    /// curation exception in the same table is a security reviewer's call, so
+    /// a repository admin can neither list, read nor decide one.
+    #[tokio::test]
+    async fn a_repo_admin_cannot_reach_another_gates_exception_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        tdh::grant_repo_admin(&pool, repo_id, user_id).await;
+        let scan_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO age_gate_reviews \
+             (gate, repository_id, package_name, package_version, status) \
+             VALUES ('scan', $1, 'left-pad', '1.0.0', 'pending') RETURNING id",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed scan exception");
+        let state = gated_state(pool.clone(), &dir);
+        let caller = tdh::make_auth(user_id, &username);
+
+        let (status, body) = tdh::send(
+            review_app(state.clone(), caller.clone()),
+            tdh::get(format!("/{key}/age-gate/reviews?gate=scan")),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["pagination"]["total"], 0, "`gate` must not widen it");
+
+        let (status, _) = tdh::send(
+            review_app(state.clone(), caller.clone()),
+            tdh::get(format!("/{key}/age-gate/reviews/{scan_id}")),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+
+        let (status, _) = tdh::send(
+            review_app(state.clone(), caller),
+            decide(&key, scan_id, "approve"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(review_status(&pool, scan_id).await, "pending");
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    /// `/exceptions` sits behind plain auth, so the in-handler capability check is the only gate
+    #[tokio::test]
+    async fn the_exceptions_mount_needs_security_review_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let scan_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO age_gate_reviews \
+             (gate, repository_id, package_name, package_version, status, basis_digest) \
+             VALUES ('scan', $1, 'left-pad', '1.0.0', 'pending', 'sha256:aaa') RETURNING id",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed scan exception");
+        let state = gated_state(pool.clone(), &dir);
+        let caller = tdh::make_auth(user_id, &username);
+        let app = || tdh::router_with_auth_ext(exceptions_router(), state.clone(), caller.clone());
+        let body = || bytes::Bytes::from_static(br#"{"reason":"decided in a test"}"#);
+
+        for req in [
+            tdh::get(format!("/reviews?repository_key={key}")),
+            tdh::get(format!("/reviews/{scan_id}")),
+            tdh::post(
+                format!("/reviews/{scan_id}/approve"),
+                "application/json",
+                body(),
+            ),
+            tdh::post(
+                format!("/reviews/{scan_id}/reject"),
+                "application/json",
+                body(),
+            ),
+            tdh::post(
+                format!("/reviews/{scan_id}/reopen"),
+                "application/json",
+                body(),
+            ),
+        ] {
+            let (status, _) = tdh::send(app(), req).await;
+            assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        }
+        assert_eq!(review_status(&pool, scan_id).await, "pending");
+
+        sqlx::query(
+            "INSERT INTO user_global_roles (user_id, role_id) \
+             SELECT $1, id FROM roles WHERE name = 'security-reviewer'",
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("grant security-reviewer");
+
+        let (status, list) =
+            tdh::send(app(), tdh::get(format!("/reviews?repository_key={key}"))).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let list: serde_json::Value = serde_json::from_slice(&list).unwrap();
+        assert_eq!(
+            list["pagination"]["total"], 1,
+            "an omitted gate lists every gate here"
+        );
+        assert_eq!(list["items"][0]["gate"], "scan");
+
+        // Separation of duties: the reviewer who asked for it cannot grant it
+        sqlx::query(
+            "UPDATE age_gate_reviews SET requested_by = $2, justification = 'mine' WHERE id = $1",
+        )
+        .bind(scan_id)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("file as the reviewer");
+        let (status, _) = tdh::send(
+            app(),
+            tdh::post(
+                format!("/reviews/{scan_id}/approve"),
+                "application/json",
+                body(),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(review_status(&pool, scan_id).await, "pending");
+        sqlx::query("UPDATE age_gate_reviews SET requested_by = NULL WHERE id = $1")
+            .bind(scan_id)
+            .execute(&pool)
+            .await
+            .expect("clear requester");
+
+        let (status, _) = tdh::send(
+            app(),
+            tdh::post(
+                format!("/reviews/{scan_id}/approve"),
+                "application/json",
+                body(),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(review_status(&pool, scan_id).await, "approved");
+
+        let _ = sqlx::query("DELETE FROM role_assignments WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    /// A requester who is not a reviewer sees their own requests and nothing else
+    #[tokio::test]
+    async fn a_requester_reads_only_their_own_requests_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (other_id, _) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let seed = |package: &'static str, requester: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO age_gate_reviews \
+                     (gate, repository_id, package_name, package_version, status, \
+                      justification, requested_by) \
+                     VALUES ('curation', $1, $2, '*', 'pending', 'needed', $3) RETURNING id",
+                )
+                .bind(repo_id)
+                .bind(package)
+                .bind(requester)
+                .fetch_one(&pool)
+                .await
+                .expect("seed request")
+            }
+        };
+        let mine = seed("left-pad", user_id).await;
+        let theirs = seed("right-pad", other_id).await;
+        let state = gated_state(pool.clone(), &dir);
+        let caller = tdh::make_auth(user_id, &username);
+        let app = || tdh::router_with_auth_ext(exceptions_router(), state.clone(), caller.clone());
+
+        let (status, list) =
+            tdh::send(app(), tdh::get(format!("/requests?repository_key={key}"))).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let list: serde_json::Value = serde_json::from_slice(&list).unwrap();
+        assert_eq!(list["pagination"]["total"], 1);
+        assert_eq!(list["items"][0]["id"], mine.to_string());
+        assert_eq!(list["items"][0]["status"], "pending");
+
+        let (status, _) = tdh::send(app(), tdh::get(format!("/requests/{mine}"))).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let (status, _) = tdh::send(app(), tdh::get(format!("/requests/{theirs}"))).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        // The reviewer queue itself stays closed to them
+        let (status, _) = tdh::send(app(), tdh::get(format!("/reviews/{mine}"))).await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        tdh::cleanup_user(&pool, user_id).await;
+        tdh::cleanup_user(&pool, other_id).await;
+    }
+
+    /// A scan request filed before any refusal has no digest to bind, so it
+    /// cannot be granted until the gate records one
+    #[tokio::test]
+    async fn a_scan_request_without_a_digest_cannot_be_granted_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO age_gate_reviews \
+             (gate, repository_id, package_name, package_version, status, justification) \
+             VALUES ('scan', $1, 'left-pad', '1.0.0', 'pending', 'needed') RETURNING id",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed scan request");
+        let state = gated_state(pool.clone(), &dir);
+        let caller = AuthExtension {
+            user_id,
+            username,
+            ..auth(true)
+        };
+        let app = || tdh::router_with_auth_ext(exceptions_router(), state.clone(), caller.clone());
+        let approve = || {
+            tdh::post(
+                format!("/reviews/{id}/approve"),
+                "application/json",
+                bytes::Bytes::from_static(br#"{"reason":"decided in a test"}"#),
+            )
+        };
+
+        let (status, _) = tdh::send(app(), approve()).await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(review_status(&pool, id).await, "pending");
+
+        sqlx::query("UPDATE age_gate_reviews SET basis_digest = 'sha256:aaa' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("a refusal recorded the digest");
+        let (status, _) = tdh::send(app(), approve()).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(review_status(&pool, id).await, "approved");
 
         tdh::cleanup(&pool, repo_id, user_id).await;
         tdh::cleanup_user(&pool, user_id).await;

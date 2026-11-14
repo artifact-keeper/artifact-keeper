@@ -322,6 +322,69 @@ pub(crate) struct ReviewPolicyView {
     /// basis, threshold, and upstream on every decision.
     pub is_automatic: bool,
     pub identity: ReviewIdentityMatch,
+    /// `expires_at` is set and already in the past (migration 381). Resolved
+    /// by the caller against one `now` so this stays a pure view and the whole
+    /// decision remains testable without a clock.
+    ///
+    /// An expired approval is treated exactly like a stale one: it does not
+    /// allow, and the row is voided back to `pending` so the package is
+    /// re-reviewed rather than silently re-served.
+    pub expired: bool,
+}
+
+/// The queue's gate values (migration 381). `age` is the default so a row
+/// written before the column existed, or read through a `SELECT` that omits
+/// it, still behaves as the age gate it was.
+pub const GATE_AGE: &str = "age";
+pub const GATE_SCAN: &str = "scan";
+pub const GATE_CURATION: &str = "curation";
+
+/// Parse a client-supplied gate name. Unknown values are a client error,
+/// never a silent fallback: filing against a gate that does not exist would
+/// create a row no seam will ever consult.
+pub fn parse_gate(value: &str) -> Result<&'static str> {
+    match value {
+        GATE_AGE => Ok(GATE_AGE),
+        GATE_SCAN => Ok(GATE_SCAN),
+        GATE_CURATION => Ok(GATE_CURATION),
+        other => Err(AppError::Validation(format!(
+            "Unknown gate '{other}': expected '{GATE_AGE}', '{GATE_SCAN}' or '{GATE_CURATION}'"
+        ))),
+    }
+}
+
+/// Is this row the age gate's? `None` means the column was not selected, which
+/// only happens on pre-381 reads, and those rows are all age rows.
+pub(crate) fn is_age_gate(gate: Option<&str>) -> bool {
+    gate.unwrap_or(GATE_AGE) == GATE_AGE
+}
+
+/// Event name for a queue transition, per gate.
+///
+/// The four `age_gate.*` names are kept verbatim for the age gate because
+/// `webhook_producer.rs` already maps them and operators have subscriptions
+/// pointed at them; renaming would silently stop delivering. The other gates
+/// get their own namespace rather than masquerading as age events.
+/// `age_event` is the FULL age-gate event name, spelled as a literal at every
+/// call site on purpose: `webhook_producer`'s producer inventory scans source
+/// for the first string literal after an `emit_*` call, so a name assembled
+/// here from a bare action would hide the producer and trip that gate (#3985).
+pub(crate) fn gate_event(gate: Option<&str>, age_event: &str) -> String {
+    if is_age_gate(gate) {
+        return age_event.to_string();
+    }
+    let action = age_event.rsplit('.').next().unwrap_or(age_event);
+    format!("exception.{}.{}", gate.unwrap_or(GATE_AGE), action)
+}
+
+/// Has a granted exception lapsed as of `now`?
+///
+/// `None` means never expires, which is a deliberate (and deliberately
+/// visible) choice a reviewer makes, not an absence of policy. Expiry is
+/// evaluated on every read rather than swept, so an exception lapses on time
+/// without depending on a background job having run.
+pub(crate) fn exception_expired(expires_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    expires_at.is_some_and(|at| at <= now)
 }
 
 /// Compare a review row's recorded basis identity against the current policy.
@@ -372,10 +435,16 @@ pub(crate) enum AgeGateCheckAction {
 ///   status (a pending row is retired to `approved` on the way through);
 /// * below the threshold, only a *manual* approval whose identity matches the
 ///   current policy (or a pre-identity legacy manual approval) still allows;
-/// * a manual approval under a different identity, or any automatic
-///   approval that no longer holds (raised threshold, switched mode,
-///   repointed upstream, legacy row), is voided back to pending and blocks;
+/// * a manual approval under a different identity, an EXPIRED manual approval
+///   (migration 381), or any automatic approval that no longer holds (raised
+///   threshold, switched mode, repointed upstream, legacy row), is voided back
+///   to pending and blocks;
 /// * anything else blocks and records/bumps the pending review.
+///
+/// Note the threshold test runs BEFORE the approval arms, which is what makes
+/// expiry safe: a package that has since aged past its repository's threshold
+/// is allowed on that basis alone, so a lapsed exception can never re-block
+/// something the gate no longer has any reason to withhold.
 pub(crate) fn decide_age_gate_check(
     existing: Option<&ReviewPolicyView>,
     meets_threshold: bool,
@@ -393,7 +462,10 @@ pub(crate) fn decide_age_gate_check(
     }
     match existing {
         Some(review) if review.status == AgeGateReviewStatus::Approved.as_str() => {
-            if !review.is_automatic && review.identity != ReviewIdentityMatch::Differs {
+            if !review.is_automatic
+                && review.identity != ReviewIdentityMatch::Differs
+                && !review.expired
+            {
                 AgeGateCheckAction::AllowAlreadyApproved
             } else {
                 AgeGateCheckAction::BlockAndResetReview
@@ -476,6 +548,11 @@ pub(crate) struct PackageReviewRow {
     pub is_automatic: bool,
     pub basis_mode: Option<String>,
     pub basis_upstream_fingerprint: Option<String>,
+    /// When a granted exception lapses; `None` = never. Carried here so the
+    /// listing filter applies the SAME expiry rule as the download gate,
+    /// these two classifiers must agree or a version is served on download
+    /// but hidden from the index (or the reverse).
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// Classify every version in a metadata document without I/O. Used by
@@ -519,6 +596,7 @@ pub(crate) fn classify_versions_for_metadata_listing(
                     current_mode,
                     current_fingerprint,
                 ) != ReviewIdentityMatch::Differs
+                && !exception_expired(review.expires_at, now)
             {
                 continue;
             }
@@ -617,6 +695,30 @@ pub struct AgeGateReview {
     /// it. See [`require_may_relax_review`].
     #[sqlx(default)]
     pub instance_locked: bool,
+    /// Which withhold gate filed this row: `age` | `scan` | `curation`
+    /// (migration 381).
+    #[sqlx(default)]
+    pub gate: Option<String>,
+    /// A human's stated reason for wanting this package. `None` means nobody
+    /// asked: the row exists only because a pull was refused, so it is demand
+    /// signal, not a request. This is the sole `requested` vs `attempted`
+    /// discriminator.
+    #[sqlx(default)]
+    pub justification: Option<String>,
+    /// Who filed the justification. `None` on auto-filed rows.
+    #[sqlx(default)]
+    pub requested_by: Option<Uuid>,
+    /// The requester's username, so a reviewer who is not an admin (and so
+    /// cannot look users up) can see who asked. `None` when unknown.
+    #[sqlx(default)]
+    pub requested_by_username: Option<String>,
+    /// When an approval stops being honored. `None` = never expires.
+    /// Evaluated at READ time, so an exception lapses without a sweep.
+    #[sqlx(default)]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Scan gate only: the content digest the acceptance was granted against.
+    #[sqlx(default)]
+    pub basis_digest: Option<String>,
 }
 
 /// Which tier of administrator is acting on the age gate (#4238).
@@ -721,6 +823,20 @@ fn invalidate_decision_memos(repository_id: Uuid) {
     crate::api::handlers::vscode::invalidate_gallery_age_gate_memo(repository_id);
 }
 
+/// Which queue rows [`AgeGateService::list_reviews`] returns. Every `None`
+/// (and `justified_only: false`) means no filter on that field.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReviewFilter<'a> {
+    pub gates: Option<&'a [String]>,
+    pub repository_key: Option<&'a str>,
+    pub statuses: Option<&'a [String]>,
+    pub justified_only: bool,
+    /// Only rows this user currently holds the request on
+    pub requested_by: Option<Uuid>,
+    /// Only rows in these repositories (a repository-restricted token's ceiling)
+    pub repository_ids: Option<&'a [Uuid]>,
+}
+
 pub struct AgeGateService {
     db: PgPool,
     event_bus: Arc<EventBus>,
@@ -738,6 +854,13 @@ impl AgeGateService {
 
     pub fn metadata_cache(&self) -> &UpstreamMetadataCache {
         &self.metadata_cache
+    }
+
+    /// The pool this service holds, so the enforcement seam can resolve the
+    /// exception-request link without being handed a second `&PgPool` it
+    /// already has access to through here.
+    pub fn db(&self) -> &PgPool {
+        &self.db
     }
 
     /// Whether an operator has asked for gating on this repository at
@@ -870,6 +993,7 @@ impl AgeGateService {
                 repo.age_gate_mode,
                 &current_fingerprint,
             ),
+            expired: exception_expired(r.expires_at, now),
         });
         let meets_threshold =
             Self::meets_age_threshold(published_at, repo.age_gate_min_age_days, now);
@@ -1313,28 +1437,55 @@ impl AgeGateService {
         Ok(classification.blocked)
     }
 
+    /// List package-exception queue rows.
+    ///
+    /// `gates` filters which withhold gates to include; `None` means ALL of
+    /// them, which is what the unified reviewer queue wants. The age-gate admin
+    /// endpoint passes `["age"]` so its contract is unchanged by migration 381
+    /// making the table multi-gate.
+    ///
+    /// `justified_only` selects the reviewer's DEFAULT view: rows a human
+    /// actually filed a justification for. `false` widens it to every refused
+    /// pull the gates auto-filed (`justification IS NULL`), which is demand
+    /// signal rather than a request queue.
     pub async fn list_reviews(
         &self,
-        repository_key: Option<&str>,
-        statuses: Option<&[String]>,
+        filter: &ReviewFilter<'_>,
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<AgeGateReview>, i64)> {
-        let total: i64 = sqlx::query_scalar!(
+        let ReviewFilter {
+            gates,
+            repository_key,
+            statuses,
+            justified_only,
+            requested_by,
+            repository_ids,
+        } = *filter;
+        // Non-macro (was `query_scalar!`) so adding the gate/justification
+        // filters needs no `.sqlx` offline-metadata regeneration.
+        let total: i64 = sqlx::query_scalar::<_, i64>(
             r#"
             SELECT COUNT(*)::bigint
             FROM age_gate_reviews r
             INNER JOIN repositories repo ON repo.id = r.repository_id
-            WHERE ($1::text IS NULL OR repo.key = $1)
-              AND ($2::text[] IS NULL OR r.status = ANY($2))
+            WHERE ($1::text[] IS NULL OR r.gate = ANY($1))
+              AND ($2::text IS NULL OR repo.key = $2)
+              AND ($3::text[] IS NULL OR r.status = ANY($3))
+              AND (NOT $4 OR r.justification IS NOT NULL)
+              AND ($5::uuid IS NULL OR r.requested_by = $5)
+              AND ($6::uuid[] IS NULL OR r.repository_id = ANY($6))
             "#,
-            repository_key,
-            statuses
         )
+        .bind(gates)
+        .bind(repository_key)
+        .bind(statuses)
+        .bind(justified_only)
+        .bind(requested_by)
+        .bind(repository_ids)
         .fetch_one(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .unwrap_or(0);
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
         // Non-macro sqlx (like every query touching the migration-185 columns)
         // so the change needs no `.sqlx` offline-metadata regeneration.
@@ -1346,21 +1497,33 @@ impl AgeGateService {
                 r.reviewed_by, r.reviewed_at, r.review_reason,
                 r.request_count, r.last_requested_at,
                 r.basis_mode, r.basis_upstream_fingerprint,
+                r.gate, r.justification, r.requested_by,
+                r.expires_at, r.basis_digest,
                 repo.key as repository_key,
                 reviewer.username as reviewed_by_username,
                 reviewer.is_service_account as reviewed_by_is_service_account,
+                requester.username as requested_by_username,
                 r.instance_locked
             FROM age_gate_reviews r
             INNER JOIN repositories repo ON repo.id = r.repository_id
             LEFT JOIN users reviewer ON reviewer.id = r.reviewed_by
-            WHERE ($1::text IS NULL OR repo.key = $1)
-              AND ($2::text[] IS NULL OR r.status = ANY($2))
+            LEFT JOIN users requester ON requester.id = r.requested_by
+            WHERE ($1::text[] IS NULL OR r.gate = ANY($1))
+              AND ($2::text IS NULL OR repo.key = $2)
+              AND ($3::text[] IS NULL OR r.status = ANY($3))
+              AND (NOT $4 OR r.justification IS NOT NULL)
+              AND ($5::uuid IS NULL OR r.requested_by = $5)
+              AND ($6::uuid[] IS NULL OR r.repository_id = ANY($6))
             ORDER BY r.last_requested_at DESC
-            OFFSET $3 LIMIT $4
+            OFFSET $7 LIMIT $8
             "#,
         )
+        .bind(gates)
         .bind(repository_key)
         .bind(statuses)
+        .bind(justified_only)
+        .bind(requested_by)
+        .bind(repository_ids)
         .bind(offset)
         .bind(limit)
         .fetch_all(&self.db)
@@ -1379,13 +1542,17 @@ impl AgeGateService {
                 r.reviewed_by, r.reviewed_at, r.review_reason,
                 r.request_count, r.last_requested_at,
                 r.basis_mode, r.basis_upstream_fingerprint,
+                r.gate, r.justification, r.requested_by,
+                r.expires_at, r.basis_digest,
                 repo.key as repository_key,
                 reviewer.username as reviewed_by_username,
                 reviewer.is_service_account as reviewed_by_is_service_account,
+                requester.username as requested_by_username,
                 r.instance_locked
             FROM age_gate_reviews r
             INNER JOIN repositories repo ON repo.id = r.repository_id
             LEFT JOIN users reviewer ON reviewer.id = r.reviewed_by
+            LEFT JOIN users requester ON requester.id = r.requested_by
             WHERE r.id = $1
             "#,
         )
@@ -1396,15 +1563,19 @@ impl AgeGateService {
         .ok_or_else(|| AppError::NotFound("Age gate review not found".to_string()))
     }
 
-    /// Approve as an instance administrator — the only tier that could decide
-    /// a review before #4238.
+    /// Approve as an instance administrator, the only tier that could decide
+    /// a review before #4238. `expires_at` is when the exception stops being
+    /// honored; `None` means never, which the caller must have chosen
+    /// deliberately rather than defaulted (see the API layer's
+    /// `DEFAULT_EXPIRY_DAYS`).
     pub async fn approve(
         &self,
         id: Uuid,
         reviewer_id: Uuid,
         reason: Option<&str>,
+        expires_at: Option<DateTime<Utc>>,
     ) -> Result<AgeGateReview> {
-        self.approve_as(id, reviewer_id, ActorTier::Instance, reason)
+        self.approve_as(id, reviewer_id, ActorTier::Instance, reason, expires_at)
             .await
     }
 
@@ -1419,29 +1590,51 @@ impl AgeGateService {
         reviewer_id: Uuid,
         tier: ActorTier,
         reason: Option<&str>,
+        expires_at: Option<DateTime<Utc>>,
     ) -> Result<AgeGateReview> {
         let review = self.get_review_by_id(id).await?;
         require_may_relax_review(tier, review.instance_locked)?;
         require_distinct_status(&review.status, AgeGateReviewStatus::Approved)?;
         let expected_status = review.status.clone();
 
-        let params = resolve_repo_params(&self.db, review.repository_id).await?;
-        let fingerprint = upstream_fingerprint(params.upstream_url.as_deref());
+        // The basis identity re-stamped on approval is AGE-SPECIFIC: it binds
+        // the decision to the repository's age mode and upstream so a mode
+        // switch or a repoint voids it (migration 191). A `scan` or `curation`
+        // row has no such identity, its binding is `basis_digest`, recorded by
+        // the enforcement seam when it refused the bytes, not chosen by the
+        // reviewer here. Stamping age columns on those rows would write
+        // meaningless identity AND silently leave the digest binding unset,
+        // which is the one thing that makes a scan exception safe.
+        let age_basis = if is_age_gate(review.gate.as_deref()) {
+            let params = resolve_repo_params(&self.db, review.repository_id).await?;
+            Some((
+                params.age_gate_mode.as_str().to_string(),
+                upstream_fingerprint(params.upstream_url.as_deref()),
+            ))
+        } else {
+            None
+        };
+
+        // COALESCE leaves the existing value in place when no age basis
+        // applies, rather than nulling a column this gate does not own.
         let res = sqlx::query(
             "UPDATE age_gate_reviews
              SET status = 'approved', reviewed_by = $2, reviewed_at = NOW(),
-                 review_reason = $3, basis_mode = $4,
-                 basis_upstream_fingerprint = $5,
-                 instance_locked = instance_locked OR $7
+                 review_reason = $3,
+                 basis_mode = COALESCE($4, basis_mode),
+                 basis_upstream_fingerprint = COALESCE($5, basis_upstream_fingerprint),
+                 instance_locked = instance_locked OR $7,
+                 expires_at = $8
              WHERE id = $1 AND status = $6 AND ($7 OR NOT instance_locked)",
         )
         .bind(id)
         .bind(reviewer_id)
         .bind(reason)
-        .bind(params.age_gate_mode.as_str())
-        .bind(&fingerprint)
+        .bind(age_basis.as_ref().map(|(mode, _)| mode.as_str()))
+        .bind(age_basis.as_ref().map(|(_, fp)| fp.as_str()))
         .bind(&expected_status)
         .bind(tier.is_instance())
+        .bind(expires_at)
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1453,7 +1646,7 @@ impl AgeGateService {
         }
         invalidate_decision_memos(review.repository_id);
         self.event_bus.emit_for_repo(
-            "age_gate.approved",
+            &gate_event(review.gate.as_deref(), "age_gate.approved"),
             id,
             review.repository_id,
             Some(reviewer_id.to_string()),
@@ -1489,21 +1682,31 @@ impl AgeGateService {
         require_distinct_status(&review.status, AgeGateReviewStatus::Rejected)?;
         let expected_status = review.status.clone();
 
-        let params = resolve_repo_params(&self.db, review.repository_id).await?;
-        let fingerprint = upstream_fingerprint(params.upstream_url.as_deref());
+        // Age-only basis stamping, for the reasons spelled out in `approve_as`.
+        let age_basis = if is_age_gate(review.gate.as_deref()) {
+            let params = resolve_repo_params(&self.db, review.repository_id).await?;
+            Some((
+                params.age_gate_mode.as_str().to_string(),
+                upstream_fingerprint(params.upstream_url.as_deref()),
+            ))
+        } else {
+            None
+        };
         let res = sqlx::query(
             "UPDATE age_gate_reviews
              SET status = 'rejected', reviewed_by = $2, reviewed_at = NOW(),
-                 review_reason = $3, basis_mode = $4,
-                 basis_upstream_fingerprint = $5,
-                 instance_locked = instance_locked OR $7
+                 review_reason = $3,
+                 basis_mode = COALESCE($4, basis_mode),
+                 basis_upstream_fingerprint = COALESCE($5, basis_upstream_fingerprint),
+                 instance_locked = instance_locked OR $7,
+                 expires_at = NULL
              WHERE id = $1 AND status = $6",
         )
         .bind(id)
         .bind(reviewer_id)
         .bind(reason)
-        .bind(params.age_gate_mode.as_str())
-        .bind(&fingerprint)
+        .bind(age_basis.as_ref().map(|(mode, _)| mode.as_str()))
+        .bind(age_basis.as_ref().map(|(_, fp)| fp.as_str()))
         .bind(&expected_status)
         .bind(tier.is_instance())
         .execute(&self.db)
@@ -1517,7 +1720,7 @@ impl AgeGateService {
         }
         invalidate_decision_memos(review.repository_id);
         self.event_bus.emit_for_repo(
-            "age_gate.rejected",
+            &gate_event(review.gate.as_deref(), "age_gate.rejected"),
             id,
             review.repository_id,
             Some(reviewer_id.to_string()),
@@ -1567,7 +1770,7 @@ impl AgeGateService {
         let res = sqlx::query(
             "UPDATE age_gate_reviews
              SET status = 'pending', reviewed_by = $2, reviewed_at = NOW(),
-                 review_reason = $3,
+                 review_reason = $3, expires_at = NULL,
                  instance_locked = instance_locked AND NOT $5
              WHERE id = $1 AND status = $4 AND ($5 OR NOT instance_locked)",
         )
@@ -1587,7 +1790,7 @@ impl AgeGateService {
         }
         invalidate_decision_memos(review.repository_id);
         self.event_bus.emit_for_repo(
-            "age_gate.reopened",
+            &gate_event(review.gate.as_deref(), "age_gate.reopened"),
             id,
             review.repository_id,
             Some(reviewer_id.to_string()),
@@ -1708,7 +1911,7 @@ impl AgeGateService {
                 "UPDATE age_gate_reviews
                  SET upstream_published_at = NULL, basis_mode = NULL,
                      basis_upstream_fingerprint = NULL
-                 WHERE repository_id = $1 AND status = 'pending'",
+                 WHERE gate = 'age' AND repository_id = $1 AND status = 'pending'",
             )
             .bind(repo_id)
             .execute(&mut *tx)
@@ -1734,7 +1937,15 @@ impl AgeGateService {
         package_name: &str,
         exclude_version: &str,
     ) -> Result<Option<LastKnownGood>> {
-        let rows = sqlx::query!(
+        // The join is scoped to `gate = 'age'` (migration 381): the table now
+        // holds a row per (gate, coordinate), so an unscoped join would let a
+        // `scan` or `curation` row decide age eligibility, a pending scan
+        // exception would hide an age-approved version from LKG, and an
+        // approved one would pass a version the age gate never cleared.
+        //
+        // Non-macro sqlx, like every other statement here that touches a
+        // post-185 column, so the change needs no `.sqlx` regeneration.
+        let rows = sqlx::query_as::<_, (Option<String>, String)>(
             r#"
             SELECT a.version, a.path
             FROM artifacts a
@@ -1742,6 +1953,7 @@ impl AgeGateService {
               ON r.repository_id = a.repository_id
              AND r.package_name = $2
              AND r.package_version = a.version
+             AND r.gate = 'age'
             WHERE a.repository_id = $1
               AND a.is_deleted = false
               AND a.version IS NOT NULL
@@ -1749,10 +1961,10 @@ impl AgeGateService {
               AND LOWER(a.name) = LOWER($2)
               AND (r.status IS NULL OR r.status = 'approved')
             "#,
-            repository_id,
-            package_name,
-            exclude_version
         )
+        .bind(repository_id)
+        .bind(package_name)
+        .bind(exclude_version)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1760,7 +1972,7 @@ impl AgeGateService {
         Ok(select_newest_approved_artifact(
             &rows
                 .into_iter()
-                .filter_map(|row| Some((row.version?, row.path)))
+                .filter_map(|(version, path)| Some((version?, path)))
                 .collect::<Vec<_>>(),
         ))
     }
@@ -1779,9 +1991,12 @@ impl AgeGateService {
                 reviewed_by, reviewed_at, review_reason,
                 request_count, last_requested_at,
                 basis_mode, basis_upstream_fingerprint,
+                gate, justification, requested_by,
+                expires_at, basis_digest,
                 NULL::text as repository_key
             FROM age_gate_reviews
-            WHERE repository_id = $1 AND package_name = $2 AND package_version = $3
+            WHERE gate = 'age'
+              AND repository_id = $1 AND package_name = $2 AND package_version = $3
             "#,
         )
         .bind(repository_id)
@@ -1815,11 +2030,11 @@ impl AgeGateService {
         let id: Uuid = sqlx::query_scalar(
             r#"
             INSERT INTO age_gate_reviews (
-                repository_id, package_name, package_version,
+                gate, repository_id, package_name, package_version,
                 upstream_published_at, status, basis_mode, basis_upstream_fingerprint
             )
-            VALUES ($1, $2, $3, $4, 'pending', $5, $6)
-            ON CONFLICT (repository_id, package_name, package_version)
+            VALUES ('age', $1, $2, $3, $4, 'pending', $5, $6)
+            ON CONFLICT (gate, repository_id, package_name, package_version)
             DO UPDATE SET
                 request_count = age_gate_reviews.request_count + 1,
                 last_requested_at = NOW(),
@@ -1883,10 +2098,13 @@ impl AgeGateService {
     ) -> Result<Uuid> {
         sqlx::query(
             r#"
+            -- `justification` / `requested_by` deliberately survive a reset:
+            -- the person still wants the package, so their request stays queued.
             UPDATE age_gate_reviews
             SET status = 'pending', reviewed_by = NULL, reviewed_at = NULL,
                 review_reason = NULL, upstream_published_at = $2,
                 basis_mode = $3, basis_upstream_fingerprint = $4,
+                expires_at = NULL,
                 request_count = request_count + 1, last_requested_at = NOW()
             WHERE id = $1
             "#,
@@ -1952,9 +2170,9 @@ impl AgeGateService {
         let rows = sqlx::query(
             r#"
             SELECT package_version, status, (reviewed_by IS NULL) AS is_automatic,
-                   basis_mode, basis_upstream_fingerprint
+                   basis_mode, basis_upstream_fingerprint, expires_at
             FROM age_gate_reviews
-            WHERE repository_id = $1 AND package_name = $2
+            WHERE gate = 'age' AND repository_id = $1 AND package_name = $2
             "#,
         )
         .bind(repository_id)
@@ -1975,6 +2193,7 @@ impl AgeGateService {
                         basis_upstream_fingerprint: r
                             .try_get("basis_upstream_fingerprint")
                             .map_err(column)?,
+                        expires_at: r.try_get("expires_at").map_err(column)?,
                     },
                 ))
             })
@@ -2014,12 +2233,12 @@ impl AgeGateService {
         let rows = sqlx::query(
             r#"
             INSERT INTO age_gate_reviews (
-                repository_id, package_name, package_version,
+                gate, repository_id, package_name, package_version,
                 upstream_published_at, status, basis_mode, basis_upstream_fingerprint
             )
-            SELECT $1, $2, v, p, 'pending', $6, $7
+            SELECT 'age', $1, $2, v, p, 'pending', $6, $7
             FROM UNNEST($3::text[], $4::timestamptz[]) AS t(v, p)
-            ON CONFLICT (repository_id, package_name, package_version)
+            ON CONFLICT (gate, repository_id, package_name, package_version)
             DO UPDATE SET
                 request_count = age_gate_reviews.request_count + 1,
                 last_requested_at = NOW(),
@@ -2133,7 +2352,8 @@ impl AgeGateService {
                 UPDATE age_gate_reviews
                 SET status = 'approved', reviewed_by = NULL, reviewed_at = NOW(),
                     review_reason = $2
-                WHERE repository_id = $1
+                WHERE gate = 'age'
+                  AND repository_id = $1
                   AND status = 'pending'
                   AND ($3 = 0
                        OR (upstream_published_at IS NOT NULL
@@ -3115,6 +3335,7 @@ mod tests {
                 is_automatic: false,
                 basis_mode: None,
                 basis_upstream_fingerprint: None,
+                expires_at: None,
             },
         )]);
         let out = classify_versions_for_metadata_listing(
@@ -3345,14 +3566,23 @@ mod tests {
             .expect("pending review");
         assert_eq!(pending.repository_key.as_deref(), Some(repo_key.as_str()));
         let (items, total) = svc
-            .list_reviews(Some(&repo_key), Some(&["pending".to_string()]), 0, 10)
+            .list_reviews(
+                &ReviewFilter {
+                    gates: Some(&[GATE_AGE.to_string()]),
+                    repository_key: Some(&repo_key),
+                    statuses: Some(&["pending".to_string()]),
+                    ..Default::default()
+                },
+                0,
+                10,
+            )
             .await
             .expect("list reviews");
         assert!(total >= 1);
         assert!(items.iter().any(|r| r.id == pending_id));
 
         let approved = svc
-            .approve(pending_id, reviewer, Some("unit test approval"))
+            .approve(pending_id, reviewer, Some("unit test approval"), None)
             .await
             .expect("approve pending review");
         assert_eq!(approved.status, "approved");
@@ -3441,7 +3671,7 @@ mod tests {
 
         // Admin approves -> pulls are now allowed.
         let approved = svc
-            .approve(review_id, reviewer, Some("looked fine"))
+            .approve(review_id, reviewer, Some("looked fine"), None)
             .await
             .expect("approve pending");
         assert_eq!(approved.status, "approved");
@@ -3451,7 +3681,7 @@ mod tests {
         ));
 
         // Re-approving an already-approved review is a refused no-op.
-        assert!(svc.approve(review_id, reviewer, None).await.is_err());
+        assert!(svc.approve(review_id, reviewer, None, None).await.is_err());
 
         // Reopen the terminal review -> back to pending, and the young version is
         // re-blocked on the very next pull.
@@ -3485,7 +3715,7 @@ mod tests {
 
         // Directly re-approve the rejected review (no reopen step) -> unblocked.
         let reapproved = svc
-            .approve(review_id, reviewer, Some("now fine"))
+            .approve(review_id, reviewer, Some("now fine"), None)
             .await
             .expect("re-approve rejected review");
         assert_eq!(reapproved.status, "approved");
@@ -3791,7 +4021,67 @@ mod tests {
             status: status.to_string(),
             is_automatic,
             identity,
+            expired: false,
         }
+    }
+
+    fn expired_view(
+        status: &str,
+        is_automatic: bool,
+        identity: ReviewIdentityMatch,
+    ) -> ReviewPolicyView {
+        ReviewPolicyView {
+            expired: true,
+            ..view(status, is_automatic, identity)
+        }
+    }
+
+    #[test]
+    fn is_age_gate_treats_an_unselected_column_as_age() {
+        assert!(is_age_gate(Some(GATE_AGE)));
+        // A `SELECT` that omits `gate`, or a pre-381 row, must behave as the
+        // age gate it was, never as some other gate's exception.
+        assert!(is_age_gate(None));
+        assert!(!is_age_gate(Some(GATE_SCAN)));
+        assert!(!is_age_gate(Some(GATE_CURATION)));
+    }
+
+    #[test]
+    fn gate_event_keeps_age_names_and_namespaces_the_rest() {
+        // The four `age_gate.*` names are already mapped by
+        // `webhook_producer.rs`; renaming them would silently stop delivering
+        // to existing subscriptions.
+        assert_eq!(
+            gate_event(Some(GATE_AGE), "age_gate.approved"),
+            "age_gate.approved"
+        );
+        assert_eq!(gate_event(None, "age_gate.queued"), "age_gate.queued");
+        assert_eq!(
+            gate_event(Some(GATE_SCAN), "age_gate.approved"),
+            "exception.scan.approved"
+        );
+        assert_eq!(
+            gate_event(Some(GATE_CURATION), "age_gate.rejected"),
+            "exception.curation.rejected"
+        );
+    }
+
+    #[test]
+    fn exception_expired_boundaries() {
+        let now = Utc::now();
+        // Never-expires is the documented meaning of NULL, not "expired".
+        assert!(!exception_expired(None, now));
+        assert!(!exception_expired(
+            Some(now + chrono::Duration::days(1)),
+            now
+        ));
+        assert!(exception_expired(
+            Some(now - chrono::Duration::days(1)),
+            now
+        ));
+        // Exactly at the instant counts as lapsed: the window is half-open, so
+        // an exception granted for 0 remaining time cannot serve one last pull.
+        assert!(exception_expired(Some(now), now));
     }
 
     #[test]
@@ -3834,6 +4124,22 @@ mod tests {
             decide_age_gate_check(Some(&view("approved", false, Differs)), false),
             AgeGateCheckAction::BlockAndResetReview,
             "a manual approval under a different identity is voided"
+        );
+        // An EXPIRED manual approval is voided the same way a stale one is
+        // (migration 381): the exception lapsed, so the package goes back on
+        // the queue rather than continuing to be served.
+        assert_eq!(
+            decide_age_gate_check(Some(&expired_view("approved", false, Matches)), false),
+            AgeGateCheckAction::BlockAndResetReview,
+            "an expired manual approval stops allowing"
+        );
+        // ...but expiry must never re-block something the gate has no reason
+        // to withhold any more. The threshold arm runs first, so a package
+        // that has since aged past its threshold is allowed on that basis.
+        assert_eq!(
+            decide_age_gate_check(Some(&expired_view("approved", false, Matches)), true),
+            AgeGateCheckAction::Allow,
+            "a lapsed exception does not re-block a version that aged out"
         );
         // Automatic approvals are never sticky.
         for identity in [Matches, Differs, Legacy] {
@@ -3897,6 +4203,7 @@ mod tests {
             is_automatic,
             basis_mode: identity_fp.map(|_| "upstream_publish_time".to_string()),
             basis_upstream_fingerprint: identity_fp.map(str::to_string),
+            expires_at: None,
         }
     }
 

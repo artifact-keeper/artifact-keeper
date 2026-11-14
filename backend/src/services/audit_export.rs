@@ -109,7 +109,10 @@ impl AuditAction {
             AuditAction::McpBundleSignatureRejected => Outcome::Denied,
             AuditAction::McpGateUnavailable => Outcome::Failure,
             AuditAction::McpNamespaceProofFailed => Outcome::Failure,
-            AuditAction::Login
+            // Filing a request SUCCEEDED; whether the exception is then
+            // granted is a separate, later decision with its own event.
+            AuditAction::ExceptionRequested
+            | AuditAction::Login
             | AuditAction::Logout
             | AuditAction::PasswordChanged
             | AuditAction::ApiTokenCreated
