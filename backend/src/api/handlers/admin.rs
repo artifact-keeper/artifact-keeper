@@ -6088,7 +6088,7 @@ mod tests {
 
 /// Through the real router: the `/admin` nest's `admin_middleware` plus the
 /// handler gate on the instance-wide listings (#4550).
-#[cfg(ak_test_shard = "router")]
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod router_tests {
     use crate::api::handlers::test_db_helpers as tdh;

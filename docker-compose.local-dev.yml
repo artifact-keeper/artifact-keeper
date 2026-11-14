@@ -225,6 +225,8 @@ services:
       DEPENDENCY_TRACK_URL: http://dependency-track-apiserver:8080
       DEPENDENCY_TRACK_API_KEY_FILE: /shared/dtrack-api-key
       DEPENDENCY_TRACK_ENABLED: "true"
+      DEPENDENCY_TRACK_AUTO_COLLECTIONS: ${DEPENDENCY_TRACK_AUTO_COLLECTIONS:-false}
+      DEPENDENCY_TRACK_MAVEN_EXCLUDED_CLASSIFIERS: ${DEPENDENCY_TRACK_MAVEN_EXCLUDED_CLASSIFIERS:-}
       ALLOW_HTTP_INTEGRATIONS: "1"
       # Webhooks v2 signing-secret encryption key. 32 bytes, base64 encoded.
       # Generate once for your local stack with: openssl rand -base64 32,

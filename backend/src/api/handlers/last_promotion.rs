@@ -171,6 +171,7 @@ pub(crate) async fn readable_repo_ids(
         .collect()
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

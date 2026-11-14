@@ -10959,6 +10959,18 @@ impl ScannerService {
         // source repo. `purl_type` comes from the repo format because
         // purl encoding is a property of the format, not the artifact.
         let repo_format = repo_row.as_ref().and_then(|(_, fmt)| fmt.clone());
+        // DT-only policy: local scans/results/gates have already completed.
+        // Parse real coordinates before inventory extraction or SBOM generation.
+        let maven_coordinates = dt.maven_coordinates(repo_format.as_deref(), &artifact.path);
+        if let Some(coordinates) = maven_coordinates.as_ref() {
+            if dt.excludes_maven_classifier(coordinates) {
+                info!(artifact_id = %artifact.id, maven_group = %coordinates.group_id,
+                    maven_artifact = %coordinates.artifact_id, maven_version = %coordinates.version,
+                    classifier = ?coordinates.classifier,
+                    "Excluded Maven classifier from Dependency-Track submission");
+                return;
+            }
+        }
         let (repo_label, purl_type) =
             derive_dt_project_info(repo_row, &artifact.repository_id.to_string());
         let project_name = artifact.name.as_str();
@@ -11119,14 +11131,26 @@ impl ScannerService {
         // the endpoint URL, the DT response body, and (on 401/403) the
         // required DT team permissions. Without this, the operator sees a
         // fully green scan even when DT silently rejects every upload.
-        let dt_project = match dt
-            .get_or_create_project(
+        let description = format!("Repository: {}", repo_label);
+        let project_result = if let Some(coordinates) =
+            maven_coordinates.as_ref().filter(|_| dt.auto_collections())
+        {
+            dt.get_or_create_maven_project_with_db(
+                &self.db,
+                coordinates,
                 project_name,
-                artifact.version.as_deref(),
-                Some(&format!("Repository: {}", repo_label)),
+                &description,
             )
             .await
-        {
+        } else {
+            dt.get_or_create_project(
+                project_name,
+                artifact.version.as_deref(),
+                Some(&description),
+            )
+            .await
+        };
+        let dt_project = match project_result {
             Ok(p) => p,
             Err(e) => {
                 error!(
@@ -32261,9 +32285,79 @@ tonic-build = "0.12"
                 api_key: Some("matrix-test-key".to_string()),
                 api_key_file: None,
                 enabled: true,
+                auto_collections: false,
+                maven_excluded_classifiers: Default::default(),
             })
             .expect("construct DT service");
             Arc::new(dt)
+        }
+
+        /// Run the actual forced/manual scan pipeline. Filtering is confined
+        /// to DT submission, after both scanners persist inventory/findings.
+        #[tokio::test]
+        async fn test_dt_maven_exclusion_preserves_local_and_manual_scans() {
+            for auto_collections in [false, true] {
+                let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+                    return;
+                };
+                let server = MockServer::start().await;
+                let dt = DependencyTrackService::new(DependencyTrackConfig {
+                    base_url: server.uri(),
+                    api_key: Some("test-key".into()),
+                    api_key_file: None,
+                    enabled: true,
+                    auto_collections,
+                    maven_excluded_classifiers: DependencyTrackConfig::parse_excluded_classifiers(
+                        "Javadoc",
+                    ),
+                })
+                .unwrap();
+                let artifact_id = seed_versioned_scannable_artifact(
+                    &fx,
+                    "core",
+                    "1.0",
+                    "ru/molnet/core/1.0/core-1.0-javadoc.jar",
+                    Bytes::from_static(b"scan-me"),
+                )
+                .await;
+                let scanner = make_scanner_service_with(
+                    &fx,
+                    vec![
+                        grype_completed(),
+                        FakeScanner::completed("dependency", two_cve_findings(), two_packages()),
+                    ],
+                    Some(Arc::new(dt)),
+                );
+                scanner
+                    .scan_artifact_with_options(artifact_id, true, true)
+                    .await
+                    .unwrap();
+                for scan_type in ["grype", "dependency"] {
+                    let row = latest_scan_row(&fx.pool, artifact_id, scan_type).await;
+                    assert_eq!(row.status, "completed");
+                    assert_eq!(row.findings_count, 2);
+                    let scan_id = latest_scan_id(&fx.pool, artifact_id, scan_type).await;
+                    assert_eq!(scan_package_count(&fx.pool, scan_id).await, 2);
+                }
+                let sboms: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM sbom_documents WHERE artifact_id = $1",
+                )
+                .bind(artifact_id)
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+                assert_eq!(sboms, 0, "filter runs before SBOM generation");
+                assert!(server.received_requests().await.unwrap().is_empty());
+                assert_eq!(
+                    fx.state
+                        .storage
+                        .get(&format!("catalog/{artifact_id}/blob"))
+                        .await
+                        .unwrap(),
+                    Bytes::from_static(b"scan-me")
+                );
+                finish(fx).await;
+            }
         }
 
         // ===================================================================
