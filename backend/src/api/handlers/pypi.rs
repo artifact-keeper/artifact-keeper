@@ -17649,6 +17649,152 @@ mod tests {
         );
     }
 
+    /// #5159: a Remote member's `popularity` rule runs its name checks on
+    /// the virtual path too, resolved per member exactly like the `pattern`
+    /// rules above (#2912). The virtual repository has curation off.
+    ///
+    /// On PyPI a name check only flags: edit-distance matches never block on
+    /// downloads, and `normalize_pep503` strips the non-ASCII codepoints a
+    /// Unicode homoglyph needs. So the test proves the member's rules are
+    /// consulted through the virtual in two ways:
+    ///
+    /// * `numba` (edit distance 2 from the seed `numpy`) is served, and the
+    ///   flag is logged naming the member's popularity rule.
+    /// * The flag does not end evaluation: the member's lower-priority
+    ///   `pattern` block on `reqeusts` (itself flagged by the popularity
+    ///   rule) still refuses it before its upstream is asked.
+    #[tokio::test]
+    async fn test_virtual_member_popularity_flag_logged_and_later_block_applies_5159() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        /// Captures the fields of every proxy-curation flag event.
+        #[derive(Clone, Default)]
+        struct FlagEvents(Arc<Mutex<Vec<std::collections::HashMap<String, String>>>>);
+        struct Fields(std::collections::HashMap<String, String>);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                self.0.insert(f.name().to_string(), format!("{v:?}"));
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FlagEvents {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut fields = Fields(Default::default());
+                event.record(&mut fields);
+                if fields
+                    .0
+                    .get("message")
+                    .is_some_and(|m| m.contains("curation flagged a proxy download"))
+                {
+                    self.0.lock().unwrap().push(fields.0);
+                }
+            }
+        }
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        let wheel = "numba-0.60.0-py3-none-any.whl";
+        Mock::given(method("GET"))
+            .and(path("/simple/numba/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(pep658_index_html(wheel)))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/simple/reqeusts/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(pep658_index_html(wheel)))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let (member_id, _member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+        sqlx::query(
+            "UPDATE repositories SET curation_enabled = true, curation_default_action = 'allow' \
+             WHERE id = $1",
+        )
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("enable curation on the member");
+        let popularity_rule: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO curation_rules (staging_repo_id, package_pattern, version_constraint, \
+             architecture, action, priority, reason, rule_type, config, created_by) \
+             VALUES ($1, '*', '*', '*', 'block', 10, '#5159', 'popularity', $2, $3) \
+             RETURNING id",
+        )
+        .bind(member_id)
+        .bind(serde_json::json!({"block_typosquat": true, "download_name_checks": true}))
+        .bind(fx.user_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("insert member popularity rule");
+        sqlx::query(
+            "INSERT INTO curation_rules (staging_repo_id, package_pattern, version_constraint, \
+             architecture, action, priority, reason, created_by) \
+             VALUES ($1, 'reqeusts', '*', '*', 'block', 100, '#5159 pattern block', $2)",
+        )
+        .bind(member_id)
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert member pattern block");
+
+        let events = FlagEvents::default();
+        let guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(events.clone()));
+        let simple = |project: &str| tdh::get(format!("/{}/simple/{project}/", fx.repo_key));
+        let (squat_status, _) = tdh::send(
+            tdh::router_anon(super::router(), state.clone()),
+            simple("reqeusts"),
+        )
+        .await;
+        let (flagged_status, flagged_body) =
+            tdh::send(tdh::router_anon(super::router(), state), simple("numba")).await;
+        drop(guard);
+
+        let _ = sqlx::query("DELETE FROM curation_rules WHERE staging_repo_id = $1")
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await;
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_ne!(
+            squat_status,
+            StatusCode::OK,
+            "the member's later pattern block must still refuse a flagged name"
+        );
+        assert_eq!(flagged_status, StatusCode::OK, "a flag serves the download");
+        assert!(
+            String::from_utf8_lossy(&flagged_body).contains(wheel),
+            "the member's index must reach the client"
+        );
+        let logged = events.0.lock().unwrap().clone();
+        assert_eq!(
+            logged.len(),
+            1,
+            "exactly the numba download is flagged: {logged:?}"
+        );
+        assert_eq!(logged[0].get("package").map(String::as_str), Some("numba"));
+        assert_eq!(
+            logged[0].get("rule_id"),
+            Some(&popularity_rule.to_string()),
+            "the flag names the member's popularity rule"
+        );
+        assert_eq!(logged[0].get("repo_id"), Some(&member_id.to_string()));
+        // Dropping the server verifies `reqeusts` was never fetched.
+        drop(upstream);
+    }
+
     /// #3183: the PEP 708 dependency-confusion isolation must not depend on how
     /// the client spells the project segment.
     ///

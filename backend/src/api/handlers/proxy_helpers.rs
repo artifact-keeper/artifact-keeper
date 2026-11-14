@@ -10047,6 +10047,10 @@ pub struct CurationTarget<'a> {
     pub repo_type: &'a str,
     pub curation_enabled: bool,
     pub default_action: &'a str,
+    /// The repository's format key (`npm`, `pypi`, …). `popularity` rules
+    /// apply only to formats with a popularity ecosystem (#5159); `None`
+    /// skips them.
+    pub format: Option<&'a str>,
 }
 
 impl<'a> From<&'a RepoInfo> for CurationTarget<'a> {
@@ -10057,6 +10061,7 @@ impl<'a> From<&'a RepoInfo> for CurationTarget<'a> {
             repo_type: &repo.repo_type,
             curation_enabled: repo.curation_enabled,
             default_action: &repo.curation_default_action,
+            format: Some(&repo.format),
         }
     }
 }
@@ -10079,10 +10084,17 @@ impl<'a> From<&'a RepoInfo> for CurationTarget<'a> {
 /// fails OPEN (logged with repo + package so the unenforced request is
 /// greppable) rather than taking the proxy down — identical to the pypi seam.
 ///
-/// Only `pattern` rules are consulted here (via
-/// [`CurationService::evaluate_pep503_package`]), matching the pypi seam
-/// exactly; typed `publisher_trust` / `popularity` rules run on the
-/// staging/sync path, not on the hot download path.
+/// `pattern` rules are consulted here (via
+/// [`CurationService::evaluate_pep503_package`]), and so are the name-only
+/// checks of `popularity` rules that opt in with `download_name_checks: true`
+/// on npm and PyPI repositories (#5159, #5274): the
+/// typo-squat, homoglyph and affix comparisons against the popular list,
+/// which need no network call. The download-count threshold and
+/// `publisher_trust` rules still run only on the staging sync. A `popularity`
+/// `Block` (a homoglyph or mixed-script match under `block_typosquat`)
+/// refuses the pull like a `block` rule. Edit-distance and affix matches only
+/// flag. A `Flag` serves the pull and logs it, because the proxy path has no
+/// review queue.
 #[allow(clippy::result_large_err)]
 pub async fn enforce_curation<'a>(
     db: &PgPool,
@@ -10112,7 +10124,13 @@ pub async fn evaluate_curation<'a>(
     }
     let svc = crate::services::curation_service::CurationService::new(db.clone());
     let eval = svc
-        .evaluate_pep503_package(target.id, target.default_action, package, version)
+        .evaluate_pep503_package(
+            target.id,
+            target.default_action,
+            target.format,
+            package,
+            version,
+        )
         .await
         .map_err(|e| {
             tracing::warn!(
@@ -10124,15 +10142,45 @@ pub async fn evaluate_curation<'a>(
             );
         })
         .ok();
-    if let Some(eval) = eval {
-        if eval.action == "block" {
-            return Err(CurationBlock {
-                package: package.to_string(),
-                reason: eval.reason,
-            });
-        }
+    match eval {
+        Some(eval) => curation_verdict(&target, package, eval),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// Map a proxy-path rule evaluation onto the download outcome: `block`
+/// refuses, anything else serves.
+///
+/// A `review` verdict from a rule is a `popularity` `Flag` (#5159; `pattern`
+/// rules only take `allow` / `block`). The proxy path has no review queue,
+/// so the pull is served and the flag is logged with the rule and reason.
+/// A `review` default stance with no matching rule serves silently, as it
+/// always has.
+fn curation_verdict(
+    target: &CurationTarget<'_>,
+    package: &str,
+    eval: crate::services::curation_service::RuleEvaluation,
+) -> Result<(), CurationBlock> {
+    match (eval.action.as_str(), eval.rule_id) {
+        ("block", _) => Err(CurationBlock {
+            package: package.to_string(),
+            reason: eval.reason,
+        }),
+        ("review", Some(rule_id)) => {
+            // `warn`, like the fail-open line above: a flagged download is
+            // served, so deployments that log at warn must still see it.
+            tracing::warn!(
+                repo_id = %target.id,
+                repo_key = %target.key,
+                package = %package,
+                rule_id = %rule_id,
+                reason = %eval.reason,
+                "curation flagged a proxy download; serving it (no review queue on the proxy path)"
+            );
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Curation enforcement (#2930) for handlers whose repo struct does NOT carry
@@ -10207,6 +10255,9 @@ pub async fn evaluate_curation_lookup(
         repo_type,
         curation_enabled,
         default_action: &default_action,
+        // The callers (cargo, OCI) serve formats with no popularity
+        // ecosystem, so the typed name checks never apply here (#5159).
+        format: None,
     };
     evaluate_curation(db, target, package, version).await
 }
@@ -27368,6 +27419,153 @@ mod tests {
         );
 
         curation_cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // ── popularity name checks on the proxy path (#5159) ─────────────────
+
+    /// Cyrillic `о` (U+043E) for the first `o` of the npm seed name `lodash`.
+    const LODASH_HOMOGLYPH: &str = "l\u{043e}dash";
+
+    /// Attach a repo-scoped `popularity` rule (never global: a global rule
+    /// would reach every peer test's npm/PyPI evaluation).
+    async fn insert_popularity_rule(
+        pool: &sqlx::PgPool,
+        repo_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+        config: serde_json::Value,
+    ) -> uuid::Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO curation_rules (staging_repo_id, package_pattern, version_constraint, \
+             architecture, action, priority, reason, rule_type, config, created_by) \
+             VALUES ($1, '*', '*', '*', 'block', 100, '#5159 popularity', 'popularity', $2, $3) \
+             RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(config)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("insert popularity rule")
+    }
+
+    #[tokio::test]
+    async fn test_curation_popularity_name_check_blocks_homoglyph_on_npm_remote() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let (user_id, repo_id, key) = seed_curated_repo(&pool, "remote", true, None).await;
+        // Upgrade safety (#5274): a rule written before the download checks
+        // existed has no `download_name_checks` key and changes nothing here.
+        let rule_id = insert_popularity_rule(
+            &pool,
+            repo_id,
+            user_id,
+            serde_json::json!({"block_typosquat": true, "min_downloads": 1000}),
+        )
+        .await;
+        let repo = repo_info_for(repo_id, &key, "remote", true);
+        let before_opt_in = evaluate_curation(&pool, &repo, LODASH_HOMOGLYPH, None).await;
+        sqlx::query("UPDATE curation_rules SET config = config || $2 WHERE id = $1")
+            .bind(rule_id)
+            .bind(serde_json::json!({"download_name_checks": true}))
+            .execute(&pool)
+            .await
+            .expect("opt the rule into download checks");
+
+        let blocked = evaluate_curation(&pool, &repo, LODASH_HOMOGLYPH, None).await;
+        let resp = enforce_curation(&pool, &repo, LODASH_HOMOGLYPH, None).await;
+        let seed = enforce_curation(&pool, &repo, "lodash", None).await;
+        // The lookup seam (cargo/OCI) has no format, so the rule is skipped.
+        let lookup =
+            enforce_curation_lookup(&pool, repo_id, &key, "remote", LODASH_HOMOGLYPH, None).await;
+        curation_cleanup(&pool, repo_id, user_id).await;
+
+        assert!(
+            before_opt_in.is_ok(),
+            "a rule without download_name_checks must not touch downloads"
+        );
+        let block = blocked.expect_err("a homoglyph of a seed package must be refused");
+        assert_eq!(block.package, LODASH_HOMOGLYPH);
+        assert!(block.reason.contains("'lodash'"), "{}", block.reason);
+        let resp = resp.expect_err("the rendered seam must 403 too");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "curation_blocked");
+        assert!(seed.is_ok(), "the legitimate seed package must be served");
+        assert!(
+            lookup.is_ok(),
+            "a format-less lookup must not run name checks"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_curation_popularity_flag_serves_and_skips_other_formats() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let (user_id, repo_id, key) = seed_curated_repo(&pool, "remote", true, None).await;
+        // Default config: a typo-squat is flagged, not blocked.
+        insert_popularity_rule(
+            &pool,
+            repo_id,
+            user_id,
+            serde_json::json!({"download_name_checks": true}),
+        )
+        .await;
+        let repo = repo_info_for(repo_id, &key, "remote", true);
+        let flagged = enforce_curation(&pool, &repo, LODASH_HOMOGLYPH, None).await;
+
+        // The same blocking rule on a format without a popularity ecosystem
+        // has no effect.
+        sqlx::query("UPDATE curation_rules SET config = $2 WHERE staging_repo_id = $1")
+            .bind(repo_id)
+            .bind(serde_json::json!({"block_typosquat": true, "download_name_checks": true}))
+            .execute(&pool)
+            .await
+            .expect("escalate rule");
+        let mut maven = repo_info_for(repo_id, &key, "remote", true);
+        maven.format = "maven".to_string();
+        let other_format = enforce_curation(&pool, &maven, LODASH_HOMOGLYPH, None).await;
+        curation_cleanup(&pool, repo_id, user_id).await;
+
+        assert!(flagged.is_ok(), "a Flag must serve the download");
+        assert!(other_format.is_ok(), "popularity applies to npm/PyPI only");
+    }
+
+    fn proxy_eval(
+        action: &str,
+        rule_id: Option<uuid::Uuid>,
+    ) -> crate::services::curation_service::RuleEvaluation {
+        crate::services::curation_service::RuleEvaluation {
+            action: action.to_string(),
+            reason: "test reason".to_string(),
+            rule_id,
+        }
+    }
+
+    #[test]
+    fn test_curation_verdict_maps_proxy_outcomes() {
+        let repo = repo_info_for(uuid::Uuid::new_v4(), "k", "remote", true);
+        let target = CurationTarget::from(&repo);
+        let rule = Some(uuid::Uuid::new_v4());
+
+        let block =
+            curation_verdict(&target, "pkg", proxy_eval("block", rule)).expect_err("block refuses");
+        assert_eq!(
+            block,
+            CurationBlock {
+                package: "pkg".to_string(),
+                reason: "test reason".to_string(),
+            }
+        );
+        // A flagged rule and the review default stance both serve.
+        assert!(curation_verdict(&target, "pkg", proxy_eval("review", rule)).is_ok());
+        assert!(curation_verdict(&target, "pkg", proxy_eval("review", None)).is_ok());
+        assert!(curation_verdict(&target, "pkg", proxy_eval("allow", rule)).is_ok());
+        assert_eq!(target.format, Some("npm"));
     }
 
     // -----------------------------------------------------------------------
