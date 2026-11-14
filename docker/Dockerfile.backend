@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # ---------- Base: Rust toolchain on UBI 9 ----------
-FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rust-base
+FROM registry.access.redhat.com/ubi9/ubi:9.9 AS rust-base
 
 # Build toolchain versions, declared once per image rather than inline.
 #
@@ -128,7 +128,7 @@ RUN if [ "$(uname -m)" = aarch64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi
     fi
 
 # ---------- Stage 4: Build minimal rootfs ----------
-FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rootfs-builder
+FROM registry.access.redhat.com/ubi9/ubi:9.9 AS rootfs-builder
 
 # Install only essential runtime libraries into a clean rootfs.
 # --refresh forces fresh repo metadata and the follow-up `upgrade -y` pulls
@@ -779,7 +779,7 @@ RUN set -eu; \
 #
 # GPL-2.0 s.3(a): the exact source tarball this binary is built from ships in
 # the runtime image next to the licence, under /licenses/squashfs-tools/.
-FROM registry.access.redhat.com/ubi9/ubi:9.8 AS squashfs-bin
+FROM registry.access.redhat.com/ubi9/ubi:9.9 AS squashfs-bin
 ARG SQUASHFS_TOOLS_VERSION=4.7.5
 ARG SQUASHFS_TOOLS_SHA256=547b7b7f4d2e44bf91b6fc554664850c69563701deab9fd9cd7e21f694c88ea6
 RUN dnf install -y --nodocs gcc make binutils zlib-devel xz-devel libzstd-devel \
@@ -821,7 +821,7 @@ RUN mkdir -p /grype-db && grype db update && grype db status
 # Named so CI can cache-bust the package-refresh stages (`no-cache-filters`);
 # see docker-publish.yml. Without that, the registry build cache can serve the
 # rootfs-builder `dnf upgrade` layer stale and ship months-old errata (#2391).
-FROM registry.access.redhat.com/ubi9/ubi-micro:9.8 AS runtime
+FROM registry.access.redhat.com/ubi9/ubi-micro:9.9 AS runtime
 
 # Copy minimal rootfs (glibc, openssl, ca-certs, curl, user/group, dirs)
 COPY --from=rootfs-builder /mnt/rootfs /
