@@ -4401,10 +4401,15 @@ pub type VirtualManifestResolution = (
 /// the member's own lookup. The pull answers that fault (`503 UNAVAILABLE`
 /// with `Retry-After` for an upstream one) instead of a lower member's tag,
 /// which in a virtual whose members hold different images under one tag is
-/// a different image. A `404` (or an upstream refusing the Remote's
-/// credentials) is still a miss. A pull by digest is addressed by content,
-/// as a blob pull is, and keeps walking. The setting is read only once a
-/// member is unavailable, so a walk that meets none makes no extra lookup.
+/// a different image. A `404`, an upstream refusing the Remote's
+/// credentials, and a permanent 4xx from the token endpoint (the anonymous
+/// `401`/`403` #4527 reads as a miss) are still misses. Anything else the
+/// proxy reports without a permanent upstream status is unavailable, and so
+/// terminal here: a manifest over the buffered size cap, or another
+/// status-less `BadGateway`. A pull by digest is addressed by content, as a
+/// blob pull is, and keeps walking. The setting is read only once a member
+/// is unavailable, so a walk that meets none makes no extra lookup; if that
+/// read fails, the pull fails closed and answers `503`.
 async fn try_resolve_virtual_manifest(
     state: &SharedState,
     auth: Option<&crate::api::middleware::auth::AuthExtension>,
@@ -4629,10 +4634,23 @@ async fn try_resolve_virtual_manifest(
         if (member_failure.is_some() || upstream_unavailable) && !is_digest_ref && !fallback_checked
         {
             fallback_checked = true;
-            if proxy_helpers::virtual_member_fallback(&state.db, repo_id)
-                .await
-                .is_strict()
+            // Fails closed: with a member already unavailable and the setting
+            // unreadable, a lower member's tag may be the wrong image, so the
+            // pull answers the retryable 503 instead.
+            let strict = match proxy_helpers::try_virtual_member_fallback(&state.db, repo_id).await
             {
+                Ok(fallback) => fallback.is_strict(),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        virtual_repo_id = %repo_id,
+                        "reading {} failed while a member is unavailable; answering 503",
+                        proxy_helpers::VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY
+                    );
+                    true
+                }
+            };
+            if strict {
                 tracing::warn!(
                     member = %member.key,
                     image = %image_name,
@@ -5373,7 +5391,12 @@ async fn try_upstream_fetch_with_accept(
         Err(error) if proxy_helpers::is_upstream_auth_failure(&error) => {
             UpstreamFetchOutcome::UpstreamAuthFailed
         }
-        Err(error) if proxy_helpers::is_member_unavailable_response(&error) => {
+        // #4527: a permanent refusal from the token endpoint (an anonymous
+        // 401/403) is a miss, though it carries `MemberUnavailable`.
+        Err(error)
+            if proxy_helpers::is_member_unavailable_response(&error)
+                && !proxy_helpers::is_token_endpoint_refusal(&error) =>
+        {
             UpstreamFetchOutcome::Unavailable
         }
         Err(_) => UpstreamFetchOutcome::Indeterminate,
@@ -52918,5 +52941,197 @@ mod virtual_manifest_strict_fallback_5810 {
             (by_digest.0.as_str(), by_digest.3.id),
             (digest_b.as_str(), member_b)
         );
+    }
+
+    async fn strict_virtual(pool: &sqlx::PgPool, members: &[Uuid], strict: bool) -> Uuid {
+        let virt = insert_repo(pool, "virtual", None).await;
+        for (priority, member) in members.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(virt)
+            .bind(member)
+            .bind(priority as i32 + 1)
+            .execute(pool)
+            .await
+            .expect("link member");
+        }
+        if strict {
+            sqlx::query(
+                "INSERT INTO repository_config (repository_id, key, value) \
+                 VALUES ($1, $2, 'strict')",
+            )
+            .bind(virt)
+            .bind(proxy_helpers::VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY)
+            .execute(pool)
+            .await
+            .expect("set strict");
+        }
+        virt
+    }
+
+    async fn delete_repos(pool: &sqlx::PgPool, ids: &[Uuid]) {
+        for id in ids {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+    }
+
+    /// A token endpoint refusing an anonymous token request (`401`) is a
+    /// miss (#4527), not an unavailable member: a strict virtual walks on to
+    /// the lower member and the pull succeeds.
+    ///
+    /// FAILS on `af614f19`: the refusal's `Storage` error carries
+    /// `MemberUnavailable`, so strict mode answered 503.
+    #[tokio::test]
+    async fn a_strict_virtual_walks_past_an_anonymous_token_refusal_5810() {
+        use wiremock::matchers::path;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // The realm goes through the SSRF guard, which refuses loopback.
+        let (server_a, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/myimage/manifests/latest"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "www-authenticate",
+                format!(
+                    r#"Bearer realm="{}/token",service="reg.test",scope="repository:myimage:pull""#,
+                    server_a.uri()
+                )
+                .as_str(),
+            ))
+            .mount(&server_a)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server_a)
+            .await;
+        let body_b =
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","member":"b-5810-token"}"#;
+        let server_b = MockServer::start().await;
+        mount(&server_b, "latest", manifest(body_b)).await;
+
+        let tmp = std::env::temp_dir().join(format!("oci-5810-token-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+        let member_a = insert_repo(&pool, "remote", Some(&server_a.uri())).await;
+        let member_b = insert_repo(&pool, "remote", Some(&server_b.uri())).await;
+        let virt = strict_virtual(&pool, &[member_a, member_b], true).await;
+
+        virtual_negative_cache_clear();
+        let pulled =
+            try_resolve_virtual_manifest(&state, None, virt, "myimage", "latest", None).await;
+        delete_repos(&pool, &[virt, member_a, member_b]).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let served = match pulled {
+            Ok(Some(found)) => found,
+            Ok(None) => panic!("member B holds :latest"),
+            Err(resp) => panic!(
+                "an anonymous token refusal is a miss, got {}",
+                resp.status()
+            ),
+        };
+        assert_eq!(served.3.id, member_b);
+        assert_eq!(served.2.as_ref(), body_b.as_slice());
+    }
+
+    /// A Local member whose tag lookup fails (the database times out) is
+    /// unavailable: a strict virtual answers that `503` instead of the lower
+    /// Remote member's tag, which the default mode serves. With the setting
+    /// itself unreadable, the pull fails closed and answers `503` too.
+    #[tokio::test]
+    async fn a_strict_virtual_stops_at_a_local_member_whose_lookup_fails_5810() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let body_b =
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","member":"b-5810-db"}"#;
+        let server_b = MockServer::start().await;
+        mount(&server_b, "latest", manifest(body_b)).await;
+
+        let tmp = std::env::temp_dir().join(format!("oci-5810-db-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let local = insert_repo(&pool, "local", None).await;
+        let member_b = insert_repo(&pool, "remote", Some(&server_b.uri())).await;
+        let available = strict_virtual(&pool, &[local, member_b], false).await;
+        let strict = strict_virtual(&pool, &[local, member_b], true).await;
+
+        async fn pull_through(
+            pool: &sqlx::PgPool,
+            tmp: &std::path::Path,
+            tables: &[&str],
+            virt: Uuid,
+        ) -> Result<Option<VirtualManifestResolution>, Response> {
+            let outage = tdh::TableQueryOutage::start(pool, tables)
+                .await
+                .expect("outage pool");
+            let proxy =
+                tdh::build_proxy_service_with_fs(outage.pool.clone(), tmp.to_str().unwrap());
+            let state =
+                tdh::build_state_with_proxy(outage.pool.clone(), tmp.to_str().unwrap(), proxy);
+            virtual_negative_cache_clear();
+            let pulled =
+                try_resolve_virtual_manifest(&state, None, virt, "myimage", "latest", None).await;
+            outage.end().await;
+            pulled
+        }
+
+        let default_mode = pull_through(&pool, &tmp, &["oci_tags"], available).await;
+        let strict_mode = pull_through(&pool, &tmp, &["oci_tags"], strict).await;
+        let unreadable =
+            pull_through(&pool, &tmp, &["oci_tags", "repository_config"], strict).await;
+        delete_repos(&pool, &[available, strict, local, member_b]).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let served = default_mode
+            .expect("available walks on")
+            .expect("member B serves");
+        assert_eq!(served.3.id, member_b);
+        for (label, pulled) in [("strict", strict_mode), ("setting unreadable", unreadable)] {
+            match pulled {
+                Err(resp) => {
+                    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{label}")
+                }
+                Ok(Some(found)) => panic!("{label}: served member {}", found.3.key),
+                Ok(None) => panic!("{label}: answered a miss"),
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_permanent_token_endpoint_status_is_a_refusal_5810() {
+        use crate::services::proxy_service::is_permanent_token_endpoint_refusal as refusal;
+        let token = |status: StatusCode| {
+            crate::services::proxy_service::token_endpoint_status_error(
+                "https://auth.example.test/token",
+                status,
+                false,
+                None,
+            )
+        };
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::BAD_REQUEST,
+            StatusCode::NOT_FOUND,
+        ] {
+            assert!(refusal(&token(status)), "{status}");
+        }
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(!refusal(&token(status)), "{status}");
+        }
+        assert!(!refusal(&AppError::Storage("connection reset".into())));
     }
 }

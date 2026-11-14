@@ -116,7 +116,11 @@ that member answers again.
   higher-priority member is unavailable (an upstream `5xx`, a transport
   failure or timeout, or a database or storage fault on that member's
   lookup), the pull answers `503 UNAVAILABLE` with `Retry-After` instead of
-  the lower member's tag. Manifest pulls take no download deadline and no
+  the lower member's tag. A `404`, an upstream refusing the Remote's
+  credentials, and a token service refusing an anonymous token request
+  (`401`/`403`) are still misses. Anything else the upstream fetch reports
+  without a permanent status counts as unavailable, a manifest over the size
+  cap included. Manifest pulls take no download deadline and no
   member breaker: a hung member's upstream holds the pull for the upstream
   read timeout. A Remote member whose cached tag is past its TTL and whose
   upstream does not answer still serves its cached copy, as a direct pull of
@@ -124,9 +128,10 @@ that member answers again.
 - An OCI blob, and a manifest pulled by digest, are requested by their
   digest, so no member can hold different bytes for them. Those pulls are
   not affected.
-- The setting is read once per download. A Docker/OCI manifest pull reads it
-  only once a member turns out to be unavailable. If the read fails, the download
-  uses `available` and logs a `WARN`.
+- The setting is read once per download. If the read fails, the download
+  uses `available` and logs a `WARN`. A Docker/OCI manifest pull reads it
+  only once a member turns out to be unavailable, and if that read fails the
+  pull answers `503` rather than risk serving a lower member's tag.
 
 ## Upgrade note
 

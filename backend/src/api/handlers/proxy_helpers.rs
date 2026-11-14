@@ -685,6 +685,7 @@ fn map_proxy_error_classified(
     // timeout (the member may hold the object) from a permanent 4xx (a miss).
     // Both can render as the same 502.
     let unavailable = is_member_unavailable_error(&e);
+    let token_refusal = crate::services::proxy_service::is_permanent_token_endpoint_refusal(&e);
     let mut response = match &e {
         crate::error::AppError::NotFound(_) => {
             tracing::info!(
@@ -822,7 +823,26 @@ fn map_proxy_error_classified(
     if unavailable {
         response.extensions_mut().insert(MemberUnavailable);
     }
+    if token_refusal {
+        response.extensions_mut().insert(TokenEndpointRefusal);
+    }
     response
+}
+
+/// Response extension marking a permanent 4xx from an OCI token endpoint
+/// (#5810), such as the anonymous `401`/`403` #4527 reads as a miss. The
+/// error keeps its `Storage` class (and [`MemberUnavailable`]), so the
+/// default walk is unchanged; the OCI manifest walk's strict mode uses this
+/// to treat it as a miss rather than an unavailable member.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TokenEndpointRefusal;
+
+/// Whether a proxy error `Response` is a [`TokenEndpointRefusal`].
+pub(crate) fn is_token_endpoint_refusal(response: &Response) -> bool {
+    response
+        .extensions()
+        .get::<TokenEndpointRefusal>()
+        .is_some()
 }
 
 /// Response extension marking a member fetch failure that says nothing about
@@ -4969,22 +4989,34 @@ impl VirtualMemberFallback {
 /// [`VirtualMemberFallback::Available`] with a `WARN`, the behaviour every
 /// virtual had before the setting existed.
 pub async fn virtual_member_fallback(db: &PgPool, virtual_repo_id: Uuid) -> VirtualMemberFallback {
+    try_virtual_member_fallback(db, virtual_repo_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                virtual_repo_id = %virtual_repo_id,
+                "reading {VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY} failed; using available"
+            );
+            VirtualMemberFallback::Available
+        })
+}
+
+/// [`virtual_member_fallback`] that reports a failed read instead of
+/// reading it as [`VirtualMemberFallback::Available`], for a caller that
+/// fails closed (the OCI manifest walk, which reads the setting only once a
+/// member is already unavailable).
+pub async fn try_virtual_member_fallback(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+) -> Result<VirtualMemberFallback, sqlx::Error> {
     let value: Option<String> = sqlx::query_scalar(
         "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
     )
     .bind(virtual_repo_id)
     .bind(VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY)
     .fetch_optional(db)
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(
-            error = %e,
-            virtual_repo_id = %virtual_repo_id,
-            "reading {VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY} failed; using available"
-        );
-        None
-    });
-    VirtualMemberFallback::from_stored(value.as_deref())
+    .await?;
+    Ok(VirtualMemberFallback::from_stored(value.as_deref()))
 }
 
 /// Mark a degraded merged response: name the missing members, forbid caching
