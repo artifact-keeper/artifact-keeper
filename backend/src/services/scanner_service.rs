@@ -12431,20 +12431,23 @@ pub async fn trigger_scan_on_upload(
 /// Queue a committed upload's scan at the hosted band (#5946). A pushed OCI
 /// manifest becomes one `hosted_image` job per (repository, digest); every
 /// other artifact one `hosted_upload` job.
-async fn enqueue_scan_on_upload(db: &PgPool, repository_id: Uuid, artifact_id: Uuid) -> Result<()> {
+pub(crate) async fn enqueue_scan_on_upload(
+    db: &PgPool,
+    repository_id: Uuid,
+    artifact_id: Uuid,
+) -> Result<()> {
     use crate::services::scan_queue::{ScanQueue, PRIORITY_HOSTED};
-    let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT path, checksum_sha256 FROM artifacts \
-         WHERE id = $1 AND repository_id = $2 AND is_deleted = false",
-    )
-    .bind(artifact_id)
-    .bind(repository_id)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    // The worker selects manifest rows with the same predicate (#5946).
+    let row: Option<(String, bool)> =
+        sqlx::query_as(crate::services::scan_queue::UPLOAD_SCAN_TARGET_SQL)
+            .bind(artifact_id)
+            .bind(repository_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
     let queue = ScanQueue::new(db.clone());
     match row {
-        Some((path, digest)) if parse_oci_manifest_path(&path).is_some() => {
+        Some((digest, true)) => {
             queue
                 .enqueue_hosted_image(repository_id, &digest, PRIORITY_HOSTED)
                 .await?;

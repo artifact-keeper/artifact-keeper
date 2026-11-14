@@ -37755,13 +37755,15 @@ mod oci_write_authz_and_size_tests {
             queued.rows
         );
 
-        let Some((spawned, _)) = image_push_scan_on_upload(1, false).await else {
+        let Some((spawned, _)) = image_push_scan_on_upload(2, false).await else {
             return;
         };
         assert!(spawned.jobs_before_worker.is_empty());
+        // The same two pushes both ways: one queued job must leave exactly
+        // the rows the two in-process scans leave.
         assert_eq!(
             queued.rows, spawned.rows,
-            "the queued scan must record what the in-process scan records"
+            "the queued scan must record what the in-process scans record"
         );
     }
 

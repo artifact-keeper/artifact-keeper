@@ -40,6 +40,35 @@ pub const RENEW_CLAIM_SQL: &str = r#"
       AND claim_token = $2
 "#;
 
+/// The OCI manifest-row test both sides of a `hosted_image` job use (#5946):
+/// the enqueue side classifies an upload with it and the worker selects the
+/// rows to scan with it, so a row one side counts is a row the other finds. A
+/// leading `/` is tolerated, as `parse_oci_manifest_path` tolerates it.
+macro_rules! oci_manifest_path_predicate {
+    () => {
+        "ltrim(path, '/') LIKE 'v2/%/manifests/%'"
+    };
+}
+
+/// An upload's digest and whether it is an OCI manifest row. Binds `$1 =
+/// artifact id`, `$2 = repository id`.
+pub const UPLOAD_SCAN_TARGET_SQL: &str = concat!(
+    "SELECT checksum_sha256, ",
+    oci_manifest_path_predicate!(),
+    " AS is_manifest FROM artifacts WHERE id = $1 AND repository_id = $2 AND is_deleted = false"
+);
+
+/// Every live manifest row in a repository whose bytes are one digest: all the
+/// tags and digest references that point at that manifest, including tags
+/// pushed before or after the push that queued the job. Binds `$1 =
+/// repository id`, `$2 = digest`.
+pub const HOSTED_IMAGE_ROWS_SQL: &str = concat!(
+    "SELECT id FROM artifacts WHERE repository_id = $1 AND checksum_sha256 = $2 ",
+    "AND is_deleted = false AND ",
+    oci_manifest_path_predicate!(),
+    " ORDER BY created_at, id"
+);
+
 /// Wakes a same-process worker on enqueue so a fail-closed pull does not wait out
 /// a tick. `notify_one` parks a permit, so an enqueue between ticks is not lost.
 static ENQUEUE_SIGNAL: std::sync::OnceLock<std::sync::Arc<tokio::sync::Notify>> =
@@ -509,6 +538,9 @@ impl ScanQueue {
 
     /// Back to `pending` behind a backoff, or terminal `failed` once attempts run
     /// out. The dedup indexes exclude terminal rows, so a re-pull queues afresh.
+    /// A job marked `requeue` goes back to `pending` with a fresh budget either
+    /// way, as in [`Self::complete`]; so do [`Self::mark_terminal`] and
+    /// [`Self::recover_expired_claims`].
     pub async fn fail(
         &self,
         job_id: Uuid,
@@ -519,12 +551,16 @@ impl ScanQueue {
         let result = sqlx::query(
             r#"
             UPDATE scan_queue
-            SET attempts = attempts + 1,
+            SET attempts = CASE WHEN requeue THEN 0 ELSE attempts + 1 END,
                 last_error = $3,
+                -- An enqueue marked it while it ran (migration 383): that
+                -- request was never tried, so it does not inherit this
+                -- attempt's exhaustion.
                 state = CASE
-                    WHEN attempts + 1 < max_attempts THEN 'pending'
+                    WHEN requeue OR attempts + 1 < max_attempts THEN 'pending'
                     ELSE 'failed'
                 END,
+                requeue = false,
                 next_attempt_at = NOW() + make_interval(secs => $4),
                 claimed_by = NULL,
                 claim_token = NULL,
@@ -595,8 +631,10 @@ impl ScanQueue {
         let result = sqlx::query(
             r#"
             UPDATE scan_queue
-            SET state = 'failed',
-                attempts = max_attempts,
+            SET state = CASE WHEN requeue THEN 'pending' ELSE 'failed' END,
+                attempts = CASE WHEN requeue THEN 0 ELSE max_attempts END,
+                next_attempt_at = NOW(),
+                requeue = false,
                 last_error = $3,
                 claimed_by = NULL,
                 claim_token = NULL,
@@ -622,11 +660,12 @@ impl ScanQueue {
         let result = sqlx::query(
             r#"
             UPDATE scan_queue
-            SET attempts = attempts + 1,
+            SET attempts = CASE WHEN requeue THEN 0 ELSE attempts + 1 END,
                 state = CASE
-                    WHEN attempts + 1 < max_attempts THEN 'pending'
+                    WHEN requeue OR attempts + 1 < max_attempts THEN 'pending'
                     ELSE 'failed'
                 END,
+                requeue = false,
                 last_error = COALESCE(last_error, 'claim expired; worker vanished mid-scan'),
                 next_attempt_at = NOW() + make_interval(secs => $1),
                 claimed_by = NULL,
@@ -1550,6 +1589,151 @@ mod tests {
             .expect("complete"));
         assert_eq!(pending_count(&pool, "again01").await, 0, "now retired");
 
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #5946 review (A1): a push that lands during the LAST attempt must not be
+    /// lost when that attempt fails, is retired as unrunnable, or dies with
+    /// its worker. Each finalizer sends a `requeue`-marked job back to
+    /// `pending` with a fresh budget instead of leaving it `failed`.
+    #[tokio::test]
+    async fn a_push_during_the_last_attempt_survives_every_finalizer() {
+        let Some(pool) = try_pool().await else { return };
+        for finalizer in ["fail", "mark_terminal", "recover_expired_claims"] {
+            let repo = fresh_queue(&pool).await;
+            let q = ScanQueue::new(pool.clone());
+            q.enqueue_hosted_image(repo, "last01", PRIORITY_HOSTED)
+                .await
+                .expect("enqueue");
+            // Two attempts already spent: this claim is the last one.
+            sqlx::query("UPDATE scan_queue SET attempts = max_attempts - 1")
+                .execute(&pool)
+                .await
+                .expect("spend attempts");
+            let job = q
+                .claim(1, "w", CLAIM_TTL_SECS)
+                .await
+                .expect("claim")
+                .pop()
+                .expect("one job");
+            assert!(!job.will_retry_after_failure(), "this is the last attempt");
+            assert!(!q
+                .enqueue_hosted_image(repo, "last01", PRIORITY_HOSTED)
+                .await
+                .expect("push while running"));
+
+            match finalizer {
+                "fail" => {
+                    assert!(q
+                        .fail(job.id, job.claim_token(), "boom", 0.0)
+                        .await
+                        .expect("fail"));
+                }
+                "mark_terminal" => {
+                    assert!(q
+                        .mark_terminal(job.id, job.claim_token(), "unrunnable")
+                        .await
+                        .expect("terminal"));
+                }
+                _ => {
+                    sqlx::query(
+                        "UPDATE scan_queue SET claim_expires_at = NOW() - INTERVAL '1 second'",
+                    )
+                    .execute(&pool)
+                    .await
+                    .expect("lapse the claim");
+                    assert_eq!(q.recover_expired_claims(0.0).await.expect("recover"), 1);
+                }
+            }
+
+            let (state, attempts, requeue) = sqlx::query_as::<_, (String, i32, bool)>(
+                "SELECT state, attempts, requeue FROM scan_queue WHERE digest = 'last01'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("row kept");
+            assert_eq!(
+                (state.as_str(), attempts, requeue),
+                ("pending", 0, false),
+                "{finalizer}: the push that arrived mid-scan must still be scanned"
+            );
+            assert!(
+                !q.claim(1, "w", CLAIM_TTL_SECS)
+                    .await
+                    .expect("claim again")
+                    .is_empty(),
+                "{finalizer}: and it is due"
+            );
+            drop_repo(&pool, repo).await;
+        }
+    }
+
+    /// #5946 review (A2): the enqueue side and the worker agree on what an
+    /// OCI manifest row is. A row stored with a leading `/` is queued as a
+    /// `hosted_image` job AND found by the worker's row query; before, the
+    /// worker's `LIKE 'v2/...'` missed it and the job scanned nothing.
+    #[tokio::test]
+    async fn the_enqueue_and_the_worker_agree_on_manifest_rows() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let seed = |path: &'static str, digest: &'static str| {
+            let pool = pool.clone();
+            async move {
+                let id = Uuid::new_v4();
+                sqlx::query(
+                    "INSERT INTO artifacts (id, repository_id, path, name, size_bytes, \
+                     checksum_sha256, content_type, storage_key) \
+                     VALUES ($1, $2, $3, 'n', 1, $4, 'application/octet-stream', $3)",
+                )
+                .bind(id)
+                .bind(repo)
+                .bind(path)
+                .bind(digest)
+                .execute(&pool)
+                .await
+                .expect("seed artifact");
+                id
+            }
+        };
+        let slashed = seed("/v2/img/manifests/1.0", "slash01").await;
+        let plain = seed("v2/img/manifests/1.1", "plain01").await;
+        let file = seed("pkg/file-1.0.tgz", "file01").await;
+        for id in [slashed, plain, file] {
+            crate::services::scanner_service::enqueue_scan_on_upload(&pool, repo, id)
+                .await
+                .expect("enqueue");
+        }
+        let jobs: Vec<(String, Option<String>, Option<Uuid>)> = sqlx::query_as(
+            "SELECT kind, digest, artifact_id FROM scan_queue ORDER BY kind, digest",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("jobs");
+        assert_eq!(
+            jobs,
+            vec![
+                (
+                    "hosted_image".to_string(),
+                    Some("plain01".to_string()),
+                    None
+                ),
+                (
+                    "hosted_image".to_string(),
+                    Some("slash01".to_string()),
+                    None
+                ),
+                ("hosted_upload".to_string(), None, Some(file)),
+            ]
+        );
+        for (digest, id) in [("slash01", slashed), ("plain01", plain)] {
+            let rows: Vec<Uuid> = sqlx::query_scalar(HOSTED_IMAGE_ROWS_SQL)
+                .bind(repo)
+                .bind(digest)
+                .fetch_all(&pool)
+                .await
+                .expect("worker rows");
+            assert_eq!(rows, vec![id], "the worker must find the {digest} row");
+        }
         drop_repo(&pool, repo).await;
     }
 

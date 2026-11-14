@@ -441,21 +441,14 @@ async fn scan_hosted_upload(state: &SharedState, job: &ScanJob) -> Result<(), Jo
     }
 }
 
-/// Manifest rows in one repository whose bytes are one digest: every tag and
-/// digest reference a push of that manifest wrote.
-const HOSTED_IMAGE_ROWS_SQL: &str = r#"
-    SELECT id FROM artifacts
-    WHERE repository_id = $1
-      AND checksum_sha256 = $2
-      AND is_deleted = false
-      AND path LIKE 'v2/%/manifests/%'
-    ORDER BY created_at, id
-"#;
-
 /// Scan a pushed OCI manifest (#5946): each manifest row in the repository
 /// with the job's digest, through [`ScannerService::scan_artifact`] as the
 /// in-process trigger does, so the adapter image scan and grype run as today.
-/// The scan dedup turns the second and later rows into reuses of the first.
+///
+/// That is every tag of the manifest in the repository, not only the one whose
+/// push queued the job (the job is keyed by digest, so pushes of several tags
+/// share it). A tag already scanned for these bytes is a no-op or a reuse
+/// through the scan dedup, so only the first row costs a scan.
 ///
 /// [`ScannerService::scan_artifact`]: crate::services::scanner_service::ScannerService::scan_artifact
 async fn scan_hosted_image(state: &SharedState, job: &ScanJob) -> Result<(), JobFailure> {
@@ -471,12 +464,13 @@ async fn scan_hosted_image(state: &SharedState, job: &ScanJob) -> Result<(), Job
         .as_ref()
         .ok_or_else(|| JobFailure::Retryable("no scanner service configured".to_string()))?;
 
-    let rows: Vec<uuid::Uuid> = sqlx::query_scalar(HOSTED_IMAGE_ROWS_SQL)
-        .bind(repo_id)
-        .bind(digest)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| JobFailure::Retryable(format!("manifest lookup failed: {e}")))?;
+    let rows: Vec<uuid::Uuid> =
+        sqlx::query_scalar(crate::services::scan_queue::HOSTED_IMAGE_ROWS_SQL)
+            .bind(repo_id)
+            .bind(digest)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| JobFailure::Retryable(format!("manifest lookup failed: {e}")))?;
 
     // No row: the image was deleted since the push, nothing to grade.
     let mut first_error = None;

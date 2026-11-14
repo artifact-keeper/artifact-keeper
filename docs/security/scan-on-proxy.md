@@ -533,7 +533,9 @@ an extraction permit, so raise the two together. `SCAN_WORKER_TRIVY_ADAPTER_URL`
 gives the scans a worker runs their own scanner-adapter URL in place of
 `TRIVY_ADAPTER_URL`, so a worker pod can use an adapter running next to it while
 the API pods keep the Service URL. It is read only with the queue and the worker
-on.
+on. Only the URL changes: the worker's adapter client sends the same credentials
+as the API pods' (for example a `TRIVY_ADAPTER_TOKEN`, where set), so the
+adapter next to the worker must accept them.
 
 The worker publishes `ak_scan_queue_depth`,
 `ak_scan_queue_oldest_pending_seconds`, `ak_scan_queue_wait_seconds`,
