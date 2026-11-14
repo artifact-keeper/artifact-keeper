@@ -1876,22 +1876,34 @@ fn classify_stream_write(bytes_written: u64, expected_len: Option<u64>) -> Strea
 /// (`scan_results.artifact_id` is `NOT NULL REFERENCES artifacts(id)`,
 /// migration 022:21). Proxy-cached content is intentionally NOT recorded
 /// in `artifacts` (#1278, enforced by the `cache_artifact` meta-test), so
-/// there is no row to scan and nowhere to persist a `scan_results` record.
-/// A real scan-on-proxy implementation needs a dedicated proxy-cache
-/// artifact model and is tracked for v1.3.0.
+/// a proxied object has no `artifacts` row; the scan-on-proxy gate works
+/// around that with digest-keyed verdicts in `proxy_scan_results` (#2954,
+/// #4514). Whatever that gate does not reach — a format that has not
+/// adopted it, an object over the byte cap under fail-open, an index or
+/// metadata file a format leaves unscanned — is cached with no scan
+/// record at all.
 ///
-/// Until that lands, the worst failure mode is *silent*: an operator
-/// enables "Scan on Proxy", pulls packages, sees zero scans, and assumes
-/// they are protected. This helper drives a loud, structured warning so
-/// the gap is observable in logs/alerts instead of being invisible.
+/// Until that gap is closed, the worst failure mode is *silent*: an
+/// operator enables "Scan on Proxy", pulls packages, sees zero scans, and
+/// assumes they are protected. This helper drives a loud, structured
+/// warning so the gap is observable in logs/alerts instead of being
+/// invisible.
 ///
-/// Returns `true` only when scan-on-proxy is enabled for the repo AND the
-/// cache write actually created a new entry (`newly_cached`). A plain
-/// cache hit re-serves already-cached bytes and must not log on every
-/// request; a failed/empty cache write (`newly_cached == false`) created
-/// nothing to warn about.
-pub(crate) fn should_warn_proxy_scan_skipped(proxy_scan_enabled: bool, newly_cached: bool) -> bool {
-    proxy_scan_enabled && newly_cached
+/// Returns `true` only when scan-on-proxy is enabled for the repo, the
+/// cache write actually created a new entry (`newly_cached`), and the
+/// object carries no scan record (`has_scan_record == false`, #5630): the
+/// gate stores a `proxy_scan_results` row for every digest it scans —
+/// clean, vulnerable, or record-only — so a verdict row for the cached
+/// content's digest means the object was not cached unscanned, and the
+/// warning would be wrong noise about it. A plain cache hit re-serves
+/// already-cached bytes and must not log on every request; a failed/empty
+/// cache write (`newly_cached == false`) created nothing to warn about.
+pub(crate) fn should_warn_proxy_scan_skipped(
+    proxy_scan_enabled: bool,
+    newly_cached: bool,
+    has_scan_record: bool,
+) -> bool {
+    proxy_scan_enabled && newly_cached && !has_scan_record
 }
 
 /// Build the operator-facing message for the scan-on-proxy gap (#1274), or
@@ -1904,9 +1916,10 @@ pub(crate) fn should_warn_proxy_scan_skipped(proxy_scan_enabled: bool, newly_cac
 pub(crate) fn proxy_scan_skipped_warning(
     proxy_scan_enabled: bool,
     newly_cached: bool,
+    has_scan_record: bool,
     artifact_path: &str,
 ) -> Option<String> {
-    if !should_warn_proxy_scan_skipped(proxy_scan_enabled, newly_cached) {
+    if !should_warn_proxy_scan_skipped(proxy_scan_enabled, newly_cached, has_scan_record) {
         return None;
     }
     Some(format!(
@@ -5974,6 +5987,15 @@ pub struct ProxyService {
     /// it would be listed as a cached 0-byte object. Bounded and short-lived;
     /// a later serve of the path that does tee clears its entry.
     uncached_serves: Cache<(Uuid, String), ()>,
+    /// `(repository_id, cache_path)` of objects this process has already
+    /// emitted the scan-on-proxy gap warning for (#1274, once-per-object
+    /// #5630). The warning must not drown a scanning Remote's log: an
+    /// unscanned object is refetched as its TTL lapses, and re-warning on
+    /// every refill was one warn per object per TTL cycle. Capacity-bounded
+    /// with no TTL — "at most once per object" holds per process lifetime
+    /// up to the bound, and a restart or an eviction under enough distinct
+    /// objects can warn about the same object again.
+    scan_gap_warned: Cache<(Uuid, String), ()>,
     /// Whether the database-backed serve gates run: the origin policy
     /// (#4506) and the stored scan verdict on the cache fast paths (#4514).
     /// Always `true` outside tests; only `without_origin_policy_gate`, which
@@ -6006,6 +6028,11 @@ pub struct ProxyService {
 /// reads it right after the serve (or from its deferred task moments later),
 /// so this only has to outlive that window.
 const UNCACHED_SERVE_TTL: Duration = Duration::from_secs(300);
+
+/// How many distinct objects [`ProxyService::scan_gap_warned`] remembers
+/// (#5630). The same bound the TTL policy cache uses: enough to cover a
+/// scanning Remote's unscanned objects one-for-one, bounded in memory.
+const SCAN_GAP_WARNED_CAPACITY: u64 = 10_000;
 
 /// How long [`TtlPolicyCache`] trusts a looked-up value. Bounds how long a TTL
 /// change made on another replica takes to reach this one; the replica that
@@ -6147,6 +6174,9 @@ impl ProxyService {
             uncached_serves: Cache::builder()
                 .max_capacity(TtlPolicyCache::CAPACITY)
                 .time_to_live(UNCACHED_SERVE_TTL)
+                .build(),
+            scan_gap_warned: Cache::builder()
+                .max_capacity(SCAN_GAP_WARNED_CAPACITY)
                 .build(),
             origin_policy_gate: true,
             stale_if_error_grace_secs: cache_classifier::STALE_IF_ERROR_GRACE_SECS,
@@ -7068,9 +7098,16 @@ impl ProxyService {
             .await
         {
             Ok(()) => {
-                self.warn_if_proxy_scan_unsupported(commit.repository_id, &commit.cache_path)
-                    .await;
+                // One digest for both concerns below: the #1274 gap check
+                // (a stored verdict for it means the gate scanned the
+                // object, #5630) and the catalog index's checksum.
                 let checksum = StorageService::calculate_hash(&commit.content);
+                self.warn_if_proxy_scan_unsupported(
+                    commit.repository_id,
+                    &commit.cache_path,
+                    Some(&checksum),
+                )
+                .await;
                 self.index_cached_package(
                     commit.repository_id,
                     &commit.cache_path,
@@ -7579,8 +7616,10 @@ impl ProxyService {
                 } else {
                     // New artifact cached from upstream: surface the
                     // scan-on-proxy gap (#1274) so an enabled-but-
-                    // unimplemented setting fails loudly, not silently.
-                    self.warn_if_proxy_scan_unsupported(repo.id, cache_path)
+                    // unimplemented setting fails loudly, not silently —
+                    // unless the object carries a scan record (#5630).
+                    let checksum = StorageService::calculate_hash(&resp.content);
+                    self.warn_if_proxy_scan_unsupported(repo.id, cache_path, Some(&checksum))
                         .await;
 
                     // #1999: index the newly-cached Maven artifact into
@@ -7588,7 +7627,6 @@ impl ProxyService {
                     // only — never the artifacts table, preserving
                     // #1278). Best-effort: failures are swallowed and
                     // never fail the client's proxy fetch.
-                    let checksum = StorageService::calculate_hash(&resp.content);
                     self.index_cached_package(
                         repo.id,
                         cache_path,
@@ -8621,7 +8659,20 @@ impl ProxyService {
         // cached. Surface the scan-on-proxy gap (#1274) before teeing to
         // the background cache writer so an enabled-but-unimplemented
         // setting is observable in logs rather than silently doing nothing.
-        self.warn_if_proxy_scan_unsupported(repo.id, cache_path)
+        // #5630: only without a scan record — a digest-verified fill (an
+        // OCI blob, a Cargo `cksum`-pinned file) names the SHA-256 its
+        // bytes are gated on, and a stored verdict for it means the object
+        // was scanned, not cached UNSCANNED. A fill whose expectation is
+        // non-SHA-256 (npm's SRI) or absent has no digest to look up here:
+        // those arms are the unscanned ones, which is the gap this
+        // warning exists to surface.
+        let expected_sha256 = match expected_checksum.as_ref() {
+            Some(ExpectedCommitDigest::Resolved(CacheCommitDigest::Sha256Hex(hex))) => {
+                Some(hex.clone())
+            }
+            _ => None,
+        };
+        self.warn_if_proxy_scan_unsupported(repo.id, cache_path, expected_sha256.as_deref())
             .await;
 
         // #1999: index the newly-cached Maven artifact into the package
@@ -11664,15 +11715,35 @@ impl ProxyService {
     }
 
     /// Emit a structured warning when a brand-new artifact is cached from
-    /// upstream through a repository that has `scan_on_proxy` enabled.
+    /// upstream through a repository that has `scan_on_proxy` enabled AND
+    /// the object carries no scan record — the #1274 gap.
     ///
     /// See [`should_warn_proxy_scan_skipped`] for the rationale (#1274):
-    /// scan-on-proxy is not yet wired to the scanner pipeline because
-    /// proxy-cached items are deliberately absent from the `artifacts`
-    /// table (#1278). This makes the no-op observable instead of silent.
+    /// the paths the scan-on-proxy gate covers are deliberately absent from
+    /// the `artifacts` table (#1278), so the gate records digest-keyed
+    /// verdicts in `proxy_scan_results` instead. #5630: that gate runs
+    /// BEFORE the deferred cache commit it publishes, and it also commits a
+    /// body it refused with `403` (so the cached copy stays listed and
+    /// rescannable) — every object it scanned therefore has a verdict row,
+    /// and the warning must not fire for it. Before #5630 it fired on
+    /// every newly cached object of a scanning Remote (64/hour on the
+    /// reporting instance) while claiming each one was "cached UNSCANNED".
     ///
-    /// Best-effort: a failure to read the scan config never affects the
-    /// proxy fetch. Called only on the new-cache path, never on cache hits.
+    /// `content_digest` is the SHA-256 of the cached bytes on the buffered
+    /// paths, the expected content-addressed digest on a digest-verified
+    /// streaming fill, and `None` on a plain streaming fill — the formats
+    /// there do not run the gate at all, which is exactly the situation the
+    /// warning exists to surface. The verdict read goes through the
+    /// fast-path memo ([`Self::stored_verdict_for`]), which the gate's own
+    /// writes invalidate, so a just-recorded verdict is always seen.
+    ///
+    /// At most once per object per process (#5630): an unscanned object is
+    /// refetched as its cache TTL lapses, and re-warning per refill is the
+    /// log-drowning the dedup bounds. See [`Self::scan_gap_warned`].
+    ///
+    /// Best-effort: a failure to read the scan config or the stored verdict
+    /// never affects the proxy fetch. Called only on the new-cache path,
+    /// never on cache hits.
     ///
     /// Reads the `scan_on_proxy` flag directly from `scan_configs` (mirrors
     /// `ScanConfigService::is_proxy_scan_enabled`) so `ProxyService` does not
@@ -11681,7 +11752,18 @@ impl ProxyService {
     /// message are produced by the unit-tested pure
     /// [`proxy_scan_skipped_warning`]. `newly_cached = true` because this is
     /// only invoked on the new-cache path.
-    async fn warn_if_proxy_scan_unsupported(&self, repository_id: Uuid, artifact_path: &str) {
+    async fn warn_if_proxy_scan_unsupported(
+        &self,
+        repository_id: Uuid,
+        artifact_path: &str,
+        content_digest: Option<&str>,
+    ) {
+        if self
+            .scan_gap_warned
+            .contains_key(&(repository_id, artifact_path.to_string()))
+        {
+            return;
+        }
         let proxy_scan_enabled = sqlx::query_scalar!(
             r#"SELECT scan_on_proxy FROM scan_configs WHERE repository_id = $1"#,
             repository_id
@@ -11691,9 +11773,31 @@ impl ProxyService {
         .ok()
         .flatten()
         .unwrap_or(false);
+        // Repositories that do not scan on proxy never warn, so they skip
+        // the verdict read on every cache commit.
+        let has_scan_record = match content_digest {
+            Some(_) if !proxy_scan_enabled => false,
+            // An unreadable verdict lookup degrades to "no record": loud is
+            // the point of this warning (#1274), and the once-per-object
+            // dedup bounds the damage of a transient read failure.
+            Some(digest) if !digest.is_empty() => self
+                .stored_verdict_for(digest)
+                .await
+                .ok()
+                .flatten()
+                .is_some(),
+            // No digest at hand (a plain streaming fill): those formats do
+            // not run the gate, so there is no record to find.
+            _ => false,
+        };
 
-        if let Some(message) = proxy_scan_skipped_warning(proxy_scan_enabled, true, artifact_path) {
+        if let Some(message) =
+            proxy_scan_skipped_warning(proxy_scan_enabled, true, has_scan_record, artifact_path)
+        {
             tracing::warn!(repository_id = %repository_id, "{}", message);
+            self.scan_gap_warned
+                .insert((repository_id, artifact_path.to_string()), ())
+                .await;
         }
     }
 
@@ -12327,33 +12431,43 @@ mod tests {
 
     #[test]
     fn test_proxy_scan_warns_only_when_enabled_and_newly_cached() {
-        // The exact condition the warning fires on: setting enabled AND a
-        // brand-new cache entry was created from upstream.
-        assert!(should_warn_proxy_scan_skipped(true, true));
+        // The exact condition the warning fires on: setting enabled, a
+        // brand-new cache entry from upstream, and no scan record.
+        assert!(should_warn_proxy_scan_skipped(true, true, false));
     }
 
     #[test]
     fn test_proxy_scan_no_warn_when_disabled() {
         // scan_on_proxy off => never warn, even on a fresh cache write.
-        assert!(!should_warn_proxy_scan_skipped(false, true));
+        assert!(!should_warn_proxy_scan_skipped(false, true, false));
     }
 
     #[test]
     fn test_proxy_scan_no_warn_on_cache_hit() {
         // A plain cache hit (nothing newly cached) must not warn on every
         // request, even with the setting enabled.
-        assert!(!should_warn_proxy_scan_skipped(true, false));
+        assert!(!should_warn_proxy_scan_skipped(true, false, false));
     }
 
     #[test]
     fn test_proxy_scan_no_warn_when_disabled_and_cache_hit() {
-        assert!(!should_warn_proxy_scan_skipped(false, false));
+        assert!(!should_warn_proxy_scan_skipped(false, false, false));
+    }
+
+    #[test]
+    fn test_proxy_scan_no_warn_when_object_has_scan_record_5630() {
+        // #5630: the scan-on-proxy gate records a digest-keyed verdict for
+        // everything it scans (including a 403-blocked body it still
+        // commits), so an object with a scan record was not cached
+        // UNSCANNED and must not be reported as such — that was the log
+        // flood on every newly cached object of a scanning Remote.
+        assert!(!should_warn_proxy_scan_skipped(true, true, true));
     }
 
     #[test]
     fn test_proxy_scan_warning_message_includes_path_and_issue_refs() {
-        let msg = proxy_scan_skipped_warning(true, true, "react/-/react-18.2.0.tgz")
-            .expect("warning must be produced when enabled + newly cached");
+        let msg = proxy_scan_skipped_warning(true, true, false, "react/-/react-18.2.0.tgz")
+            .expect("warning must be produced when enabled + newly cached + unscanned");
         // Operators grep/alert on these tokens; pin them.
         assert!(msg.contains("scan_on_proxy is enabled"));
         assert!(msg.contains("#1274"));
@@ -12364,12 +12478,117 @@ mod tests {
 
     #[test]
     fn test_proxy_scan_warning_message_none_when_disabled() {
-        assert!(proxy_scan_skipped_warning(false, true, "any/path").is_none());
+        assert!(proxy_scan_skipped_warning(false, true, false, "any/path").is_none());
     }
 
     #[test]
     fn test_proxy_scan_warning_message_none_on_cache_hit() {
-        assert!(proxy_scan_skipped_warning(true, false, "any/path").is_none());
+        assert!(proxy_scan_skipped_warning(true, false, false, "any/path").is_none());
+    }
+
+    #[test]
+    fn test_proxy_scan_warning_message_none_with_scan_record_5630() {
+        assert!(proxy_scan_skipped_warning(true, true, true, "any/path").is_none());
+    }
+
+    /// #5630, end to end against the tables the gate writes: the
+    /// scan-on-proxy gap warning (#1274) must not fire for an object whose
+    /// content digest has a `proxy_scan_results` row — what the gate leaves
+    /// behind for everything it scans, including a 403-blocked body it still
+    /// commits — must fire for a genuinely unscanned object, and must fire at
+    /// most once per object, so a TTL refresh refill does not re-warn.
+    #[tokio::test]
+    async fn test_scan_gap_warning_only_without_a_scan_record_and_once_per_object_5630() {
+        use crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE;
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _repo_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query(
+            "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
+                 scan_on_proxy, block_on_policy_violation, severity_threshold) \
+             VALUES ($1, true, false, true, false, 'high')",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("seed a scanning Remote's scan_configs row");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+
+        // Digests derived from a fresh UUID so a row left behind by an
+        // earlier run cannot collide on `uq_proxy_scan`.
+        let scanned_digest =
+            StorageService::calculate_hash(format!("5630-scanned-{}", Uuid::new_v4()).as_bytes());
+        let unscanned_digest =
+            StorageService::calculate_hash(format!("5630-unscanned-{}", Uuid::new_v4()).as_bytes());
+        sqlx::query(
+            "INSERT INTO proxy_scan_results (checksum_sha256, scan_type, verdict) \
+                     VALUES ($1, $2, 'clean')",
+        )
+        .bind(&scanned_digest)
+        .bind(PROXY_SCAN_TYPE)
+        .execute(&pool)
+        .await
+        .expect("seed the scanned object's verdict row");
+
+        // 1. An object the gate just scanned (it records the verdict before
+        //    publishing the deferred commit): no gap warning.
+        let capture = tdh::LogCapture::default();
+        let guard = capture.install(tracing::Level::WARN);
+        proxy
+            .warn_if_proxy_scan_unsupported(repo_id, "org/a/1.0/a-1.0.jar", Some(&scanned_digest))
+            .await;
+        tracing::warn!("5630 absence control");
+        drop(guard);
+        let logs = capture.text();
+        assert!(
+            logs.contains("5630 absence control"),
+            "the capture is live, so the absence below is meaningful: {logs}"
+        );
+        assert!(
+            !logs.contains("UNSCANNED"),
+            "#5630: an object with a scan record must not be reported cached UNSCANNED: {logs}"
+        );
+
+        // 2. A genuinely unscanned object of the same scanning Remote: the
+        //    gap warning still fires (#1274).
+        let capture = tdh::LogCapture::default();
+        let guard = capture.install(tracing::Level::WARN);
+        proxy
+            .warn_if_proxy_scan_unsupported(repo_id, "org/b/1.0/b-1.0.jar", Some(&unscanned_digest))
+            .await;
+        drop(guard);
+        let logs = capture.text();
+        assert!(
+            logs.contains("UNSCANNED") && logs.contains("org/b/1.0/b-1.0.jar"),
+            "an unscanned object must still surface the #1274 gap: {logs}"
+        );
+
+        // 3. ... exactly once per object: the same path again (a TTL refresh
+        //    refill) stays silent.
+        let capture = tdh::LogCapture::default();
+        let guard = capture.install(tracing::Level::WARN);
+        proxy
+            .warn_if_proxy_scan_unsupported(repo_id, "org/b/1.0/b-1.0.jar", Some(&unscanned_digest))
+            .await;
+        tracing::warn!("5630 absence control");
+        drop(guard);
+        let logs = capture.text();
+        assert!(
+            logs.contains("5630 absence control"),
+            "the capture is live, so the absence below is meaningful: {logs}"
+        );
+        assert!(
+            !logs.contains("UNSCANNED"),
+            "#5630: the gap warning must fire at most once per object: {logs}"
+        );
+
+        let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = ANY($1)")
+            .bind(vec![scanned_digest, unscanned_digest])
+            .execute(&pool)
+            .await;
     }
 
     // -----------------------------------------------------------------------
