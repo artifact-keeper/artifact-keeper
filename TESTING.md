@@ -61,6 +61,8 @@ cargo nextest run --workspace --lib test_create_repository
 cargo nextest run --workspace --run-ignored ignored-only --test integration_tests
 ```
 
+The route-authorization guard (`iam_route_guard::api_v1_declarations_match_the_live_router`) is an ordinary unit test in the `router` shard. When it fails because a route was added or annotated, see "Declaring route authorization" in [CONTRIBUTING.md](CONTRIBUTING.md); the baseline is regenerated with `AK_UPDATE_AUTHZ_BASELINE=1`.
+
 ### Test Location
 
 - `backend/tests/integration_tests.rs` - API integration tests
