@@ -2427,6 +2427,13 @@ pub async fn admin_middleware(
         }
     };
 
+    // The full path, `request.uri()` is what is left after the `/api/v1/admin` nest (#5603)
+    let gate_path = request
+        .extensions()
+        .get::<OriginalUri>()
+        .map(|o| o.0.path().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
+
     if !auth_ext.is_admin {
         // Best-effort RBAC-deny audit event (#2366): an authenticated non-admin
         // reaching an admin-only route is exactly the kind of authorization
@@ -2443,7 +2450,7 @@ pub async fn admin_middleware(
                 .actor_name(auth_ext.username.clone())
                 .details_typed(
                     crate::services::audit_export::details::AuthDetails::permission_denied(
-                        request.uri().path(),
+                        &gate_path,
                         request.method().as_str(),
                         "admin_privileges_required",
                     ),
@@ -2458,11 +2465,6 @@ pub async fn admin_middleware(
     // ever changed, say -- could use every admin route while `auth_middleware`
     // refused it everywhere else. Same path exemptions, same 428, same
     // `OriginalUri` reasoning as in `auth_middleware`.
-    let gate_path = request
-        .extensions()
-        .get::<OriginalUri>()
-        .map(|o| o.0.path().to_string())
-        .unwrap_or_else(|| request.uri().path().to_string());
     if !path_exempt_from_password_change(&gate_path)
         && principal_must_change_password(auth_service.db(), auth_ext.user_id).await
     {
@@ -11800,6 +11802,49 @@ mod tests {
             StatusCode::OK,
             "unflagged principal must not be gated"
         );
+    }
+
+    /// #5603: a non-admin refused on a nested admin route is audited with
+    /// the full request path, not what is left after the nest
+    #[tokio::test]
+    async fn admin_denial_audits_the_full_request_path_5603() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::{middleware, routing::any, Router};
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            make_test_config_for_middleware(),
+        ));
+        let app = Router::new().nest(
+            "/api/v1/admin",
+            Router::new()
+                .route("/settings", any(|| async { (StatusCode::OK, "settings") }))
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    admin_middleware,
+                )),
+        );
+        let (user_id, bearer) = mint_bearer_for_flagged_user(&pool, &auth_service, false).await;
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/admin/settings")
+                    .header("Authorization", &bearer)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let audit = tdh::audit_row_eventually(&pool, user_id, "PERMISSION_DENIED").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(audit.details["path"], "/api/v1/admin/settings");
+        assert_eq!(audit.details["method"], "GET");
     }
 
     // -----------------------------------------------------------------------
