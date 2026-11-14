@@ -131,21 +131,29 @@ pub fn resolve_proxy_metadata_budget_bytes(
 /// An idle family holds nothing, so other formats can still use the whole
 /// shared budget when it is quiet.
 ///
-/// The VS Code gallery is the first family; RPM repodata (#2665) has the same
-/// shape and joins by adding a variant here.
+/// The VS Code gallery was the first family and RubyGems Remote documents the
+/// second (#5973); RPM repodata (#2665) has the same shape and joins by adding
+/// a variant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataBudgetFamily {
     /// Open VSX gallery queries on a VS Code Remote (#3255, #3914).
     VscodeGallery,
+    /// Documents a RubyGems Remote passes through from its upstream: the
+    /// Compact Index, the specs indexes and the quick gemspecs (#5973).
+    RubygemsRemote,
 }
 
 impl MetadataBudgetFamily {
     /// Every family, for registry sizing and tests.
-    pub const ALL: [MetadataBudgetFamily; 1] = [MetadataBudgetFamily::VscodeGallery];
+    pub const ALL: [MetadataBudgetFamily; 2] = [
+        MetadataBudgetFamily::VscodeGallery,
+        MetadataBudgetFamily::RubygemsRemote,
+    ];
 
     fn index(self) -> usize {
         match self {
             MetadataBudgetFamily::VscodeGallery => 0,
+            MetadataBudgetFamily::RubygemsRemote => 1,
         }
     }
 
@@ -153,6 +161,7 @@ impl MetadataBudgetFamily {
     pub fn label(self) -> &'static str {
         match self {
             MetadataBudgetFamily::VscodeGallery => "vscode_gallery",
+            MetadataBudgetFamily::RubygemsRemote => "rubygems_remote",
         }
     }
 
@@ -162,6 +171,7 @@ impl MetadataBudgetFamily {
     pub fn size_env(self) -> &'static str {
         match self {
             MetadataBudgetFamily::VscodeGallery => "AK_VSCODE_GALLERY_METADATA_BUDGET_BYTES",
+            MetadataBudgetFamily::RubygemsRemote => "AK_RUBYGEMS_REMOTE_METADATA_BUDGET_BYTES",
         }
     }
 
@@ -171,12 +181,21 @@ impl MetadataBudgetFamily {
     /// Gallery: 3/8, which is 384 MiB of the default 1 GiB. One composed
     /// gallery response at full width holds four concurrent 64 MiB skeleton
     /// reservations (256 MiB), so the share admits that plus a handful of
-    /// plain queries, while at least 640 MiB — five worst-case 128 MiB
-    /// `LARGE_METADATA_MAX_BYTES` buffers — always stays available to npm,
-    /// PyPI, Debian, RPM and the rest however many gallery reads are in flight.
+    /// plain queries.
+    ///
+    /// RubyGems Remote: 1/4, which is 256 MiB of the default 1 GiB: two
+    /// documents reserved at the full 128 MiB `LARGE_METADATA_MAX_BYTES` cap
+    /// (a cold `/versions` or specs index fetch), or many more cache hits,
+    /// which reserve their cached size instead (#5973).
+    ///
+    /// With both families saturated at once, 384 MiB — three worst-case
+    /// 128 MiB `LARGE_METADATA_MAX_BYTES` buffers — always stays available to
+    /// npm, PyPI, Debian, RPM and the rest however many gallery and RubyGems
+    /// reads are in flight.
     fn default_share(self) -> (usize, usize) {
         match self {
             MetadataBudgetFamily::VscodeGallery => (3, 8),
+            MetadataBudgetFamily::RubygemsRemote => (1, 4),
         }
     }
 
@@ -190,6 +209,9 @@ impl MetadataBudgetFamily {
             MetadataBudgetFamily::VscodeGallery => {
                 crate::api::handlers::vscode::GALLERY_PEAK_REQUEST_RESERVATION_BYTES
             }
+            // A RubyGems request buffers one document at a time, at most the
+            // large-metadata cap.
+            MetadataBudgetFamily::RubygemsRemote => LARGE_METADATA_MAX_BYTES,
         }
     }
 }
@@ -1431,7 +1453,11 @@ pub async fn proxy_post_json_uncached_capped_budgeted(
 /// to act on it without re-deriving the cause from a rendered response (and
 /// silently reclassifying a genuine upstream 404/503 as "too large"). Every
 /// other failure therefore stays a rendered `Response`.
-pub enum CappedMetadataGet {
+///
+/// `P` is the budget reservation riding along with the bytes: the shared
+/// budget's permit for most callers, a [`FamilyMetadataPermit`] for a family
+/// fetch (#5973).
+pub enum CappedMetadataGet<P = OwnedSemaphorePermit> {
     Buffered {
         content: Bytes,
         content_type: Option<String>,
@@ -1440,7 +1466,7 @@ pub enum CappedMetadataGet {
         /// `stale-if-error` grace, so the caller can mark its response (and a
         /// virtual merge can decide how to represent the member's staleness).
         stale_since: Option<DateTime<Utc>>,
-        budget_permit: OwnedSemaphorePermit,
+        budget_permit: P,
     },
     /// Upstream exceeded `max`; nothing past the ceiling was ever buffered,
     /// and no truncated body was persisted (the capped read aborts BEFORE any
@@ -1485,16 +1511,17 @@ pub async fn proxy_fetch_capped_budgeted_with_encoding(
 ///
 /// For a caller that must bound how long it waits for the reservation, or
 /// account for it together with other memory it holds (the virtual conda
-/// merge, #4608), instead of queueing on the budget without limit.
-pub async fn proxy_fetch_capped_with_encoding_reserved(
+/// merge, #4608), instead of queueing on the budget without limit. The permit
+/// type is the caller's: a family fetch passes a [`FamilyMetadataPermit`].
+pub async fn proxy_fetch_capped_with_encoding_reserved<P>(
     proxy_service: &ProxyService,
     repo_id: Uuid,
     repo_key: &str,
     upstream_url: &str,
     path: &str,
     max: usize,
-    budget_permit: OwnedSemaphorePermit,
-) -> Result<CappedMetadataGet, Response> {
+    budget_permit: P,
+) -> Result<CappedMetadataGet<P>, Response> {
     let repo = build_remote_repo(repo_id, repo_key, upstream_url);
     match proxy_service
         .fetch_artifact_with_cache_path_and_accept_capped(&repo, path, path, None, max)
@@ -1514,6 +1541,103 @@ pub async fn proxy_fetch_capped_with_encoding_reserved(
         }),
         Err(error) if is_over_cap_error(&error) => Ok(CappedMetadataGet::OverCap),
         Err(error) => Err(map_proxy_error(repo_key, path, error)),
+    }
+}
+
+/// The reservation a family fetch holds for its buffered document (#5973):
+/// what it reserved before the fetch and, when the document came back larger
+/// than that, the top-up for the difference. Dropping it releases both.
+pub struct FamilyMetadataPermit {
+    _reserved: MetadataBudgetPermit,
+    _top_up: Option<MetadataBudgetPermit>,
+}
+
+/// Bytes a family fetch of a document reserves before it buffers it (#5973):
+/// the size of a fresh cache entry when there is one, since the cache hit
+/// serves exactly those bytes, else the full cap, since an upstream or
+/// revalidated body may be as large as the cap.
+///
+/// A fresh entry's size is read from the metadata sidecar (through the
+/// sidecar LRU), never from the body. A cached size above `max` is not taken:
+/// the fetch would refuse such a body anyway.
+pub fn family_fetch_reservation_bytes(fresh_cached_size: Option<u64>, max: usize) -> usize {
+    fresh_cached_size
+        .and_then(|size| usize::try_from(size).ok())
+        .filter(|size| *size <= max)
+        .unwrap_or(max)
+}
+
+/// As [`proxy_fetch_capped_budgeted_with_encoding`], for a family whose
+/// reservations are capped by a sub-budget of their own (#3914, #5973), with
+/// the reservation sized to the document where its size is known.
+///
+/// * The reservation draws on `family`'s sub-budget and the shared budget,
+///   inside the `wait` bound: a fetch that cannot be admitted in time answers
+///   [`metadata_budget_saturated_response`] (503 + `Retry-After`) instead of
+///   queueing without a bound behind every other in-flight fetch.
+/// * A fresh cached document reserves its cached size, a miss the full `max`
+///   ([`family_fetch_reservation_bytes`]). If the entry changed between that
+///   look and the read, so the body is larger than reserved, the difference
+///   is reserved on top before the bytes are handed on, so the reservation
+///   still covers every buffered byte for the rest of the request.
+///
+/// The byte ceiling is `max` either way, so what is served is unchanged.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_fetch_capped_family_budgeted_in(
+    shared: &ProxyMetadataBudget,
+    sub: &'static MetadataSubBudget,
+    wait: Duration,
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+) -> Result<CappedMetadataGet<FamilyMetadataPermit>, Response> {
+    let reserved =
+        family_fetch_reservation_bytes(proxy_service.fresh_cached_size(repo_key, path).await, max);
+    let permit = reserve_metadata_budget_in(shared, Some(sub), reserved, Some(wait)).await?;
+    let fetched = proxy_fetch_capped_with_encoding_reserved(
+        proxy_service,
+        repo_id,
+        repo_key,
+        upstream_url,
+        path,
+        max,
+        FamilyMetadataPermit {
+            _reserved: permit,
+            _top_up: None,
+        },
+    )
+    .await?;
+    match fetched {
+        CappedMetadataGet::Buffered {
+            content,
+            content_type,
+            content_encoding,
+            stale_since,
+            mut budget_permit,
+        } => {
+            if content.len() > reserved {
+                budget_permit._top_up = Some(
+                    reserve_metadata_budget_in(
+                        shared,
+                        Some(sub),
+                        content.len() - reserved,
+                        Some(wait),
+                    )
+                    .await?,
+                );
+            }
+            Ok(CappedMetadataGet::Buffered {
+                content,
+                content_type,
+                content_encoding,
+                stale_since,
+                budget_permit,
+            })
+        }
+        CappedMetadataGet::OverCap => Ok(CappedMetadataGet::OverCap),
     }
 }
 
@@ -16458,6 +16582,50 @@ mod tests {
         );
         assert_eq!(metadata_sub_budget_bytes(family, None, 4), 4);
         assert_eq!(metadata_sub_budget_bytes(family, None, 0), 1);
+    }
+
+    /// #5973: the RubyGems Remote share is a quarter of the shared budget,
+    /// floored at one large-metadata cap so a lone request never sheds
+    /// against its own family, and both default shares together still leave
+    /// three worst-case buffers to every other format.
+    #[test]
+    fn rubygems_remote_sub_budget_defaults_leave_room_for_other_formats() {
+        let family = MetadataBudgetFamily::RubygemsRemote;
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        assert_eq!(metadata_sub_budget_bytes(family, None, gib), 256 * mib);
+        assert_eq!(
+            metadata_sub_budget_bytes(family, None, 256 * mib),
+            LARGE_METADATA_MAX_BYTES,
+            "floored at one cap"
+        );
+        assert_eq!(metadata_sub_budget_bytes(family, None, 64 * mib), 64 * mib);
+        assert_eq!(metadata_sub_budget_bytes(family, Some("8192"), gib), 8192);
+        let families: usize = MetadataBudgetFamily::ALL
+            .iter()
+            .map(|f| metadata_sub_budget_bytes(*f, None, DEFAULT_PROXY_METADATA_BUDGET_BYTES))
+            .sum();
+        assert!(
+            DEFAULT_PROXY_METADATA_BUDGET_BYTES - families >= 3 * LARGE_METADATA_MAX_BYTES,
+            "every family saturated at once still leaves three 128 MiB buffers"
+        );
+    }
+
+    /// #5973: a family fetch reserves a fresh cached document's own size, and
+    /// the full cap when the size is unknown or larger than the cap.
+    #[test]
+    fn family_fetch_reservation_is_the_cached_size_when_known() {
+        let cap = LARGE_METADATA_MAX_BYTES;
+        assert_eq!(family_fetch_reservation_bytes(None, cap), cap);
+        assert_eq!(
+            family_fetch_reservation_bytes(Some(24_000_000), cap),
+            24_000_000
+        );
+        assert_eq!(family_fetch_reservation_bytes(Some(0), cap), 0);
+        assert_eq!(
+            family_fetch_reservation_bytes(Some(cap as u64 + 1), cap),
+            cap
+        );
     }
 
     #[test]

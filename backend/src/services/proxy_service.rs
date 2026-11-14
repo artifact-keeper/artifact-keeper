@@ -6564,6 +6564,27 @@ impl ProxyService {
         (metadata.expires_under(mutability) > now).then_some(metadata.checksum_sha256)
     }
 
+    /// Size of the bytes cached at `path` in `repo_key` while that entry is
+    /// fresh, i.e. while a buffered read would serve exactly those bytes from
+    /// the cache without contacting the upstream; `None` otherwise.
+    ///
+    /// Reads only the metadata sidecar (through the sidecar LRU), like
+    /// [`Self::fresh_cache_validator`]. For sizing a buffered-metadata budget
+    /// reservation to the document instead of to its cap (#5973).
+    pub async fn fresh_cached_size(&self, repo_key: &str, path: &str) -> Option<u64> {
+        let keys = CacheKeys::derive(&self.cache_scope, repo_key, path).ok()?;
+        let metadata = self.load_cache_metadata(&keys.metadata).await.ok()??;
+        let now = Utc::now();
+        if metadata.negative_cached_until.is_some_and(|t| t > now) {
+            return None;
+        }
+        let mutability = self.effective_mutability_by_key(repo_key, path).await;
+        if metadata.expires_under(mutability) <= now {
+            return None;
+        }
+        u64::try_from(metadata.size_bytes).ok()
+    }
+
     pub async fn is_cache_fresh(&self, repo_key: &str, path: &str) -> bool {
         // A path that fails validation cannot have produced a cache entry
         // we'd want to redirect to anyway: treat it as a miss so the caller
