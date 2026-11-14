@@ -17,9 +17,10 @@ package main
 //
 // A file that exists but holds no token (empty, or only comments) accepts no
 // token from it. A file that cannot be read (deleted, permissions, a line over
-// 1 MiB) keeps the last set read for at most tokensFileGrace, which covers an
-// atomic swap of a mounted Secret; after that the set is dropped, so deleting
-// the file revokes every token it held.
+// 1 MiB) keeps the last set read for up to tokensFileGrace after the adapter
+// first sees it fail (on a request, not at the moment of deletion), which
+// covers an atomic swap of a mounted Secret; after that the set is dropped, so
+// deleting the file revokes every token it held.
 
 import (
 	"bufio"
@@ -125,6 +126,9 @@ func (a *scanAuth) refresh() {
 // the last good set within the grace, drop it after.
 func (a *scanAuth) readFailed(err error) {
 	now := a.now()
+	// The grace is measured from the first request that found the file
+	// failing, not from when it was deleted: the file is only checked on
+	// requests, so an idle adapter starts the clock late.
 	if a.failingSince.IsZero() {
 		a.failingSince = now
 	}
