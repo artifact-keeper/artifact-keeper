@@ -29122,9 +29122,17 @@ mod proxy_download_recording_tests {
                 "serve_scanned_pypi_file(",
                 1,
             ),
+            // #5875: the cache-first and the index-resolved paths both
+            // go through one scanned serve
             (
                 "pypi.rs",
                 "serve_scanned_pypi_file",
+                "serve_scanned_pypi_target(",
+                2,
+            ),
+            (
+                "pypi.rs",
+                "serve_scanned_pypi_target",
                 "serve_scanned_proxy_file(",
                 1,
             ),
