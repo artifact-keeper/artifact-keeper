@@ -9299,6 +9299,10 @@ pub struct ScannerService {
     scan_workspace_path: String,
     dependency_track:
         Option<Arc<crate::services::dependency_track_service::DependencyTrackService>>,
+    /// `SCAN_QUEUE_ENABLED`, mirrored here because the scan_on_upload trigger
+    /// is handed the scanner, not the config. Set by
+    /// [`crate::api::AppState::set_scanner_service`].
+    scan_queue_enabled: std::sync::atomic::AtomicBool,
 }
 
 /// Construction-only types and the scanner-registry owner.
@@ -9471,6 +9475,7 @@ mod construction {
                 storage_base_path,
                 scan_workspace_path,
                 dependency_track: None,
+                scan_queue_enabled: Default::default(),
             }
         }
     }
@@ -9485,6 +9490,18 @@ impl ScannerService {
         dt: Arc<crate::services::dependency_track_service::DependencyTrackService>,
     ) {
         self.dependency_track = Some(dt);
+    }
+
+    /// Route `scan_on_upload` through the durable scan queue (#5946).
+    pub fn set_scan_queue_enabled(&self, enabled: bool) {
+        self.scan_queue_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether `scan_on_upload` queues its scan instead of spawning it.
+    pub fn scan_queue_enabled(&self) -> bool {
+        self.scan_queue_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Synchronously create one placeholder `running` scan_result row per
@@ -9839,6 +9856,7 @@ impl ScannerService {
             storage_base_path,
             scan_workspace_path,
             dependency_track: None,
+            scan_queue_enabled: Default::default(),
         }
     }
 
@@ -12393,11 +12411,51 @@ pub async fn trigger_scan_on_upload(
         return false;
     };
     let should_scan = scan_on_upload_enabled(db, repository_id).await;
+    if should_scan && scanner.scan_queue_enabled() {
+        match enqueue_scan_on_upload(db, repository_id, artifact_id).await {
+            Ok(()) => return true,
+            // The upload committed; a lost scan is worse than an in-process one.
+            Err(e) => tracing::warn!(
+                artifact_id = %artifact_id, error = %e,
+                "could not queue the scan_on_upload; running it in this process"
+            ),
+        }
+    }
     spawn_scan_on_upload(should_scan, artifact_id, move |aid| async move {
         if let Err(e) = scanner.scan_artifact(aid).await {
             tracing::warn!(artifact_id = %aid, error = %e, "scan_on_upload trigger failed");
         }
     })
+}
+
+/// Queue a committed upload's scan at the hosted band (#5946). A pushed OCI
+/// manifest becomes one `hosted_image` job per (repository, digest); every
+/// other artifact one `hosted_upload` job.
+async fn enqueue_scan_on_upload(db: &PgPool, repository_id: Uuid, artifact_id: Uuid) -> Result<()> {
+    use crate::services::scan_queue::{ScanQueue, PRIORITY_HOSTED};
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT path, checksum_sha256 FROM artifacts \
+         WHERE id = $1 AND repository_id = $2 AND is_deleted = false",
+    )
+    .bind(artifact_id)
+    .bind(repository_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    let queue = ScanQueue::new(db.clone());
+    match row {
+        Some((path, digest)) if parse_oci_manifest_path(&path).is_some() => {
+            queue
+                .enqueue_hosted_image(repository_id, &digest, PRIORITY_HOSTED)
+                .await?;
+        }
+        _ => {
+            queue
+                .enqueue_hosted_upload(artifact_id, PRIORITY_HOSTED)
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 /// Count one committed upload (#4642), labelled by the artifact's repository
@@ -13660,6 +13718,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             dependency_track: None,
+            scan_queue_enabled: Default::default(),
         }
     }
 
@@ -14105,6 +14164,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             dependency_track: None,
+            scan_queue_enabled: Default::default(),
         };
 
         // A clean rescan (0 findings) must not release/downgrade the rejection.
@@ -14186,6 +14246,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             dependency_track: None,
+            scan_queue_enabled: Default::default(),
         };
 
         // A clean rescan (0 findings) must not release the admin/policy hold.
@@ -29635,6 +29696,7 @@ tonic-build = "0.12"
                 .to_string_lossy()
                 .into_owned(),
             dependency_track: None,
+            scan_queue_enabled: Default::default(),
         };
 
         scanner
@@ -29716,6 +29778,7 @@ tonic-build = "0.12"
                 .to_string_lossy()
                 .into_owned(),
             dependency_track: None,
+            scan_queue_enabled: Default::default(),
         };
 
         // prepared=None -> InsertFresh path.
@@ -29844,6 +29907,7 @@ tonic-build = "0.12"
                 .to_string_lossy()
                 .into_owned(),
             dependency_track: None,
+            scan_queue_enabled: Default::default(),
         }
     }
 
@@ -30731,6 +30795,7 @@ tonic-build = "0.12"
                 .to_string_lossy()
                 .into_owned(),
             dependency_track: None,
+            scan_queue_enabled: Default::default(),
         };
 
         scanner
@@ -30822,6 +30887,7 @@ tonic-build = "0.12"
                 .to_string_lossy()
                 .into_owned(),
             dependency_track: None,
+            scan_queue_enabled: Default::default(),
         };
 
         let mut prepared = HashMap::new();
@@ -30872,6 +30938,7 @@ tonic-build = "0.12"
                 .to_string_lossy()
                 .into_owned(),
             dependency_track: None,
+            scan_queue_enabled: Default::default(),
         }
     }
 
@@ -31054,6 +31121,7 @@ tonic-build = "0.12"
                 .to_string_lossy()
                 .into_owned(),
             dependency_track: None,
+            scan_queue_enabled: Default::default(),
         };
 
         scanner
@@ -31999,6 +32067,7 @@ tonic-build = "0.12"
                     .to_string_lossy()
                     .into_owned(),
                 dependency_track,
+                scan_queue_enabled: Default::default(),
             }
         }
 

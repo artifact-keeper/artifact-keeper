@@ -58,13 +58,29 @@ pub enum ScanJobKind {
     ProxyFile,
     /// A hosted artifact whose `scan_results` placeholders already exist.
     HostedArtifact,
+    /// A `scan_on_upload` for one artifact row, run as the in-process trigger
+    /// runs it. Migration 383.
+    HostedUpload,
+    /// A pushed OCI manifest: repository plus manifest digest. The worker scans
+    /// every manifest row in that repository with the digest. Migration 383.
+    HostedImage,
 }
 
 impl ScanJobKind {
+    /// Every kind this build runs, for gauges that must publish each one.
+    pub const ALL: [Self; 4] = [
+        Self::ProxyFile,
+        Self::HostedArtifact,
+        Self::HostedUpload,
+        Self::HostedImage,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ProxyFile => "proxy_file",
             Self::HostedArtifact => "hosted_artifact",
+            Self::HostedUpload => "hosted_upload",
+            Self::HostedImage => "hosted_image",
         }
     }
 
@@ -74,6 +90,8 @@ impl ScanJobKind {
         match value {
             "proxy_file" => Some(Self::ProxyFile),
             "hosted_artifact" => Some(Self::HostedArtifact),
+            "hosted_upload" => Some(Self::HostedUpload),
+            "hosted_image" => Some(Self::HostedImage),
             _ => None,
         }
     }
@@ -204,6 +222,7 @@ impl ScanQueue {
             -- only ever raises, so backfill cannot demote it.
             ON CONFLICT (kind, digest)
                 WHERE state IN ('pending', 'running') AND digest IS NOT NULL
+                  AND kind <> 'hosted_image'
             DO UPDATE SET
                 priority = GREATEST(scan_queue.priority, EXCLUDED.priority),
                 updated_at = NOW()
@@ -275,6 +294,77 @@ impl ScanQueue {
         Ok(claimed)
     }
 
+    /// Queue the `scan_on_upload` of one committed artifact row (#5946). Returns
+    /// whether a row was inserted. A second upload of the artifact while its job
+    /// is pending dedups into it; while it is running, the job is marked to run
+    /// again once it completes, since the worker may have read the old bytes.
+    pub async fn enqueue_hosted_upload(&self, artifact_id: Uuid, priority: i16) -> Result<bool> {
+        let row = sqlx::query(
+            r#"
+                INSERT INTO scan_queue (kind, priority, artifact_id)
+                VALUES ('hosted_upload', $1, $2)
+                ON CONFLICT (kind, artifact_id)
+                    WHERE state IN ('pending', 'running') AND artifact_id IS NOT NULL
+                DO UPDATE SET
+                    priority = GREATEST(scan_queue.priority, EXCLUDED.priority),
+                    requeue = scan_queue.requeue OR scan_queue.state = 'running',
+                    updated_at = NOW()
+                RETURNING (xmax = 0) AS inserted
+                "#,
+        )
+        .bind(priority)
+        .bind(artifact_id)
+        .fetch_one(&self.db)
+        .await;
+        Self::hosted_enqueued(row)
+    }
+
+    /// Queue the scan of a pushed OCI manifest (#5946): one job per
+    /// `(repository, digest)`, `digest` being the manifest's sha256 hex as
+    /// `artifacts.checksum_sha256` stores it. A push of the same manifest while
+    /// the job is pending dedups into it; while it is running, the job is marked
+    /// to run again, so a tag pushed after the worker listed the rows is scanned.
+    pub async fn enqueue_hosted_image(
+        &self,
+        repository_id: Uuid,
+        digest: &str,
+        priority: i16,
+    ) -> Result<bool> {
+        let row = sqlx::query(
+            r#"
+                INSERT INTO scan_queue (kind, priority, repository_id, digest)
+                VALUES ('hosted_image', $1, $2, $3)
+                ON CONFLICT (repository_id, digest)
+                    WHERE kind = 'hosted_image' AND state IN ('pending', 'running')
+                DO UPDATE SET
+                    priority = GREATEST(scan_queue.priority, EXCLUDED.priority),
+                    requeue = scan_queue.requeue OR scan_queue.state = 'running',
+                    updated_at = NOW()
+                RETURNING (xmax = 0) AS inserted
+                "#,
+        )
+        .bind(priority)
+        .bind(repository_id)
+        .bind(digest)
+        .fetch_one(&self.db)
+        .await;
+        Self::hosted_enqueued(row)
+    }
+
+    /// Decode a hosted enqueue's `RETURNING (xmax = 0) AS inserted`.
+    fn hosted_enqueued(
+        row: std::result::Result<sqlx::postgres::PgRow, sqlx::Error>,
+    ) -> Result<bool> {
+        use sqlx::Row;
+        let row = row.map_err(|e| AppError::Database(e.to_string()))?;
+        let inserted: bool = row.try_get("inserted").unwrap_or(false);
+        if inserted {
+            // Wake an in-process worker now rather than at its next tick.
+            enqueue_signal().notify_one();
+        }
+        Ok(inserted)
+    }
+
     /// Claim up to `limit` due jobs. Select and flip in one statement, so replicas
     /// drain disjoint jobs.
     ///
@@ -302,6 +392,8 @@ impl ScanQueue {
             claimed AS (
                 UPDATE scan_queue q
                 SET state = 'running',
+                    -- A claim reads everything afresh, so an earlier mark is spent.
+                    requeue = false,
                     claimed_by = $2,
                     claim_token = gen_random_uuid(),
                     claim_expires_at = NOW() + make_interval(secs => $3),
@@ -354,16 +446,65 @@ impl ScanQueue {
 
     /// Retire a finished job, token-guarded. Deleted, since the verdict row is the
     /// durable record. `false` means the claim lapsed and someone else owns it.
+    ///
+    /// A job an enqueue marked `requeue` while it ran (migration 383) goes back
+    /// to `pending` instead, with its attempts reset: the new request was never
+    /// tried.
     pub async fn complete(&self, job_id: Uuid, claim_token: Uuid) -> Result<bool> {
-        let result = sqlx::query(
-            "DELETE FROM scan_queue WHERE id = $1 AND state = 'running' AND claim_token = $2",
-        )
-        .bind(job_id)
-        .bind(claim_token)
-        .execute(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-        Ok(result.rows_affected() == 1)
+        // Two statements, requeue first. A mark set between them makes the
+        // delete miss, so look once more rather than leave the row running
+        // until its lease lapses.
+        for _ in 0..3 {
+            let requeued = sqlx::query(
+                r#"
+                UPDATE scan_queue
+                SET state = 'pending',
+                    requeue = false,
+                    attempts = 0,
+                    last_error = NULL,
+                    next_attempt_at = NOW(),
+                    claimed_by = NULL,
+                    claim_token = NULL,
+                    claim_expires_at = NULL,
+                    updated_at = NOW()
+                WHERE id = $1 AND state = 'running' AND claim_token = $2 AND requeue
+                "#,
+            )
+            .bind(job_id)
+            .bind(claim_token)
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+            if requeued.rows_affected() == 1 {
+                enqueue_signal().notify_one();
+                return Ok(true);
+            }
+            let deleted = sqlx::query(
+                "DELETE FROM scan_queue \
+                 WHERE id = $1 AND state = 'running' AND claim_token = $2 AND NOT requeue",
+            )
+            .bind(job_id)
+            .bind(claim_token)
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+            if deleted.rows_affected() == 1 {
+                return Ok(true);
+            }
+            let still_ours: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM scan_queue \
+                 WHERE id = $1 AND state = 'running' AND claim_token = $2)",
+            )
+            .bind(job_id)
+            .bind(claim_token)
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+            if !still_ours {
+                return Ok(false);
+            }
+        }
+        Ok(false)
     }
 
     /// Back to `pending` behind a backoff, or terminal `failed` once attempts run
@@ -646,7 +787,7 @@ mod tests {
     /// A rename of the stored token would orphan every queued job of that kind.
     #[test]
     fn kind_round_trips_through_its_stored_token() {
-        for kind in [ScanJobKind::ProxyFile, ScanJobKind::HostedArtifact] {
+        for kind in ScanJobKind::ALL {
             assert_eq!(ScanJobKind::from_db(kind.as_str()), Some(kind));
         }
     }
@@ -1303,6 +1444,158 @@ mod tests {
             job.bypass_dedup,
             "a forced rescan stays forced on the worker"
         );
+
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #5946: an image job is one per (repository, digest). The same digest
+    /// in another repository is its own job (findings are per artifact row),
+    /// and a proxy_file job of that digest keeps its fleet-wide dedup.
+    #[tokio::test]
+    async fn hosted_image_dedups_per_repository_and_digest() {
+        let Some(pool) = try_pool().await else { return };
+        let repo_a = fresh_queue(&pool).await;
+        let repo_b = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $2, $3, 'local', 'docker')",
+        )
+        .bind(repo_b)
+        .bind(format!("scan-queue-test-{repo_b}"))
+        .bind(format!("/tmp/scan-queue-test/{repo_b}"))
+        .execute(&pool)
+        .await
+        .expect("seed second repository");
+        let q = ScanQueue::new(pool.clone());
+
+        assert!(q
+            .enqueue_hosted_image(repo_a, "img01", PRIORITY_HOSTED)
+            .await
+            .expect("first"));
+        assert!(
+            !q.enqueue_hosted_image(repo_a, "img01", PRIORITY_HOSTED)
+                .await
+                .expect("again"),
+            "the same manifest in the same repository dedups"
+        );
+        assert!(
+            q.enqueue_hosted_image(repo_b, "img01", PRIORITY_HOSTED)
+                .await
+                .expect("other repo"),
+            "another repository's push of the digest is its own job"
+        );
+        assert!(
+            q.enqueue_proxy_file(repo_a, "x", "img01", None, 1, None, PRIORITY_BACKFILL)
+                .await
+                .expect("proxy"),
+            "a proxy_file job of the digest is unaffected"
+        );
+        assert_eq!(pending_count(&pool, "img01").await, 3);
+
+        drop_repo(&pool, repo_a).await;
+        drop_repo(&pool, repo_b).await;
+    }
+
+    /// #5946: a push that lands while its job RUNS cannot be dropped, the
+    /// worker listed the rows before it. Completing the job sends it back to
+    /// `pending` with a fresh attempt budget; completing that one retires it.
+    #[tokio::test]
+    async fn an_enqueue_on_a_running_hosted_job_runs_it_again() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        q.enqueue_hosted_image(repo, "again01", PRIORITY_HOSTED)
+            .await
+            .expect("enqueue");
+        let job = q
+            .claim(1, "w", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("one job");
+        assert!(matches!(job.job_kind(), Some(ScanJobKind::HostedImage)));
+
+        assert!(
+            !q.enqueue_hosted_image(repo, "again01", PRIORITY_HOSTED)
+                .await
+                .expect("push while running"),
+            "still one row for the key"
+        );
+        assert!(q
+            .complete(job.id, job.claim_token())
+            .await
+            .expect("complete"));
+        let (state, attempts, requeue) = sqlx::query_as::<_, (String, i32, bool)>(
+            "SELECT state, attempts, requeue FROM scan_queue WHERE digest = 'again01'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("row kept");
+        assert_eq!(
+            (state.as_str(), attempts, requeue),
+            ("pending", 0, false),
+            "the job must run again for the push that arrived mid-scan"
+        );
+
+        let again = q
+            .claim(1, "w", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("due again");
+        assert_eq!(again.id, job.id);
+        assert!(q
+            .complete(again.id, again.claim_token())
+            .await
+            .expect("complete"));
+        assert_eq!(pending_count(&pool, "again01").await, 0, "now retired");
+
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #5946: one `hosted_upload` job per artifact, and its own kind, so a
+    /// `POST /security/scan` job for the artifact is not merged into it.
+    #[tokio::test]
+    async fn hosted_upload_dedups_per_artifact() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let artifact_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, path, name, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, 'p/u.jar', 'u.jar', 1, 'abc', 'application/java-archive', 'k')",
+        )
+        .bind(artifact_id)
+        .bind(repo)
+        .execute(&pool)
+        .await
+        .expect("seed artifact");
+        let q = ScanQueue::new(pool.clone());
+
+        assert!(q
+            .enqueue_hosted_upload(artifact_id, PRIORITY_HOSTED)
+            .await
+            .expect("first"));
+        assert!(!q
+            .enqueue_hosted_upload(artifact_id, PRIORITY_HOSTED)
+            .await
+            .expect("again"));
+        assert!(q
+            .enqueue_hosted_artifact(
+                artifact_id,
+                &serde_json::json!({ "grype": Uuid::new_v4() }),
+                false,
+                PRIORITY_HOSTED
+            )
+            .await
+            .expect("hosted_artifact"));
+        let kinds: Vec<String> =
+            sqlx::query_scalar("SELECT kind FROM scan_queue WHERE artifact_id = $1 ORDER BY kind")
+                .bind(artifact_id)
+                .fetch_all(&pool)
+                .await
+                .expect("kinds");
+        assert_eq!(kinds, vec!["hosted_artifact", "hosted_upload"]);
 
         drop_repo(&pool, repo).await;
     }

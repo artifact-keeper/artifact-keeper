@@ -37671,6 +37671,202 @@ mod oci_write_authz_and_size_tests {
         };
         assert_eq!(scans, 0, "scan_on_upload is off, so the push must not scan");
     }
+
+    /// #5946: push `pushes` times the same image manifest under tag `1.0`,
+    /// queued or in-process, and return what the scans recorded.
+    async fn image_push_scan_on_upload(
+        pushes: usize,
+        queued: bool,
+    ) -> Option<(tdh::ScanOnUploadProbe, String)> {
+        let fx = tdh::Fixture::setup("local", "docker").await?;
+        let auth = tdh::bearer_for(&fx.state, fx.user_id).await;
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{}", "c".repeat(64)),
+                "size": 37,
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": format!("sha256:{}", "1".repeat(64)),
+                "size": 17,
+            }],
+        }))
+        .unwrap();
+        let digest = {
+            use sha2::Digest as _;
+            hex::encode(sha2::Sha256::digest(&manifest))
+        };
+        let uri = format!("/{}/scanme/manifests/1.0", fx.repo_key);
+        let make_req = || {
+            Request::builder()
+                .method("PUT")
+                .uri(&uri)
+                .header(AUTHORIZATION, auth.clone())
+                .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+                .body(Body::from(manifest.clone()))
+                .unwrap()
+        };
+        let probe = tdh::scan_on_upload_probe(
+            &fx,
+            router(None),
+            make_req,
+            pushes,
+            queued,
+            Duration::from_secs(60),
+        )
+        .await;
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+        Some((probe, digest))
+    }
+
+    /// #5946: with the queue on, a push queues ONE `hosted_image` job keyed
+    /// by the manifest digest, a second push of the same manifest while it is
+    /// pending adds none, nothing scans until a worker runs, and the worker
+    /// records the same findings the in-process trigger does.
+    #[tokio::test]
+    async fn image_push_scans_through_one_hosted_image_job_queued() {
+        let Some((queued, _)) = image_push_scan_on_upload(2, true).await else {
+            return;
+        };
+        assert_eq!(
+            queued.jobs_before_worker,
+            vec![("hosted_image".to_string(), "pending".to_string())],
+            "two pushes of one manifest must queue exactly one hosted_image job"
+        );
+        assert_eq!(
+            queued.scans_before_worker, 0,
+            "with the queue on the push must not scan in-process"
+        );
+        assert_eq!(queued.jobs_left, 0, "the worker must complete the job");
+        assert!(
+            queued
+                .rows
+                .iter()
+                .any(|(_, status, _, cves)| status == "completed"
+                    && cves.iter().any(|c| c == tdh::PROBE_FINDING_CVE)),
+            "the worker must record the scanner's finding: {:?}",
+            queued.rows
+        );
+
+        let Some((spawned, _)) = image_push_scan_on_upload(1, false).await else {
+            return;
+        };
+        assert!(spawned.jobs_before_worker.is_empty());
+        assert_eq!(
+            queued.rows, spawned.rows,
+            "the queued scan must record what the in-process scan records"
+        );
+    }
+
+    /// #5946: the job row carries the repository and the manifest digest, the
+    /// key it is deduplicated on.
+    #[tokio::test]
+    async fn image_push_job_is_keyed_by_repository_and_manifest_digest_queued() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let auth = tdh::bearer_for(&fx.state, fx.user_id).await;
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{}", "d".repeat(64)),
+                "size": 37,
+            },
+            "layers": [],
+        }))
+        .unwrap();
+        let digest = {
+            use sha2::Digest as _;
+            hex::encode(sha2::Sha256::digest(&manifest))
+        };
+        sqlx::query(
+            "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
+                 scan_on_proxy, block_on_policy_violation, severity_threshold) \
+             VALUES ($1, true, true, false, false, 'high')",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed scan_configs");
+        let storage_path = fx.storage_dir.to_string_lossy().into_owned();
+        let state = tdh::with_scan_queue(tdh::build_scan_state_with_leaf_scanners(
+            &fx,
+            &storage_path,
+            vec![],
+        ));
+        // Two tags of one manifest: still one job for the digest.
+        for tag in ["1.0", "latest"] {
+            let app = tdh::router_with_auth(
+                router(None),
+                state.clone(),
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let req = Request::builder()
+                .method("PUT")
+                .uri(format!("/{}/keyed/manifests/{tag}", fx.repo_key))
+                .header(AUTHORIZATION, auth.clone())
+                .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+                .body(Body::from(manifest.clone()))
+                .unwrap();
+            let (status, body) = tdh::send(app, req).await;
+            assert!(
+                status.is_success(),
+                "push failed: {status} {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        let jobs: Vec<(String, Option<Uuid>, Option<String>, Option<Uuid>, i16)> = sqlx::query_as(
+            "SELECT kind, repository_id, digest, artifact_id, priority FROM scan_queue \
+                 WHERE repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("read jobs");
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+        assert_eq!(
+            jobs,
+            vec![(
+                "hosted_image".to_string(),
+                Some(fx.repo_id),
+                Some(digest),
+                None,
+                crate::services::scan_queue::PRIORITY_HOSTED,
+            )]
+        );
+    }
+
+    /// #5946: with the queue off a push scans in-process exactly as before
+    /// and writes no queue row.
+    #[tokio::test]
+    async fn image_push_with_the_queue_off_scans_in_process_and_queues_nothing() {
+        let Some((probe, _)) = image_push_scan_on_upload(1, false).await else {
+            return;
+        };
+        assert!(probe.jobs_before_worker.is_empty(), "{probe:?}");
+        assert_eq!(probe.jobs_left, 0, "{probe:?}");
+        assert!(
+            probe
+                .rows
+                .iter()
+                .any(|(_, status, _, cves)| status == "completed"
+                    && cves.iter().any(|c| c == tdh::PROBE_FINDING_CVE)),
+            "the in-process scan must still run: {probe:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
