@@ -4009,6 +4009,127 @@ mod remote_document_budget_5973 {
         assert_eq!(budget.shared.available_bytes(), budget.shared.total_bytes());
     }
 
+    /// Fetch `path` through the family fetch with an up-front reservation of
+    /// `reserved` bytes, as a stale size lookup would choose it.
+    async fn fetch_reserving(
+        state: &SharedState,
+        repo: &RepoInfo,
+        budget: RemoteDocumentBudget,
+        path: &str,
+        reserved: usize,
+    ) -> Result<proxy_helpers::CappedMetadataGet<proxy_helpers::FamilyMetadataPermit>, Response>
+    {
+        proxy_helpers::proxy_fetch_capped_family_reserved_in(
+            budget.shared,
+            budget.family,
+            budget.wait,
+            state.proxy_service.as_deref().expect("proxy service"),
+            repo.id,
+            &repo.key,
+            repo.upstream_url.as_deref().expect("upstream"),
+            path,
+            LARGE_METADATA_MAX_BYTES,
+            reserved,
+        )
+        .await
+    }
+
+    fn reserved_bytes(budget: &proxy_helpers::ProxyMetadataBudget) -> usize {
+        budget.total_bytes() - budget.available_bytes()
+    }
+
+    /// A body larger than its up-front reservation (the cached entry grew
+    /// between the size lookup and the read) is topped up, so the reservation
+    /// covers every buffered byte while the body is held.
+    #[tokio::test]
+    async fn test_rubygems_remote_body_larger_than_its_reservation_is_topped_up_5973() {
+        let Some(fx) = tdh::Fixture::setup("remote", "rubygems").await else {
+            return;
+        };
+        let doc = vec![b'v'; 64 * 1024];
+        let upstream = wiremock::MockServer::start().await;
+        mount_slow(&upstream, "/versions", &doc, Duration::ZERO).await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let repo = resolve_rubygems_repo(&state.db, &fx.repo_key)
+            .await
+            .unwrap_or_else(|_| panic!("remote repo resolves"));
+        let budget = default_sized_budget(Duration::from_secs(10));
+
+        let fetched = fetch_reserving(&state, &repo, budget, "versions", 4096).await;
+        let held = (
+            reserved_bytes(budget.shared),
+            reserved_bytes(budget.family.budget()),
+        );
+        let served = matches!(
+            &fetched,
+            Ok(proxy_helpers::CappedMetadataGet::Buffered { content, .. }) if content.len() == doc.len()
+        );
+        drop(fetched);
+        fx.teardown().await;
+
+        assert!(served, "the grown body is served");
+        assert_eq!(
+            held,
+            (doc.len(), doc.len()),
+            "4 KiB reserved up front plus the 60 KiB top-up cover the 64 KiB body"
+        );
+        assert_eq!(budget.shared.available_bytes(), budget.shared.total_bytes());
+        assert_eq!(budget.family.saturation(), 0.0);
+    }
+
+    /// The top-up never waits on the request's own reservation: with a share
+    /// smaller than the document, the up-front reservation is clamped to the
+    /// whole share, so a blocking top-up could only be satisfied by this
+    /// request letting go. It used to wait out the 10 s bound and answer 503
+    /// for a body already fetched; it is now served at once, over-committed.
+    #[tokio::test]
+    async fn test_rubygems_remote_top_up_never_waits_on_its_own_reservation_5973() {
+        let Some(fx) = tdh::Fixture::setup("remote", "rubygems").await else {
+            return;
+        };
+        let doc = vec![b'v'; 64 * 1024];
+        let upstream = wiremock::MockServer::start().await;
+        mount_slow(&upstream, "/versions", &doc, Duration::ZERO).await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let repo = resolve_rubygems_repo(&state.db, &fx.repo_key)
+            .await
+            .unwrap_or_else(|_| panic!("remote repo resolves"));
+        let wait = Duration::from_secs(10);
+        let budget = RemoteDocumentBudget {
+            family: Box::leak(Box::new(MetadataSubBudget::new(
+                MetadataBudgetFamily::RubygemsRemote,
+                16 * 1024,
+            ))),
+            ..default_sized_budget(wait)
+        };
+
+        let started = std::time::Instant::now();
+        let fetched = fetch_reserving(&state, &repo, budget, "versions", 32 * 1024).await;
+        let elapsed = started.elapsed();
+        let share_held = budget.family.saturation();
+        let served = matches!(
+            &fetched,
+            Ok(proxy_helpers::CappedMetadataGet::Buffered { content, .. }) if content.len() == doc.len()
+        );
+        drop(fetched);
+        fx.teardown().await;
+
+        assert!(
+            served,
+            "a body this request already fetched is served, not shed"
+        );
+        assert!(
+            elapsed < wait / 2,
+            "the top-up waited {elapsed:?} on the request's own reservation"
+        );
+        assert_eq!(
+            share_held, 1.0,
+            "the up-front reservation took the whole share"
+        );
+        assert_eq!(budget.family.saturation(), 0.0);
+        assert_eq!(budget.shared.available_bytes(), budget.shared.total_bytes());
+    }
+
     /// A fresh cached document reserves its own size, not the 128 MiB cap: with
     /// all but 1 MiB of the family share held elsewhere, a cached `/versions`
     /// is still served, while a document that is not cached yet (which must

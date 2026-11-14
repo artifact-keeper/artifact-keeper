@@ -350,6 +350,35 @@ pub async fn reserve_metadata_budget_in(
     }
 }
 
+/// Non-blocking [`reserve_metadata_budget_in`]: `bytes` of `shared` and, when
+/// given, of `sub`, or `None` at once when either cannot satisfy them right
+/// now. A sub-budget slice taken before the shared budget refused is given
+/// back, never held.
+pub fn try_reserve_metadata_budget_in(
+    shared: &ProxyMetadataBudget,
+    sub: Option<&'static MetadataSubBudget>,
+    bytes: usize,
+) -> Option<MetadataBudgetPermit> {
+    let family = match sub {
+        Some(sub) => Some((sub, sub.budget.try_reserve(bytes)?)),
+        None => None,
+    };
+    let Some(shared) = shared.try_reserve(bytes) else {
+        if let Some((sub, permit)) = family {
+            drop(permit);
+            sub.record_saturation();
+        }
+        return None;
+    };
+    if let Some((sub, _)) = &family {
+        sub.record_saturation();
+    }
+    Some(MetadataBudgetPermit {
+        _shared: shared,
+        family,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Shared RepoInfo
 // ---------------------------------------------------------------------------
@@ -1576,10 +1605,9 @@ pub fn family_fetch_reservation_bytes(fresh_cached_size: Option<u64>, max: usize
 ///   [`metadata_budget_saturated_response`] (503 + `Retry-After`) instead of
 ///   queueing without a bound behind every other in-flight fetch.
 /// * A fresh cached document reserves its cached size, a miss the full `max`
-///   ([`family_fetch_reservation_bytes`]). If the entry changed between that
-///   look and the read, so the body is larger than reserved, the difference
-///   is reserved on top before the bytes are handed on, so the reservation
-///   still covers every buffered byte for the rest of the request.
+///   ([`family_fetch_reservation_bytes`]). A body that comes back larger than
+///   reserved is topped up as [`proxy_fetch_capped_family_reserved_in`]
+///   describes.
 ///
 /// The byte ceiling is `max` either way, so what is served is unchanged.
 #[allow(clippy::too_many_arguments)]
@@ -1596,6 +1624,47 @@ pub async fn proxy_fetch_capped_family_budgeted_in(
 ) -> Result<CappedMetadataGet<FamilyMetadataPermit>, Response> {
     let reserved =
         family_fetch_reservation_bytes(proxy_service.fresh_cached_size(repo_key, path).await, max);
+    proxy_fetch_capped_family_reserved_in(
+        shared,
+        sub,
+        wait,
+        proxy_service,
+        repo_id,
+        repo_key,
+        upstream_url,
+        path,
+        max,
+        reserved,
+    )
+    .await
+}
+
+/// [`proxy_fetch_capped_family_budgeted_in`] with the size of the up-front
+/// reservation, `reserved`, chosen by the caller.
+///
+/// `reserved` is reserved within `wait` before anything is buffered. When the
+/// body comes back larger (the cached entry was replaced by a larger one
+/// between the size lookup and the read), the difference is topped up with a
+/// NON-blocking reservation. The bytes are already resident by then, so
+/// waiting would only delay a body this request already holds, and it could
+/// wait on itself: when the up-front reservation was clamped to the whole
+/// share, or two top-ups race in a saturated share, the extra bytes cannot be
+/// freed until this request lets go. If the top-up does not fit, the body is
+/// served anyway, over-committing the budget by at most the entry's growth
+/// for the rest of this one request.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_fetch_capped_family_reserved_in(
+    shared: &ProxyMetadataBudget,
+    sub: &'static MetadataSubBudget,
+    wait: Duration,
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+    reserved: usize,
+) -> Result<CappedMetadataGet<FamilyMetadataPermit>, Response> {
     let permit = reserve_metadata_budget_in(shared, Some(sub), reserved, Some(wait)).await?;
     let fetched = proxy_fetch_capped_with_encoding_reserved(
         proxy_service,
@@ -1619,15 +1688,19 @@ pub async fn proxy_fetch_capped_family_budgeted_in(
             mut budget_permit,
         } => {
             if content.len() > reserved {
-                budget_permit._top_up = Some(
-                    reserve_metadata_budget_in(
-                        shared,
-                        Some(sub),
-                        content.len() - reserved,
-                        Some(wait),
-                    )
-                    .await?,
-                );
+                let grown = content.len() - reserved;
+                budget_permit._top_up = try_reserve_metadata_budget_in(shared, Some(sub), grown);
+                if budget_permit._top_up.is_none() {
+                    tracing::debug!(
+                        repository = %repo_key,
+                        path = %path,
+                        reserved,
+                        body_bytes = content.len(),
+                        family = sub.family().label(),
+                        "buffered metadata body outgrew its reservation and the budget has no \
+                         room for the difference; serving it over-committed"
+                    );
+                }
             }
             Ok(CappedMetadataGet::Buffered {
                 content,
@@ -16726,6 +16799,43 @@ mod tests {
         assert_eq!(sub.budget().available_bytes(), 60 * U);
         assert_eq!(shared.available_bytes(), 60 * U);
         drop(permit);
+    }
+
+    /// #5973: the non-blocking family reservation used for a top-up refuses
+    /// at once instead of waiting, both when the share is held whole and when
+    /// the shared budget is, and a family slice taken before the shared
+    /// budget refused is given back.
+    #[test]
+    fn try_reserve_metadata_budget_never_waits_and_returns_a_refused_slice() {
+        const U: usize = PROXY_METADATA_BUDGET_UNIT_BYTES;
+        let shared = ProxyMetadataBudget::new(100 * U);
+        let sub = leaked_sub_budget(50 * U);
+
+        let whole = try_reserve_metadata_budget_in(&shared, Some(sub), 50 * U)
+            .unwrap_or_else(|| panic!("an idle share admits its whole size"));
+        assert!(
+            try_reserve_metadata_budget_in(&shared, Some(sub), U).is_none(),
+            "a share held whole refuses at once"
+        );
+        drop(whole);
+
+        let hog = shared.try_reserve(100 * U).expect("fresh budget");
+        assert!(try_reserve_metadata_budget_in(&shared, Some(sub), 10 * U).is_none());
+        assert_eq!(
+            sub.budget().available_bytes(),
+            50 * U,
+            "the family slice is given back when the shared budget refuses"
+        );
+        assert_eq!(sub.saturation(), 0.0);
+        drop(hog);
+
+        let permit = try_reserve_metadata_budget_in(&shared, Some(sub), 10 * U)
+            .unwrap_or_else(|| panic!("fits once free"));
+        assert_eq!(shared.available_bytes(), 90 * U);
+        assert_eq!(sub.budget().available_bytes(), 40 * U);
+        drop(permit);
+        assert_eq!(shared.available_bytes(), 100 * U);
+        assert_eq!(sub.budget().available_bytes(), 50 * U);
     }
 
     /// The saturation gauge is emitted per family and follows reserve and
