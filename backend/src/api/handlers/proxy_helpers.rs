@@ -10886,6 +10886,10 @@ async fn run_scan_within_budget<T, E>(
     budget: std::time::Duration,
     scan_fut: impl std::future::Future<Output = std::result::Result<T, E>>,
 ) -> std::result::Result<T, ScanTimeoutOutcome<E>> {
+    // The scanners share `budget`; a scanner-adapter that is still starting
+    // gets the fixed readiness gate here, not SCANNER_ADAPTER_READY_TIMEOUT_SECS
+    // (#5945), so it cannot spend the whole budget.
+    let scan_fut = crate::services::scanner_adapter_client::with_fixed_ready_gate(scan_fut);
     match tokio::time::timeout(budget, scan_fut).await {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(ScanTimeoutOutcome::Failed(e)),
@@ -15159,6 +15163,45 @@ mod tests {
     /// it in isolation. The conflation bug itself (all three arms producing
     /// the SAME response) is what the handler-mapping tests in security.rs
     /// prove red -> green.
+    /// #5945: a scanner-adapter that is not ready does not spend an inline
+    /// proxy scan's budget, even with a long SCANNER_ADAPTER_READY_TIMEOUT_SECS:
+    /// inside the budget the gate keeps its fixed three attempts, so the scan
+    /// finishes (here: fails, the adapter never turning ready) well inside it.
+    #[tokio::test]
+    async fn run_scan_within_budget_keeps_the_fixed_adapter_ready_gate() {
+        use crate::services::scanner_adapter_client::{
+            tar_workspace_capped, AdapterReadyWait, ScannerAdapterFsClient,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/probe/ready"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("composer.lock"), b"{}").unwrap();
+        let tar = tar_workspace_capped(dir.path(), 1024 * 1024).unwrap();
+        let client = ScannerAdapterFsClient::new(server.uri())
+            .with_ready_wait(AdapterReadyWait::Budget(std::time::Duration::from_secs(60)));
+
+        let started = std::time::Instant::now();
+        let outcome = run_scan_within_budget(
+            crate::services::scanner_service::PROXY_SCAN_INLINE_BUDGET,
+            client.scan_workspace_tar(tar),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(outcome, Err(ScanTimeoutOutcome::Failed(_))),
+            "the scan must end on its own, not on the inline budget"
+        );
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    }
+
     #[tokio::test]
     async fn run_scan_within_budget_classifies_ok_failed_and_timed_out() {
         // A future that resolves Ok passes the value through untouched.
