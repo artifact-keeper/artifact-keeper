@@ -151,8 +151,9 @@ jobs:
         run: mkdir -p scripts/native-tests
 
       - name: Run native client tests
+        env:
+          PROFILE: ${{ inputs.profile || 'smoke' }}
         run: |
-          PROFILE="${{ inputs.profile || 'smoke' }}"
           echo "Running native client tests with profile: $PROFILE"
 
           if [ "$PROFILE" = "smoke" ] || [ -z "$PROFILE" ]; then
@@ -289,12 +290,16 @@ jobs:
     if: always()
     steps:
       - name: Check E2E status
+        env:
+          PROFILE: ${{ inputs.profile || 'smoke' }}
+          INCLUDE_STRESS: ${{ inputs.include_stress }}
+          INCLUDE_FAILURE: ${{ inputs.include_failure }}
         run: |
           echo "## E2E Test Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Profile**: ${{ inputs.profile || 'smoke' }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Stress Tests**: ${{ inputs.include_stress }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Failure Tests**: ${{ inputs.include_failure }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Profile**: ${PROFILE}" >> $GITHUB_STEP_SUMMARY
+          echo "**Stress Tests**: ${INCLUDE_STRESS}" >> $GITHUB_STEP_SUMMARY
+          echo "**Failure Tests**: ${INCLUDE_FAILURE}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           overall_pass=true
@@ -308,7 +313,7 @@ jobs:
           fi
 
           # Stress Tests (only check if enabled)
-          if [[ "${{ inputs.include_stress }}" == "true" ]]; then
+          if [[ "$INCLUDE_STRESS" == "true" ]]; then
             stress_result="${{ needs.stress-tests.result }}"
             if [[ "$stress_result" == "success" ]]; then
               echo "✅ Stress Tests: Passed" >> $GITHUB_STEP_SUMMARY
@@ -323,7 +328,7 @@ jobs:
           fi
 
           # Failure Tests (only check if enabled)
-          if [[ "${{ inputs.include_failure }}" == "true" ]]; then
+          if [[ "$INCLUDE_FAILURE" == "true" ]]; then
             failure_result="${{ needs.failure-tests.result }}"
             if [[ "$failure_result" == "success" ]]; then
               echo "✅ Failure Tests: Passed" >> $GITHUB_STEP_SUMMARY
