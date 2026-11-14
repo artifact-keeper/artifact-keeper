@@ -36,6 +36,27 @@ const _: () = {
 
 tokio::task_local! {
     static BACKGROUND_BAND: ();
+    static ENGINE_UNAVAILABLE: std::cell::Cell<bool>;
+}
+
+/// Run `fut`, reporting whether a scanner engine said it was unavailable while
+/// it ran (#5994): unreachable, or not ready within its readiness wait. The
+/// orchestrator records such a scan `failed`, which is right for a request
+/// that cannot wait, but a queued job can try again once the engine is back.
+pub async fn tracking_engine_unavailable<F: std::future::Future>(fut: F) -> (F::Output, bool) {
+    ENGINE_UNAVAILABLE
+        .scope(std::cell::Cell::new(false), async {
+            let out = fut.await;
+            (out, ENGINE_UNAVAILABLE.with(|c| c.get()))
+        })
+        .await
+}
+
+/// Note that the scanner engine was unavailable for the current scan. A no-op
+/// outside [`tracking_engine_unavailable`], so an in-process scan (queue off)
+/// is unaffected.
+pub fn note_engine_unavailable() {
+    let _ = ENGINE_UNAVAILABLE.try_with(|c| c.set(true));
 }
 
 /// Run `fut` in the background priority band (#5947): a scan nobody waits on.
@@ -918,6 +939,19 @@ mod tests {
         assert!(!job_with_attempts(3, 3).will_retry_after_failure());
         // A job configured for a single attempt is terminal on its first failure.
         assert!(!job_with_attempts(0, 1).will_retry_after_failure());
+    }
+
+    /// #5994: the unavailable signal is seen only inside a tracking scope,
+    /// and noting it outside one (an in-process scan) does nothing.
+    #[tokio::test]
+    async fn the_engine_unavailable_signal_is_scoped() {
+        note_engine_unavailable();
+        let ((), seen) = tracking_engine_unavailable(async {}).await;
+        assert!(!seen, "nothing noted inside the scope");
+        let ((), seen) = tracking_engine_unavailable(async { note_engine_unavailable() }).await;
+        assert!(seen);
+        let ((), seen) = tracking_engine_unavailable(async {}).await;
+        assert!(!seen, "each scope starts clear");
     }
 
     // ── DB-backed queue semantics ───────────────────────────────────────────

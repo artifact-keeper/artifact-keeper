@@ -736,6 +736,10 @@ impl ImageScanner {
         if !fixed {
             log_adapter_ready_outcome(&self.adapter_url, started, &outcome);
         }
+        if outcome.is_err() {
+            // #5994: a queued scan retries this later; inline scans ignore it.
+            crate::services::scan_queue::note_engine_unavailable();
+        }
         outcome.map(|_| ()).map_err(|f| {
             AppError::BadGateway(format!(
                 "Scanner adapter at {} is {}{}: {}",
@@ -751,6 +755,9 @@ impl ImageScanner {
     async fn submit_scan(&self, body: &serde_json::Value) -> Result<String> {
         let url = format!("{}/api/v1/scan", self.adapter_url);
         let resp = self.http.post(&url).json(body).send().await.map_err(|e| {
+            // #5994: the adapter went away between the readiness gate and the
+            // submit; a queued scan retries.
+            crate::services::scan_queue::note_engine_unavailable();
             AppError::BadGateway(format!("Scanner adapter scan request failed: {}", e))
         })?;
 
@@ -824,7 +831,12 @@ impl ImageScanner {
                             tokio::time::sleep(wait).await;
                             continue;
                         }
-                        None => return Err(AppError::BadGateway(detail).into()),
+                        None => {
+                            // #5994: unreachable past the grace; a queued
+                            // scan retries.
+                            crate::services::scan_queue::note_engine_unavailable();
+                            return Err(AppError::BadGateway(detail).into());
+                        }
                     }
                 }
             };
@@ -1562,6 +1574,22 @@ mod tests {
             "scan() must Err when the adapter is unreachable, not Ok(empty)"
         );
         assert!(matches!(result.unwrap_err(), AppError::BadGateway(_)));
+    }
+
+    /// #5994: an unreachable adapter reports the engine unavailable, so a
+    /// queued scan retries instead of completing with a `failed` row. A
+    #[tokio::test]
+    async fn test_adapter_unreachable_reports_the_engine_unavailable() {
+        let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
+        let (result, unavailable) = crate::services::scan_queue::tracking_engine_unavailable(
+            scanner.scan(&oci_image_artifact(), None, &Bytes::new()),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::BadGateway(_))));
+        assert!(
+            unavailable,
+            "an unreachable adapter is a transient engine failure"
+        );
     }
 
     /// Mount an adapter whose `/probe/ready` answers 503 `not_ready_for`
