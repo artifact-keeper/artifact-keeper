@@ -147,24 +147,135 @@ impl CurationService {
     /// 2. `version` is an `Option`. When the request does not carry a version, a
     ///    version-constrained rule is skipped rather than compared against a
     ///    placeholder.
+    ///
+    /// This is the evaluation every Remote/Virtual proxy download runs, so
+    /// `format` (the repository's format key, `None` when the caller does not
+    /// know it) also lets `popularity` rules contribute their name-only
+    /// checks (#5159); see [`Self::evaluate_proxy_rules`].
     pub async fn evaluate_pep503_package(
         &self,
         staging_repo_id: Uuid,
         default_action: &str,
+        format: Option<&str>,
         package_name: &str,
         version: Option<&str>,
     ) -> Result<RuleEvaluation, sqlx::Error> {
         let rules = self.fetch_applicable_rules(staging_repo_id).await?;
 
-        Ok(Self::evaluate_rules(
+        Ok(Self::evaluate_proxy_rules(
             &rules,
+            default_action,
+            format,
+            package_name,
+            version,
+        ))
+    }
+
+    /// First-match evaluation of a proxy download against a pre-fetched,
+    /// priority-ordered rule set (no DB call, no network call).
+    ///
+    /// * `pattern` rules match exactly as [`Self::evaluate_rules`] does with
+    ///   PEP 503 folding and an optional version, so a pattern-only rule set
+    ///   decides as it always has.
+    /// * `popularity` rules that opt in with `"download_name_checks": true`
+    ///   run [`crate::services::curation::popularity::evaluate_name_only`]
+    ///   (#5159): the local typo-squat, homoglyph and affix checks against
+    ///   the popular list. A rule without the key is skipped, as it was
+    ///   before #5274, so existing rules change no download on upgrade. The download-count threshold needs pypistats or
+    ///   the npm downloads API and stays on the staging sync. A rule with no
+    ///   lexical signal, or a `format` with no popularity ecosystem (or none
+    ///   given), has no effect and evaluation continues.
+    ///   - A `Block` (only a homoglyph or mixed-script match under
+    ///     `block_typosquat`) decides as `"block"`.
+    ///   - Edit-distance and affix matches are only a `Flag` on downloads:
+    ///     edit distance 2 from the short seed names reaches real packages
+    ///     (npm `preact`, `vite`, `chai`, `vuex`; PyPI `numba`, `httpie`,
+    ///     `attr`, `pipx`), and with no review step a block would refuse them.
+    ///   - A `Flag` does not end evaluation, because on a download it serves.
+    ///     Ending there would let a flag shadow a lower-priority `block`. The
+    ///     first flag is kept and later rules still run. A later `block` wins;
+    ///     otherwise the result is the flag, as `"review"`, so the caller
+    ///     serves and logs it.
+    /// * `publisher_trust` rules are skipped: they need the registry
+    ///   metadata (and for attestations a Rekor round-trip) that a download
+    ///   request does not carry.
+    pub(crate) fn evaluate_proxy_rules(
+        rules: &[CurationRule],
+        default_action: &str,
+        format: Option<&str>,
+        package_name: &str,
+        version: Option<&str>,
+    ) -> RuleEvaluation {
+        let mut flag: Option<RuleEvaluation> = None;
+        for rule in rules {
+            match rule.rule_type.as_str() {
+                "pattern" => {
+                    let eval = Self::evaluate_rules(
+                        std::slice::from_ref(rule),
+                        default_action,
+                        package_name,
+                        version,
+                        None,
+                        true,
+                        false,
+                    );
+                    if eval.rule_id.is_some() {
+                        // A matching allow serves; a pending flag is still
+                        // reported so the caller logs it.
+                        return match (eval.action.as_str(), flag) {
+                            ("block", _) | (_, None) => eval,
+                            (_, Some(flag)) => flag,
+                        };
+                    }
+                }
+                "popularity" => {
+                    // Opt-in per rule (#5274): a rule without
+                    // `download_name_checks: true` is skipped here exactly as
+                    // before, so upgrading changes no download.
+                    if !crate::services::curation::popularity::checks_downloads(&rule.config) {
+                        continue;
+                    }
+                    let Some(format) = format else { continue };
+                    match crate::services::curation::popularity::evaluate_name_only(
+                        &rule.config,
+                        format,
+                        package_name,
+                    ) {
+                        CurationDecision::Block(reason) => {
+                            return RuleEvaluation {
+                                action: "block".to_string(),
+                                reason,
+                                rule_id: Some(rule.id),
+                            }
+                        }
+                        CurationDecision::Flag(reason) => {
+                            flag.get_or_insert(RuleEvaluation {
+                                action: "review".to_string(),
+                                reason,
+                                rule_id: Some(rule.id),
+                            });
+                        }
+                        CurationDecision::Allow | CurationDecision::NotApplicable => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        let default = Self::evaluate_rules(
+            &[],
             default_action,
             package_name,
             version,
             None,
             true,
             false,
-        ))
+        );
+        // The column CHECK limits the stance to `allow` / `review`, both of
+        // which serve, so a pending flag carries the outcome.
+        match flag {
+            Some(flag) if default.action != "block" => flag,
+            _ => default,
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -864,7 +975,8 @@ impl CurationService {
     /// `package_pattern` to `*`, so interpreting them here would silently
     /// turn e.g. a global publisher-trust `block` policy into a
     /// block-everything glob on the legacy paths (the PEP 503 proxy gate).
-    /// Typed rules are evaluated exclusively by [`Self::evaluate_typed_rules`].
+    /// Typed rules are evaluated by [`Self::evaluate_typed_rules`], and on the
+    /// proxy path by [`Self::evaluate_proxy_rules`].
     #[allow(clippy::too_many_arguments)]
     fn evaluate_rules(
         rules: &[CurationRule],
@@ -1923,6 +2035,261 @@ mod tests {
         .await;
         assert_eq!(decision, CurationDecision::Allow);
         assert_eq!(rule_id, Some(allow.id));
+    }
+
+    // -- proxy-path evaluation (#5159) ---------------------------------------
+
+    /// Cyrillic `о` (U+043E) for the first `o` of the npm seed name `lodash`.
+    const LODASH_HOMOGLYPH: &str = "l\u{043e}dash";
+
+    /// A `popularity` rule that opts into the download checks (#5274).
+    fn blocking_popularity_rule() -> CurationRule {
+        typed_rule(
+            "popularity",
+            serde_json::json!({"block_typosquat": true, "download_name_checks": true}),
+        )
+    }
+
+    #[test]
+    fn test_proxy_rules_skip_popularity_rules_that_do_not_opt_in_5274() {
+        // Upgrade safety: rules written before #5274 have no
+        // `download_name_checks` key. Downloads must decide exactly as
+        // before, where typed rules were never consulted.
+        let pattern_block = make_rule("reqeusts", "*", "*", "block");
+        for config in [
+            serde_json::json!({}),
+            serde_json::json!({"block_typosquat": true}),
+            serde_json::json!({"block_typosquat": true, "download_name_checks": false}),
+        ] {
+            let popularity = typed_rule("popularity", config.clone());
+            for (name, format) in [
+                (LODASH_HOMOGLYPH, "npm"),
+                ("preact", "npm"),
+                ("reqeusts", "pypi"),
+                ("c1ick", "pypi"),
+            ] {
+                let with_rule = vec![popularity.clone(), pattern_block.clone()];
+                let without = vec![pattern_block.clone()];
+                for default in ["allow", "review"] {
+                    let got = CurationService::evaluate_proxy_rules(
+                        &with_rule,
+                        default,
+                        Some(format),
+                        name,
+                        None,
+                    );
+                    let before = CurationService::evaluate_rules(
+                        &without, default, name, None, None, true, false,
+                    );
+                    assert_eq!(
+                        (got.action.as_str(), got.rule_id, got.reason.as_str()),
+                        (
+                            before.action.as_str(),
+                            before.rule_id,
+                            before.reason.as_str()
+                        ),
+                        "{config} {name} {default}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_proxy_rules_pattern_only_matches_pep503_evaluation() {
+        // A pattern-only rule set must decide exactly as before the typed
+        // rules joined the proxy path: PEP 503 folding, optional version.
+        let rules = vec![
+            make_rule("Evil_Pkg", "*", "*", "block"),
+            make_rule("pinned", ">= 2.0", "*", "block"),
+            make_rule("*", "*", "x86_64", "block"),
+        ];
+        for (name, version) in [
+            ("evil-pkg", None),
+            ("pinned", None),
+            ("pinned", Some("2.1")),
+            ("pinned", Some("1.0")),
+            ("anything", None),
+        ] {
+            let proxy =
+                CurationService::evaluate_proxy_rules(&rules, "allow", Some("pypi"), name, version);
+            let legacy =
+                CurationService::evaluate_rules(&rules, "allow", name, version, None, true, false);
+            assert_eq!(proxy.action, legacy.action, "{name} {version:?}");
+            assert_eq!(proxy.rule_id, legacy.rule_id, "{name} {version:?}");
+            assert_eq!(proxy.reason, legacy.reason, "{name} {version:?}");
+        }
+    }
+
+    #[test]
+    fn test_proxy_rules_popularity_blocks_homoglyph_and_serves_seed_name() {
+        let rule = blocking_popularity_rule();
+        let rules = vec![rule.clone()];
+
+        let blocked = CurationService::evaluate_proxy_rules(
+            &rules,
+            "allow",
+            Some("npm"),
+            LODASH_HOMOGLYPH,
+            None,
+        );
+        assert_eq!(blocked.action, "block");
+        assert_eq!(blocked.rule_id, Some(rule.id));
+        assert!(blocked.reason.contains("'lodash'"), "{}", blocked.reason);
+
+        let seed =
+            CurationService::evaluate_proxy_rules(&rules, "allow", Some("npm"), "lodash", None);
+        assert_eq!(seed.action, "allow");
+        assert!(seed.rule_id.is_none(), "a clean name falls to the default");
+    }
+
+    #[test]
+    fn test_proxy_rules_popularity_flag_maps_to_review() {
+        let rule = typed_rule(
+            "popularity",
+            serde_json::json!({"download_name_checks": true}),
+        );
+        let eval = CurationService::evaluate_proxy_rules(
+            std::slice::from_ref(&rule),
+            "allow",
+            Some("pypi"),
+            "reqeusts",
+            None,
+        );
+        assert_eq!(eval.action, "review");
+        assert_eq!(eval.rule_id, Some(rule.id));
+        assert!(eval.reason.contains("typo-squat"), "{}", eval.reason);
+    }
+
+    #[test]
+    fn test_proxy_rules_first_match_across_rule_types() {
+        // A higher-priority pattern allow shadows the popularity block, as
+        // it would on the staging sync.
+        let allow = make_rule("l*dash", "*", "*", "allow");
+        let popularity = blocking_popularity_rule();
+        let eval = CurationService::evaluate_proxy_rules(
+            &[allow.clone(), popularity.clone()],
+            "allow",
+            Some("npm"),
+            LODASH_HOMOGLYPH,
+            None,
+        );
+        assert_eq!(
+            (eval.action.as_str(), eval.rule_id),
+            ("allow", Some(allow.id))
+        );
+
+        // A popularity rule with nothing to say does NOT shadow a
+        // lower-priority pattern block: the name check never allows.
+        let block = make_rule("lodash", "*", "*", "block");
+        let eval = CurationService::evaluate_proxy_rules(
+            &[popularity, block.clone()],
+            "allow",
+            Some("npm"),
+            "lodash",
+            None,
+        );
+        assert_eq!(
+            (eval.action.as_str(), eval.rule_id),
+            ("block", Some(block.id))
+        );
+    }
+
+    #[test]
+    fn test_proxy_rules_edit_distance_only_flags_under_block_typosquat() {
+        // `preact` is one edit from the seed `react`; a block would refuse a
+        // real package on download.
+        let rule = blocking_popularity_rule();
+        let eval = CurationService::evaluate_proxy_rules(
+            std::slice::from_ref(&rule),
+            "allow",
+            Some("npm"),
+            "preact",
+            None,
+        );
+        assert_eq!(
+            (eval.action.as_str(), eval.rule_id),
+            ("review", Some(rule.id))
+        );
+    }
+
+    #[test]
+    fn test_proxy_rules_flag_does_not_shadow_a_later_block() {
+        // A flag serves on downloads, so it must not end evaluation: a
+        // lower-priority block still refuses.
+        let popularity = blocking_popularity_rule();
+        let block = make_rule("reqeusts", "*", "*", "block");
+        let eval = CurationService::evaluate_proxy_rules(
+            &[popularity.clone(), block.clone()],
+            "allow",
+            Some("pypi"),
+            "reqeusts",
+            None,
+        );
+        assert_eq!(
+            (eval.action.as_str(), eval.rule_id),
+            ("block", Some(block.id))
+        );
+
+        // A later allow (or the default) serves, and the flag is what the
+        // caller sees, so it is logged.
+        let allow = make_rule("reqeusts", "*", "*", "allow");
+        for rules in [vec![popularity.clone(), allow], vec![popularity.clone()]] {
+            let eval = CurationService::evaluate_proxy_rules(
+                &rules,
+                "review",
+                Some("pypi"),
+                "reqeusts",
+                None,
+            );
+            assert_eq!(
+                (eval.action.as_str(), eval.rule_id),
+                ("review", Some(popularity.id))
+            );
+            assert!(eval.reason.contains("typo-squat"), "{}", eval.reason);
+        }
+
+        // Robustness: a block default stance would still refuse.
+        let eval = CurationService::evaluate_proxy_rules(
+            std::slice::from_ref(&popularity),
+            "block",
+            Some("pypi"),
+            "reqeusts",
+            None,
+        );
+        assert_eq!((eval.action.as_str(), eval.rule_id), ("block", None));
+    }
+
+    #[test]
+    fn test_proxy_rules_skip_popularity_without_ecosystem_and_publisher_trust() {
+        let rules = vec![
+            blocking_popularity_rule(),
+            typed_rule(
+                "publisher_trust",
+                serde_json::json!({"trusted_publishers": ["acme"], "action": "block"}),
+            ),
+        ];
+        for format in [None, Some("maven"), Some("cargo")] {
+            let eval = CurationService::evaluate_proxy_rules(
+                &rules,
+                "review",
+                format,
+                LODASH_HOMOGLYPH,
+                None,
+            );
+            assert_eq!(eval.action, "review", "{format:?}: default stance");
+            assert!(eval.rule_id.is_none(), "{format:?}: no rule decided");
+        }
+        // publisher_trust alone on an npm download: skipped, default applies.
+        let eval = CurationService::evaluate_proxy_rules(
+            &rules[1..],
+            "allow",
+            Some("npm"),
+            "some-unsigned-pkg",
+            None,
+        );
+        assert_eq!(eval.action, "allow");
+        assert!(eval.rule_id.is_none());
     }
 
     #[tokio::test]

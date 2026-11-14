@@ -3,6 +3,10 @@
 //! Implements Connect RPC endpoints compatible with `buf push`, `buf pull`,
 //! and the BSR module/commit/label services.
 //!
+//! Each endpoint serves both Connect codecs: the JSON shapes defined below,
+//! and the binary protobuf codec the `buf` CLI actually speaks, whose
+//! messages, identifiers and digests live in `protobuf_wire` (#5066).
+//!
 //! Routes are mounted at `/protobuf/{repo_key}/...`:
 //!   POST /:repo_key/buf.registry.module.v1.ModuleService/GetModules
 //!   POST /:repo_key/buf.registry.module.v1.ModuleService/CreateModules
@@ -35,6 +39,9 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use tracing::info;
 
+use crate::api::handlers::protobuf_wire as wire;
+use crate::api::handlers::protobuf_wire::proto::{v1 as pb1, v1beta1 as pb1b};
+use crate::api::handlers::protobuf_wire::{ids, Codec};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
@@ -62,13 +69,23 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/buf.registry.module.v1.CommitService/ListCommits",
             post(list_commits),
         )
+        // A push carries the module's files, so it keeps the 256 MiB limit
+        // every route had; the route-level limit overrides the router's.
+        .route(
+            "/:repo_key/buf.registry.module.v1.UploadService/Upload",
+            post(upload_v1).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),
+        )
         .route(
             "/:repo_key/buf.registry.module.v1beta1.UploadService/Upload",
-            post(upload),
+            post(upload_v1beta1).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),
+        )
+        .route(
+            "/:repo_key/buf.registry.module.v1.DownloadService/Download",
+            post(download_v1),
         )
         .route(
             "/:repo_key/buf.registry.module.v1beta1.DownloadService/Download",
-            post(download),
+            post(download_v1beta1),
         )
         .route(
             "/:repo_key/buf.registry.module.v1.LabelService/GetLabels",
@@ -86,8 +103,35 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/buf.registry.module.v1.ResourceService/GetResources",
             post(get_resources),
         )
+        .route(
+            "/:repo_key/buf.registry.owner.v1.OwnerService/GetOwners",
+            post(get_owners),
+        )
         .route("/:repo_key/*bsr_path", post(catch_all_bsr))
-        .layer(DefaultBodyLimit::max(256 * 1024 * 1024)) // 256 MB
+        // Every other RPC carries references, not content. Now that the
+        // handlers take the body raw for both codecs, a small limit keeps a
+        // read from buffering 256 MiB before it is decoded.
+        .layer(DefaultBodyLimit::max(RPC_BODY_LIMIT))
+}
+
+/// The body limit of the two Upload routes (a module's files).
+const UPLOAD_BODY_LIMIT: usize = 256 * 1024 * 1024;
+/// The body limit of every other BSR route (references only).
+const RPC_BODY_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Which `buf.registry.module` package a push or pull arrived on.
+///
+/// The CLI chooses per call, not per registry: `buf push` uses v1beta1's
+/// Upload only when the module depends on a second registry (legacy
+/// federation), and Download is chosen by the digest type asked for. A
+/// repository answering b5 therefore has to serve both packages and answer
+/// each in its own, since the two differ in more than the package name --
+/// v1beta1 carries a registry per dependency and the pre-v2 buf.yaml and
+/// buf.lock of a module, and numbers its DigestType differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BsrApi {
+    V1,
+    V1Beta1,
 }
 
 async fn catch_all_bsr(
@@ -98,6 +142,152 @@ async fn catch_all_bsr(
     body: Bytes,
 ) -> Result<Response, Response> {
     super::protobuf_bsr::dispatch_unknown_bsr(state, repo_key, bsr_path, headers, body, auth).await
+}
+
+// ---------------------------------------------------------------------------
+// POST GetOwners
+// ---------------------------------------------------------------------------
+
+/// Resolving a dependency the CLI holds only ids for ends here: it asks for
+/// the module by id and the owner by id, and composes the module's full name
+/// from the two. Reached when a consumer pins a module whose own dependencies
+/// it never named, so without this a dependency chain stops with
+/// `unimplemented: 'buf.registry.owner.v1.OwnerService/GetOwners'`.
+async fn get_owners(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let codec = Codec::from_headers(&headers)?;
+    let body: GetOwnersRequest = codec.decode(&body, GetOwnersRequest::from_pb)?;
+    let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
+    reject_binary_on_proxy_repo(&repo, codec)?;
+
+    let mut owners = Vec::with_capacity(body.owner_refs.len());
+    for owner_ref in &body.owner_refs {
+        let name = resolve_owner_ref(&state, &repo, owner_ref).await?;
+        owners.push(OwnerInfo {
+            organization: OrganizationInfo {
+                id: ids::owner(&name),
+                name,
+            },
+        });
+    }
+
+    let resp = GetOwnersResponse { owners };
+    if codec.is_proto() {
+        return Ok(wire::respond_proto(
+            &wire::proto::owner_v1::GetOwnersResponse {
+                owners: resp
+                    .owners
+                    .iter()
+                    .map(|owner| wire::proto::owner_v1::Owner {
+                        value: Some(wire::proto::owner_v1::owner::Value::Organization(
+                            wire::proto::owner_v1::Organization {
+                                id: owner.organization.id.clone(),
+                                create_time: None,
+                                update_time: None,
+                                name: owner.organization.name.clone(),
+                            },
+                        )),
+                    })
+                    .collect(),
+            },
+        ));
+    }
+    Ok(wire::respond_json(&resp))
+}
+
+/// The owner an `OwnerRef` names: the first segment of a module name this
+/// repository holds.
+///
+/// An owner id is derived from that segment and resolved like the other ids
+/// -- from what was recorded at push time, falling back to deriving the id of
+/// each owner the repository holds. The reply is positional, so an owner that
+/// owns nothing here is `not_found` rather than an entry the CLI would pair
+/// with the wrong reference.
+async fn resolve_owner_ref(
+    state: &SharedState,
+    repo: &RepoInfo,
+    owner_ref: &OwnerRef,
+) -> Result<String, Response> {
+    if let Some(name) = owner_ref.name.as_deref().filter(|n| !n.is_empty()) {
+        let exists: Option<String> = sqlx::query_scalar(
+            r#"SELECT name
+            FROM artifacts
+            WHERE repository_id = $1
+              AND name LIKE $2 || '/%' ESCAPE '\'
+              AND is_deleted = false
+            LIMIT 1"#,
+        )
+        .bind(repo.id)
+        // `_` and `%` are legal in an owner name and would otherwise match
+        // the modules of other owners.
+        .bind(super::escape_like_literal(name))
+        .fetch_optional(&state.db)
+        .await
+        .map_err(connect_db_error)?;
+        if exists.is_none() {
+            return Err(connect_error(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("owner {name} owns no module in this repository"),
+            ));
+        }
+        return Ok(name.to_string());
+    }
+
+    let id = owner_ref.id.as_deref().ok_or_else(|| {
+        connect_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "Owner reference must specify id or name",
+        )
+    })?;
+
+    let recorded: Option<String> = sqlx::query_scalar(
+        r#"SELECT m.metadata->>'module'
+        FROM artifacts a
+        JOIN artifact_metadata m ON m.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND m.metadata->>'ownerId' = $2
+        LIMIT 1"#,
+    )
+    .bind(repo.id)
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(connect_db_error)?;
+    if let Some(module_name) = recorded {
+        return Ok(owner_of(&module_name).to_string());
+    }
+
+    let names: Vec<String> = sqlx::query_scalar(
+        r#"SELECT DISTINCT name
+        FROM artifacts
+        WHERE repository_id = $1
+          AND version IS DISTINCT FROM '_labels'
+          AND is_deleted = false"#,
+    )
+    .bind(repo.id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(connect_db_error)?;
+
+    names
+        .iter()
+        .map(|name| owner_of(name))
+        .find(|owner| ids::owner(owner) == id)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            connect_error(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("owner {id} not found"),
+            )
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +323,12 @@ struct ResourceRef {
 struct ModuleInfo {
     id: String,
     owner_id: String,
+    /// `owner/module`: what the repository keys on, what every derived id is
+    /// a function of, and what the JSON codec has always answered as `name`.
+    /// The binary codec answers the schema's `name` instead, the module alone
+    /// (`pb_module`): `buf` composes `registry/owner/name` itself and rejects
+    /// a name containing a slash ("name \"acme/payments\" cannot contain
+    /// slashes"). The JSON reply keeps its shape so its callers are unchanged.
     name: String,
     create_time: String,
     update_time: String,
@@ -351,6 +547,45 @@ struct GetGraphRequest {
     resource_refs: Vec<ResourceRef>,
 }
 
+// -- GetOwners
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct OwnerRef {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetOwnersRequest {
+    #[serde(default)]
+    owner_refs: Vec<OwnerRef>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OrganizationInfo {
+    id: String,
+    name: String,
+}
+
+/// The reply's oneof as JSON names it. An owner here is the first segment of
+/// a module name -- a namespace, not a person -- so it is an organization.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OwnerInfo {
+    organization: OrganizationInfo,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GetOwnersResponse {
+    owners: Vec<OwnerInfo>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GraphEdge {
@@ -410,6 +645,31 @@ pub(crate) fn connect_error(status: StatusCode, code: &str, message: &str) -> Re
             .body(Body::from(serde_json::to_string(&body).unwrap()))
             .unwrap(),
     )
+}
+
+/// The binary codec on a remote or virtual repository.
+///
+/// The hosted handlers answer from this repository's own rows, and a remote
+/// or virtual repository holds none the CLI could use: its modules live
+/// upstream or in its members. Before #5074 such a call was a `415`; it is a
+/// Connect `unimplemented` now, rather than an answer built from local rows
+/// that would look like "nothing there". The JSON codec keeps its behaviour.
+#[allow(clippy::result_large_err)]
+fn reject_binary_on_proxy_repo(repo: &RepoInfo, codec: Codec) -> Result<(), Response> {
+    if codec.is_proto()
+        && (repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual)
+    {
+        return Err(connect_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "unimplemented",
+            &format!(
+                "the binary Connect codec is served for hosted (local) protobuf repositories \
+                 only; '{}' is a {} repository",
+                repo.key, repo.repo_type
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// A database failure as the Connect `internal` error.
@@ -534,22 +794,183 @@ fn module_name_from_ref(module_ref: &ModuleRef) -> Result<String, Response> {
     }
 }
 
+/// The JSON codec's reading of a `ResourceRef`'s module, unchanged since
+/// before the binary codec: `owner/module`, or the `id` taken as a name.
 #[allow(clippy::result_large_err)]
 fn module_name_from_resource_ref(resource_ref: &ResourceRef) -> Result<String, Response> {
     match (&resource_ref.owner, &resource_ref.module) {
         (Some(owner), Some(module)) => Ok(format!("{}/{}", owner, module)),
-        _ => {
-            if let Some(id) = &resource_ref.id {
-                Ok(id.clone())
-            } else {
-                Err(connect_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_argument",
-                    "Resource reference must specify owner/module or id",
-                ))
-            }
-        }
+        _ => resource_ref.id.clone().ok_or_else(|| {
+            connect_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                "Resource reference must specify owner/module or id",
+            )
+        }),
     }
+}
+
+/// The module a `ModuleRef` names.
+///
+/// Like a commit id, a module id is a one-way function of the name
+/// (`protobuf_wire::ids`), so it is matched by deriving the id of each module
+/// the repository holds -- `buf dep update` asks for its dependency's module
+/// by id, and reading the id as a name answered "module <tuuid> not found".
+/// An id that matches nothing is left to mean a module name.
+///
+/// Only the binary codec resolves derived ids: a JSON caller has never been
+/// answered one, and its `id` keeps meaning what it always did, a module name.
+async fn resolve_module_ref(
+    state: &SharedState,
+    repo: &RepoInfo,
+    module_ref: &ModuleRef,
+    codec: Codec,
+) -> Result<String, Response> {
+    if !codec.is_proto() {
+        return module_name_from_ref(module_ref);
+    }
+    if let (Some(owner), Some(module)) = (&module_ref.owner, &module_ref.module) {
+        return Ok(format!("{}/{}", owner, module));
+    }
+    let id = module_ref.id.as_deref().ok_or_else(|| {
+        connect_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "Module reference must specify owner/module or id",
+        )
+    })?;
+
+    let recorded: Option<String> = sqlx::query_scalar(
+        r#"SELECT a.name
+        FROM artifacts a
+        JOIN artifact_metadata m ON m.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND m.metadata->>'moduleId' = $2
+        LIMIT 1"#,
+    )
+    .bind(repo.id)
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(connect_db_error)?;
+    if let Some(name) = recorded {
+        return Ok(name);
+    }
+
+    // A commit pushed before the id was recorded has nothing to match, so the
+    // id is derived for each module the repository holds. This is a scan
+    // bounded by the number of modules in the repository (every /proto POST
+    // is authenticated by the visibility middleware's write gate); it is a
+    // fallback for those commits, not the way a reference by id is normally
+    // resolved.
+    let names: Vec<String> = sqlx::query_scalar(
+        r#"SELECT DISTINCT name
+        FROM artifacts
+        WHERE repository_id = $1
+          AND version IS DISTINCT FROM '_labels'
+          AND is_deleted = false"#,
+    )
+    .bind(repo.id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(connect_db_error)?;
+
+    Ok(names
+        .into_iter()
+        .find(|name| ids::module(name) == id)
+        .unwrap_or_else(|| id.to_string()))
+}
+
+/// The module and commit a `ResourceRef` names.
+///
+/// The CLI addresses a commit by the tuuid this repository derives, and that
+/// derivation is one-way, so an id is resolved through the `commitId`
+/// recorded next to the commit at push time rather than from any column --
+/// `buf dep update` asks for its dependency this way and was answered
+/// "Module '<tuuid>' not found" when the id was read as a module name. A
+/// `ref` is a label or a commit id and the CLI does not say which, so the
+/// label index is consulted first and the id second. An id that is neither
+/// is left to mean a module name.
+///
+/// The JSON codec keeps the resolution it has always had, so its callers are
+/// answered exactly as before (#5074): the module is `owner/module` (or the
+/// `id`, read as a module name), the commit is the `label`'s if it names one,
+/// otherwise the `id` read as a commit digest, otherwise the latest.
+async fn resolve_resource_ref(
+    state: &SharedState,
+    repo: &RepoInfo,
+    resource_ref: &ResourceRef,
+    codec: Codec,
+) -> Result<(String, Option<String>), Response> {
+    if !codec.is_proto() {
+        let module_name = module_name_from_resource_ref(resource_ref)?;
+        let digest = match &resource_ref.label {
+            Some(label) => resolve_commit_by_label(&state.db, repo.id, &module_name, label).await,
+            None => resource_ref.id.clone(),
+        };
+        return Ok((module_name, digest));
+    }
+    if let (Some(owner), Some(module)) = (&resource_ref.owner, &resource_ref.module) {
+        let module_name = format!("{}/{}", owner, module);
+        let digest = match &resource_ref.label {
+            // A `ref` that is neither a label nor a commit id of this
+            // repository resolves to nothing, and the reply is positional, so
+            // a mistyped label would otherwise be served the module's latest
+            // commit as though it had been asked for.
+            Some(r) => match resolve_commit_by_label(&state.db, repo.id, &module_name, r).await {
+                Some(digest) => Some(digest),
+                None => match commit_by_derived_id(state, repo, r).await? {
+                    Some((_, version)) => Some(version),
+                    None => {
+                        return Err(connect_error(
+                            StatusCode::NOT_FOUND,
+                            "not_found",
+                            &format!("module {module_name} has no label or commit '{r}'"),
+                        ));
+                    }
+                },
+            },
+            None => None,
+        };
+        return Ok((module_name, digest));
+    }
+
+    let id = resource_ref.id.as_deref().ok_or_else(|| {
+        connect_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "Resource reference must specify owner/module or id",
+        )
+    })?;
+    if let Some((module_name, version)) = commit_by_derived_id(state, repo, id).await? {
+        return Ok((module_name, Some(version)));
+    }
+    Ok((id.to_string(), None))
+}
+
+/// The module name and stored digest of the commit a derived tuuid names.
+async fn commit_by_derived_id(
+    state: &SharedState,
+    repo: &RepoInfo,
+    commit_id: &str,
+) -> Result<Option<(String, String)>, Response> {
+    let row = sqlx::query(
+        r#"SELECT a.name, a.version
+        FROM artifacts a
+        JOIN artifact_metadata m ON m.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND m.metadata->>'commitId' = $2
+        LIMIT 1"#,
+    )
+    .bind(repo.id)
+    .bind(commit_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(connect_db_error)?;
+
+    Ok(row.map(|r| (r.get("name"), r.get("version"))))
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,21 +1473,34 @@ fn build_commit_info_from_row(row: &sqlx::postgres::PgRow) -> CommitInfo {
 async fn get_modules(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
-    axum::Json(body): axum::Json<GetModulesRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, Response> {
+    let codec = Codec::from_headers(&headers)?;
+    let body: GetModulesRequest = codec.decode(&body, GetModulesRequest::from_pb)?;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
+    reject_binary_on_proxy_repo(&repo, codec)?;
 
     let mut modules = Vec::new();
 
     for module_ref in &body.module_refs {
-        let module_name = module_name_from_ref(module_ref)?;
+        let module_name = resolve_module_ref(&state, &repo, module_ref, codec).await?;
 
+        // The label index is a real artifact row since #4889, sharing the
+        // module's `name` and written after the commit in the same push. So
+        // every latest-by-name query here answers with the index rather than
+        // a commit unless it excludes that `version`, and the index's
+        // storage object is a JSON document: `buf dep update` resolving a
+        // dependency came back 500 "invalid gzip header" from reading it as
+        // a commit bundle. `IS DISTINCT FROM` because `version` is nullable
+        // and `<>` would drop a NULL-version row along with the index.
         let row = sqlx::query(
             r#"SELECT DISTINCT ON (name)
                 id, name, created_at, updated_at, uploaded_by
             FROM artifacts
             WHERE repository_id = $1
               AND name = $2
+              AND version IS DISTINCT FROM '_labels'
               AND is_deleted = false
             ORDER BY name, created_at DESC
             LIMIT 1"#,
@@ -1083,17 +1517,33 @@ async fn get_modules(
             )
         })?;
 
-        if let Some(row) = row {
-            modules.push(build_module_info_from_row(&row));
+        match row {
+            Some(row) => modules.push(build_module_info_from_row(&row)),
+            // The JSON codec has always left a missing module out of the
+            // list, and still does.
+            None if !codec.is_proto() => {}
+            // The CLI pairs refs with modules positionally and reports a short
+            // list as a bug in itself ("expected 1 Module, found 0"), and
+            // `buf push --create` decides to create the module from exactly
+            // this not_found. An empty list in place of the error strands
+            // both: nothing is created and the push cannot proceed.
+            None => {
+                return Err(connect_error(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    &format!("module {module_name} not found"),
+                ));
+            }
         }
     }
 
     let resp = GetModulesResponse { modules };
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&resp).unwrap()))
-        .unwrap())
+    if codec.is_proto() {
+        return Ok(wire::respond_proto(&pb1::GetModulesResponse {
+            modules: resp.modules.iter().map(pb_module).collect(),
+        }));
+    }
+    Ok(wire::respond_json(&resp))
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,8 +1554,19 @@ async fn create_modules(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
-    axum::Json(body): axum::Json<serde_json::Value>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, Response> {
+    // A JSON caller is answered in main's order: the body is read (415, 400,
+    // 422) before the scope, repository and hosted checks, as axum's `Json`
+    // extractor did. The binary codec authorises first.
+    let codec = Codec::from_headers(&headers)?;
+    let json_body: Option<serde_json::Value> = if codec.is_proto() {
+        None
+    } else {
+        Some(wire::decode_json(&body)?)
+    };
+
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let _user_id = require_auth_basic_scope(auth, "protobuf", "write:artifacts")?.user_id;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
@@ -1113,13 +1574,40 @@ async fn create_modules(
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
-    // CreateModules is implicitly handled during upload. Return the request
-    // echoed back as acknowledgement (modules are created on first push).
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap())
+    // CreateModules is implicitly handled during upload: a module exists from
+    // its first push, so the request is acknowledged as it stands.
+    if let Some(body) = json_body {
+        return Ok(wire::respond_json(&body));
+    }
+    {
+        let req: pb1::CreateModulesRequest = wire::decode_proto(&body)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let modules = req
+            .values
+            .iter()
+            .map(|value| {
+                let owner = match value.owner_ref.as_ref().and_then(|o| o.value.clone()) {
+                    Some(wire::proto::owner_v1::owner_ref::Value::Name(name)) => name,
+                    Some(wire::proto::owner_v1::owner_ref::Value::Id(id)) => id,
+                    None => String::new(),
+                };
+                pb_module(&ModuleInfo {
+                    id: String::new(),
+                    owner_id: String::new(),
+                    name: format!("{}/{}", owner, value.name),
+                    create_time: now.clone(),
+                    update_time: now.clone(),
+                    state: "ACTIVE".to_string(),
+                    default_label_name: if value.default_label_name.is_empty() {
+                        "main".to_string()
+                    } else {
+                        value.default_label_name.clone()
+                    },
+                })
+            })
+            .collect();
+        Ok(wire::respond_proto(&pb1::CreateModulesResponse { modules }))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,21 +1617,19 @@ async fn create_modules(
 async fn get_commits(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
-    axum::Json(body): axum::Json<GetCommitsRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, Response> {
+    let codec = Codec::from_headers(&headers)?;
+    let body: GetCommitsRequest = codec.decode(&body, GetCommitsRequest::from_pb)?;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
+    reject_binary_on_proxy_repo(&repo, codec)?;
 
     let mut commits = Vec::new();
 
     for resource_ref in &body.resource_refs {
-        let module_name = module_name_from_resource_ref(resource_ref)?;
-
-        // If a label is specified, resolve it to a commit digest first
-        let digest_filter = if let Some(label) = &resource_ref.label {
-            resolve_commit_by_label(&state.db, repo.id, &module_name, label).await
-        } else {
-            resource_ref.id.clone()
-        };
+        let (module_name, digest_filter) =
+            resolve_resource_ref(&state, &repo, resource_ref, codec).await?;
 
         let row = if let Some(digest) = &digest_filter {
             sqlx::query(
@@ -1166,6 +1652,7 @@ async fn get_commits(
                 FROM artifacts
                 WHERE repository_id = $1
                   AND name = $2
+                  AND version IS DISTINCT FROM '_labels'
                   AND is_deleted = false
                 ORDER BY created_at DESC
                 LIMIT 1"#,
@@ -1184,17 +1671,29 @@ async fn get_commits(
             )
         })?;
 
-        if let Some(row) = row {
-            commits.push(build_commit_info_from_row(&row));
+        match row {
+            Some(row) => commits.push(build_commit_info_from_row(&row)),
+            None if !codec.is_proto() => {}
+            // Same positional contract as GetModules: `buf dep update`
+            // resolving a dependency rejects a short list outright
+            // ("expected 1 Commits, got 0") instead of reading it as absence.
+            None => {
+                return Err(connect_error(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    &format!("no commit for module {module_name}"),
+                ));
+            }
         }
     }
 
     let resp = GetCommitsResponse { commits };
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&resp).unwrap()))
-        .unwrap())
+    if codec.is_proto() {
+        return Ok(wire::respond_proto(&pb1::GetCommitsResponse {
+            commits: pb_commits(&state, &repo, &resp.commits).await?,
+        }));
+    }
+    Ok(wire::respond_json(&resp))
 }
 
 // ---------------------------------------------------------------------------
@@ -1204,9 +1703,13 @@ async fn get_commits(
 async fn list_commits(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
-    axum::Json(body): axum::Json<ListCommitsRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, Response> {
+    let codec = Codec::from_headers(&headers)?;
+    let body: ListCommitsRequest = codec.decode(&body, ListCommitsRequest::from_pb)?;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
+    reject_binary_on_proxy_repo(&repo, codec)?;
 
     let module_name = match (&body.owner, &body.module) {
         (Some(owner), Some(module)) => format!("{}/{}", owner, module),
@@ -1227,6 +1730,7 @@ async fn list_commits(
         FROM artifacts
         WHERE repository_id = $1
           AND name = $2
+          AND version IS DISTINCT FROM '_labels'
           AND is_deleted = false
         ORDER BY created_at DESC
         LIMIT $3 OFFSET $4"#,
@@ -1253,24 +1757,59 @@ async fn list_commits(
         commits,
         next_page_token,
     };
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&resp).unwrap()))
-        .unwrap())
+    if codec.is_proto() {
+        return Ok(wire::respond_proto(&pb1::ListCommitsResponse {
+            next_page_token: resp.next_page_token.clone(),
+            commits: pb_commits(&state, &repo, &resp.commits).await?,
+        }));
+    }
+    Ok(wire::respond_json(&resp))
 }
 
 // ---------------------------------------------------------------------------
 // POST Upload (buf push)
 // ---------------------------------------------------------------------------
 
+async fn upload_v1(
+    state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
+    repo_key: Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Response> {
+    upload(state, auth, repo_key, headers, body, BsrApi::V1).await
+}
+
+async fn upload_v1beta1(
+    state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
+    repo_key: Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Response> {
+    upload(state, auth, repo_key, headers, body, BsrApi::V1Beta1).await
+}
+
 async fn upload(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
-    axum::Json(body): axum::Json<UploadRequest>,
+    body: Bytes,
+    api: BsrApi,
 ) -> Result<Response, Response> {
+    // A JSON caller is answered in main's order: the body is read (415, 400,
+    // 422) before the scope, repository and hosted checks, as axum's `Json`
+    // extractor did. The binary codec, which is new, authorises before it
+    // decodes: the body limit on this route is 256 MiB, and an
+    // unauthenticated request has no claim on that much work.
+    let codec = Codec::from_headers(&headers)?;
+    let json_body: Option<UploadRequest> = if codec.is_proto() {
+        None
+    } else {
+        Some(wire::decode_json(&body)?)
+    };
+
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "protobuf", "write:artifacts")?.user_id;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
@@ -1278,28 +1817,84 @@ async fn upload(
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
+    let body: UploadRequest = match (json_body, api) {
+        (Some(body), _) => body,
+        (None, BsrApi::V1) => codec.decode(&body, UploadRequest::from_pb_v1)?,
+        (None, BsrApi::V1Beta1) => codec.decode(&body, UploadRequest::from_pb)?,
+    };
+
+    // Over the CLI's codec a push carries one module. Both proto packages
+    // carry the dependency commit ids once for the whole push, not per
+    // module, and the request says nothing about which module imports which
+    // -- the reference BSR derives that from the uploaded files themselves --
+    // so with several modules every b5 composition would be a guess, and the
+    // digest the CLI then verifies wrong for a reason nothing states. A
+    // workspace is pushed module by module instead.
+    if codec.is_proto() && body.contents.len() > 1 {
+        return Err(connect_error(
+            StatusCode::BAD_REQUEST,
+            "failed_precondition",
+            "this upload pushes several modules, which this registry cannot give correct \
+             b5 digests: the request carries the dependency commit ids once for the whole \
+             push, with nothing saying which module imports which. Push each module on its \
+             own.",
+        ));
+    }
+
     let mut result_commits = Vec::new();
 
     for content in &body.contents {
         let module_name = module_name_from_ref(&content.module_ref)?;
 
-        // Decode and hash all files to compute the commit digest
-        let commit_digest = {
-            let mut decoded_files = Vec::with_capacity(content.files.len());
-            for file in &content.files {
-                let decoded = base64::engine::general_purpose::STANDARD
-                    .decode(&file.content)
-                    .map_err(|e| {
-                        connect_error(
-                            StatusCode::BAD_REQUEST,
-                            "invalid_argument",
-                            &format!("Invalid base64 content for file '{}': {}", file.path, e),
-                        )
-                    })?;
-                decoded_files.push((file.path.clone(), decoded));
-            }
+        // Decode and hash all files to compute the commit digest. The decoded
+        // files outlive the digest: they are also what the b5 digest hashes.
+        let mut decoded_files = Vec::with_capacity(content.files.len());
+        for file in &content.files {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&file.content)
+                .map_err(|e| {
+                    connect_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_argument",
+                        &format!("Invalid base64 content for file '{}': {}", file.path, e),
+                    )
+                })?;
+            decoded_files.push((file.path.clone(), decoded));
+        }
+        let dep_names = extract_dep_names(&content.dep_refs);
+        // Over the CLI's codec a commit is its files AND the dependency
+        // commits it was built against: the same files pushed again after
+        // `buf dep update` moved a dependency from c1 to c2 are a new commit
+        // with a new b5, not the old one. So the dependency commit ids are
+        // part of its identity (and of the derived commit id). The JSON codec
+        // keeps the files-only digest it has always had.
+        let commit_digest = if codec.is_proto() && !dep_names.is_empty() {
+            compute_commit_digest_with_deps(&decoded_files, &dep_names)
+        } else {
             compute_commit_digest(&decoded_files)
         };
+
+        // Resolve the b5 before anything is stored. A dependency is recorded
+        // by the commit id the CLI sent, and the digest the CLI verifies this
+        // commit against covers every dependency's own b5, which this
+        // repository holds only for the modules it hosts itself (#5066).
+        let b5 = resolve_push_b5(&state, &repo, &decoded_files, &dep_names).await?;
+        // Over the CLI's codec a commit without a b5 is one every later
+        // request would refuse, so it is refused here, before its bundle is
+        // stored, labelled or queued for sync. The JSON codec records bare
+        // module names and keeps storing such a commit, with the dependencies
+        // that went unresolved named in its metadata.
+        if let (true, B5Outcome::UnresolvedDeps(deps)) = (codec.is_proto(), &b5) {
+            return Err(connect_unresolved_deps(&module_name, deps));
+        }
+        let protobuf_metadata = build_protobuf_metadata(
+            &module_name,
+            &commit_digest,
+            content.files.len(),
+            &dep_names,
+            &ids::commit(&module_name, &commit_digest),
+            &b5,
+        );
 
         // Check for duplicate (idempotent)
         let existing = sqlx::query(
@@ -1325,6 +1920,11 @@ async fn upload(
         })?;
 
         if let Some(existing_row) = existing {
+            // A commit pushed before #5066 has none of the ids or the b5 a
+            // dependency reference resolves through, so without this it could
+            // never be depended on: pushing it again is how it gains them.
+            backfill_commit_metadata(&state, existing_row.get("id"), &protobuf_metadata).await?;
+
             let commit = build_commit_info_from_row(&existing_row);
             result_commits.push(commit);
 
@@ -1428,9 +2028,13 @@ async fn upload(
                 crate::api::handlers::db_err_message(&e),
             )
         })?;
-        tx.commit().await.map_err(connect_db_error)?;
-
         let artifact_id: uuid::Uuid = row.get("id");
+
+        // In the same transaction as the row: the ids and the b5 recorded here
+        // are what every reference by id and every dependency on this commit
+        // resolves through, so a commit stored without them is a broken one.
+        upsert_commit_metadata(&mut *tx, artifact_id, &protobuf_metadata).await?;
+        tx.commit().await.map_err(connect_db_error)?;
 
         crate::services::quarantine_service::apply_upload_hold_hosted(
             &state.db,
@@ -1444,27 +2048,6 @@ async fn upload(
             repo.id,
             artifact_id,
         )
-        .await;
-
-        // Build metadata including dependency refs
-        let dep_names = extract_dep_names(&content.dep_refs);
-
-        let protobuf_metadata = build_protobuf_metadata(
-            &module_name,
-            &commit_digest,
-            content.files.len(),
-            &dep_names,
-        );
-
-        // Store metadata
-        let _ = sqlx::query(
-            r#"INSERT INTO artifact_metadata (artifact_id, format, metadata)
-            VALUES ($1, 'protobuf', $2)
-            ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2"#,
-        )
-        .bind(artifact_id)
-        .bind(&protobuf_metadata)
-        .execute(&state.db)
         .await;
 
         // Update labels (default to "main" if none provided)
@@ -1531,37 +2114,71 @@ async fn upload(
     let resp = UploadResponse {
         commits: result_commits,
     };
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&resp).unwrap()))
-        .unwrap())
+    if codec.is_proto() {
+        if api == BsrApi::V1 {
+            return Ok(wire::respond_proto(&pb1::UploadResponse {
+                commits: pb_commits(&state, &repo, &resp.commits).await?,
+            }));
+        }
+        let mut commits = Vec::with_capacity(resp.commits.len());
+        for commit in &resp.commits {
+            let b5 = commit_b5(&state, &repo, &commit.module_id, &commit.digest.value).await?;
+            commits.push(pb_commit_v1beta1(commit, &b5)?);
+        }
+        return Ok(wire::respond_proto(&pb1b::UploadResponse { commits }));
+    }
+    Ok(wire::respond_json(&resp))
 }
 
 // ---------------------------------------------------------------------------
 // POST Download (buf pull)
 // ---------------------------------------------------------------------------
 
+async fn download_v1(
+    state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
+    repo_key: Path<String>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Response> {
+    download(state, auth, repo_key, ctx, headers, body, BsrApi::V1).await
+}
+
+async fn download_v1beta1(
+    state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
+    repo_key: Path<String>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Response> {
+    download(state, auth, repo_key, ctx, headers, body, BsrApi::V1Beta1).await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn download(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
-    axum::Json(body): axum::Json<DownloadRequest>,
+    headers: HeaderMap,
+    body: Bytes,
+    api: BsrApi,
 ) -> Result<Response, Response> {
+    let codec = Codec::from_headers(&headers)?;
+    let body: DownloadRequest = match api {
+        BsrApi::V1 => codec.decode(&body, DownloadRequest::from_pb_v1)?,
+        BsrApi::V1Beta1 => codec.decode(&body, DownloadRequest::from_pb)?,
+    };
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
+    reject_binary_on_proxy_repo(&repo, codec)?;
 
     let mut contents = Vec::new();
 
     for value in &body.values {
-        let module_name = module_name_from_resource_ref(&value.resource_ref)?;
-
-        // Resolve commit digest: prefer label, then direct id, then latest
-        let commit_digest = if let Some(label) = &value.resource_ref.label {
-            resolve_commit_by_label(&state.db, repo.id, &module_name, label).await
-        } else {
-            value.resource_ref.id.clone()
-        };
+        let (module_name, commit_digest) =
+            resolve_resource_ref(&state, &repo, &value.resource_ref, codec).await?;
 
         // Fetch the artifact
         let artifact_row = if let Some(digest) = &commit_digest {
@@ -1747,11 +2364,49 @@ async fn download(
     }
 
     let resp = DownloadResponse { contents };
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&resp).unwrap()))
-        .unwrap())
+    if codec.is_proto() && api == BsrApi::V1 {
+        let mut contents = Vec::with_capacity(resp.contents.len());
+        for content in &resp.contents {
+            let b5 = commit_b5(
+                &state,
+                &repo,
+                &content.commit.module_id,
+                &content.commit.digest.value,
+            )
+            .await?;
+            contents.push(pb1::download_response::Content {
+                commit: Some(pb_commit(&content.commit, &b5)?),
+                files: decode_bundle_files(&content.files)?
+                    .into_iter()
+                    .map(|(path, content)| pb1::File { path, content })
+                    .collect(),
+            });
+        }
+        return Ok(wire::respond_proto(&pb1::DownloadResponse { contents }));
+    }
+    if codec.is_proto() {
+        let mut contents = Vec::with_capacity(resp.contents.len());
+        for content in &resp.contents {
+            let b5 = commit_b5(
+                &state,
+                &repo,
+                &content.commit.module_id,
+                &content.commit.digest.value,
+            )
+            .await?;
+            contents.push(pb1b::download_response::Content {
+                commit: Some(pb_commit_v1beta1(&content.commit, &b5)?),
+                files: decode_bundle_files(&content.files)?
+                    .into_iter()
+                    .map(|(path, content)| pb1b::File { path, content })
+                    .collect(),
+                v1_buf_yaml_file: None,
+                v1_buf_lock_file: None,
+            });
+        }
+        return Ok(wire::respond_proto(&pb1b::DownloadResponse { contents }));
+    }
+    Ok(wire::respond_json(&resp))
 }
 
 // ---------------------------------------------------------------------------
@@ -1761,9 +2416,13 @@ async fn download(
 async fn get_labels(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
-    axum::Json(body): axum::Json<GetLabelsRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, Response> {
+    let codec = Codec::from_headers(&headers)?;
+    let body: GetLabelsRequest = codec.decode(&body, GetLabelsRequest::from_pb)?;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
+    reject_binary_on_proxy_repo(&repo, codec)?;
 
     let mut labels = Vec::new();
 
@@ -1793,11 +2452,12 @@ async fn get_labels(
     }
 
     let resp = GetLabelsResponse { labels };
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&resp).unwrap()))
-        .unwrap())
+    if codec.is_proto() {
+        return Ok(wire::respond_proto(&pb1::GetLabelsResponse {
+            labels: resp.labels.iter().map(pb_label).collect(),
+        }));
+    }
+    Ok(wire::respond_json(&resp))
 }
 
 // ---------------------------------------------------------------------------
@@ -1809,14 +2469,28 @@ async fn create_or_update_labels(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
-    axum::Json(body): axum::Json<CreateOrUpdateLabelsRequest>,
+    body: Bytes,
 ) -> Result<Response, Response> {
+    // The same order as `upload`: a JSON body is read before the checks, as
+    // main's extractor did; the binary codec authorises first.
+    let codec = Codec::from_headers(&headers)?;
+    let json_body: Option<CreateOrUpdateLabelsRequest> = if codec.is_proto() {
+        None
+    } else {
+        Some(wire::decode_json(&body)?)
+    };
+
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "protobuf", "write:artifacts")?.user_id;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
+
+    let body: CreateOrUpdateLabelsRequest = match json_body {
+        Some(body) => body,
+        None => codec.decode(&body, CreateOrUpdateLabelsRequest::from_pb)?,
+    };
 
     let mut labels = Vec::new();
     let now = chrono::Utc::now().to_rfc3339();
@@ -1888,11 +2562,12 @@ async fn create_or_update_labels(
     }
 
     let resp = CreateOrUpdateLabelsResponse { labels };
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&resp).unwrap()))
-        .unwrap())
+    if codec.is_proto() {
+        return Ok(wire::respond_proto(&pb1::CreateOrUpdateLabelsResponse {
+            labels: resp.labels.iter().map(pb_label).collect(),
+        }));
+    }
+    Ok(wire::respond_json(&resp))
 }
 
 // ---------------------------------------------------------------------------
@@ -1902,85 +2577,73 @@ async fn create_or_update_labels(
 async fn get_graph(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
-    axum::Json(body): axum::Json<GetGraphRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, Response> {
+    let codec = Codec::from_headers(&headers)?;
+    let body: GetGraphRequest = codec.decode(&body, GetGraphRequest::from_pb)?;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
+    reject_binary_on_proxy_repo(&repo, codec)?;
 
-    let mut commits = Vec::new();
+    // A graph is the closure, not the commits that were asked for. The CLI
+    // builds a map from every commit in the reply and then looks up each
+    // edge's node in it, so a dependency reached by an edge but absent from
+    // `commits` is reported to the user as a bug in buf ("did not have
+    // RegistryCommitID ... in registryCommitIDToModuleKey"). Dependencies are
+    // therefore followed transitively, which is also what resolving a
+    // consumer's dependency needs: `buf dep update` asks for one module and
+    // pins everything that module brings in.
+    let mut commits: Vec<CommitInfo> = Vec::new();
     let mut edges = Vec::new();
+    let mut queue: std::collections::VecDeque<(String, Option<String>)> =
+        std::collections::VecDeque::new();
+    let mut walked: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
 
     for resource_ref in &body.resource_refs {
-        let module_name = module_name_from_resource_ref(resource_ref)?;
+        queue.push_back(resolve_resource_ref(&state, &repo, resource_ref, codec).await?);
+    }
 
-        // Resolve the target commit
-        let commit_digest = if let Some(label) = &resource_ref.label {
-            resolve_commit_by_label(&state.db, repo.id, &module_name, label).await
-        } else {
-            resource_ref.id.clone()
+    while let Some((module_name, commit_digest)) = queue.pop_front() {
+        let Some(row) =
+            load_commit_with_metadata(&state, &repo, &module_name, commit_digest.as_deref())
+                .await?
+        else {
+            continue;
         };
-
-        // Fetch the artifact and its metadata for dependency graph
-        let row = if let Some(digest) = &commit_digest {
-            sqlx::query(
-                r#"SELECT a.id, a.name, a.version, a.created_at, a.updated_at,
-                    a.uploaded_by, a.checksum_sha256, am.metadata
-                FROM artifacts a
-                LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-                WHERE a.repository_id = $1
-                  AND a.name = $2
-                  AND a.version = $3
-                  AND a.is_deleted = false
-                LIMIT 1"#,
-            )
-            .bind(repo.id)
-            .bind(&module_name)
-            .bind(digest)
-            .fetch_optional(&state.db)
-            .await
-        } else {
-            sqlx::query(
-                r#"SELECT a.id, a.name, a.version, a.created_at, a.updated_at,
-                    a.uploaded_by, a.checksum_sha256, am.metadata
-                FROM artifacts a
-                LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-                WHERE a.repository_id = $1
-                  AND a.name = $2
-                  AND a.is_deleted = false
-                ORDER BY a.created_at DESC
-                LIMIT 1"#,
-            )
-            .bind(repo.id)
-            .bind(&module_name)
-            .fetch_optional(&state.db)
-            .await
-        };
-
-        let row = row.map_err(|e| {
-            connect_error(
-                crate::api::handlers::db_status(&e),
-                "internal",
-                crate::api::handlers::db_err_message(&e),
-            )
-        })?;
-
-        if let Some(row) = row {
-            let commit = build_commit_info_from_row(&row);
-            let commit_id = commit.id.clone();
-
-            // Extract dependency edges from metadata
-            let metadata: Option<serde_json::Value> = row.get("metadata");
-            edges.extend(extract_graph_edges(&metadata, &commit_id));
-
-            commits.push(commit);
+        let commit = build_commit_info_from_row(&row);
+        // A diamond reaches the same commit twice; its edges are already in.
+        // (The JSON codec walks nothing and answers each ref it was given.)
+        if codec.is_proto()
+            && !walked.insert((commit.module_id.clone(), commit.digest.value.clone()))
+        {
+            continue;
         }
+
+        let metadata: Option<serde_json::Value> = row.get("metadata");
+        let commit_edges = extract_graph_edges(&metadata, &commit.id);
+        // The JSON codec answers the commits asked for and their direct
+        // edges, as it always has; only the CLI's codec walks the closure.
+        for edge in commit_edges.iter().filter(|_| codec.is_proto()) {
+            // A dependency that resolves to no commit here stays in the edge
+            // list and is refused by name when the reply is built, rather
+            // than dropped into a graph that would look complete.
+            if let Some((dep_module, dep_digest)) =
+                commit_by_derived_id(&state, &repo, &edge.to_commit_id).await?
+            {
+                queue.push_back((dep_module, Some(dep_digest)));
+            }
+        }
+        edges.extend(commit_edges);
+        commits.push(commit);
     }
 
     let resp = GetGraphResponse { commits, edges };
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&resp).unwrap()))
-        .unwrap())
+    if codec.is_proto() {
+        return Ok(wire::respond_proto(&pb1::GetGraphResponse {
+            graph: Some(pb_graph(&state, &repo, &resp.commits, &resp.edges).await?),
+        }));
+    }
+    Ok(wire::respond_json(&resp))
 }
 
 // ---------------------------------------------------------------------------
@@ -1990,21 +2653,19 @@ async fn get_graph(
 async fn get_resources(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
-    axum::Json(body): axum::Json<GetResourcesRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, Response> {
+    let codec = Codec::from_headers(&headers)?;
+    let body: GetResourcesRequest = codec.decode(&body, GetResourcesRequest::from_pb)?;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
+    reject_binary_on_proxy_repo(&repo, codec)?;
 
     let mut resources = Vec::new();
 
     for resource_ref in &body.resource_refs {
-        let module_name = module_name_from_resource_ref(resource_ref)?;
-
-        // Resolve commit digest via label if provided
-        let commit_digest = if let Some(label) = &resource_ref.label {
-            resolve_commit_by_label(&state.db, repo.id, &module_name, label).await
-        } else {
-            resource_ref.id.clone()
-        };
+        let (module_name, commit_digest) =
+            resolve_resource_ref(&state, &repo, resource_ref, codec).await?;
 
         let row = if let Some(digest) = &commit_digest {
             sqlx::query(
@@ -2027,6 +2688,7 @@ async fn get_resources(
                 FROM artifacts
                 WHERE repository_id = $1
                   AND name = $2
+                  AND version IS DISTINCT FROM '_labels'
                   AND is_deleted = false
                 ORDER BY created_at DESC
                 LIMIT 1"#,
@@ -2053,11 +2715,971 @@ async fn get_resources(
     }
 
     let resp = GetResourcesResponse { resources };
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&resp).unwrap()))
-        .unwrap())
+    if codec.is_proto() {
+        // A reference resolves to the commit it names: that is what the CLI
+        // asks GetResources for, and `Resource` is a oneof, so a reply cannot
+        // carry the module and the commit at once the way the JSON shape does.
+        let mut resources = Vec::with_capacity(resp.resources.len());
+        for resource in &resp.resources {
+            let b5 = commit_b5(
+                &state,
+                &repo,
+                &resource.commit.module_id,
+                &resource.commit.digest.value,
+            )
+            .await?;
+            resources.push(pb1::Resource {
+                value: Some(pb1::resource::Value::Commit(pb_commit(
+                    &resource.commit,
+                    &b5,
+                )?)),
+            });
+        }
+        return Ok(wire::respond_proto(&pb1::GetResourcesResponse {
+            resources,
+        }));
+    }
+    Ok(wire::respond_json(&resp))
+}
+
+// ---------------------------------------------------------------------------
+// The buf CLI's codec (#5066)
+//
+// The CLI speaks Connect with the binary protobuf codec, so every hosted
+// endpoint decodes its request from either codec and answers in the one it
+// arrived in. The JSON shapes above stay exactly as they were; the generated
+// messages below are what the CLI reads, and they carry the identifiers and
+// the digest it insists on:
+//
+//   * ids are tuuids, derived from the names this repository already keys on
+//     (`protobuf_wire::ids`), so they are stable without an id column;
+//   * `Digest` is b5 over the module's files and its dependencies' b5s, not
+//     the SHA-256 the bundle is stored under.
+// ---------------------------------------------------------------------------
+
+/// The `owner` half of an `owner/module` module name.
+fn owner_of(module_name: &str) -> &str {
+    module_name.split('/').next().unwrap_or(module_name)
+}
+
+/// The module segment of an `owner/module` name.
+fn module_of(module_name: &str) -> &str {
+    module_name.split_once('/').map_or(module_name, |(_, m)| m)
+}
+
+fn pb_timestamp(rfc3339: &str) -> Option<prost_types::Timestamp> {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .ok()
+        .map(|t| prost_types::Timestamp {
+            seconds: t.timestamp(),
+            nanos: t.timestamp_subsec_nanos() as i32,
+        })
+}
+
+impl ModuleRef {
+    fn from_pb_v1(value: Option<pb1::module_ref::Value>) -> Self {
+        match value {
+            Some(pb1::module_ref::Value::Id(id)) => ModuleRef {
+                id: Some(id),
+                owner: None,
+                module: None,
+            },
+            Some(pb1::module_ref::Value::Name(name)) => ModuleRef {
+                id: None,
+                owner: Some(name.owner),
+                module: Some(name.module),
+            },
+            None => ModuleRef {
+                id: None,
+                owner: None,
+                module: None,
+            },
+        }
+    }
+
+    fn from_pb_v1beta1(value: Option<pb1b::module_ref::Value>) -> Self {
+        match value {
+            Some(pb1b::module_ref::Value::Id(id)) => ModuleRef {
+                id: Some(id),
+                owner: None,
+                module: None,
+            },
+            Some(pb1b::module_ref::Value::Name(name)) => ModuleRef {
+                id: None,
+                owner: Some(name.owner),
+                module: Some(name.module),
+            },
+            None => ModuleRef {
+                id: None,
+                owner: None,
+                module: None,
+            },
+        }
+    }
+}
+
+impl ResourceRef {
+    fn from_pb(value: Option<pb1::resource_ref::Value>) -> Self {
+        match value {
+            Some(pb1::resource_ref::Value::Id(id)) => ResourceRef {
+                id: Some(id),
+                owner: None,
+                module: None,
+                label: None,
+            },
+            Some(pb1::resource_ref::Value::Name(name)) => {
+                // `child` distinguishes a label from a `ref`, which may be a
+                // label name or a commit id. Either way the repository looks
+                // it up as a label first and falls back to a digest, so both
+                // land in the same field.
+                // The CLI sets the oneof to an empty `ref` when it wants
+                // the module's default label rather than a named one, and an
+                // empty string names nothing, so it is the same as unset. Not
+                // normalising it here made a `buf push` of a module with a
+                // dependency fail: resolving the dependency asked for the ref
+                // '' and was told, correctly for a named ref, not_found.
+                let label = match name.child {
+                    Some(pb1::resource_ref::name::Child::LabelName(l)) => non_empty(l),
+                    Some(pb1::resource_ref::name::Child::Ref(r)) => non_empty(r),
+                    None => None,
+                };
+                ResourceRef {
+                    id: None,
+                    owner: Some(name.owner),
+                    module: Some(name.module),
+                    label,
+                }
+            }
+            None => ResourceRef {
+                id: None,
+                owner: None,
+                module: None,
+                label: None,
+            },
+        }
+    }
+
+    fn from_pb_v1beta1(value: Option<pb1b::resource_ref::Value>) -> Self {
+        match value {
+            Some(pb1b::resource_ref::Value::Id(id)) => ResourceRef {
+                id: Some(id),
+                owner: None,
+                module: None,
+                label: None,
+            },
+            Some(pb1b::resource_ref::Value::Name(name)) => {
+                let label = match name.child {
+                    Some(pb1b::resource_ref::name::Child::LabelName(l)) => non_empty(l),
+                    Some(pb1b::resource_ref::name::Child::Ref(r)) => non_empty(r),
+                    None => None,
+                };
+                ResourceRef {
+                    id: None,
+                    owner: Some(name.owner),
+                    module: Some(name.module),
+                    label,
+                }
+            }
+            None => ResourceRef {
+                id: None,
+                owner: None,
+                module: None,
+                label: None,
+            },
+        }
+    }
+}
+
+/// One commit row with its metadata: the commit a digest names, or the
+/// module's latest when it names none.
+async fn load_commit_with_metadata(
+    state: &SharedState,
+    repo: &RepoInfo,
+    module_name: &str,
+    commit_digest: Option<&str>,
+) -> Result<Option<sqlx::postgres::PgRow>, Response> {
+    let query = if let Some(digest) = commit_digest {
+        sqlx::query(
+            r#"SELECT a.id, a.name, a.version, a.created_at, a.updated_at,
+                a.uploaded_by, a.checksum_sha256, am.metadata
+            FROM artifacts a
+            LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+            WHERE a.repository_id = $1
+              AND a.name = $2
+              AND a.version = $3
+              AND a.is_deleted = false
+            LIMIT 1"#,
+        )
+        .bind(repo.id)
+        .bind(module_name)
+        .bind(digest)
+    } else {
+        sqlx::query(
+            r#"SELECT a.id, a.name, a.version, a.created_at, a.updated_at,
+                a.uploaded_by, a.checksum_sha256, am.metadata
+            FROM artifacts a
+            LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+            WHERE a.repository_id = $1
+              AND a.name = $2
+              AND a.version IS DISTINCT FROM '_labels'
+              AND a.is_deleted = false
+            ORDER BY a.created_at DESC
+            LIMIT 1"#,
+        )
+        .bind(repo.id)
+        .bind(module_name)
+    };
+
+    query
+        .fetch_optional(&state.db)
+        .await
+        .map_err(connect_db_error)
+}
+
+impl GetOwnersRequest {
+    fn from_pb(req: wire::proto::owner_v1::GetOwnersRequest) -> Self {
+        GetOwnersRequest {
+            owner_refs: req
+                .owner_refs
+                .into_iter()
+                .map(|r| match r.value {
+                    Some(wire::proto::owner_v1::owner_ref::Value::Id(id)) => OwnerRef {
+                        id: non_empty(id),
+                        name: None,
+                    },
+                    Some(wire::proto::owner_v1::owner_ref::Value::Name(name)) => OwnerRef {
+                        id: None,
+                        name: non_empty(name),
+                    },
+                    None => OwnerRef {
+                        id: None,
+                        name: None,
+                    },
+                })
+                .collect(),
+        }
+    }
+}
+
+/// An empty proto string field names nothing, so it is the same as unset.
+fn non_empty(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
+}
+
+impl GetModulesRequest {
+    fn from_pb(req: pb1::GetModulesRequest) -> Self {
+        GetModulesRequest {
+            module_refs: req
+                .module_refs
+                .into_iter()
+                .map(|r| ModuleRef::from_pb_v1(r.value))
+                .collect(),
+        }
+    }
+}
+
+impl GetCommitsRequest {
+    fn from_pb(req: pb1::GetCommitsRequest) -> Self {
+        GetCommitsRequest {
+            resource_refs: req
+                .resource_refs
+                .into_iter()
+                .map(|r| ResourceRef::from_pb(r.value))
+                .collect(),
+        }
+    }
+}
+
+impl ListCommitsRequest {
+    fn from_pb(req: pb1::ListCommitsRequest) -> Self {
+        let resource = req.resource_ref.map(|r| ResourceRef::from_pb(r.value));
+        ListCommitsRequest {
+            owner: resource.as_ref().and_then(|r| r.owner.clone()),
+            module: resource.and_then(|r| r.module),
+            page_size: if req.page_size == 0 {
+                None
+            } else {
+                Some(req.page_size as i64)
+            },
+            page_token: if req.page_token.is_empty() {
+                None
+            } else {
+                Some(req.page_token)
+            },
+        }
+    }
+}
+
+impl GetGraphRequest {
+    fn from_pb(req: pb1::GetGraphRequest) -> Self {
+        GetGraphRequest {
+            resource_refs: req
+                .resource_refs
+                .into_iter()
+                .map(|r| ResourceRef::from_pb(r.value))
+                .collect(),
+        }
+    }
+}
+
+impl GetResourcesRequest {
+    fn from_pb(req: pb1::GetResourcesRequest) -> Self {
+        GetResourcesRequest {
+            resource_refs: req
+                .resource_refs
+                .into_iter()
+                .map(|r| ResourceRef::from_pb(r.value))
+                .collect(),
+        }
+    }
+}
+
+impl GetLabelsRequest {
+    fn from_pb(req: pb1::GetLabelsRequest) -> Self {
+        GetLabelsRequest {
+            label_refs: req
+                .label_refs
+                .into_iter()
+                .map(|r| match r.value {
+                    Some(pb1::label_ref::Value::Name(name)) => LabelResourceRef {
+                        owner: Some(name.owner),
+                        module: Some(name.module),
+                        label: Some(name.label),
+                    },
+                    // A label id is this repository's derived tuuid, which
+                    // names no module on its own; the handler answers an empty
+                    // list for it rather than guessing.
+                    Some(pb1::label_ref::Value::Id(_)) | None => LabelResourceRef {
+                        owner: None,
+                        module: None,
+                        label: None,
+                    },
+                })
+                .collect(),
+        }
+    }
+}
+
+impl CreateOrUpdateLabelsRequest {
+    fn from_pb(req: pb1::CreateOrUpdateLabelsRequest) -> Self {
+        CreateOrUpdateLabelsRequest {
+            values: req
+                .values
+                .into_iter()
+                .map(|v| {
+                    let (owner, module, name) = match v.label_ref.and_then(|r| r.value) {
+                        Some(pb1::label_ref::Value::Name(n)) => {
+                            (Some(n.owner), Some(n.module), n.label)
+                        }
+                        _ => (None, None, String::new()),
+                    };
+                    CreateLabelValue {
+                        owner,
+                        module,
+                        name,
+                        commit_id: v.commit_id,
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+impl DownloadRequest {
+    /// v1's `DownloadRequest` has no `digest_type`: the package itself is the
+    /// answer, since the CLI only asks v1 for b5.
+    fn from_pb_v1(req: pb1::DownloadRequest) -> Self {
+        DownloadRequest {
+            values: req
+                .values
+                .into_iter()
+                .map(|v| DownloadValue {
+                    resource_ref: v
+                        .resource_ref
+                        .map(|r| ResourceRef::from_pb(r.value))
+                        .unwrap_or(ResourceRef {
+                            id: None,
+                            owner: None,
+                            module: None,
+                            label: None,
+                        }),
+                    file_types: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn from_pb(req: pb1b::DownloadRequest) -> Self {
+        DownloadRequest {
+            values: req
+                .values
+                .into_iter()
+                .map(|v| DownloadValue {
+                    resource_ref: v
+                        .resource_ref
+                        .map(|r| ResourceRef::from_pb_v1beta1(r.value))
+                        .unwrap_or(ResourceRef {
+                            id: None,
+                            owner: None,
+                            module: None,
+                            label: None,
+                        }),
+                    file_types: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl UploadRequest {
+    /// v1's dependencies are bare commit ids, where v1beta1 pairs each with
+    /// the registry that holds it. Without federation there is only the one
+    /// registry, so the id is the whole reference.
+    fn from_pb_v1(req: pb1::UploadRequest) -> Self {
+        let dep_refs: Vec<ModuleRef> = req
+            .dep_commit_ids
+            .into_iter()
+            .map(|commit_id| ModuleRef {
+                id: Some(commit_id),
+                owner: None,
+                module: None,
+            })
+            .collect();
+
+        UploadRequest {
+            contents: req
+                .contents
+                .into_iter()
+                .map(|c| UploadContent {
+                    module_ref: c
+                        .module_ref
+                        .map(|r| ModuleRef::from_pb_v1(r.value))
+                        .unwrap_or(ModuleRef {
+                            id: None,
+                            owner: None,
+                            module: None,
+                        }),
+                    files: c
+                        .files
+                        .into_iter()
+                        .map(|f| UploadFile {
+                            path: f.path,
+                            content: base64::engine::general_purpose::STANDARD.encode(&f.content),
+                        })
+                        .collect(),
+                    dep_refs: dep_refs.clone(),
+                    label_refs: c
+                        .scoped_label_refs
+                        .into_iter()
+                        .filter_map(|l| match l.value {
+                            Some(pb1::scoped_label_ref::Value::Name(name)) => {
+                                Some(LabelRef { name })
+                            }
+                            _ => None,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The CLI's `UploadRequest` carries `dep_refs` once for the whole push
+    /// and `scoped_label_refs` per content, where the JSON shape has both per
+    /// content. The dep refs are therefore attached to every content, which is
+    /// what they apply to.
+    fn from_pb(req: pb1b::UploadRequest) -> Self {
+        let dep_refs: Vec<ModuleRef> = req
+            .dep_refs
+            .into_iter()
+            .map(|d| ModuleRef {
+                id: Some(d.commit_id),
+                owner: None,
+                module: None,
+            })
+            .collect();
+
+        UploadRequest {
+            contents: req
+                .contents
+                .into_iter()
+                .map(|c| UploadContent {
+                    module_ref: c
+                        .module_ref
+                        .map(|r| ModuleRef::from_pb_v1beta1(r.value))
+                        .unwrap_or(ModuleRef {
+                            id: None,
+                            owner: None,
+                            module: None,
+                        }),
+                    // The handler works in base64 because that is what the
+                    // JSON shape carries; the CLI sends raw bytes.
+                    files: c
+                        .files
+                        .into_iter()
+                        .map(|f| UploadFile {
+                            path: f.path,
+                            content: base64::engine::general_purpose::STANDARD.encode(&f.content),
+                        })
+                        .collect(),
+                    dep_refs: dep_refs.clone(),
+                    label_refs: c
+                        .scoped_label_refs
+                        .into_iter()
+                        .filter_map(|l| match l.value {
+                            Some(pb1b::scoped_label_ref::Value::Name(name)) => {
+                                Some(LabelRef { name })
+                            }
+                            _ => None,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+// -- Responses the CLI reads
+
+fn pb_module(info: &ModuleInfo) -> pb1::Module {
+    pb1::Module {
+        id: ids::module(&info.name),
+        create_time: pb_timestamp(&info.create_time),
+        update_time: pb_timestamp(&info.update_time),
+        name: module_of(&info.name).to_string(),
+        owner_id: ids::owner(owner_of(&info.name)),
+        visibility: pb1::ModuleVisibility::Private as i32,
+        state: pb1::ModuleState::Active as i32,
+        description: String::new(),
+        url: String::new(),
+        default_label_name: info.default_label_name.clone(),
+    }
+}
+
+/// `CommitInfo::module_id` holds the module name and `digest.value` the
+/// SHA-256 the bundle is stored under; `b5` is the digest the CLI verifies.
+fn pb_commit(info: &CommitInfo, b5: &str) -> Result<pb1::Commit, Response> {
+    let module_name = info.module_id.clone();
+    Ok(pb1::Commit {
+        id: ids::commit(&module_name, &info.digest.value),
+        create_time: pb_timestamp(&info.create_time),
+        owner_id: ids::owner(owner_of(&module_name)),
+        module_id: ids::module(&module_name),
+        digest: Some(pb1::Digest {
+            r#type: pb1::DigestType::B5 as i32,
+            value: wire::b5_bytes(b5)?,
+        }),
+        created_by_user_id: String::new(),
+        source_control_url: String::new(),
+    })
+}
+
+/// The beta package the CLI pushes and pulls over numbers b5 as 2, where v1
+/// numbers it 1 (#5066): the same commit has to be encoded per package.
+fn pb_commit_v1beta1(info: &CommitInfo, b5: &str) -> Result<pb1b::Commit, Response> {
+    let module_name = info.module_id.clone();
+    Ok(pb1b::Commit {
+        id: ids::commit(&module_name, &info.digest.value),
+        create_time: pb_timestamp(&info.create_time),
+        owner_id: ids::owner(owner_of(&module_name)),
+        module_id: ids::module(&module_name),
+        digest: Some(pb1b::Digest {
+            r#type: pb1b::DigestType::B5 as i32,
+            value: wire::b5_bytes(b5)?,
+        }),
+        created_by_user_id: String::new(),
+        source_control_url: String::new(),
+    })
+}
+
+/// `LabelInfo::id` is `module_name:label:commit_digest` and `commit_id` the
+/// commit digest, so the module the label belongs to is recoverable from the
+/// label itself -- a module name holds a `/`, never a `:`.
+fn pb_label(info: &LabelInfo) -> pb1::Label {
+    let module_name = info.id.split(':').next().unwrap_or_default().to_string();
+    pb1::Label {
+        id: ids::label(&module_name, &info.name),
+        create_time: pb_timestamp(&info.create_time),
+        update_time: pb_timestamp(&info.update_time),
+        archive_time: None,
+        name: info.name.clone(),
+        owner_id: ids::owner(owner_of(&module_name)),
+        module_id: ids::module(&module_name),
+        commit_id: ids::commit(&module_name, &info.commit_id),
+        updated_by_user_id: String::new(),
+        commit_check_state: Some(pb1::CommitCheckState {
+            // Hosted repositories run no commit checks, which the CLI reads
+            // as "nothing to wait for".
+            status: pb1::CommitCheckStatus::Disabled as i32,
+            update_time: pb_timestamp(&info.update_time),
+        }),
+    }
+}
+
+// -- The b5 digest of a stored commit
+
+/// A dependency whose own b5 this repository does not hold, so the commit's
+/// b5 cannot be computed: the CLI compares the digest it computed locally
+/// against the one it is answered, and a digest built from an incomplete
+/// dependency set would differ without saying why.
+fn connect_unresolved_deps(module_name: &str, deps: &[String]) -> Response {
+    connect_error(
+        StatusCode::BAD_REQUEST,
+        "failed_precondition",
+        &format!(
+            "cannot resolve the dependencies [{1}] of module '{0}'. A hosted repository \
+             resolves a dependency by the commit id it recorded at push time, so this is a \
+             dependency held by another registry, or one recorded as a bare module name, \
+             which names no commit to compose a digest from. Push the dependency here \
+             first, or serve the module through a virtual repository with the upstream \
+             registry as a member.",
+            module_name,
+            deps.join(", ")
+        ),
+    )
+}
+
+/// The b5 digest of one stored commit, which is what the CLI verifies and is
+/// not the SHA-256 the bundle is stored under.
+///
+/// `b5Digest` in the artifact's metadata is authoritative: it was computed at
+/// push time, when the dependency digests were known. A commit pushed before
+/// #5066, or over the JSON codec, has no such entry, so the digest is computed
+/// from the stored bundle -- which is exact as long as the module declares no
+/// dependencies, and refused rather than guessed when it does.
+async fn commit_b5(
+    state: &SharedState,
+    repo: &RepoInfo,
+    module_name: &str,
+    commit_digest: &str,
+) -> Result<String, Response> {
+    let row = sqlx::query(
+        r#"SELECT a.id, a.storage_key, m.metadata
+        FROM artifacts a
+        LEFT JOIN artifact_metadata m ON m.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.name = $2
+          AND a.version = $3
+          AND a.is_deleted = false
+        LIMIT 1"#,
+    )
+    .bind(repo.id)
+    .bind(module_name)
+    .bind(commit_digest)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(connect_db_error)?
+    .ok_or_else(|| {
+        connect_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("commit {commit_digest} of module {module_name} not found"),
+        )
+    })?;
+
+    let metadata: Option<serde_json::Value> = row.get("metadata");
+
+    if let Some(b5) = metadata
+        .as_ref()
+        .and_then(|m| m.get("b5Digest"))
+        .and_then(|v| v.as_str())
+    {
+        return Ok(b5.to_string());
+    }
+
+    let dep_names: Vec<String> = metadata
+        .as_ref()
+        .and_then(|m| m.get("dependencies"))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let (dep_digests, unresolved) = resolve_dep_b5s(state, repo, &dep_names).await?;
+    if !unresolved.is_empty() {
+        return Err(connect_unresolved_deps(module_name, &unresolved));
+    }
+
+    let storage_key: String = row.get("storage_key");
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+    // A store that is down or full answers 503/507 like Download (#5685).
+    let bundle = storage.get(&storage_key).await.map_err(|e| {
+        crate::api::handlers::storage_err_response(&e, |status, message| {
+            connect_error(status, "internal", message)
+        })
+    })?;
+
+    // The same permit-scoped decode as Download (#2561): this path inflates
+    // a whole stored bundle, and fails fast with 503 on saturation.
+    #[allow(clippy::result_large_err)]
+    let files =
+        crate::util::bounded_archive::with_ingest_extraction(|| extract_files_from_bundle(&bundle))
+            .map_err(|e| e.into_response())??;
+    let decoded = decode_bundle_files(&files)?;
+    let b5 = wire::b5_digest(&decoded, &dep_digests);
+
+    // Recorded, so an old commit pays for the decompression once: the digest
+    // is a function of the stored files and of the dependencies' recorded
+    // b5s, which do not change. Best effort -- a failed write only means the
+    // next request computes it again.
+    let artifact_id: uuid::Uuid = row.get("id");
+    if let Err(e) = sqlx::query(
+        r#"INSERT INTO artifact_metadata (artifact_id, format, metadata)
+        VALUES ($1, 'protobuf', jsonb_build_object('b5Digest', $2::text))
+        ON CONFLICT (artifact_id) DO UPDATE
+        SET metadata = artifact_metadata.metadata || jsonb_build_object('b5Digest', $2::text)"#,
+    )
+    .bind(artifact_id)
+    .bind(&b5)
+    .execute(&state.db)
+    .await
+    {
+        tracing::warn!(error = %e, "could not record a computed protobuf b5 digest");
+    }
+    Ok(b5)
+}
+
+/// The recorded b5 digest of a dependency hosted in this repository, by
+/// `owner/module` name or by a commit id this repository derived. `None` when
+/// the repository holds no b5 for it.
+async fn dep_b5(
+    state: &SharedState,
+    repo: &RepoInfo,
+    dep: &str,
+) -> Result<Option<String>, Response> {
+    // Only a commit id resolves: it is this repository's derived tuuid,
+    // recorded next to the digest at push time, and it names the one commit
+    // the depending module was built against. A dependency recorded as a bare
+    // module name (what the JSON codec's `depRefs` carry) does not say which
+    // commit that was, and taking the latest would compose a digest from
+    // whatever has been pushed since -- a digest the client never pinned and
+    // nothing would explain. Such a dependency counts as unresolved.
+    let row = sqlx::query(
+        r#"SELECT m.metadata
+        FROM artifacts a
+        JOIN artifact_metadata m ON m.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND m.metadata->>'commitId' = $2
+        LIMIT 1"#,
+    )
+    .bind(repo.id)
+    .bind(dep)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(connect_db_error)?;
+
+    Ok(row
+        .and_then(|r| r.get::<Option<serde_json::Value>, _>("metadata"))
+        .and_then(|m| {
+            m.get("b5Digest")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        }))
+}
+
+/// Each dependency's recorded b5, split into the digests found and the
+/// dependencies this repository holds none for.
+async fn resolve_dep_b5s(
+    state: &SharedState,
+    repo: &RepoInfo,
+    deps: &[String],
+) -> Result<(Vec<String>, Vec<String>), Response> {
+    let mut digests = Vec::with_capacity(deps.len());
+    let mut unresolved = Vec::new();
+    for dep in deps {
+        match dep_b5(state, repo, dep).await? {
+            Some(digest) => digests.push(digest),
+            None => unresolved.push(dep.clone()),
+        }
+    }
+    Ok((digests, unresolved))
+}
+
+/// The b5 a commit being pushed is given. Naming the dependencies that went
+/// unresolved beats recording a digest computed from an incomplete set.
+async fn resolve_push_b5(
+    state: &SharedState,
+    repo: &RepoInfo,
+    files: &[(String, Vec<u8>)],
+    deps: &[String],
+) -> Result<B5Outcome, Response> {
+    let (digests, unresolved) = resolve_dep_b5s(state, repo, deps).await?;
+    Ok(if unresolved.is_empty() {
+        B5Outcome::Resolved(wire::b5_digest(files, &digests))
+    } else {
+        B5Outcome::UnresolvedDeps(unresolved)
+    })
+}
+
+/// Bring a stored commit's metadata up to what a push records now, when the
+/// same commit is pushed again.
+async fn backfill_commit_metadata(
+    state: &SharedState,
+    artifact_id: uuid::Uuid,
+    fresh: &serde_json::Value,
+) -> Result<(), Response> {
+    let stored: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT metadata FROM artifact_metadata WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(connect_db_error)?;
+    let Some(merged) = merge_backfilled_metadata(stored.as_ref(), fresh) else {
+        return Ok(());
+    };
+    upsert_commit_metadata(&state.db, artifact_id, &merged).await
+}
+
+/// Record a commit's protobuf metadata, replacing what was there.
+async fn upsert_commit_metadata<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    artifact_id: uuid::Uuid,
+    metadata: &serde_json::Value,
+) -> Result<(), Response> {
+    sqlx::query(
+        r#"INSERT INTO artifact_metadata (artifact_id, format, metadata)
+        VALUES ($1, 'protobuf', $2)
+        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2"#,
+    )
+    .bind(artifact_id)
+    .bind(metadata)
+    .execute(executor)
+    .await
+    .map_err(connect_db_error)?;
+    Ok(())
+}
+
+/// The stored metadata with what `fresh` adds, or `None` when it adds nothing.
+///
+/// What is already recorded wins, key by key: a re-push only fills in what an
+/// older push did not record. The exception is a b5 the stored commit lacks.
+/// The digest is composed from the dependencies, so it is taken together with
+/// the dependency list it was composed from, and the `b5UnresolvedDeps` it
+/// replaces is dropped -- a digest beside a dependency list it was not
+/// computed from would let `GetGraph` and the digest disagree.
+fn merge_backfilled_metadata(
+    stored: Option<&serde_json::Value>,
+    fresh: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let fresh_object = fresh.as_object()?;
+    let Some(stored_object) = stored.and_then(|s| s.as_object()) else {
+        return Some(fresh.clone());
+    };
+    let stored_has_b5 = stored_object.contains_key("b5Digest");
+    let mut merged = stored_object.clone();
+    for (key, value) in fresh_object {
+        // A JSON re-push of a commit the CLI pushed names its dependencies
+        // unresolved; the b5 already recorded says otherwise.
+        if stored_has_b5 && key == "b5UnresolvedDeps" {
+            continue;
+        }
+        merged.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+    if !stored_has_b5 && fresh_object.contains_key("b5Digest") {
+        if let Some(deps) = fresh_object.get("dependencies") {
+            merged.insert("dependencies".to_string(), deps.clone());
+        }
+        merged.remove("b5UnresolvedDeps");
+    }
+    (&merged != stored_object).then_some(serde_json::Value::Object(merged))
+}
+
+/// Base64 bundle entries as the raw path/content pairs the digest hashes.
+fn decode_bundle_files(files: &[DownloadFile]) -> Result<Vec<(String, Vec<u8>)>, Response> {
+    files
+        .iter()
+        .map(|f| {
+            base64::engine::general_purpose::STANDARD
+                .decode(&f.content)
+                .map(|content| (f.path.clone(), content))
+                .map_err(|e| {
+                    connect_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal",
+                        &format!("stored file '{}' is not valid base64: {}", f.path, e),
+                    )
+                })
+        })
+        .collect()
+}
+
+// -- Reply builders that need the stored b5 digest
+
+async fn pb_commits(
+    state: &SharedState,
+    repo: &RepoInfo,
+    commits: &[CommitInfo],
+) -> Result<Vec<pb1::Commit>, Response> {
+    let mut out = Vec::with_capacity(commits.len());
+    for commit in commits {
+        let b5 = commit_b5(state, repo, &commit.module_id, &commit.digest.value).await?;
+        out.push(pb_commit(commit, &b5)?);
+    }
+    Ok(out)
+}
+
+/// The dependency edges as the CLI reads them: commit id to commit id, where
+/// the JSON shape names the dependency module instead. A dependency this
+/// repository does not host has no commit id here to point at, which is the
+/// same gap the digest hits, so it is refused the same way.
+async fn pb_graph(
+    state: &SharedState,
+    repo: &RepoInfo,
+    commits: &[CommitInfo],
+    edges: &[GraphEdge],
+) -> Result<pb1::Graph, Response> {
+    let pb_commits_list = pb_commits(state, repo, commits).await?;
+
+    // `GraphEdge::from_commit_id` is the artifact row's own uuid, so the edge
+    // is tied back to the commit it was extracted from by position in the
+    // same list.
+    let mut pb_edges = Vec::with_capacity(edges.len());
+    for edge in edges {
+        let from = commits
+            .iter()
+            .find(|c| c.id == edge.from_commit_id)
+            .ok_or_else(|| {
+                connect_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    "dependency edge does not belong to any commit in the reply",
+                )
+            })?;
+        // The edge names the dependency the way the push recorded it. From
+        // the CLI that is a commit id, which is the commit this module was
+        // built against and the id the graph's node carries as it stands. A
+        // bare module name (the JSON codec's `depRefs`) names no commit, and
+        // the node has to be one, so it is refused for the same reason its b5
+        // is -- see `dep_b5`.
+        let to_commit_id = match commit_by_derived_id(state, repo, &edge.to_commit_id).await? {
+            Some(_) => edge.to_commit_id.clone(),
+            None => {
+                return Err(connect_unresolved_deps(
+                    &from.module_id,
+                    std::slice::from_ref(&edge.to_commit_id),
+                ));
+            }
+        };
+        pb_edges.push(pb1::graph::Edge {
+            from_node: Some(pb1::graph::Node {
+                commit_id: ids::commit(&from.module_id, &from.digest.value),
+            }),
+            to_node: Some(pb1::graph::Node {
+                commit_id: to_commit_id,
+            }),
+        });
+    }
+
+    Ok(pb1::Graph {
+        commits: pb_commits_list,
+        edges: pb_edges,
+        registry_commit_ids: Vec::new(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2072,6 +3694,29 @@ fn compute_commit_digest(files: &[(String, Vec<u8>)]) -> String {
     for (path, content) in files {
         hasher.update(path.as_bytes());
         hasher.update(content);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// [`compute_commit_digest`] for a binary-codec commit that has dependencies:
+/// the files, then the sorted dependency commit ids, each framed so that no
+/// file content can collide with the dependency list.
+fn compute_commit_digest_with_deps(
+    files: &[(String, Vec<u8>)],
+    dep_commit_ids: &[String],
+) -> String {
+    let mut hasher = Sha256::new();
+    for (path, content) in files {
+        hasher.update(path.as_bytes());
+        hasher.update(content);
+    }
+    let mut deps: Vec<&String> = dep_commit_ids.iter().collect();
+    deps.sort();
+    deps.dedup();
+    hasher.update(b"\0buf-deps\0");
+    for dep in deps {
+        hasher.update((dep.len() as u64).to_be_bytes());
+        hasher.update(dep.as_bytes());
     }
     format!("{:x}", hasher.finalize())
 }
@@ -2105,19 +3750,52 @@ fn build_label_path(module_name: &str) -> String {
     format!("modules/{}/_labels", module_name)
 }
 
+/// Whether a push could be given the b5 digest the CLI verifies a commit
+/// against (#5066).
+enum B5Outcome {
+    /// Computed over the module's files and every dependency's own b5.
+    Resolved(String),
+    /// Dependencies whose b5 this repository does not hold, so there is no
+    /// digest to record. A later request in the CLI's codec is refused by
+    /// naming them, rather than answered a digest built from what was left.
+    UnresolvedDeps(Vec<String>),
+}
+
 /// Build protobuf metadata JSON for an upload.
+///
+/// `commit_id` is the tuuid the BSR messages name this commit by, recorded
+/// here so a dependency reference that carries only a commit id resolves back
+/// to the module and its digest. `moduleId` is recorded for the same reason:
+/// both ids are one-way functions of the names, and without a record of them
+/// a reference by id can only be resolved by deriving the id of every module
+/// in the repository and comparing.
 fn build_protobuf_metadata(
     module_name: &str,
     commit_digest: &str,
     file_count: usize,
     dep_names: &[String],
+    commit_id: &str,
+    b5: &B5Outcome,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut metadata = serde_json::json!({
         "module": module_name,
         "commitDigest": commit_digest,
         "fileCount": file_count,
         "dependencies": dep_names,
-    })
+        "commitId": commit_id,
+        "moduleId": ids::module(module_name),
+        "ownerId": ids::owner(owner_of(module_name)),
+    });
+    let object = metadata.as_object_mut().expect("object literal");
+    match b5 {
+        B5Outcome::Resolved(digest) => {
+            object.insert("b5Digest".to_string(), serde_json::json!(digest));
+        }
+        B5Outcome::UnresolvedDeps(deps) => {
+            object.insert("b5UnresolvedDeps".to_string(), serde_json::json!(deps));
+        }
+    }
+    metadata
 }
 
 /// Extract dependency names from a list of ModuleRefs.
@@ -2209,6 +3887,235 @@ fn extract_graph_edges(metadata: &Option<serde_json::Value>, commit_id: &str) ->
 mod tests {
     use super::*;
 
+    // -- The buf CLI's codec (#5066)
+
+    /// A well-formed b5 digest for the reply builders.
+    fn test_b5() -> String {
+        wire::b5_digest(&[("t.proto".to_string(), b"t".to_vec())], &[])
+    }
+
+    fn commit_fixture() -> CommitInfo {
+        build_commit_info(
+            "ignored-row-uuid",
+            "2024-01-02T03:04:05Z",
+            "ignored-owner-uuid",
+            "acme/payments",
+            "abc123",
+        )
+    }
+
+    /// The reply the CLI reads carries tuuids derived from the module name and
+    /// the commit digest, not the row uuid and module name the JSON shape
+    /// puts in those fields.
+    #[test]
+    fn pb_commit_carries_derived_ids_5066() {
+        let commit = pb_commit(&commit_fixture(), &test_b5()).unwrap();
+
+        assert_eq!(commit.id, ids::commit("acme/payments", "abc123"));
+        assert_eq!(commit.module_id, ids::module("acme/payments"));
+        assert_eq!(commit.owner_id, ids::owner("acme"));
+        assert_eq!(commit.create_time.unwrap().seconds, 1_704_164_645);
+    }
+
+    /// `Digest.value` is `bytes`, so the digest travels as the 64 raw bytes of
+    /// the b5 hash; the JSON shape's hex text decoded as base64 is junk.
+    #[test]
+    fn pb_commit_digest_is_raw_b5_bytes_5066() {
+        let b5 = wire::b5_digest(&[("a.proto".to_string(), b"x".to_vec())], &[]);
+        let digest = pb_commit(&commit_fixture(), &b5).unwrap().digest.unwrap();
+
+        assert_eq!(digest.value.len(), 64);
+        assert_eq!(digest.value, wire::b5_bytes(&b5).unwrap());
+    }
+
+    /// The beta package the CLI pushes and pulls over numbers b5 as 2 where
+    /// v1 numbers it 1. Encoding a commit with v1's number tells the CLI the
+    /// digest is b4 and it refuses the commit, so both are pinned here.
+    #[test]
+    fn b5_enum_number_differs_between_packages_5066() {
+        assert_eq!(pb1::DigestType::B5 as i32, 1);
+        assert_eq!(pb1b::DigestType::B5 as i32, 2);
+
+        let commit = commit_fixture();
+        let b5 = test_b5();
+        assert_eq!(pb_commit(&commit, &b5).unwrap().digest.unwrap().r#type, 1);
+        assert_eq!(
+            pb_commit_v1beta1(&commit, &b5)
+                .unwrap()
+                .digest
+                .unwrap()
+                .r#type,
+            2
+        );
+    }
+
+    #[test]
+    fn pb_label_recovers_its_module_5066() {
+        let info = build_label_info("acme/payments", "main", "abc123", "2024-01-02T03:04:05Z");
+        let label = pb_label(&info);
+
+        assert_eq!(label.id, ids::label("acme/payments", "main"));
+        assert_eq!(label.module_id, ids::module("acme/payments"));
+        assert_eq!(label.owner_id, ids::owner("acme"));
+        assert_eq!(label.commit_id, ids::commit("acme/payments", "abc123"));
+        assert_eq!(
+            label.commit_check_state.unwrap().status,
+            pb1::CommitCheckStatus::Disabled as i32
+        );
+    }
+
+    /// The CLI sends `dep_refs` once for the whole push and raw file bytes;
+    /// the handler works per content and in base64.
+    #[test]
+    fn upload_request_from_pb_spreads_deps_and_encodes_files_5066() {
+        let req = pb1b::UploadRequest {
+            contents: vec![
+                pb1b::upload_request::Content {
+                    module_ref: Some(pb1b::ModuleRef {
+                        value: Some(pb1b::module_ref::Value::Name(pb1b::module_ref::Name {
+                            owner: "acme".to_string(),
+                            module: "payments".to_string(),
+                        })),
+                    }),
+                    files: vec![pb1b::File {
+                        path: "a.proto".to_string(),
+                        content: b"hello".to_vec(),
+                    }],
+                    scoped_label_refs: vec![pb1b::ScopedLabelRef {
+                        value: Some(pb1b::scoped_label_ref::Value::Name("main".to_string())),
+                    }],
+                    source_control_url: String::new(),
+                },
+                pb1b::upload_request::Content {
+                    module_ref: None,
+                    files: Vec::new(),
+                    scoped_label_refs: Vec::new(),
+                    source_control_url: String::new(),
+                },
+            ],
+            dep_refs: vec![pb1b::upload_request::DepRef {
+                commit_id: "deadbeef".to_string(),
+                registry: "buf.build".to_string(),
+            }],
+        };
+
+        let body = UploadRequest::from_pb(req);
+
+        assert_eq!(body.contents.len(), 2);
+        let first = &body.contents[0];
+        assert_eq!(first.module_ref.owner.as_deref(), Some("acme"));
+        assert_eq!(first.module_ref.module.as_deref(), Some("payments"));
+        assert_eq!(
+            first.files[0].content,
+            base64::engine::general_purpose::STANDARD.encode(b"hello")
+        );
+        assert_eq!(first.label_refs[0].name, "main");
+        // The push's dep refs apply to every content in it.
+        for content in &body.contents {
+            assert_eq!(content.dep_refs.len(), 1);
+            assert_eq!(content.dep_refs[0].id.as_deref(), Some("deadbeef"));
+        }
+    }
+
+    /// A `ResourceRef` names its child either as a label or as a `ref` that
+    /// may be a label or a commit id; both resolve the same way here.
+    #[test]
+    fn resource_ref_from_pb_takes_either_child_5066() {
+        let named = |child| {
+            ResourceRef::from_pb(Some(pb1::resource_ref::Value::Name(
+                pb1::resource_ref::Name {
+                    owner: "acme".to_string(),
+                    module: "payments".to_string(),
+                    child,
+                },
+            )))
+        };
+
+        let by_label = named(Some(pb1::resource_ref::name::Child::LabelName(
+            "main".to_string(),
+        )));
+        assert_eq!(by_label.owner.as_deref(), Some("acme"));
+        assert_eq!(by_label.label.as_deref(), Some("main"));
+
+        let by_ref = named(Some(pb1::resource_ref::name::Child::Ref("abc".to_string())));
+        assert_eq!(by_ref.label.as_deref(), Some("abc"));
+
+        let by_id = ResourceRef::from_pb(Some(pb1::resource_ref::Value::Id("x".to_string())));
+        assert_eq!(by_id.id.as_deref(), Some("x"));
+        assert!(by_id.label.is_none());
+    }
+
+    /// The CLI sets the `ref` oneof to the empty string to mean "the default
+    /// label". Decoded as a set ref, it names nothing and is `not_found`,
+    /// which made `buf push` of a module with a dependency fail.
+    #[test]
+    fn an_empty_ref_or_label_decodes_as_unset_5074() {
+        for child in [
+            pb1::resource_ref::name::Child::Ref(String::new()),
+            pb1::resource_ref::name::Child::LabelName(String::new()),
+        ] {
+            let name = pb1::resource_ref::Name {
+                owner: "acme".to_string(),
+                module: "payments".to_string(),
+                child: Some(child.clone()),
+            };
+            let v1 = ResourceRef::from_pb(Some(pb1::resource_ref::Value::Name(name)));
+            assert!(v1.label.is_none(), "v1 {child:?}");
+            assert_eq!(v1.module.as_deref(), Some("payments"));
+
+            let beta_child = match child {
+                pb1::resource_ref::name::Child::Ref(r) => pb1b::resource_ref::name::Child::Ref(r),
+                pb1::resource_ref::name::Child::LabelName(l) => {
+                    pb1b::resource_ref::name::Child::LabelName(l)
+                }
+            };
+            let beta = ResourceRef::from_pb_v1beta1(Some(pb1b::resource_ref::Value::Name(
+                pb1b::resource_ref::Name {
+                    owner: "acme".to_string(),
+                    module: "payments".to_string(),
+                    child: Some(beta_child),
+                },
+            )));
+            assert!(beta.label.is_none(), "v1beta1");
+        }
+    }
+
+    #[test]
+    fn metadata_records_the_commit_id_and_its_b5_5066() {
+        let meta = build_protobuf_metadata(
+            "acme/payments",
+            "abc123",
+            1,
+            &[],
+            "c0ffee",
+            &B5Outcome::Resolved("b5:00ff".to_string()),
+        );
+
+        assert_eq!(meta["commitId"], "c0ffee");
+        assert_eq!(meta["b5Digest"], "b5:00ff");
+        assert!(meta.get("b5UnresolvedDeps").is_none());
+    }
+
+    /// No digest is recorded when a dependency's own b5 is missing: the names
+    /// are kept so a later request in the CLI's codec can say which.
+    #[test]
+    fn metadata_names_unresolved_deps_instead_of_a_digest_5066() {
+        let meta = build_protobuf_metadata(
+            "acme/payments",
+            "abc123",
+            1,
+            &["buf.build/bufbuild/protovalidate".to_string()],
+            "c0ffee",
+            &B5Outcome::UnresolvedDeps(vec!["buf.build/bufbuild/protovalidate".to_string()]),
+        );
+
+        assert!(meta.get("b5Digest").is_none());
+        assert_eq!(
+            meta["b5UnresolvedDeps"][0],
+            "buf.build/bufbuild/protovalidate"
+        );
+    }
+
     /// #4422: a quota decision maps to the Connect error an upload answers.
     #[test]
     fn connect_quota_decision_maps_scopes_4422() {
@@ -2252,17 +4159,18 @@ mod tests {
         let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
             return;
         };
-        let request = GetModulesRequest {
-            module_refs: vec![ModuleRef {
-                id: Some("mod\u{0}ule".to_string()),
-                owner: None,
-                module: None,
-            }],
-        };
+        // The handler takes the body raw now that it serves both Connect
+        // codecs (#5066); `application/json` selects the JSON one.
+        let request = serde_json::json!({
+            "moduleRefs": [{ "id": "mod\u{0}ule" }],
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
         let response = get_modules(
             State(fx.state.clone()),
             Path(fx.repo_key.clone()),
-            axum::Json(request),
+            headers,
+            Bytes::from(serde_json::to_vec(&request).expect("encode request")),
         )
         .await
         .expect_err("a NUL in the module reference must fail the lookup");
@@ -2425,43 +4333,6 @@ mod tests {
             module: Some("validate".to_string()),
         };
         assert_eq!(module_name_from_ref(&r).unwrap(), "buf/validate");
-    }
-
-    // -----------------------------------------------------------------------
-    // module_name_from_resource_ref
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_module_name_from_resource_ref_owner_and_module() {
-        let r = ResourceRef {
-            id: None,
-            owner: Some("org".to_string()),
-            module: Some("pkg".to_string()),
-            label: None,
-        };
-        assert_eq!(module_name_from_resource_ref(&r).unwrap(), "org/pkg");
-    }
-
-    #[test]
-    fn test_module_name_from_resource_ref_id_only() {
-        let r = ResourceRef {
-            id: Some("id-123".to_string()),
-            owner: None,
-            module: None,
-            label: None,
-        };
-        assert_eq!(module_name_from_resource_ref(&r).unwrap(), "id-123");
-    }
-
-    #[test]
-    fn test_module_name_from_resource_ref_no_fields() {
-        let r = ResourceRef {
-            id: None,
-            owner: None,
-            module: None,
-            label: None,
-        };
-        assert!(module_name_from_resource_ref(&r).is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -2852,7 +4723,14 @@ mod tests {
     #[test]
     fn test_build_protobuf_metadata_basic() {
         let deps = vec!["dep/one".to_string()];
-        let meta = build_protobuf_metadata("buf/validate", "abc", 3, &deps);
+        let meta = build_protobuf_metadata(
+            "buf/validate",
+            "abc",
+            3,
+            &deps,
+            "c0ffee",
+            &B5Outcome::Resolved("b5:beef".to_string()),
+        );
         assert_eq!(meta["module"], "buf/validate");
         assert_eq!(meta["commitDigest"], "abc");
         assert_eq!(meta["fileCount"], 3);
@@ -2861,14 +4739,28 @@ mod tests {
 
     #[test]
     fn test_build_protobuf_metadata_no_deps() {
-        let meta = build_protobuf_metadata("m", "d", 0, &[]);
+        let meta = build_protobuf_metadata(
+            "m",
+            "d",
+            0,
+            &[],
+            "c0ffee",
+            &B5Outcome::Resolved("b5:beef".to_string()),
+        );
         assert!(meta["dependencies"].as_array().unwrap().is_empty());
     }
 
     #[test]
     fn test_build_protobuf_metadata_many_deps() {
         let deps = vec!["a/b".to_string(), "c/d".to_string(), "e/f".to_string()];
-        let meta = build_protobuf_metadata("mod", "hash", 10, &deps);
+        let meta = build_protobuf_metadata(
+            "mod",
+            "hash",
+            10,
+            &deps,
+            "c0ffee",
+            &B5Outcome::Resolved("b5:beef".to_string()),
+        );
         assert_eq!(meta["dependencies"].as_array().unwrap().len(), 3);
     }
 
@@ -2944,7 +4836,7 @@ mod tests {
         let info = ModuleInfo {
             id: "id".to_string(),
             owner_id: "o".to_string(),
-            name: "n".to_string(),
+            name: "o/n".to_string(),
             create_time: "t1".to_string(),
             update_time: "t2".to_string(),
             state: "ACTIVE".to_string(),
@@ -2953,6 +4845,15 @@ mod tests {
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"ownerId\""));
         assert!(json.contains("\"defaultLabelName\":\"main\""));
+        // The JSON codec answers `owner/module` as `name`, as it always has
+        // (#5074 keeps the JSON shapes unchanged)...
+        assert!(json.contains("\"name\":\"o/n\""));
+        // ...and the binary codec the schema's `name`, the module alone: the
+        // CLI rejects a name with a slash in it.
+        let pb = pb_module(&info);
+        assert_eq!(pb.name, "n");
+        assert_eq!(pb.id, ids::module("o/n"));
+        assert_eq!(pb.owner_id, ids::owner("o"));
     }
 
     #[test]
@@ -3086,6 +4987,1397 @@ mod tests {
         let edges = extract_graph_edges(&meta, "c1");
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].to_commit_id, "valid/dep");
+    }
+
+    // -- The regressions the CLI found (#5117). These need a database, so
+    // they runtime-skip when `DATABASE_URL` is unset, like the DB tests
+    // above.
+
+    /// Uploads one module over the JSON codec and returns its commit digest.
+    #[cfg(test)]
+    async fn push_json_module(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        owner: &str,
+        module: &str,
+        contents: &[u8],
+    ) -> String {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use base64::Engine;
+
+        let file = (format!("{owner}/{module}/v1/api.proto"), contents.to_vec());
+        let digest = compute_commit_digest(std::slice::from_ref(&file));
+        let body = serde_json::json!({
+            "contents": [{
+                "moduleRef": { "owner": owner, "module": module },
+                "files": [{
+                    "path": file.0,
+                    "content": base64::engine::general_purpose::STANDARD.encode(&file.1),
+                }],
+            }],
+        });
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1beta1.UploadService/Upload",
+                    fx.repo_key
+                ),
+                "application/json",
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "upload failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+        digest
+    }
+
+    /// The label index is an artifact row sharing the module's `name`, written
+    /// after the commit in the same push (#4889), so a query for the module's
+    /// latest commit ordered by time answers with the index unless it is
+    /// excluded. Its stored object is a JSON document, so `buf dep update`
+    /// resolving a dependency was answered `500 invalid gzip header` from
+    /// reading it as a commit bundle.
+    #[tokio::test]
+    async fn latest_commit_queries_skip_the_label_index_row_5117() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let digest = push_json_module(&fx, "acme", "latest", b"syntax = \"proto3\";\n").await;
+
+        // The index row exists and is newer, which is what made this fail.
+        let (label_created_later,): (bool,) = sqlx::query_as(
+            "SELECT max(created_at) FILTER (WHERE version = '_labels') \
+                  >= max(created_at) FILTER (WHERE version <> '_labels') \
+             FROM artifacts WHERE repository_id = $1 AND name = 'acme/latest'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("compare row ages");
+        assert!(
+            label_created_later,
+            "the premise of this test is that the index row is the newer one"
+        );
+
+        // No ref: the module's latest commit.
+        let body = serde_json::json!({
+            "resourceRefs": [{ "owner": "acme", "module": "latest" }],
+        });
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1.CommitService/GetCommits",
+                    fx.repo_key
+                ),
+                "application/json",
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            ),
+        )
+        .await;
+        assert!(status.is_success(), "GetCommits failed: {status}");
+        let json: serde_json::Value = serde_json::from_slice(&resp).expect("JSON reply");
+        assert_eq!(
+            json["commits"][0]["digest"]["value"], digest,
+            "answered with the label index instead of the commit: {json}"
+        );
+        fx.teardown().await;
+    }
+
+    /// The CLI pairs each reference in a request with one entry in the reply
+    /// and treats a short list as a bug in itself, and `buf push --create`
+    /// decides to create a module from exactly this `not_found`. Over the
+    /// CLI's binary codec only: a JSON caller is still answered a short list,
+    /// as it always was (`json_callers_are_answered_as_before_5074`).
+    #[tokio::test]
+    async fn a_reference_that_resolves_to_nothing_is_not_found_5117() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use prost::Message;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        push_json_module(&fx, "acme", "present", b"syntax = \"proto3\";\n").await;
+
+        let module_name = |module: &str| pb1::module_ref::Name {
+            owner: "acme".to_string(),
+            module: module.to_string(),
+        };
+        let resource = |module: &str, child: Option<&str>| pb1::ResourceRef {
+            value: Some(pb1::resource_ref::Value::Name(pb1::resource_ref::Name {
+                owner: "acme".to_string(),
+                module: module.to_string(),
+                child: child.map(|r| pb1::resource_ref::name::Child::Ref(r.to_string())),
+            })),
+        };
+        let cases = [
+            (
+                "buf.registry.module.v1.ModuleService/GetModules",
+                pb1::GetModulesRequest {
+                    module_refs: vec![pb1::ModuleRef {
+                        value: Some(pb1::module_ref::Value::Name(module_name("absent"))),
+                    }],
+                }
+                .encode_to_vec(),
+                "a module that was never pushed",
+            ),
+            (
+                "buf.registry.module.v1.CommitService/GetCommits",
+                pb1::GetCommitsRequest {
+                    resource_refs: vec![resource("absent", None)],
+                }
+                .encode_to_vec(),
+                "a commit of a module that was never pushed",
+            ),
+            (
+                "buf.registry.module.v1.CommitService/GetCommits",
+                pb1::GetCommitsRequest {
+                    resource_refs: vec![resource("present", Some("typo-not-a-label"))],
+                }
+                .encode_to_vec(),
+                "a ref that is neither a label nor a commit id",
+            ),
+        ];
+
+        for (method, body, what) in cases {
+            let (status, resp) = tdh::send(
+                fx.router_with_auth(super::router()),
+                tdh::post(
+                    format!("/{}/{method}", fx.repo_key),
+                    "application/proto",
+                    bytes::Bytes::from(body),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{what}: {status} {}",
+                String::from_utf8_lossy(&resp)
+            );
+            let json: serde_json::Value = serde_json::from_slice(&resp).expect("JSON error body");
+            assert_eq!(json["code"], "not_found", "{what}");
+        }
+        fx.teardown().await;
+    }
+
+    /// Upgrade safety (#5074): the binary codec is additive, so a JSON caller
+    /// of a hosted repository is answered exactly as before it existed -- a
+    /// missing reference is left out of the reply rather than refused, a
+    /// module's `name` is `owner/module`, a `ref` that names no label falls
+    /// back to the latest commit, an `id` beside `owner`/`module` is read as
+    /// the commit digest, and `GetGraph` answers only the commits asked for.
+    #[tokio::test]
+    async fn json_callers_are_answered_as_before_5074() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let first = push_json_module(&fx, "acme", "compat", b"syntax = \"proto3\";\n").await;
+        let latest =
+            push_json_module(&fx, "acme", "compat", b"syntax = \"proto3\";\n// two\n").await;
+        assert_ne!(first, latest);
+
+        let call = |method: &'static str, body: serde_json::Value| {
+            tdh::send(
+                fx.router_with_auth(super::router()),
+                tdh::post(
+                    format!("/{}/{method}", fx.repo_key),
+                    "application/json",
+                    bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+                ),
+            )
+        };
+        let json_of = |status: StatusCode, resp: &bytes::Bytes| -> serde_json::Value {
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(resp));
+            serde_json::from_slice(resp).expect("a JSON reply")
+        };
+
+        // GetModules: the present module by `owner/module` name, the missing
+        // one left out of a 200.
+        let (status, resp) = call(
+            "buf.registry.module.v1.ModuleService/GetModules",
+            serde_json::json!({ "moduleRefs": [
+                { "owner": "acme", "module": "compat" },
+                { "owner": "acme", "module": "absent" },
+            ]}),
+        )
+        .await;
+        let json = json_of(status, &resp);
+        let modules = json["modules"].as_array().expect("modules");
+        assert_eq!(modules.len(), 1, "{json}");
+        assert_eq!(modules[0]["name"], "acme/compat");
+
+        // GetCommits: a missing module left out, a ref that names no label
+        // answered with the latest commit, an id read as the commit digest.
+        let (status, resp) = call(
+            "buf.registry.module.v1.CommitService/GetCommits",
+            serde_json::json!({ "resourceRefs": [
+                { "owner": "acme", "module": "absent" },
+                { "owner": "acme", "module": "compat", "label": "not-a-label" },
+                { "owner": "acme", "module": "compat", "id": first },
+            ]}),
+        )
+        .await;
+        let json = json_of(status, &resp);
+        let commits = json["commits"].as_array().expect("commits");
+        assert_eq!(commits.len(), 2, "{json}");
+        assert_eq!(commits[0]["digest"]["value"], latest);
+        assert_eq!(commits[1]["digest"]["value"], first);
+        assert_eq!(commits[0]["digest"]["type"], "sha256");
+        assert_eq!(commits[0]["moduleId"], "acme/compat");
+
+        // GetResources: the module's `name` there too.
+        let (status, resp) = call(
+            "buf.registry.module.v1.ResourceService/GetResources",
+            serde_json::json!({ "resourceRefs": [{ "owner": "acme", "module": "compat" }] }),
+        )
+        .await;
+        let json = json_of(status, &resp);
+        assert_eq!(json["resources"][0]["module"]["name"], "acme/compat");
+
+        // Download: an id beside the module name picks that commit.
+        let (status, resp) = call(
+            "buf.registry.module.v1beta1.DownloadService/Download",
+            serde_json::json!({ "values": [
+                { "resourceRef": { "owner": "acme", "module": "compat", "id": first } },
+            ]}),
+        )
+        .await;
+        let json = json_of(status, &resp);
+        assert_eq!(json["contents"][0]["commit"]["digest"]["value"], first);
+
+        // GetGraph: the same ref twice is answered twice, and nothing beyond.
+        let (status, resp) = call(
+            "buf.registry.module.v1.GraphService/GetGraph",
+            serde_json::json!({ "resourceRefs": [
+                { "owner": "acme", "module": "compat" },
+                { "owner": "acme", "module": "compat" },
+            ]}),
+        )
+        .await;
+        let json = json_of(status, &resp);
+        assert_eq!(json["commits"].as_array().map(Vec::len), Some(2), "{json}");
+
+        fx.teardown().await;
+    }
+
+    /// The first calls of a `buf push --create` (buf 1.x, connect-go) as they
+    /// reach a hosted repository through a host-root proxy: binary Connect
+    /// unary requests with `Connect-Protocol-Version: 1` and the CLI's
+    /// headers. `GetModules` must answer `not_found` (that is what makes the
+    /// CLI call `CreateModules`), `CreateModules` must answer the module in
+    /// the binary codec with the schema's bare `name`, the v1 `Upload` must
+    /// answer a tuuid commit with a b5 digest, and the module must then
+    /// resolve in the binary codec. Before #5074 the first call was a 415.
+    #[tokio::test]
+    async fn a_buf_cli_push_create_sequence_is_served_5074() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use prost::Message;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let buf_request = |method: &str, body: Vec<u8>| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/{}/{method}", fx.repo_key))
+                .header("content-type", "application/proto")
+                .header("connect-protocol-version", "1")
+                .header("connect-timeout-ms", "119999")
+                .header("accept-encoding", "gzip")
+                .header("user-agent", "buf/1.72.0 connect-go/1.18.1 (go1.25.1)")
+                .body(axum::body::Body::from(body))
+                .expect("build request")
+        };
+        let name = || pb1::module_ref::Name {
+            owner: "acme".to_string(),
+            module: "clipush".to_string(),
+        };
+
+        // 1. GetModules for a module that does not exist yet.
+        let get_modules = pb1::GetModulesRequest {
+            module_refs: vec![pb1::ModuleRef {
+                value: Some(pb1::module_ref::Value::Name(name())),
+            }],
+        }
+        .encode_to_vec();
+        let (status, resp, headers) = tdh::send_with_headers(
+            fx.router_with_auth(super::router()),
+            buf_request(
+                "buf.registry.module.v1.ModuleService/GetModules",
+                get_modules.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{}",
+            String::from_utf8_lossy(&resp)
+        );
+        assert_eq!(
+            headers.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "a Connect unary error is JSON in every codec"
+        );
+        let err: serde_json::Value = serde_json::from_slice(&resp).expect("Connect error");
+        assert_eq!(err["code"], "not_found");
+
+        // 2. CreateModules, which the CLI sends on that not_found.
+        let create = pb1::CreateModulesRequest {
+            values: vec![pb1::create_modules_request::Value {
+                owner_ref: Some(wire::proto::owner_v1::OwnerRef {
+                    value: Some(wire::proto::owner_v1::owner_ref::Value::Name(
+                        "acme".to_string(),
+                    )),
+                }),
+                name: "clipush".to_string(),
+                visibility: pb1::ModuleVisibility::Public as i32,
+                description: String::new(),
+                url: String::new(),
+                default_label_name: String::new(),
+            }],
+        }
+        .encode_to_vec();
+        let (status, resp, headers) = tdh::send_with_headers(
+            fx.router_with_auth(super::router()),
+            buf_request("buf.registry.module.v1.ModuleService/CreateModules", create),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
+        assert_eq!(
+            headers.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("application/proto")
+        );
+        let created = pb1::CreateModulesResponse::decode(resp.as_ref()).expect("binary reply");
+        assert_eq!(created.modules.len(), 1);
+        assert_eq!(created.modules[0].name, "clipush", "the schema's bare name");
+        assert_eq!(created.modules[0].id, ids::module("acme/clipush"));
+        assert_eq!(created.modules[0].owner_id, ids::owner("acme"));
+
+        // 3. The v1 Upload a single-registry push uses.
+        let upload = pb1::UploadRequest {
+            contents: vec![pb1::upload_request::Content {
+                module_ref: Some(pb1::ModuleRef {
+                    value: Some(pb1::module_ref::Value::Name(name())),
+                }),
+                files: vec![pb1::File {
+                    path: "acme/clipush/v1/clipush.proto".to_string(),
+                    content: b"syntax = \"proto3\";\npackage acme.clipush.v1;\n".to_vec(),
+                }],
+                scoped_label_refs: Vec::new(),
+                source_control_url: String::new(),
+            }],
+            dep_commit_ids: Vec::new(),
+        }
+        .encode_to_vec();
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            buf_request("buf.registry.module.v1.UploadService/Upload", upload),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
+        let uploaded = pb1::UploadResponse::decode(resp.as_ref()).expect("binary reply");
+        let commit = uploaded.commits.first().expect("one commit");
+        assert_eq!(commit.module_id, ids::module("acme/clipush"));
+        assert_eq!(commit.owner_id, ids::owner("acme"));
+        let digest = commit.digest.as_ref().expect("a digest");
+        assert_eq!(digest.r#type, pb1::DigestType::B5 as i32);
+        let expected_b5 = wire::b5_digest(
+            &[(
+                "acme/clipush/v1/clipush.proto".to_string(),
+                b"syntax = \"proto3\";\npackage acme.clipush.v1;\n".to_vec(),
+            )],
+            &[],
+        );
+        assert_eq!(digest.value, wire::b5_bytes(&expected_b5).unwrap());
+
+        // 4. The module now resolves, in the binary codec.
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            buf_request(
+                "buf.registry.module.v1.ModuleService/GetModules",
+                get_modules,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
+        let modules = pb1::GetModulesResponse::decode(resp.as_ref()).expect("binary reply");
+        assert_eq!(modules.modules.len(), 1);
+        assert_eq!(modules.modules[0].name, "clipush");
+        assert_eq!(modules.modules[0].id, ids::module("acme/clipush"));
+
+        fx.teardown().await;
+    }
+
+    /// The round trip the CLI makes: push over the v1 `UploadService` in the
+    /// binary codec, then ask for the commit back by the id the reply gave,
+    /// which is a derived tuuid no column holds.
+    #[tokio::test]
+    async fn a_binary_upload_is_fetched_back_by_its_derived_commit_id_5117() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use prost::Message;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+
+        let request = pb1::UploadRequest {
+            contents: vec![pb1::upload_request::Content {
+                module_ref: Some(pb1::ModuleRef {
+                    value: Some(pb1::module_ref::Value::Name(pb1::module_ref::Name {
+                        owner: "acme".to_string(),
+                        module: "wire".to_string(),
+                    })),
+                }),
+                files: vec![pb1::File {
+                    path: "acme/wire/v1/wire.proto".to_string(),
+                    content: b"syntax = \"proto3\";\n".to_vec(),
+                }],
+                scoped_label_refs: Vec::new(),
+                source_control_url: String::new(),
+            }],
+            dep_commit_ids: Vec::new(),
+        };
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1.UploadService/Upload",
+                    fx.repo_key
+                ),
+                "application/proto",
+                bytes::Bytes::from(request.encode_to_vec()),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "binary upload failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+        let uploaded =
+            pb1::UploadResponse::decode(resp.as_ref()).expect("a protobuf reply, not JSON");
+        let commit = uploaded.commits.first().expect("one commit per content");
+        assert_eq!(commit.id.len(), 32, "the id is a tuuid: {}", commit.id);
+        let digest = commit.digest.as_ref().expect("a digest");
+        assert_eq!(digest.r#type, pb1::DigestType::B5 as i32);
+        assert_eq!(digest.value.len(), 64, "b5 is 64 raw bytes");
+
+        // By id alone: nothing stores it, so it resolves through the id
+        // recorded with the commit at push time.
+        let request = pb1::GetCommitsRequest {
+            resource_refs: vec![pb1::ResourceRef {
+                value: Some(pb1::resource_ref::Value::Id(commit.id.clone())),
+            }],
+        };
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1.CommitService/GetCommits",
+                    fx.repo_key
+                ),
+                "application/proto",
+                bytes::Bytes::from(request.encode_to_vec()),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "GetCommits by derived id failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+        let fetched = pb1::GetCommitsResponse::decode(resp.as_ref()).expect("a protobuf reply");
+        let same = fetched.commits.first().expect("one commit per reference");
+        assert_eq!(same.id, commit.id);
+        assert_eq!(same.digest, commit.digest, "the same b5 digest comes back");
+        fx.teardown().await;
+    }
+
+    /// Pushes a module in the binary codec and returns its reply.
+    #[cfg(test)]
+    async fn push_proto_module(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        owner: &str,
+        module: &str,
+        contents: &[u8],
+        dep_commit_ids: Vec<String>,
+    ) -> pb1::Commit {
+        use prost::Message;
+
+        let (status, resp) = send_proto_upload(fx, owner, module, contents, dep_commit_ids).await;
+        assert!(
+            status.is_success(),
+            "binary upload of {owner}/{module} failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+        pb1::UploadResponse::decode(resp.as_ref())
+            .expect("a protobuf reply")
+            .commits
+            .into_iter()
+            .next()
+            .expect("one commit per content")
+    }
+
+    /// The chain the CLI walks when a consumer pins one module and gets its
+    /// dependencies with it: the graph has to be the closure, not the commits
+    /// that were asked for, and a dependency recorded as a commit id has to
+    /// resolve. The same shape as `test-protobuf-buf-cli.sh`, in a test CI
+    /// runs.
+    #[tokio::test]
+    async fn the_dependency_chain_resolves_over_the_binary_codec_5117() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use prost::Message;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+
+        let base =
+            push_proto_module(&fx, "acme", "base", b"syntax = \"proto3\";\n", Vec::new()).await;
+        let middle = push_proto_module(
+            &fx,
+            "acme",
+            "middle",
+            b"syntax = \"proto3\";\n// middle\n",
+            vec![base.id.clone()],
+        )
+        .await;
+
+        // The dependent's b5 composes its own files with the dependency's b5
+        // -- the digest buf recomputes and compares.
+        let expected = wire::b5_digest(
+            &[(
+                "acme/middle/v1/api.proto".to_string(),
+                b"syntax = \"proto3\";\n// middle\n".to_vec(),
+            )],
+            &[b5_string(&base)],
+        );
+        assert_eq!(
+            middle.digest.as_ref().map(|d| d.value.clone()),
+            Some(wire::b5_bytes(&expected).unwrap()),
+            "the dependent's b5 must cover the dependency's b5"
+        );
+        assert_ne!(
+            middle.digest.as_ref().map(|d| d.value.clone()),
+            Some(
+                wire::b5_bytes(&wire::b5_digest(
+                    &[(
+                        "acme/middle/v1/api.proto".to_string(),
+                        b"syntax = \"proto3\";\n// middle\n".to_vec(),
+                    )],
+                    &[],
+                ))
+                .unwrap()
+            ),
+            "a b5 without the dependency's digest is not the one buf verifies"
+        );
+
+        // Asking for the middle module alone must answer with both commits
+        // and the edge between them: the CLI builds a map from `commits` and
+        // then looks up each edge's node in it.
+        let request = pb1::GetGraphRequest {
+            resource_refs: vec![pb1::ResourceRef {
+                value: Some(pb1::resource_ref::Value::Id(middle.id.clone())),
+            }],
+        };
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1.GraphService/GetGraph",
+                    fx.repo_key
+                ),
+                "application/proto",
+                bytes::Bytes::from(request.encode_to_vec()),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "GetGraph failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+        let graph = pb1::GetGraphResponse::decode(resp.as_ref())
+            .expect("a protobuf reply")
+            .graph
+            .expect("a graph");
+
+        let commit_ids: Vec<&str> = graph.commits.iter().map(|c| c.id.as_str()).collect();
+        assert!(
+            commit_ids.contains(&middle.id.as_str()) && commit_ids.contains(&base.id.as_str()),
+            "the graph must carry the closure, got {commit_ids:?}"
+        );
+        let edge = graph.edges.first().expect("one dependency edge");
+        assert_eq!(
+            edge.from_node.as_ref().map(|n| n.commit_id.as_str()),
+            Some(middle.id.as_str())
+        );
+        assert_eq!(
+            edge.to_node.as_ref().map(|n| n.commit_id.as_str()),
+            Some(base.id.as_str()),
+            "the edge must name the commit the dependency was recorded as"
+        );
+
+        // And the files come back over the v1 download the CLI uses for b5.
+        let request = pb1::DownloadRequest {
+            values: vec![pb1::download_request::Value {
+                resource_ref: Some(pb1::ResourceRef {
+                    value: Some(pb1::resource_ref::Value::Id(middle.id.clone())),
+                }),
+                file_types: Vec::new(),
+                paths: Vec::new(),
+                paths_allow_not_exist: false,
+            }],
+        };
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1.DownloadService/Download",
+                    fx.repo_key
+                ),
+                "application/proto",
+                bytes::Bytes::from(request.encode_to_vec()),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "Download failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+        let downloaded = pb1::DownloadResponse::decode(resp.as_ref()).expect("a protobuf reply");
+        let content = downloaded.contents.first().expect("one content per value");
+        assert_eq!(
+            content.commit.as_ref().map(|c| c.id.as_str()),
+            Some(middle.id.as_str())
+        );
+        let file = content.files.first().expect("the pushed file");
+        assert_eq!(file.path, "acme/middle/v1/api.proto");
+        assert_eq!(file.content, b"syntax = \"proto3\";\n// middle\n");
+
+        fx.teardown().await;
+    }
+
+    /// Both proto packages carry the dependency commit ids once for the whole
+    /// push, so a push of several modules that declares dependencies cannot
+    /// say which module imports which. Recording a digest composed from every
+    /// dependency would be wrong for a reason nothing states.
+    #[tokio::test]
+    async fn a_multi_module_push_with_dependencies_is_refused_5117() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use prost::Message;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let base =
+            push_proto_module(&fx, "acme", "shared", b"syntax = \"proto3\";\n", Vec::new()).await;
+
+        let content = |module: &str| pb1::upload_request::Content {
+            module_ref: Some(pb1::ModuleRef {
+                value: Some(pb1::module_ref::Value::Name(pb1::module_ref::Name {
+                    owner: "acme".to_string(),
+                    module: module.to_string(),
+                })),
+            }),
+            files: vec![pb1::File {
+                path: format!("acme/{module}/v1/api.proto"),
+                content: b"syntax = \"proto3\";\n".to_vec(),
+            }],
+            scoped_label_refs: Vec::new(),
+            source_control_url: String::new(),
+        };
+        let request = pb1::UploadRequest {
+            contents: vec![content("one"), content("two")],
+            dep_commit_ids: vec![base.id.clone()],
+        };
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1.UploadService/Upload",
+                    fx.repo_key
+                ),
+                "application/proto",
+                bytes::Bytes::from(request.encode_to_vec()),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let json: serde_json::Value = serde_json::from_slice(&resp).expect("a Connect error body");
+        assert_eq!(json["code"], "failed_precondition");
+
+        // Nothing was stored: the refusal comes before the first content.
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifacts WHERE repository_id = $1 AND name IN \
+             ('acme/one', 'acme/two')",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count the modules");
+        assert_eq!(stored, 0, "a refused push must store nothing");
+
+        fx.teardown().await;
+    }
+
+    /// A commit's b5 as the `b5:<hex>` string the digest functions take.
+    #[cfg(test)]
+    fn b5_string(commit: &pb1::Commit) -> String {
+        format!(
+            "b5:{}",
+            hex::encode(&commit.digest.as_ref().expect("a digest").value)
+        )
+    }
+
+    /// Sends one binary request to `method` and returns the status and body.
+    #[cfg(test)]
+    async fn send_proto(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        method: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, bytes::Bytes) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!("/{}/{method}", fx.repo_key),
+                "application/proto",
+                bytes::Bytes::from(body),
+            ),
+        )
+        .await
+    }
+
+    /// `buf dep update` moving a dependency from c1 to c2, then `buf push` of
+    /// the same files: a new commit with a new b5 and a graph edge to c2.
+    /// Keyed on the files alone, the push collapsed into the old commit and
+    /// answered c1's b5 and graph (#5074 review).
+    #[tokio::test]
+    async fn a_dependency_bump_with_the_same_files_is_a_new_commit_5074() {
+        use prost::Message;
+
+        let Some(fx) =
+            crate::api::handlers::test_db_helpers::Fixture::setup("local", "protobuf").await
+        else {
+            return;
+        };
+        let c1 = push_proto_module(&fx, "acme", "dep", b"syntax = \"proto3\";\n", Vec::new()).await;
+        let c2 = push_proto_module(
+            &fx,
+            "acme",
+            "dep",
+            b"syntax = \"proto3\";\n// v2\n",
+            Vec::new(),
+        )
+        .await;
+        assert_ne!(c1.id, c2.id);
+
+        let files = b"syntax = \"proto3\";\n// app\n";
+        let on_c1 = push_proto_module(&fx, "acme", "app", files, vec![c1.id.clone()]).await;
+        let on_c2 = push_proto_module(&fx, "acme", "app", files, vec![c2.id.clone()]).await;
+
+        assert_ne!(on_c1.id, on_c2.id, "a dependency bump is a new commit");
+        assert_ne!(on_c1.digest, on_c2.digest, "with a new b5");
+        let expected = wire::b5_digest(
+            &[("acme/app/v1/api.proto".to_string(), files.to_vec())],
+            &[b5_string(&c2)],
+        );
+        assert_eq!(
+            on_c2.digest.as_ref().map(|d| d.value.clone()),
+            Some(wire::b5_bytes(&expected).unwrap())
+        );
+
+        // The same push again is still idempotent.
+        let again = push_proto_module(&fx, "acme", "app", files, vec![c2.id.clone()]).await;
+        assert_eq!(again.id, on_c2.id);
+
+        // And the graph of the new commit points at c2.
+        let (status, resp) = send_proto(
+            &fx,
+            "buf.registry.module.v1.GraphService/GetGraph",
+            pb1::GetGraphRequest {
+                resource_refs: vec![pb1::ResourceRef {
+                    value: Some(pb1::resource_ref::Value::Id(on_c2.id.clone())),
+                }],
+            }
+            .encode_to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
+        let graph = pb1::GetGraphResponse::decode(resp.as_ref())
+            .unwrap()
+            .graph
+            .unwrap();
+        let to: Vec<String> = graph
+            .edges
+            .iter()
+            .filter_map(|e| e.to_node.as_ref().map(|n| n.commit_id.clone()))
+            .collect();
+        assert_eq!(to, vec![c2.id.clone()]);
+
+        fx.teardown().await;
+    }
+
+    /// Over the binary codec a push carries one module: a workspace push of
+    /// several would get b5 digests composed from a push-wide dependency list.
+    #[tokio::test]
+    async fn a_binary_multi_module_push_is_refused_even_without_dependencies_5074() {
+        use prost::Message;
+
+        let Some(fx) =
+            crate::api::handlers::test_db_helpers::Fixture::setup("local", "protobuf").await
+        else {
+            return;
+        };
+        let content = |module: &str| pb1::upload_request::Content {
+            module_ref: Some(pb1::ModuleRef {
+                value: Some(pb1::module_ref::Value::Name(pb1::module_ref::Name {
+                    owner: "acme".to_string(),
+                    module: module.to_string(),
+                })),
+            }),
+            files: vec![pb1::File {
+                path: format!("acme/{module}/v1/api.proto"),
+                content: b"syntax = \"proto3\";\n".to_vec(),
+            }],
+            scoped_label_refs: Vec::new(),
+            source_control_url: String::new(),
+        };
+        let (status, resp) = send_proto(
+            &fx,
+            "buf.registry.module.v1.UploadService/Upload",
+            pb1::UploadRequest {
+                contents: vec![content("ws-one"), content("ws-two")],
+                dep_commit_ids: Vec::new(),
+            }
+            .encode_to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let json: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert_eq!(json["code"], "failed_precondition");
+        assert!(json["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("several modules"));
+        assert_eq!(module_rows(&fx, "acme/ws-one").await, 0);
+        assert_eq!(module_rows(&fx, "acme/ws-two").await, 0);
+        fx.teardown().await;
+    }
+
+    /// Derived ids are pure functions of names, so the same id names a
+    /// module in every repository; resolving one must stay inside the
+    /// repository the request addressed. An owner, and a dependency edge,
+    /// that exist only in repository A are not found from repository B.
+    #[tokio::test]
+    async fn derived_ids_resolve_within_one_repository_5074() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use prost::Message;
+
+        let Some(a) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let Some(b) = tdh::Fixture::setup("local", "protobuf").await else {
+            a.teardown().await;
+            return;
+        };
+        let base =
+            push_proto_module(&a, "onlyina", "base", b"syntax = \"proto3\";\n", Vec::new()).await;
+
+        // ownerId: recorded in A only.
+        let (status, resp) = send_proto(
+            &b,
+            "buf.registry.owner.v1.OwnerService/GetOwners",
+            wire::proto::owner_v1::GetOwnersRequest {
+                owner_refs: vec![wire::proto::owner_v1::OwnerRef {
+                    value: Some(wire::proto::owner_v1::owner_ref::Value::Id(ids::owner(
+                        "onlyina",
+                    ))),
+                }],
+            }
+            .encode_to_vec(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an owner recorded in A is not B's: {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        // moduleId: recorded in A only.
+        let (status, _) = send_proto(
+            &b,
+            "buf.registry.module.v1.ModuleService/GetModules",
+            pb1::GetModulesRequest {
+                module_refs: vec![pb1::ModuleRef {
+                    value: Some(pb1::module_ref::Value::Id(base.module_id.clone())),
+                }],
+            }
+            .encode_to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "a module id of A from B");
+
+        // commitId: a commit in B whose recorded dependency is A's commit.
+        // Resolving the edge from B must not find A's row.
+        let lonely =
+            push_proto_module(&b, "inb", "lonely", b"syntax = \"proto3\";\n", Vec::new()).await;
+        sqlx::query(
+            "UPDATE artifact_metadata m SET metadata = jsonb_set(m.metadata, '{dependencies}', \
+             jsonb_build_array($2::text)) FROM artifacts a \
+             WHERE a.id = m.artifact_id AND a.repository_id = $1 AND a.name = 'inb/lonely' \
+               AND a.version <> '_labels'",
+        )
+        .bind(b.repo_id)
+        .bind(&base.id)
+        .execute(&b.pool)
+        .await
+        .expect("point B's commit at A's");
+        let (status, resp) = send_proto(
+            &b,
+            "buf.registry.module.v1.GraphService/GetGraph",
+            pb1::GetGraphRequest {
+                resource_refs: vec![pb1::ResourceRef {
+                    value: Some(pb1::resource_ref::Value::Id(lonely.id.clone())),
+                }],
+            }
+            .encode_to_vec(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a dependency held only by A is unresolved from B: {}",
+            String::from_utf8_lossy(&resp)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert_eq!(json["code"], "failed_precondition");
+
+        b.teardown().await;
+        a.teardown().await;
+    }
+
+    /// A remote or virtual repository holds no rows the CLI could use, so the
+    /// binary codec is `unimplemented` there instead of an answer built from
+    /// local rows; the JSON codec answers as before (#5074 review).
+    #[tokio::test]
+    async fn the_binary_codec_is_unimplemented_on_remote_and_virtual_repos_5074() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use prost::Message;
+
+        for repo_type in ["remote", "virtual"] {
+            let Some(fx) = tdh::Fixture::setup(repo_type, "protobuf").await else {
+                return;
+            };
+            let (status, resp) = send_proto(
+                &fx,
+                "buf.registry.module.v1.ModuleService/GetModules",
+                pb1::GetModulesRequest {
+                    module_refs: vec![pb1::ModuleRef {
+                        value: Some(pb1::module_ref::Value::Name(pb1::module_ref::Name {
+                            owner: "acme".to_string(),
+                            module: "x".to_string(),
+                        })),
+                    }],
+                }
+                .encode_to_vec(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{repo_type}");
+            let json: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+            assert_eq!(json["code"], "unimplemented", "{repo_type}");
+
+            let (status, resp) = send_proto(
+                &fx,
+                "buf.registry.module.v1.DownloadService/Download",
+                pb1::DownloadRequest { values: Vec::new() }.encode_to_vec(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_IMPLEMENTED,
+                "{repo_type} Download: {}",
+                String::from_utf8_lossy(&resp)
+            );
+
+            // JSON: the empty answer it always gave.
+            let (status, resp) = tdh::send(
+                fx.router_with_auth(super::router()),
+                tdh::post(
+                    format!(
+                        "/{}/buf.registry.module.v1.ModuleService/GetModules",
+                        fx.repo_key
+                    ),
+                    "application/json",
+                    bytes::Bytes::from_static(b"{}"),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{repo_type} JSON");
+            assert_eq!(&resp[..], br#"{"modules":[]}"#);
+            fx.teardown().await;
+        }
+    }
+
+    /// A JSON write answers in main's order: a malformed body or a missing
+    /// JSON content type is refused before authorisation, as axum's `Json`
+    /// extractor refused it, so an anonymous caller still sees the 415/400/422
+    /// it always did (#5074 review).
+    #[tokio::test]
+    async fn json_writes_read_the_body_before_authorising_5074() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        for method in [
+            "buf.registry.module.v1.ModuleService/CreateModules",
+            "buf.registry.module.v1beta1.UploadService/Upload",
+            "buf.registry.module.v1.LabelService/CreateOrUpdateLabels",
+        ] {
+            let anon = || tdh::router_anon(super::router(), fx.state.clone());
+            let uri = format!("/{}/{method}", fx.repo_key);
+
+            let (status, _) = tdh::send(
+                anon(),
+                tdh::post(
+                    uri.clone(),
+                    "application/json",
+                    bytes::Bytes::from_static(b"{nope"),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{method}: syntax error first"
+            );
+
+            let (status, _) = tdh::send(
+                anon(),
+                tdh::post(uri.clone(), "text/plain", bytes::Bytes::from_static(b"{}")),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{method}: content type first"
+            );
+
+            // A well-formed JSON body reaches the scope check.
+            let body: &'static [u8] = if method.ends_with("CreateOrUpdateLabels") {
+                br#"{"values":[]}"#
+            } else {
+                b"{}"
+            };
+            let (status, _) = tdh::send(
+                anon(),
+                tdh::post(
+                    uri.clone(),
+                    "application/json",
+                    bytes::Bytes::from_static(body),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method}: then auth");
+
+            // The binary codec authorises first: anonymous garbage is a 401.
+            let (status, _) = tdh::send(
+                anon(),
+                tdh::post(
+                    uri.clone(),
+                    "application/proto",
+                    bytes::Bytes::from_static(b"\xff\xff"),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method}: binary auth first"
+            );
+        }
+        fx.teardown().await;
+    }
+
+    /// Sends one binary v1 upload and returns the status and body unchecked.
+    #[cfg(test)]
+    async fn send_proto_upload(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        owner: &str,
+        module: &str,
+        contents: &[u8],
+        dep_commit_ids: Vec<String>,
+    ) -> (StatusCode, bytes::Bytes) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use prost::Message;
+
+        let request = pb1::UploadRequest {
+            contents: vec![pb1::upload_request::Content {
+                module_ref: Some(pb1::ModuleRef {
+                    value: Some(pb1::module_ref::Value::Name(pb1::module_ref::Name {
+                        owner: owner.to_string(),
+                        module: module.to_string(),
+                    })),
+                }),
+                files: vec![pb1::File {
+                    path: format!("{owner}/{module}/v1/api.proto"),
+                    content: contents.to_vec(),
+                }],
+                scoped_label_refs: Vec::new(),
+                source_control_url: String::new(),
+            }],
+            dep_commit_ids,
+        };
+        tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1.UploadService/Upload",
+                    fx.repo_key
+                ),
+                "application/proto",
+                bytes::Bytes::from(request.encode_to_vec()),
+            ),
+        )
+        .await
+    }
+
+    /// The rows a push of `module` left: commits and the label index alike.
+    #[cfg(test)]
+    async fn module_rows(fx: &crate::api::handlers::test_db_helpers::Fixture, module: &str) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM artifacts WHERE repository_id = $1 AND name = $2")
+            .bind(fx.repo_id)
+            .bind(module)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("count the module's rows")
+    }
+
+    /// A dependency this repository holds no b5 for is refused before the
+    /// commit's bundle is stored: no commit row, no label index, nothing for
+    /// a push peer to replicate. It used to be stored, labelled and queued,
+    /// and only the reply failed.
+    #[tokio::test]
+    async fn a_push_with_an_unresolved_dependency_stores_nothing_5074() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let unknown = ids::commit("elsewhere/dep", "never-pushed-here");
+        let (status, resp) = send_proto_upload(
+            &fx,
+            "acme",
+            "orphan",
+            b"syntax = \"proto3\";\n",
+            vec![unknown.clone()],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let json: serde_json::Value = serde_json::from_slice(&resp).expect("a Connect error body");
+        assert_eq!(json["code"], "failed_precondition");
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&unknown),
+            "the refusal names the dependency: {json}"
+        );
+        assert_eq!(
+            module_rows(&fx, "acme/orphan").await,
+            0,
+            "a refused push must store nothing"
+        );
+
+        fx.teardown().await;
+    }
+
+    /// A commit pushed before #5066 carries none of `commitId`, `moduleId`,
+    /// `ownerId` or `b5Digest`, so nothing can depend on it. Pushing the same
+    /// commit again is the idempotent path, and it is where those are filled
+    /// in; without that, such a commit could never be a dependency.
+    #[tokio::test]
+    async fn a_repush_backfills_the_ids_of_an_old_shape_commit_5074() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let base =
+            push_proto_module(&fx, "acme", "legacy", b"syntax = \"proto3\";\n", Vec::new()).await;
+
+        // What a pre-#5066 push recorded.
+        sqlx::query(
+            "UPDATE artifact_metadata m SET metadata = m.metadata \
+                 - 'commitId' - 'moduleId' - 'ownerId' - 'b5Digest' \
+             FROM artifacts a \
+             WHERE a.id = m.artifact_id AND a.repository_id = $1 AND a.name = 'acme/legacy'",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("strip the metadata to its old shape");
+
+        let (status, _) = send_proto_upload(
+            &fx,
+            "acme",
+            "dependent",
+            b"syntax = \"proto3\";\n",
+            vec![base.id.clone()],
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "the old-shape commit cannot be resolved as a dependency yet"
+        );
+
+        let again =
+            push_proto_module(&fx, "acme", "legacy", b"syntax = \"proto3\";\n", Vec::new()).await;
+        assert_eq!(again.id, base.id, "the same commit, pushed again");
+
+        let metadata: serde_json::Value = sqlx::query_scalar(
+            "SELECT m.metadata FROM artifact_metadata m JOIN artifacts a ON a.id = m.artifact_id \
+             WHERE a.repository_id = $1 AND a.name = 'acme/legacy' AND a.version <> '_labels'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("the commit's metadata");
+        assert_eq!(metadata["commitId"], base.id);
+        assert_eq!(metadata["moduleId"], ids::module("acme/legacy"));
+        assert_eq!(metadata["ownerId"], ids::owner("acme"));
+        assert!(metadata["b5Digest"].is_string(), "b5 recorded: {metadata}");
+
+        let (status, resp) = send_proto_upload(
+            &fx,
+            "acme",
+            "dependent",
+            b"syntax = \"proto3\";\n",
+            vec![base.id.clone()],
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "the backfilled commit resolves as a dependency: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        fx.teardown().await;
+    }
+
+    /// `_` and `%` are legal in an owner name, and in a `LIKE` pattern they are
+    /// wildcards: unescaped, `GetOwners` for `a_me` answered for `acme`.
+    #[tokio::test]
+    async fn an_owner_name_is_matched_literally_5074() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        push_json_module(&fx, "acme", "payments", b"syntax = \"proto3\";\n").await;
+
+        let get_owner = |name: &'static str| {
+            let body = serde_json::json!({ "ownerRefs": [{ "name": name }] });
+            tdh::send(
+                fx.router_with_auth(super::router()),
+                tdh::post(
+                    format!(
+                        "/{}/buf.registry.owner.v1.OwnerService/GetOwners",
+                        fx.repo_key
+                    ),
+                    "application/json",
+                    bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+                ),
+            )
+        };
+
+        let (status, _) = get_owner("acme").await;
+        assert!(status.is_success(), "the real owner resolves: {status}");
+        for wildcard in ["a_me", "%", "ac%"] {
+            let (status, resp) = get_owner(wildcard).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{wildcard} must not match acme: {}",
+                String::from_utf8_lossy(&resp)
+            );
+        }
+
+        fx.teardown().await;
+    }
+
+    #[test]
+    fn backfill_fills_only_what_the_stored_commit_lacks() {
+        let stored = serde_json::json!({
+            "module": "acme/a", "commitDigest": "d", "fileCount": 1, "dependencies": [],
+        });
+        let fresh = serde_json::json!({
+            "module": "acme/a", "commitDigest": "d", "fileCount": 9, "dependencies": [],
+            "commitId": "c", "moduleId": "m", "ownerId": "o", "b5Digest": "b5:00",
+        });
+        let merged = merge_backfilled_metadata(Some(&stored), &fresh).expect("ids added");
+        assert_eq!(merged["fileCount"], 1, "what is recorded wins");
+        assert_eq!(merged["commitId"], "c");
+        assert_eq!(merged["moduleId"], "m");
+        assert_eq!(merged["ownerId"], "o");
+        assert_eq!(merged["b5Digest"], "b5:00");
+
+        assert!(
+            merge_backfilled_metadata(Some(&merged), &fresh).is_none(),
+            "nothing to add the second time"
+        );
+    }
+
+    #[test]
+    fn backfill_takes_a_new_b5_with_the_dependencies_it_was_composed_from() {
+        let stored = serde_json::json!({
+            "module": "acme/a", "dependencies": ["acme/base"],
+            "b5UnresolvedDeps": ["acme/base"],
+        });
+        let fresh = serde_json::json!({
+            "module": "acme/a", "dependencies": ["c0ffee"], "b5Digest": "b5:00",
+        });
+        let merged = merge_backfilled_metadata(Some(&stored), &fresh).expect("b5 added");
+        assert_eq!(merged["b5Digest"], "b5:00");
+        assert_eq!(merged["dependencies"], serde_json::json!(["c0ffee"]));
+        assert!(merged.get("b5UnresolvedDeps").is_none());
+    }
+
+    #[test]
+    fn backfill_keeps_a_recorded_b5_over_a_json_repush() {
+        let stored = serde_json::json!({
+            "module": "acme/a", "dependencies": ["c0ffee"], "b5Digest": "b5:00",
+            "commitId": "c", "moduleId": "m", "ownerId": "o",
+        });
+        let fresh = serde_json::json!({
+            "module": "acme/a", "dependencies": ["acme/base"],
+            "b5UnresolvedDeps": ["acme/base"],
+            "commitId": "c", "moduleId": "m", "ownerId": "o",
+        });
+        assert!(merge_backfilled_metadata(Some(&stored), &fresh).is_none());
+    }
+
+    #[test]
+    fn backfill_writes_the_fresh_metadata_when_none_is_stored() {
+        let fresh = serde_json::json!({ "module": "acme/a", "commitId": "c" });
+        assert_eq!(merge_backfilled_metadata(None, &fresh), Some(fresh.clone()));
+        assert!(merge_backfilled_metadata(None, &serde_json::json!([])).is_none());
     }
 
     /// #4725: a `buf push` to a hosted repository must queue a push sync task
@@ -3778,7 +7070,7 @@ mod catalog_registration_tests {
         // a coin flip.
         let digest: Option<String> = sqlx::query_scalar(
             "SELECT version FROM artifacts \
-             WHERE repository_id = $1 AND name = 'acme/widgets' AND version <> '_labels'",
+             WHERE repository_id = $1 AND name = 'acme/widgets' AND version IS DISTINCT FROM '_labels'",
         )
         .bind(fx.repo_id)
         .fetch_optional(&fx.pool)
@@ -3892,7 +7184,7 @@ pub(crate) mod integrity_tests {
         );
         sqlx::query_scalar(
             "SELECT version FROM artifacts \
-             WHERE repository_id = $1 AND name = 'acme/integrity' AND version <> '_labels'",
+             WHERE repository_id = $1 AND name = 'acme/integrity' AND version IS DISTINCT FROM '_labels'",
         )
         .bind(fx.repo_id)
         .fetch_one(&fx.pool)
@@ -4169,5 +7461,125 @@ mod download_latest_commit_tests {
             file_content(&resp),
             b"syntax = \"proto3\";\nmessage Two {}\n"
         );
+    }
+}
+
+/// #5074 review: the binary codec's authorisation through the production
+/// router, where the visibility middleware runs in front of the handlers.
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod router_authz_tests {
+    use super::pb1;
+    use axum::http::StatusCode;
+    use base64::Engine;
+
+    /// Through the production router (visibility middleware included): an
+    /// anonymous binary Upload, Download and GetOwners are refused, and a
+    /// token scoped to `read:artifacts` cannot push, even for a user whose
+    /// role may write -- the handler's own scope check is what refuses it
+    /// (GHSA-vvc3-h39c-mrq5), for the v1 Upload the CLI uses as for v1beta1.
+    #[tokio::test]
+    async fn binary_writes_need_a_write_scope_through_the_router_5074() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use prost::Message;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let (read_token, _) = crate::services::auth_service::AuthService::new(
+            fx.pool.clone(),
+            std::sync::Arc::new(fx.state.config.clone()),
+        )
+        .generate_api_token(
+            fx.user_id,
+            "pb-5074-read",
+            vec!["read:artifacts".to_string()],
+            None,
+        )
+        .await
+        .expect("mint a read-scoped token");
+        let read_basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD
+                .encode(format!("{}:{}", fx.username, read_token))
+        );
+
+        let upload = |module: &str| {
+            pb1::UploadRequest {
+                contents: vec![pb1::upload_request::Content {
+                    module_ref: Some(pb1::ModuleRef {
+                        value: Some(pb1::module_ref::Value::Name(pb1::module_ref::Name {
+                            owner: "acme".to_string(),
+                            module: module.to_string(),
+                        })),
+                    }),
+                    files: vec![pb1::File {
+                        path: format!("acme/{module}/v1/api.proto"),
+                        content: b"syntax = \"proto3\";\n".to_vec(),
+                    }],
+                    scoped_label_refs: Vec::new(),
+                    source_control_url: String::new(),
+                }],
+                dep_commit_ids: Vec::new(),
+            }
+            .encode_to_vec()
+        };
+        let call = |method: String, body: Vec<u8>, authorization: Option<String>| {
+            let state = fx.state.clone();
+            let uri = format!("/proto/{}/{method}", fx.repo_key);
+            async move {
+                let mut req = axum::http::Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/proto")
+                    .header("connect-protocol-version", "1");
+                if let Some(a) = authorization {
+                    req = req.header("authorization", a);
+                }
+                tdh::send(
+                    crate::api::routes::create_router(state),
+                    req.body(axum::body::Body::from(body)).expect("request"),
+                )
+                .await
+            }
+        };
+
+        for method in [
+            "buf.registry.module.v1.UploadService/Upload",
+            "buf.registry.module.v1beta1.UploadService/Upload",
+        ] {
+            let (status, _) = call(method.to_string(), upload("anon"), None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "anonymous {method}");
+
+            let (status, resp) = call(
+                method.to_string(),
+                upload("readscoped"),
+                Some(read_basic.clone()),
+            )
+            .await;
+            assert!(
+                status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED,
+                "a read-scoped token pushed through {method}: {status} {}",
+                String::from_utf8_lossy(&resp)
+            );
+        }
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifacts WHERE repository_id = $1 AND name IN \
+             ('acme/anon', 'acme/readscoped')",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count the modules");
+        assert_eq!(stored, 0, "a refused push must store nothing");
+
+        for method in [
+            "buf.registry.module.v1.DownloadService/Download",
+            "buf.registry.owner.v1.OwnerService/GetOwners",
+        ] {
+            let (status, _) = call(method.to_string(), Vec::new(), None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "anonymous {method}");
+        }
+        fx.teardown().await;
     }
 }

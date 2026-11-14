@@ -1413,7 +1413,33 @@ pub(crate) fn token_endpoint_status_error(
              were sent); treating the object as not available"
         );
     }
-    AppError::Storage(format!("Token endpoint {realm} returned status {status}"))
+    AppError::Storage(format!(
+        "{TOKEN_ENDPOINT_MESSAGE_PREFIX}{realm}{TOKEN_ENDPOINT_STATUS_INFIX}{status}"
+    ))
+}
+
+/// How [`token_endpoint_status_error`]'s `Storage` message starts, and what
+/// separates the realm from the status in it.
+const TOKEN_ENDPOINT_MESSAGE_PREFIX: &str = "Token endpoint ";
+const TOKEN_ENDPOINT_STATUS_INFIX: &str = " returned status ";
+
+/// Whether `err` is [`token_endpoint_status_error`]'s `Storage` error for a
+/// PERMANENT 4xx from an OCI token endpoint (#5810): an anonymous `401`/
+/// `403` (#4527), or a `400`/`404`. It keeps the `Storage` class, so a
+/// virtual walk's default mode still reads it as it always has; strict
+/// member fallback reads it as the miss it is, not as an unavailable member.
+/// `408`, `425` and `429` stay transient.
+pub(crate) fn is_permanent_token_endpoint_refusal(err: &AppError) -> bool {
+    let AppError::Storage(message) = err else {
+        return false;
+    };
+    let Some(rest) = message.strip_prefix(TOKEN_ENDPOINT_MESSAGE_PREFIX) else {
+        return false;
+    };
+    rest.rsplit_once(TOKEN_ENDPOINT_STATUS_INFIX)
+        .and_then(|(_, status)| status.get(..3))
+        .and_then(|digits| StatusCode::from_bytes(digits.as_bytes()).ok())
+        .is_some_and(is_permanent_client_error)
 }
 
 /// The error for a registry that refused the request made with an
@@ -6562,6 +6588,27 @@ impl ProxyService {
         }
         let mutability = self.effective_mutability_by_key(repo_key, path).await;
         (metadata.expires_under(mutability) > now).then_some(metadata.checksum_sha256)
+    }
+
+    /// Size of the bytes cached at `path` in `repo_key` while that entry is
+    /// fresh, i.e. while a buffered read would serve exactly those bytes from
+    /// the cache without contacting the upstream; `None` otherwise.
+    ///
+    /// Reads only the metadata sidecar (through the sidecar LRU), like
+    /// [`Self::fresh_cache_validator`]. For sizing a buffered-metadata budget
+    /// reservation to the document instead of to its cap (#5973).
+    pub async fn fresh_cached_size(&self, repo_key: &str, path: &str) -> Option<u64> {
+        let keys = CacheKeys::derive(&self.cache_scope, repo_key, path).ok()?;
+        let metadata = self.load_cache_metadata(&keys.metadata).await.ok()??;
+        let now = Utc::now();
+        if metadata.negative_cached_until.is_some_and(|t| t > now) {
+            return None;
+        }
+        let mutability = self.effective_mutability_by_key(repo_key, path).await;
+        if metadata.expires_under(mutability) <= now {
+            return None;
+        }
+        u64::try_from(metadata.size_bytes).ok()
     }
 
     pub async fn is_cache_fresh(&self, repo_key: &str, path: &str) -> bool {
