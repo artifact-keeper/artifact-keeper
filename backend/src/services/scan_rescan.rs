@@ -132,22 +132,24 @@ const STALE_DIGESTS_SQL: &str = r#"
     WITH builds AS (
         SELECT * FROM unnest($1::text[], $2::timestamptz[]) AS b(scan_type, built_at)
     ),
-    latest AS (
-        SELECT DISTINCT ON (sr.artifact_id, sr.scan_type)
-               sr.artifact_id, sr.scan_type, sr.vuln_db_published_at
-        FROM scan_results sr
-        JOIN builds b ON b.scan_type = sr.scan_type
-        WHERE sr.status = 'completed'
-        ORDER BY sr.artifact_id, sr.scan_type,
-                 sr.completed_at DESC NULLS LAST, sr.created_at DESC
-    ),
+    -- One probe of idx_scan_results_latest_per_artifact_type per artifact
+    -- and scan type for its newest completed row, so the cost follows the
+    -- artifacts, not the length of their scan history.
     stale AS (
         SELECT a.id, a.checksum_sha256 AS digest
-        FROM latest l
-        JOIN builds b ON b.scan_type = l.scan_type
-        JOIN artifacts a ON a.id = l.artifact_id AND a.is_deleted = false
+        FROM artifacts a
         JOIN scan_configs c ON c.repository_id = a.repository_id AND c.scan_enabled = true
-        WHERE l.vuln_db_published_at IS NULL OR l.vuln_db_published_at < b.built_at
+        CROSS JOIN builds b
+        CROSS JOIN LATERAL (
+            SELECT sr.vuln_db_published_at
+            FROM scan_results sr
+            WHERE sr.artifact_id = a.id AND sr.scan_type = b.scan_type
+              AND sr.status = 'completed'
+            ORDER BY sr.completed_at DESC NULLS LAST, sr.created_at DESC
+            LIMIT 1
+        ) l
+        WHERE a.is_deleted = false
+          AND (l.vuln_db_published_at IS NULL OR l.vuln_db_published_at < b.built_at)
     )
     SELECT s.digest
     FROM stale s
