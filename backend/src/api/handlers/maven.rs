@@ -14163,7 +14163,7 @@ mod tests {
         assert_eq!(available_body.as_ref(), jar.as_slice());
     }
 
-    /// #5810: in strict mode a hung higher member costs the download
+    /// #5810: in strict mode a hung higher member adds the download
     /// deadline and then answers 503, never the lower member's JAR.
     #[tokio::test]
     async fn test_virtual_download_strict_fallback_hung_member_503_at_deadline_5810() {

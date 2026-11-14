@@ -36649,7 +36649,7 @@ mod tests {
             "a virtual that never set it reads false"
         );
         assert_eq!(echo.virtual_metadata_partial, Some(true), "PUT echoes it");
-        assert_eq!(after, Some(true), "GET reads back what PUT stored");
+        assert_eq!(after, Some(true), "GET reads back what PATCH stored");
         assert_eq!(in_list, Some(true), "the listing reports it too");
         assert_eq!(local, None);
         assert_eq!(local_in_list, None);
@@ -36660,7 +36660,7 @@ mod tests {
     }
 
     /// DB-backed (#5810): `virtual_member_fallback` set on create and on
-    /// PUT reads back through the echo, GET and the listing; a virtual that
+    /// PATCH reads back through the echo, GET and the listing; a virtual that
     /// never set it reads `available`, a non-virtual omits the field and
     /// refuses it with a 400, and an unknown value is refused.
     #[tokio::test]
@@ -36741,7 +36741,7 @@ mod tests {
         .expect("a virtual is created strict");
         let created_get = read(strict_key.clone()).await;
         let created_listed = listed(strict_key.clone()).await;
-        // Back to available through PUT.
+        // Back to available through PATCH.
         let Json(echo) = put(
             strict_key.clone(),
             r#"{"virtual_member_fallback":"available"}"#,
@@ -36752,7 +36752,7 @@ mod tests {
         let after_listed = listed(strict_key.clone()).await;
         let Json(echo_strict) = put(unset_key.clone(), r#"{"virtual_member_fallback":"strict"}"#)
             .await
-            .expect("a virtual accepts strict on PUT");
+            .expect("a virtual accepts strict on PATCH");
         // Defaults and non-virtuals.
         let (fresh_id, fresh_key, _fdir) = tdh::create_repo(&pool, "virtual", "maven").await;
         let fresh_get = read(fresh_key.clone()).await;
@@ -36801,7 +36801,7 @@ mod tests {
         assert_eq!(
             echo.virtual_member_fallback,
             Some(Available),
-            "PUT echoes it"
+            "PATCH echoes it"
         );
         assert_eq!(after_get, Some(Available));
         assert_eq!(after_listed, Some(Available));
@@ -36820,7 +36820,7 @@ mod tests {
                 .status(),
             StatusCode::BAD_REQUEST
         );
-        assert_eq!(local_stored, None, "nothing stored on the refused PUT");
+        assert_eq!(local_stored, None, "nothing stored on the refused PATCH");
         assert_eq!(
             bogus_create
                 .expect_err("an unknown value is refused on create")
@@ -36830,7 +36830,7 @@ mod tests {
         );
     }
 
-    /// #5810: an unknown `virtual_member_fallback` on PUT is refused by the
+    /// #5810: an unknown `virtual_member_fallback` on PATCH is refused by the
     /// JSON extractor (400 `VALIDATION_ERROR`, #1368) before the handler
     /// runs, and the two known values parse.
     #[tokio::test]
@@ -36838,7 +36838,7 @@ mod tests {
         use axum::extract::FromRequest;
         let request = |body: &'static str| {
             axum::http::Request::builder()
-                .method("PUT")
+                .method("PATCH")
                 .uri("/api/v1/repositories/v")
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from(body))

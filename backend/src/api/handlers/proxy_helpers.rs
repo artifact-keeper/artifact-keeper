@@ -17340,7 +17340,7 @@ mod tests {
         );
         assert_eq!(elapsed, slow_ok);
 
-        // A hung top member costs the deadline, then strict answers
+        // A hung top member adds the deadline, then strict answers
         // Unavailable rather than the lower hit.
         let members = members_5810(&["hung", "ok"]);
         let (out, elapsed) = walk_5810(

@@ -51,8 +51,8 @@ match it. The deadline applies there in the same way.
 
 ## The member breaker
 
-A Remote member that keeps failing would cost every download one deadline
-before the next member serves. After `AK_VIRTUAL_MEMBER_BREAKER_FAILURES`
+A Remote member that keeps failing would hold up every download for one
+deadline before the next member serves. After `AK_VIRTUAL_MEMBER_BREAKER_FAILURES`
 (default `3`) failures in a row, the member's breaker opens. For
 `AK_VIRTUAL_MEMBER_BREAKER_OPEN_SECS` (default `30`) downloads pass over the
 member without dialling it, as if it were unavailable. Then one download is
@@ -80,7 +80,7 @@ member's copy is a different artifact, not a fallback. Set
 repository API:
 
 ```bash
-curl -X PUT "$AK/api/v1/repositories/<virtual-key>" \
+curl -X PATCH "$AK/api/v1/repositories/<virtual-key>" \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"virtual_member_fallback": "strict"}'
 ```
@@ -103,8 +103,8 @@ that member answers again.
   block, behave as they do by default.
 - Only the members ranked above the one that serves matter. A member ranked
   below it is never waited for.
-- With the [download deadline](#the-download-deadline), a hung member costs
-  the deadline (20 s by default), then the download answers `503`.
+- With the [download deadline](#the-download-deadline), a hung member adds
+  the deadline (20 s by default) to the download, which then answers `503`.
 - With the [member breaker](#the-member-breaker) open, the download answers
   `503` at once, without dialling the member, until the breaker lets a probe
   through.
@@ -112,9 +112,20 @@ that member answers again.
   request governs the whole walk, including the members of nested virtuals.
 - Metadata merges are not affected. They have their own policy,
   [`virtual_metadata_partial`](virtual-metadata-merges.md#virtual_metadata_partial).
-- An OCI blob is requested by its digest, so no member can hold different
-  bytes for it. Blob pulls are not affected.
-- The setting is read once per download. If the read fails, the download
+- Docker/OCI manifest pulls by tag follow the setting too: while a
+  higher-priority member is unavailable (an upstream `5xx`, a transport
+  failure or timeout, or a database or storage fault on that member's
+  lookup), the pull answers `503 UNAVAILABLE` with `Retry-After` instead of
+  the lower member's tag. Manifest pulls take no download deadline and no
+  member breaker: a hung member's upstream holds the pull for the upstream
+  read timeout. A Remote member whose cached tag is past its TTL and whose
+  upstream does not answer still serves its cached copy, as a direct pull of
+  that member does.
+- An OCI blob, and a manifest pulled by digest, are requested by their
+  digest, so no member can hold different bytes for them. Those pulls are
+  not affected.
+- The setting is read once per download. A Docker/OCI manifest pull reads it
+  only once a member turns out to be unavailable. If the read fails, the download
   uses `available` and logs a `WARN`.
 
 ## Upgrade note
