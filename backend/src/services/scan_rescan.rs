@@ -273,12 +273,13 @@ pub async fn enqueue_rescans(db: &PgPool, builds: &[Build], max_per_day: u64) ->
     }
 
     // A short page means nothing else is stale for these builds: skip the
-    // selection until a database moves again. Not while a rescan is still
-    // queued or running, though: one that started on an older database may
-    // leave its digest stale for this key, and must be found again.
+    // selection until a database moves again. Not while a hosted scan or a
+    // rescan is still queued or running, though: the selection skipped those
+    // artifacts, and one that started on an older database may leave its
+    // digest stale for this key, so it must be looked at again.
     let active: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM scan_queue \
-         WHERE kind = 'rescan' AND state IN ('pending', 'running'))",
+         WHERE kind <> 'proxy_file' AND state IN ('pending', 'running'))",
     )
     .fetch_one(&mut *tx)
     .await
