@@ -145,6 +145,7 @@ flowchart TD
 | **Debian** | Ubuntu, Debian |
 | **Alpine** | Alpine Linux (APK) |
 | **Pacman** | Arch Linux (hosted) |
+| **Homebrew** | Homebrew bottles (hosted) |
 | **Conda** | Conda channels |
 | **OPKG** | OpenWrt, embedded Linux |
 

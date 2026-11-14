@@ -84,6 +84,8 @@ pub enum RepositoryFormat {
     Lxc,
     // Linux distribution packages (#3343)
     Pacman,
+    // Homebrew bottles (#5985)
+    Homebrew,
     // AI coding-agent plugin bundles (#5251)
     #[sqlx(rename = "agentplugins")]
     AgentPlugins,
@@ -167,6 +169,7 @@ impl RepositoryFormat {
         RepositoryFormat::Incus,
         RepositoryFormat::Lxc,
         RepositoryFormat::Pacman,
+        RepositoryFormat::Homebrew,
         RepositoryFormat::AgentPlugins,
         RepositoryFormat::Mcp,
     ];
@@ -236,6 +239,7 @@ impl RepositoryFormat {
             Self::Incus => "incus",
             Self::Lxc => "lxc",
             Self::Pacman => "pacman",
+            Self::Homebrew => "homebrew",
             Self::AgentPlugins => "agentplugins",
             Self::Mcp => "mcp",
         }
