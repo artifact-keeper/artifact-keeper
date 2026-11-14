@@ -551,10 +551,10 @@ results stay. Most recently downloaded digests go first, at most
 `SCAN_RESCAN_MAX_PER_DAY` a day across all workers, and each digest once per
 database build, whether or not its rescan succeeded. Pending rescans and the
 oldest one's age are `ak_scan_queue_depth{kind="rescan",state="pending"}` and
-`ak_scan_queue_oldest_pending_seconds{kind="rescan"}`. A rescan runs in the
-background band (`scan_queue::in_background_band`) so a scanner client can tell
-the scanner adapter it is background work; a scanner that ignores that scans it
-as any other job.
+`ak_scan_queue_oldest_pending_seconds{kind="rescan"}`. A rescan asks the scanner
+adapter for its background band: `"priority": "background"` in an image scan
+request and `X-Scan-Priority: background` on a filesystem upload. Other scans
+send neither, and an adapter without that band ignores both and scans as usual.
 
 The worker publishes `ak_scan_queue_depth`,
 `ak_scan_queue_oldest_pending_seconds`, `ak_scan_queue_wait_seconds`,
