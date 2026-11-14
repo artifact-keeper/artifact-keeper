@@ -7565,7 +7565,7 @@ mod router_authz_tests {
             );
         }
         let stored: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM artifacts WHERE repository_id = $1 AND name IN \\
+            "SELECT count(*) FROM artifacts WHERE repository_id = $1 AND name IN \
              ('acme/anon', 'acme/readscoped')",
         )
         .bind(fx.repo_id)
