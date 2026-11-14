@@ -28933,9 +28933,10 @@ mod oci_blob_upload_streaming_tests {
         };
         let pool = f.inner.pool.clone();
         let repo = f.inner.repo_key.clone();
-        let outage = tdh::TableQueryOutage::start(&pool, &["oci_manifest_subjects"])
-            .await
-            .expect("outage pool");
+        let outage =
+            tdh::TableQueryOutage::start(&pool, &["oci_manifests", "oci_manifest_subjects"])
+                .await
+                .expect("outage pool");
         let subject = compute_sha256(b"oci 5901 referrers subject");
         let resp = send(
             app_on_pool_5901(&f, &outage.pool),
@@ -52956,6 +52957,8 @@ mod oci_push_replication_4790_tests {
     /// #5901: a replicated blob whose `oci_blobs` row cannot be written
     /// answers the sanitised 500, not the database's text, and records no row.
     #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test assertion buffers a bounded error body, not an artifact path (#1608)
     async fn oci_replication_blob_row_failure_answers_the_sanitised_message_5901() {
         let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
             return;
