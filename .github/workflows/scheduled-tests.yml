@@ -219,7 +219,7 @@ jobs:
   # artifact: release.yml builds the shipped windows-amd64 binary
   # itself. Its only product is the signal that the tree still
   # cross-compiles for Windows, and a daily signal from a GitHub-hosted
-  # runner buys that at zero pool cost. Same target, linker and features
+  # runner buys that at no pool time. Same target, linker and features
   # as the windows leg of release.yml's build-binaries.
   windows-cross-build:
     name: 🪟 Windows Cross-Build
