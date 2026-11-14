@@ -621,6 +621,30 @@ jobs:
       - name: Check unit-test shard gates
         run: python3 scripts/ci/test-shards.py check
 
+      # The one heavy rustc this job runs fills the hosted VM: 15 GiB of RAM
+      # and a 2 GiB swapfile (`free -g` in this job's memory report). On
+      # main's tip the lib-test rustc's peak RSS is 14.3-14.7 GiB in every
+      # unit leg and Check Rust's cgroup peak is 15.1 GiB, so the VM has
+      # under 1 GiB left for Postgres, dockerd and the runner agent. Runs
+      # that go over it are not OOM-killed: the runner stops answering ("lost
+      # communication", a shutdown signal and exit 143, or a clippy that
+      # crawls past the 30-minute limit), always inside this compile step.
+      # The disk has ~80 GB free, so a 12 GiB swapfile on it gives the
+      # kernel somewhere to put cold pages instead. Best effort: a failure
+      # here is a ::warning::, never a red job.
+      - name: Add swap
+        run: |
+          if sudo fallocate -l 12G /ak-ci-swapfile \
+             && sudo chmod 600 /ak-ci-swapfile \
+             && sudo mkswap /ak-ci-swapfile >/dev/null \
+             && sudo swapon /ak-ci-swapfile; then
+            echo "added a 12 GiB swapfile"
+          else
+            echo "::warning title=No extra swap::could not add /ak-ci-swapfile; this job runs with the image's default swap only."
+          fi
+          swapon --show
+          free -m
+
       - name: Run Clippy
         # CARGO_BUILD_JOBS is the hosted runner's core count. It was capped
         # at 2 and then 4 on the self-hosted pool after lib-test compiles
@@ -812,6 +836,30 @@ jobs:
       # One step of its own, so a BUILD failure is visibly distinct from a
       # test failure (#3154). The lib-test and bin-test targets are compiled
       # one at a time: their two rustc processes overlap otherwise (#3494).
+      # The one heavy rustc this job runs fills the hosted VM: 15 GiB of RAM
+      # and a 2 GiB swapfile (`free -g` in this job's memory report). On
+      # main's tip the lib-test rustc's peak RSS is 14.3-14.7 GiB in every
+      # unit leg and Check Rust's cgroup peak is 15.1 GiB, so the VM has
+      # under 1 GiB left for Postgres, dockerd and the runner agent. Runs
+      # that go over it are not OOM-killed: the runner stops answering ("lost
+      # communication", a shutdown signal and exit 143, or a clippy that
+      # crawls past the 30-minute limit), always inside this compile step.
+      # The disk has ~80 GB free, so a 12 GiB swapfile on it gives the
+      # kernel somewhere to put cold pages instead. Best effort: a failure
+      # here is a ::warning::, never a red job.
+      - name: Add swap
+        run: |
+          if sudo fallocate -l 12G /ak-ci-swapfile \
+             && sudo chmod 600 /ak-ci-swapfile \
+             && sudo mkswap /ak-ci-swapfile >/dev/null \
+             && sudo swapon /ak-ci-swapfile; then
+            echo "added a 12 GiB swapfile"
+          else
+            echo "::warning title=No extra swap::could not add /ak-ci-swapfile; this job runs with the image's default swap only."
+          fi
+          swapon --show
+          free -m
+
       # Only the BIN_SHARD leg has bin-target tests, so only it pays for the
       # bins pass (the non-test library, instrumented, then main.rs's test
       # harness). run-measured-build.sh records each pass's peak RSS in the
@@ -898,6 +946,8 @@ jobs:
         run: |
           df -h / | tail -1
           du -sh target 2>/dev/null || true
+          free -m
+          swapon --show
 
   # INTEGRATION SUITES (backend/tests/), GitHub-hosted.
   #

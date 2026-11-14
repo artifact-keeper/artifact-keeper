@@ -44,6 +44,12 @@ type Config struct {
 	// disables both routes (403): a route that replaces the DB every scan is
 	// matched against is never served unauthenticated.
 	AdapterToken string
+	// ScanToken (SCANNER_SCAN_TOKEN) and ScanTokensFile
+	// (SCANNER_SCAN_TOKENS_FILE, one token per line, re-read on change) gate
+	// the scan and report routes behind a bearer token (#5948; scan_auth.go).
+	// Both empty (default): those routes stay open.
+	ScanToken      string
+	ScanTokensFile string
 	// VulnDBMaxUploadBytes (SCANNER_VULNDB_MAX_UPLOAD_BYTES) caps the
 	// compressed db.tar.gz body of PUT /api/v1/vulndb. Default 2 GiB.
 	VulnDBMaxUploadBytes int64
@@ -158,6 +164,8 @@ func LoadConfig() *Config {
 		Offline:             getenvBool("SCANNER_OFFLINE", false),
 		DBSchemaVersion:     getenvIntNonNeg("SCANNER_TRIVY_DB_SCHEMA_VERSION", 2),
 		AdapterToken:        strings.TrimSpace(os.Getenv("SCANNER_ADAPTER_TOKEN")),
+		ScanToken:           strings.TrimSpace(os.Getenv("SCANNER_SCAN_TOKEN")),
+		ScanTokensFile:      strings.TrimSpace(os.Getenv("SCANNER_SCAN_TOKENS_FILE")),
 
 		VulnDBMaxUploadBytes:    getenvInt64("SCANNER_VULNDB_MAX_UPLOAD_BYTES", 2*1024*1024*1024),
 		VulnDBMaxExtractedBytes: getenvInt64("SCANNER_VULNDB_MAX_EXTRACTED_BYTES", 8*1024*1024*1024),
