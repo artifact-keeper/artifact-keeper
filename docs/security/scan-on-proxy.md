@@ -537,6 +537,25 @@ on. Only the URL changes: the worker's adapter client sends the same credentials
 as the API pods' (for example a `TRIVY_ADAPTER_TOKEN`, where set), so the
 adapter next to the worker must accept them.
 
+**Rescans after a vulnerability-database update.** `SCAN_RESCAN_MAX_PER_DAY`
+(default `0`, off) has the worker look every 15 minutes for stored artifacts
+whose latest completed scan used an older database build than the one the
+scanner reports now: Grype's from `grype db status`, or for a scanner that
+reports its database only with a scan (the scanner adapter's Trivy), the newest
+build a scan recorded in the last two days. A latest scan with no recorded build
+counts as older. Each such content digest, in a repository with scanning on,
+becomes one `rescan` job at the lowest priority, below hosted scans, so every
+other job is claimed first. The worker scans the digest once and gives every
+artifact row in this instance that holds it the fresh result; the earlier
+results stay. Most recently downloaded digests go first, at most
+`SCAN_RESCAN_MAX_PER_DAY` a day across all workers, and each digest once per
+database build, whether or not its rescan succeeded. Pending rescans and the
+oldest one's age are `ak_scan_queue_depth{kind="rescan",state="pending"}` and
+`ak_scan_queue_oldest_pending_seconds{kind="rescan"}`. A rescan runs in the
+background band (`scan_queue::in_background_band`) so a scanner client can tell
+the scanner adapter it is background work; a scanner that ignores that scans it
+as any other job.
+
 The worker publishes `ak_scan_queue_depth`,
 `ak_scan_queue_oldest_pending_seconds`, `ak_scan_queue_wait_seconds`,
 `ak_scan_queue_consumers`, `ak_scan_worker_slots_in_flight`,

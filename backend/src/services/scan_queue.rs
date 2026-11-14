@@ -22,13 +22,39 @@ pub const CLAIM_TTL_SECS: f64 = 120.0;
 pub const PRIORITY_CLIENT_WAITING: i16 = 100;
 pub const PRIORITY_BACKFILL: i16 = 50;
 pub const PRIORITY_HOSTED: i16 = 10;
+/// Rescans after a vulnerability-database update (#5947): below everything a
+/// user or a pull is waiting on, so a backlog of them never delays those.
+pub const PRIORITY_RESCAN: i16 = 5;
 
 /// The claim CTE sorts on these, and getting the order wrong is a silent
 /// latency regression rather than a failure, so assert it at compile time.
 const _: () = {
     assert!(PRIORITY_CLIENT_WAITING > PRIORITY_BACKFILL);
     assert!(PRIORITY_BACKFILL > PRIORITY_HOSTED);
+    assert!(PRIORITY_HOSTED > PRIORITY_RESCAN);
 };
+
+tokio::task_local! {
+    static BACKGROUND_BAND: ();
+}
+
+/// Run `fut` in the background priority band (#5947): a scan nobody waits on.
+/// Scanner clients can read [`in_background_band`] and pass it on, for example
+/// as [`BACKGROUND_PRIORITY_HEADER`], to a scanner adapter that schedules such
+/// work behind interactive scans. A scanner that ignores it scans as usual.
+pub async fn in_background<F: std::future::Future>(fut: F) -> F::Output {
+    BACKGROUND_BAND.scope((), fut).await
+}
+
+/// Whether the current task runs a background-band scan (see [`in_background`]).
+/// Task-local: a task spawned from inside the scan does not inherit it.
+pub fn in_background_band() -> bool {
+    BACKGROUND_BAND.try_with(|_| ()).is_ok()
+}
+
+/// Header (and value) a scanner-adapter client may send for a background-band
+/// scan. Not sent by any client yet; an adapter that does not know it ignores it.
+pub const BACKGROUND_PRIORITY_HEADER: (&str, &str) = ("X-AK-Scan-Priority", "background");
 
 /// Claim extension for one job. Binds `$1 = id`, `$2 = token`, `$3 = ttl`.
 pub const RENEW_CLAIM_SQL: &str = r#"
@@ -95,15 +121,19 @@ pub enum ScanJobKind {
     /// A pushed OCI manifest: repository plus manifest digest. The worker scans
     /// every manifest row in that repository with the digest. Migration 383.
     HostedImage,
+    /// A rescan of one content digest after a vulnerability-database update,
+    /// across every artifact row in this instance holding it. Migration 384.
+    Rescan,
 }
 
 impl ScanJobKind {
     /// Every kind this build runs, for gauges that must publish each one.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::ProxyFile,
         Self::HostedArtifact,
         Self::HostedUpload,
         Self::HostedImage,
+        Self::Rescan,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -112,6 +142,7 @@ impl ScanJobKind {
             Self::HostedArtifact => "hosted_artifact",
             Self::HostedUpload => "hosted_upload",
             Self::HostedImage => "hosted_image",
+            Self::Rescan => "rescan",
         }
     }
 
@@ -123,6 +154,7 @@ impl ScanJobKind {
             "hosted_artifact" => Some(Self::HostedArtifact),
             "hosted_upload" => Some(Self::HostedUpload),
             "hosted_image" => Some(Self::HostedImage),
+            "rescan" => Some(Self::Rescan),
             _ => None,
         }
     }
@@ -1800,6 +1832,91 @@ mod tests {
                 .expect("kinds");
         assert_eq!(kinds, vec!["hosted_artifact", "hosted_upload"]);
 
+        drop_repo(&pool, repo).await;
+    }
+
+    async fn enqueue_rescan(pool: &sqlx::PgPool, digest: &str) {
+        sqlx::query("INSERT INTO scan_queue (kind, priority, digest) VALUES ('rescan', $1, $2)")
+            .bind(PRIORITY_RESCAN)
+            .bind(digest)
+            .execute(pool)
+            .await
+            .expect("enqueue rescan");
+    }
+
+    /// #5947: a pending rescan is claimed only after every job of a higher
+    /// band, even when it has waited longest.
+    #[tokio::test]
+    async fn a_rescan_is_claimed_after_every_higher_band() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        // Oldest first, so age alone would pick it.
+        enqueue_rescan(&pool, "resc01").await;
+        q.enqueue_hosted_image(repo, "host01", PRIORITY_HOSTED)
+            .await
+            .expect("hosted");
+        q.enqueue_proxy_file(repo, "b", "back01", None, 1, None, PRIORITY_BACKFILL)
+            .await
+            .expect("backfill");
+        q.enqueue_proxy_file(repo, "w", "wait01", None, 1, None, PRIORITY_CLIENT_WAITING)
+            .await
+            .expect("waiting");
+
+        let mut picked = Vec::new();
+        for _ in 0..4 {
+            let job = q
+                .claim(1, "w", CLAIM_TTL_SECS)
+                .await
+                .expect("claim")
+                .pop()
+                .expect("due");
+            picked.push(job.digest.clone().unwrap_or_default());
+        }
+        assert_eq!(picked, vec!["wait01", "back01", "host01", "resc01"]);
+
+        sqlx::query("DELETE FROM scan_queue")
+            .execute(&pool)
+            .await
+            .unwrap();
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #5947: a backlog of rescans does not starve normal work. A job queued
+    /// after 200 pending rescans is the next one claimed.
+    #[tokio::test]
+    async fn a_rescan_backlog_does_not_delay_a_new_hosted_job() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        sqlx::query(
+            "INSERT INTO scan_queue (kind, priority, digest) \
+             SELECT 'rescan', $1, 'backlog' || g FROM generate_series(1, 200) g",
+        )
+        .bind(PRIORITY_RESCAN)
+        .execute(&pool)
+        .await
+        .expect("backlog");
+        // Drain a few rescans first, as a worker would.
+        let early = q.claim(3, "w", CLAIM_TTL_SECS).await.expect("claim");
+        assert!(early.iter().all(|j| j.kind == "rescan"));
+
+        q.enqueue_hosted_image(repo, "late01", PRIORITY_HOSTED)
+            .await
+            .expect("hosted");
+        let next = q
+            .claim(1, "w", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("due");
+        assert_eq!(next.digest.as_deref(), Some("late01"));
+        assert_eq!(next.kind, "hosted_image");
+
+        sqlx::query("DELETE FROM scan_queue")
+            .execute(&pool)
+            .await
+            .unwrap();
         drop_repo(&pool, repo).await;
     }
 

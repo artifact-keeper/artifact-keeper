@@ -95,6 +95,7 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
         // Start due, so a pod that comes up after a crash recovers the dead
         // pod's claims on its first pass instead of 30s in.
         let mut next_sweep = tokio::time::Instant::now();
+        let mut next_rescan = tokio::time::Instant::now();
 
         loop {
             // The tick is a floor: a same-process enqueue wakes us immediately.
@@ -164,6 +165,11 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
                     Ok(n) => tracing::info!(jobs = n, "purged terminal scan jobs past retention"),
                     Err(e) => tracing::warn!(error = %e, "scan-job retention purge failed"),
                 }
+            }
+
+            if state.config.scan_rescan_max_per_day > 0 && now >= next_rescan {
+                next_rescan = now + crate::services::scan_rescan::RESCAN_TICK;
+                rescan_tick(&state).await;
             }
 
             // A claimed job is invisible to other replicas, so over-claiming
@@ -304,6 +310,9 @@ async fn execute(state: &SharedState, job: &ScanJob) -> Result<(), JobFailure> {
         Some(ScanJobKind::HostedArtifact) => scan_hosted_artifact(state, job).await,
         Some(ScanJobKind::HostedUpload) => scan_hosted_upload(state, job).await,
         Some(ScanJobKind::HostedImage) => scan_hosted_image(state, job).await,
+        Some(ScanJobKind::Rescan) => {
+            crate::services::scan_queue::in_background(rescan_digest(state, job)).await
+        }
         // A kind written by a newer replica. Not `failed`: that would discard
         // work the other half of the fleet can run.
         None => Err(JobFailure::Retryable(format!(
@@ -492,6 +501,77 @@ async fn scan_hosted_image(state: &SharedState, job: &ScanJob) -> Result<(), Job
     }
 }
 
+/// Rescan one digest after a vulnerability-database update (#5947): every live
+/// artifact row holding it, oldest first. The first scans fresh and the rest
+/// reuse that result, since each only takes a verdict graded after the job
+/// started. Earlier `scan_results` rows stay as they are.
+async fn rescan_digest(state: &SharedState, job: &ScanJob) -> Result<(), JobFailure> {
+    use crate::services::scan_rescan;
+    let digest = job
+        .digest
+        .as_deref()
+        .ok_or_else(|| JobFailure::Terminal("rescan job has no digest".to_string()))?;
+    let scanner = state
+        .scanner_service
+        .as_ref()
+        .ok_or_else(|| JobFailure::Retryable("no scanner service configured".to_string()))?;
+    let since = scan_rescan::db_now(&state.db)
+        .await
+        .map_err(|e| JobFailure::Retryable(format!("clock read failed: {e}")))?;
+    let rows = scan_rescan::artifacts_with_digest(&state.db, digest)
+        .await
+        .map_err(|e| JobFailure::Retryable(format!("artifact lookup failed: {e}")))?;
+    let mut first_error = None;
+    for artifact_id in rows {
+        match scanner
+            .rescan_artifact_graded_since(artifact_id, since)
+            .await
+        {
+            Ok(()) | Err(crate::error::AppError::NotFound(_)) => {}
+            Err(e) => {
+                tracing::warn!(
+                    artifact_id = %artifact_id, digest = %digest, error = %e,
+                    "rescan failed for one artifact row"
+                );
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    match first_error {
+        None => Ok(()),
+        Some(e) => Err(JobFailure::Retryable(format!("rescan failed: {e}"))),
+    }
+}
+
+/// One rescan selection pass (#5947), on the worker's sweep. Off with
+/// `SCAN_RESCAN_MAX_PER_DAY=0`, the default.
+async fn rescan_tick(state: &SharedState) {
+    use crate::services::scan_rescan;
+    let max = state.config.scan_rescan_max_per_day;
+    let Some(scanner) = state.scanner_service.as_ref() else {
+        return;
+    };
+    if max == 0 {
+        return;
+    }
+    let observed = match scan_rescan::observed_builds(&state.db).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read recent vulnerability-database builds");
+            Vec::new()
+        }
+    };
+    let builds = scan_rescan::merge_builds(scanner.current_vuln_db_builds().await, observed);
+    match scan_rescan::enqueue_rescans(&state.db, &builds, max).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            digests = n,
+            "queued rescans after a vulnerability-database update"
+        ),
+        Err(e) => tracing::warn!(error = %e, "rescan selection failed"),
+    }
+}
+
 /// `NoScanner` is instance-level and the next two per-attempt, so those retry.
 /// `RequestPinned` names a coordinate a job cannot carry, retrying can't help
 fn classify_inconclusive(
@@ -514,7 +594,7 @@ fn classify_inconclusive(
     }
 }
 
-const QUEUE_KINDS: [ScanJobKind; 4] = ScanJobKind::ALL;
+const QUEUE_KINDS: [ScanJobKind; 5] = ScanJobKind::ALL;
 const QUEUE_STATES: [&str; 3] = ["pending", "running", "failed"];
 
 /// `(kind, state, jobs)` depths and `(kind, seconds)` oldest-pending ages
@@ -559,7 +639,7 @@ mod tests {
                 oldest_pending_secs: oldest,
             };
         let (depths, oldest) = queue_gauges(&[row("proxy_file", "pending", 442, Some(49.0))]);
-        assert_eq!(depths.len(), 12);
+        assert_eq!(depths.len(), 15);
         assert!(depths.contains(&("proxy_file", "pending", 442.0)));
         assert!(depths.contains(&("proxy_file", "running", 0.0)));
         assert!(depths.contains(&("hosted_artifact", "pending", 0.0)));
@@ -571,7 +651,8 @@ mod tests {
                 ("proxy_file", 49.0),
                 ("hosted_artifact", 0.0),
                 ("hosted_upload", 0.0),
-                ("hosted_image", 0.0)
+                ("hosted_image", 0.0),
+                ("rescan", 0.0)
             ]
         );
 

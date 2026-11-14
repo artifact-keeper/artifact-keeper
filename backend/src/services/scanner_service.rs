@@ -9644,7 +9644,7 @@ impl ScannerService {
             .map(|(scan_type, id)| (scan_type.clone(), *id))
             .collect();
         let result = self
-            .scan_artifact_inner(artifact_id, force, bypass_dedup, Some(prepared))
+            .scan_artifact_inner(artifact_id, force, bypass_dedup, Some(prepared), None)
             .await;
         self.fail_unfinished_prepared_scans(artifact_id, prepared_ids, result.as_ref().err())
             .await;
@@ -9872,8 +9872,41 @@ impl ScannerService {
         force: bool,
         bypass_dedup: bool,
     ) -> Result<()> {
-        self.scan_artifact_inner(artifact_id, force, bypass_dedup, None)
+        self.scan_artifact_inner(artifact_id, force, bypass_dedup, None, None)
             .await
+    }
+
+    /// Rescan one artifact after a vulnerability-database update (#5947).
+    ///
+    /// Reuses only a result graded at or after `fresh_since` (the rescan's
+    /// start, on the database clock): the first row of a digest scans fresh,
+    /// every later row of that digest copies that fresh result as an
+    /// `is_reused` row instead of scanning the same bytes again. Earlier rows
+    /// are never touched, a rescan only adds results. Honours the repository's
+    /// scan config like [`Self::scan_artifact`].
+    pub async fn rescan_artifact_graded_since(
+        &self,
+        artifact_id: Uuid,
+        fresh_since: DateTime<Utc>,
+    ) -> Result<()> {
+        self.scan_artifact_inner(artifact_id, false, false, None, Some(fresh_since))
+            .await
+    }
+
+    /// The vulnerability-database build each registered scanner reports right
+    /// now (#5947), as `(scan_type, built_at)`. Live-API scanners (the
+    /// dependency scanner's `live:*` feeds) are left out: they have no build,
+    /// their "published" time is the query time.
+    pub async fn current_vuln_db_builds(&self) -> Vec<(String, DateTime<Utc>)> {
+        let mut builds = Vec::new();
+        for scanner in &self.scanners {
+            if let Some(p) = scanner.vuln_db().await {
+                if let (false, Some(at)) = (p.version.starts_with("live:"), p.published_at) {
+                    builds.push((scanner.scan_type().to_string(), at));
+                }
+            }
+        }
+        builds
     }
 
     async fn scan_artifact_inner(
@@ -9882,6 +9915,7 @@ impl ScannerService {
         force: bool,
         bypass_dedup: bool,
         prepared: Option<HashMap<String, Uuid>>,
+        fresh_since: Option<DateTime<Utc>>,
     ) -> Result<()> {
         // Fetch artifact and content
         let artifact = sqlx::query_as!(
@@ -10162,6 +10196,12 @@ impl ScannerService {
                     .ok()
                     .flatten()
             };
+            // #5947: a DB-update rescan reuses only what was graded after it
+            // started; anything older is the stale verdict it exists to replace.
+            let reusable = match fresh_since {
+                Some(since) => reusable.filter(|r| r.completed_at.is_some_and(|c| c >= since)),
+                None => reusable,
+            };
             if let Some(mut source_scan) = reusable {
                 // #4425: `find_reusable_scan` only returns ORIGINAL scans, so
                 // an artifact whose own row is a reused copy is handed the
@@ -10172,7 +10212,11 @@ impl ScannerService {
                 // (pin, not_cataloged, TTL), so the #1373 branch below treats
                 // it as already scanned. A lookup error falls through to the
                 // copy, the pre-#4425 behaviour.
-                if needs_own_scan_lookup(source_scan.artifact_id, artifact_id, &prepared_action) {
+                // A rescan's fresh source must not be traded for this
+                // artifact's own (stale) row.
+                if fresh_since.is_none()
+                    && needs_own_scan_lookup(source_scan.artifact_id, artifact_id, &prepared_action)
+                {
                     match self
                         .scan_result_service
                         .find_own_reusable_scan(
