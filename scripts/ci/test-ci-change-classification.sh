@@ -111,15 +111,37 @@ for required in check-rust test-backend-unit; do
 done
 
 # --- stub gh: the pulls/files listing ---------------------------------------
+# FAKE_FILES holds one changed file per line, `new<TAB>old` for a rename. The
+# listings are answered as the API shapes them (pulls/files: an array of file
+# objects; compare: an object with a `files` array, a rename carrying
+# `previous_filename`) and filtered through the step's OWN --jq expression,
+# so a jq that drops the rename's old path fails here.
 STUB="$WORK/bin"; mkdir -p "$STUB"
+cat > "$STUB/fake-listing.py" <<'STUBPY'
+import json, os, sys
+files = []
+for line in os.environ.get("FAKE_FILES", "").splitlines():
+    if not line:
+        continue
+    new, _, old = line.partition("\t")
+    entry = {"filename": new, "status": "modified"}
+    if old:
+        entry.update(status="renamed", previous_filename=old)
+    files.append(entry)
+json.dump({"files": files} if sys.argv[1] == "compare" else files, sys.stdout)
+STUBPY
 cat > "$STUB/gh" <<'STUBGH'
 #!/usr/bin/env bash
 [ "${FAKE_GH_FAIL-0}" = 1 ] && exit 1
+jq_expr=""
+prev=""
+for a in "$@"; do [ "$prev" = "--jq" ] && jq_expr="$a"; prev="$a"; done
+listing() { python3 "$(dirname "$0")/fake-listing.py" "$1" | jq -r "$jq_expr"; }
 case "$*" in
-  *pulls/*/files*) printf '%s\n' "${FAKE_FILES-}" ;;
+  *pulls/*/files*) listing pulls ;;
   *compare/*)
     [ "${FAKE_COMPARE_FAIL-0}" = 1 ] && exit 1
-    printf '%s\n' "${FAKE_FILES-}" ;;
+    listing compare ;;
   *pulls/*)
     [ "${FAKE_LABELS_FAIL-0}" = 1 ] && exit 1
     printf '%s\n' "${FAKE_LABELS-}" | tr ',' '\n' ;;
@@ -184,6 +206,18 @@ expect "nested Cargo.toml"                         "true true true true"     pul
 expect "anything unrecognised is a Rust input"     "true false false true"   pull_request docker/Dockerfile.backend
 expect "a script in scripts/ but outside ci/"      "true false false true"   pull_request scripts/e2e-setup.sh
 FAKE_GH_FAIL=1 expect "file listing fails -> full CI" "true true true true"  pull_request whatever
+# A rename is classified by both of its paths: the old one left the tree.
+TAB=$'\t'
+expect "rename of a Rust source to .md"            "true true false true"    pull_request "backend/src/x.md${TAB}backend/src/x.rs"
+expect "rename of Cargo.toml to .md"               "true true true true"     pull_request "notes/Cargo.md${TAB}Cargo.toml"
+expect "rename between docs stays docs-only"       "false false false false" pull_request "docs/new.md${TAB}docs/old.md"
+expect "rename of docs onto a Rust path"           "true true false true"    pull_request "backend/src/x.rs${TAB}docs/x.md"
+many=(); for i in $(seq 1 2999); do many+=("docs/p$i.md"); done
+expect "PR listing just under the 3000-file cap"   "false false false false" pull_request "${many[@]}"
+many+=("docs/p3000.md")
+expect "PR listing at the 3000-file cap -> full CI" "true true true true"   pull_request "${many[@]}"
+many=(); for i in $(seq 1 1500); do many+=("docs/n$i.md${TAB}docs/o$i.md"); done
+expect "1500 renames are 1500 files, not 3000 paths" "false false false false" pull_request "${many[@]}"
 
 # expect_kv <label> <"key=value ..."> <event> [files...] -- any outputs.
 expect_kv() {
@@ -237,6 +271,7 @@ expect "merge group, docs only"                    "false false false false" mer
 expect "merge group, backend code"                 "true true false true"    merge_group backend/src/main.rs
 expect "merge group, Cargo.lock"                   "true true true true"     merge_group Cargo.lock backend/src/main.rs
 expect "merge group, CI-only scripts"              "true false false false"  merge_group scripts/ci/test-foo.sh
+expect "merge group, rename of a Rust source to .md" "true true false true"  merge_group "backend/src/x.md${TAB}backend/src/x.rs"
 expect_kv "merge group, backend code: tests off, integration still runs by event" "tests=false" merge_group backend/src/main.rs
 FAKE_LABELS="ci:full,ci:image" expect_kv "merge group ignores labels" "ci_full=false ci_image=false" merge_group backend/src/main.rs
 FAKE_COMPARE_FAIL=1 expect "merge group, compare fails -> full CI" "true true true true" merge_group backend/src/main.rs

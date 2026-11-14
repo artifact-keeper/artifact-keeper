@@ -214,6 +214,13 @@ jobs:
             echo "scanner_adapter=true" >> "$GITHUB_OUTPUT"
             exit 0
           }
+          # One line per changed file: its path, then a tab and the path it
+          # was renamed FROM when it is a rename. Both paths are classified:
+          # renaming backend/src/x.rs to x.md removes a Rust source, and
+          # classifying only the new name would call that docs-only.
+          #
+          # Truncation is checked on the entry count (one per file), never
+          # on the path count, which renames inflate.
           if [ "$EVENT_NAME" = "merge_group" ]; then
             # The group's own diff: base is the `main` tip the queue built
             # on, head the commit `main` becomes. The compare API returns at
@@ -222,15 +229,23 @@ jobs:
             if [ -z "$MG_BASE_SHA" ] || [ -z "$MG_HEAD_SHA" ]; then
               full_ci "merge-group event carries no base/head sha"
             fi
-            if ! files=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${MG_BASE_SHA}...${MG_HEAD_SHA}" --jq '.files[].filename'); then
+            if ! listing=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${MG_BASE_SHA}...${MG_HEAD_SHA}" --jq '.files[] | [.filename, (.previous_filename // empty)] | @tsv'); then
               full_ci "merge-group file listing failed"
             fi
-            if [ "$(printf '%s\n' "$files" | grep -c .)" -ge 300 ]; then
+            if [ "$(printf '%s\n' "$listing" | grep -c .)" -ge 300 ]; then
               full_ci "merge-group file listing may be truncated at 300 files"
             fi
-          elif ! files=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename'); then
-            full_ci "PR file listing failed"
+          else
+            # The pulls/files API lists at most 3000 files however it is
+            # paginated; a listing that reaches that cap may be truncated.
+            if ! listing=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate --jq '.[] | [.filename, (.previous_filename // empty)] | @tsv'); then
+              full_ci "PR file listing failed"
+            fi
+            if [ "$(printf '%s\n' "$listing" | grep -c .)" -ge 3000 ]; then
+              full_ci "PR file listing may be truncated at 3000 files"
+            fi
           fi
+          files=$(printf '%s\n' "$listing" | tr '\t' '\n')
           code=false
           backend=false
           manifest=false
