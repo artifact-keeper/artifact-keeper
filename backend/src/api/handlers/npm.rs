@@ -2791,6 +2791,8 @@ async fn attestation_cached_meta_fetch(
 ///   - `/-/ping` → `200 {}` (standard liveness probe)
 ///   - `/-/whoami` → `200 {"username":"<name>"}` when authenticated,
 ///     `401 {"error":"unauthenticated"}` otherwise
+///   - `/-/npm/v1/attestations/{pkg}@{ver}` → `404` (hosted versions carry no
+///     attestations; also on a Virtual with no Remote member)
 ///   - All other `/-/` paths → `501 Not Implemented`
 ///
 /// Without this route, the `/:package/:version` catch-all previously matched
@@ -2908,6 +2910,9 @@ async fn npm_meta_get(
                 &refusals,
             ));
         }
+        if let Some(resp) = npm_meta_no_attestations(endpoint, &repo_key) {
+            return Err(resp);
+        }
         // No Remote member: nothing could answer this endpoint.
         return Err(npm_meta_error(
             StatusCode::NOT_IMPLEMENTED,
@@ -2923,6 +2928,9 @@ async fn npm_meta_get(
     if let Some(resp) = npm_meta_local_stub(endpoint, auth.as_ref()) {
         return resp;
     }
+    if let Some(resp) = npm_meta_no_attestations(endpoint, &repo_key) {
+        return Err(resp);
+    }
 
     // All other /-/ endpoints are not implemented for local repos.
     Err(npm_meta_error(
@@ -2934,6 +2942,22 @@ async fn npm_meta_get(
 /// The `{"error": ...}` body every `/-/` meta failure answers with.
 fn npm_meta_error(status: StatusCode, message: String) -> Response {
     (status, axum::Json(serde_json::json!({ "error": message }))).into_response()
+}
+
+/// `/-/npm/v1/attestations/{pkg}@{ver}` on a repository with no upstream to
+/// ask: `404`, the answer registry.npmjs.org gives a version published
+/// without provenance. Hosted versions carry no attestations (AK does not keep
+/// publish-time `.sigstore` bundles), so this is the true answer, not a gap.
+///
+/// pnpm's `minimumReleaseAge` check probes this endpoint for every resolved
+/// version; a `501` here made each probe a server error logged at ERROR.
+/// `None` for every other endpoint.
+fn npm_meta_no_attestations(endpoint: &str, repo_key: &str) -> Option<Response> {
+    let spec = endpoint.strip_prefix("npm/v1/attestations/")?;
+    Some(npm_meta_error(
+        StatusCode::NOT_FOUND,
+        format!("no attestations for {spec} in repository '{repo_key}'"),
+    ))
 }
 
 /// The built-in answers for `/-/ping` and `/-/whoami`, which need no upstream.
@@ -23227,16 +23251,35 @@ mod meta_upstream_failure_5345_tests {
     }
 
     #[tokio::test]
-    async fn local_repository_keeps_its_501() {
+    async fn local_repository_answers_attestations_404_and_keeps_its_501() {
         let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
             return;
         };
         let app = fx.router_anon(super::router());
+        let (status, error) = get_meta(app.clone(), &fx.repo_key, ATTESTATION).await;
+        let (keys_status, keys_error) = get_meta(app, &fx.repo_key, "npm/v1/keys").await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{error}");
+        assert!(
+            error.contains("no attestations for lodash@4.17.21"),
+            "{error}"
+        );
+        assert_eq!(keys_status, StatusCode::NOT_IMPLEMENTED, "{keys_error}");
+        assert!(keys_error.contains(LOCAL_STUB), "{keys_error}");
+    }
+
+    #[tokio::test]
+    async fn virtual_without_remote_member_answers_attestations_404() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let app = fx.router_with_auth(super::router());
         let (status, error) = get_meta(app, &fx.repo_key, ATTESTATION).await;
         fx.teardown().await;
 
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{error}");
-        assert!(error.contains(LOCAL_STUB), "{error}");
+        assert_eq!(status, StatusCode::NOT_FOUND, "{error}");
+        assert!(error.contains("no attestations"), "{error}");
     }
 
     #[test]
