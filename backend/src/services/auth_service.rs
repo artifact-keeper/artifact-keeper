@@ -3493,6 +3493,18 @@ impl AuthService {
 
     /// Validate API token and return user with scopes and repository restrictions.
     pub async fn validate_api_token(&self, token: &str) -> Result<ApiTokenValidation> {
+        // Accept the separator-less token spelling classic conda's URL regex
+        // can carry (#5642). Restoring the canonical form here, before the
+        // shape check, the cache key and the bcrypt comparison, means both
+        // spellings resolve to the same row and share one cache entry.
+        let canonical;
+        let token = match canonical_api_token(token) {
+            Some(token) => {
+                canonical = token;
+                canonical.as_str()
+            }
+            None => token,
+        };
         // Hash the raw token before using it as cache key so plaintext tokens
         // are never stored in memory.
         let cache_key = format!("{:x}", Sha256::digest(token.as_bytes()));
@@ -3533,7 +3545,8 @@ impl AuthService {
             }
         }
 
-        // API tokens have format: prefix_secret
+        // API tokens have format: prefix_secret (or the separator-less
+        // spelling conda can carry, restored above).
         // We store hash of full token and prefix for lookup.
         //
         // Every rejection that can be decided without the secret is decided
@@ -4670,6 +4683,31 @@ pub(crate) fn is_api_token_shape(value: &str) -> bool {
         && bytes[9..].iter().all(u8::is_ascii_hexdigit)
 }
 
+/// The canonical `<8 hex>_<32 hex>` spelling of a token carried without its
+/// separator, or `None` for every other value.
+///
+/// Classic conda reads a channel token out of the URL path with
+/// `re.search(r"/t/([a-zA-Z0-9-]*)", url)` (`conda/common/url.py`). `_` is not
+/// in that alphabet, so conda stops at the separator inside an Artifact Keeper
+/// token, drops the rest of the credential into the channel path, and the
+/// request 401s (#5642). A conda user therefore writes the token without the
+/// separator (`/conda/t/<40 hex>/<repo>`); those 40 hex digits are the same
+/// 8-digit prefix and 32-digit secret, so re-inserting the separator yields
+/// exactly the token Artifact Keeper minted.
+///
+/// The mapping is bijective: a canonical token has `_` at index 8, which is
+/// never a hex digit, so a 40-hex-digit value can only be the separator-less
+/// spelling. The credential space is unchanged, so accepting it widens no
+/// secret.
+pub(crate) fn canonical_api_token(token: &str) -> Option<String> {
+    let bytes = token.as_bytes();
+    if bytes.len() == 40 && bytes.iter().all(u8::is_ascii_hexdigit) {
+        Some(format!("{}_{}", &token[..8], &token[8..]))
+    } else {
+        None
+    }
+}
+
 /// Three non-empty base64url segments with a JSON header: a compact JWS.
 pub(crate) fn is_jwt_shape(value: &str) -> bool {
     let mut segments = value.split('.');
@@ -4774,6 +4812,30 @@ mod tests {
         assert_eq!(AuthService::api_token_prefix(&token), Some("0123abcd"));
     }
 
+    /// #5642: classic conda's URL-token regex has no `_` in its alphabet, so a
+    /// conda token channel carries the token without the separator. Restoring
+    /// it must reproduce the minted token, and every other value (including a
+    /// canonical token) must be left to the caller untouched.
+    #[test]
+    fn canonical_api_token_restores_condas_separator_less_spelling_5642() {
+        let secret = "0123456789abcdef0123456789abcdef";
+        // The separator-less spelling conda can carry, 40 hex digits.
+        assert_eq!(
+            canonical_api_token(&format!("0123abcd{secret}")),
+            Some(format!("0123abcd_{secret}"))
+        );
+        // The canonical spelling is already canonical: no rewrite.
+        assert_eq!(canonical_api_token(&format!("0123abcd_{secret}")), None);
+        // Not a token: wrong length, non-hex digits, or a separator elsewhere.
+        assert_eq!(canonical_api_token("0123abcd"), None);
+        assert_eq!(canonical_api_token(&"f".repeat(41)), None);
+        assert_eq!(canonical_api_token(&"z".repeat(40)), None);
+        assert_eq!(
+            canonical_api_token("0123456_0123456789abcdef0123456789abcdef"),
+            None
+        );
+    }
+
     /// The real path: the credential from #5485 finding 2 used to panic in
     /// `validate_api_token` before any lookup; it is now a plain 401.
     #[tokio::test]
@@ -4802,6 +4864,42 @@ mod tests {
             .await
             .expect_err("has_scope refuses the same credential");
         assert!(matches!(err, AppError::Authentication(_)), "{err:?}");
+    }
+
+    /// #5642: a token minted in the canonical `<8 hex>_<32 hex>` shape also
+    /// validates with the separator removed, the spelling classic conda's
+    /// URL-token regex can carry. Both spellings resolve to the same row.
+    #[tokio::test]
+    async fn validate_api_token_accepts_condas_separator_less_spelling_5642() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+        let (token, _id) = svc
+            .generate_api_token(
+                user_id,
+                "conda-5642",
+                vec!["read:artifacts".to_string()],
+                None,
+            )
+            .await
+            .expect("mint API token");
+
+        let canonical = svc
+            .validate_api_token(&token)
+            .await
+            .expect("the canonical token validates");
+        let conda_spelling = format!("{}{}", &token[..8], &token[9..]);
+        assert!(!conda_spelling.contains('_'));
+        let via_conda = svc
+            .validate_api_token(&conda_spelling)
+            .await
+            .expect("the separator-less token validates");
+        assert_eq!(canonical.user.id, user_id);
+        assert_eq!(via_conda.user.id, user_id);
     }
 
     // -----------------------------------------------------------------------
