@@ -18,7 +18,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"runtime"
 	"strings"
 	"time"
 )
@@ -41,8 +40,10 @@ var manifestAccept = strings.Join([]string{
 const maxManifestBytes = 4 << 20
 
 // imageSizeCheckTimeout bounds the whole size check (index plus one platform
-// manifest).
-const imageSizeCheckTimeout = 30 * time.Second
+// manifest). Kept short: a hung registry must not eat into the backend's
+// report-poll budget before trivy even starts, and the check fails open.
+// A var so tests can shorten it.
+var imageSizeCheckTimeout = 10 * time.Second
 
 // imageTooLargeError is the outcome of an image over SCANNER_MAX_IMAGE_BYTES.
 // Its message is what the report route returns, so it names the image, both
@@ -111,37 +112,46 @@ func (m *registryManifest) imageBytes() (int64, error) {
 	return total, nil
 }
 
-// pickPlatform returns the digest of the index entry the size check measures:
-// linux on the adapter's own architecture, else linux/amd64 (the platform
-// container tooling resolves an index to by default). "" when neither is
-// listed; the check then does not block the scan.
-func pickPlatform(manifests []registryDescriptor, arch string) string {
-	for _, want := range []string{arch, "amd64"} {
-		for _, d := range manifests {
-			if d.Platform != nil && d.Platform.OS == "linux" && d.Platform.Architecture == want && d.Digest != "" {
-				return d.Digest
-			}
+// pickPlatform returns the digest of the index entry the size check
+// measures: the one trivy scans. The adapter passes trivy no --platform, and
+// then trivy (pkg/remote/remote.go tryGet, v0.76.0) adds no
+// remote.WithPlatform, so go-containerregistry (v0.22.1,
+// pkg/v1/remote/index.go childByPlatform) resolves the index to its default
+// platform, linux/amd64 (pkg/v1/remote/options.go defaultPlatform), whatever
+// the adapter's own architecture: the first entry whose OS and architecture
+// are linux and amd64, an entry without a platform counting as linux/amd64.
+// "" when none matches; the check then does not block the scan.
+func pickPlatform(manifests []registryDescriptor) string {
+	for _, d := range manifests {
+		os, arch := "linux", "amd64"
+		if d.Platform != nil {
+			os, arch = d.Platform.OS, d.Platform.Architecture
+		}
+		if os == "linux" && arch == "amd64" && d.Digest != "" {
+			return d.Digest
 		}
 	}
 	return ""
 }
 
 // manifestBaseURLs returns the registry base URLs to try, in order. A URL with
-// a scheme is used as is. Without one, https is tried first and, when
-// SCANNER_TRIVY_INSECURE is set, plain http after it, as trivy's --insecure
-// does.
+// a scheme (matched after trimming and ignoring case) is used as is. Without
+// one, https is tried first and, when SCANNER_TRIVY_INSECURE is set, plain
+// http after it, as trivy's --insecure does.
 func manifestBaseURLs(registryURL string, insecure bool) []string {
-	host := trimRegistryHost(registryURL)
+	u := strings.TrimSpace(registryURL)
+	lower := strings.ToLower(u)
 	switch {
-	case strings.HasPrefix(registryURL, "http://"):
-		return []string{"http://" + host}
-	case strings.HasPrefix(registryURL, "https://"):
-		return []string{"https://" + host}
-	case insecure:
-		return []string{"https://" + host, "http://" + host}
-	default:
-		return []string{"https://" + host}
+	case strings.HasPrefix(lower, "http://"):
+		return []string{"http://" + strings.TrimRight(u[len("http://"):], "/")}
+	case strings.HasPrefix(lower, "https://"):
+		return []string{"https://" + strings.TrimRight(u[len("https://"):], "/")}
 	}
+	host := strings.TrimRight(u, "/")
+	if insecure {
+		return []string{"https://" + host, "http://" + host}
+	}
+	return []string{"https://" + host}
 }
 
 // newRegistryHTTPClient is the client of the size check. With
@@ -192,7 +202,7 @@ func fetchManifest(ctx context.Context, client *http.Client, base, repository, r
 }
 
 // measureImage returns the compressed size of the image req names, resolving
-// an index to one platform manifest (see pickPlatform).
+// an index to the platform manifest trivy scans (see pickPlatform).
 func (s *Scanner) measureImage(ctx context.Context, req *ScanRequest) (int64, error) {
 	reference := req.Artifact.Digest
 	if reference == "" {
@@ -218,9 +228,9 @@ func (s *Scanner) measureAt(ctx context.Context, base, repository, reference, au
 		return 0, err
 	}
 	if m.isIndex(contentType) {
-		digest := pickPlatform(m.Manifests, runtime.GOARCH)
+		digest := pickPlatform(m.Manifests)
 		if digest == "" {
-			return 0, fmt.Errorf("index lists no linux/%s or linux/amd64 image", runtime.GOARCH)
+			return 0, fmt.Errorf("index lists no linux/amd64 image (the platform trivy scans)")
 		}
 		m, contentType, err = fetchManifest(ctx, s.registryClient, base, repository, digest, authorization)
 		if err != nil {
