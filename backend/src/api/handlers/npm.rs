@@ -3234,6 +3234,7 @@ struct NpmMetadataArtifact {
     version: Option<String>,
     checksum_sha256: String,
     metadata: Option<serde_json::Value>,
+    created_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Build an npm package metadata JSON response from a set of artifacts.
@@ -3259,6 +3260,30 @@ fn build_npm_metadata_response(
         ),
         want_abbreviated,
     ))
+}
+
+/// The packument `time` map, each live version's publish time plus `created` and `modified`
+/// Yarn's age gate and `npm install --before` read it (#5789)
+fn npm_packument_time(artifacts: &[NpmMetadataArtifact]) -> serde_json::Value {
+    let stamp = |t: &chrono::DateTime<chrono::Utc>| {
+        serde_json::Value::String(t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    };
+    let mut time = serde_json::Map::new();
+    let mut created: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut modified: Option<chrono::DateTime<chrono::Utc>> = None;
+    for artifact in artifacts {
+        let Some(version) = &artifact.version else {
+            continue;
+        };
+        time.insert(version.clone(), stamp(&artifact.created_at));
+        created = Some(created.map_or(artifact.created_at, |c| c.min(artifact.created_at)));
+        modified = Some(modified.map_or(artifact.created_at, |m| m.max(artifact.created_at)));
+    }
+    if let (Some(created), Some(modified)) = (created, modified) {
+        time.insert("created".to_string(), stamp(&created));
+        time.insert("modified".to_string(), stamp(&modified));
+    }
+    serde_json::Value::Object(time)
 }
 
 /// Build the FULL packument JSON value from a set of stored artifacts — the
@@ -3321,6 +3346,7 @@ fn build_npm_metadata_value(
         "name": package_name,
         "versions": versions,
         "dist-tags": serde_json::Value::Object(dist_tags),
+        "time": npm_packument_time(artifacts),
     })
 }
 
@@ -3471,6 +3497,7 @@ async fn fetch_npm_artifacts(
             version: a.version,
             checksum_sha256: a.checksum_sha256,
             metadata: a.metadata,
+            created_at: a.created_at,
         })
         .collect())
 }
@@ -12179,6 +12206,7 @@ mod tests {
             version: Some(version.to_string()),
             checksum_sha256: sha256.to_string(),
             metadata: None,
+            created_at: chrono::DateTime::UNIX_EPOCH,
         }
     }
 
@@ -12308,6 +12336,7 @@ mod tests {
                     "main": "index.js"
                 }
             })),
+            created_at: chrono::DateTime::UNIX_EPOCH,
         }];
 
         let body =
@@ -12331,6 +12360,7 @@ mod tests {
                 version: None,
                 checksum_sha256: SHA256_ABCD.to_string(),
                 metadata: None,
+                created_at: chrono::DateTime::UNIX_EPOCH,
             },
         ];
 
@@ -12340,6 +12370,48 @@ mod tests {
         let versions = body["versions"].as_object().unwrap();
         assert_eq!(versions.len(), 1);
         assert!(versions.contains_key("1.0.0"));
+    }
+
+    #[test]
+    fn test_build_npm_metadata_value_emits_time_5789() {
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let artifacts = vec![
+            NpmMetadataArtifact {
+                created_at: at("2024-03-01T10:00:00.123Z"),
+                ..make_artifact("pkg/1.0.0/pkg-1.0.0.tgz", "1.0.0", SHA256_ZEROS)
+            },
+            NpmMetadataArtifact {
+                created_at: at("2024-03-02T11:30:00Z"),
+                ..make_artifact("pkg/1.0.1/pkg-1.0.1.tgz", "1.0.1", SHA256_ABCD)
+            },
+            NpmMetadataArtifact {
+                version: None,
+                created_at: at("2025-01-01T00:00:00Z"),
+                ..make_artifact("pkg/x/pkg-x.tgz", "x", SHA256_ABCD)
+            },
+        ];
+
+        let full = build_npm_metadata_value(
+            &artifacts,
+            "pkg",
+            "http://localhost:8080",
+            "npm-hosted",
+            &serde_json::Map::new(),
+        );
+
+        assert_eq!(full["time"]["1.0.0"], "2024-03-01T10:00:00.123Z");
+        assert_eq!(full["time"]["1.0.1"], "2024-03-02T11:30:00.000Z");
+        assert_eq!(full["time"]["created"], "2024-03-01T10:00:00.123Z");
+        assert_eq!(full["time"]["modified"], "2024-03-02T11:30:00.000Z");
+        assert_eq!(full["time"].as_object().unwrap().len(), 4);
+        assert_eq!(
+            abbreviate_packument(&full)["modified"],
+            "2024-03-02T11:30:00.000Z"
+        );
     }
 
     // Integrity preservation tests (issue #745)
@@ -12554,6 +12626,7 @@ mod tests {
             checksum_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 .to_string(),
             metadata: None,
+            created_at: chrono::DateTime::UNIX_EPOCH,
         }];
         let scoped = vec![NpmMetadataArtifact {
             path: "@types/mdurl/2.0.0/mdurl-2.0.0.tgz".to_string(),
@@ -12561,6 +12634,7 @@ mod tests {
             checksum_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 .to_string(),
             metadata: None,
+            created_at: chrono::DateTime::UNIX_EPOCH,
         }];
 
         let resp_unscoped = build_npm_metadata_response(
@@ -18276,6 +18350,55 @@ mod db_cov_tests {
             .expect("read packument body");
         let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
         (status, cache_control, json)
+    }
+
+    /// #5789: a hosted packument carries `time`, so Yarn's age gate and
+    /// `npm install --before` can see when each version was published
+    #[tokio::test]
+    async fn test_local_packument_has_publish_time_5789() {
+        use axum::http::{HeaderMap, StatusCode};
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        for version in ["1.0.0", "1.0.1"] {
+            let published = super::publish_package(
+                &fx.state,
+                Some(tdh::make_auth(fx.user_id, &fx.username)),
+                &fx.repo_key,
+                "timepkg",
+                &HeaderMap::new(),
+                publish_body("timepkg", version),
+            )
+            .await;
+            assert!(published.is_ok(), "publish {version} must succeed");
+        }
+        for (version, at) in [
+            ("1.0.0", "2024-03-01T10:00:00Z"),
+            ("1.0.1", "2024-03-02T11:30:00Z"),
+        ] {
+            sqlx::query(
+                "UPDATE artifacts SET created_at = $3::timestamptz \
+                 WHERE repository_id = $1 AND name = 'timepkg' AND version = $2",
+            )
+            .bind(fx.repo_id)
+            .bind(version)
+            .bind(at)
+            .execute(&fx.pool)
+            .await
+            .expect("pin created_at");
+        }
+
+        let (status, _, body) = fetch_packument_json(&fx.state, &fx.repo_key, "timepkg").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["time"]["1.0.0"], "2024-03-01T10:00:00.000Z",
+            "got {body:?}"
+        );
+        assert_eq!(body["time"]["1.0.1"], "2024-03-02T11:30:00.000Z");
+        assert_eq!(body["time"]["created"], "2024-03-01T10:00:00.000Z");
+        assert_eq!(body["time"]["modified"], "2024-03-02T11:30:00.000Z");
+        fx.teardown().await;
     }
 
     /// Minimal `npm publish` body for one version.
