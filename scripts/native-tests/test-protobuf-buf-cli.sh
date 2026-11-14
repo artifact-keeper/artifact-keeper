@@ -31,9 +31,11 @@ echo "==> Protobuf / BSR test with the real buf CLI"
 echo "Registry: $REGISTRY_URL"
 echo "Repo key: $REPO_KEY"
 
+# A missing CLI is a failure, not a skip: a suite that silently passes
+# without running is how #5066 went unnoticed.
 if ! command -v buf >/dev/null 2>&1; then
-  echo "  SKIP: buf is not on PATH (install: https://buf.build/docs/installation)"
-  exit 0
+  echo "ERROR: buf is not on PATH (install: https://buf.build/docs/installation)"
+  exit 1
 fi
 echo "  buf: $(buf --version)"
 

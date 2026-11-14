@@ -69,13 +69,15 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/buf.registry.module.v1.CommitService/ListCommits",
             post(list_commits),
         )
+        // A push carries the module's files, so it keeps the 256 MiB limit
+        // every route had; the route-level limit overrides the router's.
         .route(
             "/:repo_key/buf.registry.module.v1.UploadService/Upload",
-            post(upload_v1),
+            post(upload_v1).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),
         )
         .route(
             "/:repo_key/buf.registry.module.v1beta1.UploadService/Upload",
-            post(upload_v1beta1),
+            post(upload_v1beta1).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),
         )
         .route(
             "/:repo_key/buf.registry.module.v1.DownloadService/Download",
@@ -106,8 +108,16 @@ pub fn router() -> Router<SharedState> {
             post(get_owners),
         )
         .route("/:repo_key/*bsr_path", post(catch_all_bsr))
-        .layer(DefaultBodyLimit::max(256 * 1024 * 1024)) // 256 MB
+        // Every other RPC carries references, not content. Now that the
+        // handlers take the body raw for both codecs, a small limit keeps a
+        // read from buffering 256 MiB before it is decoded.
+        .layer(DefaultBodyLimit::max(RPC_BODY_LIMIT))
 }
+
+/// The body limit of the two Upload routes (a module's files).
+const UPLOAD_BODY_LIMIT: usize = 256 * 1024 * 1024;
+/// The body limit of every other BSR route (references only).
+const RPC_BODY_LIMIT: usize = 4 * 1024 * 1024;
 
 /// Which `buf.registry.module` package a push or pull arrived on.
 ///
@@ -152,6 +162,7 @@ async fn get_owners(
     let codec = Codec::from_headers(&headers)?;
     let body: GetOwnersRequest = codec.decode(&body, GetOwnersRequest::from_pb)?;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
+    reject_binary_on_proxy_repo(&repo, codec)?;
 
     let mut owners = Vec::with_capacity(body.owner_refs.len());
     for owner_ref in &body.owner_refs {
@@ -636,6 +647,31 @@ pub(crate) fn connect_error(status: StatusCode, code: &str, message: &str) -> Re
     )
 }
 
+/// The binary codec on a remote or virtual repository.
+///
+/// The hosted handlers answer from this repository's own rows, and a remote
+/// or virtual repository holds none the CLI could use: its modules live
+/// upstream or in its members. Before #5074 such a call was a `415`; it is a
+/// Connect `unimplemented` now, rather than an answer built from local rows
+/// that would look like "nothing there". The JSON codec keeps its behaviour.
+#[allow(clippy::result_large_err)]
+fn reject_binary_on_proxy_repo(repo: &RepoInfo, codec: Codec) -> Result<(), Response> {
+    if codec.is_proto()
+        && (repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual)
+    {
+        return Err(connect_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "unimplemented",
+            &format!(
+                "the binary Connect codec is served for hosted (local) protobuf repositories \
+                 only; '{}' is a {} repository",
+                repo.key, repo.repo_type
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// A database failure as the Connect `internal` error.
 fn connect_db_error(e: sqlx::Error) -> Response {
     connect_error(
@@ -823,10 +859,11 @@ async fn resolve_module_ref(
     }
 
     // A commit pushed before the id was recorded has nothing to match, so the
-    // id is derived for each module the repository holds. This is a scan on a
-    // path a public repository serves unauthenticated, bounded by the number
-    // of modules; it is a fallback for those commits, not the way a reference
-    // by id is normally resolved.
+    // id is derived for each module the repository holds. This is a scan
+    // bounded by the number of modules in the repository (every /proto POST
+    // is authenticated by the visibility middleware's write gate); it is a
+    // fallback for those commits, not the way a reference by id is normally
+    // resolved.
     let names: Vec<String> = sqlx::query_scalar(
         r#"SELECT DISTINCT name
         FROM artifacts
@@ -1442,6 +1479,7 @@ async fn get_modules(
     let codec = Codec::from_headers(&headers)?;
     let body: GetModulesRequest = codec.decode(&body, GetModulesRequest::from_pb)?;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
+    reject_binary_on_proxy_repo(&repo, codec)?;
 
     let mut modules = Vec::new();
 
@@ -1519,6 +1557,16 @@ async fn create_modules(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
+    // A JSON caller is answered in main's order: the body is read (415, 400,
+    // 422) before the scope, repository and hosted checks, as axum's `Json`
+    // extractor did. The binary codec authorises first.
+    let codec = Codec::from_headers(&headers)?;
+    let json_body: Option<serde_json::Value> = if codec.is_proto() {
+        None
+    } else {
+        Some(wire::decode_json(&body)?)
+    };
+
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let _user_id = require_auth_basic_scope(auth, "protobuf", "write:artifacts")?.user_id;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
@@ -1528,8 +1576,10 @@ async fn create_modules(
 
     // CreateModules is implicitly handled during upload: a module exists from
     // its first push, so the request is acknowledged as it stands.
-    let codec = Codec::from_headers(&headers)?;
-    if codec.is_proto() {
+    if let Some(body) = json_body {
+        return Ok(wire::respond_json(&body));
+    }
+    {
         let req: pb1::CreateModulesRequest = wire::decode_proto(&body)?;
         let now = chrono::Utc::now().to_rfc3339();
         let modules = req
@@ -1556,10 +1606,8 @@ async fn create_modules(
                 })
             })
             .collect();
-        return Ok(wire::respond_proto(&pb1::CreateModulesResponse { modules }));
+        Ok(wire::respond_proto(&pb1::CreateModulesResponse { modules }))
     }
-    let body: serde_json::Value = wire::decode_json(&body)?;
-    Ok(wire::respond_json(&body))
 }
 
 // ---------------------------------------------------------------------------
@@ -1575,6 +1623,7 @@ async fn get_commits(
     let codec = Codec::from_headers(&headers)?;
     let body: GetCommitsRequest = codec.decode(&body, GetCommitsRequest::from_pb)?;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
+    reject_binary_on_proxy_repo(&repo, codec)?;
 
     let mut commits = Vec::new();
 
@@ -1660,6 +1709,7 @@ async fn list_commits(
     let codec = Codec::from_headers(&headers)?;
     let body: ListCommitsRequest = codec.decode(&body, ListCommitsRequest::from_pb)?;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
+    reject_binary_on_proxy_repo(&repo, codec)?;
 
     let module_name = match (&body.owner, &body.module) {
         (Some(owner), Some(module)) => format!("{}/{}", owner, module),
@@ -1748,39 +1798,46 @@ async fn upload(
     body: Bytes,
     api: BsrApi,
 ) -> Result<Response, Response> {
-    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing. Before
-    // decoding, too: the body limit on these routes is 256 MiB, and an
+    // A JSON caller is answered in main's order: the body is read (415, 400,
+    // 422) before the scope, repository and hosted checks, as axum's `Json`
+    // extractor did. The binary codec, which is new, authorises before it
+    // decodes: the body limit on this route is 256 MiB, and an
     // unauthenticated request has no claim on that much work.
+    let codec = Codec::from_headers(&headers)?;
+    let json_body: Option<UploadRequest> = if codec.is_proto() {
+        None
+    } else {
+        Some(wire::decode_json(&body)?)
+    };
+
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "protobuf", "write:artifacts")?.user_id;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
-    let codec = Codec::from_headers(&headers)?;
-    let body: UploadRequest = match api {
-        BsrApi::V1 => codec.decode(&body, UploadRequest::from_pb_v1)?,
-        BsrApi::V1Beta1 => codec.decode(&body, UploadRequest::from_pb)?,
+    let body: UploadRequest = match (json_body, api) {
+        (Some(body), _) => body,
+        (None, BsrApi::V1) => codec.decode(&body, UploadRequest::from_pb_v1)?,
+        (None, BsrApi::V1Beta1) => codec.decode(&body, UploadRequest::from_pb)?,
     };
 
-    // Both proto packages carry the dependency commit ids once for the whole
-    // push, not per module, and the request says nothing about which module
-    // imports which -- the reference BSR derives that from the uploaded files
-    // themselves. With one module the attribution is unambiguous; with
-    // several it would put every dependency into every module's b5
-    // composition, and each digest the CLI then verifies would be wrong for a
-    // reason nothing states. Refusing names the limit instead.
-    if codec.is_proto()
-        && body.contents.len() > 1
-        && body.contents.iter().any(|c| !c.dep_refs.is_empty())
-    {
+    // Over the CLI's codec a push carries one module. Both proto packages
+    // carry the dependency commit ids once for the whole push, not per
+    // module, and the request says nothing about which module imports which
+    // -- the reference BSR derives that from the uploaded files themselves --
+    // so with several modules every b5 composition would be a guess, and the
+    // digest the CLI then verifies wrong for a reason nothing states. A
+    // workspace is pushed module by module instead.
+    if codec.is_proto() && body.contents.len() > 1 {
         return Err(connect_error(
             StatusCode::BAD_REQUEST,
             "failed_precondition",
-            "this upload pushes several modules and declares dependencies, which this \
-             registry cannot attribute to individual modules: the request carries the \
-             dependency commit ids once for the whole push. Push each module that has \
-             dependencies on its own.",
+            "this upload pushes several modules, which this registry cannot give correct \
+             b5 digests: the request carries the dependency commit ids once for the whole \
+             push, with nothing saying which module imports which. Push each module on its \
+             own.",
         ));
     }
 
@@ -1804,13 +1861,23 @@ async fn upload(
                 })?;
             decoded_files.push((file.path.clone(), decoded));
         }
-        let commit_digest = compute_commit_digest(&decoded_files);
+        let dep_names = extract_dep_names(&content.dep_refs);
+        // Over the CLI's codec a commit is its files AND the dependency
+        // commits it was built against: the same files pushed again after
+        // `buf dep update` moved a dependency from c1 to c2 are a new commit
+        // with a new b5, not the old one. So the dependency commit ids are
+        // part of its identity (and of the derived commit id). The JSON codec
+        // keeps the files-only digest it has always had.
+        let commit_digest = if codec.is_proto() && !dep_names.is_empty() {
+            compute_commit_digest_with_deps(&decoded_files, &dep_names)
+        } else {
+            compute_commit_digest(&decoded_files)
+        };
 
         // Resolve the b5 before anything is stored. A dependency is recorded
         // by the commit id the CLI sent, and the digest the CLI verifies this
         // commit against covers every dependency's own b5, which this
         // repository holds only for the modules it hosts itself (#5066).
-        let dep_names = extract_dep_names(&content.dep_refs);
         let b5 = resolve_push_b5(&state, &repo, &decoded_files, &dep_names).await?;
         // Over the CLI's codec a commit without a b5 is one every later
         // request would refuse, so it is refused here, before its bundle is
@@ -2056,7 +2123,7 @@ async fn upload(
         let mut commits = Vec::with_capacity(resp.commits.len());
         for commit in &resp.commits {
             let b5 = commit_b5(&state, &repo, &commit.module_id, &commit.digest.value).await?;
-            commits.push(pb_commit_v1beta1(commit, &b5));
+            commits.push(pb_commit_v1beta1(commit, &b5)?);
         }
         return Ok(wire::respond_proto(&pb1b::UploadResponse { commits }));
     }
@@ -2105,6 +2172,7 @@ async fn download(
         BsrApi::V1Beta1 => codec.decode(&body, DownloadRequest::from_pb)?,
     };
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
+    reject_binary_on_proxy_repo(&repo, codec)?;
 
     let mut contents = Vec::new();
 
@@ -2307,7 +2375,7 @@ async fn download(
             )
             .await?;
             contents.push(pb1::download_response::Content {
-                commit: Some(pb_commit(&content.commit, &b5)),
+                commit: Some(pb_commit(&content.commit, &b5)?),
                 files: decode_bundle_files(&content.files)?
                     .into_iter()
                     .map(|(path, content)| pb1::File { path, content })
@@ -2327,7 +2395,7 @@ async fn download(
             )
             .await?;
             contents.push(pb1b::download_response::Content {
-                commit: Some(pb_commit_v1beta1(&content.commit, &b5)),
+                commit: Some(pb_commit_v1beta1(&content.commit, &b5)?),
                 files: decode_bundle_files(&content.files)?
                     .into_iter()
                     .map(|(path, content)| pb1b::File { path, content })
@@ -2354,6 +2422,7 @@ async fn get_labels(
     let codec = Codec::from_headers(&headers)?;
     let body: GetLabelsRequest = codec.decode(&body, GetLabelsRequest::from_pb)?;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
+    reject_binary_on_proxy_repo(&repo, codec)?;
 
     let mut labels = Vec::new();
 
@@ -2402,17 +2471,26 @@ async fn create_or_update_labels(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing, and before
-    // decoding the body, as in `upload`.
+    // The same order as `upload`: a JSON body is read before the checks, as
+    // main's extractor did; the binary codec authorises first.
+    let codec = Codec::from_headers(&headers)?;
+    let json_body: Option<CreateOrUpdateLabelsRequest> = if codec.is_proto() {
+        None
+    } else {
+        Some(wire::decode_json(&body)?)
+    };
+
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "protobuf", "write:artifacts")?.user_id;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
-    let codec = Codec::from_headers(&headers)?;
-    let body: CreateOrUpdateLabelsRequest =
-        codec.decode(&body, CreateOrUpdateLabelsRequest::from_pb)?;
+    let body: CreateOrUpdateLabelsRequest = match json_body {
+        Some(body) => body,
+        None => codec.decode(&body, CreateOrUpdateLabelsRequest::from_pb)?,
+    };
 
     let mut labels = Vec::new();
     let now = chrono::Utc::now().to_rfc3339();
@@ -2505,6 +2583,7 @@ async fn get_graph(
     let codec = Codec::from_headers(&headers)?;
     let body: GetGraphRequest = codec.decode(&body, GetGraphRequest::from_pb)?;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
+    reject_binary_on_proxy_repo(&repo, codec)?;
 
     // A graph is the closure, not the commits that were asked for. The CLI
     // builds a map from every commit in the reply and then looks up each
@@ -2580,6 +2659,7 @@ async fn get_resources(
     let codec = Codec::from_headers(&headers)?;
     let body: GetResourcesRequest = codec.decode(&body, GetResourcesRequest::from_pb)?;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
+    reject_binary_on_proxy_repo(&repo, codec)?;
 
     let mut resources = Vec::new();
 
@@ -2652,7 +2732,7 @@ async fn get_resources(
                 value: Some(pb1::resource::Value::Commit(pb_commit(
                     &resource.commit,
                     &b5,
-                ))),
+                )?)),
             });
         }
         return Ok(wire::respond_proto(&pb1::GetResourcesResponse {
@@ -3177,38 +3257,38 @@ fn pb_module(info: &ModuleInfo) -> pb1::Module {
 
 /// `CommitInfo::module_id` holds the module name and `digest.value` the
 /// SHA-256 the bundle is stored under; `b5` is the digest the CLI verifies.
-fn pb_commit(info: &CommitInfo, b5: &str) -> pb1::Commit {
+fn pb_commit(info: &CommitInfo, b5: &str) -> Result<pb1::Commit, Response> {
     let module_name = info.module_id.clone();
-    pb1::Commit {
+    Ok(pb1::Commit {
         id: ids::commit(&module_name, &info.digest.value),
         create_time: pb_timestamp(&info.create_time),
         owner_id: ids::owner(owner_of(&module_name)),
         module_id: ids::module(&module_name),
         digest: Some(pb1::Digest {
             r#type: pb1::DigestType::B5 as i32,
-            value: wire::b5_bytes(b5),
+            value: wire::b5_bytes(b5)?,
         }),
         created_by_user_id: String::new(),
         source_control_url: String::new(),
-    }
+    })
 }
 
 /// The beta package the CLI pushes and pulls over numbers b5 as 2, where v1
 /// numbers it 1 (#5066): the same commit has to be encoded per package.
-fn pb_commit_v1beta1(info: &CommitInfo, b5: &str) -> pb1b::Commit {
+fn pb_commit_v1beta1(info: &CommitInfo, b5: &str) -> Result<pb1b::Commit, Response> {
     let module_name = info.module_id.clone();
-    pb1b::Commit {
+    Ok(pb1b::Commit {
         id: ids::commit(&module_name, &info.digest.value),
         create_time: pb_timestamp(&info.create_time),
         owner_id: ids::owner(owner_of(&module_name)),
         module_id: ids::module(&module_name),
         digest: Some(pb1b::Digest {
             r#type: pb1b::DigestType::B5 as i32,
-            value: wire::b5_bytes(b5),
+            value: wire::b5_bytes(b5)?,
         }),
         created_by_user_id: String::new(),
         source_control_url: String::new(),
-    }
+    })
 }
 
 /// `LabelInfo::id` is `module_name:label:commit_digest` and `commit_id` the
@@ -3273,7 +3353,7 @@ async fn commit_b5(
     commit_digest: &str,
 ) -> Result<String, Response> {
     let row = sqlx::query(
-        r#"SELECT a.storage_key, m.metadata
+        r#"SELECT a.id, a.storage_key, m.metadata
         FROM artifacts a
         LEFT JOIN artifact_metadata m ON m.artifact_id = a.id
         WHERE a.repository_id = $1
@@ -3334,9 +3414,34 @@ async fn commit_b5(
         )
     })?;
 
-    let files = extract_files_from_bundle(&bundle)?;
+    // The same permit-scoped decode as Download (#2561): this path inflates
+    // a whole stored bundle, and fails fast with 503 on saturation.
+    #[allow(clippy::result_large_err)]
+    let files =
+        crate::util::bounded_archive::with_ingest_extraction(|| extract_files_from_bundle(&bundle))
+            .map_err(|e| e.into_response())??;
     let decoded = decode_bundle_files(&files)?;
-    Ok(wire::b5_digest(&decoded, &dep_digests))
+    let b5 = wire::b5_digest(&decoded, &dep_digests);
+
+    // Recorded, so an old commit pays for the decompression once: the digest
+    // is a function of the stored files and of the dependencies' recorded
+    // b5s, which do not change. Best effort -- a failed write only means the
+    // next request computes it again.
+    let artifact_id: uuid::Uuid = row.get("id");
+    if let Err(e) = sqlx::query(
+        r#"INSERT INTO artifact_metadata (artifact_id, format, metadata)
+        VALUES ($1, 'protobuf', jsonb_build_object('b5Digest', $2::text))
+        ON CONFLICT (artifact_id) DO UPDATE
+        SET metadata = artifact_metadata.metadata || jsonb_build_object('b5Digest', $2::text)"#,
+    )
+    .bind(artifact_id)
+    .bind(&b5)
+    .execute(&state.db)
+    .await
+    {
+        tracing::warn!(error = %e, "could not record a computed protobuf b5 digest");
+    }
+    Ok(b5)
 }
 
 /// The recorded b5 digest of a dependency hosted in this repository, by
@@ -3514,7 +3619,7 @@ async fn pb_commits(
     let mut out = Vec::with_capacity(commits.len());
     for commit in commits {
         let b5 = commit_b5(state, repo, &commit.module_id, &commit.digest.value).await?;
-        out.push(pb_commit(commit, &b5));
+        out.push(pb_commit(commit, &b5)?);
     }
     Ok(out)
 }
@@ -3590,6 +3695,29 @@ fn compute_commit_digest(files: &[(String, Vec<u8>)]) -> String {
     for (path, content) in files {
         hasher.update(path.as_bytes());
         hasher.update(content);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// [`compute_commit_digest`] for a binary-codec commit that has dependencies:
+/// the files, then the sorted dependency commit ids, each framed so that no
+/// file content can collide with the dependency list.
+fn compute_commit_digest_with_deps(
+    files: &[(String, Vec<u8>)],
+    dep_commit_ids: &[String],
+) -> String {
+    let mut hasher = Sha256::new();
+    for (path, content) in files {
+        hasher.update(path.as_bytes());
+        hasher.update(content);
+    }
+    let mut deps: Vec<&String> = dep_commit_ids.iter().collect();
+    deps.sort();
+    deps.dedup();
+    hasher.update(b"\0buf-deps\0");
+    for dep in deps {
+        hasher.update((dep.len() as u64).to_be_bytes());
+        hasher.update(dep.as_bytes());
     }
     format!("{:x}", hasher.finalize())
 }
@@ -3762,6 +3890,11 @@ mod tests {
 
     // -- The buf CLI's codec (#5066)
 
+    /// A well-formed b5 digest for the reply builders.
+    fn test_b5() -> String {
+        wire::b5_digest(&[("t.proto".to_string(), b"t".to_vec())], &[])
+    }
+
     fn commit_fixture() -> CommitInfo {
         build_commit_info(
             "ignored-row-uuid",
@@ -3777,7 +3910,7 @@ mod tests {
     /// puts in those fields.
     #[test]
     fn pb_commit_carries_derived_ids_5066() {
-        let commit = pb_commit(&commit_fixture(), "b5:00ff");
+        let commit = pb_commit(&commit_fixture(), &test_b5()).unwrap();
 
         assert_eq!(commit.id, ids::commit("acme/payments", "abc123"));
         assert_eq!(commit.module_id, ids::module("acme/payments"));
@@ -3790,10 +3923,10 @@ mod tests {
     #[test]
     fn pb_commit_digest_is_raw_b5_bytes_5066() {
         let b5 = wire::b5_digest(&[("a.proto".to_string(), b"x".to_vec())], &[]);
-        let digest = pb_commit(&commit_fixture(), &b5).digest.unwrap();
+        let digest = pb_commit(&commit_fixture(), &b5).unwrap().digest.unwrap();
 
         assert_eq!(digest.value.len(), 64);
-        assert_eq!(digest.value, wire::b5_bytes(&b5));
+        assert_eq!(digest.value, wire::b5_bytes(&b5).unwrap());
     }
 
     /// The beta package the CLI pushes and pulls over numbers b5 as 2 where
@@ -3805,9 +3938,14 @@ mod tests {
         assert_eq!(pb1b::DigestType::B5 as i32, 2);
 
         let commit = commit_fixture();
-        assert_eq!(pb_commit(&commit, "b5:00ff").digest.unwrap().r#type, 1);
+        let b5 = test_b5();
+        assert_eq!(pb_commit(&commit, &b5).unwrap().digest.unwrap().r#type, 1);
         assert_eq!(
-            pb_commit_v1beta1(&commit, "b5:00ff").digest.unwrap().r#type,
+            pb_commit_v1beta1(&commit, &b5)
+                .unwrap()
+                .digest
+                .unwrap()
+                .r#type,
             2
         );
     }
@@ -3906,6 +4044,41 @@ mod tests {
         let by_id = ResourceRef::from_pb(Some(pb1::resource_ref::Value::Id("x".to_string())));
         assert_eq!(by_id.id.as_deref(), Some("x"));
         assert!(by_id.label.is_none());
+    }
+
+    /// The CLI sets the `ref` oneof to the empty string to mean "the default
+    /// label". Decoded as a set ref, it names nothing and is `not_found`,
+    /// which made `buf push` of a module with a dependency fail.
+    #[test]
+    fn an_empty_ref_or_label_decodes_as_unset_5074() {
+        for child in [
+            pb1::resource_ref::name::Child::Ref(String::new()),
+            pb1::resource_ref::name::Child::LabelName(String::new()),
+        ] {
+            let name = pb1::resource_ref::Name {
+                owner: "acme".to_string(),
+                module: "payments".to_string(),
+                child: Some(child.clone()),
+            };
+            let v1 = ResourceRef::from_pb(Some(pb1::resource_ref::Value::Name(name)));
+            assert!(v1.label.is_none(), "v1 {child:?}");
+            assert_eq!(v1.module.as_deref(), Some("payments"));
+
+            let beta_child = match child {
+                pb1::resource_ref::name::Child::Ref(r) => pb1b::resource_ref::name::Child::Ref(r),
+                pb1::resource_ref::name::Child::LabelName(l) => {
+                    pb1b::resource_ref::name::Child::LabelName(l)
+                }
+            };
+            let beta = ResourceRef::from_pb_v1beta1(Some(pb1b::resource_ref::Value::Name(
+                pb1b::resource_ref::Name {
+                    owner: "acme".to_string(),
+                    module: "payments".to_string(),
+                    child: Some(beta_child),
+                },
+            )));
+            assert!(beta.label.is_none(), "v1beta1");
+        }
     }
 
     #[test]
@@ -5226,7 +5399,7 @@ mod tests {
             )],
             &[],
         );
-        assert_eq!(digest.value, wire::b5_bytes(&expected_b5));
+        assert_eq!(digest.value, wire::b5_bytes(&expected_b5).unwrap());
 
         // 4. The module now resolves, in the binary codec.
         let (status, resp) = tdh::send(
@@ -5381,6 +5554,35 @@ mod tests {
         )
         .await;
 
+        // The dependent's b5 composes its own files with the dependency's b5
+        // -- the digest buf recomputes and compares.
+        let expected = wire::b5_digest(
+            &[(
+                "acme/middle/v1/api.proto".to_string(),
+                b"syntax = \"proto3\";\n// middle\n".to_vec(),
+            )],
+            &[b5_string(&base)],
+        );
+        assert_eq!(
+            middle.digest.as_ref().map(|d| d.value.clone()),
+            Some(wire::b5_bytes(&expected).unwrap()),
+            "the dependent's b5 must cover the dependency's b5"
+        );
+        assert_ne!(
+            middle.digest.as_ref().map(|d| d.value.clone()),
+            Some(
+                wire::b5_bytes(&wire::b5_digest(
+                    &[(
+                        "acme/middle/v1/api.proto".to_string(),
+                        b"syntax = \"proto3\";\n// middle\n".to_vec(),
+                    )],
+                    &[],
+                ))
+                .unwrap()
+            ),
+            "a b5 without the dependency's digest is not the one buf verifies"
+        );
+
         // Asking for the middle module alone must answer with both commits
         // and the edge between them: the CLI builds a map from `commits` and
         // then looks up each edge's node in it.
@@ -5528,6 +5730,387 @@ mod tests {
         .expect("count the modules");
         assert_eq!(stored, 0, "a refused push must store nothing");
 
+        fx.teardown().await;
+    }
+
+    /// A commit's b5 as the `b5:<hex>` string the digest functions take.
+    #[cfg(test)]
+    fn b5_string(commit: &pb1::Commit) -> String {
+        format!(
+            "b5:{}",
+            hex::encode(&commit.digest.as_ref().expect("a digest").value)
+        )
+    }
+
+    /// Sends one binary request to `method` and returns the status and body.
+    #[cfg(test)]
+    async fn send_proto(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        method: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, bytes::Bytes) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!("/{}/{method}", fx.repo_key),
+                "application/proto",
+                bytes::Bytes::from(body),
+            ),
+        )
+        .await
+    }
+
+    /// `buf dep update` moving a dependency from c1 to c2, then `buf push` of
+    /// the same files: a new commit with a new b5 and a graph edge to c2.
+    /// Keyed on the files alone, the push collapsed into the old commit and
+    /// answered c1's b5 and graph (#5074 review).
+    #[tokio::test]
+    async fn a_dependency_bump_with_the_same_files_is_a_new_commit_5074() {
+        use prost::Message;
+
+        let Some(fx) =
+            crate::api::handlers::test_db_helpers::Fixture::setup("local", "protobuf").await
+        else {
+            return;
+        };
+        let c1 = push_proto_module(&fx, "acme", "dep", b"syntax = \"proto3\";\n", Vec::new()).await;
+        let c2 = push_proto_module(
+            &fx,
+            "acme",
+            "dep",
+            b"syntax = \"proto3\";\n// v2\n",
+            Vec::new(),
+        )
+        .await;
+        assert_ne!(c1.id, c2.id);
+
+        let files = b"syntax = \"proto3\";\n// app\n";
+        let on_c1 = push_proto_module(&fx, "acme", "app", files, vec![c1.id.clone()]).await;
+        let on_c2 = push_proto_module(&fx, "acme", "app", files, vec![c2.id.clone()]).await;
+
+        assert_ne!(on_c1.id, on_c2.id, "a dependency bump is a new commit");
+        assert_ne!(on_c1.digest, on_c2.digest, "with a new b5");
+        let expected = wire::b5_digest(
+            &[("acme/app/v1/api.proto".to_string(), files.to_vec())],
+            &[b5_string(&c2)],
+        );
+        assert_eq!(
+            on_c2.digest.as_ref().map(|d| d.value.clone()),
+            Some(wire::b5_bytes(&expected).unwrap())
+        );
+
+        // The same push again is still idempotent.
+        let again = push_proto_module(&fx, "acme", "app", files, vec![c2.id.clone()]).await;
+        assert_eq!(again.id, on_c2.id);
+
+        // And the graph of the new commit points at c2.
+        let (status, resp) = send_proto(
+            &fx,
+            "buf.registry.module.v1.GraphService/GetGraph",
+            pb1::GetGraphRequest {
+                resource_refs: vec![pb1::ResourceRef {
+                    value: Some(pb1::resource_ref::Value::Id(on_c2.id.clone())),
+                }],
+            }
+            .encode_to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
+        let graph = pb1::GetGraphResponse::decode(resp.as_ref())
+            .unwrap()
+            .graph
+            .unwrap();
+        let to: Vec<String> = graph
+            .edges
+            .iter()
+            .filter_map(|e| e.to_node.as_ref().map(|n| n.commit_id.clone()))
+            .collect();
+        assert_eq!(to, vec![c2.id.clone()]);
+
+        fx.teardown().await;
+    }
+
+    /// Over the binary codec a push carries one module: a workspace push of
+    /// several would get b5 digests composed from a push-wide dependency list.
+    #[tokio::test]
+    async fn a_binary_multi_module_push_is_refused_even_without_dependencies_5074() {
+        use prost::Message;
+
+        let Some(fx) =
+            crate::api::handlers::test_db_helpers::Fixture::setup("local", "protobuf").await
+        else {
+            return;
+        };
+        let content = |module: &str| pb1::upload_request::Content {
+            module_ref: Some(pb1::ModuleRef {
+                value: Some(pb1::module_ref::Value::Name(pb1::module_ref::Name {
+                    owner: "acme".to_string(),
+                    module: module.to_string(),
+                })),
+            }),
+            files: vec![pb1::File {
+                path: format!("acme/{module}/v1/api.proto"),
+                content: b"syntax = \"proto3\";\n".to_vec(),
+            }],
+            scoped_label_refs: Vec::new(),
+            source_control_url: String::new(),
+        };
+        let (status, resp) = send_proto(
+            &fx,
+            "buf.registry.module.v1.UploadService/Upload",
+            pb1::UploadRequest {
+                contents: vec![content("ws-one"), content("ws-two")],
+                dep_commit_ids: Vec::new(),
+            }
+            .encode_to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let json: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert_eq!(json["code"], "failed_precondition");
+        assert!(json["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("several modules"));
+        assert_eq!(module_rows(&fx, "acme/ws-one").await, 0);
+        assert_eq!(module_rows(&fx, "acme/ws-two").await, 0);
+        fx.teardown().await;
+    }
+
+    /// Derived ids are pure functions of names, so the same id names a
+    /// module in every repository; resolving one must stay inside the
+    /// repository the request addressed. An owner, and a dependency edge,
+    /// that exist only in repository A are not found from repository B.
+    #[tokio::test]
+    async fn derived_ids_resolve_within_one_repository_5074() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use prost::Message;
+
+        let Some(a) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let Some(b) = tdh::Fixture::setup("local", "protobuf").await else {
+            a.teardown().await;
+            return;
+        };
+        let base =
+            push_proto_module(&a, "onlyina", "base", b"syntax = \"proto3\";\n", Vec::new()).await;
+
+        // ownerId: recorded in A only.
+        let (status, resp) = send_proto(
+            &b,
+            "buf.registry.owner.v1.OwnerService/GetOwners",
+            wire::proto::owner_v1::GetOwnersRequest {
+                owner_refs: vec![wire::proto::owner_v1::OwnerRef {
+                    value: Some(wire::proto::owner_v1::owner_ref::Value::Id(ids::owner(
+                        "onlyina",
+                    ))),
+                }],
+            }
+            .encode_to_vec(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an owner recorded in A is not B's: {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        // moduleId: recorded in A only.
+        let (status, _) = send_proto(
+            &b,
+            "buf.registry.module.v1.ModuleService/GetModules",
+            pb1::GetModulesRequest {
+                module_refs: vec![pb1::ModuleRef {
+                    value: Some(pb1::module_ref::Value::Id(base.module_id.clone())),
+                }],
+            }
+            .encode_to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "a module id of A from B");
+
+        // commitId: a commit in B whose recorded dependency is A's commit.
+        // Resolving the edge from B must not find A's row.
+        let lonely =
+            push_proto_module(&b, "inb", "lonely", b"syntax = \"proto3\";\n", Vec::new()).await;
+        sqlx::query(
+            "UPDATE artifact_metadata m SET metadata = jsonb_set(m.metadata, '{dependencies}', \
+             jsonb_build_array($2::text)) FROM artifacts a \
+             WHERE a.id = m.artifact_id AND a.repository_id = $1 AND a.name = 'inb/lonely' \
+               AND a.version <> '_labels'",
+        )
+        .bind(b.repo_id)
+        .bind(&base.id)
+        .execute(&b.pool)
+        .await
+        .expect("point B's commit at A's");
+        let (status, resp) = send_proto(
+            &b,
+            "buf.registry.module.v1.GraphService/GetGraph",
+            pb1::GetGraphRequest {
+                resource_refs: vec![pb1::ResourceRef {
+                    value: Some(pb1::resource_ref::Value::Id(lonely.id.clone())),
+                }],
+            }
+            .encode_to_vec(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a dependency held only by A is unresolved from B: {}",
+            String::from_utf8_lossy(&resp)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert_eq!(json["code"], "failed_precondition");
+
+        b.teardown().await;
+        a.teardown().await;
+    }
+
+    /// A remote or virtual repository holds no rows the CLI could use, so the
+    /// binary codec is `unimplemented` there instead of an answer built from
+    /// local rows; the JSON codec answers as before (#5074 review).
+    #[tokio::test]
+    async fn the_binary_codec_is_unimplemented_on_remote_and_virtual_repos_5074() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use prost::Message;
+
+        for repo_type in ["remote", "virtual"] {
+            let Some(fx) = tdh::Fixture::setup(repo_type, "protobuf").await else {
+                return;
+            };
+            let (status, resp) = send_proto(
+                &fx,
+                "buf.registry.module.v1.ModuleService/GetModules",
+                pb1::GetModulesRequest {
+                    module_refs: vec![pb1::ModuleRef {
+                        value: Some(pb1::module_ref::Value::Name(pb1::module_ref::Name {
+                            owner: "acme".to_string(),
+                            module: "x".to_string(),
+                        })),
+                    }],
+                }
+                .encode_to_vec(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{repo_type}");
+            let json: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+            assert_eq!(json["code"], "unimplemented", "{repo_type}");
+
+            let (status, resp) = send_proto(
+                &fx,
+                "buf.registry.module.v1.DownloadService/Download",
+                pb1::DownloadRequest { values: Vec::new() }.encode_to_vec(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_IMPLEMENTED,
+                "{repo_type} Download: {}",
+                String::from_utf8_lossy(&resp)
+            );
+
+            // JSON: the empty answer it always gave.
+            let (status, resp) = tdh::send(
+                fx.router_with_auth(super::router()),
+                tdh::post(
+                    format!(
+                        "/{}/buf.registry.module.v1.ModuleService/GetModules",
+                        fx.repo_key
+                    ),
+                    "application/json",
+                    bytes::Bytes::from_static(b"{}"),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{repo_type} JSON");
+            assert_eq!(&resp[..], br#"{"modules":[]}"#);
+            fx.teardown().await;
+        }
+    }
+
+    /// A JSON write answers in main's order: a malformed body or a missing
+    /// JSON content type is refused before authorisation, as axum's `Json`
+    /// extractor refused it, so an anonymous caller still sees the 415/400/422
+    /// it always did (#5074 review).
+    #[tokio::test]
+    async fn json_writes_read_the_body_before_authorising_5074() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        for method in [
+            "buf.registry.module.v1.ModuleService/CreateModules",
+            "buf.registry.module.v1beta1.UploadService/Upload",
+            "buf.registry.module.v1.LabelService/CreateOrUpdateLabels",
+        ] {
+            let anon = || tdh::router_anon(super::router(), fx.state.clone());
+            let uri = format!("/{}/{method}", fx.repo_key);
+
+            let (status, _) = tdh::send(
+                anon(),
+                tdh::post(
+                    uri.clone(),
+                    "application/json",
+                    bytes::Bytes::from_static(b"{nope"),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{method}: syntax error first"
+            );
+
+            let (status, _) = tdh::send(
+                anon(),
+                tdh::post(uri.clone(), "text/plain", bytes::Bytes::from_static(b"{}")),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{method}: content type first"
+            );
+
+            // A well-formed JSON body reaches the scope check.
+            let body: &'static [u8] = if method.ends_with("CreateOrUpdateLabels") {
+                br#"{"values":[]}"#
+            } else {
+                b"{}"
+            };
+            let (status, _) = tdh::send(
+                anon(),
+                tdh::post(
+                    uri.clone(),
+                    "application/json",
+                    bytes::Bytes::from_static(body),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method}: then auth");
+
+            // The binary codec authorises first: anonymous garbage is a 401.
+            let (status, _) = tdh::send(
+                anon(),
+                tdh::post(
+                    uri.clone(),
+                    "application/proto",
+                    bytes::Bytes::from_static(b"\xff\xff"),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method}: binary auth first"
+            );
+        }
         fx.teardown().await;
     }
 
@@ -6879,5 +7462,125 @@ mod download_latest_commit_tests {
             file_content(&resp),
             b"syntax = \"proto3\";\nmessage Two {}\n"
         );
+    }
+}
+
+/// #5074 review: the binary codec's authorisation through the production
+/// router, where the visibility middleware runs in front of the handlers.
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod router_authz_tests {
+    use super::pb1;
+    use axum::http::StatusCode;
+    use base64::Engine;
+
+    /// Through the production router (visibility middleware included): an
+    /// anonymous binary Upload, Download and GetOwners are refused, and a
+    /// token scoped to `read:artifacts` cannot push, even for a user whose
+    /// role may write -- the handler's own scope check is what refuses it
+    /// (GHSA-vvc3-h39c-mrq5), for the v1 Upload the CLI uses as for v1beta1.
+    #[tokio::test]
+    async fn binary_writes_need_a_write_scope_through_the_router_5074() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use prost::Message;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let (read_token, _) = crate::services::auth_service::AuthService::new(
+            fx.pool.clone(),
+            std::sync::Arc::new(fx.state.config.clone()),
+        )
+        .generate_api_token(
+            fx.user_id,
+            "pb-5074-read",
+            vec!["read:artifacts".to_string()],
+            None,
+        )
+        .await
+        .expect("mint a read-scoped token");
+        let read_basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD
+                .encode(format!("{}:{}", fx.username, read_token))
+        );
+
+        let upload = |module: &str| {
+            pb1::UploadRequest {
+                contents: vec![pb1::upload_request::Content {
+                    module_ref: Some(pb1::ModuleRef {
+                        value: Some(pb1::module_ref::Value::Name(pb1::module_ref::Name {
+                            owner: "acme".to_string(),
+                            module: module.to_string(),
+                        })),
+                    }),
+                    files: vec![pb1::File {
+                        path: format!("acme/{module}/v1/api.proto"),
+                        content: b"syntax = \"proto3\";\n".to_vec(),
+                    }],
+                    scoped_label_refs: Vec::new(),
+                    source_control_url: String::new(),
+                }],
+                dep_commit_ids: Vec::new(),
+            }
+            .encode_to_vec()
+        };
+        let call = |method: String, body: Vec<u8>, authorization: Option<String>| {
+            let state = fx.state.clone();
+            let uri = format!("/proto/{}/{method}", fx.repo_key);
+            async move {
+                let mut req = axum::http::Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/proto")
+                    .header("connect-protocol-version", "1");
+                if let Some(a) = authorization {
+                    req = req.header("authorization", a);
+                }
+                tdh::send(
+                    crate::api::routes::create_router(state),
+                    req.body(axum::body::Body::from(body)).expect("request"),
+                )
+                .await
+            }
+        };
+
+        for method in [
+            "buf.registry.module.v1.UploadService/Upload",
+            "buf.registry.module.v1beta1.UploadService/Upload",
+        ] {
+            let (status, _) = call(method.to_string(), upload("anon"), None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "anonymous {method}");
+
+            let (status, resp) = call(
+                method.to_string(),
+                upload("readscoped"),
+                Some(read_basic.clone()),
+            )
+            .await;
+            assert!(
+                status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED,
+                "a read-scoped token pushed through {method}: {status} {}",
+                String::from_utf8_lossy(&resp)
+            );
+        }
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifacts WHERE repository_id = $1 AND name IN \\
+             ('acme/anon', 'acme/readscoped')",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count the modules");
+        assert_eq!(stored, 0, "a refused push must store nothing");
+
+        for method in [
+            "buf.registry.module.v1.DownloadService/Download",
+            "buf.registry.owner.v1.OwnerService/GetOwners",
+        ] {
+            let (status, _) = call(method.to_string(), Vec::new(), None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "anonymous {method}");
+        }
+        fx.teardown().await;
     }
 }

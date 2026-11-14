@@ -76,9 +76,14 @@ impl Codec {
     /// is still refused with that extractor's own `415`, so a JSON caller sees
     /// the same answers it did before the binary codec was added.
     ///
-    /// Only `application/proto` is the bare message these handlers decode.
-    /// gRPC and Connect's streaming codecs (`application/connect+proto`,
-    /// `application/connect+json`) frame every message with a five-byte
+    /// That includes the enveloped JSON types (`application/connect+json`,
+    /// `application/grpc+json`, `application/grpc-web+json`): the extractor
+    /// took them as JSON, so they still are, with the same answers.
+    ///
+    /// Only `application/proto` is the bare protobuf message these handlers
+    /// decode. gRPC and Connect's streaming protobuf codecs
+    /// (`application/grpc`, `application/grpc+proto`,
+    /// `application/connect+proto`) frame every message with a five-byte
     /// envelope, which a bare decode would read as part of the message: a
     /// misleading `invalid_argument`, or in rare cases a message that decodes
     /// as something it is not. Those are refused as `unimplemented` instead.
@@ -94,6 +99,11 @@ impl Codec {
         if content_type.starts_with("application/proto") {
             return Ok(Codec::Proto);
         }
+        // Checked before the enveloped protobuf types: `application/grpc+json`
+        // is JSON to the extractor, and it stays JSON here.
+        if is_json_content_type(&content_type) {
+            return Ok(Codec::Json);
+        }
         if content_type.starts_with("application/grpc")
             || content_type.starts_with("application/connect+")
         {
@@ -101,9 +111,6 @@ impl Codec {
                 "this registry serves unary Connect with the 'application/json' and \
                  'application/proto' codecs; '{content_type}' is enveloped and is not implemented"
             )));
-        }
-        if is_json_content_type(&content_type) {
-            return Ok(Codec::Json);
         }
         Err(axum::extract::rejection::MissingJsonContentType::default().into_response())
     }
@@ -292,12 +299,34 @@ pub fn b5_of(files_digest: &str, dep_digests: &[String]) -> String {
 
 /// The 64 raw bytes of a `b5:<hex>` string, for `Digest.value`, which is
 /// `bytes` and not the hex text the JSON endpoints put in it.
-pub fn b5_bytes(digest: &str) -> Vec<u8> {
+///
+/// A recorded digest that is not exactly 64 bytes of hex is refused rather
+/// than shortened: the CLI would compare a truncated digest and reject the
+/// commit without saying why.
+pub fn b5_bytes(digest: &str) -> Result<Vec<u8>, Response> {
     let hex = digest.strip_prefix("b5:").unwrap_or(digest);
+    let malformed = || {
+        let body = serde_json::json!({
+            "code": "internal",
+            "message": "a recorded b5 digest is malformed",
+        });
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    if hex.len() != SHAKE256_LEN * 2 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(malformed());
+    }
     hex.as_bytes()
         .chunks(2)
-        .filter(|pair| pair.len() == 2)
-        .filter_map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+        .map(|pair| {
+            std::str::from_utf8(pair)
+                .ok()
+                .and_then(|p| u8::from_str_radix(p, 16).ok())
+                .ok_or_else(malformed)
+        })
         .collect()
 }
 
@@ -457,7 +486,19 @@ mod tests {
         let digest = b5_digest(&files, &[]);
         assert!(digest.starts_with("b5:"));
         assert_eq!(digest.len(), "b5:".len() + SHAKE256_LEN * 2);
-        assert_eq!(b5_bytes(&digest).len(), SHAKE256_LEN);
+        assert_eq!(b5_bytes(&digest).ok().map(|b| b.len()), Some(SHAKE256_LEN));
+        // Bad hex, an odd length or a short digest is refused, not shortened.
+        for bad in [
+            format!("b5:{}", "z".repeat(128)),
+            format!("b5:{}", "a".repeat(127)),
+            "b5:abcd".to_string(),
+        ] {
+            assert_eq!(
+                b5_bytes(&bad).err().map(|r| r.status()),
+                Some(StatusCode::INTERNAL_SERVER_ERROR),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
@@ -514,6 +555,26 @@ mod tests {
         );
     }
 
+    /// The enveloped JSON types were JSON to axum's `Json` extractor before
+    /// the binary codec existed, and they still select the JSON codec
+    /// (upgrade safety, #5074 review).
+    #[test]
+    fn enveloped_json_types_stay_json() {
+        for content_type in [
+            "application/connect+json",
+            "application/grpc+json",
+            "application/grpc-web+json",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, content_type.parse().unwrap());
+            assert_eq!(
+                Codec::from_headers(&headers).ok(),
+                Some(Codec::Json),
+                "{content_type}"
+            );
+        }
+    }
+
     /// A request that names neither codec is refused as axum's `Json`
     /// extractor refused it before the binary codec existed: the JSON callers
     /// of the hosted endpoints see the same `415` they always did (#5074).
@@ -556,14 +617,10 @@ mod tests {
     /// produces a misleading `invalid_argument` at best.
     #[test]
     fn enveloped_codecs_are_refused_not_decoded_as_bare_messages() {
-        // The last one is enveloped JSON, not protobuf: it is refused for
-        // its framing, which is what this test is about, and it is not one of
-        // the bodies the proxy recognises as protobuf.
         for (content_type, proxy_passes_through) in [
             ("application/grpc", true),
             ("application/grpc+proto", true),
             ("application/connect+proto", true),
-            ("application/connect+json", false),
         ] {
             let mut headers = HeaderMap::new();
             headers.insert(CONTENT_TYPE, content_type.parse().unwrap());
