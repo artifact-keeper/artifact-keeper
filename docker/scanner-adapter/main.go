@@ -25,6 +25,11 @@ func main() {
 	if cfg.Offline {
 		log.Printf("offline mode (SCANNER_OFFLINE): no vulnerability-DB or Java-DB download, scans run with --skip-db-update --skip-java-db-update (and, like every scan, --offline-scan); import a DB with PUT /api/v1/vulndb")
 	}
+	if cfg.MaxImageBytes > 0 {
+		log.Printf("image size check on: images over %d bytes (compressed layers) are not scanned (SCANNER_MAX_IMAGE_BYTES)", cfg.MaxImageBytes)
+	} else {
+		log.Printf("image size check off (SCANNER_MAX_IMAGE_BYTES unset or 0)")
+	}
 	if cfg.AdapterToken == "" {
 		log.Printf("SCANNER_ADAPTER_TOKEN unset: GET/PUT /api/v1/vulndb are disabled")
 	}

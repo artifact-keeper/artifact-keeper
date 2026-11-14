@@ -9,8 +9,8 @@ use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::user::User;
 use crate::services::auth_service::AuthService;
 use crate::services::scanner_adapter_client::{
-    adapter_status_is_unreachable, with_adapter_resubmits, AdapterAttemptError, AdapterAuth,
-    AdapterPollClock, AdapterResubmit,
+    adapter_reports_too_large, adapter_status_is_unreachable, with_adapter_resubmits,
+    AdapterAttemptError, AdapterAuth, AdapterPollClock, AdapterResubmit,
 };
 use crate::services::scanner_service::{ScanOutput, ScanTarget, Scanner};
 
@@ -457,6 +457,11 @@ async fn adapter_visible_registry_url(adapter_url: &str) -> Option<String> {
 /// error path: a silent zero-finding completion is exactly the false-clean
 /// regression #2088 tracks (the old trivy-server Twirp `Scan` call returned an
 /// empty result that was mapped to "completed, 0 findings").
+///
+/// One adapter outcome is not a gateway error: an image the adapter refused
+/// as over its `SCANNER_MAX_IMAGE_BYTES` (#5909) is
+/// `Err(AppError::UnprocessableEntity)` carrying the adapter's "not scanned:
+/// image too large" reason. It is still an `Err`, so the scan is `failed`.
 pub struct ImageScanner {
     /// Base URL of the Harbor scanner adapter, e.g. `http://trivy:8090`.
     adapter_url: String,
@@ -846,7 +851,17 @@ impl ImageScanner {
             // resubmits once or twice when the id was lost (#5657).
             let pending = status == reqwest::StatusCode::FOUND;
             if !pending {
+                let too_large = adapter_reports_too_large(status, resp.headers());
                 let text = crate::services::scanner_adapter_client::adapter_error_text(resp).await;
+                if too_large {
+                    // #5909: the adapter refused the image before running
+                    // trivy because it is over SCANNER_MAX_IMAGE_BYTES. Still
+                    // an Err (no report, the scan is recorded `failed`), but
+                    // with the adapter's own "not scanned: image too large"
+                    // reason instead of a gateway error, and never
+                    // resubmitted.
+                    return Err(AppError::UnprocessableEntity(text.trim().to_string()).into());
+                }
                 return Err(AdapterAttemptError {
                     resubmit: AdapterResubmit::classify(status, &text),
                     error: AppError::BadGateway(format!(
@@ -2030,6 +2045,52 @@ mod tests {
             .expect_err("a failed job fails the scan");
         assert!(matches!(err, AppError::BadGateway(_)), "{err:?}");
         assert_eq!(count_posts(&server).await, 1);
+    }
+
+    /// #5909: an image the adapter refused as too large (422 +
+    /// `X-Scan-Status: TooLarge`) fails the scan with the adapter's "not
+    /// scanned: image too large" reason, not a gateway error, and is not
+    /// resubmitted. A 422 without the header stays an ordinary failure.
+    #[tokio::test]
+    async fn test_adapter_too_large_image_is_reported_and_not_resubmitted() {
+        use wiremock::ResponseTemplate;
+
+        let reason = "not scanned: image too large: backend:8080/app:1 is 4400000000 bytes \
+                      (compressed layers), over SCANNER_MAX_IMAGE_BYTES=2147483648";
+        let server = wiremock::MockServer::start().await;
+        mount_ready_and_submit_sequence(&server, &["big"]).await;
+        mount_report(
+            &server,
+            "big",
+            ResponseTemplate::new(422)
+                .insert_header("X-Scan-Status", "TooLarge")
+                .set_body_string(format!("{reason}\n")),
+        )
+        .await;
+        let err = ImageScanner::new(server.uri())
+            .scan(&oci_image_artifact(), None, &Bytes::new())
+            .await
+            .expect_err("a refused image has no report");
+        match &err {
+            AppError::UnprocessableEntity(msg) => assert_eq!(msg, reason),
+            other => panic!("want UnprocessableEntity, got {other:?}"),
+        }
+        assert!(err.to_string().contains("not scanned: image too large"));
+        assert_eq!(count_posts(&server).await, 1);
+
+        let server = wiremock::MockServer::start().await;
+        mount_ready_and_submit_sequence(&server, &["odd"]).await;
+        mount_report(
+            &server,
+            "odd",
+            ResponseTemplate::new(422).set_body_string("unexpected"),
+        )
+        .await;
+        let err = ImageScanner::new(server.uri())
+            .scan(&oci_image_artifact(), None, &Bytes::new())
+            .await
+            .expect_err("a 422 without the header is still a failure");
+        assert!(matches!(err, AppError::BadGateway(_)), "{err:?}");
     }
 
     /// An empty scan id from the submit endpoint must fail the scan up front:
