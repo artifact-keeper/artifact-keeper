@@ -422,6 +422,20 @@ const REPOSITORIES_EXPORT_SQL: &str =
      THEN jsonb_build_object('repodata_depth', ak_rpm_repodata_depth(id)) \
      ELSE '{}'::jsonb END FROM repositories t";
 
+/// The scoped `repositories` export (#5884): [`REPOSITORIES_EXPORT_SQL`] with
+/// a curation source or target outside the scope (`$1`) written as NULL, as
+/// `virtual_repo_members` leaves out a membership whose member is out of
+/// scope. The caller appends the `WHERE` clause.
+const REPOSITORIES_SCOPED_EXPORT_SQL: &str =
+    "SELECT to_jsonb(t) || CASE WHEN ak_rpm_repodata_depth(id) > 0 \
+     THEN jsonb_build_object('repodata_depth', ak_rpm_repodata_depth(id)) \
+     ELSE '{}'::jsonb END || jsonb_build_object( \
+       'curation_source_repo_id', \
+       CASE WHEN t.curation_source_repo_id = ANY($1) THEN t.curation_source_repo_id END, \
+       'curation_target_repo_id', \
+       CASE WHEN t.curation_target_repo_id = ANY($1) THEN t.curation_target_repo_id END) \
+     FROM repositories t";
+
 /// Validate that a table name is in the export allowlist.
 fn validate_export_table(table: &str) -> Result<()> {
     if !ALLOWED_EXPORT_TABLES.contains(&table) {
@@ -2058,15 +2072,8 @@ impl BackupService {
         let since_filter = parse_since_filter(backup.metadata.as_ref());
 
         // Layout and artifact rows must describe the same database snapshot.
-        let mut snapshot = self.db.begin().await?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-            .execute(&mut *snapshot)
-            .await?;
-        // Resolve which repositories this backup covers (#2772), in the same
-        // snapshot as the rows (#5884). `None` means "every repository" and
-        // preserves the historical, unfiltered dump.
-        let repository_filter =
-            Self::effective_repository_filter(&mut snapshot, backup.metadata.as_ref()).await?;
+        let (mut snapshot, repository_filter) =
+            Self::open_export_snapshot(&self.db, backup.metadata.as_ref()).await?;
         let mut table_data: Vec<(String, Vec<u8>)> = Vec::new();
         for table in &table_names {
             ensure_backup_not_cancelled(cancel)?;
@@ -2348,20 +2355,26 @@ impl BackupService {
     /// brings back a repository it does not cover or a statistics row whose
     /// artifact it does not carry. Every other core table is server-wide and
     /// exported whole. Without a filter or cutoff this is [`Self::export_table`].
+    ///
+    /// A scoped `repositories` row whose curation source or target is out of
+    /// scope has that column written as NULL: the archive does not carry the
+    /// referenced repository, so restoring the reference would fail its
+    /// foreign key once that repository is gone.
     async fn export_core_table(
         conn: &mut sqlx::PgConnection,
         table: &str,
         repository_filter: Option<&[Uuid]>,
         since: Option<DateTime<Utc>>,
     ) -> Result<serde_json::Value> {
-        validate_export_table(table)?;
         let repo_ids: Option<Vec<Uuid>> = repository_filter.map(|r| r.to_vec());
+        // The scoped arms name their table literally; every other table is
+        // validated by `export_table`.
         let query = match table {
             "artifacts" => return Self::export_artifacts(conn, repository_filter, since).await,
             "repositories" if repo_ids.is_some() => {
                 // `$2` is bound for every query; this keeps it typed.
                 format!(
-                    "{REPOSITORIES_EXPORT_SQL} WHERE t.id = ANY($1) \
+                    "{REPOSITORIES_SCOPED_EXPORT_SQL} WHERE t.id = ANY($1) \
                      AND ($2::timestamptz IS NULL OR TRUE)"
                 )
             }
@@ -2406,6 +2419,25 @@ impl BackupService {
     /// exclusions), so full backups keep dumping every repository exactly as
     /// before. The complete repository set is only queried for the exclude-only
     /// case, where it is needed to compute "everything except the excluded ids".
+    /// Open the backup's `REPEATABLE READ, READ ONLY` snapshot and resolve
+    /// its repository filter inside it (#5884), so an exclude-only filter
+    /// lists exactly the repositories the snapshot's rows are read from. The
+    /// filter's query, when it runs, is the snapshot's first.
+    async fn open_export_snapshot(
+        db: &PgPool,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<(
+        sqlx::Transaction<'static, sqlx::Postgres>,
+        Option<Vec<Uuid>>,
+    )> {
+        let mut snapshot = db.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *snapshot)
+            .await?;
+        let repository_filter = Self::effective_repository_filter(&mut snapshot, metadata).await?;
+        Ok((snapshot, repository_filter))
+    }
+
     async fn effective_repository_filter(
         conn: &mut sqlx::PgConnection,
         metadata: Option<&serde_json::Value>,
