@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#5948]
+---
+- **The scanner-adapter's scan and report routes can require a bearer token, and the backend sends one** (#5948). With `SCANNER_SCAN_TOKEN` set on the adapter, `POST /api/v1/scan`, `POST /api/v1/filesystem/scan` and their report routes answer `401` unless the request carries `Authorization: Bearer <token>`, compared in constant time. `SCANNER_SCAN_TOKENS_FILE` adds tokens from a file, one per line, re-read when it changes, so one adapter can serve several Artifact Keeper instances with distinct credentials and drop one without touching the others. The probes and `GET /api/v1/metadata` stay open, and with neither set the routes behave as before. The scan token is separate from `SCANNER_ADAPTER_TOKEN`, the vulnerability-DB import credential. On the backend, `TRIVY_ADAPTER_TOKEN` (or `TRIVY_ADAPTER_TOKEN_FILE`) is sent on every adapter request, image and filesystem scans alike, and never appears in a log line or an error message; an unreadable token file fails adapter scans rather than sending them without it. See `docker/scanner-adapter/README.md`.

@@ -73,12 +73,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /probe/ready", s.handleReady)
 	mux.HandleFunc("GET /probe/healthy", s.handleHealthy)
 	mux.HandleFunc("GET /api/v1/metadata", s.handleMetadata)
-	mux.HandleFunc("POST /api/v1/scan", s.handleScan)
-	mux.HandleFunc("GET /api/v1/scan/{id}/report", s.handleReport)
+	// Scan and report routes: bearer token when SCANNER_SCAN_TOKEN(S_FILE)
+	// is set (#5948); the probes and metadata above stay open.
+	auth := newScanAuth(s.cfg)
+	mux.HandleFunc("POST /api/v1/scan", auth.wrap(s.handleScan))
+	mux.HandleFunc("GET /api/v1/scan/{id}/report", auth.wrap(s.handleReport))
 	// Filesystem scans (#2363): the backend uploads a tarred, pre-hardened
 	// workspace; the adapter untars it and runs `trivy filesystem` over it.
-	mux.HandleFunc("POST /api/v1/filesystem/scan", s.handleFsScan)
-	mux.HandleFunc("GET /api/v1/filesystem/scan/{id}/report", s.handleFsReport)
+	mux.HandleFunc("POST /api/v1/filesystem/scan", auth.wrap(s.handleFsScan))
+	mux.HandleFunc("GET /api/v1/filesystem/scan/{id}/report", auth.wrap(s.handleFsReport))
 	// Vulnerability-DB status and offline import (#5287); bearer-token only.
 	mux.HandleFunc("GET /api/v1/vulndb", s.handleVulnDBGet)
 	mux.HandleFunc("PUT /api/v1/vulndb", s.handleVulnDBPut)

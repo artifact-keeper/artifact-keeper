@@ -311,6 +311,98 @@ impl AdapterPollClock {
     }
 }
 
+/// Env var naming the bearer token the backend sends on every
+/// scanner-adapter request (#5948), image and filesystem alike; also read as
+/// `TRIVY_ADAPTER_TOKEN_FILE` (a mounted secret, #4142). It matches the
+/// adapter's `SCANNER_SCAN_TOKEN` (or one line of its
+/// `SCANNER_SCAN_TOKENS_FILE`). The Harbor request body's
+/// `registry.authorization` stays the separate image-pull credential.
+pub(crate) const ADAPTER_TOKEN_ENV: &str = "TRIVY_ADAPTER_TOKEN";
+
+/// How the backend authenticates to the scanner-adapter. The token is held
+/// only as a sensitive header value: `Debug` never prints it, and it is never
+/// put in a log line or an error message.
+#[derive(Clone)]
+pub(crate) enum AdapterAuth {
+    /// No token configured: requests carry no `Authorization` header.
+    None,
+    /// `Authorization: Bearer <token>` on every request.
+    Bearer(reqwest::header::HeaderValue),
+    /// A token was configured but cannot be used (an unreadable or empty
+    /// `TRIVY_ADAPTER_TOKEN_FILE`, or characters a header cannot carry).
+    /// Every scan fails at the readiness gate with this reason rather than
+    /// going out unauthenticated. The text names the variable and the path,
+    /// never the value.
+    Unusable(String),
+}
+
+impl std::fmt::Debug for AdapterAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("AdapterAuth::None"),
+            Self::Bearer(_) => f.write_str("AdapterAuth::Bearer([redacted])"),
+            Self::Unusable(why) => write!(f, "AdapterAuth::Unusable({why})"),
+        }
+    }
+}
+
+impl AdapterAuth {
+    /// A bearer token. Surrounding whitespace is trimmed; an empty token
+    /// means no token.
+    pub(crate) fn bearer(token: &str) -> Self {
+        let token = token.trim();
+        if token.is_empty() {
+            return Self::None;
+        }
+        match reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
+            Ok(mut value) => {
+                value.set_sensitive(true);
+                Self::Bearer(value)
+            }
+            Err(_) => Self::Unusable(format!(
+                "{ADAPTER_TOKEN_ENV} contains characters an HTTP header cannot carry"
+            )),
+        }
+    }
+
+    /// Resolve [`ADAPTER_TOKEN_ENV`] / `TRIVY_ADAPTER_TOKEN_FILE`.
+    pub(crate) fn from_env() -> Self {
+        Self::resolve(crate::config::secret_or_env(ADAPTER_TOKEN_ENV))
+    }
+
+    fn resolve(found: std::result::Result<Option<String>, String>) -> Self {
+        let auth = match found {
+            Ok(Some(token)) => Self::bearer(&token),
+            Ok(None) => Self::None,
+            Err(why) => Self::Unusable(why),
+        };
+        if let Self::Unusable(why) = &auth {
+            tracing::error!("scanner-adapter token unusable; adapter scans will fail: {why}");
+        }
+        auth
+    }
+
+    /// Add the header to every request a client built from `builder` sends.
+    pub(crate) fn apply(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        match self {
+            Self::Bearer(value) => {
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(reqwest::header::AUTHORIZATION, value.clone());
+                builder.default_headers(headers)
+            }
+            Self::None | Self::Unusable(_) => builder,
+        }
+    }
+
+    /// The reason scans cannot be sent, if a configured token is unusable.
+    pub(crate) fn unusable(&self) -> Option<&str> {
+        match self {
+            Self::Unusable(why) => Some(why),
+            _ => None,
+        }
+    }
+}
+
 /// Which engine a trivy-based filesystem scanner drives: the legacy local CLI
 /// (back-compat for deployments that bundle `trivy` and set `TRIVY_URL`) or
 /// the scanner-adapter's HTTP filesystem endpoint (#2363).
@@ -445,6 +537,8 @@ struct FsScanSubmitResponse {
 /// the error-mapping contract.
 pub(crate) struct ScannerAdapterFsClient {
     adapter_url: String,
+    /// Bearer token sent on every request (#5948).
+    auth: AdapterAuth,
     http: reqwest::Client,
     /// Redirects disabled so a `302 Found` "report not ready" is observed
     /// rather than followed.
@@ -465,19 +559,27 @@ impl ScannerAdapterFsClient {
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
     pub fn new(adapter_url: String) -> Self {
+        Self::with_auth(adapter_url, AdapterAuth::from_env())
+    }
+
+    /// Build a client that authenticates with `auth` (#5948).
+    pub(crate) fn with_auth(adapter_url: String, auth: AdapterAuth) -> Self {
         Self {
             adapter_url,
-            http: crate::services::http_client::internal_service_client_builder()
+            http: auth
+                .apply(crate::services::http_client::internal_service_client_builder())
                 // Generous: the body is the tarred workspace, potentially GBs
                 // for an incus rootfs.
                 .timeout(std::time::Duration::from_secs(900))
                 .build()
                 .unwrap_or_default(),
-            poll_http: crate::services::http_client::internal_service_client_builder()
+            poll_http: auth
+                .apply(crate::services::http_client::internal_service_client_builder())
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_default(),
+            auth,
         }
     }
 
@@ -509,6 +611,9 @@ impl ScannerAdapterFsClient {
     /// Gate on `/probe/ready` with bounded retries. Any failure here is an
     /// availability state, not a scan failure.
     async fn ensure_ready(&self) -> Result<()> {
+        if let Some(why) = self.auth.unusable() {
+            return Err(self.unavailable(why));
+        }
         let url = format!("{}/probe/ready", self.adapter_url);
         let mut last: Option<String> = None;
 
@@ -767,6 +872,127 @@ mod tests {
     use super::*;
     use wiremock::matchers::{method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // ---- adapter bearer token (#5948) ---------------------------------
+
+    const FS_TOKEN_5948: &str = "tok-5948-fs-9876543210";
+
+    #[test]
+    fn test_adapter_auth_resolution_and_redaction() {
+        assert!(matches!(AdapterAuth::resolve(Ok(None)), AdapterAuth::None));
+        assert!(matches!(AdapterAuth::bearer("   "), AdapterAuth::None));
+        let auth = AdapterAuth::resolve(Ok(Some(format!("  {FS_TOKEN_5948}\n"))));
+        match &auth {
+            AdapterAuth::Bearer(v) => {
+                assert!(v.is_sensitive());
+                assert_eq!(v.to_str().unwrap(), format!("Bearer {FS_TOKEN_5948}"));
+            }
+            other => panic!("expected Bearer, got {other:?}"),
+        }
+        assert!(!format!("{auth:?}").contains(FS_TOKEN_5948));
+        let broken = AdapterAuth::resolve(Err(
+            "TRIVY_ADAPTER_TOKEN_FILE points at /nope, but the file could not be read".into(),
+        ));
+        assert!(broken.unusable().unwrap().contains("/nope"));
+        let bad = AdapterAuth::bearer("line\nbreak");
+        assert!(bad.unusable().is_some());
+        assert!(!format!("{bad:?}").contains("break"));
+    }
+
+    /// The `_FILE` form (#4142) reaches the header.
+    #[test]
+    fn test_adapter_token_file_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("adapter-token");
+        std::fs::write(&file, format!("{FS_TOKEN_5948}\n")).unwrap();
+        let var = "TEST_ADAPTER_TOKEN_5948";
+        // A variable name no other test uses.
+        std::env::remove_var(var);
+        std::env::set_var(format!("{var}_FILE"), &file);
+        let auth = AdapterAuth::resolve(crate::config::secret_or_env(var));
+        std::env::remove_var(format!("{var}_FILE"));
+        match auth {
+            AdapterAuth::Bearer(v) => {
+                assert_eq!(v.to_str().unwrap(), format!("Bearer {FS_TOKEN_5948}"))
+            }
+            other => panic!("expected Bearer, got {other:?}"),
+        }
+    }
+
+    /// Filesystem scans send the token on the probe, the upload and the
+    /// polls; a refused token fails the scan and stays out of the error.
+    #[tokio::test]
+    async fn test_fs_requests_carry_bearer_token() {
+        use wiremock::matchers::header;
+        let bearer = format!("Bearer {FS_TOKEN_5948}");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/probe/ready"))
+            .and(header("authorization", bearer.as_str()))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/filesystem/scan"))
+            .and(header("authorization", bearer.as_str()))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({"id": "f1"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/v1/filesystem/scan/.+/report$"))
+            .and(header("authorization", bearer.as_str()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"report": {"Results": []}, "stderr": ""})),
+            )
+            .mount(&server)
+            .await;
+        ScannerAdapterFsClient::with_auth(server.uri(), AdapterAuth::bearer(FS_TOKEN_5948))
+            .scan_workspace_tar(tiny_tar())
+            .await
+            .expect("an authenticated fs scan must complete");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        for r in &requests {
+            assert_eq!(
+                r.headers.get("authorization").and_then(|v| v.to_str().ok()),
+                Some(bearer.as_str())
+            );
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/probe/ready"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/filesystem/scan"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("invalid bearer token"))
+            .mount(&server)
+            .await;
+        let err = ScannerAdapterFsClient::with_auth(server.uri(), AdapterAuth::bearer("wrong-one"))
+            .scan_workspace_tar(tiny_tar())
+            .await
+            .expect_err("a refused token fails the fs scan");
+        let msg = err.to_string();
+        assert!(msg.contains("401"), "{msg}");
+        assert!(!msg.contains("wrong-one"), "{msg}");
+
+        let err = ScannerAdapterFsClient::with_auth(
+            server.uri(),
+            AdapterAuth::Unusable(
+                "TRIVY_ADAPTER_TOKEN_FILE points at /x, but the file is empty".into(),
+            ),
+        )
+        .scan_workspace_tar(tiny_tar())
+        .await
+        .expect_err("an unusable token fails before any request");
+        assert!(
+            matches!(err, AppError::ScannerEngineUnavailable(_)),
+            "{err:?}"
+        );
+    }
 
     fn tiny_tar() -> Vec<u8> {
         let dir = tempfile::tempdir().unwrap();
