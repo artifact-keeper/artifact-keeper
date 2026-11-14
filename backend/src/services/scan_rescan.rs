@@ -37,7 +37,7 @@ const TICK_LOCK_KEY: i64 = 0x5947_5ca9;
 /// How far back [`observed_builds`] looks for databases scanners reported
 /// with a scan (the adapter reports its Trivy DB that way, not by probe). Only
 /// how a new build is learned: [`refresh_builds`] keeps it after that.
-const OBSERVED_WINDOW_HOURS: f64 = 48.0;
+const OBSERVED_WINDOW_HOURS: i32 = 48;
 
 /// One scan type's current database build.
 pub type Build = (String, DateTime<Utc>);
@@ -49,7 +49,9 @@ pub async fn observed_builds(db: &PgPool) -> Result<Vec<Build>> {
         r#"
         SELECT scan_type, MAX(vuln_db_published_at)
         FROM scan_results
-        WHERE created_at > NOW() - make_interval(hours => $1)
+        -- `make_interval`'s `hours` is an integer: a float8 bind has no
+        -- matching function (#5992).
+        WHERE created_at > NOW() - make_interval(hours => $1::int)
           AND status = 'completed'
           AND vuln_db_published_at IS NOT NULL
           AND (vuln_db_version IS NULL OR vuln_db_version NOT LIKE 'live:%')
@@ -810,6 +812,96 @@ mod tests {
             "the newest scan is on the current build"
         );
         assert!(rescan_digests(&pool).await.is_empty());
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(r)
+            .execute(&pool)
+            .await
+            .unwrap();
+        reset(&pool).await;
+    }
+
+    /// #5992: `observed_builds` against real Postgres. A Trivy (`image`)
+    /// build a recent scan recorded is observed. The query used to bind
+    /// `make_interval(hours => float8)`, which Postgres rejects, so every
+    /// tick failed and the adapter's builds never reached
+    /// `scan_vuln_db_builds`. A row older than the window and a live-feed row
+    /// are not observed.
+    #[tokio::test]
+    async fn observed_builds_reads_a_recent_trivy_build_from_postgres() {
+        let Some(pool) = try_pool().await else { return };
+        reset(&pool).await;
+        let r = repo(&pool).await;
+        // Far-future builds, so no other test's row can be the maximum.
+        let trivy_at = at("2099-01-02T03:04:05Z");
+        let stale_at = at("2099-06-01T00:00:00Z");
+        let live_at = at("2099-07-01T00:00:00Z");
+        let insert = |scan_type: &'static str,
+                      version: &'static str,
+                      built: DateTime<Utc>,
+                      age: &'static str| {
+            let pool = pool.clone();
+            async move {
+                let id = Uuid::new_v4();
+                let d = digest('t');
+                sqlx::query(
+                    "INSERT INTO artifacts (id, repository_id, path, name, size_bytes, \
+                     checksum_sha256, content_type, storage_key) \
+                     VALUES ($1, $2, $3, $3, 1, $4, 'application/octet-stream', $3)",
+                )
+                .bind(id)
+                .bind(r)
+                .bind(format!("obs/{id}"))
+                .bind(&d)
+                .execute(&pool)
+                .await
+                .expect("artifact");
+                sqlx::query(
+                    "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
+                     checksum_sha256, completed_at, created_at, vuln_db_version, \
+                     vuln_db_published_at) \
+                     VALUES ($1, $2, $3, 'completed', $4, NOW(), NOW() - $5::interval, $6, $7)",
+                )
+                .bind(id)
+                .bind(r)
+                .bind(scan_type)
+                .bind(&d)
+                .bind(age)
+                .bind(version)
+                .bind(built)
+                .execute(&pool)
+                .await
+                .expect("scan row");
+            }
+        };
+        insert("image", "trivy-db-v2", trivy_at, "1 minute").await;
+        insert("malware", "probe-db", stale_at, "3 days").await;
+        insert("dependency", "live:osv", live_at, "1 minute").await;
+
+        let observed = observed_builds(&pool)
+            .await
+            .expect("observed_builds must run on Postgres");
+        let of = |t: &str| observed.iter().find(|(s, _)| s == t).map(|(_, at)| *at);
+        assert_eq!(of("image"), Some(trivy_at), "{observed:?}");
+        assert_ne!(
+            of("malware"),
+            Some(stale_at),
+            "outside the window: {observed:?}"
+        );
+        assert_ne!(
+            of("dependency"),
+            Some(live_at),
+            "a live feed has no build: {observed:?}"
+        );
+
+        // And it reaches the persisted builds, which is what rescans compare.
+        let builds = refresh_builds(&pool, &merge_builds(vec![], observed))
+            .await
+            .expect("record");
+        assert!(
+            builds.contains(&("image".to_string(), trivy_at)),
+            "{builds:?}"
+        );
 
         sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(r)
