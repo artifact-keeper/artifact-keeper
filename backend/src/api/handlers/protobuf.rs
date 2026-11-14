@@ -3988,14 +3988,16 @@ mod tests {
             return;
         };
         // The handler takes the body raw now that it serves both Connect
-        // codecs (#5066); no Content-Type selects the JSON one.
+        // codecs (#5066); `application/json` selects the JSON one.
         let request = serde_json::json!({
             "moduleRefs": [{ "id": "mod\u{0}ule" }],
         });
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
         let response = get_modules(
             State(fx.state.clone()),
             Path(fx.repo_key.clone()),
-            HeaderMap::new(),
+            headers,
             Bytes::from(serde_json::to_vec(&request).expect("encode request")),
         )
         .await
