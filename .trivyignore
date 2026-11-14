@@ -25,7 +25,10 @@
 #
 # * These are deliberately NOT suppressed in the backend service binary, the
 #   scanner-adapter binary (rebuilt from source with a patched Go toolchain on
-#   every build), or in the UBI/Alpine base OS packages. Only
+#   every build), or in the UBI/Alpine base OS packages. The one exception is
+#   the time-boxed krb5-libs block near the bottom (#5991): Red Hat has
+#   published the fix but not yet to the UBI repositories CI builds from,
+#   and every entry there expires on its own. Otherwise only
 #   bundled-scanner-binary CVEs are listed, and since #3352 the bar for
 #   listing one is no longer "no fixed *tool release* exists" — both binaries
 #   are now built by us, so that is nearly always true and stopped
@@ -235,6 +238,51 @@
 # — the precise failure mode this file's header warns about. If they ever
 # appear against a backend image whose version label matches current main,
 # that is a real regression: investigate, do not add a line here.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# TIME-BOXED base-OS exception (#5991): krb5-libs in the UBI 9 runtime images.
+#
+# Backend (docker/Dockerfile.backend) and OpenSCAP (docker/Dockerfile.openscap)
+# both ship krb5-libs-1.21.1-10.el9_8.1, and Trivy reports the 14 CVEs below
+# as HIGH, fixed in 1.21.1-10.el9_9.2. That build is in the entitled RHEL 9
+# BaseOS repositories only. Measured 2026-11-14: the UBI 9 BaseOS repository
+# (cdn-ubi.redhat.com .../ubi9/9/{x86_64,aarch64}/baseos/os, repomd revision
+# of 2026-11-11) carries el9_8.1 and nothing newer, ubi9/ubi:9.9 ships el9_8.1
+# too, and CentOS Stream 9 BaseOS tops out at 1.21.1-10.el9. Unentitled CI
+# has no fixed RPM to install, so neither a base-image bump nor the
+# rootfs-builder `upgrade -y` can clear these today.
+#
+# Why they are not reachable in these images: krb5-libs is present ONLY as a
+# shared-library dependency of libcurl and of libssh and cyrus-sasl-lib, which
+# libcurl itself pulls in (curl for the backend HEALTHCHECK; openscap-scanner's
+# remote-content fetch). Neither image ships a KDC or
+# kadmind (krb5-server is not installed), no keytab or krb5.conf realm is
+# configured, and nothing uses GSSAPI/Negotiate: the backend binary uses
+# rustls and does not link libkrb5. Every CVE below is a KDC or kadmind
+# server-side bug (ASN.1/XDR decoding, RPCSEC_GSS, AUTH_GSSAPI, KDB keytab,
+# CAMMAC authentication indicators).
+#
+# Retirement: the rootfs-builder `upgrade -y` (both Dockerfiles) installs
+# el9_9.2 on the first build after Red Hat syncs it to UBI, with no
+# Dockerfile change. Then replace these lines with `# RETIRED:` tombstones.
+# If that has not happened by the expiry date, the entries stop applying and
+# the publish gate goes red again on purpose: re-measure, do not just move
+# the date.
+CVE-2026-107364 exp:2026-12-14
+CVE-2026-112315 exp:2026-12-14
+CVE-2026-112316 exp:2026-12-14
+CVE-2026-112317 exp:2026-12-14
+CVE-2026-112318 exp:2026-12-14
+CVE-2026-112319 exp:2026-12-14
+CVE-2026-112320 exp:2026-12-14
+CVE-2026-112321 exp:2026-12-14
+CVE-2026-112322 exp:2026-12-14
+CVE-2026-112323 exp:2026-12-14
+CVE-2026-118380 exp:2026-12-14
+CVE-2026-119079 exp:2026-12-14
+CVE-2026-71199 exp:2026-12-14
+CVE-2026-71200 exp:2026-12-14
 # ---------------------------------------------------------------------------
 
 # ===========================================================================
