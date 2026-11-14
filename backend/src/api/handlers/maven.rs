@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Extension;
@@ -2942,7 +2942,16 @@ async fn download(
     // honours the client's `Range` through the shared helper (#5668): a
     // segmented download (Maven Resolver's, a download manager's) of a
     // 200-with-the-whole-body otherwise stitches the file together wrong.
-    let served = serve_artifact(&state, &repo, &repo_key, &path, auth.as_ref(), &ctx).await?;
+    let served = serve_artifact(
+        &state,
+        &repo,
+        &repo_key,
+        &path,
+        auth.as_ref(),
+        &headers,
+        &ctx,
+    )
+    .await?;
     proxy_helpers::apply_range_to_streamed_serve(served, &headers, ctx.is_head)
 }
 
@@ -4098,6 +4107,7 @@ async fn serve_artifact(
     repo_key: &str,
     path: &str,
     auth: Option<&AuthExtension>,
+    request_headers: &HeaderMap,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     // Only a HOSTED repo owns rows in the `artifacts` table. Remote (proxy)
@@ -4151,6 +4161,11 @@ async fn serve_artifact(
                     )
                     .await
                     .map_err(|e| e.into_response())?;
+                    if let Some(not_modified) =
+                        hosted_artifact_not_modified(request_headers, &resolved.checksum_sha256)
+                    {
+                        return Ok(not_modified);
+                    }
                     let storage = state
                         .storage_for_repo(&repo.storage_location())
                         .map_err(|e| e.into_response())?;
@@ -4184,14 +4199,14 @@ async fn serve_artifact(
                         || format!("{repo_key}/{}", resolved.path),
                     )?;
 
-                    let ct = content_type_for_path(path);
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, ct)
-                        .header(CONTENT_LENGTH, content.len().to_string())
-                        .header("X-Checksum-SHA256", &resolved.checksum_sha256)
-                        .body(Body::from(content))
-                        .unwrap());
+                    let headers = hosted_artifact_headers(
+                        path,
+                        content.len() as i64,
+                        &resolved.checksum_sha256,
+                        None,
+                        None,
+                    );
+                    return Ok((StatusCode::OK, headers, Body::from(content)).into_response());
                 }
                 None
             }
@@ -4622,6 +4637,12 @@ async fn serve_artifact(
         .await
         .map_err(|e| e.into_response())?;
 
+    if let Some(not_modified) =
+        hosted_artifact_not_modified(request_headers, &artifact.checksum_sha256)
+    {
+        return Ok(not_modified);
+    }
+
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
@@ -4662,21 +4683,79 @@ async fn serve_artifact(
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, ctx).await;
 
-    let ct = content_type_for_path(path);
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, ct)
-        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
-        .header("X-Checksum-SHA256", &artifact.checksum_sha256);
+    let headers = hosted_artifact_headers(
+        path,
+        artifact.size_bytes,
+        &artifact.checksum_sha256,
+        artifact.checksum_md5.as_deref(),
+        artifact.checksum_sha1.as_deref(),
+    );
+    Ok((StatusCode::OK, headers, Body::from_stream(stream)).into_response())
+}
 
-    if let Some(ref md5) = artifact.checksum_md5 {
-        builder = builder.header("X-Checksum-MD5", md5);
-    }
-    if let Some(ref sha1) = artifact.checksum_sha1 {
-        builder = builder.header("X-Checksum-SHA1", sha1);
-    }
+/// `Cache-Control` of a hosted artifact. A SNAPSHOT alias can point at new
+/// bytes at any time, so a client may keep a copy but revalidates it, which
+/// the ETag makes a 304
+const HOSTED_ARTIFACT_CACHE_CONTROL: &str = "no-cache";
 
-    Ok(builder.body(Body::from_stream(stream)).unwrap())
+/// The strong ETag of a hosted artifact, its quoted SHA-256 (#5871)
+fn hosted_artifact_etag(checksum_sha256: &str) -> String {
+    format!("\"{checksum_sha256}\"")
+}
+
+/// The 304 for a hosted artifact the client already holds (#5871). Only
+/// called once the download gate passed, so a blocked artifact stays 403
+fn hosted_artifact_not_modified(
+    request_headers: &HeaderMap,
+    checksum_sha256: &str,
+) -> Option<Response> {
+    cache_headers::check_conditional_request_with(
+        request_headers,
+        &hosted_artifact_etag(checksum_sha256),
+        HOSTED_ARTIFACT_CACHE_CONTROL,
+        None,
+    )
+}
+
+/// Response headers of a hosted artifact: type, length, ETag and checksums
+fn hosted_artifact_headers(
+    path: &str,
+    size_bytes: i64,
+    checksum_sha256: &str,
+    checksum_md5: Option<&str>,
+    checksum_sha1: Option<&str>,
+) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static(content_type_for_path(path)),
+    );
+    headers.insert(CONTENT_LENGTH, HeaderValue::from(size_bytes));
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static(HOSTED_ARTIFACT_CACHE_CONTROL),
+    );
+    let checksums = [
+        (ETAG, Some(hosted_artifact_etag(checksum_sha256))),
+        (
+            HeaderName::from_static("x-checksum-sha256"),
+            Some(checksum_sha256.to_string()),
+        ),
+        (
+            HeaderName::from_static("x-checksum-md5"),
+            checksum_md5.map(str::to_string),
+        ),
+        (
+            HeaderName::from_static("x-checksum-sha1"),
+            checksum_sha1.map(str::to_string),
+        ),
+    ];
+    for (name, value) in checksums {
+        if let Some(value) = value.and_then(|v| HeaderValue::from_str(&v).ok()) {
+            headers.insert(name, value);
+        }
+    }
+    headers
 }
 
 /// Whether a Maven checksum (`*.md5` / `*.sha1`) for an artifact should be
@@ -10461,6 +10540,135 @@ mod tests {
                 "#4288: a failed -SNAPSHOT alias lookup must fail closed, got Ok({:?})",
                 target.map(|t| t.path)
             ),
+        }
+    }
+
+    /// #5871: a hosted artifact carries its SHA-256 as a strong ETag on the
+    /// exact path and on the SNAPSHOT alias, and a matching If-None-Match
+    /// answers 304 with no body. A blocked artifact stays 403 whatever the
+    /// client holds
+    #[tokio::test]
+    async fn test_hosted_download_etag_and_not_modified_5871() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (hosted_id, hosted_key, hosted_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        tdh::publish_repo(&pool, hosted_id).await;
+        let state = tdh::build_state(pool.clone(), hosted_dir.to_str().unwrap());
+        let hosted = tdh::make_repo_info(hosted_id, &hosted_key, &hosted_dir, "local", None);
+        let jar_path = "com/example/etag5871/lib/1.0/lib-1.0.jar";
+        let snap_path = "com/example/etag5871/snap/1.0-SNAPSHOT/snap-1.0-20260101.120000-1.jar";
+        let snap_alias = "com/example/etag5871/snap/1.0-SNAPSHOT/snap-1.0-SNAPSHOT.jar";
+        let mut probes = Vec::new();
+        for (path, version, route) in [
+            (jar_path, "1.0", jar_path),
+            (snap_path, "1.0-SNAPSHOT", snap_alias),
+        ] {
+            let id = tdh::seed_artifact(
+                &state,
+                &pool,
+                &hosted,
+                &format!("maven/{path}"),
+                path,
+                "etag5871",
+                version,
+                "application/java-archive",
+                Bytes::from(format!("bytes:{path}")),
+                user_id,
+            )
+            .await;
+            let sha256: String =
+                sqlx::query_scalar("SELECT checksum_sha256 FROM artifacts WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("stored sha256");
+            probes.push((format!("/{hosted_key}/{route}"), format!("\"{sha256}\"")));
+        }
+        let app = tdh::router_anon(super::router(), state);
+        let conditional = |route: &str, tag: &str| {
+            axum::http::Request::builder()
+                .method("GET")
+                .uri(route)
+                .header(axum::http::header::IF_NONE_MATCH, tag)
+                .body(Body::empty())
+                .expect("conditional GET")
+        };
+
+        let mut observed = Vec::new();
+        for (route, etag) in &probes {
+            let (plain, _, headers) =
+                tdh::send_with_headers(app.clone(), tdh::get(route.clone())).await;
+            let served_etag = headers
+                .get(axum::http::header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let (matched, matched_body, _) =
+                tdh::send_with_headers(app.clone(), conditional(route, etag)).await;
+            let (other, _, _) =
+                tdh::send_with_headers(app.clone(), conditional(route, "\"stale\"")).await;
+            observed.push((
+                route.clone(),
+                etag.clone(),
+                plain,
+                served_etag,
+                matched,
+                matched_body,
+                other,
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', true, false, true)",
+        )
+        .bind(format!("etag-5871-maven-{hosted_id}"))
+        .bind(hosted_id)
+        .execute(&pool)
+        .await
+        .expect("insert block_unscanned policy");
+        let mut blocked = Vec::new();
+        for (route, etag) in &probes {
+            let (status, _, _) =
+                tdh::send_with_headers(app.clone(), conditional(route, etag)).await;
+            blocked.push((route.clone(), status));
+        }
+
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(hosted_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_member_repo(&pool, hosted_id, &hosted_dir).await;
+        tdh::cleanup_user(&pool, user_id).await;
+
+        for (route, etag, plain, served_etag, matched, matched_body, other) in observed {
+            assert_eq!(plain, StatusCode::OK, "GET {route}");
+            assert_eq!(
+                served_etag.as_deref(),
+                Some(etag.as_str()),
+                "ETag of {route}"
+            );
+            assert_eq!(
+                matched,
+                StatusCode::NOT_MODIFIED,
+                "If-None-Match {etag} on {route}"
+            );
+            assert!(matched_body.is_empty(), "a 304 has no body ({route})");
+            assert_eq!(
+                other,
+                StatusCode::OK,
+                "a stale tag gets the bytes ({route})"
+            );
+        }
+        for (route, status) in blocked {
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "a blocked artifact must stay 403, never 304 ({route})"
+            );
         }
     }
 
