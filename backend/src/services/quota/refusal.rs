@@ -83,6 +83,13 @@ fn non_negative(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
 
+/// `Some(upload)` when a refused write of `upload` bytes was refused only
+/// because it does not fit in the space left (usage still below a finite
+/// limit); `None` when the quota itself is reached or the size is unknown.
+fn does_not_fit(limit: u64, used: u64, upload: Option<u64>) -> Option<u64> {
+    upload.filter(|n| *n > 0 && used < limit)
+}
+
 impl QuotaRefusal {
     fn base(kind: RefusalKind, message: String, limit_bytes: u64) -> Self {
         Self {
@@ -102,13 +109,37 @@ impl QuotaRefusal {
 
     /// The instance storage quota refuses a write.
     pub fn instance_storage(limit_bytes: u64, used_bytes: u64, help_url: Option<String>) -> Self {
-        let message = format!(
-            "{}: {} of {} used. Delete artifacts or raise the quota to upload again. \
-             Downloads are not affected.",
-            QuotaScope::Instance.exceeded_message(),
-            format_bytes(used_bytes),
-            format_bytes(limit_bytes),
-        );
+        Self::instance_storage_write(limit_bytes, used_bytes, None, help_url)
+    }
+
+    /// The instance storage quota refuses a write that would add `upload`
+    /// bytes (`None` when unknown). Below the quota the message says the
+    /// upload does not fit in the space left, rather than that the quota is
+    /// reached: smaller uploads still succeed.
+    pub fn instance_storage_write(
+        limit_bytes: u64,
+        used_bytes: u64,
+        upload: Option<u64>,
+        help_url: Option<String>,
+    ) -> Self {
+        let message = match does_not_fit(limit_bytes, used_bytes, upload) {
+            Some(upload) => format!(
+                "This upload ({}) would exceed the storage quota: {} of {} used, {} free. \
+                 Smaller uploads still fit; delete artifacts or raise the quota to upload \
+                 this one. Downloads are not affected.",
+                format_bytes(upload),
+                format_bytes(used_bytes),
+                format_bytes(limit_bytes),
+                format_bytes(limit_bytes - used_bytes),
+            ),
+            None => format!(
+                "{}: {} of {} used. Delete artifacts or raise the quota to upload again. \
+                 Downloads are not affected.",
+                QuotaScope::Instance.exceeded_message(),
+                format_bytes(used_bytes),
+                format_bytes(limit_bytes),
+            ),
+        };
         Self {
             scope: Some("instance"),
             used_bytes: Some(used_bytes),
@@ -117,12 +148,24 @@ impl QuotaRefusal {
         }
     }
 
+    /// This refusal with the refused request's declared `Content-Length`
+    /// (`content_length` in the body), when known.
+    pub fn with_content_length(mut self, content_length: Option<u64>) -> Self {
+        self.content_length = content_length;
+        self
+    }
+
     /// The refusal a storage-quota denial answers with.
     pub fn from_denial(denial: &QuotaDenial) -> Self {
         let limit = non_negative(denial.limit_bytes);
         let used = non_negative(denial.used_bytes);
         match denial.scope {
-            QuotaScope::Instance => Self::instance_storage(limit, used, super::storage::help_url()),
+            QuotaScope::Instance => Self::instance_storage_write(
+                limit,
+                used,
+                denial.additional_bytes,
+                super::storage::help_url(),
+            ),
             QuotaScope::Repository | QuotaScope::Project => {
                 let (scope, subject) = match denial.scope {
                     QuotaScope::Project => (
@@ -142,13 +185,25 @@ impl QuotaRefusal {
                             .unwrap_or_else(|| "the repository".to_string()),
                     ),
                 };
-                let message = format!(
-                    "{}: {subject} uses {} of its {} quota. Delete artifacts from it or \
-                     raise its quota to upload again. Downloads are not affected.",
-                    denial.scope.exceeded_message(),
-                    format_bytes(used),
-                    format_bytes(limit),
-                );
+                let message = match does_not_fit(limit, used, denial.additional_bytes) {
+                    Some(upload) => format!(
+                        "This upload ({}) would exceed the storage quota of {subject}: it uses \
+                         {} of its {} quota, {} free. Smaller uploads still fit; delete \
+                         artifacts from it or raise its quota to upload this one. Downloads \
+                         are not affected.",
+                        format_bytes(upload),
+                        format_bytes(used),
+                        format_bytes(limit),
+                        format_bytes(limit - used),
+                    ),
+                    None => format!(
+                        "{}: {subject} uses {} of its {} quota. Delete artifacts from it or \
+                         raise its quota to upload again. Downloads are not affected.",
+                        denial.scope.exceeded_message(),
+                        format_bytes(used),
+                        format_bytes(limit),
+                    ),
+                };
                 Self {
                     scope: Some(scope),
                     repository: denial.repository.clone(),
@@ -436,6 +491,88 @@ mod tests {
             denial.into_error(),
             crate::error::AppError::QuotaRefused(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn an_upload_that_does_not_fit_says_so_below_the_quota() {
+        const MIB: u64 = 1 << 20;
+        // 97.5 % used, a 256 MiB upload: refused because it does not fit,
+        // not because the quota is reached.
+        let used = 10 * GIB - 256 * MIB;
+        let refusal = QuotaRefusal::instance_storage_write(10 * GIB, used, Some(512 * MIB), None)
+            .with_content_length(Some(512 * MIB));
+        let (status, body) = json_of(refusal.into_response()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "code": "STORAGE_QUOTA_EXCEEDED",
+                "message": "This upload (512.0 MiB) would exceed the storage quota: 9.8 GiB of \
+                            10.0 GiB used, 256.0 MiB free. Smaller uploads still fit; delete \
+                            artifacts or raise the quota to upload this one. Downloads are not \
+                            affected.",
+                "scope": "instance",
+                "limit_bytes": 10 * GIB,
+                "used_bytes": used,
+                "content_length": 512 * MIB,
+            })
+        );
+
+        // At the quota the size does not matter: the quota is reached.
+        for upload in [Some(1), Some(GIB), None] {
+            let at = QuotaRefusal::instance_storage_write(10 * GIB, 10 * GIB, upload, None);
+            assert!(at
+                .message
+                .starts_with("Storage quota reached: 10.0 GiB of 10.0 GiB used."));
+        }
+        // An unknown or empty size keeps the reached wording, and no
+        // content_length is invented.
+        let unknown =
+            QuotaRefusal::instance_storage_write(100, 60, None, None).with_content_length(None);
+        assert!(unknown.message.starts_with("Storage quota reached"));
+        assert!(unknown.body().get("content_length").is_none());
+        assert!(QuotaRefusal::instance_storage_write(100, 60, Some(0), None)
+            .message
+            .starts_with("Storage quota reached"));
+
+        // The same from an instance denial that knows the write's size.
+        let denial = QuotaDenial::new(QuotaScope::Instance, 100, 60).with_additional(41);
+        assert!(denial.refusal().message.starts_with(
+            "This upload (41 bytes) would exceed the storage quota: 60 bytes of \
+                          100 bytes used, 40 bytes free."
+        ));
+    }
+
+    #[test]
+    fn a_repository_upload_that_does_not_fit_says_so_below_its_quota() {
+        let mut denial = QuotaDenial::new(QuotaScope::Repository, 100, 60).with_additional(50);
+        denial.repository = Some("libs".into());
+        let refusal = denial.refusal();
+        assert_eq!(refusal.code(), "QUOTA_EXCEEDED");
+        assert_eq!(
+            refusal.message,
+            "This upload (50 bytes) would exceed the storage quota of repository 'libs': it \
+             uses 60 bytes of its 100 bytes quota, 40 bytes free. Smaller uploads still fit; \
+             delete artifacts from it or raise its quota to upload this one. Downloads are not \
+             affected."
+        );
+        let refusal = refusal.with_content_length(Some(50));
+        assert_eq!(refusal.body()["content_length"], 50);
+        assert_eq!(refusal.body()["used_bytes"], 60);
+
+        let mut denial = QuotaDenial::new(QuotaScope::Project, 100, 100).with_additional(1);
+        denial.project = Some("team".into());
+        assert!(denial
+            .refusal()
+            .message
+            .starts_with("Project storage quota exceeded: project 'team' uses 100 bytes"));
+        // A non-positive size is not recorded.
+        assert_eq!(
+            QuotaDenial::new(QuotaScope::Repository, 1, 1)
+                .with_additional(-5)
+                .additional_bytes,
+            None
+        );
     }
 
     #[tokio::test]

@@ -177,7 +177,7 @@ async fn repository_refusal(
     Ok(RepositoryService::new(db.clone())
         .quota_preflight(repo_id, additional)
         .await?
-        .map(|denial| denial.refusal()))
+        .map(|denial| denial.refusal().with_content_length(Some(declared))))
 }
 
 /// The refusal, if any, of a write that declares `declared` bytes.
