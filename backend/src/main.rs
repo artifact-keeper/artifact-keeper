@@ -1317,6 +1317,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         state.event_bus.clone(),
         advisory_client.clone(),
         state.proxy_service.clone(),
+        state.npm_packument_cache.clone(),
     );
 
     // Drains the durable scan queue (migration 362) when SCAN_QUEUE_ENABLED and
