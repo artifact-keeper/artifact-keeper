@@ -5614,8 +5614,10 @@ fn sidecar_digest_token(body: &[u8]) -> Option<String> {
 ///   else is 409, exactly what re-uploading the released file answers.
 /// * The body does not name the digest the artifact row stores for this
 ///   algorithm: 400. Maven and Gradle upload each sidecar after its file, so
-///   the row is there to compare against. SHA-512 has no stored digest and
-///   is not compared.
+///   the row is there to compare against. SHA-512 has no stored digest, so a
+///   `.sha512` naming a digest is held to a hash of the stored artifact
+///   (#5776), up to [`MAX_SHA512_ON_DEMAND_BYTES`]. Above that, or when the
+///   artifact cannot be read, it is not compared and a stored one keeps its 409.
 async fn check_checksum_sidecar_upload(
     db: &PgPool,
     storage: &dyn crate::storage::StorageBackend,
@@ -5631,8 +5633,8 @@ async fn check_checksum_sidecar_upload(
         return Ok(SidecarUpload::Store);
     }
     let row = sqlx::query(
-        "SELECT checksum_sha256, checksum_sha1, checksum_md5 FROM artifacts \
-         WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        "SELECT checksum_sha256, checksum_sha1, checksum_md5, storage_key, size_bytes \
+         FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
     )
     .bind(repo_id)
     .bind(base_path)
@@ -5655,7 +5657,7 @@ async fn check_checksum_sidecar_upload(
             .flatten(),
         ChecksumType::Sha512 => None,
     };
-    let expected = expected.map(|e| e.trim().to_ascii_lowercase());
+    let mut expected = expected.map(|e| e.trim().to_ascii_lowercase());
     let suffix = checksum_suffix(checksum_type);
     let uploaded = if staged.size_bytes() <= MAX_CHECKSUM_SIDECAR_BYTES {
         let body = staged
@@ -5666,6 +5668,8 @@ async fn check_checksum_sidecar_upload(
     } else {
         None
     };
+    // Hashed at most once, and only once an upload names a digest to compare
+    let mut sha512_pending = matches!(checksum_type, ChecksumType::Sha512) && uploaded.is_some();
 
     if !crate::services::cache_classifier::maven_coordinate_is_republishable(base_path)
         && storage
@@ -5677,6 +5681,9 @@ async fn check_checksum_sidecar_upload(
         if uploaded.is_some() && uploaded == stored {
             return Ok(SidecarUpload::AlreadyStored);
         }
+        if std::mem::take(&mut sha512_pending) {
+            expected = stored_artifact_sha512(storage, &row).await;
+        }
         let corrects_stored = expected.is_some() && uploaded == expected && stored != expected;
         if !corrects_stored {
             return Err(AppError::Conflict(format!(
@@ -5687,6 +5694,9 @@ async fn check_checksum_sidecar_upload(
         }
     }
 
+    if sha512_pending {
+        expected = stored_artifact_sha512(storage, &row).await;
+    }
     let Some(expected) = expected else {
         return Ok(SidecarUpload::Store);
     };
@@ -5698,6 +5708,36 @@ async fn check_checksum_sidecar_upload(
         .into_response());
     }
     Ok(SidecarUpload::Store)
+}
+
+/// Largest artifact a `.sha512` upload is checked against by hashing it (#5776)
+const MAX_SHA512_ON_DEMAND_BYTES: i64 = 512 * 1024 * 1024;
+
+/// SHA-512 of the stored artifact behind a sidecar's `artifacts` row, `None`
+/// when it is over [`MAX_SHA512_ON_DEMAND_BYTES`] or cannot be read
+async fn stored_artifact_sha512(
+    storage: &dyn crate::storage::StorageBackend,
+    row: &sqlx::postgres::PgRow,
+) -> Option<String> {
+    use sqlx::Row;
+
+    let size: i64 = row.try_get("size_bytes").ok()?;
+    if size > MAX_SHA512_ON_DEMAND_BYTES {
+        return None;
+    }
+    let key: String = row.try_get("storage_key").ok()?;
+    let mut stream = storage.get_stream(&key).await.ok()?;
+    let mut hasher = sha2::Sha512::new();
+    let mut read = 0usize;
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        let chunk = chunk.ok()?;
+        read += chunk.len();
+        if read as i64 > MAX_SHA512_ON_DEMAND_BYTES {
+            return None;
+        }
+        hasher.update(&chunk);
+    }
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 /// What [`check_checksum_sidecar_upload`] decided for an allowed upload.
@@ -14983,6 +15023,86 @@ mod tests {
             good_sha1,
             "the served .sha1 is the deploy's, never the forged one"
         );
+    }
+
+    /// #5776. FAILS BEFORE THE FIX: with no stored SHA-512 the deploy's own
+    /// `.sha512` got 409 behind a wrong one sent before the jar, and a wrong
+    /// `.sha512` after the jar was stored unchecked
+    #[tokio::test]
+    async fn test_sha512_sidecar_is_checked_against_the_stored_jar_5776() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let dir = "com/example/shop5776/shop-core";
+        let jar_at = |version: &str| format!("{dir}/{version}/shop-core-{version}.jar");
+        let jar = bytes::Bytes::from_static(b"released shop-core jar bytes 5776");
+        let good = compute_checksum(&jar, ChecksumType::Sha512);
+        let wrong = "0".repeat(128);
+        let other = "1".repeat(128);
+
+        let put = |path: String, body: bytes::Bytes| {
+            let app = fx.router_with_auth(super::router());
+            let uri = format!("/{}/{path}", fx.repo_key);
+            async move {
+                let (status, body) = tdh::send(app, tdh::put(uri, body)).await;
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+        let text = |v: &str| bytes::Bytes::from(v.to_string());
+
+        let mut steps: Vec<(&str, StatusCode, StatusCode, String)> = Vec::new();
+        let (s, b) = put(format!("{}.sha512", jar_at("1.0.0")), text(&wrong)).await;
+        steps.push(("a wrong .sha512 before its jar", StatusCode::CREATED, s, b));
+        let (s, b) = put(jar_at("1.0.0"), jar.clone()).await;
+        steps.push(("deploy the release jar", StatusCode::CREATED, s, b));
+        let (s, b) = put(format!("{}.sha512", jar_at("1.0.0")), text(&good)).await;
+        steps.push(("the deploy's own .sha512", StatusCode::CREATED, s, b));
+        let (s, b) = put(format!("{}.sha512", jar_at("1.0.0")), text(&good)).await;
+        steps.push(("a retried .sha512", StatusCode::OK, s, b));
+        let (s, b) = put(format!("{}.sha512", jar_at("1.0.0")), text(&other)).await;
+        steps.push(("a different .sha512", StatusCode::CONFLICT, s, b));
+
+        let (s, b) = put(jar_at("1.0.1"), jar.clone()).await;
+        steps.push(("deploy a second release jar", StatusCode::CREATED, s, b));
+        let (s, b) = put(format!("{}.sha512", jar_at("1.0.1")), text(&wrong)).await;
+        let mismatch = b.clone();
+        steps.push((
+            "a wrong .sha512 after its jar",
+            StatusCode::BAD_REQUEST,
+            s,
+            b,
+        ));
+
+        // Over the cap nothing is hashed, the sidecar is stored as before
+        let (s, b) = put(jar_at("1.0.2"), jar.clone()).await;
+        steps.push(("deploy a third release jar", StatusCode::CREATED, s, b));
+        sqlx::query("UPDATE artifacts SET size_bytes = $3 WHERE repository_id = $1 AND path = $2")
+            .bind(fx.repo_id)
+            .bind(jar_at("1.0.2"))
+            .bind(MAX_SHA512_ON_DEMAND_BYTES + 1)
+            .execute(&fx.pool)
+            .await
+            .expect("mark the jar as over the hashing cap");
+        let (s, b) = put(format!("{}.sha512", jar_at("1.0.2")), text(&wrong)).await;
+        steps.push(("a .sha512 of a jar over the cap", StatusCode::CREATED, s, b));
+
+        let app = fx.router_with_auth(super::router());
+        let (gs, served) = tdh::send(
+            app,
+            tdh::get(format!("/{}/{}.sha512", fx.repo_key, jar_at("1.0.0"))),
+        )
+        .await;
+        fx.teardown().await;
+
+        for (what, want, got, body) in &steps {
+            assert_eq!(got, want, "{what}: body={body}");
+        }
+        assert!(mismatch.contains("Checksum mismatch"), "{mismatch}");
+        assert_eq!(gs, StatusCode::OK);
+        assert_eq!(String::from_utf8_lossy(&served).trim(), good);
     }
 
     /// #5678: a released artifact's stored sidecar answered 409 even to a
