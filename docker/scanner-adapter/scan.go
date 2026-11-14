@@ -75,8 +75,9 @@ func buildRef(registryURL, repository, tag, digest string) (string, error) {
 	}
 }
 
-// buildArgs returns the trivy CLI arguments for scanning imageRef.
-func (s *Scanner) buildArgs(imageRef string) []string {
+// buildArgs returns the trivy CLI arguments for scanning imageRef in the
+// analysis-cache partition partition ("" for none; see imagePartition).
+func (s *Scanner) buildArgs(imageRef, partition string) []string {
 	args := []string{
 		"image",
 		"--format", "json",
@@ -94,7 +95,7 @@ func (s *Scanner) buildArgs(imageRef string) []string {
 	if s.cfg.DBRepository != "" {
 		args = append(args, "--db-repository", s.cfg.DBRepository)
 	}
-	args = append(args, s.cfg.clientArgs()...)
+	args = append(args, s.cfg.clientArgs(partition)...)
 	args = append(args, imageRef)
 	return args
 }
@@ -134,17 +135,57 @@ func (c *Config) dbUpdateArgs() []string {
 
 // clientArgs returns the flags shared by every scan invocation for the
 // client/server settings: `--server` when a trivy server is configured, and the
-// cache-partition `--skip-dirs` entry when a partition is configured.
-func (c *Config) clientArgs() []string {
+// cache-partition `--skip-dirs` entry when partition is non-empty.
+func (c *Config) clientArgs(partition string) []string {
 	var args []string
 	if c.TrivyServer != "" {
 		args = append(args, "--server", c.TrivyServer)
 	}
-	if c.CachePartition != "" {
-		args = append(args, "--skip-dirs", cachePartitionDir(c.CachePartition))
+	if partition != "" {
+		args = append(args, "--skip-dirs", cachePartitionDir(partition))
 	}
 	return args
 }
+
+// imagePartition returns the analysis-cache partition of an image scan
+// pulled from registryURL (#5943). Static mode: CachePartition for every
+// scan. Registry mode: CachePartition + "|" + the normalized registry host,
+// so two registry hosts never share a partition, the same host always maps
+// to the same one whatever scheme or trailing slash the URL carries, and the
+// operator-set value still keeps two adapter fleets apart. The partition
+// also applies to the standalone on-disk cache (trivy keys it the same way).
+//
+// The host is the one trivy pulls from: a forged layer analysis can only be
+// planted under a host's partition by an image served from that host.
+//
+// A request with no registry host (an empty registry.url, which no Artifact
+// Keeper backend sends) carries nothing to derive a partition from and falls
+// back to CachePartition, exactly as in static mode.
+func (c *Config) imagePartition(registryURL string) string {
+	if c.CachePartitionMode != partitionModeRegistry {
+		return c.CachePartition
+	}
+	host := partitionHost(registryURL)
+	if host == "" {
+		return c.CachePartition
+	}
+	return c.CachePartition + "|" + host
+}
+
+// partitionHost normalizes a registry URL to the host key of a registry-mode
+// partition: trimRegistryHost (scheme and trailing slash dropped, port kept)
+// and lowercased, since host names are case-insensitive.
+func partitionHost(registryURL string) string {
+	return strings.ToLower(trimRegistryHost(strings.TrimSpace(registryURL)))
+}
+
+// fsPartition returns the analysis-cache partition of a filesystem scan:
+// CachePartition in both modes. A filesystem upload names no registry, and it
+// needs no per-request partition: trivy reuses a cached filesystem analysis
+// only for a workspace that is a clean git repository (keyed by its HEAD
+// commit), and in registry mode the upload's root .git is not extracted, so
+// every filesystem scan is analyzed from the uploaded files (#5943).
+func (c *Config) fsPartition() string { return c.CachePartition }
 
 // cachePartitionDir maps a cache partition to the `--skip-dirs` pattern that
 // carries it. trivy folds the skip-dirs list into every analysis cache key, so
@@ -368,12 +409,13 @@ func (s *Scanner) Scan(ctx context.Context, req *ScanRequest) (*HarborScanReport
 			defer s.imageCacheMu.Unlock()
 		}
 	}
-	stdout, stderr, localDB, err := s.runImageScan(ctx, imageRef, cred.env, memoryCache)
+	partition := s.cfg.imagePartition(req.Registry.URL)
+	stdout, stderr, localDB, err := s.runImageScan(ctx, imageRef, partition, cred.env, memoryCache)
 	if err != nil && !memoryCache && trivyCacheLocked(stderr) {
 		// The lock is held outside this process (another adapter replica or
 		// a trivy run sharing the cache volume): retry without the cache.
 		log.Printf("trivy analysis cache in %s is locked by another process; rescanning %s with the memory cache backend", s.cfg.CacheDir, imageRef)
-		stdout, stderr, localDB, err = s.runImageScan(ctx, imageRef, cred.env, true)
+		stdout, stderr, localDB, err = s.runImageScan(ctx, imageRef, partition, cred.env, true)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("trivy scan failed for %s: %v: %s", imageRef, err, strings.TrimSpace(stderr))
@@ -404,12 +446,13 @@ func (s *Scanner) Scan(ctx context.Context, req *ScanRequest) (*HarborScanReport
 	return report, nil
 }
 
-// runImageScan runs one `trivy image` invocation for imageRef with the extra
-// credential env, on the on-disk analysis cache or, when memoryCache is set,
+// runImageScan runs one `trivy image` invocation for imageRef in the given
+// cache partition with the extra credential env, on the on-disk analysis
+// cache or, when memoryCache is set,
 // on trivy's memory cache backend. It returns stdout, stderr, the local DB
 // provenance (see runLocked) and the run error.
-func (s *Scanner) runImageScan(ctx context.Context, imageRef string, env []string, memoryCache bool) (string, string, *VulnDBInfo, error) {
-	args := s.buildArgs(imageRef)
+func (s *Scanner) runImageScan(ctx context.Context, imageRef, partition string, env []string, memoryCache bool) (string, string, *VulnDBInfo, error) {
+	args := s.buildArgs(imageRef, partition)
 	if memoryCache {
 		args = withMemoryCache(args)
 	}
@@ -484,7 +527,7 @@ func (s *Scanner) buildFsArgs(dir string) []string {
 	}
 	args = append(args, s.cfg.dbUpdateArgs()...)
 	args = append(args, noLookupArgs...)
-	args = append(args, s.cfg.clientArgs()...)
+	args = append(args, s.cfg.clientArgs(s.cfg.fsPartition())...)
 	return append(args, dir)
 }
 

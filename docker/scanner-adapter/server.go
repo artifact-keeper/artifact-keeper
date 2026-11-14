@@ -128,6 +128,9 @@ func (s *Server) handleMetadata(w http.ResponseWriter, _ *http.Request) {
 			ConsumesMimeTypes: []string{ociManifestMimeType, dockerManifestMimeType},
 			ProducesMimeTypes: []string{reportMimeType},
 		}},
+		Properties: map[string]string{
+			cachePartitionModeProperty: s.cfg.CachePartitionMode,
+		},
 	}
 	writeJSON(w, http.StatusOK, meta)
 }
@@ -220,7 +223,7 @@ func (s *Server) handleFsScan(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to secure scan workspace", http.StatusInternalServerError)
 		return
 	}
-	if err := untarWorkspace(body, dir); err != nil {
+	if err := untarWorkspaceOpts(body, dir, s.cfg.CachePartitionMode == partitionModeRegistry); err != nil {
 		_ = os.RemoveAll(dir)
 		// An over-cap body surfaces here as a read error from MaxBytesReader.
 		http.Error(w, "invalid workspace tar: "+err.Error(), http.StatusBadRequest)

@@ -81,7 +81,7 @@ func TestBuildArgs(t *testing.T) {
 		Insecure:     true,
 		SkipDBUpdate: true,
 	}
-	args := strings.Join(NewScanner(cfg).buildArgs("backend:8080/repo:tag"), " ")
+	args := strings.Join(NewScanner(cfg).buildArgs("backend:8080/repo:tag", ""), " ")
 	for _, want := range []string{
 		"image", "--format json", "--scanners vuln", "--severity HIGH,CRITICAL",
 		"--timeout 5m0s", "--cache-dir /cache", "--quiet", "--insecure",
@@ -104,7 +104,7 @@ func TestNoLookupArgsOnEveryScan(t *testing.T) {
 	} {
 		s := NewScanner(cfg)
 		for name, args := range map[string][]string{
-			"image":      s.buildArgs("backend:8080/repo:tag"),
+			"image":      s.buildArgs("backend:8080/repo:tag", ""),
 			"filesystem": s.buildFsArgs("/work"),
 		} {
 			joined := strings.Join(args, " ")
@@ -119,7 +119,7 @@ func TestNoLookupArgsOnEveryScan(t *testing.T) {
 
 func TestBuildArgsOmitsOptionalFlags(t *testing.T) {
 	cfg := &Config{Severity: "LOW", ScanTimeout: time.Minute, CacheDir: "/c"}
-	args := strings.Join(NewScanner(cfg).buildArgs("ref"), " ")
+	args := strings.Join(NewScanner(cfg).buildArgs("ref", ""), " ")
 	if strings.Contains(args, "--insecure") {
 		t.Error("--insecure should be absent when Insecure=false")
 	}
@@ -134,7 +134,7 @@ func TestBuildArgsOmitsOptionalFlags(t *testing.T) {
 func TestBuildArgsIncludesDBRepository(t *testing.T) {
 	cfg := &Config{Severity: "LOW", ScanTimeout: time.Minute, CacheDir: "/c",
 		DBRepository: "ghcr.io/artifact-keeper/trivy-db"}
-	args := strings.Join(NewScanner(cfg).buildArgs("ref"), " ")
+	args := strings.Join(NewScanner(cfg).buildArgs("ref", ""), " ")
 	if !strings.Contains(args, "--db-repository ghcr.io/artifact-keeper/trivy-db") {
 		t.Errorf("expected --db-repository in args; got: %s", args)
 	}
