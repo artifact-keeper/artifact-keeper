@@ -18997,6 +18997,144 @@ mod db_cov_tests {
         std::fs::create_dir_all(&fx.storage_dir).expect("recreate storage dir");
     }
 
+    /// Admin auth for the trash and lifecycle handlers
+    fn admin_auth(fx: &tdh::Fixture) -> crate::api::middleware::auth::AuthExtension {
+        let mut auth = tdh::make_auth(fx.user_id, &fx.username);
+        auth.is_admin = true;
+        auth
+    }
+
+    /// A Virtual over one published Local with `package` 1.0.0 and 2.0.0
+    async fn virtual_with_two_versions(
+        fx: &tdh::Fixture,
+        package: &str,
+    ) -> (uuid::Uuid, String, std::path::PathBuf) {
+        let (member_id, member_key, member_dir) = attach_local_member(fx).await;
+        for version in ["1.0.0", "2.0.0"] {
+            let published = super::publish_package(
+                &fx.state,
+                Some(tdh::make_auth(fx.user_id, &fx.username)),
+                &member_key,
+                package,
+                &axum::http::HeaderMap::new(),
+                publish_body(package, version),
+            )
+            .await;
+            assert!(published.is_ok(), "publish {version} must succeed");
+        }
+        (member_id, member_key, member_dir)
+    }
+
+    /// #5779. FAILS BEFORE THE FIX: a version restored from the trash stayed
+    /// out of the Virtual's cached packument until the entry expired
+    #[tokio::test]
+    async fn trash_restore_invalidates_the_virtual_packument_5779() {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "trash-restore-5779";
+        let (member_id, member_key, member_dir) = virtual_with_two_versions(&fx, package).await;
+
+        // Into the trash behind the handlers' back, then a fresh Virtual entry without it
+        let trashed: uuid::Uuid = sqlx::query_scalar(
+            "UPDATE artifacts SET is_deleted = true \
+             WHERE repository_id = $1 AND name = $2 AND version = '1.0.0' RETURNING id",
+        )
+        .bind(member_id)
+        .bind(package)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("trash 1.0.0");
+        super::invalidate_packument_caches(&fx.state, member_id, &member_key, package).await;
+        let (_, _, warm) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
+        assert!(warm["versions"]["1.0.0"].is_null(), "got {warm:?}");
+        assert!(warm["versions"]["2.0.0"].is_object(), "got {warm:?}");
+
+        let restored = crate::api::handlers::trash::restore_trashed_artifact(
+            State(fx.state.clone()),
+            Extension(admin_auth(&fx)),
+            Path(trashed),
+        )
+        .await;
+        assert!(restored.is_ok(), "trash restore must succeed");
+        let (_, _, after) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
+        assert!(
+            after["versions"]["1.0.0"].is_object(),
+            "a trash restore must invalidate the Virtual packument; got {after:?}"
+        );
+
+        cleanup_member(&fx, member_id, &member_dir).await;
+        fx.teardown().await;
+    }
+
+    /// #5779. FAILS BEFORE THE FIX: a retention sweep left the swept version
+    /// in the Virtual's cached packument until the entry expired
+    #[tokio::test]
+    async fn retention_sweep_invalidates_the_virtual_packument_5779() {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "retention-sweep-5779";
+        let (member_id, _, member_dir) = virtual_with_two_versions(&fx, package).await;
+        sqlx::query(
+            "UPDATE artifacts SET created_at = NOW() - INTERVAL '30 days', \
+             updated_at = NOW() - INTERVAL '30 days' \
+             WHERE repository_id = $1 AND name = $2 AND version = '1.0.0'",
+        )
+        .bind(member_id)
+        .bind(package)
+        .execute(&fx.pool)
+        .await
+        .expect("age 1.0.0");
+        let (_, _, warm) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
+        assert!(warm["versions"]["1.0.0"].is_object(), "got {warm:?}");
+
+        let policy = crate::services::lifecycle_service::LifecycleService::new(fx.pool.clone())
+            .create_policy(
+                crate::services::lifecycle_service::CreateLifecyclePolicyRequest {
+                    applies_to_all: false,
+                    repository_ids: None,
+                    repository_id: Some(member_id),
+                    name: format!("expire-7d-{}", member_id.simple()),
+                    description: None,
+                    policy_type: "max_age_days".to_string(),
+                    config: serde_json::json!({"days": 7}),
+                    priority: None,
+                    cron_schedule: None,
+                    enabled: None,
+                },
+            )
+            .await
+            .expect("create lifecycle policy");
+        let run = crate::api::handlers::lifecycle::execute_policy(
+            State(fx.state.clone()),
+            Extension(admin_auth(&fx)),
+            Path(policy.id),
+        )
+        .await
+        .expect("execute policy");
+        assert_eq!(run.0.artifacts_removed, 1, "{:?}", run.0);
+        let (_, _, after) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
+        assert!(
+            after["versions"]["1.0.0"].is_null(),
+            "a retention sweep must invalidate the Virtual packument; got {after:?}"
+        );
+        assert!(after["versions"]["2.0.0"].is_object(), "got {after:?}");
+
+        let _ = sqlx::query("DELETE FROM lifecycle_policies WHERE id = $1")
+            .bind(policy.id)
+            .execute(&fx.pool)
+            .await;
+        cleanup_member(&fx, member_id, &member_dir).await;
+        fx.teardown().await;
+    }
+
     /// End-to-end #2162 stale-while-revalidate on a remote repo: with a zero
     /// fresh window every warm hit classifies as stale, so the handler must
     /// serve the cached body immediately (no inline upstream fetch) and

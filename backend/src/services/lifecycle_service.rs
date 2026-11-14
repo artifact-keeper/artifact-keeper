@@ -1341,6 +1341,10 @@ pub struct LifecycleService {
     proxy_service: Option<std::sync::Arc<crate::services::proxy_service::ProxyService>>,
     /// Candidates per page of a live proxy-cache sweep.
     proxy_cache_page_size: i64,
+    /// Dropped for every npm package a sweep removes versions of (#5779).
+    /// See [`LifecycleService::with_npm_packument_cache`].
+    npm_packument_cache:
+        Option<std::sync::Arc<crate::services::npm_packument_cache::NpmPackumentCache>>,
 }
 
 impl LifecycleService {
@@ -1349,7 +1353,19 @@ impl LifecycleService {
             db,
             proxy_service: None,
             proxy_cache_page_size: proxy_cache::EVICTION_PAGE_SIZE,
+            npm_packument_cache: None,
         }
+    }
+
+    /// The npm packument cache a sweep invalidates (#5779). Without it a
+    /// Local's packument, and that of every Virtual serving it, keeps listing
+    /// a swept version until the cache entry expires
+    pub fn with_npm_packument_cache(
+        mut self,
+        cache: Option<std::sync::Arc<crate::services::npm_packument_cache::NpmPackumentCache>>,
+    ) -> Self {
+        self.npm_packument_cache = cache;
+        self
     }
 
     /// Execute a policy (dry_run=true previews without deleting).
@@ -1609,6 +1625,8 @@ impl LifecycleService {
         // naming it (ETARGET for clients) and the catalog's Latest on it.
         if result.artifacts_removed > 0 {
             self.retract_swept_versions(repository_id, deleted_at).await;
+            self.invalidate_swept_packuments(repository_id, deleted_at)
+                .await;
         }
 
         Ok(result)
@@ -1646,6 +1664,54 @@ impl LifecycleService {
             }
         };
         ArtifactService::retract_deleted_versions(&self.db, repository_id, &swept).await;
+    }
+
+    /// Drop the cached packument of every npm package a sweep of
+    /// `repository_id` removed versions of in the transaction stamped
+    /// `deleted_at` (#5779), in the repository and every Virtual serving it,
+    /// as the per-artifact delete does. Best effort, the deletions are committed
+    async fn invalidate_swept_packuments(&self, repository_id: Uuid, deleted_at: DateTime<Utc>) {
+        let Some(cache) = self.npm_packument_cache.as_ref() else {
+            return;
+        };
+        let swept: std::result::Result<Vec<(String, String)>, sqlx::Error> = sqlx::query_as(
+            "SELECT DISTINCT r.key, a.path FROM artifacts a \
+             JOIN repositories r ON r.id = a.repository_id \
+             WHERE a.repository_id = $1 AND r.format::text = 'npm' \
+               AND a.is_deleted = true AND a.deleted_at >= $2",
+        )
+        .bind(repository_id)
+        .bind(deleted_at)
+        .fetch_all(&self.db)
+        .await;
+        let swept = match swept {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    "Lifecycle: failed to list the npm versions swept from repository {}: {}",
+                    repository_id,
+                    e
+                );
+                return;
+            }
+        };
+        let packages: std::collections::BTreeSet<(&str, &str)> = swept
+            .iter()
+            .filter_map(|(key, path)| {
+                crate::api::handlers::npm::npm_package_name_from_artifact_path(path)
+                    .map(|package| (key.as_str(), package))
+            })
+            .collect();
+        for (key, package) in packages {
+            crate::services::npm_packument_cache::invalidate_package_and_virtuals(
+                &self.db,
+                cache,
+                repository_id,
+                key,
+                package,
+            )
+            .await;
+        }
     }
 
     /// Dispatch to the per-type implementation against a single

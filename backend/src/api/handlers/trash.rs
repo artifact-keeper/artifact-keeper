@@ -130,6 +130,7 @@ pub async fn restore_trashed_artifact(
     auth.require_admin()?;
     require_trashed_in_token_scope(&state, &auth, id).await?;
     let restored = trash_service(&state).restore(id).await?;
+    invalidate_restored_packument(&state, &restored).await;
 
     let entry = AuditEntry::new(AuditAction::ArtifactRestored, ResourceType::Artifact)
         .user(auth.user_id)
@@ -228,6 +229,38 @@ pub(crate) async fn audit_purge(
             uploaded_by: None,
         });
     audit_fire_and_forget(state.db.clone(), entry).await;
+}
+
+/// A restored npm version is back in its packument, so the cached one, and
+/// that of every Virtual serving the repository, has to go (#5779)
+async fn invalidate_restored_packument(state: &SharedState, restored: &TrashedArtifact) {
+    let format: Option<String> =
+        sqlx::query_scalar("SELECT format::text FROM repositories WHERE id = $1")
+            .bind(restored.repository_id)
+            .fetch_optional(&state.db)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "Trash restore: failed to read the format of repository {}: {}",
+                    restored.repository_id,
+                    e
+                );
+                None
+            });
+    if format.as_deref() != Some("npm") {
+        return;
+    }
+    if let Some(package) =
+        crate::api::handlers::npm::npm_package_name_from_artifact_path(&restored.path)
+    {
+        crate::api::handlers::npm::invalidate_packument_caches(
+            state,
+            restored.repository_id,
+            &restored.repository_key,
+            package,
+        )
+        .await;
+    }
 }
 
 #[cfg(ak_test_shard = "handlers-2")]

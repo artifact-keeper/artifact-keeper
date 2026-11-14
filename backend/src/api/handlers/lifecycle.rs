@@ -46,7 +46,9 @@ pub struct LifecycleApiDoc;
 /// The lifecycle service with the proxy cache attached, so a run can evict
 /// Remote repositories' cached objects (#3734).
 fn lifecycle_service(state: &SharedState) -> LifecycleService {
-    LifecycleService::new(state.db.clone()).with_proxy_service(state.proxy_service.clone())
+    LifecycleService::new(state.db.clone())
+        .with_proxy_service(state.proxy_service.clone())
+        .with_npm_packument_cache(state.npm_packument_cache.clone())
 }
 
 pub fn router() -> Router<SharedState> {
