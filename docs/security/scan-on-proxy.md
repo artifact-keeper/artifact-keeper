@@ -550,7 +550,10 @@ other job is claimed first. The worker scans the digest once, with the scanners
 that have a vulnerability database, and gives every artifact row in this
 instance that holds it the fresh result (at most 1000 rows a job, newest first;
 in practice only the empty file's digest is that common); the earlier results
-stay. Rescans hold at most half a worker's `SCAN_WORKER_CONCURRENCY` slots (one
+stay. The copy follows the usual reuse rules, so a fresh result that cataloged
+nothing (`not_cataloged`, for example a package the CVE engine found no
+components in) is not copied: every row holding that digest is scanned on its
+own, as two uploads of those bytes would be. Rescans hold at most half a worker's `SCAN_WORKER_CONCURRENCY` slots (one
 on a single-slot worker), and the selection runs beside the claim loop, never in
 it. Most recently downloaded digests go first, at most
 `SCAN_RESCAN_MAX_PER_DAY` a day across all workers, and each digest once per
