@@ -1676,7 +1676,10 @@ mod tests {
     async fn the_enqueue_and_the_worker_agree_on_manifest_rows() {
         let Some(pool) = try_pool().await else { return };
         let repo = fresh_queue(&pool).await;
-        let seed = |path: &'static str, digest: &'static str| {
+        // `artifacts.checksum_sha256` is CHAR(64): real-length digests, so the
+        // value read back is the value written.
+        let (slash01, plain01, file01) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        let seed = |path: &'static str, digest: String| {
             let pool = pool.clone();
             async move {
                 let id = Uuid::new_v4();
@@ -1695,9 +1698,9 @@ mod tests {
                 id
             }
         };
-        let slashed = seed("/v2/img/manifests/1.0", "slash01").await;
-        let plain = seed("v2/img/manifests/1.1", "plain01").await;
-        let file = seed("pkg/file-1.0.tgz", "file01").await;
+        let slashed = seed("/v2/img/manifests/1.0", slash01.clone()).await;
+        let plain = seed("v2/img/manifests/1.1", plain01.clone()).await;
+        let file = seed("pkg/file-1.0.tgz", file01.clone()).await;
         for id in [slashed, plain, file] {
             crate::services::scanner_service::enqueue_scan_on_upload(&pool, repo, id)
                 .await
@@ -1712,20 +1715,12 @@ mod tests {
         assert_eq!(
             jobs,
             vec![
-                (
-                    "hosted_image".to_string(),
-                    Some("plain01".to_string()),
-                    None
-                ),
-                (
-                    "hosted_image".to_string(),
-                    Some("slash01".to_string()),
-                    None
-                ),
+                ("hosted_image".to_string(), Some(slash01.clone()), None),
+                ("hosted_image".to_string(), Some(plain01.clone()), None),
                 ("hosted_upload".to_string(), None, Some(file)),
             ]
         );
-        for (digest, id) in [("slash01", slashed), ("plain01", plain)] {
+        for (digest, id) in [(&slash01, slashed), (&plain01, plain)] {
             let rows: Vec<Uuid> = sqlx::query_scalar(HOSTED_IMAGE_ROWS_SQL)
                 .bind(repo)
                 .bind(digest)
