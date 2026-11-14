@@ -104,6 +104,9 @@ pub enum AuditAction {
     /// An instance administrator released such a lock: handed a policy back
     /// to the repository's admins, or reopened a review (#4238).
     AgeGateLockReleased,
+    /// A user asked for a package exception (migration 381). Distinct from
+    /// `AgeGateQueued`, which is a gate noticing rather than a human asking.
+    ExceptionRequested,
 
     // Authorization decisions (#2366 functional audit log). Recorded when an
     // authenticated principal is refused a privileged operation (e.g. a
@@ -407,6 +410,7 @@ impl AuditAction {
             AuditAction::AgeGateReopened => "AGE_GATE_REOPENED",
             AuditAction::AgeGateLockSet => "AGE_GATE_LOCK_SET",
             AuditAction::AgeGateLockReleased => "AGE_GATE_LOCK_RELEASED",
+            AuditAction::ExceptionRequested => "EXCEPTION_REQUESTED",
             AuditAction::PermissionDenied => "PERMISSION_DENIED",
             AuditAction::CurationSyncTriggered => "CURATION_SYNC_TRIGGERED",
             AuditAction::CurationVersionCreated => "CURATION_VERSION_CREATED",

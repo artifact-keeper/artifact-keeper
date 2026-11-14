@@ -974,12 +974,21 @@ async fn enforce_go_zip_age_gate(
     )
     .await?;
     if let Some(blocked) = lkg_opt {
+        let request_url = crate::services::exception_queue::exception_request_url(
+            &state.db,
+            crate::services::age_gate_service::GATE_AGE,
+            &params.key,
+            module,
+            version,
+        )
+        .await;
         return Err(proxy_helpers::age_gate_blocked_response(
             blocked.review_id,
             module,
             version,
             params.age_gate_min_age_days,
             None,
+            request_url.as_deref(),
         ));
     }
     Ok(())

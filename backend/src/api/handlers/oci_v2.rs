@@ -12226,16 +12226,25 @@ fn oci_manifest_synthetic_artifact(
 /// `curation_blocked_response`, which is unconditionally `FORBIDDEN`.
 /// Sibling of [`oci_scan_deny_response`].
 fn oci_curation_deny_response(block: &proxy_helpers::CurationBlock) -> Response {
+    // `errors[0].message` is what `docker pull` prints, so the link goes in
+    // the sentence rather than only in `detail`: this is the one format where
+    // the operator reliably sees the body.
+    let ask = block
+        .request_url
+        .as_deref()
+        .map(|u| format!(" Request an exception: {u}"))
+        .unwrap_or_default();
     oci_error_detail(
         StatusCode::FORBIDDEN,
         "DENIED",
         &format!(
-            "curation_blocked: pull of {} is blocked by this repository's curation policy: {}",
-            block.package, block.reason
+            "curation_blocked: pull of {} is blocked by this repository's curation policy: {}.{}",
+            block.package, block.reason, ask
         ),
         Some(serde_json::json!({
             "package": block.package,
             "reason": block.reason,
+            "exception_request_url": block.request_url,
         })),
     )
 }
@@ -12244,15 +12253,29 @@ fn oci_curation_deny_response(block: &proxy_helpers::CurationBlock) -> Response 
 /// clients surface. Status is preserved: 403 = cached/inline vulnerable
 /// verdict, 423 = inconclusive under fail-closed (scan pending/failed —
 /// retry; never unscanned bytes).
-fn oci_scan_deny_response(status: StatusCode, image_ref: &str) -> Response {
+fn oci_scan_deny_response(
+    status: StatusCode,
+    image_ref: &str,
+    request_url: Option<&str>,
+) -> Response {
+    // The shared seam sets a link only on a 403 or on a 423 that can never clear
+    let ask = request_url
+        .map(|u| format!(". Request an exception: {u}"))
+        .unwrap_or_default();
     if status == StatusCode::FORBIDDEN {
         oci_error(
             StatusCode::FORBIDDEN,
             "DENIED",
             &format!(
-                "pull of {} blocked by scan policy: vulnerabilities found",
-                image_ref
+                "pull of {} blocked by scan policy: vulnerabilities found{}",
+                image_ref, ask
             ),
+        )
+    } else if request_url.is_some() {
+        oci_error(
+            StatusCode::LOCKED,
+            "DENIED",
+            &format!("pull of {image_ref} withheld: image cannot be scanned{ask}"),
         )
     } else {
         oci_error(
@@ -12522,7 +12545,18 @@ async fn gate_oci_proxy_manifest_scan(
     {
         proxy_helpers::ProxyScanServeOutcome::Serve(served) => Ok(served),
         proxy_helpers::ProxyScanServeOutcome::Deny(resp) => {
-            Err(oci_scan_deny_response(resp.status(), &image_ref))
+            // The shared seam already resolved the link and put it on the
+            // header; read it back rather than resolving a second time.
+            let request_url = resp
+                .headers()
+                .get(proxy_helpers::EXCEPTION_URL_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            Err(oci_scan_deny_response(
+                resp.status(),
+                &image_ref,
+                request_url.as_deref(),
+            ))
         }
     }
 }
@@ -16854,6 +16888,7 @@ mod tests {
         let resp = oci_curation_deny_response(&proxy_helpers::CurationBlock {
             package: "someimage".to_string(),
             reason: "blocked by test rule".to_string(),
+            request_url: None,
         });
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
@@ -39462,14 +39497,27 @@ mod proxy_scan_block_tests {
         ));
     }
 
+    #[tokio::test]
+    async fn test_oci_unscannable_423_carries_the_exception_link() {
+        let resp = oci_scan_deny_response(
+            StatusCode::LOCKED,
+            "app:latest",
+            Some("https://ak.example/exceptions/request"),
+        );
+        assert_eq!(resp.status(), StatusCode::LOCKED);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("Request an exception: https://ak.example/exceptions/request"));
+    }
+
     #[test]
     fn test_oci_scan_deny_response_statuses() {
         assert_eq!(
-            oci_scan_deny_response(StatusCode::FORBIDDEN, "app:latest").status(),
+            oci_scan_deny_response(StatusCode::FORBIDDEN, "app:latest", None).status(),
             StatusCode::FORBIDDEN
         );
         assert_eq!(
-            oci_scan_deny_response(StatusCode::LOCKED, "app:latest").status(),
+            oci_scan_deny_response(StatusCode::LOCKED, "app:latest", None).status(),
             StatusCode::LOCKED
         );
     }

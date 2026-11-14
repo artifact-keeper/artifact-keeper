@@ -78,6 +78,7 @@ Responses:
 | Clean | `200` | `X-AK-Scan: clean` |
 | Served before a verdict exists (fail-open, record-only) | `200` | `X-AK-Scan: pending` |
 | Vulnerable, record-only | `200` | `X-AK-Scan: recorded` |
+| Vulnerable, released by an approved package exception | `200` | `X-AK-Scan: recorded` |
 | Vulnerable and blocked by the policy | `403` | `{"error": "scan_blocked", "file": ...}` |
 | No conclusive verdict under fail-closed | `423` | `{"error": "scan_pending", "file": ...}`; retry later |
 | Scan still queued or running under fail-closed, npm tarball routes | `503` | The same `scan_pending` body with `Retry-After: 5`; see [Clients that do not retry a `423`](#clients-that-do-not-retry-a-423) |
@@ -287,6 +288,18 @@ and the package's digest), the NuGet digest-pinned row repair, and an OCI blob
 pull of a blocked image (the entry names `<image>@<blob digest>`). OCI
 manifest pulls go through the shared gate. A Docker schema1 manifest refused
 under scan-on-proxy has no verdict and writes no entry.
+
+## Package exceptions
+
+A refused pull (`403 scan_blocked`, or a `423 scan_pending` that cannot clear because no
+scanner is configured or the scan failed) files a row on the package-exception queue, and
+the response carries `exception_request_url` and an `X-AK-Exception-Request` header. A
+holder of `security_review` (the `security-reviewer` role) or an instance administrator
+decides it under `/api/v1/exceptions/reviews`. An approved row serves exactly the refused
+digest under that package version until `expires_at`, with `X-AK-Scan: recorded`; other
+bytes under the same version are refused again. The verdict and its findings are not
+changed. Unlike a finding acknowledgement (see [download holds](download-holds.md)), an
+exception covers the whole verdict for those bytes, not one advisory.
 
 ## Previewing enforcement
 
@@ -607,7 +620,9 @@ hit, a cached metadata hit.
   | Anything else: none, stale, unprovable, `clean` graded on nothing, `clean` graded as a coordinate only the request names (Go, Composer, Conan, Debian, RPM, Alpine) or graded without one | redirect declined | redirected | redirected |
 
   A declined redirect is not an error: the request is answered by the next
-  path, which reads the body itself. A `403` answered here is audited
+  path, which reads the body itself. A blocking verdict whose digest has an
+  approved, unexpired package exception in that Remote declines the redirect,
+  so the gated path decides it. A `403` answered here is audited
   (`PROXY_SCAN_BLOCKED`) and counted in `ak_proxy_scan_verdicts_total`.
   Verdict reads on these paths are memoised per digest, so a new verdict
   reaches them within 30 seconds.

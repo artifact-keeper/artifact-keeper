@@ -1662,6 +1662,14 @@ fn api_v1_routes(
                 auth_middleware,
             )),
         )
+        // Plain auth, not admin: a non-admin security reviewer decides exceptions, each handler checks it
+        .nest(
+            "/exceptions",
+            handlers::age_gate::exceptions_router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
         // Package curation routes with auth middleware
         .nest(
             "/curation",

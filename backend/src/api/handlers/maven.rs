@@ -1562,21 +1562,31 @@ async fn enforce_maven_age_gate(
     let blocked =
         proxy_helpers::enforce_age_gate(svc, params, &target.package, &target.version, basis)
             .await?;
-    match blocked {
-        None => Ok(()),
-        Some(blocked) => Err(proxy_helpers::age_gate_blocked_response(
-            blocked.review_id,
-            &target.package,
-            &target.version,
-            params.age_gate_min_age_days,
-            basis.map(|b| {
-                crate::services::age_gate_service::AgeGateService::package_age_days(
-                    b,
-                    chrono::Utc::now(),
-                )
-            }),
-        )),
-    }
+    let Some(blocked) = blocked else {
+        return Ok(());
+    };
+    // Resolved only on the refusal path, so a served pull pays nothing.
+    let request_url = crate::services::exception_queue::exception_request_url(
+        &state.db,
+        crate::services::age_gate_service::GATE_AGE,
+        &params.key,
+        &target.package,
+        &target.version,
+    )
+    .await;
+    Err(proxy_helpers::age_gate_blocked_response(
+        blocked.review_id,
+        &target.package,
+        &target.version,
+        params.age_gate_min_age_days,
+        basis.map(|b| {
+            crate::services::age_gate_service::AgeGateService::package_age_days(
+                b,
+                chrono::Utc::now(),
+            )
+        }),
+        request_url.as_deref(),
+    ))
 }
 
 /// The age gate of a Remote repository for a request `path` (#4702): a no-op
