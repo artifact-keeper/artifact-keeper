@@ -1,7 +1,11 @@
 # Incus image scanning
 
 The Incus scanner (`INCUS_SCANNER_ENABLED`, on by default) scans uploaded
-Incus/LXC images for OS-package vulnerabilities. It extracts the image's
+Incus/LXC images for OS-package vulnerabilities. It applies to artifacts in
+Incus and LXC repositories only: a package archive whose path merely looks
+like `<product>/<version>/<file>` (a PyPI sdist such as
+`pyyaml/5.3.1/PyYAML-5.3.1.tar.gz`) is never treated as a rootfs (#5644).
+It extracts the image's
 root filesystem into the scan workspace and runs Trivy over it, either the
 local CLI or the scanner-adapter. VM disk images (QCOW2/IMG) and
 metadata-only tarballs are skipped.
