@@ -145,12 +145,20 @@ fn popular_skeleton(name: &str) -> String {
     use std::sync::{LazyLock, RwLock};
     static CACHE: LazyLock<RwLock<HashMap<String, String>>> =
         LazyLock::new(|| RwLock::new(HashMap::new()));
-    if let Ok(cache) = CACHE.read() {
-        if let Some(hit) = cache.get(name) {
-            return hit.clone();
+    let full = match CACHE.read() {
+        Ok(cache) => {
+            if let Some(hit) = cache.get(name) {
+                return hit.clone();
+            }
+            cache.len() >= POPULAR_SKELETON_CACHE_MAX
         }
-    }
+        Err(_) => true,
+    };
     let skeleton = confusable_skeleton(name);
+    // A full cache takes no write lock: misses past the bound only compute.
+    if full {
+        return skeleton;
+    }
     if let Ok(mut cache) = CACHE.write() {
         if cache.len() < POPULAR_SKELETON_CACHE_MAX {
             cache.insert(name.to_string(), skeleton.clone());

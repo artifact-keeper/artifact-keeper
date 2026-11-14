@@ -10167,7 +10167,9 @@ fn curation_verdict(
             reason: eval.reason,
         }),
         ("review", Some(rule_id)) => {
-            tracing::info!(
+            // `warn`, like the fail-open line above: a flagged download is
+            // served, so deployments that log at warn must still see it.
+            tracing::warn!(
                 repo_id = %target.id,
                 repo_key = %target.key,
                 package = %package,

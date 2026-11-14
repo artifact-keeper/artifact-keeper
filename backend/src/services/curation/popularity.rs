@@ -296,6 +296,9 @@ pub fn evaluate_name_only(
     let Some(ecosystem) = ecosystem_for_format(format) else {
         return CurationDecision::NotApplicable;
     };
+    if !is_checkable_name(ecosystem, name) {
+        return CurationDecision::NotApplicable;
+    }
     let cfg = PopularityConfig::parse(config, ecosystem);
     if !cfg.typosquat_check {
         return CurationDecision::NotApplicable;
@@ -320,6 +323,51 @@ pub fn evaluate_name_only(
         CurationDecision::Block(reasons.join("; "))
     } else {
         CurationDecision::Flag(reasons.join("; "))
+    }
+}
+
+/// Longest package name the download-path name checks look at, in bytes:
+/// npm's published limit, and far beyond any real PyPI project name.
+const MAX_CHECKED_NAME_BYTES: usize = 214;
+
+/// Whether the download-path name checks should look at `name` at all.
+///
+/// The checks cost name length times popular-list length (edit distance and
+/// skeletons), and a download runs them before the format handler has
+/// validated the name, so an unbounded name from an anonymous request would
+/// tie up a worker. Anything that cannot be a real package name gets no
+/// verdict ([`CurationDecision::NotApplicable`]) and goes on to the format's
+/// own handling unchanged:
+///
+/// * any name over [`MAX_CHECKED_NAME_BYTES`];
+/// * on PyPI, a name outside PEP 508, which the PyPI handlers refuse anyway.
+///   So only ASCII confusables (`c1ick`) can match on PyPI;
+/// * on npm, an empty name, one with whitespace or control characters, or
+///   one with a `/` other than the single scope separator of `@scope/name`.
+///   Non-ASCII names stay checkable on npm on purpose: a Unicode lookalike
+///   is what the homoglyph signal is for, and an npm-compatible upstream may
+///   serve one even though the public registry no longer accepts new ones.
+fn is_checkable_name(ecosystem: &str, name: &str) -> bool {
+    if name.is_empty() || name.len() > MAX_CHECKED_NAME_BYTES {
+        return false;
+    }
+    match ecosystem {
+        "pypi" => crate::formats::pypi_name::is_valid_project_name(name),
+        "npm" => {
+            if name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return false;
+            }
+            match name.strip_prefix('@') {
+                Some(rest) => match rest.split_once('/') {
+                    Some((scope, pkg)) => {
+                        !scope.is_empty() && !pkg.is_empty() && !pkg.contains('/')
+                    }
+                    None => false,
+                },
+                None => !name.contains('/'),
+            }
+        }
+        _ => false,
     }
 }
 
@@ -922,6 +970,65 @@ mod tests {
     /// Cyrillic `о` (U+043E) for the first `o` of `lodash`: pixel-identical,
     /// one edit away, and mixed-script.
     const LODASH_HOMOGLYPH: &str = "l\u{043e}dash";
+
+    #[test]
+    fn name_only_gives_no_verdict_on_oversized_or_invalid_names_5274() {
+        // A huge name must cost nothing: without the guard a 400 KB name took
+        // seconds per check against the seed list.
+        let cfg = config(serde_json::json!({"block_typosquat": true}));
+        let huge = "l\u{043e}dash".repeat(400 * 1024 / 7);
+        assert!(huge.len() >= 400 * 1000);
+        for format in ["npm", "pypi"] {
+            let start = std::time::Instant::now();
+            assert_eq!(
+                evaluate_name_only(&cfg, format, &huge),
+                CurationDecision::NotApplicable,
+                "{format}"
+            );
+            assert!(
+                start.elapsed() < std::time::Duration::from_millis(100),
+                "{format}: {:?}",
+                start.elapsed()
+            );
+        }
+        // Just past the cap: no verdict, even though it starts like a squat.
+        let long = format!("reqeusts{}", "x".repeat(MAX_CHECKED_NAME_BYTES));
+        assert_eq!(
+            evaluate_name_only(&cfg, "pypi", &long),
+            CurationDecision::NotApplicable
+        );
+        // Names the format cannot carry get no verdict either.
+        for (format, name) in [
+            ("pypi", LODASH_HOMOGLYPH),
+            ("pypi", "req uests"),
+            ("pypi", ""),
+            ("npm", ""),
+            ("npm", "lod ash"),
+            ("npm", "a/b"),
+            ("npm", "@scope"),
+            ("npm", "@scope/a/b"),
+            ("npm", "lodash\n"),
+        ] {
+            assert_eq!(
+                evaluate_name_only(&cfg, format, name),
+                CurationDecision::NotApplicable,
+                "{format} {name:?}"
+            );
+        }
+        // Real-looking names still get their verdicts.
+        assert!(matches!(
+            evaluate_name_only(&cfg, "npm", LODASH_HOMOGLYPH),
+            CurationDecision::Block(_)
+        ));
+        assert!(matches!(
+            evaluate_name_only(&cfg, "pypi", "c1ick"),
+            CurationDecision::Block(_)
+        ));
+        assert!(matches!(
+            evaluate_name_only(&cfg, "npm", "@scope/preact"),
+            CurationDecision::NotApplicable | CurationDecision::Flag(_)
+        ));
+    }
 
     #[test]
     fn download_name_checks_are_opt_in_5274() {
