@@ -211,11 +211,17 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
                 continue;
             }
 
-            // No rescan slot free: leave rescans pending rather than claim
-            // them only to hand them back (which also skews their wait).
-            let skip_rescans = rescan_permits.available_permits() == 0;
+            // No more rescans than free rescan slots: the rest stay pending
+            // rather than being claimed only to be handed back (which also
+            // skews their wait).
+            let free_rescan_slots = rescan_permits.available_permits() as i64;
             let claimed = match queue
-                .claim_filtered(available as i64, &identity, CLAIM_TTL_SECS, skip_rescans)
+                .claim_filtered(
+                    available as i64,
+                    &identity,
+                    CLAIM_TTL_SECS,
+                    free_rescan_slots,
+                )
                 .await
             {
                 Ok(jobs) => jobs,
