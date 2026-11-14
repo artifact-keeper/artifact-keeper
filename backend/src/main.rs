@@ -965,6 +965,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     );
     app_state.set_quality_check_service(quality_check_service);
     if let Some(search) = search_service {
+        artifact_keeper_backend::services::search_indexer::start_search_indexer(
+            app_state.event_bus.clone(),
+            app_state.db.clone(),
+            search.clone(),
+        );
         app_state.set_search_service(search);
     }
     if let Some(dt) = dt_service_arc {
