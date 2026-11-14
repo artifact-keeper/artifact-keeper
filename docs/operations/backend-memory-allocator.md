@@ -60,8 +60,8 @@ Other images and builds:
 
 * **Compose builds from this repository** use `docker/Dockerfile.backend` and
   inherit the default.
-* **Linux release tarballs.** `.github/workflows/release.yml` and
-  `publish-binaries.yml` build the Linux binaries with
+* **Linux release tarballs.** `.github/workflows/release.yml` builds the
+  Linux binaries with
   `--features vendored-openssl,jemalloc`, and `release-cli-caches.yml` warms
   the same feature set. The aarch64 leg is cross-compiled on a 4 KiB-page
   runner, so it sets `JEMALLOC_SYS_WITH_LG_PAGE=16`; the tarball starts on
