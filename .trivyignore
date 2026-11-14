@@ -266,6 +266,8 @@
 # Retirement: the rootfs-builder `upgrade -y` (both Dockerfiles) installs
 # el9_9.2 on the first build after Red Hat syncs it to UBI, with no
 # Dockerfile change. Then replace these lines with `# RETIRED:` tombstones.
+# The matching not_affected statements are .vex/<CVE>.vex.json (one per ID);
+# they remain true after the fix and may be kept or dropped with the block.
 # If that has not happened by the expiry date, the entries stop applying and
 # the publish gate goes red again on purpose: re-measure, do not just move
 # the date.
