@@ -84,6 +84,8 @@ async fn list(
         group_by: Some(group_by.to_string()),
         cursor,
         count: count_exact.then(|| "exact".to_string()),
+        sort_by: None,
+        sort_order: None,
     };
     list_artifacts(
         State(state.clone()),

@@ -292,6 +292,8 @@ mod tests {
             group_by: group_by.map(str::to_string),
             cursor: None,
             count: None,
+            sort_by: None,
+            sort_order: None,
         }
     }
 

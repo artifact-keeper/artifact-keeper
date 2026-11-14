@@ -798,6 +798,104 @@ enum CasRewrite {
     Unavailable,
 }
 
+/// Column the flat artifact listing is ordered by (#5040).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactSortKey {
+    Path,
+    Size,
+    CreatedAt,
+}
+
+/// Order of the flat artifact listing. The default, `path` ascending, is the
+/// listing's historical order and keeps its own path-only keyset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactSort {
+    pub key: ArtifactSortKey,
+    pub descending: bool,
+}
+
+impl ArtifactSort {
+    pub const DEFAULT: Self = Self {
+        key: ArtifactSortKey::Path,
+        descending: false,
+    };
+
+    /// Parse `sort_by` / `sort_order`, `None` for a value outside the closed set.
+    pub fn parse(sort_by: Option<&str>, sort_order: Option<&str>) -> Option<Self> {
+        let key = match sort_by.unwrap_or("path") {
+            "path" => ArtifactSortKey::Path,
+            "size" => ArtifactSortKey::Size,
+            "created_at" => ArtifactSortKey::CreatedAt,
+            _ => return None,
+        };
+        let descending = match sort_order.unwrap_or("asc") {
+            "asc" => false,
+            "desc" => true,
+            _ => return None,
+        };
+        Some(Self { key, descending })
+    }
+
+    /// `sort_by:sort_order`, the tag a cursor carries so it is only replayed
+    /// against the order that produced it.
+    pub fn tag(self) -> &'static str {
+        match (self.key, self.descending) {
+            (ArtifactSortKey::Path, false) => "path:asc",
+            (ArtifactSortKey::Path, true) => "path:desc",
+            (ArtifactSortKey::Size, false) => "size:asc",
+            (ArtifactSortKey::Size, true) => "size:desc",
+            (ArtifactSortKey::CreatedAt, false) => "created_at:asc",
+            (ArtifactSortKey::CreatedAt, true) => "created_at:desc",
+        }
+    }
+
+    /// `(ORDER BY, keyset predicate)` from fixed literals only, so no request
+    /// text reaches the SQL. `$4` is the cursor's sort value as text, `$5` its id.
+    fn sql(self) -> (&'static str, &'static str) {
+        match (self.key, self.descending) {
+            (ArtifactSortKey::Path, false) => ("path ASC, id ASC", "(path, id) > ($4, $5::uuid)"),
+            (ArtifactSortKey::Path, true) => ("path DESC, id DESC", "(path, id) < ($4, $5::uuid)"),
+            (ArtifactSortKey::Size, false) => (
+                "size_bytes ASC, id ASC",
+                "(size_bytes, id) > ($4::bigint, $5::uuid)",
+            ),
+            (ArtifactSortKey::Size, true) => (
+                "size_bytes DESC, id DESC",
+                "(size_bytes, id) < ($4::bigint, $5::uuid)",
+            ),
+            (ArtifactSortKey::CreatedAt, false) => (
+                "created_at ASC, id ASC",
+                "(created_at, id) > ($4::timestamptz, $5::uuid)",
+            ),
+            (ArtifactSortKey::CreatedAt, true) => (
+                "created_at DESC, id DESC",
+                "(created_at, id) < ($4::timestamptz, $5::uuid)",
+            ),
+        }
+    }
+
+    /// The row's sort value as cursor text, readable back by [`Self::sql`].
+    pub fn cursor_value(self, artifact: &Artifact) -> String {
+        match self.key {
+            ArtifactSortKey::Path => artifact.path.clone(),
+            ArtifactSortKey::Size => artifact.size_bytes.to_string(),
+            ArtifactSortKey::CreatedAt => artifact
+                .created_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        }
+    }
+
+    /// Whether `value` is a sort value this order can bind, so a forged cursor
+    /// is a 400 rather than a cast error.
+    pub fn accepts_cursor_value(self, value: &str) -> bool {
+        match self.key {
+            ArtifactSortKey::Path => true,
+            ArtifactSortKey::Size => value.parse::<i64>().is_ok(),
+            ArtifactSortKey::CreatedAt => chrono::DateTime::parse_from_rfc3339(value).is_ok(),
+        }
+    }
+}
+
 /// Artifact service
 pub struct ArtifactService {
     db: PgPool,
@@ -2664,6 +2762,69 @@ impl ArtifactService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(artifacts)
+    }
+
+    /// One keyset page of the flat artifact listing in an order other than
+    /// the default `path` ascending (#5040), over one repository or a
+    /// Virtual's members (de-duplicated by path like
+    /// [`list_for_repos_page`], higher-priority member first). Ties break on
+    /// `id`, so `after` (the last row's sort value as text and its id) is an
+    /// exact position. Filters match [`list_page`].
+    ///
+    /// [`list_page`]: Self::list_page
+    /// [`list_for_repos_page`]: Self::list_for_repos_page
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_sorted_page(
+        &self,
+        repo_ids: &[Uuid],
+        path_prefix: Option<&str>,
+        search_query: Option<&str>,
+        sort: ArtifactSort,
+        after: Option<(&str, Uuid)>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<Artifact>> {
+        if repo_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let prefix_pattern = path_prefix.map(|p| format!("{}%", escape_like_literal(p)));
+        let search_pattern =
+            search_query.map(|q| format!("%{}%", escape_like_literal(&q.to_lowercase())));
+        const COLUMNS: &str = "id, repository_id, path, name, version, size_bytes, \
+            checksum_sha256, checksum_md5, checksum_sha1, content_type, storage_key, is_deleted, \
+            uploaded_by, quarantine_status, quarantine_until, created_at, updated_at";
+        const FILTERS: &str = "AND is_deleted = false \
+            AND ($2::text IS NULL OR path LIKE $2 ESCAPE '\\') \
+            AND ($3::text IS NULL OR LOWER(name) LIKE $3 ESCAPE '\\' OR LOWER(path) LIKE $3 ESCAPE '\\')";
+        let (order, keyset) = sort.sql();
+        let sql = if repo_ids.len() > 1 {
+            format!(
+                "SELECT {COLUMNS} FROM (\
+                   SELECT DISTINCT ON (path) {COLUMNS} FROM artifacts \
+                   WHERE repository_id = ANY($1) {FILTERS} \
+                   ORDER BY path, array_position($1::uuid[], repository_id)\
+                 ) sub \
+                 WHERE ($4::text IS NULL OR {keyset}) ORDER BY {order} LIMIT $6 OFFSET $7"
+            )
+        } else {
+            format!(
+                "SELECT {COLUMNS} FROM artifacts \
+                 WHERE repository_id = ($1::uuid[])[1] {FILTERS} \
+                   AND ($4::text IS NULL OR {keyset}) \
+                 ORDER BY {order} LIMIT $6 OFFSET $7"
+            )
+        };
+        sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(repo_ids)
+            .bind(&prefix_pattern)
+            .bind(&search_pattern)
+            .bind(after.map(|(value, _)| value))
+            .bind(after.map(|(_, id)| id))
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Exact de-duplicated match count for [`list_for_repos_page`]'s
