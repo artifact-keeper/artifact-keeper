@@ -541,7 +541,7 @@ async fn create_contract_permissions_and_unsupported_settings_are_atomic_4216() 
         return;
     };
     for (format, kind, expected) in [
-        ("rpm", "hosted", StatusCode::OK),
+        ("rpm", "hosted", StatusCode::CREATED),
         ("generic", "local", StatusCode::UNPROCESSABLE_ENTITY),
     ] {
         let key = format!("depth-{}", uuid::Uuid::new_v4().simple());
@@ -554,7 +554,7 @@ async fn create_contract_permissions_and_unsupported_settings_are_atomic_4216() 
                 .fetch_optional(&f.pool)
                 .await
                 .unwrap();
-        if expected == StatusCode::OK {
+        if expected == StatusCode::CREATED {
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["repodata_depth"], 2);
             assert_eq!(body["repodata_depth_editable"], true);

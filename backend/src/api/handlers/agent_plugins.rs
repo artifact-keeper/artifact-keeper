@@ -2318,7 +2318,8 @@ mod tests {
             .execute(&pool)
             .await;
 
-        let remote = remote.expect("an agentplugins remote is created").0;
+        let (_, _, remote) = remote.expect("an agentplugins remote is created");
+        let remote = remote.0;
         assert_eq!(remote.key, remote_key);
         assert_eq!(remote.repo_type, "remote");
         match refused {
