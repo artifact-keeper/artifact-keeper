@@ -683,6 +683,65 @@ fn break_glass_ignores_deny_but_not_the_ceiling() {
         .is_permit());
 }
 
+#[test]
+fn an_administrator_acts_as_one_only_with_an_unrestricted_credential() {
+    let mut fx = Fx::new();
+    fx.bind(subj(ADMIN), SystemRole::Admin, ScopeRef::Instance);
+    fx.bind(subj(ADMIN), SystemRole::Developer, repo(fx.a));
+    let narrow = CredentialRef::Token(id(502));
+    let all_but_reads = Permission::ALL
+        .iter()
+        .copied()
+        .filter(|p| !p.id().ends_with(".read"))
+        .collect();
+    fx.s.set_ceiling(
+        narrow,
+        Ceiling {
+            permissions: Some(all_but_reads),
+            repository_ids: None,
+        },
+    );
+    let wide = CredentialRef::Token(id(503));
+    fx.s.set_ceiling(
+        wide,
+        Ceiling {
+            permissions: None,
+            repository_ids: None,
+        },
+    );
+    let narrow_caller = Caller::with_credential(user(ADMIN), narrow);
+    let wide_caller = Caller::with_credential(user(ADMIN), wide);
+    let ctx = at(None);
+
+    // The admin binding confers nothing through a narrow credential...
+    assert_eq!(
+        fx.decide(narrow_caller, P::MigrationManage, ScopeRef::Instance),
+        refused(RefusalClass::Forbidden {
+            missing: P::MigrationManage
+        })
+    );
+    assert!(!fx
+        .decide(narrow_caller, P::ArtifactWrite, repo(fx.b))
+        .is_permit());
+    assert!(!super::decide::is_instance_admin(
+        &fx.s,
+        &narrow_caller,
+        &ctx
+    ));
+    // ...while the principal's other bindings still do.
+    assert!(fx
+        .decide(narrow_caller, P::ArtifactWrite, repo(fx.a))
+        .is_permit());
+    // A session and an unrestricted token keep the administration.
+    for caller in [session(ADMIN), wide_caller] {
+        assert!(fx
+            .decide(caller, P::MigrationManage, ScopeRef::Instance)
+            .is_permit());
+        assert!(fx.decide(caller, P::ArtifactWrite, repo(fx.b)).is_permit());
+        assert!(super::decide::is_instance_admin(&fx.s, &caller, &ctx));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 3.1 scenarios: missing inputs
 // ---------------------------------------------------------------------------

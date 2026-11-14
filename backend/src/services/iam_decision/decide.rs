@@ -119,6 +119,7 @@ fn core(
     };
 
     // The credential ceiling bounds everything, the baseline included.
+    let mut narrow_credential = false;
     if let Some(credential) = caller.credential {
         let Some(ceiling) = snapshot.ceiling(credential) else {
             return Core::Unavailable(Unavailability::UnknownCredential);
@@ -126,6 +127,7 @@ fn core(
         if !ceiling.allows(permission, resource) {
             return Core::Refuse;
         }
+        narrow_credential = ceiling.permissions.is_some();
     }
 
     // A permission is only ever checked where it applies.
@@ -142,15 +144,16 @@ fn core(
     let mut unresolved = false;
     let mut is_admin = false;
     for binding in bindings_in_chain(snapshot, &subjects, &chain) {
+        if narrow_credential && is_admin_role(binding) {
+            continue;
+        }
         let truth = evaluate(binding.conditions.as_ref(), ctx);
         match &binding.permissions {
             // An unknown IP makes an allow condition false, so only a binding
             // whose conditions hold could have granted.
             None => unresolved |= truth == Truth::True,
             Some(perms) if truth == Truth::True => {
-                if binding.scope == ScopeRef::Instance
-                    && binding.role == RoleRef::System(SystemRole::Admin)
-                {
+                if binding.scope == ScopeRef::Instance && is_admin_role(binding) {
                     is_admin = true;
                 }
                 if granting.is_none() && perms.contains(&permission) {
@@ -304,15 +307,25 @@ fn refusal_class(
     }
 }
 
-/// Whether `principal` is an instance administrator in this context.
-pub fn is_instance_admin(
-    snapshot: &PolicySnapshot,
-    principal: Principal,
-    ctx: &RequestContext,
-) -> bool {
-    let subjects = subjects_of(snapshot, principal);
+/// A binding of the `admin` system role. It confers nothing through a
+/// credential whose ceiling restricts permissions: an administrator acts as
+/// one only with an unrestricted credential, as a legacy token needs the
+/// `admin` or `*` scope to be an administrator.
+fn is_admin_role(binding: &SnapshotBinding) -> bool {
+    binding.role == RoleRef::System(SystemRole::Admin)
+}
+
+/// Whether `caller` acts as an instance administrator in this context.
+pub fn is_instance_admin(snapshot: &PolicySnapshot, caller: &Caller, ctx: &RequestContext) -> bool {
+    if let Some(credential) = caller.credential {
+        match snapshot.ceiling(credential) {
+            Some(ceiling) if ceiling.permissions.is_none() => {}
+            _ => return false,
+        }
+    }
+    let subjects = subjects_of(snapshot, caller.principal);
     bindings_in_chain(snapshot, &subjects, &[ScopeRef::Instance]).any(|b| {
-        b.role == RoleRef::System(SystemRole::Admin)
+        is_admin_role(b)
             && b.permissions.is_some()
             && evaluate(b.conditions.as_ref(), ctx) == Truth::True
     })
