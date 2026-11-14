@@ -258,10 +258,10 @@
 # libcurl itself pulls in (curl for the backend HEALTHCHECK; openscap-scanner's
 # remote-content fetch). Neither image ships a KDC or
 # kadmind (krb5-server is not installed), no keytab or krb5.conf realm is
-# configured, and nothing uses GSSAPI/Negotiate: the backend binary uses
-# rustls and does not link libkrb5. Every CVE below is a KDC or kadmind
-# server-side bug (ASN.1/XDR decoding, RPCSEC_GSS, AUTH_GSSAPI, KDB keytab,
-# CAMMAC authentication indicators).
+# configured, and nothing uses GSSAPI/Negotiate: the backend binary's ELF
+# NEEDED list has no libkrb5 or libgssapi_krb5. Every CVE below is a KDC or
+# kadmind server-side bug (ASN.1/XDR decoding, RPCSEC_GSS, AUTH_GSSAPI, KDB
+# keytab, CAMMAC authentication indicators).
 #
 # Retirement: the rootfs-builder `upgrade -y` (both Dockerfiles) installs
 # el9_9.2 on the first build after Red Hat syncs it to UBI, with no
