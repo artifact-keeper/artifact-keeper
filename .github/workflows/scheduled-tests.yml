@@ -216,11 +216,11 @@ jobs:
   # not. Over the 30 pushes to main before this change the job was
   # cancelled 26 times (four of them at its own ceiling) and succeeded
   # twice, at up to 30 pool-minutes per attempt. Nothing consumes its
-  # artifact: release.yml and publish-binaries.yml build the shipped
-  # windows-amd64 binary themselves. Its only product is the signal that
-  # the tree still cross-compiles for Windows, and a daily signal from a
-  # GitHub-hosted runner buys that at zero pool cost. Same recipe as the
-  # windows leg of publish-binaries.yml.
+  # artifact: release.yml builds the shipped windows-amd64 binary
+  # itself. Its only product is the signal that the tree still
+  # cross-compiles for Windows, and a daily signal from a GitHub-hosted
+  # runner buys that at zero pool cost. Same target, linker and features
+  # as the windows leg of release.yml's build-binaries.
   windows-cross-build:
     name: 🪟 Windows Cross-Build
     if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *') || (github.event_name == 'workflow_dispatch' && contains(fromJSON('["all", "windows-cross-build"]'), inputs.job)) }}
