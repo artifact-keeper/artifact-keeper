@@ -21,7 +21,7 @@
 use axum::body::Body;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use prost::Message;
 use serde::de::DeserializeOwned;
@@ -68,9 +68,13 @@ pub enum Codec {
 }
 
 impl Codec {
-    /// The codec the `Content-Type` selects. Anything that is not a protobuf
-    /// media type is treated as JSON, which is what the pre-#5066 endpoints
-    /// assumed of every request.
+    /// The codec the `Content-Type` selects.
+    ///
+    /// The JSON codec is selected exactly as axum's `Json` extractor, which
+    /// every pre-#5066 endpoint used, accepted a request: `application/json`
+    /// or any `application/*+json`. Any other type that is not a protobuf one
+    /// is still refused with that extractor's own `415`, so a JSON caller sees
+    /// the same answers it did before the binary codec was added.
     ///
     /// Only `application/proto` is the bare message these handlers decode.
     /// gRPC and Connect's streaming codecs (`application/connect+proto`,
@@ -98,7 +102,10 @@ impl Codec {
                  'application/proto' codecs; '{content_type}' is enveloped and is not implemented"
             )));
         }
-        Ok(Codec::Json)
+        if is_json_content_type(&content_type) {
+            return Ok(Codec::Json);
+        }
+        Err(axum::extract::rejection::MissingJsonContentType::default().into_response())
     }
 
     /// Decode a request body into the handler's own request type.
@@ -112,9 +119,7 @@ impl Codec {
         from_proto: impl FnOnce(P) -> T,
     ) -> Result<T, Response> {
         match self {
-            Codec::Json => serde_json::from_slice::<T>(body).map_err(|e| {
-                connect_invalid_argument(&format!("malformed JSON request body: {e}"))
-            }),
+            Codec::Json => decode_json(body),
             Codec::Proto => P::decode(body.clone()).map(from_proto).map_err(|e| {
                 connect_invalid_argument(&format!("malformed protobuf request body: {e}"))
             }),
@@ -194,11 +199,23 @@ pub fn decode_proto<P: Message + Default>(body: &Bytes) -> Result<P, Response> {
         .map_err(|e| connect_invalid_argument(&format!("malformed protobuf request body: {e}")))
 }
 
-/// Deserialise a JSON body, for the handlers whose request type has no
-/// generated counterpart yet.
+/// Deserialise a JSON body the way axum's `Json` extractor did before #5066,
+/// rejections included (`400` for a syntax error, `422` for a body of the
+/// wrong shape), so a JSON caller's malformed request is answered as it was.
 pub fn decode_json<T: DeserializeOwned>(body: &Bytes) -> Result<T, Response> {
-    serde_json::from_slice::<T>(body)
-        .map_err(|e| connect_invalid_argument(&format!("malformed JSON request body: {e}")))
+    axum::Json::<T>::from_bytes(body)
+        .map(|axum::Json(value)| value)
+        .map_err(IntoResponse::into_response)
+}
+
+/// `application/json`, or an `application/*+json` type: what axum's `Json`
+/// extractor accepted. `content_type` is already lower-cased.
+fn is_json_content_type(content_type: &str) -> bool {
+    let essence = content_type.split(';').next().unwrap_or_default().trim();
+    match essence.split_once('/') {
+        Some(("application", subtype)) => subtype == "json" || subtype.ends_with("+json"),
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -479,8 +496,15 @@ mod tests {
             Codec::from_headers(&headers)
         };
 
-        assert_eq!(codec_of(None).ok(), Some(Codec::Json));
         assert_eq!(codec_of(Some("application/json")).ok(), Some(Codec::Json));
+        assert_eq!(
+            codec_of(Some("application/json; charset=utf-8")).ok(),
+            Some(Codec::Json)
+        );
+        assert_eq!(
+            codec_of(Some("application/vnd.acme+json")).ok(),
+            Some(Codec::Json)
+        );
         assert_eq!(codec_of(Some("application/proto")).ok(), Some(Codec::Proto));
         // Unary Connect carries no charset here, but a client may still send
         // parameters, and the codec is the media type.
@@ -488,6 +512,41 @@ mod tests {
             codec_of(Some("Application/Proto; charset=utf-8")).ok(),
             Some(Codec::Proto)
         );
+    }
+
+    /// A request that names neither codec is refused as axum's `Json`
+    /// extractor refused it before the binary codec existed: the JSON callers
+    /// of the hosted endpoints see the same `415` they always did (#5074).
+    #[test]
+    fn a_request_naming_neither_codec_keeps_the_json_extractors_415() {
+        for content_type in [None, Some("text/plain"), Some("application/xml")] {
+            let mut headers = HeaderMap::new();
+            if let Some(ct) = content_type {
+                headers.insert(CONTENT_TYPE, ct.parse().unwrap());
+            }
+            let err = Codec::from_headers(&headers).expect_err("neither codec");
+            assert_eq!(
+                err.status(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{content_type:?}"
+            );
+        }
+    }
+
+    /// A malformed JSON body is answered with the extractor's own statuses.
+    #[test]
+    fn a_malformed_json_body_keeps_the_json_extractors_statuses() {
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        struct Shape {
+            values: Vec<String>,
+        }
+        let syntax =
+            decode_json::<Shape>(&Bytes::from_static(b"{not json")).expect_err("syntax error");
+        assert_eq!(syntax.status(), StatusCode::BAD_REQUEST);
+        let data = decode_json::<Shape>(&Bytes::from_static(br#"{"values": 3}"#))
+            .expect_err("wrong shape");
+        assert_eq!(data.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     /// The enveloped codecs are not this registry's: each of their messages
