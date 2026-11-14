@@ -358,6 +358,19 @@ async fn reset_backfill_reencodes_a_stored_legacy_shard_5432() {
         rmp_serde::from_slice(&zstd::decode_all(&stored[..]).unwrap()).unwrap();
     assert!(decoded.packages[&filename].contains_key("fn"));
 
+    // A synthesised subdir built from an upstream document that has not
+    // changed would otherwise keep its old wire records indefinitely.
+    sqlx::query(
+        "INSERT INTO conda_synthesized_subdirs \
+           (repository_id, subdir, source_path, source_sha256, built_at, stale_since, checked_at) \
+         VALUES ($1, 'linux-64', 'linux-64/repodata.json', $2, NOW(), NULL, NOW())",
+    )
+    .bind(fx.repo_id)
+    .bind("ab".repeat(32))
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+
     let mut tx = fx.pool.begin().await.unwrap();
     sqlx::raw_sql(sqlx::AssertSqlSafe(include_str!(
         "../../../../migrations/343_conda_shard_filename_compat.sql"
@@ -374,6 +387,18 @@ async fn reset_backfill_reencodes_a_stored_legacy_shard_5432() {
     .await
     .unwrap();
     assert_eq!(reset, (None, None));
+    let stale: bool = sqlx::query_scalar(
+        "SELECT stale_since IS NOT NULL FROM conda_synthesized_subdirs \
+          WHERE repository_id = $1 AND subdir = 'linux-64'",
+    )
+    .bind(fx.repo_id)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert!(
+        stale,
+        "migration 343 must mark a built synthesised subdir stale"
+    );
 
     assert_eq!(
         shard_store::backfill_batch_sized(&fx.pool, fx.repo_id, 1)

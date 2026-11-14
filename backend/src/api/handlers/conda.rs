@@ -5248,11 +5248,13 @@ enum ShardField<'a> {
 }
 
 /// A repodata record in CEP-16 shard form: every field as in `repodata.json`
-/// except `fn` (the enclosing map already supplies the filename) and the
-/// digests, which become `bin`. Conda 26.7 supplies `fn` itself when creating
-/// a PackageRecord and rejects a second value from the shard. A digest field that is not valid
-/// hex of the right length (an empty `md5` on a row with no extracted
-/// metadata) is omitted rather than sent as a string a reader would reject.
+/// except `fn` and the digests. The enclosing map's key already is the
+/// filename, and conda 26.7 passes that key as `fn` when it builds a
+/// `PackageRecord`, so a record that also carries `fn` fails with "multiple
+/// values for keyword argument 'fn'" (#5432). The digests become `bin`; a
+/// digest field that is not valid hex of the right length (an empty `md5` on
+/// a row with no extracted metadata) is omitted rather than sent as a string
+/// a reader would reject.
 struct ShardRecord<'a>(&'a serde_json::Map<String, serde_json::Value>);
 
 impl serde::Serialize for ShardRecord<'_> {
@@ -14293,7 +14295,7 @@ mod tests {
     }
 
     #[test]
-    fn shard_wire_records_do_not_duplicate_the_filename() {
+    fn shard_wire_records_do_not_duplicate_the_filename_5432() {
         #[derive(serde::Deserialize)]
         struct Decoded {
             packages: BTreeMap<String, BTreeMap<String, serde::de::IgnoredAny>>,
