@@ -16,7 +16,7 @@
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::http::header::{HeaderMap, HeaderName, CONTENT_TYPE};
+use axum::http::header::{HeaderMap, HeaderName};
 use axum::http::StatusCode;
 use axum::response::Response;
 use bytes::{Bytes, BytesMut};
@@ -130,19 +130,7 @@ pub(crate) fn is_allowed_bsr_read_rpc(bsr_path: &str) -> bool {
     )
 }
 
-/// Connect binary protobuf codec used by the `buf` CLI.
-pub(crate) fn is_binary_protobuf(headers: &HeaderMap) -> bool {
-    headers
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|ct| {
-            let ct = ct.to_ascii_lowercase();
-            ct.starts_with("application/proto")
-                || ct.starts_with("application/grpc")
-                || ct.starts_with("application/connect+proto")
-        })
-        .unwrap_or(false)
-}
+pub(crate) use super::protobuf_wire::is_binary_protobuf;
 
 /// Join `{upstream}/` + `{Service}/{Method}` without doubling slashes.
 /// Rejects `..` and any path that is not exactly `Service/Method`.
@@ -432,6 +420,7 @@ pub(crate) async fn dispatch_unknown_bsr(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::header::CONTENT_TYPE;
     use axum::http::header::{AUTHORIZATION, HOST};
     use axum::http::HeaderValue;
 
