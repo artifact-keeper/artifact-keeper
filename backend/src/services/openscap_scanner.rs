@@ -4,9 +4,9 @@
 //! HTTP wrapper sidecar to run XCCDF evaluation, and converts results into
 //! RawFinding structs.
 
+use crate::services::http_client::Client;
 use async_trait::async_trait;
 use bytes::Bytes;
-use reqwest::Client;
 use serde::Deserialize;
 use std::path::Path;
 use std::time::Duration;

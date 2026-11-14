@@ -423,7 +423,9 @@ pub fn validate_no_proxy(no_proxy: &str) -> Result<()> {
 /// resolver's proxy-host exemption differ.
 ///
 /// [`http_client::base_client_builder`]: crate::services::http_client::base_client_builder
-pub fn build_repo_client(config: &EgressProxyConfig) -> Result<reqwest::Client> {
+pub fn build_repo_client(
+    config: &EgressProxyConfig,
+) -> Result<crate::services::http_client::Client> {
     repo_client_builder(config)?
         .build()
         .map_err(|e| AppError::Internal(format!("Failed to build egress-proxy HTTP client: {e}")))
@@ -431,7 +433,9 @@ pub fn build_repo_client(config: &EgressProxyConfig) -> Result<reqwest::Client> 
 
 /// The [`reqwest::ClientBuilder`] behind [`build_repo_client`], for a caller
 /// that adds its own settings (a client-wide timeout) before building.
-pub fn repo_client_builder(config: &EgressProxyConfig) -> Result<reqwest::ClientBuilder> {
+pub fn repo_client_builder(
+    config: &EgressProxyConfig,
+) -> Result<crate::services::http_client::ClientBuilder> {
     // `direct` and `explicit` replace the environment proxy, so they start
     // from a builder that never installs it (or its destination check).
     let mut builder = match config.mode {

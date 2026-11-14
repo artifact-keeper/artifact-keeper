@@ -896,7 +896,7 @@ fn jwks_cache() -> &'static RwLock<HashMap<String, JwksCacheEntry>> {
 /// CI OIDC provider service.
 pub struct CiOidcService {
     db: PgPool,
-    http: reqwest::Client,
+    http: crate::services::http_client::Client,
 }
 
 /// The claim checks every exchanged CI assertion must pass, whatever the

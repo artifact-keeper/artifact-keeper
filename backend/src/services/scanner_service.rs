@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::AsyncReadExt;
 
+use crate::services::http_client::Client;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -20,7 +21,6 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use reqwest::Client;
 use serde::Deserialize;
 use sqlx::PgPool;
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
