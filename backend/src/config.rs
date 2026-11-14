@@ -1210,6 +1210,13 @@ pub struct Config {
     /// Env var: `SCAN_WORKER_CONCURRENCY`. Default: unset.
     pub scan_worker_concurrency: Option<usize>,
 
+    /// Scanner-adapter URL for the scans this instance's queue worker runs, in
+    /// place of `TRIVY_ADAPTER_URL` (#5946). Lets a worker pod use an adapter
+    /// next to it while API pods keep the Service URL. Only read with the queue
+    /// and the worker on; blank is unset.
+    /// Env var: `SCAN_WORKER_TRIVY_ADAPTER_URL`. Default: unset.
+    pub scan_worker_trivy_adapter_url: Option<String>,
+
     /// Maximum upload size in bytes for artifact uploads.
     /// Defaults to 10 GB (10737418240 bytes). Set to 0 to disable the limit.
     pub max_upload_size_bytes: u64,
@@ -1879,6 +1886,7 @@ redacted_debug!(Config {
     show ldap_base_dn,
     show trivy_url,
     show trivy_adapter_url,
+    show scan_worker_trivy_adapter_url,
     show incus_scanner_enabled,
     show scan_token_ttl_seconds,
     show openscap_url,
@@ -2093,6 +2101,7 @@ impl Default for Config {
             scan_queue_enabled: false,
             scan_worker_enabled: true,
             scan_worker_concurrency: None,
+            scan_worker_trivy_adapter_url: None,
             max_upload_size_bytes: 10_737_418_240,
             quotas: QuotaSettings::default(),
             allow_local_admin_login: false,
@@ -2447,6 +2456,10 @@ impl Config {
                 .ok()
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .filter(|n| *n > 0),
+            scan_worker_trivy_adapter_url: env::var("SCAN_WORKER_TRIVY_ADAPTER_URL")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
             max_upload_size_bytes: env_parse("MAX_UPLOAD_SIZE", 10_737_418_240_u64),
             quotas: QuotaSettings::from_env(),
             allow_local_admin_login: matches!(
