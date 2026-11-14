@@ -3406,12 +3406,11 @@ async fn commit_b5(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
+    // A store that is down or full answers 503/507 like Download (#5685).
     let bundle = storage.get(&storage_key).await.map_err(|e| {
-        connect_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            crate::api::handlers::storage_err_message(&e),
-        )
+        crate::api::handlers::storage_err_response(&e, |status, message| {
+            connect_error(status, "internal", message)
+        })
     })?;
 
     // The same permit-scoped decode as Download (#2561): this path inflates
