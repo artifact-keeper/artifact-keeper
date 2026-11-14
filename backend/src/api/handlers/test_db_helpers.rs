@@ -666,14 +666,33 @@ pub fn lazy_pool() -> PgPool {
         .expect("lazy pool")
 }
 
-/// Turn the durable scan queue on and run a worker for it. Hold the guard for the
-/// test's duration. Tests using it belong in nextest's `db-serial` group: the
-/// queue claim is unfiltered, so two workers would grade each other's jobs.
-pub fn with_scan_worker(mut state: SharedState) -> (SharedState, tokio_util::sync::DropGuard) {
+/// Turn the durable scan queue on, with no worker: jobs stay queued until a
+/// test starts one with [`start_scan_worker`].
+pub fn with_scan_queue(mut state: SharedState) -> SharedState {
     Arc::get_mut(&mut state)
         .expect("state not shared yet")
         .config
         .scan_queue_enabled = true;
+    if let Some(scanner) = state.scanner_service.as_ref() {
+        scanner.set_scan_queue_enabled(true);
+    }
+    state
+}
+
+/// Start a worker for `state`, which must already have the queue on. Hold the
+/// guard for the test's duration (`db-serial`, as for [`with_scan_worker`]).
+pub fn start_scan_worker(state: &SharedState) -> tokio_util::sync::DropGuard {
+    assert!(state.config.scan_queue_enabled, "turn the queue on first");
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    crate::services::scan_worker::spawn_scan_worker(state.clone(), shutdown.clone());
+    shutdown.drop_guard()
+}
+
+/// Turn the durable scan queue on and run a worker for it. Hold the guard for the
+/// test's duration. Tests using it belong in nextest's `db-serial` group: the
+/// queue claim is unfiltered, so two workers would grade each other's jobs.
+pub fn with_scan_worker(state: SharedState) -> (SharedState, tokio_util::sync::DropGuard) {
+    let state = with_scan_queue(state);
     let shutdown = tokio_util::sync::CancellationToken::new();
     crate::services::scan_worker::spawn_scan_worker(state.clone(), shutdown.clone());
     (state, shutdown.drop_guard())
@@ -684,6 +703,7 @@ fn cfg(storage_path: &str) -> Config {
         scan_worker_enabled: true,
         scan_queue_enabled: false,
         scan_worker_concurrency: None,
+        scan_worker_trivy_adapter_url: None,
         database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
         bind_address: "127.0.0.1:0".into(),
         log_level: "error".into(),
@@ -3586,6 +3606,173 @@ pub async fn native_upload_probe_scans(
         .expect("count scan_results");
         if n > 0 || std::time::Instant::now() >= deadline {
             return n;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// #5946: leaf scanner for the queued scan_on_upload tests. Like
+/// [`UploadProbeScanner`] (scan_type `malware`, applies to everything) but it
+/// reports one finding, so the queued and in-process paths are compared on
+/// what they record rather than on a row count.
+struct FindingProbeScanner;
+
+/// The CVE [`FindingProbeScanner`] reports.
+pub const PROBE_FINDING_CVE: &str = "CVE-2026-59460";
+
+#[async_trait::async_trait]
+impl crate::services::scanner_service::Scanner for FindingProbeScanner {
+    fn name(&self) -> &str {
+        "finding-probe"
+    }
+
+    fn scan_type(&self) -> &str {
+        "malware"
+    }
+
+    async fn scan(
+        &self,
+        _artifact: &crate::models::artifact::Artifact,
+        _metadata: Option<&crate::models::artifact::ArtifactMetadata>,
+        _content: &Bytes,
+    ) -> crate::error::Result<crate::services::scanner_service::ScanOutput> {
+        Ok(crate::services::scanner_service::ScanOutput {
+            findings: vec![crate::models::security::RawFinding {
+                severity: crate::models::security::Severity::High,
+                title: "probe finding".to_string(),
+                description: None,
+                cve_id: Some(PROBE_FINDING_CVE.to_string()),
+                affected_component: Some("probe".to_string()),
+                affected_version: Some("1.0".to_string()),
+                fixed_version: None,
+                source: Some("finding-probe".to_string()),
+                source_url: None,
+                finding_class: crate::models::security::FindingClass::Vulnerability,
+            }],
+            ..Default::default()
+        })
+    }
+}
+
+/// One probe scan row: artifact path, status, findings count, CVE ids.
+pub type ProbeScanRow = (String, String, i32, Vec<String>);
+
+/// What a [`scan_on_upload_probe`] run left behind.
+#[derive(Debug)]
+pub struct ScanOnUploadProbe {
+    /// `(kind, state)` of the repository's queue jobs once the uploads
+    /// returned, before any worker ran. Empty on the in-process path.
+    pub jobs_before_worker: Vec<(String, String)>,
+    /// Probe scan rows that existed before the worker started.
+    pub scans_before_worker: usize,
+    /// Probe scan rows once every scan finished, ordered.
+    pub rows: Vec<ProbeScanRow>,
+    /// Queue jobs left for the repository at the end.
+    pub jobs_left: usize,
+}
+
+async fn probe_scan_rows(pool: &PgPool, repo_id: Uuid) -> Vec<ProbeScanRow> {
+    sqlx::query_as(
+        "SELECT a.path, sr.status, sr.findings_count, \
+                COALESCE(array_agg(f.cve_id ORDER BY f.cve_id) \
+                         FILTER (WHERE f.cve_id IS NOT NULL), '{}') \
+         FROM scan_results sr \
+         JOIN artifacts a ON a.id = sr.artifact_id \
+         LEFT JOIN scan_findings f ON f.scan_result_id = sr.id \
+         WHERE sr.repository_id = $1 AND sr.scan_type = 'malware' \
+         GROUP BY sr.id, a.path, sr.status, sr.findings_count \
+         ORDER BY a.path, sr.status",
+    )
+    .bind(repo_id)
+    .fetch_all(pool)
+    .await
+    .expect("read probe scan rows")
+}
+
+async fn repository_scan_jobs(pool: &PgPool, repo_id: Uuid) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT q.kind, q.state FROM scan_queue q \
+         LEFT JOIN artifacts a ON a.id = q.artifact_id \
+         WHERE q.repository_id = $1 OR a.repository_id = $1 \
+         ORDER BY q.kind, q.state",
+    )
+    .bind(repo_id)
+    .fetch_all(pool)
+    .await
+    .expect("read scan_queue")
+}
+
+/// #5946: send `uploads` requests from `make_req` through `router` for `fx`'s
+/// repository with `scan_enabled` + `scan_on_upload`, scanning with
+/// [`FindingProbeScanner`]. With `queued` the durable queue is on and no
+/// worker runs until every upload returned, so the queue rows can be read
+/// first; then one starts. Waits up to `budget` for every probe scan row to
+/// leave `running` and, when queued, for the repository's jobs to drain.
+///
+/// A `queued` caller belongs in nextest's `db-serial` group (name it
+/// `*_queued`): the worker it starts claims every due job.
+pub async fn scan_on_upload_probe(
+    fx: &Fixture,
+    router: Router<SharedState>,
+    make_req: impl Fn() -> Request<Body>,
+    uploads: usize,
+    queued: bool,
+    budget: std::time::Duration,
+) -> ScanOnUploadProbe {
+    sqlx::query(
+        "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
+             scan_on_proxy, block_on_policy_violation, severity_threshold) \
+         VALUES ($1, true, true, false, false, 'high')",
+    )
+    .bind(fx.repo_id)
+    .execute(&fx.pool)
+    .await
+    .expect("seed scan_configs");
+
+    let storage_path = fx.storage_dir.to_string_lossy().into_owned();
+    let state =
+        build_scan_state_with_leaf_scanners(fx, &storage_path, vec![Arc::new(FindingProbeScanner)]);
+    let state = if queued {
+        with_scan_queue(state)
+    } else {
+        state
+    };
+    for _ in 0..uploads {
+        let app = router_with_auth(
+            router.clone(),
+            state.clone(),
+            make_auth(fx.user_id, &fx.username),
+        );
+        let (status, body) = send(app, make_req()).await;
+        assert!(
+            status.is_success(),
+            "upload failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    let jobs_before_worker = repository_scan_jobs(&fx.pool, fx.repo_id).await;
+    let scans_before_worker = if queued {
+        probe_scan_rows(&fx.pool, fx.repo_id).await.len()
+    } else {
+        0
+    };
+    let _worker = queued.then(|| start_scan_worker(&state));
+
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let rows = probe_scan_rows(&fx.pool, fx.repo_id).await;
+        let jobs_left = repository_scan_jobs(&fx.pool, fx.repo_id).await.len();
+        let settled = !rows.is_empty()
+            && rows.iter().all(|(_, status, _, _)| status != "running")
+            && (!queued || jobs_left == 0);
+        if settled || std::time::Instant::now() >= deadline {
+            return ScanOnUploadProbe {
+                jobs_before_worker,
+                scans_before_worker,
+                rows,
+                jobs_left,
+            };
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }

@@ -17,7 +17,8 @@ analysis and matching locally. Several adapters can instead share one
 |---|---|
 | `SCANNER_TRIVY_SERVER` | `http(s)://host[:port]` of a `trivy server`: no path, query or credentials (a malformed value keeps the adapter not-ready). Every image and filesystem scan runs as `trivy --server <url>`. No local vulnerability DB is downloaded; `/probe/ready` answers 200 only while `GET <url>/version` reports a loaded DB and the same trivy release as the bundled CLI (re-checked at most every 10s, 3s timeout). Empty (default): standalone. |
 | `SCANNER_TRIVY_SERVER_INSECURE` | Default `false`. Required to use an `https` server while `SCANNER_TRIVY_INSECURE` is `true` (see TLS below); the adapter logs a warning at startup when it is set. |
-| `SCANNER_TRIVY_CACHE_PARTITION` | Optional. Partitions the analysis-cache keys this adapter reads and writes on the server (it adds a never-matching `--skip-dirs` entry, which trivy folds into every cache key). Adapters with different partitions share the server's DB but never each other's cached layer analysis. |
+| `SCANNER_TRIVY_CACHE_PARTITION` | Optional. Partitions the analysis-cache keys this adapter reads and writes on the server (it adds a never-matching `--skip-dirs` entry, which trivy folds into every cache key). Adapters with different partitions share the server's DB but never each other's cached layer analysis. In `registry` mode it is the prefix of every derived partition. |
+| `SCANNER_TRIVY_CACHE_PARTITION_MODE` | `static` (default) or `registry`; see [Per-registry cache partitions](#per-registry-cache-partitions-adapter--170). Any other value stops the adapter at startup. |
 | `TRIVY_TOKEN`, `TRIVY_TOKEN_HEADER` | trivy's own variables, inherited by every invocation; set them when the server runs with `--token`. |
 
 What the server shares and what it does not, per trivy's client/server design:
@@ -26,9 +27,11 @@ What the server shares and what it does not, per trivy's client/server design:
   and for **image** scans the per-layer analysis cache. A client asks the
   server which layer keys are missing and only downloads and analyzes those;
   a layer another client already analyzed is neither pulled nor re-analyzed.
-- Not shared: **filesystem** scans always analyze locally (the server's cache
-  is only consulted for clean git repositories), so they share the DB and
-  nothing else. The Java DB, needed to analyze JAR files, is downloaded on the
+- Not shared, mostly: **filesystem** scans analyze locally and share the DB.
+  The one exception is a workspace that is a clean git repository: trivy then
+  keys its analysis by the HEAD commit and reuses a cached analysis from the
+  server. In `registry` partition mode the adapter does not extract a root
+  `.git` from an uploaded workspace, so that never happens. The Java DB, needed to analyze JAR files, is downloaded on the
   client when a JAR is analyzed, so `SCANNER_TRIVY_CACHE_DIR` still needs room
   for it.
 - Trust: an image layer's cache key is derived from the diff ID the image's
@@ -36,7 +39,9 @@ What the server shares and what it does not, per trivy's client/server design:
   client that scans a crafted image first can therefore store a false
   analysis under the diff ID of a real layer, and every later client in the
   same partition reuses it. Give adapters that do not trust each other
-  distinct `SCANNER_TRIVY_CACHE_PARTITION` values (or separate servers).
+  distinct `SCANNER_TRIVY_CACHE_PARTITION` values (or separate servers), and
+  run an adapter that serves several Artifact Keeper instances in `registry`
+  partition mode (below).
 - The server must run the same trivy release as the adapter image (trivy does
   not refuse a mismatched client; the adapter does). The release compared is
   the bundled CLI's own `trivy --version`, probed at startup even when
@@ -59,6 +64,54 @@ What the server shares and what it does not, per trivy's client/server design:
   `/version`), never from `SCANNER_TRIVY_CACHE_DIR/db/metadata.json` (which
   holds no DB, or a stale one, in client mode). A DB block that cannot be
   parsed omits the field without failing the scan.
+
+## Per-registry cache partitions (adapter >= 1.7.0)
+
+`SCANNER_TRIVY_CACHE_PARTITION` is one value for the whole adapter process,
+so an adapter that serves several Artifact Keeper instances puts every
+instance's layer analysis into one partition: anyone who can push to one
+instance can plant a false analysis that the others reuse (see Trust above).
+`SCANNER_TRIVY_CACHE_PARTITION_MODE=registry` derives the partition per image
+scan instead (#5943):
+
+- partition = `SCANNER_TRIVY_CACHE_PARTITION` + `|` + the request's
+  `registry.url` host, lowercased, without scheme or trailing slash, port
+  kept. `http://ak.example:8080/` and `ak.example:8080` share a partition;
+  `ak.example:8080` and `ak.example:8081` do not.
+- Two registry hosts never share layer analysis, so a scan for one instance
+  never reuses analysis cached by another instance's scan.
+- **Each instance must set a stable, unique `TRIVY_ADAPTER_REGISTRY_URL`**
+  (a service DNS name such as `http://ak-backend.<namespace>.svc:8080`) in
+  this mode. Without it the backend advertises `http://<pod IP>:8080`, and
+  cached analysis has no expiry on the trivy server: when that pod IP is later
+  given to another instance's backend, the second instance would read the
+  first one's partition, including anything planted in it. The adapter logs
+  a warning (once per host) when a registry-mode partition is keyed by a bare
+  IPv4 or IPv6 address; it still scans. Instances behind one shared host name
+  share a partition, as they share a registry.
+- The operator-set value stays a prefix, so two adapter fleets scanning the
+  same host still stay apart. It may be empty in this mode, and must not
+  contain `|` (the separator; the adapter refuses to start).
+- The partition applies in standalone mode too: trivy keys the local on-disk
+  cache the same way.
+- Filesystem scans carry no registry and keep the static partition. In this
+  mode the adapter does not extract a root `.git` from the uploaded workspace,
+  the only case in which trivy reuses a cached filesystem analysis (keyed by
+  the HEAD commit the `.git` claims), so there is nothing to partition. trivy
+  skips `.git` when scanning, so no finding changes.
+- A scan request with no registry host (an empty or scheme-only
+  `registry.url`) is refused with `400` in this mode.
+- Switching modes changes every image-layer cache key once, so the first
+  scans afterwards re-analyze their layers.
+
+The startup log reports the mode, and in `registry` mode `GET /api/v1/metadata`
+adds `properties."env.SCANNER_TRIVY_CACHE_PARTITION_MODE"`; neither ever shows
+a partition value. In `static` mode the metadata document is unchanged.
+The startup log no longer prints the static partition's `--skip-dirs` hash
+either.
+
+Upgrading changes nothing unless the mode is set: the default `static` mode
+uses `SCANNER_TRIVY_CACHE_PARTITION` exactly as before.
 
 ## Concurrent scans (adapter >= 1.7.0)
 
@@ -87,6 +140,38 @@ again (up to three submissions in all), and does the same for a job that
 failed on the cache lock, so neither ends as a failed scan. While the old pod
 is gone and the new one not yet answering, the backend keeps polling for up
 to two minutes instead of failing on the gap.
+
+## Authenticating the scan routes (adapter >= 1.7.0)
+
+By default anything that can reach the adapter can submit a scan, which makes
+it pull and analyze an image of the caller's choosing (in client mode, into
+its cache partition on the trivy server; see "Trust" above). Network isolation
+is the only defence then, and it is hard to keep once the adapter sits behind
+a shared proxy or load balancer, or serves several Artifact Keeper instances.
+A bearer token closes that:
+
+| Variable | Effect |
+|---|---|
+| `SCANNER_SCAN_TOKEN` | When set, `POST /api/v1/scan`, `POST /api/v1/filesystem/scan` and both report routes require `Authorization: Bearer <token>` (compared in constant time) and answer `401` otherwise. Unset (default): those routes are open, as before. |
+| `SCANNER_SCAN_TOKENS_FILE` | Path to a file with one token per line (blank lines and lines starting with `#` are ignored); any of them is accepted, alongside `SCANNER_SCAN_TOKEN` if both are set. The file is re-read when its modification time or size changes, so a mounted Secret can add or drop a token without a restart. A file that is empty or holds only comments accepts no token from it. If the file cannot be read (deleted, unreadable, a line over 1 MiB), the last set read stays valid for at most 60 s, which covers an atomic swap of a mounted Secret, and is then dropped, so deleting the file revokes its tokens. A leading UTF-8 BOM is ignored. In every case the routes fail closed. |
+
+`/probe/ready`, `/probe/healthy` and `GET /api/v1/metadata` stay open either
+way. The scan token is separate from `SCANNER_ADAPTER_TOKEN` (the
+vulnerability-DB import credential below), so the two rotate independently;
+neither is accepted in place of the other. Giving each Artifact Keeper
+instance its own line in the tokens file lets one adapter serve several of
+them and revoke one without touching the others.
+
+On the backend, set `TRIVY_ADAPTER_TOKEN` (or `TRIVY_ADAPTER_TOKEN_FILE`, a
+path to a mounted secret) to the same value. It is sent on every adapter
+request, image and filesystem scans alike, and never logged. The Harbor scan
+request's `registry.authorization` remains the separate credential the
+adapter uses to pull the image.
+
+To rotate the backend's token without a failed scan: add the new token as a
+line of `SCANNER_SCAN_TOKENS_FILE` (picked up without a restart), point
+`TRIVY_ADAPTER_TOKEN` / `TRIVY_ADAPTER_TOKEN_FILE` at it and restart the
+backend (it reads the token at startup), then remove the old line.
 
 ## Offline use and vulnerability-DB import (adapter >= 1.7.0)
 

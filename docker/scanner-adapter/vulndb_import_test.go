@@ -219,7 +219,7 @@ func TestOfflineScanArgs(t *testing.T) {
 	cfg.TrivyServer = ""
 	s := NewScanner(cfg)
 	for name, args := range map[string][]string{
-		"image":      s.buildArgs("backend:8080/repo:tag"),
+		"image":      s.buildArgs("backend:8080/repo:tag", ""),
 		"filesystem": s.buildFsArgs("/work"),
 	} {
 		joined := strings.Join(args, " ")
