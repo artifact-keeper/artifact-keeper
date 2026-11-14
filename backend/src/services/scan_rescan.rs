@@ -133,7 +133,7 @@ const STALE_DIGESTS_SQL: &str = r#"
         SELECT * FROM unnest($1::text[], $2::timestamptz[]) AS b(scan_type, built_at)
     ),
     -- One probe of idx_scan_results_latest_per_artifact_type per artifact
-    -- and scan type for its newest completed row, so the cost follows the
+    -- and scan type for its newest completed row, so the work follows the
     -- artifacts, not the length of their scan history.
     stale AS (
         SELECT a.id, a.checksum_sha256 AS digest
