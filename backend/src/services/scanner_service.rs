@@ -9286,6 +9286,13 @@ fn completeness_for_feeds(degraded: bool) -> ScanCompleteness {
 // Scanner orchestrator
 // ---------------------------------------------------------------------------
 
+/// What a DB-update rescan (#5947) changes in a scan: which scanners run, and
+/// that only a result graded at or after `fresh_since` may be reused.
+struct RescanScope<'a> {
+    fresh_since: DateTime<Utc>,
+    scan_types: &'a [String],
+}
+
 pub struct ScannerService {
     db: PgPool,
     scanners: Vec<Arc<dyn Scanner>>,
@@ -9884,13 +9891,27 @@ impl ScannerService {
     /// `is_reused` row instead of scanning the same bytes again. Earlier rows
     /// are never touched, a rescan only adds results. Honours the repository's
     /// scan config like [`Self::scan_artifact`].
+    ///
+    /// Only the scanners whose `scan_type` is in `scan_types` run: the ones
+    /// with a vulnerability database. A license or compliance result does not
+    /// go stale when a CVE database updates.
     pub async fn rescan_artifact_graded_since(
         &self,
         artifact_id: Uuid,
         fresh_since: DateTime<Utc>,
+        scan_types: &[String],
     ) -> Result<()> {
-        self.scan_artifact_inner(artifact_id, false, false, None, Some(fresh_since))
-            .await
+        self.scan_artifact_inner(
+            artifact_id,
+            false,
+            false,
+            None,
+            Some(RescanScope {
+                fresh_since,
+                scan_types,
+            }),
+        )
+        .await
     }
 
     /// The vulnerability-database build each registered scanner reports right
@@ -9915,8 +9936,9 @@ impl ScannerService {
         force: bool,
         bypass_dedup: bool,
         prepared: Option<HashMap<String, Uuid>>,
-        fresh_since: Option<DateTime<Utc>>,
+        rescan: Option<RescanScope<'_>>,
     ) -> Result<()> {
+        let fresh_since = rescan.as_ref().map(|r| r.fresh_since);
         // Fetch artifact and content
         let artifact = sqlx::query_as!(
             Artifact,
@@ -10093,6 +10115,12 @@ impl ScannerService {
         );
 
         for scanner in &self.scanners {
+            // #5947: a DB-update rescan runs only the database-backed scanners.
+            if let Some(r) = rescan.as_ref() {
+                if !r.scan_types.iter().any(|t| t == scanner.scan_type()) {
+                    continue;
+                }
+            }
             // Take any pre-allocated row id committed by the trigger handler.
             // The id was already returned to the client in TriggerScanResponse,
             // so we must keep the same row alive (UPDATE rather than INSERT).

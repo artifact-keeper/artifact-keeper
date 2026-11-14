@@ -45,3 +45,13 @@ CREATE TABLE IF NOT EXISTS scan_rescan_state (
     exhausted_key  TEXT,
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- The newest vulnerability-database build seen per scan type, from a live
+-- probe or recorded with a scan. Kept, not windowed, so a scanner that reports
+-- its database only alongside a scan (the adapter's Trivy) is still compared
+-- after a quiet spell, and its scan type never drops out of the builds key.
+CREATE TABLE IF NOT EXISTS scan_vuln_db_builds (
+    scan_type   TEXT PRIMARY KEY,
+    built_at    TIMESTAMPTZ NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);

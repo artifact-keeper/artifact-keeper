@@ -35,7 +35,8 @@ const LEDGER_RETENTION_DAYS: f64 = 30.0;
 const TICK_LOCK_KEY: i64 = 0x5947_5ca9;
 
 /// How far back [`observed_builds`] looks for databases scanners reported
-/// with a scan (the adapter reports its Trivy DB that way, not by probe).
+/// with a scan (the adapter reports its Trivy DB that way, not by probe). Only
+/// how a new build is learned: [`refresh_builds`] keeps it after that.
 const OBSERVED_WINDOW_HOURS: f64 = 48.0;
 
 /// One scan type's current database build.
@@ -62,15 +63,56 @@ pub async fn observed_builds(db: &PgPool) -> Result<Vec<Build>> {
 }
 
 /// The newest build per scan type across both sources, sorted by scan type.
+///
+/// Timestamps are truncated to microseconds, Postgres' resolution, so a build
+/// read back from `scan_vuln_db_builds` keys the same as the live probe's.
 pub fn merge_builds(a: Vec<Build>, b: Vec<Build>) -> Vec<Build> {
+    use chrono::SubsecRound;
     let mut by_type = std::collections::BTreeMap::<String, DateTime<Utc>>::new();
     for (scan_type, at) in a.into_iter().chain(b) {
+        let at = at.trunc_subsecs(6);
         let slot = by_type.entry(scan_type).or_insert(at);
         if at > *slot {
             *slot = at;
         }
     }
     by_type.into_iter().collect()
+}
+
+/// Record `seen` in `scan_vuln_db_builds` (never moving a build backwards)
+/// and return every scan type's last-known build. A scanner seen once stays
+/// compared after a quiet spell with no scans, instead of dropping out.
+pub async fn refresh_builds(db: &PgPool, seen: &[Build]) -> Result<Vec<Build>> {
+    let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
+    if !seen.is_empty() {
+        let (types, ats): (Vec<String>, Vec<DateTime<Utc>>) = seen.iter().cloned().unzip();
+        sqlx::query(
+            r#"
+            INSERT INTO scan_vuln_db_builds (scan_type, built_at)
+            SELECT * FROM unnest($1::text[], $2::timestamptz[])
+            ON CONFLICT (scan_type) DO UPDATE SET
+                built_at = GREATEST(scan_vuln_db_builds.built_at, EXCLUDED.built_at),
+                updated_at = NOW()
+            "#,
+        )
+        .bind(&types)
+        .bind(&ats)
+        .execute(db)
+        .await
+        .map_err(db_err)?;
+    }
+    sqlx::query_as("SELECT scan_type, built_at FROM scan_vuln_db_builds ORDER BY scan_type")
+        .fetch_all(db)
+        .await
+        .map_err(db_err)
+}
+
+/// Scan types with a known database build: the scanners a rescan runs.
+pub async fn rescan_scan_types(db: &PgPool) -> Result<Vec<String>> {
+    sqlx::query_scalar("SELECT scan_type FROM scan_vuln_db_builds ORDER BY scan_type")
+        .fetch_all(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
 }
 
 /// Stable identity of a set of builds: a new key means some database moved.
@@ -117,6 +159,13 @@ const STALE_DIGESTS_SQL: &str = r#"
     WHERE NOT EXISTS (
         SELECT 1 FROM scan_rescan_ledger r
         WHERE r.digest = s.digest AND r.builds_key = $3
+    )
+      -- Already queued (an earlier key's pass still pending): it will grade
+      -- against the newest database when it runs, so do not charge it again.
+      AND NOT EXISTS (
+        SELECT 1 FROM scan_queue q
+        WHERE q.kind = 'rescan' AND q.digest = s.digest
+          AND q.state IN ('pending', 'running')
     )
     GROUP BY s.digest
     ORDER BY MAX(dl.at) DESC NULLS LAST, s.digest
@@ -177,8 +226,9 @@ pub async fn enqueue_rescans(db: &PgPool, builds: &[Build], max_per_day: u64) ->
         .await
         .map_err(db_err)?;
 
+    let mut queued: Vec<String> = Vec::new();
     if !digests.is_empty() {
-        sqlx::query(
+        queued = sqlx::query_scalar(
             r#"
             INSERT INTO scan_queue (kind, priority, digest)
             SELECT 'rescan', $1, d FROM unnest($2::text[]) AS d
@@ -186,18 +236,20 @@ pub async fn enqueue_rescans(db: &PgPool, builds: &[Build], max_per_day: u64) ->
                 WHERE state IN ('pending', 'running') AND digest IS NOT NULL
                   AND kind <> 'hosted_image'
             DO NOTHING
+            RETURNING digest
             "#,
         )
         .bind(PRIORITY_RESCAN)
         .bind(&digests)
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
+        // Only what was actually queued counts against the cap.
         sqlx::query(
             "INSERT INTO scan_rescan_ledger (digest, builds_key) \
              SELECT d, $2 FROM unnest($1::text[]) AS d ON CONFLICT DO NOTHING",
         )
-        .bind(&digests)
+        .bind(&queued)
         .bind(&key)
         .execute(&mut *tx)
         .await
@@ -228,20 +280,30 @@ pub async fn enqueue_rescans(db: &PgPool, builds: &[Build], max_per_day: u64) ->
     .map_err(db_err)?;
 
     tx.commit().await.map_err(db_err)?;
-    if !digests.is_empty() {
+    if !queued.is_empty() {
         crate::services::scan_queue::enqueue_signal().notify_one();
     }
-    Ok(digests.len() as u64)
+    Ok(queued.len() as u64)
 }
 
-/// Every live artifact row in this instance whose bytes are `digest`, oldest
-/// first, so the fresh scan lands on a stable row and the rest reuse it.
+/// Most artifact rows one rescan job touches. A digest held by more rows than
+/// this (in practice the empty file, whose digest every zero-byte upload
+/// shares) has its newest rows refreshed and the rest keep their earlier
+/// result until the next database build.
+pub const MAX_ROWS_PER_DIGEST: i64 = 1000;
+
+/// Live artifact rows in this instance whose bytes are `digest`, at most
+/// [`MAX_ROWS_PER_DIGEST`], oldest first so the fresh scan lands on a stable
+/// row and the rest reuse it.
 pub async fn artifacts_with_digest(db: &PgPool, digest: &str) -> Result<Vec<Uuid>> {
     sqlx::query_scalar(
-        "SELECT id FROM artifacts WHERE checksum_sha256 = $1 AND is_deleted = false \
+        "SELECT id FROM (SELECT id, created_at FROM artifacts \
+             WHERE checksum_sha256 = $1 AND is_deleted = false \
+             ORDER BY created_at DESC, id DESC LIMIT $2) newest \
          ORDER BY created_at, id",
     )
     .bind(digest)
+    .bind(MAX_ROWS_PER_DIGEST)
     .fetch_all(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))
@@ -311,6 +373,7 @@ mod tests {
             "DELETE FROM scan_queue",
             "DELETE FROM scan_rescan_ledger",
             "DELETE FROM scan_rescan_state",
+            "DELETE FROM scan_vuln_db_builds",
         ] {
             sqlx::query(sql).execute(pool).await.expect(sql);
         }
@@ -536,7 +599,9 @@ mod tests {
             &storage_path,
             vec![std::sync::Arc::new(CountingProbe(calls.clone()))],
         );
-        let builds = vec![("malware".to_string(), at(NEW_DB))];
+        let builds = refresh_builds(&fx.pool, &[("malware".to_string(), at(NEW_DB))])
+            .await
+            .expect("record the build");
         assert_eq!(
             enqueue_rescans(&fx.pool, &builds, 10).await.expect("tick"),
             1,
@@ -608,6 +673,87 @@ mod tests {
 
         reset(&fx.pool).await;
         fx.teardown().await;
+    }
+
+    /// #5947 review (B2): a builds-key change while the first pass is still
+    /// pending must not re-charge the daily cap for digests already queued.
+    /// Before, the ledger took every selected digest even when the queue
+    /// insert hit `ON CONFLICT DO NOTHING`, so the second pass spent 3 of the
+    /// cap and queued nothing.
+    #[tokio::test]
+    async fn a_key_change_does_not_recharge_digests_already_queued() {
+        let Some(pool) = try_pool().await else { return };
+        reset(&pool).await;
+        let r = repo(&pool).await;
+        for c in ['g', 'h', 'i'] {
+            scanned(&pool, r, &digest(c), "2026-11-01T00:00:00Z").await;
+        }
+        let first = vec![("malware".to_string(), at("2026-11-10T00:00:00Z"))];
+        assert_eq!(enqueue_rescans(&pool, &first, 4).await.expect("first"), 3);
+
+        // Another database moves before any of the three ran: a new key.
+        let second = vec![
+            ("malware".to_string(), at("2026-11-10T00:00:00Z")),
+            ("image".to_string(), at("2026-11-11T00:00:00Z")),
+        ];
+        assert_eq!(
+            enqueue_rescans(&pool, &second, 4).await.expect("second"),
+            0,
+            "all three are still queued"
+        );
+        let charged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_rescan_ledger")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(charged, 3, "only what was actually queued is charged");
+
+        // So the fourth slot of the cap is still there for a new stale digest.
+        scanned(&pool, r, &digest('j'), "2026-11-01T00:00:00Z").await;
+        let third = vec![
+            ("malware".to_string(), at("2026-11-10T00:00:00Z")),
+            ("image".to_string(), at("2026-11-12T00:00:00Z")),
+        ];
+        assert_eq!(enqueue_rescans(&pool, &third, 4).await.expect("third"), 1);
+        assert_eq!(rescan_digests(&pool).await.len(), 4);
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(r)
+            .execute(&pool)
+            .await
+            .unwrap();
+        reset(&pool).await;
+    }
+
+    /// #5947 review (B3): a build seen once is kept. With no recent scan and
+    /// no live probe the scan type is still compared (and the key unchanged),
+    /// and a build never moves backwards.
+    #[tokio::test]
+    async fn a_known_build_survives_a_quiet_spell() {
+        let Some(pool) = try_pool().await else { return };
+        reset(&pool).await;
+        let newer = at("2026-11-10T00:00:00.123456789Z");
+        let kept = refresh_builds(&pool, &merge_builds(vec![("image".into(), newer)], vec![]))
+            .await
+            .expect("record");
+        let quiet = refresh_builds(&pool, &[]).await.expect("nothing seen");
+        assert_eq!(quiet, kept, "nothing seen recently: the build is kept");
+        assert_eq!(builds_key(&quiet), builds_key(&kept));
+        let older = refresh_builds(&pool, &[("image".into(), at("2026-11-01T00:00:00Z"))])
+            .await
+            .expect("older");
+        assert_eq!(older, kept, "a build never moves backwards");
+        // Truncated to Postgres' microseconds, so the probe's value keys the
+        // same as the stored one.
+        assert_eq!(
+            merge_builds(vec![("image".into(), newer)], vec![]),
+            kept,
+            "the live value and the stored value are one key"
+        );
+        assert_eq!(
+            rescan_scan_types(&pool).await.expect("types"),
+            vec!["image"]
+        );
+        reset(&pool).await;
     }
 
     /// `SCAN_RESCAN_MAX_PER_DAY=0`, the default, queues nothing and selects
