@@ -119,6 +119,11 @@ func TestImageOverLimitIsRefusedWithoutRunningTrivy(t *testing.T) {
 	if bytes.Contains(body, []byte("tok")) {
 		t.Errorf("body leaks the registry token: %q", body)
 	}
+	// The image is named by host, not by the registry URL with its scheme
+	// (buildRef takes an already-trimmed host since #5943).
+	if want := strings.TrimPrefix(registry.URL, "http://") + "/repo/big:v1"; !bytes.Contains(body, []byte(want)) || bytes.Contains(body, []byte("http://")) {
+		t.Errorf("body %q should name the image as %q", body, want)
+	}
 }
 
 // TestImageUnderLimitIsScanned: at or under the limit the scan runs as before.

@@ -252,7 +252,8 @@ func (s *Scanner) checkImageSize(ctx context.Context, req *ScanRequest) *imageTo
 	if s.cfg.MaxImageBytes <= 0 {
 		return nil
 	}
-	ref, err := buildRef(req.Registry.URL, req.Artifact.Repository, req.Artifact.Tag, req.Artifact.Digest)
+	// buildRef takes the host as given (#5943): trim it once, like Scan does.
+	ref, err := buildRef(trimRegistryHost(req.Registry.URL), req.Artifact.Repository, req.Artifact.Tag, req.Artifact.Digest)
 	if err != nil {
 		return nil // Scan reports the bad reference itself.
 	}
