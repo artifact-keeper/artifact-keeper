@@ -581,6 +581,7 @@ impl LdapService {
     ///
     /// `native_tls::Certificate::from_pem` only handles a single cert, so this
     /// splits the bundle on PEM boundaries and returns each cert individually.
+    #[cfg(feature = "default-tls")]
     fn parse_pem_certificates(
         pem_bytes: &[u8],
         source: &str,
@@ -637,6 +638,7 @@ impl LdapService {
             None
         };
 
+        #[cfg(feature = "default-tls")]
         if let Some((pem_bytes, source)) = ca_source {
             let certs = Self::parse_pem_certificates(&pem_bytes, &source)?;
             let mut builder = native_tls::TlsConnector::builder();
@@ -655,6 +657,27 @@ impl LdapService {
                 count = certs.len(),
                 "Loaded custom CA certificate(s) for LDAP"
             );
+        }
+
+        // FIPS build: rustls with the process-wide FIPS provider instead of
+        // native-tls. Always our own config, so the same provider verifies
+        // the server whether or not a custom CA or skip-verify is set.
+        #[cfg(feature = "fips")]
+        {
+            let extra_roots = match ca_source {
+                Some((pem_bytes, source)) => {
+                    let certs = Self::parse_pem_certificates(&pem_bytes, &source)?;
+                    tracing::info!(
+                        source = %source,
+                        count = certs.len(),
+                        "Loaded custom CA certificate(s) for LDAP"
+                    );
+                    certs
+                }
+                None => Vec::new(),
+            };
+            let config = fips_tls::client_config(extra_roots, self.config.no_tls_verify)?;
+            settings = settings.set_config(config);
         }
 
         Ok(settings)
@@ -1372,6 +1395,234 @@ impl LdapService {
             ldap.unbind().await.ok();
         }
         Ok(())
+    }
+}
+
+#[cfg(feature = "fips")]
+impl LdapService {
+    /// Parse PEM certificates from a byte buffer (FIPS build).
+    ///
+    /// Same splitting and error messages as the native-tls version; each
+    /// certificate is checked to be a usable trust anchor, as OpenSSL's
+    /// parse does in the default build.
+    fn parse_pem_certificates(
+        pem_bytes: &[u8],
+        source: &str,
+    ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+        use rustls::pki_types::{pem::PemObject, CertificateDer};
+
+        let pem_str = String::from_utf8_lossy(pem_bytes);
+        let mut certs = Vec::new();
+        for block in pem_str.split("-----END CERTIFICATE-----") {
+            let trimmed = block.trim();
+            if trimmed.is_empty() || !trimmed.contains("-----BEGIN CERTIFICATE-----") {
+                continue;
+            }
+            let pem = format!("{trimmed}\n-----END CERTIFICATE-----\n");
+            let parse_err =
+                |e: String| AppError::Config(format!("Failed to parse CA cert from {source}: {e}"));
+            let cert = CertificateDer::from_pem_slice(pem.as_bytes())
+                .map_err(|e| parse_err(e.to_string()))?;
+            rustls::RootCertStore::empty()
+                .add(cert.clone())
+                .map_err(|e| parse_err(e.to_string()))?;
+            certs.push(cert);
+        }
+        if certs.is_empty() {
+            return Err(AppError::Config(format!(
+                "No valid PEM certificates found in {source}"
+            )));
+        }
+        Ok(certs)
+    }
+}
+
+/// rustls client configuration for LDAPS / StartTLS in the FIPS build.
+///
+/// Mirrors what native-tls does in the default build: the system trust store
+/// plus any custom CA certificates, and `no_tls_verify` turning certificate
+/// (and hostname) verification off. Everything else, including the handshake
+/// signature checks that still run with `no_tls_verify`, uses the
+/// process-wide rustls provider, which `main` sets to the FIPS provider.
+#[cfg(feature = "fips")]
+mod fips_tls {
+    use std::sync::{Arc, LazyLock};
+
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+
+    use crate::error::{AppError, Result};
+
+    /// The system trust store, loaded once (like ldap3's own rustls default).
+    static SYSTEM_ROOTS: LazyLock<Vec<CertificateDer<'static>>> = LazyLock::new(|| {
+        let result = rustls_native_certs::load_native_certs();
+        for err in &result.errors {
+            tracing::warn!(error = %err, "Could not load a system CA certificate for LDAP");
+        }
+        result.certs
+    });
+
+    /// The process-wide provider (the FIPS one `main` installs), or the
+    /// rustls FIPS provider if nothing is installed yet (unit tests).
+    pub(super) fn provider() -> Arc<CryptoProvider> {
+        CryptoProvider::get_default()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(rustls::crypto::default_fips_provider()))
+    }
+
+    pub(super) fn client_config(
+        extra_roots: Vec<CertificateDer<'static>>,
+        no_tls_verify: bool,
+    ) -> Result<Arc<ClientConfig>> {
+        let provider = provider();
+        let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| AppError::Config(format!("Failed to build LDAP TLS config: {e}")))?;
+
+        let config = if no_tls_verify {
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertVerification { provider }))
+                .with_no_client_auth()
+        } else {
+            let mut roots = RootCertStore::empty();
+            roots.add_parsable_certificates(SYSTEM_ROOTS.iter().cloned());
+            for cert in extra_roots {
+                roots.add(cert).map_err(|e| {
+                    AppError::Config(format!("Failed to add LDAP CA certificate: {e}"))
+                })?;
+            }
+            builder.with_root_certificates(roots).with_no_client_auth()
+        };
+        Ok(Arc::new(config))
+    }
+
+    /// `no_tls_verify`: accept any server certificate and name, but still
+    /// check the handshake signatures with the provider's algorithms.
+    #[derive(Debug)]
+    struct NoCertVerification {
+        provider: Arc<CryptoProvider>,
+    }
+
+    impl ServerCertVerifier for NoCertVerification {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+            verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+            verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.provider
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    #[cfg(ak_test_shard = "services-1")]
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const TEST_CA: &[u8] = include_bytes!("../../tests/fixtures/test-ca.pem");
+
+        fn test_ca() -> Vec<CertificateDer<'static>> {
+            super::super::LdapService::parse_pem_certificates(TEST_CA, "test-ca.pem")
+                .expect("test CA parses")
+        }
+
+        #[test]
+        fn test_fips_provider_is_fips() {
+            assert!(provider().fips());
+        }
+
+        #[test]
+        fn test_fips_config_default_roots_is_fips() {
+            let config = client_config(Vec::new(), false).expect("config builds");
+            assert!(config.fips(), "LDAP rustls config must be FIPS");
+        }
+
+        #[test]
+        fn test_fips_config_with_custom_ca_is_fips() {
+            let config = client_config(test_ca(), false).expect("config with CA builds");
+            assert!(config.fips());
+        }
+
+        #[test]
+        fn test_fips_config_insecure_is_fips() {
+            let config = client_config(test_ca(), true).expect("insecure config builds");
+            assert!(config.fips());
+        }
+
+        #[test]
+        fn test_fips_config_rejects_non_certificate_der() {
+            let err = client_config(vec![CertificateDer::from(vec![1u8, 2, 3])], false)
+                .expect_err("bad DER must be rejected");
+            assert!(err.to_string().contains("LDAP CA certificate"), "{err}");
+        }
+
+        #[test]
+        fn test_fips_insecure_verifier_uses_provider_schemes() {
+            let provider = provider();
+            let verifier = NoCertVerification {
+                provider: Arc::clone(&provider),
+            };
+            assert_eq!(
+                verifier.supported_verify_schemes(),
+                provider
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            );
+            // The FIPS provider offers no SHA-1 signature schemes.
+            assert!(!verifier
+                .supported_verify_schemes()
+                .contains(&SignatureScheme::RSA_PKCS1_SHA1));
+        }
+
+        #[test]
+        fn test_fips_parse_rejects_valid_base64_non_certificate() {
+            // Base64 that decodes fine but is not an X.509 certificate.
+            let pem = b"-----BEGIN CERTIFICATE-----\nAQIDBA==\n-----END CERTIFICATE-----\n";
+            let err = super::super::LdapService::parse_pem_certificates(pem, "bad.pem")
+                .expect_err("non-certificate DER must be rejected");
+            assert!(err
+                .to_string()
+                .contains("Failed to parse CA cert from bad.pem"));
+        }
     }
 }
 

@@ -949,6 +949,136 @@ jobs:
           free -m
           swapon --show
 
+  # FIPS 140-3 BUILD (backend `fips` feature; docs/fips.md). The same lib and
+  # bin unit tests as the shards above, built with `--no-default-features
+  # --features fips` so the AWS-LC FIPS module replaces ring/native-tls, plus
+  # the dependency-graph assertion and a clippy pass of that build. Not
+  # instrumented (coverage comes from the default build) and not a required
+  # context: `ci-complete` does not wait on it. aws-lc-fips-sys builds the
+  # FIPS module from source with CMake and Go, both preinstalled on
+  # ubuntu-24.04; the toolchain step prints their versions.
+  test-backend-fips:
+    name: 🔐 FIPS Build (${{ matrix.shard }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    needs: [changes, release-bump]
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Same legs as test-backend-unit-shard (scripts/ci/test-shards.py).
+        shard: [handlers-1, handlers-2, services-1, services-2, router]
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_BUILD_JOBS: "4"
+      CARGO_INCREMENTAL: "0"
+      CARGO_NET_RETRY: "10"
+      SQLX_OFFLINE: true
+      BIN_SHARD: services-2
+      FIPS_FEATURES: --no-default-features --features fips,test-shard-${{ matrix.shard }}
+    services:
+      postgres:
+        image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
+        env:
+          POSTGRES_USER: registry
+          POSTGRES_PASSWORD: registry
+          POSTGRES_DB: artifact_registry
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy
+
+      - name: Assert the pinned Rust toolchain is in force
+        run: ./scripts/ci/check-toolchain-pin.sh --active
+
+      - name: Install cargo-nextest and sqlx-cli
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,sqlx-cli
+
+      - name: Install protoc and show the FIPS module toolchain
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler ${{ matrix.shard == 'services-1' && 'squashfs-tools' || '' }}
+          cmake --version | head -1
+          go version
+          cc --version | head -1
+
+      - name: Check the FIPS dependency graph
+        if: matrix.shard == 'router'
+        run: ./scripts/ci/check-fips-dependency-graph.sh
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: v1-rust
+          shared-key: fips-unit-shard
+          save-if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && matrix.shard == 'router' }}
+
+      - name: Fetch dependencies
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if cargo fetch; then
+              exit 0
+            fi
+            echo "cargo fetch failed (attempt ${attempt}/3) — retrying" >&2
+            sleep $(( attempt * 10 ))
+          done
+          echo "ERROR: cargo fetch failed after 3 attempts" >&2
+          exit 1
+
+      - name: Clippy (FIPS build)
+        if: matrix.shard == 'router'
+        run: cargo clippy -p artifact-keeper-backend --lib --bins --no-default-features --features fips -- -D warnings
+
+      - name: Run database migrations
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/localhost/5432) >/dev/null 2>&1; then
+              break
+            fi
+            echo "  waiting for postgres... ($i/30)"
+            sleep 1
+          done
+          sqlx migrate run --source backend/migrations
+        env:
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+
+      - name: Build FIPS test binaries
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086 # FIPS_FEATURES is a flag list
+          cargo nextest run --workspace --lib --no-run $FIPS_FEATURES
+          if [ "${{ matrix.shard }}" = "$BIN_SHARD" ]; then
+            # shellcheck disable=SC2086
+            cargo nextest run --workspace --bins --no-run $FIPS_FEATURES
+          fi
+
+      - name: Run unit tests (FIPS build)
+        env:
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+          AK_TESTS_REQUIRE_DB: "1"
+          AK_TESTS_REQUIRE_SQUASHFS: ${{ matrix.shard == 'services-1' && '1' || '' }}
+          JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
+        run: |
+          set -euo pipefail
+          filter="$(python3 scripts/ci/test-shards.py filter "${{ matrix.shard }}")"
+          echo "nextest filter for this leg: ${filter}"
+          targets=(--lib)
+          if [ "${{ matrix.shard }}" = "$BIN_SHARD" ]; then targets+=(--bins); fi
+          # shellcheck disable=SC2086
+          cargo nextest run --workspace "${targets[@]}" $FIPS_FEATURES -E "$filter" --test-threads 8 --no-fail-fast
+
   # INTEGRATION SUITES (backend/tests/), GitHub-hosted.
   #
   # These link the library WITHOUT `cfg(test)`, so the unit-test sharding
@@ -3054,6 +3184,69 @@ jobs:
           name: backend-image
           path: /tmp/backend-image.tar.gz
           retention-days: 1
+
+  # The `-fips` variant of the backend image (docker/Dockerfile.backend with
+  # `FIPS=1`; docs/fips.md), on the same triggers as build-backend-image.
+  # Advisory like that job: never pushed, not a `ci-complete` dependency.
+  # The smoke step runs the image with no database and asserts that it got
+  # past the FIPS provider check and logged FIPS mode.
+  build-backend-image-fips:
+    name: 🐳 Build Backend Image (FIPS)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    needs: [changes, detect-changes]
+    if: ${{ !cancelled() && needs.detect-changes.result == 'success' && ((github.event_name != 'pull_request' && needs.detect-changes.outputs.backend == 'true') || (github.event_name == 'pull_request' && (needs.detect-changes.outputs.docker == 'true' || needs.changes.outputs.ci_image == 'true'))) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Build backend image (FIPS)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: ./docker/Dockerfile.backend
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: artifact-keeper-backend:pr-test-fips
+          # Read-only, as in build-backend-image; the FIPS Rust stages miss it.
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-amd64
+          build-args: |
+            CARGO_BUILD_JOBS=4
+            CARGO_PROFILE=ci
+            FIPS=1
+
+      - name: Verify the image starts in FIPS mode
+        run: |
+          set -uo pipefail
+          # No usable database: the process keeps retrying the connect, but the
+          # FIPS provider check and the crypto-mode log line come first.
+          docker run -d --name ak-fips-test \
+            -e DATABASE_URL=postgresql://test:test@127.0.0.1:1/test \
+            artifact-keeper-backend:pr-test-fips
+          sleep 10
+          logs="$(docker logs ak-fips-test 2>&1 | head -200)"
+          docker rm -f ak-fips-test >/dev/null 2>&1 || true
+          printf '%s\n' "$logs" | head -30
+          if printf '%s\n' "$logs" | grep -q 'FATAL: FIPS 140-3 mode check failed'; then
+            echo "::error title=FIPS image refused to start::the FIPS provider check failed"
+            exit 1
+          fi
+          if ! printf '%s\n' "$logs" | grep -q 'FIPS 140-3 mode'; then
+            echo "::error title=FIPS image did not report FIPS mode::no 'FIPS 140-3 mode' log line"
+            exit 1
+          fi
+
+      - name: Image size
+        run: |
+          {
+            echo "## Backend Image (FIPS)"
+            echo '```'
+            docker images artifact-keeper-backend:pr-test-fips --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build-openscap-image:
     name: 🐳 Build OpenSCAP Image

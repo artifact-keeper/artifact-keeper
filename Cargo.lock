@@ -245,6 +245,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
+ "aws-lc-rs",
  "axum 0.7.9",
  "axum-test",
  "base64 0.22.1",
@@ -306,6 +307,7 @@ dependencies = [
  "rmp-serde",
  "rsa",
  "rustls",
+ "rustls-native-certs",
  "semver",
  "serde",
  "serde_json",
@@ -4181,12 +4183,16 @@ dependencies = [
  "native-tls",
  "nom 7.1.3",
  "percent-encoding",
+ "rustls",
+ "rustls-native-certs",
  "thiserror 2.0.21",
  "tokio",
  "tokio-native-tls",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-util",
  "url",
+ "x509-parser",
 ]
 
 [[package]]
@@ -4233,9 +4239,12 @@ dependencies = [
  "nom 8.0.0",
  "percent-encoding",
  "quoted_printable",
+ "rustls",
+ "rustls-native-certs",
  "socket2",
  "tokio",
  "tokio-native-tls",
+ "tokio-rustls",
  "url",
 ]
 
