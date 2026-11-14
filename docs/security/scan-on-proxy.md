@@ -475,8 +475,8 @@ set the timeout on each proxy.
 The in-flight table above belongs to one backend process: a restart loses what
 it holds, a retry on another replica scans again, and the CVE engine runs on the
 pods that serve requests. `SCAN_QUEUE_ENABLED=true` (default `false`) moves
-proxy file scans and `POST /api/v1/security/scan` to a `scan_queue` table in
-Postgres instead. A worker claims a job, scans it and records the verdict, and a
+proxy file scans, `POST /api/v1/security/scan` and `scan_on_upload` to a
+`scan_queue` table in Postgres instead. A worker claims a job, scans it and records the verdict, and a
 job outlives the pod that queued it. Left off, nothing on this page changes.
 
 A job carries a reference to the proxy-cached object (repository, cache path,
@@ -504,6 +504,15 @@ costs rows rather than memory.
 - Nor is an empty body (the proxy cache never stores one) or one over the scan
   cap (a worker refuses it unread). Both take the in-flight table, as with the
   queue off
+- **`scan_on_upload`** queues a job at the hosted priority instead of scanning
+  in the process that took the upload. A pushed OCI manifest is one
+  `hosted_image` job per repository and manifest digest: pushing the same
+  manifest again, or under another tag, while the job is pending adds no second
+  job, and the worker scans every manifest row in the repository with that
+  digest, with the scanner adapter's image scan and grype as before. Every other
+  format is one `hosted_upload` job per artifact. An upload or push that arrives
+  while its job is running marks the job to run once more when it finishes. If
+  the job cannot be queued, the scan runs in-process.
 - A job is tried three times with backoff. A worker that dies mid-scan loses its
   claim when the lease lapses, and the attempt counts. A completed job is
   deleted, since the verdict row is the record. A job that failed for good is
@@ -520,7 +529,13 @@ it `false` on the API pods and run the same image with it on as a scan worker.
 The worker has to read what an API pod wrote: object storage, or a filesystem
 volume both can mount. `SCAN_WORKER_CONCURRENCY` sets how many jobs one worker
 runs at once and defaults to `MAX_CONCURRENT_SCAN_EXTRACTIONS`. Each job takes
-an extraction permit, so raise the two together.
+an extraction permit, so raise the two together. `SCAN_WORKER_TRIVY_ADAPTER_URL`
+gives the scans a worker runs their own scanner-adapter URL in place of
+`TRIVY_ADAPTER_URL`, so a worker pod can use an adapter running next to it while
+the API pods keep the Service URL. It is read only with the queue and the worker
+on. Only the URL changes: the worker's adapter client sends the same credentials
+as the API pods' (for example a `TRIVY_ADAPTER_TOKEN`, where set), so the
+adapter next to the worker must accept them.
 
 The worker publishes `ak_scan_queue_depth`,
 `ak_scan_queue_oldest_pending_seconds`, `ak_scan_queue_wait_seconds`,

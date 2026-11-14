@@ -17,7 +17,11 @@ import (
 
 func main() {
 	cfg := LoadConfig()
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("invalid configuration: %v", err)
+	}
 	srv := NewServer(cfg)
+	log.Print(partitionModeLogLine(cfg))
 	if cfg.Offline {
 		log.Printf("offline mode (SCANNER_OFFLINE): no vulnerability-DB or Java-DB download, scans run with --skip-db-update --skip-java-db-update (and, like every scan, --offline-scan); import a DB with PUT /api/v1/vulndb")
 	}
@@ -38,9 +42,6 @@ func main() {
 			log.Printf("trivy client mode not started (staying not-ready): %v", err)
 		} else {
 			log.Printf("trivy client mode: server %s holds the vuln DB; readiness follows it (trivy=%s)", redactURL(cfg.TrivyServer), cfg.ClientVersion)
-			if cfg.CachePartition != "" {
-				log.Printf("trivy analysis cache partitioned (%s)", cachePartitionDir(cfg.CachePartition))
-			}
 		}
 	} else {
 		startStandalone(srv, cfg)
@@ -104,4 +105,18 @@ func startStandalone(srv *Server, cfg *Config) {
 			log.Printf("trivy vuln DB not present in %s (staying not-ready until one is downloaded or imported via PUT /api/v1/vulndb)", cfg.CacheDir)
 		}
 	}
+}
+
+// partitionModeLogLine is the startup line describing the analysis-cache
+// partition mode (#5943). It names the mode and whether an operator prefix is
+// set, never a partition value or its hash.
+func partitionModeLogLine(cfg *Config) string {
+	prefix := "no SCANNER_TRIVY_CACHE_PARTITION"
+	if cfg.CachePartition != "" {
+		prefix = "SCANNER_TRIVY_CACHE_PARTITION set"
+	}
+	if cfg.CachePartitionMode == partitionModeRegistry {
+		return "trivy analysis cache partition mode: registry (one partition per registry host of each image scan; " + prefix + " as the prefix)"
+	}
+	return "trivy analysis cache partition mode: static (" + prefix + ")"
 }

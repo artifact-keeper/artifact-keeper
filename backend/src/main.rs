@@ -875,24 +875,39 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         }
     };
 
-    let mut scanner_service = ScannerService::new(
-        db_pool.clone(),
-        advisory_client.clone(),
-        scan_result_service,
-        scan_config_service,
-        config.trivy_url.clone(),
-        config.trivy_adapter_url.clone(),
-        config.incus_scanner_enabled,
-        primary_storage.clone(),
-        storage_registry.clone(),
-        config.storage_path.clone(),
-        config.scan_workspace_path.clone(),
-        config.openscap_url.clone(),
-        config.openscap_profile.clone(),
-        scanner_auth,
-        scanner_identity,
-        config.scan_token_ttl_seconds,
-    );
+    // #5946: the queue worker's scans may use their own adapter URL, so the
+    // scanner set is built once per URL.
+    let build_scanner_service = |trivy_adapter_url: Option<String>| {
+        ScannerService::new(
+            db_pool.clone(),
+            advisory_client.clone(),
+            scan_result_service.clone(),
+            scan_config_service.clone(),
+            config.trivy_url.clone(),
+            trivy_adapter_url,
+            config.incus_scanner_enabled,
+            primary_storage.clone(),
+            storage_registry.clone(),
+            config.storage_path.clone(),
+            config.scan_workspace_path.clone(),
+            config.openscap_url.clone(),
+            config.openscap_profile.clone(),
+            scanner_auth.clone(),
+            scanner_identity.clone(),
+            config.scan_token_ttl_seconds,
+        )
+    };
+    let mut scanner_service = build_scanner_service(config.trivy_adapter_url.clone());
+    let mut worker_scanner_service = match config.scan_worker_trivy_adapter_url.clone() {
+        Some(url) if config.scan_queue_enabled && config.scan_worker_enabled => {
+            tracing::info!(
+                adapter_url = %url,
+                "Queued scans on this instance use SCAN_WORKER_TRIVY_ADAPTER_URL"
+            );
+            Some(build_scanner_service(Some(url)))
+        }
+        _ => None,
+    };
 
     // Initialize Dependency-Track integration (before wrapping scanner in Arc,
     // so we can wire the DT service into the scan pipeline for SBOM submission).
@@ -911,9 +926,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     if let Some(ref dt) = dt_service_arc {
         scanner_service.set_dependency_track(dt.clone());
+        if let Some(worker) = worker_scanner_service.as_mut() {
+            worker.set_dependency_track(dt.clone());
+        }
     }
 
     let scanner_service = Arc::new(scanner_service);
+    let worker_scanner_service = worker_scanner_service.map(Arc::new);
 
     let scheduler_storage = primary_storage.clone();
     let mut app_state = match plugin_services {
@@ -1303,7 +1322,14 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // Drains the durable scan queue (migration 362) when SCAN_QUEUE_ENABLED and
     // SCAN_WORKER_ENABLED are both on, before the listeners bind
     artifact_keeper_backend::services::scan_worker::spawn_scan_worker(
-        state.clone(),
+        match worker_scanner_service {
+            Some(scanner) => {
+                artifact_keeper_backend::services::scan_worker::state_with_worker_scanner(
+                    &state, scanner,
+                )
+            }
+            None => state.clone(),
+        },
         runtime_shutdown_token.clone(),
     );
 

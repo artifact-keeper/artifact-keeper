@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -44,6 +45,12 @@ type Config struct {
 	// disables both routes (403): a route that replaces the DB every scan is
 	// matched against is never served unauthenticated.
 	AdapterToken string
+	// ScanToken (SCANNER_SCAN_TOKEN) and ScanTokensFile
+	// (SCANNER_SCAN_TOKENS_FILE, one token per line, re-read on change) gate
+	// the scan and report routes behind a bearer token (#5948; scan_auth.go).
+	// Both empty (default): those routes stay open.
+	ScanToken      string
+	ScanTokensFile string
 	// VulnDBMaxUploadBytes (SCANNER_VULNDB_MAX_UPLOAD_BYTES) caps the
 	// compressed db.tar.gz body of PUT /api/v1/vulndb. Default 2 GiB.
 	VulnDBMaxUploadBytes int64
@@ -115,8 +122,18 @@ type Config struct {
 	// server's vulnerability DB. Use it when the adapters sharing a server
 	// should not trust each other's cache entries (image-layer cache keys are
 	// derived from the diff IDs an image's config CLAIMS, which trivy does not
-	// re-verify against the layer content). Empty means no partition.
+	// re-verify against the layer content). Empty means no partition. In
+	// registry mode (CachePartitionMode) it is the prefix of every derived
+	// partition instead.
 	CachePartition string
+	// CachePartitionMode (SCANNER_TRIVY_CACHE_PARTITION_MODE, #5943) selects
+	// where an image scan's partition comes from: partitionModeStatic (the
+	// default) uses CachePartition for every scan; partitionModeRegistry
+	// derives one per request from CachePartition and the request's registry
+	// host (see imagePartition), so one adapter serving several Artifact
+	// Keeper instances never reuses one instance's cached layer analysis for
+	// another's scan. Any other value fails Validate.
+	CachePartitionMode string
 	// ScannerVersion is the trivy version reported in the Harbor report's
 	// `scanner.version`. Empty at construction; filled by ProbeVersion at
 	// startup (or overridden via SCANNER_SCANNER_VERSION).
@@ -154,10 +171,13 @@ func LoadConfig() *Config {
 		ScannerVersion:      os.Getenv("SCANNER_SCANNER_VERSION"),
 		TrivyServer:         strings.TrimRight(strings.TrimSpace(os.Getenv("SCANNER_TRIVY_SERVER")), "/"),
 		CachePartition:      strings.TrimSpace(os.Getenv("SCANNER_TRIVY_CACHE_PARTITION")),
+		CachePartitionMode:  partitionModeFromEnv(os.Getenv("SCANNER_TRIVY_CACHE_PARTITION_MODE")),
 		TrivyServerInsecure: getenvBool("SCANNER_TRIVY_SERVER_INSECURE", false),
 		Offline:             getenvBool("SCANNER_OFFLINE", false),
 		DBSchemaVersion:     getenvIntNonNeg("SCANNER_TRIVY_DB_SCHEMA_VERSION", 2),
 		AdapterToken:        strings.TrimSpace(os.Getenv("SCANNER_ADAPTER_TOKEN")),
+		ScanToken:           strings.TrimSpace(os.Getenv("SCANNER_SCAN_TOKEN")),
+		ScanTokensFile:      strings.TrimSpace(os.Getenv("SCANNER_SCAN_TOKENS_FILE")),
 
 		VulnDBMaxUploadBytes:    getenvInt64("SCANNER_VULNDB_MAX_UPLOAD_BYTES", 2*1024*1024*1024),
 		VulnDBMaxExtractedBytes: getenvInt64("SCANNER_VULNDB_MAX_EXTRACTED_BYTES", 8*1024*1024*1024),
@@ -171,6 +191,42 @@ func LoadConfig() *Config {
 		cfg.SkipDBUpdate = true
 	}
 	return cfg
+}
+
+// Cache partition modes (SCANNER_TRIVY_CACHE_PARTITION_MODE, #5943).
+const (
+	partitionModeStatic   = "static"
+	partitionModeRegistry = "registry"
+)
+
+// partitionModeFromEnv normalizes SCANNER_TRIVY_CACHE_PARTITION_MODE: unset,
+// empty or only whitespace is static (the default); anything else is
+// lowercased for Validate.
+func partitionModeFromEnv(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	if v == "" {
+		return partitionModeStatic
+	}
+	return v
+}
+
+// Validate reports a configuration the adapter must not start with. An
+// unknown partition mode is refused rather than read as static: falling back
+// would silently put every client's layer analysis into one partition, the
+// exact sharing registry mode is set to prevent.
+func (c *Config) Validate() error {
+	switch c.CachePartitionMode {
+	case partitionModeStatic, partitionModeRegistry:
+	default:
+		return fmt.Errorf("SCANNER_TRIVY_CACHE_PARTITION_MODE=%q: must be %q or %q", c.CachePartitionMode, partitionModeStatic, partitionModeRegistry)
+	}
+	// In registry mode "|" separates the prefix from the host, so a prefix
+	// containing it could spell another prefix's partition. Static mode
+	// keeps accepting any value, as before.
+	if c.CachePartitionMode == partitionModeRegistry && strings.Contains(c.CachePartition, "|") {
+		return fmt.Errorf("SCANNER_TRIVY_CACHE_PARTITION must not contain %q in registry partition mode", "|")
+	}
+	return nil
 }
 
 func getenv(key, def string) string {
