@@ -573,22 +573,25 @@ pub async fn repair_release_1_5_x_divergence(db: &PgPool) -> Result<()> {
 }
 
 /// `(migration version, index name)` for every `-- no-transaction`
-/// `CREATE INDEX CONCURRENTLY` migration whose interrupted build must be
-/// cleaned up before the migrator retries it.
+/// `CREATE INDEX CONCURRENTLY` migration. [`repair_invalid_concurrent_indexes`]
+/// checks each of these indexes before every migrator run.
 ///
-/// sqlx records a migration only after its SQL succeeds. A concurrent build
-/// that fails part-way (lock timeout behind a long transaction, pod killed
-/// mid-build) is not recorded, so it re-runs on the next boot, but it leaves
-/// an INVALID index behind, and `CREATE INDEX CONCURRENTLY IF NOT EXISTS`
-/// skips that leftover and records success. A transactional
-/// `DROP INDEX IF EXISTS` migration placed before the build does not help:
-/// it is recorded on the first boot and never runs again. So the cleanup has
-/// to happen here, before every migrator run, for each pair whose migration
-/// is not yet recorded. See #4426.
+/// A concurrent build that fails part-way (lock timeout behind a long
+/// transaction, a deadlock, the pod killed mid-build) leaves an INVALID
+/// index behind, and `CREATE INDEX CONCURRENTLY IF NOT EXISTS` skips that
+/// leftover. If the build's migration is not yet recorded, the retry then
+/// records success over an index the planner never uses (#4426). Before
+/// #5993 the retry could also come from another replica that was already
+/// inside the migrator, so the migration could be recorded with the index
+/// still INVALID. A transactional `DROP INDEX IF EXISTS` migration placed
+/// before the build does not help: it is recorded on the first boot and
+/// never runs again. So the repair runs at startup, under the migration
+/// lock, for every pair here.
 ///
-/// Add a pair whenever a new concurrent index migration lands. Migrations
-/// before 266 predate this table; their builds completed long ago.
+/// Add a pair whenever a new concurrent index migration lands (a unit test
+/// enforces it).
 pub const CONCURRENT_INDEX_MIGRATIONS: &[(i64, &str)] = &[
+    (230, "idx_artifacts_origin_upstream_url"),
     (266, "idx_artifacts_download_holds_quarantine"),
     (272, "idx_proxy_cache_download_holds"),
     (274, "idx_scan_results_dedup_local"),
@@ -603,8 +606,9 @@ pub const CONCURRENT_INDEX_MIGRATIONS: &[(i64, &str)] = &[
 ];
 
 /// The index names from `table` whose migration version is not in
-/// `applied`. Only those can carry a leftover from an interrupted build; an
-/// applied migration's index is left alone even if it is invalid.
+/// `applied`. An INVALID index for one of these is an interrupted build
+/// that the migrator is about to retry, so the repair drops it and lets the
+/// migration build it again.
 pub fn unapplied_concurrent_indexes<'a>(
     table: &'a [(i64, &'a str)],
     applied: &[i64],
@@ -616,79 +620,261 @@ pub fn unapplied_concurrent_indexes<'a>(
         .collect()
 }
 
-/// Drop INVALID leftovers of interrupted `CREATE INDEX CONCURRENTLY`
-/// migrations (see [`CONCURRENT_INDEX_MIGRATIONS`]) so the migrator's retry
-/// builds the index from scratch. Returns the names it dropped.
+/// What [`repair_invalid_concurrent_indexes`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ConcurrentIndexRepair {
+    /// INVALID indexes of unrecorded migrations, dropped so the migrator's
+    /// retry builds them from scratch.
+    pub dropped: Vec<String>,
+    /// INVALID indexes of recorded migrations, rebuilt in place with
+    /// `REINDEX INDEX CONCURRENTLY` (#5993).
+    pub rebuilt: Vec<String>,
+}
+
+impl ConcurrentIndexRepair {
+    pub fn is_empty(&self) -> bool {
+        self.dropped.is_empty() && self.rebuilt.is_empty()
+    }
+}
+
+/// Repair INVALID indexes left by interrupted `CREATE INDEX CONCURRENTLY`
+/// migrations (see [`CONCURRENT_INDEX_MIGRATIONS`]).
 ///
-/// Runs on the migration connection under sqlx's own migrator advisory
-/// lock: a concurrent build in progress on another replica also shows
-/// `indisvalid = false`, and holding the lock the migrator holds while it
-/// builds guarantees no build is in flight when this looks. A no-op on a
-/// fresh install (no ledger yet) and on every healthy database. The drop is
-/// `DROP INDEX CONCURRENTLY`, so it never blocks writers on the table.
+/// - Migration not recorded yet: `DROP INDEX CONCURRENTLY`, so the migrator's
+///   retry builds the index instead of skipping it (#4426).
+/// - Migration already recorded: `REINDEX INDEX CONCURRENTLY`, which builds a
+///   valid copy and swaps it in, so the index never goes missing (#5993).
+///
+/// Valid and missing indexes are left alone, so this is a catalogue-only
+/// no-op on fresh and healthy databases. Neither statement blocks writers on
+/// the table. An index whose build is in progress in another session
+/// (`pg_stat_progress_create_index`) is skipped.
+///
+/// The caller must hold the migration lock ([`run_startup_migrations`]
+/// does): a build running inside another replica's migrator also shows
+/// `indisvalid = false`, and only the lock rules that out.
 pub async fn repair_invalid_concurrent_indexes(
     conn: &mut sqlx::PgConnection,
-) -> Result<Vec<String>> {
-    use sqlx::migrate::Migrate;
-
+) -> Result<ConcurrentIndexRepair> {
     let table_exists: bool =
         sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
             .fetch_one(&mut *conn)
             .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+            .map_err(db_err)?;
     if !table_exists {
-        return Ok(Vec::new());
+        return Ok(ConcurrentIndexRepair::default());
     }
-
-    conn.lock()
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-    let dropped = drop_invalid_unapplied_indexes(conn).await;
-    conn.unlock()
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-    let dropped = dropped?;
-    if !dropped.is_empty() {
-        tracing::warn!(
-            indexes = ?dropped,
-            "Dropped INVALID index(es) left by an interrupted concurrent index \
-             migration; the migrator will rebuild them. See issue #4426."
-        );
-    }
-    Ok(dropped)
-}
-
-async fn drop_invalid_unapplied_indexes(conn: &mut sqlx::PgConnection) -> Result<Vec<String>> {
     let applied: Vec<i64> =
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success")
             .fetch_all(&mut *conn)
             .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-    let mut dropped = Vec::new();
-    for name in unapplied_concurrent_indexes(CONCURRENT_INDEX_MIGRATIONS, &applied) {
+            .map_err(db_err)?;
+    let unapplied = unapplied_concurrent_indexes(CONCURRENT_INDEX_MIGRATIONS, &applied);
+
+    let mut report = ConcurrentIndexRepair::default();
+    for (_, name) in CONCURRENT_INDEX_MIGRATIONS {
         // `to_regclass` resolves against the connection's search_path, like
         // the migrator itself; NULL (no such index) matches no row.
-        let invalid: Option<bool> = sqlx::query_scalar(
-            "SELECT NOT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)",
+        let state: Option<(bool, bool)> = sqlx::query_as(
+            "SELECT i.indisvalid, \
+                    EXISTS (SELECT 1 FROM pg_stat_progress_create_index p \
+                            WHERE p.datid = (SELECT oid FROM pg_database \
+                                             WHERE datname = current_database()) \
+                              AND p.index_relid = i.indexrelid) \
+             FROM pg_index i WHERE i.indexrelid = to_regclass($1)",
         )
         .bind(name)
         .fetch_optional(&mut *conn)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-        if invalid != Some(true) {
+        .map_err(db_err)?;
+        let Some((valid, building)) = state else {
+            continue;
+        };
+        if valid {
+            continue;
+        }
+        if building {
+            tracing::warn!(
+                index = name,
+                "INVALID index is being built by another session; leaving it alone"
+            );
             continue;
         }
         // `name` is a compile-time constant from CONCURRENT_INDEX_MIGRATIONS
         // (plain lowercase identifiers, pinned by a unit test).
-        sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP INDEX CONCURRENTLY IF EXISTS \"{name}\""
-        )))
+        if unapplied.contains(name) {
+            exec_ddl(
+                conn,
+                &format!("DROP INDEX CONCURRENTLY IF EXISTS \"{name}\""),
+            )
+            .await?;
+            report.dropped.push(name.to_string());
+        } else {
+            for leftover in reindex_leftovers(conn, name).await? {
+                exec_ddl(
+                    conn,
+                    &format!("DROP INDEX CONCURRENTLY IF EXISTS \"{leftover}\""),
+                )
+                .await?;
+            }
+            exec_ddl(conn, &format!("REINDEX INDEX CONCURRENTLY \"{name}\"")).await?;
+            report.rebuilt.push(name.to_string());
+        }
+    }
+    if !report.dropped.is_empty() {
+        tracing::warn!(
+            indexes = ?report.dropped,
+            "Dropped INVALID index(es) left by an interrupted concurrent index \
+             migration; the migrator will rebuild them. See issue #4426."
+        );
+    }
+    if !report.rebuilt.is_empty() {
+        tracing::warn!(
+            indexes = ?report.rebuilt,
+            "Rebuilt INVALID index(es) whose concurrent index migration was \
+             recorded as applied. See issue #5993."
+        );
+    }
+    Ok(report)
+}
+
+/// INVALID `<name>_ccnew[N]` indexes on the same table as `name`: what a
+/// `REINDEX INDEX CONCURRENTLY` interrupted on an earlier boot leaves behind.
+/// Only names of exactly that shape are returned, so they are safe to quote.
+async fn reindex_leftovers(conn: &mut sqlx::PgConnection, name: &str) -> Result<Vec<String>> {
+    let candidates: Vec<String> = sqlx::query_scalar(
+        "SELECT c.relname::text FROM pg_index i \
+         JOIN pg_class c ON c.oid = i.indexrelid \
+         WHERE NOT i.indisvalid \
+           AND c.relnamespace = (SELECT relnamespace FROM pg_class WHERE oid = to_regclass($1)) \
+           AND i.indrelid = (SELECT indrelid FROM pg_index WHERE indexrelid = to_regclass($1))",
+    )
+    .bind(name)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    let prefix = format!("{name}_ccnew");
+    Ok(candidates
+        .into_iter()
+        .filter(|c| {
+            c.strip_prefix(&prefix)
+                .is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .collect())
+}
+
+async fn exec_ddl(conn: &mut sqlx::PgConnection, sql: &str) -> Result<()> {
+    sqlx::query(sqlx::AssertSqlSafe(sql))
         .execute(&mut *conn)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-        dropped.push(name.to_string());
+        .map_err(db_err)?;
+    Ok(())
+}
+
+fn db_err(e: sqlx::Error) -> AppError {
+    AppError::Database(e.to_string())
+}
+
+/// The session advisory-lock key sqlx's migrator takes for `database_name`
+/// (`sqlx-postgres` `migrate.rs::generate_lock_id`: a constant times the
+/// CRC-32/ISO-HDLC of the name). Using the same key keeps the startup
+/// migrator mutually exclusive with `sqlx migrate run` from the CLI.
+pub fn sqlx_migrator_lock_id(database_name: &str) -> i64 {
+    0x3d32ad9e * i64::from(crc32_iso_hdlc(database_name.as_bytes()))
+}
+
+fn crc32_iso_hdlc(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &b in bytes {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
     }
-    Ok(dropped)
+    !crc
+}
+
+/// How often a replica waiting for the migration lock tries again.
+const MIGRATION_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Run `migrator` the way a replica does at startup: take the migration
+/// lock, repair INVALID concurrent indexes, apply pending migrations, and
+/// release the lock.
+///
+/// The lock is sqlx's own key ([`sqlx_migrator_lock_id`]), but it is taken
+/// by polling `pg_try_advisory_lock` instead of a blocking
+/// `pg_advisory_lock` (#5993). A session blocked in `pg_advisory_lock` is a
+/// running statement with a snapshot, and `CREATE INDEX CONCURRENTLY` in
+/// the lock holder waits for every such snapshot to finish, while the
+/// blocked session waits for the holder: PostgreSQL detects the cycle and
+/// aborts one side with `deadlock detected`. When the build is the side it
+/// aborts, the index is left INVALID. Between polls a waiting replica runs
+/// no statement and holds no snapshot, so the build never waits on it.
+///
+/// The repair runs under the same lock hold as the migrator, so no other
+/// replica can start or interrupt a build between the check and the run.
+pub async fn run_startup_migrations(
+    conn: &mut sqlx::PgConnection,
+    migrator: &sqlx::migrate::Migrator,
+) -> Result<()> {
+    let database: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    let lock_id = sqlx_migrator_lock_id(&database);
+
+    let started = std::time::Instant::now();
+    let mut last_log: Option<std::time::Instant> = None;
+    loop {
+        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+            .bind(lock_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(db_err)?;
+        if acquired {
+            break;
+        }
+        if last_log.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(30)) {
+            tracing::info!(
+                waited_secs = started.elapsed().as_secs(),
+                "Another process is running database migrations; waiting for it to finish"
+            );
+            last_log = Some(std::time::Instant::now());
+        }
+        tokio::time::sleep(MIGRATION_LOCK_POLL).await;
+    }
+
+    let outcome = migrate_locked(conn, migrator).await;
+    let unlocked = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
+        .bind(lock_id)
+        .fetch_one(&mut *conn)
+        .await;
+    outcome?;
+    unlocked.map_err(db_err)?;
+    Ok(())
+}
+
+async fn migrate_locked(
+    conn: &mut sqlx::PgConnection,
+    migrator: &sqlx::migrate::Migrator,
+) -> Result<()> {
+    repair_invalid_concurrent_indexes(conn).await?;
+    // The same migration set without sqlx's own (blocking) lock: this
+    // session already holds it.
+    let unlocked = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(migrator.migrations.to_vec()),
+        ignore_missing: migrator.ignore_missing,
+        locking: false,
+        no_tx: migrator.no_tx,
+        table_name: migrator.table_name.clone(),
+        create_schemas: migrator.create_schemas.clone(),
+    };
+    unlocked.run_direct(None, conn, false).await?;
+    Ok(())
 }
 
 #[cfg(ak_test_shard = "services-2")]
@@ -1664,15 +1850,15 @@ mod tests {
         }
     }
 
-    /// The reverse direction (#4539): every `-- no-transaction`
-    /// `CREATE INDEX CONCURRENTLY` migration from 260 on is registered in
+    /// The reverse direction (#4539, #5993): every `-- no-transaction`
+    /// `CREATE INDEX CONCURRENTLY` migration is registered in
     /// [`CONCURRENT_INDEX_MIGRATIONS`] under the index it builds, so a new
     /// concurrent index cannot land without the interrupted-build repair.
     #[test]
     fn every_concurrent_index_migration_is_registered() {
         let migrator = sqlx::migrate!("./migrations");
         const OPENER: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS ";
-        for m in migrator.iter().filter(|m| m.version >= 260) {
+        for m in migrator.iter() {
             let sql = m.sql.as_str();
             if !sql.starts_with("-- no-transaction") || !sql.contains("CREATE INDEX CONCURRENTLY") {
                 continue;
@@ -1737,10 +1923,16 @@ mod tests {
         mark_index_invalid(&pool, "idx_scan_results_dedup_local").await;
 
         let mut conn = pool.acquire().await.expect("conn");
-        let dropped = repair_invalid_concurrent_indexes(&mut conn)
+        let report = repair_invalid_concurrent_indexes(&mut conn)
             .await
             .expect("repair");
-        assert_eq!(dropped, vec!["idx_scan_results_dedup_local".to_string()]);
+        assert_eq!(
+            report,
+            ConcurrentIndexRepair {
+                dropped: vec!["idx_scan_results_dedup_local".to_string()],
+                rebuilt: vec![],
+            }
+        );
         assert_eq!(
             index_validity(&pool, "idx_scan_results_dedup_local").await,
             None
@@ -1758,16 +1950,20 @@ mod tests {
             "the old index is dropped only after the new one is valid"
         );
 
-        // 274 is recorded now: an invalid index is no longer this step's
-        // business (it is not a build leftover).
+        // 274 is recorded now: an INVALID index is rebuilt in place rather
+        // than dropped, so it never goes missing (#5993).
         mark_index_invalid(&pool, "idx_scan_results_dedup_local").await;
-        let dropped = repair_invalid_concurrent_indexes(&mut conn)
+        let report = repair_invalid_concurrent_indexes(&mut conn)
             .await
-            .expect("repair no-op");
-        assert!(dropped.is_empty());
+            .expect("repair recorded");
+        assert_eq!(
+            report.rebuilt,
+            vec!["idx_scan_results_dedup_local".to_string()]
+        );
+        assert!(report.dropped.is_empty());
         assert_eq!(
             index_validity(&pool, "idx_scan_results_dedup_local").await,
-            Some(false)
+            Some(true)
         );
         drop(conn);
         drop_scratch_database(&admin_url, pool, &db).await;
@@ -1794,5 +1990,206 @@ mod tests {
         drop(conn);
         drop(pool);
         drop_isolation_schema(&url, &schema).await;
+    }
+
+    // ---- #5993: multi-replica first boot ---------------------------------
+
+    /// The key is sqlx's: CRC-32/ISO-HDLC check value, and the formula from
+    /// `sqlx-postgres` `generate_lock_id`.
+    #[test]
+    fn migrator_lock_id_matches_sqlx() {
+        assert_eq!(crc32_iso_hdlc(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32_iso_hdlc(b""), 0);
+        assert_eq!(
+            sqlx_migrator_lock_id("artifact_registry"),
+            0x3d32ad9e * i64::from(crc32_iso_hdlc(b"artifact_registry"))
+        );
+    }
+
+    /// The names of every INVALID index in the database.
+    async fn invalid_indexes(pool: &PgPool) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT c.relname::text FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+             WHERE NOT i.indisvalid ORDER BY 1",
+        )
+        .fetch_all(pool)
+        .await
+        .expect("pg_index")
+    }
+
+    async fn index_oid(pool: &PgPool, name: &str) -> Option<i64> {
+        sqlx::query_scalar("SELECT to_regclass($1)::oid::bigint")
+            .bind(name)
+            .fetch_one(pool)
+            .await
+            .expect("to_regclass")
+    }
+
+    /// Our lock and sqlx's are the same lock: while sqlx's migrator lock is
+    /// held, `run_startup_migrations` waits, and runs once it is released.
+    #[tokio::test]
+    async fn startup_migrations_share_the_sqlx_migrator_lock() {
+        use sqlx::migrate::Migrate;
+        let Some((admin_url, db, pool)) = setup_scratch_database("issue5993_lock").await else {
+            return;
+        };
+        let mut holder = pool.acquire().await.expect("conn");
+        holder.lock().await.expect("sqlx lock");
+
+        let waiter_pool = pool.clone();
+        let waiter = tokio::spawn(async move {
+            let mut conn = waiter_pool.acquire().await.expect("conn");
+            run_startup_migrations(&mut conn, &crate::MIGRATOR).await
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert!(!waiter.is_finished(), "must wait for the sqlx lock");
+        let ledger: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .expect("ledger");
+        assert!(!ledger, "nothing may migrate while the lock is held");
+
+        holder.unlock().await.expect("sqlx unlock");
+        drop(holder);
+        tokio::time::timeout(std::time::Duration::from_secs(600), waiter)
+            .await
+            .expect("waiter finishes")
+            .expect("join")
+            .expect("migrations");
+        assert!(invalid_indexes(&pool).await.is_empty());
+        drop_scratch_database(&admin_url, pool, &db).await;
+    }
+
+    /// #5993: the three indexes the multi-replica first boot left INVALID
+    /// with their migrations recorded are rebuilt on the next start, an
+    /// INVALID `_ccnew` leftover of an interrupted rebuild is cleared, and a
+    /// valid index is not touched.
+    #[tokio::test]
+    async fn invalid_index_recorded_as_applied_is_rebuilt_on_next_start() {
+        let Some((admin_url, db, pool)) = setup_scratch_database("issue5993_rebuild").await else {
+            return;
+        };
+        let mut conn = pool.acquire().await.expect("conn");
+        run_startup_migrations(&mut conn, &crate::MIGRATOR)
+            .await
+            .expect("first boot");
+        drop(conn);
+
+        let broken = [
+            "idx_artifacts_origin_upstream_url",
+            "idx_artifacts_download_holds_quarantine",
+            "idx_proxy_cache_download_holds",
+        ];
+        for name in broken {
+            mark_index_invalid(&pool, name).await;
+        }
+        // What an interrupted `REINDEX INDEX CONCURRENTLY` leaves behind.
+        sqlx::raw_sql(
+            "CREATE INDEX idx_proxy_cache_download_holds_ccnew \
+                 ON proxy_cache_artifacts (id)",
+        )
+        .execute(&pool)
+        .await
+        .expect("ccnew leftover");
+        mark_index_invalid(&pool, "idx_proxy_cache_download_holds_ccnew").await;
+        let untouched = index_oid(&pool, "idx_sync_tasks_artifact_id").await;
+        assert!(untouched.is_some());
+        assert_eq!(
+            invalid_indexes(&pool).await.len(),
+            broken.len() + 1,
+            "setup"
+        );
+
+        let mut conn = pool.acquire().await.expect("conn");
+        run_startup_migrations(&mut conn, &crate::MIGRATOR)
+            .await
+            .expect("next start");
+        drop(conn);
+
+        assert!(
+            invalid_indexes(&pool).await.is_empty(),
+            "every index must be valid after the next start"
+        );
+        for name in broken {
+            assert_eq!(index_validity(&pool, name).await, Some(true), "{name}");
+        }
+        assert_eq!(
+            index_oid(&pool, "idx_proxy_cache_download_holds_ccnew").await,
+            None
+        );
+        assert_eq!(
+            index_oid(&pool, "idx_sync_tasks_artifact_id").await,
+            untouched,
+            "a valid index is left alone"
+        );
+
+        // A healthy database: the repair is a no-op.
+        let mut conn = pool.acquire().await.expect("conn");
+        assert!(repair_invalid_concurrent_indexes(&mut conn)
+            .await
+            .expect("healthy")
+            .is_empty());
+        drop(conn);
+        drop_scratch_database(&admin_url, pool, &db).await;
+    }
+
+    /// #5993: four replicas booting together on a fresh database. Each has
+    /// its own pool (its own sessions), as separate pods do. With a blocking
+    /// `pg_advisory_lock` the waiters deadlock the holder's concurrent index
+    /// builds; with the polling lock every replica succeeds and every index
+    /// ends valid.
+    #[tokio::test]
+    async fn concurrent_first_boot_leaves_every_index_valid() {
+        const REPLICAS: usize = 4;
+        let Some((admin_url, db, pool)) = setup_scratch_database("issue5993_race").await else {
+            return;
+        };
+        let url = with_database(&admin_url, &db);
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(REPLICAS));
+        let mut replicas = Vec::new();
+        for replica in 0..REPLICAS {
+            let url = url.clone();
+            let barrier = barrier.clone();
+            replicas.push(async move {
+                let pool = sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(2)
+                    .connect(&url)
+                    .await
+                    .expect("replica pool");
+                let mut conn = pool.acquire().await.expect("conn");
+                barrier.wait().await;
+                let outcome = run_startup_migrations(&mut conn, &crate::MIGRATOR).await;
+                drop(conn);
+                pool.close().await;
+                outcome.map_err(|e| format!("replica {replica}: {e}"))
+            });
+        }
+        // Polled together on this task: the replicas' sessions run in
+        // parallel on the server, which is where the race is.
+        let failures: Vec<String> = tokio::time::timeout(
+            std::time::Duration::from_secs(900),
+            futures::future::join_all(replicas),
+        )
+        .await
+        .expect("replicas finish")
+        .into_iter()
+        .filter_map(|r| r.err())
+        .collect();
+        assert!(failures.is_empty(), "replicas failed: {failures:?}");
+
+        assert!(
+            invalid_indexes(&pool).await.is_empty(),
+            "INVALID indexes after a concurrent first boot"
+        );
+        for (_, name) in CONCURRENT_INDEX_MIGRATIONS {
+            assert_eq!(index_validity(&pool, name).await, Some(true), "{name}");
+        }
+        let pending: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE NOT success")
+                .fetch_one(&pool)
+                .await
+                .expect("ledger");
+        assert_eq!(pending, 0);
+        drop_scratch_database(&admin_url, pool, &db).await;
     }
 }

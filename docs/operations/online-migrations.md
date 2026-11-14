@@ -135,15 +135,33 @@ The reset migration cannot help, because it was recorded on the first boot and
 does not run again.
 
 So the backend repairs it before migrating. On every start that runs
-migrations (not with `SKIP_MIGRATIONS=true`), before `MIGRATOR.run` and under
-the migrator's advisory lock,
-`migration_repair::repair_invalid_concurrent_indexes` walks
-`CONCURRENT_INDEX_MIGRATIONS`. For each registered build migration that is not
-yet recorded in `_sqlx_migrations`, it drops the named index if
-`pg_index.indisvalid` is false, and the build re-runs from scratch. A recorded
-migration and a valid index are never touched. Keep the reset migration as
-well: it covers an attempt made outside the migrator, which the repair does not
-know about.
+migrations (not with `SKIP_MIGRATIONS=true`),
+`migration_repair::run_startup_migrations` takes the migration lock, runs
+`migration_repair::repair_invalid_concurrent_indexes`, applies pending
+migrations and releases the lock, all in one lock hold. The repair walks
+`CONCURRENT_INDEX_MIGRATIONS` and looks only at indexes whose
+`pg_index.indisvalid` is false:
+
+- build migration not yet recorded: it drops the index, and the build re-runs
+  from scratch;
+- build migration already recorded: it rebuilds the index with
+  `REINDEX INDEX CONCURRENTLY` (and first drops any INVALID `<name>_ccnew`
+  leftover of an earlier interrupted rebuild).
+
+Valid and missing indexes are never touched, and an index that another session
+is still building is skipped. Keep the reset migration as well: it covers an
+attempt made outside the migrator.
+
+The lock is sqlx's migrator key, so `sqlx migrate run` from the CLI still
+serializes with the backend. The backend takes it by polling
+`pg_try_advisory_lock`, not with a blocking `pg_advisory_lock`. A replica
+blocked in `pg_advisory_lock` holds a snapshot, a concurrent build in the lock
+holder waits for that snapshot, and PostgreSQL aborts one of the two with
+`deadlock detected`. When it aborted the build, several replicas booting
+together on a fresh database left INVALID indexes recorded as applied (#5993).
+A replica that polls holds no snapshot between attempts. Do not run
+`sqlx migrate run` against a database while backend replicas are migrating
+it: the CLI waits in `pg_advisory_lock` and can deadlock a build the same way.
 
 One index per migration. `CONCURRENTLY` cannot share a file with anything else,
 and a file that builds two indexes has two ways to fail half-way.
