@@ -37824,7 +37824,9 @@ mod oci_write_authz_and_size_tests {
                 String::from_utf8_lossy(&body)
             );
         }
-        let jobs: Vec<(String, Option<Uuid>, Option<String>, Option<Uuid>, i16)> = sqlx::query_as(
+        /// `(kind, repository_id, digest, artifact_id, priority)`.
+        type JobRow = (String, Option<Uuid>, Option<String>, Option<Uuid>, i16);
+        let jobs: Vec<JobRow> = sqlx::query_as(
             "SELECT kind, repository_id, digest, artifact_id, priority FROM scan_queue \
                  WHERE repository_id = $1",
         )
