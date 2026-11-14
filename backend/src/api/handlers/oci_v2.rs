@@ -37625,6 +37625,9 @@ mod oci_write_authz_and_size_tests {
         let auth = tdh::bearer_for(&fx.state, fx.user_id).await;
         let manifest = serde_json::json!({
             "schemaVersion": 2,
+            // Unique bytes per run: concurrent OCI tests push manifests too, and
+            // identical bytes would let this scan reuse another test's result.
+            "annotations": {"test.nonce": Uuid::new_v4().to_string()},
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
             "config": {
                 "mediaType": "application/vnd.oci.image.config.v1+json",
@@ -37682,6 +37685,9 @@ mod oci_write_authz_and_size_tests {
         let auth = tdh::bearer_for(&fx.state, fx.user_id).await;
         let manifest = serde_json::to_vec(&serde_json::json!({
             "schemaVersion": 2,
+            // Unique bytes per run: concurrent OCI tests push manifests too, and
+            // identical bytes would let this scan reuse another test's result.
+            "annotations": {"test.nonce": Uuid::new_v4().to_string()},
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
             "config": {
                 "mediaType": "application/vnd.oci.image.config.v1+json",
@@ -37777,6 +37783,9 @@ mod oci_write_authz_and_size_tests {
         let auth = tdh::bearer_for(&fx.state, fx.user_id).await;
         let manifest = serde_json::to_vec(&serde_json::json!({
             "schemaVersion": 2,
+            // Unique bytes per run: concurrent OCI tests push manifests too, and
+            // identical bytes would let this scan reuse another test's result.
+            "annotations": {"test.nonce": Uuid::new_v4().to_string()},
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
             "config": {
                 "mediaType": "application/vnd.oci.image.config.v1+json",

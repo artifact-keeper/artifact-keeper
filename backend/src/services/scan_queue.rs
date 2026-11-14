@@ -42,11 +42,13 @@ pub const RENEW_CLAIM_SQL: &str = r#"
 
 /// The OCI manifest-row test both sides of a `hosted_image` job use (#5946):
 /// the enqueue side classifies an upload with it and the worker selects the
-/// rows to scan with it, so a row one side counts is a row the other finds. A
-/// leading `/` is tolerated, as `parse_oci_manifest_path` tolerates it.
+/// rows to scan with it, so a row one side counts is a row the other finds. As
+/// in `parse_oci_manifest_path`, a leading `/` is tolerated and both the image
+/// name and the reference must be non-empty (`v2//manifests/x` and
+/// `v2/a/manifests/` are not manifest rows).
 macro_rules! oci_manifest_path_predicate {
     () => {
-        "ltrim(path, '/') LIKE 'v2/%/manifests/%'"
+        "ltrim(path, '/') ~ '^v2/.+/manifests/.+$'"
     };
 }
 
@@ -1701,25 +1703,47 @@ mod tests {
         let slashed = seed("/v2/img/manifests/1.0", slash01.clone()).await;
         let plain = seed("v2/img/manifests/1.1", plain01.clone()).await;
         let file = seed("pkg/file-1.0.tgz", file01.clone()).await;
-        for id in [slashed, plain, file] {
+        // Malformed manifest paths `parse_oci_manifest_path` rejects are not
+        // manifest rows on either side: an empty name, an empty reference.
+        let (noname01, noref01) = ("d".repeat(64), "e".repeat(64));
+        let no_name = seed("v2//manifests/x", noname01.clone()).await;
+        let no_ref = seed("v2/a/manifests/", noref01.clone()).await;
+        assert!(
+            crate::services::scanner_service::parse_oci_manifest_path("v2//manifests/x").is_none()
+        );
+        assert!(
+            crate::services::scanner_service::parse_oci_manifest_path("v2/a/manifests/").is_none()
+        );
+        for id in [slashed, plain, file, no_name, no_ref] {
             crate::services::scanner_service::enqueue_scan_on_upload(&pool, repo, id)
                 .await
                 .expect("enqueue");
         }
-        let jobs: Vec<(String, Option<String>, Option<Uuid>)> = sqlx::query_as(
+        let mut jobs: Vec<(String, Option<String>, Option<Uuid>)> = sqlx::query_as(
             "SELECT kind, digest, artifact_id FROM scan_queue ORDER BY kind, digest",
         )
         .fetch_all(&pool)
         .await
         .expect("jobs");
-        assert_eq!(
-            jobs,
-            vec![
-                ("hosted_image".to_string(), Some(slash01.clone()), None),
-                ("hosted_image".to_string(), Some(plain01.clone()), None),
-                ("hosted_upload".to_string(), None, Some(file)),
-            ]
-        );
+        jobs.sort();
+        let mut expected = vec![
+            ("hosted_image".to_string(), Some(slash01.clone()), None),
+            ("hosted_image".to_string(), Some(plain01.clone()), None),
+            ("hosted_upload".to_string(), None, Some(file)),
+            ("hosted_upload".to_string(), None, Some(no_name)),
+            ("hosted_upload".to_string(), None, Some(no_ref)),
+        ];
+        expected.sort();
+        assert_eq!(jobs, expected);
+        for digest in [&noname01, &noref01] {
+            let rows: Vec<Uuid> = sqlx::query_scalar(HOSTED_IMAGE_ROWS_SQL)
+                .bind(repo)
+                .bind(digest)
+                .fetch_all(&pool)
+                .await
+                .expect("worker rows");
+            assert!(rows.is_empty(), "not a manifest row: {digest}");
+        }
         for (digest, id) in [(&slash01, slashed), (&plain01, plain)] {
             let rows: Vec<Uuid> = sqlx::query_scalar(HOSTED_IMAGE_ROWS_SQL)
                 .bind(repo)

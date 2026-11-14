@@ -448,7 +448,7 @@ async fn scan_hosted_upload(state: &SharedState, job: &ScanJob) -> Result<(), Jo
 /// That is every tag of the manifest in the repository, not only the one whose
 /// push queued the job (the job is keyed by digest, so pushes of several tags
 /// share it). A tag already scanned for these bytes is a no-op or a reuse
-/// through the scan dedup, so only the first row costs a scan.
+/// through the scan dedup, so only the first row needs a scan.
 ///
 /// [`ScannerService::scan_artifact`]: crate::services::scanner_service::ScannerService::scan_artifact
 async fn scan_hosted_image(state: &SharedState, job: &ScanJob) -> Result<(), JobFailure> {
