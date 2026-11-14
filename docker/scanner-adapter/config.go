@@ -93,6 +93,23 @@ type Config struct {
 	// image scan at a time can use the on-disk analysis cache. Default 4; 0
 	// removes the bound.
 	MaxConcurrentScans int
+	// ClientLimitsFile (SCANNER_CLIENT_LIMITS_FILE, #5944) is an optional
+	// JSON or YAML file of per-client max_concurrent and weight, with a
+	// `default` entry; re-read when it changes (see limits.go). Empty: every
+	// client has no per-client cap and weight 1.
+	ClientLimitsFile string
+	// BackgroundMaxWait (SCANNER_BACKGROUND_MAX_WAIT, #5944) is the
+	// starvation bound of the background band: a background scan that has
+	// waited this long starts ahead of interactive scans. Default 30m; 0
+	// disables the bound.
+	BackgroundMaxWait time.Duration
+	// MetricsAddr (SCANNER_METRICS_ADDR, #5944) is the listen address of the
+	// Prometheus /metrics listener, separate from the API listener. Empty
+	// (default): no metrics listener.
+	MetricsAddr string
+	// MetricsClientLabel (SCANNER_METRICS_CLIENT_LABEL, #5944) adds per-client
+	// queue series. Off by default: the client set is unbounded.
+	MetricsClientLabel bool
 	// JobTTL is how long a finished job (report or error) is retained before the
 	// sweeper evicts it.
 	JobTTL time.Duration
@@ -167,6 +184,10 @@ func LoadConfig() *Config {
 		FsMaxUploadBytes:    getenvInt64("SCANNER_FS_MAX_UPLOAD_BYTES", 64*1024*1024*1024),
 		JobTTL:              getenvDuration("SCANNER_JOB_TTL", 30*time.Minute),
 		MaxConcurrentScans:  getenvIntNonNeg("SCANNER_MAX_CONCURRENT_SCANS", 4),
+		ClientLimitsFile:    strings.TrimSpace(os.Getenv("SCANNER_CLIENT_LIMITS_FILE")),
+		BackgroundMaxWait:   getenvDurationNonNeg("SCANNER_BACKGROUND_MAX_WAIT", 30*time.Minute),
+		MetricsAddr:         strings.TrimSpace(os.Getenv("SCANNER_METRICS_ADDR")),
+		MetricsClientLabel:  getenvBool("SCANNER_METRICS_CLIENT_LABEL", false),
 		LogLevel:            getenv("SCANNER_LOG_LEVEL", "info"),
 		ScannerVersion:      os.Getenv("SCANNER_SCANNER_VERSION"),
 		TrivyServer:         strings.TrimRight(strings.TrimSpace(os.Getenv("SCANNER_TRIVY_SERVER")), "/"),
@@ -281,6 +302,20 @@ func getenvDuration(key string, def time.Duration) time.Duration {
 	}
 	d, err := time.ParseDuration(strings.TrimSpace(v))
 	if err != nil {
+		return def
+	}
+	return d
+}
+
+// getenvDurationNonNeg parses a duration that may be 0 but not negative. An
+// unparsable or negative value yields def.
+func getenvDurationNonNeg(key string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 {
 		return def
 	}
 	return d

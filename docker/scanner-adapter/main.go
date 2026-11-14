@@ -22,6 +22,9 @@ func main() {
 	}
 	srv := NewServer(cfg)
 	log.Print(partitionModeLogLine(cfg))
+	stop := make(chan struct{})
+	defer close(stop)
+	startScheduling(srv, cfg, stop)
 	if cfg.Offline {
 		log.Printf("offline mode (SCANNER_OFFLINE): no vulnerability-DB or Java-DB download, scans run with --skip-db-update --skip-java-db-update (and, like every scan, --offline-scan); import a DB with PUT /api/v1/vulndb")
 	}
@@ -47,8 +50,6 @@ func main() {
 		startStandalone(srv, cfg)
 	}
 
-	stop := make(chan struct{})
-	defer close(stop)
 	go srv.jobs.RunSweeper(stop)
 
 	server := &http.Server{
@@ -119,4 +120,38 @@ func partitionModeLogLine(cfg *Config) string {
 		return "trivy analysis cache partition mode: registry (one partition per registry host of each image scan; " + prefix + " as the prefix)"
 	}
 	return "trivy analysis cache partition mode: static (" + prefix + ")"
+}
+
+// startScheduling loads the per-client limits file (a missing or invalid one
+// at startup is fatal: the adapter would otherwise run without the caps it
+// was given), starts watching it, and starts the metrics listener (#5944).
+func startScheduling(srv *Server, cfg *Config, stop <-chan struct{}) {
+	if cfg.ClientLimitsFile != "" {
+		stamp := statClientLimits(cfg.ClientLimitsFile) // before the load: see watchClientLimits
+		l, err := loadClientLimitsFile(cfg.ClientLimitsFile)
+		if err != nil {
+			log.Fatalf("SCANNER_CLIENT_LIMITS_FILE: %v", err)
+		}
+		srv.sched.SetLimits(l)
+		log.Printf("client limits loaded from %s (%d client entries); re-read on change", cfg.ClientLimitsFile, len(l.clients))
+		go watchClientLimits(cfg.ClientLimitsFile, stamp, limitsReloadInterval, srv.sched.SetLimits, stop)
+	}
+	if cfg.BackgroundMaxWait > 0 {
+		log.Printf("background scans yield to interactive ones for up to %s (SCANNER_BACKGROUND_MAX_WAIT)", cfg.BackgroundMaxWait)
+	} else {
+		log.Printf("background scans yield to interactive ones with no starvation bound (SCANNER_BACKGROUND_MAX_WAIT=0)")
+	}
+	if cfg.MetricsAddr != "" {
+		ms := &http.Server{
+			Addr:              cfg.MetricsAddr,
+			Handler:           srv.metrics.Handler(srv.sched),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		go func() {
+			log.Printf("metrics listening on %s (/metrics)", cfg.MetricsAddr)
+			if err := ms.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("metrics listener: %v", err)
+			}
+		}()
+	}
 }

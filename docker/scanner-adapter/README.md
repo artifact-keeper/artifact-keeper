@@ -173,6 +173,92 @@ line of `SCANNER_SCAN_TOKENS_FILE` (picked up without a restart), point
 `TRIVY_ADAPTER_TOKEN` / `TRIVY_ADAPTER_TOKEN_FILE` at it and restart the
 backend (it reads the token at startup), then remove the old line.
 
+## Clients, fair queueing and background scans (adapter >= 1.7.0)
+
+Several Artifact Keeper instances or registries can share one adapter. By
+default nothing changes: queued scans get slots in arrival order. The
+following are opt-in (#5944).
+
+**Client identity.** An image scan's client is its `registry.url` host
+(lowercased, scheme and trailing slash dropped, port kept). A filesystem
+upload names no registry; its client is the `X-Scan-Client` header
+(normalized the same way, so a backend can send the registry URL it uses for
+image scans) or, without it, the remote IP address. The identity is
+independent of any scan-route bearer token, so this works with or without one.
+
+The identity is advisory: the caller supplies both the `registry.url` and
+`X-Scan-Client`, so any caller can claim another client's share or cap.
+Expose the adapter only to trusted Artifact Keeper backends (network policy,
+and the scan-route token from #5948 to restrict who can call it). Filesystem
+scans are keyed by the remote IP unless the backend sends `X-Scan-Client`,
+so without that header they do not match a registry-host entry in the
+limits file (they get the `default` entry).
+
+Limits keys only work for a backend whose `registry.url` is stable: set
+`TRIVY_ADAPTER_REGISTRY_URL` on each instance (a service DNS name). Without
+it each backend replica advertises its own pod IP, so every replica is a
+separate client and none matches a limits entry.
+
+**Per-client limits and weighted fair queueing.** `SCANNER_CLIENT_LIMITS_FILE`
+names a JSON or YAML file, re-read within 5s of a change (an invalid edit is
+logged and the previous limits stay; an invalid or missing file at startup
+stops the adapter):
+
+```yaml
+default:              # every client not listed
+  max_concurrent: 2   # 0 or absent: no per-client cap
+  weight: 1           # >= 1
+"ak-one.example:8080":
+  max_concurrent: 4
+  weight: 3
+ak-two.example:8443: {weight: 2}   # absent fields come from default
+```
+
+The adapter reads block mappings and flow mappings like these (JSON works
+too); it does not read every YAML construct. With a limits file set:
+
+- A client at its `max_concurrent` waits even when global slots
+  (`SCANNER_MAX_CONCURRENT_SCANS`) are free.
+- When a slot frees, the next job is chosen by deficit round robin across the
+  clients with queued jobs: each client starts up to `weight` jobs per round.
+  Within a client jobs stay FIFO. A busy client's backlog no longer delays
+  everyone else's scans.
+
+Without a limits file all jobs are queued as one client, i.e. in arrival
+order.
+
+**Priority bands.** An image scan request may carry `"priority":
+"interactive"` (the default) or `"background"`; a filesystem upload uses the
+`X-Scan-Priority` header. Any other value is refused with `400`. A background
+job starts only when no interactive job can take the slot (none is waiting,
+or each waiting one is held by its own client's `max_concurrent`), or once it
+has waited `SCANNER_BACKGROUND_MAX_WAIT` (default `30m`, `0` for no bound).
+A background job past that bound gets the next free slot ahead of waiting
+interactive jobs, but starved jobs never all go first: at most one starved
+job runs at a time, and right after one starts the next slot goes to
+interactive work. A backlog of background jobs (such as a rescan wave)
+therefore alternates with interactive scans instead of holding them past
+the backend's 30-minute queue budget. The bound is checked whenever a slot
+frees. Requests without the field are interactive, as every scan was
+before.
+
+**Metrics.** `SCANNER_METRICS_ADDR` (e.g. `:9090`, off by default) starts a
+separate listener serving Prometheus text on `GET /metrics`:
+
+| Metric | Type | |
+|---|---|---|
+| `scanner_adapter_jobs_queued{priority}` | gauge | jobs waiting for a slot, `interactive` / `background` |
+| `scanner_adapter_jobs_running` | gauge | jobs holding a slot |
+| `scanner_adapter_slots_capacity` | gauge | `SCANNER_MAX_CONCURRENT_SCANS` (`0`: unbounded) |
+| `scanner_adapter_queue_wait_seconds` | histogram | time from submission to slot |
+| `scanner_adapter_jobs_total{outcome}` | counter | finished jobs, `succeeded` / `failed` |
+
+`SCANNER_METRICS_CLIENT_LABEL=true` adds
+`scanner_adapter_client_jobs_queued{client,priority}` and
+`scanner_adapter_client_jobs_running{client}` for the clients with a job
+queued or running. It is opt-in because the client set is unbounded, and it
+needs a limits file (without one every job is the same client, `""`).
+
 ## Offline use and vulnerability-DB import (adapter >= 1.7.0)
 
 For a disconnected install, set one switch:
