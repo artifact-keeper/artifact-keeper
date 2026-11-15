@@ -927,6 +927,14 @@ impl ScannerAdapterFsClient {
         .await
     }
 
+    /// [`Self::unavailable`] for an adapter that is unreachable or not ready,
+    /// which a queued scan retries once it is back (#5994). A no-op signal for
+    /// an in-process scan. Misconfiguration (an unusable token) is not this.
+    fn unreachable(&self, detail: impl std::fmt::Display) -> AppError {
+        crate::services::scan_queue::note_engine_unavailable();
+        self.unavailable(detail)
+    }
+
     /// Availability-class error: the sidecar is down/unready, which degrades
     /// the scan to `not_applicable` (#2324) instead of failing it closed.
     fn unavailable(&self, detail: impl std::fmt::Display) -> AppError {
@@ -982,7 +990,7 @@ impl ScannerAdapterFsClient {
             log_adapter_ready_outcome(&self.adapter_url, started, &outcome);
         }
         outcome.map(|_| ()).map_err(|f| {
-            self.unavailable(format!(
+            self.unreachable(format!(
                 "{}{} ({})",
                 f.kind.describe(),
                 f.budget_note(),
@@ -1009,11 +1017,11 @@ impl ScannerAdapterFsClient {
             .body(tar)
             .send()
             .await
-            .map_err(|e| self.unavailable(format!("workspace upload failed: {}", e)))?;
+            .map_err(|e| self.unreachable(format!("workspace upload failed: {}", e)))?;
 
         let status = resp.status();
         if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-            return Err(self.unavailable("adapter answered 503 on submit"));
+            return Err(self.unreachable("adapter answered 503 on submit"));
         }
         if !status.is_success() {
             let text = adapter_error_text(resp).await;
@@ -1071,7 +1079,7 @@ impl ScannerAdapterFsClient {
                             tokio::time::sleep(wait).await;
                             continue;
                         }
-                        None => return Err(self.unavailable(detail).into()),
+                        None => return Err(self.unreachable(detail).into()),
                     }
                 }
             };
@@ -1764,6 +1772,19 @@ mod tests {
             matches!(err, AppError::ScannerEngineUnavailable(_)),
             "unreachable adapter must be ScannerEngineUnavailable, got {err:?}"
         );
+    }
+
+    /// #5994: an unreachable adapter on the filesystem path also reports the
+    /// engine unavailable, so a queued scan retries it like an image scan.
+    #[tokio::test]
+    async fn test_unreachable_adapter_reports_the_engine_unavailable() {
+        let client = ScannerAdapterFsClient::new("http://127.0.0.1:1".to_string());
+        let (result, unavailable) = crate::services::scan_queue::tracking_engine_unavailable(
+            client.scan_workspace_tar(tiny_tar()),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::ScannerEngineUnavailable(_))));
+        assert!(unavailable);
     }
 
     /// A 503 from /probe/ready (adapter starting / DB not loaded) is also an
