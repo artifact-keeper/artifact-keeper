@@ -570,7 +570,7 @@ jobs:
       # (helm/gate-profiles.txt, scripts/render-gate-profiles.sh), shared with
       # iac's helm-ci.yml so the three cannot drift. Running that repository's
       # main here trusts it no further than the release-gate job below, which
-      # runs its main with `secrets: inherit`; and nothing from the certified
+      # runs its main with GHCR_DOCKER_CONFIG; and nothing from the certified
       # commit is executed (CODE FROM MAIN, DATA FROM THE COMMIT above).
       - name: Checkout the gate's chart (artifact-keeper-iac@main)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -745,10 +745,10 @@ jobs:
       # release.yml runs that copy on the tag and would refuse the
       # certification after the tag exists (backport first).
       #
-      # The Release Gate cannot be pinned to this image yet: release-gate.yml
-      # (artifact-keeper-test) takes no adapter input and deploys the chart's
-      # pinned adapter (artifact-keeper-test#380). `adapter_image_ref` is the
-      # value to pass once it does.
+      # The Release Gate's scanner-adapter DTF tiers run this adapter: the job
+      # below passes `adapter_tag` as the gate's scanner_adapter_tag. The k8s
+      # deploy still uses the chart's pinned adapter
+      # (artifact-keeper-test#380).
       - name: Pin the scanner-adapter digest that ships
         id: adapter
         env:
@@ -774,6 +774,13 @@ jobs:
           && needs.bookkeeping.result == 'success'
           && needs.images.result == 'success'
           && fromJSON(github.run_attempt) == 1 }}
+    # The gate's jobs request at most contents: read and packages: read (ghcr
+    # pulls); a called workflow can never hold more than its calling job grants.
+    permissions:
+      contents: read
+      packages: read
+    # Still @main: SHA-pinning waits on branch protection for
+    # artifact-keeper-test, and on the 1.12.0 gate wiring landing there.
     uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main
     with:
       backend_tag: sha-${{ needs.resolve.outputs.short }}
@@ -781,9 +788,15 @@ jobs:
       # same ref before the gate is dispatched (#4722): keep the two in step.
       iac_ref: main
       backend_digest: ${{ needs.images.outputs.backend_digest }}
+      # The adapter this release ships (pin-adapter-digest.sh): this commit's
+      # sha-<short> rebuild when its VERSION is new, the published :VERSION
+      # when it stays. The gate's scanner-adapter tiers run it.
+      scanner_adapter_tag: ${{ needs.images.outputs.adapter_tag }}
       web_tag: latest
       test_suite: all
-    secrets: inherit
+    # Only the one secret the gate declares, not every secret this repo holds.
+    secrets:
+      GHCR_DOCKER_CONFIG: ${{ secrets.GHCR_DOCKER_CONFIG }}
 
   gate-rerun-refused:
     name: Refuse a re-run of the gate

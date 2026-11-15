@@ -201,7 +201,7 @@ func TestMaxConcurrentScansConfig(t *testing.T) {
 	}
 	t.Setenv("SCANNER_MAX_CONCURRENT_SCANS", "0")
 	cfg := LoadConfig()
-	if cfg.MaxConcurrentScans != 0 || NewServer(cfg).scanSlots != nil {
+	if cfg.MaxConcurrentScans != 0 || NewServer(cfg).sched.capacity != 0 {
 		t.Errorf("SCANNER_MAX_CONCURRENT_SCANS=0 must be unbounded")
 	}
 }

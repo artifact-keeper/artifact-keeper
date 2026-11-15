@@ -2401,9 +2401,12 @@ async fn download(
                     }
                 }
 
+                // #5810: no member scans; the virtual's member-fallback policy.
+                let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
                 let result = resolve_unscanned_crate_members(
                     &state,
                     members,
+                    fallback,
                     proxy_for_virtual,
                     &member_fetch_urls,
                     &coordinate,
@@ -2740,6 +2743,7 @@ async fn serve_scanned_crate(
 async fn resolve_unscanned_crate_members(
     state: &SharedState,
     members: Vec<crate::models::repository::Repository>,
+    fallback: proxy_helpers::VirtualMemberFallback,
     proxy: Option<&crate::services::proxy_service::ProxyService>,
     member_fetch_urls: &HashMap<uuid::Uuid, String>,
     coordinate: &CrateCoordinate<'_>,
@@ -2747,6 +2751,7 @@ async fn resolve_unscanned_crate_members(
     let (name, version) = (coordinate.name, coordinate.version);
     proxy_helpers::resolve_virtual_download_from_members_with_fetch_urls(
         members,
+        fallback,
         proxy,
         coordinate.cache_path,
         member_fetch_urls,
@@ -2800,7 +2805,9 @@ async fn serve_scanned_virtual_crate(
         .collect();
     let index_overrides = fetch_index_upstream_overrides(&state.db, &scanning_ids).await;
 
-    let mut failures = proxy_helpers::MemberWalkFailures::default();
+    // #5810: the virtual's member-fallback policy, for every member below.
+    let fallback = proxy_helpers::virtual_member_fallback(&state.db, virtual_id).await;
+    let mut failures = proxy_helpers::MemberWalkFailures::new(fallback);
     let mut unscanned = Vec::new();
     for (member, policy) in members.iter().zip(policies) {
         let Some(policy) = policy else {
@@ -2809,7 +2816,8 @@ async fn serve_scanned_virtual_crate(
         };
         let run = std::mem::take(&mut unscanned);
         if let Some(served) = failures.run_answer(
-            resolve_unscanned_crate_run(state, proxy, run, member_fetch_urls, coordinate).await,
+            resolve_unscanned_crate_run(state, proxy, run, fallback, member_fetch_urls, coordinate)
+                .await,
         ) {
             return Some(served);
         }
@@ -2844,7 +2852,9 @@ async fn serve_scanned_virtual_crate(
                 return Some(Err(resp))
             }
             Err(resp) => {
-                failures.note(&resp);
+                if let Some(ended) = failures.note(&resp) {
+                    return Some(ended);
+                }
                 tracing::debug!(
                     member_key = %member.key, status = %resp.status(),
                     "scanned cargo virtual member did not serve; trying next member"
@@ -2852,9 +2862,19 @@ async fn serve_scanned_virtual_crate(
             }
         }
     }
-    Some(failures.finish(
-        resolve_unscanned_crate_run(state, proxy, unscanned, member_fetch_urls, coordinate).await,
-    ))
+    Some(
+        failures.finish(
+            resolve_unscanned_crate_run(
+                state,
+                proxy,
+                unscanned,
+                fallback,
+                member_fetch_urls,
+                coordinate,
+            )
+            .await,
+        ),
+    )
 }
 
 /// [`resolve_unscanned_crate_members`] inside the scanned walk: `None` is a
@@ -2864,14 +2884,22 @@ async fn resolve_unscanned_crate_run(
     state: &SharedState,
     proxy: &crate::services::proxy_service::ProxyService,
     run: Vec<crate::models::repository::Repository>,
+    fallback: proxy_helpers::VirtualMemberFallback,
     member_fetch_urls: &HashMap<uuid::Uuid, String>,
     coordinate: &CrateCoordinate<'_>,
 ) -> Option<Result<Response, Response>> {
     if run.is_empty() {
         return None;
     }
-    match resolve_unscanned_crate_members(state, run, Some(proxy), member_fetch_urls, coordinate)
-        .await
+    match resolve_unscanned_crate_members(
+        state,
+        run,
+        fallback,
+        Some(proxy),
+        member_fetch_urls,
+        coordinate,
+    )
+    .await
     {
         Ok(result) => Some(Ok(virtual_crate_response(coordinate.filename, result))),
         Err(resp) => proxy_helpers::unscanned_run_failure(resp),
