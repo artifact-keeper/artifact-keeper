@@ -4,11 +4,13 @@
 -- Hosted channels: reset the per-channel backfill cursors so the existing
 -- background backfill rebuilds every package name in bounded batches. Until
 -- it finishes, a channel's shard endpoints use the per-request path, which
--- already writes the new records. Old addressed bodies are kept, so a client
--- holding an old shard address still gets a body that hashes to it.
+-- already writes the new records. A rebuild replaces a name's row in place,
+-- so its old shard address stops resolving; a client holding one refetches
+-- the shard index, as after any package update.
 --
 -- Synthesised remote channels: mark every built subdir stale, so the next
--- request rebuilds it even when the upstream document has not changed.
+-- request rebuilds it even when the upstream document has not changed. Its
+-- rebuilt names' old addresses stop resolving the same way.
 --
 -- On a database upgraded from 1.11.x both tables are empty (they first ship
 -- in 1.12.0) and both statements update nothing.
