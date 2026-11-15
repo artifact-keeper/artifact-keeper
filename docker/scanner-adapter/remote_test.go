@@ -35,7 +35,7 @@ func TestLoadConfigClientModeDefaultsOff(t *testing.T) {
 	if cfg.TrivyServer != "" || cfg.CachePartition != "" {
 		t.Fatalf("client mode must be off by default, got server=%q partition=%q", cfg.TrivyServer, cfg.CachePartition)
 	}
-	if args := cfg.clientArgs(); len(args) != 0 {
+	if args := cfg.clientArgs(""); len(args) != 0 {
 		t.Fatalf("standalone mode must add no client args, got %v", args)
 	}
 }
@@ -58,7 +58,7 @@ func TestBuildArgsClientMode(t *testing.T) {
 	cfg.CachePartition = "team-a"
 	s := NewScanner(cfg)
 	for name, args := range map[string][]string{
-		"image":      s.buildArgs("backend:8080/repo/app:1"),
+		"image":      s.buildArgs("backend:8080/repo/app:1", cfg.imagePartition(trimRegistryHost("http://backend:8080"))),
 		"filesystem": s.buildFsArgs("/tmp/ws"),
 	} {
 		joined := strings.Join(args, " ")
@@ -70,7 +70,7 @@ func TestBuildArgsClientMode(t *testing.T) {
 		}
 	}
 	// The target stays the last argument.
-	if args := s.buildArgs("backend:8080/repo/app:1"); args[len(args)-1] != "backend:8080/repo/app:1" {
+	if args := s.buildArgs("backend:8080/repo/app:1", cfg.imagePartition(trimRegistryHost("http://backend:8080"))); args[len(args)-1] != "backend:8080/repo/app:1" {
 		t.Errorf("image ref not last: %v", args)
 	}
 	if args := s.buildFsArgs("/tmp/ws"); args[len(args)-1] != "/tmp/ws" {

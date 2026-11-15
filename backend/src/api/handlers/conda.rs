@@ -7149,8 +7149,11 @@ async fn download_package(
                     }
                 }
 
+                // #5810: no member scans; the virtual's member-fallback policy.
+                let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
                 let result = proxy_helpers::resolve_virtual_download_from_members(
                     members,
+                    fallback,
                     proxy_service,
                     &serve_key.cache_key,
                     Some(&ctx),
@@ -7465,7 +7468,9 @@ where
     if policies.iter().all(Option::is_none) {
         return None;
     }
-    let mut failures = proxy_helpers::MemberWalkFailures::default();
+    // #5810: the virtual's member-fallback policy, for every member below.
+    let fallback = proxy_helpers::virtual_member_fallback(&state.db, virtual_id).await;
+    let mut failures = proxy_helpers::MemberWalkFailures::new(fallback);
     let mut unscanned = Vec::new();
     for (member, policy) in members.iter().zip(policies) {
         let (Some(policy), Some(upstream_url)) = (policy, member.upstream_url.as_deref()) else {
@@ -7473,9 +7478,9 @@ where
             continue;
         };
         let run = std::mem::take(&mut unscanned);
-        if let Some(served) =
-            failures.run_answer(resolve_unscanned_conda_run(proxy, run, target, local_fetch).await)
-        {
+        if let Some(served) = failures.run_answer(
+            resolve_unscanned_conda_run(proxy, run, fallback, target, local_fetch).await,
+        ) {
             return Some(served);
         }
         match serve_scanned_conda_package(
@@ -7496,7 +7501,9 @@ where
                 return Some(Err(resp))
             }
             Err(resp) => {
-                failures.note(&resp);
+                if let Some(ended) = failures.note(&resp) {
+                    return Some(ended);
+                }
                 tracing::debug!(
                     member_key = %member.key, status = %resp.status(),
                     "scanned conda virtual member did not serve; trying next member"
@@ -7504,7 +7511,11 @@ where
             }
         }
     }
-    Some(failures.finish(resolve_unscanned_conda_run(proxy, unscanned, target, local_fetch).await))
+    Some(
+        failures.finish(
+            resolve_unscanned_conda_run(proxy, unscanned, fallback, target, local_fetch).await,
+        ),
+    )
 }
 
 /// A run of non-scanning members inside the scanned walk, through the shared
@@ -7514,6 +7525,7 @@ where
 async fn resolve_unscanned_conda_run<F, Fut>(
     proxy: &crate::services::proxy_service::ProxyService,
     run: Vec<crate::models::repository::Repository>,
+    fallback: proxy_helpers::VirtualMemberFallback,
     target: &CondaPackageTarget<'_>,
     local_fetch: &F,
 ) -> Option<Result<Response, Response>>
@@ -7528,6 +7540,7 @@ where
     }
     match proxy_helpers::resolve_virtual_download_from_members(
         run,
+        fallback,
         Some(proxy),
         target.cache_key,
         Some(target.ctx),
@@ -9733,6 +9746,9 @@ async fn serve_sidecar(
         // uses; a refusal ends the walk, as it does for the package.
         let policies =
             proxy_helpers::virtual_member_scan_policies(&state.db, repo.id, &members).await?;
+        // #5810: in strict mode a Remote member that could not answer ends
+        // the walk with the retryable 503, as it does for the package.
+        let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
         for (member, policy) in members.iter().zip(policies) {
             if member.repo_type == RepositoryType::Remote {
                 if !remote_admitted {
@@ -9751,7 +9767,7 @@ async fn serve_sidecar(
                 {
                     return Err(blocked);
                 }
-                if let Ok(response) = proxy_sidecar(
+                match proxy_sidecar(
                     state,
                     member.id,
                     &member.key,
@@ -9761,7 +9777,14 @@ async fn serve_sidecar(
                 )
                 .await
                 {
-                    return Ok(response);
+                    Ok(response) => return Ok(response),
+                    Err(resp)
+                        if fallback.is_strict()
+                            && proxy_helpers::is_member_unavailable_response(&resp) =>
+                    {
+                        return Err(proxy_helpers::member_unavailable_response());
+                    }
+                    Err(_) => {}
                 }
                 continue;
             }

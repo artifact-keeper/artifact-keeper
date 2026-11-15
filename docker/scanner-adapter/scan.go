@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,6 +36,8 @@ type Scanner struct {
 	// scans already default to the memory backend, and client mode uses the
 	// trivy server's cache, so neither takes it.
 	imageCacheMu sync.Mutex
+	// ipWarned records the registry hosts warnIPPartition already logged.
+	ipWarned sync.Map
 }
 
 // NewScanner constructs a Scanner bound to cfg.
@@ -46,7 +49,7 @@ func NewScanner(cfg *Config) *Scanner {
 // it can be used as the host prefix of a trivy image reference. Single source
 // of truth for host normalization (referenced by buildRef + tests).
 func trimRegistryHost(registryURL string) string {
-	host := registryURL
+	host := strings.TrimSpace(registryURL)
 	host = strings.TrimPrefix(host, "http://")
 	host = strings.TrimPrefix(host, "https://")
 	host = strings.TrimRight(host, "/")
@@ -55,9 +58,12 @@ func trimRegistryHost(registryURL string) string {
 
 // buildRef assembles a fully-qualified trivy image reference from the Harbor
 // request fields. It enforces the #1483 rule: a digest reference is joined with
-// `@`, a tag with `:`, and exactly one of the two must be present.
-func buildRef(registryURL, repository, tag, digest string) (string, error) {
-	host := trimRegistryHost(registryURL)
+// `@`, a tag with `:`, and exactly one of the two must be present. host is
+// used as given: callers pass trimRegistryHost(registry.url), the same value
+// the partition and the pull credential are derived from, so the three can
+// never disagree (trimming twice would turn "https://http://x" into "x" for
+// the pull only).
+func buildRef(host, repository, tag, digest string) (string, error) {
 	if repository == "" {
 		return "", fmt.Errorf("repository is required")
 	}
@@ -75,8 +81,9 @@ func buildRef(registryURL, repository, tag, digest string) (string, error) {
 	}
 }
 
-// buildArgs returns the trivy CLI arguments for scanning imageRef.
-func (s *Scanner) buildArgs(imageRef string) []string {
+// buildArgs returns the trivy CLI arguments for scanning imageRef in the
+// analysis-cache partition partition ("" for none; see imagePartition).
+func (s *Scanner) buildArgs(imageRef, partition string) []string {
 	args := []string{
 		"image",
 		"--format", "json",
@@ -94,7 +101,7 @@ func (s *Scanner) buildArgs(imageRef string) []string {
 	if s.cfg.DBRepository != "" {
 		args = append(args, "--db-repository", s.cfg.DBRepository)
 	}
-	args = append(args, s.cfg.clientArgs()...)
+	args = append(args, s.cfg.clientArgs(partition)...)
 	args = append(args, imageRef)
 	return args
 }
@@ -134,17 +141,82 @@ func (c *Config) dbUpdateArgs() []string {
 
 // clientArgs returns the flags shared by every scan invocation for the
 // client/server settings: `--server` when a trivy server is configured, and the
-// cache-partition `--skip-dirs` entry when a partition is configured.
-func (c *Config) clientArgs() []string {
+// cache-partition `--skip-dirs` entry when partition is non-empty.
+func (c *Config) clientArgs(partition string) []string {
 	var args []string
 	if c.TrivyServer != "" {
 		args = append(args, "--server", c.TrivyServer)
 	}
-	if c.CachePartition != "" {
-		args = append(args, "--skip-dirs", cachePartitionDir(c.CachePartition))
+	if partition != "" {
+		args = append(args, "--skip-dirs", cachePartitionDir(partition))
 	}
 	return args
 }
+
+// imagePartition returns the analysis-cache partition of an image scan
+// whose registry host is host, as trimRegistryHost returns it for the
+// request's registry.url: the same value the pull reference and the pull
+// credential are built from (#5943). Static mode: CachePartition for every
+// scan. Registry mode: CachePartition + "|" + the host lowercased, so two
+// registry hosts never share a partition, the same host always maps to the
+// same one whatever scheme, trailing slash or letter case the URL carries,
+// and the operator-set value still keeps two adapter fleets apart. The
+// partition also applies to the standalone on-disk cache (trivy keys it the
+// same way).
+//
+// The host is the one trivy pulls from: a forged layer analysis can only be
+// planted under a host's partition by an image served from that host.
+//
+// handleScan refuses a registry-mode request without a host, so the empty
+// case below is only a safe default for direct callers.
+func (c *Config) imagePartition(host string) string {
+	if c.CachePartitionMode != partitionModeRegistry {
+		return c.CachePartition
+	}
+	key := partitionHostKey(host)
+	if key == "" {
+		return c.CachePartition
+	}
+	return c.CachePartition + "|" + key
+}
+
+// partitionHostKey is the registry-mode partition key of a host returned by
+// trimRegistryHost: lowercased, since host names are case-insensitive.
+func partitionHostKey(host string) string { return strings.ToLower(host) }
+
+// hostIsIPLiteral reports whether a registry host (port optional) is a bare
+// IPv4 or IPv6 address rather than a name.
+func hostIsIPLiteral(host string) bool {
+	h := host
+	if hp, _, err := net.SplitHostPort(host); err == nil {
+		h = hp
+	}
+	h = strings.TrimSuffix(strings.TrimPrefix(h, "["), "]")
+	return net.ParseIP(h) != nil
+}
+
+// warnIPPartition logs, once per host, that a registry-mode partition is
+// keyed by a bare IP address. A backend without TRIVY_ADAPTER_REGISTRY_URL
+// advertises its pod IP, and a recycled IP would hand another instance the
+// first one's cached analysis (the cache has no expiry). Warns, never
+// refuses: the scan itself is unaffected.
+func (s *Scanner) warnIPPartition(host string) {
+	if s.cfg.CachePartitionMode != partitionModeRegistry || !hostIsIPLiteral(host) {
+		return
+	}
+	if _, seen := s.ipWarned.LoadOrStore(partitionHostKey(host), true); seen {
+		return
+	}
+	log.Printf("WARNING: registry partition mode: registry host %s is a bare IP address; if that address is later reused by another Artifact Keeper instance it would share this partition's cached analysis. Give each instance a stable, unique TRIVY_ADAPTER_REGISTRY_URL (a service DNS name)", host)
+}
+
+// fsPartition returns the analysis-cache partition of a filesystem scan:
+// CachePartition in both modes. A filesystem upload names no registry, and it
+// needs no per-request partition: trivy reuses a cached filesystem analysis
+// only for a workspace that is a clean git repository (keyed by its HEAD
+// commit), and in registry mode the upload's root .git is not extracted, so
+// every filesystem scan is analyzed from the uploaded files (#5943).
+func (c *Config) fsPartition() string { return c.CachePartition }
 
 // cachePartitionDir maps a cache partition to the `--skip-dirs` pattern that
 // carries it. trivy folds the skip-dirs list into every analysis cache key, so
@@ -339,7 +411,8 @@ func DownloadDB(ctx context.Context, cfg *Config) error {
 // non-zero exit or parse failure is an error (the caller marks the job Failed
 // and the report endpoint 500s — fail-closed, never a silent empty report).
 func (s *Scanner) Scan(ctx context.Context, req *ScanRequest) (*HarborScanReport, error) {
-	imageRef, err := buildRef(req.Registry.URL, req.Artifact.Repository, req.Artifact.Tag, req.Artifact.Digest)
+	host := trimRegistryHost(req.Registry.URL)
+	imageRef, err := buildRef(host, req.Artifact.Repository, req.Artifact.Tag, req.Artifact.Digest)
 	if err != nil {
 		return nil, err
 	}
@@ -368,12 +441,14 @@ func (s *Scanner) Scan(ctx context.Context, req *ScanRequest) (*HarborScanReport
 			defer s.imageCacheMu.Unlock()
 		}
 	}
-	stdout, stderr, localDB, err := s.runImageScan(ctx, imageRef, cred.env, memoryCache)
+	s.warnIPPartition(host)
+	partition := s.cfg.imagePartition(host)
+	stdout, stderr, localDB, err := s.runImageScan(ctx, imageRef, partition, cred.env, memoryCache)
 	if err != nil && !memoryCache && trivyCacheLocked(stderr) {
 		// The lock is held outside this process (another adapter replica or
 		// a trivy run sharing the cache volume): retry without the cache.
 		log.Printf("trivy analysis cache in %s is locked by another process; rescanning %s with the memory cache backend", s.cfg.CacheDir, imageRef)
-		stdout, stderr, localDB, err = s.runImageScan(ctx, imageRef, cred.env, true)
+		stdout, stderr, localDB, err = s.runImageScan(ctx, imageRef, partition, cred.env, true)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("trivy scan failed for %s: %v: %s", imageRef, err, strings.TrimSpace(stderr))
@@ -404,12 +479,13 @@ func (s *Scanner) Scan(ctx context.Context, req *ScanRequest) (*HarborScanReport
 	return report, nil
 }
 
-// runImageScan runs one `trivy image` invocation for imageRef with the extra
-// credential env, on the on-disk analysis cache or, when memoryCache is set,
+// runImageScan runs one `trivy image` invocation for imageRef in the given
+// cache partition with the extra credential env, on the on-disk analysis
+// cache or, when memoryCache is set,
 // on trivy's memory cache backend. It returns stdout, stderr, the local DB
 // provenance (see runLocked) and the run error.
-func (s *Scanner) runImageScan(ctx context.Context, imageRef string, env []string, memoryCache bool) (string, string, *VulnDBInfo, error) {
-	args := s.buildArgs(imageRef)
+func (s *Scanner) runImageScan(ctx context.Context, imageRef, partition string, env []string, memoryCache bool) (string, string, *VulnDBInfo, error) {
+	args := s.buildArgs(imageRef, partition)
 	if memoryCache {
 		args = withMemoryCache(args)
 	}
@@ -484,7 +560,7 @@ func (s *Scanner) buildFsArgs(dir string) []string {
 	}
 	args = append(args, s.cfg.dbUpdateArgs()...)
 	args = append(args, noLookupArgs...)
-	args = append(args, s.cfg.clientArgs()...)
+	args = append(args, s.cfg.clientArgs(s.cfg.fsPartition())...)
 	return append(args, dir)
 }
 
