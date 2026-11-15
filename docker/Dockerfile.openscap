@@ -14,13 +14,27 @@
 # path. HTTPS fetches still work with this build; Negotiate/Kerberos, SCP/SFTP
 # and LDAP URLs do not.
 #
-# COST: this libcurl is not an RPM, so Trivy cannot see it. Keep CURL_VERSION
-# on a current curl release by hand (Dependabot does not track it). The
-# tarball is pinned by SHA-256, taken from the release whose detached signature
-# verified against Daniel Stenberg's key (fingerprint
-# 27ED EAF2 2F3A BCEB 50DB 9A12 5CC9 08FD B71E 12C2).
 # Retire this stage once UBI 9 carries a fixed krb5-libs: delete the stage and
 # the swap RUN in stage 1.
+#
+# ---------------------------------------------------------------------------
+# CURL_VERSION IS HAND-MAINTAINED. Nothing bumps it for you: Dependabot does
+# not read ARGs, the libcurl below is not an RPM so Trivy and the publish gate
+# cannot see it, and scripts/ci has no pin check for source tarballs. When you
+# touch this file, and at least once a release:
+#   * New releases: https://curl.se/download/ (or the curl/curl GitHub
+#     releases). curl ships roughly every 8 weeks, with patch releases for
+#     security fixes in between.
+#   * CVEs: https://curl.se/docs/security.html and
+#     https://curl.se/docs/vuln-<version>.html list every advisory with the
+#     versions it affects. Most advisories are for features compiled out here
+#     (SSH, LDAP, GSSAPI, HTTP/2, IDN); check which ones apply.
+#   * To bump: set CURL_VERSION, download curl-<v>.tar.xz and its .asc, verify
+#     the signature against Daniel Stenberg's key (fingerprint
+#     27ED EAF2 2F3A BCEB 50DB 9A12 5CC9 08FD B71E 12C2, from
+#     https://daniel.haxx.se/mykey.asc), then put the tarball's sha256sum in
+#     CURL_SHA256. The build refuses a tarball whose hash does not match.
+# ---------------------------------------------------------------------------
 FROM registry.access.redhat.com/ubi9/ubi:9.8 AS curl-builder
 
 ARG CURL_VERSION=8.23.0
@@ -49,10 +63,18 @@ RUN curl -fsSLo /tmp/curl.tar.xz "https://curl.se/download/curl-${CURL_VERSION}.
 # ---------- Stage 1: Build minimal rootfs with OpenSCAP ----------
 FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rootfs-builder
 
-# Add CentOS 9 Stream repo for scap-security-guide (not in UBI repos)
+# CentOS Stream 9 AppStream supplies scap-security-guide, which is not in the
+# UBI repositories. `includepkgs` limits that repository to the one data
+# package: without it, Stream's newer openscap, libcurl and curl won on version
+# and the image silently shipped Stream binaries instead of UBI ones.
 RUN ARCH=$(uname -m) && \
-    dnf install -y --nodocs 'dnf-command(config-manager)' && \
-    dnf config-manager --add-repo "https://mirror.stream.centos.org/9-stream/AppStream/${ARCH}/os/"
+    printf '%s\n' \
+      '[centos-stream-9-appstream]' \
+      'name=CentOS Stream 9 AppStream (scap-security-guide only)' \
+      "baseurl=https://mirror.stream.centos.org/9-stream/AppStream/${ARCH}/os/" \
+      'includepkgs=scap-security-guide' \
+      'enabled=1' \
+      > /etc/yum.repos.d/centos-stream-9-appstream.repo
 
 # Install OpenSCAP, SCAP content, and Python into a clean rootfs.
 # Then remove pip/setuptools wheel packages from RPM database (not needed
@@ -90,8 +112,8 @@ RUN mkdir -p /mnt/rootfs && \
     && rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
 
 # Swap in the Kerberos-free libcurl from stage 0 and remove the Kerberos
-# stack. `rpm -e --nodeps` because openscap and the curl CLI (required by rpm)
-# still declare a dependency on the libcurl RPM; the replacement provides the
+# stack. `rpm -e --nodeps` because openscap and the curl CLI (curl-minimal,
+# required by rpm) still declare a dependency on the libcurl RPM; the replacement provides the
 # same libcurl.so.4 soname. The ldd sweep fails the build if anything in the
 # rootfs still needs a removed library.
 COPY --from=curl-builder /out/usr/lib64/ /tmp/newcurl/
