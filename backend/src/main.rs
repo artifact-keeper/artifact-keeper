@@ -1779,16 +1779,32 @@ async fn assert_connect_info_wired(app: Router) {
 // Platform-specific entrypoints
 // ---------------------------------------------------------------------------
 
+/// `artifact-keeper healthcheck [URL]`: the image's HEALTHCHECK probe, run
+/// before any runtime or config is built (see `cli::healthcheck`). Exits the
+/// process when the subcommand is given; returns otherwise.
+fn run_healthcheck_subcommand_if_requested() {
+    use artifact_keeper_backend::cli::healthcheck;
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some(healthcheck::SUBCOMMAND) {
+        std::process::exit(healthcheck::run(&args[2..]));
+    }
+}
+
 #[cfg(not(windows))]
-#[tokio::main]
-async fn main() -> Result<()> {
-    run_server(None).await
+fn main() -> Result<()> {
+    run_healthcheck_subcommand_if_requested();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime")
+        .block_on(run_server(None))
 }
 
 #[cfg(windows)]
 fn main() -> Result<()> {
     use artifact_keeper_backend::error::AppError;
 
+    run_healthcheck_subcommand_if_requested();
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--service") {
