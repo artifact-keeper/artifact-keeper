@@ -684,6 +684,43 @@ async fn caller_may_push(
             .is_ok()
 }
 
+/// Whether the caller of a `/v2` write to `image_name` passes the push gate
+/// the write handlers apply: an authenticating credential that is not the
+/// anonymous pull token, `write:artifacts` among its action scopes, a hosted
+/// repository, and the repository `write` decision
+/// ([`require_oci_repo_write_access`]).
+///
+/// The quota pre-check (`services::quota::http::upload_admission`) asks this
+/// before it answers a quota refusal, so a caller the handler would refuse
+/// gets the handler's answer (401, 403 `DENIED`, 404 `NAME_UNKNOWN`) and never
+/// the repository's quota or usage. Any doubt answers `false`: the handler
+/// then decides, and the publish admission after the body still enforces the
+/// quota for a caller it lets through.
+pub(crate) async fn caller_may_write_repository(
+    state: &SharedState,
+    headers: &HeaderMap,
+    image_name: &str,
+) -> bool {
+    if is_anonymous_token(headers) {
+        return false;
+    }
+    let Ok((claims, token_scopes)) =
+        authenticate_oci_with_scopes(&state.db, &state.config, headers).await
+    else {
+        return false;
+    };
+    if !oci_scopes_grant(&token_scopes, OCI_SCOPE_WRITE) {
+        return false;
+    }
+    let Ok((repo, format)) = resolve_repo_for_write(&state.db, image_name).await else {
+        return false;
+    };
+    stores_own_manifests(&repo.repo_type)
+        && require_oci_repo_write_access(state, &claims, &repo, &format, image_name, "write")
+            .await
+            .is_ok()
+}
+
 /// Authenticate an OCI request and also return the API-token scopes if the
 /// caller presented one. Returns `(claims, None)` when the caller authenticated
 /// via JWT or password (no scope restriction), and `(claims, Some(scopes))`
