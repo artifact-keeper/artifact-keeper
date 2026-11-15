@@ -138,6 +138,7 @@ pub mod saml_service;
 pub mod sbom_service;
 pub mod scan_config_service;
 pub mod scan_queue;
+pub mod scan_rescan;
 pub mod scan_result_service;
 pub mod scan_state;
 pub mod scan_worker;

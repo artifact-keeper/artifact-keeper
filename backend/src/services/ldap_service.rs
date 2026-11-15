@@ -1389,6 +1389,7 @@ pub(crate) mod tests {
             scan_queue_enabled: false,
             scan_worker_concurrency: None,
             scan_worker_trivy_adapter_url: None,
+            scan_rescan_max_per_day: 0,
             database_url: "postgres://localhost/test".into(),
             bind_address: "0.0.0.0:8080".into(),
             log_level: "info".into(),

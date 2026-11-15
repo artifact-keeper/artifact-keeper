@@ -5443,6 +5443,7 @@ mod tests {
                 scan_queue_enabled: false,
                 scan_worker_concurrency: None,
                 scan_worker_trivy_adapter_url: None,
+                scan_rescan_max_per_day: 0,
                 database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
                 bind_address: "127.0.0.1:0".into(),
                 log_level: "error".into(),
