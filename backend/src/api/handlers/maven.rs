@@ -3580,14 +3580,16 @@ const MAVEN_PREFIXES_PATH: &str = ".meta/prefixes.txt";
 
 /// Fetch and parse one virtual member's `.meta/prefixes.txt`.
 ///
-/// `Ok(Some(lines))`: member answered with a valid `2.0` body.
-/// `Ok(None)`: member answered 404 — it genuinely publishes no prefixes file,
-/// contributes nothing to the union, and that's fine (#3382 review finding 2).
-/// `Err`: anything else — timeout, 5xx, non-UTF8, or the upstream's own
-/// `@ unsupported` marker (RRF's "I can't answer", not "I have nothing" —
-/// finding 2 and finding 10's "turns 'I can't answer' into 'I have nothing'"
-/// are the same bug). The full set can't be determined, so the caller must
-/// bail rather than publish a partial union.
+/// `Ok(lines)`: member answered with a valid `2.0` body.
+/// `Err`: the union cannot be completed. That is the member having no
+/// upstream/proxy configured, answering 404, timing out, answering 5xx or
+/// non-UTF8, or carrying the upstream's own `@ unsupported` marker (RRF's "I
+/// can't answer", not "I have nothing" — #3382 findings 2 and 10). A 404 is
+/// included because a Remote that publishes no prefix file can serve ANY
+/// groupId: its contribution is unknowable, not empty, and merging the other
+/// members alone would publish an allowlist that denies everything behind it
+/// (#5743). In every case the caller must bail rather than publish a partial
+/// union.
 ///
 /// Caps the buffer at [`proxy_helpers::DEFAULT_METADATA_MAX_BYTES`] (8 MiB),
 /// not the artifact-sized [`proxy_helpers::LARGE_METADATA_MAX_BYTES`] (128
@@ -3596,7 +3598,7 @@ const MAVEN_PREFIXES_PATH: &str = ".meta/prefixes.txt";
 async fn fetch_remote_member_prefixes(
     state: &SharedState,
     member: &crate::models::repository::Repository,
-) -> Result<Option<Vec<String>>, Response> {
+) -> Result<Vec<String>, Response> {
     let unavailable =
         || AppError::NotFound("Prefix file not available".to_string()).into_response();
     let upstream_url = member.upstream_url.as_deref().ok_or_else(unavailable)?;
@@ -3618,11 +3620,11 @@ async fn fetch_remote_member_prefixes(
     match fetched {
         Ok((content, _, _permit)) => {
             let text = std::str::from_utf8(&content).map_err(|_| unavailable())?;
-            parse_member_prefixes_body(text)
-                .map(Some)
-                .ok_or_else(unavailable)
+            parse_member_prefixes_body(text).ok_or_else(unavailable)
         }
-        Err(resp) if resp.status() == StatusCode::NOT_FOUND => Ok(None),
+        // A 404 used to read as "contributes nothing". It does not: bail with
+        // the member's response, exactly like any other member failure, so the
+        // virtual answers 404 and Maven Resolver does not filter (#5743).
         Err(resp) => Err(resp),
     }
 }
@@ -3673,10 +3675,12 @@ fn parse_prefixes_lines(text: &str) -> Vec<String> {
 
 /// The three ways [`fetch_maven_prefixes_bytes_uncached`] fails.
 enum PrefixesError {
-    /// Locally-decided "no complete answer" (unknown repo_type, or an
-    /// upstream/remote-member unavailability that leaves the virtual union
-    /// incomplete), or a complete set that is empty (#5668). Cacheable: a
-    /// publish invalidates the entry.
+    /// Locally-decided "no complete answer" (unknown repo_type, or the
+    /// fail-closed Virtual-member guard), or a complete set that is empty
+    /// (#5668). A Remote member that cannot answer — including one whose
+    /// upstream answers 404 (#5743) — passes its own `Response` through as
+    /// `Proxied` instead, so it is not cached. Cacheable: a publish
+    /// invalidates the entry.
     NotFound(String),
     /// A DB error from `collect_local_group_prefixes`. `sqlx::Error` isn't
     /// `Clone`, so it's stringified at the call site — the same information
@@ -3786,12 +3790,14 @@ async fn fetch_maven_prefixes_bytes(
 /// the union of members' prefixes (Local/Staging members generated from
 /// stored groupIds, Remote members proxied) and refuse to publish a partial
 /// union (#3382 review findings 2/3); Local/Staging repos generate it from
-/// their own stored groupIds. An unrecognized `repo_type` fails closed
-/// (finding 4) instead of falling through to the hosted generator. A
-/// COMPLETE-but-empty set (a hosted repo with no artifacts yet, or a virtual
-/// whose members all confirmably contributed nothing) is 404 as well, since a
-/// header-only file denies every path (#5668); see
-/// [`prefixes_or_not_published`].
+/// their own stored groupIds. A Remote member that publishes no prefix file
+/// can serve any groupId, so its absence makes the union unknowable too and
+/// the virtual bails rather than list the other members alone (#5743). An
+/// unrecognized `repo_type` fails closed (finding 4) instead of falling
+/// through to the hosted generator. A COMPLETE-but-empty set (a hosted repo
+/// with no artifacts yet, or a virtual whose members all confirmably
+/// contributed nothing) is 404 as well, since a header-only file denies every
+/// path (#5668); see [`prefixes_or_not_published`].
 async fn fetch_maven_prefixes_bytes_uncached(
     state: &SharedState,
     repo: &RepoInfo,
@@ -3847,21 +3853,19 @@ async fn fetch_maven_prefixes_bytes_uncached(
                         )),
                         _ => collect_local_group_prefixes(&state.db, member.id)
                             .await
-                            .map(Some)
                             .map_err(|e| PrefixesError::Db(e.to_string())),
                     }
                 }))
                 .await;
                 for result in batch {
-                    // A member that ERRORED (unknown/timeout/`@ unsupported`)
-                    // already returned `Err` above and bailed the whole merge
-                    // via `?` — this loop only ever sees confirmed
-                    // contributions, including a confirmed-empty one, so an
-                    // empty `prefixes` here means the union is COMPLETE and
-                    // genuinely has nothing, not that it's incomplete.
-                    if let Some(lines) = result? {
-                        prefixes.extend(lines);
-                    }
+                    // A member that could not answer (unknown/timeout/5xx/
+                    // `@ unsupported`/404) already returned `Err` above and
+                    // bailed the whole merge via `?` — this loop only ever
+                    // sees members that confirmed their contribution,
+                    // including a hosted member that confirmed it has none,
+                    // so an empty `prefixes` here means the union is COMPLETE
+                    // and genuinely has nothing, not that it's incomplete.
+                    prefixes.extend(result?);
                 }
             }
             // A complete-but-empty union is 404 too (#5668): a header-only
@@ -11308,10 +11312,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_virtual_prefixes_when_a_member_has_no_prefixes_file() {
-        // A remote member confirmed 404 for `.meta/prefixes.txt` genuinely
-        // publishes nothing and contributes nothing to the union — the
-        // virtual must still answer from its other (local) member rather
-        // than bailing (#3382 review finding 2).
+        // #5743: a remote member whose upstream confirms 404 for
+        // `.meta/prefixes.txt` publishes no allowlist, so it can hold ANY
+        // groupId. Merging the other members alone would publish a file that
+        // Maven Resolver reads as authoritative and that denies everything
+        // behind this remote ("prefixes file denies" / "appears stale"). The
+        // union is unknowable, so the virtual must answer 404 — the same bail
+        // an errored member produces — rather than a partial allowlist. (This
+        // replaces the pre-#5743 expectation of a 200 built from the local
+        // member alone.)
         use crate::api::handlers::test_db_helpers as tdh;
 
         let Some(pool) = tdh::try_pool().await else {
@@ -11359,15 +11368,10 @@ mod tests {
 
         assert_eq!(
             status,
-            StatusCode::OK,
-            "a confirmed-empty member must not bail the merge"
-        );
-        let text = String::from_utf8_lossy(&body);
-        assert_eq!(
-            text.lines().collect::<Vec<_>>(),
-            ["## repository-prefixes/2.0", "/com/local/prfxnone"],
-            "expected only the local member's prefixes: {}",
-            text
+            StatusCode::NOT_FOUND,
+            "a remote member with no prefix file makes the union unknowable, so \
+             the virtual must not publish a partial allowlist: {}",
+            String::from_utf8_lossy(&body)
         );
     }
 
