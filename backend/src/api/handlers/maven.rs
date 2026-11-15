@@ -4174,6 +4174,7 @@ async fn serve_artifact(
                         path,
                         &resolved.storage_key,
                         resolved.id,
+                        resolved.size_bytes,
                         ctx,
                     )
                     .await
@@ -4653,6 +4654,7 @@ async fn serve_artifact(
         path,
         &artifact.storage_key,
         artifact.id,
+        artifact.size_bytes,
         ctx,
     )
     .await

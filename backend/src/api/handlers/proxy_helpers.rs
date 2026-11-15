@@ -7447,6 +7447,7 @@ pub async fn try_hosted_blob_redirect(
     path: &str,
     storage_key: &str,
     artifact_id: Uuid,
+    size_bytes: i64,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Option<Response> {
     // #3181: a presigned URL is signed for ONE HTTP method — the method is part
@@ -7470,19 +7471,11 @@ pub async fn try_hosted_blob_redirect(
     if !state.config.presigned_downloads_enabled || !is_blob_redirect_eligible(path) {
         return None;
     }
-    if !storage.supports_redirect() {
-        return None;
-    }
-    // #6035: the transfer quota counts the object when the URL is issued, so
-    // the redirect needs the row's size; a row that cannot be read streams.
-    let size_bytes: i64 = sqlx::query_scalar("SELECT size_bytes FROM artifacts WHERE id = $1")
-        .bind(artifact_id)
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten()?;
     let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
-    // `try_presigned_redirect` additionally returns `None` on a signing error.
+    // `try_presigned_redirect` additionally verifies `supports_redirect()` and
+    // returns `None` for filesystem backends or on a signing error. It tags the
+    // redirect with the row's `size_bytes`: the transfer quota counts the
+    // object when the URL is issued (#6035).
     let redirect = try_presigned_redirect(storage, storage_key, true, expiry, size_bytes).await?;
     // Count-at-redirect (#2260): record BEFORE handing back the 302, matching the
     // generic download handler. A body-less redirect otherwise never counts.
@@ -27752,6 +27745,9 @@ mod tests {
 
     /// Insert a hosted artifact row and return its id, so the redirect helper's
     /// count-at-redirect INSERT into `download_statistics` has a valid FK.
+    /// `size_bytes` of the row [`seed_blob_artifact`] writes.
+    const SEEDED_BLOB_SIZE: i64 = 9;
+
     async fn seed_blob_artifact(
         pool: &PgPool,
         repo_id: Uuid,
@@ -27769,7 +27765,7 @@ mod tests {
         .bind(path)
         .bind("lib")
         .bind("1.0")
-        .bind(9_i64)
+        .bind(SEEDED_BLOB_SIZE)
         .bind("test-blob")
         .bind("application/java-archive")
         .bind(storage_key)
@@ -27847,6 +27843,7 @@ mod tests {
             path,
             storage_key,
             artifact_id,
+            SEEDED_BLOB_SIZE,
             &get_ctx,
         )
         .await;
@@ -27865,6 +27862,7 @@ mod tests {
             path,
             storage_key,
             artifact_id,
+            SEEDED_BLOB_SIZE,
             &head_ctx,
         )
         .await;
@@ -27956,6 +27954,7 @@ mod tests {
                 path,
                 &storage_key,
                 artifact_id,
+                SEEDED_BLOB_SIZE,
                 &ctx_for(user_id, /* is_head = */ false),
             )
             .await;
@@ -27967,6 +27966,7 @@ mod tests {
                 path,
                 &storage_key,
                 artifact_id,
+                SEEDED_BLOB_SIZE,
                 &ctx_for(user_id, /* is_head = */ true),
             )
             .await;
@@ -28018,9 +28018,16 @@ mod tests {
         );
         let ctx = ctx_for(user_id, /* is_head = */ false);
 
-        let out =
-            super::try_hosted_blob_redirect(&state, &storage, path, storage_key, artifact_id, &ctx)
-                .await;
+        let out = super::try_hosted_blob_redirect(
+            &state,
+            &storage,
+            path,
+            storage_key,
+            artifact_id,
+            SEEDED_BLOB_SIZE,
+            &ctx,
+        )
+        .await;
 
         let stat_count = download_stat_count(&pool, artifact_id).await;
         let presign_calls = storage
@@ -28059,9 +28066,16 @@ mod tests {
         );
         let ctx = ctx_for(user_id, /* is_head = */ false);
 
-        let out =
-            super::try_hosted_blob_redirect(&state, &storage, path, storage_key, artifact_id, &ctx)
-                .await;
+        let out = super::try_hosted_blob_redirect(
+            &state,
+            &storage,
+            path,
+            storage_key,
+            artifact_id,
+            SEEDED_BLOB_SIZE,
+            &ctx,
+        )
+        .await;
 
         let stat_count = download_stat_count(&pool, artifact_id).await;
         db_helpers::cleanup(&pool, repo_id, user_id).await;
@@ -28092,9 +28106,16 @@ mod tests {
         let state = db_helpers::build_state(pool.clone(), dir.to_str().unwrap());
         let ctx = ctx_for(user_id, /* is_head = */ false);
 
-        let out =
-            super::try_hosted_blob_redirect(&state, &storage, path, storage_key, artifact_id, &ctx)
-                .await;
+        let out = super::try_hosted_blob_redirect(
+            &state,
+            &storage,
+            path,
+            storage_key,
+            artifact_id,
+            SEEDED_BLOB_SIZE,
+            &ctx,
+        )
+        .await;
 
         let presign_calls = storage
             .presigned_calls

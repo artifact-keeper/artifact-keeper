@@ -131,7 +131,9 @@ impl Walk {
         digest
     }
 
-    /// A fresh proxy-cache entry of `size` bytes for Remote `repo_key`.
+    /// A fresh proxy-cache entry for Remote `repo_key` whose sidecar records
+    /// `size` bytes. The stored body is deliberately a different length, so
+    /// a redirect that took its size from anywhere but the sidecar fails.
     fn seed_cache(&self, repo_key: &str, cache_path: &str, size: usize) {
         let scope = ProxyCacheScope::unscoped();
         let content = ProxyService::cache_storage_key(&scope, repo_key, cache_path).unwrap();
@@ -140,7 +142,7 @@ impl Walk {
             serde_json::from_slice(&tdh::fresh_cache_sidecar_bytes()).unwrap();
         sidecar.size_bytes = size as i64;
         let mut objects = self.cache.objects.lock().unwrap();
-        objects.insert(content, Bytes::from(vec![b'c'; size]));
+        objects.insert(content, Bytes::from(vec![b'c'; size + 13]));
         objects.insert(meta, Bytes::from(serde_json::to_vec(&sidecar).unwrap()));
     }
 
@@ -314,9 +316,9 @@ async fn hosted_presigned_redirects_count_the_object_size_6035() {
     w.teardown().await;
 }
 
-/// Proxy-cached objects: a Remote OCI blob, a Remote PyPI distribution and
-/// a virtual's Remote member (RubyGems), each redirected from a fresh cache
-/// entry whose sidecar records the size.
+/// Proxy-cached objects: a Remote OCI blob, a Remote PyPI distribution (direct
+/// and through a virtual) and a virtual's Remote member (RubyGems), each
+/// redirected from a fresh cache entry whose sidecar records the size.
 #[tokio::test]
 async fn proxy_cached_presigned_redirects_count_the_object_size_6035() {
     let Some(mut w) = Walk::setup().await else {
@@ -339,6 +341,17 @@ async fn proxy_cached_presigned_redirects_count_the_object_size_6035() {
     w.assert_counted(
         "PyPI Remote proxy cache",
         &format!("/pypi/{pypi_remote}/simple/cached6035/{wheel}"),
+        6_006,
+    )
+    .await;
+
+    // The same remote PyPI cache entry, reached through a virtual.
+    let pypi_virt = w.repo("virtual", "pypi").await;
+    let pypi_member = w.repos.iter().find(|r| r.1 == pypi_remote).unwrap().0;
+    tdh::link_virtual_member(&w.pool, pypi_virt.0, pypi_member, 1).await;
+    w.assert_counted(
+        "PyPI virtual's Remote member cache",
+        &format!("/pypi/{}/simple/cached6035/{wheel}", pypi_virt.1),
         6_006,
     )
     .await;
