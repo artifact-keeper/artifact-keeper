@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#5994]
----
-- **A queued scan whose scanner adapter is down is retried instead of being recorded failed for good** (#5994). With `SCAN_QUEUE_ENABLED=true`, an image scan that failed because the scanner adapter was unreachable or not ready within its readiness wait still completed its queue job on the first attempt. The scan was recorded `failed`, the artifact stayed flagged, and nothing scanned it again: a rescan only considers completed scans. Now, when the adapter is unreachable or not ready, for an image scan or a filesystem scan sent through it (which records `not_applicable` when the adapter is down), the job goes back to the queue with the attempt charged, after a backoff of 60 seconds that doubles each time, and the next attempt scans once the adapter answers. That attempt's `failed` row stays as its record. This applies to `scan_on_upload`, pushed image and rescan jobs. An adapter that stays down still ends the job `failed` after its three attempts, and scans run in-process with the queue off behave as before.
