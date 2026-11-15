@@ -30,7 +30,7 @@ SCOPE PER IMAGE
 ---------------
 The backend image ships the curl TOOL with libcurl linked statically into it,
 so "lib", "tool" and "both" advisories all apply. The OpenSCAP image ships only
-the LIBRARY from source (its curl command is the curl-minimal RPM, which Trivy
+the LIBRARY from source (its curl command is the curl RPM (curl-7.76.1), which Trivy
 already sees), so a "tool"-only advisory is reported there as not applicable.
 The PINS table below is the source of truth; a pin that disappears from its
 Dockerfile is INFRA, so retiring a stage means editing that table.

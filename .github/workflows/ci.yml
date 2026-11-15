@@ -2964,6 +2964,7 @@ jobs:
             openscap:
               - 'docker/Dockerfile.openscap'
               - 'scripts/openscap-wrapper.py'
+              - 'docker/curl-sbom.sh'
             # What makes the backend image build run on a pull request.
             docker:
               - 'docker/**'
