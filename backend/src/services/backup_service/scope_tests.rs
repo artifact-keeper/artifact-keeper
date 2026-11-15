@@ -1,5 +1,6 @@
 //! A scoped backup archives only the rows of its scope (#5884).
 use super::restore_identity_tests::archive_tables;
+use super::test_archives::keep_only_rows_of_this_test;
 use super::*;
 use crate::api::handlers::test_db_helpers as tdh;
 use crate::services::rpm_layout;
@@ -166,38 +167,27 @@ async fn a_repository_scoped_backup_archives_only_its_repositories_and_their_dow
         "the archive carries only the downloads of the artifacts it archives"
     );
 
-    // Restore the tables the backup scopes, exactly as it archived them. The
+    // Restore the real archive, cut down to this test's rows (#5934). The
     // server-wide tables (users, roles, user_roles, api_tokens, grants,
-    // groups, settings) are exported whole by design (#5884 does not scope
-    // them), so in the shared test database they hold the rows of every test
-    // running alongside this one. Those tests create and delete their users
-    // while this restore runs: a user that still exists when the `users` pass
-    // skips its row and is gone by the `user_roles` pass fails that row's
-    // foreign key and makes the restore `partial`, and a user deleted before
-    // the restore would be brought back. Neither says anything about scoping.
-    let scoped: Vec<(&str, serde_json::Value)> =
-        ["repositories", "artifacts", "download_statistics"]
-            .into_iter()
-            .map(|table| {
-                let rows = archive_table_rows(&entries, table);
-                (table, serde_json::Value::Array(rows))
-            })
-            .collect();
-    // `archive_tables` writes a full backup, which must carry the bytes its
-    // artifact rows reference. This restore writes no objects.
-    let a_bytes: Vec<(String, Vec<u8>)> = archive_table_rows(&entries, "artifacts")
-        .iter()
-        .filter_map(|row| row.get("storage_key")?.as_str())
-        .map(|key| (key.to_string(), b"5884".to_vec()))
-        .collect();
-    let scoped_backup = archive_tables(&service, &scoped, &a_bytes).await;
+    // groups, settings) are exported whole by design, so in the shared test
+    // database they hold the rows of every test running alongside this one,
+    // which create and delete them while this restore runs. The scoped
+    // tables are left as the backup wrote them: A's rows are already all
+    // they hold.
+    let row = service.get_by_id(backup_id).await.expect("backup row");
+    keep_only_rows_of_this_test(
+        &service,
+        &row,
+        &[a.repo_id.to_string(), a.user_id.to_string()],
+    )
+    .await;
 
     // B goes away entirely (its artifact and statistics cascade), then A.
     delete_repositories(&pool, &[b_id, a.repo_id]).await;
 
     let result = service
         .restore(
-            scoped_backup,
+            backup_id,
             RestoreOptions {
                 restore_database: true,
                 restore_artifacts: false,
@@ -231,7 +221,7 @@ async fn a_repository_scoped_backup_archives_only_its_repositories_and_their_dow
     assert_eq!(downloads, 1, "A's download is back and B's is not");
 
     delete_repositories(&pool, &[a.repo_id]).await;
-    forget_backups(&pool, &[backup_id, scoped_backup]).await;
+    forget_backups(&pool, &[backup_id]).await;
     let _ = std::fs::remove_dir_all(&archive_root);
     let _ = std::fs::remove_dir_all(&b_dir);
     let _ = std::fs::remove_dir_all(&a.storage_dir);
