@@ -18073,6 +18073,32 @@ mod tests {
             out
         }
 
+        // Each arm's cache writer is a spawned task, and the client stream can
+        // end before that task has even opened its staging object (the chunks
+        // sit in the channel). A fixed sleep before looking at the staging
+        // prefix is therefore a guess: 200 ms was too short on a loaded CI
+        // runner, where the write's fsync was still pending and the in-flight
+        // `.<key>.<id>.tmp` file was reported as a leak (#6019). Wait for the
+        // writer to finish instead: `tee_stream` registers its publish guard
+        // before returning, and the guard signals `done` only as the task
+        // ends, after every discard has run. Taken right after `tee_stream`,
+        // so the writer cannot have deregistered unseen.
+        fn writer_done(metadata_key: &str) -> tokio::sync::watch::Receiver<bool> {
+            lock_tee_publish_registry()
+                .get(metadata_key)
+                .map(|entry| entry.done_rx.clone())
+                .expect("tee_stream registers its publish before returning")
+        }
+        async fn wait_for_writer(mut done: tokio::sync::watch::Receiver<bool>, arm: &str) {
+            let finished = tokio::time::timeout(Duration::from_secs(10), done.wait_for(|d| *d))
+                .await
+                .is_ok();
+            assert!(
+                finished,
+                "the {arm} arm's cache writer did not finish within 10 s"
+            );
+        }
+
         let temp_dir = tempfile::TempDir::new().unwrap();
         let root = temp_dir.path().to_path_buf();
         let storage = Arc::new(RealStorageService::new(Arc::new(FilesystemBackend::new(
@@ -18089,6 +18115,7 @@ mod tests {
             Some(body.len() as u64),
             None,
         );
+        let committed_writer = writer_done("proxy-cache/repo/committed.meta");
         let mut client_bytes = Vec::new();
         while let Some(chunk) = client.next().await {
             client_bytes.extend_from_slice(&chunk.unwrap());
@@ -18124,10 +18151,12 @@ mod tests {
                 Some(999),
                 None,
             );
+        let rejected_writer = writer_done("proxy-cache/repo/rejected.meta");
         while let Some(chunk) = reject_client.next().await {
             let _ = chunk.unwrap();
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_writer(committed_writer, "commit").await;
+        wait_for_writer(rejected_writer, "reject").await;
         assert!(
             !storage.exists("proxy-cache/repo/rejected").await.unwrap(),
             "a rejected write must leave the live key absent -- before this PR \
