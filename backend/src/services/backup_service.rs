@@ -3633,7 +3633,6 @@ mod rpm_depth_tests;
 #[cfg(test)]
 mod scope_tests;
 
-#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod test_archives;
 

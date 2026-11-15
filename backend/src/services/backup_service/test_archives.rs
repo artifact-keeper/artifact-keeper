@@ -1,4 +1,5 @@
 //! Test helpers shared by the backup test modules.
+#![allow(dead_code)]
 use super::*;
 
 /// Rewrite the archive of `row` so it carries only the rows of this test
