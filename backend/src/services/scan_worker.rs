@@ -99,7 +99,10 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
         state.config.scan_worker_concurrency,
         crate::services::scanner_service::max_concurrent_scan_extractions(),
     );
-    let queue = ScanQueue::new(state.db.clone());
+    // #6032: how long a fail-open proxy scan waits before it competes with
+    // hosted scans on age alone. Read once, like the extraction limit.
+    let backfill_aging = crate::services::scan_queue::backfill_aging();
+    let queue = ScanQueue::new(state.db.clone()).with_backfill_aging(backfill_aging);
     let permits = Arc::new(Semaphore::new(concurrency));
     // #5947: rescans take at most half the slots (one on a single-slot
     // worker), so on two or more slots a hosted or waiting job always finds
@@ -109,6 +112,7 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
 
     tracing::info!(
         concurrency,
+        backfill_aging_secs = backfill_aging.as_secs(),
         worker = %identity,
         "Scan worker started (SCAN_WORKER_ENABLED)"
     );
