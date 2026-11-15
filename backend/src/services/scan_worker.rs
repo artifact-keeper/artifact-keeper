@@ -51,6 +51,23 @@ enum JobFailure {
     Retryable(String),
     /// Will never succeed for this job. Consumes all remaining attempts.
     Terminal(String),
+    /// The scanner engine was unreachable or not ready (#5994). Retried on a
+    /// longer, growing backoff, since the engine may take minutes to return.
+    EngineUnavailable(String),
+}
+
+/// First backoff after the scanner engine was unavailable (#5994), doubling
+/// with each attempt and capped at [`ENGINE_RETRY_BACKOFF_MAX`].
+const ENGINE_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+const ENGINE_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(15 * 60);
+
+/// Backoff before the next try of a job whose engine was unavailable, given
+/// the attempts already charged.
+fn engine_retry_backoff(attempts: i32) -> Duration {
+    let doublings = u32::try_from(attempts.clamp(0, 16)).unwrap_or(0);
+    ENGINE_RETRY_BACKOFF
+        .saturating_mul(1u32 << doublings)
+        .min(ENGINE_RETRY_BACKOFF_MAX)
 }
 
 /// Start the worker when the queue is on and `SCAN_WORKER_ENABLED` is not off,
@@ -194,11 +211,17 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
                 continue;
             }
 
-            // No rescan slot free: leave rescans pending rather than claim
-            // them only to hand them back (which also skews their wait).
-            let skip_rescans = rescan_permits.available_permits() == 0;
+            // No more rescans than free rescan slots: the rest stay pending
+            // rather than being claimed only to be handed back (which also
+            // skews their wait).
+            let free_rescan_slots = rescan_permits.available_permits() as i64;
             let claimed = match queue
-                .claim_filtered(available as i64, &identity, CLAIM_TTL_SECS, skip_rescans)
+                .claim_filtered(
+                    available as i64,
+                    &identity,
+                    CLAIM_TTL_SECS,
+                    free_rescan_slots,
+                )
                 .await
             {
                 Ok(jobs) => jobs,
@@ -282,6 +305,7 @@ async fn run_claimed_job(state: SharedState, queue: ScanQueue, job: Claimed<Scan
     let job_id = job.id;
     let claim_token = job.claim_token();
     let kind = job.kind.clone();
+    let attempts = job.attempts;
 
     // Heartbeat, so a long scan is not reclaimed underneath us.
     let (_renewal, lost_ownership) = spawn_row_claim_renewal(
@@ -332,6 +356,9 @@ async fn run_claimed_job(state: SharedState, queue: ScanQueue, job: Claimed<Scan
         Err(failure) => {
             let (message, backoff) = match failure {
                 JobFailure::Retryable(m) => (m, RETRY_BACKOFF.as_secs_f64()),
+                JobFailure::EngineUnavailable(m) => {
+                    (m, engine_retry_backoff(attempts).as_secs_f64())
+                }
                 // A job that cannot succeed must not come back.
                 JobFailure::Terminal(m) => {
                     if let Err(e) = queue.mark_terminal(job_id, claim_token, &m).await {
@@ -349,15 +376,39 @@ async fn run_claimed_job(state: SharedState, queue: ScanQueue, job: Claimed<Scan
     }
 }
 
+/// Turn a scan the orchestrator finished but recorded `failed` because the
+/// scanner engine was unavailable into a retry (#5994). The `failed` row stays
+/// as the record of that attempt; the next attempt adds its own row once the
+/// engine answers, and when attempts run out the job ends `failed` as before.
+async fn retry_when_engine_unavailable(
+    scan: impl std::future::Future<Output = Result<(), JobFailure>>,
+) -> Result<(), JobFailure> {
+    let (result, unavailable) =
+        crate::services::scan_queue::tracking_engine_unavailable(scan).await;
+    match result {
+        Ok(()) if unavailable => Err(JobFailure::EngineUnavailable(
+            "the scanner engine was unreachable or not ready; retrying once it is back".to_string(),
+        )),
+        other => other,
+    }
+}
+
 /// Dispatch to the branch for this job's kind.
 async fn execute(state: &SharedState, job: &ScanJob) -> Result<(), JobFailure> {
     match job.job_kind() {
         Some(ScanJobKind::ProxyFile) => scan_proxy_file(state, job).await,
         Some(ScanJobKind::HostedArtifact) => scan_hosted_artifact(state, job).await,
-        Some(ScanJobKind::HostedUpload) => scan_hosted_upload(state, job).await,
-        Some(ScanJobKind::HostedImage) => scan_hosted_image(state, job).await,
+        Some(ScanJobKind::HostedUpload) => {
+            retry_when_engine_unavailable(scan_hosted_upload(state, job)).await
+        }
+        Some(ScanJobKind::HostedImage) => {
+            retry_when_engine_unavailable(scan_hosted_image(state, job)).await
+        }
         Some(ScanJobKind::Rescan) => {
-            crate::services::scan_queue::in_background(rescan_digest(state, job)).await
+            crate::services::scan_queue::in_background(retry_when_engine_unavailable(
+                rescan_digest(state, job),
+            ))
+            .await
         }
         // A kind written by a newer replica. Not `failed`: that would discard
         // work the other half of the fleet can run.
@@ -739,6 +790,267 @@ mod tests {
         });
         assert!(task.await.is_err(), "the tick panicked");
         assert!(!flag.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn engine_retry_backoff_grows_and_is_capped() {
+        assert_eq!(engine_retry_backoff(0), Duration::from_secs(60));
+        assert_eq!(engine_retry_backoff(1), Duration::from_secs(120));
+        assert_eq!(engine_retry_backoff(2), Duration::from_secs(240));
+        assert_eq!(engine_retry_backoff(30), ENGINE_RETRY_BACKOFF_MAX);
+        assert!(ENGINE_RETRY_BACKOFF > RETRY_BACKOFF);
+    }
+
+    // ── #5994: a queued scan whose engine is unavailable is retried ─────────
+
+    /// A leaf scanner standing in for an unreachable adapter: for its first
+    /// `down` calls it reports the engine unavailable (as `ImageScanner`'s
+    /// readiness gate does) and fails the scan, then it answers.
+    struct FlakyEngine {
+        down: std::sync::atomic::AtomicUsize,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::scanner_service::Scanner for FlakyEngine {
+        fn name(&self) -> &str {
+            "flaky-engine"
+        }
+        fn scan_type(&self) -> &str {
+            "malware"
+        }
+        async fn scan(
+            &self,
+            _artifact: &crate::models::artifact::Artifact,
+            _metadata: Option<&crate::models::artifact::ArtifactMetadata>,
+            _content: &bytes::Bytes,
+        ) -> crate::error::Result<crate::services::scanner_service::ScanOutput> {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let still_down = self
+                .down
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if still_down {
+                crate::services::scan_queue::note_engine_unavailable();
+                return Err(crate::error::AppError::BadGateway(
+                    "Scanner adapter at http://adapter is unreachable".to_string(),
+                ));
+            }
+            Ok(crate::services::scanner_service::ScanOutput::default())
+        }
+    }
+
+    struct EngineFixture {
+        fx: crate::api::handlers::test_db_helpers::Fixture,
+        artifact_id: uuid::Uuid,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        state: SharedState,
+    }
+
+    async fn engine_fixture(down: usize) -> Option<EngineFixture> {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let fx = tdh::Fixture::setup("local", "generic").await?;
+        sqlx::query(
+            "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
+                 scan_on_proxy, block_on_policy_violation, severity_threshold) \
+             VALUES ($1, true, true, false, false, 'high')",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("scan config");
+        let content = bytes::Bytes::from(format!("engine-5994-{}", uuid::Uuid::new_v4()));
+        let digest = {
+            use sha2::Digest as _;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        let repo = fx.repo_info("local", None);
+        let artifact_id = tdh::seed_artifact_with_checksum(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            "engine/a.bin",
+            "engine/a.bin",
+            "a.bin",
+            "1.0",
+            "application/octet-stream",
+            content,
+            fx.user_id,
+            &digest,
+        )
+        .await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let storage_path = fx.storage_dir.to_string_lossy().into_owned();
+        let state = tdh::build_scan_state_with_leaf_scanners(
+            &fx,
+            &storage_path,
+            vec![Arc::new(FlakyEngine {
+                down: std::sync::atomic::AtomicUsize::new(down),
+                calls: Arc::clone(&calls),
+            })],
+        );
+        Some(EngineFixture {
+            fx,
+            artifact_id,
+            calls,
+            state,
+        })
+    }
+
+    async fn scan_statuses(pool: &sqlx::PgPool, artifact_id: uuid::Uuid) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT status FROM scan_results WHERE artifact_id = $1 AND scan_type = 'malware' \
+             ORDER BY created_at",
+        )
+        .bind(artifact_id)
+        .fetch_all(pool)
+        .await
+        .expect("scan rows")
+    }
+
+    async fn job_row(pool: &sqlx::PgPool, artifact_id: uuid::Uuid) -> Option<(String, i32)> {
+        sqlx::query_as("SELECT state, attempts FROM scan_queue WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .fetch_optional(pool)
+            .await
+            .expect("job row")
+    }
+
+    /// Wait until `cond` holds for the artifact's job row, then make a pending
+    /// job due now instead of after its backoff.
+    async fn wait_job(
+        pool: &sqlx::PgPool,
+        artifact_id: uuid::Uuid,
+        cond: impl Fn(&Option<(String, i32)>) -> bool,
+    ) -> Option<(String, i32)> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let row = job_row(pool, artifact_id).await;
+            if cond(&row) {
+                sqlx::query(
+                    "UPDATE scan_queue SET next_attempt_at = NOW() \
+                     WHERE artifact_id = $1 AND state = 'pending'",
+                )
+                .bind(artifact_id)
+                .execute(pool)
+                .await
+                .expect("make due");
+                return row;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "job never reached the expected state: {row:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// With the adapter unreachable, a queued upload scan is not completed on
+    /// its first attempt: the job goes back to `pending` with the attempt
+    /// charged and a backoff, and once the engine answers the next attempt
+    /// completes the scan and retires the job.
+    #[tokio::test]
+    async fn an_unavailable_engine_is_retried_until_it_answers_queued() {
+        let Some(e) = engine_fixture(1).await else {
+            return;
+        };
+        let (state, _worker) = crate::api::handlers::test_db_helpers::with_scan_worker(e.state);
+        crate::services::scan_queue::ScanQueue::new(state.db.clone())
+            .enqueue_hosted_upload(e.artifact_id, crate::services::scan_queue::PRIORITY_HOSTED)
+            .await
+            .expect("enqueue");
+
+        let first = wait_job(
+            &e.fx.pool,
+            e.artifact_id,
+            |r| matches!(r, Some((s, 1)) if s == "pending"),
+        )
+        .await;
+        assert_eq!(first, Some(("pending".to_string(), 1)));
+        assert_eq!(
+            scan_statuses(&e.fx.pool, e.artifact_id).await,
+            vec!["failed"]
+        );
+
+        wait_job(&e.fx.pool, e.artifact_id, |r| r.is_none()).await;
+        assert_eq!(
+            scan_statuses(&e.fx.pool, e.artifact_id).await,
+            vec!["failed", "completed"],
+            "the retry scans once the engine is back; the failed attempt stays recorded"
+        );
+        assert_eq!(e.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        e.fx.teardown().await;
+    }
+
+    /// An engine that never comes back still ends the job after its bounded
+    /// attempts, `failed`, with every attempt's scan recorded `failed`.
+    #[tokio::test]
+    async fn an_engine_that_stays_down_ends_after_max_attempts_queued() {
+        let Some(e) = engine_fixture(usize::MAX).await else {
+            return;
+        };
+        let (state, _worker) = crate::api::handlers::test_db_helpers::with_scan_worker(e.state);
+        crate::services::scan_queue::ScanQueue::new(state.db.clone())
+            .enqueue_hosted_upload(e.artifact_id, crate::services::scan_queue::PRIORITY_HOSTED)
+            .await
+            .expect("enqueue");
+        for attempt in 1..=2 {
+            wait_job(
+                &e.fx.pool,
+                e.artifact_id,
+                |r| matches!(r, Some((s, a)) if s == "pending" && *a == attempt),
+            )
+            .await;
+        }
+        let last = wait_job(
+            &e.fx.pool,
+            e.artifact_id,
+            |r| matches!(r, Some((s, _)) if s == "failed"),
+        )
+        .await;
+        assert_eq!(last, Some(("failed".to_string(), 3)));
+        assert_eq!(
+            scan_statuses(&e.fx.pool, e.artifact_id).await,
+            vec!["failed", "failed", "failed"]
+        );
+        e.fx.teardown().await;
+    }
+
+    /// Queue off: the in-process scan_on_upload is unchanged. It runs once,
+    /// records `failed`, and nothing is queued or retried.
+    #[tokio::test]
+    async fn with_the_queue_off_an_unavailable_engine_is_not_retried() {
+        let Some(e) = engine_fixture(1).await else {
+            return;
+        };
+        assert!(
+            crate::services::scanner_service::trigger_scan_on_upload(
+                &e.state.db,
+                e.state.scanner_service.clone(),
+                e.fx.repo_id,
+                e.artifact_id,
+            )
+            .await,
+            "the in-process scan was spawned"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while scan_statuses(&e.fx.pool, e.artifact_id).await != vec!["failed"] {
+            assert!(std::time::Instant::now() < deadline, "no failed scan row");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            scan_statuses(&e.fx.pool, e.artifact_id).await,
+            vec!["failed"]
+        );
+        assert_eq!(
+            job_row(&e.fx.pool, e.artifact_id).await,
+            None,
+            "nothing queued"
+        );
+        assert_eq!(e.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        e.fx.teardown().await;
     }
 
     /// Never claim more than we hold permits for.

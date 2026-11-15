@@ -151,19 +151,24 @@ const STALE_DIGESTS_SQL: &str = r#"
             LIMIT 1
         ) l
         WHERE a.is_deleted = false
+          AND ($5::uuid[] IS NULL OR a.repository_id = ANY($5))
           AND (l.vuln_db_published_at IS NULL OR l.vuln_db_published_at < b.built_at)
-          -- A scan of this row is already queued (an upload, a push, a
-          -- `POST /security/scan`): it grades against the current database,
-          -- and a rescan beside it would add a second result for one update.
-          AND NOT EXISTS (
-            SELECT 1 FROM scan_queue q
-            WHERE q.state IN ('pending', 'running')
-              AND ((q.kind IN ('hosted_upload', 'hosted_artifact') AND q.artifact_id = a.id)
-                OR (q.kind = 'hosted_image' AND q.repository_id = a.repository_id
-                    AND q.digest = a.checksum_sha256))
-          )
     )
-    SELECT s.digest
+    SELECT s.digest,
+           -- Held back: a scan of a row holding this digest is already queued
+           -- (an upload, a push, a `POST /security/scan`). It grades against
+           -- the current database, and a rescan beside it would add a second
+           -- result for one update. Per digest, as the rescan is.
+           EXISTS (
+               SELECT 1 FROM scan_queue q
+               WHERE q.state IN ('pending', 'running')
+                 AND ((q.kind = 'hosted_image' AND q.digest = s.digest)
+                   OR (q.kind IN ('hosted_upload', 'hosted_artifact')
+                       AND q.artifact_id IN (
+                           SELECT a2.id FROM artifacts a2
+                           WHERE a2.checksum_sha256 = s.digest
+                             AND a2.is_deleted = false)))
+           ) AS held
     FROM stale s
     LEFT JOIN LATERAL (
         SELECT MAX(d.downloaded_at) AS at
@@ -184,14 +189,48 @@ const STALE_DIGESTS_SQL: &str = r#"
           AND q.state IN ('pending', 'running')
     )
     GROUP BY s.digest
-    ORDER BY MAX(dl.at) DESC NULLS LAST, s.digest
+    -- Held-back digests last: they only tell the caller not to call this
+    -- key exhausted yet.
+    ORDER BY held, MAX(dl.at) DESC NULLS LAST, s.digest
     LIMIT $4
 "#;
+
+/// Whether a job in flight may still leave a row graded against an older
+/// database once it finishes, so a short selection must not be remembered as
+/// "nothing stale for this key":
+///
+/// - a rescan, pending or running: a running one grades against the database
+///   it started with;
+/// - a RUNNING hosted scan (`hosted_upload`, `hosted_image`,
+///   `hosted_artifact`): it may be grading a row that has no completed scan
+///   yet, so is in no stale set, against an older database (a replica that
+///   has not updated), and finish after the memo is written.
+///
+/// A PENDING hosted scan does not block it: it grades against whatever
+/// database is current when it runs. On a busy instance there nearly always
+/// is one, and counting it would re-run the full selection on every pass.
+const EXHAUSTION_BLOCKED_SQL: &str = "SELECT EXISTS (SELECT 1 FROM scan_queue \
+     WHERE (kind = 'rescan' AND state IN ('pending', 'running')) \
+        OR (kind IN ('hosted_upload', 'hosted_image', 'hosted_artifact') \
+            AND state = 'running'))";
 
 /// Queue the rescans a set of database builds calls for, within what is left
 /// of `max_per_day`. Returns how many digests were queued. `0` with
 /// `max_per_day == 0`, which is the default: nothing is selected at all.
 pub async fn enqueue_rescans(db: &PgPool, builds: &[Build], max_per_day: u64) -> Result<u64> {
+    enqueue_rescans_in(db, builds, max_per_day, None).await
+}
+
+/// [`enqueue_rescans`] over the artifacts of `repositories` only (all with
+/// `None`). The DB tests use it so another test's artifacts, scanned at the
+/// same time in the same database, are not selected. A scoped pass neither
+/// reads nor records the instance-wide "nothing stale for this key" memo.
+async fn enqueue_rescans_in(
+    db: &PgPool,
+    builds: &[Build],
+    max_per_day: u64,
+    repositories: Option<&[Uuid]>,
+) -> Result<u64> {
     if max_per_day == 0 || builds.is_empty() {
         return Ok(0);
     }
@@ -214,7 +253,7 @@ pub async fn enqueue_rescans(db: &PgPool, builds: &[Build], max_per_day: u64) ->
             .await
             .map_err(db_err)?
             .flatten();
-    if exhausted.as_deref() == Some(key.as_str()) {
+    if repositories.is_none() && exhausted.as_deref() == Some(key.as_str()) {
         return Ok(0);
     }
 
@@ -233,14 +272,21 @@ pub async fn enqueue_rescans(db: &PgPool, builds: &[Build], max_per_day: u64) ->
     let limit = budget.min(BATCH_MAX);
 
     let (types, ats): (Vec<String>, Vec<DateTime<Utc>>) = builds.iter().cloned().unzip();
-    let digests: Vec<String> = sqlx::query_scalar(STALE_DIGESTS_SQL)
+    let page: Vec<(String, bool)> = sqlx::query_as(STALE_DIGESTS_SQL)
         .bind(&types)
         .bind(&ats)
         .bind(&key)
         .bind(limit)
+        .bind(repositories.map(<[Uuid]>::to_vec))
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
+    let held_back = page.iter().any(|(_, held)| *held);
+    let page_len = page.len();
+    let digests: Vec<String> = page
+        .into_iter()
+        .filter_map(|(d, held)| (!held).then_some(d))
+        .collect();
 
     let mut queued: Vec<String> = Vec::new();
     if !digests.is_empty() {
@@ -273,18 +319,21 @@ pub async fn enqueue_rescans(db: &PgPool, builds: &[Build], max_per_day: u64) ->
     }
 
     // A short page means nothing else is stale for these builds: skip the
-    // selection until a database moves again. Not while a hosted scan or a
-    // rescan is still queued or running, though: the selection skipped those
-    // artifacts, and one that started on an older database may leave its
-    // digest stale for this key, so it must be looked at again.
-    let active: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM scan_queue \
-         WHERE kind <> 'proxy_file' AND state IN ('pending', 'running'))",
-    )
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(db_err)?;
-    if (digests.len() as i64) < limit && queued.is_empty() && !active {
+    // selection until a database moves again, unless something in flight
+    // may still leave a row stale for this key (see `EXHAUSTION_BLOCKED_SQL`),
+    // or a stale digest was held back by a queued hosted scan: that scan
+    // grades only its own row, and the digest's other rows must still be
+    // found.
+    let active: bool = sqlx::query_scalar(EXHAUSTION_BLOCKED_SQL)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    if repositories.is_none()
+        && (page_len as i64) < limit
+        && queued.is_empty()
+        && !held_back
+        && !active
+    {
         sqlx::query(
             "INSERT INTO scan_rescan_state (id, exhausted_key, updated_at) VALUES (true, $1, NOW()) \
              ON CONFLICT (id) DO UPDATE SET exhausted_key = EXCLUDED.exhausted_key, \
@@ -387,8 +436,13 @@ mod tests {
 
     // ── DB-backed ───────────────────────────────────────────────────────────
     //
-    // `db-serial` (nextest): these clear and count the whole scan_queue and
-    // the rescan ledger.
+    // These rely on nextest's `db-serial` group (`.config/nextest.toml`, the
+    // `test(scan_rescan::tests)` override): they share the selection's
+    // advisory lock, the instance-wide ledger, builds and memo tables, and
+    // `reset()` runs `DELETE FROM scan_queue`, so two of them at once would
+    // see each other's rows. Scoping each selection to the test's own
+    // repositories (`enqueue_rescans_in`) is what keeps OTHER, non-serial DB
+    // tests' artifacts out of it; the group is what keeps these apart.
 
     async fn try_pool() -> Option<PgPool> {
         crate::testing::try_pool_with(3).await
@@ -488,13 +542,20 @@ mod tests {
         scanned(&pool, r2, &fresh, "2026-11-10T00:00:00Z").await;
 
         let builds = vec![("malware".to_string(), at("2026-11-10T00:00:00Z"))];
-        assert_eq!(enqueue_rescans(&pool, &builds, 100).await.expect("tick"), 2);
+        assert_eq!(
+            enqueue_rescans_in(&pool, &builds, 100, Some(&[r1, r2]))
+                .await
+                .expect("tick"),
+            2
+        );
         assert_eq!(
             rescan_digests(&pool).await,
             vec![(a.clone(), PRIORITY_RESCAN), (b.clone(), PRIORITY_RESCAN)]
         );
         assert_eq!(
-            enqueue_rescans(&pool, &builds, 100).await.expect("again"),
+            enqueue_rescans_in(&pool, &builds, 100, Some(&[r1, r2]))
+                .await
+                .expect("again"),
             0,
             "one pass per build"
         );
@@ -505,13 +566,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            enqueue_rescans(&pool, &builds, 100).await.expect("after"),
+            enqueue_rescans_in(&pool, &builds, 100, Some(&[r1, r2]))
+                .await
+                .expect("after"),
             0
         );
 
         // The next build queues them again.
         let newer = vec![("malware".to_string(), at("2026-11-12T00:00:00Z"))];
-        assert_eq!(enqueue_rescans(&pool, &newer, 100).await.expect("newer"), 3);
+        assert_eq!(
+            enqueue_rescans_in(&pool, &newer, 100, Some(&[r1, r2]))
+                .await
+                .expect("newer"),
+            3
+        );
 
         for r in [r1, r2] {
             sqlx::query("DELETE FROM repositories WHERE id = $1")
@@ -629,7 +697,9 @@ mod tests {
             .await
             .expect("record the build");
         assert_eq!(
-            enqueue_rescans(&fx.pool, &builds, 10).await.expect("tick"),
+            enqueue_rescans_in(&fx.pool, &builds, 10, Some(&[fx.repo_id]))
+                .await
+                .expect("tick"),
             1,
             "one job for the digest both rows hold"
         );
@@ -715,7 +785,12 @@ mod tests {
             scanned(&pool, r, &digest(c), "2026-11-01T00:00:00Z").await;
         }
         let first = vec![("malware".to_string(), at("2026-11-10T00:00:00Z"))];
-        assert_eq!(enqueue_rescans(&pool, &first, 4).await.expect("first"), 3);
+        assert_eq!(
+            enqueue_rescans_in(&pool, &first, 4, Some(&[r]))
+                .await
+                .expect("first"),
+            3
+        );
 
         // Another database moves before any of the three ran: a new key.
         let second = vec![
@@ -723,7 +798,9 @@ mod tests {
             ("image".to_string(), at("2026-11-11T00:00:00Z")),
         ];
         assert_eq!(
-            enqueue_rescans(&pool, &second, 4).await.expect("second"),
+            enqueue_rescans_in(&pool, &second, 4, Some(&[r]))
+                .await
+                .expect("second"),
             0,
             "all three are still queued"
         );
@@ -739,7 +816,12 @@ mod tests {
             ("malware".to_string(), at("2026-11-10T00:00:00Z")),
             ("image".to_string(), at("2026-11-12T00:00:00Z")),
         ];
-        assert_eq!(enqueue_rescans(&pool, &third, 4).await.expect("third"), 1);
+        assert_eq!(
+            enqueue_rescans_in(&pool, &third, 4, Some(&[r]))
+                .await
+                .expect("third"),
+            1
+        );
         assert_eq!(rescan_digests(&pool).await.len(), 4);
 
         sqlx::query("DELETE FROM repositories WHERE id = $1")
@@ -818,7 +900,9 @@ mod tests {
 
         let builds = vec![("malware".to_string(), at("2026-11-10T00:00:00Z"))];
         assert_eq!(
-            enqueue_rescans(&pool, &builds, 100).await.expect("tick"),
+            enqueue_rescans_in(&pool, &builds, 100, Some(&[r]))
+                .await
+                .expect("tick"),
             0,
             "the newest scan is on the current build"
         );
@@ -933,6 +1017,9 @@ mod tests {
         let r = repo(&pool).await;
         let (up, img) = (digest('u'), digest('v'));
         let up_id = scanned(&pool, r, &up, "2026-11-01T00:00:00Z").await;
+        // A second row with the upload's digest and no job of its own: the
+        // digest is still held back, since the rescan is per digest.
+        scanned(&pool, r, &up, "2026-11-01T00:00:00Z").await;
         scanned(&pool, r, &img, "2026-11-01T00:00:00Z").await;
         let q = crate::services::scan_queue::ScanQueue::new(pool.clone());
         q.enqueue_hosted_upload(up_id, crate::services::scan_queue::PRIORITY_HOSTED)
@@ -943,17 +1030,89 @@ mod tests {
             .expect("image job");
 
         let builds = vec![("malware".to_string(), at("2026-11-10T00:00:00Z"))];
-        assert_eq!(enqueue_rescans(&pool, &builds, 100).await.expect("tick"), 0);
+        assert_eq!(
+            enqueue_rescans_in(&pool, &builds, 100, Some(&[r]))
+                .await
+                .expect("tick"),
+            0
+        );
 
         sqlx::query("DELETE FROM scan_queue")
             .execute(&pool)
             .await
             .unwrap();
         assert_eq!(
-            enqueue_rescans(&pool, &builds, 100).await.expect("after"),
+            enqueue_rescans_in(&pool, &builds, 100, Some(&[r]))
+                .await
+                .expect("after"),
             2,
             "with the jobs gone both are stale and selected"
         );
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(r)
+            .execute(&pool)
+            .await
+            .unwrap();
+        reset(&pool).await;
+    }
+
+    /// #6011 review: what keeps a short selection from being remembered as
+    /// "nothing stale". A running hosted scan blocks it (it may be grading a
+    /// row with no completed scan yet against an older database, and finish
+    /// after the memo); a pending one does not (it grades against the current
+    /// database); a pending or running rescan blocks it.
+    #[tokio::test]
+    async fn only_running_hosted_scans_and_rescans_block_the_memo() {
+        let Some(pool) = try_pool().await else { return };
+        reset(&pool).await;
+        let r = repo(&pool).await;
+        let blocked = || async {
+            sqlx::query_scalar::<_, bool>(EXHAUSTION_BLOCKED_SQL)
+                .fetch_one(&pool)
+                .await
+                .expect("blocked query")
+        };
+        let set_state = |state: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query("UPDATE scan_queue SET state = $1")
+                    .bind(state)
+                    .execute(&pool)
+                    .await
+                    .expect("set state");
+            }
+        };
+        assert!(!blocked().await, "an empty queue blocks nothing");
+
+        let a = scanned(&pool, r, &digest('w'), "2026-11-01T00:00:00Z").await;
+        crate::services::scan_queue::ScanQueue::new(pool.clone())
+            .enqueue_hosted_upload(a, crate::services::scan_queue::PRIORITY_HOSTED)
+            .await
+            .expect("upload job");
+        assert!(
+            !blocked().await,
+            "a pending hosted scan grades against the current build"
+        );
+        set_state("running").await;
+        assert!(
+            blocked().await,
+            "a running hosted scan may be on an older build"
+        );
+        sqlx::query("DELETE FROM scan_queue")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "INSERT INTO scan_queue (kind, priority, digest) VALUES ('rescan', 5, 'memo01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(blocked().await, "a pending rescan blocks it");
+        set_state("running").await;
+        assert!(blocked().await, "a running rescan blocks it");
 
         sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(r)
@@ -975,7 +1134,12 @@ mod tests {
         }
         let builds = vec![("malware".to_string(), at("2026-11-10T00:00:00Z"))];
 
-        assert_eq!(enqueue_rescans(&pool, &builds, 0).await.expect("off"), 0);
+        assert_eq!(
+            enqueue_rescans_in(&pool, &builds, 0, Some(&[r]))
+                .await
+                .expect("off"),
+            0
+        );
         assert!(rescan_digests(&pool).await.is_empty(), "off queues nothing");
         let ledger: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_rescan_ledger")
             .fetch_one(&pool)
@@ -983,9 +1147,16 @@ mod tests {
             .unwrap();
         assert_eq!(ledger, 0, "off writes nothing either");
 
-        assert_eq!(enqueue_rescans(&pool, &builds, 1).await.expect("cap 1"), 1);
         assert_eq!(
-            enqueue_rescans(&pool, &builds, 1).await.expect("cap spent"),
+            enqueue_rescans_in(&pool, &builds, 1, Some(&[r]))
+                .await
+                .expect("cap 1"),
+            1
+        );
+        assert_eq!(
+            enqueue_rescans_in(&pool, &builds, 1, Some(&[r]))
+                .await
+                .expect("cap spent"),
             0,
             "the day's budget is spent"
         );

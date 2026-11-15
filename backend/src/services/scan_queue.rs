@@ -36,6 +36,27 @@ const _: () = {
 
 tokio::task_local! {
     static BACKGROUND_BAND: ();
+    static ENGINE_UNAVAILABLE: std::cell::Cell<bool>;
+}
+
+/// Run `fut`, reporting whether a scanner engine said it was unavailable while
+/// it ran (#5994): unreachable, or not ready within its readiness wait. The
+/// orchestrator records such a scan `failed`, which is right for a request
+/// that cannot wait, but a queued job can try again once the engine is back.
+pub async fn tracking_engine_unavailable<F: std::future::Future>(fut: F) -> (F::Output, bool) {
+    ENGINE_UNAVAILABLE
+        .scope(std::cell::Cell::new(false), async {
+            let out = fut.await;
+            (out, ENGINE_UNAVAILABLE.with(|c| c.get()))
+        })
+        .await
+}
+
+/// Note that the scanner engine was unavailable for the current scan. A no-op
+/// outside [`tracking_engine_unavailable`], so an in-process scan (queue off)
+/// is unaffected.
+pub fn note_engine_unavailable() {
+    let _ = ENGINE_UNAVAILABLE.try_with(|c| c.set(true));
 }
 
 /// Run `fut` in the background priority band (#5947): a scan nobody waits on.
@@ -444,33 +465,51 @@ impl ScanQueue {
         claimed_by: &str,
         claim_ttl_secs: f64,
     ) -> Result<Vec<Claimed<ScanJob>>> {
-        self.claim_filtered(limit, claimed_by, claim_ttl_secs, false)
+        self.claim_filtered(limit, claimed_by, claim_ttl_secs, limit)
             .await
     }
 
-    /// [`Self::claim`], leaving `rescan` jobs pending when `skip_rescans` is
-    /// set: a worker whose rescan slots are full (#5947) does not claim one
-    /// just to hand it back.
+    /// [`Self::claim`], taking at most `max_rescans` of the `rescan` jobs: a
+    /// worker claims no more rescans than it has free rescan slots (#5947),
+    /// so it never claims one just to hand it back.
     pub async fn claim_filtered(
         &self,
         limit: i64,
         claimed_by: &str,
         claim_ttl_secs: f64,
-        skip_rescans: bool,
+        max_rescans: i64,
     ) -> Result<Vec<Claimed<ScanJob>>> {
         use sqlx::{FromRow, Row};
 
         let rows = sqlx::query(
             r#"
-            WITH candidate AS (
-                SELECT q.id
+            WITH other AS (
+                SELECT q.id, q.priority, q.created_at
                 FROM scan_queue q
                 WHERE q.state = 'pending'
                   AND q.next_attempt_at <= NOW()
-                  AND NOT ($4::boolean AND q.kind = 'rescan')
+                  AND q.kind <> 'rescan'
                 ORDER BY q.priority DESC, q.created_at ASC
                 LIMIT $1
                 FOR UPDATE OF q SKIP LOCKED
+            ),
+            rescans AS (
+                SELECT q.id, q.priority, q.created_at
+                FROM scan_queue q
+                WHERE q.state = 'pending'
+                  AND q.next_attempt_at <= NOW()
+                  AND q.kind = 'rescan'
+                ORDER BY q.priority DESC, q.created_at ASC
+                LIMIT GREATEST($4, 0)
+                FOR UPDATE OF q SKIP LOCKED
+            ),
+            -- The best `limit` of both, in the one claim order. A rescan row
+            -- locked above but not chosen stays pending.
+            candidate AS (
+                SELECT c.id
+                FROM (SELECT * FROM other UNION ALL SELECT * FROM rescans) c
+                ORDER BY c.priority DESC, c.created_at ASC
+                LIMIT $1
             ),
             claimed AS (
                 UPDATE scan_queue q
@@ -499,7 +538,7 @@ impl ScanQueue {
         .bind(limit)
         .bind(claimed_by)
         .bind(claim_ttl_secs)
-        .bind(skip_rescans)
+        .bind(max_rescans)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -918,6 +957,19 @@ mod tests {
         assert!(!job_with_attempts(3, 3).will_retry_after_failure());
         // A job configured for a single attempt is terminal on its first failure.
         assert!(!job_with_attempts(0, 1).will_retry_after_failure());
+    }
+
+    /// #5994: the unavailable signal is seen only inside a tracking scope,
+    /// and noting it outside one (an in-process scan) does nothing.
+    #[tokio::test]
+    async fn the_engine_unavailable_signal_is_scoped() {
+        note_engine_unavailable();
+        let ((), seen) = tracking_engine_unavailable(async {}).await;
+        assert!(!seen, "nothing noted inside the scope");
+        let ((), seen) = tracking_engine_unavailable(async { note_engine_unavailable() }).await;
+        assert!(seen);
+        let ((), seen) = tracking_engine_unavailable(async {}).await;
+        assert!(!seen, "each scope starts clear");
     }
 
     // ── DB-backed queue semantics ───────────────────────────────────────────
@@ -1941,41 +1993,51 @@ mod tests {
         drop_repo(&pool, repo).await;
     }
 
-    /// #5947 review: a worker with its rescan slots full claims around the
-    /// rescans, leaving them pending, instead of claiming one to release it.
+    /// #5947 review / #5994 run: a worker claims no more rescans than it has
+    /// free rescan slots, leaving the rest pending, instead of claiming them
+    /// to release them again (which churned ~50 updates a minute).
     #[tokio::test]
-    async fn a_claim_can_leave_rescans_pending() {
+    async fn a_claim_takes_no_more_rescans_than_free_slots() {
         let Some(pool) = try_pool().await else { return };
         let repo = fresh_queue(&pool).await;
         let q = ScanQueue::new(pool.clone());
-        enqueue_rescan(&pool, "skip01").await;
+        for d in ["skip01", "skip02", "skip03"] {
+            enqueue_rescan(&pool, d).await;
+        }
         q.enqueue_hosted_image(repo, "keep01", PRIORITY_HOSTED)
             .await
             .expect("hosted");
+
+        // No rescan slot free: only the hosted job is claimed.
         let got = q
-            .claim_filtered(10, "w", CLAIM_TTL_SECS, true)
+            .claim_filtered(10, "w", CLAIM_TTL_SECS, 0)
             .await
             .expect("claim");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].kind, "hosted_image");
-        let state: String =
-            sqlx::query_scalar("SELECT state FROM scan_queue WHERE digest = 'skip01'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(state, "pending", "the rescan was never claimed");
-        let attempts: i32 =
-            sqlx::query_scalar("SELECT attempts FROM scan_queue WHERE digest = 'skip01'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(attempts, 0);
-        let later = q
-            .claim_filtered(10, "w", CLAIM_TTL_SECS, false)
+
+        // One slot free: one rescan, the others left pending and untouched.
+        let got = q
+            .claim_filtered(10, "w", CLAIM_TTL_SECS, 1)
             .await
             .expect("claim");
-        assert_eq!(later.len(), 1);
-        assert_eq!(later[0].kind, "rescan");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind, "rescan");
+        let (pending, touched): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*) FILTER (WHERE state = 'pending'), \
+                    COUNT(*) FILTER (WHERE state = 'pending' AND (attempts > 0 OR claimed_by IS NOT NULL)) \
+             FROM scan_queue WHERE kind = 'rescan'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((pending, touched), (2, 0));
+
+        // `claim` is unrestricted.
+        assert_eq!(
+            q.claim(10, "w", CLAIM_TTL_SECS).await.expect("claim").len(),
+            2
+        );
         sqlx::query("DELETE FROM scan_queue")
             .execute(&pool)
             .await
