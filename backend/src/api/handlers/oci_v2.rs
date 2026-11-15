@@ -684,6 +684,113 @@ async fn caller_may_push(
             .is_ok()
 }
 
+/// The outcome of one `/v2` credential verification.
+type OciAuthResult =
+    Result<(crate::services::auth_service::Claims, Option<Vec<String>>), OciAuthError>;
+
+/// A credential the quota pre-check already verified for this request, with
+/// the `Authorization` value it verified.
+#[derive(Clone)]
+struct PreverifiedOci {
+    authorization: axum::http::HeaderValue,
+    result: OciAuthResult,
+}
+
+tokio::task_local! {
+    /// Set by [`run_with_preverified`] around the handler of a `/v2` write the
+    /// quota pre-check let through, so the handler's
+    /// [`authenticate_oci_with_scopes`] reuses that verification instead of
+    /// checking the credential again.
+    static PREVERIFIED_OCI: PreverifiedOci;
+}
+
+/// What [`check_write_repository`] found: whether the caller may write, and
+/// the credential verification it made on the way, for the handler to reuse.
+pub(crate) struct OciWriteCheck {
+    pub(crate) may_write: bool,
+    preverified: Option<PreverifiedOci>,
+}
+
+/// Whether the caller of a `/v2` write to `image_name` passes the push gate
+/// the write handlers apply: an authenticating credential that is not the
+/// anonymous pull token, `write:artifacts` among its action scopes, a hosted
+/// repository, and the repository `write` decision
+/// ([`require_oci_repo_write_access`]).
+///
+/// The quota pre-check (`services::quota::http::upload_admission`) asks this
+/// before it answers a quota refusal, so a caller the handler would refuse
+/// gets the handler's answer (401, 403 `DENIED`, 404 `NAME_UNKNOWN`) and never
+/// the repository's quota or usage. Any doubt answers `false`: the handler
+/// then decides, and the publish admission after the body still enforces the
+/// quota for a caller it lets through.
+///
+/// The credential is verified once per request: the result is handed to the
+/// handler through [`run_with_preverified`]. Verifying a Basic password twice
+/// would cost a second bcrypt and, for a wrong password, charge the
+/// Basic-password login budget (#5485) and the account's failed-login count
+/// twice for one request.
+pub(crate) async fn check_write_repository(
+    state: &SharedState,
+    headers: &HeaderMap,
+    image_name: &str,
+) -> OciWriteCheck {
+    let refused = |preverified| OciWriteCheck {
+        may_write: false,
+        preverified,
+    };
+    if is_anonymous_token(headers) {
+        return refused(None);
+    }
+    let Some(authorization) = headers.get(AUTHORIZATION).cloned() else {
+        return refused(None);
+    };
+    let result = verify_oci_credential(&state.db, &state.config, headers).await;
+    let preverified = Some(PreverifiedOci {
+        authorization,
+        result: result.clone(),
+    });
+    let Ok((claims, token_scopes)) = result else {
+        return refused(preverified);
+    };
+    if !oci_scopes_grant(&token_scopes, OCI_SCOPE_WRITE) {
+        return refused(preverified);
+    }
+    let Ok((repo, format)) = resolve_repo_for_write(&state.db, image_name).await else {
+        return refused(preverified);
+    };
+    let may_write = stores_own_manifests(&repo.repo_type)
+        && require_oci_repo_write_access(state, &claims, &repo, &format, image_name, "write")
+            .await
+            .is_ok();
+    OciWriteCheck {
+        may_write,
+        preverified,
+    }
+}
+
+/// Run `handler` (the rest of a `/v2` request) with the credential
+/// verification `check` made, so the handler does not verify it again.
+pub(crate) async fn run_with_preverified<F: std::future::Future>(
+    check: OciWriteCheck,
+    handler: F,
+) -> F::Output {
+    match check.preverified {
+        Some(preverified) => PREVERIFIED_OCI.scope(preverified, handler).await,
+        None => handler.await,
+    }
+}
+
+/// The verification [`check_write_repository`] made for this request, when
+/// it verified the same `Authorization` value.
+fn preverified_result(headers: &HeaderMap) -> Option<OciAuthResult> {
+    PREVERIFIED_OCI
+        .try_with(|p| {
+            (headers.get(AUTHORIZATION) == Some(&p.authorization)).then(|| p.result.clone())
+        })
+        .ok()
+        .flatten()
+}
+
 /// Authenticate an OCI request and also return the API-token scopes if the
 /// caller presented one. Returns `(claims, None)` when the caller authenticated
 /// via JWT or password (no scope restriction), and `(claims, Some(scopes))`
@@ -695,7 +802,10 @@ async fn authenticate_oci_with_scopes(
     config: &crate::config::Config,
     headers: &HeaderMap,
 ) -> Result<(crate::services::auth_service::Claims, Option<Vec<String>>), OciAuthError> {
-    let result = verify_oci_credential(db, config, headers).await;
+    let result = match preverified_result(headers) {
+        Some(result) => result,
+        None => verify_oci_credential(db, config, headers).await,
+    };
     // The OCI surface authenticates in the handler rather than through the
     // auth middleware; note the principal for the `Request completed` log
     // line's `user` field all the same (#4674).
