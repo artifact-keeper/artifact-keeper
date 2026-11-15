@@ -239,12 +239,15 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         sqlx::query("SET lock_timeout = '5min'")
             .execute(&mut *conn)
             .await?;
-        // Clear INVALID leftovers of interrupted CREATE INDEX CONCURRENTLY
-        // migrations so the retry rebuilds them instead of skipping them
-        // (#4426). Under the migrator's own advisory lock, on this session.
-        artifact_keeper_backend::migration_repair::repair_invalid_concurrent_indexes(&mut conn)
-            .await?;
-        artifact_keeper_backend::MIGRATOR.run(&mut *conn).await?;
+        // Takes the migration lock without blocking in pg_advisory_lock (a
+        // blocked waiter deadlocks a CREATE INDEX CONCURRENTLY in the holder,
+        // #5993), repairs INVALID concurrent index leftovers under that lock
+        // (#4426, #5993), then applies pending migrations.
+        artifact_keeper_backend::migration_repair::run_startup_migrations(
+            &mut conn,
+            &artifact_keeper_backend::MIGRATOR,
+        )
+        .await?;
         tracing::info!("Database migrations complete");
     }
 
