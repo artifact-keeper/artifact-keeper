@@ -1893,6 +1893,16 @@ jobs:
       - name: Check the toolchain-pin gate catches what it must
         run: bash scripts/ci/test-check-toolchain-pin.sh
 
+      # The daily curl advisory watch (scheduled-curl-advisory-watch.yml,
+      # #6003) is the only control over the curl / libcurl the backend and
+      # OpenSCAP images build from source, and it is silent while the pins are
+      # clean. This drives its OSV range arithmetic against real vuln.json
+      # records (an old 8.10.0 pin must be flagged) and its INFRA legs (an
+      # unreadable feed or a missing pin must never read as clean). Offline,
+      # ~1s.
+      - name: Check the curl advisory watch catches what it must
+        run: bash scripts/ci/test-check-curl-advisories.sh
+
       # The red-team suite's own reporting (#3491). It ran green against 1.8.0
       # while its report could not be parsed by `jq`, its summary printed
       # "Passed: 1 checks" after dozens of PASS lines, and its exit-code gate
@@ -2954,6 +2964,7 @@ jobs:
             openscap:
               - 'docker/Dockerfile.openscap'
               - 'scripts/openscap-wrapper.py'
+              - 'docker/curl-sbom.sh'
             # What makes the backend image build run on a pull request.
             docker:
               - 'docker/**'

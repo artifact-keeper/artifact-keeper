@@ -857,10 +857,14 @@ RUN set -eu; \
 # Trade-off: a self-built curl is INVISIBLE to Trivy and dependabot, so they
 # will not report a future curl CVE against this image. grype DOES detect it
 # (from the binary's version string, as pkg:generic/curl with CPE haxx:curl),
-# so grype is the one scanner that still matches curl CVEs here. Still watch
-# https://curl.se/docs/security.html and bump by hand. Retire this stage (and
-# go back to the curl-minimal RPM) once UBI 9 ships a fixed krb5-libs.
-# #6003 tracks this scanning blind spot for this image and OpenSCAP's libcurl.
+# so grype is the one scanner that still matches curl CVEs here. Two
+# controls cover the blind spot (#6003): scheduled-curl-advisory-watch.yml
+# checks CURL_VERSION against https://curl.se/docs/vuln.json daily and opens a
+# type:security issue when it is affected, and the image carries a CycloneDX
+# entry for curl and libcurl at /usr/share/sbom/curl.cdx.json, generated
+# below from CURL_VERSION. Nothing bumps the pin: do that by hand. Retire this
+# stage (and go back to the curl-minimal RPM) once UBI 9 ships a fixed
+# krb5-libs.
 FROM registry.access.redhat.com/ubi9/ubi:9.8 AS curl-bin
 ARG CURL_VERSION=8.23.0
 ARG CURL_SHA256=8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5
@@ -869,6 +873,7 @@ RUN dnf install -y --nodocs gcc make binutils diffutils perl xz gnupg2 \
       openssl-devel zlib-devel libnghttp2-devel \
     && dnf clean all
 COPY docker/keys/curl-daniel-stenberg.gpg /tmp/curl-release.gpg
+COPY docker/curl-sbom.sh /usr/local/bin/curl-sbom.sh
 RUN set -eu; \
     base="https://curl.se/download/curl-${CURL_VERSION}.tar.xz"; \
     curl --proto '=https' --tlsv1.2 -sSfL "${base}" -o /tmp/curl.tar.xz; \
@@ -913,7 +918,12 @@ RUN set -eu; \
       echo "ERROR: curl was built with Kerberos/NTLM/LDAP/SSH/SASL support" >&2; exit 1; \
     fi; \
     printf '%s\n' "${features}" | grep -q '^Features:.* HTTP2' \
-      || { echo "ERROR: curl was built without HTTP/2" >&2; exit 1; }
+      || { echo "ERROR: curl was built without HTTP/2" >&2; exit 1; }; \
+    printf '%s\n' "${features}" | head -1 | grep -q "^curl ${CURL_VERSION} .* libcurl/${CURL_VERSION} " \
+      || { echo "ERROR: the built curl does not report ${CURL_VERSION}" >&2; exit 1; }; \
+    mkdir -p /out/sbom; \
+    sh /usr/local/bin/curl-sbom.sh curl "${CURL_VERSION}" "${CURL_SHA256}" \
+      "statically linked into /usr/bin/curl" > /out/sbom/curl.cdx.json
 
 # ---------- Stage 5b: Pre-seed the Grype vulnerability DB ----------
 # Populates the Grype DB at build time so the image works on egress-restricted
@@ -961,6 +971,11 @@ COPY --from=squashfs-bin /licenses/squashfs-tools /licenses/squashfs-tools
 # working. Its licence travels with it.
 COPY --from=curl-bin /out/curl /usr/bin/curl
 COPY --from=curl-bin /licenses/curl /licenses/curl
+# CycloneDX entry for that curl and its static libcurl (#6003), generated in
+# the curl-bin stage from the same CURL_VERSION. RPM-database scanners cannot
+# see a source-built curl; this gives CPE-matching scanners (syft's
+# sbom-cataloger, grype) cpe:2.3:a:haxx:curl and cpe:2.3:a:haxx:libcurl.
+COPY --from=curl-bin /out/sbom/curl.cdx.json /usr/share/sbom/curl.cdx.json
 
 # Pre-seeded Grype vulnerability DB (avoids first-scan network fetch).
 #

@@ -25,10 +25,7 @@
 #
 # * These are deliberately NOT suppressed in the backend service binary, the
 #   scanner-adapter binary (rebuilt from source with a patched Go toolchain on
-#   every build), or in the UBI/Alpine base OS packages. The one exception is
-#   the time-boxed krb5-libs block near the bottom (#5991): Red Hat has
-#   published the fix but not yet to the UBI repositories CI builds from,
-#   and every entry there expires on its own. Otherwise only
+#   every build), or in the UBI/Alpine base OS packages. Only
 #   bundled-scanner-binary CVEs are listed, and since #3352 the bar for
 #   listing one is no longer "no fixed *tool release* exists" — both binaries
 #   are now built by us, so that is nearly always true and stopped
@@ -241,6 +238,12 @@
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# RETIRED at #5991 (2026-11-15): this block no longer suppresses anything;
+# its 14 tokens are tombstoned at the bottom of this file. release/1.11.x still
+# carries it live, because its images still ship krb5-libs, and it expires
+# there on 2026-12-14. The history below is kept because it is the record of
+# why the tokens were ever here.
+#
 # TIME-BOXED base-OS exception (#5991): krb5-libs in the UBI 9 runtime images.
 #
 # Backend (docker/Dockerfile.backend) and OpenSCAP (docker/Dockerfile.openscap)
@@ -266,25 +269,21 @@
 # Retirement: the rootfs-builder `upgrade -y` (both Dockerfiles) installs
 # el9_9.2 on the first build after Red Hat syncs it to UBI, with no
 # Dockerfile change. Then replace these lines with `# RETIRED:` tombstones.
-# The matching not_affected statements are .vex/<CVE>.vex.json (one per ID);
-# they remain true after the fix and may be kept or dropped with the block.
+# The matching not_affected statements were .vex/<CVE>.vex.json (one per ID);
+# they were dropped with the block (see below).
 # If that has not happened by the expiry date, the entries stop applying and
 # the publish gate goes red again on purpose: re-measure, do not just move
 # the date.
-CVE-2026-107364 exp:2026-12-14
-CVE-2026-112315 exp:2026-12-14
-CVE-2026-112316 exp:2026-12-14
-CVE-2026-112317 exp:2026-12-14
-CVE-2026-112318 exp:2026-12-14
-CVE-2026-112319 exp:2026-12-14
-CVE-2026-112320 exp:2026-12-14
-CVE-2026-112321 exp:2026-12-14
-CVE-2026-112322 exp:2026-12-14
-CVE-2026-112323 exp:2026-12-14
-CVE-2026-118380 exp:2026-12-14
-CVE-2026-119079 exp:2026-12-14
-CVE-2026-71199 exp:2026-12-14
-CVE-2026-71200 exp:2026-12-14
+#
+# Retired by removing the package rather than by the fix arriving: #6002 gave
+# the OpenSCAP image its own Kerberos-free libcurl, and #6004 gave the backend
+# image its own curl build and moved the image HEALTHCHECK to the
+# `artifact-keeper healthcheck` subcommand. Neither image installs krb5-libs
+# any more, so there is nothing left to suppress. The 14 .vex/<CVE>.vex.json
+# not_affected statements were deleted with it: with the package gone there
+# is no component for a statement to be about, and the VEX already attached
+# to earlier images stays with those digests. See the measurement record at
+# the bottom of this file.
 # ---------------------------------------------------------------------------
 
 # ===========================================================================
@@ -293,7 +292,8 @@ CVE-2026-71200 exp:2026-12-14
 #
 # Each line below records a token main has REMOVED because the finding was
 # measured absent from every image main ships. The tokens still appear in
-# release/1.5.x and/or release/1.6.x's .trivyignore; without these tombstones
+# release/1.5.x and/or release/1.6.x's .trivyignore (the krb5-libs ones in
+# release/1.11.x's); without these tombstones
 # the pre-tag gate would (rightly) refuse the removal as a possible
 # forward-port miss. A tombstone is NOT an active exception — nothing is
 # suppressed by it. Delete a tombstone once no active release branch lists
@@ -342,6 +342,24 @@ CVE-2026-71200 exp:2026-12-14
 #   the rebuilt grype, the rebuilt buildctl and the scanner-adapter's pinned
 #   trivy: none of the five appears, and none of the three binaries' Go build
 #   info lists github.com/docker/docker.
+#
+# Measurement record (2026-11-15, #5991):
+# * The 14 krb5-libs tokens — CVE-2026-107364, CVE-2026-112315 through
+#   -112323, CVE-2026-118380, -119079, -71199 and -71200. Suppressed (with
+#   exp:2026-12-14) since #5996 because both UBI 9 images shipped
+#   krb5-libs-1.21.1-10.el9_8.1 and the UBI repositories had no fixed build.
+#   #6002 (OpenSCAP: own libcurl without GSSAPI/SSH/LDAP) and #6004 (backend:
+#   own curl build, `artifact-keeper healthcheck` HEALTHCHECK) removed the
+#   package from both images instead. Measured on the first images published
+#   from main with both, sha-e9f1166 (Docker Publish run 43696045728):
+#   backend sha256:85c0efdd..., OpenSCAP sha256:a8429cb6.... trivy 0.76.0,
+#   --severity CRITICAL,HIGH --ignore-unfixed, this file with the 14 tokens
+#   removed: 0 findings for each image on linux/amd64 and linux/arm64. The
+#   same scan of the previous publish, sha-94e464e, reports exactly the 14
+#   against krb5-libs-1.21.1-10.el9_8.1 in each image. `rpm -q krb5-libs`
+#   reports "package krb5-libs is not installed" for both images.
+#   release/1.11.x still lists all 14 live (its images still ship krb5-libs),
+#   which is why these are tombstoned rather than deleted.
 # ===========================================================================
 # RETIRED: GHSA-hrxh-6v49-42gf (2026-08-13, grype grpc-go fixed in v0.117.0, #3307/#3309)
 # RETIRED: CVE-2026-27145 (2026-08-16, grype stdlib cleared by go1.26.6 source build, #3352)
@@ -363,3 +381,17 @@ CVE-2026-71200 exp:2026-12-14
 # RETIRED: CVE-2026-41567 (2026-11-09, docker/docker dropped by grype v0.121.3, #5565)
 # RETIRED: CVE-2026-41568 (2026-11-09, docker/docker dropped by grype v0.121.3, #5565)
 # RETIRED: CVE-2026-42306 (2026-11-09, docker/docker dropped by grype v0.121.3, #5565)
+# RETIRED: CVE-2026-107364 (2026-11-15, krb5-libs dropped from backend and OpenSCAP images, #6002/#6004/#5991)
+# RETIRED: CVE-2026-112315 (2026-11-15, krb5-libs dropped from backend and OpenSCAP images, #6002/#6004/#5991)
+# RETIRED: CVE-2026-112316 (2026-11-15, krb5-libs dropped from backend and OpenSCAP images, #6002/#6004/#5991)
+# RETIRED: CVE-2026-112317 (2026-11-15, krb5-libs dropped from backend and OpenSCAP images, #6002/#6004/#5991)
+# RETIRED: CVE-2026-112318 (2026-11-15, krb5-libs dropped from backend and OpenSCAP images, #6002/#6004/#5991)
+# RETIRED: CVE-2026-112319 (2026-11-15, krb5-libs dropped from backend and OpenSCAP images, #6002/#6004/#5991)
+# RETIRED: CVE-2026-112320 (2026-11-15, krb5-libs dropped from backend and OpenSCAP images, #6002/#6004/#5991)
+# RETIRED: CVE-2026-112321 (2026-11-15, krb5-libs dropped from backend and OpenSCAP images, #6002/#6004/#5991)
+# RETIRED: CVE-2026-112322 (2026-11-15, krb5-libs dropped from backend and OpenSCAP images, #6002/#6004/#5991)
+# RETIRED: CVE-2026-112323 (2026-11-15, krb5-libs dropped from backend and OpenSCAP images, #6002/#6004/#5991)
+# RETIRED: CVE-2026-118380 (2026-11-15, krb5-libs dropped from backend and OpenSCAP images, #6002/#6004/#5991)
+# RETIRED: CVE-2026-119079 (2026-11-15, krb5-libs dropped from backend and OpenSCAP images, #6002/#6004/#5991)
+# RETIRED: CVE-2026-71199 (2026-11-15, krb5-libs dropped from backend and OpenSCAP images, #6002/#6004/#5991)
+# RETIRED: CVE-2026-71200 (2026-11-15, krb5-libs dropped from backend and OpenSCAP images, #6002/#6004/#5991)
