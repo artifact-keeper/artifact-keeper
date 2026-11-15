@@ -125,13 +125,16 @@ MODULES_RESP=$(curl -sf -X POST \
   -H "Content-Type: application/json" \
   -d '{"moduleRefs": [{"owner": "acme", "module": "payments"}]}')
 
+# The JSON codec has always answered `owner/module` as the module's name;
+# the binary codec the buf CLI speaks answers the schema's bare `payments`
+# (test-protobuf-buf-cli.sh covers that side).
 MODULE_NAME=$(echo "$MODULES_RESP" | jq -r '.modules[0].name')
-if [ "$MODULE_NAME" != "payments" ]; then
+if [ "$MODULE_NAME" != "acme/payments" ]; then
   echo "ERROR: GetModules returned unexpected name: $MODULE_NAME"
   echo "$MODULES_RESP"
   exit 1
 fi
-echo "  Module found: acme/$MODULE_NAME"
+echo "  Module found: $MODULE_NAME"
 
 # --------------------------------------------------------------------------
 # Test 3: GetLabels — verify labels were created
@@ -241,11 +244,11 @@ RESOURCES_RESP=$(curl -sf -X POST \
   -d '{"resourceRefs": [{"owner": "acme", "module": "payments", "label": "main"}]}')
 
 RESOURCE_MODULE=$(echo "$RESOURCES_RESP" | jq -r '.resources[0].module.name')
-if [ "$RESOURCE_MODULE" != "payments" ]; then
+if [ "$RESOURCE_MODULE" != "acme/payments" ]; then
   echo "ERROR: GetResources returned unexpected module: $RESOURCE_MODULE"
   exit 1
 fi
-echo "  Resource resolved: acme/$RESOURCE_MODULE"
+echo "  Resource resolved: $RESOURCE_MODULE"
 
 # --------------------------------------------------------------------------
 # Test 9: Write rejection on remote repo
