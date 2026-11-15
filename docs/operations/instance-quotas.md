@@ -58,6 +58,12 @@ monitoring read the refusal as a server fault. The body names the scope, the
 repository and the figures. A declared `Content-Length` that does not fit is
 refused before the body is read.
 
+A quota refusal is only given to a caller who may write the repository.
+Anyone else gets the same answer as for any other write they may not make:
+`401` without credentials and `403 FORBIDDEN` (`DENIED` on `/v2`) for a
+signed-in caller who may not write. The quota figures are never shown to
+them.
+
 A storage backend that is genuinely full (a bucket quota on the object store,
 a full volume) still answers `507 STORAGE_FULL`. In that case the server
 failed to store what it accepted, and the operator has to act. That is not a

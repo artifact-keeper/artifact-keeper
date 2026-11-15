@@ -502,3 +502,366 @@ async fn transfer_quota_through_the_router_5912() {
     .unwrap();
     fx.teardown().await;
 }
+
+/// A local user with a bcrypt password, as `Basic` credentials.
+async fn basic_user(pool: &PgPool, tag: &str) -> (Uuid, String) {
+    let id = Uuid::new_v4();
+    let username = format!("quota-{tag}-{id}");
+    let hash = bcrypt::hash("quotapass", 4).unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, \
+         is_active, password_changed_at, privileges_changed_at, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, 'local', false, true, NOW() - INTERVAL '60 seconds', \
+         NOW() - INTERVAL '60 seconds', NOW() - INTERVAL '60 seconds', \
+         NOW() - INTERVAL '60 seconds')",
+    )
+    .bind(id)
+    .bind(&username)
+    .bind(format!("{username}@test.local"))
+    .bind(&hash)
+    .execute(pool)
+    .await
+    .unwrap();
+    use base64::Engine;
+    let raw = format!("{username}:quotapass");
+    (
+        id,
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(raw)
+        ),
+    )
+}
+
+/// The over-quota write of each upload surface the pre-check covers, against
+/// public repositories with a 16-byte repository quota.
+struct WriteGateFx {
+    pool: PgPool,
+    app: Router,
+    /// Public: generic (REST artifact API), docker (`/v2`), maven, npm.
+    /// Then private: generic, docker, on which `reader` holds no grant.
+    repos: Vec<(Uuid, String, std::path::PathBuf)>,
+    writer: (Uuid, String),
+    reader: (Uuid, String),
+    _serial: tdh::UsageLedgerSerialGuard,
+}
+
+/// The declared length of every over-quota write below.
+const OVER_QUOTA: u64 = 4096;
+
+impl WriteGateFx {
+    async fn setup() -> Option<Self> {
+        let serial = tdh::usage_ledger_serial_lock().await;
+        let pool = tdh::try_pool().await?;
+        let mut repos = Vec::new();
+        for (format, public) in [
+            ("generic", true),
+            ("docker", true),
+            ("maven", true),
+            ("npm", true),
+            ("generic", false),
+            ("docker", false),
+        ] {
+            let repo = tdh::create_repo(&pool, "local", format).await;
+            sqlx::query(
+                "UPDATE repositories SET visibility = $2::repository_visibility, \
+                 is_public = $3, quota_bytes = 16 WHERE id = $1",
+            )
+            .bind(repo.0)
+            .bind(if public { "public" } else { "private" })
+            .bind(public)
+            .execute(&pool)
+            .await
+            .unwrap();
+            repos.push(repo);
+        }
+        let state = tdh::build_state(pool.clone(), repos[0].2.to_str().unwrap());
+        let app = crate::api::routes::create_router(state);
+        let writer = basic_user(&pool, "writer").await;
+        let reader = basic_user(&pool, "reader").await;
+        for (repo_id, ..) in &repos[..4] {
+            tdh::grant_repo_role(&pool, *repo_id, writer.0, "developer").await;
+            tdh::grant_repo_role(&pool, *repo_id, reader.0, "reader").await;
+        }
+        Some(Self {
+            pool,
+            app,
+            repos,
+            writer,
+            reader,
+            _serial: serial,
+        })
+    }
+
+    /// Every over-quota write to a public repository, as (label, method,
+    /// uri). Only the `rest` and `oci` rows reproduce the original bug: those
+    /// handlers authorize the write after the pre-check. The maven and npm
+    /// routes are write-gated by `repo_visibility_middleware` first, and npm
+    /// skips the pre-check; they pin that the answer stays the same there.
+    fn writes(&self) -> Vec<(&'static str, Method, String)> {
+        let key = |i: usize| self.repos[i].1.as_str();
+        vec![
+            (
+                "rest",
+                Method::PUT,
+                format!("/api/v1/repositories/{}/artifacts/q/a.bin", key(0)),
+            ),
+            (
+                "oci",
+                Method::POST,
+                format!("/v2/{}/app/blobs/uploads/", key(1)),
+            ),
+            (
+                "maven",
+                Method::PUT,
+                format!("/maven/{}/com/q/lib/1.0/lib-1.0.jar", key(2)),
+            ),
+            ("npm", Method::PUT, format!("/npm/{}/quota-pkg", key(3))),
+        ]
+    }
+
+    /// Send an over-quota write as `auth` (anonymous when `None`), with a
+    /// body that records whether it was read.
+    async fn send(
+        &self,
+        method: Method,
+        uri: &str,
+        auth: Option<&str>,
+    ) -> (StatusCode, Bytes, usize) {
+        let polled = Arc::new(AtomicUsize::new(0));
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_LENGTH, OVER_QUOTA)
+            .header(header::CONTENT_TYPE, "application/octet-stream");
+        if let Some(auth) = auth {
+            req = req.header(header::AUTHORIZATION, auth);
+        }
+        let req = req.body(watched_body(polled.clone(), b"x")).unwrap();
+        let response = self.app.clone().oneshot(req).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, body, polled.load(Ordering::SeqCst))
+    }
+
+    /// A `/v2/token` Bearer for `basic` with push on the public docker
+    /// repository.
+    async fn oci_bearer(&self, basic: &str) -> String {
+        let uri = format!(
+            "/v2/token?service=artifact-keeper&scope=repository:{}/app:push,pull",
+            self.repos[1].1
+        );
+        let req = Request::get(uri)
+            .header(header::AUTHORIZATION, basic)
+            .body(Body::empty())
+            .unwrap();
+        let response = self.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "/v2/token");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        format!("Bearer {}", json(&body)["token"].as_str().unwrap())
+    }
+
+    async fn teardown(self) {
+        for (id, _, dir) in &self.repos {
+            tdh::cleanup_member_repo(&self.pool, *id, dir).await;
+        }
+        for user in [self.writer.0, self.reader.0] {
+            let _ = sqlx::query("DELETE FROM role_assignments WHERE user_id = $1")
+                .bind(user)
+                .execute(&self.pool)
+                .await;
+            tdh::cleanup_user(&self.pool, user).await;
+        }
+    }
+}
+
+/// The quota figures a refusal carries; none may reach a caller who cannot
+/// write.
+fn assert_no_quota_figures(label: &str, body: &Bytes) {
+    let text = String::from_utf8_lossy(body);
+    for field in [
+        "QUOTA_EXCEEDED",
+        "limit_bytes",
+        "used_bytes",
+        "\"scope\"",
+        "\"repository\"",
+        "\"project\"",
+    ] {
+        assert!(
+            !text.contains(field),
+            "{label}: a caller who cannot write was told about the quota ({field}): {text}"
+        );
+    }
+}
+
+/// A reader of a public repository (read, no write) who declares an upload
+/// over the repository quota gets the write-permission refusal it got before
+/// the quota pre-check existed (403 FORBIDDEN, `DENIED` on `/v2`), never
+/// `403 QUOTA_EXCEEDED` with the repository's quota and usage.
+#[tokio::test]
+async fn over_quota_write_by_a_reader_gets_the_permission_refusal_5912() {
+    let Some(fx) = WriteGateFx::setup().await else {
+        return;
+    };
+    for (label, method, uri) in fx.writes() {
+        let (status, body, _) = fx.send(method, &uri, Some(&fx.reader.1)).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{label}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_no_quota_figures(label, &body);
+        match label {
+            "rest" => assert_eq!(json(&body)["code"], "FORBIDDEN", "{label}"),
+            "oci" => assert_eq!(json(&body)["errors"][0]["code"], "DENIED", "{label}"),
+            _ => {}
+        }
+    }
+    fx.teardown().await;
+}
+
+/// The same write from an anonymous caller gets the authentication refusal
+/// it got before the quota pre-check existed (401), with no quota figures.
+#[tokio::test]
+async fn over_quota_write_by_an_anonymous_caller_gets_the_auth_refusal_5912() {
+    let Some(fx) = WriteGateFx::setup().await else {
+        return;
+    };
+    for (label, method, uri) in fx.writes() {
+        let (status, body, _) = fx.send(method, &uri, None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{label}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_no_quota_figures(label, &body);
+    }
+    fx.teardown().await;
+}
+
+/// Control: a caller who may write still gets `403 QUOTA_EXCEEDED` (`DENIED`
+/// with the figures on `/v2`) before the body is read. npm is left out: its
+/// package document is admitted by the npm handler once it knows whether the
+/// document carries a tarball.
+#[tokio::test]
+async fn over_quota_write_by_a_writer_gets_the_quota_refusal_unread_5912() {
+    let Some(fx) = WriteGateFx::setup().await else {
+        return;
+    };
+    // `docker push` presents the Bearer token `/v2/token` issues (a Basic
+    // password is covered by `over_quota_oci_push_verifies_a_basic_password_once_5912`).
+    let bearer = fx.oci_bearer(&fx.writer.1).await;
+    for (label, method, uri) in fx.writes().into_iter().filter(|w| w.0 != "npm") {
+        let auth = if label == "oci" {
+            &bearer
+        } else {
+            &fx.writer.1
+        };
+        let (status, body, polled) = fx.send(method, &uri, Some(auth)).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{label}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(polled, 0, "{label}: refused before the body is read");
+        let body = json(&body);
+        let refusal = if label == "oci" {
+            assert_eq!(body["errors"][0]["code"], "DENIED", "{label}");
+            body["errors"][0]["detail"].clone()
+        } else {
+            assert_eq!(body["code"], "QUOTA_EXCEEDED", "{label}: {body}");
+            body
+        };
+        assert_eq!(refusal["scope"], "repository", "{label}: {refusal}");
+        assert_eq!(refusal["limit_bytes"], 16, "{label}");
+    }
+    fx.teardown().await;
+}
+
+/// A caller who cannot even read a private repository gets the handler's own
+/// write refusal for an over-quota write, as for any other write it may not
+/// make, never the quota refusal. On main that refusal is the unknown-key 404
+/// of #5458 (`NAME_UNKNOWN` on `/v2`); #5458 is not on 1.11.x, so here it is
+/// the 403 these handlers gave before the pre-check existed (`FORBIDDEN` on
+/// REST, `DENIED` on `/v2`).
+#[tokio::test]
+async fn over_quota_write_to_an_unreadable_repository_gets_the_handler_refusal_5912() {
+    let Some(fx) = WriteGateFx::setup().await else {
+        return;
+    };
+    let writes = [
+        (
+            "rest",
+            Method::PUT,
+            format!("/api/v1/repositories/{}/artifacts/q/a.bin", fx.repos[4].1),
+        ),
+        (
+            "oci",
+            Method::POST,
+            format!("/v2/{}/app/blobs/uploads/", fx.repos[5].1),
+        ),
+    ];
+    for (label, method, uri) in writes {
+        let (status, body, _) = fx.send(method, &uri, Some(&fx.reader.1)).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{label}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_no_quota_figures(label, &body);
+        if label == "oci" {
+            assert_eq!(json(&body)["errors"][0]["code"], "DENIED", "{label}");
+        } else {
+            assert_eq!(json(&body)["code"], "FORBIDDEN", "{label}");
+        }
+    }
+    fx.teardown().await;
+}
+
+/// The `/v2` write gate the pre-check asks verifies the credential once per
+/// request: the handler reuses that verification. A wrong Basic password on an
+/// over-quota push is one failed login (401, `failed_login_attempts` 1), not
+/// two, and a right one still gets the quota refusal before the body.
+#[tokio::test]
+async fn over_quota_oci_push_verifies_a_basic_password_once_5912() {
+    let Some(fx) = WriteGateFx::setup().await else {
+        return;
+    };
+    let uri = format!("/v2/{}/app/blobs/uploads/", fx.repos[1].1);
+    let wrong = {
+        use base64::Engine;
+        let username: String = sqlx::query_scalar("SELECT username FROM users WHERE id = $1")
+            .bind(fx.writer.0)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:wrongpass"))
+        )
+    };
+    let (status, body, _) = fx.send(Method::POST, &uri, Some(&wrong)).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_no_quota_figures("oci wrong password", &body);
+    let failed: i32 = sqlx::query_scalar("SELECT failed_login_attempts FROM users WHERE id = $1")
+        .bind(fx.writer.0)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    assert_eq!(failed, 1, "one request, one failed login");
+
+    let (status, body, polled) = fx.send(Method::POST, &uri, Some(&fx.writer.1)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(polled, 0, "refused before the body is read");
+    assert_eq!(json(&body)["errors"][0]["detail"]["scope"], "repository");
+    fx.teardown().await;
+}
