@@ -909,8 +909,6 @@ impl ScannerAdapterFsClient {
         .await
     }
 
-    /// Availability-class error: the sidecar is down/unready, which degrades
-    /// the scan to `not_applicable` (#2324) instead of failing it closed.
     /// [`Self::unavailable`] for an adapter that is unreachable or not ready,
     /// which a queued scan retries once it is back (#5994). A no-op signal for
     /// an in-process scan. Misconfiguration (an unusable token) is not this.
@@ -919,6 +917,8 @@ impl ScannerAdapterFsClient {
         self.unavailable(detail)
     }
 
+    /// Availability-class error: the sidecar is down/unready, which degrades
+    /// the scan to `not_applicable` (#2324) instead of failing it closed.
     fn unavailable(&self, detail: impl std::fmt::Display) -> AppError {
         AppError::ScannerEngineUnavailable(format!(
             "Trivy scanner-adapter at {} is unavailable for filesystem scans: {}. \
