@@ -1,0 +1,5 @@
+---
+section: Security
+issues: [#5995, #5991]
+---
+- **Docker Publish publishes again: the backend and OpenSCAP images carry a time-boxed exception for 14 `krb5-libs` CVEs whose fix is not yet in the UBI 9 repositories** (#5995, #5991). Since 2026-11-14 the publish gate has reported CVE-2026-107364 and 13 sibling CVEs (all HIGH) against `krb5-libs-1.21.1-10.el9_8.1` in both UBI images, fixed in `1.21.1-10.el9_9.2`. Red Hat has shipped that build to the entitled RHEL 9 repositories but not to the UBI 9 BaseOS repository the images build from, and `ubi9/ubi:9.9` still ships `el9_8.1`, so neither a base bump nor the rootfs `dnf upgrade` can install it yet. `krb5-libs` is in the images only as a shared-library dependency of `libcurl`. Neither image ships a KDC or `kadmind`, and nothing uses Kerberos. Every one of the 14 CVEs is a KDC or `kadmind` server-side bug. The 14 IDs are listed in `.trivyignore` with an expiry of 2026-12-14. The rootfs upgrade picks up `el9_9.2` on the first build after Red Hat syncs it to UBI, and the entries are retired then. If the fix has not reached UBI by the expiry date, the gate fails again.
