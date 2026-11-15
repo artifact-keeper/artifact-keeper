@@ -4017,8 +4017,9 @@ const DEFAULT_MAX_CONCURRENT_SCAN_EXTRACTIONS: usize = 4;
 const MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV: &str = "MAX_CONCURRENT_SCAN_EXTRACTIONS";
 
 /// Effective concurrent-extraction cap, honouring
-/// [`MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV`] over the default.
-fn max_concurrent_scan_extractions() -> usize {
+/// [`MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV`] over the default. The queue
+/// worker's default concurrency reads it too (#6033).
+pub(crate) fn max_concurrent_scan_extractions() -> usize {
     positive_env_or(
         MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV,
         DEFAULT_MAX_CONCURRENT_SCAN_EXTRACTIONS as u64,
