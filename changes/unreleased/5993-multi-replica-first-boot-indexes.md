@@ -1,0 +1,7 @@
+---
+section: Fixed
+issues: [#5993]
+---
+- **Several backend or scan-worker pods starting together on a fresh database no longer crash with `deadlock detected` or leave indexes INVALID** (#5993). Pods waiting for the migration lock blocked in `pg_advisory_lock`, and the pod holding it deadlocked against them in its `CREATE INDEX CONCURRENTLY` migrations. When PostgreSQL aborted the build, the next pod skipped the leftover and recorded the migration as applied, so `idx_artifacts_origin_upstream_url`, `idx_artifacts_download_holds_quarantine` and `idx_proxy_cache_download_holds` stayed INVALID and unused. Waiting pods now poll for the lock and hold nothing a concurrent build waits on. On each start, under the migration lock, the backend checks every index built by a concurrent migration: it rebuilds an INVALID one whose migration is recorded with `REINDEX INDEX CONCURRENTLY`, and drops one whose migration is not, so the migration builds it again. Valid indexes are not touched.
+
+  Upgrade: a database that already has one of these indexes INVALID gets it rebuilt on the first start of this release. The rebuild does not block reads or writes. Pods waiting for the migration lock wait for it to finish. If the rebuild fails, for example on a lock timeout behind a long transaction of a pod still running the old version, the backend logs a warning and starts anyway; the next start retries it.

@@ -1,6 +1,9 @@
 package main
 
 import (
+	"fmt"
+	"log"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -44,6 +47,12 @@ type Config struct {
 	// disables both routes (403): a route that replaces the DB every scan is
 	// matched against is never served unauthenticated.
 	AdapterToken string
+	// ScanToken (SCANNER_SCAN_TOKEN) and ScanTokensFile
+	// (SCANNER_SCAN_TOKENS_FILE, one token per line, re-read on change) gate
+	// the scan and report routes behind a bearer token (#5948; scan_auth.go).
+	// Both empty (default): those routes stay open.
+	ScanToken      string
+	ScanTokensFile string
 	// VulnDBMaxUploadBytes (SCANNER_VULNDB_MAX_UPLOAD_BYTES) caps the
 	// compressed db.tar.gz body of PUT /api/v1/vulndb. Default 2 GiB.
 	VulnDBMaxUploadBytes int64
@@ -86,6 +95,33 @@ type Config struct {
 	// image scan at a time can use the on-disk analysis cache. Default 4; 0
 	// removes the bound.
 	MaxConcurrentScans int
+	// MaxImageBytes (SCANNER_MAX_IMAGE_BYTES) refuses an image whose
+	// compressed config and layers add up to more than this many bytes,
+	// before trivy runs (#5909): trivy downloads every layer into CacheDir
+	// and holds the analysed layers in memory, so an image too large for the
+	// pod's memory or ephemeral-storage limit got the adapter OOM-killed or
+	// evicted mid-scan. The job ends TooLarge (report 422,
+	// X-Scan-Status: TooLarge), not Failed. A manifest that cannot be read
+	// never blocks a scan. Default 0: no bound. The right value depends on
+	// the pod's limits, which the adapter does not know.
+	MaxImageBytes int64
+	// ClientLimitsFile (SCANNER_CLIENT_LIMITS_FILE, #5944) is an optional
+	// JSON or YAML file of per-client max_concurrent and weight, with a
+	// `default` entry; re-read when it changes (see limits.go). Empty: every
+	// client has no per-client cap and weight 1.
+	ClientLimitsFile string
+	// BackgroundMaxWait (SCANNER_BACKGROUND_MAX_WAIT, #5944) is the
+	// starvation bound of the background band: a background scan that has
+	// waited this long starts ahead of interactive scans. Default 30m; 0
+	// disables the bound.
+	BackgroundMaxWait time.Duration
+	// MetricsAddr (SCANNER_METRICS_ADDR, #5944) is the listen address of the
+	// Prometheus /metrics listener, separate from the API listener. Empty
+	// (default): no metrics listener.
+	MetricsAddr string
+	// MetricsClientLabel (SCANNER_METRICS_CLIENT_LABEL, #5944) adds per-client
+	// queue series. Off by default: the client set is unbounded.
+	MetricsClientLabel bool
 	// JobTTL is how long a finished job (report or error) is retained before the
 	// sweeper evicts it.
 	JobTTL time.Duration
@@ -115,8 +151,18 @@ type Config struct {
 	// server's vulnerability DB. Use it when the adapters sharing a server
 	// should not trust each other's cache entries (image-layer cache keys are
 	// derived from the diff IDs an image's config CLAIMS, which trivy does not
-	// re-verify against the layer content). Empty means no partition.
+	// re-verify against the layer content). Empty means no partition. In
+	// registry mode (CachePartitionMode) it is the prefix of every derived
+	// partition instead.
 	CachePartition string
+	// CachePartitionMode (SCANNER_TRIVY_CACHE_PARTITION_MODE, #5943) selects
+	// where an image scan's partition comes from: partitionModeStatic (the
+	// default) uses CachePartition for every scan; partitionModeRegistry
+	// derives one per request from CachePartition and the request's registry
+	// host (see imagePartition), so one adapter serving several Artifact
+	// Keeper instances never reuses one instance's cached layer analysis for
+	// another's scan. Any other value fails Validate.
+	CachePartitionMode string
 	// ScannerVersion is the trivy version reported in the Harbor report's
 	// `scanner.version`. Empty at construction; filled by ProbeVersion at
 	// startup (or overridden via SCANNER_SCANNER_VERSION).
@@ -150,14 +196,22 @@ func LoadConfig() *Config {
 		FsMaxUploadBytes:    getenvInt64("SCANNER_FS_MAX_UPLOAD_BYTES", 64*1024*1024*1024),
 		JobTTL:              getenvDuration("SCANNER_JOB_TTL", 30*time.Minute),
 		MaxConcurrentScans:  getenvIntNonNeg("SCANNER_MAX_CONCURRENT_SCANS", 4),
+		MaxImageBytes:       getenvBytes("SCANNER_MAX_IMAGE_BYTES", 0),
+		ClientLimitsFile:    strings.TrimSpace(os.Getenv("SCANNER_CLIENT_LIMITS_FILE")),
+		BackgroundMaxWait:   getenvDurationNonNeg("SCANNER_BACKGROUND_MAX_WAIT", 30*time.Minute),
+		MetricsAddr:         strings.TrimSpace(os.Getenv("SCANNER_METRICS_ADDR")),
+		MetricsClientLabel:  getenvBool("SCANNER_METRICS_CLIENT_LABEL", false),
 		LogLevel:            getenv("SCANNER_LOG_LEVEL", "info"),
 		ScannerVersion:      os.Getenv("SCANNER_SCANNER_VERSION"),
 		TrivyServer:         strings.TrimRight(strings.TrimSpace(os.Getenv("SCANNER_TRIVY_SERVER")), "/"),
 		CachePartition:      strings.TrimSpace(os.Getenv("SCANNER_TRIVY_CACHE_PARTITION")),
+		CachePartitionMode:  partitionModeFromEnv(os.Getenv("SCANNER_TRIVY_CACHE_PARTITION_MODE")),
 		TrivyServerInsecure: getenvBool("SCANNER_TRIVY_SERVER_INSECURE", false),
 		Offline:             getenvBool("SCANNER_OFFLINE", false),
 		DBSchemaVersion:     getenvIntNonNeg("SCANNER_TRIVY_DB_SCHEMA_VERSION", 2),
 		AdapterToken:        strings.TrimSpace(os.Getenv("SCANNER_ADAPTER_TOKEN")),
+		ScanToken:           strings.TrimSpace(os.Getenv("SCANNER_SCAN_TOKEN")),
+		ScanTokensFile:      strings.TrimSpace(os.Getenv("SCANNER_SCAN_TOKENS_FILE")),
 
 		VulnDBMaxUploadBytes:    getenvInt64("SCANNER_VULNDB_MAX_UPLOAD_BYTES", 2*1024*1024*1024),
 		VulnDBMaxExtractedBytes: getenvInt64("SCANNER_VULNDB_MAX_EXTRACTED_BYTES", 8*1024*1024*1024),
@@ -171,6 +225,42 @@ func LoadConfig() *Config {
 		cfg.SkipDBUpdate = true
 	}
 	return cfg
+}
+
+// Cache partition modes (SCANNER_TRIVY_CACHE_PARTITION_MODE, #5943).
+const (
+	partitionModeStatic   = "static"
+	partitionModeRegistry = "registry"
+)
+
+// partitionModeFromEnv normalizes SCANNER_TRIVY_CACHE_PARTITION_MODE: unset,
+// empty or only whitespace is static (the default); anything else is
+// lowercased for Validate.
+func partitionModeFromEnv(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	if v == "" {
+		return partitionModeStatic
+	}
+	return v
+}
+
+// Validate reports a configuration the adapter must not start with. An
+// unknown partition mode is refused rather than read as static: falling back
+// would silently put every client's layer analysis into one partition, the
+// exact sharing registry mode is set to prevent.
+func (c *Config) Validate() error {
+	switch c.CachePartitionMode {
+	case partitionModeStatic, partitionModeRegistry:
+	default:
+		return fmt.Errorf("SCANNER_TRIVY_CACHE_PARTITION_MODE=%q: must be %q or %q", c.CachePartitionMode, partitionModeStatic, partitionModeRegistry)
+	}
+	// In registry mode "|" separates the prefix from the host, so a prefix
+	// containing it could spell another prefix's partition. Static mode
+	// keeps accepting any value, as before.
+	if c.CachePartitionMode == partitionModeRegistry && strings.Contains(c.CachePartition, "|") {
+		return fmt.Errorf("SCANNER_TRIVY_CACHE_PARTITION must not contain %q in registry partition mode", "|")
+	}
+	return nil
 }
 
 func getenv(key, def string) string {
@@ -218,6 +308,56 @@ func getenvIntNonNeg(key string, def int) int {
 	return n
 }
 
+// byteSuffixes are the size suffixes getenvBytes accepts, as in Kubernetes
+// quantities: binary Ki/Mi/Gi/Ti and decimal K/M/G/T.
+var byteSuffixes = []struct {
+	suffix string
+	mult   int64
+}{
+	{"Ki", 1 << 10}, {"Mi", 1 << 20}, {"Gi", 1 << 30}, {"Ti", 1 << 40},
+	{"K", 1e3}, {"M", 1e6}, {"G", 1e9}, {"T", 1e12},
+}
+
+// parseByteSize parses a non-negative byte count: plain digits, or digits
+// with one of byteSuffixes (e.g. "4Gi", "500M").
+func parseByteSize(v string) (int64, error) {
+	v = strings.TrimSpace(v)
+	mult := int64(1)
+	for _, s := range byteSuffixes {
+		if strings.HasSuffix(v, s.suffix) {
+			v, mult = strings.TrimSpace(strings.TrimSuffix(v, s.suffix)), s.mult
+			break
+		}
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("not a byte count (digits, optionally with Ki/Mi/Gi/Ti or K/M/G/T)")
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("must not be negative")
+	}
+	if n > math.MaxInt64/mult {
+		return 0, fmt.Errorf("overflows int64")
+	}
+	return n * mult, nil
+}
+
+// getenvBytes reads a byte limit where 0 means "no bound". An unparsable
+// value is logged and def is used, so a typo is visible rather than quietly
+// meaning no limit.
+func getenvBytes(key string, def int64) int64 {
+	v := os.Getenv(key)
+	if strings.TrimSpace(v) == "" {
+		return def
+	}
+	n, err := parseByteSize(v)
+	if err != nil {
+		log.Printf("WARNING: %s=%q is ignored (%v); using %d", key, v, err, def)
+		return def
+	}
+	return n
+}
+
 func getenvDuration(key string, def time.Duration) time.Duration {
 	v := os.Getenv(key)
 	if v == "" {
@@ -225,6 +365,20 @@ func getenvDuration(key string, def time.Duration) time.Duration {
 	}
 	d, err := time.ParseDuration(strings.TrimSpace(v))
 	if err != nil {
+		return def
+	}
+	return d
+}
+
+// getenvDurationNonNeg parses a duration that may be 0 but not negative. An
+// unparsable or negative value yields def.
+func getenvDurationNonNeg(key string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 {
 		return def
 	}
 	return d

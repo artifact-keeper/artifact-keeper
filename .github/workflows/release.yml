@@ -398,7 +398,15 @@ jobs:
     outputs:
       backend_digest: ${{ steps.resolve.outputs.backend_digest }}   # sha256:...
       version: ${{ steps.resolve.outputs.version }}
+      # The scanner-adapter tag the gate's adapter tiers run. The adapter has
+      # its own VERSION, so the backend version names no adapter image;
+      # docker-publish tags the adapter it builds from this commit sha-<7>.
+      adapter_tag: ${{ steps.adapter-tag.outputs.adapter_tag }}
     steps:
+      - name: Name this commit's scanner-adapter tag
+        id: adapter-tag
+        run: echo "adapter_tag=sha-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
       # scripts/ci for the resolver + adoption gate, .github/scripts for the
       # registry probes, and full history so the adoption gate can diff the
       # published image's source revision against the tag (the sparse worktree
@@ -702,13 +710,23 @@ jobs:
           && needs.candidate-certified.result == 'success'
           && needs.candidate-certified.outputs.certified != 'true'
           && fromJSON(github.run_attempt) == 1 }}
+    # The gate's jobs request at most contents: read and packages: read (ghcr
+    # pulls); a called workflow can never hold more than its calling job grants.
+    permissions:
+      contents: read
+      packages: read
+    # Still @main: SHA-pinning waits on branch protection for
+    # artifact-keeper-test, and on the 1.12.0 gate wiring landing there.
     uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main
     with:
       backend_tag: ${{ needs.resolve-candidate-digest.outputs.version }}
       backend_digest: ${{ needs.resolve-candidate-digest.outputs.backend_digest }}
+      scanner_adapter_tag: ${{ needs.resolve-candidate-digest.outputs.adapter_tag }}
       web_tag: latest
       test_suite: all
-    secrets: inherit
+    # Only the one secret the gate declares, not every secret this repo holds.
+    secrets:
+      GHCR_DOCKER_CONFIG: ${{ secrets.GHCR_DOCKER_CONFIG }}
 
   gate-rerun-refused:
     name: Refuse a re-run of the gate

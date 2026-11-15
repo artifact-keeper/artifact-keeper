@@ -592,6 +592,30 @@ jobs:
       # 145 GB root with 86 GB free before the build (run 42089930178), and
       # the arm64 leg never needed it.
 
+      # The release-profile compile of the artifact-keeper-backend lib (one
+      # codegen unit, opt-level 3, linker-plugin LTO) is one rustc that no
+      # longer fits the hosted amd64 VM's ~15 GiB of RAM and 2-3 GiB of
+      # swapfile: runs 43673124373 and 43677325227 on main were SIGKILLed
+      # 6.3 min into that crate (buildx `ResourceExhausted`). setup-buildx
+      # uses the docker-container driver with no memory limit, so BuildKit
+      # compiles in the host's memory and host swap applies. The root disk
+      # has ~86 GB free (see above), so add 20 GiB of swap on it before the
+      # build. Best effort: a failure is a ::warning::, never a red job. It
+      # also runs on arm64, where it is harmless.
+      - name: Add swap
+        run: |
+          if sudo fallocate -l 20G /ak-ci-swapfile \
+             && sudo chmod 600 /ak-ci-swapfile \
+             && sudo mkswap /ak-ci-swapfile >/dev/null \
+             && sudo swapon /ak-ci-swapfile; then
+            echo "added a 20 GiB swapfile"
+          else
+            echo "::warning title=No extra swap::could not add /ak-ci-swapfile; this build runs with the image's default swap only."
+          fi
+          swapon --show
+          free -m
+          df -h / | tail -1
+
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
@@ -638,6 +662,14 @@ jobs:
             APP_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
             CARGO_BUILD_JOBS=${{ matrix.cargo-build-jobs }}
             CARGO_FEATURES=jemalloc
+
+      # Report only, so the next run shows how much of the swap the build used.
+      - name: Memory and disk report
+        if: always()
+        run: |
+          swapon --show
+          free -m
+          df -h / | tail -1
 
       - name: Export digest
         run: |

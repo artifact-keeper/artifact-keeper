@@ -925,7 +925,13 @@ pub struct Config {
     /// OpenSCAP wrapper URL for compliance scanning (optional)
     pub openscap_url: Option<String>,
 
-    /// OpenSCAP SCAP profile to evaluate (default: standard)
+    /// OpenSCAP XCCDF profile to evaluate (`OPENSCAP_PROFILE`). Default: CIS
+    /// Level 1 - Server
+    /// ([`crate::services::openscap_scanner::DEFAULT_OPENSCAP_PROFILE`]), which
+    /// every shipped datastream defines. The old default,
+    /// `content_profile_standard`, is in none of them (#6000). A profile no
+    /// shipped datastream defines fails the scan with the list of profiles
+    /// that exist; it is never silently replaced.
     pub openscap_profile: String,
 
     /// OpenSearch URL for search indexing (optional)
@@ -1209,6 +1215,19 @@ pub struct Config {
     /// `MAX_CONCURRENT_SCAN_EXTRACTIONS`. Raise both together on worker pods.
     /// Env var: `SCAN_WORKER_CONCURRENCY`. Default: unset.
     pub scan_worker_concurrency: Option<usize>,
+
+    /// Scanner-adapter URL for the scans this instance's queue worker runs, in
+    /// place of `TRIVY_ADAPTER_URL` (#5946). Lets a worker pod use an adapter
+    /// next to it while API pods keep the Service URL. Only read with the queue
+    /// and the worker on; blank is unset.
+    /// Env var: `SCAN_WORKER_TRIVY_ADAPTER_URL`. Default: unset.
+    pub scan_worker_trivy_adapter_url: Option<String>,
+
+    /// Most content digests queued per day for a rescan after a
+    /// vulnerability-database update (#5947), at the lowest queue priority.
+    /// `0` turns it off. Only read with the queue and the worker on.
+    /// Env var: `SCAN_RESCAN_MAX_PER_DAY`. Default: 0 (off).
+    pub scan_rescan_max_per_day: u64,
 
     /// Maximum upload size in bytes for artifact uploads.
     /// Defaults to 10 GB (10737418240 bytes). Set to 0 to disable the limit.
@@ -1879,6 +1898,8 @@ redacted_debug!(Config {
     show ldap_base_dn,
     show trivy_url,
     show trivy_adapter_url,
+    show scan_worker_trivy_adapter_url,
+    show scan_rescan_max_per_day,
     show incus_scanner_enabled,
     show scan_token_ttl_seconds,
     show openscap_url,
@@ -2048,7 +2069,7 @@ impl Default for Config {
             incus_scanner_enabled: true,
             scan_token_ttl_seconds: 300,
             openscap_url: None,
-            openscap_profile: "xccdf_org.ssgproject.content_profile_standard".into(),
+            openscap_profile: crate::services::openscap_scanner::DEFAULT_OPENSCAP_PROFILE.into(),
             opensearch_url: None,
             opensearch_username: None,
             opensearch_password: None,
@@ -2093,6 +2114,8 @@ impl Default for Config {
             scan_queue_enabled: false,
             scan_worker_enabled: true,
             scan_worker_concurrency: None,
+            scan_worker_trivy_adapter_url: None,
+            scan_rescan_max_per_day: 0,
             max_upload_size_bytes: 10_737_418_240,
             quotas: QuotaSettings::default(),
             allow_local_admin_login: false,
@@ -2279,7 +2302,11 @@ impl Config {
             scan_token_ttl_seconds: env_parse("SCAN_TOKEN_TTL_SECONDS", 300),
             openscap_url: env::var("OPENSCAP_URL").ok(),
             openscap_profile: env::var("OPENSCAP_PROFILE")
-                .unwrap_or_else(|_| "xccdf_org.ssgproject.content_profile_standard".into()),
+                .ok()
+                .filter(|p| !p.trim().is_empty())
+                .unwrap_or_else(|| {
+                    crate::services::openscap_scanner::DEFAULT_OPENSCAP_PROFILE.into()
+                }),
             opensearch_url: env::var("OPENSEARCH_URL").ok(),
             opensearch_username: env::var("OPENSEARCH_USERNAME").ok(),
             opensearch_password: secret_or_env("OPENSEARCH_PASSWORD").map_err(AppError::Config)?,
@@ -2447,6 +2474,11 @@ impl Config {
                 .ok()
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .filter(|n| *n > 0),
+            scan_worker_trivy_adapter_url: env::var("SCAN_WORKER_TRIVY_ADAPTER_URL")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            scan_rescan_max_per_day: env_parse("SCAN_RESCAN_MAX_PER_DAY", 0_u64),
             max_upload_size_bytes: env_parse("MAX_UPLOAD_SIZE", 10_737_418_240_u64),
             quotas: QuotaSettings::from_env(),
             allow_local_admin_login: matches!(
@@ -3987,20 +4019,14 @@ mod tests {
     /// deployed. The Linux binaries attached to a release are built from the
     /// same tree and used to keep glibc's malloc, so a tarball deployment
     /// still had the retaining allocator. Pin the release workflows too:
-    /// `release.yml` builds the assets, `publish-binaries.yml` replaces them
-    /// when a release is cut without the normal gate, and
-    /// `release-cli-caches.yml` must warm the same feature set or the tag
-    /// build compiles jemalloc cold.
+    /// `release.yml` builds the assets, and `release-cli-caches.yml` must
+    /// warm the same feature set or the tag build compiles jemalloc cold.
     #[test]
     fn release_binaries_build_with_jemalloc_5130() {
         for (name, workflow) in [
             (
                 "release.yml",
                 include_str!("../../.github/workflows/release.yml"),
-            ),
-            (
-                "publish-binaries.yml",
-                include_str!("../../.github/workflows/publish-binaries.yml"),
             ),
             (
                 "release-cli-caches.yml",

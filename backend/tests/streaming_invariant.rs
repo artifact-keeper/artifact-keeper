@@ -557,11 +557,31 @@ fn streaming_invariant_exempt_sites_match_allowlist() {
 /// through `GenericStagedBody::stage_for_repo` + `put_staged_body` (only a
 /// bounded `conanmanifest.txt` is read back for the revision admission), so
 /// the conan.rs row is removed.
+///
+/// #5074 / #5117: the hosted protobuf (BSR) `upload` handler takes `body: Bytes`
+/// because it serves both Connect unary codecs from one handler, and a unary
+/// Connect request is ONE message: the binary codec (`application/proto`, what
+/// the buf CLI sends) cannot be decoded from a partial body, and the JSON codec
+/// was already buffered whole by axum's `Json` extractor on this route before
+/// #5074 (it never appeared here only because the scan looks for `body: Bytes`).
+/// The module's files are then built into one tar.gz bundle that is hashed for
+/// the commit and b5 digests before `storage.put`, so there is no stream to
+/// pass through. It is bounded and gated:
+///   * a hard 256 MiB `DefaultBodyLimit` on the two Upload routes only (every
+///     other BSR route is capped at 4 MiB), the same cap the route had before;
+///   * every `/proto` POST passes the visibility middleware's write gate, and
+///     the handler requires the `write:artifacts` scope
+///     (`require_auth_basic_scope`) before a binary body is decoded and before
+///     anything is stored; the storage quotas are admitted before the put;
+///   * a stored bundle is only ever read back under the shared ingest
+///     extraction permit and byte budget (`with_ingest_extraction`,
+///     `bounded_archive`).
 const RAW_BODY_BLOB_ALLOWLIST: &[(&str, usize)] = &[
     ("src/api/handlers/cocoapods.rs", 1),
     ("src/api/handlers/composer.rs", 1),
     ("src/api/handlers/debian.rs", 1),
     ("src/api/handlers/goproxy.rs", 2),
+    ("src/api/handlers/protobuf.rs", 1),
     ("src/api/handlers/proxy_helpers.rs", 1),
     ("src/api/handlers/sbt.rs", 1),
     ("src/api/handlers/vscode.rs", 1),

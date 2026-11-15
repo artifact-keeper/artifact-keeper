@@ -509,6 +509,7 @@ impl AppState {
 
     /// Set the scanner service for security scanning.
     pub fn set_scanner_service(&mut self, scanner_service: Arc<ScannerService>) {
+        scanner_service.set_scan_queue_enabled(self.config.scan_queue_enabled);
         self.scanner_service = Some(scanner_service);
     }
 
