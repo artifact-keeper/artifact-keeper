@@ -714,6 +714,36 @@ mod tests {
         }
     }
 
+    /// #5810: `virtual_member_fallback` is published as the
+    /// `VirtualMemberFallback` enum (`available` / `strict`) on the create
+    /// and update requests and the repository response, so generated clients
+    /// get the two values instead of a free-form string.
+    #[test]
+    fn test_virtual_member_fallback_in_spec_5810() {
+        let spec = serde_json::to_value(build_openapi()).expect("serialize spec");
+        let schemas = &spec["components"]["schemas"];
+        let values: Vec<&str> = schemas["VirtualMemberFallback"]["enum"]
+            .as_array()
+            .expect("VirtualMemberFallback is an enum schema")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(values, ["available", "strict"]);
+        for schema in [
+            "CreateRepositoryRequest",
+            "UpdateRepositoryRequest",
+            "RepositoryResponse",
+        ] {
+            let field =
+                serde_json::to_string(&schemas[schema]["properties"]["virtual_member_fallback"])
+                    .unwrap();
+            assert!(
+                field.contains("#/components/schemas/VirtualMemberFallback"),
+                "{schema}.virtual_member_fallback must reference the enum: {field}"
+            );
+        }
+    }
+
     /// #4330: `UpdateRepositoryRequest.curation_default_action` is an
     /// `Option<String>` (absent leaves the stored value unchanged), but a
     /// `value_type = String` override made the spec list it as required, so
