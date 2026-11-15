@@ -402,8 +402,13 @@ mod tests {
 
     // ── DB-backed ───────────────────────────────────────────────────────────
     //
-    // `db-serial` (nextest): these clear and count the whole scan_queue and
-    // the rescan ledger.
+    // These rely on nextest's `db-serial` group (`.config/nextest.toml`, the
+    // `test(scan_rescan::tests)` override): they share the selection's
+    // advisory lock, the instance-wide ledger, builds and memo tables, and
+    // `reset()` runs `DELETE FROM scan_queue`, so two of them at once would
+    // see each other's rows. Scoping each selection to the test's own
+    // repositories (`enqueue_rescans_in`) is what keeps OTHER, non-serial DB
+    // tests' artifacts out of it; the group is what keeps these apart.
 
     async fn try_pool() -> Option<PgPool> {
         crate::testing::try_pool_with(3).await
