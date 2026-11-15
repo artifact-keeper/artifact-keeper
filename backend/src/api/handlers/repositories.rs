@@ -9980,7 +9980,7 @@ async fn stage_multipart_field(
 /// Authorize a generic artifact write: resolve the repository and enforce the
 /// write gates shared by the raw-`PUT` and multipart upload entry points, before
 /// any request body is consumed.
-async fn authorize_generic_upload(
+pub(crate) async fn authorize_generic_upload(
     state: &SharedState,
     auth: &AuthExtension,
     key: &str,
