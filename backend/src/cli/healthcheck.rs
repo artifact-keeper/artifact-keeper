@@ -24,8 +24,9 @@
 //!     supported; the backend listener is plain HTTP.
 //!
 //! The whole probe -- name resolution, connect, request and reading the status
-//! line -- runs under one deadline (5 s), so a peer that trickles bytes cannot
-//! hold it open past Docker's HEALTHCHECK timeout.
+//! line -- runs under one deadline (9 s, just under the image HEALTHCHECK
+//! `--timeout=10s`), so a peer that trickles bytes cannot hold it open past
+//! Docker's HEALTHCHECK timeout.
 //!
 //! Exit status 0 when the server answers 2xx, 1 otherwise (not reachable,
 //! non-2xx, timed out, or a usage error). Docker reserves exit status 2 for
@@ -50,7 +51,7 @@ const DEFAULT_BIND: &str = "0.0.0.0:8080";
 /// must keep reporting unhealthy to Docker.
 const DEFAULT_PATH: &str = "/health";
 /// Total budget for one probe, from name resolution to the status line.
-const DEADLINE: Duration = Duration::from_secs(5);
+const DEADLINE: Duration = Duration::from_secs(9);
 /// Only the status line is needed; this bounds the read against a peer that
 /// streams forever without a newline.
 const MAX_RESPONSE_HEAD: usize = 8 * 1024;

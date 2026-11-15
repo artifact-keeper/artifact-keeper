@@ -21,7 +21,7 @@ at once when a shared dependency fails.
 The backend image's Docker `HEALTHCHECK` runs `artifact-keeper healthcheck`,
 which sends `GET /health` to the address in `BIND_ADDRESS` (default
 `0.0.0.0:8080`, probed on loopback). It exits `0` on a `2xx` answer and `1`
-otherwise, with a 5 second budget for the whole probe. Pass a path
+otherwise, with a 9 second budget for the whole probe. Pass a path
 (`artifact-keeper healthcheck /livez`) or an `http://host:port/path` URL to
 probe something else, for example in a compose `healthcheck.test`:
 

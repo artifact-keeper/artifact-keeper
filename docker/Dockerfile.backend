@@ -854,8 +854,10 @@ RUN set -eu; \
 # below. A bump is CURL_VERSION + CURL_SHA256; the build fails on a mismatch
 # of either.
 #
-# Trade-off: a self-built curl is INVISIBLE to Trivy, grype and dependabot, so
-# nothing will report a future curl CVE against this image. Watch
+# Trade-off: a self-built curl is INVISIBLE to Trivy and dependabot, so they
+# will not report a future curl CVE against this image. grype DOES detect it
+# (from the binary's version string, as pkg:generic/curl with CPE haxx:curl),
+# so grype is the one scanner that still matches curl CVEs here. Still watch
 # https://curl.se/docs/security.html and bump by hand. Retire this stage (and
 # go back to the curl-minimal RPM) once UBI 9 ships a fixed krb5-libs.
 # #6003 tracks this scanning blind spot for this image and OpenSCAP's libcurl.
@@ -902,7 +904,7 @@ RUN set -eu; \
     echo "curl ${CURL_VERSION} NEEDED: ${needed}"; \
     for lib in ${needed}; do \
       case "${lib}" in \
-        libc.so.6|libssl.so.3|libcrypto.so.3|libz.so.1|libnghttp2.so.14) ;; \
+        libc.so.6|ld-linux-*.so.[12]|libssl.so.3|libcrypto.so.3|libz.so.1|libnghttp2.so.14) ;; \
         *) echo "ERROR: curl links ${lib}, which the runtime rootfs is not meant to carry" >&2; exit 1 ;; \
       esac; \
     done; \
@@ -1064,7 +1066,7 @@ EXPOSE 8080 9090
 
 # The probe is the backend binary itself (backend/src/cli/healthcheck.rs): a
 # plain HTTP GET of /health (the endpoint the old curl HEALTHCHECK checked:
-# database and storage) on the BIND_ADDRESS (or PORT) port, exit 0 on 2xx,
+# database and storage) on the BIND_ADDRESS port, exit 0 on 2xx,
 # without loading any config or opening a database connection itself (#5991).
 # The image still ships a curl (the curl-bin stage) for compose files and
 # scripts that exec it here; the HEALTHCHECK itself no longer depends on it.
