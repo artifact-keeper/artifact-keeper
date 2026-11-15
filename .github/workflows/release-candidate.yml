@@ -745,10 +745,10 @@ jobs:
       # release.yml runs that copy on the tag and would refuse the
       # certification after the tag exists (backport first).
       #
-      # The Release Gate cannot be pinned to this image yet: release-gate.yml
-      # (artifact-keeper-test) takes no adapter input and deploys the chart's
-      # pinned adapter (artifact-keeper-test#380). `adapter_image_ref` is the
-      # value to pass once it does.
+      # The Release Gate's scanner-adapter DTF tiers run this adapter: the job
+      # below passes `adapter_tag` as the gate's scanner_adapter_tag. The k8s
+      # deploy still uses the chart's pinned adapter
+      # (artifact-keeper-test#380).
       - name: Pin the scanner-adapter digest that ships
         id: adapter
         env:
@@ -788,6 +788,10 @@ jobs:
       # same ref before the gate is dispatched (#4722): keep the two in step.
       iac_ref: main
       backend_digest: ${{ needs.images.outputs.backend_digest }}
+      # The adapter this release ships (pin-adapter-digest.sh): this commit's
+      # sha-<short> rebuild when its VERSION is new, the published :VERSION
+      # when it stays. The gate's scanner-adapter tiers run it.
+      scanner_adapter_tag: ${{ needs.images.outputs.adapter_tag }}
       web_tag: latest
       test_suite: all
     # Only the one secret the gate declares, not every secret this repo holds.
