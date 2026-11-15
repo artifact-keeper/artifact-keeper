@@ -38216,15 +38216,19 @@ mod oci_write_authz_and_size_tests {
             queued.rows
         );
 
-        let Some((spawned, _)) = image_push_scan_on_upload(2, false).await else {
+        // Compared with ONE in-process push. Two back-to-back in-process
+        // pushes spawn two concurrent scans of the same row, and whether the
+        // second finds the first's result (one row) or races it (two rows)
+        // is timing: that comparison flaked. The queue removes the race by
+        // deduplicating the pushes into one job, so its two pushes must
+        // record what a single in-process scan records.
+        let Some((spawned, _)) = image_push_scan_on_upload(1, false).await else {
             return;
         };
         assert!(spawned.jobs_before_worker.is_empty());
-        // The same two pushes both ways: one queued job must leave exactly
-        // the rows the two in-process scans leave.
         assert_eq!(
             queued.rows, spawned.rows,
-            "the queued scan must record what the in-process scans record"
+            "the queued scan must record what the in-process scan records"
         );
     }
 
