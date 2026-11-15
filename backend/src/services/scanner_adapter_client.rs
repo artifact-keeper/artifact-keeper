@@ -186,6 +186,24 @@ where
 /// Older adapters send no such header; their pending jobs count as running.
 pub(crate) const ADAPTER_SCAN_STATUS_HEADER: &str = "X-Scan-Status";
 
+/// `X-Scan-Status` value of a job the adapter refused because the image is
+/// over its `SCANNER_MAX_IMAGE_BYTES` (#5909). It comes on a terminal `422`.
+pub(crate) const ADAPTER_SCAN_STATUS_TOO_LARGE: &str = "TooLarge";
+
+/// Whether a terminal report response says the adapter refused the image as
+/// too large to scan (#5909), as opposed to a scan that ran and failed. Such
+/// a job is never resubmitted: the image is the same size the next time.
+pub(crate) fn adapter_reports_too_large(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> bool {
+    status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        && headers
+            .get(ADAPTER_SCAN_STATUS_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case(ADAPTER_SCAN_STATUS_TOO_LARGE))
+}
+
 /// Longest a job may wait in the adapter's queue on top of a client's own
 /// poll budget. Time spent `Queued` is not charged to that budget, which is
 /// sized for one trivy run, so a burst of scans waits for a slot instead of
