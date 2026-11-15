@@ -146,6 +146,66 @@ fn shards_group_a_name_across_sections_and_encodings_4178() {
         .any(|k| k.to_string() == "a-2.0-0.conda"));
 }
 
+/// #5432: an upstream `repodata.json` whose records carry `fn` (older
+/// channels and `conda index` output do) is synthesised into shard records
+/// without it, since conda 26.7 takes the filename from the record's key and
+/// refuses a second `fn`. The rest of the record is kept.
+#[test]
+fn synthesised_records_omit_an_upstream_fn_5432() {
+    let mut doc = repodata("noarch", &["a-1.0-0.tar.bz2"], &["a-2.0-0.conda"]);
+    for (section, filename) in [
+        ("packages", "a-1.0-0.tar.bz2"),
+        ("packages.conda", "a-2.0-0.conda"),
+    ] {
+        doc[section][filename]["fn"] = serde_json::json!(filename);
+        doc[section][filename]["license"] = serde_json::json!("MIT");
+    }
+    let (parts, records) = spill_document(
+        serde_json::to_vec(&doc).unwrap().into(),
+        None,
+        RepodataEncoding::Json,
+    )
+    .unwrap();
+    assert_eq!(records, 2);
+    let mut shards = Vec::new();
+    for p in &parts.paths {
+        shards.extend(shards_of_partition(p).unwrap());
+    }
+    assert_eq!(shards.len(), 1);
+    type Keys = std::collections::BTreeMap<String, serde::de::IgnoredAny>;
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        packages: std::collections::BTreeMap<String, Keys>,
+        #[serde(rename = "packages.conda")]
+        packages_conda: std::collections::BTreeMap<String, Keys>,
+    }
+    let raw: Raw = rmp_serde::from_slice(&zstd::decode_all(&shards[0].1[..]).unwrap()).unwrap();
+    for (records, filename) in [
+        (&raw.packages, "a-1.0-0.tar.bz2"),
+        (&raw.packages_conda, "a-2.0-0.conda"),
+    ] {
+        let keys: Vec<&String> = records[filename].keys().collect();
+        assert!(
+            !records[filename].contains_key("fn"),
+            "{filename}: {keys:?}"
+        );
+        for kept in ["license", "sha256", "md5", "depends", "name", "version"] {
+            assert!(
+                records[filename].contains_key(kept),
+                "{filename}: {kept} in {keys:?}"
+            );
+        }
+    }
+    // A rattler reader still sees both records under their filenames.
+    let shard = decode_shard(&shards[0].1);
+    assert_eq!(shard.packages.len(), 1);
+    assert_eq!(shard.conda_packages.len(), 1);
+    assert!(shard
+        .conda_packages
+        .values()
+        .all(|r| r.license.as_deref() == Some("MIT")));
+}
+
 /// #4178, hostile upstream: a record whose `name` is not the package its
 /// filename names lands in the shard of the name it carries (what a solver
 /// reading the upstream `repodata.json` would see) and leaves the other

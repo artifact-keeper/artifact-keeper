@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"log"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -93,6 +95,16 @@ type Config struct {
 	// image scan at a time can use the on-disk analysis cache. Default 4; 0
 	// removes the bound.
 	MaxConcurrentScans int
+	// MaxImageBytes (SCANNER_MAX_IMAGE_BYTES) refuses an image whose
+	// compressed config and layers add up to more than this many bytes,
+	// before trivy runs (#5909): trivy downloads every layer into CacheDir
+	// and holds the analysed layers in memory, so an image too large for the
+	// pod's memory or ephemeral-storage limit got the adapter OOM-killed or
+	// evicted mid-scan. The job ends TooLarge (report 422,
+	// X-Scan-Status: TooLarge), not Failed. A manifest that cannot be read
+	// never blocks a scan. Default 0: no bound. The right value depends on
+	// the pod's limits, which the adapter does not know.
+	MaxImageBytes int64
 	// JobTTL is how long a finished job (report or error) is retained before the
 	// sweeper evicts it.
 	JobTTL time.Duration
@@ -167,6 +179,7 @@ func LoadConfig() *Config {
 		FsMaxUploadBytes:    getenvInt64("SCANNER_FS_MAX_UPLOAD_BYTES", 64*1024*1024*1024),
 		JobTTL:              getenvDuration("SCANNER_JOB_TTL", 30*time.Minute),
 		MaxConcurrentScans:  getenvIntNonNeg("SCANNER_MAX_CONCURRENT_SCANS", 4),
+		MaxImageBytes:       getenvBytes("SCANNER_MAX_IMAGE_BYTES", 0),
 		LogLevel:            getenv("SCANNER_LOG_LEVEL", "info"),
 		ScannerVersion:      os.Getenv("SCANNER_SCANNER_VERSION"),
 		TrivyServer:         strings.TrimRight(strings.TrimSpace(os.Getenv("SCANNER_TRIVY_SERVER")), "/"),
@@ -269,6 +282,56 @@ func getenvIntNonNeg(key string, def int) int {
 	}
 	n, err := strconv.Atoi(strings.TrimSpace(v))
 	if err != nil || n < 0 {
+		return def
+	}
+	return n
+}
+
+// byteSuffixes are the size suffixes getenvBytes accepts, as in Kubernetes
+// quantities: binary Ki/Mi/Gi/Ti and decimal K/M/G/T.
+var byteSuffixes = []struct {
+	suffix string
+	mult   int64
+}{
+	{"Ki", 1 << 10}, {"Mi", 1 << 20}, {"Gi", 1 << 30}, {"Ti", 1 << 40},
+	{"K", 1e3}, {"M", 1e6}, {"G", 1e9}, {"T", 1e12},
+}
+
+// parseByteSize parses a non-negative byte count: plain digits, or digits
+// with one of byteSuffixes (e.g. "4Gi", "500M").
+func parseByteSize(v string) (int64, error) {
+	v = strings.TrimSpace(v)
+	mult := int64(1)
+	for _, s := range byteSuffixes {
+		if strings.HasSuffix(v, s.suffix) {
+			v, mult = strings.TrimSpace(strings.TrimSuffix(v, s.suffix)), s.mult
+			break
+		}
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("not a byte count (digits, optionally with Ki/Mi/Gi/Ti or K/M/G/T)")
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("must not be negative")
+	}
+	if n > math.MaxInt64/mult {
+		return 0, fmt.Errorf("overflows int64")
+	}
+	return n * mult, nil
+}
+
+// getenvBytes reads a byte limit where 0 means "no bound". An unparsable
+// value is logged and def is used, so a typo is visible rather than quietly
+// meaning no limit.
+func getenvBytes(key string, def int64) int64 {
+	v := os.Getenv(key)
+	if strings.TrimSpace(v) == "" {
+		return def
+	}
+	n, err := parseByteSize(v)
+	if err != nil {
+		log.Printf("WARNING: %s=%q is ignored (%v); using %d", key, v, err, def)
 		return def
 	}
 	return n
