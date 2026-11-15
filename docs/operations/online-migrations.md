@@ -146,7 +146,9 @@ migrations and releases the lock, all in one lock hold. The repair walks
   from scratch;
 - build migration already recorded: it rebuilds the index with
   `REINDEX INDEX CONCURRENTLY` (and first drops any INVALID `<name>_ccnew`
-  leftover of an earlier interrupted rebuild).
+  leftover of an earlier interrupted rebuild). A failed rebuild (for example
+  a lock timeout behind a long transaction on a pod still running the old
+  version) is logged and does not fail startup; the next start retries it.
 
 Valid and missing indexes are never touched, and an index that another session
 is still building is skipped. Keep the reset migration as well: it covers an

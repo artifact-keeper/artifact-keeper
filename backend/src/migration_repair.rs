@@ -629,11 +629,16 @@ pub struct ConcurrentIndexRepair {
     /// INVALID indexes of recorded migrations, rebuilt in place with
     /// `REINDEX INDEX CONCURRENTLY` (#5993).
     pub rebuilt: Vec<String>,
+    /// INVALID indexes of recorded migrations whose rebuild failed (e.g. a
+    /// lock timeout behind a long transaction of a pod still serving the old
+    /// version). Not fatal: the index was already unused, and the next start
+    /// retries.
+    pub failed: Vec<String>,
 }
 
 impl ConcurrentIndexRepair {
     pub fn is_empty(&self) -> bool {
-        self.dropped.is_empty() && self.rebuilt.is_empty()
+        self.dropped.is_empty() && self.rebuilt.is_empty() && self.failed.is_empty()
     }
 }
 
@@ -644,6 +649,12 @@ impl ConcurrentIndexRepair {
 ///   retry builds the index instead of skipping it (#4426).
 /// - Migration already recorded: `REINDEX INDEX CONCURRENTLY`, which builds a
 ///   valid copy and swaps it in, so the index never goes missing (#5993).
+///   A failed rebuild is logged and reported in `failed`, not returned as an
+///   error: the index was INVALID (unused) before, so serving without it is
+///   no worse, and failing startup would stall a rolling upgrade behind old
+///   pods' transactions. The next start retries. A failed drop stays fatal,
+///   since the migrator would otherwise record success over the INVALID
+///   index (#4426).
 ///
 /// Valid and missing indexes are left alone, so this is a catalogue-only
 /// no-op on fresh and healthy databases. Neither statement blocks writers on
@@ -710,15 +721,20 @@ pub async fn repair_invalid_concurrent_indexes(
             .await?;
             report.dropped.push(name.to_string());
         } else {
-            for leftover in reindex_leftovers(conn, name).await? {
-                exec_ddl(
-                    conn,
-                    &format!("DROP INDEX CONCURRENTLY IF EXISTS \"{leftover}\""),
-                )
-                .await?;
+            // Each statement runs in autocommit, so a failure leaves no
+            // aborted transaction behind on this session.
+            match rebuild_in_place(conn, name).await {
+                Ok(()) => report.rebuilt.push(name.to_string()),
+                Err(e) => {
+                    tracing::warn!(
+                        index = name,
+                        error = %e,
+                        "Could not rebuild INVALID index; continuing without it, \
+                         the next start retries. See issue #5993."
+                    );
+                    report.failed.push(name.to_string());
+                }
             }
-            exec_ddl(conn, &format!("REINDEX INDEX CONCURRENTLY \"{name}\"")).await?;
-            report.rebuilt.push(name.to_string());
         }
     }
     if !report.dropped.is_empty() {
@@ -736,6 +752,19 @@ pub async fn repair_invalid_concurrent_indexes(
         );
     }
     Ok(report)
+}
+
+/// Drop the `_ccnew` leftovers of an earlier interrupted rebuild of `name`,
+/// then `REINDEX INDEX CONCURRENTLY` it.
+async fn rebuild_in_place(conn: &mut sqlx::PgConnection, name: &str) -> Result<()> {
+    for leftover in reindex_leftovers(conn, name).await? {
+        exec_ddl(
+            conn,
+            &format!("DROP INDEX CONCURRENTLY IF EXISTS \"{leftover}\""),
+        )
+        .await?;
+    }
+    exec_ddl(conn, &format!("REINDEX INDEX CONCURRENTLY \"{name}\"")).await
 }
 
 /// INVALID `<name>_ccnew[N]` indexes on the same table as `name`: what a
@@ -1931,6 +1960,7 @@ mod tests {
             ConcurrentIndexRepair {
                 dropped: vec!["idx_scan_results_dedup_local".to_string()],
                 rebuilt: vec![],
+                failed: vec![],
             }
         );
         assert_eq!(
@@ -2129,6 +2159,59 @@ mod tests {
             .await
             .expect("healthy")
             .is_empty());
+        drop(conn);
+        drop_scratch_database(&admin_url, pool, &db).await;
+    }
+
+    /// A rebuild that fails (here: a lock timeout behind another session's
+    /// lock on the table, as a long transaction on an old-version pod causes
+    /// during a rolling upgrade) does not fail startup. The index is reported
+    /// in `failed`, stays in place, and the next start rebuilds it.
+    #[tokio::test]
+    async fn failed_rebuild_does_not_block_startup() {
+        const NAME: &str = "idx_sync_tasks_artifact_id";
+        let Some((admin_url, db, pool)) = setup_scratch_database("issue5993_rebuild_fail").await
+        else {
+            return;
+        };
+        let mut conn = pool.acquire().await.expect("conn");
+        run_startup_migrations(&mut conn, &crate::MIGRATOR)
+            .await
+            .expect("first boot");
+        mark_index_invalid(&pool, NAME).await;
+        let oid = index_oid(&pool, NAME).await;
+
+        // Conflicts with the SHARE UPDATE EXCLUSIVE lock REINDEX CONCURRENTLY
+        // takes on the table.
+        let mut holder = pool.begin().await.expect("holder tx");
+        sqlx::query("LOCK TABLE sync_tasks IN SHARE UPDATE EXCLUSIVE MODE")
+            .execute(&mut *holder)
+            .await
+            .expect("hold table lock");
+        sqlx::query("SET lock_timeout = '200ms'")
+            .execute(&mut *conn)
+            .await
+            .expect("lock_timeout");
+
+        let report = repair_invalid_concurrent_indexes(&mut conn)
+            .await
+            .expect("a failed rebuild is not an error");
+        assert_eq!(report.failed, vec![NAME.to_string()]);
+        assert!(report.rebuilt.is_empty() && report.dropped.is_empty());
+        assert!(!report.is_empty());
+        assert_eq!(index_oid(&pool, NAME).await, oid, "the index stays");
+        assert_eq!(index_validity(&pool, NAME).await, Some(false));
+        // The session is usable, and the whole startup path succeeds.
+        run_startup_migrations(&mut conn, &crate::MIGRATOR)
+            .await
+            .expect("startup with a failing rebuild");
+
+        holder.rollback().await.expect("release table lock");
+        run_startup_migrations(&mut conn, &crate::MIGRATOR)
+            .await
+            .expect("next start");
+        assert_eq!(index_validity(&pool, NAME).await, Some(true));
+        assert!(invalid_indexes(&pool).await.is_empty());
         drop(conn);
         drop_scratch_database(&admin_url, pool, &db).await;
     }
