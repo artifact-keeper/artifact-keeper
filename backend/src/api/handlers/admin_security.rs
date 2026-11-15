@@ -84,7 +84,7 @@ pub struct ScanQueueResponse {
 pub struct ScanQueueQuery {
     /// `pending` | `running` | `failed`.
     pub state: Option<String>,
-    /// `proxy_file` | `hosted_artifact` | `hosted_upload` | `hosted_image`.
+    /// `proxy_file` | `hosted_artifact` | `hosted_upload` | `hosted_image` | `rescan`.
     pub kind: Option<String>,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
@@ -1453,6 +1453,7 @@ mod tests {
             "hosted_artifact",
             "hosted_upload",
             "hosted_image",
+            "rescan",
         ] {
             assert!(validate_scan_queue_filters(None, Some(kind)).is_ok());
         }
