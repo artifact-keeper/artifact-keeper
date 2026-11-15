@@ -196,13 +196,19 @@ class Results(unittest.TestCase):
 class Isolation(unittest.TestCase):
     """How oscap's probes get CAP_SYS_CHROOT: user namespace, or opt-in root."""
 
-    def test_default_is_user_namespace_even_as_root(self):
-        # Running as root without the opt-in never runs oscap outside a user
-        # namespace.
-        self.assertEqual(w.isolation_plan(0, False, False), ("userns", None))
-        mode, reason = w.isolation_plan(0, False, True)
+    def test_root_without_opt_in_refuses_to_scan(self):
+        # Running as root without the opt-in never runs oscap at all, user
+        # namespace or not.
+        for blocked in (False, True):
+            mode, reason = w.isolation_plan(0, False, blocked)
+            self.assertIsNone(mode)
+            self.assertIn(w.RUN_AS_ROOT_ENV, reason)
+            self.assertIn("refusing to scan", reason)
+
+    def test_non_root_default_is_user_namespace(self):
+        self.assertEqual(w.isolation_plan(1001, False, False), ("userns", None))
+        mode, reason = w.isolation_plan(1001, False, True)
         self.assertIsNone(mode)
-        self.assertIn(w.RUN_AS_ROOT_ENV, reason)
         self.assertIn("rootless Podman", reason)
 
     def test_root_mode_needs_opt_in_and_root(self):
@@ -221,16 +227,17 @@ class Isolation(unittest.TestCase):
             self.assertFalse(w.run_as_root_requested({w.RUN_AS_ROOT_ENV: v}), v)
         self.assertFalse(w.run_as_root_requested({}))
 
-    def test_root_mode_keeps_only_chroot_and_read_search(self):
+    def test_root_mode_keeps_only_chroot(self):
         docker_default = "CapBnd:\t00000000a80425fb\n"  # Docker's default set
         bnd = w.bounding_caps(docker_default)
         self.assertIn(w.CAP_SYS_CHROOT, bnd)
         self.assertNotIn(w.CAP_DAC_READ_SEARCH, bnd)
         self.assertEqual(w.root_mode_caps(bnd), (w.CAP_SYS_CHROOT,))
+        # Never CAP_DAC_READ_SEARCH, even when the container grants it.
         self.assertEqual(w.root_mode_caps(bnd | {w.CAP_DAC_READ_SEARCH}),
-                         (w.CAP_SYS_CHROOT, w.CAP_DAC_READ_SEARCH))
+                         (w.CAP_SYS_CHROOT,))
         self.assertIsNone(w.root_mode_caps({w.CAP_DAC_READ_SEARCH}))
-        self.assertEqual(w.cap_mask((w.CAP_SYS_CHROOT, w.CAP_DAC_READ_SEARCH)), (0x40004, 0))
+        self.assertEqual(w.cap_mask((w.CAP_SYS_CHROOT,)), (0x40000, 0))
 
     def test_root_path_runs_without_user_namespace(self):
         from unittest import mock
@@ -272,7 +279,7 @@ class Isolation(unittest.TestCase):
         try:
             w._ISOLATION["userns_blocked"] = False
             with mock.patch.object(w, "RUN_AS_ROOT", False), \
-                 mock.patch.object(w.os, "geteuid", return_value=0), \
+                 mock.patch.object(w.os, "geteuid", return_value=1001), \
                  mock.patch.object(w.subprocess, "run",
                                    side_effect=sp.SubprocessError("preexec")) as run:
                 with self.assertRaises(w.OfflineUnsupported):
@@ -282,7 +289,101 @@ class Isolation(unittest.TestCase):
             w._ISOLATION.update(old)
 
 
+    def test_root_without_opt_in_never_runs_oscap(self):
+        from unittest import mock
+        with mock.patch.object(w, "RUN_AS_ROOT", False), \
+             mock.patch.object(w.os, "geteuid", return_value=0), \
+             mock.patch.object(w.subprocess, "run") as run:
+            with self.assertRaises(w.OfflineUnsupported) as ctx:
+                w._run_oscap_offline(["oscap"], "/scan-workspace/x/rootfs", 5)
+        run.assert_not_called()
+        self.assertIn("refusing to scan", str(ctx.exception))
+
+
+class PrivilegeDrop(unittest.TestCase):
+    """_verify_privilege_drop: the root-mode child really became the scan user."""
+
+    def patched(self, resuid=(1001,) * 3, resgid=(0,) * 3, groups=(), setuid_ok=False):
+        from unittest import mock
+
+        def setuid(_uid):
+            if not setuid_ok:
+                raise PermissionError(1, "Operation not permitted")
+
+        return [
+            mock.patch.object(w.os, "getresuid", return_value=resuid),
+            mock.patch.object(w.os, "getresgid", return_value=resgid),
+            mock.patch.object(w.os, "getgroups", return_value=list(groups)),
+            mock.patch.object(w.os, "setuid", side_effect=setuid),
+        ]
+
+    def run_check(self, **kw):
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            for p in self.patched(**kw):
+                stack.enter_context(p)
+            w._verify_privilege_drop(1001, 0)
+
+    def test_clean_drop_passes(self):
+        self.run_check()
+
+    def test_wrong_uid_raises(self):
+        for resuid in ((0, 1001, 1001), (1001, 0, 1001), (1001, 1001, 0), (1002,) * 3):
+            with self.assertRaises(OSError, msg=resuid):
+                self.run_check(resuid=resuid)
+
+    def test_wrong_gid_raises(self):
+        with self.assertRaises(OSError):
+            self.run_check(resgid=(0, 0, 1001))
+
+    def test_supplementary_groups_raise(self):
+        with self.assertRaises(OSError):
+            self.run_check(groups=(10,))
+
+    def test_regaining_root_raises(self):
+        with self.assertRaises(OSError) as ctx:
+            self.run_check(setuid_ok=True)
+        self.assertIn("setuid(0)", str(ctx.exception))
+
+    def test_root_scan_uid_is_refused(self):
+        with self.assertRaises(OSError):
+            w._verify_privilege_drop(0, 0)
+
+    def test_scan_uid_config(self):
+        self.assertIsNone(w.check_scan_uid(1001))
+        for bad in (0, -1, None):
+            self.assertIn(w.SCAN_UID_ENV, w.check_scan_uid(bad))
+        self.assertIn("'abc'", w.check_scan_uid(None, "abc"))
+
+    def test_startup_rejects_root_scan_uid(self):
+        import subprocess
+        import sys
+        script = os.path.join(HERE, "openscap-wrapper.py")
+        for value in ("0", "-5", "abc"):
+            env = dict(os.environ, OPENSCAP_SCAN_UID=value, OPENSCAP_PORT="0")
+            proc = subprocess.run([sys.executable, "-I", script], env=env,
+                                  capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(proc.returncode, 0, value)
+            self.assertIn("OPENSCAP_SCAN_UID", proc.stderr, value)
+
+
+class RequestLimits(unittest.TestCase):
+    def test_content_length(self):
+        self.assertEqual(w.parse_content_length(None)[0], 411)
+        for bad in ("-1", "abc", "", "1.5"):
+            self.assertEqual(w.parse_content_length(bad)[0], 400, bad)
+        self.assertEqual(w.parse_content_length("65537")[0], 413)
+        self.assertEqual(w.parse_content_length("65536"), (None, 65536))
+        self.assertEqual(w.parse_content_length("0"), (None, 0))
+
+
 class Paths(unittest.TestCase):
+    def test_default_allowlist_is_scan_workspace_only(self):
+        if "OPENSCAP_ALLOWED_SCAN_DIRS" not in os.environ:
+            self.assertEqual(w.ALLOWED_SCAN_DIRS, ["/scan-workspace/"])
+        self.assertIsNone(w.validate_scan_path("/tmp"))
+        self.assertIsNone(w.validate_scan_path("/var/tmp"))
+
     def test_sibling_prefix_is_not_allowed(self):
         old = w.ALLOWED_SCAN_DIRS
         try:

@@ -469,15 +469,16 @@ services:
   #      seccomp profile blocks them:
   #        security_opt:
   #          - seccomp=unconfined
+  #      This disables syscall filtering on a container that parses untrusted
+  #      images; prefer option 3 on Docker.
   #   3. Root mode: start the wrapper as root and opt in. Each scan's oscap
-  #      process still drops to UID 1001 with only CAP_SYS_CHROOT (and
-  #      CAP_DAC_READ_SEARCH if added, so mode-0000 files such as /etc/shadow
-  #      can be read) and no_new_privs:
+  #      process still drops to UID 1001 with only CAP_SYS_CHROOT and
+  #      no_new_privs. Rules about mode-0000 files (such as /etc/shadow)
+  #      report error in this mode. A root wrapper without the opt-in refuses
+  #      to scan.
   #        user: "0"
   #        environment:
   #          OPENSCAP_RUN_AS_ROOT: "true"
-  #        cap_add:
-  #          - DAC_READ_SEARCH
   # Without one of these (stock Docker), every OpenSCAP scan is recorded
   # not_applicable with that reason, never as a pass.
   openscap:
@@ -492,7 +493,7 @@ services:
     volumes:
       - scan_workspace:/scan-workspace:ro
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8091/health')"]
+      test: ["CMD", "python3", "-I", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8091/health')"]
       interval: 30s
       timeout: 5s
       retries: 3

@@ -36,8 +36,9 @@
 //! writing beneath it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -140,6 +141,10 @@ impl From<NotUnpackable> for AppError {
     }
 }
 
+/// Most layers one image may have. Real images stay far below this; a
+/// manifest repeating one tiny blob thousands of times is refused.
+const MAX_IMAGE_LAYERS: usize = 256;
+
 /// Read the ordered filesystem layers from an image manifest body.
 pub(crate) fn parse_image_layers(
     body: &[u8],
@@ -151,6 +156,9 @@ pub(crate) fn parse_image_layers(
         .and_then(|l| l.as_array())
         .filter(|l| !l.is_empty())
         .ok_or(NotUnpackable::NotAnImageManifest)?;
+    if layers.len() > MAX_IMAGE_LAYERS {
+        return Err(NotUnpackable::NotAnImageManifest);
+    }
     layers
         .iter()
         .map(|layer| {
@@ -179,6 +187,12 @@ pub(crate) fn parse_image_layers(
 fn is_sha256_digest(d: &str) -> bool {
     d.strip_prefix("sha256:")
         .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Sum of the manifest's declared layer sizes; saturates rather than
+/// overflowing on hostile `size` values.
+fn declared_size(layers: &[ImageLayer]) -> u64 {
+    layers.iter().fold(0u64, |a, l| a.saturating_add(l.size))
 }
 
 /// Extracts a stored image's root filesystem into `<workspace>/rootfs`.
@@ -260,7 +274,7 @@ pub(crate) async fn unpack_layers(
     workspace: &Path,
     cancel: std::sync::Arc<AtomicBool>,
 ) -> Result<PathBuf> {
-    let declared: u64 = layers.iter().map(|l| l.size).sum();
+    let declared = declared_size(layers);
     if declared > MAX_SCAN_INPUT_BYTES {
         return Err(AppError::Internal(format!(
             "image layers total {declared} bytes, over the {MAX_SCAN_INPUT_BYTES}-byte scan input limit"
@@ -343,7 +357,14 @@ struct Capped<R> {
     inner: R,
     remaining: u64,
     breached: bool,
+    /// Bytes the tar crate may read while it parses the NEXT header. It
+    /// buffers GNU long names and PAX records whole in memory, so this is
+    /// what bounds that allocation (the byte budget alone allows 2 GiB).
+    meta_window: std::rc::Rc<std::cell::Cell<u64>>,
 }
+
+/// Most bytes one entry's headers (ustar + GNU long name/link + PAX) may take.
+const MAX_TAR_META_BYTES: u64 = 1 << 20;
 
 const BUDGET_BREACH: &str = "rootfs extraction budget exceeded";
 
@@ -355,6 +376,13 @@ impl<R: Read> Read for Capped<R> {
             return Err(std::io::Error::other(BUDGET_BREACH));
         }
         self.remaining -= n as u64;
+        let window = self.meta_window.get();
+        if n as u64 > window {
+            return Err(std::io::Error::other(
+                "tar entry headers exceed the metadata limit",
+            ));
+        }
+        self.meta_window.set(window - n as u64);
         Ok(n)
     }
 }
@@ -366,8 +394,16 @@ fn budget_error() -> AppError {
     )
 }
 
+/// Longest path an error message carries: tar paths are attacker-controlled.
+const MAX_ERROR_PATH_CHARS: usize = 256;
+
 fn io_err(what: &str, path: &Path, e: std::io::Error) -> AppError {
-    AppError::Internal(format!("{what} {}: {e}", path.display()))
+    let shown = path.display().to_string();
+    let shown = match shown.char_indices().nth(MAX_ERROR_PATH_CHARS) {
+        Some((cut, _)) => format!("{}...", &shown[..cut]),
+        None => shown,
+    };
+    AppError::Internal(format!("{what} {shown}: {e}"))
 }
 
 /// Applies image layers into one root directory. Blocking.
@@ -411,10 +447,12 @@ impl RootfsBuilder {
     }
 
     fn apply_tar<R: Read>(&mut self, reader: R, cancel: &AtomicBool) -> Result<()> {
+        let window = std::rc::Rc::new(std::cell::Cell::new(MAX_TAR_META_BYTES));
         let mut archive = tar::Archive::new(Capped {
             inner: reader,
             remaining: self.remaining_bytes,
             breached: false,
+            meta_window: window.clone(),
         });
         // Paths this layer created: an opaque whiteout removes only what LOWER
         // layers put in its directory.
@@ -426,8 +464,11 @@ impl RootfsBuilder {
                 AppError::Internal(format!("Image layer is not a readable tar: {e}"))
             }
         };
-        let entries = archive.entries().map_err(walk_err)?;
-        for entry in entries {
+        let mut entries = archive.entries().map_err(walk_err)?;
+        loop {
+            window.set(MAX_TAR_META_BYTES);
+            let Some(entry) = entries.next() else { break };
+            window.set(u64::MAX);
             if cancel.load(Ordering::SeqCst) {
                 return Err(AppError::Internal(
                     "Rootfs extraction cancelled: the scan was abandoned".to_string(),
@@ -446,6 +487,7 @@ impl RootfsBuilder {
                 .map_err(|e| AppError::Internal(format!("Bad tar entry path: {e}")))?
                 .into_owned();
             let Some(rel) = normalize_entry_path(&raw_path) else {
+                std::io::copy(&mut entry, &mut std::io::sink()).map_err(walk_err)?;
                 continue;
             };
             let header = entry.header();
@@ -453,6 +495,9 @@ impl RootfsBuilder {
             let mode = header.mode().unwrap_or(0o644);
             let link_name = entry.link_name().ok().flatten().map(|l| l.into_owned());
             self.apply_entry(&rel, kind, mode, link_name, &mut entry, &mut created)?;
+            // Drain what apply_entry did not read so it is not charged to
+            // the next entry's metadata window.
+            std::io::copy(&mut entry, &mut std::io::sink()).map_err(walk_err)?;
         }
         self.remaining_bytes = archive.into_inner().remaining;
         Ok(())
@@ -468,17 +513,20 @@ impl RootfsBuilder {
         created: &mut HashSet<PathBuf>,
     ) -> Result<()> {
         let (name, parent_rel) = rel.split_last().expect("normalized path is non-empty");
-        let name_str = name.to_string_lossy();
-
-        // Whiteouts (OCI image-spec layer.md).
-        if let Some(hidden) = name_str.strip_prefix(".wh.") {
+        // Whiteouts (OCI image-spec layer.md). Matched on raw bytes so a
+        // non-UTF-8 name still hides its lower-layer file.
+        if let Some(hidden) = name.as_bytes().strip_prefix(b".wh.") {
             let Some(parent) = self.resolve(parent_rel, true, false)? else {
                 return Ok(());
             };
-            if hidden == ".wh..opq" {
+            if hidden == b".wh..opq" {
                 self.clear_lower(&parent, created)?;
-            } else if !hidden.is_empty() && hidden != "." && hidden != ".." {
-                remove_any(&parent.join(hidden))?;
+            } else if !hidden.is_empty() && hidden != b"." && hidden != b".." {
+                let victim = parent.join(OsStr::from_bytes(hidden));
+                // A whiteout hides only what LOWER layers put there.
+                if !created.contains(&victim) {
+                    remove_any(&victim)?;
+                }
             }
             return Ok(());
         }
@@ -572,7 +620,9 @@ impl RootfsBuilder {
         }
     }
 
-    /// Opaque whiteout: drop every child of `dir` this layer did not create.
+    /// Opaque whiteout: drop everything under `dir` this layer did not
+    /// create, descending into directories this layer did create (or touch)
+    /// so lower-layer files beneath them go too.
     fn clear_lower(&self, dir: &Path, created: &HashSet<PathBuf>) -> Result<()> {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return Ok(());
@@ -581,6 +631,8 @@ impl RootfsBuilder {
             let path = entry.path();
             if !created.contains(&path) {
                 remove_any(&path)?;
+            } else if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+                self.clear_lower(&path, created)?;
             }
         }
         Ok(())
@@ -788,11 +840,19 @@ mod tests {
         fn new() -> Self {
             Self(Vec::new())
         }
-        fn entry(&mut self, path: &str, kind: tar::EntryType, mode: u32, link: &str, data: &[u8]) {
+        fn entry<P: AsRef<[u8]>>(
+            &mut self,
+            path: P,
+            kind: tar::EntryType,
+            mode: u32,
+            link: &str,
+            data: &[u8],
+        ) {
+            let path = path.as_ref();
             let mut h = tar::Header::new_ustar();
             {
                 let raw = h.as_old_mut();
-                raw.name[..path.len()].copy_from_slice(path.as_bytes());
+                raw.name[..path.len()].copy_from_slice(path);
                 raw.linkname[..link.len()].copy_from_slice(link.as_bytes());
             }
             h.set_entry_type(kind);
@@ -1178,5 +1238,131 @@ mod tests {
         assert_eq!(normalize_entry_path(Path::new("/etc/x")).unwrap().len(), 2);
         assert!(normalize_entry_path(Path::new("etc/../../x")).is_none());
         assert!(normalize_entry_path(Path::new("./")).is_none());
+    }
+    /// A GNU long name far larger than any real path is refused before it
+    /// is buffered whole (#6000 review 1): it used to be read into memory up
+    /// to the 2 GiB byte budget.
+    #[test]
+    fn oversized_gnu_long_name_hits_the_metadata_limit() {
+        let mut f = fixture_with(2 << 30, 10_000);
+        let n: u64 = 8 << 20;
+        let mut h = tar::Header::new_gnu();
+        h.as_old_mut().name[..13].copy_from_slice(b"././@LongLink");
+        h.set_entry_type(tar::EntryType::GNULongName);
+        h.set_mode(0o644);
+        h.set_size(n);
+        h.set_cksum();
+        let mut tail = TarBuf::new();
+        tail.file("x", 0o644, b"");
+        let stream = std::io::Cursor::new(h.as_bytes().to_vec())
+            .chain(std::io::repeat(b'a').take(n))
+            .chain(std::io::Cursor::new(tail.bytes()));
+        let err = f
+            .builder
+            .apply_layer(stream, LayerCoding::Plain, &AtomicBool::new(false))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("metadata limit"), "{err}");
+        assert!(err.len() < 1024, "error message must not carry the name");
+    }
+
+    /// Entry bodies the unpacker skips are drained, so they do not count
+    /// against the next entry's header window.
+    #[test]
+    fn skipped_bodies_and_long_names_within_the_limit_still_apply() {
+        let mut f = fixture();
+        let mut t = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Char);
+        h.set_size(2 << 20);
+        h.set_mode(0o644);
+        t.append_data(&mut h, "dev/x", &vec![0u8; 2 << 20][..])
+            .unwrap();
+        let long = format!("{}/f", "d".repeat(250));
+        let mut h = tar::Header::new_gnu();
+        h.set_size(3);
+        h.set_mode(0o644);
+        t.append_data(&mut h, &long, &b"abc"[..]).unwrap();
+        let v = t.into_inner().unwrap();
+        f.builder
+            .apply_layer(&v[..], LayerCoding::Plain, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(std::fs::read(root(&f).join(&long)).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn io_err_truncates_long_paths() {
+        let long = PathBuf::from("a".repeat(10_000));
+        let msg = io_err("Failed to create", &long, std::io::Error::other("x")).to_string();
+        assert!(msg.len() < 400, "{}", msg.len());
+    }
+
+    #[test]
+    fn opaque_whiteout_reaches_under_a_dir_this_layer_touched() {
+        let mut f = fixture();
+        let mut lower = TarBuf::new();
+        lower
+            .file("etc/conf.d/old.conf", 0o644, b"old")
+            .file("etc/other", 0o644, b"o");
+        apply(&mut f, &lower).unwrap();
+        let mut upper = TarBuf::new();
+        upper
+            .file("etc/conf.d/new.conf", 0o644, b"new")
+            .file("etc/.wh..wh..opq", 0o644, b"");
+        apply(&mut f, &upper).unwrap();
+        let r = root(&f);
+        assert!(!r.join("etc/other").exists());
+        assert!(!r.join("etc/conf.d/old.conf").exists());
+        assert!(r.join("etc/conf.d/new.conf").exists());
+    }
+
+    #[test]
+    fn whiteout_does_not_remove_its_own_layers_file() {
+        let mut f = fixture();
+        let mut l = TarBuf::new();
+        l.file("etc/a", 0o644, b"a").file("etc/.wh.a", 0o644, b"");
+        apply(&mut f, &l).unwrap();
+        assert!(root(&f).join("etc/a").exists());
+    }
+
+    #[test]
+    fn non_utf8_whiteout_hides_the_lower_file() {
+        let mut f = fixture();
+        let mut lower = TarBuf::new();
+        lower.entry(b"etc/\xff", tar::EntryType::Regular, 0o644, "", b"lower");
+        apply(&mut f, &lower).unwrap();
+        let p = root(&f).join("etc").join(OsStr::from_bytes(b"\xff"));
+        assert!(p.exists());
+        let mut upper = TarBuf::new();
+        upper.entry(b"etc/.wh.\xff", tar::EntryType::Regular, 0o644, "", b"");
+        apply(&mut f, &upper).unwrap();
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn declared_layer_sizes_saturate_and_layer_count_is_capped() {
+        let d = format!("sha256:{}", "a".repeat(64));
+        let layer = |size: u64| {
+            serde_json::json!({
+                "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                "digest": d,
+                "size": size,
+            })
+        };
+        let body = serde_json::json!({"layers": [layer(u64::MAX), layer(2)]});
+        let layers = parse_image_layers(body.to_string().as_bytes()).unwrap();
+        assert_eq!(declared_size(&layers), u64::MAX);
+
+        let many: Vec<_> = (0..=MAX_IMAGE_LAYERS).map(|_| layer(1)).collect();
+        let body = serde_json::json!({ "layers": many });
+        assert!(parse_image_layers(body.to_string().as_bytes()).is_err());
+        let ok: Vec<_> = (0..MAX_IMAGE_LAYERS).map(|_| layer(1)).collect();
+        let body = serde_json::json!({ "layers": ok });
+        assert_eq!(
+            parse_image_layers(body.to_string().as_bytes())
+                .unwrap()
+                .len(),
+            MAX_IMAGE_LAYERS
+        );
     }
 }

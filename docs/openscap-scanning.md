@@ -66,6 +66,9 @@ oscap's probes `chroot(2)` into `OSCAP_PROBE_ROOT`. The sidecar runs as UID
        - seccomp=unconfined
    ```
 
+   This turns off syscall filtering entirely for a container that parses
+   untrusted image contents. Prefer root mode (option 3) on Docker.
+
 3. **Root mode.** Start the sidecar as root and opt in with
    `OPENSCAP_RUN_AS_ROOT=true`:
 
@@ -74,16 +77,14 @@ oscap's probes `chroot(2)` into `OSCAP_PROBE_ROOT`. The sidecar runs as UID
      user: "0"
      environment:
        OPENSCAP_RUN_AS_ROOT: "true"
-     cap_add:
-       - DAC_READ_SEARCH   # optional: lets the scan read mode-0000 files
    ```
 
    Only the HTTP wrapper runs as root. Before it execs oscap, each scan's
    child process:
-   - shrinks its capability bounding set to `CAP_SYS_CHROOT` (plus
-     `CAP_DAC_READ_SEARCH`, read-only access to any file, when the container
-     grants it);
-   - drops to UID 1001 with only those capabilities;
+   - shrinks its capability bounding set to `CAP_SYS_CHROOT` alone;
+   - drops to UID 1001 (real, effective and saved UID and GID set, no
+     supplementary groups) with only that capability, and checks that the
+     drop held, including that it can no longer `setuid(0)`;
    - sets `no_new_privs`.
 
    The probes therefore read the unpacked tree, which is mounted read-only,
@@ -91,11 +92,14 @@ oscap's probes `chroot(2)` into `OSCAP_PROBE_ROOT`. The sidecar runs as UID
    librpm inside the image's tree, and librpm reads the image's rpm
    configuration. The container must keep `CAP_SETUID`, `CAP_SETGID`,
    `CAP_SETPCAP` and `CAP_SYS_CHROOT`, which Docker and Podman grant by
-   default. Without `CAP_DAC_READ_SEARCH`, rules that read a file the image
-   ships at mode 0000 (`/etc/shadow`) report `error`.
+   default. The child reads the tree as its owner and holds no
+   `CAP_DAC_READ_SEARCH`, so rules that read a file the image ships at mode
+   0000 (such as `/etc/shadow`) report `error` in root mode.
 
-   `OPENSCAP_RUN_AS_ROOT` has no effect unless the process is root, and a
-   root sidecar without it never runs oscap outside a user namespace.
+   `OPENSCAP_RUN_AS_ROOT` has no effect unless the process is root. A sidecar
+   that runs as root without it refuses to scan: every scan is answered
+   `not_applicable` with that reason. `OPENSCAP_SCAN_UID` must be a non-zero
+   UID; the wrapper exits at start-up otherwise.
 
 On stock Docker with none of these, every OpenSCAP scan is recorded
 `not_applicable` with that reason. The sidecar logs

@@ -23,11 +23,11 @@ ways to get it:
 * root mode, opt-in: ``OPENSCAP_RUN_AS_ROOT=true`` with the container started
   as root (compose ``user: "0"``). oscap is started without a user namespace,
   but NOT as full root: the child drops to the image's ``oscap`` UID (1001),
-  keeps only ``CAP_SYS_CHROOT`` (plus ``CAP_DAC_READ_SEARCH``, read-only
-  access to every file, when the container grants it), shrinks its
-  capability bounding set to those, and sets ``no_new_privs``. librpm, which the ``rpminfo`` probe drives
-  inside the chroot, reads the image's own rpm configuration, so the probe
-  child must not hold real root.
+  keeps only ``CAP_SYS_CHROOT``, shrinks its capability bounding set to it,
+  verifies the drop held, and sets ``no_new_privs``. librpm, which the
+  ``rpminfo`` probe drives inside the chroot, reads the image's own rpm
+  configuration, so the probe child must not hold real root. A sidecar that
+  runs as root WITHOUT the opt-in refuses to scan.
 
 When neither is available the scan is answered ``not_applicable`` with that
 reason. It is never evaluated against this container's own filesystem, which
@@ -70,7 +70,7 @@ PORT = int(os.environ.get("OPENSCAP_PORT", "8091"))
 # down further can still override via the OPENSCAP_ALLOWED_SCAN_DIRS env
 # var (colon-separated list of allowed base dirs).
 ALLOWED_SCAN_DIRS = os.environ.get(
-    "OPENSCAP_ALLOWED_SCAN_DIRS", "/scan-workspace/:/tmp/:/var/tmp/"
+    "OPENSCAP_ALLOWED_SCAN_DIRS", "/scan-workspace/"
 ).split(":")
 
 # The profile evaluated when a request names none. It must exist in the
@@ -111,13 +111,12 @@ CLONE_NEWUSER = 0x10000000
 # Capability numbers (linux/capability.h).
 CAP_DAC_READ_SEARCH = 2
 CAP_SYS_CHROOT = 18
-# The only capabilities a root-mode probe child keeps: CAP_SYS_CHROOT always,
-# CAP_DAC_READ_SEARCH (read any file, write none) when the container grants it.
-# Neither Docker nor Podman grants CAP_DAC_READ_SEARCH by default; without it
-# the child reads the tree as its owner, so a file the image ships at mode
-# 0000 (/etc/shadow) cannot be read and the rules that read it report error.
+# The only capability a root-mode probe child keeps: CAP_SYS_CHROOT. It never
+# gets CAP_DAC_READ_SEARCH, even when the container grants it: the child reads
+# the tree as its owner, so a file the image ships at mode 0000 (/etc/shadow)
+# cannot be read and the rules that read it report error.
 ROOT_MODE_REQUIRED_CAPS = (CAP_SYS_CHROOT,)
-ROOT_MODE_OPTIONAL_CAPS = (CAP_DAC_READ_SEARCH,)
+ROOT_MODE_OPTIONAL_CAPS = ()
 # prctl(2) options.
 PR_CAPBSET_DROP = 24
 PR_SET_KEEPCAPS = 8
@@ -129,7 +128,27 @@ _LINUX_CAPABILITY_VERSION_3 = 0x20080522
 # Opt-in root mode (see the module docstring). Read once at start-up.
 RUN_AS_ROOT_ENV = "OPENSCAP_RUN_AS_ROOT"
 # The UID a root-mode probe child drops to: the image's `oscap` user.
-SCAN_UID = int(os.environ.get("OPENSCAP_SCAN_UID", "1001"))
+# Validated at start-up (must be a non-zero UID); see check_scan_uid.
+SCAN_UID_ENV = "OPENSCAP_SCAN_UID"
+_SCAN_UID_RAW = os.environ.get(SCAN_UID_ENV, "1001")
+try:
+    SCAN_UID = int(_SCAN_UID_RAW)
+except ValueError:
+    SCAN_UID = None
+# The scan child's GID: 0, the image's arbitrary-UID convention.
+SCAN_GID = 0
+
+# Largest POST body accepted (the request is a small JSON object).
+MAX_BODY_BYTES = 64 * 1024
+
+
+def check_scan_uid(uid, raw=None):
+    """An error message when `uid` is not usable as the scan UID, else None."""
+    if not isinstance(uid, int) or uid <= 0:
+        shown = raw if raw is not None else uid
+        return (f"{SCAN_UID_ENV}={shown!r} is invalid: the root-mode scan "
+                "child must drop to a positive, non-zero UID")
+    return None
 
 # How to get real results, quoted in every "cannot evaluate here" reason.
 ENABLE_HINT = (
@@ -326,10 +345,16 @@ def isolation_plan(euid, root_requested, userns_blocked):
 
     Returns ("root", None), ("userns", None) or (None, reason). Root mode is
     used only when it was asked for AND the process is root; nothing else
-    ever runs oscap without a user namespace.
+    ever runs oscap without a user namespace. A root process that was not
+    opted in refuses to scan.
     """
-    if root_requested and euid == 0:
-        return "root", None
+    if euid == 0:
+        if root_requested:
+            return "root", None
+        return None, (
+            f"the OpenSCAP sidecar runs as root without {RUN_AS_ROOT_ENV}=true; "
+            f"refusing to scan (run it as a non-root UID, or set {RUN_AS_ROOT_ENV}=true)"
+        )
     if not userns_blocked:
         return "userns", None
     if root_requested:
@@ -406,6 +431,30 @@ def _last_cap():
         return 40
 
 
+def _verify_privilege_drop(uid, gid):
+    """Raise unless the process is now fully `uid`/`gid` and cannot regain root.
+
+    Checks the real, effective and saved IDs, that no supplementary group is
+    left, and that setuid(0) fails.
+    """
+    if uid <= 0:
+        raise OSError(f"refusing to run the scan as UID {uid}")
+    resuid = tuple(os.getresuid())
+    if resuid != (uid, uid, uid):
+        raise OSError(f"privilege drop failed: resuid {resuid}, expected UID {uid}")
+    resgid = tuple(os.getresgid())
+    if resgid != (gid, gid, gid):
+        raise OSError(f"privilege drop failed: resgid {resgid}, expected GID {gid}")
+    groups = os.getgroups()
+    if groups:
+        raise OSError(f"privilege drop failed: supplementary groups {groups} remain")
+    try:
+        os.setuid(0)
+    except OSError:
+        return
+    raise OSError("privilege drop failed: setuid(0) succeeded after the drop")
+
+
 def _root_mode_preexec(scan_uid, keep):
     """preexec_fn for root mode: drop from root to `scan_uid` with `keep` only.
 
@@ -431,7 +480,7 @@ def _root_mode_preexec(scan_uid, keep):
         #    kept as the image's arbitrary-UID convention has it).
         check(libc.prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0), "PR_SET_KEEPCAPS")
         os.setgroups([])
-        os.setgid(0)
+        os.setgid(SCAN_GID)
         os.setuid(scan_uid)
         # 3. Effective, permitted and inheritable = `keep`.
         low, high = cap_mask(keep)
@@ -446,6 +495,9 @@ def _root_mode_preexec(scan_uid, keep):
         header = Header(_LINUX_CAPABILITY_VERSION_3, 0)
         data = (Data * 2)(Data(low, low, low), Data(high, high, high))
         check(libc.capset(ctypes.byref(header), data), "capset")
+        # The permitted set is now `keep` alone: confirm the IDs changed
+        # everywhere and that root cannot be regained.
+        _verify_privilege_drop(scan_uid, SCAN_GID)
         # 4. Ambient, so the capabilities survive exec of oscap (which has no
         #    file capabilities) for a non-root UID.
         for cap in keep:
@@ -715,6 +767,21 @@ def plan_scan(scan_path, profile, available_content, profiles_of=list_profiles):
     return "scan", label, content_file, target_os
 
 
+def parse_content_length(value):
+    """(None, length) for an acceptable Content-Length, else (status, error)."""
+    if value is None:
+        return 411, "Content-Length required"
+    try:
+        length = int(value.strip())
+    except ValueError:
+        return 400, "invalid Content-Length"
+    if length < 0:
+        return 400, "invalid Content-Length"
+    if length > MAX_BODY_BYTES:
+        return 413, f"request body larger than {MAX_BODY_BYTES} bytes"
+    return None, length
+
+
 class OpenSCAPHandler(BaseHTTPRequestHandler):
     available_content = find_scap_content()
 
@@ -742,7 +809,10 @@ class OpenSCAPHandler(BaseHTTPRequestHandler):
             self._json_response(404, {"error": "not found"})
             return
 
-        content_length = int(self.headers.get("Content-Length", 0))
+        status, content_length = parse_content_length(self.headers.get("Content-Length"))
+        if status is not None:
+            self._json_response(status, {"error": content_length})
+            return
         body = self.rfile.read(content_length)
 
         try:
@@ -789,6 +859,10 @@ class OpenSCAPHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    uid_error = check_scan_uid(SCAN_UID, _SCAN_UID_RAW)
+    if uid_error:
+        print(f"[openscap-wrapper] {uid_error}", file=sys.stderr, flush=True)
+        sys.exit(2)
     print(f"OpenSCAP wrapper starting on port {PORT}", flush=True)
     content = find_scap_content()
     print(f"Available SCAP content: {list(content.keys())}", flush=True)
