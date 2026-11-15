@@ -6665,6 +6665,22 @@ impl ProxyService {
         Ok(())
     }
 
+    /// Size of the cached body at `(repo_key, path)` as its sidecar records
+    /// it, for a presigned-redirect fast path: the transfer meter counts the
+    /// object when the URL is issued (#6035). `None` when the sidecar is
+    /// missing or unreadable; a fast path then streams instead, so a redirect
+    /// is never issued for an object of unknown size. The sidecar is the one
+    /// the freshness probe and the hold gate just read, so this is served
+    /// from the metadata cache.
+    pub async fn cached_size_bytes(&self, repo_key: &str, path: &str) -> Option<i64> {
+        let metadata_key = Self::cache_metadata_key(&self.cache_scope, repo_key, path).ok()?;
+        self.load_cache_metadata(&metadata_key)
+            .await
+            .ok()
+            .flatten()
+            .map(|m| m.size_bytes)
+    }
+
     /// Gate a presigned-redirect fast path on the stored scan verdict of the
     /// cached body (#4514), the sibling of [`Self::cache_quarantine_gate`].
     ///

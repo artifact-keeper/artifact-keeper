@@ -2097,6 +2097,9 @@ async fn try_member_cache_redirect(
     if proxy.cache_origin_policy_gate(&member.key).await.is_err() {
         return None;
     }
+    // #6035: the transfer meter counts the cached object's size when the URL
+    // is issued; with no sidecar size the member streams instead.
+    let size_bytes = proxy.cached_size_bytes(&member.key, path).await?;
     let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
     try_proxy_cache_redirect(
         storage.as_ref(),
@@ -2104,6 +2107,7 @@ async fn try_member_cache_redirect(
         /* presigned_enabled = */ true,
         expiry,
         /* cache_is_fresh = */ true,
+        size_bytes,
     )
     .await
 }
@@ -2295,6 +2299,11 @@ pub(crate) async fn proxy_cache_fresh_redirect(
     let cache_key =
         ProxyService::cache_storage_key(proxy_service.cache_scope(), repo_key, cache_path)
             .map_err(refused)?;
+    // #6035: the transfer meter counts the cached object's size when the URL
+    // is issued; with no sidecar size the caller serves the request itself.
+    let Some(size_bytes) = proxy_service.cached_size_bytes(repo_key, cache_path).await else {
+        return Ok(None);
+    };
     let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
     Ok(try_proxy_cache_redirect(
         storage.as_ref(),
@@ -2302,6 +2311,7 @@ pub(crate) async fn proxy_cache_fresh_redirect(
         /* presigned_enabled = */ true,
         expiry,
         /* cache_is_fresh = */ true,
+        size_bytes,
     )
     .await)
 }
@@ -2463,6 +2473,8 @@ pub async fn proxy_fetch_or_redirect(
         // #1555: sign the just-populated cache entry through the proxy's
         // no-prefix backend (same handle that wrote it), not the prefixed
         // repo handle. The entry was just written, so treat it as fresh.
+        // #6035: the entry holds exactly the bytes just fetched (served
+        // verbatim below), so their length is the size the meter counts.
         let storage = proxy_service.cache_storage_backend();
         if let Some(redirect) = try_proxy_cache_redirect(
             storage.as_ref(),
@@ -2470,6 +2482,7 @@ pub async fn proxy_fetch_or_redirect(
             presigned_enabled,
             expiry,
             /* cache_is_fresh = */ true,
+            i64::try_from(content.len()).unwrap_or(i64::MAX),
         )
         .await
         {
@@ -2500,6 +2513,10 @@ pub async fn proxy_fetch_or_redirect(
 /// Otherwise returns `None` so the caller falls through to the buffered
 /// fetch + cache + serve path.
 ///
+/// `size_bytes` is the size of the cached object (from its sidecar, or the
+/// body just written); the redirect is tagged with it so the transfer meter
+/// counts the object when the URL is issued (#6035).
+///
 /// Extracted from `proxy_fetch_or_redirect` so the redirect short-circuit can
 /// be exercised in unit tests with recording mock storage backends.
 ///
@@ -2517,6 +2534,7 @@ pub(crate) async fn try_proxy_cache_redirect<
     presigned_enabled: bool,
     expiry: Duration,
     cache_is_fresh: bool,
+    size_bytes: i64,
 ) -> Option<Response> {
     if !presigned_enabled || !cache_is_fresh || !storage.supports_redirect() {
         return None;
@@ -2530,7 +2548,7 @@ pub(crate) async fn try_proxy_cache_redirect<
                 "Serving proxy-cache artifact via presigned redirect"
             );
             Some(
-                crate::api::download_response::DownloadResponse::redirect(presigned)
+                crate::api::download_response::DownloadResponse::redirect(presigned, size_bytes)
                     .into_response(),
             )
         }
@@ -7363,19 +7381,24 @@ pub async fn local_fetch_or_redirect(
                     /* presigned_enabled = */ true,
                     expiry,
                     /* cache_is_fresh = */ object_present,
+                    artifact.size_bytes,
                 )
                 .await
             }
             None => {
-                try_presigned_redirect(storage.as_ref(), &artifact.storage_key, true, expiry).await
+                try_presigned_redirect(
+                    storage.as_ref(),
+                    &artifact.storage_key,
+                    true,
+                    expiry,
+                    artifact.size_bytes,
+                )
+                .await
             }
         };
-        if let Some(mut redirect) = redirect {
-            // The transfer quota counts the object when the URL is issued.
-            crate::services::quota::http::tag_presigned_download(
-                &mut redirect,
-                artifact.size_bytes,
-            );
+        // Tagged with `artifact.size_bytes` by the builder: the transfer quota
+        // counts the object when the URL is issued (#6035).
+        if let Some(redirect) = redirect {
             return Ok(redirect);
         }
     }
@@ -7447,23 +7470,20 @@ pub async fn try_hosted_blob_redirect(
     if !state.config.presigned_downloads_enabled || !is_blob_redirect_eligible(path) {
         return None;
     }
-    let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
-    // `try_presigned_redirect` additionally verifies `supports_redirect()` and
-    // returns `None` for filesystem backends or on a signing error.
-    let mut redirect = try_presigned_redirect(storage, storage_key, true, expiry).await?;
-    // The transfer quota counts the object when the URL is issued.
-    if state.transfer_meter.enabled() {
-        let size: Option<i64> =
-            sqlx::query_scalar("SELECT size_bytes FROM artifacts WHERE id = $1")
-                .bind(artifact_id)
-                .fetch_optional(&state.db)
-                .await
-                .ok()
-                .flatten();
-        if let Some(size) = size {
-            crate::services::quota::http::tag_presigned_download(&mut redirect, size);
-        }
+    if !storage.supports_redirect() {
+        return None;
     }
+    // #6035: the transfer quota counts the object when the URL is issued, so
+    // the redirect needs the row's size; a row that cannot be read streams.
+    let size_bytes: i64 = sqlx::query_scalar("SELECT size_bytes FROM artifacts WHERE id = $1")
+        .bind(artifact_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()?;
+    let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
+    // `try_presigned_redirect` additionally returns `None` on a signing error.
+    let redirect = try_presigned_redirect(storage, storage_key, true, expiry, size_bytes).await?;
     // Count-at-redirect (#2260): record BEFORE handing back the 302, matching the
     // generic download handler. A body-less redirect otherwise never counts.
     // Only GETs reach here (HEAD returned above), so the recorder's `ctx.is_head`
@@ -18745,6 +18765,12 @@ mod tests {
             "member redirect signed a non-scoped key (a revert to unscoped drops the \
              scope segment): {loc}"
         );
+        // #6035: tagged with the sidecar's size for the transfer meter.
+        assert_eq!(
+            resp.extensions()
+                .get::<crate::services::quota::http::PresignedDownload>(),
+            Some(&crate::services::quota::http::PresignedDownload(11))
+        );
     }
 
     /// `proxy_fetch_or_redirect` (proxy_helpers.rs generic presign fast path).
@@ -18791,6 +18817,12 @@ mod tests {
             "generic redirect signed a non-scoped key (a revert to unscoped drops the \
              scope segment): {loc}"
         );
+        // #6035: tagged with the sidecar's size for the transfer meter.
+        assert_eq!(
+            resp.extensions()
+                .get::<crate::services::quota::http::PresignedDownload>(),
+            Some(&crate::services::quota::http::PresignedDownload(11))
+        );
     }
 
     /// `proxy_cache_fresh_redirect` signs a fresh entry under the live scope,
@@ -18836,6 +18868,13 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(loc.contains(&content_key), "signed the wrong key: {loc}");
+        // #6035: tagged with the sidecar's size for the transfer meter.
+        assert_eq!(
+            signed
+                .extensions()
+                .get::<crate::services::quota::http::PresignedDownload>(),
+            Some(&crate::services::quota::http::PresignedDownload(11))
+        );
 
         assert!(redirect(&presigned, PATH, &head).await.is_none());
         assert!(
@@ -20482,6 +20521,7 @@ mod tests {
             /* presigned_enabled = */ true,
             std::time::Duration::from_secs(300),
             /* cache_is_fresh = */ true,
+            /* size_bytes = */ 11,
         )
         .await;
 
@@ -20502,6 +20542,12 @@ mod tests {
 
         let resp = result.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::FOUND);
+        // #6035: the redirect carries the object size for the transfer meter.
+        assert_eq!(
+            resp.extensions()
+                .get::<crate::services::quota::http::PresignedDownload>(),
+            Some(&crate::services::quota::http::PresignedDownload(11))
+        );
         let location = resp
             .headers()
             .get("location")
@@ -20547,6 +20593,7 @@ mod tests {
             /* presigned_enabled = */ true,
             std::time::Duration::from_secs(300),
             /* cache_is_fresh = */ true,
+            /* size_bytes = */ 11,
         )
         .await
         .expect("fresh cache + redirect-capable backend must yield a redirect");
@@ -20697,6 +20744,7 @@ mod tests {
             /* presigned_enabled = */ false,
             std::time::Duration::from_secs(300),
             /* cache_is_fresh = */ true,
+            /* size_bytes = */ 11,
         )
         .await;
 
@@ -20716,6 +20764,7 @@ mod tests {
             /* presigned_enabled = */ true,
             std::time::Duration::from_secs(300),
             /* cache_is_fresh = */ false,
+            /* size_bytes = */ 11,
         )
         .await;
 
@@ -20738,6 +20787,7 @@ mod tests {
             /* presigned_enabled = */ true,
             std::time::Duration::from_secs(300),
             /* cache_is_fresh = */ true,
+            /* size_bytes = */ 11,
         )
         .await;
 
@@ -20819,6 +20869,7 @@ mod tests {
             /* presigned_enabled = */ true,
             std::time::Duration::from_secs(300),
             /* cache_is_fresh = */ true,
+            /* size_bytes = */ 11,
         )
         .await;
         assert!(
@@ -20838,6 +20889,7 @@ mod tests {
             /* presigned_enabled = */ true,
             std::time::Duration::from_secs(300),
             /* cache_is_fresh = */ true,
+            /* size_bytes = */ 11,
         )
         .await;
         assert!(

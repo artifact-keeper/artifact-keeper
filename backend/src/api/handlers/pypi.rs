@@ -4051,6 +4051,8 @@ async fn pypi_proxy_cache_redirect(
         cache_path,
     )
     .ok()?;
+    // #6035: the transfer meter counts the cached size when the URL is issued.
+    let size_bytes = proxy.cached_size_bytes(repo_key, cache_path).await?;
     let expiry = std::time::Duration::from_secs(state.config.presigned_download_expiry_secs);
     proxy_helpers::try_proxy_cache_redirect(
         storage.as_ref(),
@@ -4058,6 +4060,7 @@ async fn pypi_proxy_cache_redirect(
         /* presigned_enabled = */ true,
         expiry,
         /* cache_is_fresh = */ true,
+        size_bytes,
     )
     .await
 }
@@ -17281,6 +17284,12 @@ mod tests {
         assert!(
             loc.contains("proxy-cache/prod-eu/pypi-remote/"),
             "pypi redirect signed a non-scoped key (a revert to unscoped drops the scope): {loc}"
+        );
+        // #6035: tagged with the sidecar's size for the transfer meter.
+        assert_eq!(
+            resp.extensions()
+                .get::<crate::services::quota::http::PresignedDownload>(),
+            Some(&crate::services::quota::http::PresignedDownload(11))
         );
     }
 

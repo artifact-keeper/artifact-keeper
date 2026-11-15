@@ -7701,17 +7701,16 @@ async fn handle_get_blob(
             // #2894: offload the transfer to the object store with a 307 to a
             // presigned URL when enabled. A remote repo probes for the object
             // first, because a missing one is re-fetched from upstream below.
-            if let Some(mut redirect) = oci_blob_redirect::try_stored_blob_redirect(
+            if let Some(redirect) = oci_blob_redirect::try_stored_blob_redirect(
                 state,
                 storage.as_ref(),
                 &b.storage_key,
                 digest,
                 repo.repo_type == RepositoryType::Remote,
+                b.size_bytes,
             )
             .await
             {
-                // The transfer quota counts the blob when the URL is issued.
-                crate::services::quota::http::tag_presigned_download(&mut redirect, b.size_bytes);
                 return redirect;
             }
             // Stream the blob straight from the backend instead of buffering the
@@ -7792,6 +7791,7 @@ async fn handle_get_blob(
                         &storage_key,
                         digest,
                         false,
+                        size_bytes,
                     )
                     .await
                     {

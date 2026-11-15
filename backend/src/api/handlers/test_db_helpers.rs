@@ -1248,10 +1248,34 @@ pub fn build_state_with_cloud_and_proxy(
     (Arc::new(state), mem)
 }
 
+/// A presigning cloud state (as [`build_state_with_presigning_cloud`]) with
+/// `proxy` as the proxy service and the test `Config` adjusted by `mutate`
+/// before the state, and so its transfer meter, is built (#6035).
+pub fn build_presigning_cloud_state_with_proxy(
+    pool: PgPool,
+    backend_name: &str,
+    proxy: Arc<crate::services::proxy_service::ProxyService>,
+    mutate: impl FnOnce(&mut Config),
+) -> (SharedState, Arc<MemStorage>) {
+    let (state, mem) = build_cloud_state_with(pool, backend_name, true, mutate);
+    let mut state = Arc::try_unwrap(state).unwrap_or_else(|_| unreachable!("fresh state"));
+    state.set_proxy_service(proxy);
+    (Arc::new(state), mem)
+}
+
 fn build_cloud_state(
     pool: PgPool,
     backend_name: &str,
     presign: bool,
+) -> (SharedState, Arc<MemStorage>) {
+    build_cloud_state_with(pool, backend_name, presign, |_| {})
+}
+
+fn build_cloud_state_with(
+    pool: PgPool,
+    backend_name: &str,
+    presign: bool,
+    mutate: impl FnOnce(&mut Config),
 ) -> (SharedState, Arc<MemStorage>) {
     let mem = Arc::new(MemStorage {
         presign,
@@ -1267,6 +1291,7 @@ fn build_cloud_state(
     let storage: Arc<dyn crate::storage::StorageBackend> = mem.clone();
     let mut config = cfg("/tmp/ak-cloud-test-unused");
     config.presigned_downloads_enabled = presign;
+    mutate(&mut config);
     let state = Arc::new(AppState::new(config, pool, storage, registry));
     (state, mem)
 }
