@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -26,9 +29,11 @@ type Server struct {
 	// remote is the trivy-server readiness gate in client mode
 	// (cfg.TrivyServer set); nil in standalone mode.
 	remote *remoteGate
-	// scanSlots holds one token per running scan, image and filesystem alike
-	// (#5657); nil when cfg.MaxConcurrentScans is 0 (unbounded).
-	scanSlots chan struct{}
+	// sched grants the MaxConcurrentScans scan slots, image and filesystem
+	// alike (#5657), by client and priority band (#5944).
+	sched *Scheduler
+	// metrics backs the SCANNER_METRICS_ADDR listener (#5944).
+	metrics *Metrics
 }
 
 // NewServer constructs a Server. It is NOT ready until MarkReady is called.
@@ -38,9 +43,11 @@ func NewServer(cfg *Config) *Server {
 		jobs:    NewJobStore(cfg.JobTTL),
 		scanner: NewScanner(cfg),
 	}
-	if cfg.MaxConcurrentScans > 0 {
-		s.scanSlots = make(chan struct{}, cfg.MaxConcurrentScans)
-	}
+	// Per-client limits and fair queueing are opt-in: without a limits file
+	// slots go out in arrival order, as before #5944.
+	s.sched = NewScheduler(cfg.MaxConcurrentScans, nil, cfg.BackgroundMaxWait, cfg.ClientLimitsFile != "")
+	s.metrics = NewMetrics(cfg.MetricsClientLabel)
+	s.sched.onGrant = s.metrics.ObserveWait
 	if cfg.TrivyServer != "" {
 		client := newServerHTTPClient(cfg)
 		s.remote = newRemoteGate(10*time.Second, func(ctx context.Context) error {
@@ -166,42 +173,66 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	band, err := parsePriority(req.Priority)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	job, err := s.jobs.Create()
 	if err != nil {
 		http.Error(w, "failed to create scan job", http.StatusInternalServerError)
 		return
 	}
 
-	go s.runJob(job.ID, req)
+	go s.runJob(job.ID, clientKey(req.Registry.URL), band, req)
 
 	writeJSON(w, http.StatusAccepted, ScanResponse{ID: job.ID})
 }
 
-// acquireScanSlot blocks until one of the MaxConcurrentScans slots is free,
-// marking the job Queued while it waits, then marks it Running (#5657). The
-// returned func frees the slot. The scan's own timeout starts after this, so
-// time spent queued never eats into it.
-func (s *Server) acquireScanSlot(id string) (release func()) {
-	if s.scanSlots == nil {
-		s.jobs.Running(id)
-		return func() {}
-	}
+// acquireScanSlot blocks until the scheduler grants the job a scan slot,
+// marking it Queued while it waits, then marks it Running (#5657). Which
+// waiting job gets a freed slot depends on its client and band (#5944, see
+// sched.go). The returned func frees the slot. The scan's own timeout starts
+// after this, so time spent queued never eats into it.
+func (s *Server) acquireScanSlot(id, client string, band Priority) (release func()) {
+	t := s.sched.Enqueue(client, band)
 	select {
-	case s.scanSlots <- struct{}{}:
+	case <-t.Granted():
 	default:
 		s.jobs.Queued(id)
-		log.Printf("scan %s queued: %d scans already running (SCANNER_MAX_CONCURRENT_SCANS)", id, cap(s.scanSlots))
-		s.scanSlots <- struct{}{}
+		log.Printf("scan %s queued (client %s, %s band): no scan slot it may take yet (SCANNER_MAX_CONCURRENT_SCANS, client limits)", id, logSafe(client), band)
+		<-t.Granted()
 	}
 	s.jobs.Running(id)
-	return func() { <-s.scanSlots }
+	return t.Release
+}
+
+// jobDone counts a finished job in the metrics.
+func (s *Server) jobDone(err error) {
+	if err != nil {
+		s.metrics.JobDone(outcomeFailed)
+		return
+	}
+	s.metrics.JobDone(outcomeSucceeded)
 }
 
 // runJob executes the scan and records the outcome. Detached from the request
 // context so a client disconnect does not cancel the scan.
-func (s *Server) runJob(id string, req ScanRequest) {
-	defer s.acquireScanSlot(id)()
+//
+// The image size check (#5909) runs first, before the job is queued for a
+// scan slot: it is two manifest GETs at most, and an image it refuses never
+// waits for or takes a fair-queue slot. It counts as outcome too_large.
+func (s *Server) runJob(id, client string, band Priority, req ScanRequest) {
+	if tooLarge := s.scanner.checkImageSize(context.Background(), &req); tooLarge != nil {
+		log.Printf("scan %s refused: %v", id, tooLarge)
+		s.metrics.JobDone(outcomeTooLarge)
+		s.jobs.TooLarge(id, tooLarge.Error())
+		return
+	}
+	defer s.acquireScanSlot(id, client, band)()
 	report, err := s.scanner.Scan(context.Background(), &req)
+	s.jobDone(err)
 	if err != nil {
 		// Do not include the request authorization; Scan's error messages only
 		// carry the image ref + trivy stderr.
@@ -222,7 +253,18 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 // dir, and starts the filesystem scan asynchronously (#2363). The body is
 // capped at cfg.FsMaxUploadBytes; since the tar is uncompressed, the cap also
 // bounds the extracted tree.
+//
+// The upload names no registry, so its client and band come from optional
+// headers (#5944): X-Scan-Client (normalized like a registry URL; the remote
+// IP when absent) and X-Scan-Priority (interactive, the default, or
+// background).
 func (s *Server) handleFsScan(w http.ResponseWriter, r *http.Request) {
+	band, err := parsePriority(r.Header.Get(scanPriorityHeader))
+	if err != nil {
+		http.Error(w, scanPriorityHeader+": "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	client := fsClientKey(r.Header.Get(scanClientHeader), r.RemoteAddr)
 	body := http.MaxBytesReader(w, r.Body, s.cfg.FsMaxUploadBytes)
 
 	dir, err := os.MkdirTemp("", "fs-scan-")
@@ -237,7 +279,13 @@ func (s *Server) handleFsScan(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := untarWorkspaceOpts(body, dir, s.cfg.CachePartitionMode == partitionModeRegistry); err != nil {
 		_ = os.RemoveAll(dir)
-		// An over-cap body surfaces here as a read error from MaxBytesReader.
+		// An over-cap body surfaces here as a read error from MaxBytesReader:
+		// answer it as such (413), not as a malformed tar (#5909).
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, fmt.Sprintf("not scanned: workspace too large: over SCANNER_FS_MAX_UPLOAD_BYTES=%d", s.cfg.FsMaxUploadBytes), http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "invalid workspace tar: "+err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -249,7 +297,7 @@ func (s *Server) handleFsScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go s.runFsJob(job.ID, dir)
+	go s.runFsJob(job.ID, client, band, dir)
 
 	writeJSON(w, http.StatusAccepted, ScanResponse{ID: job.ID})
 }
@@ -257,10 +305,11 @@ func (s *Server) handleFsScan(w http.ResponseWriter, r *http.Request) {
 // runFsJob executes the filesystem scan and records the outcome, then removes
 // the untarred workspace. Detached from the request context so a client
 // disconnect does not cancel the scan.
-func (s *Server) runFsJob(id, dir string) {
+func (s *Server) runFsJob(id, client string, band Priority, dir string) {
 	defer func() { _ = os.RemoveAll(dir) }()
-	defer s.acquireScanSlot(id)()
+	defer s.acquireScanSlot(id, client, band)()
 	report, db, stderr, err := s.scanner.ScanFilesystem(context.Background(), dir)
+	s.jobDone(err)
 	if err != nil {
 		log.Printf("filesystem scan %s failed: %v", id, err)
 		s.jobs.Fail(id, err.Error())
@@ -284,8 +333,9 @@ func (s *Server) handleFsReport(w http.ResponseWriter, r *http.Request) {
 // serveJobReport implements the shared report-polling contract for both scan
 // families: 200 + body when Succeeded, 500 when Failed (fail-closed — a trivy
 // error is NEVER a 200 with empty findings), 302 + integer Refresh-After while
-// Pending/Queued/Running (the state in X-Scan-Status, #5657), 404 for an
-// unknown/expired id.
+// Pending/Queued/Running (the state in X-Scan-Status, #5657), 422 with
+// X-Scan-Status: TooLarge for an image refused by SCANNER_MAX_IMAGE_BYTES
+// (#5909), 404 for an unknown/expired id.
 func (s *Server) serveJobReport(w http.ResponseWriter, id, contentType string, body func(*Job) any) {
 	job, ok := s.jobs.Get(id)
 	if !ok {
@@ -301,6 +351,12 @@ func (s *Server) serveJobReport(w http.ResponseWriter, id, contentType string, b
 		writeJSON(w, http.StatusOK, body(job))
 	case StatusFailed:
 		http.Error(w, "scan failed: "+job.Err, http.StatusInternalServerError)
+	case StatusTooLarge:
+		// Not a scan failure: the image was refused before trivy ran
+		// (#5909). Clients that do not know the header still read a
+		// terminal non-2xx answer, i.e. no report.
+		w.Header().Set(scanStatusHeader, string(job.Status))
+		http.Error(w, job.Err, http.StatusUnprocessableEntity)
 	default:
 		w.Header().Set("Refresh-After", "5")
 		w.Header().Set(scanStatusHeader, string(job.Status))
@@ -310,9 +366,19 @@ func (s *Server) serveJobReport(w http.ResponseWriter, id, contentType string, b
 
 // scanStatusHeader carries a pending job's state (Pending, Queued or Running)
 // on the 302 report response, so the backend can tell a scan waiting for a
-// slot from one that is running (#5657). Not part of the Harbor contract;
-// clients that ignore it see the same 302 + Refresh-After as before.
+// slot from one that is running (#5657), and the TooLarge state on the 422
+// of an image refused by SCANNER_MAX_IMAGE_BYTES (#5909). Not part of the
+// Harbor contract; clients that ignore it see the same 302 + Refresh-After
+// as before, and a terminal non-2xx for TooLarge.
 const scanStatusHeader = "X-Scan-Status"
+
+// Optional filesystem-scan request headers (#5944): the client a scan is
+// scheduled under and its priority band. Image scans take the client from
+// registry.url and the band from the body's `priority`.
+const (
+	scanClientHeader   = "X-Scan-Client"
+	scanPriorityHeader = "X-Scan-Priority"
+)
 
 // writeJSON writes v as a JSON response with the given status.
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -321,4 +387,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	}
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// logSafe drops CR and LF from a caller-supplied value before it is logged,
+// so a registry.url or X-Scan-Client cannot forge extra log lines.
+func logSafe(v string) string {
+	return strings.NewReplacer("\r", "", "\n", "").Replace(v)
 }

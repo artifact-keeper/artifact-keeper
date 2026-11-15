@@ -131,21 +131,29 @@ pub fn resolve_proxy_metadata_budget_bytes(
 /// An idle family holds nothing, so other formats can still use the whole
 /// shared budget when it is quiet.
 ///
-/// The VS Code gallery is the first family; RPM repodata (#2665) has the same
-/// shape and joins by adding a variant here.
+/// The VS Code gallery was the first family and RubyGems Remote documents the
+/// second (#5973); RPM repodata (#2665) has the same shape and joins by adding
+/// a variant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataBudgetFamily {
     /// Open VSX gallery queries on a VS Code Remote (#3255, #3914).
     VscodeGallery,
+    /// Documents a RubyGems Remote passes through from its upstream: the
+    /// Compact Index, the specs indexes and the quick gemspecs (#5973).
+    RubygemsRemote,
 }
 
 impl MetadataBudgetFamily {
     /// Every family, for registry sizing and tests.
-    pub const ALL: [MetadataBudgetFamily; 1] = [MetadataBudgetFamily::VscodeGallery];
+    pub const ALL: [MetadataBudgetFamily; 2] = [
+        MetadataBudgetFamily::VscodeGallery,
+        MetadataBudgetFamily::RubygemsRemote,
+    ];
 
     fn index(self) -> usize {
         match self {
             MetadataBudgetFamily::VscodeGallery => 0,
+            MetadataBudgetFamily::RubygemsRemote => 1,
         }
     }
 
@@ -153,6 +161,7 @@ impl MetadataBudgetFamily {
     pub fn label(self) -> &'static str {
         match self {
             MetadataBudgetFamily::VscodeGallery => "vscode_gallery",
+            MetadataBudgetFamily::RubygemsRemote => "rubygems_remote",
         }
     }
 
@@ -162,6 +171,7 @@ impl MetadataBudgetFamily {
     pub fn size_env(self) -> &'static str {
         match self {
             MetadataBudgetFamily::VscodeGallery => "AK_VSCODE_GALLERY_METADATA_BUDGET_BYTES",
+            MetadataBudgetFamily::RubygemsRemote => "AK_RUBYGEMS_REMOTE_METADATA_BUDGET_BYTES",
         }
     }
 
@@ -171,12 +181,21 @@ impl MetadataBudgetFamily {
     /// Gallery: 3/8, which is 384 MiB of the default 1 GiB. One composed
     /// gallery response at full width holds four concurrent 64 MiB skeleton
     /// reservations (256 MiB), so the share admits that plus a handful of
-    /// plain queries, while at least 640 MiB — five worst-case 128 MiB
-    /// `LARGE_METADATA_MAX_BYTES` buffers — always stays available to npm,
-    /// PyPI, Debian, RPM and the rest however many gallery reads are in flight.
+    /// plain queries.
+    ///
+    /// RubyGems Remote: 1/4, which is 256 MiB of the default 1 GiB: two
+    /// documents reserved at the full 128 MiB `LARGE_METADATA_MAX_BYTES` cap
+    /// (a cold `/versions` or specs index fetch), or many more cache hits,
+    /// which reserve their cached size instead (#5973).
+    ///
+    /// With both families saturated at once, 384 MiB — three worst-case
+    /// 128 MiB `LARGE_METADATA_MAX_BYTES` buffers — always stays available to
+    /// npm, PyPI, Debian, RPM and the rest however many gallery and RubyGems
+    /// reads are in flight.
     fn default_share(self) -> (usize, usize) {
         match self {
             MetadataBudgetFamily::VscodeGallery => (3, 8),
+            MetadataBudgetFamily::RubygemsRemote => (1, 4),
         }
     }
 
@@ -190,6 +209,9 @@ impl MetadataBudgetFamily {
             MetadataBudgetFamily::VscodeGallery => {
                 crate::api::handlers::vscode::GALLERY_PEAK_REQUEST_RESERVATION_BYTES
             }
+            // A RubyGems request buffers one document at a time, at most the
+            // large-metadata cap.
+            MetadataBudgetFamily::RubygemsRemote => LARGE_METADATA_MAX_BYTES,
         }
     }
 }
@@ -326,6 +348,35 @@ pub async fn reserve_metadata_budget_in(
             metadata_budget_saturated_response()
         }),
     }
+}
+
+/// Non-blocking [`reserve_metadata_budget_in`]: `bytes` of `shared` and, when
+/// given, of `sub`, or `None` at once when either cannot satisfy them right
+/// now. A sub-budget slice taken before the shared budget refused is given
+/// back, never held.
+pub fn try_reserve_metadata_budget_in(
+    shared: &ProxyMetadataBudget,
+    sub: Option<&'static MetadataSubBudget>,
+    bytes: usize,
+) -> Option<MetadataBudgetPermit> {
+    let family = match sub {
+        Some(sub) => Some((sub, sub.budget.try_reserve(bytes)?)),
+        None => None,
+    };
+    let Some(shared) = shared.try_reserve(bytes) else {
+        if let Some((sub, permit)) = family {
+            drop(permit);
+            sub.record_saturation();
+        }
+        return None;
+    };
+    if let Some((sub, _)) = &family {
+        sub.record_saturation();
+    }
+    Some(MetadataBudgetPermit {
+        _shared: shared,
+        family,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1451,7 +1502,11 @@ pub async fn proxy_post_json_uncached_capped_budgeted(
 /// to act on it without re-deriving the cause from a rendered response (and
 /// silently reclassifying a genuine upstream 404/503 as "too large"). Every
 /// other failure therefore stays a rendered `Response`.
-pub enum CappedMetadataGet {
+///
+/// `P` is the budget reservation riding along with the bytes: the shared
+/// budget's permit for most callers, a [`FamilyMetadataPermit`] for a family
+/// fetch (#5973).
+pub enum CappedMetadataGet<P = OwnedSemaphorePermit> {
     Buffered {
         content: Bytes,
         content_type: Option<String>,
@@ -1460,7 +1515,7 @@ pub enum CappedMetadataGet {
         /// `stale-if-error` grace, so the caller can mark its response (and a
         /// virtual merge can decide how to represent the member's staleness).
         stale_since: Option<DateTime<Utc>>,
-        budget_permit: OwnedSemaphorePermit,
+        budget_permit: P,
     },
     /// Upstream exceeded `max`; nothing past the ceiling was ever buffered,
     /// and no truncated body was persisted (the capped read aborts BEFORE any
@@ -1505,16 +1560,17 @@ pub async fn proxy_fetch_capped_budgeted_with_encoding(
 ///
 /// For a caller that must bound how long it waits for the reservation, or
 /// account for it together with other memory it holds (the virtual conda
-/// merge, #4608), instead of queueing on the budget without limit.
-pub async fn proxy_fetch_capped_with_encoding_reserved(
+/// merge, #4608), instead of queueing on the budget without limit. The permit
+/// type is the caller's: a family fetch passes a [`FamilyMetadataPermit`].
+pub async fn proxy_fetch_capped_with_encoding_reserved<P>(
     proxy_service: &ProxyService,
     repo_id: Uuid,
     repo_key: &str,
     upstream_url: &str,
     path: &str,
     max: usize,
-    budget_permit: OwnedSemaphorePermit,
-) -> Result<CappedMetadataGet, Response> {
+    budget_permit: P,
+) -> Result<CappedMetadataGet<P>, Response> {
     let repo = build_remote_repo(repo_id, repo_key, upstream_url);
     match proxy_service
         .fetch_artifact_with_cache_path_and_accept_capped(&repo, path, path, None, max)
@@ -1534,6 +1590,147 @@ pub async fn proxy_fetch_capped_with_encoding_reserved(
         }),
         Err(error) if is_over_cap_error(&error) => Ok(CappedMetadataGet::OverCap),
         Err(error) => Err(map_proxy_error(repo_key, path, error)),
+    }
+}
+
+/// The reservation a family fetch holds for its buffered document (#5973):
+/// what it reserved before the fetch and, when the document came back larger
+/// than that, the top-up for the difference. Dropping it releases both.
+pub struct FamilyMetadataPermit {
+    _reserved: MetadataBudgetPermit,
+    _top_up: Option<MetadataBudgetPermit>,
+}
+
+/// Bytes a family fetch of a document reserves before it buffers it (#5973):
+/// the size of a fresh cache entry when there is one, since the cache hit
+/// serves exactly those bytes, else the full cap, since an upstream or
+/// revalidated body may be as large as the cap.
+///
+/// A fresh entry's size is read from the metadata sidecar (through the
+/// sidecar LRU), never from the body. A cached size above `max` is not taken:
+/// the fetch would refuse such a body anyway.
+pub fn family_fetch_reservation_bytes(fresh_cached_size: Option<u64>, max: usize) -> usize {
+    fresh_cached_size
+        .and_then(|size| usize::try_from(size).ok())
+        .filter(|size| *size <= max)
+        .unwrap_or(max)
+}
+
+/// As [`proxy_fetch_capped_budgeted_with_encoding`], for a family whose
+/// reservations are capped by a sub-budget of their own (#3914, #5973), with
+/// the reservation sized to the document where its size is known.
+///
+/// * The reservation draws on `family`'s sub-budget and the shared budget,
+///   inside the `wait` bound: a fetch that cannot be admitted in time answers
+///   [`metadata_budget_saturated_response`] (503 + `Retry-After`) instead of
+///   queueing without a bound behind every other in-flight fetch.
+/// * A fresh cached document reserves its cached size, a miss the full `max`
+///   ([`family_fetch_reservation_bytes`]). A body that comes back larger than
+///   reserved is topped up as [`proxy_fetch_capped_family_reserved_in`]
+///   describes.
+///
+/// The byte ceiling is `max` either way, so what is served is unchanged.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_fetch_capped_family_budgeted_in(
+    shared: &ProxyMetadataBudget,
+    sub: &'static MetadataSubBudget,
+    wait: Duration,
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+) -> Result<CappedMetadataGet<FamilyMetadataPermit>, Response> {
+    let reserved =
+        family_fetch_reservation_bytes(proxy_service.fresh_cached_size(repo_key, path).await, max);
+    proxy_fetch_capped_family_reserved_in(
+        shared,
+        sub,
+        wait,
+        proxy_service,
+        repo_id,
+        repo_key,
+        upstream_url,
+        path,
+        max,
+        reserved,
+    )
+    .await
+}
+
+/// [`proxy_fetch_capped_family_budgeted_in`] with the size of the up-front
+/// reservation, `reserved`, chosen by the caller.
+///
+/// `reserved` is reserved within `wait` before anything is buffered. When the
+/// body comes back larger (the cached entry was replaced by a larger one
+/// between the size lookup and the read), the difference is topped up with a
+/// NON-blocking reservation. The bytes are already resident by then, so
+/// waiting would only delay a body this request already holds, and it could
+/// wait on itself: when the up-front reservation was clamped to the whole
+/// share, or two top-ups race in a saturated share, the extra bytes cannot be
+/// freed until this request lets go. If the top-up does not fit, the body is
+/// served anyway, over-committing the budget by at most the entry's growth
+/// for the rest of this one request.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_fetch_capped_family_reserved_in(
+    shared: &ProxyMetadataBudget,
+    sub: &'static MetadataSubBudget,
+    wait: Duration,
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+    reserved: usize,
+) -> Result<CappedMetadataGet<FamilyMetadataPermit>, Response> {
+    let permit = reserve_metadata_budget_in(shared, Some(sub), reserved, Some(wait)).await?;
+    let fetched = proxy_fetch_capped_with_encoding_reserved(
+        proxy_service,
+        repo_id,
+        repo_key,
+        upstream_url,
+        path,
+        max,
+        FamilyMetadataPermit {
+            _reserved: permit,
+            _top_up: None,
+        },
+    )
+    .await?;
+    match fetched {
+        CappedMetadataGet::Buffered {
+            content,
+            content_type,
+            content_encoding,
+            stale_since,
+            mut budget_permit,
+        } => {
+            if content.len() > reserved {
+                let grown = content.len() - reserved;
+                budget_permit._top_up = try_reserve_metadata_budget_in(shared, Some(sub), grown);
+                if budget_permit._top_up.is_none() {
+                    tracing::debug!(
+                        repository = %repo_key,
+                        path = %path,
+                        reserved,
+                        body_bytes = content.len(),
+                        family = sub.family().label(),
+                        "buffered metadata body outgrew its reservation and the budget has no \
+                         room for the difference; serving it over-committed"
+                    );
+                }
+            }
+            Ok(CappedMetadataGet::Buffered {
+                content,
+                content_type,
+                content_encoding,
+                stale_since,
+                budget_permit,
+            })
+        }
+        CappedMetadataGet::OverCap => Ok(CappedMetadataGet::OverCap),
     }
 }
 
@@ -10200,6 +10397,10 @@ pub struct CurationTarget<'a> {
     pub repo_type: &'a str,
     pub curation_enabled: bool,
     pub default_action: &'a str,
+    /// The repository's format key (`npm`, `pypi`, …). `popularity` rules
+    /// apply only to formats with a popularity ecosystem (#5159); `None`
+    /// skips them.
+    pub format: Option<&'a str>,
 }
 
 impl<'a> From<&'a RepoInfo> for CurationTarget<'a> {
@@ -10210,6 +10411,7 @@ impl<'a> From<&'a RepoInfo> for CurationTarget<'a> {
             repo_type: &repo.repo_type,
             curation_enabled: repo.curation_enabled,
             default_action: &repo.curation_default_action,
+            format: Some(&repo.format),
         }
     }
 }
@@ -10232,10 +10434,17 @@ impl<'a> From<&'a RepoInfo> for CurationTarget<'a> {
 /// fails OPEN (logged with repo + package so the unenforced request is
 /// greppable) rather than taking the proxy down — identical to the pypi seam.
 ///
-/// Only `pattern` rules are consulted here (via
-/// [`CurationService::evaluate_pep503_package`]), matching the pypi seam
-/// exactly; typed `publisher_trust` / `popularity` rules run on the
-/// staging/sync path, not on the hot download path.
+/// `pattern` rules are consulted here (via
+/// [`CurationService::evaluate_pep503_package`]), and so are the name-only
+/// checks of `popularity` rules that opt in with `download_name_checks: true`
+/// on npm and PyPI repositories (#5159, #5274): the
+/// typo-squat, homoglyph and affix comparisons against the popular list,
+/// which need no network call. The download-count threshold and
+/// `publisher_trust` rules still run only on the staging sync. A `popularity`
+/// `Block` (a homoglyph or mixed-script match under `block_typosquat`)
+/// refuses the pull like a `block` rule. Edit-distance and affix matches only
+/// flag. A `Flag` serves the pull and logs it, because the proxy path has no
+/// review queue.
 #[allow(clippy::result_large_err)]
 pub async fn enforce_curation<'a>(
     db: &PgPool,
@@ -10265,7 +10474,13 @@ pub async fn evaluate_curation<'a>(
     }
     let svc = crate::services::curation_service::CurationService::new(db.clone());
     let eval = svc
-        .evaluate_pep503_package(target.id, target.default_action, package, version)
+        .evaluate_pep503_package(
+            target.id,
+            target.default_action,
+            target.format,
+            package,
+            version,
+        )
         .await
         .map_err(|e| {
             tracing::warn!(
@@ -10277,15 +10492,45 @@ pub async fn evaluate_curation<'a>(
             );
         })
         .ok();
-    if let Some(eval) = eval {
-        if eval.action == "block" {
-            return Err(CurationBlock {
-                package: package.to_string(),
-                reason: eval.reason,
-            });
-        }
+    match eval {
+        Some(eval) => curation_verdict(&target, package, eval),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// Map a proxy-path rule evaluation onto the download outcome: `block`
+/// refuses, anything else serves.
+///
+/// A `review` verdict from a rule is a `popularity` `Flag` (#5159; `pattern`
+/// rules only take `allow` / `block`). The proxy path has no review queue,
+/// so the pull is served and the flag is logged with the rule and reason.
+/// A `review` default stance with no matching rule serves silently, as it
+/// always has.
+fn curation_verdict(
+    target: &CurationTarget<'_>,
+    package: &str,
+    eval: crate::services::curation_service::RuleEvaluation,
+) -> Result<(), CurationBlock> {
+    match (eval.action.as_str(), eval.rule_id) {
+        ("block", _) => Err(CurationBlock {
+            package: package.to_string(),
+            reason: eval.reason,
+        }),
+        ("review", Some(rule_id)) => {
+            // `warn`, like the fail-open line above: a flagged download is
+            // served, so deployments that log at warn must still see it.
+            tracing::warn!(
+                repo_id = %target.id,
+                repo_key = %target.key,
+                package = %package,
+                rule_id = %rule_id,
+                reason = %eval.reason,
+                "curation flagged a proxy download; serving it (no review queue on the proxy path)"
+            );
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Curation enforcement (#2930) for handlers whose repo struct does NOT carry
@@ -10360,6 +10605,9 @@ pub async fn evaluate_curation_lookup(
         repo_type,
         curation_enabled,
         default_action: &default_action,
+        // The callers (cargo, OCI) serve formats with no popularity
+        // ecosystem, so the typed name checks never apply here (#5159).
+        format: None,
     };
     evaluate_curation(db, target, package, version).await
 }
@@ -16824,6 +17072,50 @@ mod tests {
         assert_eq!(metadata_sub_budget_bytes(family, None, 0), 1);
     }
 
+    /// #5973: the RubyGems Remote share is a quarter of the shared budget,
+    /// floored at one large-metadata cap so a lone request never sheds
+    /// against its own family, and both default shares together still leave
+    /// three worst-case buffers to every other format.
+    #[test]
+    fn rubygems_remote_sub_budget_defaults_leave_room_for_other_formats() {
+        let family = MetadataBudgetFamily::RubygemsRemote;
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        assert_eq!(metadata_sub_budget_bytes(family, None, gib), 256 * mib);
+        assert_eq!(
+            metadata_sub_budget_bytes(family, None, 256 * mib),
+            LARGE_METADATA_MAX_BYTES,
+            "floored at one cap"
+        );
+        assert_eq!(metadata_sub_budget_bytes(family, None, 64 * mib), 64 * mib);
+        assert_eq!(metadata_sub_budget_bytes(family, Some("8192"), gib), 8192);
+        let families: usize = MetadataBudgetFamily::ALL
+            .iter()
+            .map(|f| metadata_sub_budget_bytes(*f, None, DEFAULT_PROXY_METADATA_BUDGET_BYTES))
+            .sum();
+        assert!(
+            DEFAULT_PROXY_METADATA_BUDGET_BYTES - families >= 3 * LARGE_METADATA_MAX_BYTES,
+            "every family saturated at once still leaves three 128 MiB buffers"
+        );
+    }
+
+    /// #5973: a family fetch reserves a fresh cached document's own size, and
+    /// the full cap when the size is unknown or larger than the cap.
+    #[test]
+    fn family_fetch_reservation_is_the_cached_size_when_known() {
+        let cap = LARGE_METADATA_MAX_BYTES;
+        assert_eq!(family_fetch_reservation_bytes(None, cap), cap);
+        assert_eq!(
+            family_fetch_reservation_bytes(Some(24_000_000), cap),
+            24_000_000
+        );
+        assert_eq!(family_fetch_reservation_bytes(Some(0), cap), 0);
+        assert_eq!(
+            family_fetch_reservation_bytes(Some(cap as u64 + 1), cap),
+            cap
+        );
+    }
+
     #[test]
     fn metadata_budget_family_metadata_is_distinct_per_family() {
         let labels: std::collections::HashSet<_> = MetadataBudgetFamily::ALL
@@ -16922,6 +17214,43 @@ mod tests {
         assert_eq!(sub.budget().available_bytes(), 60 * U);
         assert_eq!(shared.available_bytes(), 60 * U);
         drop(permit);
+    }
+
+    /// #5973: the non-blocking family reservation used for a top-up refuses
+    /// at once instead of waiting, both when the share is held whole and when
+    /// the shared budget is, and a family slice taken before the shared
+    /// budget refused is given back.
+    #[test]
+    fn try_reserve_metadata_budget_never_waits_and_returns_a_refused_slice() {
+        const U: usize = PROXY_METADATA_BUDGET_UNIT_BYTES;
+        let shared = ProxyMetadataBudget::new(100 * U);
+        let sub = leaked_sub_budget(50 * U);
+
+        let whole = try_reserve_metadata_budget_in(&shared, Some(sub), 50 * U)
+            .unwrap_or_else(|| panic!("an idle share admits its whole size"));
+        assert!(
+            try_reserve_metadata_budget_in(&shared, Some(sub), U).is_none(),
+            "a share held whole refuses at once"
+        );
+        drop(whole);
+
+        let hog = shared.try_reserve(100 * U).expect("fresh budget");
+        assert!(try_reserve_metadata_budget_in(&shared, Some(sub), 10 * U).is_none());
+        assert_eq!(
+            sub.budget().available_bytes(),
+            50 * U,
+            "the family slice is given back when the shared budget refuses"
+        );
+        assert_eq!(sub.saturation(), 0.0);
+        drop(hog);
+
+        let permit = try_reserve_metadata_budget_in(&shared, Some(sub), 10 * U)
+            .unwrap_or_else(|| panic!("fits once free"));
+        assert_eq!(shared.available_bytes(), 90 * U);
+        assert_eq!(sub.budget().available_bytes(), 40 * U);
+        drop(permit);
+        assert_eq!(shared.available_bytes(), 100 * U);
+        assert_eq!(sub.budget().available_bytes(), 50 * U);
     }
 
     /// The saturation gauge is emitted per family and follows reserve and
@@ -27991,6 +28320,153 @@ mod tests {
         );
 
         curation_cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // ── popularity name checks on the proxy path (#5159) ─────────────────
+
+    /// Cyrillic `о` (U+043E) for the first `o` of the npm seed name `lodash`.
+    const LODASH_HOMOGLYPH: &str = "l\u{043e}dash";
+
+    /// Attach a repo-scoped `popularity` rule (never global: a global rule
+    /// would reach every peer test's npm/PyPI evaluation).
+    async fn insert_popularity_rule(
+        pool: &sqlx::PgPool,
+        repo_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+        config: serde_json::Value,
+    ) -> uuid::Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO curation_rules (staging_repo_id, package_pattern, version_constraint, \
+             architecture, action, priority, reason, rule_type, config, created_by) \
+             VALUES ($1, '*', '*', '*', 'block', 100, '#5159 popularity', 'popularity', $2, $3) \
+             RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(config)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("insert popularity rule")
+    }
+
+    #[tokio::test]
+    async fn test_curation_popularity_name_check_blocks_homoglyph_on_npm_remote() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let (user_id, repo_id, key) = seed_curated_repo(&pool, "remote", true, None).await;
+        // Upgrade safety (#5274): a rule written before the download checks
+        // existed has no `download_name_checks` key and changes nothing here.
+        let rule_id = insert_popularity_rule(
+            &pool,
+            repo_id,
+            user_id,
+            serde_json::json!({"block_typosquat": true, "min_downloads": 1000}),
+        )
+        .await;
+        let repo = repo_info_for(repo_id, &key, "remote", true);
+        let before_opt_in = evaluate_curation(&pool, &repo, LODASH_HOMOGLYPH, None).await;
+        sqlx::query("UPDATE curation_rules SET config = config || $2 WHERE id = $1")
+            .bind(rule_id)
+            .bind(serde_json::json!({"download_name_checks": true}))
+            .execute(&pool)
+            .await
+            .expect("opt the rule into download checks");
+
+        let blocked = evaluate_curation(&pool, &repo, LODASH_HOMOGLYPH, None).await;
+        let resp = enforce_curation(&pool, &repo, LODASH_HOMOGLYPH, None).await;
+        let seed = enforce_curation(&pool, &repo, "lodash", None).await;
+        // The lookup seam (cargo/OCI) has no format, so the rule is skipped.
+        let lookup =
+            enforce_curation_lookup(&pool, repo_id, &key, "remote", LODASH_HOMOGLYPH, None).await;
+        curation_cleanup(&pool, repo_id, user_id).await;
+
+        assert!(
+            before_opt_in.is_ok(),
+            "a rule without download_name_checks must not touch downloads"
+        );
+        let block = blocked.expect_err("a homoglyph of a seed package must be refused");
+        assert_eq!(block.package, LODASH_HOMOGLYPH);
+        assert!(block.reason.contains("'lodash'"), "{}", block.reason);
+        let resp = resp.expect_err("the rendered seam must 403 too");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "curation_blocked");
+        assert!(seed.is_ok(), "the legitimate seed package must be served");
+        assert!(
+            lookup.is_ok(),
+            "a format-less lookup must not run name checks"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_curation_popularity_flag_serves_and_skips_other_formats() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let (user_id, repo_id, key) = seed_curated_repo(&pool, "remote", true, None).await;
+        // Default config: a typo-squat is flagged, not blocked.
+        insert_popularity_rule(
+            &pool,
+            repo_id,
+            user_id,
+            serde_json::json!({"download_name_checks": true}),
+        )
+        .await;
+        let repo = repo_info_for(repo_id, &key, "remote", true);
+        let flagged = enforce_curation(&pool, &repo, LODASH_HOMOGLYPH, None).await;
+
+        // The same blocking rule on a format without a popularity ecosystem
+        // has no effect.
+        sqlx::query("UPDATE curation_rules SET config = $2 WHERE staging_repo_id = $1")
+            .bind(repo_id)
+            .bind(serde_json::json!({"block_typosquat": true, "download_name_checks": true}))
+            .execute(&pool)
+            .await
+            .expect("escalate rule");
+        let mut maven = repo_info_for(repo_id, &key, "remote", true);
+        maven.format = "maven".to_string();
+        let other_format = enforce_curation(&pool, &maven, LODASH_HOMOGLYPH, None).await;
+        curation_cleanup(&pool, repo_id, user_id).await;
+
+        assert!(flagged.is_ok(), "a Flag must serve the download");
+        assert!(other_format.is_ok(), "popularity applies to npm/PyPI only");
+    }
+
+    fn proxy_eval(
+        action: &str,
+        rule_id: Option<uuid::Uuid>,
+    ) -> crate::services::curation_service::RuleEvaluation {
+        crate::services::curation_service::RuleEvaluation {
+            action: action.to_string(),
+            reason: "test reason".to_string(),
+            rule_id,
+        }
+    }
+
+    #[test]
+    fn test_curation_verdict_maps_proxy_outcomes() {
+        let repo = repo_info_for(uuid::Uuid::new_v4(), "k", "remote", true);
+        let target = CurationTarget::from(&repo);
+        let rule = Some(uuid::Uuid::new_v4());
+
+        let block =
+            curation_verdict(&target, "pkg", proxy_eval("block", rule)).expect_err("block refuses");
+        assert_eq!(
+            block,
+            CurationBlock {
+                package: "pkg".to_string(),
+                reason: "test reason".to_string(),
+            }
+        );
+        // A flagged rule and the review default stance both serve.
+        assert!(curation_verdict(&target, "pkg", proxy_eval("review", rule)).is_ok());
+        assert!(curation_verdict(&target, "pkg", proxy_eval("review", None)).is_ok());
+        assert!(curation_verdict(&target, "pkg", proxy_eval("allow", rule)).is_ok());
+        assert_eq!(target.format, Some("npm"));
     }
 
     // -----------------------------------------------------------------------

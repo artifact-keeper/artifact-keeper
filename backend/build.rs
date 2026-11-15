@@ -1,6 +1,18 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = std::env::var("OUT_DIR").unwrap();
 
+    // Declaring any rerun-if-changed at all (the git SHA below does) turns off
+    // cargo's default of rerunning on every change in the package, so the
+    // schemas have to name themselves or an edited .proto regenerates nothing
+    // and the build fails against the previous generation -- or, worse, keeps
+    // compiling against it.
+    for entry in std::fs::read_dir("proto")? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|ext| ext == "proto") {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+
     // Generate file descriptor set for gRPC reflection
     let descriptor_path = format!("{}/sbom_descriptor.bin", out_dir);
 
@@ -22,6 +34,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/hex_names.proto",
                 "proto/hex_versions.proto",
                 "proto/hex_package.proto",
+            ],
+            &["proto"],
+        )?;
+
+    // The hosted BSR endpoints answer the buf CLI, which speaks Connect with
+    // the binary protobuf codec, so the messages it sends and expects need real
+    // generated types rather than hand-written serde structs. Only the subset
+    // the endpoints exchange is vendored; see proto/bsr_module_v1.proto.
+    prost_build::Config::new()
+        .out_dir(&out_dir)
+        .compile_protos(
+            &[
+                "proto/bsr_owner_v1.proto",
+                "proto/bsr_module_v1.proto",
+                "proto/bsr_module_v1beta1.proto",
             ],
             &["proto"],
         )?;

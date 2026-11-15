@@ -95,6 +95,7 @@ pub mod oci_manifests;
 pub mod oci_migration_reindex;
 pub mod oci_promotion;
 pub mod oci_referenced_content;
+pub mod oci_rootfs;
 pub mod oci_trusted_realms;
 pub mod oidc_env_bootstrap;
 pub mod oidc_service;

@@ -186,6 +186,24 @@ where
 /// Older adapters send no such header; their pending jobs count as running.
 pub(crate) const ADAPTER_SCAN_STATUS_HEADER: &str = "X-Scan-Status";
 
+/// `X-Scan-Status` value of a job the adapter refused because the image is
+/// over its `SCANNER_MAX_IMAGE_BYTES` (#5909). It comes on a terminal `422`.
+pub(crate) const ADAPTER_SCAN_STATUS_TOO_LARGE: &str = "TooLarge";
+
+/// Whether a terminal report response says the adapter refused the image as
+/// too large to scan (#5909), as opposed to a scan that ran and failed. Such
+/// a job is never resubmitted: the image is the same size the next time.
+pub(crate) fn adapter_reports_too_large(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> bool {
+    status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        && headers
+            .get(ADAPTER_SCAN_STATUS_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case(ADAPTER_SCAN_STATUS_TOO_LARGE))
+}
+
 /// Longest a job may wait in the adapter's queue on top of a client's own
 /// poll budget. Time spent `Queued` is not charged to that budget, which is
 /// sized for one trivy run, so a burst of scans waits for a slot instead of
@@ -909,6 +927,14 @@ impl ScannerAdapterFsClient {
         .await
     }
 
+    /// [`Self::unavailable`] for an adapter that is unreachable or not ready,
+    /// which a queued scan retries once it is back (#5994). A no-op signal for
+    /// an in-process scan. Misconfiguration (an unusable token) is not this.
+    fn unreachable(&self, detail: impl std::fmt::Display) -> AppError {
+        crate::services::scan_queue::note_engine_unavailable();
+        self.unavailable(detail)
+    }
+
     /// Availability-class error: the sidecar is down/unready, which degrades
     /// the scan to `not_applicable` (#2324) instead of failing it closed.
     fn unavailable(&self, detail: impl std::fmt::Display) -> AppError {
@@ -964,7 +990,7 @@ impl ScannerAdapterFsClient {
             log_adapter_ready_outcome(&self.adapter_url, started, &outcome);
         }
         outcome.map(|_| ()).map_err(|f| {
-            self.unavailable(format!(
+            self.unreachable(format!(
                 "{}{} ({})",
                 f.kind.describe(),
                 f.budget_note(),
@@ -991,11 +1017,11 @@ impl ScannerAdapterFsClient {
             .body(tar)
             .send()
             .await
-            .map_err(|e| self.unavailable(format!("workspace upload failed: {}", e)))?;
+            .map_err(|e| self.unreachable(format!("workspace upload failed: {}", e)))?;
 
         let status = resp.status();
         if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-            return Err(self.unavailable("adapter answered 503 on submit"));
+            return Err(self.unreachable("adapter answered 503 on submit"));
         }
         if !status.is_success() {
             let text = adapter_error_text(resp).await;
@@ -1053,7 +1079,7 @@ impl ScannerAdapterFsClient {
                             tokio::time::sleep(wait).await;
                             continue;
                         }
-                        None => return Err(self.unavailable(detail).into()),
+                        None => return Err(self.unreachable(detail).into()),
                     }
                 }
             };
@@ -1746,6 +1772,19 @@ mod tests {
             matches!(err, AppError::ScannerEngineUnavailable(_)),
             "unreachable adapter must be ScannerEngineUnavailable, got {err:?}"
         );
+    }
+
+    /// #5994: an unreachable adapter on the filesystem path also reports the
+    /// engine unavailable, so a queued scan retries it like an image scan.
+    #[tokio::test]
+    async fn test_unreachable_adapter_reports_the_engine_unavailable() {
+        let client = ScannerAdapterFsClient::new("http://127.0.0.1:1".to_string());
+        let (result, unavailable) = crate::services::scan_queue::tracking_engine_unavailable(
+            client.scan_workspace_tar(tiny_tar()),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::ScannerEngineUnavailable(_))));
+        assert!(unavailable);
     }
 
     /// A 503 from /probe/ready (adapter starting / DB not loaded) is also an

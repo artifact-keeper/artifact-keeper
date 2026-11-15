@@ -239,12 +239,15 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         sqlx::query("SET lock_timeout = '5min'")
             .execute(&mut *conn)
             .await?;
-        // Clear INVALID leftovers of interrupted CREATE INDEX CONCURRENTLY
-        // migrations so the retry rebuilds them instead of skipping them
-        // (#4426). Under the migrator's own advisory lock, on this session.
-        artifact_keeper_backend::migration_repair::repair_invalid_concurrent_indexes(&mut conn)
-            .await?;
-        artifact_keeper_backend::MIGRATOR.run(&mut *conn).await?;
+        // Takes the migration lock without blocking in pg_advisory_lock (a
+        // blocked waiter deadlocks a CREATE INDEX CONCURRENTLY in the holder,
+        // #5993), repairs INVALID concurrent index leftovers under that lock
+        // (#4426, #5993), then applies pending migrations.
+        artifact_keeper_backend::migration_repair::run_startup_migrations(
+            &mut conn,
+            &artifact_keeper_backend::MIGRATOR,
+        )
+        .await?;
         tracing::info!("Database migrations complete");
     }
 
@@ -1779,16 +1782,32 @@ async fn assert_connect_info_wired(app: Router) {
 // Platform-specific entrypoints
 // ---------------------------------------------------------------------------
 
+/// `artifact-keeper healthcheck [URL]`: the image's HEALTHCHECK probe, run
+/// before any runtime or config is built (see `cli::healthcheck`). Exits the
+/// process when the subcommand is given; returns otherwise.
+fn run_healthcheck_subcommand_if_requested() {
+    use artifact_keeper_backend::cli::healthcheck;
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some(healthcheck::SUBCOMMAND) {
+        std::process::exit(healthcheck::run(&args[2..]));
+    }
+}
+
 #[cfg(not(windows))]
-#[tokio::main]
-async fn main() -> Result<()> {
-    run_server(None).await
+fn main() -> Result<()> {
+    run_healthcheck_subcommand_if_requested();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime")
+        .block_on(run_server(None))
 }
 
 #[cfg(windows)]
 fn main() -> Result<()> {
     use artifact_keeper_backend::error::AppError;
 
+    run_healthcheck_subcommand_if_requested();
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--service") {
