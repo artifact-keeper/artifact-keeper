@@ -20,8 +20,10 @@
 # ---------------------------------------------------------------------------
 # CURL_VERSION IS HAND-MAINTAINED. Nothing bumps it for you: Dependabot does
 # not read ARGs, the libcurl below is not an RPM so Trivy and the publish gate
-# cannot see it, and scripts/ci has no pin check for source tarballs. When you
-# touch this file, and at least once a release:
+# cannot see it. scripts/ci/check-curl-advisories.py checks the pin against
+# https://curl.se/docs/vuln.json daily (scheduled-curl-advisory-watch.yml,
+# #6003), but nothing bumps it. When you touch this file, and at least once a
+# release:
 #   * New releases: https://curl.se/download/ (or the curl/curl GitHub
 #     releases). curl ships roughly every 8 weeks, with patch releases for
 #     security fixes in between.
@@ -59,6 +61,16 @@ RUN curl -fsSLo /tmp/curl.tar.xz "https://curl.se/download/curl-${CURL_VERSION}.
     && make -j"$(nproc)" -C lib \
     && make -C lib install DESTDIR=/out \
     && ! readelf -d /out/usr/lib64/libcurl.so.4 | grep -E 'krb5|gssapi|libssh|ldap|sasl'
+
+# CycloneDX entry for this libcurl (#6003), from the same CURL_VERSION, after
+# checking the unpacked source declares that version. Installed in the runtime
+# image as /usr/share/sbom/curl.cdx.json: RPM-database scanners cannot see a
+# source-built libcurl, CPE-matching ones (syft's sbom-cataloger, grype) can.
+COPY docker/curl-sbom.sh /usr/local/bin/curl-sbom.sh
+RUN grep -q "^#define LIBCURL_VERSION \"${CURL_VERSION}\"" /src/include/curl/curlver.h \
+    && mkdir -p /out/sbom \
+    && sh /usr/local/bin/curl-sbom.sh libcurl "${CURL_VERSION}" "${CURL_SHA256}" \
+        /usr/lib64/libcurl.so.4 > /out/sbom/curl.cdx.json
 
 # ---------- Stage 1: Build minimal rootfs with OpenSCAP ----------
 FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rootfs-builder
@@ -204,6 +216,9 @@ FROM registry.access.redhat.com/ubi9/ubi-micro:9.8
 COPY --from=rootfs-builder /mnt/rootfs /
 
 COPY scripts/openscap-wrapper.py /usr/local/bin/openscap-wrapper.py
+
+# CycloneDX entry for the source-built libcurl (stage 0, #6003).
+COPY --from=curl-builder /out/sbom/curl.cdx.json /usr/share/sbom/curl.cdx.json
 
 # restricted-v2 runs this container as a UID with no /etc/passwd entry, so
 # glibc cannot resolve a home directory and HOME arrives as `/`, which the
