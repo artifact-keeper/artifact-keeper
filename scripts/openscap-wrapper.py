@@ -13,13 +13,29 @@ directory. The wrapper evaluates THAT tree, offline, by pointing oscap's
 probes at it with the ``OSCAP_PROBE_ROOT`` environment variable. oscap 1.3 has
 no ``--chroot`` option (``oscap-chroot`` is a shell wrapper that sets the same
 variable), and every probe that does not handle the root itself (``rpminfo``,
-for one) ``chroot(2)``s into it, which needs ``CAP_SYS_CHROOT``. This process
-runs as a non-root UID, so oscap is started inside a fresh user namespace
-where it is root over the files the backend wrote (their owner UID is mapped
-to 0). When user namespaces are blocked (Docker's default seccomp profile
-blocks ``unshare(CLONE_NEWUSER)``) and the process cannot chroot either, the
-scan is answered ``not_applicable`` with that reason. It is never evaluated
-against this container's own filesystem, which is what every scan did before.
+for one) ``chroot(2)``s into it, which needs ``CAP_SYS_CHROOT``. There are two
+ways to get it:
+
+* default: the wrapper runs as a non-root UID and starts oscap in a fresh user
+  namespace, where it is root over the files the backend wrote (their owner
+  UID is mapped to 0). Rootless Podman allows this out of the box; Docker's
+  default seccomp profile blocks ``unshare(CLONE_NEWUSER)``.
+* root mode, opt-in: ``OPENSCAP_RUN_AS_ROOT=true`` with the container started
+  as root (compose ``user: "0"``). oscap is started without a user namespace,
+  but NOT as full root: the child drops to the image's ``oscap`` UID (1001),
+  keeps only ``CAP_SYS_CHROOT`` (plus ``CAP_DAC_READ_SEARCH``, read-only
+  access to every file, when the container grants it), shrinks its
+  capability bounding set to those, and sets ``no_new_privs``. librpm, which the ``rpminfo`` probe drives
+  inside the chroot, reads the image's own rpm configuration, so the probe
+  child must not hold real root.
+
+When neither is available the scan is answered ``not_applicable`` with that
+reason. It is never evaluated against this container's own filesystem, which
+is what every scan did before.
+
+Symlinks: the backend writes every symlink in the tree with a relative target
+that resolves inside the tree, so a probe that does not chroot (oscap's own
+offline mode for the file probes) cannot be led out of it either.
 
 A scan that cannot be evaluated meaningfully is ``not_applicable``, never a
 clean pass: no ``os-release`` in the tree, no shipped datastream for its OS,
@@ -82,6 +98,7 @@ OWNERSHIP_RULE_RE = re.compile(
     r"|_(group_?)?ownership$"
     r"|unowned|ungroupowned"
     r"|_(root|system)_owned$"
+    r"|^file_etc_security_opasswd$"
 )
 
 # XCCDF results that mean the rule was evaluated against the target.
@@ -91,8 +108,35 @@ FINDING_RESULTS = ("fail", "error", "unknown")
 
 # Linux unshare(2) flag.
 CLONE_NEWUSER = 0x10000000
-# Bit of CAP_SYS_CHROOT in /proc/self/status CapEff.
+# Capability numbers (linux/capability.h).
+CAP_DAC_READ_SEARCH = 2
 CAP_SYS_CHROOT = 18
+# The only capabilities a root-mode probe child keeps: CAP_SYS_CHROOT always,
+# CAP_DAC_READ_SEARCH (read any file, write none) when the container grants it.
+# Neither Docker nor Podman grants CAP_DAC_READ_SEARCH by default; without it
+# the child reads the tree as its owner, so a file the image ships at mode
+# 0000 (/etc/shadow) cannot be read and the rules that read it report error.
+ROOT_MODE_REQUIRED_CAPS = (CAP_SYS_CHROOT,)
+ROOT_MODE_OPTIONAL_CAPS = (CAP_DAC_READ_SEARCH,)
+# prctl(2) options.
+PR_CAPBSET_DROP = 24
+PR_SET_KEEPCAPS = 8
+PR_SET_NO_NEW_PRIVS = 38
+PR_CAP_AMBIENT = 47
+PR_CAP_AMBIENT_RAISE = 2
+_LINUX_CAPABILITY_VERSION_3 = 0x20080522
+
+# Opt-in root mode (see the module docstring). Read once at start-up.
+RUN_AS_ROOT_ENV = "OPENSCAP_RUN_AS_ROOT"
+# The UID a root-mode probe child drops to: the image's `oscap` user.
+SCAN_UID = int(os.environ.get("OPENSCAP_SCAN_UID", "1001"))
+
+# How to get real results, quoted in every "cannot evaluate here" reason.
+ENABLE_HINT = (
+    "run the sidecar on rootless Podman, allow unprivileged user namespaces "
+    "for it (for example seccomp=unconfined), or start it as root with "
+    f"{RUN_AS_ROOT_ENV}=true"
+)
 
 
 def _is_under(path, base):
@@ -271,18 +315,33 @@ def is_ownership_rule(rule_id):
     return bool(OWNERSHIP_RULE_RE.search(short))
 
 
-def can_chroot():
-    """Whether this process can chroot(2) without a user namespace."""
-    if os.geteuid() == 0:
-        return True
-    try:
-        with open("/proc/self/status") as f:
-            for line in f:
-                if line.startswith("CapEff:"):
-                    return bool(int(line.split()[1], 16) & (1 << CAP_SYS_CHROOT))
-    except (OSError, ValueError):
-        pass
-    return False
+def run_as_root_requested(environ=None):
+    """Whether the operator opted in to root mode."""
+    value = (environ if environ is not None else os.environ).get(RUN_AS_ROOT_ENV, "")
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def isolation_plan(euid, root_requested, userns_blocked):
+    """Decide how oscap's probes get CAP_SYS_CHROOT.
+
+    Returns ("root", None), ("userns", None) or (None, reason). Root mode is
+    used only when it was asked for AND the process is root; nothing else
+    ever runs oscap without a user namespace.
+    """
+    if root_requested and euid == 0:
+        return "root", None
+    if not userns_blocked:
+        return "userns", None
+    if root_requested:
+        return None, (
+            f"{RUN_AS_ROOT_ENV} is set but the OpenSCAP sidecar is not running as "
+            "root (start the container with user \"0\"), and user namespaces are "
+            "blocked in this container runtime"
+        )
+    return None, (
+        "the OpenSCAP sidecar cannot evaluate an unpacked filesystem here: user "
+        f"namespaces are blocked in this container runtime; {ENABLE_HINT}"
+    )
 
 
 def _userns_preexec(uid, gid):
@@ -308,10 +367,101 @@ def _userns_preexec(uid, gid):
     return enter
 
 
-# Which isolation worked last: "userns", "direct", or None (not yet known).
+def cap_mask(caps):
+    """The 64-bit capability mask of `caps`, as the (low, high) u32 words."""
+    mask = 0
+    for c in caps:
+        mask |= 1 << c
+    return mask & 0xFFFFFFFF, mask >> 32
+
+
+def bounding_caps(status_text=None):
+    """The capability numbers in this process's bounding set."""
+    if status_text is None:
+        try:
+            with open("/proc/self/status") as f:
+                status_text = f.read()
+        except OSError:
+            return set()
+    for line in status_text.splitlines():
+        if line.startswith("CapBnd:"):
+            mask = int(line.split()[1], 16)
+            return {c for c in range(64) if mask & (1 << c)}
+    return set()
+
+
+def root_mode_caps(bounding):
+    """What a root-mode child keeps, or None when CAP_SYS_CHROOT is missing."""
+    if not all(c in bounding for c in ROOT_MODE_REQUIRED_CAPS):
+        return None
+    return tuple(ROOT_MODE_REQUIRED_CAPS) + tuple(
+        c for c in ROOT_MODE_OPTIONAL_CAPS if c in bounding)
+
+
+def _last_cap():
+    try:
+        with open("/proc/sys/kernel/cap_last_cap") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return 40
+
+
+def _root_mode_preexec(scan_uid, keep):
+    """preexec_fn for root mode: drop from root to `scan_uid` with `keep` only.
+
+    Runs in the forked child, before exec. Every step must succeed, or the
+    child raises and the scan is refused rather than run with more privilege
+    than intended.
+    """
+    def enter():
+        libc = ctypes.CDLL(None, use_errno=True)
+
+        def check(rc, what):
+            if rc != 0:
+                err = ctypes.get_errno()
+                raise OSError(err, f"{what}: {os.strerror(err)}")
+
+        # 1. Shrink the bounding set to `keep`: nothing dropped here can come
+        #    back, whatever this process execs.
+        for cap in range(_last_cap() + 1):
+            if cap not in keep:
+                check(libc.prctl(PR_CAPBSET_DROP, cap, 0, 0, 0), f"drop capability {cap}")
+        # 2. Keep the permitted set across the UID change, then become the
+        #    unprivileged scanning user (supplementary groups cleared, GID 0
+        #    kept as the image's arbitrary-UID convention has it).
+        check(libc.prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0), "PR_SET_KEEPCAPS")
+        os.setgroups([])
+        os.setgid(0)
+        os.setuid(scan_uid)
+        # 3. Effective, permitted and inheritable = `keep`.
+        low, high = cap_mask(keep)
+
+        class Header(ctypes.Structure):
+            _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+
+        class Data(ctypes.Structure):
+            _fields_ = [("effective", ctypes.c_uint32), ("permitted", ctypes.c_uint32),
+                        ("inheritable", ctypes.c_uint32)]
+
+        header = Header(_LINUX_CAPABILITY_VERSION_3, 0)
+        data = (Data * 2)(Data(low, low, low), Data(high, high, high))
+        check(libc.capset(ctypes.byref(header), data), "capset")
+        # 4. Ambient, so the capabilities survive exec of oscap (which has no
+        #    file capabilities) for a non-root UID.
+        for cap in keep:
+            check(libc.prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, cap, 0, 0),
+                  f"raise ambient capability {cap}")
+        # 5. Nothing oscap execs can gain privilege (setuid files, file caps).
+        check(libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), "PR_SET_NO_NEW_PRIVS")
+    return enter
+
+
 # A deployment that blocks user namespaces blocks them for every scan, so the
 # failed attempt is not repeated.
 _ISOLATION = {"userns_blocked": False}
+RUN_AS_ROOT = run_as_root_requested()
+# Scans evaluated per isolation mode since start-up, reported by /health.
+EVALUATIONS = {}
 
 
 def _run_oscap_offline(cmd, scan_path, timeout):
@@ -320,27 +470,37 @@ def _run_oscap_offline(cmd, scan_path, timeout):
     Returns (CompletedProcess, isolation) or raises OfflineUnsupported.
     """
     env = dict(os.environ, OSCAP_PROBE_ROOT=scan_path)
-    if not _ISOLATION["userns_blocked"]:
+    while True:
+        mode, reason = isolation_plan(os.geteuid(), RUN_AS_ROOT, _ISOLATION["userns_blocked"])
+        if mode is None:
+            raise OfflineUnsupported(reason)
+        if mode == "root":
+            keep = root_mode_caps(bounding_caps())
+            if keep is None:
+                raise OfflineUnsupported(
+                    f"{RUN_AS_ROOT_ENV} is set but the container does not grant "
+                    "CAP_SYS_CHROOT, which oscap needs to enter the unpacked filesystem"
+                )
+            preexec = _root_mode_preexec(SCAN_UID, keep)
+        else:
+            preexec = _userns_preexec(os.getuid(), os.getgid())
         try:
             result = subprocess.run(  # noqa: S603 - inputs validated by caller
                 cmd, capture_output=True, text=True, timeout=timeout, env=env,
-                preexec_fn=_userns_preexec(os.getuid(), os.getgid()),
+                preexec_fn=preexec,
             )
-            return result, "userns"
+            return result, mode
+        except subprocess.TimeoutExpired:
+            raise
         except subprocess.SubprocessError as e:
-            if isinstance(e, subprocess.TimeoutExpired):
-                raise
-            # The preexec_fn raised: user namespaces are not available here.
+            # The preexec_fn raised.
+            if mode == "root":
+                raise OfflineUnsupported(
+                    f"{RUN_AS_ROOT_ENV} is set but the OpenSCAP sidecar could not drop "
+                    f"to UID {SCAN_UID} with only CAP_SYS_CHROOT ({e}); the container "
+                    "must keep CAP_SETUID, CAP_SETGID, CAP_SETPCAP and CAP_SYS_CHROOT"
+                )
             _ISOLATION["userns_blocked"] = True
-    if not can_chroot():
-        raise OfflineUnsupported(
-            "the OpenSCAP sidecar cannot evaluate an unpacked filesystem here: "
-            "user namespaces are blocked and the process lacks CAP_SYS_CHROOT"
-        )
-    result = subprocess.run(  # noqa: S603 - inputs validated by caller
-        cmd, capture_output=True, text=True, timeout=timeout, env=env,
-    )
-    return result, "direct"
 
 
 class OfflineUnsupported(Exception):
@@ -386,8 +546,8 @@ def run_oscap_scan(scan_path, profile, content_file):
         if "chroot" in result.stderr and "not permitted" in result.stderr:
             return 200, {
                 "status": "not_applicable",
-                "reason": "the OpenSCAP sidecar cannot chroot into the unpacked filesystem "
-                          "(needs a user namespace or CAP_SYS_CHROOT)",
+                "reason": "the OpenSCAP sidecar cannot chroot into the unpacked filesystem; "
+                          + ENABLE_HINT,
                 "findings": [],
             }
         return 500, {
@@ -397,6 +557,8 @@ def run_oscap_scan(scan_path, profile, content_file):
 
     rule_results = parse_xccdf_results(results_file, content_file)
     _unlink(results_file)
+    EVALUATIONS[isolation] = EVALUATIONS.get(isolation, 0) + 1
+    sys.stderr.write(f"[openscap-wrapper] evaluated {scan_path} isolation={isolation}\n")
     summary = summarize_results(rule_results)
     response = {
         "status": "completed",
@@ -569,6 +731,8 @@ class OpenSCAPHandler(BaseHTTPRequestHandler):
                 "version": version,
                 "content_files": list(self.available_content.keys()),
                 "default_profile": DEFAULT_PROFILE,
+                "run_as_root": RUN_AS_ROOT and os.geteuid() == 0,
+                "evaluations": dict(EVALUATIONS),
             })
         else:
             self._json_response(404, {"error": "not found"})
@@ -628,5 +792,8 @@ if __name__ == "__main__":
     print(f"OpenSCAP wrapper starting on port {PORT}", flush=True)
     content = find_scap_content()
     print(f"Available SCAP content: {list(content.keys())}", flush=True)
+    if RUN_AS_ROOT:
+        state = "active" if os.geteuid() == 0 else "requested, but the process is not root"
+        print(f"{RUN_AS_ROOT_ENV}: {state}", flush=True)
     server = HTTPServer(("0.0.0.0", PORT), OpenSCAPHandler)
     server.serve_forever()

@@ -462,13 +462,24 @@ services:
   #
   # The backend unpacks each image into the shared scan workspace and the
   # wrapper evaluates that tree offline (OSCAP_PROBE_ROOT). oscap's probes
-  # chroot(2) into it, so the non-root wrapper starts oscap in a user
-  # namespace (#6000). Rootless Podman allows that by default. Docker's
-  # default seccomp profile blocks unprivileged user namespaces, and every
-  # OpenSCAP scan is then recorded not_applicable with that reason. To
-  # evaluate images on Docker, allow them for this service, for example:
-  #   security_opt:
-  #     - seccomp=unconfined
+  # chroot(2) into it (#6000), which works in one of three ways:
+  #   1. Rootless Podman: the non-root wrapper starts oscap in a user
+  #      namespace. Works with no change here.
+  #   2. Allow unprivileged user namespaces for this service. Docker's default
+  #      seccomp profile blocks them:
+  #        security_opt:
+  #          - seccomp=unconfined
+  #   3. Root mode: start the wrapper as root and opt in. Each scan's oscap
+  #      process still drops to UID 1001 with only CAP_SYS_CHROOT (and
+  #      CAP_DAC_READ_SEARCH if added, so mode-0000 files such as /etc/shadow
+  #      can be read) and no_new_privs:
+  #        user: "0"
+  #        environment:
+  #          OPENSCAP_RUN_AS_ROOT: "true"
+  #        cap_add:
+  #          - DAC_READ_SEARCH
+  # Without one of these (stock Docker), every OpenSCAP scan is recorded
+  # not_applicable with that reason, never as a pass.
   openscap:
     # Same release tag as the backend: both are published by every backend
     # release (#4481).

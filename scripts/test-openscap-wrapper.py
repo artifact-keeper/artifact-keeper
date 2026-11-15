@@ -181,7 +181,8 @@ class Results(unittest.TestCase):
                      "file_audit_tools_group_ownership", "rpm_verify_ownership",
                      "no_files_unowned_by_user", "file_permissions_ungroupowned",
                      "dir_perms_world_writable_root_owned",
-                     "accounts_users_home_files_groupownership"):
+                     "accounts_users_home_files_groupownership",
+                     "file_etc_security_opasswd"):
             self.assertTrue(w.is_ownership_rule("xccdf_org.ssgproject.content_rule_" + rule), rule)
         for rule in ("audit_owner_change_failed", "audit_rules_dac_modification_chown",
                      "file_permissions_etc_shadow", "sshd_disable_user_known_hosts"):
@@ -190,6 +191,95 @@ class Results(unittest.TestCase):
     def test_all_notapplicable_counts_nothing_evaluated(self):
         summary = w.summarize_results([self.rr("a", "notapplicable"), self.rr("b", "notselected")])
         self.assertEqual(summary["evaluated"], 0)
+
+
+class Isolation(unittest.TestCase):
+    """How oscap's probes get CAP_SYS_CHROOT: user namespace, or opt-in root."""
+
+    def test_default_is_user_namespace_even_as_root(self):
+        # Running as root without the opt-in never runs oscap outside a user
+        # namespace.
+        self.assertEqual(w.isolation_plan(0, False, False), ("userns", None))
+        mode, reason = w.isolation_plan(0, False, True)
+        self.assertIsNone(mode)
+        self.assertIn(w.RUN_AS_ROOT_ENV, reason)
+        self.assertIn("rootless Podman", reason)
+
+    def test_root_mode_needs_opt_in_and_root(self):
+        self.assertEqual(w.isolation_plan(0, True, True), ("root", None))
+        self.assertEqual(w.isolation_plan(0, True, False), ("root", None))
+        # Opted in but not root: user namespace if it works, else explain.
+        self.assertEqual(w.isolation_plan(1001, True, False), ("userns", None))
+        mode, reason = w.isolation_plan(1001, True, True)
+        self.assertIsNone(mode)
+        self.assertIn('user "0"', reason)
+
+    def test_opt_in_values(self):
+        for v in ("1", "true", "TRUE", " yes ", "on"):
+            self.assertTrue(w.run_as_root_requested({w.RUN_AS_ROOT_ENV: v}), v)
+        for v in ("", "0", "false", "no", "root"):
+            self.assertFalse(w.run_as_root_requested({w.RUN_AS_ROOT_ENV: v}), v)
+        self.assertFalse(w.run_as_root_requested({}))
+
+    def test_root_mode_keeps_only_chroot_and_read_search(self):
+        docker_default = "CapBnd:\t00000000a80425fb\n"  # Docker's default set
+        bnd = w.bounding_caps(docker_default)
+        self.assertIn(w.CAP_SYS_CHROOT, bnd)
+        self.assertNotIn(w.CAP_DAC_READ_SEARCH, bnd)
+        self.assertEqual(w.root_mode_caps(bnd), (w.CAP_SYS_CHROOT,))
+        self.assertEqual(w.root_mode_caps(bnd | {w.CAP_DAC_READ_SEARCH}),
+                         (w.CAP_SYS_CHROOT, w.CAP_DAC_READ_SEARCH))
+        self.assertIsNone(w.root_mode_caps({w.CAP_DAC_READ_SEARCH}))
+        self.assertEqual(w.cap_mask((w.CAP_SYS_CHROOT, w.CAP_DAC_READ_SEARCH)), (0x40004, 0))
+
+    def test_root_path_runs_without_user_namespace(self):
+        from unittest import mock
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(kw["preexec_fn"])
+            self.assertEqual(kw["env"]["OSCAP_PROBE_ROOT"], "/scan-workspace/x/rootfs")
+            return mock.Mock(returncode=0, stderr="")
+
+        sentinel = object()
+        with mock.patch.object(w, "RUN_AS_ROOT", True), \
+             mock.patch.object(w.os, "geteuid", return_value=0), \
+             mock.patch.object(w, "bounding_caps", return_value={w.CAP_SYS_CHROOT}), \
+             mock.patch.object(w, "_root_mode_preexec", return_value=sentinel) as root_pre, \
+             mock.patch.object(w, "_userns_preexec") as userns_pre, \
+             mock.patch.object(w.subprocess, "run", side_effect=fake_run):
+            _, mode = w._run_oscap_offline(["oscap"], "/scan-workspace/x/rootfs", 5)
+        self.assertEqual(mode, "root")
+        self.assertEqual(calls, [sentinel])
+        root_pre.assert_called_once_with(w.SCAN_UID, (w.CAP_SYS_CHROOT,))
+        userns_pre.assert_not_called()
+
+    def test_root_path_without_chroot_capability_is_refused(self):
+        from unittest import mock
+        with mock.patch.object(w, "RUN_AS_ROOT", True), \
+             mock.patch.object(w.os, "geteuid", return_value=0), \
+             mock.patch.object(w, "bounding_caps", return_value=set()), \
+             mock.patch.object(w.subprocess, "run") as run:
+            with self.assertRaises(w.OfflineUnsupported) as ctx:
+                w._run_oscap_offline(["oscap"], "/scan-workspace/x/rootfs", 5)
+        run.assert_not_called()
+        self.assertIn("CAP_SYS_CHROOT", str(ctx.exception))
+
+    def test_blocked_user_namespace_without_opt_in_never_runs_unconfined(self):
+        import subprocess as sp
+        from unittest import mock
+        old = dict(w._ISOLATION)
+        try:
+            w._ISOLATION["userns_blocked"] = False
+            with mock.patch.object(w, "RUN_AS_ROOT", False), \
+                 mock.patch.object(w.os, "geteuid", return_value=0), \
+                 mock.patch.object(w.subprocess, "run",
+                                   side_effect=sp.SubprocessError("preexec")) as run:
+                with self.assertRaises(w.OfflineUnsupported):
+                    w._run_oscap_offline(["oscap"], "/scan-workspace/x/rootfs", 5)
+            self.assertEqual(run.call_count, 1, "one userns attempt, no unconfined retry")
+        finally:
+            w._ISOLATION.update(old)
 
 
 class Paths(unittest.TestCase):
