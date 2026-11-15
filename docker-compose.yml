@@ -459,6 +459,16 @@ services:
   # ---------------------------------------------------------------------------
   # Runs SCAP compliance checks against container images. Optional: remove
   # this service and unset OPENSCAP_URL on the backend if not needed.
+  #
+  # The backend unpacks each image into the shared scan workspace and the
+  # wrapper evaluates that tree offline (OSCAP_PROBE_ROOT). oscap's probes
+  # chroot(2) into it, so the non-root wrapper starts oscap in a user
+  # namespace (#6000). Rootless Podman allows that by default. Docker's
+  # default seccomp profile blocks unprivileged user namespaces, and every
+  # OpenSCAP scan is then recorded not_applicable with that reason. To
+  # evaluate images on Docker, allow them for this service, for example:
+  #   security_opt:
+  #     - seccomp=unconfined
   openscap:
     # Same release tag as the backend: both are published by every backend
     # release (#4481).

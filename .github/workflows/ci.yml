@@ -1623,6 +1623,13 @@ jobs:
       - name: Check the E2E-proof check refuses what it must
         run: bash scripts/ci/test-check-e2e-proof.sh
 
+      # The OpenSCAP wrapper's decisions (#6000): which datastream describes
+      # the scanned tree, an unknown profile is an error and never a silent
+      # substitute, symlinks resolve inside the tree, a tree with no
+      # os-release is not_applicable. Pure Python, no oscap needed. ~1s.
+      - name: Check the OpenSCAP wrapper evaluates only what it can
+        run: python3 -I scripts/test-openscap-wrapper.py
+
       # One layer further out again (#3538). The preflight can be right and
       # still not matter: nothing asserted that one had RUN against the commit
       # being tagged. v1.7.5 burned a version number to a check that existed
