@@ -151,6 +151,7 @@ const STALE_DIGESTS_SQL: &str = r#"
             LIMIT 1
         ) l
         WHERE a.is_deleted = false
+          AND ($5::uuid[] IS NULL OR a.repository_id = ANY($5))
           AND (l.vuln_db_published_at IS NULL OR l.vuln_db_published_at < b.built_at)
           -- A scan of this row is already queued (an upload, a push, a
           -- `POST /security/scan`): it grades against the current database,
@@ -192,6 +193,19 @@ const STALE_DIGESTS_SQL: &str = r#"
 /// of `max_per_day`. Returns how many digests were queued. `0` with
 /// `max_per_day == 0`, which is the default: nothing is selected at all.
 pub async fn enqueue_rescans(db: &PgPool, builds: &[Build], max_per_day: u64) -> Result<u64> {
+    enqueue_rescans_in(db, builds, max_per_day, None).await
+}
+
+/// [`enqueue_rescans`] over the artifacts of `repositories` only (all with
+/// `None`). The DB tests use it so another test's artifacts, scanned at the
+/// same time in the same database, are not selected. A scoped pass neither
+/// reads nor records the instance-wide "nothing stale for this key" memo.
+async fn enqueue_rescans_in(
+    db: &PgPool,
+    builds: &[Build],
+    max_per_day: u64,
+    repositories: Option<&[Uuid]>,
+) -> Result<u64> {
     if max_per_day == 0 || builds.is_empty() {
         return Ok(0);
     }
@@ -214,7 +228,7 @@ pub async fn enqueue_rescans(db: &PgPool, builds: &[Build], max_per_day: u64) ->
             .await
             .map_err(db_err)?
             .flatten();
-    if exhausted.as_deref() == Some(key.as_str()) {
+    if repositories.is_none() && exhausted.as_deref() == Some(key.as_str()) {
         return Ok(0);
     }
 
@@ -238,6 +252,7 @@ pub async fn enqueue_rescans(db: &PgPool, builds: &[Build], max_per_day: u64) ->
         .bind(&ats)
         .bind(&key)
         .bind(limit)
+        .bind(repositories.map(<[Uuid]>::to_vec))
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -284,7 +299,7 @@ pub async fn enqueue_rescans(db: &PgPool, builds: &[Build], max_per_day: u64) ->
     .fetch_one(&mut *tx)
     .await
     .map_err(db_err)?;
-    if (digests.len() as i64) < limit && queued.is_empty() && !active {
+    if repositories.is_none() && (digests.len() as i64) < limit && queued.is_empty() && !active {
         sqlx::query(
             "INSERT INTO scan_rescan_state (id, exhausted_key, updated_at) VALUES (true, $1, NOW()) \
              ON CONFLICT (id) DO UPDATE SET exhausted_key = EXCLUDED.exhausted_key, \
@@ -488,13 +503,20 @@ mod tests {
         scanned(&pool, r2, &fresh, "2026-11-10T00:00:00Z").await;
 
         let builds = vec![("malware".to_string(), at("2026-11-10T00:00:00Z"))];
-        assert_eq!(enqueue_rescans(&pool, &builds, 100).await.expect("tick"), 2);
+        assert_eq!(
+            enqueue_rescans_in(&pool, &builds, 100, Some(&[r1, r2]))
+                .await
+                .expect("tick"),
+            2
+        );
         assert_eq!(
             rescan_digests(&pool).await,
             vec![(a.clone(), PRIORITY_RESCAN), (b.clone(), PRIORITY_RESCAN)]
         );
         assert_eq!(
-            enqueue_rescans(&pool, &builds, 100).await.expect("again"),
+            enqueue_rescans_in(&pool, &builds, 100, Some(&[r1, r2]))
+                .await
+                .expect("again"),
             0,
             "one pass per build"
         );
@@ -505,13 +527,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            enqueue_rescans(&pool, &builds, 100).await.expect("after"),
+            enqueue_rescans_in(&pool, &builds, 100, Some(&[r1, r2]))
+                .await
+                .expect("after"),
             0
         );
 
         // The next build queues them again.
         let newer = vec![("malware".to_string(), at("2026-11-12T00:00:00Z"))];
-        assert_eq!(enqueue_rescans(&pool, &newer, 100).await.expect("newer"), 3);
+        assert_eq!(
+            enqueue_rescans_in(&pool, &newer, 100, Some(&[r1, r2]))
+                .await
+                .expect("newer"),
+            3
+        );
 
         for r in [r1, r2] {
             sqlx::query("DELETE FROM repositories WHERE id = $1")
@@ -629,7 +658,9 @@ mod tests {
             .await
             .expect("record the build");
         assert_eq!(
-            enqueue_rescans(&fx.pool, &builds, 10).await.expect("tick"),
+            enqueue_rescans_in(&fx.pool, &builds, 10, Some(&[fx.repo_id]))
+                .await
+                .expect("tick"),
             1,
             "one job for the digest both rows hold"
         );
@@ -715,7 +746,12 @@ mod tests {
             scanned(&pool, r, &digest(c), "2026-11-01T00:00:00Z").await;
         }
         let first = vec![("malware".to_string(), at("2026-11-10T00:00:00Z"))];
-        assert_eq!(enqueue_rescans(&pool, &first, 4).await.expect("first"), 3);
+        assert_eq!(
+            enqueue_rescans_in(&pool, &first, 4, Some(&[r]))
+                .await
+                .expect("first"),
+            3
+        );
 
         // Another database moves before any of the three ran: a new key.
         let second = vec![
@@ -723,7 +759,9 @@ mod tests {
             ("image".to_string(), at("2026-11-11T00:00:00Z")),
         ];
         assert_eq!(
-            enqueue_rescans(&pool, &second, 4).await.expect("second"),
+            enqueue_rescans_in(&pool, &second, 4, Some(&[r]))
+                .await
+                .expect("second"),
             0,
             "all three are still queued"
         );
@@ -739,7 +777,12 @@ mod tests {
             ("malware".to_string(), at("2026-11-10T00:00:00Z")),
             ("image".to_string(), at("2026-11-12T00:00:00Z")),
         ];
-        assert_eq!(enqueue_rescans(&pool, &third, 4).await.expect("third"), 1);
+        assert_eq!(
+            enqueue_rescans_in(&pool, &third, 4, Some(&[r]))
+                .await
+                .expect("third"),
+            1
+        );
         assert_eq!(rescan_digests(&pool).await.len(), 4);
 
         sqlx::query("DELETE FROM repositories WHERE id = $1")
@@ -818,7 +861,9 @@ mod tests {
 
         let builds = vec![("malware".to_string(), at("2026-11-10T00:00:00Z"))];
         assert_eq!(
-            enqueue_rescans(&pool, &builds, 100).await.expect("tick"),
+            enqueue_rescans_in(&pool, &builds, 100, Some(&[r]))
+                .await
+                .expect("tick"),
             0,
             "the newest scan is on the current build"
         );
@@ -943,14 +988,21 @@ mod tests {
             .expect("image job");
 
         let builds = vec![("malware".to_string(), at("2026-11-10T00:00:00Z"))];
-        assert_eq!(enqueue_rescans(&pool, &builds, 100).await.expect("tick"), 0);
+        assert_eq!(
+            enqueue_rescans_in(&pool, &builds, 100, Some(&[r]))
+                .await
+                .expect("tick"),
+            0
+        );
 
         sqlx::query("DELETE FROM scan_queue")
             .execute(&pool)
             .await
             .unwrap();
         assert_eq!(
-            enqueue_rescans(&pool, &builds, 100).await.expect("after"),
+            enqueue_rescans_in(&pool, &builds, 100, Some(&[r]))
+                .await
+                .expect("after"),
             2,
             "with the jobs gone both are stale and selected"
         );
@@ -975,7 +1027,12 @@ mod tests {
         }
         let builds = vec![("malware".to_string(), at("2026-11-10T00:00:00Z"))];
 
-        assert_eq!(enqueue_rescans(&pool, &builds, 0).await.expect("off"), 0);
+        assert_eq!(
+            enqueue_rescans_in(&pool, &builds, 0, Some(&[r]))
+                .await
+                .expect("off"),
+            0
+        );
         assert!(rescan_digests(&pool).await.is_empty(), "off queues nothing");
         let ledger: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_rescan_ledger")
             .fetch_one(&pool)
@@ -983,9 +1040,16 @@ mod tests {
             .unwrap();
         assert_eq!(ledger, 0, "off writes nothing either");
 
-        assert_eq!(enqueue_rescans(&pool, &builds, 1).await.expect("cap 1"), 1);
         assert_eq!(
-            enqueue_rescans(&pool, &builds, 1).await.expect("cap spent"),
+            enqueue_rescans_in(&pool, &builds, 1, Some(&[r]))
+                .await
+                .expect("cap 1"),
+            1
+        );
+        assert_eq!(
+            enqueue_rescans_in(&pool, &builds, 1, Some(&[r]))
+                .await
+                .expect("cap spent"),
             0,
             "the day's budget is spent"
         );
