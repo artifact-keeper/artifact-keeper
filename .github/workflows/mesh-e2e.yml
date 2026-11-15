@@ -40,9 +40,9 @@ jobs:
 
       - name: Sync mesh applications
         if: ${{ !inputs.skip_deploy }}
+        env:
+          TAG: ${{ inputs.image_tag || 'dev' }}
         run: |
-          TAG="${{ inputs.image_tag || 'dev' }}"
-
           for app in ak-mesh-main ak-mesh-peer-1 ak-mesh-peer-2 ak-mesh-peer-3; do
             echo "Setting image tag $TAG on $app..."
 

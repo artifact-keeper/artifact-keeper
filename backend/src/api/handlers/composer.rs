@@ -1819,8 +1819,11 @@ async fn serve_virtual_composer_dist(
         return Ok(Some(served));
     }
 
+    // #5810: no member scans; the virtual's member-fallback policy.
+    let fallback = proxy_helpers::virtual_member_fallback(&state.db, virtual_id).await;
     let result = proxy_helpers::resolve_virtual_download_from_members_with_fetch_urls(
         members,
+        fallback,
         Some(proxy),
         &upstream_path,
         &member_fetch_urls,
