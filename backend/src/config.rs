@@ -925,7 +925,13 @@ pub struct Config {
     /// OpenSCAP wrapper URL for compliance scanning (optional)
     pub openscap_url: Option<String>,
 
-    /// OpenSCAP SCAP profile to evaluate (default: standard)
+    /// OpenSCAP XCCDF profile to evaluate (`OPENSCAP_PROFILE`). Default: CIS
+    /// Level 1 - Server
+    /// ([`crate::services::openscap_scanner::DEFAULT_OPENSCAP_PROFILE`]), which
+    /// every shipped datastream defines. The old default,
+    /// `content_profile_standard`, is in none of them (#6000). A profile no
+    /// shipped datastream defines fails the scan with the list of profiles
+    /// that exist; it is never silently replaced.
     pub openscap_profile: String,
 
     /// OpenSearch URL for search indexing (optional)
@@ -2063,7 +2069,7 @@ impl Default for Config {
             incus_scanner_enabled: true,
             scan_token_ttl_seconds: 300,
             openscap_url: None,
-            openscap_profile: "xccdf_org.ssgproject.content_profile_standard".into(),
+            openscap_profile: crate::services::openscap_scanner::DEFAULT_OPENSCAP_PROFILE.into(),
             opensearch_url: None,
             opensearch_username: None,
             opensearch_password: None,
@@ -2296,7 +2302,11 @@ impl Config {
             scan_token_ttl_seconds: env_parse("SCAN_TOKEN_TTL_SECONDS", 300),
             openscap_url: env::var("OPENSCAP_URL").ok(),
             openscap_profile: env::var("OPENSCAP_PROFILE")
-                .unwrap_or_else(|_| "xccdf_org.ssgproject.content_profile_standard".into()),
+                .ok()
+                .filter(|p| !p.trim().is_empty())
+                .unwrap_or_else(|| {
+                    crate::services::openscap_scanner::DEFAULT_OPENSCAP_PROFILE.into()
+                }),
             opensearch_url: env::var("OPENSEARCH_URL").ok(),
             opensearch_username: env::var("OPENSEARCH_USERNAME").ok(),
             opensearch_password: secret_or_env("OPENSEARCH_PASSWORD").map_err(AppError::Config)?,
