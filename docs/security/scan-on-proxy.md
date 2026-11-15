@@ -322,6 +322,13 @@ bytes under the same version are refused again. The verdict and its findings are
 changed. Unlike a finding acknowledgement (see [download holds](download-holds.md)), an
 exception covers the whole verdict for those bytes, not one advisory.
 
+An approval with no `expires_in_days` lasts 90 days on a scan or curation row and never
+expires on an age-gate row. The exceptions page in the web UI fills in 90 days for every
+gate, so an age-gate grant made there lapses after 90 days, while the same grant from the
+Age Gate page lasts until it is revoked. A lapsed grant stays `approved` with its
+`expires_at` in the past, and the gate refuses the package again. To renew it, reopen the
+row, then grant it again.
+
 ## Previewing enforcement
 
 `record_only` refuses nothing, so the three views above are empty under it.
