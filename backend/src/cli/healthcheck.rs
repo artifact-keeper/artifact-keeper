@@ -12,10 +12,12 @@
 //! server setup.
 //!
 //! Usage: `artifact-keeper healthcheck [URL]`
-//!   - no argument: `GET /livez` on the port the server binds, taken from
+//!   - no argument: `GET /health` (what the image HEALTHCHECK has always
+//!     checked: database and storage, 503 when either is down) on the port
+//!     the server binds, taken from
 //!     `BIND_ADDRESS` (default `0.0.0.0:8080`), else `PORT`, else 8080;
 //!     an unspecified bind address (`0.0.0.0`, `::`) is probed on loopback.
-//!   - a path (`/health`): that path on the same address.
+//!   - a path (`/livez` for liveness only): that path on the same address.
 //!   - an `http://host[:port][/path]` URL: exactly that. `https` is not
 //!     supported; the backend listener is plain HTTP.
 //!
@@ -31,7 +33,10 @@ use std::time::Duration;
 pub const SUBCOMMAND: &str = "healthcheck";
 
 const DEFAULT_BIND: &str = "0.0.0.0:8080";
-const DEFAULT_PATH: &str = "/livez";
+/// `/health`, not `/livez`: the image HEALTHCHECK used `curl -sf .../health`
+/// before this subcommand existed, so a backend that has lost its database
+/// must keep reporting unhealthy to Docker.
+const DEFAULT_PATH: &str = "/health";
 const TIMEOUT: Duration = Duration::from_secs(5);
 /// Only the status line is needed; this bounds the read against a peer that
 /// streams forever.
@@ -260,13 +265,13 @@ mod tests {
     }
 
     #[test]
-    fn target_defaults_to_livez_on_the_bind_port() {
+    fn target_defaults_to_health_on_the_bind_port() {
         let t = target(None, "0.0.0.0:8080").unwrap();
         assert_eq!(t.addr, "127.0.0.1:8080".parse().unwrap());
-        assert_eq!(t.path, "/livez");
+        assert_eq!(t.path, "/health");
         assert_eq!(
-            target(Some("/health"), "0.0.0.0:8080").unwrap().path,
-            "/health"
+            target(Some("/livez"), "0.0.0.0:8080").unwrap().path,
+            "/livez"
         );
     }
 

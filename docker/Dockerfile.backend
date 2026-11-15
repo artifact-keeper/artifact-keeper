@@ -1048,8 +1048,9 @@ ENV RUST_LOG=info \
 EXPOSE 8080 9090
 
 # The probe is the backend binary itself (backend/src/cli/healthcheck.rs): a
-# plain HTTP GET of /livez on the BIND_ADDRESS (or PORT) port, exit 0 on 2xx,
-# with no config or database access (#5991).
+# plain HTTP GET of /health (the endpoint the old curl HEALTHCHECK checked:
+# database and storage) on the BIND_ADDRESS (or PORT) port, exit 0 on 2xx,
+# without loading any config or opening a database connection itself (#5991).
 # The image still ships a curl (the curl-bin stage) for compose files and
 # scripts that exec it here; the HEALTHCHECK itself no longer depends on it.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
