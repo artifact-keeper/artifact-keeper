@@ -166,7 +166,8 @@ const STALE_DIGESTS_SQL: &str = r#"
                    OR (q.kind IN ('hosted_upload', 'hosted_artifact')
                        AND q.artifact_id IN (
                            SELECT a2.id FROM artifacts a2
-                           WHERE a2.checksum_sha256 = s.digest)))
+                           WHERE a2.checksum_sha256 = s.digest
+                             AND a2.is_deleted = false)))
            ) AS held
     FROM stale s
     LEFT JOIN LATERAL (
@@ -193,6 +194,25 @@ const STALE_DIGESTS_SQL: &str = r#"
     ORDER BY held, MAX(dl.at) DESC NULLS LAST, s.digest
     LIMIT $4
 "#;
+
+/// Whether a job in flight may still leave a row graded against an older
+/// database once it finishes, so a short selection must not be remembered as
+/// "nothing stale for this key":
+///
+/// - a rescan, pending or running: a running one grades against the database
+///   it started with;
+/// - a RUNNING hosted scan (`hosted_upload`, `hosted_image`,
+///   `hosted_artifact`): it may be grading a row that has no completed scan
+///   yet, so is in no stale set, against an older database (a replica that
+///   has not updated), and finish after the memo is written.
+///
+/// A PENDING hosted scan does not block it: it grades against whatever
+/// database is current when it runs. On a busy instance there nearly always
+/// is one, and counting it would re-run the full selection on every pass.
+const EXHAUSTION_BLOCKED_SQL: &str = "SELECT EXISTS (SELECT 1 FROM scan_queue \
+     WHERE (kind = 'rescan' AND state IN ('pending', 'running')) \
+        OR (kind IN ('hosted_upload', 'hosted_image', 'hosted_artifact') \
+            AND state = 'running'))";
 
 /// Queue the rescans a set of database builds calls for, within what is left
 /// of `max_per_day`. Returns how many digests were queued. `0` with
@@ -299,20 +319,15 @@ async fn enqueue_rescans_in(
     }
 
     // A short page means nothing else is stale for these builds: skip the
-    // selection until a database moves again. Not while a rescan is still
-    // queued or running, though: one that started on an older database may
-    // leave its digest stale for this key, so it must be looked at again.
-    // Nor while a stale digest was held back by a queued hosted scan: that
-    // scan grades only its own row, and the digest's other rows must still be
-    // found. Any other queued hosted scan does not matter, so a busy
-    // instance does not re-run the full selection on every sweep.
-    let active: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM scan_queue \
-         WHERE kind = 'rescan' AND state IN ('pending', 'running'))",
-    )
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(db_err)?;
+    // selection until a database moves again, unless something in flight
+    // may still leave a row stale for this key (see `EXHAUSTION_BLOCKED_SQL`),
+    // or a stale digest was held back by a queued hosted scan: that scan
+    // grades only its own row, and the digest's other rows must still be
+    // found.
+    let active: bool = sqlx::query_scalar(EXHAUSTION_BLOCKED_SQL)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
     if repositories.is_none()
         && (page_len as i64) < limit
         && queued.is_empty()
@@ -1033,6 +1048,71 @@ mod tests {
             2,
             "with the jobs gone both are stale and selected"
         );
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(r)
+            .execute(&pool)
+            .await
+            .unwrap();
+        reset(&pool).await;
+    }
+
+    /// #6011 review: what keeps a short selection from being remembered as
+    /// "nothing stale". A running hosted scan blocks it (it may be grading a
+    /// row with no completed scan yet against an older database, and finish
+    /// after the memo); a pending one does not (it grades against the current
+    /// database); a pending or running rescan blocks it.
+    #[tokio::test]
+    async fn only_running_hosted_scans_and_rescans_block_the_memo() {
+        let Some(pool) = try_pool().await else { return };
+        reset(&pool).await;
+        let r = repo(&pool).await;
+        let blocked = || async {
+            sqlx::query_scalar::<_, bool>(EXHAUSTION_BLOCKED_SQL)
+                .fetch_one(&pool)
+                .await
+                .expect("blocked query")
+        };
+        let set_state = |state: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query("UPDATE scan_queue SET state = $1")
+                    .bind(state)
+                    .execute(&pool)
+                    .await
+                    .expect("set state");
+            }
+        };
+        assert!(!blocked().await, "an empty queue blocks nothing");
+
+        let a = scanned(&pool, r, &digest('w'), "2026-11-01T00:00:00Z").await;
+        crate::services::scan_queue::ScanQueue::new(pool.clone())
+            .enqueue_hosted_upload(a, crate::services::scan_queue::PRIORITY_HOSTED)
+            .await
+            .expect("upload job");
+        assert!(
+            !blocked().await,
+            "a pending hosted scan grades against the current build"
+        );
+        set_state("running").await;
+        assert!(
+            blocked().await,
+            "a running hosted scan may be on an older build"
+        );
+        sqlx::query("DELETE FROM scan_queue")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "INSERT INTO scan_queue (kind, priority, digest) VALUES ('rescan', 5, 'memo01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(blocked().await, "a pending rescan blocks it");
+        set_state("running").await;
+        assert!(blocked().await, "a running rescan blocks it");
 
         sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(r)
