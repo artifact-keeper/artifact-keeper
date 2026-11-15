@@ -22462,6 +22462,7 @@ mod unpublish_4025_tests {
 /// Archives with two entries at one path (see `services::archive_entry_paths`):
 /// the format's reader takes the first copy and the scan extractor keeps the
 /// last, so the gate establishes no identity for them.
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod duplicate_entry_tests {
     use super::*;

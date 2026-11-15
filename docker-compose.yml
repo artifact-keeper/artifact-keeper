@@ -324,6 +324,8 @@ services:
       # setting DEPENDENCY_TRACK_ENABLED=true *and* starting the dtrack
       # profile: `docker compose --profile dtrack up`. See issue #1432.
       DEPENDENCY_TRACK_ENABLED: ${DEPENDENCY_TRACK_ENABLED:-false}
+      DEPENDENCY_TRACK_AUTO_COLLECTIONS: ${DEPENDENCY_TRACK_AUTO_COLLECTIONS:-false}
+      DEPENDENCY_TRACK_MAVEN_EXCLUDED_CLASSIFIERS: ${DEPENDENCY_TRACK_MAVEN_EXCLUDED_CLASSIFIERS:-}
       ALLOW_HTTP_INTEGRATIONS: "1"
       # Webhooks v2 signing-secret encryption key. 32 bytes, base64 encoded.
       # Generate with: openssl rand -base64 32, then set the variable in
