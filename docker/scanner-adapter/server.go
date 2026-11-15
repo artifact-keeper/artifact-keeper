@@ -73,12 +73,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /probe/ready", s.handleReady)
 	mux.HandleFunc("GET /probe/healthy", s.handleHealthy)
 	mux.HandleFunc("GET /api/v1/metadata", s.handleMetadata)
-	mux.HandleFunc("POST /api/v1/scan", s.handleScan)
-	mux.HandleFunc("GET /api/v1/scan/{id}/report", s.handleReport)
+	// Scan and report routes: bearer token when SCANNER_SCAN_TOKEN(S_FILE)
+	// is set (#5948); the probes and metadata above stay open.
+	auth := newScanAuth(s.cfg)
+	mux.HandleFunc("POST /api/v1/scan", auth.wrap(s.handleScan))
+	mux.HandleFunc("GET /api/v1/scan/{id}/report", auth.wrap(s.handleReport))
 	// Filesystem scans (#2363): the backend uploads a tarred, pre-hardened
 	// workspace; the adapter untars it and runs `trivy filesystem` over it.
-	mux.HandleFunc("POST /api/v1/filesystem/scan", s.handleFsScan)
-	mux.HandleFunc("GET /api/v1/filesystem/scan/{id}/report", s.handleFsReport)
+	mux.HandleFunc("POST /api/v1/filesystem/scan", auth.wrap(s.handleFsScan))
+	mux.HandleFunc("GET /api/v1/filesystem/scan/{id}/report", auth.wrap(s.handleFsReport))
 	// Vulnerability-DB status and offline import (#5287); bearer-token only.
 	mux.HandleFunc("GET /api/v1/vulndb", s.handleVulnDBGet)
 	mux.HandleFunc("PUT /api/v1/vulndb", s.handleVulnDBPut)
@@ -129,6 +132,11 @@ func (s *Server) handleMetadata(w http.ResponseWriter, _ *http.Request) {
 			ProducesMimeTypes: []string{reportMimeType},
 		}},
 	}
+	// Only registry mode adds the property, so with no new config the
+	// document is exactly what it was.
+	if s.cfg.CachePartitionMode == partitionModeRegistry {
+		meta.Properties = map[string]string{cachePartitionModeProperty: s.cfg.CachePartitionMode}
+	}
 	writeJSON(w, http.StatusOK, meta)
 }
 
@@ -142,6 +150,13 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Artifact.Repository == "" {
 		http.Error(w, "artifact.repository is required", http.StatusBadRequest)
+		return
+	}
+	// Registry partition mode derives the partition from the registry host,
+	// so a request without one is refused rather than given the shared
+	// prefix partition (#5943).
+	if s.cfg.CachePartitionMode == partitionModeRegistry && trimRegistryHost(req.Registry.URL) == "" {
+		http.Error(w, "registry.url with a host is required in registry partition mode", http.StatusBadRequest)
 		return
 	}
 	hasTag := req.Artifact.Tag != ""
@@ -220,7 +235,7 @@ func (s *Server) handleFsScan(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to secure scan workspace", http.StatusInternalServerError)
 		return
 	}
-	if err := untarWorkspace(body, dir); err != nil {
+	if err := untarWorkspaceOpts(body, dir, s.cfg.CachePartitionMode == partitionModeRegistry); err != nil {
 		_ = os.RemoveAll(dir)
 		// An over-cap body surfaces here as a read error from MaxBytesReader.
 		http.Error(w, "invalid workspace tar: "+err.Error(), http.StatusBadRequest)
