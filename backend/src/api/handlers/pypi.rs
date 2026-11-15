@@ -3880,7 +3880,7 @@ async fn fetch_resolver_index(
     let mut leader_error: Option<Response> = None;
     let read = RESOLVER_INDEX_MEMO
         .try_get_with(key, async {
-            match proxy_helpers::proxy_fetch_uncached(
+            match proxy_helpers::proxy_fetch_uncached_decoded(
                 proxy,
                 repo_id,
                 repo_key,
@@ -17112,6 +17112,90 @@ mod tests {
             "the served content-type must be pinned to text/plain, not relayed \
              from the upstream (which answered text/html here)"
         );
+    }
+
+    /// #5983: the resolver reads the simple index with `Accept-Encoding: gzip`
+    /// and decodes it, the sidecar download itself stays identity (#2915)
+    #[tokio::test]
+    async fn test_resolver_index_read_asks_for_gzip_5983() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::io::Write;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+
+        let project = "gzindex5983";
+        let wheel = "gzindex5983-1.0-py3-none-any.whl";
+        let metadata: &[u8] = b"Metadata-Version: 2.1\nName: gzindex5983\nVersion: 1.0\n";
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(pep658_index_html(wheel).as_bytes())
+            .expect("gzip write");
+        let gz_index = enc.finish().expect("gzip finish");
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .and(header("accept-encoding", "gzip"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .insert_header("content-type", "text/html")
+                    .set_body_bytes(gz_index),
+            )
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(406))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}.metadata")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(metadata))
+            .mount(&upstream)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let (status, body, _) = tdh::send_with_headers(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!(
+                "/{}/simple/{project}/{wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+        let requests = upstream.received_requests().await.unwrap_or_default();
+        let coding_of = |p: String| {
+            requests
+                .iter()
+                .filter(|r| r.url.path() == p)
+                .map(|r| {
+                    r.headers
+                        .get("accept-encoding")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        let index_codings = coding_of(format!("/simple/{project}/"));
+        let sidecar_codings = coding_of(format!("/packages/{wheel}.metadata"));
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(&body[..], metadata);
+        assert_eq!(index_codings, vec!["gzip".to_string()]);
+        assert_eq!(sidecar_codings, vec!["identity".to_string()]);
     }
 
     /// A repeated `.whl.metadata` request is served from the proxy cache

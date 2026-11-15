@@ -4697,6 +4697,21 @@ const USER_AGENT_CACHE_TTL_SECS: u64 = 60;
 /// TTL for cached per-repository egress-proxy clients.
 const EGRESS_CLIENT_CACHE_TTL_SECS: u64 = 60;
 
+/// Strip the content coding off an upstream body the caller only parses
+fn decode_parsed_upstream_body(body: Bytes, coding: Option<&str>, cap: u64) -> Result<Bytes> {
+    use crate::util::content_coding::{strip_content_coding_to, Decoded};
+    let decoded = match strip_content_coding_to(&body, coding, cap)? {
+        Decoded::Bytes(std::borrow::Cow::Owned(v)) => Some(v),
+        Decoded::Bytes(std::borrow::Cow::Borrowed(_)) => None,
+        Decoded::Unsupported => {
+            return Err(AppError::BadGateway(format!(
+                "upstream answered with an unsupported content coding {coding:?}"
+            )))
+        }
+    };
+    Ok(decoded.map(Bytes::from).unwrap_or(body))
+}
+
 /// Apply a custom User-Agent header to a request builder if one is configured.
 fn apply_custom_ua(req: reqwest::RequestBuilder, ua: Option<&str>) -> reqwest::RequestBuilder {
     match ua {
@@ -4992,6 +5007,18 @@ impl UpstreamClient {
         Ok(None)
     }
 
+    async fn fetch_buffered(
+        &self,
+        url: &str,
+        repo_id: Uuid,
+        accept: Option<&str>,
+        max: usize,
+        auth_mode: crate::services::upstream_auth::UpstreamAuthMode,
+    ) -> Result<UpstreamResponse> {
+        self.fetch_buffered_coded(url, repo_id, accept, None, max, auth_mode)
+            .await
+    }
+
     /// Buffered upstream fetch. Relocated verbatim from
     /// `ProxyService::fetch_from_upstream_with_accept`.
     ///
@@ -5005,11 +5032,15 @@ impl UpstreamClient {
     /// with 404 / 406 / a legacy v1 manifest the client cannot consume.
     /// Mirroring the client's `Accept` upstream removes that source of
     /// silent content-type mismatches and the spurious 404s they trigger.
-    async fn fetch_buffered(
+    ///
+    /// `accept_encoding` overrides the client's `identity` default for a body
+    /// the caller decodes itself, `max` then bounds the coded bytes
+    async fn fetch_buffered_coded(
         &self,
         url: &str,
         repo_id: Uuid,
         accept: Option<&str>,
+        accept_encoding: Option<&str>,
         max: usize,
         auth_mode: crate::services::upstream_auth::UpstreamAuthMode,
     ) -> Result<UpstreamResponse> {
@@ -5041,6 +5072,9 @@ impl UpstreamClient {
         if let Some(accept_value) = accept {
             request = request.header(ACCEPT, accept_value);
         }
+        if let Some(coding) = accept_encoding {
+            request = request.header(reqwest::header::ACCEPT_ENCODING, coding);
+        }
 
         let response = self
             .send(request, Some(repo_id), UpstreamCaller::Proxy)
@@ -5066,6 +5100,10 @@ impl UpstreamClient {
             if let Some(retry_response) = self
                 .exchange_bearer_then(response, url, repo_id, &upstream_auth, &client, |req| {
                     let req = apply_custom_ua(req, custom_ua.as_deref());
+                    let req = match accept_encoding {
+                        Some(coding) => req.header(reqwest::header::ACCEPT_ENCODING, coding),
+                        None => req,
+                    };
                     if let Some(accept_value) = accept {
                         req.header(ACCEPT, accept_value)
                     } else {
@@ -9498,6 +9536,36 @@ impl ProxyService {
             .fetch_from_upstream(&full_url, repo.id, LARGE_METADATA_MAX_BYTES)
             .await?;
         Ok((resp.content, resp.content_type, resp.effective_url))
+    }
+
+    /// [`Self::fetch_upstream_direct`] for a body that is only parsed, never
+    /// served or cached (the PyPI resolver's simple index, #5983). Asks for
+    /// `gzip` and decodes it under the same LARGE cap, a body that would
+    /// inflate past it is refused
+    pub async fn fetch_upstream_direct_decoded(
+        &self,
+        repo: &Repository,
+        path: &str,
+    ) -> Result<(Bytes, Option<String>, String)> {
+        self.ensure_origin_policy_allows(repo).await?;
+        let full_url = self.gated_upstream_url(repo, path).await?;
+        let resp = self
+            .upstream_client
+            .fetch_buffered_coded(
+                &full_url,
+                repo.id,
+                None,
+                Some("gzip"),
+                LARGE_METADATA_MAX_BYTES,
+                crate::services::upstream_auth::UpstreamAuthMode::RepoConfigured,
+            )
+            .await?;
+        let content = decode_parsed_upstream_body(
+            resp.content,
+            resp.content_encoding.as_deref(),
+            LARGE_METADATA_MAX_BYTES as u64,
+        )?;
+        Ok((content, resp.content_type, resp.effective_url))
     }
 
     /// Fetch metadata from upstream without reading or writing the proxy cache,
@@ -31155,6 +31223,50 @@ mod upstream_fetch_path_tests {
                 "{bad:?}"
             );
         }
+    }
+}
+
+/// #5983: the resolver's gzip index read is decoded under a cap
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod parsed_body_coding_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn gzip(data: &[u8]) -> Bytes {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(data).expect("gzip write");
+        Bytes::from(enc.finish().expect("gzip finish"))
+    }
+
+    #[test]
+    fn identity_body_is_returned_as_is() {
+        let body = Bytes::from_static(b"<html></html>");
+        let out = decode_parsed_upstream_body(body.clone(), None, 64).expect("identity");
+        assert_eq!(out, body);
+        let out =
+            decode_parsed_upstream_body(body.clone(), Some("identity"), 64).expect("identity");
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn gzip_body_is_decoded() {
+        let html = b"<html><body><a href=\"/p/x-1.0.whl\">x-1.0.whl</a></body></html>";
+        let out = decode_parsed_upstream_body(gzip(html), Some("gzip"), 1024).expect("gzip");
+        assert_eq!(&out[..], &html[..]);
+    }
+
+    #[test]
+    fn gzip_body_over_the_cap_is_refused_not_inflated() {
+        let coded = gzip(&vec![b'a'; 64 * 1024]);
+        assert!(coded.len() < 1024, "fixture must be small on the wire");
+        assert!(decode_parsed_upstream_body(coded, Some("gzip"), 1024).is_err());
+    }
+
+    #[test]
+    fn unsupported_coding_is_refused() {
+        let body = Bytes::from_static(b"not really brotli");
+        assert!(decode_parsed_upstream_body(body, Some("br"), 1024).is_err());
     }
 }
 
