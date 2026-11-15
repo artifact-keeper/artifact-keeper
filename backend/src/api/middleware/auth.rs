@@ -2843,6 +2843,11 @@ fn is_write_method(method: &Method) -> bool {
 ///   advisory data (proxied upstream for a Remote) and never change AK state;
 ///   `npm install` and `npm audit` issue them with whatever credential the
 ///   client has for reads, which on a public registry is none.
+/// * **BSR reads** — `POST /proto/<repo_key>/<Service>/<Method>` for the
+///   read-only `buf.registry.*` RPCs (`Download`, `GetModules`, `GetCommits`,
+///   `GetGraph`, …). Connect makes every RPC a `POST`, so without this a
+///   read-only member got 403 on `buf dep update`. `CreateModules`, `Upload`
+///   and `CreateOrUpdateLabels` stay writes.
 ///
 /// These paths are classified as reads for the *permission* check only. The
 /// `#508` write-auth requirement (writes require authentication; anonymous
@@ -2886,8 +2891,24 @@ pub(crate) fn is_non_mutating_format_post(path: &str) -> bool {
         Some("npm") => is_npm_audit_tail(segments),
         // /mcp/<repo_key>/{v0,v0.1}/validate (#5253)
         Some("mcp") => is_mcp_validate_tail(segments),
+        // /proto/<repo_key>/<buf.registry Service>/<read Method>
+        Some("proto") => is_bsr_read_tail(segments),
         _ => false,
     }
+}
+
+/// `<repo_key>/<Service>/<Method>` naming a read-only BSR RPC — the remaining
+/// segments of a Connect path after the leading `proto`. Connect sends every
+/// RPC as a `POST`, reads included, so the method cannot tell `buf dep update`
+/// from `buf push`; the RPC name can. The classification is the handler's own
+/// ([`is_bsr_read_only_rpc`]), so this list cannot drift from the routes.
+///
+/// [`is_bsr_read_only_rpc`]: crate::api::handlers::protobuf_bsr::is_bsr_read_only_rpc
+fn is_bsr_read_tail<'a>(mut segments: impl Iterator<Item = &'a str>) -> bool {
+    matches!(segments.next(), Some(k) if !k.is_empty())
+        && crate::api::handlers::protobuf_bsr::is_bsr_read_only_rpc(
+            &segments.collect::<Vec<_>>().join("/"),
+        )
 }
 
 /// `<repo_key>/v0/validate` or `<repo_key>/v0.1/validate` — the remaining
@@ -2931,6 +2952,14 @@ fn is_mcp_validate_tail<'a>(mut segments: impl Iterator<Item = &'a str>) -> bool
 ///   read (version taken, package resolution) are skipped for an anonymous
 ///   caller. A private registry still answers an anonymous caller 401, as
 ///   every read does.
+///
+/// * **BSR reads** — the read-only Connect RPCs under `POST /proto/<repo_key>/`
+///   (`Download`, `GetModules`, `GetCommits`, `GetLabels`, `GetGraph`,
+///   `GetResources`, `GetOwners`, …). The `buf` CLI resolves and downloads
+///   dependencies with no credential when it has none, as it does against
+///   buf.build, so `buf dep update` against a public repository answered 401.
+///   The handlers only read; every BSR write keeps its 401 here and its
+///   `write:artifacts` check in the handler.
 ///
 /// git-lfs `objects/batch` and conan `users/authenticate` are deliberately NOT
 /// here. `batch` is an upload *and* download negotiation whose upload arm mints
@@ -2985,6 +3014,8 @@ fn is_anonymous_readable_format_post(path: &str) -> bool {
         Some("npm") => is_npm_audit_tail(segments),
         // /mcp/<repo_key>/{v0,v0.1}/validate (#5253)
         Some("mcp") => is_mcp_validate_tail(segments),
+        // /proto/<repo_key>/<buf.registry Service>/<read Method>
+        Some("proto") => is_bsr_read_tail(segments),
         _ => false,
     }
 }
@@ -9977,6 +10008,69 @@ mod tests {
                 .unwrap();
             let resp = run_through_visibility(state.clone(), req).await;
             assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{key} publish");
+        }
+    }
+
+    const BSR_READS: [&str; 4] = [
+        "buf.registry.module.v1.ModuleService/GetModules",
+        "buf.registry.module.v1.CommitService/GetCommits",
+        "buf.registry.module.v1.DownloadService/Download",
+        "buf.registry.module.v1beta1.DownloadService/Download",
+    ];
+    const BSR_WRITES: [&str; 3] = [
+        "buf.registry.module.v1.ModuleService/CreateModules",
+        "buf.registry.module.v1beta1.UploadService/Upload",
+        "buf.registry.module.v1.LabelService/CreateOrUpdateLabels",
+    ];
+
+    #[test]
+    fn test_bsr_read_post_is_anonymous_readable_and_non_mutating() {
+        for rpc in BSR_READS {
+            let path = format!("/proto/bsr/{rpc}");
+            assert!(is_anonymous_readable_format_post(&path), "{path}");
+            assert!(is_non_mutating_format_post(&path), "{path}");
+        }
+        let writes = BSR_WRITES.map(|rpc| format!("/proto/bsr/{rpc}"));
+        for path in writes.iter().map(String::as_str).chain([
+            "/proto//buf.registry.module.v1.DownloadService/Download",
+            "/proto/bsr/buf.registry.module.v1.DownloadService/Download/",
+            "/proto/bsr/buf.registry.module.v1.DownloadService",
+            "/proto/bsr/evil.DownloadService/Download",
+            "/npm/bsr/buf.registry.module.v1.DownloadService/Download",
+        ]) {
+            assert!(!is_anonymous_readable_format_post(path), "{path}");
+            assert!(!is_non_mutating_format_post(path), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bsr_read_post_no_auth_passes_public_and_401s_private() {
+        let proto = |is_public| CachedRepo {
+            format: "protobuf".to_string(),
+            ..make_cached_repo(is_public)
+        };
+        let post = |key: &str, rpc: &str| {
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri(format!("/proto/{key}/{rpc}"))
+                .header("content-type", "application/proto")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        for (key, public, want) in [
+            ("pubproto", true, StatusCode::OK),
+            ("privproto", false, StatusCode::UNAUTHORIZED),
+        ] {
+            let state = make_vis_state(Some((key.to_string(), proto(public)))).await;
+            for rpc in BSR_READS {
+                let resp = run_through_visibility(state.clone(), post(key, rpc)).await;
+                assert_eq!(resp.status(), want, "{key} {rpc}");
+            }
+            // Every write stays an anonymous-write 401 on either.
+            for rpc in BSR_WRITES {
+                let resp = run_through_visibility(state.clone(), post(key, rpc)).await;
+                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{key} {rpc}");
+            }
         }
     }
 
