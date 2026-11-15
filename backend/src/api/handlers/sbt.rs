@@ -195,9 +195,10 @@ async fn serve_scanned_sbt_virtual(
     };
     // sbt's resolver path records no hosted download today (unlike Maven's,
     // #4268), so the walk keeps that: `record` is `None`.
-    let resolve_run = |run: Vec<crate::models::repository::Repository>| {
+    let resolve_run = |run: Vec<crate::models::repository::Repository>, fallback| {
         proxy_helpers::resolve_unscanned_member_run(
             run,
+            fallback,
             Some(proxy),
             request_path,
             &local_fetch,
@@ -230,8 +231,11 @@ async fn serve_scanned_sbt_virtual(
     {
         return served;
     }
+    // #5810: no member scans; the virtual's member-fallback policy.
+    let fallback = proxy_helpers::virtual_member_fallback(&state.db, virtual_id).await;
     let result = proxy_helpers::resolve_virtual_download_from_members(
         members,
+        fallback,
         Some(proxy),
         request_path,
         Some(ctx),

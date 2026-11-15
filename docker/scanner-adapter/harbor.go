@@ -74,7 +74,15 @@ type HarborVulnerability struct {
 type ScannerMetadata struct {
 	Scanner      HarborScannerInfo   `json:"scanner"`
 	Capabilities []ScannerCapability `json:"capabilities"`
+	// Properties is the spec's optional free-form string map. It names
+	// settings such as the partition mode; it never carries a secret or a
+	// partition value.
+	Properties map[string]string `json:"properties,omitempty"`
 }
+
+// cachePartitionModeProperty is the metadata property naming the cache
+// partition mode (#5943). Only the mode is reported, never a partition.
+const cachePartitionModeProperty = "env.SCANNER_TRIVY_CACHE_PARTITION_MODE"
 
 // HarborScannerInfo describes the scanner in metadata.
 type HarborScannerInfo struct {
