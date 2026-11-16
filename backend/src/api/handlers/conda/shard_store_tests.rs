@@ -1277,3 +1277,126 @@ async fn scan_policy_blocked_packages_leave_the_listings_4978() {
         Some(vec![pkg.clone()])
     );
 }
+
+/// #6090: the dirty-mark triggers fire only for rows a conda output can
+/// contain. Shards, repodata records and `removed` all keep a row only when its
+/// file name ends in `.conda` or `.tar.bz2` (`is_conda_package`), so a mark for
+/// any other row changed nothing a client receives. A non-package row, its
+/// metadata, an edit and its delete leave no mark; a package row still marks on
+/// insert, on a metadata change, and when it is renamed to a non-package path
+/// (the old key), and its delete still marks.
+#[tokio::test]
+async fn only_package_rows_mark_their_shard_dirty_6090() {
+    let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+        return;
+    };
+    let marks = || async {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT subdir, package_name FROM conda_shard_dirty \
+              WHERE repository_id = $1 ORDER BY subdir, package_name",
+        )
+        .bind(fx.repo_id)
+        .fetch_all(&fx.pool)
+        .await
+        .unwrap();
+        rows
+    };
+    let clear = || async {
+        sqlx::query("DELETE FROM conda_shard_dirty WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+    };
+    let key = |s: &str, n: &str| (s.to_string(), n.to_string());
+
+    // A non-package row and its metadata: no mark.
+    let note = insert_row(
+        &fx,
+        "noarch/release-notes.txt",
+        "release-notes",
+        Some("notes"),
+    )
+    .await;
+    assert_eq!(marks().await, vec![], "a non-package row marks nothing");
+    sqlx::query("UPDATE artifacts SET size_bytes = 11 WHERE id = $1")
+        .bind(note)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE artifact_metadata SET metadata = metadata || '{\"name\": \"notes-2\"}' \
+          WHERE artifact_id = $1",
+    )
+    .bind(note)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        marks().await,
+        vec![],
+        "editing a non-package row marks nothing"
+    );
+
+    // A package row marks on insert (path key and metadata key).
+    let pkg = insert_row(&fx, "noarch/pk-a-1.0-h0_0.tar.bz2", "pk-a", Some("pk-a")).await;
+    assert!(
+        marks().await.contains(&key("noarch", "pk-a")),
+        "{:?}",
+        marks().await
+    );
+    clear().await;
+
+    // A metadata change on a package row still marks.
+    sqlx::query(
+        "UPDATE artifact_metadata SET metadata = metadata || '{\"build_number\": 1}' \
+          WHERE artifact_id = $1",
+    )
+    .bind(pkg)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    assert!(
+        marks().await.contains(&key("noarch", "pk-a")),
+        "{:?}",
+        marks().await
+    );
+    clear().await;
+
+    // Renaming a package to a non-package path marks the key it leaves.
+    sqlx::query("UPDATE artifacts SET path = 'noarch/pk-a.txt' WHERE id = $1")
+        .bind(pkg)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    assert!(
+        marks().await.contains(&key("noarch", "pk-a")),
+        "{:?}",
+        marks().await
+    );
+    clear().await;
+
+    // Deleting a non-package row marks nothing; deleting a package row marks.
+    sqlx::query("DELETE FROM artifacts WHERE id = $1")
+        .bind(note)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        marks().await,
+        vec![],
+        "deleting a non-package row marks nothing"
+    );
+    let gone = insert_row(&fx, "noarch/pk-b-1.0-h0_0.conda", "pk-b", None).await;
+    clear().await;
+    sqlx::query("DELETE FROM artifacts WHERE id = $1")
+        .bind(gone)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    assert!(
+        marks().await.contains(&key("noarch", "pk-b")),
+        "{:?}",
+        marks().await
+    );
+}
