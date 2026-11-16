@@ -2745,6 +2745,20 @@ pub async fn rescan_for_inventory(
         "admin.rescan_for_inventory: dispatching background rescans"
     );
 
+    if state.config.scan_queue_enabled {
+        crate::services::scan_queue::ScanQueue::new(state.db.clone())
+            .enqueue_hosted_rescans(
+                &artifact_ids,
+                true,
+                crate::services::scan_queue::PRIORITY_HOSTED,
+            )
+            .await?;
+        return Ok(Json(RescanForInventoryResponse {
+            artifacts_enqueued: enqueued,
+            limit,
+        }));
+    }
+
     let semaphore = rescan_inflight_semaphore().clone();
     for artifact_id in artifact_ids {
         let scanner_for_spawn = scanner.clone();

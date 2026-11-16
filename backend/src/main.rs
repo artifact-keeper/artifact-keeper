@@ -937,6 +937,19 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     let scanner_service = Arc::new(scanner_service);
     let worker_scanner_service = worker_scanner_service.map(Arc::new);
+    if let Some((is_error, notice)) =
+        artifact_keeper_backend::services::grype_scanner::grype_absence_notice(
+            artifact_keeper_backend::services::grype_scanner::grype_on_path().is_some(),
+            config.scan_queue_enabled,
+            config.scan_worker_enabled,
+        )
+    {
+        if is_error {
+            tracing::error!("{notice}");
+        } else {
+            tracing::warn!("{notice}");
+        }
+    }
 
     let scheduler_storage = primary_storage.clone();
     let mut app_state = match plugin_services {

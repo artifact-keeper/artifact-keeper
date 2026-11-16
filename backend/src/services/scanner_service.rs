@@ -6418,6 +6418,52 @@ async fn run_inline_proxy_scanners_target(
     Ok(verdict)
 }
 
+/// `system_settings` key the scan workers write their CVE scanner version to.
+pub(crate) const REPORTED_CVE_SCANNER_VERSION_KEY: &str = "scan.cve_scanner_version";
+
+/// How long an instance without a CVE scanner of its own trusts the version
+/// it last read. The workers write theirs every sweep.
+const REPORTED_CVE_SCANNER_VERSION_TTL: Duration = Duration::from_secs(60);
+
+/// Record the CVE scanner version a scan worker runs, so instances without
+/// one (API pods without grype) can still tell a verdict graded by an older
+/// scanner. Writes only when the value changes.
+pub(crate) async fn publish_cve_scanner_version(db: &PgPool, version: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO system_settings (key, value, description) \
+         VALUES ($1, to_jsonb($2::text), 'CVE scanner version the scan workers last reported') \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW() \
+         WHERE system_settings.value IS DISTINCT FROM EXCLUDED.value",
+    )
+    .bind(REPORTED_CVE_SCANNER_VERSION_KEY)
+    .bind(version)
+    .execute(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(())
+}
+
+/// The CVE scanner version the scan workers last reported, read at most once
+/// a minute. `None` when none did or the read failed.
+async fn reported_cve_scanner_version(db: &PgPool) -> Option<String> {
+    static CACHE: std::sync::LazyLock<VersionCache> = std::sync::LazyLock::new(VersionCache::new);
+    cached_cli_version_with_hit_ttl(&CACHE, REPORTED_CVE_SCANNER_VERSION_TTL, || {
+        read_reported_cve_scanner_version(db)
+    })
+    .await
+}
+
+async fn read_reported_cve_scanner_version(db: &PgPool) -> Option<String> {
+    let value: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT value FROM system_settings WHERE key = $1")
+            .bind(REPORTED_CVE_SCANNER_VERSION_KEY)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    value.and_then(|v| v.as_str().map(str::to_owned))
+}
+
 /// Live version string of the CVE-authoritative scanner (Grype), e.g.
 /// `grype-0.83.0`.
 ///
@@ -6511,6 +6557,12 @@ pub trait Scanner: Send + Sync {
     /// absent or down, must not fail-close the proxy path.
     fn is_cve_authoritative(&self) -> bool {
         false
+    }
+
+    /// Whether this process can run the scanner's engine. `false` only for an
+    /// engine this image does not ship (grype on the image without it).
+    fn is_installed(&self) -> bool {
+        true
     }
 
     /// Run the scan against artifact content and metadata. Returns both
@@ -9609,8 +9661,12 @@ mod construction {
             // image and intentionally stays fail-closed: a missing grype binary is
             // `classify_grype_spawn_error` -> hard error -> `failed`, the safety net
             // for an image that somehow ships no scanner engine at all.
-            info!("Grype scanner enabled");
             let mut grype_scanner = GrypeScanner::new(scan_workspace_path.clone());
+            if grype_scanner.is_installed() {
+                info!("Grype scanner enabled");
+            } else {
+                warn!("Grype scanner enabled but grype is not installed, grype scans fail here");
+            }
             // Wire the per-repo token minter so grype's registry pull is
             // authenticated for private images (#2093).
             if let Some(identity) = scan_identity.clone() {
@@ -9994,7 +10050,19 @@ impl ScannerService {
     /// proxy serve path threads this into `verdict_is_fresh` as
     /// `current_version` so a cached verdict from an older scanner / CVE-DB
     /// forces a re-scan instead of serving stale-clean until the TTL expires.
+    /// Without the engine installed here, the version the scan workers report.
     pub async fn cve_scanner_version(&self) -> Option<String> {
+        let cve = self.scanners.iter().find(|s| s.is_cve_authoritative())?;
+        if cve.is_installed() {
+            cve.version().await
+        } else {
+            reported_cve_scanner_version(&self.db).await
+        }
+    }
+
+    /// The CVE scanner version this process can run itself, without the
+    /// version the scan workers report.
+    pub async fn local_cve_scanner_version(&self) -> Option<String> {
         cve_authoritative_scanner_version(&self.scanners).await
     }
 
@@ -12317,25 +12385,6 @@ pub(crate) mod test_helpers {
         }
     }
 
-    /// Assert that a scan result is an error containing the expected label.
-    pub fn assert_scan_failed(
-        result: &crate::error::Result<crate::services::scanner_service::ScanOutput>,
-        expected_label: &str,
-    ) {
-        assert!(
-            result.is_err(),
-            "scan() must return Err, not Ok(vec![]), when {} fails",
-            expected_label
-        );
-        let err_msg = result.as_ref().unwrap_err().to_string();
-        assert!(
-            err_msg.contains(&format!("{} failed", expected_label)),
-            "error message should contain '{} failed', got: {}",
-            expected_label,
-            err_msg
-        );
-    }
-
     /// A non-login scanner service-account `User` fixture (#2093). Shared by the
     /// image- and grype-scanner token-minter tests so the fixture is defined
     /// once.
@@ -13994,6 +14043,62 @@ mod tests {
             post_scan_status_decision(None, 1, Some(&ok), false).status,
             "flagged"
         );
+    }
+
+    /// An instance without grype compares stored verdicts against the version
+    /// the scan workers report. `_queued`: workers in other tests publish too.
+    #[tokio::test]
+    async fn cve_version_without_grype_is_the_one_the_workers_report_queued() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let clear = || {
+            sqlx::query("DELETE FROM system_settings WHERE key = $1")
+                .bind(REPORTED_CVE_SCANNER_VERSION_KEY)
+                .execute(&pool)
+        };
+        clear().await.expect("clear");
+        assert_eq!(read_reported_cve_scanner_version(&pool).await, None);
+        for version in [
+            "grype-0.121.3+db-2026-11-13",
+            "grype-0.121.3+db-2026-11-13",
+            "grype-0.121.3+db-2026-11-14",
+        ] {
+            publish_cve_scanner_version(&pool, version)
+                .await
+                .expect("publish");
+            assert_eq!(
+                read_reported_cve_scanner_version(&pool).await.as_deref(),
+                Some(version)
+            );
+        }
+
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let ws = workspace.path().to_string_lossy().into_owned();
+        let service = ScannerService {
+            db: pool.clone(),
+            scanners: vec![Arc::new(
+                crate::services::grype_scanner::GrypeScanner::new(ws.clone()).with_binary(None),
+            )],
+            scan_result_service: Arc::new(ScanResultService::new(pool.clone())),
+            scan_config_service: Arc::new(ScanConfigService::new(pool.clone())),
+            storage: Arc::new(crate::storage::filesystem::FilesystemStorage::new(&ws)),
+            storage_registry: Arc::new(crate::storage::StorageRegistry::new(
+                HashMap::new(),
+                "filesystem".to_string(),
+            )),
+            storage_base_path: ws.clone(),
+            scan_workspace_path: ws,
+            dependency_track: None,
+            scan_queue_enabled: Default::default(),
+        };
+        assert_eq!(service.local_cve_scanner_version().await, None);
+        assert_eq!(
+            service.cve_scanner_version().await.as_deref(),
+            Some("grype-0.121.3+db-2026-11-14")
+        );
+
+        clear().await.expect("clear");
     }
 
     /// Build a `ScannerService` wired to the fixture's pool and storage.

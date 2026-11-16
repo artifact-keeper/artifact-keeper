@@ -205,6 +205,20 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
                     concurrency as f64,
                 );
 
+                // API pods without grype compare stored verdicts against this.
+                if let Some(scanner) = state.scanner_service.as_deref() {
+                    if let Some(version) = scanner.local_cve_scanner_version().await {
+                        if let Err(e) =
+                            crate::services::scanner_service::publish_cve_scanner_version(
+                                &state.db, &version,
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, "failed to publish the CVE scanner version");
+                        }
+                    }
+                }
+
                 // Terminal rows are read by operators, not by code, so nothing
                 // else would ever remove them.
                 match queue.purge_failed(FAILED_RETENTION.as_secs_f64()).await {

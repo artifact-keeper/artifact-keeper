@@ -581,6 +581,49 @@ impl ScanQueue {
         Ok(inserted)
     }
 
+    /// Queue rescans of hosted artifacts, a `hosted_artifact` job each with no
+    /// placeholders, so the worker inserts its rows as an in-process repository
+    /// scan does. A pending job keeps the placeholders another trigger committed,
+    /// a running one is left alone. Returns the jobs added or merged.
+    pub async fn enqueue_hosted_rescans(
+        &self,
+        artifact_ids: &[Uuid],
+        bypass_dedup: bool,
+        priority: i16,
+    ) -> Result<u64> {
+        let mut ids = artifact_ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let queued = sqlx::query(
+            r#"
+            INSERT INTO scan_queue (kind, priority, artifact_id, prepared, bypass_dedup)
+            SELECT 'hosted_artifact', $1, id, '{}'::jsonb, $2
+            FROM unnest($3::uuid[]) AS id
+            ON CONFLICT (kind, artifact_id)
+                WHERE state IN ('pending', 'running') AND artifact_id IS NOT NULL
+            DO UPDATE SET
+                bypass_dedup = scan_queue.bypass_dedup OR EXCLUDED.bypass_dedup,
+                priority = GREATEST(scan_queue.priority, EXCLUDED.priority),
+                updated_at = NOW()
+            WHERE scan_queue.state = 'pending'
+            "#,
+        )
+        .bind(priority)
+        .bind(bypass_dedup)
+        .bind(&ids)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .rows_affected();
+        if queued > 0 {
+            enqueue_signal().notify_one();
+        }
+        Ok(queued)
+    }
+
     /// Claim up to `limit` due jobs. Select and flip in one statement, so replicas
     /// drain disjoint jobs.
     ///
@@ -2382,6 +2425,82 @@ mod tests {
         .await
         .expect("waiting");
         assert_eq!(claim_one(&q).await.digest.as_deref(), Some("wait6032"));
+
+        drop_repo(&pool, repo).await;
+    }
+
+    /// A repository rescan queues one job per artifact. It must not wipe the
+    /// placeholders a pending `POST /security/scan` job carries, nor touch a
+    /// job a worker is running.
+    #[tokio::test]
+    async fn hosted_rescans_keep_pending_placeholders_and_skip_running_jobs() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let mut ids = Vec::new();
+        for n in 0..3 {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO artifacts (id, repository_id, path, name, size_bytes, \
+                 checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, $2, $3, $3, 1, 'abc', 'application/java-archive', 'k')",
+            )
+            .bind(id)
+            .bind(repo)
+            .bind(format!("p/r{n}.jar"))
+            .execute(&pool)
+            .await
+            .expect("seed artifact");
+            ids.push(id);
+        }
+        let q = ScanQueue::new(pool.clone());
+        let placeholder = Uuid::new_v4();
+        q.enqueue_hosted_artifact(
+            ids[0],
+            &serde_json::json!({ "grype": placeholder }),
+            false,
+            PRIORITY_HOSTED,
+        )
+        .await
+        .expect("enqueue placeholders");
+        q.enqueue_hosted_artifact(ids[1], &serde_json::json!({}), false, PRIORITY_HOSTED)
+            .await
+            .expect("enqueue");
+        let running = q.claim(1, "w", CLAIM_TTL_SECS).await.expect("claim");
+        assert_eq!(running.len(), 1);
+        let running_id = running[0].artifact_id.expect("artifact");
+
+        let queued = q
+            .enqueue_hosted_rescans(&[ids[0], ids[1], ids[2], ids[2]], true, PRIORITY_HOSTED)
+            .await
+            .expect("enqueue rescans");
+        assert_eq!(
+            queued, 2,
+            "the pending job and the new one, not the running one"
+        );
+
+        let rows: Vec<(Uuid, String, serde_json::Value, bool)> = sqlx::query_as(
+            "SELECT artifact_id, state, prepared, bypass_dedup FROM scan_queue \
+             WHERE artifact_id = ANY($1) ORDER BY artifact_id",
+        )
+        .bind(&ids)
+        .fetch_all(&pool)
+        .await
+        .expect("rows");
+        assert_eq!(rows.len(), 3, "one job per artifact: {rows:?}");
+        for (artifact_id, state, prepared, bypass) in rows {
+            if artifact_id == running_id {
+                assert_eq!(state, "running");
+                assert!(!bypass, "a running job is left as it is");
+            } else {
+                assert_eq!(state, "pending");
+                assert!(bypass, "the rescan asked for a forced scan");
+            }
+            if artifact_id == ids[0] {
+                assert_eq!(prepared, serde_json::json!({ "grype": placeholder }));
+            } else if artifact_id == ids[2] {
+                assert_eq!(prepared, serde_json::json!({}));
+            }
+        }
 
         drop_repo(&pool, repo).await;
     }
