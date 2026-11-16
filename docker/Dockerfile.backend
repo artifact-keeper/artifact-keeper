@@ -948,17 +948,10 @@ FROM registry.access.redhat.com/ubi9/ubi-micro:9.8 AS runtime
 # No curl RPM: /usr/bin/curl comes from the curl-bin stage below.
 COPY --from=rootfs-builder /mnt/rootfs /
 
-# Copy the grype scanner CLI (local SBOM/vuln scans). The trivy CLI is
-# deliberately omitted; image scans use the trivy sidecar via TRIVY_URL.
-COPY --from=grype-bin /grype /usr/local/bin/
+# No grype here: it and its DB are in the `scanner` stage below. The trivy CLI
+# is deliberately omitted too, image scans use the trivy sidecar via TRIVY_URL.
 COPY --from=buildkit-bin /buildctl /usr/local/bin/buildctl
-
-# Apache-2.0 §4(a): grype is now built from source here rather than copied out
-# of an upstream image, so we are the ones distributing the binary and the
-# licence has to travel with it. Same arrangement the scanner-adapter uses for
-# its self-built trivy (/licenses/trivy).
-COPY --from=grype-bin /licenses/grype /licenses/grype
-# Same for buildctl (Apache-2.0), built from source here since 2026-10-10.
+# buildctl (Apache-2.0) is built from source here, so its licence ships with it.
 COPY --from=buildkit-bin /licenses/buildkit /licenses/buildkit
 
 # unsquashfs for the Incus scanner's SquashFS extraction (#4469), with its
@@ -976,30 +969,6 @@ COPY --from=curl-bin /licenses/curl /licenses/curl
 # see a source-built curl; this gives CPE-matching scanners (syft's
 # sbom-cataloger, grype) cpe:2.3:a:haxx:curl and cpe:2.3:a:haxx:libcurl.
 COPY --from=curl-bin /out/sbom/curl.cdx.json /usr/share/sbom/curl.cdx.json
-
-# Pre-seeded Grype vulnerability DB (avoids first-scan network fetch).
-#
-# --chmod is READ-ONLY (0550), not writable. An earlier revision of this line
-# said the mode existed "so an arbitrary OpenShift UID can refresh the DB at
-# runtime", which this same file contradicts: GRYPE_DB_AUTO_UPDATE=false and
-# GRYPE_DB_VALIDATE_AGE=false below, re-asserted per invocation in
-# grype_scanner.rs, and the comment on that ENV block says outright that the
-# DB is refreshed by rebuilding the image. Nothing writes it at runtime, so
-# group-write on the DB was privilege the process never needs.
-#
-# The mode is 0550 and not 0440/0660 because BuildKit applies a SINGLE --chmod
-# to every copied entry, directories included: the DB lives under a schema
-# subdirectory (`6/`), and any mode without the group execute bit makes that
-# directory untraversable and the DB unreadable. 0550 is the least-privilege
-# mode that still traverses.
-#
-# This COPY depends on /home/artifact/.cache/grype ALREADY EXISTING from the
-# rootfs COPY above (it is in the rootfs-builder `mkdir -p`), which is what
-# keeps the parent at 0775. If the destination did not pre-exist, BuildKit
-# would auto-create the intermediates at 0750 and ignore --chmod for them.
-# Do not drop it from that mkdir, and do not reorder this COPY above the
-# rootfs COPY.
-COPY --from=grype-db-seed --chown=1001:0 --chmod=0550 /grype-db /home/artifact/.cache/grype
 
 # Copy application binary (from `target/<profile>/`; see CARGO_PROFILE in the
 # deps stage).
@@ -1044,17 +1013,6 @@ RUN ["/usr/bin/rm", "-f", \
 WORKDIR /app
 USER 1001
 
-# Grype defaults `db.auto-update=true` and `db.validate-age=true`. With those
-# defaults, Grype at scan time checks the pre-seeded DB's build timestamp; if
-# it is older than `db.max-allowed-built-age` (5 days), Grype refuses to use
-# it and tries to download a fresh copy from grype.anchore.io. In the
-# network-restricted environments PR #1002 (#1001) was meant to fix (ARC
-# runner pods, release-gate jobs), that fetch fails and Grype exits 1 with
-# no stderr (because the scanner invocation passes `-q`). We disable both
-# knobs so the seeded DB is honored for the full image lifetime; the DB is
-# refreshed by rebuilding the image, not at runtime. See artifact-keeper#1001
-# and PR #1002 (commit 23d9743) which added the seed stage.
-#
 # HOME/XDG_CACHE_HOME are set explicitly because restricted-v2 runs the
 # container as a UID with no /etc/passwd entry, so glibc cannot resolve a home
 # directory and HOME arrives as `/` — which the process cannot write (verified:
@@ -1069,11 +1027,7 @@ ENV RUST_LOG=info \
     BACKUP_PATH=/data/backups \
     HOME=/home/artifact \
     XDG_CACHE_HOME=/home/artifact/.cache \
-    GRYPE_DB_CACHE_DIR=/home/artifact/.cache/grype \
     TRIVY_CACHE_DIR=/home/artifact/.cache/trivy \
-    GRYPE_DB_AUTO_UPDATE=false \
-    GRYPE_DB_VALIDATE_AGE=false \
-    GRYPE_CHECK_FOR_APP_UPDATE=false \
     HOST=0.0.0.0 \
     PORT=8080
 
@@ -1089,3 +1043,56 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD ["artifact-keeper", "healthcheck"]
 
 CMD ["artifact-keeper"]
+
+# ---------- Stage 7: scanner, the runtime plus grype and its seeded DB ----------
+# Published as artifact-keeper-backend:<tag>-scanner, for scan workers
+# (SCAN_QUEUE_ENABLED) and for instances that scan in process. The plain image
+# is `runtime` above. Kept last so a build without --target still has grype.
+FROM runtime AS scanner
+
+COPY --from=grype-bin /grype /usr/local/bin/
+# Apache-2.0 §4(a): grype is built from source here rather than copied out of
+# an upstream image, so we are the ones distributing the binary and the
+# licence has to travel with it. Same arrangement the scanner-adapter uses for
+# its self-built trivy (/licenses/trivy).
+COPY --from=grype-bin /licenses/grype /licenses/grype
+
+# Pre-seeded Grype vulnerability DB (avoids first-scan network fetch).
+#
+# --chmod is READ-ONLY (0550), not writable. An earlier revision of this line
+# said the mode existed "so an arbitrary OpenShift UID can refresh the DB at
+# runtime", which this same file contradicts: GRYPE_DB_AUTO_UPDATE=false and
+# GRYPE_DB_VALIDATE_AGE=false below, re-asserted per invocation in
+# grype_scanner.rs, and the comment on that ENV block says outright that the
+# DB is refreshed by rebuilding the image. Nothing writes it at runtime, so
+# group-write on the DB was privilege the process never needs.
+#
+# The mode is 0550 and not 0440/0660 because BuildKit applies a SINGLE --chmod
+# to every copied entry, directories included: the DB lives under a schema
+# subdirectory (`6/`), and any mode without the group execute bit makes that
+# directory untraversable and the DB unreadable. 0550 is the least-privilege
+# mode that still traverses.
+#
+# This COPY depends on /home/artifact/.cache/grype ALREADY EXISTING from the
+# rootfs COPY above (it is in the rootfs-builder `mkdir -p`), which is what
+# keeps the parent at 0775. If the destination did not pre-exist, BuildKit
+# would auto-create the intermediates at 0750 and ignore --chmod for them.
+# Do not drop it from that mkdir, and do not reorder this COPY above the
+# rootfs COPY.
+COPY --from=grype-db-seed --chown=1001:0 --chmod=0550 /grype-db /home/artifact/.cache/grype
+
+# Grype defaults `db.auto-update=true` and `db.validate-age=true`. With those
+# defaults, Grype at scan time checks the pre-seeded DB's build timestamp; if
+# it is older than `db.max-allowed-built-age` (5 days), Grype refuses to use
+# it and tries to download a fresh copy from grype.anchore.io. In the
+# network-restricted environments PR #1002 (#1001) was meant to fix (ARC
+# runner pods, release-gate jobs), that fetch fails and Grype exits 1 with
+# no stderr (because the scanner invocation passes `-q`). We disable both
+# knobs so the seeded DB is honored for the full image lifetime; the DB is
+# refreshed by rebuilding the image, not at runtime. See artifact-keeper#1001
+# and PR #1002 (commit 23d9743) which added the seed stage.
+#
+ENV GRYPE_DB_CACHE_DIR=/home/artifact/.cache/grype \
+    GRYPE_DB_AUTO_UPDATE=false \
+    GRYPE_DB_VALIDATE_AGE=false \
+    GRYPE_CHECK_FOR_APP_UPDATE=false

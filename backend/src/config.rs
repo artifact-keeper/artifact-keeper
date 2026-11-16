@@ -7800,19 +7800,36 @@ mod tests {
             .any(|root| path == root || path.starts_with(&format!("{root}/")))
     }
 
-    /// The last `FROM` line's image reference, i.e. the base the RUNTIME stage
-    /// is built on. `--platform=` flags are skipped. Test-only.
+    /// The image the last stage is built on, i.e. the base the RUNTIME stage
+    /// ships. A last stage `FROM` an earlier stage (`FROM runtime AS scanner`)
+    /// resolves to that stage's base. `--platform=` flags are skipped. Test-only.
     fn dockerfile_runtime_base(content: &str) -> Option<String> {
-        content
+        let stages: Vec<(String, Option<String>)> = content
             .lines()
             .filter_map(|line| line.trim().strip_prefix("FROM "))
             .map(|rest| {
-                rest.split_whitespace()
-                    .find(|token| !token.starts_with("--"))
-                    .unwrap_or_default()
-                    .to_string()
+                let mut tokens = rest.split_whitespace().filter(|t| !t.starts_with("--"));
+                let base = tokens.next().unwrap_or_default().to_string();
+                let alias = match (tokens.next(), tokens.next()) {
+                    (Some(kw), Some(name)) if kw.eq_ignore_ascii_case("AS") => {
+                        Some(name.to_ascii_lowercase())
+                    }
+                    _ => None,
+                };
+                (base, alias)
             })
-            .next_back()
+            .collect();
+        let mut i = stages.len().checked_sub(1)?;
+        loop {
+            let base = &stages[i].0;
+            match stages[..i]
+                .iter()
+                .rposition(|(_, alias)| alias.as_deref() == Some(&base.to_ascii_lowercase()))
+            {
+                Some(j) => i = j,
+                None => return Some(base.clone()),
+            }
+        }
     }
 
     /// The last `USER` directive in a Dockerfile, i.e. the identity the runtime
@@ -8088,6 +8105,20 @@ mod tests {
         assert_eq!(
             dockerfile_runtime_base("FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS b\n"),
             Some("golang:1.27-alpine".into())
+        );
+        // A last stage built on an earlier one ships that one's base.
+        let layered = "FROM golang:1.27-alpine AS bin\n\
+                       FROM registry.access.redhat.com/ubi9/ubi-micro:9.8 AS runtime\n\
+                       FROM runtime AS scanner\nUSER 1001\n";
+        assert_eq!(
+            dockerfile_runtime_base(layered),
+            Some("registry.access.redhat.com/ubi9/ubi-micro:9.8".into())
+        );
+        assert_eq!(
+            dockerfile_runtime_base(
+                "FROM ubi AS base\nFROM alpine:3.23 AS runtime\nFROM runtime AS scanner\n"
+            ),
+            Some("alpine:3.23".into())
         );
 
         // Mutation 3: USER moved off the UID the passwd entry grants GID 0 to.

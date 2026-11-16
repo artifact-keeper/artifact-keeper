@@ -654,6 +654,9 @@ jobs:
         with:
           context: .
           file: ./docker/Dockerfile.backend
+          # The image without grype (#5971). The `-scanner` variant is the
+          # next step, on the same builder, so it reuses these layers.
+          target: runtime
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }},push-by-digest=true,name-canonical=true,push=true
@@ -681,7 +684,9 @@ jobs:
           # is now compiled from source on the floating `golang:1.27-alpine`
           # too, instead of copied out of moby/buildkit (whose go1.26.8 build
           # failed the Trivy gate on four HIGH stdlib/x-net findings).
-          no-cache-filters: rootfs-builder,grype-bin,buildkit-bin,grype-db-seed,runtime
+          # grype-bin and grype-db-seed are only built by the scanner step below
+          # and are in its filters.
+          no-cache-filters: rootfs-builder,buildkit-bin,runtime
           sbom: true
           provenance: mode=max
           # #5130: glibc's malloc retains freed proxy-download buffers in
@@ -714,6 +719,46 @@ jobs:
         with:
           name: backend-digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
           path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+      # `runtime` plus grype and its seeded DB, published as `<tag>-scanner`
+      # for scan workers (#5971). `runtime` and everything below it comes from
+      # the step above on this builder, so the two images share those layers.
+      # grype-bin and grype-db-seed are refreshed for the same reasons as the
+      # stages in the filters above.
+      - name: Build and push scanner variant by digest
+        id: build-scanner
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: ./docker/Dockerfile.backend
+          target: scanner
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:buildcache-${{ matrix.cache-tag }}
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:buildcache-${{ matrix.cache-tag }},mode=max,image-manifest=true,oci-mediatypes=true
+          no-cache-filters: grype-bin,grype-db-seed,scanner
+          sbom: true
+          provenance: mode=max
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            APP_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+            CARGO_BUILD_JOBS=${{ matrix.cargo-build-jobs }}
+            CARGO_FEATURES=jemalloc
+
+      - name: Export scanner variant digest
+        run: |
+          mkdir -p /tmp/scanner-digests
+          digest="${{ steps.build-scanner.outputs.digest }}"
+          touch "/tmp/scanner-digests/${digest#sha256:}"
+
+      - name: Upload scanner variant digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: backend-scanner-digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/scanner-digests/*
           if-no-files-found: error
           retention-days: 1
 
@@ -1003,6 +1048,12 @@ jobs:
           name: backend-digests-amd64
           path: /tmp/backend-digests
 
+      - name: Download backend scanner variant amd64 digest
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: backend-scanner-digests-amd64
+          path: /tmp/backend-scanner-digests
+
       - name: Download openscap amd64 digest
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -1026,9 +1077,11 @@ jobs:
         id: refs
         run: |
           BACKEND_DIGEST=$(ls /tmp/backend-digests/)
+          BACKEND_SCANNER_DIGEST=$(ls /tmp/backend-scanner-digests/)
           OPENSCAP_DIGEST=$(ls /tmp/openscap-digests/)
           SCANNER_ADAPTER_DIGEST=$(ls /tmp/scanner-adapter-digests/)
           echo "backend=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@sha256:${BACKEND_DIGEST}" >> $GITHUB_OUTPUT
+          echo "backend-scanner=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@sha256:${BACKEND_SCANNER_DIGEST}" >> $GITHUB_OUTPUT
           echo "openscap=${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}@sha256:${OPENSCAP_DIGEST}" >> $GITHUB_OUTPUT
           echo "scanner-adapter=${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}@sha256:${SCANNER_ADAPTER_DIGEST}" >> $GITHUB_OUTPUT
           # backend-alpine digest output skipped while alpine builds are suspended.
@@ -1167,6 +1220,7 @@ jobs:
             done
           }
           pull_with_retry "${{ steps.refs.outputs.backend }}"
+          pull_with_retry "${{ steps.refs.outputs.backend-scanner }}"
           pull_with_retry "${{ steps.refs.outputs.openscap }}"
           pull_with_retry "${{ steps.refs.outputs.scanner-adapter }}"
 
@@ -1178,6 +1232,27 @@ jobs:
           image-ref: ${{ steps.refs.outputs.backend }}
           format: 'sarif'
           output: 'backend-trivy.sarif'
+          # No `severity:` here on purpose — trivy-action unsets it for SARIF
+          # (#3122). All severities are reported; the gate pass below filters.
+          ignore-unfixed: true
+          # Suppress residual CVEs in the bundled trivy/grype CLI binaries that
+          # have no fixed tool release yet (justified per-CVE in .trivyignore).
+          trivyignores: '.trivyignore'
+          exit-code: '0'
+          skip-setup-trivy: true
+          # DB caching is owned by the explicit steps above.
+          cache: 'false'
+        env:
+          # DB was pre-fetched (with retry) above; never download mid-scan.
+          TRIVY_SKIP_DB_UPDATE: 'true'
+
+      - name: Trivy SARIF - Backend Scanner
+        if: always()
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
+        with:
+          image-ref: ${{ steps.refs.outputs.backend-scanner }}
+          format: 'sarif'
+          output: 'backend-scanner-trivy.sarif'
           # No `severity:` here on purpose — trivy-action unsets it for SARIF
           # (#3122). All severities are reported; the gate pass below filters.
           ignore-unfixed: true
@@ -1259,6 +1334,21 @@ jobs:
         env:
           TRIVY_SKIP_DB_UPDATE: 'true'
 
+      - name: Trivy gate - Backend Scanner
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
+        if: always()
+        with:
+          image-ref: ${{ steps.refs.outputs.backend-scanner }}
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          trivyignores: '.trivyignore'
+          exit-code: '1'
+          skip-setup-trivy: true
+          cache: 'false'
+        env:
+          TRIVY_SKIP_DB_UPDATE: 'true'
+
       - name: Trivy gate - OpenSCAP
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         if: always()
@@ -1312,6 +1402,13 @@ jobs:
           sarif_file: 'backend-trivy.sarif'
           category: 'trivy-backend'
 
+      - name: Upload Backend Scanner Trivy SARIF
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+        if: always()
+        with:
+          sarif_file: 'backend-scanner-trivy.sarif'
+          category: 'trivy-backend-scanner'
+
       - name: Upload OpenSCAP Trivy SARIF
         uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         if: always()
@@ -1341,6 +1438,7 @@ jobs:
           name: trivy-scan-reports
           path: |
             backend-trivy.sarif
+            backend-scanner-trivy.sarif
             openscap-trivy.sarif
             scanner-adapter-trivy.sarif
             backend-alpine-trivy.sarif
@@ -1419,6 +1517,7 @@ jobs:
           echo "- **Report scope**: the SARIF uploaded to the Security tab carries **all** severities, fixed CVEs only — a LOW/MEDIUM alert there does *not* block publication (#3122)" >> $GITHUB_STEP_SUMMARY
           echo "- **Policy**: enforced — a CRITICAL/HIGH CVE with an available fix fails this job, and the merge jobs depend on it, so publication is blocked" >> $GITHUB_STEP_SUMMARY
           echo "- **Backend**: $([ -f backend-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
+          echo "- **Backend scanner variant**: $([ -f backend-scanner-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
           echo "- **OpenSCAP**: $([ -f openscap-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
           echo "- **Scanner Adapter**: $([ -f scanner-adapter-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
           echo "- **Backend Alpine**: $([ -f backend-alpine-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
@@ -1838,6 +1937,259 @@ jobs:
       # it, and every failure raises a ::warning:: and a summary entry. If VEX
       # ever becomes a control, delete the failure-collecting arm rather than
       # re-adding continue-on-error.
+      - name: Attach VEX attestations
+        run: |
+          set -uo pipefail
+          failed=()
+          for vex in .vex/*.vex.json; do
+            [ -f "$vex" ] || continue
+            echo "Attaching VEX: $vex"
+            if ! docker scout attestation add \
+              --file "$vex" \
+              --predicate-type https://openvex.dev/ns/v0.2.0 \
+              ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@${{ steps.incoming.outputs.digest }}; then
+              failed+=("$vex")
+            fi
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::warning title=VEX attestation not attached::docker scout attestation add failed for ${failed[*]}. The image is published and its provenance is attested; only the VEX predicate is missing. Re-run this job to retry."
+            {
+              echo "### VEX attestations NOT attached"
+              echo ""
+              printf -- '- `%s`\n' "${failed[@]}"
+              echo ""
+              echo "Best-effort step (#3496): the published image is unaffected. Re-run this job to retry."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # The `-scanner` variant (#5971): merge-backend's steps on the scanner
+  # digests, every tag with the `-scanner` suffix. `version` stays the bare
+  # X.Y.Z so apply-floating-tags compares it like merge-backend's.
+  merge-backend-scanner:
+    name: Backend Scanner Variant Multi-Arch Manifest
+    runs-on: ubuntu-latest
+    needs: [publish-preflight, build-backend, scan-containers]
+    if: >-
+      ${{ !cancelled() && needs.publish-preflight.result == 'success'
+          && (needs.publish-preflight.outputs.promote_version != ''
+              || (needs.build-backend.result == 'success' && needs.scan-containers.result == 'success')) }}
+    outputs:
+      digest: ${{ steps.incoming.outputs.digest }}
+      version: ${{ steps.plan.outputs.exact }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      PROMOTE_VERSION: ${{ needs.publish-preflight.outputs.promote_version }}
+      PROMOTE_SOURCE_TAG: ${{ needs.publish-preflight.outputs.promote_source_tag }}
+
+    steps:
+      - name: Checkout (scripts and VEX files)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            .github/scripts
+            .vex
+            scripts/ci
+
+      - name: Download digests
+        if: ${{ env.PROMOTE_VERSION == '' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: /tmp/digests
+          pattern: backend-scanner-digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata (ghcr.io)
+        id: meta
+        if: ${{ env.PROMOTE_VERSION == '' }}
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
+          flavor: |
+            suffix=-scanner
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
+            type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
+
+      - name: Extract metadata (Docker Hub)
+        id: meta-dockerhub
+        if: ${{ env.PROMOTE_VERSION == '' }}
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: docker.io/${{ env.DOCKERHUB_BACKEND }}
+          flavor: |
+            suffix=-scanner
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
+            type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
+
+      - name: Resolve publish plan
+        id: plan
+        env:
+          META_JSON: ${{ steps.meta.outputs.json }}
+          META_HUB_JSON: ${{ steps.meta-dockerhub.outputs.json }}
+          META_VERSION: ${{ steps.meta.outputs.version }}
+          GH_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${PROMOTE_VERSION}" ]]; then
+            VERSION="${PROMOTE_VERSION}-scanner"
+            GIMG="${REGISTRY}/${BACKEND_IMAGE}"; HIMG="docker.io/${DOCKERHUB_BACKEND}"
+            vdig=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${GIMG}:${VERSION}" 2>/dev/null | jq -r '.digest' 2>/dev/null || true)
+            if [[ "${vdig}" == sha256:* ]]; then
+              PROMOTE_REF="${GIMG}:${VERSION}"
+            elif [[ -n "${PROMOTE_SOURCE_TAG}" ]]; then
+              sdig=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${GIMG}:${PROMOTE_SOURCE_TAG}-scanner" 2>/dev/null | jq -r '.digest' 2>/dev/null || true)
+              if [[ "${sdig}" != sha256:* ]]; then
+                echo "::error title=Nothing to promote::${GIMG}:${VERSION} is absent and the certified source ${GIMG}:${PROMOTE_SOURCE_TAG}-scanner is not present on ghcr either; cannot promote."; exit 1
+              fi
+              PROMOTE_REF="${GIMG}:${PROMOTE_SOURCE_TAG}-scanner"
+              echo "${GIMG}:${VERSION} is absent; applying it to ${PROMOTE_REF} (${sdig})."
+            else
+              echo "::error title=Nothing to promote::${GIMG}:${VERSION} is not present on ghcr; cannot promote."; exit 1
+            fi
+            echo "promote_ref=${PROMOTE_REF}" >> "$GITHUB_OUTPUT"
+            ghcr=( "${GIMG}:${VERSION}" ); hub=( "${HIMG}:${VERSION}" )
+            printf '%s\n' "${ghcr[@]}" | jq -R . | jq -cs . > /tmp/ghcr-tags.json
+            printf '%s\n' "${hub[@]}"  | jq -R . | jq -cs . > /tmp/hub-tags.json
+            echo "exact=${PROMOTE_VERSION}" >> "$GITHUB_OUTPUT"
+          else
+            jq -c '.tags' <<< "${META_JSON}" > /tmp/ghcr-tags.json
+            jq -c '.tags' <<< "${META_HUB_JSON}" > /tmp/hub-tags.json
+            if [[ "${GH_REF}" == refs/tags/v* ]]; then
+              echo "exact=${META_VERSION%-scanner}" >> "$GITHUB_OUTPUT"
+            else
+              echo "exact=" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+          echo "ghcr tags:"; cat /tmp/ghcr-tags.json; echo
+          echo "hub tags:";  cat /tmp/hub-tags.json;  echo
+
+      - name: Resolve incoming digest
+        id: incoming
+        env:
+          PROMOTE_REF: ${{ steps.plan.outputs.promote_ref }}
+        run: |
+          set -euo pipefail
+          IMG="${REGISTRY}/${BACKEND_IMAGE}"
+          if [[ -n "${PROMOTE_VERSION}" ]]; then
+            REF="${PROMOTE_REF:-${IMG}:${PROMOTE_VERSION}-scanner}"
+          else
+            ANCHOR=$(jq -r 'map(select(test(":sha-")))[0] // empty' /tmp/ghcr-tags.json)
+            if [[ -z "${ANCHOR}" ]]; then
+              echo "::error::no :sha- anchor tag in the ghcr tag set; cannot stage the manifest safely"; exit 1
+            fi
+            shopt -s nullglob
+            srcs=()
+            for f in /tmp/digests/*; do srcs+=( "${IMG}@sha256:$(basename "$f")" ); done
+            if [[ "${#srcs[@]}" -eq 0 ]]; then
+              echo "::error::no per-arch digests in /tmp/digests"; exit 1
+            fi
+            docker buildx imagetools create -t "${ANCHOR}" "${srcs[@]}"
+            REF="${ANCHOR}"
+          fi
+          DIGEST=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${REF}" | jq -r '.digest')
+          [[ "${DIGEST}" == sha256:* ]] || { echo "::error::could not resolve a digest for ${REF}"; exit 1; }
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Incoming manifest-list digest: ${DIGEST} (from ${REF})"
+
+      - name: Refuse to overwrite a published backend scanner variant version
+        if: ${{ steps.plan.outputs.exact != '' }}
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          .github/scripts/assert-version-digest-consistent.sh \
+            "${{ steps.plan.outputs.exact }}-scanner" \
+            "${{ steps.incoming.outputs.digest }}" \
+            "ghcr.io|${BACKEND_IMAGE}" \
+            "docker.io|${DOCKERHUB_BACKEND}"
+
+      - name: Apply ghcr tags
+        run: |
+          set -euo pipefail
+          mapfile -t TAGS < <(jq -r '.[]' /tmp/ghcr-tags.json)
+          args=(); for t in "${TAGS[@]}"; do args+=( -t "$t" ); done
+          docker buildx imagetools create "${args[@]}" \
+            "${REGISTRY}/${BACKEND_IMAGE}@${{ steps.incoming.outputs.digest }}"
+          docker buildx imagetools inspect "${REGISTRY}/${BACKEND_IMAGE}@${{ steps.incoming.outputs.digest }}" >/dev/null
+
+      - name: Copy to Docker Hub
+        run: |
+          set -euo pipefail
+          mapfile -t TAGS < <(jq -r '.[]' /tmp/hub-tags.json)
+          args=(); for t in "${TAGS[@]}"; do args+=( -t "$t" ); done
+          SRC="${REGISTRY}/${BACKEND_IMAGE}@${{ steps.incoming.outputs.digest }}"
+          n=0; max=5
+          until docker buildx imagetools create "${args[@]}" "${SRC}"; do
+            n=$((n + 1))
+            if [[ "$n" -ge "$max" ]]; then
+              echo "::error title=Docker Hub mirror failed::imagetools create to Docker Hub failed after ${max} attempts."
+              exit 1
+            fi
+            echo "Docker Hub copy attempt ${n}/${max} failed; retrying in $((n * 10))s..."
+            sleep $((n * 10))
+          done
+
+      - name: Sign image with cosign (keyless)
+        run: |
+          set -euo pipefail
+          cosign sign --yes \
+            ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@${{ steps.incoming.outputs.digest }}
+          cosign sign --yes \
+            docker.io/${{ env.DOCKERHUB_BACKEND }}@${{ steps.incoming.outputs.digest }}
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
+          subject-digest: ${{ steps.incoming.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify the published tags resolve to signed bytes
+        env:
+          PUBLISHED_SIG_IDENTITY_REGEXP: ^https://github\.com/artifact-keeper/artifact-keeper/\.github/workflows/docker-publish\.yml@refs/(heads|tags)/.+$
+          PUBLISHED_SIG_BASIC_AUTH: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
+          PUBLISHED_SIG_BASIC_AUTH_HOST: ghcr.io
+        run: |
+          set -euo pipefail
+          mapfile -t REFS < <(jq -r '.[]' /tmp/ghcr-tags.json /tmp/hub-tags.json)
+          scripts/ci/check-published-image-signature.sh "${REFS[@]}"
+
       - name: Attach VEX attestations
         run: |
           set -uo pipefail
@@ -2787,9 +3139,10 @@ jobs:
       ${{ !cancelled()
           && needs.publish-preflight.result == 'success'
           && needs.merge-backend.result == 'success'
+          && needs.merge-backend-scanner.result == 'success'
           && needs.merge-openscap.result == 'success'
           && needs.merge-scanner-adapter.result == 'success' }}
-    needs: [publish-preflight, merge-backend, merge-openscap, merge-scanner-adapter]
+    needs: [publish-preflight, merge-backend, merge-backend-scanner, merge-openscap, merge-scanner-adapter]
     permissions:
       contents: read   # read published GitHub Releases (the floating-tag rule)
       packages: write  # re-point ghcr tags
@@ -2798,6 +3151,8 @@ jobs:
       ADVANCE_FLOATING: ${{ needs.publish-preflight.outputs.advance_floating }}
       BACKEND_DIGEST: ${{ needs.merge-backend.outputs.digest }}
       BACKEND_VERSION: ${{ needs.merge-backend.outputs.version }}
+      BACKEND_SCANNER_DIGEST: ${{ needs.merge-backend-scanner.outputs.digest }}
+      BACKEND_SCANNER_VERSION: ${{ needs.merge-backend-scanner.outputs.version }}
       OPENSCAP_DIGEST: ${{ needs.merge-openscap.outputs.digest }}
       OPENSCAP_VERSION: ${{ needs.merge-openscap.outputs.version }}
       ADAPTER_DIGEST: ${{ needs.merge-scanner-adapter.outputs.digest }}
@@ -2887,7 +3242,7 @@ jobs:
             # tag names -- that equality is the whole "bytes tested == bytes
             # published" claim, so it is checked rather than assumed. The merge
             # jobs report the version they guarded; it has to be this one.
-            for pair in "backend:${BACKEND_VERSION}" "openscap:${OPENSCAP_VERSION}"; do
+            for pair in "backend:${BACKEND_VERSION}" "backend-scanner:${BACKEND_SCANNER_VERSION}" "openscap:${OPENSCAP_VERSION}"; do
               if [[ "${pair#*:}" != "${PROMOTE_VERSION}" ]]; then
                 echo "::error title=Promote version mismatch::${pair%%:*} published '${pair#*:}' but this run is promoting '${PROMOTE_VERSION}'. Refusing to alias a floating tag onto a digest that is not the promoted version's."
                 exit 1
@@ -2913,6 +3268,7 @@ jobs:
                 echo "::notice title=No floating tag advances::${PROMOTE_VERSION} is newest in neither its series nor overall; :latest and :X.Y stay where they are."
               fi
               plan "$GB" "$HB" "${BACKEND_DIGEST}"  advance ${FT[@]+"${FT[@]}"}
+              plan "$GB" "$HB" "${BACKEND_SCANNER_DIGEST}" advance ${FT[@]+"${FT[@]/%/-scanner}"}
               plan "$GO" "$HO" "${OPENSCAP_DIGEST}" advance ${FT[@]+"${FT[@]}"}
             else
               refused+=("backend/openscap ${PROMOTE_VERSION}")
@@ -2960,6 +3316,7 @@ jobs:
               echo "  prerelease ${PROMOTE_VERSION}: no AK floating tags exist to mirror."
             else
               plan "$GB" "$HB" "${BACKEND_DIGEST}"  mirror "${PROMOTE_VERSION%.*}" latest
+              plan "$GB" "$HB" "${BACKEND_SCANNER_DIGEST}" mirror "${PROMOTE_VERSION%.*}-scanner" latest-scanner
               plan "$GO" "$HO" "${OPENSCAP_DIGEST}" mirror "${PROMOTE_VERSION%.*}" latest
             fi
             plan "$GS" "$HS" "${ADAPTER_DIGEST}" mirror \
@@ -3107,7 +3464,7 @@ jobs:
     # does. Floating tags are no longer part of what a tag push promises to
     # publish -- on a stable tag `:latest` and `:X.Y` are applied by the
     # post-gate promotion, so asserting them here would fail every cut.
-    needs: [merge-backend, merge-openscap, merge-scanner-adapter, apply-floating-tags]
+    needs: [merge-backend, merge-backend-scanner, merge-openscap, merge-scanner-adapter, apply-floating-tags]
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       # Needed to read docker/scanner-adapter/VERSION — the adapter is
@@ -3164,6 +3521,7 @@ jobs:
           # merge-scanner-adapter.
           EXPECTED=(
             "${BACKEND_IMAGE}:${VERSION}"
+            "${BACKEND_IMAGE}:${VERSION}-scanner"
             "${OPENSCAP_IMAGE}:${VERSION}"
           )
 
@@ -3276,7 +3634,7 @@ jobs:
     name: Publish Summary
     runs-on: ubuntu-latest
     permissions: {}
-    needs: [merge-backend, merge-openscap, merge-scanner-adapter, apply-floating-tags]
+    needs: [merge-backend, merge-backend-scanner, merge-openscap, merge-scanner-adapter, apply-floating-tags]
     # always() would otherwise run this even when the fork guard on
     # publish-preflight skipped everything else; mirror that guard here.
     if: ${{ always() && (github.event_name != 'schedule' || github.repository == 'artifact-keeper/artifact-keeper') }}
