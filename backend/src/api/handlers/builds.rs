@@ -341,7 +341,29 @@ pub struct ListBuildsQuery {
     pub search: Option<String>,
     pub sort_by: Option<String>,
     pub sort_order: Option<String>,
+    /// Exact build name
+    pub name: Option<String>,
+    /// Exact VCS branch
+    pub branch: Option<String>,
+    /// Exact agent
+    pub agent: Option<String>,
+    /// Builds created at or after this time (RFC 3339)
+    pub created_after: Option<chrono::DateTime<chrono::Utc>>,
+    /// Builds created before this time (RFC 3339)
+    pub created_before: Option<chrono::DateTime<chrono::Utc>>,
 }
+
+/// The list's `WHERE`, shared by the page and the count: `$1` status, `$2`
+/// search pattern, `$3` to `$7` the exact filters
+const LIST_FILTER: &str = r#"
+        WHERE ($1::text IS NULL OR status = $1)
+          AND ($2::text IS NULL OR name ILIKE $2 ESCAPE '\')
+          AND ($3::text IS NULL OR name = $3)
+          AND ($4::text IS NULL OR vcs_branch = $4)
+          AND ($5::text IS NULL OR agent = $5)
+          AND ($6::timestamptz IS NULL OR created_at >= $6)
+          AND ($7::timestamptz IS NULL OR created_at < $7)
+"#;
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct BuildArtifact {
@@ -520,37 +542,39 @@ pub async fn list_builds(
                vcs_url, vcs_revision, vcs_branch, vcs_message, metadata,
                created_at, updated_at, created_by
         FROM builds
-        WHERE ($1::text IS NULL OR status = $1)
-          AND ($2::text IS NULL OR name ILIKE $2 ESCAPE '\')
-        {}
-        OFFSET $3
-        LIMIT $4
-        "#,
-        order_clause
+        {LIST_FILTER}
+        {order_clause}
+        OFFSET $8
+        LIMIT $9
+        "#
     );
 
     let builds: Vec<BuildReadRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
         .bind(&query.status)
         .bind(&search_pattern)
+        .bind(&query.name)
+        .bind(&query.branch)
+        .bind(&query.agent)
+        .bind(query.created_after)
+        .bind(query.created_before)
         .bind(offset)
         .bind(per_page as i64)
         .fetch_all(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let total: i64 = sqlx::query_scalar(
-        r#"
-        SELECT COUNT(*)
-        FROM builds
-        WHERE ($1::text IS NULL OR status = $1)
-          AND ($2::text IS NULL OR name ILIKE $2 ESCAPE '\')
-        "#,
-    )
-    .bind(&query.status)
-    .bind(&search_pattern)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(0);
+    let count_sql = format!("SELECT COUNT(*) FROM builds {LIST_FILTER}");
+    let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(&*count_sql))
+        .bind(&query.status)
+        .bind(&search_pattern)
+        .bind(&query.name)
+        .bind(&query.branch)
+        .bind(&query.agent)
+        .bind(query.created_after)
+        .bind(query.created_before)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
     let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
 
@@ -1423,6 +1447,11 @@ mod tests {
             search: None,
             sort_by: None,
             sort_order: None,
+            name: None,
+            branch: None,
+            agent: None,
+            created_after: None,
+            created_before: None,
         };
         let err = list_builds(State(state), Extension(None), Query(query))
             .await
@@ -2744,6 +2773,89 @@ mod tests {
             .await;
         tdh::cleanup_user(&pool, owner_id).await;
         tdh::cleanup_user(&pool, other_id).await;
+    }
+
+    /// web#618: the list only filtered by status and a name substring. It now
+    /// takes an exact name, branch and agent and a creation time range, and
+    /// the total counts the same rows
+    #[tokio::test]
+    async fn list_builds_filters_by_name_branch_agent_and_time_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool.clone(), "/tmp/ph-618-filter");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let app = tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+        let p = format!("ph-618-filter-{}", Uuid::new_v4());
+        let (app_name, lib_name) = (format!("{p}-app"), format!("{p}-app-lib"));
+
+        // number, name, branch, agent, created hours ago
+        for (number, name, branch, agent, hours) in [
+            (1, &app_name, "main", "runner-a", 50),
+            (2, &app_name, "feat/x", "runner-b", 26),
+            (3, &app_name, "main", "runner-b", 2),
+            (4, &lib_name, "main", "runner-a", 1),
+        ] {
+            let b = send_json(
+                app.clone(),
+                post_json(
+                    "/",
+                    json!({ "name": name, "build_number": number,
+                            "vcs_branch": branch, "agent": agent }),
+                ),
+            )
+            .await;
+            sqlx::query(
+                "UPDATE builds SET created_at = NOW() - make_interval(hours => $2) WHERE id = $1",
+            )
+            .bind(Uuid::parse_str(b["id"].as_str().expect("id")).expect("uuid"))
+            .bind(hours)
+            .execute(&pool)
+            .await
+            .expect("backdate");
+        }
+
+        let after = (Utc::now() - chrono::Duration::hours(30)).format("%Y-%m-%dT%H:%M:%SZ");
+        let before = (Utc::now() - chrono::Duration::hours(3)).format("%Y-%m-%dT%H:%M:%SZ");
+        let numbers = |filter: String| {
+            let app = app.clone();
+            let p = p.clone();
+            async move {
+                let list = send_json(
+                    app,
+                    tdh::get(format!("/?search={p}&sort_by=build_number&{filter}")),
+                )
+                .await;
+                let items: Vec<i64> = list["items"]
+                    .as_array()
+                    .expect("items")
+                    .iter()
+                    .map(|b| b["number"].as_i64().expect("number"))
+                    .collect();
+                assert_eq!(list["pagination"]["total"], items.len(), "{list}");
+                items
+            }
+        };
+
+        assert_eq!(numbers(String::new()).await, [1, 2, 3, 4]);
+        assert_eq!(numbers(format!("name={app_name}")).await, [1, 2, 3]);
+        assert_eq!(numbers("branch=main".to_string()).await, [1, 3, 4]);
+        assert_eq!(numbers("branch=feat%2Fx".to_string()).await, [2]);
+        assert_eq!(numbers("agent=runner-b".to_string()).await, [2, 3]);
+        assert_eq!(numbers(format!("created_after={after}")).await, [2, 3, 4]);
+        assert_eq!(numbers(format!("created_before={before}")).await, [1, 2]);
+        assert_eq!(
+            numbers(format!("name={app_name}&branch=main&created_after={after}")).await,
+            [3]
+        );
+        assert!(numbers("name=nope".to_string()).await.is_empty());
+
+        let _ = sqlx::query("DELETE FROM builds WHERE name LIKE $1")
+            .bind(format!("{p}-%"))
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, user_id).await;
     }
 
     /// #6046: the list parsed `sort_by` and always ordered by build number.
