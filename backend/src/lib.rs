@@ -34,6 +34,7 @@ pub mod cli;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod fips;
 pub mod formats;
 pub mod grpc;
 pub mod migration_repair;

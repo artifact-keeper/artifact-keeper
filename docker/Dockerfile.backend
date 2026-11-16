@@ -39,6 +39,20 @@ RUN dnf install -y --nodocs \
     cargo install cargo-chef --locked
 ENV PATH="/root/.cargo/bin:${PATH}"
 
+# FIPS 140-3 variant (the `-fips` image tag), for deployments that require
+# FIPS 140-3 validated cryptography: `--build-arg FIPS=1` builds the backend
+# with `--no-default-features --features fips` (backend/Cargo.toml, and
+# docs/fips.md). The AWS-LC FIPS module (`aws-lc-fips-sys`) is built from
+# source and needs CMake and Go on top of the C toolchain above. Empty, the
+# default, installs nothing and every stage below runs exactly the commands
+# it ran before this ARG existed. Declared after the toolchain RUN so the
+# default build's existing layers keep their cache. Declared again in each
+# compiling stage (an ARG does not cross a FROM); all three must agree.
+ARG FIPS=""
+RUN if [ -n "$FIPS" ]; then \
+      dnf install -y --nodocs cmake golang && dnf clean all; \
+    fi
+
 # ---------- Stage 1: Plan dependencies ----------
 FROM rust-base AS planner
 WORKDIR /app
@@ -88,8 +102,13 @@ ARG CARGO_PROFILE=release
 # also run on 64 KiB-page arm64 kernels (RHEL's kernel-64k, NVIDIA Grace), so
 # aarch64 builds jemalloc for 64 KiB pages, which also works on 4 KiB kernels.
 # The builder stage sets the same value; a mismatch rebuilds jemalloc there.
+# FIPS variant: the same cook with the default TLS features off (see the
+# FIPS ARG in rust-base).
+ARG FIPS=""
 RUN if [ "$(uname -m)" = aarch64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi && \
-    if [ -n "$CARGO_FEATURES" ]; then \
+    if [ -n "$FIPS" ]; then \
+      cargo chef cook --profile "$CARGO_PROFILE" --no-default-features --features "fips${CARGO_FEATURES:+,$CARGO_FEATURES}" --recipe-path recipe.json; \
+    elif [ -n "$CARGO_FEATURES" ]; then \
       cargo chef cook --profile "$CARGO_PROFILE" --features "$CARGO_FEATURES" --recipe-path recipe.json; \
     else \
       cargo chef cook --profile "$CARGO_PROFILE" --recipe-path recipe.json; \
@@ -112,6 +131,8 @@ ARG CARGO_BUILD_JOBS=8
 # Same profile as the deps stage above; the two must match or the cooked
 # dependencies are not reused.
 ARG CARGO_PROFILE=release
+# Same FIPS switch as the deps stage above; the two must match.
+ARG FIPS=""
 ENV SQLX_OFFLINE=true
 ENV GIT_SHA=${GIT_SHA}
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
@@ -121,7 +142,9 @@ RUN if [ "$(uname -m)" = aarch64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi
       CLEAN_VERSION=$(echo "${APP_VERSION}" | sed 's/^v//'); \
       sed -i "s/^version = \".*\"/version = \"${CLEAN_VERSION}\"/" Cargo.toml; \
     fi && \
-    if [ -n "$CARGO_FEATURES" ]; then \
+    if [ -n "$FIPS" ]; then \
+      cargo build --profile "$CARGO_PROFILE" --no-default-features --features "fips${CARGO_FEATURES:+,$CARGO_FEATURES}" --bin artifact-keeper; \
+    elif [ -n "$CARGO_FEATURES" ]; then \
       cargo build --profile "$CARGO_PROFILE" --features "$CARGO_FEATURES" --bin artifact-keeper; \
     else \
       cargo build --profile "$CARGO_PROFILE" --bin artifact-keeper; \

@@ -112,9 +112,19 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // Required by rustls 0.23+ when multiple providers (ring, aws-lc-rs)
     // are compiled in via transitive dependencies (object_store, reqwest, sqlx).
     // Without this, IRSA/STS credential fetches panic at startup.
+    #[cfg(not(feature = "fips"))]
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install rustls CryptoProvider");
+    // FIPS build: the AWS-LC FIPS provider instead, and refuse to start unless
+    // it reports FIPS mode. Tracing is not up yet, hence stderr.
+    #[cfg(feature = "fips")]
+    if let Err(e) = artifact_keeper_backend::fips::install_fips_provider() {
+        eprintln!("FATAL: FIPS 140-3 mode check failed, refusing to start: {e}");
+        return Err(artifact_keeper_backend::error::AppError::Config(format!(
+            "FIPS 140-3 mode check failed: {e}"
+        )));
+    }
 
     // Resolve the shutdown token early so background workers spawned during
     // startup (email dispatcher, webhook producer) share the same
@@ -151,6 +161,9 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         otel_endpoint.as_deref(),
         &otel_service_name,
     );
+    // Reported as early as tracing allows, before anything that can fail on
+    // configuration, so a FIPS image always says which provider it runs on.
+    artifact_keeper_backend::fips::log_crypto_mode();
 
     // Resolve LOG_PROBE_REQUESTS now so a typo warns at startup rather than on
     // the first probe request.
@@ -188,6 +201,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         git = artifact_keeper_backend::build_info::short_sha(),
         "Starting Artifact Keeper"
     );
+    // FIPS build: fix how legacy bcrypt password/token hashes are treated,
+    // and refuse to start on an unrecognised FIPS_LEGACY_PASSWORD_HASHES.
+    #[cfg(feature = "fips")]
+    {
+        use artifact_keeper_backend::services::fips_password;
+        let policy = fips_password::validate_policy_env()
+            .map_err(artifact_keeper_backend::error::AppError::Config)?;
+        tracing::info!(
+            legacy_password_hashes = policy.as_str(),
+            "FIPS 140-3 mode: new password and API-token hashes use PBKDF2-HMAC-SHA256"
+        );
+    }
 
     // Install the Prometheus recorder before anything records a metric.
     // `db::create_pool` counts failed initial connect attempts in

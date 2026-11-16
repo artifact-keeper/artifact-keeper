@@ -50,6 +50,8 @@ pub mod environment_service;
 pub mod event_bus;
 pub mod federated_email;
 pub mod finding_acknowledgements;
+#[cfg(feature = "fips")]
+pub mod fips_password;
 pub mod grype_scanner;
 pub mod guest_access_policy;
 pub mod helm_lint_checker;
