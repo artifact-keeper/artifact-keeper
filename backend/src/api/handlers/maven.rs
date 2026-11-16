@@ -1271,10 +1271,27 @@ async fn maven_remote_stream(
         };
         // #4573: the cached `.sha1` is read alongside the content open, not
         // after it (the #3982/#4289 rule), and from the cache only.
-        let (result, sha1) = tokio::join!(
-            content,
-            maven_remote_sha1(proxy, repo_id, repo_key, upstream_url, path, is_head),
-        );
+        //
+        // #6069: both reach the Remote's origin gate; inside this memo the
+        // sidecar read reuses the content fetch's pass instead of looking the
+        // Remote up and loading its policies again. The scope is this pair
+        // only: the sidecar decides nothing but the checksum header on a body
+        // the content fetch's own gate already decided. Boxed: the pair's
+        // future would otherwise sit inline in this handler's, which is already
+        // near the layout depth the proxy fetch boxes against.
+        let pair = Box::pin(async {
+            tokio::join!(
+                content,
+                maven_remote_sha1(proxy, repo_id, repo_key, upstream_url, path, is_head),
+            )
+        });
+        // GET only: a HEAD's fall-back GET and its cold `.sha1` fetch contact
+        // the upstream and commit to the cache, so a HEAD evaluates every time.
+        let (result, sha1) = if is_head {
+            pair.await
+        } else {
+            crate::services::proxy_service::ProxyService::with_origin_gate_memo(pair).await
+        };
         let result = result.map_err(IntoResponse::into_response)?;
         let mut response = proxy_helpers::build_streaming_response_with_disposition(
             result,
