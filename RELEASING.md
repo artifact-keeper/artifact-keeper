@@ -70,6 +70,11 @@ names the same commit.
    instruction. The transcript says which checks did not run, so re-run the
    preflight for a full verdict once you have fixed them.
 
+   **Cut from a nightly-green commit (#6075).** Before you write the prep,
+   pick its base: the newest commit on the line the nightly full gate
+   measured green. Check 8 of the preflight names it. The full procedure is
+   [Cut from a nightly-green commit](#cut-from-a-nightly-green-commit).
+
    **This step is now enforced, not advisory (#3538).** `release.yml`'s
    `preflight-evidence` job refuses to proceed unless a green run of the
    **Release Preflight workflow** exists for the exact commit the tag points
@@ -629,6 +634,66 @@ names the same commit.
 
    `SECURITY.md` carries the same commands written out for a user who does
    not have the repository checked out; keep the two in step.
+
+## Cut from a nightly-green commit
+
+A Release Candidate runs the full gate (1.5–3 hours). It used to be the first
+time a commit met that gate, so drift merged since the last cut (stale tests,
+timing races in tiers, runner tooling gaps) showed up one red candidate at a
+time: 8 of 10 candidates went red on 2026-11-15/16 (#6081). The **Nightly
+Release Gate** (`.github/workflows/nightly-release-gate.yml`, #6073) runs the
+same gate every night at 08:00 UTC on `main` and on every `release/X.Y.x`
+with a commit in the last 30 days, against the newest Docker Publish image
+of each, with the tests ref a candidate would use (`switch-tests-ref.sh`:
+the tests' `release/X.Y.x` when it exists, else the tests' `main`). Each red
+tier has one open issue (label `release-gate`, title `Nightly gate [<line>]:
+<tier> is red`) naming the first red commit range. The issue closes the first
+night the tier is green again.
+
+What it records, per tested commit:
+
+- the commit status **`release-gate/nightly`** (`success` or `failure`),
+  written only after a complete full-suite run;
+- the **`nightly-gate-verdict`** artifact on the nightly run (`verdict.json`:
+  each line's sha, digest, version, tests ref and sha, verdict, red tiers and
+  per-tier conclusions; kept 90 days).
+
+Neither is a release certification, and nothing on the release path accepts
+either as one. Only the candidate's signed attestation certifies.
+
+**The procedure.**
+
+1. Find the base. `scripts/ci/release-preflight.sh` check 8 reports the
+   nightly result for `HEAD`. When `HEAD` has none, or a red one, it names
+   the newest nightly-green commit in the last 30 first-parent commits. By
+   hand: the commit page shows the `release-gate/nightly` status, or run
+   `gh api repos/artifact-keeper/artifact-keeper/commits/<sha>/statuses --jq '.[] | select(.context == "release-gate/nightly") | .state' | head -1`.
+2. Write the prep on that base. On a maintenance line, branch the prep from
+   the green commit. On main, either merge the prep while that commit is
+   still main's tip, or hold unrelated merges to main from the nightly
+   run until the prep merges. Anything merged after the green commit is
+   untested by the nightly, and it is inside the release tree.
+3. The prep must change **only release bookkeeping**: `CHANGELOG.md`,
+   `.github/release-notes/`, `changes/unreleased/`, `docker/*/VERSION`, and
+   the version line in `Cargo.toml`, `Cargo.lock` and
+   `backend/src/api/openapi.rs`. Check 8 then reports the prep commit as
+   covered ("differs from it only in release bookkeeping"). Any other change,
+   even a one-line fix folded into the prep, breaks the link, and check 8 warns.
+4. Dispatch the candidate on the prep commit as usual (step 6). It still runs
+   the full gate. The nightly predicts that gate; it does not replace it.
+
+**When check 8 warns.** It is advisory and never changes the verdict.
+
+- *Red on the base.* Open the tracking issues for that line. A candidate on
+  this tree will most likely go red on the same tiers. Fix them, or wait for
+  a green night.
+- *No result.* Either the commit is newer than the last nightly run (cut
+  from the commit check 8 names, or wait a night), or the nightly was
+  pre-empted that night. The nightly gives way to any Release Candidate in
+  flight and records nothing for a night it did not finish.
+- To get a result sooner, dispatch the nightly by hand once no candidate is
+  in flight: `gh workflow run nightly-release-gate.yml -f lines=<main|X.Y.x>
+  -f track_issues=true`. It writes the status only for `test_suite=all`.
 
 ## Creating a release line
 

@@ -145,6 +145,11 @@
 #      closed type:bug issue in the milestone has a tier wired into the
 #      release gate that COVERS it, a suite, or an exemption
 #      (scripts/ci/check-e2e-proof.py milestone). Rationale at the check.
+#   8. NIGHTLY FULL GATE RESULT (advisory, never blocks): the
+#      `release-gate/nightly` status nightly-release-gate.yml wrote on this
+#      commit, or on the commit it differs from only in release bookkeeping
+#      (#6075). Red or missing warns and names the newest nightly-green
+#      commit to cut from instead.
 #
 # Exit-code contract (mirrors scripts/ci/check-migration-ledger.sh):
 #   0  ready       -- no blocking problem found.
@@ -1033,6 +1038,116 @@ else
       warn "check 7 could not be measured (advisory): $(printf '%s\n' "$e2e_out" | grep -m1 INFRA | cut -c1-120 || true)"
       ;;
   esac
+fi
+echo
+# --- check 8: the nightly full gate's result for this commit (advisory) -----
+#
+# A Release Candidate used to be the first time the commit met the full gate,
+# so a candidate often went red on drift and each retry cost a full 1.5-3 h
+# run (#6075; 8 of 10 candidates on 2026-11-15/16). The nightly gate
+# (nightly-release-gate.yml, #6073) now runs the same gate every night on
+# main and each active release/X.Y.x and writes the commit status
+# `release-gate/nightly` (success/failure) on the commit it tested. Cut from
+# a commit it measured green.
+#
+# A release prep is never the commit the nightly tested: it lands after the
+# fact. So a commit counts as covered when it differs from a commit the
+# nightly measured only in release BOOKKEEPING: CHANGELOG.md,
+# .github/release-notes/, changes/unreleased/, docker/*/VERSION (the release
+# prep's path set, release-commit-exemptions.sh), and version-only line changes
+# in Cargo.toml, Cargo.lock and backend/src/api/openapi.rs. The walk goes back
+# along first parents while every commit is bookkeeping-only; the first
+# commit with a nightly result decides. Past the first non-bookkeeping commit,
+# nothing older vouches for HEAD.
+#
+# ADVISORY by design (#6075 asks for a warning): the nightly is advisory, a
+# candidate still runs the full gate, and a fresh commit legitimately has no
+# nightly result yet. Every outcome is ok or warn, never FAIL or INFRA. When
+# HEAD is not covered, the newest nightly-green commit within the last
+# PREFLIGHT_NIGHTLY_LOOKBACK (default 30) first-parent commits is named as
+# the one to cut from.
+#
+# Env: PREFLIGHT_SKIP_NIGHTLY_GATE=1 skips it; PREFLIGHT_NIGHTLY_LOOKBACK.
+echo "8) nightly full gate result for the commit being cut (advisory)"
+NIGHTLY_CONTEXT="release-gate/nightly"
+
+# Prints "<state> <target_url>" of the newest release-gate/nightly status on
+# a commit, "none" when it has none. Non-zero exit when the API failed.
+nightly_status() {
+  local out
+  out="$(gh api "repos/${REPO}/commits/$1/statuses?per_page=100" \
+    --jq "[.[] | select(.context == \"${NIGHTLY_CONTEXT}\")][0] // empty | \"\(.state) \(.target_url)\"" 2>/dev/null)" || return 1
+  printf '%s\n' "${out:-none}"
+}
+
+# True when commit $1 changes only release bookkeeping relative to its first
+# parent. A root commit or an unreadable diff is not bookkeeping.
+bookkeeping_only_commit() {
+  local c="$1" f changed
+  git rev-parse -q --verify "${c}^" >/dev/null 2>&1 || return 1
+  changed="$(git diff --name-only "${c}^" "$c" 2>/dev/null)" || return 1
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    case "$f" in
+      CHANGELOG.md|.github/release-notes/*|changes/unreleased/*|docker/*/VERSION) ;;
+      Cargo.toml|Cargo.lock|backend/src/api/openapi.rs)
+        # Every changed line must be a version line (the X.Y.Z bump).
+        if git diff -U0 "${c}^" "$c" -- "$f" | grep -E '^[+-]' | grep -vE '^(\+\+\+|---) ' \
+             | grep -qvE '^[+-][[:space:]]*version[[:space:]]*[:=]'; then
+          return 1
+        fi ;;
+      *) return 1 ;;
+    esac
+  done <<<"$changed"
+  return 0
+}
+
+if [[ "${PREFLIGHT_SKIP_NIGHTLY_GATE:-0}" == "1" ]]; then
+  note "PREFLIGHT_SKIP_NIGHTLY_GATE=1; skipped."
+elif ! command -v gh >/dev/null 2>&1; then
+  note "NOT MEASURED (gh not on PATH)."
+else
+  nightly_head="$(git rev-parse HEAD 2>/dev/null || true)"
+  lookback="${PREFLIGHT_NIGHTLY_LOOKBACK:-30}"
+  nightly_verdict=""; nightly_at=""; nightly_url=""; nightly_err=0
+  c="$nightly_head"
+  while [[ -n "$c" ]]; do
+    if ! s="$(nightly_status "$c")"; then nightly_err=1; break; fi
+    if [[ "$s" != none ]]; then
+      nightly_verdict="${s%% *}"; nightly_url="${s#* }"; nightly_at="$c"; break
+    fi
+    bookkeeping_only_commit "$c" || break
+    c="$(git rev-parse -q --verify "${c}^" 2>/dev/null || true)"
+  done
+  if [[ "$nightly_err" -eq 1 ]]; then
+    warn "could not read the ${NIGHTLY_CONTEXT} status (gh api failed); check 8 not measured (advisory)"
+  elif [[ "$nightly_verdict" == success ]]; then
+    if [[ "$nightly_at" == "$nightly_head" ]]; then
+      ok "the nightly full gate was green on this commit (${nightly_url})"
+    else
+      ok "the nightly full gate was green on ${nightly_at:0:7}; this commit differs from it only in release bookkeeping (${nightly_url})"
+    fi
+  else
+    if [[ -n "$nightly_verdict" ]]; then
+      warn "the nightly full gate was ${nightly_verdict^^} on ${nightly_at:0:7}$([[ "$nightly_at" != "$nightly_head" ]] && echo ', which this commit differs from only in bookkeeping') (${nightly_url})"
+      note "  -> its tracking issues: label release-gate, title 'Nightly gate [...]'. A candidate on this commit will most likely go red on the same tiers."
+    else
+      warn "no nightly full gate result for this commit or for any commit it differs from only in release bookkeeping"
+    fi
+    # Name the commit to cut from instead.
+    green=""
+    while read -r cand; do
+      [[ -z "$cand" || "$cand" == "$nightly_at" ]] && continue
+      s="$(nightly_status "$cand" 2>/dev/null)" || break
+      if [[ "${s%% *}" == success ]]; then green="$cand"; break; fi
+    done < <(git rev-list --first-parent -n "$lookback" HEAD 2>/dev/null)
+    if [[ -n "$green" ]]; then
+      note "  -> the newest nightly-green commit on ${AUDIT_REF} is ${green:0:7} ($(git log -1 --format=%s "$green" | cut -c1-70))."
+      note "     Cut from it: base the release prep on it, so the prep adds only bookkeeping (RELEASING.md, 'Cut from a nightly-green commit')."
+    else
+      note "  -> no nightly-green commit in the last ${lookback} first-parent commits of ${AUDIT_REF}. Cutting anyway means the candidate is the first full-gate run of this tree."
+    fi
+  fi
 fi
 echo
 # --- verdict ----------------------------------------------------------------

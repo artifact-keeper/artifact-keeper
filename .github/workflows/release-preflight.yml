@@ -55,6 +55,9 @@ on:
 permissions:
   contents: read
   actions: read
+  # Check 8 reads the advisory `release-gate/nightly` commit status the
+  # nightly release gate writes (#6075).
+  statuses: read
   # Check 4 reads published component manifests from ghcr.io. These packages
   # are public, so an anonymous pull token would usually do -- but "usually"
   # is not a property to depend on: if one is ever made private the probe
