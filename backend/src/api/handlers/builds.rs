@@ -14,6 +14,7 @@ use uuid::Uuid;
 use std::collections::{HashMap, HashSet};
 
 use crate::api::dto::Pagination;
+use crate::api::handlers::artifacts::{check_artifact_visibility, check_repo_visibility};
 use crate::api::handlers::last_promotion::readable_repo_ids;
 // #3713: the crate's `Json` rather than `axum::Json`, so a body this module
 // refuses (a NUL in a bound field included) is the 400 VALIDATION_ERROR
@@ -190,13 +191,16 @@ struct BuildReadRow {
 /// a build artifact only when `<key>/<path>` is a non-deleted row of
 /// `artifacts` in repository `<key>`, and that repository passes the grant
 /// half plus the token-scope half (`readable_repo_ids`, the predicate the
-/// virtual-member and promotion listings use). Everything else is visible
-/// only to the creator or an administrator.
+/// virtual-member and promotion listings use). An entry linked to a stored
+/// artifact shows when `links` (the caller's readable links) has it and the
+/// artifact is not in the trash. Everything else is visible only to the
+/// creator or an administrator.
 async fn readable_artifacts(
     state: &SharedState,
     auth: &AuthExtension,
     artifacts: Vec<StoredBuildArtifact>,
     details_visible: &HashSet<Uuid>,
+    links: &HashMap<Uuid, ArtifactLink>,
 ) -> Result<Vec<StoredBuildArtifact>> {
     let candidates: HashSet<(String, String)> = artifacts
         .iter()
@@ -243,6 +247,9 @@ async fn readable_artifacts(
         .into_iter()
         .filter(|a| {
             details_visible.contains(&a.build_id)
+                || a.artifact_id
+                    .and_then(|id| links.get(&id))
+                    .is_some_and(|l| !l.deleted)
                 || split_artifact_path(&a.path)
                     .is_some_and(|(k, p)| resolved.contains(&(k.to_string(), p.to_string())))
         })
@@ -268,7 +275,8 @@ async fn build_responses(
     let artifacts = BuildService::new(state.db.clone())
         .list_artifacts(&ids, per_build)
         .await?;
-    let artifacts = readable_artifacts(state, auth, artifacts, &details_visible).await?;
+    let links = readable_links(state, auth, &artifacts).await?;
+    let artifacts = readable_artifacts(state, auth, artifacts, &details_visible, &links).await?;
 
     let mut by_build: HashMap<Uuid, Vec<StoredBuildArtifact>> = HashMap::new();
     for a in artifacts {
@@ -291,7 +299,7 @@ async fn build_responses(
                 // is shown (out of the per-read cap).
                 response.artifact_count = Some(i32::try_from(artifacts.len()).unwrap_or(i32::MAX));
             }
-            response.modules = Some(group_into_modules(artifacts));
+            response.modules = Some(group_into_modules(artifacts, &links));
             response
         })
         .collect())
@@ -300,23 +308,21 @@ async fn build_responses(
 /// Group a build's artifact rows by `module_name`, in first-seen order.
 /// Artifacts attached without a module go to a module with an empty name.
 /// A module has no row of its own: its id is the id of its first artifact.
-fn group_into_modules(artifacts: Vec<StoredBuildArtifact>) -> Vec<BuildModule> {
+fn group_into_modules(
+    artifacts: Vec<StoredBuildArtifact>,
+    links: &HashMap<Uuid, ArtifactLink>,
+) -> Vec<BuildModule> {
     let mut modules: Vec<BuildModule> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     for a in artifacts {
-        let name = a.module_name.unwrap_or_default();
-        let artifact = BuildArtifact {
-            name: a.name,
-            path: a.path,
-            checksum_sha256: a.checksum_sha256,
-            size_bytes: a.size_bytes,
-        };
+        let (id, name) = (a.id, a.module_name.clone().unwrap_or_default());
+        let artifact = to_build_artifact(a, links);
         match index.get(&name) {
             Some(&i) => modules[i].artifacts.push(artifact),
             None => {
                 index.insert(name.clone(), modules.len());
                 modules.push(BuildModule {
-                    id: a.id,
+                    id,
                     name,
                     artifacts: vec![artifact],
                 });
@@ -404,6 +410,80 @@ pub struct BuildArtifact {
     pub path: String,
     pub checksum_sha256: String,
     pub size_bytes: i64,
+    /// The stored artifact this entry links to, when the caller can read its
+    /// repository
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository_key: Option<String>,
+    /// The linked artifact is in the trash
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub artifact_deleted: bool,
+}
+
+/// A linked artifact as the caller may see it
+#[derive(Debug, Clone)]
+struct ArtifactLink {
+    repository_key: String,
+    deleted: bool,
+}
+
+/// The links of `artifacts` the caller can read, by artifact id. A link into
+/// a repository the caller can't read is left out: the build's creator sees
+/// the entry as a free-form one without the repository, anyone else does not
+/// see the entry (`readable_artifacts`)
+async fn readable_links(
+    state: &SharedState,
+    auth: &AuthExtension,
+    artifacts: &[StoredBuildArtifact],
+) -> Result<HashMap<Uuid, ArtifactLink>> {
+    let ids: Vec<Uuid> = artifacts.iter().filter_map(|a| a.artifact_id).collect();
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<(Uuid, bool, Uuid, String, RepositoryVisibility)> = sqlx::query_as(
+        "SELECT a.id, a.is_deleted, r.id, r.key, r.visibility \
+         FROM artifacts a JOIN repositories r ON r.id = a.repository_id \
+         WHERE a.id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let caller = Some(auth.clone());
+    let mut readable: HashMap<Uuid, bool> = HashMap::new();
+    let mut links = HashMap::new();
+    for (artifact_id, deleted, repo_id, key, visibility) in rows {
+        if crate::models::repository::is_deleting_key(&key) {
+            continue;
+        }
+        let can_read = match readable.get(&repo_id) {
+            Some(can_read) => *can_read,
+            None => {
+                let can_read =
+                    match check_repo_visibility(&caller, repo_id, visibility, &state.db, "read")
+                        .await
+                    {
+                        Ok(()) => true,
+                        Err(AppError::NotFound(_)) | Err(AppError::Authorization(_)) => false,
+                        Err(e) => return Err(e),
+                    };
+                readable.insert(repo_id, can_read);
+                can_read
+            }
+        };
+        if can_read {
+            links.insert(
+                artifact_id,
+                ArtifactLink {
+                    repository_key: key,
+                    deleted,
+                },
+            );
+        }
+    }
+    Ok(links)
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -686,6 +766,20 @@ pub async fn get_build(
     Ok(Json(response))
 }
 
+/// The response shape of a stored entry, with its link when readable
+fn to_build_artifact(a: StoredBuildArtifact, links: &HashMap<Uuid, ArtifactLink>) -> BuildArtifact {
+    let link = a.artifact_id.and_then(|id| links.get(&id).map(|l| (id, l)));
+    BuildArtifact {
+        name: a.name,
+        path: a.path,
+        checksum_sha256: a.checksum_sha256,
+        size_bytes: a.size_bytes,
+        artifact_id: link.map(|(id, _)| id),
+        repository_key: link.map(|(_, l)| l.repository_key.clone()),
+        artifact_deleted: link.is_some_and(|(_, l)| l.deleted),
+    }
+}
+
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct BuildDiffQuery {
     pub build_a: Uuid,
@@ -722,23 +816,80 @@ pub struct BuildDiffResponse {
     responses(
         (status = 200, description = "Diff between two builds", body = BuildDiffResponse),
         (status = 401, description = "Authentication required"),
+        (status = 404, description = "Build not found"),
     )
 )]
 pub async fn get_build_diff(
-    State(_state): State<SharedState>,
+    State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Query(query): Query<BuildDiffQuery>,
 ) -> Result<Json<BuildDiffResponse>> {
-    let _auth = require_auth(auth)?;
+    let auth = require_auth(auth)?;
 
-    // For now, return empty diff - this would require build_artifacts table
+    let ids = [query.build_a, query.build_b];
+    let service = BuildService::new(state.db.clone());
+    let mut details_visible = HashSet::new();
+    for id in ids {
+        if build_details_visible(&auth, service.created_by(id).await?) {
+            details_visible.insert(id);
+        }
+    }
+    let artifacts = service
+        .list_artifacts(&ids, MAX_ARTIFACTS_PER_BUILD)
+        .await?;
+    let links = readable_links(&state, &auth, &artifacts).await?;
+    let artifacts = readable_artifacts(&state, &auth, artifacts, &details_visible, &links).await?;
+    let (a, b): (Vec<_>, Vec<_>) = artifacts
+        .into_iter()
+        .partition(|x| x.build_id == query.build_a);
+    let (added, removed, modified) = diff_artifacts(a, b, &links);
+
     Ok(Json(BuildDiffResponse {
         build_a: query.build_a,
         build_b: query.build_b,
-        added: vec![],
-        removed: vec![],
-        modified: vec![],
+        added,
+        removed,
+        modified,
     }))
+}
+
+/// Compare two builds' artifacts by path: in `b` only is added, in `a` only
+/// is removed, on both with another checksum is modified
+fn diff_artifacts(
+    a: Vec<StoredBuildArtifact>,
+    b: Vec<StoredBuildArtifact>,
+    links: &HashMap<Uuid, ArtifactLink>,
+) -> (
+    Vec<BuildArtifact>,
+    Vec<BuildArtifact>,
+    Vec<BuildArtifactDiff>,
+) {
+    let mut old: HashMap<String, StoredBuildArtifact> =
+        a.into_iter().map(|x| (x.path.clone(), x)).collect();
+    let mut added = Vec::new();
+    let mut modified = Vec::new();
+    for new in b {
+        match old.remove(&new.path) {
+            None => added.push(to_build_artifact(new, links)),
+            Some(prev) if prev.checksum_sha256 != new.checksum_sha256 => {
+                modified.push(BuildArtifactDiff {
+                    name: new.name,
+                    path: new.path,
+                    old_checksum: prev.checksum_sha256,
+                    new_checksum: new.checksum_sha256,
+                    old_size_bytes: prev.size_bytes,
+                    new_size_bytes: new.size_bytes,
+                })
+            }
+            Some(_) => {}
+        }
+    }
+    let mut removed: Vec<BuildArtifact> = old
+        .into_values()
+        .map(|x| to_build_artifact(x, links))
+        .collect();
+    removed.sort_by(|x, y| x.path.cmp(&y.path));
+    (added, removed, modified)
 }
 
 // --- Write endpoints ---
@@ -881,6 +1032,10 @@ pub struct AddBuildArtifactsRequest {
     pub artifacts: Vec<BuildArtifactInputPayload>,
 }
 
+/// One artifact to attach. Either a free-form entry (`name`, `path`,
+/// `checksum_sha256`, `size_bytes` all given) or a link to a stored artifact,
+/// by `artifact_id` or by `repository_key` + `path`. A link takes the path,
+/// checksum and size from the artifact, and its name unless one is given
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct BuildArtifactInputPayload {
     // #3713: the four text fields are bound verbatim into the `INSERT INTO
@@ -891,13 +1046,139 @@ pub struct BuildArtifactInputPayload {
         deserialize_with = "crate::api::extractors::deserialize_nul_free_opt_string"
     )]
     pub module_name: Option<String>,
-    #[serde(deserialize_with = "crate::api::extractors::deserialize_nul_free_string")]
-    pub name: String,
-    #[serde(deserialize_with = "crate::api::extractors::deserialize_nul_free_string")]
-    pub path: String,
-    #[serde(deserialize_with = "crate::api::extractors::deserialize_nul_free_string")]
-    pub checksum_sha256: String,
-    pub size_bytes: i64,
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_nul_free_opt_string"
+    )]
+    pub name: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_nul_free_opt_string"
+    )]
+    pub path: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_nul_free_opt_string"
+    )]
+    pub checksum_sha256: Option<String>,
+    #[serde(default)]
+    pub size_bytes: Option<i64>,
+    /// Link a stored artifact by id
+    #[serde(default)]
+    pub artifact_id: Option<Uuid>,
+    /// Link the stored artifact at `path` in this repository
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_nul_free_opt_string"
+    )]
+    pub repository_key: Option<String>,
+}
+
+/// A stored artifact a build entry links to
+#[derive(Debug, FromRow)]
+struct LinkTarget {
+    id: Uuid,
+    name: String,
+    path: String,
+    checksum_sha256: String,
+    size_bytes: i64,
+    repository_key: String,
+}
+
+/// Find the artifact an entry links to, `None` for a free-form entry. An
+/// artifact that doesn't exist, is in the trash or sits in a repository the
+/// caller can't read is the same 404, so the answer doesn't tell them apart
+async fn resolve_link(
+    state: &SharedState,
+    auth: &AuthExtension,
+    entry: &BuildArtifactInputPayload,
+) -> Result<Option<LinkTarget>> {
+    let target: Option<LinkTarget> = match (&entry.artifact_id, &entry.repository_key) {
+        (Some(id), _) => sqlx::query_as(
+            "SELECT a.id, a.name, a.path, a.checksum_sha256, a.size_bytes, \
+                    r.key AS repository_key \
+             FROM artifacts a JOIN repositories r ON r.id = a.repository_id \
+             WHERE a.is_deleted = false AND a.id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?,
+        (None, Some(key)) => {
+            let path = entry
+                .path
+                .as_deref()
+                .map(|p| p.trim_start_matches('/'))
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| {
+                    AppError::Validation("repository_key needs the artifact path".to_string())
+                })?;
+            sqlx::query_as(
+                "SELECT a.id, a.name, a.path, a.checksum_sha256, a.size_bytes, \
+                        r.key AS repository_key \
+                 FROM artifacts a JOIN repositories r ON r.id = a.repository_id \
+                 WHERE a.is_deleted = false AND r.key = $1 \
+                   AND a.path IN ($2::text, '/' || $2::text) \
+                 ORDER BY a.created_at DESC LIMIT 1",
+            )
+            .bind(key)
+            .bind(path)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+        }
+        (None, None) => return Ok(None),
+    };
+    let not_found = || AppError::NotFound("Artifact not found".to_string());
+    let target = target.ok_or_else(not_found)?;
+    match check_artifact_visibility(&Some(auth.clone()), target.id, &state.db, "read").await {
+        Ok(()) => Ok(Some(target)),
+        Err(AppError::NotFound(_)) | Err(AppError::Authorization(_)) => Err(not_found()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The row to store for `entry`, with its link's repository key
+fn artifact_input(
+    entry: BuildArtifactInputPayload,
+    link: Option<LinkTarget>,
+) -> Result<(BuildArtifactInput, Option<String>)> {
+    if let Some(t) = link {
+        return Ok((
+            BuildArtifactInput {
+                module_name: entry.module_name,
+                name: entry.name.filter(|n| !n.is_empty()).unwrap_or(t.name),
+                path: t.path,
+                checksum_sha256: t.checksum_sha256,
+                size_bytes: t.size_bytes,
+                artifact_id: Some(t.id),
+            },
+            Some(t.repository_key),
+        ));
+    }
+    match (
+        entry.name,
+        entry.path,
+        entry.checksum_sha256,
+        entry.size_bytes,
+    ) {
+        (Some(name), Some(path), Some(checksum_sha256), Some(size_bytes)) => Ok((
+            BuildArtifactInput {
+                module_name: entry.module_name,
+                name,
+                path,
+                checksum_sha256,
+                size_bytes,
+                artifact_id: None,
+            },
+            None,
+        )),
+        _ => Err(AppError::Validation(
+            "An artifact needs artifact_id, repository_key and path, or all of name, path, \
+             checksum_sha256 and size_bytes"
+                .to_string(),
+        )),
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -909,6 +1190,10 @@ pub struct BuildArtifactResponse {
     pub path: String,
     pub checksum_sha256: String,
     pub size_bytes: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository_key: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -930,9 +1215,10 @@ pub struct AddBuildArtifactsResponse {
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Artifacts added to build", body = AddBuildArtifactsResponse),
+        (status = 400, description = "An entry is neither a link nor a complete free-form entry"),
         (status = 403, description = "Caller is neither the build's creator nor an administrator, or the token lacks write:artifacts"),
         (status = 401, description = "Authentication required"),
-        (status = 404, description = "Build not found"),
+        (status = 404, description = "Build not found, or a linked artifact is missing or not readable"),
     )
 )]
 pub async fn add_build_artifacts(
@@ -944,24 +1230,24 @@ pub async fn add_build_artifacts(
     let auth = require_auth(auth)?;
     require_build_owner(&state, &auth, id, "write:artifacts").await?;
 
-    let service = BuildService::new(state.db.clone());
-    let inputs: Vec<BuildArtifactInput> = payload
-        .artifacts
-        .into_iter()
-        .map(|a| BuildArtifactInput {
-            module_name: a.module_name,
-            name: a.name,
-            path: a.path,
-            checksum_sha256: a.checksum_sha256,
-            size_bytes: a.size_bytes,
-        })
-        .collect();
+    // Resolve every entry before inserting any, so one bad link stores nothing
+    let mut inputs = Vec::with_capacity(payload.artifacts.len());
+    let mut keys = Vec::with_capacity(payload.artifacts.len());
+    for entry in payload.artifacts {
+        let link = resolve_link(&state, &auth, &entry).await?;
+        let (input, key) = artifact_input(entry, link)?;
+        inputs.push(input);
+        keys.push(key);
+    }
 
-    let artifacts = service.add_artifacts(id, inputs).await?;
+    let artifacts = BuildService::new(state.db.clone())
+        .add_artifacts(id, inputs)
+        .await?;
 
     let response_artifacts = artifacts
         .into_iter()
-        .map(|a| BuildArtifactResponse {
+        .zip(keys)
+        .map(|(a, repository_key)| BuildArtifactResponse {
             id: a.id,
             build_id: a.build_id,
             module_name: a.module_name,
@@ -969,6 +1255,8 @@ pub async fn add_build_artifacts(
             path: a.path,
             checksum_sha256: a.checksum_sha256,
             size_bytes: a.size_bytes,
+            artifact_id: a.artifact_id,
+            repository_key,
             created_at: a.created_at,
         })
         .collect();
@@ -1459,20 +1747,6 @@ mod tests {
         ))
     }
 
-    fn sample_auth() -> AuthExtension {
-        AuthExtension {
-            user_id: Uuid::new_v4(),
-            username: "builder".to_string(),
-            email: "builder@example.com".to_string(),
-            is_admin: false,
-            is_api_token: false,
-            is_service_account: false,
-            scopes: None,
-            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
-            iat_ms: None,
-        }
-    }
-
     #[tokio::test]
     async fn test_list_builds_rejects_anonymous() {
         let state = test_state();
@@ -1515,24 +1789,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Authentication(_)), "got: {err}");
-    }
-
-    #[tokio::test]
-    async fn test_get_build_diff_allows_authenticated() {
-        // get_build_diff performs no database access, so an authenticated call
-        // exercises the full success path and returns an (empty) diff.
-        let state = test_state();
-        let build_a = Uuid::new_v4();
-        let build_b = Uuid::new_v4();
-        let query = BuildDiffQuery { build_a, build_b };
-        let resp = get_build_diff(State(state), Extension(Some(sample_auth())), Query(query))
-            .await
-            .expect("authenticated diff should succeed");
-        assert_eq!(resp.0.build_a, build_a);
-        assert_eq!(resp.0.build_b, build_b);
-        assert!(resp.0.added.is_empty());
-        assert!(resp.0.removed.is_empty());
-        assert!(resp.0.modified.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1691,6 +1947,7 @@ mod tests {
             path: path.to_string(),
             checksum_sha256: "0".repeat(64),
             size_bytes: 1,
+            artifact_id: None,
             created_at: Utc::now(),
         }
     }
@@ -1705,7 +1962,7 @@ mod tests {
             stored_artifact(build_id, Some("lib"), "dist/c.jar"),
         ];
         let first_app_id = rows[0].id;
-        let modules = group_into_modules(rows);
+        let modules = group_into_modules(rows, &HashMap::new());
         let names: Vec<&str> = modules.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, ["app", "", "lib"]);
         assert_eq!(modules[0].id, first_app_id);
@@ -1716,7 +1973,7 @@ mod tests {
             .collect();
         assert_eq!(app, ["dist/a.jar", "dist/b.jar"]);
         assert_eq!(modules[1].artifacts[0].path, "dist/notes.txt");
-        assert!(group_into_modules(vec![]).is_empty());
+        assert!(group_into_modules(vec![], &HashMap::new()).is_empty());
     }
 
     /// #6240: one module per name however many artifacts share it, without
@@ -1727,7 +1984,7 @@ mod tests {
         let rows: Vec<_> = (0..5000)
             .map(|i| stored_artifact(build_id, Some(&format!("m{}", i % 500)), &format!("d/{i}")))
             .collect();
-        let modules = group_into_modules(rows);
+        let modules = group_into_modules(rows, &HashMap::new());
         assert_eq!(modules.len(), 500);
         assert!(modules.iter().all(|m| m.artifacts.len() == 10));
     }
@@ -2129,8 +2386,8 @@ mod tests {
         assert_eq!(req.artifacts.len(), 2);
         assert_eq!(req.artifacts[0].module_name.as_deref(), Some("core"));
         assert!(req.artifacts[1].module_name.is_none());
-        assert_eq!(req.artifacts[0].size_bytes, 1024);
-        assert_eq!(req.artifacts[1].size_bytes, 2048);
+        assert_eq!(req.artifacts[0].size_bytes, Some(1024));
+        assert_eq!(req.artifacts[1].size_bytes, Some(2048));
     }
 
     // -----------------------------------------------------------------------
@@ -2254,10 +2511,12 @@ mod tests {
                 Json(AddBuildArtifactsRequest {
                     artifacts: vec![BuildArtifactInputPayload {
                         module_name: None,
-                        name: "forged.bin".to_string(),
-                        path: "forged.bin".to_string(),
-                        checksum_sha256: "0".repeat(64),
-                        size_bytes: 1,
+                        name: Some("forged.bin".to_string()),
+                        path: Some("forged.bin".to_string()),
+                        checksum_sha256: Some("0".repeat(64)),
+                        size_bytes: Some(1),
+                        artifact_id: None,
+                        repository_key: None,
                     }],
                 }),
             )
@@ -3028,6 +3287,299 @@ mod tests {
         for user in [owner_id, other_id, admin_id] {
             tdh::cleanup_user(&pool, user).await;
         }
+    }
+
+    async fn seed_stored_artifact(pool: &sqlx::PgPool, repo_id: Uuid, path: &str) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, '1.0', 42, $4, 'application/java-archive', $2) RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .bind(path.rsplit('/').next().unwrap_or(path))
+        .bind("c".repeat(64))
+        .fetch_one(pool)
+        .await
+        .expect("seed artifact")
+    }
+
+    /// web#618: a build entry was a free-form path with no tie to what CI
+    /// stored. It now links a stored artifact by id or by repository key and
+    /// path, only one the caller can read (an unreadable one is the same 404
+    /// as a missing one), the link is shown only to readers of that
+    /// repository, and it survives the artifact going to the trash or away.
+    /// #6240: another user sees a linked entry only while the artifact is
+    /// stored in a repository it can read, and nothing else of the build's
+    /// artifacts
+    #[tokio::test]
+    async fn build_artifacts_link_to_stored_artifacts_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool.clone(), "/tmp/ph-618-link");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (other_id, other_name) = tdh::create_user(&pool).await;
+        let (reader_id, reader_name) = tdh::create_user(&pool).await;
+        let app = tdh::router_with_auth(
+            super::router(),
+            state.clone(),
+            tdh::make_auth(user_id, &username),
+        );
+        let other = tdh::router_with_auth(
+            super::router(),
+            state.clone(),
+            tdh::make_auth(other_id, &other_name),
+        );
+        let reader = tdh::router_with_auth(
+            super::router(),
+            state,
+            tdh::make_auth(reader_id, &reader_name),
+        );
+        let (readable, readable_key, _) = tdh::create_repo(&pool, "local", "generic").await;
+        let (private, private_key, _) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_role(&pool, readable, user_id, "reader").await;
+        tdh::grant_repo_role(&pool, readable, reader_id, "reader").await;
+        let art = seed_stored_artifact(&pool, readable, "libs/app-1.0.jar").await;
+        let hidden = seed_stored_artifact(&pool, private, "libs/secret-1.0.jar").await;
+
+        let created = send_json(
+            app.clone(),
+            post_json(
+                "/",
+                json!({ "name": format!("ph-618-link-{}", Uuid::new_v4()), "build_number": 1 }),
+            ),
+        )
+        .await;
+        let id = created["id"].as_str().expect("id").to_string();
+        let attach = |body: serde_json::Value| {
+            let app = app.clone();
+            let uri = format!("/{id}/artifacts");
+            async move { tdh::send(app, post_json(&uri, json!({ "artifacts": [body] }))).await }
+        };
+
+        // Refused links store nothing, and say the same thing
+        let mut bodies = Vec::new();
+        for body in [
+            json!({ "artifact_id": hidden }),
+            json!({ "artifact_id": Uuid::new_v4() }),
+            json!({ "repository_key": private_key, "path": "libs/secret-1.0.jar" }),
+        ] {
+            let (status, bytes) = attach(body).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{}",
+                String::from_utf8_lossy(&bytes)
+            );
+            bodies.push(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        assert!(bodies.iter().all(|b| b == &bodies[0]), "{bodies:?}");
+        let (status, _) = attach(json!({ "name": "half.jar" })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = attach(json!({ "repository_key": readable_key })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let got = send_json(
+            app.clone(),
+            post_json(
+                &format!("/{id}/artifacts"),
+                json!({ "artifacts": [
+                    { "module_name": "app", "artifact_id": art },
+                    { "module_name": "app", "repository_key": readable_key,
+                      "path": "/libs/app-1.0.jar", "name": "by-path.jar" },
+                    { "module_name": "app", "name": "free.txt", "path": "dist/free.txt",
+                      "checksum_sha256": "f".repeat(64), "size_bytes": 3 },
+                ] }),
+            ),
+        )
+        .await;
+        let stored = got["artifacts"].as_array().expect("artifacts");
+        assert_eq!(stored.len(), 3, "{got}");
+        assert_eq!(stored[0]["artifact_id"], json!(art));
+        assert_eq!(stored[0]["repository_key"], json!(readable_key));
+        assert_eq!(stored[0]["name"], "app-1.0.jar");
+        assert_eq!(stored[0]["path"], "libs/app-1.0.jar");
+        assert_eq!(stored[0]["checksum_sha256"], "c".repeat(64));
+        assert_eq!(stored[0]["size_bytes"], 42);
+        assert_eq!(stored[1]["artifact_id"], json!(art));
+        assert_eq!(stored[1]["name"], "by-path.jar");
+        assert!(stored[2].get("artifact_id").is_none(), "{got}");
+
+        let entries = |v: serde_json::Value| {
+            v["modules"][0]["artifacts"]
+                .as_array()
+                .cloned()
+                .expect("artifacts")
+        };
+        let read = entries(send_json(app.clone(), tdh::get(format!("/{id}"))).await);
+        assert_eq!(read.len(), 3);
+        assert_eq!(read[0]["artifact_id"], json!(art));
+        assert_eq!(read[0]["repository_key"], json!(readable_key));
+        assert!(read[0].get("artifact_deleted").is_none());
+        let listed = send_json(
+            app.clone(),
+            tdh::get(format!("/?search={}", created["name"].as_str().unwrap())),
+        )
+        .await;
+        assert_eq!(
+            listed["items"][0]["modules"][0]["artifacts"][0]["artifact_id"],
+            json!(art)
+        );
+
+        // Another user who can't read the repository sees no entry at all
+        let theirs = send_json(other.clone(), tdh::get(format!("/{id}"))).await;
+        assert_eq!(theirs["modules"], json!([]), "{theirs}");
+        assert_eq!(theirs["artifact_count"], 0, "{theirs}");
+        let listed = send_json(
+            other,
+            tdh::get(format!("/?search={}", created["name"].as_str().unwrap())),
+        )
+        .await;
+        assert_eq!(listed["items"][0]["modules"], json!([]), "{listed}");
+
+        // A reader of the repository sees the two links, not the free-form entry
+        let theirs = send_json(reader.clone(), tdh::get(format!("/{id}"))).await;
+        assert_eq!(theirs["artifact_count"], 2, "{theirs}");
+        let linked = entries(theirs);
+        assert_eq!(linked.len(), 2, "{linked:?}");
+        assert!(linked.iter().all(|e| e["artifact_id"] == json!(art)));
+        assert!(linked
+            .iter()
+            .all(|e| e["repository_key"] == json!(readable_key)));
+
+        // Trash, then purge: the link says so, then the entry stays free-form
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+            .bind(art)
+            .execute(&pool)
+            .await
+            .expect("trash");
+        let read = entries(send_json(app.clone(), tdh::get(format!("/{id}"))).await);
+        assert_eq!(read[0]["artifact_deleted"], true);
+        let theirs = send_json(reader, tdh::get(format!("/{id}"))).await;
+        assert_eq!(theirs["modules"], json!([]), "{theirs}");
+        sqlx::query("DELETE FROM artifacts WHERE id = $1")
+            .bind(art)
+            .execute(&pool)
+            .await
+            .expect("purge");
+        let read = entries(send_json(app, tdh::get(format!("/{id}"))).await);
+        assert_eq!(read.len(), 3);
+        assert!(read[0].get("artifact_id").is_none(), "{read:?}");
+        assert_eq!(read[0]["path"], "libs/app-1.0.jar");
+
+        let _ = sqlx::query("DELETE FROM builds WHERE id = $1")
+            .bind(Uuid::parse_str(&id).unwrap())
+            .execute(&pool)
+            .await;
+        for repo in [readable, private] {
+            let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+                .bind(repo)
+                .execute(&pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo)
+                .execute(&pool)
+                .await;
+        }
+        for user in [user_id, other_id, reader_id] {
+            tdh::cleanup_user(&pool, user).await;
+        }
+    }
+
+    /// web#618: the diff of two builds was always empty. #6240: it compares
+    /// only the artifacts the caller would see reading each build
+    #[tokio::test]
+    async fn build_diff_compares_artifacts_by_path_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool.clone(), "/tmp/ph-618-diff");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (other_id, other_name) = tdh::create_user(&pool).await;
+        let app = tdh::router_with_auth(
+            super::router(),
+            state.clone(),
+            tdh::make_auth(user_id, &username),
+        );
+        let other = tdh::router_with_auth(
+            super::router(),
+            state,
+            tdh::make_auth(other_id, &other_name),
+        );
+        let name = format!("ph-618-diff-{}", Uuid::new_v4());
+        let mut ids = Vec::new();
+        for (number, files) in [
+            (1, [("x.jar", "1"), ("y.jar", "2")]),
+            (2, [("y.jar", "3"), ("z.jar", "4")]),
+        ] {
+            let b = send_json(
+                app.clone(),
+                post_json("/", json!({ "name": name, "build_number": number })),
+            )
+            .await;
+            let id = b["id"].as_str().expect("id").to_string();
+            let artifacts: Vec<_> = files
+                .iter()
+                .map(|(f, c)| {
+                    json!({ "name": f, "path": format!("dist/{f}"),
+                                      "checksum_sha256": c.repeat(64), "size_bytes": 1 })
+                })
+                .collect();
+            send_json(
+                app.clone(),
+                post_json(
+                    &format!("/{id}/artifacts"),
+                    json!({ "artifacts": artifacts }),
+                ),
+            )
+            .await;
+            ids.push(id);
+        }
+
+        let diff = send_json(
+            app.clone(),
+            tdh::get(format!("/diff?build_a={}&build_b={}", ids[0], ids[1])),
+        )
+        .await;
+        assert_eq!(diff["added"].as_array().map(Vec::len), Some(1), "{diff}");
+        assert_eq!(diff["added"][0]["path"], "dist/z.jar");
+        assert_eq!(diff["removed"][0]["path"], "dist/x.jar");
+        assert_eq!(diff["modified"][0]["path"], "dist/y.jar");
+        assert_eq!(diff["modified"][0]["old_checksum"], "2".repeat(64));
+        assert_eq!(diff["modified"][0]["new_checksum"], "3".repeat(64));
+
+        // Another user reads neither build's free-form entries, so it gets no diff
+        let theirs = send_json(
+            other,
+            tdh::get(format!("/diff?build_a={}&build_b={}", ids[0], ids[1])),
+        )
+        .await;
+        for field in ["added", "removed", "modified"] {
+            assert_eq!(theirs[field], json!([]), "{theirs}");
+        }
+
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/diff?build_a={}&build_b={}",
+                ids[0],
+                Uuid::new_v4()
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let _ = sqlx::query("DELETE FROM builds WHERE name = $1")
+            .bind(&name)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, user_id).await;
+        tdh::cleanup_user(&pool, other_id).await;
     }
 
     /// #6046: the list parsed `sort_by` and always ordered by build number.
