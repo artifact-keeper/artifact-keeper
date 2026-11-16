@@ -1871,9 +1871,7 @@ jobs:
       #     once a patch release can be cut from release/X.Y.x. Its
       #     permissive direction hands an attacker-controlled branch the
       #     right to sign, so it must refuse an arbitrary branch, a case
-      #     variant of a real one, a commit on neither, and a
-      #     release-candidate.yml that is not byte-identical to a copy that
-      #     lives on main;
+      #     variant of a real one and a commit on neither;
       #   * registry-tag-digest.sh -- the digest probe the certification is
       #     compared against; must never invent a digest or read a 404 from
       #     an unreadable repository as absence;

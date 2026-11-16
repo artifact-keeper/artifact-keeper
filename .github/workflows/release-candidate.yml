@@ -88,15 +88,18 @@ name: Release Candidate
 #   from repository state alone and never from a dispatch input -- an
 #   ancestor of `main`, failing that an ancestor of
 #   `refs/heads/release/<X>.<Y>.x` with X.Y read from `Cargo.toml` AT THAT
-#   COMMIT. It also pins the CONTENT of this file: `release-candidate.yml` at
-#   the certified commit must be byte-identical (same blob id) to the copy
-#   `main` carries at the merge base, or to main's current copy, which is what
-#   a forward-port produces. That is not load-bearing for the identity any
-#   more, but it is cheap and it backstops the window during which an admin
-#   has the release ruleset toggled off to create a line. The predicate
-#   records the resolved line as `certified_ref`, which the verifier checks
-#   against the same derivation. See RELEASING.md, "Patch releases from a
-#   `release/X.Y.x` branch".
+#   COMMIT. The predicate records the resolved line as `certified_ref`, which
+#   the verifier checks against the same derivation. See RELEASING.md, "Patch
+#   releases from a `release/X.Y.x` branch".
+#
+#   THE COPY OF THIS FILE ON A RELEASE BRANCH IS INERT (#6122). Nothing runs
+#   it: the dispatch guard is main-only, every checkout is main, and only
+#   main's identity is accepted. Its blob is recorded in the predicate
+#   (`certified_workflow_blob`) and no longer has to match main's copy, so
+#   an edit to this file on main needs NO backport to any release/X.Y.x.
+#   (Until #6122 it had to be byte-identical to main's current copy, a
+#   demand that protected nothing that runs and refused every maintenance
+#   candidate after each main edit until someone backported it by hand.)
 #
 # PARITY (#3773). Every check that used to run only on a clean `refs/tags/v*`
 # ref, or was skipped for prereleases, runs here against the same inputs:
@@ -324,18 +327,14 @@ jobs:
           # commits main may certify: an ancestor of main, else of the
           # release/X.Y.x its own Cargo.toml names. Derived by the one
           # resolver every consumer uses, from repository state and never
-          # from a dispatch input. The same call pins the content of this
-          # file at the certified commit to a copy that lives on main.
-          # CERTREF_REQUIRE_MAIN_WORKFLOW: this run is the moment of blessing,
-          # and the only one. It demands that release-candidate.yml at the
-          # certified commit be main's CURRENT copy; the blob is then recorded
-          # in the signed predicate and every later consumer compares against
-          # THAT, not against main's tip -- which moves, and would otherwise
-          # strand an already-certified commit on an unrelated merge (r2 N1).
+          # from a dispatch input. It also reports the blob of this file at
+          # the certified commit, which the signed predicate records; it is
+          # not compared with main's copy, because that copy never runs
+          # here (#6122).
           rc=0
-          resolved="$(GITHUB_OUTPUT='' CERTREF_REQUIRE_MAIN_WORKFLOW=1 scripts/ci/resolve-certified-ref.sh "$SHA")" || rc=$?
+          resolved="$(GITHUB_OUTPUT='' scripts/ci/resolve-certified-ref.sh "$SHA")" || rc=$?
           if [[ "$rc" -ne 0 ]]; then
-            echo "::error title=Commit cannot be certified::${SHA} is on neither main nor the maintenance line its Cargo.toml names, or its release-candidate.yml is not a copy that lives on main (resolver exit ${rc}; its message is above)."
+            echo "::error title=Commit cannot be certified::${SHA} is on neither main nor the maintenance line its Cargo.toml names (resolver exit ${rc}; its message is above)."
             exit 1
           fi
           CERTIFIED_REF="$(sed -n 's/^certified_ref=//p' <<<"$resolved" | head -1)"
@@ -348,6 +347,13 @@ jobs:
           if ! git merge-base --is-ancestor "$SHA" "refs/remotes/origin/${CERTIFIED_REF#refs/heads/}"; then
             echo "::error title=Ancestry disagreement::${SHA} resolves to ${CERTIFIED_REF} over the API but is not reachable from origin/${CERTIFIED_REF#refs/heads/} in this checkout. Failing closed."
             exit 1
+          fi
+          # Information only (#6122): a maintenance line's copy of this file
+          # lags main's after any main edit. It is never executed, so that is
+          # expected and nothing has to be backported.
+          RUNNING_BLOB="$(git rev-parse "HEAD:.github/workflows/release-candidate.yml")"
+          if [[ "$CERTIFIED_REF" != "refs/heads/main" && "$WORKFLOW_BLOB" != "$RUNNING_BLOB" ]]; then
+            echo "::notice title=Release-branch copy of release-candidate.yml differs from main's::${CERTIFIED_REF#refs/heads/} carries blob ${WORKFLOW_BLOB:0:12}; main's copy running here is ${RUNNING_BLOB:0:12}. Expected and inert: that copy never runs, and its blob is only recorded in the certification (#6122)."
           fi
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error title=Not a stable version::Cargo.toml at ${SHA} says '${VERSION:-<none>}'. A candidate certifies a stable X.Y.Z (land the release prep first); prereleases keep the -rc.N tag path."
@@ -1238,9 +1244,9 @@ jobs:
               # from the repository (scripts/ci/resolve-certified-ref.sh).
               certified_ref: $certified_ref,
               # The git blob id of release-candidate.yml at the certified
-              # commit, blessed against the copy on main by THIS run.
-              # Verifiers compare against this record, never against the
-              # moving tip of main. (No apostrophes in here: the whole jq
+              # commit, recorded (not compared with main, #6122: that copy
+              # never runs). Verifiers compare the commit against this
+              # record, never against the moving tip of main. (No apostrophes in here: the whole jq
               # program is single-quoted in the shell.)
               certified_workflow_blob: $workflow_blob,
               sha_tag: ("sha-" + ($sha | .[0:7])),
