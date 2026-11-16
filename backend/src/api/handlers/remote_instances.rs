@@ -186,6 +186,7 @@ pub fn router() -> Router<SharedState> {
 /// List all remote instances for the authenticated user
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "",
     context_path = "/api/v1/instances",
     tag = "admin",
@@ -212,6 +213,7 @@ struct CreateInstanceRequest {
 /// Create a new remote instance
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "",
     context_path = "/api/v1/instances",
     tag = "admin",
@@ -238,6 +240,7 @@ async fn create_instance(
 /// Delete a remote instance
 #[utoipa::path(
     delete,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/{id}",
     context_path = "/api/v1/instances",
     tag = "admin",
@@ -520,6 +523,7 @@ async fn relay_with_body(
 /// Proxy a GET request to a remote instance
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/{id}/proxy/{path}",
     context_path = "/api/v1/instances",
     tag = "admin",
@@ -554,6 +558,7 @@ async fn proxy_get(
 /// Proxy a POST request to a remote instance
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/{id}/proxy/{path}",
     context_path = "/api/v1/instances",
     tag = "admin",
@@ -591,6 +596,7 @@ async fn proxy_post(
 /// Proxy a PUT request to a remote instance
 #[utoipa::path(
     put,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/{id}/proxy/{path}",
     context_path = "/api/v1/instances",
     tag = "admin",
@@ -628,6 +634,7 @@ async fn proxy_put(
 /// Proxy a PATCH request to a remote instance
 #[utoipa::path(
     patch,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/{id}/proxy/{path}",
     context_path = "/api/v1/instances",
     tag = "admin",
@@ -665,6 +672,7 @@ async fn proxy_patch(
 /// Proxy a DELETE request to a remote instance
 #[utoipa::path(
     delete,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/{id}/proxy/{path}",
     context_path = "/api/v1/instances",
     tag = "admin",

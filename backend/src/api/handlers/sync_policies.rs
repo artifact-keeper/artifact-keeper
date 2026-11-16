@@ -395,6 +395,7 @@ fn parse_selector<T: serde::de::DeserializeOwned + Default>(
 /// List all sync policies
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("replication.read")), ("x-resource" = json!("instance"))),
     operation_id = "list_sync_policies",
     path = "",
     context_path = "/api/v1/sync-policies",
@@ -476,6 +477,7 @@ async fn audit_sync_policy_update(
 /// Create a new sync policy
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     operation_id = "create_sync_policy",
     path = "",
     context_path = "/api/v1/sync-policies",
@@ -536,6 +538,7 @@ async fn create_policy(
 /// Get a sync policy by ID
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("replication.read")), ("x-resource" = json!("instance"))),
     operation_id = "get_sync_policy",
     path = "/{id}",
     context_path = "/api/v1/sync-policies",
@@ -564,6 +567,7 @@ async fn get_policy(
 /// Update a sync policy
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     operation_id = "update_sync_policy",
     path = "/{id}",
     context_path = "/api/v1/sync-policies",
@@ -627,6 +631,7 @@ async fn update_policy(
 /// Delete a sync policy
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     operation_id = "delete_sync_policy",
     path = "/{id}",
     context_path = "/api/v1/sync-policies",
@@ -669,6 +674,7 @@ async fn delete_policy(
 /// Toggle a sync policy (enable/disable)
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/toggle",
     context_path = "/api/v1/sync-policies",
     tag = "peers",
@@ -705,6 +711,7 @@ async fn toggle_policy(
 /// Force re-evaluate all sync policies
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("replication.trigger")), ("x-resource" = json!("instance"))),
     path = "/evaluate",
     context_path = "/api/v1/sync-policies",
     tag = "peers",
@@ -727,6 +734,7 @@ async fn evaluate_policies(
 /// Preview what a policy would match (dry-run)
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("replication.read")), ("x-resource" = json!("instance"))),
     operation_id = "preview_sync_policy",
     path = "/preview",
     context_path = "/api/v1/sync-policies",

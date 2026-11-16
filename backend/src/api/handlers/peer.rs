@@ -129,6 +129,7 @@ fn parse_peer_status(s: &str) -> Option<PeerStatus> {
 /// GET /api/v1/peers/:id/connections
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("replication.read")), ("x-resource" = json!("instance"))),
     path = "/{id}/connections",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -178,6 +179,7 @@ async fn list_peers(
 /// GET /api/v1/peers/:id/connections/discover
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("replication.read")), ("x-resource" = json!("instance"))),
     path = "/{id}/connections/discover",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -215,6 +217,7 @@ async fn discover_peers(
 /// POST /api/v1/peers/:id/connections/probe
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/connections/probe",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -284,6 +287,7 @@ async fn probe_peer(
 /// POST /api/v1/peers/:id/connections/:target_id/unreachable
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/connections/{target_id}/unreachable",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -309,6 +313,7 @@ async fn mark_unreachable(
 /// GET /api/v1/peers/:id/chunks/:artifact_id
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("replication.read")), ("x-resource" = json!("instance"))),
     path = "/{id}/chunks/{artifact_id}",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -354,6 +359,7 @@ async fn get_chunk_availability(
 /// PUT /api/v1/peers/:id/chunks/:artifact_id
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/chunks/{artifact_id}",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -383,6 +389,7 @@ async fn update_chunk_availability(
 /// GET /api/v1/peers/:id/chunks/:artifact_id/peers
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("replication.read")), ("x-resource" = json!("instance"))),
     path = "/{id}/chunks/{artifact_id}/peers",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -421,6 +428,7 @@ async fn get_peers_with_chunks(
 /// GET /api/v1/peers/:id/chunks/:artifact_id/scored-peers
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("replication.read")), ("x-resource" = json!("instance"))),
     path = "/{id}/chunks/{artifact_id}/scored-peers",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -462,6 +470,7 @@ async fn get_scored_peers(
 /// PUT /api/v1/peers/:id/network-profile
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/network-profile",
     context_path = "/api/v1/peers",
     tag = "peers",

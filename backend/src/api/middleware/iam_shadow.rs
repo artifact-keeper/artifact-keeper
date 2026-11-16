@@ -2940,6 +2940,152 @@ mod end_to_end {
     }
 
     #[tokio::test]
+    async fn replication_operations_are_compared() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (admin, _) = tdh::create_user(&pool).await;
+        let (plain, _) = tdh::create_user(&pool).await;
+        let (other, _) = tdh::create_user(&pool).await;
+        sqlx::query("UPDATE users SET is_admin = true WHERE id = $1")
+            .bind(admin)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut rig = Rig::new(pool.clone(), &dir).await;
+        let admin_bearer = tdh::bearer_for(&rig.state, admin).await;
+        let plain_bearer = tdh::bearer_for(&rig.state, plain).await;
+        // A plain user's token with the sync trigger scope.
+        let auth = crate::services::auth_service::AuthService::new(
+            pool.clone(),
+            Arc::new(rig.state.config.clone()),
+        );
+        let (trigger, _) = auth
+            .generate_api_token(plain, "sync-trigger", vec!["trigger:sync".into()], None)
+            .await
+            .unwrap();
+        let compared = |c: &Comparison, legacy: LegacyOutcome, class: Class| {
+            assert_eq!((c.legacy, c.class), (legacy, class), "{c:?}");
+        };
+        let peer_name = format!("shadow-peer-{}", Uuid::new_v4());
+        let register = |name: &str| {
+            json_request(
+                "POST",
+                "/api/v1/peers".into(),
+                serde_json::json!({
+                    "name": name,
+                    "endpoint_url": "http://198.51.100.7:8080",
+                    "api_key": "peer-key",
+                }),
+            )
+        };
+
+        // An instance administrator registers a peer, decided on the instance.
+        let (status, c) = rig.call(Some(&admin_bearer), register(&peer_name)).await;
+        assert!(status.is_success(), "{status}");
+        assert_eq!(c.permission, Permission::ReplicationManage);
+        assert_eq!(c.resource, Some(ScopeRef::Instance));
+        compared(&c, LegacyOutcome::Permit, Class::Agree);
+
+        // A plain user reading a peer is refused by both.
+        let peer = format!("/api/v1/peers/{}", Uuid::new_v4());
+        let (status, c) = rig
+            .call(Some(&plain_bearer), empty_request("GET", peer.clone()))
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(c.permission, Permission::ReplicationRead);
+        compared(&c, LegacyOutcome::Refuse, Class::Agree);
+
+        // A missing peer is a client error after the administrator pass.
+        let (status, c) = rig
+            .call(Some(&admin_bearer), empty_request("GET", peer.clone()))
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        compared(&c, LegacyOutcome::Permit, Class::Agree);
+
+        // The sync trigger token starts a peer sync under the model only.
+        let (status, c) = rig
+            .call(
+                Some(&trigger),
+                empty_request("POST", format!("{peer}/sync")),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(c.permission, Permission::ReplicationTrigger);
+        assert_eq!(c.resource, Some(ScopeRef::Instance));
+        compared(&c, LegacyOutcome::Refuse, Class::NewWider);
+
+        // The same token cannot register a peer in either.
+        let refused_name = format!("shadow-peer-{}", Uuid::new_v4());
+        let (status, c) = rig.call(Some(&trigger), register(&refused_name)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(c.permission, Permission::ReplicationManage);
+        compared(&c, LegacyOutcome::Refuse, Class::Agree);
+
+        // Listing peers is authenticated: a plain user gets no peer, and the
+        // request is not compared (the next comparison is the declared read
+        // sent after it).
+        let app = crate::api::routes::create_router(rig.state.clone());
+        let mut list = empty_request("GET", "/api/v1/peers".into());
+        list.headers_mut()
+            .insert("authorization", plain_bearer.parse().unwrap());
+        let (status, body) = tdh::send(app, list).await;
+        assert_eq!(status, StatusCode::OK);
+        let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let listed = listed
+            .get("items")
+            .unwrap_or(&listed)
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(listed.is_empty(), "{body:?}");
+
+        // Another user's remote instance stays the creator's, uncompared.
+        let instance: Uuid = sqlx::query_scalar(
+            "INSERT INTO remote_instances (user_id, name, url, api_key_encrypted)
+             VALUES ($1, 'shadow-remote', 'https://198.51.100.8', $2) RETURNING id",
+        )
+        .bind(other)
+        .bind("00")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let app = crate::api::routes::create_router(rig.state.clone());
+        let mut delete = empty_request("DELETE", format!("/api/v1/instances/{instance}"));
+        delete
+            .headers_mut()
+            .insert("authorization", plain_bearer.parse().unwrap());
+        let (status, _) = tdh::send(app, delete).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM remote_instances WHERE id = $1")
+            .bind(instance)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept, 1);
+
+        let (_, c) = rig
+            .call(Some(&plain_bearer), empty_request("GET", peer.clone()))
+            .await;
+        assert_eq!(c.route, "/api/v1/peers/:id");
+
+        rig.shutdown.cancel();
+        let _ = sqlx::query("DELETE FROM remote_instances WHERE id = $1")
+            .bind(instance)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE name = ANY($1)")
+            .bind(vec![peer_name, refused_name])
+            .execute(&pool)
+            .await;
+        for user in [plain, other] {
+            tdh::cleanup_user(&pool, user).await;
+        }
+        tdh::cleanup(&pool, repo, admin).await;
+    }
+
+    #[tokio::test]
     async fn storage_gc_by_a_non_administrator_agrees() {
         let Some(pool) = tdh::try_pool().await else {
             return;

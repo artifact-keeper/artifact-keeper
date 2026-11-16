@@ -273,6 +273,7 @@ fn parse_status(s: &str) -> Option<InstanceStatus> {
 /// List peer instances
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -346,6 +347,7 @@ pub async fn list_peers(
 /// Register new peer instance
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     path = "",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -413,6 +415,7 @@ pub async fn register_peer(
 /// Get peer instance details
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("replication.read")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -461,6 +464,7 @@ pub async fn get_peer(
 /// Unregister peer instance
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -488,6 +492,7 @@ pub async fn unregister_peer(
 /// Heartbeat from peer instance
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/heartbeat",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -521,6 +526,7 @@ pub async fn heartbeat(
 /// Trigger sync for peer instance
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("replication.trigger")), ("x-resource" = json!("instance"))),
     path = "/{id}/sync",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -548,6 +554,7 @@ pub async fn trigger_sync(
 /// Get pending sync tasks for peer instance
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("replication.read")), ("x-resource" = json!("instance"))),
     path = "/{id}/sync/tasks",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -594,6 +601,7 @@ pub async fn get_sync_tasks(
 /// Get assigned repositories for peer instance
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("replication.read")), ("x-resource" = json!("instance"))),
     path = "/{id}/repositories",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -626,6 +634,7 @@ pub async fn get_assigned_repos(
 /// Assign repository to peer instance
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/repositories",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -685,6 +694,7 @@ pub async fn assign_repo(
 /// filter (e.g. `{"include_patterns": ["\\.tar\\.gz$"]}`) was persisted.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("replication.read")), ("x-resource" = json!("instance"))),
     path = "/{id}/repositories/{repo_id}",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -720,6 +730,7 @@ pub async fn get_subscription(
 /// unique constraint `(peer_instance_id, artifact_id, task_type)`.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("replication.trigger")), ("x-resource" = json!("instance"))),
     path = "/{id}/repositories/{repo_id}/sync",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -754,6 +765,7 @@ pub async fn run_subscription_now(
 /// Unassign repository from peer instance
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/repositories/{repo_id}",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -782,6 +794,7 @@ pub async fn unassign_repo(
 /// POST /api/v1/peers/announce
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     path = "/announce",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -822,6 +835,7 @@ async fn announce_peer(
 /// GET /api/v1/peers/identity
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("replication.read")), ("x-resource" = json!("instance"))),
     path = "/identity",
     context_path = "/api/v1/peers",
     tag = "peers",

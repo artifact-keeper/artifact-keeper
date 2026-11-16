@@ -80,6 +80,7 @@ pub struct FailBody {
 /// POST /api/v1/peers/:id/transfer/init
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/transfer/init",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -126,6 +127,7 @@ async fn init_transfer(
 /// GET /api/v1/peers/:id/transfer/:session_id/chunks
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("replication.read")), ("x-resource" = json!("instance"))),
     path = "/{id}/transfer/{session_id}/chunks",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -166,6 +168,7 @@ async fn get_chunk_manifest(
 /// GET /api/v1/peers/:id/transfer/:session_id
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("replication.read")), ("x-resource" = json!("instance"))),
     path = "/{id}/transfer/{session_id}",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -204,6 +207,7 @@ async fn get_session(
 /// POST /api/v1/peers/:id/transfer/:session_id/chunk/:chunk_index/complete
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/transfer/{session_id}/chunk/{chunk_index}/complete",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -234,6 +238,7 @@ async fn complete_chunk(
 /// POST /api/v1/peers/:id/transfer/:session_id/chunk/:chunk_index/fail
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/transfer/{session_id}/chunk/{chunk_index}/fail",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -264,6 +269,7 @@ async fn fail_chunk(
 /// POST /api/v1/peers/:id/transfer/:session_id/chunk/:chunk_index/retry
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/transfer/{session_id}/chunk/{chunk_index}/retry",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -290,6 +296,7 @@ async fn retry_chunk(
 /// POST /api/v1/peers/:id/transfer/:session_id/complete
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/transfer/{session_id}/complete",
     context_path = "/api/v1/peers",
     tag = "peers",
@@ -315,6 +322,7 @@ async fn complete_session(
 /// POST /api/v1/peers/:id/transfer/:session_id/fail
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/transfer/{session_id}/fail",
     context_path = "/api/v1/peers",
     tag = "peers",

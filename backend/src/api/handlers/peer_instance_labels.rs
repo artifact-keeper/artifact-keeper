@@ -111,6 +111,7 @@ async fn trigger_peer_policy_evaluation(db: &sqlx::PgPool, peer_id: Uuid) {
 /// List all labels on a peer instance
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("replication.read")), ("x-resource" = json!("instance"))),
     path = "/{id}/labels",
     context_path = "/api/v1/peers",
     tag = "peer-instance-labels",
@@ -141,6 +142,7 @@ async fn list_labels(
 /// Set all labels on a peer instance (replaces existing)
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/labels",
     context_path = "/api/v1/peers",
     tag = "peer-instance-labels",
@@ -191,6 +193,7 @@ async fn set_labels(
 /// Add or update a single label on a peer instance
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/labels/{label_key}",
     context_path = "/api/v1/peers",
     tag = "peer-instance-labels",
@@ -229,6 +232,7 @@ async fn add_label(
 /// Delete a label by key from a peer instance
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("replication.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}/labels/{label_key}",
     context_path = "/api/v1/peers",
     tag = "peer-instance-labels",

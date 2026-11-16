@@ -3035,9 +3035,9 @@ mod tests {
             // The four label operations, the 111 repository and artifact
             // operations, the 16 project and group operations, the 128 admin
             // operations, the 64 identity operations, the 35 instance and 49
-            // per-object security operations, and the 58 integration
-            // operations.
-            assert_eq!(declared.len(), 465, "{declared:?}");
+            // per-object security operations, the 58 integration operations,
+            // and the 51 replication operations.
+            assert_eq!(declared.len(), 516, "{declared:?}");
             assert!(declared.is_subset(&live), "{declared:?}");
         }
 
