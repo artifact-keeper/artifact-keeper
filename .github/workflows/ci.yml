@@ -1588,6 +1588,13 @@ jobs:
       - name: Check the candidate publish-run resolver selects and blocks correctly
         run: bash scripts/ci/test-resolve-candidate-publish-run.sh
 
+      # What a Release Candidate rerun of the failed gate groups runs, and
+      # whether it may run at all (#6076): the wrong commit, a non-candidate
+      # original, a replaced record or a dropped failed group must BLOCK.
+      # Stubs `gh`; offline, ~1s.
+      - name: Check the candidate rerun resolver selects and blocks correctly
+        run: bash scripts/ci/test-resolve-candidate-rerun.sh
+
       # The other half of #3640: when the accepted run is a promote dispatch,
       # the published bytes were built from a DIFFERENT commit than the tag,
       # and adoption must be verified against the image's actual input set --

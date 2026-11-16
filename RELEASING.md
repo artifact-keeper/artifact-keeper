@@ -348,13 +348,89 @@ names the same commit.
    the attestation (`scripts/ci/assert-candidate-certified.sh`, pinned to
    the candidate workflow's identity), nothing else.
 
-   **If it fails, fix the cause and dispatch a new candidate.** Do not
-   "Re-run failed jobs" on a failed gate: GitHub replays the gate's `deploy`
-   outputs instead of re-executing them, so every suite targets a namespace
-   the first attempt's teardown already deleted and dies on "backend not
-   ready" (#3774; how v1.9.0's re-runs failed). The workflow refuses a
-   re-run of the gate and says so. Nothing was named, so a failed candidate
-   costs a gate run and nothing else — the version number is intact.
+   **If it fails, fix the cause and dispatch a new candidate**, or, when
+   only gate groups went red and the cause was a flake or the test itself,
+   **rerun just the failed groups** (see "Rerunning the failed gate groups"
+   below). Never "Re-run failed jobs" on a candidate: GitHub replays the
+   gate's `deploy` outputs instead of re-executing them, so every suite
+   targets a namespace the first attempt's teardown already deleted and dies
+   on "backend not ready" (#3774; how v1.9.0's re-runs failed). The workflow
+   refuses a re-run of the gate and says so. Nothing was named, so a failed
+   candidate costs a gate run and nothing else — the version number is
+   intact.
+
+   ### Rerunning the failed gate groups
+
+   A rerun is a **new dispatch** of the candidate that names the failed run
+   (#6076). Its gate runs only the gate jobs, and the single `dtf-gate` legs,
+   that did not pass in that run, so a red DTF leg costs that leg, not a
+   fresh 1.5 to 3 hour candidate:
+
+   ```bash
+   gh workflow run release-candidate.yml --repo artifact-keeper/artifact-keeper \
+     --ref main -f sha=<the same 40-hex commit> \
+     -f rerun_of=<the failed candidate's run id> \
+     -f reason='dtf-gate/storage-1.11.0 hit the s3-copy timeout flake (artifact-keeper-test#NNN)'
+     # -f tests=moved   only when a test-only fix merged to artifact-keeper-test since
+   ```
+
+   **A rerun is allowed when** the commit is right and the red was not the
+   product's fault: a known flake, a runner or registry blip, or a test that
+   was wrong and has been fixed in artifact-keeper-test (`tests=moved`). Say
+   which in `reason`, with the issue; it goes into the certification.
+
+   **At most one rerun per candidate.** A second rerun of the same original
+   is refused, whatever became of the first (failed, cancelled or green):
+   dispatch a fresh candidate instead. A rerun of a rerun is refused too.
+
+   **A fresh candidate is needed when**
+   - the candidate has already been rerun once;
+   - a red group is, or might be, a real regression: the fix is a new
+     commit, and a new commit is always a new candidate;
+   - anything outside the gate failed (preflight, bookkeeping, images, Docker
+     Publish): there is nothing to rerun, and the rerun says so;
+   - Docker Publish has rebuilt the commit's images since (the digests
+     differ), the line's test branch moved with `tests=same`, or
+     `release-candidate.yml` changed on main since;
+   - the original started more than 72 hours ago (`RERUN_MAX_AGE_HOURS`):
+     the gate's chart (`iac@main`), web image (`:latest`) and runners are not
+     pinned between runs, so two runs' results only add up while they are
+     close together;
+   - the gate gained a job or a DTF leg since the original (only possible with
+     `tests=moved`): nobody ran it, so `certify` refuses.
+
+   What a rerun checks, all before its gate starts unless noted:
+   - the original is a failed attempt-1 dispatch of `release-candidate.yml`
+     on main, whose pre-gate jobs all passed, which did not certify, and which
+     was not itself a rerun;
+   - no earlier dispatch has rerun it: any candidate run since the original
+     whose `release-candidate-record` names it as `rerun.of` counts, whatever
+     its conclusion. A dispatch refused before its record was written never
+     reached its gate and does not count;
+   - the commit, the three digests the original tested, the adapter decision,
+     the version, the line and this workflow's blob are unchanged (the
+     original's `release-candidate-record` artifact, written before its gate
+     started, against this run's own resolution);
+   - `tests=same` (the default) runs the original's artifact-keeper-test
+     commit, pinned through the gate's `tests_sha`, and refuses if
+     `release-gate.yml` changed since. `tests=moved` runs the current tests
+     and records `tests_moved: true`;
+   - after the gate, every gate job and leg of the rerun also ran in the
+     original (`certify`).
+
+   It certifies when its gate passes: every selected required job succeeded
+   (the gate's subset verdict, artifact-keeper-test#830), and the original
+   passed every gate job and leg the rerun did not run. The certification
+   records `gate_scope: "rerun"`, a `rerun` object (original run, reason,
+   actor, the groups rerun, the tests mode and whether the tests moved), and
+   `contributing_runs` with both runs, their actors, their `release-gate.yml`
+   commits and their tests commits. A full candidate records
+   `gate_scope: "full"` and itself alone. The `release-candidate/certified`
+   status and the run summary name both runs.
+
+   The cap exists because retrying a group until it goes green turns a flaky
+   product bug into a release. A group that is red on the candidate and on its
+   rerun is a regression until shown otherwise.
 
    **Fallback: a prerelease tag.** `vX.Y.Z-rc.N` still works as it always
    did (the ruleset excludes `v*-rc*`, `v*-beta*`, `v*-alpha*` from
@@ -1055,10 +1131,13 @@ scanned bytes; deleting it breaks every chart that pins it.
   entry, the preflight evidence, the exact-tag digest guard and the
   scanner-adapter exact-version decision on both registries, and the image
   adoption gate.
-- A failed Release Gate is never re-run; the recovery is a new candidate
-  (#3774). "Re-run failed jobs" replays the gate's `deploy` outputs, so the
-  suites target a namespace that no longer exists. Both workflows refuse the
-  re-run and say why.
+- A failed Release Gate is never re-run with "Re-run failed jobs" (#3774):
+  it replays the gate's `deploy` outputs, so the suites target a namespace
+  that no longer exists. Both workflows refuse it and say why. The recovery
+  is a new candidate, or, for a flake or a test-only fix, a new candidate
+  dispatch with `rerun_of` and a `reason` that runs only the failed gate
+  groups on the same commit and digests and records both runs in the
+  certification (#6076; "Rerunning the failed gate groups").
 
 
 ## Release-notes style

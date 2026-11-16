@@ -431,7 +431,8 @@ elif ! command -v jq >/dev/null 2>&1; then
   fail "jq is not on PATH; the predicate cannot be executed"
 else
   prog="$(awk '
-    /^ +jq -n \\$/      { f = 1 }
+    /- name: Write the certification predicate/ { armed = 1 }
+    armed && /^ +jq -n \\$/ { f = 1 }
     f                   { sub(/^          /, ""); print }
     /certification\/predicate\.json$/ { if (f) exit }
   ' "$WORKFLOW")"
@@ -460,6 +461,12 @@ else
       echo 'BACKEND_IMAGE=ghcr.io/o/r-backend'
       echo 'OPENSCAP_IMAGE=ghcr.io/o/r-openscap'
       echo 'ADAPTER_IMAGE=ghcr.io/o/r-scanner-adapter'
+      # A rerun of the failed gate groups (#6076): the richest shape.
+      echo 'GATE_WORKFLOW_SHA=dddddddddddddddddddddddddddddddddddddddd'
+      echo 'TESTS_SHA=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+      echo 'TESTS_BRANCH=release/1.9.x'
+      echo "CONTRIBUTING_RUNS='[{\"run_id\":\"4141\",\"role\":\"original\"},{\"run_id\":\"4242\",\"role\":\"rerun\",\"reason\":\"it is the flake\"}]'"
+      echo "RERUN='{\"of\":\"4141\",\"reason\":\"it is the flake (#1)\",\"actor\":\"someone\",\"only_jobs\":[\"dtf-gate/core\"],\"tests_mode\":\"same\",\"tests_moved\":false}'"
       printf '%s\n' "$prog"
     } > "$pdir/run.sh"
     out=""; rc=0
@@ -483,7 +490,12 @@ else
         '(.digests | keys) == ["backend","openscap","scanner_adapter"]' \
         '.sha_tag == "sha-aaaaaaa"' \
         '.scanner_adapter_version == "2.3.4"' \
-        '.scanner_adapter_decision == {"decision":"stays","owner_rev":"cccccccccccccccccccccccccccccccccccccccc","tag":"2.3.4"}'
+        '.scanner_adapter_decision == {"decision":"stays","owner_rev":"cccccccccccccccccccccccccccccccccccccccc","tag":"2.3.4"}' \
+        '.gate_workflow_sha == "dddddddddddddddddddddddddddddddddddddddd"' \
+        '.tests == {"sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","branch":"release/1.9.x"}' \
+        '.gate_scope == "rerun"' \
+        '.rerun.of == "4141" and .rerun.reason == "it is the flake (#1)" and .rerun.actor == "someone"' \
+        '[.contributing_runs[].run_id] == ["4141","4242"]'
       do
         if jq -e "$probe" "$pdir/certification/predicate.json" >/dev/null 2>&1; then
           pass "predicate: ${probe}"
