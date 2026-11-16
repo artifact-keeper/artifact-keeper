@@ -35,8 +35,14 @@
 #     assemble a certification over a week);
 #   * an original whose pre-gate jobs did not all succeed, whose gate never
 #     ran, or that certified anyway;
-#   * an original that was itself a rerun: a rerun always names the full run,
-#     and reruns it again for every group that run did not pass;
+#   * an original that was itself a rerun: a rerun always names the full run;
+#   * an original that has ALREADY been rerun: at most one rerun per candidate.
+#     Any earlier dispatch of this workflow whose release-candidate-record says
+#     `rerun.of` = this original counts, whatever its conclusion: a failed or
+#     cancelled rerun still used up the one allowed. (The candidate's
+#     concurrency group is keyed by the sha, so two reruns of one original
+#     cannot overlap: the second starts only once the first has finished, by
+#     which time its record exists if its gate ever started.);
 #   * a different commit than the one dispatched;
 #   * in `tests=same` mode, a release-gate.yml whose content changed since the
 #     original (dispatch with `tests=moved` to accept that, recorded);
@@ -195,7 +201,29 @@ rec() { jq -r "$1 // empty" <<<"$record"; }
 [[ "$(rec .candidate_run_id)" == "$OF" ]] || blocked "run ${OF}'s record names run '$(rec .candidate_run_id)'."
 [[ "$(rec .gate_scope)" == full ]] || blocked "run ${OF} was itself a rerun (of $(rec .rerun.of)). Name the full run it followed up: a rerun reruns every group that run did not pass."
 
-# --- 4. which tests --------------------------------------------------------------
+# --- 4. at most one rerun per candidate --------------------------------------
+# Every dispatch of this workflow on main since the original started, except
+# the original and this run. A run with no record never reached its gate (it
+# was refused earlier), so it ran nothing and does not count.
+since="$(jq -rn --arg t "$created" '$t | @uri')"
+later="$(gh api --paginate "repos/${REPO}/actions/workflows/release-candidate.yml/runs?event=workflow_dispatch&branch=main&created=%3E%3D${since}&per_page=100" \
+  --jq '.workflow_runs[] | .id' 2>"$WORK/err")" || infra "listing the candidate runs since ${created} failed: $(head -c 300 "$WORK/err")"
+for rid in $later; do
+  [[ "$rid" =~ ^[0-9]+$ && "$rid" != "$OF" && "$rid" != "$SELF" ]] || continue
+  n="$(api "repos/${REPO}/actions/runs/${rid}/artifacts?name=${RECORD_NAME}&per_page=100" '[.artifacts[] | select(.name == "'"$RECORD_NAME"'")] | length')" || exit $?
+  [[ "$n" -gt 0 ]] || continue
+  mkdir -p "$WORK/later/${rid}"
+  gh run download "$rid" --repo "$REPO" --name "$RECORD_NAME" --dir "$WORK/later/${rid}" >/dev/null 2>"$WORK/err" \
+    || infra "downloading run ${rid}'s ${RECORD_NAME} failed: $(head -c 300 "$WORK/err")"
+  prior_of="$(jq -r '.rerun.of // empty' "$WORK/later/${rid}/record.json" 2>/dev/null)" \
+    || infra "run ${rid}'s ${RECORD_NAME} has no readable record.json."
+  if [[ "$prior_of" == "$OF" ]]; then
+    prior_conc="$(api "repos/${REPO}/actions/runs/${rid}" '.conclusion // .status')" || exit $?
+    blocked "run ${OF} has already been rerun once, by run ${rid} (${prior_conc}). At most one rerun per candidate: dispatch a fresh Release Candidate on ${SHA} instead."
+  fi
+done
+
+# --- 5. which tests --------------------------------------------------------------
 gate_sha_of() { jq -r --arg p "${TEST_REPO}/${GATE_PATH}@" '[.referenced_workflows[]? | select(.path | startswith($p)) | .sha] | first // empty' <<<"$1"; }
 blob_of() { api "repos/${TEST_REPO}/contents/${GATE_PATH}?ref=$1" .sha; }
 orig_gate_sha="$(gate_sha_of "$run")"

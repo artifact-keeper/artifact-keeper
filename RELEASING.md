@@ -415,7 +415,12 @@ names the same commit.
    was wrong and has been fixed in artifact-keeper-test (`tests=moved`). Say
    which in `reason`, with the issue; it goes into the certification.
 
+   **At most one rerun per candidate.** A second rerun of the same original
+   is refused, whatever became of the first (failed, cancelled or green):
+   dispatch a fresh candidate instead. A rerun of a rerun is refused too.
+
    **A fresh candidate is needed when**
+   - the candidate has already been rerun once;
    - a red group is, or might be, a real regression: the fix is a new
      commit, and a new commit is always a new candidate;
    - anything outside the gate failed (preflight, bookkeeping, images, Docker
@@ -433,8 +438,11 @@ names the same commit.
    What a rerun checks, all before its gate starts unless noted:
    - the original is a failed attempt-1 dispatch of `release-candidate.yml`
      on main, whose pre-gate jobs all passed, which did not certify, and which
-     was not itself a rerun (a second rerun names the same original and runs
-     every group it did not pass, again);
+     was not itself a rerun;
+   - no earlier dispatch has rerun it: any candidate run since the original
+     whose `release-candidate-record` names it as `rerun.of` counts, whatever
+     its conclusion. A dispatch refused before its record was written never
+     reached its gate and does not count;
    - the commit, the three digests the original tested, the adapter decision,
      the version, the line and this workflow's blob are unchanged (the
      original's `release-candidate-record` artifact, written before its gate
@@ -456,10 +464,9 @@ names the same commit.
    `gate_scope: "full"` and itself alone. The `release-candidate/certified`
    status and the run summary name both runs.
 
-   Retrying a group until it goes green turns a flaky product bug into a
-   release. Rerun a group at most once without a filed issue that explains
-   the flake; a group that is red twice is a regression until shown
-   otherwise.
+   The cap exists because retrying a group until it goes green turns a flaky
+   product bug into a release. A group that is red on the candidate and on its
+   rerun is a regression until shown otherwise.
 
    **Fallback: a prerelease tag.** `vX.Y.Z-rc.N` still works as it always
    did (the ruleset excludes `v*-rc*`, `v*-beta*`, `v*-alpha*` from

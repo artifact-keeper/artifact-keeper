@@ -43,9 +43,10 @@ cat > "$STUB/gh" <<'STUBGH'
 #!/usr/bin/env bash
 F="$FAKE_DIR"
 if [ "$1" = run ] && [ "$2" = download ]; then
-  dir=""; while [ $# -gt 0 ]; do [ "$1" = --dir ] && dir="$2"; shift; done
-  [ -f "$F/record.json" ] || exit 1
-  cp "$F/record.json" "$dir/record.json"; exit 0
+  rid="$3"; dir=""; while [ $# -gt 0 ]; do [ "$1" = --dir ] && dir="$2"; shift; done
+  src="$F/record.json"; [ "$rid" = "$FAKE_OF" ] || src="$F/record_${rid}.json"
+  [ -f "$src" ] || exit 1
+  cp "$src" "$dir/record.json"; exit 0
 fi
 [ "$1" = api ] || exit 1
 shift
@@ -66,6 +67,9 @@ case "$path" in
   */actions/runs/"$FAKE_OF"/artifacts*)       file="$F/arts.json" ;;
   */actions/runs/"$FAKE_SELF")                file="$F/self_run.json" ;;
   */contents/*ref=*)                          file="$F/blob_${path##*ref=}.json" ;;
+  */actions/workflows/release-candidate.yml/runs*) file="$F/runs.json" ;;
+  */actions/runs/*/artifacts*) rid="${path#*/actions/runs/}"; file="$F/arts_${rid%%/*}.json" ;;
+  */actions/runs/*)            file="$F/run_${path##*/actions/runs/}.json" ;;
   *) echo "stub: unexpected path $path" >&2; exit 1 ;;
 esac
 [ -f "$file" ] || { echo "HTTP 404 $path" >&2; exit 1; }
@@ -116,6 +120,8 @@ reset_case() {
     '{commit_sha: $s, candidate_run_id: $run, gate_scope: "full", tests: {sha: $t, branch: "main"},
       digests: {backend: "sha256:b", openscap: "sha256:o", scanner_adapter: "sha256:a"}}' > "$F/record.json"
   echo '{"sha":"blobA"}' > "$F/blob_${GATE_A}.json"
+  # Candidate runs since the original: the original and this run only.
+  jq -n --argjson a "$OF" --argjson b "$SELF" '{workflow_runs: [{id: $a}, {id: $b}]}' > "$F/runs.json"
   CASE_TESTS=same; CASE_SHA="$SHA"; CASE_OF="$OF"; CASE_MODE=resolve; FAKE_API_FAIL=0
 }
 
@@ -207,6 +213,35 @@ reset_case; edit record.json '.candidate_run_id = "1"'
 expect "a record naming another run -> BLOCKED" 1 "record names run '1'"
 reset_case; rm "$F/record.json"
 expect "record unreadable -> INFRA" 2 "INFRA"
+
+echo "candidate rerun resolver: at most one rerun per candidate"
+# prior_run <id> <conclusion> <record jq or 'none'>: an earlier dispatch since the original
+prior_run() {
+  local id="$1" conc="$2" rec="$3"
+  jq --argjson id "$id" '.workflow_runs += [{id: $id}]' "$F/runs.json" > "$F/runs.new" && mv "$F/runs.new" "$F/runs.json"
+  jq -n --arg c "$conc" '{conclusion: $c, status: "completed"}' > "$F/run_${id}.json"
+  if [ "$rec" = none ]; then
+    echo '{"artifacts": []}' > "$F/arts_${id}.json"
+  else
+    echo '{"artifacts": [{"name": "release-candidate-record"}]}' > "$F/arts_${id}.json"
+    jq -n "$rec" > "$F/record_${id}.json"
+  fi
+}
+reset_case; prior_run 43900000001 failure "{gate_scope: \"rerun\", rerun: {of: \"$OF\"}}"
+expect "an earlier rerun of this original that failed -> BLOCKED" 1 "has already been rerun once, by run 43900000001 (failure)"
+expect "the refusal says to dispatch a fresh candidate" 1 "dispatch a fresh Release Candidate"
+reset_case; prior_run 43900000002 cancelled "{gate_scope: \"rerun\", rerun: {of: \"$OF\"}}"
+expect "an earlier rerun that was cancelled still counts -> BLOCKED" 1 "by run 43900000002 (cancelled)"
+reset_case; prior_run 43900000003 success "{gate_scope: \"rerun\", rerun: {of: \"$OF\"}}"
+expect "an earlier rerun that certified -> BLOCKED" 1 "has already been rerun once"
+reset_case; prior_run 43900000004 failure "{gate_scope: \"rerun\", rerun: {of: \"43800000000\"}}"
+expect "a rerun of a DIFFERENT original does not count" 0 "rerun_jobs="
+reset_case; prior_run 43900000005 failure '{gate_scope: "full", rerun: null}'
+expect "a later full candidate on the same commit does not count" 0 "rerun_jobs="
+reset_case; prior_run 43900000006 failure none
+expect "a dispatch refused before its record (no gate ran) does not count" 0 "rerun_jobs="
+reset_case; prior_run 43900000007 failure '{gate_scope: "full", rerun: null}'; prior_run 43900000008 failure "{gate_scope: \"rerun\", rerun: {of: \"$OF\"}}"
+expect "the earlier rerun is found among other runs -> BLOCKED" 1 "by run 43900000008"
 
 echo "candidate rerun resolver: infra is never a pass"
 reset_case; FAKE_API_FAIL=1

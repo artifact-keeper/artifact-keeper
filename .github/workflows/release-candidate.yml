@@ -120,8 +120,10 @@ name: Release Candidate
 # only the jobs and dtf-gate legs the original did not pass (the gate's
 # `only_jobs`, artifact-keeper-test#830), and certifies only when:
 #   * the original is a failed attempt-1 dispatch of this file on main, under
-#     RERUN_MAX_AGE_HOURS old, whose pre-gate jobs all succeeded and which was
-#     not itself a rerun (scripts/ci/resolve-candidate-rerun.sh);
+#     RERUN_MAX_AGE_HOURS old, whose pre-gate jobs all succeeded, which was
+#     not itself a rerun, and which no earlier dispatch has rerun: at most ONE
+#     rerun per candidate, whatever that rerun's conclusion
+#     (scripts/ci/resolve-candidate-rerun.sh);
 #   * the commit, the three certified digests, the adapter decision, the
 #     version, the line and this file's blob are the ones the original tested
 #     (`record`; any difference refuses before the gate);
