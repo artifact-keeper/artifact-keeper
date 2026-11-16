@@ -186,6 +186,7 @@ pub struct BuildListResponse {
 /// List builds
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "",
     context_path = "/api/v1/builds",
     tag = "builds",
@@ -295,6 +296,7 @@ pub async fn list_builds(
 /// Get a build by ID
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/{id}",
     context_path = "/api/v1/builds",
     tag = "builds",
@@ -372,6 +374,7 @@ pub struct BuildDiffResponse {
 /// Get diff between two builds
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/diff",
     context_path = "/api/v1/builds",
     tag = "builds",
@@ -445,6 +448,7 @@ pub struct CreateBuildRequest {
 /// Create a new build (POST /api/v1/builds)
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "",
     context_path = "/api/v1/builds",
     tag = "builds",
@@ -492,6 +496,7 @@ pub struct UpdateBuildRequest {
 /// Update build status (PUT /api/v1/builds/:id)
 #[utoipa::path(
     put,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/{id}",
     context_path = "/api/v1/builds",
     tag = "builds",
@@ -574,6 +579,7 @@ pub struct AddBuildArtifactsResponse {
 /// Attach artifacts to a build (POST /api/v1/builds/:id/artifacts)
 #[utoipa::path(
     post,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/{id}/artifacts",
     context_path = "/api/v1/builds",
     tag = "builds",

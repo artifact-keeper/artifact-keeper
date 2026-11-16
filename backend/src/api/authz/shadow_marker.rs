@@ -87,6 +87,9 @@ pub struct Recorded {
     pub passed: Vec<(ScopeRef, LegacyLevel)>,
     /// The first refusal the handler keeps after enforcement, by reason.
     pub kept_refusal: Option<&'static str>,
+    /// Whether the handler keeps its existence-hiding refusal as well, so the
+    /// hidden refusal does not settle the comparison.
+    pub hidden_kept: bool,
     /// The resource a body-resolved declaration was authorized on.
     pub target: Option<ScopeRef>,
     pub principal: Option<RecordedPrincipal>,
@@ -108,6 +111,7 @@ struct Recorder {
     hidden_refusal: Cell<Option<Uuid>>,
     passed: RefCell<Vec<(ScopeRef, LegacyLevel)>>,
     kept_refusal: Cell<Option<&'static str>>,
+    hidden_kept: Cell<bool>,
     target: Cell<Option<ScopeRef>>,
     principal: Cell<Option<RecordedPrincipal>>,
     api_token: Cell<Option<Uuid>>,
@@ -177,6 +181,22 @@ pub fn keep_refusal(reason: &'static str, error: crate::error::AppError) -> crat
     error
 }
 
+/// Record an existence-hiding `error` as a refusal the handler keeps after
+/// enforcement, under a fixed `reason`, so it is not compared as a refusal of
+/// the declared operation; returns it unchanged. For a check the declaration
+/// does not cover, such as the caller's read access to a repository an API
+/// token's capability is used on.
+pub fn keep_hidden_refusal(
+    reason: &'static str,
+    error: crate::error::AppError,
+) -> crate::error::AppError {
+    if matches!(error, crate::error::AppError::NotFound(_)) {
+        note_kept_refusal(reason);
+        let _ = RECORDER.try_with(|r| r.hidden_kept.set(true));
+    }
+    error
+}
+
 /// Record the resource the handler authorized for a body-resolved
 /// declaration; the last call wins.
 pub fn note_target(target: ScopeRef) {
@@ -209,6 +229,26 @@ pub async fn note_repository_target(
     }
 }
 
+/// Record the one staging repository every named curated package belongs to,
+/// or the instance when they span several or none exists. Reads the database
+/// only inside a [`scope`].
+pub async fn note_shared_staging_target(db: &sqlx::PgPool, package_ids: &[Uuid]) {
+    if RECORDER.try_with(|_| ()).is_err() {
+        return;
+    }
+    let repositories: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT staging_repo_id FROM curation_packages WHERE id = ANY($1)",
+    )
+    .bind(package_ids)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    note_target(match repositories.as_slice() {
+        [one] => ScopeRef::Repository(*one),
+        _ => ScopeRef::Instance,
+    });
+}
+
 /// Record the principal the authentication middleware resolved; the last call
 /// wins.
 pub fn note_principal(ext: &AuthExtension) {
@@ -230,6 +270,7 @@ pub async fn scope<F: Future>(fut: F) -> (F::Output, Recorded) {
                 hidden_refusal: r.hidden_refusal.get(),
                 passed: r.passed.borrow().clone(),
                 kept_refusal: r.kept_refusal.get(),
+                hidden_kept: r.hidden_kept.get(),
                 target: r.target.get(),
                 principal: r.principal.get(),
                 api_token: r.api_token.get(),

@@ -158,7 +158,8 @@ pub fn legacy_outcome(
         ScopeRef::Repository(id) => Some(id),
         _ => None,
     };
-    let hidden_here = repository.is_some() && recorded.hidden_refusal == repository;
+    let hidden_here =
+        repository.is_some() && recorded.hidden_refusal == repository && !recorded.hidden_kept;
     let refusal = matches!(
         status,
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
@@ -692,6 +693,16 @@ pub async fn resolve(
         // every one.
         "acknowledgement" => repository_or_instance(db, uuid()?, ACKNOWLEDGEMENT_REPOSITORY).await,
         "webhook" => repository_or_instance(db, uuid()?, WEBHOOK_REPOSITORY).await,
+        "curation_rule" => repository_or_instance(db, uuid()?, CURATION_RULE_REPOSITORY).await,
+        "curation_package" => {
+            repository_of("SELECT staging_repo_id FROM curation_packages WHERE id = $1").await
+        }
+        "promotion_rule" => {
+            repository_of("SELECT source_repo_id FROM promotion_rules WHERE id = $1").await
+        }
+        "approval" => {
+            repository_of("SELECT source_repo_id FROM promotion_approvals WHERE id = $1").await
+        }
         // CVE history by artifact or by CVE id, as the handler reads the path.
         "cve_subject" => {
             let raw = param.ok_or("missing_parameter")?;
@@ -718,6 +729,7 @@ const ARTIFACT_REPOSITORY: &str = "SELECT repository_id FROM artifacts WHERE id 
 const ACKNOWLEDGEMENT_REPOSITORY: &str =
     "SELECT repository_id FROM finding_acknowledgements WHERE id = $1";
 const WEBHOOK_REPOSITORY: &str = "SELECT repository_id FROM webhooks WHERE id = $1";
+const CURATION_RULE_REPOSITORY: &str = "SELECT staging_repo_id FROM curation_rules WHERE id = $1";
 
 /// The repository in a nullable `repository_id` column, or the instance when
 /// it is null.
@@ -828,6 +840,19 @@ mod tests {
             ),
             (StatusCode::FORBIDDEN, none.clone(), here, L::Admin, Refuse),
             (StatusCode::NOT_FOUND, hidden(repo), here, L::Read, Refuse),
+            // A hidden refusal the handler keeps counts as kept.
+            (
+                StatusCode::NOT_FOUND,
+                Recorded {
+                    hidden_refusal: Some(repo),
+                    kept_refusal: Some("x"),
+                    hidden_kept: true,
+                    ..Recorded::default()
+                },
+                here,
+                L::Admin,
+                KeptRefusal,
+            ),
             // A hidden refusal of the declared repository outranks a kept one.
             (
                 StatusCode::NOT_FOUND,
@@ -2728,6 +2753,127 @@ mod end_to_end {
         .expect("insert a webhook")
     }
 
+    async fn insert_curation_package(pool: &PgPool, staging: Uuid, remote: Uuid) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO curation_packages \
+             (staging_repo_id, remote_repo_id, format, package_name, version, upstream_path) \
+             VALUES ($1, $2, 'generic', $3, '1.0.0', 'pkg/1.0.0') RETURNING id",
+        )
+        .bind(staging)
+        .bind(remote)
+        .bind(format!("shadow-{}", Uuid::new_v4()))
+        .fetch_one(pool)
+        .await
+        .expect("insert a curated package")
+    }
+
+    async fn insert_curation_rule(pool: &PgPool, staging: Option<Uuid>) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO curation_rules (staging_repo_id, package_pattern, action, reason) \
+             VALUES ($1, 'shadow-*', 'allow', 'shadow') RETURNING id",
+        )
+        .bind(staging)
+        .fetch_one(pool)
+        .await
+        .expect("insert a curation rule")
+    }
+
+    async fn insert_promotion_rule(pool: &PgPool, source: Uuid, target: Uuid) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO promotion_rules (name, source_repo_id, target_repo_id) \
+             VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind(format!("shadow-{}", Uuid::new_v4()))
+        .bind(source)
+        .bind(target)
+        .fetch_one(pool)
+        .await
+        .expect("insert a promotion rule")
+    }
+
+    async fn insert_approval(
+        pool: &PgPool,
+        artifact: Uuid,
+        source: Uuid,
+        target: Uuid,
+        requested_by: Uuid,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO promotion_approvals \
+             (artifact_id, source_repo_id, target_repo_id, requested_by) \
+             VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(artifact)
+        .bind(source)
+        .bind(target)
+        .bind(requested_by)
+        .fetch_one(pool)
+        .await
+        .expect("insert an approval request")
+    }
+
+    #[tokio::test]
+    async fn promotion_and_curation_objects_resolve_to_their_repository() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (staging, _, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (remote, _, _dir2) = tdh::create_repo(&pool, "remote", "generic").await;
+        let (user, _) = tdh::create_user(&pool).await;
+        let artifact = insert_artifact(&pool, staging).await;
+        let package = insert_curation_package(&pool, staging, remote).await;
+        let rule = insert_curation_rule(&pool, Some(staging)).await;
+        let global_rule = insert_curation_rule(&pool, None).await;
+        let promotion_rule = insert_promotion_rule(&pool, staging, remote).await;
+        let approval = insert_approval(&pool, artifact, staging, remote, user).await;
+        let resolve_as = |id: &'static str, param: String| {
+            let pool = pool.clone();
+            async move { resolve(&pool, Resolver::lookup(id).unwrap(), Some(&param)).await }
+        };
+        let here = Ok(ScopeRef::Repository(staging));
+        let mut outcomes = Vec::new();
+        for (id, object) in [
+            ("curation_package:id", package),
+            ("curation_rule:id", rule),
+            ("promotion_rule:id", promotion_rule),
+            ("approval:id", approval),
+        ] {
+            outcomes.push((id, "found", resolve_as(id, object.to_string()).await, here));
+            outcomes.push((
+                id,
+                "missing",
+                resolve_as(id, Uuid::new_v4().to_string()).await,
+                Err("resource_not_found"),
+            ));
+            outcomes.push((
+                id,
+                "malformed",
+                resolve_as(id, "object".into()).await,
+                Err("malformed_parameter"),
+            ));
+        }
+        let global = resolve_as("curation_rule:id", global_rule.to_string()).await;
+        let _ = sqlx::query("DELETE FROM promotion_approvals WHERE id = $1")
+            .bind(approval)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM curation_rules WHERE id = ANY($1)")
+            .bind(vec![rule, global_rule])
+            .execute(&pool)
+            .await;
+        for repo in [staging, remote] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo)
+                .execute(&pool)
+                .await;
+        }
+        tdh::cleanup_user(&pool, user).await;
+        for (id, case, got, expected) in outcomes {
+            assert_eq!(got, expected, "{id} {case}");
+        }
+        assert_eq!(global, Ok(ScopeRef::Instance));
+    }
+
     #[tokio::test]
     async fn a_webhook_resolves_to_its_repository_or_the_instance() {
         let Some(pool) = tdh::try_pool().await else {
@@ -3083,6 +3229,277 @@ mod end_to_end {
             tdh::cleanup_user(&pool, user).await;
         }
         tdh::cleanup(&pool, repo, admin).await;
+    }
+
+    #[tokio::test]
+    async fn promotion_and_curation_operations_are_compared() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (source, source_key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (target, target_key, _d1) = tdh::create_repo(&pool, "local", "maven").await;
+        let (other, other_key, _d2) = tdh::create_repo(&pool, "local", "generic").await;
+        let (release, _, _d3) = tdh::create_repo(&pool, "local", "generic").await;
+        let (admin, _) = tdh::create_user(&pool).await;
+        let (releaser, _) = tdh::create_user(&pool).await;
+        let (outsider, _) = tdh::create_user(&pool).await;
+        let (owner, _) = tdh::create_user(&pool).await;
+        let (reader, _) = tdh::create_user(&pool).await;
+        let (plain, _) = tdh::create_user(&pool).await;
+        sqlx::query("UPDATE users SET is_admin = true WHERE id = $1")
+            .bind(admin)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // The promotion tenant check binds administrators too: a grant on both
+        // repositories makes them the caller's tenant.
+        for repo in [source, target] {
+            tdh::grant_repo_role(&pool, repo, releaser, "reader").await;
+            tdh::grant_repo_role(&pool, repo, admin, "reader").await;
+        }
+        tdh::grant_repo_role(&pool, source, owner, "repository-owner").await;
+        tdh::grant_repo_role(&pool, source, reader, "reader").await;
+        let artifact = insert_artifact(&pool, source).await;
+        let package = insert_curation_package(&pool, source, other).await;
+        let elsewhere = insert_curation_package(&pool, other, source).await;
+        let approval = insert_approval(&pool, artifact, source, release, admin).await;
+        let build: Uuid = sqlx::query_scalar(
+            "INSERT INTO builds (name, build_number, created_by) VALUES ('shadow', 1, $1) \
+             RETURNING id",
+        )
+        .bind(admin)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let mut rig = Rig::new(pool.clone(), &dir).await;
+        let auth = crate::services::auth_service::AuthService::new(
+            pool.clone(),
+            Arc::new(rig.state.config.clone()),
+        );
+        let token = |user: Uuid, name: &'static str, scope: &'static str| {
+            let auth = &auth;
+            async move {
+                auth.generate_api_token(user, name, vec![scope.into()], None)
+                    .await
+                    .unwrap()
+                    .0
+            }
+        };
+        let promote = token(releaser, "promote", "promote:artifacts").await;
+        let crossing = token(outsider, "crossing", "promote:artifacts").await;
+        let sync = token(releaser, "sync", "trigger:sync").await;
+        let unread_sync = token(outsider, "unread-sync", "trigger:sync").await;
+        let admin_bearer = tdh::bearer_for(&rig.state, admin).await;
+        let owner_bearer = tdh::bearer_for(&rig.state, owner).await;
+        let reader_bearer = tdh::bearer_for(&rig.state, reader).await;
+        let plain_bearer = tdh::bearer_for(&rig.state, plain).await;
+        let compared = |c: &Comparison, legacy: LegacyOutcome, class: Class| {
+            assert_eq!((c.legacy, c.class), (legacy, class), "{c:?}");
+        };
+        let on_source = Some(ScopeRef::Repository(source));
+        let promote_request = |key: &str| {
+            json_request(
+                "POST",
+                format!("/api/v1/promotion/repositories/{key}/artifacts/{artifact}/promote"),
+                serde_json::json!({ "target_repository": target_key }),
+            )
+        };
+
+        // An administrator promotes: the format mismatch is a client error
+        // after the capability check, so legacy permits; decided on the source.
+        let (status, c) = rig
+            .call(Some(&admin_bearer), promote_request(&source_key))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(c.permission, Permission::PromotionCreate);
+        assert_eq!(c.resource, on_source);
+        compared(&c, LegacyOutcome::Permit, Class::Agree);
+
+        // A promotion token promotes and rejects as legacy permits.
+        let (status, c) = rig.call(Some(&promote), promote_request(&source_key)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        compared(&c, LegacyOutcome::Permit, Class::Agree);
+        let reject = json_request(
+            "POST",
+            format!("/api/v1/promotion/repositories/{source_key}/artifacts/{artifact}/reject"),
+            serde_json::json!({ "reason": "shadow" }),
+        );
+        let (status, c) = rig.call(Some(&promote), reject).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(c.permission, Permission::PromotionReject);
+        compared(&c, LegacyOutcome::Permit, Class::Agree);
+
+        // The same token approving a request: only the model permits.
+        let review = |action: &str| {
+            json_request(
+                "POST",
+                format!("/api/v1/approval/{approval}/{action}"),
+                serde_json::json!({}),
+            )
+        };
+        let (status, c) = rig.call(Some(&promote), review("approve")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(c.permission, Permission::PromotionApprove);
+        assert_eq!(c.resource, on_source);
+        compared(&c, LegacyOutcome::Refuse, Class::NewWider);
+
+        // A token whose owner holds no grant on the private source: the
+        // tenant check refuses, which the comparison leaves to the handler.
+        let (status, c) = rig
+            .call(Some(&crossing), promote_request(&source_key))
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(c.legacy, LegacyOutcome::KeptRefusal, "{c:?}");
+        assert_eq!(c.class, Class::Inconclusive("handler_check"));
+        let plain_state = tdh::build_state(pool.clone(), dir.to_str().unwrap());
+        let (_, reason) = kept_reason(&plain_state, &crossing, promote_request(&source_key)).await;
+        assert_eq!(reason, Some("tenant_boundary"));
+
+        // The administrator-only override is kept the same way.
+        let override_request = json_request(
+            "POST",
+            format!("/api/v1/promotion/repositories/{source_key}/artifacts/{artifact}/promote"),
+            serde_json::json!({ "target_repository": target_key, "skip_policy_check": true }),
+        );
+        let (status, reason) = kept_reason(&plain_state, &promote, override_request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(reason, Some("admin_override"));
+
+        // A token whose owner cannot read the repository is refused with the
+        // existence-hiding 404, which the comparison leaves to the handler.
+        let reject_unread = || {
+            json_request(
+                "POST",
+                format!("/api/v1/promotion/repositories/{source_key}/artifacts/{artifact}/reject"),
+                serde_json::json!({ "reason": "shadow" }),
+            )
+        };
+        let (status, c) = rig.call(Some(&crossing), reject_unread()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(c.permission, Permission::PromotionReject);
+        assert_eq!(c.legacy, LegacyOutcome::KeptRefusal, "{c:?}");
+        assert_eq!(c.class, Class::Inconclusive("handler_check"));
+        let (_, reason) = kept_reason(&plain_state, &crossing, reject_unread()).await;
+        assert_eq!(reason, Some("repository_visibility"));
+        let sync_unread =
+            || empty_request("POST", format!("/api/v1/curation/repos/{source_key}/sync"));
+        let (status, c) = rig.call(Some(&unread_sync), sync_unread()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(c.permission, Permission::CurationPublish);
+        assert_eq!(c.legacy, LegacyOutcome::KeptRefusal, "{c:?}");
+        assert_eq!(c.class, Class::Inconclusive("handler_check"));
+
+        // A repository owner approves a package curated into their repository.
+        let (status, c) = rig
+            .call(
+                Some(&owner_bearer),
+                json_request(
+                    "POST",
+                    format!("/api/v1/curation/packages/{package}/approve"),
+                    serde_json::json!({ "reason": "shadow" }),
+                ),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(c.permission, Permission::CurationReview);
+        assert_eq!(c.resource, on_source);
+        compared(&c, LegacyOutcome::Refuse, Class::NewWider);
+
+        // A bulk approval is decided on the packages' one staging repository,
+        // or on the instance when they span several.
+        let bulk = |ids: Vec<Uuid>| {
+            json_request(
+                "POST",
+                "/api/v1/curation/packages/bulk-approve".into(),
+                serde_json::json!({ "ids": ids, "reason": "shadow" }),
+            )
+        };
+        let (_, c) = rig.call(Some(&plain_bearer), bulk(vec![package])).await;
+        assert_eq!(c.resource, on_source);
+        compared(&c, LegacyOutcome::Refuse, Class::Agree);
+        let (status, c) = rig
+            .call(Some(&plain_bearer), bulk(vec![package, elsewhere]))
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(c.resource, Some(ScopeRef::Instance));
+        compared(&c, LegacyOutcome::Refuse, Class::Agree);
+
+        // A reader of the source requests an approval: a read on the source.
+        let request = json_request(
+            "POST",
+            "/api/v1/approval/request".into(),
+            serde_json::json!({
+                "source_repository": source_key,
+                "target_repository": other_key,
+                "artifact_id": artifact,
+            }),
+        );
+        let (status, c) = rig.call(Some(&reader_bearer), request).await;
+        assert!(status.is_success(), "{status}");
+        assert_eq!(c.permission, Permission::ArtifactRead);
+        assert_eq!(c.resource, on_source);
+        compared(&c, LegacyOutcome::Permit, Class::Agree);
+
+        // A sync token creates a curated version as legacy permits.
+        let (_, c) = rig
+            .call(
+                Some(&sync),
+                empty_request(
+                    "POST",
+                    format!("/api/v1/curation/repos/{source_key}/versions"),
+                ),
+            )
+            .await;
+        assert_eq!(c.permission, Permission::CurationPublish);
+        compared(&c, LegacyOutcome::Permit, Class::Agree);
+
+        // Changing another user's build is refused as before, uncompared: the
+        // next comparison seen is the declared read sent after it.
+        let app = crate::api::routes::create_router(rig.state.clone());
+        let mut change = json_request(
+            "PUT",
+            format!("/api/v1/builds/{build}"),
+            serde_json::json!({ "status": "success" }),
+        );
+        change
+            .headers_mut()
+            .insert("authorization", plain_bearer.parse().unwrap());
+        let (status, _) = tdh::send(app, change).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (_, c) = rig
+            .call(
+                Some(&reader_bearer),
+                empty_request(
+                    "GET",
+                    format!("/api/v1/promotion/repositories/{source_key}/promotion-history"),
+                ),
+            )
+            .await;
+        assert_eq!(c.permission, Permission::RepositoryRead);
+
+        rig.shutdown.cancel();
+        let _ = sqlx::query("DELETE FROM builds WHERE id = $1")
+            .bind(build)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM promotion_approvals WHERE artifact_id = $1")
+            .bind(artifact)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM promotion_history WHERE artifact_id = $1")
+            .bind(artifact)
+            .execute(&pool)
+            .await;
+        for repo in [target, other, release] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo)
+                .execute(&pool)
+                .await;
+        }
+        for user in [releaser, outsider, owner, reader, plain] {
+            tdh::cleanup_user(&pool, user).await;
+        }
+        tdh::cleanup(&pool, source, admin).await;
     }
 
     #[tokio::test]

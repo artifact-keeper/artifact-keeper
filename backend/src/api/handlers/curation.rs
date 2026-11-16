@@ -368,6 +368,7 @@ pub struct SyncTriggerResponse {
 
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "/api/v1/curation/rules",
     operation_id = "list_curation_rules",
     params(
@@ -426,6 +427,7 @@ async fn list_rules(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("curation.review")), ("x-resource" = json!("repository:body"))),
     path = "/api/v1/curation/rules",
     operation_id = "create_curation_rule",
     request_body = CreateRuleRequest,
@@ -440,6 +442,12 @@ async fn create_rule(
     Extension(auth): Extension<AuthExtension>,
     Json(req): Json<CreateRuleRequest>,
 ) -> Result<(StatusCode, Json<RuleResponse>), AppError> {
+    crate::api::authz::shadow_marker::note_target(match req.staging_repo_id {
+        Some(repository) => {
+            crate::services::iam_legacy_projection::ScopeRef::Repository(repository)
+        }
+        None => crate::services::iam_legacy_projection::ScopeRef::Instance,
+    });
     auth.require_admin()?;
     validate_typed_rule_fields(
         &req.action,
@@ -468,6 +476,7 @@ async fn create_rule(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("curation_rule:id"))),
     path = "/api/v1/curation/rules/{id}",
     operation_id = "get_curation_rule",
     params(("id" = Uuid, Path, description = "Rule ID")),
@@ -502,6 +511,7 @@ async fn get_rule(
 
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("curation.review")), ("x-resource" = json!("curation_rule:id"))),
     path = "/api/v1/curation/rules/{id}",
     operation_id = "update_curation_rule",
     request_body = UpdateRuleRequest,
@@ -540,6 +550,7 @@ async fn update_rule(
 
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("curation.review")), ("x-resource" = json!("curation_rule:id"))),
     path = "/api/v1/curation/rules/{id}",
     operation_id = "delete_curation_rule",
     params(("id" = Uuid, Path, description = "Rule ID")),
@@ -559,6 +570,7 @@ async fn delete_rule(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("artifact.read")), ("x-resource" = json!("repository:body"))),
     path = "/api/v1/curation/packages",
     operation_id = "list_curation_packages",
     params(PackageListQuery),
@@ -572,6 +584,9 @@ async fn list_packages(
 ) -> Result<Json<Vec<CurationPackageResponse>>, AppError> {
     // Cross-repo authorization (#2443): staged packages awaiting curation belong
     // to a private staging repo. Gate on that repo's visibility before listing.
+    crate::api::authz::shadow_marker::note_target(
+        crate::services::iam_legacy_projection::ScopeRef::Repository(query.staging_repo_id),
+    );
     require_repo_id_visible(
         &state.db,
         &auth,
@@ -593,6 +608,7 @@ async fn list_packages(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("artifact.read")), ("x-resource" = json!("curation_package:id"))),
     path = "/api/v1/curation/packages/{id}",
     operation_id = "get_curation_package",
     params(("id" = Uuid, Path, description = "Package ID")),
@@ -627,6 +643,7 @@ async fn get_package(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("curation.review")), ("x-resource" = json!("curation_package:id"))),
     path = "/api/v1/curation/packages/{id}/approve",
     params(("id" = Uuid, Path, description = "Package ID")),
     responses((status = 200, body = CurationPackageResponse)),
@@ -662,6 +679,7 @@ async fn approve_package(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("curation.review")), ("x-resource" = json!("curation_package:id"))),
     path = "/api/v1/curation/packages/{id}/block",
     params(("id" = Uuid, Path, description = "Package ID")),
     responses((status = 200, body = CurationPackageResponse)),
@@ -690,6 +708,7 @@ async fn block_package(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("curation.review")), ("x-resource" = json!("repository:body"))),
     path = "/api/v1/curation/packages/bulk-approve",
     request_body = BulkStatusRequest,
     responses((status = 200, body = u64)),
@@ -700,6 +719,7 @@ async fn bulk_approve(
     Extension(auth): Extension<AuthExtension>,
     Json(req): Json<BulkStatusRequest>,
 ) -> Result<Json<u64>, AppError> {
+    crate::api::authz::shadow_marker::note_shared_staging_target(&state.db, &req.ids).await;
     auth.require_admin()?;
     let svc = CurationService::new(state.db.clone());
     let count = svc
@@ -718,6 +738,7 @@ async fn bulk_approve(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("curation.review")), ("x-resource" = json!("repository:body"))),
     path = "/api/v1/curation/packages/bulk-block",
     request_body = BulkStatusRequest,
     responses((status = 200, body = u64)),
@@ -728,6 +749,7 @@ async fn bulk_block(
     Extension(auth): Extension<AuthExtension>,
     Json(req): Json<BulkStatusRequest>,
 ) -> Result<Json<u64>, AppError> {
+    crate::api::authz::shadow_marker::note_shared_staging_target(&state.db, &req.ids).await;
     auth.require_admin()?;
     let svc = CurationService::new(state.db.clone());
     let count = svc
@@ -746,6 +768,7 @@ async fn bulk_block(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("curation.review")), ("x-resource" = json!("repository:body"))),
     path = "/api/v1/curation/packages/re-evaluate",
     request_body = ReEvaluateRequest,
     responses((status = 200, body = u64)),
@@ -756,6 +779,9 @@ async fn re_evaluate(
     Extension(auth): Extension<AuthExtension>,
     Json(req): Json<ReEvaluateRequest>,
 ) -> Result<Json<u64>, AppError> {
+    crate::api::authz::shadow_marker::note_target(
+        crate::services::iam_legacy_projection::ScopeRef::Repository(req.staging_repo_id),
+    );
     auth.require_admin()?;
     let svc = CurationService::new(state.db.clone());
     let count = svc
@@ -872,6 +898,7 @@ async fn source_upstream_url_refusal(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("curation.publish")), ("x-resource" = json!("repo:repo_key"))),
     path = "/api/v1/curation/repos/{repo_key}/sync",
     operation_id = "trigger_curation_sync",
     params(("repo_key" = String, Path, description = "Staging repository key")),
@@ -904,6 +931,10 @@ async fn trigger_sync(
             AppError::NotFound(_) => AppError::NotFound("Repository not found".to_string()),
             other => other,
         })?;
+    crate::api::authz::shadow_marker::note_passed(
+        repo.id,
+        crate::api::authz::shadow_marker::LegacyLevel::Admin,
+    );
 
     // Tenant-ownership gate (campaign-#4 systemic authz), enforced independently
     // of the admin flag. A repo-scoped admin cannot trigger a sync for a repo in
@@ -930,12 +961,19 @@ async fn trigger_sync(
             repo.key
         )));
         crate::api::handlers::repositories::hide_write_denial_from_non_readers(
-            denied,
+            denied
+                .map_err(|e| crate::api::authz::shadow_marker::keep_refusal("tenant_boundary", e)),
             &auth,
             &repo,
             &repo_service,
         )
-        .await?;
+        .await
+        .map_err(|e| match auth.is_api_token {
+            true => {
+                crate::api::authz::shadow_marker::keep_hidden_refusal("repository_visibility", e)
+            }
+            false => e,
+        })?;
     }
 
     // #5253 / #5422: a Remote MCP registry syncs its upstream catalog, in the
@@ -1044,6 +1082,7 @@ async fn audit_sync_trigger(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("artifact.read")), ("x-resource" = json!("repo:repo_key"))),
     path = "/api/v1/curation/repos/{repo_key}/packages/search",
     operation_id = "search_curation_packages",
     params(
@@ -1128,6 +1167,10 @@ async fn authorize_version_action(
             AppError::NotFound(_) => AppError::NotFound("Repository not found".to_string()),
             other => other,
         })?;
+    crate::api::authz::shadow_marker::note_passed(
+        repo.id,
+        crate::api::authz::shadow_marker::LegacyLevel::Admin,
+    );
 
     // TENANT-GATE-ONLY (#3331). Same reasoning as `trigger_sync`: the global
     // capability (admin or `trigger:sync`) is checked above, and this is purely
@@ -1142,16 +1185,20 @@ async fn authorize_version_action(
         )
         .await?;
     if !sync_tenant_access_allowed(repo.is_public, has_grant) {
-        return Err(AppError::Authorization(format!(
-            "You are not authorized to manage curated versions for the '{}' repository's tenant",
-            repo.key
-        )));
+        return Err(crate::api::authz::shadow_marker::keep_refusal(
+            "tenant_boundary",
+            AppError::Authorization(format!(
+                "You are not authorized to manage curated versions for the '{}' repository's tenant",
+                repo.key
+            )),
+        ));
     }
     Ok(repo)
 }
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("curation.publish")), ("x-resource" = json!("repo:repo_key"))),
     path = "/api/v1/curation/repos/{repo_key}/versions",
     operation_id = "create_curation_version",
     params(("repo_key" = String, Path, description = "Staging repository key")),
@@ -1206,6 +1253,7 @@ async fn create_version(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("curation.publish")), ("x-resource" = json!("repo:repo_key"))),
     path = "/api/v1/curation/repos/{repo_key}/versions/{n}/publish",
     operation_id = "publish_curation_version",
     params(
@@ -1274,6 +1322,7 @@ async fn publish_version(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("artifact.read")), ("x-resource" = json!("repository:body"))),
     path = "/api/v1/curation/stats",
     params(StatsQuery),
     responses((status = 200, body = StatsResponse)),
@@ -1286,6 +1335,9 @@ async fn stats(
 ) -> Result<Json<StatsResponse>, AppError> {
     // Cross-repo authorization (#2443): curation stats aggregate a private
     // staging repo's package pipeline. Gate on that repo's visibility first.
+    crate::api::authz::shadow_marker::note_target(
+        crate::services::iam_legacy_projection::ScopeRef::Repository(query.staging_repo_id),
+    );
     require_repo_id_visible(
         &state.db,
         &auth,

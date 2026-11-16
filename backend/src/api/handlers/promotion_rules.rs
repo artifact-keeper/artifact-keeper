@@ -204,6 +204,7 @@ fn eval_to_response(eval: &RuleEvaluationResult) -> RuleEvaluationResponse {
 /// List all promotion rules
 #[utoipa::path(
     get,
+    extensions(("x-auth-requirement" = json!("authenticated"))),
     path = "",
     context_path = "/api/v1/promotion-rules",
     tag = "promotion",
@@ -240,6 +241,7 @@ async fn list_rules(
 /// Create a promotion rule
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("promotion.rule.manage")), ("x-resource" = json!("instance"))),
     path = "",
     context_path = "/api/v1/promotion-rules",
     tag = "promotion",
@@ -278,6 +280,7 @@ async fn create_rule(
 /// Get a promotion rule by ID
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("promotion_rule:id"))),
     path = "/{id}",
     context_path = "/api/v1/promotion-rules",
     tag = "promotion",
@@ -313,6 +316,7 @@ async fn get_rule(
 /// Update a promotion rule
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("promotion.rule.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/promotion-rules",
     tag = "promotion",
@@ -352,6 +356,7 @@ async fn update_rule(
 /// Delete a promotion rule
 #[utoipa::path(
     delete,
+    extensions(("x-required-permission" = json!("promotion.rule.manage")), ("x-resource" = json!("instance"))),
     path = "/{id}",
     context_path = "/api/v1/promotion-rules",
     tag = "promotion",
@@ -378,6 +383,7 @@ async fn delete_rule(
 /// Dry-run evaluate a rule against all artifacts in its source repository
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("promotion_rule:id"))),
     path = "/{id}/evaluate",
     context_path = "/api/v1/promotion-rules",
     tag = "promotion",

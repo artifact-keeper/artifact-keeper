@@ -455,6 +455,7 @@ async fn require_source_grant_for_request(
 /// Request approval for promoting an artifact from staging to release.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("artifact.read")), ("x-resource" = json!("repository:body"))),
     path = "/request",
     context_path = "/api/v1/approval",
     tag = "approval",
@@ -474,6 +475,9 @@ pub async fn request_approval(
 ) -> Result<(axum::http::StatusCode, Json<ApprovalResponse>)> {
     let repo_service = RepositoryService::new(state.db.clone());
     let source_repo = repo_service.get_by_key(&req.source_repository).await?;
+    crate::api::authz::shadow_marker::note_target(
+        crate::services::iam_legacy_projection::ScopeRef::Repository(source_repo.id),
+    );
     let target_repo = repo_service.get_by_key(&req.target_repository).await?;
     validate_promotion_repos(&source_repo, &target_repo)?;
 
@@ -632,6 +636,7 @@ pub async fn request_approval(
 /// List pending approval requests. Optionally filter by source repository.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("promotion.approve")), ("x-resource" = json!("instance"))),
     path = "/pending",
     context_path = "/api/v1/approval",
     tag = "approval",
@@ -737,6 +742,7 @@ pub async fn list_pending_approvals(
 /// Get a single approval request by ID.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("approval:id"))),
     path = "/{id}",
     context_path = "/api/v1/approval",
     tag = "approval",
@@ -788,6 +794,7 @@ pub async fn get_approval(
 /// updates the approval status to "approved".
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("promotion.approve")), ("x-resource" = json!("approval:id"))),
     path = "/{id}/approve",
     context_path = "/api/v1/approval",
     tag = "approval",
@@ -814,6 +821,7 @@ pub async fn approve_promotion(
             "Only admins can approve promotions".to_string(),
         ));
     }
+    crate::api::authz::shadow_marker::note_instance_admin_pass();
 
     #[derive(sqlx::FromRow)]
     #[allow(dead_code)]
@@ -1211,6 +1219,7 @@ pub async fn approve_promotion(
 /// Reject a pending promotion request. Admin-only.
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("promotion.approve")), ("x-resource" = json!("approval:id"))),
     path = "/{id}/reject",
     context_path = "/api/v1/approval",
     tag = "approval",
@@ -1237,6 +1246,7 @@ pub async fn reject_promotion(
             "Only admins can reject promotions".to_string(),
         ));
     }
+    crate::api::authz::shadow_marker::note_instance_admin_pass();
 
     let current_status: Option<(String,)> =
         sqlx::query_as("SELECT status FROM promotion_approvals WHERE id = $1")
@@ -1307,6 +1317,7 @@ pub async fn reject_promotion(
 /// List approval history with optional filtering by status or source repository.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("promotion.approve")), ("x-resource" = json!("instance"))),
     path = "/history",
     context_path = "/api/v1/approval",
     tag = "approval",

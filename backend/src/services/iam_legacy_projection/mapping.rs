@@ -112,6 +112,8 @@ pub fn system_role_permissions(role: SystemRole) -> BTreeSet<Permission> {
         SystemRole::ReleaseManager => set(&[
             P::PromotionCreate,
             P::PromotionReceive,
+            // A `promote:artifacts` token rejects staged artifacts today.
+            P::PromotionReject,
             P::PromotionRequest,
             P::PromotionApprove,
         ]),
@@ -327,6 +329,19 @@ mod tests {
     fn actions(list: &[&str]) -> BTreeSet<LegacyAction> {
         let owned: Vec<String> = list.iter().map(|s| s.to_string()).collect();
         parse_actions(&owned).0
+    }
+
+    #[test]
+    fn a_release_manager_holds_every_promotion_operation_but_rule_management() {
+        let expected: BTreeSet<Permission> = Permission::ALL
+            .iter()
+            .copied()
+            .filter(|p| p.id().starts_with("promotion.") && *p != P::PromotionRuleManage)
+            .collect();
+        assert_eq!(
+            system_role_permissions(SystemRole::ReleaseManager),
+            expected
+        );
     }
 
     #[test]

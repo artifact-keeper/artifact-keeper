@@ -129,6 +129,25 @@ pub const RESOLVERS: &[Resolver] = &[
         id: "webhook:body",
         scope: Scope::Repository,
     },
+    // Promotion and curation objects: a curated package and a curation rule
+    // resolve to their staging repository (an instance-wide rule to the
+    // instance), a promotion rule and an approval request to their source.
+    Resolver {
+        id: "curation_package:id",
+        scope: Scope::Repository,
+    },
+    Resolver {
+        id: "curation_rule:id",
+        scope: Scope::Repository,
+    },
+    Resolver {
+        id: "promotion_rule:id",
+        scope: Scope::Repository,
+    },
+    Resolver {
+        id: "approval:id",
+        scope: Scope::Repository,
+    },
 ];
 
 impl Resolver {

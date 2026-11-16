@@ -642,10 +642,13 @@ pub(crate) async fn require_promotion_tenant_access(
             )
             .await?;
         if !promotion_tenant_access_allowed(repo.is_public, has_grant) {
-            return Err(AppError::Authorization(format!(
-                "You are not authorized to promote into the '{}' repository's tenant",
-                repo.key
-            )));
+            return Err(crate::api::authz::shadow_marker::keep_refusal(
+                "tenant_boundary",
+                AppError::Authorization(format!(
+                    "You are not authorized to promote into the '{}' repository's tenant",
+                    repo.key
+                )),
+            ));
         }
     }
     Ok(())
@@ -687,11 +690,16 @@ async fn authorize_and_resolve_promotion(
     ensure_promotion_authorized(auth.is_admin, has_promote_scope)?;
     // The break-glass override is admin-only (#4203): checked at the shared
     // choke point so neither the single nor the bulk route can forget it.
-    ensure_skip_policy_check_authorized(auth.is_admin, skip_policy_check)?;
+    ensure_skip_policy_check_authorized(auth.is_admin, skip_policy_check)
+        .map_err(|e| crate::api::authz::shadow_marker::keep_refusal("admin_override", e))?;
 
     let repo_service = RepositoryService::new(state.db.clone());
 
     let source_repo = repo_service.get_by_key(repo_key).await?;
+    crate::api::authz::shadow_marker::note_passed(
+        source_repo.id,
+        crate::api::authz::shadow_marker::LegacyLevel::Admin,
+    );
 
     // Resolve the target: explicit request field, or linked release repo from config.
     let target_key = resolve_effective_target(&state.db, requested_target, source_repo.id).await?;
@@ -1185,6 +1193,7 @@ async fn insert_promotion_history_row(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("promotion.create")), ("x-resource" = json!("repo:key"))),
     path = "/repositories/{key}/artifacts/{artifact_id}/promote",
     context_path = "/api/v1/promotion",
     tag = "promotion",
@@ -1607,6 +1616,7 @@ pub async fn promote_artifact(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("promotion.create")), ("x-resource" = json!("repo:key"))),
     path = "/repositories/{key}/promote",
     context_path = "/api/v1/promotion",
     tag = "promotion",
@@ -2105,6 +2115,7 @@ pub async fn promote_artifacts_bulk(
 
 #[utoipa::path(
     post,
+    extensions(("x-required-permission" = json!("promotion.reject")), ("x-resource" = json!("repo:key"))),
     path = "/repositories/{key}/artifacts/{artifact_id}/reject",
     context_path = "/api/v1/promotion",
     tag = "promotion",
@@ -2135,9 +2146,22 @@ pub async fn reject_artifact(
     // and the tenant gate the promote routes apply. Visibility comes first so
     // a caller who cannot read the repository gets its 404 for every
     // artifact id, and the endpoint is not an existence oracle.
-    require_visible(&source_repo, &Some(auth.clone()), &repo_service).await?;
+    // A token's owner who cannot read the repository is refused here, a check
+    // the declared promotion capability does not cover.
+    require_visible(&source_repo, &Some(auth.clone()), &repo_service)
+        .await
+        .map_err(|e| match auth.is_api_token {
+            true => {
+                crate::api::authz::shadow_marker::keep_hidden_refusal("repository_visibility", e)
+            }
+            false => e,
+        })?;
     let has_promote_scope = auth.is_api_token && auth.has_scope("promote:artifacts");
     ensure_promotion_authorized(auth.is_admin, has_promote_scope)?;
+    crate::api::authz::shadow_marker::note_passed(
+        source_repo.id,
+        crate::api::authz::shadow_marker::LegacyLevel::Admin,
+    );
     require_promotion_tenant_access(&repo_service, auth.user_id, &source_repo, &source_repo)
         .await?;
 
@@ -2219,6 +2243,7 @@ pub async fn reject_artifact(
 
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/repositories/{key}/promotion-history",
     context_path = "/api/v1/promotion",
     tag = "promotion",
@@ -2417,6 +2442,7 @@ pub struct SetReleaseTargetRequest {
 /// Get the linked release target for a staging repository.
 #[utoipa::path(
     get,
+    extensions(("x-required-permission" = json!("repository.read")), ("x-resource" = json!("repo:key"))),
     path = "/repositories/{key}/release-target",
     context_path = "/api/v1/promotion",
     tag = "promotion",
@@ -2518,6 +2544,7 @@ fn linked_release_target(release_id: Uuid, key: String, readable: bool) -> Relea
 /// remove the link.
 #[utoipa::path(
     put,
+    extensions(("x-required-permission" = json!("repository.update")), ("x-resource" = json!("repo:key"))),
     path = "/repositories/{key}/release-target",
     context_path = "/api/v1/promotion",
     tag = "promotion",
