@@ -47,6 +47,9 @@ pub struct BuildArtifact {
     pub path: String,
     pub checksum_sha256: String,
     pub size_bytes: i64,
+    /// The stored artifact this entry points at, `None` for a free-form entry
+    /// or once that artifact is purged
+    pub artifact_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -91,6 +94,9 @@ pub struct BuildArtifactInput {
     pub path: String,
     pub checksum_sha256: String,
     pub size_bytes: i64,
+    /// A stored artifact the caller resolved and may read
+    #[serde(default)]
+    pub artifact_id: Option<Uuid>,
 }
 
 impl BuildService {
@@ -242,11 +248,11 @@ impl BuildService {
         let mut rows: Vec<BuildArtifact> = sqlx::query_as(
             r#"
             SELECT a.id, a.build_id, a.module_name, a.name, a.path,
-                   a.checksum_sha256, a.size_bytes, a.created_at
+                   a.checksum_sha256, a.size_bytes, a.artifact_id, a.created_at
             FROM unnest($1::uuid[]) AS b(id)
             CROSS JOIN LATERAL (
                 SELECT ba.id, ba.build_id, ba.module_name, ba.name, ba.path,
-                       ba.checksum_sha256, ba.size_bytes, ba.created_at
+                       ba.checksum_sha256, ba.size_bytes, ba.artifact_id, ba.created_at
                 FROM build_artifacts ba
                 WHERE ba.build_id = b.id
                 LIMIT $2
@@ -301,9 +307,11 @@ impl BuildService {
 
             let row: BuildArtifact = sqlx::query_as(
                 r#"
-                INSERT INTO build_artifacts (build_id, module_name, name, path, checksum_sha256, size_bytes)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING id, build_id, module_name, name, path, checksum_sha256, size_bytes, created_at
+                INSERT INTO build_artifacts (build_id, module_name, name, path, checksum_sha256,
+                                             size_bytes, artifact_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING id, build_id, module_name, name, path, checksum_sha256, size_bytes,
+                          artifact_id, created_at
                 "#,
             )
             .bind(build_id)
@@ -312,6 +320,7 @@ impl BuildService {
             .bind(&artifact.path)
             .bind(&artifact.checksum_sha256)
             .bind(artifact.size_bytes)
+            .bind(artifact.artifact_id)
             .fetch_one(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -524,6 +533,7 @@ mod tests {
             path: "core/target/core.jar".to_string(),
             checksum_sha256: "sha256hash".to_string(),
             size_bytes: 2_097_152,
+            artifact_id: None,
             created_at: Utc::now(),
         };
         let json = serde_json::to_value(&artifact).unwrap();
@@ -561,6 +571,7 @@ mod tests {
             path: "some/path".to_string(),
             checksum_sha256: "abc".to_string(),
             size_bytes: 100,
+            artifact_id: None,
         };
         assert!(artifact.name.is_empty());
     }
@@ -573,6 +584,7 @@ mod tests {
             path: "".to_string(),
             checksum_sha256: "abc".to_string(),
             size_bytes: 100,
+            artifact_id: None,
         };
         assert!(artifact.path.is_empty());
     }
