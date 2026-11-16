@@ -365,11 +365,13 @@ names the same commit.
    tag), the verifier anchors the adapter at that tag, and the promote's tag
    message and summary print the certified adapter digest and decision.
 
-   Until artifact-keeper-test#380 lands (tracked here as #4439), the
-   adapter's attestation is **provenance of what ships, not proof that the
-   gate exercised those bytes**: the Release Gate takes no adapter input and deploys the chart's
-   pinned adapter, for "new" and "stays" alike. The candidate exposes the
-   value to pass (`needs.images.outputs.adapter_image_ref`) for when it can.
+   The Release Gate runs **that** adapter, for "new" and "stays" alike
+   (#4439, artifact-keeper-test#380). The candidate passes the certified
+   tag and digest (`scanner_adapter_tag`, `scanner_adapter_digest`). The
+   gate's k8s stack deploys `<tag>@<digest>` in place of the chart's pinned
+   adapter and asserts that the adapter pod runs that digest. Its
+   candidate-adapter DTF tiers pull it by digest. The adapter's attestation
+   is therefore proof that the gate exercised those bytes.
 
    **Maintenance lines need the #4076 verifier before their next cut.**
    `release.yml` runs the *tagged* commit's copy of
