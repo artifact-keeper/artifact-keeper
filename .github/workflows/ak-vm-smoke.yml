@@ -1,0 +1,175 @@
+# THROWAWAY proof for #6072. Lives only on branch ci/6072-vm-smoke; never
+# merged. It runs the Docker Publish build/sign/attest sequence for the
+# scanner-adapter image on a runner labelled `ak-vm` (a per-job KVM VM) and
+# then verifies the result the way Docker Publish does.
+name: ak-vm smoke (6072, throwaway)
+
+on:
+  push:
+    branches: [ci/6072-vm-smoke]
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  SMOKE_IMAGE: artifact-keeper/ak-vm-smoke
+
+jobs:
+  build-sign-attest:
+    name: Build, sign and attest in a per-job VM
+    runs-on: ak-vm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Prove where this job runs
+        run: |
+          set -euo pipefail
+          echo "runner: ${RUNNER_NAME}"
+          echo "virt: $(systemd-detect-virt)"
+          echo "kernel: $(uname -r)"
+          [ "$(systemd-detect-virt)" = kvm ] || { echo "::error::not in a KVM guest"; exit 1; }
+          case "${RUNNER_NAME}" in akvm-*) ;; *) echo "::error::not an ak-vm runner"; exit 1 ;; esac
+          # dockerd is the guest's own, not a dind sidecar or the host's.
+          docker info --format 'docker {{.ServerVersion}} on {{.OperatingSystem}}, root {{.DockerRootDir}}, driver {{.Driver}}'
+          # The VM cannot reach the host, its LAN or the cluster (ak-vm-egress).
+          for target in 192.168.151.1:22 192.168.42.12:6443 192.168.42.12:10250 10.96.0.1:443; do
+            if timeout 5 bash -c "exec 3<>/dev/tcp/${target%:*}/${target#*:}" 2> /dev/null; then
+              echo "::error::reached ${target} from the VM"; exit 1
+            fi
+            echo "blocked: ${target}"
+          done
+          curl -fsS -o /dev/null https://ghcr.io/v2/ -w 'internet: ghcr.io %{http_code}\n' || true
+          # No IPv6 in the guest, and the one-time JIT seed ISO is gone.
+          if [ -e /proc/net/if_inet6 ]; then echo "::error::IPv6 is enabled"; exit 1; fi
+          echo "ipv6: disabled"
+          if sudo blkid /dev/sr0 2> /dev/null | grep -q cidata; then
+            echo "::error::seed ISO still attached"; exit 1
+          fi
+          echo "seed ISO: ejected"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub (for transitive base-image pulls)
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.SMOKE_IMAGE }}
+
+      # Same inputs as Docker Publish's build-scanner-adapter amd64 leg,
+      # except the image name and no cache-to (nothing is written back to the
+      # production build cache).
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: ./docker/Dockerfile.scanner-adapter
+          platforms: linux/amd64
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.SMOKE_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/artifact-keeper/artifact-keeper-scanner-adapter:buildcache-amd64
+          no-cache-filters: runtime
+          sbom: true
+          provenance: mode=max
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Tag the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "${REGISTRY}/${SMOKE_IMAGE}:vm-smoke-${GITHUB_RUN_ID}" \
+            "${REGISTRY}/${SMOKE_IMAGE}@${DIGEST}"
+
+      - name: Sign image with cosign (keyless)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${REGISTRY}/${SMOKE_IMAGE}@${DIGEST}"
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.SMOKE_IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify the published tag resolves to signed bytes
+        env:
+          PUBLISHED_SIG_IDENTITY_REGEXP: ^https://github\.com/artifact-keeper/artifact-keeper/\.github/workflows/ak-vm-smoke\.yml@refs/heads/ci/6072-vm-smoke$
+          PUBLISHED_SIG_BASIC_AUTH: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
+          PUBLISHED_SIG_BASIC_AUTH_HOST: ghcr.io
+        run: scripts/ci/check-published-image-signature.sh "${REGISTRY}/${SMOKE_IMAGE}:vm-smoke-${GITHUB_RUN_ID}"
+
+      - name: Verify the provenance attestation
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "oci://${REGISTRY}/${SMOKE_IMAGE}@${DIGEST}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/ak-vm-smoke.yml" \
+            --format json > "${RUNNER_TEMP}/attestation.json"
+          jq -r '.[] | "attestation verified: \(.verificationResult.statement.predicateType) signed by \(.verificationResult.signature.certificate.subjectAlternativeName) on runner \(.verificationResult.signature.certificate.runnerEnvironment)"' \
+            "${RUNNER_TEMP}/attestation.json"
+          docker buildx imagetools inspect "${REGISTRY}/${SMOKE_IMAGE}@${DIGEST}" --format '{{json .Provenance.SLSA}}' \
+            | jq -r '"buildkit provenance: buildType \(.buildDefinition.buildType // .buildType)"'
+          docker buildx imagetools inspect "${REGISTRY}/${SMOKE_IMAGE}@${DIGEST}" --format '{{json .SBOM.SPDX}}' \
+            | jq -r '"buildkit SBOM: \(.packages | length) SPDX packages"'
+
+  # The same verification from a GitHub-hosted runner: nothing about the VM
+  # leaks into what a consumer sees.
+  verify-elsewhere:
+    name: Verify from a GitHub-hosted runner
+    needs: build-sign-attest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+      attestations: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Verify signature and attestation
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ needs.build-sign-attest.outputs.digest }}
+          PUBLISHED_SIG_IDENTITY_REGEXP: ^https://github\.com/artifact-keeper/artifact-keeper/\.github/workflows/ak-vm-smoke\.yml@refs/heads/ci/6072-vm-smoke$
+          PUBLISHED_SIG_BASIC_AUTH: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
+          PUBLISHED_SIG_BASIC_AUTH_HOST: ghcr.io
+        run: |
+          set -euo pipefail
+          scripts/ci/check-published-image-signature.sh "${REGISTRY}/${SMOKE_IMAGE}:vm-smoke-${GITHUB_RUN_ID}"
+          gh attestation verify "oci://${REGISTRY}/${SMOKE_IMAGE}@${DIGEST}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/ak-vm-smoke.yml" \
+            --format json | jq -r '.[] | "attestation verified from GitHub-hosted: \(.verificationResult.statement.predicateType)"'
