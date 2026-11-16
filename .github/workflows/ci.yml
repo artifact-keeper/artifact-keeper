@@ -1595,6 +1595,12 @@ jobs:
       - name: Check the candidate rerun resolver selects and blocks correctly
         run: bash scripts/ci/test-resolve-candidate-rerun.sh
 
+      # #6080 (1.11.x twin #6117): the floating-tag guard withholds
+      # :1.11-dev only from a run whose commit is provably older than the one
+      # it names. Stubs `gh`; offline.
+      - name: Check the branch floating-tag guard
+        run: bash scripts/ci/test-decide-branch-floating-tags.sh
+
       # The other half of #3640: when the accepted run is a promote dispatch,
       # the published bytes were built from a DIFFERENT commit than the tag,
       # and adoption must be verified against the image's actual input set --
