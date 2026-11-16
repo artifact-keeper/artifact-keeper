@@ -13868,7 +13868,103 @@ pub async fn download_artifact(
     }
 
     // Fall back to proxied download (filesystem or S3 without redirect)
-    let artifact_service = ArtifactService::new(state.db.clone(), storage);
+    let artifact_service = ArtifactService::new(state.db.clone(), storage.clone());
+
+    // #5594: a Docker/OCI manifest's artifact row records the IMAGE size
+    // (config + layers) in `size_bytes`, not the byte length of the manifest
+    // stored at `storage_key`, while `checksum_sha256` is the manifest digest.
+    // Serving with `artifact.size_bytes` as the content length makes integrity
+    // verification fail (and would advertise a wrong Content-Length). Serve the
+    // actual manifest bytes with their real size instead.
+    if repo.repo_type != RepositoryType::Virtual
+        && repo.format == RepositoryFormat::Docker
+        && crate::services::oci_manifests::is_manifest_path(&path)
+    {
+        #[derive(sqlx::FromRow)]
+        struct ManifestArtifactRow {
+            id: Uuid,
+            storage_key: String,
+            checksum_sha256: String,
+            content_type: String,
+        }
+        let manifest_row = sqlx::query_as::<_, ManifestArtifactRow>(
+            r#"
+            SELECT id, storage_key, checksum_sha256, content_type
+            FROM artifacts
+            WHERE repository_id = $1 AND path = $2 AND is_deleted = false
+            "#,
+        )
+        .bind(repo.id)
+        .bind(&path)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        if let Some(artifact) = manifest_row {
+            crate::services::quarantine_service::enforce_download_gate(&state.db, artifact.id)
+                .await?;
+            match storage.get(&artifact.storage_key).await {
+                Ok(bytes) => {
+                    if !is_head {
+                        crate::services::artifact_service::record_download(
+                            &state.db,
+                            artifact.id,
+                            &dl_ctx,
+                        )
+                        .await;
+                    }
+                    let total = bytes.len() as u64;
+                    let body: futures::stream::BoxStream<'static, crate::error::Result<Bytes>> =
+                        Box::pin(futures::stream::once(async move { Ok(bytes) }));
+                    let range_header = request
+                        .headers()
+                        .get(header::RANGE)
+                        .and_then(|v| v.to_str().ok());
+                    let checksum = artifact.checksum_sha256.trim().to_string();
+                    let base_headers = vec![
+                        (header::CONTENT_TYPE, artifact.content_type),
+                        (
+                            header::CONTENT_DISPOSITION,
+                            format!("attachment; filename=\"{}\"", download_filename(&path)),
+                        ),
+                        (header::ETAG, artifact_etag(&checksum)),
+                        (
+                            header::HeaderName::from_static("x-checksum-sha256"),
+                            checksum,
+                        ),
+                        (
+                            header::HeaderName::from_static(X_ARTIFACT_STORAGE),
+                            "proxy".to_string(),
+                        ),
+                    ];
+                    let verify = serve_verification(
+                        state.config.download_verify_checksums
+                            && crate::storage::verify::checksum_is_content_digest(
+                                repo.format.as_key(),
+                                &path,
+                            ),
+                        &artifact.checksum_sha256,
+                        || format!("{key}/{path}"),
+                    );
+                    let response = ranged_stream_response_checked(
+                        range_header,
+                        total,
+                        body,
+                        base_headers,
+                        verify,
+                        is_head,
+                    )
+                    .await?;
+                    return Ok(response);
+                }
+                Err(AppError::NotFound(_)) if repo.repo_type == RepositoryType::Remote => {
+                    // Missing local storage for a cached remote manifest: fall
+                    // through to the normal remote fallback path below.
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
 
     let download_result = artifact_service
         .download_stream(
