@@ -1,0 +1,10 @@
+[Unit]
+Description=Run one GitHub Actions job, then power off (ak-vm-runner)
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/ak-vm-run-job
+StandardOutput=journal+console
+StandardError=journal+console

@@ -1,0 +1,14 @@
+# cgroup for every ak-vm-runner VM (domain <partition>/machine/akvm</partition>).
+# Hard-caps what the VMs can take from the host, so a runaway build cannot
+# push the node's kubelet into memory eviction. cgroup v1 (el8): MemoryLimit=.
+# Keep MemoryLimit >= AKVM_VM_COUNT * AKVM_VM_MEMORY_MIB + 4 GiB for the image-build VM
+# + ~1 GiB qemu overhead per VM (2 x 16 + 4 + 3 = 39 -> 40G).
+[Unit]
+Description=ak-vm-runner virtual machines
+Before=slices.target
+
+[Slice]
+MemoryAccounting=yes
+MemoryLimit=40G
+CPUAccounting=yes
+CPUQuota=1600%
