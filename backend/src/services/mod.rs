@@ -18,6 +18,7 @@ pub mod aws_upstream_auth;
 pub mod backup_service;
 pub mod banner_service;
 pub mod binary_catalog;
+pub mod build_retention;
 pub mod build_service;
 pub mod bundle;
 pub mod cache_classifier;

@@ -1209,6 +1209,86 @@ pub fn spawn_all(
         });
     }
 
+    // Build record retention (artifact-keeper-web#618): hourly, applies the
+    // `build_retention_days` and `build_retention_keep_last` system settings
+    // (read on every pass, both off by default). Same shape as the audit
+    // retention pass above
+    {
+        use crate::services::build_retention as retention;
+        let db = db.clone();
+        tokio::spawn(async move {
+            match retention::configured_policy(&db).await {
+                Ok(policy) => tracing::info!("{}", retention::startup_message(policy)),
+                Err(e) => tracing::warn!("Build retention: could not read the settings: {}", e),
+            }
+            tokio::time::sleep(jittered_startup_delay(240)).await;
+            let mut ticker = interval(Duration::from_secs(
+                retention::BUILD_RETENTION_INTERVAL_SECS,
+            ));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let policy = match retention::configured_policy(&db).await {
+                    Ok(policy) if policy.is_off() => {
+                        tracing::debug!("Build retention is off, skipping");
+                        continue;
+                    }
+                    Ok(policy) => policy,
+                    Err(e) => {
+                        tracing::warn!("Build retention: could not read the settings: {}", e);
+                        continue;
+                    }
+                };
+                let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+                    &db,
+                    retention::BUILD_RETENTION_LEASE_NAME,
+                    retention::BUILD_RETENTION_LEASE_TTL_SECS,
+                )
+                .await
+                else {
+                    tracing::debug!("Another replica owns the build retention lease");
+                    continue;
+                };
+                let (renewal, lost) = lease.spawn_renewal_with_cancellation(
+                    db.clone(),
+                    retention::BUILD_RETENTION_LEASE_TTL_SECS,
+                );
+                let result = match db.acquire().await {
+                    Ok(mut conn) => {
+                        retention::apply_retention(
+                            &mut conn,
+                            policy,
+                            retention::BUILD_RETENTION_BATCH_SIZE,
+                            Some(&lost),
+                        )
+                        .await
+                    }
+                    Err(e) => Err(crate::error::AppError::Database(e.to_string())),
+                };
+                match result {
+                    Ok(r) => {
+                        crate::services::metrics_service::record_cleanup(
+                            "builds",
+                            r.deleted_by_age + r.deleted_by_count,
+                        );
+                        tracing::info!(
+                            retention_days = policy.days,
+                            keep_last = policy.keep_last,
+                            deleted_by_age = r.deleted_by_age,
+                            deleted_by_count = r.deleted_by_count,
+                            batches = r.batches,
+                            interrupted = r.interrupted,
+                            "Build retention pass"
+                        )
+                    }
+                    Err(e) => tracing::warn!("Build retention pass failed: {}", e),
+                }
+                drop(renewal);
+                lease.release(&db).await;
+            }
+        });
+    }
+
     // Download statistics retention (#4541): opt-in via
     // DOWNLOAD_STATS_RETENTION_DAYS. Trims download_statistics and
     // proxy_download_statistics on one replica at a time; the lease is renewed
@@ -1576,7 +1656,7 @@ pub fn spawn_all(
     }
 
     tracing::info!(
-        "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup, age-gate auto-approval, environment advisory re-evaluation, audit retention{password_expiry}"
+        "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup, age-gate auto-approval, environment advisory re-evaluation, audit retention, build retention{password_expiry}"
     );
 }
 
