@@ -1705,6 +1705,16 @@ jobs:
       - name: Check the candidate rerun resolver selects and blocks correctly
         run: bash scripts/ci/test-resolve-candidate-rerun.sh
 
+      # The nightly release gate (#6073): which lines and images it tests,
+      # how it gives way to a release candidate on the shared pool, and the
+      # one-issue-per-red-tier tracking plus the verdict record #6075 reads.
+      # Stubs `gh`; offline, ~2s.
+      - name: Check the nightly release gate's line resolver, sentinel and report
+        run: |
+          bash scripts/ci/test-nightly-gate-lines.sh
+          bash scripts/ci/test-nightly-gate-sentinel.sh
+          bash scripts/ci/test-nightly-gate-report.sh
+
       # The other half of #3640: when the accepted run is a promote dispatch,
       # the published bytes were built from a DIFFERENT commit than the tag,
       # and adoption must be verified against the image's actual input set --
