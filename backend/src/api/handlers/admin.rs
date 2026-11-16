@@ -786,6 +786,14 @@ pub struct SystemSettings {
     /// the background detector and by `POST /api/v1/admin/cleanup`.
     /// `1..=10080`. `PEER_STALE_THRESHOLD_MINUTES` pins it when set.
     pub edge_stale_threshold_minutes: i32,
+    /// Build records that finished (or, never finished, were created) more
+    /// than this many days ago are deleted hourly, `0` = off. `0..=36500`.
+    #[serde(default)]
+    pub build_retention_days: i32,
+    /// Only the newest this many finished builds per build name are kept,
+    /// applied hourly, `0` = off. `0..=100000`.
+    #[serde(default)]
+    pub build_retention_keep_last: i32,
 }
 
 /// `POST /api/v1/admin/settings` body (#5652). Every field is optional: an
@@ -803,6 +811,8 @@ pub struct UpdateSystemSettingsRequest {
     pub audit_retention_days: Option<i32>,
     pub backup_retention_count: Option<i32>,
     pub edge_stale_threshold_minutes: Option<i32>,
+    pub build_retention_days: Option<i32>,
+    pub build_retention_keep_last: Option<i32>,
 }
 
 /// Fields removed from `POST /api/v1/admin/settings` (#5652), with the reason
@@ -820,6 +830,16 @@ const SETTING_RANGES: &[(&str, i64, i64)] = &[
     ("audit_retention_days", 0, 36_500),
     ("backup_retention_count", 1, 10_000),
     ("edge_stale_threshold_minutes", 1, 10_080),
+    (
+        crate::services::build_retention::BUILD_RETENTION_DAYS_SETTING,
+        0,
+        36_500,
+    ),
+    (
+        crate::services::build_retention::BUILD_RETENTION_KEEP_LAST_SETTING,
+        0,
+        100_000,
+    ),
 ];
 
 /// Defaults for a writable setting that was never stored.
@@ -883,7 +903,13 @@ pub async fn get_settings(State(state): State<SharedState>) -> Result<Json<Syste
         audit_retention_days: DEFAULT_AUDIT_RETENTION_DAYS,
         backup_retention_count: DEFAULT_BACKUP_RETENTION_COUNT,
         edge_stale_threshold_minutes: 0,
+        build_retention_days: 0,
+        build_retention_keep_last: 0,
     };
+
+    let build_retention = crate::services::build_retention::configured_policy(&state.db).await?;
+    result.build_retention_days = build_retention.days.unwrap_or(0);
+    result.build_retention_keep_last = build_retention.keep_last.unwrap_or(0);
 
     for row in settings {
         match row.key.as_str() {
@@ -989,6 +1015,16 @@ fn changed_settings(
             "edge_stale_threshold_minutes",
             current.edge_stale_threshold_minutes,
             request.edge_stale_threshold_minutes,
+        ),
+        (
+            crate::services::build_retention::BUILD_RETENTION_DAYS_SETTING,
+            current.build_retention_days,
+            request.build_retention_days,
+        ),
+        (
+            crate::services::build_retention::BUILD_RETENTION_KEEP_LAST_SETTING,
+            current.build_retention_keep_last,
+            request.build_retention_keep_last,
         ),
     ]
     .into_iter()
@@ -3323,6 +3359,8 @@ mod tests {
             audit_retention_days: 0,
             backup_retention_count: 10,
             edge_stale_threshold_minutes: 5,
+            build_retention_days: 0,
+            build_retention_keep_last: 0,
         }
     }
 
@@ -3618,6 +3656,152 @@ mod tests {
         assert_eq!(
             audited,
             vec!["backup_retention_count", "retention_days"],
+            "one SETTING_CHANGED row per changed field"
+        );
+    }
+
+    /// artifact-keeper-web#618: the build retention settings go through
+    /// `POST /api/v1/admin/settings` like the others: reported as 0 (off)
+    /// until stored, an update without them keeps them, a negative value is
+    /// a 400 and stores nothing, each change writes a `SETTING_CHANGED` row,
+    /// and the retention pass reads what was stored
+    #[tokio::test]
+    async fn build_retention_settings_round_trip_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::build_retention::{self, BuildRetentionPolicy};
+        use axum::http::StatusCode;
+
+        const KEYS: [&str; 2] = [
+            build_retention::BUILD_RETENTION_DAYS_SETTING,
+            build_retention::BUILD_RETENTION_KEEP_LAST_SETTING,
+        ];
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::admin_settings_serial_lock().await;
+        let saved: Vec<(String, serde_json::Value)> =
+            sqlx::query_as("SELECT key, value FROM system_settings WHERE key = ANY($1)")
+                .bind(&KEYS[..])
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        sqlx::query("DELETE FROM system_settings WHERE key = ANY($1)")
+            .bind(&KEYS[..])
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state = tdh::build_state(pool.clone(), "/tmp/admin-build-retention");
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let app = || {
+            tdh::router_with_auth_ext(
+                router(),
+                state.clone(),
+                tdh::admin_auth(admin_id, &admin_name),
+            )
+        };
+        let post = |body: serde_json::Value| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/settings")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        let get = || async {
+            let (status, body) = tdh::send(app(), tdh::get("/settings".to_string())).await;
+            assert_eq!(status, StatusCode::OK);
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        };
+
+        let before = get().await;
+        let mut set = before.clone();
+        set["build_retention_days"] = serde_json::json!(30);
+        set["build_retention_keep_last"] = serde_json::json!(5);
+        let (set_status, _) = tdh::send(app(), post(set)).await;
+        let after_set = get().await;
+        let policy = build_retention::configured_policy(&pool).await.unwrap();
+
+        let mut without = after_set.clone();
+        let fields = without.as_object_mut().unwrap();
+        fields.remove("build_retention_days");
+        fields.remove("build_retention_keep_last");
+        let (without_status, _) = tdh::send(app(), post(without)).await;
+        let after_without = get().await;
+
+        let mut negative = after_without.clone();
+        negative["build_retention_keep_last"] = serde_json::json!(-1);
+        let (neg_status, _) = tdh::send(app(), post(negative)).await;
+        let after_negative = get().await;
+
+        let mut off = after_negative.clone();
+        off["build_retention_days"] = serde_json::json!(0);
+        off["build_retention_keep_last"] = serde_json::json!(0);
+        let (off_status, _) = tdh::send(app(), post(off)).await;
+        let off_policy = build_retention::configured_policy(&pool).await.unwrap();
+
+        // The audit write is detached, give it a moment
+        let mut audited: Vec<String> = Vec::new();
+        for _ in 0..50 {
+            audited = sqlx::query_scalar(
+                "SELECT details->>'key' FROM audit_log \
+                  WHERE action = 'SETTING_CHANGED' AND user_id = $1 ORDER BY 1",
+            )
+            .bind(admin_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            if audited.len() >= 4 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        sqlx::query("DELETE FROM system_settings WHERE key = ANY($1)")
+            .bind(&KEYS[..])
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (key, value) in &saved {
+            sqlx::query("INSERT INTO system_settings (key, value) VALUES ($1, $2)")
+                .bind(key)
+                .bind(value)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let _ = sqlx::query("DELETE FROM audit_log WHERE user_id = $1")
+            .bind(admin_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, admin_id).await;
+
+        assert_eq!(before["build_retention_days"], 0, "{before}");
+        assert_eq!(before["build_retention_keep_last"], 0, "{before}");
+        assert_eq!(set_status, StatusCode::OK);
+        assert_eq!(after_set["build_retention_days"], 30, "{after_set}");
+        assert_eq!(after_set["build_retention_keep_last"], 5, "{after_set}");
+        assert_eq!(
+            policy,
+            BuildRetentionPolicy {
+                days: Some(30),
+                keep_last: Some(5),
+            }
+        );
+        assert_eq!(without_status, StatusCode::OK);
+        assert_eq!(after_without["build_retention_days"], 30);
+        assert_eq!(after_without["build_retention_keep_last"], 5);
+        assert_eq!(neg_status, StatusCode::BAD_REQUEST);
+        assert_eq!(after_negative["build_retention_keep_last"], 5);
+        assert_eq!(off_status, StatusCode::OK);
+        assert!(off_policy.is_off(), "{off_policy:?}");
+        assert_eq!(
+            audited,
+            vec![
+                "build_retention_days",
+                "build_retention_days",
+                "build_retention_keep_last",
+                "build_retention_keep_last",
+            ],
             "one SETTING_CHANGED row per changed field"
         );
     }
