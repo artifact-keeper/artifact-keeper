@@ -14407,9 +14407,8 @@ mod tests {
             return;
         };
         let upstream = MockServer::start().await;
-        let released_now = chrono::Utc::now()
-            .format("%a, %d %b %Y %H:%M:%S GMT")
-            .to_string();
+        let now = chrono::Utc::now();
+        let released_now = now.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
         let packument = serde_json::json!({
             "name": "agepkg",
             "dist-tags": {"latest": "2.0.0"},
@@ -14419,7 +14418,7 @@ mod tests {
                 "2.0.0": {"name": "agepkg", "version": "2.0.0", "dist": {
                     "tarball": format!("{}/agepkg/-/agepkg-2.0.0.tgz", upstream.uri())}},
             },
-            "time": {"1.0.0": "2015-10-21T07:28:00.000Z", "2.0.0": "2026-11-16T00:00:00.000Z"}
+            "time": {"1.0.0": "2015-10-21T07:28:00.000Z", "2.0.0": now.to_rfc3339()}
         });
         Mock::given(method("GET"))
             .and(path("/agepkg"))

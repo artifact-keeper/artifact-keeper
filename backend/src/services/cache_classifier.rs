@@ -1230,6 +1230,7 @@ mod tests {
                 "simple/requests/requests-2.32.0-py3-none-any.whl.metadata",
             ),
             (RepositoryFormat::Maven, "org/example/app/1.0/app-1.0.jar"),
+            (RepositoryFormat::Maven, "org/example/app/1.0/app-1.0.pom"),
             (
                 RepositoryFormat::Maven,
                 "org/example/app/1.0-SNAPSHOT/app-1.0-SNAPSHOT.jar",
