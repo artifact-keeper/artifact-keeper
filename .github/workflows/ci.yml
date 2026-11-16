@@ -1667,6 +1667,15 @@ jobs:
       - name: Check the conflict-marker gate catches what it must
         run: bash scripts/ci/test-check-conflict-markers.sh
 
+      # The gate-test rule for behaviour changes (#6074; main's require-e2e-proof.yml
+      # runs this branch's copy of the script on PRs into this line).
+      # It passes on every unlabelled PR, so a fail-open regression -- a Gate
+      # line hidden in a comment, a test PR against the wrong release line, an
+      # exemption with no reason -- would look exactly like a working check.
+      # Stubs `gh`; offline, ~3s.
+      - name: Check the E2E-proof check refuses what it must
+        run: bash scripts/ci/test-check-e2e-proof.sh
+
       # Stock compose version pins (#4481): openscap and web were hardcoded to
       # :latest, so setting ARTIFACT_KEEPER_VERSION still left two images
       # floating. Pure YAML inspection, ~1s.
