@@ -56,7 +56,9 @@ name: Nightly Release Gate
 #   * During the gate: the `sentinel` jobs poll for a Release Candidate every
 #     3 minutes and, as soon as one exists, CANCEL this run. The gate's
 #     teardown and cleanup are `if: always()`, so they still run and leave no
-#     namespace behind. A pre-empted night records nothing.
+#     namespace behind. A night pre-empted during the gate records nothing;
+#     one pre-empted during a lane keeps the gate's report (the lanes start
+#     only after it) and records nothing for the lane.
 #   * Concurrency group `nightly-release-gate`, never cancel-in-progress: one
 #     nightly at a time, a second one waits rather than interleaving. It is
 #     deliberately NOT shared with release-candidate.yml, whose group is per
@@ -74,6 +76,34 @@ name: Nightly Release Gate
 #   it (backend and tests compare links). A comment each night it stays red;
 #   closed the first night it is green. Dispatched runs track only when
 #   `track_issues` is set.
+#
+# LANES OUTSIDE THE GATE (#6121)
+#   After every gate line has finished, advisory lanes run against main's
+#   image (the same sha-<short>@digest the gate tested). They are not part of
+#   the release gate and never write the commit status:
+#   * s3    artifact-keeper-test's nightly-s3-formats.yml: the gate's format
+#           suites with S3 (the gate's MinIO) as the default storage.
+#   (A 3-instance mesh lane, #6120, is parked; it would slot in the same way.)
+#   Lanes start only after the gate lines (`needs: gate`), so the pool never
+#   holds a gate and a lane at once. They yield to a candidate like the gate
+#   does (the sentinels watch until `Nightly finished`), and tear down in
+#   `if: always()` jobs.
+#   Each lane reports through nightly-gate-report.js with REPORT_LANE set:
+#   issues keyed "<line>~<lane>|<tier>" (never closed by a gate result and
+#   vice versa), its own `nightly-lane-verdict-<lane>` artifact, no status.
+#   Which run: a dispatch's `lanes` input (empty = the gate only); a
+#   scheduled night's NIGHTLY_LANES repository variable (a kill switch
+#   without a PR), else "gate s3". An unknown word is dropped with a warning,
+#   never fatal, so a typo cannot take the gate down; nothing left = gate.
+#   A red lane turns the nightly run red even when the gate is green: read
+#   the per-job results (or the issues), not the run's conclusion.
+#
+# NIGHTLY TIMELINE (UTC). 08:00 start; one line of the full gate took
+#   73-114 min across the 2026-11-16 candidates, so main and 1.11.x end by
+#   about 10:30-12:00; the s3 lane adds at most about an hour (budget 60
+#   min). Done by about 13:00 UTC, before 09:00 US Eastern. A 3-hour gate line (the 2026-11-10 worst case) pushes
+#   the end to about 15:00: the lanes then finish into the morning, which
+#   costs nothing but a busy pool.
 #
 # RE-RUNS. As for a candidate (#3774), "Re-run failed jobs" cannot re-run the
 # gate: its deploy job's first-attempt outputs are replayed and every suite
@@ -94,6 +124,11 @@ on:
     inputs:
       lines:
         description: 'Lines to test, such as "main" or "main 1.11.x". Empty = main plus every active release/X.Y.x.'
+        required: false
+        type: string
+        default: ''
+      lanes:
+        description: 'What runs: any of "gate s3" (the gate, the S3 format lane). Empty = the gate only. Lanes test main only.'
         required: false
         type: string
         default: ''
@@ -143,7 +178,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  REPORT_JOB: Report nightly gate results
+  # The sentinels watch until this job exists: the last job of the night.
+  DONE_JOB: Nightly finished
 
 jobs:
   resolve:
@@ -158,7 +194,32 @@ jobs:
       lines: ${{ steps.lines.outputs.lines }}
       matrix: ${{ steps.lines.outputs.matrix }}
       run: ${{ steps.lines.outputs.run }}
+      lanes: ${{ steps.lanes.outputs.lanes }}
+      main_line: ${{ steps.lines.outputs.main_line }}
+      main_short: ${{ steps.lines.outputs.main_short }}
+      main_digest: ${{ steps.lines.outputs.main_digest }}
     steps:
+      - name: Choose what runs tonight
+        id: lanes
+        env:
+          LANES: ${{ github.event_name == 'schedule' && (vars.NIGHTLY_LANES || 'gate s3') || (inputs.lanes || 'gate') }}
+        run: |
+          set -euo pipefail -o noglob
+          out=""
+          for w in $LANES; do
+            case "$w" in
+              gate|s3) [[ "$out " == *" $w "* ]] || out="$out $w" ;;
+              *) echo "::warning title=Unknown lane::'$w' is not one of gate, s3; ignored." ;;
+            esac
+          done
+          if [[ -z "$out" ]]; then
+            echo "::warning title=No lane selected::'${LANES}' names no known lane; running the gate."
+            out=" gate"
+          fi
+          # Space-padded, so a job can test contains(lanes, ' s3 ').
+          echo "lanes=${out} " >> "$GITHUB_OUTPUT"
+          echo "Running:${out}"
+
       - name: Refuse a self-test run id that is not a number
         if: inputs.self_test_run != ''
         env:
@@ -225,6 +286,15 @@ jobs:
             jq -r '.[] | select(.error) | "::warning title=Line not tested::\(.branch): \(.error)"' <<<"$json"
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
+          # The lanes test main's image. Empty when main did not resolve: the
+          # lanes are then skipped, with this warning.
+          main="$(jq -c '[.[] | select(.line == "main" and .error == null)]' <<<"$json")"
+          [[ "$main" != "[]" ]] || echo "::warning title=Lanes not run::main did not resolve to an image (or was not among the lines); the lanes outside the gate are skipped."
+          {
+            echo "main_line=${main}"
+            echo "main_short=$(jq -r '.[0].short // ""' <<<"$main")"
+            echo "main_digest=$(jq -r '.[0].digest // ""' <<<"$main")"
+          } >> "$GITHUB_OUTPUT"
 
   gate:
     name: "Gate [${{ matrix.line }}]"
@@ -233,6 +303,7 @@ jobs:
     if: >-
       ${{ needs.resolve.outputs.run == 'true'
           && inputs.self_test_run == ''
+          && contains(needs.resolve.outputs.lanes, ' gate ')
           && fromJSON(github.run_attempt) == 1 }}
     strategy:
       # One line at a time: the pool fits one gate (see the header).
@@ -256,7 +327,9 @@ jobs:
 
   # Two chained watches: a hosted job lives at most 6 hours and two lines can
   # take longer than that. The first hands over to the second when its budget
-  # runs out; each ends early once the report job exists.
+  # runs out; each ends early once `Nightly finished` (env.DONE_JOB) exists,
+  # after the gate's report and every lane's report. Two watches cover about
+  # 9.7 hours: two gate lines plus the S3 lane fit with hours to spare.
   sentinel:
     name: Yield to a release candidate
     needs: resolve
@@ -281,7 +354,7 @@ jobs:
           SENTINEL_REPO: ${{ github.repository }}
           SENTINEL_WATCH: ${{ vars.NIGHTLY_GATE_OUTRANKED_BY || 'release-candidate.yml' }}
           SENTINEL_RUN_ID: ${{ github.run_id }}
-          SENTINEL_DONE_JOB: ${{ env.REPORT_JOB }}
+          SENTINEL_DONE_JOB: ${{ env.DONE_JOB }}
           SENTINEL_BUDGET_SECONDS: '17400'
         run: scripts/ci/nightly-gate-sentinel.sh --watch
 
@@ -306,16 +379,15 @@ jobs:
           SENTINEL_REPO: ${{ github.repository }}
           SENTINEL_WATCH: ${{ vars.NIGHTLY_GATE_OUTRANKED_BY || 'release-candidate.yml' }}
           SENTINEL_RUN_ID: ${{ github.run_id }}
-          SENTINEL_DONE_JOB: ${{ env.REPORT_JOB }}
+          SENTINEL_DONE_JOB: ${{ env.DONE_JOB }}
           SENTINEL_BUDGET_SECONDS: '17400'
         run: scripts/ci/nightly-gate-sentinel.sh --watch
 
   report:
-    # Keep this name equal to env.REPORT_JOB: the sentinels end when it appears.
     name: Report nightly gate results
     needs: [resolve, gate]
     # Not on a cancelled (pre-empted) run: a cancelled tier is not a red one.
-    if: ${{ !cancelled() && needs.resolve.outputs.run == 'true' }}
+    if: ${{ !cancelled() && needs.resolve.outputs.run == 'true' && contains(needs.resolve.outputs.lanes, ' gate ') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -357,3 +429,102 @@ jobs:
           path: ${{ runner.temp }}/verdict.json
           if-no-files-found: ignore
           retention-days: 90
+
+  # ── Lanes outside the gate (#6121): see LANES OUTSIDE THE GATE ──────────────
+  # `needs: [gate, report]` holds them until every gate line is done and
+  # reported (the pool fits one gate); `!cancelled()` lets them run after a
+  # red or skipped gate, but not once the sentinel has cancelled the night.
+  s3:
+    name: "S3 [main]"
+    # After the gate's report too, not beside it: a candidate that pre-empts
+    # the night during the lane must not cut the gate's issue and status
+    # writes short. A skipped or failed report still lets the lane run.
+    needs: [resolve, gate, report]
+    if: >-
+      ${{ !cancelled()
+          && needs.resolve.outputs.run == 'true'
+          && needs.resolve.outputs.main_short != ''
+          && inputs.self_test_run == ''
+          && contains(needs.resolve.outputs.lanes, ' s3 ')
+          && fromJSON(github.run_attempt) == 1 }}
+    permissions:
+      contents: read
+      packages: read
+    uses: artifact-keeper/artifact-keeper-test/.github/workflows/nightly-s3-formats.yml@main
+    with:
+      backend_tag: sha-${{ needs.resolve.outputs.main_short }}
+      backend_digest: ${{ needs.resolve.outputs.main_digest }}
+      iac_ref: main
+      web_tag: latest
+    secrets:
+      GHCR_DOCKER_CONFIG: ${{ secrets.GHCR_DOCKER_CONFIG }}
+
+  report-lanes:
+    name: "Report nightly ${{ matrix.lane }} lane"
+    needs: [resolve, s3]
+    if: ${{ !cancelled() && needs.resolve.outputs.run == 'true' && needs.resolve.outputs.main_short != '' && inputs.self_test_run == '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: s3
+            prefix: 'S3 [{line}]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read     # this run's jobs, earlier runs' lane records
+      issues: write     # tracking issues
+    steps:
+      - name: Skip a lane that did not run tonight
+        id: on
+        env:
+          LANES: ${{ needs.resolve.outputs.lanes }}
+          LANE: ${{ matrix.lane }}
+        run: |
+          if [[ "$LANES" == *" $LANE "* ]]; then echo "run=true" >> "$GITHUB_OUTPUT"; else echo "The $LANE lane was not selected."; fi
+
+      - name: Checkout main's tooling
+        if: steps.on.outputs.run == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          sparse-checkout: scripts/ci
+
+      - name: Record the verdict, track the red tiers
+        if: steps.on.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPORT_LANE: ${{ matrix.lane }}
+          REPORT_REPO: ${{ github.repository }}
+          REPORT_RUN_ID: ${{ github.run_id }}
+          REPORT_RUN_ATTEMPT: ${{ github.run_attempt }}
+          REPORT_JOB_PREFIX: ${{ matrix.prefix }}
+          REPORT_LINES_JSON: ${{ needs.resolve.outputs.main_line }}
+          REPORT_SUITE: all
+          REPORT_EVENT: ${{ github.event_name }}
+          REPORT_TRACK: ${{ github.event_name == 'schedule' || inputs.track_issues }}
+          REPORT_STATUS: 'false'
+          REPORT_OUT: ${{ runner.temp }}/verdict.json
+          REPORT_SERVER_URL: ${{ github.server_url }}
+        run: node scripts/ci/nightly-gate-report.js
+
+      - name: Upload the lane record
+        if: always() && steps.on.outputs.run == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nightly-lane-verdict-${{ matrix.lane }}
+          path: ${{ runner.temp }}/verdict.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+  finished:
+    # Keep this name equal to env.DONE_JOB: the sentinels end when it appears.
+    name: Nightly finished
+    needs: [report, report-lanes]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - run: echo "Every gate line and lane of this night has finished and been reported."
