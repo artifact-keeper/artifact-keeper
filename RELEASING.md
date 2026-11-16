@@ -513,7 +513,11 @@ names the same commit.
      older tags). No AMI build has ever succeeded. Until one does, the
      `ami-build` job in `release.yml` is `continue-on-error: true`: a red AMI
      build shows as a failed job without failing the release run. Remove that
-     line (TODO in the job) once a tagged build succeeds.
+     line (TODO in the job) once a tagged build succeeds. While
+     `ami-build.yml` itself is disabled in the repository's Actions settings,
+     the job skips the dispatch with an "AMI build skipped" notice and summary
+     line instead of failing on GitHub's 422 (#5709); enable it with
+     `gh workflow enable ami-build.yml` to resume automatic builds.
 
 9. **Post-release checks.** Confirm the GitHub Release is published (not
    draft), release notes are the curated per-version body (see "Release-notes
