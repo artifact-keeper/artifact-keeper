@@ -31,6 +31,10 @@ const DEFAULT_CONCURRENCY: usize = 4;
 /// nobody holds a socket, but bounded so a wedged grype releases its permit.
 const DEFAULT_JOB_BUDGET: Duration = Duration::from_secs(600);
 
+// A scanner that times out must be recorded inside the job, not take the job
+// budget and the other scanners' results with it (#5942).
+const _: () = assert!(crate::config::MAX_SCANNER_TIMEOUT_SECS < DEFAULT_JOB_BUDGET.as_secs());
+
 /// Backoff before a failed job becomes due again.
 const RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
