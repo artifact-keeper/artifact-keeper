@@ -476,6 +476,38 @@ expect_gate "Gate-Exempt with no reason -> FAIL" 1 "needs a reason" \
 expect_gate "API failure is INFRA, not a verdict" 2 "INFRA" \
   "$(body $'Closes #101\nGate: artifact-keeper-test#9') $BC" '.GET["repos/\(env.T)/pulls/9"] = "__FAIL__"'
 
+# --- the workflow's checkout (#6112) ---------------------------------------------
+echo
+echo "require-e2e-proof.yml: the checker comes from the default branch"
+# pull_request_target runs the default branch's workflow for PRs into every
+# branch; checking the script out at the PR's base ran a release line's copy,
+# and a line without it failed every PR. Every checkout must take the default
+# branch, and none may name the PR head.
+WF="$HERE/../../.github/workflows/require-e2e-proof.yml"
+wf_refs="$(python3 - "$WF" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+steps = re.split(r"\n\s*- (?:name|uses):", text)
+for st in steps:
+    if "actions/checkout@" in st:
+        m = re.search(r"^\s*ref:\s*(.+?)\s*$", st, re.MULTILINE)
+        print(m.group(1) if m else "(none)")
+PY
+)"
+n_checkouts="$(printf '%s\n' "$wf_refs" | grep -c .)"
+if [ "$n_checkouts" -lt 2 ]; then
+  fail "expected a checkout in each of the two jobs, found $n_checkouts"
+elif printf '%s\n' "$wf_refs" | grep -vqxF '${{ github.event.repository.default_branch }}'; then
+  fail "a checkout does not take the default branch: $(printf '%s ' "$wf_refs")"
+else
+  pass "all $n_checkouts checkouts take the default branch"
+fi
+if grep -nE 'pull_request\.head|github\.head_ref' "$WF"; then
+  fail "the workflow names the PR head"
+else
+  pass "the workflow never names the PR head"
+fi
+
 echo
 if [ "$fails" -gt 0 ]; then
   echo "test-check-e2e-proof: $fails case(s) FAILED"

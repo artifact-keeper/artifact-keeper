@@ -6,11 +6,19 @@ name: Require E2E Proof
 # scripts/ci/test-check-e2e-proof.sh (run by ci.yml).
 #
 # pull_request_target, like require-linked-issue.yml, so the token can copy
-# the needs-e2e-test label to the linked issue on fork PRs too. Safe: the job
-# checks out only the BASE ref, so the script that runs is the reviewed one on
-# the target branch, and the PR body is read from the event payload as data
-# (the script strips HTML comments, fenced code blocks and inline code spans
-# exactly as require-linked-issue.yml does). No PR code is checked out or run.
+# the needs-e2e-test label to the linked issue on fork PRs too. Safe: each job
+# checks out only scripts/ci of the DEFAULT branch, so the script that runs is
+# the reviewed one on main, and the PR body is read from the event payload as
+# data (the script strips HTML comments, fenced code blocks and inline code
+# spans exactly as require-linked-issue.yml does). No PR code is checked out or
+# run.
+#
+# Why the default branch and not the PR's base (#6112): pull_request_target
+# runs THIS file from the default branch for PRs into every branch, so the
+# script has to come from the same place. Checking out the base sha ran a
+# release line's scripts/ci, and a line cut before the script existed
+# (release/1.11.x until #6107) failed every PR with exit 2.
+# scripts/ci/test-check-e2e-proof.sh pins these checkout refs.
 #
 # ADVISORY for now: while the 1.12.0 backfill lands, a missing or invalid
 # proof is reported as a warning annotation and in the job summary, and the
@@ -47,10 +55,10 @@ jobs:
     env:
       ENFORCE: 'false'
     steps:
-      - name: Check out the base ref (never the PR head)
+      - name: Check out the default branch's scripts (never the PR head)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
           sparse-checkout: |
             scripts/ci
@@ -84,10 +92,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Check out the base ref (never the PR head)
+      - name: Check out the default branch's scripts (never the PR head)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
           sparse-checkout: |
             scripts/ci
