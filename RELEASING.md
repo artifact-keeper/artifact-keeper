@@ -183,12 +183,10 @@ names the same commit.
    `needs-e2e-test` label to get past it.
 
    **Cut checklist, beyond the preflight.** Before dispatching the candidate,
-   also confirm the secrets the post-release jobs need (step 8): the
-   `DISCORD_RELEASE_WEBHOOK` webhook is live (rotate it if the last
-   announcement failed with 404), and `AWS_AMI_BUILDER_ROLE_ARN` names a role
-   whose OIDC trust admits this repository. Neither is visible to the
-   preflight, and a missing one turns a published release's announcement or
-   AMI job red.
+   also confirm the secret the AMI job needs (step 8):
+   `AWS_AMI_BUILDER_ROLE_ARN` names a role whose OIDC trust admits this
+   repository. It is not visible to the preflight, and a missing one turns a
+   published release's AMI job red.
 
 2. **Bump the version set.** The version is displayed or pinned in several
    decoupled places; a partial bump ships a stale version string. Update
@@ -501,12 +499,11 @@ names the same commit.
    **second** AMI for the same version; there is no de-duplication, so check
    the AMI build run's summary for an AMI ID before re-running it.
 
-   **Release prerequisites for these jobs.** They fail until two secrets are
-   in place:
+   **Release prerequisites for these jobs.**
 
-   - `DISCORD_RELEASE_WEBHOOK` must be a live webhook. The last two announce
-     runs (v1.7.0, v1.7.3) got HTTP 404 from Discord, so it needs rotating
-     (channel → Integrations → Webhooks → new webhook → update the secret).
+   - `DISCORD_RELEASE_WEBHOOK` is optional. When it is unset or Discord
+     refuses the post, `release-announce.yml` skips the announcement and
+     stays green, so it never fails the release run (#6079).
    - `AWS_AMI_BUILDER_ROLE_ARN` (repo or org secret) must name an IAM role
      whose OIDC trust policy admits this repository's runs on `refs/tags/v*`
      (the dispatch runs on the tag) and on `refs/heads/main` (manual runs for
