@@ -1172,15 +1172,15 @@ impl PeerInstanceService {
 
     /// Mark stale nodes as offline
     pub async fn mark_stale_offline(&self, stale_threshold_minutes: i32) -> Result<u64> {
-        let result = sqlx::query!(
+        let result = sqlx::query(
             r#"
             UPDATE peer_instances
-            SET status = 'offline'
-            WHERE status = 'online'
+            SET status = 'offline', updated_at = NOW()
+            WHERE status IN ('online', 'syncing', 'degraded')
               AND last_heartbeat_at < NOW() - make_interval(mins => $1)
             "#,
-            stale_threshold_minutes
         )
+        .bind(stale_threshold_minutes)
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;

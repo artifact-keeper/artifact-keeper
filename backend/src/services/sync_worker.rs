@@ -41,6 +41,55 @@ const PEER_HEARTBEAT_TIMEOUT_SECS: u64 = 10;
 /// `(stale_check_interval_ticks * 10s) + (stale_threshold_minutes * 60s)`.
 const STALE_CHECK_INTERVAL_TICKS: u64 = 6;
 
+/// Consecutive failed probes or transfers before an online or syncing peer
+/// is marked `degraded`. Override with `PEER_DEGRADED_FAILURE_THRESHOLD`
+const PEER_DEGRADED_FAILURE_THRESHOLD: i32 = 3;
+
+pub(crate) fn peer_degraded_failure_threshold() -> i32 {
+    env_i32_min(
+        "PEER_DEGRADED_FAILURE_THRESHOLD",
+        PEER_DEGRADED_FAILURE_THRESHOLD,
+        1,
+    )
+}
+
+/// The status a failing peer moves to, `None` to leave it. `offline` stays
+/// with the stale-heartbeat sweep, a good probe brings any of them back
+pub(crate) fn demoted_status(current: &str, failures: i32, threshold: i32) -> Option<&'static str> {
+    match current {
+        "online" | "syncing" if failures >= threshold => Some("degraded"),
+        _ => None,
+    }
+}
+
+async fn demote_failing_peer(
+    db: &PgPool,
+    peer_id: Uuid,
+    threshold: i32,
+) -> Result<(), sqlx::Error> {
+    let row: Option<(String, i32)> = sqlx::query_as(
+        "SELECT status::TEXT, consecutive_failures FROM peer_instances WHERE id = $1",
+    )
+    .bind(peer_id)
+    .fetch_optional(db)
+    .await?;
+    let Some((current, failures)) = row else {
+        return Ok(());
+    };
+    if let Some(next) = demoted_status(&current, failures, threshold) {
+        sqlx::query(
+            "UPDATE peer_instances SET status = $2::instance_status, updated_at = NOW() \
+             WHERE id = $1 AND status::TEXT = $3",
+        )
+        .bind(peer_id)
+        .bind(next)
+        .bind(&current)
+        .execute(db)
+        .await?;
+    }
+    Ok(())
+}
+
 /// Read the configured stale-peer threshold (minutes) from
 /// `PEER_STALE_THRESHOLD_MINUTES`, falling back to
 /// `STALE_PEER_THRESHOLD_MINUTES`.  Non-positive values are rejected so we
@@ -588,7 +637,7 @@ async fn mark_peer_probe_failed(db: &PgPool, peer_id: Uuid) -> Result<(), sqlx::
     .execute(db)
     .await?;
 
-    Ok(())
+    demote_failing_peer(db, peer_id, peer_degraded_failure_threshold()).await
 }
 
 fn env_bool(key: &str, default: bool) -> bool {
@@ -2828,6 +2877,15 @@ async fn handle_transfer_failure_scoped(
     .bind(format!("{} seconds", backoff.as_secs()))
     .execute(db)
     .await;
+
+    // Without probes a demoted peer waits for its own heartbeat to come back
+    if env_bool("PEER_HEARTBEAT_ENABLED", true) {
+        if let Err(e) =
+            demote_failing_peer(db, task.peer_instance_id, peer_degraded_failure_threshold()).await
+        {
+            tracing::warn!("Failed to demote peer {}: {e}", task.peer_instance_id);
+        }
+    }
 
     rearm_if_superseded(db, task).await;
 }
@@ -5351,6 +5409,119 @@ mod tests {
         std::env::remove_var("SYNC_PEER_CONNECT_TIMEOUT_SECS");
     }
 
+    #[test]
+    fn test_demoted_status_6030() {
+        assert_eq!(demoted_status("online", 3, 3), Some("degraded"));
+        assert_eq!(demoted_status("syncing", 4, 3), Some("degraded"));
+        assert_eq!(demoted_status("syncing", 2, 3), None);
+        assert_eq!(demoted_status("degraded", 9, 3), None);
+        assert_eq!(demoted_status("offline", 9, 3), None);
+    }
+
+    #[test]
+    fn test_peer_degraded_failure_threshold_env_6030() {
+        std::env::remove_var("PEER_DEGRADED_FAILURE_THRESHOLD");
+        assert_eq!(
+            peer_degraded_failure_threshold(),
+            PEER_DEGRADED_FAILURE_THRESHOLD
+        );
+        std::env::set_var("PEER_DEGRADED_FAILURE_THRESHOLD", "5");
+        assert_eq!(peer_degraded_failure_threshold(), 5);
+        std::env::set_var("PEER_DEGRADED_FAILURE_THRESHOLD", "0");
+        assert_eq!(peer_degraded_failure_threshold(), 1);
+        std::env::remove_var("PEER_DEGRADED_FAILURE_THRESHOLD");
+    }
+
+    async fn demotion_peer(status: &str) -> Option<(sqlx::PgPool, Uuid)> {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::try_pool().await?;
+        let peer_id = tdh::register_test_peer(&pool, "demote-6030", "t").await;
+        sqlx::query(
+            "UPDATE peer_instances SET status = $2::instance_status, \
+             last_heartbeat_at = NOW() WHERE id = $1",
+        )
+        .bind(peer_id)
+        .bind(status)
+        .execute(&pool)
+        .await
+        .expect("set status");
+        Some((pool, peer_id))
+    }
+
+    async fn peer_state(pool: &sqlx::PgPool, peer_id: Uuid) -> (String, i32) {
+        sqlx::query_as(
+            "SELECT status::TEXT, consecutive_failures FROM peer_instances WHERE id = $1",
+        )
+        .bind(peer_id)
+        .fetch_one(pool)
+        .await
+        .expect("peer")
+    }
+
+    async fn drop_peer(pool: &sqlx::PgPool, peer_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer_id)
+            .execute(pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn stale_syncing_peer_goes_offline_6030() {
+        let Some((pool, peer_id)) = demotion_peer("syncing").await else {
+            return;
+        };
+        sqlx::query(
+            "UPDATE peer_instances SET last_heartbeat_at = NOW() - INTERVAL '10 minutes' \
+             WHERE id = $1",
+        )
+        .bind(peer_id)
+        .execute(&pool)
+        .await
+        .expect("age heartbeat");
+
+        run_stale_peer_detection(&pool, 5).await;
+        let (status, _) = peer_state(&pool, peer_id).await;
+        drop_peer(&pool, peer_id).await;
+
+        assert_eq!(status, "offline");
+    }
+
+    #[tokio::test]
+    async fn failed_probes_demote_a_syncing_peer_until_one_succeeds_6030() {
+        let Some((pool, peer_id)) = demotion_peer("syncing").await else {
+            return;
+        };
+        let mut seen = Vec::new();
+        for _ in 0..PEER_DEGRADED_FAILURE_THRESHOLD {
+            mark_peer_probe_failed(&pool, peer_id)
+                .await
+                .expect("probe failed");
+            seen.push(peer_state(&pool, peer_id).await.0);
+        }
+        mark_peer_online(&pool, peer_id).await.expect("probe ok");
+        let after = peer_state(&pool, peer_id).await;
+        drop_peer(&pool, peer_id).await;
+
+        assert_eq!(seen, ["syncing", "syncing", "degraded"]);
+        assert_eq!(after, ("online".to_string(), 0));
+    }
+
+    #[tokio::test]
+    async fn failed_probes_leave_an_offline_peer_offline_6030() {
+        let Some((pool, peer_id)) = demotion_peer("offline").await else {
+            return;
+        };
+        for _ in 0..PEER_DEGRADED_FAILURE_THRESHOLD {
+            mark_peer_probe_failed(&pool, peer_id)
+                .await
+                .expect("probe failed");
+        }
+        let (status, _) = peer_state(&pool, peer_id).await;
+        drop_peer(&pool, peer_id).await;
+
+        assert_eq!(status, "offline");
+    }
+
     // -----------------------------------------------------------------------
     // Cluster-wide task claims (Tier-2: no-op without DATABASE_URL)
     // -----------------------------------------------------------------------
@@ -6211,6 +6382,31 @@ mod tests {
             "the row must point at a content-addressed object"
         );
         assert_eq!(metadata["revision"], 1);
+    }
+
+    #[tokio::test]
+    async fn failed_transfers_demote_the_peer_6030() {
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+        make_protobuf_commit_row(&f, false).await;
+        sqlx::query(
+            "UPDATE peer_instances SET status = 'syncing', consecutive_failures = $2 \
+             WHERE id = $1",
+        )
+        .bind(f.peer_id)
+        .bind(PEER_DEGRADED_FAILURE_THRESHOLD - 1)
+        .execute(&f.pool)
+        .await
+        .expect("seed failures");
+        let flaky = mock_upload_peer(503, "unavailable").await;
+
+        let result = run_claimed_transfer(&f, &flaky).await;
+        let (status, _) = peer_state(&f.pool, f.peer_id).await;
+        teardown_claim_fixture(&f).await;
+
+        assert!(result.is_err());
+        assert_eq!(status, "degraded");
     }
 
     /// #4921: a permanent rejection of one artifact (409 checksum mismatch)
