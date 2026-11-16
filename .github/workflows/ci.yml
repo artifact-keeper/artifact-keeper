@@ -1768,6 +1768,14 @@ jobs:
       - name: Check the conflict-marker gate catches what it must
         run: bash scripts/ci/test-check-conflict-markers.sh
 
+      # A native test that writes ~/.npmrc, ~/.cargo or ~/.m2 leaves the test
+      # registry and its credentials on the developer's machine (#5940).
+      - name: Check native tests keep client config in their work dir
+        run: bash scripts/ci/check-native-tests-user-config.sh
+
+      - name: Check the native-test config gate catches what it must
+        run: bash scripts/ci/test-check-native-tests-user-config.sh
+
       # Stock compose version pins (#4481): openscap and web were hardcoded to
       # :latest, so setting ARTIFACT_KEEPER_VERSION still left two images
       # floating. Pure YAML inspection, ~1s.
