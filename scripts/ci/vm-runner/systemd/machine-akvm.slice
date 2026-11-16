@@ -1,14 +1,19 @@
 # cgroup for every ak-vm-runner VM (domain <partition>/machine/akvm</partition>).
 # Hard-caps what the VMs can take from the host, so a runaway build cannot
 # push the node's kubelet into memory eviction. cgroup v1 (el8): MemoryLimit=.
-# Keep MemoryLimit >= AKVM_VM_COUNT * AKVM_VM_MEMORY_MIB + 4 GiB for the image-build VM
-# + ~1 GiB qemu overhead per VM (2 x 16 + 4 + 3 = 39 -> 40G).
+# Sized for ONE job VM: 14 GiB guest + ~1 GiB qemu/page-cache overhead = 15,
+# plus ~1 GiB slack -> 16G; CPUQuota=800% = the job VM's 8 vCPUs.
+# The 4 GiB image-build VM (+1 GiB) does NOT fit beside a job VM: build-image
+# drains the pool and waits for the job VM to go, and the controller reads
+# this limit at runtime and starts no VM that would not fit.
+# The same 16 GiB / 8 CPU is reserved for ak-vm in artifact-keeper-arc-runners
+# budget/rocky.yaml (reserved.ak_vm): change one and you must change the other.
 [Unit]
 Description=ak-vm-runner virtual machines
 Before=slices.target
 
 [Slice]
 MemoryAccounting=yes
-MemoryLimit=40G
+MemoryLimit=16G
 CPUAccounting=yes
-CPUQuota=1600%
+CPUQuota=800%

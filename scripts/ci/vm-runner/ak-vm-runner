@@ -15,7 +15,7 @@
 #   once          run one reconcile pass and exit
 #   build-image   build a new golden image (ak-vm-runner-image.service)
 #   status        print the VMs this service owns
-#   drain         stop creating VMs; running jobs finish (undo: undrain)
+#   drain         no new VMs, idle ones recycled; running jobs finish (undrain)
 #   undrain       resume creating VMs
 #   destroy-all   destroy every job VM now and remove its runner registration
 #
@@ -33,9 +33,9 @@ AKVM_ORG="${AKVM_ORG:-artifact-keeper}"
 AKVM_RUNNER_GROUP_ID="${AKVM_RUNNER_GROUP_ID:-1}"
 AKVM_LABELS="${AKVM_LABELS:-ak-vm}"
 AKVM_HOST_TAG="${AKVM_HOST_TAG:-$(hostname -s 2>/dev/null || echo host)}"
-AKVM_VM_COUNT="${AKVM_VM_COUNT:-2}"
+AKVM_VM_COUNT="${AKVM_VM_COUNT:-1}"
 AKVM_VM_VCPUS="${AKVM_VM_VCPUS:-8}"
-AKVM_VM_MEMORY_MIB="${AKVM_VM_MEMORY_MIB:-16384}"
+AKVM_VM_MEMORY_MIB="${AKVM_VM_MEMORY_MIB:-14336}"
 AKVM_VM_DISK_GB="${AKVM_VM_DISK_GB:-80}"
 AKVM_STATE_DIR="${AKVM_STATE_DIR:-/home/ak-vm-runner}"
 AKVM_TOKEN_FILE="${AKVM_TOKEN_FILE:-/etc/ak-vm-runner/github-token}"
@@ -55,6 +55,16 @@ AKVM_KEEP_IMAGES="${AKVM_KEEP_IMAGES:-3}"
 AKVM_CONSOLE_RETENTION_DAYS="${AKVM_CONSOLE_RETENTION_DAYS:-30}"
 AKVM_IMAGE_TIMEOUT="${AKVM_IMAGE_TIMEOUT:-2400}"
 AKVM_IMAGE_DISK_GB="${AKVM_IMAGE_DISK_GB:-24}"
+# How long build-image waits for room in the slice (a job VM to finish) before
+# it gives up. Default: the longest a job VM can live (AKVM_MAX_VM_SECONDS).
+AKVM_IMAGE_WAIT_SECONDS="${AKVM_IMAGE_WAIT_SECONDS:-28800}"
+# The systemd slice behind AKVM_PARTITION, and its memory cap in MiB. Empty =
+# read the cap from systemd on every check; "infinity" = no cap.
+AKVM_SLICE="${AKVM_SLICE:-machine-akvm.slice}"
+AKVM_SLICE_MEMORY_MIB="${AKVM_SLICE_MEMORY_MIB:-}"
+# What one VM costs the slice beyond its guest memory (qemu itself, its page
+# cache for the disk images), so the cap is never hit by the sum of guests.
+AKVM_VM_OVERHEAD_MIB="${AKVM_VM_OVERHEAD_MIB:-1024}"
 AKVM_BASE_IMAGE_URL="${AKVM_BASE_IMAGE_URL:-https://cloud-images.ubuntu.com/releases/noble/release-20261017/ubuntu-24.04-server-cloudimg-amd64.img}"
 AKVM_BASE_IMAGE_SHA256="${AKVM_BASE_IMAGE_SHA256:-04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94}"
 AKVM_RUNNER_VERSION="${AKVM_RUNNER_VERSION:-2.338.2}"
@@ -64,6 +74,9 @@ AKVM_CODE_DIR="${AKVM_CODE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 
 JOB_PREFIX="akvm-${AKVM_HOST_TAG}-"
 IMAGE_PREFIX="akvm-image-"
+# The image-build VM's shape.
+IMAGE_VM_MEMORY_MIB=4096
+IMAGE_VM_VCPUS=4
 
 VMS_DIR="$AKVM_STATE_DIR/vms"
 IMAGES_DIR="$AKVM_STATE_DIR/images"
@@ -157,6 +170,72 @@ mem_available_mib() {
   awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo
 }
 
+# Memory cap of $AKVM_SLICE in MiB, or "infinity". Read at runtime so a
+# changed slice takes effect without a restart. On cgroup v1 (el8) the cap is
+# MemoryLimit= and MemoryMax= reads infinity; on cgroup v2 it is the other
+# way round, so the smaller of the two that is set wins.
+slice_memory_limit_mib() {
+  if [[ -n "$AKVM_SLICE_MEMORY_MIB" ]]; then
+    printf '%s' "$AKVM_SLICE_MEMORY_MIB"
+    return 0
+  fi
+  local vals val mib lim=""
+  vals="$(systemctl show -p MemoryLimit -p MemoryMax --value "$AKVM_SLICE" 2> /dev/null)" || vals=""
+  for val in $vals; do
+    # Plain byte counts only; 19+ digits (2^64-1 = unset) overflow bash.
+    [[ "$val" =~ ^[0-9]{1,18}$ ]] || continue
+    mib=$((val / 1048576))
+    if [[ -z "$lim" ]] || ((mib < lim)); then lim="$mib"; fi
+  done
+  printf '%s' "${lim:-infinity}"
+}
+
+# Guest memory in MiB of a defined domain (from libvirt, so it is true for a
+# VM created by an older version of this script too).
+domain_memory_mib() { # <domain>
+  v dominfo "$1" 2> /dev/null | awk '/^Max memory:/ { print int($3 / 1024); f = 1 } END { exit !f }'
+}
+
+domain_vcpus() { # <domain>
+  v dominfo "$1" 2> /dev/null | awk '/^CPU\(s\):/ { print $2; f = 1 } END { exit !f }'
+}
+
+# What the running ak-vm domains (job VMs of any host tag and image-build VMs,
+# all in AKVM_PARTITION) hold of the slice: guest memory plus overhead each.
+slice_committed_mib() {
+  local names name state mem total=0
+  names="$(v list --all --name)" || return 1
+  for name in $names; do
+    [[ "$name" == akvm-* ]] || continue
+    state="$(v domstate "$name" 2> /dev/null)" || continue
+    case "$state" in "" | "shut off" | crashed) continue ;; esac
+    mem="$(domain_memory_mib "$name")" || continue
+    total=$((total + mem + AKVM_VM_OVERHEAD_MIB))
+  done
+  printf '%s' "$total"
+}
+
+# Prints a reason and returns 1 when a VM of <memory MiB> does not fit in the
+# slice beside the VMs already running there. Past the cap the kernel would
+# OOM-kill a qemu, i.e. someone's job, so the VM is not started at all.
+slice_has_room() { # <memory MiB>
+  local lim committed
+  lim="$(slice_memory_limit_mib)"
+  if [[ ! "$lim" =~ ^[0-9]+$ ]]; then
+    log "no memory cap found for $AKVM_SLICE (unset or unreadable: ${lim}); not checking slice room"
+    return 0
+  fi
+  if ! committed="$(slice_committed_mib)"; then
+    echo "cannot list libvirt domains to count $AKVM_SLICE memory"
+    return 1
+  fi
+  if ((committed + $1 + AKVM_VM_OVERHEAD_MIB > lim)); then
+    echo "slice_committed_mib=$committed + vm $1 + overhead $AKVM_VM_OVERHEAD_MIB above $AKVM_SLICE limit ${lim} MiB"
+    return 1
+  fi
+  return 0
+}
+
 # Prints a reason and returns 1 when the host cannot take one more VM.
 host_has_room() {
   local free avail
@@ -170,7 +249,7 @@ host_has_room() {
     echo "mem_available_mib=$avail below vm ${AKVM_VM_MEMORY_MIB} + reserve ${AKVM_MIN_HOST_AVAIL_MIB}"
     return 1
   fi
-  return 0
+  slice_has_room "$AKVM_VM_MEMORY_MIB"
 }
 
 # ---------------------------------------------------------------------------
@@ -450,8 +529,8 @@ create_job_vm() {
   resp=""
 
   {
-    printf 'name=%s\nrunner_id=%s\ncreated=%s\nimage=%s\nlabels=%s\n' \
-      "$name" "$runner_id" "$(now)" "$image" "$AKVM_LABELS"
+    printf 'name=%s\nrunner_id=%s\ncreated=%s\nimage=%s\nlabels=%s\nvcpus=%s\nmemory_mib=%s\n' \
+      "$name" "$runner_id" "$(now)" "$image" "$AKVM_LABELS" "$AKVM_VM_VCPUS" "$AKVM_VM_MEMORY_MIB"
   } > "$dir/vm.env"
 
   qemu-img create -q -f qcow2 -F qcow2 -b "$image" "$dir/disk.qcow2" "${AKVM_VM_DISK_GB}G"
@@ -534,10 +613,38 @@ retry_runner_deletes() {
   mv "$f.new" "$f"
 }
 
+# Recycles an idle VM (runner started, no job): removes the registration
+# first, and GitHub refuses that (422) while the runner holds a job, which
+# closes the race with a job assigned just now. Destroys only on success.
+recycle_idle() { # <vm> <reason>
+  remove_runner "$1" "$(meta_get "$1" runner_id)" > /dev/null || return 1
+  destroy_vm "$1" "$2" || true
+}
+
+# True when an idle VM was created with another vcpus/memory shape than the
+# config now asks for. VMs created before vm.env recorded the shape are asked
+# about through libvirt once, and the answer is recorded.
+vm_shape_stale() { # <vm>
+  local mem cpus
+  mem="$(meta_get "$1" memory_mib)"
+  cpus="$(meta_get "$1" vcpus)"
+  if [[ -z "$mem" ]] && mem="$(domain_memory_mib "$1")"; then
+    [[ -d "$VMS_DIR/$1" ]] && meta_set "$1" memory_mib "$mem"
+  fi
+  if [[ -z "$cpus" ]] && cpus="$(domain_vcpus "$1")"; then
+    [[ -d "$VMS_DIR/$1" ]] && meta_set "$1" vcpus "$cpus"
+  fi
+  if [[ -n "$mem" && "$mem" != "$AKVM_VM_MEMORY_MIB" ]] || [[ -n "$cpus" && "$cpus" != "$AKVM_VM_VCPUS" ]]; then
+    log "$1 has vcpus=${cpus:-?} memory_mib=${mem:-?}; config wants vcpus=$AKVM_VM_VCPUS memory_mib=$AKVM_VM_MEMORY_MIB"
+    return 0
+  fi
+  return 1
+}
+
 # One pass of the control loop.
 reconcile_once() {
   mkdir -p "$VMS_DIR" "$CONSOLE_DIR"
-  local name state age created runner_id active=0 t vms
+  local name state age created active=0 t vms idle=() counted
   t="$(now)"
   if ! vms="$(job_vms)"; then
     log "cannot list libvirt domains; skipping this pass"
@@ -576,19 +683,37 @@ reconcile_once() {
         destroy_vm "$name" boot_timeout
         continue
       fi
-    elif ! guest_has "$name" job_started && ((age > AKVM_IDLE_RECYCLE_SECONDS)); then
-      # Remove the registration first: GitHub refuses (422) while the runner
-      # holds a job, which closes the race with a job assigned just now.
-      runner_id="$(meta_get "$name" runner_id)"
-      if remove_runner "$name" "$runner_id" > /dev/null; then
-        destroy_vm "$name" idle_recycle
-        continue
+    elif ! guest_has "$name" job_started; then
+      # A busy VM is never touched here: it keeps its shape until its job
+      # ends. An idle one is replaced when it is old or has a stale shape
+      # (a config change rolls the idle pool without killing a job).
+      if ((age > AKVM_IDLE_RECYCLE_SECONDS)); then
+        recycle_idle "$name" idle_recycle && continue
+      elif vm_shape_stale "$name"; then
+        recycle_idle "$name" stale_shape && continue
+      elif [[ "$state" == running ]]; then
+        idle+=("$name")
       fi
     fi
     if [[ "$state" == running || "$state" == paused || "$state" == in_shutdown ]]; then
       active=$((active + 1))
     fi
   done <<< "$vms"
+
+  # Scale down: more VMs than the target (AKVM_VM_COUNT was lowered, or the
+  # drain flag makes the target 0). Surplus idle VMs go the idle-recycle way,
+  # one per pass; a busy VM finishes its job and a booting one is left to
+  # reach runner_start (or the boot timeout) first.
+  local target="$AKVM_VM_COUNT"
+  [[ -e "$DRAIN_FLAG" ]] && target=0
+  if ((active > target)); then
+    for counted in "${idle[@]}"; do
+      if recycle_idle "$counted" scale_down; then
+        active=$((active - 1))
+        break
+      fi
+    done
+  fi
 
   # Orphaned VM directories (a crash between mkdir and define). Only names
   # absent from the listing that just succeeded, and only once vm.env says
@@ -624,7 +749,7 @@ reconcile_once() {
   if ((t < until_ts)); then
     return 0
   fi
-  if ((active < AKVM_VM_COUNT)); then
+  if ((active < target)); then
     local why
     if why="$(host_has_room)"; then
       create_job_vm || true
@@ -763,6 +888,51 @@ prune_images() {
   done < <(find "$IMAGES_DIR/golden" -maxdepth 1 -name 'ak-vm-*.qcow2' -type f -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)
 }
 
+# Set to 1 by wait_for_image_room when it, not the operator, set the drain
+# flag; build_image_cleanup then removes it again.
+IMAGE_BUILD_SET_DRAIN=0
+
+build_image_cleanup() {
+  if ((IMAGE_BUILD_SET_DRAIN == 1)); then
+    rm -f "$DRAIN_FLAG"
+    IMAGE_BUILD_SET_DRAIN=0
+    audit drain_off by=build-image
+  fi
+}
+
+# Waits until the image-build VM fits in the slice beside the running VMs,
+# and returns holding the reconcile lock (fd 8) so the loop cannot start a
+# job VM in the room just found before the build VM is defined. While it
+# waits it holds no lock (the loop keeps running) and sets the drain flag:
+# the loop then creates no VM and recycles the idle ones, and a busy one
+# finishes its job.
+wait_for_image_room() {
+  local start why waiting=0
+  start="$(now)"
+  while true; do
+    take_reconcile_lock -w 300
+    if why="$(slice_has_room "$IMAGE_VM_MEMORY_MIB")"; then
+      return 0
+    fi
+    exec 8>&-
+    if ((waiting == 0)); then
+      waiting=1
+      if [[ ! -e "$DRAIN_FLAG" ]]; then
+        touch "$DRAIN_FLAG"
+        IMAGE_BUILD_SET_DRAIN=1
+        audit drain_on by=build-image
+      fi
+      audit image_build_waiting reason="$why" drain_set_by_build="$IMAGE_BUILD_SET_DRAIN" \
+        max_wait_s="$AKVM_IMAGE_WAIT_SECONDS"
+    fi
+    if (($(now) - start > AKVM_IMAGE_WAIT_SECONDS)); then
+      audit image_build_failed reason=no_slice_room detail="$why"
+      return 1
+    fi
+    sleep "$AKVM_POLL_SECONDS"
+  done
+}
+
 cmd_build_image() {
   exec 7> "$AKVM_STATE_DIR/build-image.lock"
   flock -n 7 || {
@@ -791,11 +961,21 @@ cmd_build_image() {
   qemu-img create -q -f qcow2 -F qcow2 -b "$base" "$dir/disk.qcow2" "${AKVM_IMAGE_DISK_GB}G"
   render_image_user_data > "$dir/user-data"
   make_seed_iso "$dir" "$name"
-  render_domain_xml "$name" 4096 4 "$dir/disk.qcow2" "$dir/seed.iso" "$console" > "$dir/domain.xml"
+  render_domain_xml "$name" "$IMAGE_VM_MEMORY_MIB" "$IMAGE_VM_VCPUS" "$dir/disk.qcow2" "$dir/seed.iso" \
+    "$console" > "$dir/domain.xml"
+  # A build that cannot start must not leave the loop drained.
+  trap build_image_cleanup EXIT
+  trap 'exit 143' TERM INT
+  if ! wait_for_image_room; then
+    rm -rf "$dir"
+    return 1
+  fi
   audit image_build_started vm="$name" base="$(basename "$base")" base_sha256="$AKVM_BASE_IMAGE_SHA256" \
     runner_version="$AKVM_RUNNER_VERSION"
   v define "$dir/domain.xml" > /dev/null
   v start "$name" > /dev/null
+  # The build VM now counts against the slice; the loop may run again.
+  exec 8>&-
   start="$(now)"
   while true; do
     state="$(v domstate "$name" 2> /dev/null || echo gone)"
