@@ -254,12 +254,21 @@ behave as on `ubuntu-24.04`. Only amd64 is provided, so arm64 legs stay on
 ## Capacity on rocky
 
 The VMs use host memory that the Kubernetes scheduler does not see. The
-`machine-akvm.slice` cap (16 GiB / 8 CPUs by default: one idle 8 vCPU /
-14 GiB VM while nothing uses the `ak-vm` label yet) bounds it, and the ARC
-budget in artifact-keeper-arc-runners counts exactly that cap as reserved:
-`budget/rocky.yaml`, `reserved.ak_vm` (16Gi / 8 CPU). The two must match:
-change one and you must change the other in the same change. Before the
-pool grows, or before Docker Publish moves onto it, raise both together
-(and lower the ARC pools by the same amount). Adding the slice cap to the
-kubelet's `systemReserved` needs a maintenance window (see the #6072 change
-plan).
+`machine-akvm.slice` cap (16 GiB / 8 CPUs by default: one 8 vCPU / 14 GiB
+VM) bounds it, and the ARC budget in artifact-keeper-arc-runners counts
+exactly that cap as reserved: `budget/rocky.yaml`, `reserved.ak_vm` (16Gi /
+8 CPU). The two must match: change one and you must change the other in the
+same change. Before the pool grows, raise both together (and lower the ARC
+pools by the same amount). Adding the slice cap to the kubelet's
+`systemReserved` needs a maintenance window (see the #6072 change plan).
+
+Docker Publish's amd64 `build-openscap` and `build-scanner-adapter` legs run
+on this pool (#6094). One VM is enough for them. They peak at about 1.2 to
+1.4 GiB in the guest (1.0 to 1.6 GiB per pod on the old dind pool, measured
+over 41 runs each) and take 2 to 4 minutes. Concurrent Docker Publish runs
+queue their legs one VM at a time: each next VM is ready about 30 to 40 s
+after the last job ends, so four legs take about 12 minutes. That is well
+inside the ~55-minute backend amd64 leg the merge jobs already wait for.
+Nothing can deadlock, because a job holds the VM only while it runs. The
+watchdog leaves such runs alone, because `publish-preflight` has already
+started.

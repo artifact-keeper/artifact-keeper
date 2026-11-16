@@ -719,9 +719,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Runner split as in build-backend.
+          # amd64 builds in a throwaway per-job KVM VM (`ak-vm`, #6072,
+          # docs/ci/vm-runners.md) instead of the privileged dind sidecar of
+          # ak-docker-runners: the job gets its own kernel and dockerd, and
+          # the VM and its disk are destroyed after the job. Signing and
+          # attestation happen later in merge-*, on GitHub-hosted runners,
+          # unchanged. arm64 stays as in build-backend.
           - platform: linux/amd64
-            runner: ak-docker-runners
+            runner: ak-vm
             cache-tag: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
@@ -802,9 +807,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Runner split as in build-backend.
+          # amd64 builds in a throwaway per-job KVM VM (`ak-vm`, #6072,
+          # docs/ci/vm-runners.md) instead of the privileged dind sidecar of
+          # ak-docker-runners: the job gets its own kernel and dockerd, and
+          # the VM and its disk are destroyed after the job. Signing and
+          # attestation happen later in merge-*, on GitHub-hosted runners,
+          # unchanged. arm64 stays as in build-backend.
           - platform: linux/amd64
-            runner: ak-docker-runners
+            runner: ak-vm
             cache-tag: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
