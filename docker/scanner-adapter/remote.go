@@ -107,6 +107,13 @@ func (s *Server) startClientMode(ctx context.Context) error {
 	if s.cfg.serverTLSUnverified() {
 		log.Printf("WARNING: SCANNER_TRIVY_SERVER_INSECURE=true: TLS to trivy server %s is NOT verified; TRIVY_TOKEN and scan results can be intercepted or forged by anyone on the path", redactURL(s.cfg.TrivyServer))
 	}
+	if !s.cfg.Offline {
+		if err := s.scanner.EnsureJavaDB(ctx); err != nil {
+			log.Printf("trivy Java DB download failed (scans will retry on demand): %v", err)
+		} else {
+			log.Printf("trivy Java DB present; scans run with --skip-java-db-update")
+		}
+	}
 	s.MarkReady()
 	return nil
 }

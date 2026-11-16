@@ -25,6 +25,14 @@ func lockingStub(t *testing.T, alwaysLocked bool) string {
 case " $* " in *" --cache-backend memory "*) sleep 1; echo '{"Results":[]}'; exit 0;; esac
 prev=""; cache=""
 for a in "$@"; do [ "$prev" = "--cache-dir" ] && cache="$a"; prev="$a"; done
+case " $* " in
+  *--download-java-db-only*)
+    mkdir -p "$cache/java-db"
+    printf db > "$cache/java-db/trivy-java.db"
+    printf '{}' > "$cache/java-db/metadata.json"
+    exit 0
+    ;;
+esac
 `+held+`if ! mkdir "$cache/fanal.lock" 2>/dev/null; then
   echo "FATAL	Fatal error	run error: image scan error: scan error: unable to initialize a scan service: unable to initialize cache: unable to initialize fs cache: cache may be in use by another process: timeout" >&2
   exit 1
@@ -104,6 +112,16 @@ func TestTrivyCacheLocked(t *testing.T) {
 // as each one begins, so a test can count how many trivy runs are in flight.
 func gatedStub(t *testing.T, gate, started string) string {
 	return writeStub(t, "#!/bin/sh\n"+stubVersion+`
+prev=""; cache=""
+for a in "$@"; do [ "$prev" = "--cache-dir" ] && cache="$a"; prev="$a"; done
+case " $* " in
+  *--download-java-db-only*)
+    mkdir -p "$cache/java-db"
+    printf db > "$cache/java-db/trivy-java.db"
+    printf '{}' > "$cache/java-db/metadata.json"
+    exit 0
+    ;;
+esac
 echo x >> "`+started+`"
 while [ ! -f "`+gate+`" ]; do sleep 0.05; done
 echo '{"Results":[]}'

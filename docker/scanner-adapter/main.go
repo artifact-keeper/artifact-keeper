@@ -104,6 +104,13 @@ func startStandalone(srv *Server, cfg *Config) {
 				log.Printf("trivy DB download failed (staying not-ready): %v", err)
 			}
 		}
+		if !cfg.Offline {
+			if err := srv.scanner.EnsureJavaDB(ctx); err != nil {
+				log.Printf("trivy Java DB download failed (scans will retry on demand): %v", err)
+			} else {
+				log.Printf("trivy Java DB present; scans run with --skip-java-db-update")
+			}
+		}
 		cancel()
 		if srv.markReadyIfDBPresent(func() bool { return DBReady(cfg) }) {
 			log.Printf("trivy vuln DB present; adapter ready (trivy=%s)", cfg.ScannerVersion)

@@ -31,9 +31,8 @@ What the server shares and what it does not, per trivy's client/server design:
   The one exception is a workspace that is a clean git repository: trivy then
   keys its analysis by the HEAD commit and reuses a cached analysis from the
   server. In `registry` partition mode the adapter does not extract a root
-  `.git` from an uploaded workspace, so that never happens. The Java DB, needed to analyze JAR files, is downloaded on the
-  client when a JAR is analyzed, so `SCANNER_TRIVY_CACHE_DIR` still needs room
-  for it.
+  `.git` from an uploaded workspace, so that never happens. The Java DB, needed to analyze JAR files, is downloaded once at startup (serialized) into
+  `SCANNER_TRIVY_CACHE_DIR` and then reused with `--skip-java-db-update`, so the cache still needs room for it. In offline mode the Java DB is never downloaded.
 - Trust: an image layer's cache key is derived from the diff ID the image's
   config *claims*; trivy does not re-hash the layer content against it. A
   client that scans a crafted image first can therefore store a false

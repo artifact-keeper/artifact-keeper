@@ -151,6 +151,16 @@ func TestFsScansKeepStaticPartition(t *testing.T) {
 // run) to argsFile and reports a clean image.
 func argsRecordingStub(t *testing.T, argsFile string) string {
 	return writeStub(t, "#!/bin/sh\n"+stubVersion+`
+prev=""; cache=""
+for a in "$@"; do [ "$prev" = "--cache-dir" ] && cache="$a"; prev="$a"; done
+case " $* " in
+  *--download-java-db-only*)
+    mkdir -p "$cache/java-db"
+    printf db > "$cache/java-db/trivy-java.db"
+    printf '{}' > "$cache/java-db/metadata.json"
+    exit 0
+    ;;
+esac
 echo "$*" >> '`+argsFile+`'
 echo '{"Results":[]}'
 `)
@@ -422,6 +432,16 @@ func TestRegistryModeWarnsOnceForIPHost(t *testing.T) {
 // the workspace it was handed (its last argument) has a root .git.
 func gitProbeStub(t *testing.T, probeFile string) string {
 	return writeStub(t, "#!/bin/sh\n"+stubVersion+`
+prev=""; cache=""
+for a in "$@"; do [ "$prev" = "--cache-dir" ] && cache="$a"; prev="$a"; done
+case " $* " in
+  *--download-java-db-only*)
+    mkdir -p "$cache/java-db"
+    printf db > "$cache/java-db/trivy-java.db"
+    printf '{}' > "$cache/java-db/metadata.json"
+    exit 0
+    ;;
+esac
 for a in "$@"; do dir="$a"; done
 if [ -e "$dir/.git" ]; then echo has-git >> '`+probeFile+`'; else echo no-git >> '`+probeFile+`'; fi
 echo '{"Results":[]}'

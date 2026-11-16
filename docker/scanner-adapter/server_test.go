@@ -32,6 +32,17 @@ const stubVersion = `if [ "$1" = "--version" ]; then echo "Version: 0.71.2"; exi
 // succeedStub emits a canned trivy JSON report with one HIGH finding.
 func succeedStub(t *testing.T) string {
 	return writeStub(t, "#!/bin/sh\n"+stubVersion+`
+prev=""; cache=""
+for a in "$@"; do [ "$prev" = "--cache-dir" ] && cache="$a"; prev="$a"; done
+case " $* " in
+  *--download-java-db-only*)
+    mkdir -p "$cache/java-db"
+    printf db > "$cache/java-db/trivy-java.db"
+    printf '{}' > "$cache/java-db/metadata.json"
+    exit 0
+    ;;
+esac
+
 cat <<'JSON'
 {"Results":[{"Target":"alpine:3.14","Class":"os-pkgs","Type":"alpine","Vulnerabilities":[
   {"VulnerabilityID":"CVE-2021-3711","PkgName":"openssl","InstalledVersion":"1.1.1k","FixedVersion":"1.1.1l","Severity":"CRITICAL","Description":"SM2 overflow","PrimaryURL":"https://avd.aquasec.com/CVE-2021-3711"}
@@ -43,6 +54,17 @@ JSON
 // failStub exits non-zero (simulating a failed pull / trivy error).
 func failStub(t *testing.T) string {
 	return writeStub(t, "#!/bin/sh\n"+stubVersion+`
+prev=""; cache=""
+for a in "$@"; do [ "$prev" = "--cache-dir" ] && cache="$a"; prev="$a"; done
+case " $* " in
+  *--download-java-db-only*)
+    mkdir -p "$cache/java-db"
+    printf db > "$cache/java-db/trivy-java.db"
+    printf '{}' > "$cache/java-db/metadata.json"
+    exit 0
+    ;;
+esac
+
 echo "FATAL: failed to pull image" 1>&2
 exit 1
 `)
@@ -52,6 +74,17 @@ exit 1
 // still Pending/Running.
 func slowStub(t *testing.T) string {
 	return writeStub(t, "#!/bin/sh\n"+stubVersion+`
+prev=""; cache=""
+for a in "$@"; do [ "$prev" = "--cache-dir" ] && cache="$a"; prev="$a"; done
+case " $* " in
+  *--download-java-db-only*)
+    mkdir -p "$cache/java-db"
+    printf db > "$cache/java-db/trivy-java.db"
+    printf '{}' > "$cache/java-db/metadata.json"
+    exit 0
+    ;;
+esac
+
 sleep 1
 echo '{"Results":[]}'
 `)

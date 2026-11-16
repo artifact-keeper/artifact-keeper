@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -37,6 +38,11 @@ type Scanner struct {
 	// scans already default to the memory backend, and client mode uses the
 	// trivy server's cache, so neither takes it.
 	imageCacheMu sync.Mutex
+	// javaDBMu/javaDBReady serialize and remember the one-time Java DB
+	// download (#5913). Concurrent first scans must not race on
+	// <CacheDir>/java-db; once ready, scans pass --skip-java-db-update.
+	javaDBMu    sync.Mutex
+	javaDBReady atomic.Bool
 	// ipWarned records the registry hosts warnIPPartition already logged.
 	ipWarned sync.Map
 	// registryClient reads image manifests for the size check (#5909).
@@ -99,7 +105,7 @@ func (s *Scanner) buildArgs(imageRef, partition string) []string {
 	if s.cfg.Insecure {
 		args = append(args, "--insecure")
 	}
-	args = append(args, s.cfg.dbUpdateArgs()...)
+	args = append(args, s.cfg.dbUpdateArgs(s.javaDBReady.Load())...)
 	args = append(args, noLookupArgs...)
 	if s.cfg.DBRepository != "" {
 		args = append(args, "--db-repository", s.cfg.DBRepository)
@@ -129,14 +135,16 @@ var noLookupArgs = []string{"--offline-scan", "--skip-version-check", "--disable
 
 // dbUpdateArgs returns the DB-update flags shared by image and filesystem
 // scans: --skip-db-update when DB updates are off (always in offline mode),
-// and in offline mode (#5287) --skip-java-db-update, so no scan contacts a
-// DB registry or the Java DB registry. Every scan adds noLookupArgs as well.
-func (c *Config) dbUpdateArgs() []string {
+// and --skip-java-db-update in offline mode (#5287) or once the adapter has
+// ensured the Java DB is present (#5913), so scans never race on the
+// on-demand Java DB download and never contact the Java DB registry once it
+// is loaded. Every scan adds noLookupArgs as well.
+func (c *Config) dbUpdateArgs(skipJavaDBUpdate bool) []string {
 	var args []string
 	if c.SkipDBUpdate || c.Offline {
 		args = append(args, "--skip-db-update")
 	}
-	if c.Offline {
+	if c.Offline || skipJavaDBUpdate {
 		args = append(args, "--skip-java-db-update")
 	}
 	return args
@@ -351,6 +359,69 @@ func dbPresent(cacheDir string) bool {
 // never advertises ready with no DB (which trivy treats as 0 vulnerabilities).
 func DBReady(cfg *Config) bool { return dbPresent(cfg.CacheDir) }
 
+// javaDBPresent reports whether the trivy Java DB is loaded in cacheDir.
+// trivy stores it at <cacheDir>/java-db/ with trivy-java.db and metadata.json.
+func javaDBPresent(cacheDir string) bool {
+	dir := filepath.Join(cacheDir, "java-db")
+	for _, name := range []string{"trivy-java.db", "metadata.json"} {
+		info, err := os.Stat(filepath.Join(dir, name))
+		if err != nil || info.IsDir() || info.Size() == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// JavaDBReady reports whether the trivy Java DB is present in cfg.CacheDir.
+func JavaDBReady(cfg *Config) bool { return javaDBPresent(cfg.CacheDir) }
+
+// downloadJavaDBArgs builds the `trivy image --download-java-db-only` argument
+// list so the Java DB is fetched once, serialized by the caller (#5913).
+func downloadJavaDBArgs(cfg *Config) []string {
+	return []string{"image", "--download-java-db-only", "--cache-dir", cfg.CacheDir,
+		"--skip-version-check", "--disable-telemetry"}
+}
+
+// downloadJavaDBOnce runs a single `trivy --download-java-db-only`. Output is
+// captured for the log; it never carries a credential.
+func downloadJavaDBOnce(ctx context.Context, cfg *Config) error {
+	cmd := exec.CommandContext(ctx, cfg.TrivyPath, downloadJavaDBArgs(cfg)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("trivy --download-java-db-only failed: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// EnsureJavaDB downloads the trivy Java DB into cfg.CacheDir at most once per
+// scanner, serialized so concurrent first scans cannot race on the same files
+// (#5913). Once present it marks the scanner to pass --skip-java-db-update so
+// scans never trigger another on-demand download. Offline mode never downloads.
+// A failed download is not cached as ready so a later scan can retry.
+func (s *Scanner) EnsureJavaDB(ctx context.Context) error {
+	if s.cfg.Offline {
+		return nil
+	}
+	if s.javaDBReady.Load() {
+		return nil
+	}
+	s.javaDBMu.Lock()
+	defer s.javaDBMu.Unlock()
+	if s.javaDBReady.Load() {
+		return nil
+	}
+	if javaDBPresent(s.cfg.CacheDir) {
+		s.javaDBReady.Store(true)
+		return nil
+	}
+	if err := downloadJavaDBOnce(ctx, s.cfg); err != nil {
+		return err
+	}
+	if javaDBPresent(s.cfg.CacheDir) {
+		s.javaDBReady.Store(true)
+	}
+	return nil
+}
+
 // downloadDBArgs builds the `trivy image --download-db-only` argument list,
 // honouring cfg.DBRepository (--db-repository) so the DB can be pulled from an
 // AK-controlled mirror instead of the shared public mirror.gcr.io endpoint.
@@ -414,6 +485,9 @@ func DownloadDB(ctx context.Context, cfg *Config) error {
 // non-zero exit or parse failure is an error (the caller marks the job Failed
 // and the report endpoint 500s — fail-closed, never a silent empty report).
 func (s *Scanner) Scan(ctx context.Context, req *ScanRequest) (*HarborScanReport, error) {
+	if err := s.EnsureJavaDB(ctx); err != nil {
+		return nil, fmt.Errorf("ensure Java DB: %w", err)
+	}
 	host := trimRegistryHost(req.Registry.URL)
 	imageRef, err := buildRef(host, req.Artifact.Repository, req.Artifact.Tag, req.Artifact.Digest)
 	if err != nil {
@@ -561,7 +635,7 @@ func (s *Scanner) buildFsArgs(dir string) []string {
 		"--cache-dir", s.cfg.CacheDir,
 		"--quiet",
 	}
-	args = append(args, s.cfg.dbUpdateArgs()...)
+	args = append(args, s.cfg.dbUpdateArgs(s.javaDBReady.Load())...)
 	args = append(args, noLookupArgs...)
 	args = append(args, s.cfg.clientArgs(s.cfg.fsPartition())...)
 	return append(args, dir)
@@ -574,6 +648,9 @@ func (s *Scanner) buildFsArgs(dir string) []string {
 // Fail-closed like Scan: a non-zero exit, an exit-0 DB failure, or unparseable
 // output is an error (the job fails and the report endpoint 500s).
 func (s *Scanner) ScanFilesystem(ctx context.Context, dir string) (json.RawMessage, *VulnDBInfo, string, error) {
+	if err := s.EnsureJavaDB(ctx); err != nil {
+		return nil, nil, "", fmt.Errorf("ensure Java DB: %w", err)
+	}
 	// Leave headroom over trivy's own --timeout so trivy's descriptive timeout
 	// error wins over a blunt context kill.
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.FsScanTimeout+30*time.Second)

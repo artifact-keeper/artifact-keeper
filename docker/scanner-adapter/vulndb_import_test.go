@@ -190,7 +190,7 @@ func TestLoadConfigOffline(t *testing.T) {
 	if cfg.VulnDBMaxUploadBytes != 2<<30 || cfg.VulnDBMaxExtractedBytes != 8<<30 {
 		t.Errorf("cap defaults: %d %d", cfg.VulnDBMaxUploadBytes, cfg.VulnDBMaxExtractedBytes)
 	}
-	if got := strings.Join(cfg.dbUpdateArgs(), " "); got != "" {
+	if got := strings.Join(cfg.dbUpdateArgs(false), " "); got != "" {
 		t.Errorf("connected install got DB flags %q", got)
 	}
 
