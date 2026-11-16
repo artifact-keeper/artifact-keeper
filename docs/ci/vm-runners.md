@@ -23,7 +23,7 @@ Kata Containers alternative is evaluated in
 ```
  ak-vm-runner.service (user akvm)                 GitHub
  ───────────────────────────────                  ──────
- every 15 s: fewer than AKVM_VM_COUNT idle VMs?
+ every 15 s: fewer than AKVM_VM_COUNT VMs (default 1)?
    │ yes
    ├─ POST /orgs/{org}/actions/runners/generate-jitconfig ──► runner "akvm-rocky-<time>-<rand>"
    │      labels: [ak-vm], one-time registration                 (label ak-vm only)
@@ -52,6 +52,8 @@ Other ways a VM ends, all audited with a `reason`:
 | `disk_critical_idle`, `disk_critical_paused` | the state filesystem fell below `AKVM_CRIT_FREE_PCT` |
 | `boot_timeout` | no `runner_start` on the console within `AKVM_BOOT_TIMEOUT` (600 s) |
 | `idle_recycle` | no job for `AKVM_IDLE_RECYCLE_SECONDS` (4 h). The registration is removed first, and GitHub refuses that (422) while a job is assigned, so a job is never cut off by this |
+| `scale_down` | more VMs than `AKVM_VM_COUNT`, or any while drained: one idle VM per pass, registration removed first as for `idle_recycle`. Busy and still-booting VMs are left alone |
+| `stale_shape` | an idle VM whose vcpus/memory differ from the config (registration first, as above). A busy VM keeps its shape until its job ends |
 | `max_age` | older than `AKVM_MAX_VM_SECONDS` (8 h), even mid-job |
 | `guest_stopped_*` | the VM stopped without reporting `runner_exit` (crash, OOM inside the guest) |
 | `operator_destroy_all` | `ak-vm-runner destroy-all` |
@@ -89,9 +91,17 @@ Other ways a VM ends, all audited with a `reason`:
 - **No inbound access:** the image has `ssh` masked and no user with a
   password. The serial console log is the only window into a VM.
 - **Resources:** every VM runs in `machine-akvm.slice`, which hard-caps memory
-  (`MemoryLimit=40G`: two 16 GiB job VMs, the 4 GiB image-build VM and
-  qemu overhead) and CPU (`CPUQuota=1600%`, 16 cores) for all VMs
-  together. Before creating a VM the controller also checks that the state
+  (`MemoryLimit=16G`: one 14 GiB job VM, ~1 GiB qemu and page-cache
+  overhead, ~1 GiB slack) and CPU (`CPUQuota=800%`, the job VM's 8 vCPUs)
+  for all VMs together. The controller reads that limit at runtime
+  (`systemctl show -p MemoryLimit -p MemoryMax`, or `AKVM_SLICE_MEMORY_MIB`)
+  and starts no VM unless the running ak-vm domains (job and image-build
+  VMs, guest memory + 1 GiB each) plus the new one and its 1 GiB fit. The
+  4 GiB image-build VM does not fit beside a job VM, so `build-image` sets
+  the drain flag (if it is not set already), waits up to
+  `AKVM_IMAGE_WAIT_SECONDS` (8 h) for the job VM to go (an idle one is
+  recycled at once, a busy one finishes its job), builds, and then removes
+  the drain flag only if it set it. Before creating a VM the controller also checks that the state
   filesystem has at least `AKVM_MIN_FREE_PCT` (35 %) free (the kubelet starts
   evicting pods at 20 % on rocky's `/home`). It also checks that
   `MemAvailable` covers the VM plus `AKVM_MIN_HOST_AVAIL_MIB` (24 GiB).
@@ -135,8 +145,9 @@ Events: `controller_started`, `controller_stopped`, `vm_created` (runner name
 and id, labels, image and its sha256, size), `jit_failed`,
 `vm_start_failed`, `vm_destroyed` (reason, lifetime, the HTTP status of the
 runner removal and the guest-reported job), `vm_orphan_removed`,
-`image_build_started`, `image_built`, `image_build_failed`, `image_pruned`,
-`drain_on` and `drain_off`.
+`image_build_waiting` (no room in the slice yet), `image_build_started`,
+`image_built`, `image_build_failed`, `image_pruned`, `drain_on` and
+`drain_off` (`by=build-image` when the image build set or cleared it).
 
 Fields prefixed `guest_` (repository, run id, job, sha, ref, actor, the
 runner's exit code) come from the job hooks inside the VM. Once a job runs,
@@ -170,8 +181,10 @@ sudo systemctl start ak-vm-runner-image             # build a new golden image n
 PATH, hence the full path) runs a subcommand as `akvm` with the config
 loaded: `status`, `drain`, `undrain`, `destroy-all`, `once`, `build-image`.
 
-- **Pause new jobs:** `drain`. Idle VMs stay registered and can still take a
-  job. Use `destroy-all` to remove them too.
+- **Pause new jobs:** `drain`. No VM is created, and idle VMs are recycled
+  one per pass (`scale_down`; the registration goes first, so a job that was
+  just assigned keeps its VM). Running jobs finish. `destroy-all` removes
+  every VM at once, mid-job included.
 - **Stop the service:** `systemctl stop ak-vm-runner`. Running VMs keep
   running, and the next start adopts them. To stop everything:
   `systemctl stop ak-vm-runner`, then `sudo /usr/local/sbin/ak-vm-runner destroy-all`.
@@ -182,10 +195,17 @@ loaded: `status`, `drain`, `undrain`, `destroy-all`, `once`, `build-image`.
   first job, so rebuild soon after a runner release. The weekly
   `ak-vm-runner-image.timer` (disabled by default) picks up Ubuntu and docker
   updates.
-- **Change the pool size:** set `AKVM_VM_COUNT` and the per-VM shape, raise
-  `MemoryLimit` in `/etc/systemd/system/machine-akvm.slice` to at least
-  `count × memory + 4 GiB + 1 GiB per VM`, then `systemctl daemon-reload && systemctl
-  restart ak-vm-runner`.
+- **Change the pool size or VM shape:** set `AKVM_VM_COUNT`,
+  `AKVM_VM_VCPUS` and `AKVM_VM_MEMORY_MIB` in `/etc/ak-vm-runner/config.env`.
+  Size `MemoryLimit` in `/etc/systemd/system/machine-akvm.slice` to at least
+  `count × (memory + 1 GiB) + 1 GiB` and `CPUQuota` to `count × vcpus × 100%`
+  (add 4 GiB + 1 GiB if the image build should run beside a full pool
+  instead of draining it). Apply the slice without restarting it:
+  `systemctl daemon-reload && systemctl set-property --runtime machine-akvm.slice MemoryLimit=<n>G CPUQuota=<n>%`,
+  then `systemctl restart ak-vm-runner`. A smaller count or a new shape takes
+  effect on the idle VMs at once (`scale_down`, `stale_shape`); a VM running
+  a job keeps its shape until the job ends. The slice is also counted in
+  the ARC budget (see [Capacity on rocky](#capacity-on-rocky)): change both.
 
 ## Installing it on your own KVM host
 
@@ -234,10 +254,12 @@ behave as on `ubuntu-24.04`. Only amd64 is provided, so arm64 legs stay on
 ## Capacity on rocky
 
 The VMs use host memory that the Kubernetes scheduler does not see. The
-`machine-akvm.slice` cap (40 GiB by default)
-bounds it, but the ARC budget in artifact-keeper-arc-runners
-(`budget/rocky.yaml`, `reserved.non_runner`) does not count it yet. Before
-the pool grows past two VMs, or before Docker Publish moves onto it, lower
-`ak-docker-runners` by the same amount, or add the slice cap to the
-budget's reservation and to the kubelet's `systemReserved`. The kubelet
-change needs a maintenance window (see the #6072 change plan).
+`machine-akvm.slice` cap (16 GiB / 8 CPUs by default: one idle 8 vCPU /
+14 GiB VM while nothing uses the `ak-vm` label yet) bounds it, and the ARC
+budget in artifact-keeper-arc-runners counts exactly that cap as reserved:
+`budget/rocky.yaml`, `reserved.ak_vm` (16Gi / 8 CPU). The two must match:
+change one and you must change the other in the same change. Before the
+pool grows, or before Docker Publish moves onto it, raise both together
+(and lower the ARC pools by the same amount). Adding the slice cap to the
+kubelet's `systemReserved` needs a maintenance window (see the #6072 change
+plan).

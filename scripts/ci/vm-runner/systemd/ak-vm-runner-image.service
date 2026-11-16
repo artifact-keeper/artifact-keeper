@@ -13,7 +13,11 @@ Group=akvm
 SupplementaryGroups=libvirt
 EnvironmentFile=/etc/ak-vm-runner/config.env
 ExecStart=/opt/ak-vm-runner/ak-vm-runner build-image
-TimeoutStartSec=3600
+# The build VM only starts once it fits in machine-akvm.slice beside the job
+# VMs, so build-image may first wait for a running job to end: up to
+# AKVM_IMAGE_WAIT_SECONDS (8 h, the longest a job VM lives) plus the build
+# itself (AKVM_IMAGE_TIMEOUT, 40 min) and slack.
+TimeoutStartSec=36000
 UMask=0027
 NoNewPrivileges=yes
 PrivateTmp=yes

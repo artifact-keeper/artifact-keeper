@@ -15,6 +15,12 @@
 #   - an idle VM past the recycle age is destroyed only when GitHub agrees to
 #     remove its registration (422 = busy keeps it);
 #   - a VM that never reports runner_start is destroyed after the boot timeout;
+#   - more VMs than AKVM_VM_COUNT (or any under drain) shrink one idle VM per
+#     pass the same registration-first way (scale_down); a VM with an old
+#     vcpus/memory shape is replaced when idle (stale_shape); busy and booting
+#     VMs are never touched;
+#   - no VM starts unless it fits in the slice's memory cap, and build-image
+#     drains and waits for room, then clears only a drain flag it set itself;
 #   - the rendered domain XML is well-formed, attaches the egress filter, and
 #     attaches the cache disk read-only only when configured.
 #
@@ -48,7 +54,8 @@ check() { # <description> <command...>
 # --- stubs -----------------------------------------------------------------
 STUB="$WORK/bin"
 mkdir -p "$STUB"
-# virsh: domains are files in $FAKE_VIRSH/<name> holding the state.
+# virsh: domains are files in $FAKE_VIRSH/<name> holding the state; their
+# "<memory MiB> <vcpus>" shape, if any, is in $FAKE_SHAPE/<name>.
 cat > "$STUB/virsh" << 'EOF'
 #!/usr/bin/env bash
 while [[ "$1" == -* ]]; do [[ "$1" == -c ]] && shift; shift; done
@@ -58,8 +65,15 @@ case "$cmd" in
   list) [[ -e "$FAKE_VIRSH/LIBVIRT_DOWN" ]] && { echo "error: failed to connect" >&2; exit 1; }
     for f in "$FAKE_VIRSH"/akvm-*; do [[ -f "$f" ]] && basename "$f"; done; exit 0 ;;
   domstate) cat "$FAKE_VIRSH/$1" 2> /dev/null; exit ;;
-  dominfo) [[ -f "$FAKE_VIRSH/$1" ]]; exit ;;
-  define) n="$(sed -n 's|.*<name>\(.*\)</name>.*|\1|p' "$1" | head -n1)"; echo "shut off" > "$FAKE_VIRSH/$n" ;;
+  dominfo) [[ -f "$FAKE_VIRSH/$1" ]] || exit 1
+    if [[ -f "$FAKE_SHAPE/$1" ]]; then
+      read -r m c < "$FAKE_SHAPE/$1"
+      printf 'Name: %s\nCPU(s):         %s\nMax memory:     %s KiB\n' "$1" "$c" "$((m * 1024))"
+    fi
+    exit 0 ;;
+  define) n="$(sed -n 's|.*<name>\(.*\)</name>.*|\1|p' "$1" | head -n1)"; echo "shut off" > "$FAKE_VIRSH/$n"
+    printf '%s %s\n' "$(sed -n "s|.*<memory unit='MiB'>\(.*\)</memory>.*|\1|p" "$1")" \
+      "$(sed -n "s|.*<vcpu placement='static'>\(.*\)</vcpu>.*|\1|p" "$1")" > "$FAKE_SHAPE/$n" ;;
   start) echo running > "$FAKE_VIRSH/$1" ;;
   destroy) [[ -f "$FAKE_VIRSH/$1" ]] && echo "shut off" > "$FAKE_VIRSH/$1" ;;
   undefine) rm -f "$FAKE_VIRSH/$1" ;;
@@ -103,8 +117,8 @@ chmod +x "$STUB"/*
 setup() {
   fails=0 # this case's own count; the parent adds the subshell's exit code
   T="$WORK/case.$RANDOM"
-  mkdir -p "$T/virsh" "$T/gh" "$T/state/images/golden"
-  export FAKE_VIRSH="$T/virsh" FAKE_GH="$T/gh"
+  mkdir -p "$T/virsh" "$T/shape" "$T/gh" "$T/state/images/golden"
+  export FAKE_VIRSH="$T/virsh" FAKE_SHAPE="$T/shape" FAKE_GH="$T/gh"
   : > "$FAKE_VIRSH/calls"
   : > "$FAKE_GH/requests"
   printf '{"runner":{"id":4242},"encoded_jit_config":"SEKRETJIT"}\n201' > "$FAKE_GH/POST"
@@ -116,7 +130,7 @@ setup() {
   export PATH="$STUB:$PATH"
   export AKVM_STATE_DIR="$T/state" AKVM_TOKEN_FILE="$T/token" AKVM_HOST_TAG=t \
     AKVM_VM_COUNT=1 AKVM_LABELS=ak-vm AKVM_CACHE_IMAGE="" RUNTIME_DIRECTORY="$T/run" \
-    AKVM_MIN_FREE_PCT=0 AKVM_MIN_HOST_AVAIL_MIB=0 AKVM_VM_MEMORY_MIB=1
+    AKVM_MIN_FREE_PCT=0 AKVM_MIN_HOST_AVAIL_MIB=0 AKVM_VM_MEMORY_MIB=1 AKVM_SLICE_MEMORY_MIB=infinity
   # shellcheck source=scripts/ci/vm-runner/ak-vm-runner
   source "$SCRIPT"
   set +e
@@ -133,6 +147,8 @@ fake_vm() {
 }
 
 audit_has() { grep -q "$1" "$AUDIT_LOG"; }
+fails_quietly() { ! "$@" > /dev/null 2>&1; }
+logs() { "$1" "${@:3}" 2>&1 | grep -q "$2"; } # <function> <pattern> [args...]
 
 echo "ak-vm-runner controller"
 
@@ -361,7 +377,7 @@ assert len(disks) == 1 and disks[0].getElementsByTagName("readonly") and disks[0
 
 (
   setup
-  AKVM_VM_COUNT=0
+  AKVM_VM_COUNT=1
   AKVM_BOOT_TIMEOUT=60
   fake_vm akvm-t-rot running 30 "AKVM event=runner_start"
   reconcile_once 2> /dev/null
@@ -394,6 +410,171 @@ assert len(disks) == 1 and disks[0].getElementsByTagName("readonly") and disks[0
   check "nor under the runtime dir" test ! -e "$T/run"
   x="$(render_domain_xml akvm-t-x 1024 2 /d.qcow2 /s.iso /c.log)"
   check "VM interfaces get an isolated bridge port (no VM-to-VM traffic)" grep -q "<port isolated='yes'/>" <<< "$x"
+  exit "$fails"
+) || fails=$((fails + $?))
+
+(
+  setup
+  AKVM_VM_COUNT=1
+  fake_vm akvm-t-a running 300 "AKVM event=runner_start"
+  fake_vm akvm-t-b running 200 "AKVM event=runner_start"
+  fake_vm akvm-t-c running 100 "AKVM event=runner_start" "AKVM event=job_started run_id=5"
+  reconcile_once 2> /dev/null
+  check "above AKVM_VM_COUNT one idle VM is recycled per pass" test ! -e "$FAKE_VIRSH/akvm-t-a" -a -e "$FAKE_VIRSH/akvm-t-b"
+  check "audited as scale_down" audit_has '"reason":"scale_down"'
+  check "its registration is removed before it is destroyed" \
+    bash -c "grep -n 'DELETE .*/runners/77' '$FAKE_GH/requests' | head -n1 | grep -q '^1:'"
+  reconcile_once 2> /dev/null
+  check "the next pass recycles the next surplus idle VM" test ! -e "$FAKE_VIRSH/akvm-t-b"
+  : > "$FAKE_GH/requests"
+  reconcile_once 2> /dev/null
+  check "a VM running a job is never scaled down" grep -q running "$FAKE_VIRSH/akvm-t-c"
+  check "and no new VM is created while the pool is full" test "$(find "$FAKE_VIRSH" -name 'akvm-t-*' | wc -l)" -eq 1
+  check "nor its registration touched" test ! -s "$FAKE_GH/requests"
+  exit "$fails"
+) || fails=$((fails + $?))
+
+(
+  setup
+  AKVM_VM_COUNT=1
+  fake_vm akvm-t-a running 300 "AKVM event=runner_start"
+  fake_vm akvm-t-b running 200 "AKVM event=runner_start"
+  printf '{"message":"busy"}\n422' > "$FAKE_GH/DELETE"
+  reconcile_once 2> /dev/null
+  check "a surplus VM GitHub calls busy (422) is kept" test -e "$FAKE_VIRSH/akvm-t-a" -a -e "$FAKE_VIRSH/akvm-t-b"
+  check "and not queued for later removal" test ! -s "$AKVM_STATE_DIR/runner-deletes-pending"
+  check "and nothing is audited as destroyed" bash -c "! grep -q vm_destroyed '$AUDIT_LOG'"
+  exit "$fails"
+) || fails=$((fails + $?))
+
+(
+  setup
+  AKVM_VM_COUNT=1
+  AKVM_BOOT_TIMEOUT=600
+  touch "$DRAIN_FLAG"
+  fake_vm akvm-t-idle running 300 "AKVM event=runner_start"
+  fake_vm akvm-t-boot running 30
+  fake_vm akvm-t-job running 100 "AKVM event=runner_start" "AKVM event=job_started run_id=5"
+  reconcile_once 2> /dev/null
+  check "under drain an idle VM is recycled" test ! -e "$FAKE_VIRSH/akvm-t-idle"
+  reconcile_once 2> /dev/null
+  check "but a booting VM is left alone" grep -q running "$FAKE_VIRSH/akvm-t-boot"
+  check "and a VM running a job too" grep -q running "$FAKE_VIRSH/akvm-t-job"
+  check "and no VM is created" test "$(find "$FAKE_VIRSH" -name 'akvm-t-*' | wc -l)" -eq 2
+  echo "AKVM event=runner_start" > "$CONSOLE_DIR/akvm-t-boot.log"
+  reconcile_once 2> /dev/null
+  check "once the booting VM's runner starts, drain recycles it" test ! -e "$FAKE_VIRSH/akvm-t-boot"
+  exit "$fails"
+) || fails=$((fails + $?))
+
+(
+  setup
+  AKVM_VM_COUNT=2
+  AKVM_VM_MEMORY_MIB=14336
+  AKVM_VM_VCPUS=8
+  fake_vm akvm-t-old running 300 "AKVM event=runner_start"
+  printf 'vcpus=8\nmemory_mib=16384\n' >> "$VMS_DIR/akvm-t-old/vm.env"
+  fake_vm akvm-t-legacy running 300 "AKVM event=runner_start"
+  echo "14336 4" > "$FAKE_SHAPE/akvm-t-legacy"
+  fake_vm akvm-t-busy running 300 "AKVM event=runner_start" "AKVM event=job_started run_id=5"
+  printf 'vcpus=8\nmemory_mib=16384\n' >> "$VMS_DIR/akvm-t-busy/vm.env"
+  fake_vm akvm-t-ok running 300 "AKVM event=runner_start"
+  printf 'vcpus=8\nmemory_mib=14336\n' >> "$VMS_DIR/akvm-t-ok/vm.env"
+  AKVM_VM_COUNT=4
+  reconcile_once 2> /dev/null
+  check "an idle VM with an old memory size is recycled" test ! -e "$FAKE_VIRSH/akvm-t-old"
+  check "audited as stale_shape" audit_has '"reason":"stale_shape"'
+  check "an idle VM without a recorded shape is judged by libvirt's" test ! -e "$FAKE_VIRSH/akvm-t-legacy"
+  check "a busy VM keeps its old shape until its job ends" grep -q running "$FAKE_VIRSH/akvm-t-busy"
+  check "a VM of the current shape is kept" grep -q running "$FAKE_VIRSH/akvm-t-ok"
+  vm="$(basename "$(find "$FAKE_VIRSH" -maxdepth 1 -name 'akvm-t-2*' | head -n1)")"
+  check "and the replacement records its shape in vm.env" \
+    bash -c "grep -qx 'memory_mib=14336' '$VMS_DIR/$vm/vm.env' && grep -qx 'vcpus=8' '$VMS_DIR/$vm/vm.env'"
+  exit "$fails"
+) || fails=$((fails + $?))
+
+(
+  setup
+  AKVM_VM_COUNT=2
+  AKVM_VM_MEMORY_MIB=14336
+  AKVM_SLICE_MEMORY_MIB=16384
+  fake_vm akvm-t-job running 100 "AKVM event=runner_start" "AKVM event=job_started run_id=5"
+  echo "14336 8" > "$FAKE_SHAPE/akvm-t-job"
+  printf 'vcpus=8\nmemory_mib=14336\n' >> "$VMS_DIR/akvm-t-job/vm.env"
+  reconcile_once 2> "$T/err"
+  check "a VM that does not fit in the slice is not created" test "$(find "$FAKE_VIRSH" -name 'akvm-t-*' | wc -l)" -eq 1
+  check "and the log says why" grep -q 'slice_committed_mib=15360 + vm 14336 + overhead 1024 above machine-akvm.slice limit 16384' "$T/err"
+  check "the 4 GiB image VM does not fit beside a 14 GiB job VM" fails_quietly slice_has_room "$IMAGE_VM_MEMORY_MIB"
+  echo "shut off" > "$FAKE_VIRSH/akvm-t-job"
+  echo "AKVM event=runner_exit code=0" >> "$CONSOLE_DIR/akvm-t-job.log"
+  reconcile_once 2> /dev/null
+  check "once the slice has room a VM is created" \
+    test "$(find "$FAKE_VIRSH" -name 'akvm-t-*' | wc -l)" -eq 1 -a ! -e "$FAKE_VIRSH/akvm-t-job"
+  rm -f "$FAKE_VIRSH"/akvm-t-*
+  check "an empty 16 GiB slice fits the image VM" slice_has_room "$IMAGE_VM_MEMORY_MIB"
+  echo running > "$FAKE_VIRSH/akvm-image-x"
+  echo "4096 4" > "$FAKE_SHAPE/akvm-image-x"
+  check "a running image-build VM counts against the slice" fails_quietly slice_has_room 14336
+  echo "shut off" > "$FAKE_VIRSH/akvm-image-x"
+  check "a stopped one does not" slice_has_room 14336
+  exit "$fails"
+) || fails=$((fails + $?))
+
+(
+  setup
+  cat > "$STUB/systemctl" << 'EOS'
+#!/usr/bin/env bash
+cat "$FAKE_VIRSH/systemctl-out"
+EOS
+  chmod +x "$STUB/systemctl"
+  AKVM_SLICE_MEMORY_MIB=""
+  printf '17179869184\ninfinity\n' > "$FAKE_VIRSH/systemctl-out"
+  check "the slice cap is read from MemoryLimit (cgroup v1)" test "$(slice_memory_limit_mib)" = 16384
+  printf 'infinity\n8589934592\n' > "$FAKE_VIRSH/systemctl-out"
+  check "or from MemoryMax (cgroup v2)" test "$(slice_memory_limit_mib)" = 8192
+  printf 'infinity\n18446744073709551615\n' > "$FAKE_VIRSH/systemctl-out"
+  check "an unset cap is no cap" test "$(slice_memory_limit_mib)" = infinity
+  check "and is logged, but does not block a VM" logs slice_has_room "no memory cap found" 999999
+  rm -f "$STUB/systemctl"
+  exit "$fails"
+) || fails=$((fails + $?))
+
+(
+  setup
+  AKVM_SLICE_MEMORY_MIB=16384
+  AKVM_POLL_SECONDS=1
+  AKVM_IMAGE_WAIT_SECONDS=2
+  fake_vm akvm-t-job running 100 "AKVM event=runner_start" "AKVM event=job_started run_id=5"
+  echo "14336 8" > "$FAKE_SHAPE/akvm-t-job"
+  (
+    wait_for_image_room 2> /dev/null
+    echo "rc=$? set=$IMAGE_BUILD_SET_DRAIN drain=$([[ -e $DRAIN_FLAG ]] && echo 1 || echo 0)" > "$T/r1"
+    build_image_cleanup 2> /dev/null
+  )
+  check "build-image beside a busy job VM sets the drain flag and waits" grep -q 'set=1 drain=1' "$T/r1"
+  check "and gives up after AKVM_IMAGE_WAIT_SECONDS" grep -q 'rc=1' "$T/r1"
+  check "audited as image_build_waiting, then failed for no room" \
+    bash -c "grep -q '\"event\":\"image_build_waiting\"' '$AUDIT_LOG' && grep -q '\"reason\":\"no_slice_room\"' '$AUDIT_LOG'"
+  check "and on exit it removes the drain flag it set" test ! -e "$DRAIN_FLAG"
+  touch "$DRAIN_FLAG"
+  (
+    wait_for_image_room 2> /dev/null
+    build_image_cleanup 2> /dev/null
+  )
+  check "a drain flag the operator set is left in place" test -e "$DRAIN_FLAG"
+  rm -f "$DRAIN_FLAG"
+  AKVM_IMAGE_WAIT_SECONDS=30
+  (sleep 2 && echo "shut off" > "$FAKE_VIRSH/akvm-t-job") &
+  (
+    wait_for_image_room 2> /dev/null
+    echo "rc=$? drain=$([[ -e $DRAIN_FLAG ]] && echo 1 || echo 0)" > "$T/r2"
+    flock -n "$AKVM_STATE_DIR/reconcile.lock" true && echo free >> "$T/r2"
+    build_image_cleanup 2> /dev/null
+  )
+  wait
+  check "once the job VM is gone build-image proceeds, still draining" grep -q 'rc=0 drain=1' "$T/r2"
+  check "holding the reconcile lock until the build VM is defined" bash -c "! grep -q free '$T/r2'"
+  check "and the loop is not left drained afterwards" test ! -e "$DRAIN_FLAG"
   exit "$fails"
 ) || fails=$((fails + $?))
 
