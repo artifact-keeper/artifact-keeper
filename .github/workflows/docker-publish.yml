@@ -545,10 +545,15 @@ jobs:
           # docker/Dockerfile.backend): 4 on both, each runner's core count.
           # The job count does not change the output; the profile, LTO and
           # codegen units are the same on both legs.
+          # amd64 runs on the self-hosted ak-beefy-runners scale set (dind
+          # limit 32Gi): the fat-LTO link of the 1.12 backend peaks near 18 GB
+          # and repeatedly cost the 16 GB hosted runner its heartbeat
+          # ("lost communication") even with the 20 GiB swapfile. Docker
+          # Publish has no pull_request trigger, so no fork code reaches it.
           - platform: linux/amd64
-            runner: ubuntu-24.04
+            runner: ak-beefy-runners
             cache-tag: amd64
-            cargo-build-jobs: 4
+            cargo-build-jobs: 8
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
             cache-tag: arm64
