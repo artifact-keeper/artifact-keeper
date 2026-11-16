@@ -1,5 +1,5 @@
 -- no-transaction
--- 378_artifacts_listing_size_index.sql
+-- 388_artifacts_listing_size_index.sql
 -- #5040: the flat artifact listing sorted by size
 -- (`GET /api/v1/repositories/{key}/artifacts?sort_by=size`) pages a repository
 -- with `WHERE repository_id = $1 AND is_deleted = false ... ORDER BY size_bytes,
