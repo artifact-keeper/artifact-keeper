@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Self-test for scripts/ci/release-preflight.sh checks 1, 3, 4, 5, 6 and 7
+# Self-test for scripts/ci/release-preflight.sh checks 1, 3, 4, 5, 6, 7 and 8
 # (issues #3308, #3309, #3338 and #3339).
 #
 # WHY THIS EXISTS
@@ -108,6 +108,14 @@ case "$1" in
         [ "${FAKE_API_FAIL-0}" = "1" ] && exit 1
         run_id="${FAKE_RUN_ID-12345}"
         [ -n "$run_id" ] && echo "$run_id ${FAKE_RUN_STATUS-completed}"
+        exit 0
+        ;;
+      *commits/*/statuses*)
+        # Check 8's release-gate/nightly lookup. FAKE_NIGHTLY_<sha> is the
+        # "<state> <url>" the real --jq prints; unset means no status.
+        [ "${FAKE_NIGHTLY_FAIL-0}" = "1" ] && exit 1
+        sha="${2#*commits/}"; sha="${sha%%/*}"; v="FAKE_NIGHTLY_${sha}"
+        [ -n "${!v-}" ] && printf '%s\n' "${!v}"
         exit 0
         ;;
       *contents/.trivyignore*)
@@ -1041,6 +1049,49 @@ PREFLIGHT_E2E_PROOF_MODE=enforce PREFLIGHT_E2E_PROOF_CMD="$REAL_E2E" PREFLIGHT_T
 PREFLIGHT_E2E_PROOF_MODE=enforce PREFLIGHT_E2E_PROOF_CMD="$REAL_E2E" PREFLIGHT_TESTS_DIR="$TESTS7" \
   FAKE_E2E_MILESTONES='[{"number":9,"title":"9.9.9"}]' FAKE_E2E_GRAPHQL="$(e2e_graphql "$(e2e_issue 300)")" \
   expect "7k. real script: every bug covered by a wired tier -> READY" 0 "every closed bug in 9.9.9"
+
+echo "release-preflight check 8 (nightly full gate result, #6075)"
+
+# A fixture line: GREEN (code, measured green by the nightly) <- PREP (only
+# CHANGELOG, release notes and the X.Y.Z bump) <- CODE (a real change).
+# Check 8 is advisory, so every case exits 0; the assertions are about what
+# it says.
+REPO8="$WORK/repo8"
+git clone -q "$REPO_DIR" "$REPO8"
+git -C "$REPO8" remote set-url origin https://github.com/artifact-keeper/artifact-keeper.git
+c8() { git -C "$REPO8" -c user.email=t@t -c user.name=t commit -qam "$1" && git -C "$REPO8" rev-parse HEAD; }
+echo 'fn a() {}' > "$REPO8/lib.rs"; git -C "$REPO8" add lib.rs
+SHA_GREEN="$(c8 'code: measured green')"
+mkdir -p "$REPO8/.github/release-notes"; echo notes > "$REPO8/.github/release-notes/9.9.10.md"
+echo '## [9.9.10]' > "$REPO8/CHANGELOG.md"; git -C "$REPO8" add -A
+for f in Cargo.toml backend/src/api/openapi.rs Cargo.lock; do sed -i 's/9\.9\.9/9.9.10/' "$REPO8/$f"; done
+SHA_PREP="$(c8 'chore(release): 9.9.10')"
+SAVED_REPO_DIR="$REPO_DIR"; REPO_DIR="$REPO8"
+U=https://g/runs/1
+# with_nightly <sha> <state> <expect args...>: the nightly status on one commit.
+with_nightly() {
+  local v="FAKE_NIGHTLY_$1"; export "$v=$2 $U"; shift 2
+  expect "$@"; unset "$v"
+}
+
+with_nightly "$SHA_PREP" success "8a. green on HEAD -> ok" 0 "the nightly full gate was green on this commit"
+with_nightly "$SHA_GREEN" success "8b. a bookkeeping-only prep on a green commit -> ok" 0 "differs from it only in release bookkeeping"
+with_nightly "$SHA_GREEN" failure "8c. red on the commit the prep sits on -> warn, still READY" 0 "the nightly full gate was FAILURE on ${SHA_GREEN:0:7}"
+
+echo 'fn b() {}' >> "$REPO8/lib.rs"; SHA_CODE="$(c8 'code after the prep')"
+with_nightly "$SHA_GREEN" success "8d. a code change since the green commit -> warn, names the commit to cut from" 0 "is ${SHA_GREEN:0:7} (code: measured green)"
+if grep -qF "no nightly full gate result for this commit" "$WORK/out.txt"; then pass "8d. says HEAD itself is not covered"; else fail "8d. no 'not covered' warning"; fi
+
+git -C "$REPO8" reset -q --hard "$SHA_GREEN"
+sed -i 's/^version = "9.9.9"$/version = "9.9.9"\nserde = "1"/' "$REPO8/Cargo.toml"; SHA_DEP="$(c8 'deps: add serde')"
+with_nightly "$SHA_GREEN" success "8e. a Cargo.toml change that is not the version line is not bookkeeping" 0 "no nightly full gate result for this commit"
+[ -n "$SHA_DEP" ] && [ -n "$SHA_CODE" ] || fail "8. fixture commits"
+
+FAKE_NIGHTLY_FAIL=1 \
+  expect "8f. the statuses API fails -> warn, never INFRA" 0 "check 8 not measured (advisory)"
+PREFLIGHT_SKIP_NIGHTLY_GATE=1 FAKE_NIGHTLY_FAIL=1 \
+  expect "8g. PREFLIGHT_SKIP_NIGHTLY_GATE=1 -> not run" 0 "PREFLIGHT_SKIP_NIGHTLY_GATE=1; skipped."
+REPO_DIR="$SAVED_REPO_DIR"
 
 echo
 if [ "$fails" -eq 0 ]; then
