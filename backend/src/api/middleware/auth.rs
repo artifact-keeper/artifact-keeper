@@ -3155,6 +3155,27 @@ fn permission_unavailable_response() -> Response {
         .unwrap()
 }
 
+/// Whether any fine-grained rule targets the repository, for the read arm of
+/// [`repo_visibility_middleware`]. A failed lookup (the database is
+/// unreachable once the 30 s rules cache entry has expired) fails closed with
+/// the same retryable 503 + `Retry-After: 1` as the write arm, so a package
+/// client backs off and retries instead of treating the outage as final.
+async fn read_rules_exist(
+    permission_service: &crate::services::permission_service::PermissionService,
+    repo_id: uuid::Uuid,
+) -> std::result::Result<bool, Response> {
+    permission_service
+        .has_any_rules_for_target("repository", repo_id)
+        .await
+        .map_err(|_| {
+            tracing::error!(
+                repository_id = %repo_id,
+                "permission check failed: database unreachable"
+            );
+            permission_unavailable_response()
+        })
+}
+
 /// The answer to a write or delete the caller may not make (#5458).
 ///
 /// A caller who cannot even READ the repository gets the existence-hiding
@@ -3811,22 +3832,10 @@ pub async fn repo_visibility_middleware(
                 // sufficient for public repos; private repos still require a
                 // role assignment). If rules do exist, the user must hold the
                 // read action.
-                let has_rules = match vis_state
-                    .permission_service
-                    .has_any_rules_for_target("repository", repo.id)
-                    .await
+                let has_rules = match read_rules_exist(&vis_state.permission_service, repo.id).await
                 {
                     Ok(v) => v,
-                    Err(_) => {
-                        // DB error on permission check: fail closed.
-                        tracing::error!("permission check failed: database unreachable");
-                        return Response::builder()
-                            .status(StatusCode::SERVICE_UNAVAILABLE)
-                            .body(axum::body::Body::from(
-                                "permission service temporarily unavailable",
-                            ))
-                            .unwrap();
-                    }
+                    Err(resp) => return resp,
                 };
 
                 if has_rules {
@@ -7323,6 +7332,24 @@ mod tests {
                     .password("invalid")
                     .database("invalid"),
             )
+    }
+
+    #[tokio::test]
+    async fn test_read_rules_lookup_db_outage_is_503_with_retry_after() {
+        // A read whose rules-existence entry has left the 30 s cache must
+        // query the database; during an outage that answer is a retryable 503
+        // carrying Retry-After: 1, like the write arm, never a bare 503.
+        let svc = crate::services::permission_service::PermissionService::new(lazy_pool());
+        let resp = read_rules_exist(&svc, uuid::Uuid::new_v4())
+            .await
+            .expect_err("an unreachable database must fail closed");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
     }
 
     #[tokio::test]
