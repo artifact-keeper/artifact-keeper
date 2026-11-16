@@ -53,6 +53,14 @@ pub(crate) fn peer_degraded_failure_threshold() -> i32 {
     )
 }
 
+/// Consecutive failures before a failing peer is marked `unhealthy`, twice
+/// the `degraded` threshold so the statuses are observable in sequence (#6030).
+const PEER_UNHEALTHY_FAILURE_FACTOR: i32 = 2;
+
+pub(crate) fn peer_unhealthy_failure_threshold() -> i32 {
+    peer_degraded_failure_threshold().saturating_mul(PEER_UNHEALTHY_FAILURE_FACTOR)
+}
+
 /// Mark an online or syncing peer `degraded` once it has failed `threshold`
 /// consecutive probes or transfers; `offline` stays with the stale-heartbeat
 /// sweep, and a good probe brings any of them back. Returns whether the peer
@@ -618,11 +626,20 @@ async fn mark_peer_probe_failed(db: &PgPool, peer_id: Uuid) -> Result<(), sqlx::
                 WHEN consecutive_failures < 2147483647 THEN consecutive_failures + 1
                 ELSE consecutive_failures
             END,
+            status = CASE
+                WHEN status = 'offline' THEN status
+                WHEN CASE
+                        WHEN consecutive_failures < 2147483647 THEN consecutive_failures + 1
+                        ELSE consecutive_failures
+                     END >= $2 THEN 'unhealthy'::instance_status
+                ELSE status
+            END,
             updated_at = NOW()
         WHERE id = $1
         "#,
     )
     .bind(peer_id)
+    .bind(peer_unhealthy_failure_threshold())
     .execute(db)
     .await?;
 
@@ -3052,6 +3069,8 @@ async fn handle_transfer_failure_scoped(
     let backoff = retry_policy.calculate_backoff(consecutive);
 
     // Update peer instance: decrement active_transfers, bump failure counters, set backoff.
+    // Repeated failures demote a peer from `online`/`syncing` to `degraded`
+    // (#6114) and then escalate it to `unhealthy` (#6030).
     let _ = sqlx::query(
         r#"
         UPDATE peer_instances
@@ -3060,12 +3079,18 @@ async fn handle_transfer_failure_scoped(
             consecutive_failures = consecutive_failures + 1,
             transfer_failures_total = transfer_failures_total + 1,
             backoff_until = NOW() + $2::INTERVAL,
+            status = CASE
+                WHEN status = 'offline' THEN status
+                WHEN consecutive_failures + 1 >= $3 THEN 'unhealthy'::instance_status
+                ELSE status
+            END,
             updated_at = NOW()
         WHERE id = $1
         "#,
     )
     .bind(task.peer_instance_id)
     .bind(format!("{} seconds", backoff.as_secs()))
+    .bind(peer_unhealthy_failure_threshold())
     .execute(db)
     .await;
 
@@ -5935,6 +5960,24 @@ mod tests {
         drop_peer(&pool, peer_id).await;
 
         assert_eq!(status, "offline");
+    }
+
+    #[tokio::test]
+    async fn repeated_failed_probes_escalate_a_peer_to_unhealthy_6030() {
+        let Some((pool, peer_id)) = demotion_peer("syncing").await else {
+            return;
+        };
+        let threshold = peer_unhealthy_failure_threshold();
+        for _ in 0..threshold {
+            mark_peer_probe_failed(&pool, peer_id)
+                .await
+                .expect("probe failed");
+        }
+        let (status, failures) = peer_state(&pool, peer_id).await;
+        drop_peer(&pool, peer_id).await;
+
+        assert_eq!(status, "unhealthy");
+        assert_eq!(failures, threshold);
     }
 
     // -----------------------------------------------------------------------
