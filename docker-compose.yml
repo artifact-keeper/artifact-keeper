@@ -17,8 +17,8 @@
 #   Docker Hub:         docker.io/artifactkeeper/{backend,web,openscap}
 #
 # To use Docker Hub instead, replace image references below. For example:
-#   ghcr.io/artifact-keeper/artifact-keeper-backend:${ARTIFACT_KEEPER_VERSION:-latest}
-#     -> docker.io/artifactkeeper/backend:${ARTIFACT_KEEPER_VERSION:-latest}
+#   ghcr.io/artifact-keeper/artifact-keeper-backend:${ARTIFACT_KEEPER_VERSION:-latest}-scanner
+#     -> docker.io/artifactkeeper/backend:${ARTIFACT_KEEPER_VERSION:-latest}-scanner
 #
 # Pin a specific release by setting ARTIFACT_KEEPER_VERSION in a .env file
 # alongside this compose file (e.g. ARTIFACT_KEEPER_VERSION=1.1.0). It pins the
@@ -195,7 +195,11 @@ services:
   # ---------------------------------------------------------------------------
   # The core Artifact Keeper service. Handles all API requests, package format
   # protocols, storage, and integrations with scanners.
-  # Docker Hub alternative: docker.io/artifactkeeper/backend:${ARTIFACT_KEEPER_VERSION:-latest}
+  # Docker Hub alternative: docker.io/artifactkeeper/backend:${ARTIFACT_KEEPER_VERSION:-latest}-scanner
+  #
+  # The -scanner variant carries grype and its database, so this single
+  # instance runs its own scans. The plain tag has no grype and is meant for
+  # API pods next to scan workers (SCAN_QUEUE_ENABLED, docs/security/scan-on-proxy.md).
   #
   # Key environment variables to review for your deployment:
   #   JWT_SECRET        - REQUIRED, no default. Generate with: openssl rand -base64 48
@@ -208,7 +212,7 @@ services:
   # For S3-compatible object storage, set S3_BUCKET, S3_REGION, S3_ACCESS_KEY,
   # S3_SECRET_KEY, and STORAGE_BACKEND=s3. See .env.example for all options.
   backend:
-    image: ghcr.io/artifact-keeper/artifact-keeper-backend:${ARTIFACT_KEEPER_VERSION:-latest}
+    image: ghcr.io/artifact-keeper/artifact-keeper-backend:${ARTIFACT_KEEPER_VERSION:-latest}-scanner
     container_name: artifact-keeper-backend
     depends_on:
       postgres:
