@@ -112,6 +112,27 @@ name: Release Candidate
 # already deleted and dies on "backend not ready". The gate job therefore
 # runs on attempt 1 only, and `gate-rerun-refused` says so in red rather than
 # letting an hour of suites fail for a reason nobody can see.
+#
+# RERUN OF THE FAILED GROUPS (#6076). The supported recovery for a flake is a
+# NEW dispatch with `rerun_of=<the failed candidate's run id>`, a `reason`, and
+# the same `sha`. It is a fresh run in every respect -- resolve, publish,
+# preflight, bookkeeping, images, all re-checked -- except that the gate runs
+# only the jobs and dtf-gate legs the original did not pass (the gate's
+# `only_jobs`, artifact-keeper-test#830), and certifies only when:
+#   * the original is a failed attempt-1 dispatch of this file on main, under
+#     RERUN_MAX_AGE_HOURS old, whose pre-gate jobs all succeeded and which was
+#     not itself a rerun (scripts/ci/resolve-candidate-rerun.sh);
+#   * the commit, the three certified digests, the adapter decision, the
+#     version, the line and this file's blob are the ones the original tested
+#     (`record`; any difference refuses before the gate);
+#   * the tests are the original's: `tests=same` pins the original's tests
+#     commit and refuses if release-gate.yml changed. `tests=moved` accepts a
+#     newer test tree (a merged test-only fix) and records that it moved;
+#   * every gate job or leg of the rerun also ran in the original (`certify`,
+#     coverage), so the union of the original's green and the rerun's green is
+#     the whole gate.
+# The certification then lists both runs, the reason and both actors. Every
+# job here is still attempt-1-only; a rerun is never `gh run rerun`.
 # ══════════════════════════════════════════════════════════════════════════════
 
 on:
@@ -122,6 +143,27 @@ on:
         required: false
         type: string
         default: ''
+      # Rerun of the failed gate groups of an earlier candidate (#6076). Empty
+      # (the default) is a full candidate. See RELEASING.md, "Rerunning the
+      # failed gate groups", for when this is allowed.
+      rerun_of:
+        description: 'Rerun only the failed gate groups of this earlier Release Candidate run (its run id). Needs sha (the same commit) and reason. Empty = a full candidate.'
+        required: false
+        type: string
+        default: ''
+      reason:
+        description: 'Required with rerun_of: why the failed groups may be rerun rather than a fresh candidate (recorded in the certification).'
+        required: false
+        type: string
+        default: ''
+      tests:
+        description: 'With rerun_of: same = the original run''s artifact-keeper-test commit (refused if release-gate.yml changed); moved = the current one (a merged test-only fix; recorded).'
+        required: false
+        type: choice
+        options:
+          - same
+          - moved
+        default: same
 
 permissions: {}
 
@@ -139,6 +181,14 @@ env:
   BACKEND_IMAGE: ghcr.io/${{ github.repository }}-backend
   OPENSCAP_IMAGE: ghcr.io/${{ github.repository }}-openscap
   ADAPTER_IMAGE: ghcr.io/${{ github.repository }}-scanner-adapter
+  # How old the original run may be for a rerun of its failed gate groups
+  # (#6076). The gate's chart (iac@main), web image (:latest) and runners are
+  # not pinned between runs, so the union of two runs' results is only
+  # meaningful while they are close together.
+  RERUN_MAX_AGE_HOURS: '72'
+  # The caller's gate job name. resolve-candidate-rerun.sh finds the gate's
+  # jobs by it ("<this> / <gate job>"): keep it in step with `release-gate`.
+  GATE_JOB_NAME: Release Gate (Full Suite)
 
 jobs:
   # ── which commit, which version ──────────────────────────────────────────────
@@ -148,6 +198,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+      actions: read    # a rerun reads its original run (#6076)
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
       short: ${{ steps.resolve.outputs.short }}
@@ -156,6 +207,17 @@ jobs:
       certified_ref: ${{ steps.resolve.outputs.certified_ref }}
       certified_branch: ${{ steps.resolve.outputs.certified_branch }}
       workflow_blob: ${{ steps.resolve.outputs.workflow_blob }}
+      # Rerun (#6076): all empty for a full candidate.
+      rerun_of: ${{ steps.rerun_inputs.outputs.rerun_of }}
+      rerun_reason: ${{ steps.rerun_inputs.outputs.reason }}
+      rerun_tests: ${{ steps.rerun_inputs.outputs.tests }}
+      rerun_jobs: ${{ steps.rerun.outputs.rerun_jobs }}
+      rerun_pin_tests_sha: ${{ steps.rerun.outputs.pin_tests_sha }}
+      rerun_gate_changed: ${{ steps.rerun.outputs.gate_changed }}
+      original_actor: ${{ steps.rerun.outputs.original_actor }}
+      original_created_at: ${{ steps.rerun.outputs.original_created_at }}
+      original_gate_sha: ${{ steps.rerun.outputs.original_gate_sha }}
+      original_record: ${{ steps.rerun.outputs.original_record }}
     steps:
       # The certification is only valid when this workflow ran on main (the
       # verifier pins the exact signing identity
@@ -175,6 +237,46 @@ jobs:
             exit 1
           fi
           echo "Dispatched on ${GITHUB_REF}."
+
+      # A rerun (#6076) needs the commit spelled out and a reason; the rerun
+      # knobs without rerun_of are refused rather than ignored. The reason is
+      # free text that lands in a signed predicate: one line, printable, 10 to
+      # 300 characters, passed only through env and jq --arg.
+      - name: Check the rerun inputs
+        id: rerun_inputs
+        env:
+          RERUN_OF: ${{ inputs.rerun_of }}
+          REASON: ${{ inputs.reason }}
+          TESTS: ${{ inputs.tests }}
+          INPUT_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$RERUN_OF" ]]; then
+            if [[ -n "$REASON" || "${TESTS:-same}" != same ]]; then
+              echo "::error title=Rerun inputs without rerun_of::reason and tests=moved only apply to a rerun of the failed gate groups (rerun_of=<run id>). A full candidate takes neither."
+              exit 1
+            fi
+            echo "Full candidate."
+            exit 0
+          fi
+          if [[ ! "$RERUN_OF" =~ ^[0-9]{1,20}$ ]]; then
+            echo "::error title=Bad rerun_of::rerun_of must be the run id of the failed Release Candidate (digits)."
+            exit 1
+          fi
+          if [[ -z "$INPUT_SHA" ]]; then
+            echo "::error title=Rerun needs the sha::A rerun certifies the same commit as its original: pass it as -f sha=<40-hex>, not the tip of main."
+            exit 1
+          fi
+          if [[ ${#REASON} -lt 10 || ${#REASON} -gt 300 || "$REASON" =~ [[:cntrl:]] ]]; then
+            echo "::error title=Rerun needs a reason::reason is required with rerun_of: one line of 10 to 300 printable characters saying why the failed groups may be rerun (for example the flake and its issue). It is recorded in the certification."
+            exit 1
+          fi
+          {
+            echo "rerun_of=${RERUN_OF}"
+            echo "reason=${REASON}"
+            echo "tests=${TESTS}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Rerun of run ${RERUN_OF} (tests=${TESTS}) by ${GITHUB_TRIGGERING_ACTOR}: ${REASON}"
 
       # Always main, never anything else: this workflow runs main's tooling
       # and signs with main's identity whatever line the commit is on. The
@@ -287,6 +389,27 @@ jobs:
             echo "certified_branch=${CERTIFIED_REF#refs/heads/}"
             echo "workflow_blob=${WORKFLOW_BLOB}"
           } >> "$GITHUB_OUTPUT"
+
+      # Which gate jobs the rerun runs, and whether it may run at all: read
+      # from the original run through the API (scripts/ci/resolve-candidate-rerun.sh,
+      # main's copy; nothing from the certified commit runs here).
+      - name: Resolve the rerun from its original run
+        id: rerun
+        if: ${{ steps.rerun_inputs.outputs.rerun_of != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RERUN_REPO: ${{ github.repository }}
+          RERUN_OF: ${{ steps.rerun_inputs.outputs.rerun_of }}
+          RERUN_SHA: ${{ steps.resolve.outputs.sha }}
+          RERUN_TESTS: ${{ steps.rerun_inputs.outputs.tests }}
+          RERUN_SELF_RUN_ID: ${{ github.run_id }}
+          RERUN_GATE_JOB: ${{ env.GATE_JOB_NAME }}
+        run: |
+          set -euo pipefail
+          rc=0
+          bash scripts/ci/resolve-candidate-rerun.sh resolve > "$RUNNER_TEMP/rerun.txt" || rc=$?
+          grep -v '^original_record=' "$RUNNER_TEMP/rerun.txt" || true
+          exit "$rc"
 
   # ── warm the CLI binary build caches (#4927) ────────────────────────────────
   # release.yml builds the CLI binaries on the tag ref, which cannot read a
@@ -482,6 +605,12 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+    outputs:
+      # The artifact-keeper-test commit (and branch) the gate runs, resolved
+      # once here and passed to the gate as `tests_sha`, so every gate job runs
+      # one tree and the certification names it (#6076).
+      tests_sha: ${{ steps.tests_ref.outputs.sha }}
+      tests_branch: ${{ steps.tests_ref.outputs.branch }}
     steps:
       # CODE FROM MAIN, DATA FROM THE COMMIT (adversarial review, finding 1).
       # This job holds a token, so nothing it EXECUTES may come from the
@@ -588,12 +717,32 @@ jobs:
           path: .gate/test
           persist-credentials: false
 
+      # A rerun with tests=same pins the original's tests commit here
+      # (GATE_TESTS_SHA, honoured since artifact-keeper-test#830); it must
+      # still be on the branch the line is gated by, or this fails.
       - name: Move the profiles to the tests ref the gate will use
         working-directory: .gate/test
         env:
           GH_TOKEN: ${{ github.token }}
           BACKEND_TAG: sha-${{ needs.resolve.outputs.short }}
+          GATE_TESTS_SHA: ${{ needs.resolve.outputs.rerun_pin_tests_sha }}
         run: scripts/switch-tests-ref.sh
+
+      - name: Record the tests ref the gate will use
+        id: tests_ref
+        working-directory: .gate/test
+        env:
+          PIN: ${{ needs.resolve.outputs.rerun_pin_tests_sha }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          branch="$(cat deploy-test/.tests-ref 2>/dev/null || echo main)"
+          if [[ -n "$PIN" && "$sha" != "$PIN" ]]; then
+            echo "::error title=Tests ref not pinned::the rerun asked for artifact-keeper-test@${PIN} but the tree is at ${sha}: this switch-tests-ref.sh predates artifact-keeper-test#830. Failing closed."
+            exit 1
+          fi
+          echo "Gate tests: artifact-keeper-test ${branch} @ ${sha}"
+          { echo "sha=${sha}"; echo "branch=${branch}"; } >> "$GITHUB_OUTPUT"
 
       - name: Set up Helm
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
@@ -762,17 +911,180 @@ jobs:
           REBUILD_DIGEST: ${{ steps.digests.outputs.adapter_digest }}
         run: scripts/ci/pin-adapter-digest.sh
 
+  # ── what this candidate tests, written down before the gate runs (#6076) ──
+  # The record a later rerun reads: the commit, the digests and adapter
+  # decision the gate will test, the line, this file's blob, and the tests
+  # commit. Uploaded as `release-candidate-record` BEFORE any gate job exists
+  # in this run; resolve-candidate-rerun.sh accepts it only if it is the one
+  # artifact of that name and no newer than this job's completion, so a gate
+  # job cannot replace it unnoticed.
+  #
+  # On a rerun it first compares all of that with the original's record and
+  # refuses any difference: a rerun cannot change the commit or the bytes
+  # being certified, and with tests=same it cannot change the tests either.
+  record:
+    name: Record what this candidate tests
+    needs: [resolve, bookkeeping, images]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read    # this run's referenced release-gate.yml commit
+    outputs:
+      tests_sha: ${{ steps.record.outputs.tests_sha }}
+      gate_workflow_sha: ${{ steps.record.outputs.gate_workflow_sha }}
+      tests_moved: ${{ steps.record.outputs.tests_moved }}
+      contributing_runs: ${{ steps.record.outputs.contributing_runs }}
+      rerun: ${{ steps.record.outputs.rerun }}
+    env:
+      SHA: ${{ needs.resolve.outputs.sha }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      CERTIFIED_REF: ${{ needs.resolve.outputs.certified_ref }}
+      WORKFLOW_BLOB: ${{ needs.resolve.outputs.workflow_blob }}
+      BACKEND_DIGEST: ${{ needs.images.outputs.backend_digest }}
+      OPENSCAP_DIGEST: ${{ needs.images.outputs.openscap_digest }}
+      ADAPTER_DIGEST: ${{ needs.images.outputs.adapter_digest }}
+      ADAPTER_DECISION: ${{ needs.images.outputs.adapter_decision }}
+      ADAPTER_OWNER_REV: ${{ needs.images.outputs.adapter_owner_rev }}
+      ADAPTER_TAG: ${{ needs.images.outputs.adapter_tag }}
+      PUBLISH_RUN_ID: ${{ needs.images.outputs.publish_run_id }}
+      TESTS_SHA: ${{ needs.bookkeeping.outputs.tests_sha }}
+      TESTS_BRANCH: ${{ needs.bookkeeping.outputs.tests_branch }}
+      RERUN_OF: ${{ needs.resolve.outputs.rerun_of }}
+      RERUN_REASON: ${{ needs.resolve.outputs.rerun_reason }}
+      RERUN_TESTS: ${{ needs.resolve.outputs.rerun_tests }}
+      RERUN_JOBS: ${{ needs.resolve.outputs.rerun_jobs }}
+      RERUN_GATE_CHANGED: ${{ needs.resolve.outputs.rerun_gate_changed }}
+      ORIGINAL_ACTOR: ${{ needs.resolve.outputs.original_actor }}
+      ORIGINAL_CREATED_AT: ${{ needs.resolve.outputs.original_created_at }}
+      ORIGINAL_GATE_SHA: ${{ needs.resolve.outputs.original_gate_sha }}
+      ORIGINAL_RECORD: ${{ needs.resolve.outputs.original_record }}
+    steps:
+      - name: Refuse a rerun whose commit, bytes or tests differ from the original
+        if: ${{ needs.resolve.outputs.rerun_of != '' }}
+        run: |
+          set -euo pipefail
+          bad=0
+          same() { # <what> <original> <now>
+            if [[ -z "$2" || "$2" != "$3" ]]; then
+              echo "::error title=Rerun differs from its original::${1}: run ${RERUN_OF} tested '${2:-<none>}', this run resolves '${3:-<none>}'."
+              bad=1
+            else
+              echo "  same ${1}: ${3}"
+            fi
+          }
+          o() { jq -r "$1 // empty" <<<"$ORIGINAL_RECORD"; }
+          same commit                "$(o .commit_sha)"                     "$SHA"
+          same version               "$(o .version)"                        "$VERSION"
+          same certified_ref         "$(o .certified_ref)"                  "$CERTIFIED_REF"
+          same workflow_blob         "$(o .certified_workflow_blob)"        "$WORKFLOW_BLOB"
+          same backend_digest        "$(o .digests.backend)"                "$BACKEND_DIGEST"
+          same openscap_digest       "$(o .digests.openscap)"               "$OPENSCAP_DIGEST"
+          same scanner_adapter_digest "$(o .digests.scanner_adapter)"       "$ADAPTER_DIGEST"
+          same adapter_decision      "$(o .scanner_adapter_decision.decision)" "$ADAPTER_DECISION"
+          same adapter_tag           "$(o .scanner_adapter_decision.tag)"   "$ADAPTER_TAG"
+          if [[ "$RERUN_TESTS" == same ]]; then
+            same tests_sha           "$(o .tests.sha)"                      "$TESTS_SHA"
+            same tests_branch        "$(o .tests.branch)"                   "$TESTS_BRANCH"
+          fi
+          if [[ "$bad" -ne 0 ]]; then
+            echo "::error title=Rerun refused::A rerun certifies exactly what its original tested. A different digest means Docker Publish rebuilt the images since; a different tests ref with tests=same means the line's test branch changed. Dispatch a fresh candidate (or tests=moved for a test-only change)."
+            exit 1
+          fi
+
+      - name: Write the record
+        id: record
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          GATE_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --jq '[.referenced_workflows[]? | select(.path | startswith("artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@")) | .sha] | first // empty')"
+          if [[ ! "$GATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=Gate commit unknown::this run records no artifact-keeper-test release-gate.yml commit (got '${GATE_SHA}')."
+            exit 1
+          fi
+          if [[ ! "$TESTS_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=Tests ref unknown::bookkeeping resolved no artifact-keeper-test commit (got '${TESTS_SHA}')."
+            exit 1
+          fi
+          this_run="$(jq -nc --arg run "$GITHUB_RUN_ID" --arg actor "$GITHUB_TRIGGERING_ACTOR" \
+            --arg gate "$GATE_SHA" --arg tsha "$TESTS_SHA" --arg tbr "$TESTS_BRANCH" \
+            '{run_id: $run, actor: $actor, gate_workflow_sha: $gate, tests: {sha: $tsha, branch: $tbr}}')"
+          if [[ -z "$RERUN_OF" ]]; then
+            scope=full
+            tests_moved=false
+            rerun=null
+            runs="$(jq -c '[. + {role: "full"}]' <<<"$this_run")"
+          else
+            scope=rerun
+            otests="$(jq -c '.tests' <<<"$ORIGINAL_RECORD")"
+            tests_moved=false
+            if [[ "$RERUN_GATE_CHANGED" == true || "$(jq -r .sha <<<"$otests")" != "$TESTS_SHA" \
+                  || "$(jq -r .branch <<<"$otests")" != "$TESTS_BRANCH" ]]; then
+              tests_moved=true
+            fi
+            rerun="$(jq -nc --arg of "$RERUN_OF" --arg reason "$RERUN_REASON" --arg actor "$GITHUB_TRIGGERING_ACTOR" \
+              --arg jobs "$RERUN_JOBS" --arg mode "$RERUN_TESTS" --argjson moved "$tests_moved" \
+              '{of: $of, reason: $reason, actor: $actor, only_jobs: ($jobs | split(" ")), tests_mode: $mode, tests_moved: $moved}')"
+            runs="$(jq -nc --argjson self "$this_run" --argjson otests "$otests" \
+              --arg of "$RERUN_OF" --arg oactor "$ORIGINAL_ACTOR" --arg ogate "$ORIGINAL_GATE_SHA" --arg ostart "$ORIGINAL_CREATED_AT" \
+              --arg reason "$RERUN_REASON" --arg jobs "$RERUN_JOBS" \
+              '[{run_id: $of, role: "original", actor: $oactor, started_at: $ostart, gate_workflow_sha: $ogate, tests: $otests,
+                 passed: "every gate job and dtf-gate leg except the ones the rerun ran"},
+                ($self + {role: "rerun", reason: $reason, ran: ($jobs | split(" "))})]')"
+          fi
+          mkdir -p record
+          jq -n \
+            --arg sha "$SHA" --arg version "$VERSION" --arg certified_ref "$CERTIFIED_REF" --arg blob "$WORKFLOW_BLOB" \
+            --arg run "$GITHUB_RUN_ID" --arg publish_run "$PUBLISH_RUN_ID" \
+            --arg backend "$BACKEND_DIGEST" --arg openscap "$OPENSCAP_DIGEST" --arg adapter "$ADAPTER_DIGEST" \
+            --arg adapter_decision "$ADAPTER_DECISION" --arg adapter_owner "$ADAPTER_OWNER_REV" --arg adapter_tag "$ADAPTER_TAG" \
+            --arg gate "$GATE_SHA" --arg tsha "$TESTS_SHA" --arg tbr "$TESTS_BRANCH" \
+            --arg scope "$scope" --argjson rerun "$rerun" --argjson runs "$runs" \
+            '{
+              schema: 1,
+              commit_sha: $sha, version: $version, certified_ref: $certified_ref, certified_workflow_blob: $blob,
+              candidate_run_id: $run, docker_publish_run_id: $publish_run,
+              digests: { backend: $backend, openscap: $openscap, scanner_adapter: $adapter },
+              scanner_adapter_decision: { decision: $adapter_decision, owner_rev: $adapter_owner, tag: $adapter_tag },
+              gate_workflow_sha: $gate,
+              tests: { sha: $tsha, branch: $tbr },
+              gate_scope: $scope,
+              rerun: $rerun,
+              contributing_runs: $runs
+            }' > record/record.json
+          cat record/record.json
+          {
+            echo "tests_sha=${TESTS_SHA}"
+            echo "gate_workflow_sha=${GATE_SHA}"
+            echo "tests_moved=${tests_moved}"
+            echo "contributing_runs=${runs}"
+            echo "rerun=${rerun}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload the record
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-candidate-record
+          path: record/record.json
+          retention-days: 90
+          if-no-files-found: error
+
   # ── the gate, exactly as release.yml runs it ─────────────────────────────────
   release-gate:
+    # The name is GATE_JOB_NAME: resolve-candidate-rerun.sh finds a run's gate
+    # jobs by it. A rerun keeps the name; only `only_jobs` narrows it.
     name: Release Gate (Full Suite)
-    needs: [resolve, preflight, bookkeeping, images]
+    needs: [resolve, preflight, bookkeeping, images, record]
     # Attempt 1 only (#3774): a re-run cannot re-create the gate's namespace.
     # `gate-rerun-refused` below turns that into a red job with the reason.
+    # A rerun of the failed groups (#6076) is a new dispatch, so attempt 1.
     if: >-
       ${{ !cancelled()
           && needs.preflight.result == 'success'
           && needs.bookkeeping.result == 'success'
           && needs.images.result == 'success'
+          && needs.record.result == 'success'
           && fromJSON(github.run_attempt) == 1 }}
     # The gate's jobs request at most contents: read and packages: read (ghcr
     # pulls); a called workflow can never hold more than its calling job grants.
@@ -794,6 +1106,11 @@ jobs:
       scanner_adapter_tag: ${{ needs.images.outputs.adapter_tag }}
       web_tag: latest
       test_suite: all
+      # One tests tree for every gate job, the one `record` names (#6076).
+      tests_sha: ${{ needs.record.outputs.tests_sha }}
+      # Empty for a full candidate. A rerun: the gate jobs and dtf-gate legs
+      # the original did not pass (artifact-keeper-test#830).
+      only_jobs: ${{ needs.resolve.outputs.rerun_jobs }}
     # Only the one secret the gate declares, not every secret this repo holds.
     secrets:
       GHCR_DOCKER_CONFIG: ${{ secrets.GHCR_DOCKER_CONFIG }}
@@ -815,7 +1132,7 @@ jobs:
   # ── certify ──────────────────────────────────────────────────────────────────
   certify:
     name: Certify the commit
-    needs: [resolve, preflight, bookkeeping, images, release-gate]
+    needs: [resolve, preflight, bookkeeping, images, record, release-gate]
     # Every gate named explicitly, `!cancelled()` rather than `always()`, so a
     # cancelled run never certifies (same reasoning as release.yml's release
     # job, #3538).
@@ -824,11 +1141,13 @@ jobs:
           && needs.preflight.result == 'success'
           && needs.bookkeeping.result == 'success'
           && needs.images.result == 'success'
+          && needs.record.result == 'success'
           && needs.release-gate.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
+      actions: read        # a rerun's coverage check lists both runs' jobs
       packages: read       # the self-verification reads the sha tags back
       id-token: write      # GitHub OIDC -> Sigstore, for actions/attest
       attestations: write  # store the certification (and read it back)
@@ -864,6 +1183,21 @@ jobs:
             scripts/ci
             .github/scripts
 
+      # A rerun's green covers the whole gate only if every gate job and leg
+      # it has also ran in the original (#6076): with tests=moved the gate may
+      # have gained a group since, which neither run would then have tested.
+      # The original's green covers everything the rerun did not run, because
+      # the rerun ran every gate job and leg the original did not pass.
+      - name: Check the rerun and its original cover the whole gate
+        if: ${{ needs.resolve.outputs.rerun_of != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RERUN_REPO: ${{ github.repository }}
+          RERUN_OF: ${{ needs.resolve.outputs.rerun_of }}
+          RERUN_SELF_RUN_ID: ${{ github.run_id }}
+          RERUN_GATE_JOB: ${{ env.GATE_JOB_NAME }}
+        run: bash scripts/ci/resolve-candidate-rerun.sh coverage
+
       # ONE predicate for all three subjects, so the verifier can require
       # that the whole image set was certified by the same run.
       - name: Write the certification predicate
@@ -873,6 +1207,11 @@ jobs:
           ADAPTER_OWNER_REV: ${{ needs.images.outputs.adapter_owner_rev }}
           ADAPTER_TAG: ${{ needs.images.outputs.adapter_tag }}
           PUBLISH_RUN_ID: ${{ needs.images.outputs.publish_run_id }}
+          GATE_WORKFLOW_SHA: ${{ needs.record.outputs.gate_workflow_sha }}
+          TESTS_SHA: ${{ needs.bookkeeping.outputs.tests_sha }}
+          TESTS_BRANCH: ${{ needs.bookkeeping.outputs.tests_branch }}
+          CONTRIBUTING_RUNS: ${{ needs.record.outputs.contributing_runs }}
+          RERUN: ${{ needs.record.outputs.rerun }}
         run: |
           set -euo pipefail
           mkdir -p certification
@@ -887,6 +1226,8 @@ jobs:
             --arg backend "$BACKEND_DIGEST" --arg openscap "$OPENSCAP_DIGEST" --arg adapter "$ADAPTER_DIGEST" \
             --arg backend_image "$BACKEND_IMAGE" --arg openscap_image "$OPENSCAP_IMAGE" --arg adapter_image "$ADAPTER_IMAGE" \
             --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg gate_sha "$GATE_WORKFLOW_SHA" --arg tests_sha "$TESTS_SHA" --arg tests_branch "$TESTS_BRANCH" \
+            --argjson runs "$CONTRIBUTING_RUNS" --argjson rerun "$RERUN" \
             '{
               commit_sha: $sha,
               version: $version,
@@ -908,6 +1249,19 @@ jobs:
               # jobs live under this run id.
               gate_run_id: $run,
               gate_workflow: "artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main",
+              # What the gate ran (#6076): the release-gate.yml commit GitHub
+              # resolved for this run, and the one tests tree every gate job
+              # checked out (the gate input tests_sha).
+              gate_workflow_sha: $gate_sha,
+              tests: { sha: $tests_sha, branch: $tests_branch },
+              # "full", or "rerun": this run ran only the gate jobs its
+              # original did not pass, and `rerun` says which, why and who.
+              gate_scope: (if $rerun == null then "full" else "rerun" end),
+              rerun: $rerun,
+              # Every run whose gate results this certification rests on,
+              # with its actor and tests ref: this run alone for a full
+              # candidate, the original and this rerun otherwise.
+              contributing_runs: $runs,
               docker_publish_run_id: $publish_run,
               scanner_adapter_version: $adapter_version,
               # The exact-version decision (#4076). On "stays" the adapter
@@ -965,6 +1319,10 @@ jobs:
       # For humans and for `gh run download`: the predicate and a one-page
       # record, named by the commit like the preflight evidence is.
       - name: Record the certification
+        env:
+          RERUN_OF: ${{ needs.resolve.outputs.rerun_of }}
+          RERUN_REASON: ${{ needs.resolve.outputs.rerun_reason }}
+          RERUN_JOBS: ${{ needs.resolve.outputs.rerun_jobs }}
         run: |
           set -euo pipefail
           {
@@ -977,6 +1335,12 @@ jobs:
             echo "scanner_adapter_digest=${ADAPTER_DIGEST}"
             echo "scanner_adapter_decision=${ADAPTER_DECISION}"
             echo "scanner_adapter_owner_rev=${ADAPTER_OWNER_REV}"
+            if [[ -n "$RERUN_OF" ]]; then
+              echo "rerun_of=${RERUN_OF}"
+              echo "rerun_actor=${GITHUB_TRIGGERING_ACTOR}"
+              echo "rerun_reason=${RERUN_REASON}"
+              echo "rerun_jobs=${RERUN_JOBS}"
+            fi
             echo "verdict=CERTIFIED"
           } > certification/certification.txt
           cat certification/certification.txt
@@ -992,12 +1356,18 @@ jobs:
       - name: Mark the commit as certified
         env:
           GH_TOKEN: ${{ github.token }}
+          RERUN_OF: ${{ needs.resolve.outputs.rerun_of }}
+          RERUN_REASON: ${{ needs.resolve.outputs.rerun_reason }}
+          RERUN_JOBS: ${{ needs.resolve.outputs.rerun_jobs }}
+          TESTS_MOVED: ${{ needs.record.outputs.tests_moved }}
         run: |
           set -euo pipefail
+          how="run ${GITHUB_RUN_ID}"
+          [[ -z "$RERUN_OF" ]] || how="run ${RERUN_OF} + rerun ${GITHUB_RUN_ID}"
           gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
             -f state=success \
             -f context=release-candidate/certified \
-            -f "description=${VERSION} passed the Release Gate (run ${GITHUB_RUN_ID})" \
+            -f "description=${VERSION} passed the Release Gate (${how})" \
             -f "target_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             --silent
           {
@@ -1011,5 +1381,11 @@ jobs:
             echo "| openscap | \`${OPENSCAP_DIGEST}\` |"
             echo "| scanner-adapter | \`${ADAPTER_DIGEST}\` (${ADAPTER_DECISION}${ADAPTER_OWNER_REV:+, published from \`${ADAPTER_OWNER_REV:0:7}\`}) |"
             echo
+            if [[ -n "$RERUN_OF" ]]; then
+              echo "**Rerun of the failed gate groups** of run [${RERUN_OF}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${RERUN_OF}) by ${GITHUB_TRIGGERING_ACTOR}: ${RERUN_REASON}"
+              echo
+              echo "Rerun here: \`${RERUN_JOBS}\`. Tests moved since the original: ${TESTS_MOVED}. The certification lists both runs."
+              echo
+            fi
             echo "Next: dispatch **Release Promote** on main with \`sha=${SHA}\`. It re-applies \`:${VERSION}\` to these digests, creates \`v${VERSION}\` last, and hands over to the release workflow."
           } >> "$GITHUB_STEP_SUMMARY"
