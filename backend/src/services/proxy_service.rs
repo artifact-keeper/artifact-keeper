@@ -7512,7 +7512,7 @@ impl ProxyService {
                 // is based on the upstream release date when known
                 // (#1771).
                 let quarantine_until = self
-                    .quarantine_until_for_new_entry(repo.id, resp.last_modified.as_deref())
+                    .quarantine_until_for_new_entry(repo, cache_path, resp.last_modified.as_deref())
                     .await;
 
                 // S3: content-addressed integrity. When `cache_path`
@@ -7922,7 +7922,7 @@ impl ProxyService {
             // Package Age Policy (#3912): the GET leader refuses a release
             // still inside the hold window with 409; so does its HEAD.
             let quarantine_until = self
-                .quarantine_until_for_new_entry(repo.id, headers.last_modified.as_deref())
+                .quarantine_until_for_new_entry(repo, cache_path, headers.last_modified.as_deref())
                 .await;
             if quarantine_until.is_some_and(|until| until > Utc::now()) {
                 return Err(AppError::Conflict(
@@ -8715,7 +8715,7 @@ impl ProxyService {
         // so the entry is cached under its hold and later requests are gated
         // by the sidecar until the window elapses or an admin releases it).
         let quarantine_until = self
-            .quarantine_until_for_new_entry(repo.id, upstream.last_modified.as_deref())
+            .quarantine_until_for_new_entry(repo, cache_path, upstream.last_modified.as_deref())
             .await;
         let hold_active = quarantine_until.is_some_and(|until| until > Utc::now());
 
@@ -11767,13 +11767,29 @@ impl ProxyService {
     /// ingestion time (#1771): an upstream release older than the configured
     /// window yields an already-elapsed hold, so old packages are not re-held
     /// from their first proxy fetch.
+    ///
+    /// A version listing (npm packument, PyPI simple page, `maven-metadata.xml`,
+    /// Cargo sparse index) is never held (#5933): upstream bumps its
+    /// `Last-Modified` on every publish, so one young release used to hold the
+    /// whole listing and every older version with it. The young version's
+    /// file is still held when it is fetched.
     async fn quarantine_until_for_new_entry(
         &self,
-        repository_id: Uuid,
+        repo: &Repository,
+        path: &str,
         last_modified: Option<&str>,
     ) -> Option<DateTime<Utc>> {
-        let config = quarantine_service::resolve_config(&self.db, repository_id).await;
+        let config = quarantine_service::resolve_config(&self.db, repo.id).await;
         if !quarantine_service::should_quarantine(&config) {
+            return None;
+        }
+        // The handlers' buffered fetches pass a Generic stand-in, so classify
+        // by the stored format.
+        let format = match self.repo_identity_by_key(&repo.key).await {
+            Some((_, format)) => format,
+            None => repo.format.clone(),
+        };
+        if cache_classifier::is_version_listing(&format, path) {
             return None;
         }
         let release = last_modified.and_then(parse_http_date);

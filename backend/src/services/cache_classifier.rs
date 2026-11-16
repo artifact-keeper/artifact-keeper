@@ -1046,6 +1046,50 @@ fn hf_revision_verdict(rev: &str) -> HfPath {
     }
 }
 
+/// Whether `path` is a package's version listing: an npm packument, a PyPI
+/// simple page, a `maven-metadata.xml` (or one of its checksums) or a Cargo
+/// sparse index file (#5933). Upstream rewrites these on every publish, so the
+/// Package Age Policy holds the files they point at, never the listing.
+/// Narrower than "not immutable": a mutable payload (a SNAPSHOT jar, a Cargo
+/// `download` redirect) is still held.
+pub fn is_version_listing(format: &RepositoryFormat, path: &str) -> bool {
+    let lower = path.trim_start_matches('/').to_ascii_lowercase();
+    match format {
+        RepositoryFormat::Npm | RepositoryFormat::Yarn | RepositoryFormat::Pnpm => {
+            !lower.is_empty() && !lower.ends_with(".tgz")
+        }
+        RepositoryFormat::Pypi | RepositoryFormat::Poetry | RepositoryFormat::Jupyter => {
+            (lower == "simple" || lower.starts_with("simple/"))
+                && !is_pypi_package_file(leaf(&lower), true)
+        }
+        RepositoryFormat::Maven | RepositoryFormat::Gradle | RepositoryFormat::Sbt => {
+            leaf(&lower).starts_with("maven-metadata.xml")
+        }
+        RepositoryFormat::Cargo => {
+            is_cargo_sparse_index_path(lower.strip_prefix("index/").unwrap_or(&lower))
+        }
+        _ => false,
+    }
+}
+
+/// `config.json` or `1/<n>`, `2/<n>`, `3/<n0>/<n>`, `<n0n1>/<n2n3>/<n>`.
+fn is_cargo_sparse_index_path(lower: &str) -> bool {
+    match lower.split('/').collect::<Vec<_>>().as_slice() {
+        ["config.json"] => true,
+        ["1", name] => name.len() == 1,
+        ["2", name] => name.len() == 2,
+        ["3", first, name] => name.len() == 3 && name.starts_with(first) && first.len() == 1,
+        [a, b, name] => {
+            a.len() == 2
+                && b.len() == 2
+                && name.len() >= 4
+                && name.get(..2) == Some(*a)
+                && name.get(2..4) == Some(*b)
+        }
+        _ => false,
+    }
+}
+
 /// The final path segment (after the last `/`), or the whole string.
 fn leaf(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
@@ -1140,6 +1184,74 @@ fn is_pypi_package_file(leaf: &str, pep658: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_listings_are_the_metadata_files_only() {
+        let listing = [
+            (RepositoryFormat::Npm, "@babel%2fcore"),
+            (RepositoryFormat::Npm, "@babel/core"),
+            (RepositoryFormat::Npm, "lodash"),
+            (RepositoryFormat::Yarn, "left-pad"),
+            (RepositoryFormat::Pypi, "simple/requests/"),
+            (RepositoryFormat::Pypi, "simple/"),
+            (RepositoryFormat::Poetry, "/simple/flask/"),
+            (
+                RepositoryFormat::Maven,
+                "org/example/app/maven-metadata.xml",
+            ),
+            (
+                RepositoryFormat::Gradle,
+                "org/example/app/maven-metadata.xml.sha1",
+            ),
+            (RepositoryFormat::Cargo, "config.json"),
+            (RepositoryFormat::Cargo, "1/a"),
+            (RepositoryFormat::Cargo, "2/io"),
+            (RepositoryFormat::Cargo, "3/s/syn"),
+            (RepositoryFormat::Cargo, "se/rd/serde"),
+            (RepositoryFormat::Cargo, "index/to/ki/tokio"),
+        ];
+        for (format, path) in listing {
+            assert!(is_version_listing(&format, path), "{format:?} {path}");
+        }
+        let payload = [
+            (RepositoryFormat::Npm, "lodash/-/lodash-4.17.21.tgz"),
+            (RepositoryFormat::Npm, "@babel/core/-/core-8.0.0.tgz"),
+            (RepositoryFormat::Npm, ""),
+            (
+                RepositoryFormat::Pypi,
+                "packages/ab/cd/requests-2.32.0.tar.gz",
+            ),
+            (
+                RepositoryFormat::Pypi,
+                "simple/requests/requests-2.32.0-py3-none-any.whl",
+            ),
+            (
+                RepositoryFormat::Pypi,
+                "simple/requests/requests-2.32.0-py3-none-any.whl.metadata",
+            ),
+            (RepositoryFormat::Maven, "org/example/app/1.0/app-1.0.jar"),
+            (
+                RepositoryFormat::Maven,
+                "org/example/app/1.0-SNAPSHOT/app-1.0-SNAPSHOT.jar",
+            ),
+            (
+                RepositoryFormat::Cargo,
+                "api/v1/crates/serde/1.0.0/download",
+            ),
+            (RepositoryFormat::Cargo, "crates/serde/serde-1.0.0.crate"),
+            (RepositoryFormat::Cargo, "se/rd/tokio"),
+            (RepositoryFormat::Cargo, "3/t/syn"),
+            (RepositoryFormat::Bower, "jquery"),
+            (RepositoryFormat::Generic, "pkg/listing"),
+            (
+                RepositoryFormat::Docker,
+                "v2/library/alpine/manifests/latest",
+            ),
+        ];
+        for (format, path) in payload {
+            assert!(!is_version_listing(&format, path), "{format:?} {path}");
+        }
+    }
     use chrono::Duration;
 
     // ----- is_explicitly_mutable_index(): release-immutability oracle ------

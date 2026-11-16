@@ -14394,6 +14394,127 @@ mod tests {
         cleanup().await;
     }
 
+    /// #5933: with the Package Age Policy on, a packument whose upstream
+    /// `Last-Modified` falls inside the window is served (the older version
+    /// stays installable), while the young version's tarball is still held.
+    #[tokio::test]
+    async fn test_age_policy_holds_the_young_tarball_not_the_packument_5933_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        let released_now = chrono::Utc::now()
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        let packument = serde_json::json!({
+            "name": "agepkg",
+            "dist-tags": {"latest": "2.0.0"},
+            "versions": {
+                "1.0.0": {"name": "agepkg", "version": "1.0.0", "dist": {
+                    "tarball": format!("{}/agepkg/-/agepkg-1.0.0.tgz", upstream.uri())}},
+                "2.0.0": {"name": "agepkg", "version": "2.0.0", "dist": {
+                    "tarball": format!("{}/agepkg/-/agepkg-2.0.0.tgz", upstream.uri())}},
+            },
+            "time": {"1.0.0": "2015-10-21T07:28:00.000Z", "2.0.0": "2026-11-16T00:00:00.000Z"}
+        });
+        Mock::given(method("GET"))
+            .and(path("/agepkg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("last-modified", released_now.as_str())
+                    .set_body_json(&packument),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/agepkg/-/agepkg-2.0.0.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .insert_header("last-modified", released_now.as_str())
+                    .set_body_bytes(b"young-tarball".as_ref()),
+            )
+            .mount(&upstream)
+            .await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("point the remote at wiremock");
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'quarantine_enabled', 'true'), \
+                    ($1, 'quarantine_duration_minutes', '1440')",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("enable the Package Age Policy");
+        crate::services::quarantine_service::invalidate_config_cache(fx.repo_id);
+
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage, proxy);
+        let auth = tdh::admin_auth_ext();
+
+        let listing = super::get_package_metadata(
+            &state,
+            auth.as_ref(),
+            &fx.repo_key,
+            "agepkg",
+            "http://localhost",
+            false,
+        )
+        .await;
+        let tarball = super::download_tarball(
+            axum::extract::State(state.clone()),
+            axum::Extension(auth.clone()),
+            axum::extract::Path((
+                fx.repo_key.clone(),
+                "agepkg".to_string(),
+                "agepkg-2.0.0.tgz".to_string(),
+            )),
+            Default::default(),
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        crate::services::quarantine_service::invalidate_config_cache(fx.repo_id);
+        tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        let listing = match listing {
+            Ok(r) => r,
+            Err(r) => panic!(
+                "a packument with a young release must not be held, got {}",
+                r.status()
+            ),
+        };
+        assert_eq!(listing.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(listing.into_body(), 1 << 20)
+            .await
+            .expect("read packument");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("parse packument");
+        assert!(json["versions"].get("1.0.0").is_some(), "{json}");
+        let status = match tarball {
+            Ok(r) => r.status(),
+            Err(r) => r.status(),
+        };
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "the young version's tarball stays held"
+        );
+    }
+
     /// GHSA-qxv7-p3mq-88fv: a remote npm tarball whose bytes disagree with
     /// the packument's `dist.integrity` must be SERVED (the client verifies
     /// the SRI itself) but NEVER CACHED — a second pull refetches upstream
