@@ -111,6 +111,22 @@ permissions: {}
 # - The group is keyed by `event_name` + `ref` so push and workflow_dispatch
 #   for the same branch are in DIFFERENT groups. A manual run (`workflow_dispatch`)
 #   never gets cancelled by an auto run, and vice versa.
+# - A BRANCH PUSH is additionally keyed by its commit (#6080): every pushed
+#   commit is a group of its own. GitHub keeps only ONE pending run per group
+#   and a newer one REPLACES it, so in a per-ref group a merge landing while
+#   the previous commit's run was still waiting cancelled that run outright
+#   (zero jobs, no `sha-<sha>` images). When that commit was a Release
+#   Candidate the candidate died with it (57a8ac57, 2026-11-10), which is why
+#   every cut needed a merge freeze on main; and a run stuck queued with no
+#   runner held the group for every later commit (ea9425b6, 75 min). Per
+#   commit, neither can happen. The order the per-ref queue used to impose on
+#   the branch's floating tags (`:main`, `:dev`, `:X.Y-dev`) is kept by
+#   scripts/ci/decide-branch-floating-tags.sh in each merge job instead: a run
+#   whose commit is older than the one those tags already name publishes its
+#   `sha-<sha>` tag and leaves them alone. Tag pushes, dispatches (the
+#   promote) and the schedule keep their per-ref groups.
+#   .github/workflows/docker-publish-watchdog.yml cancels, loudly, any run
+#   that is still queued with no runner after 30 minutes.
 # - `cancel-in-progress` is ALWAYS false. Runs queue behind each other and
 #   every one of them finishes.
 #
@@ -135,7 +151,7 @@ permissions: {}
 # those minutes by gambling that the *next* run completes — and when merges
 # arrive faster than the amd64 build takes, that gamble loses every time.
 concurrency:
-  group: docker-publish-${{ github.event_name }}-${{ github.ref }}
+  group: docker-publish-${{ github.event_name }}-${{ github.ref }}${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')) && format('-{0}', github.sha) || '' }}
   cancel-in-progress: false
 
 env:
@@ -1464,6 +1480,20 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # BRANCH FLOATING TAGS STAY MONOTONIC (#6080). Push runs no longer
+      # queue per branch, so an older commit's run can finish after a newer
+      # one's. This reads the commit `:dev` / `:X.Y-dev` already names for
+      # this image; when that commit is NEWER than this one, the branch tags
+      # are left off the tag sets below and only `sha-<sha>` is published.
+      # Any doubt means "move", which is the behaviour before the guard.
+      - name: Decide whether this run may move the branch floating tags
+        id: floating
+        if: ${{ env.PROMOTE_VERSION == '' && startsWith(github.ref, 'refs/heads/') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci/decide-branch-floating-tags.sh "${{ env.BACKEND_IMAGE }}"
+
       - name: Extract metadata (ghcr.io)
         id: meta
         if: ${{ env.PROMOTE_VERSION == '' }}
@@ -1471,12 +1501,12 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
           tags: |
-            type=ref,event=branch
+            type=ref,event=branch,enable=${{ steps.floating.outputs.move != 'false' }}
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=sha
-            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') && steps.floating.outputs.move != 'false' }}
+            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' && steps.floating.outputs.move != 'false' }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       - name: Extract metadata (Docker Hub)
@@ -1486,12 +1516,12 @@ jobs:
         with:
           images: docker.io/${{ env.DOCKERHUB_BACKEND }}
           tags: |
-            type=ref,event=branch
+            type=ref,event=branch,enable=${{ steps.floating.outputs.move != 'false' }}
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=sha
-            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') && steps.floating.outputs.move != 'false' }}
+            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' && steps.floating.outputs.move != 'false' }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       # Resolve, for BOTH modes, the full ghcr + Docker Hub tag sets and the
@@ -1871,6 +1901,20 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # BRANCH FLOATING TAGS STAY MONOTONIC (#6080). Push runs no longer
+      # queue per branch, so an older commit's run can finish after a newer
+      # one's. This reads the commit `:dev` / `:X.Y-dev` already names for
+      # this image; when that commit is NEWER than this one, the branch tags
+      # are left off the tag sets below and only `sha-<sha>` is published.
+      # Any doubt means "move", which is the behaviour before the guard.
+      - name: Decide whether this run may move the branch floating tags
+        id: floating
+        if: ${{ env.PROMOTE_VERSION == '' && startsWith(github.ref, 'refs/heads/') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci/decide-branch-floating-tags.sh "${{ env.OPENSCAP_IMAGE }}"
+
       - name: Extract metadata (ghcr.io)
         id: meta
         if: ${{ env.PROMOTE_VERSION == '' }}
@@ -1878,12 +1922,12 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}
           tags: |
-            type=ref,event=branch
+            type=ref,event=branch,enable=${{ steps.floating.outputs.move != 'false' }}
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=sha
-            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') && steps.floating.outputs.move != 'false' }}
+            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' && steps.floating.outputs.move != 'false' }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       - name: Extract metadata (Docker Hub)
@@ -1893,12 +1937,12 @@ jobs:
         with:
           images: docker.io/${{ env.DOCKERHUB_OPENSCAP }}
           tags: |
-            type=ref,event=branch
+            type=ref,event=branch,enable=${{ steps.floating.outputs.move != 'false' }}
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=sha
-            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') && steps.floating.outputs.move != 'false' }}
+            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' && steps.floating.outputs.move != 'false' }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       # See merge-backend for the full rationale of the plan/anchor/guard/apply/
@@ -2277,6 +2321,20 @@ jobs:
           echo "Keeping the exact ${ADAPTER_VERSION} tag on its published digest; this rebuild publishes sha tags only. The floating tags name the published ${ADAPTER_VERSION} digest and move only through the post-gate promotion (#3770)."
           finish
 
+      # BRANCH FLOATING TAGS STAY MONOTONIC (#6080). Push runs no longer
+      # queue per branch, so an older commit's run can finish after a newer
+      # one's. This reads the commit `:dev` / `:X.Y-dev` already names for
+      # this image; when that commit is NEWER than this one, the branch tags
+      # are left off the tag sets below and only `sha-<sha>` is published.
+      # Any doubt means "move", which is the behaviour before the guard.
+      - name: Decide whether this run may move the branch floating tags
+        id: floating
+        if: ${{ env.PROMOTE_VERSION == '' && startsWith(github.ref, 'refs/heads/') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci/decide-branch-floating-tags.sh "${{ env.SCANNER_ADAPTER_IMAGE }}"
+
       - name: Extract metadata (ghcr.io)
         id: meta
         if: ${{ env.PROMOTE_VERSION == '' }}
@@ -2292,8 +2350,8 @@ jobs:
           tags: |
             type=raw,value=${{ steps.adapter_version.outputs.version }},enable=${{ steps.adapter_publish.outputs.publish_exact == 'true' }}
             type=sha
-            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') && steps.floating.outputs.move != 'false' }}
+            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' && steps.floating.outputs.move != 'false' }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       - name: Extract metadata (Docker Hub)
@@ -2308,8 +2366,8 @@ jobs:
           tags: |
             type=raw,value=${{ steps.adapter_version.outputs.version }},enable=${{ steps.adapter_publish.outputs.publish_exact == 'true' }}
             type=sha
-            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') && steps.floating.outputs.move != 'false' }}
+            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' && steps.floating.outputs.move != 'false' }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       - name: Create manifest list and push (ghcr.io)

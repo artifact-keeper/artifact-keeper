@@ -1715,6 +1715,16 @@ jobs:
           bash scripts/ci/test-nightly-gate-sentinel.sh
           bash scripts/ci/test-nightly-gate-report.sh
 
+      # #6080: no merge freeze during a candidate. The stale-run finder
+      # cancels only runs that are queued with no runner past its threshold,
+      # never a moving one; the floating-tag guard withholds :dev / :X.Y-dev
+      # only from a run whose commit is provably older than the one they
+      # name. Stubs `gh`; offline.
+      - name: Check the stale Docker Publish run finder
+        run: bash scripts/ci/test-find-stale-docker-publish-runs.sh
+      - name: Check the branch floating-tag guard
+        run: bash scripts/ci/test-decide-branch-floating-tags.sh
+
       # The other half of #3640: when the accepted run is a promote dispatch,
       # the published bytes were built from a DIFFERENT commit than the tag,
       # and adoption must be verified against the image's actual input set --
