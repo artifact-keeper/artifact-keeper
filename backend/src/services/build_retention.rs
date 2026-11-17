@@ -15,7 +15,7 @@
 //! one replica at a time under a scheduler lease, oldest first in batches of
 //! [`BUILD_RETENTION_BATCH_SIZE`], one summary log line per pass
 
-use sqlx::{PgConnection, PgExecutor};
+use sqlx::{PgConnection, PgExecutor, PgPool};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{AppError, Result};
@@ -142,6 +142,50 @@ pub async fn apply_retention(
         }
     }
     Ok(report)
+}
+
+/// One scheduled pass under `policy`: take the scheduler lease, apply the
+/// policy while the lease is renewed, record and log the result. `None` when
+/// another replica holds the lease
+pub async fn run_pass(
+    db: &PgPool,
+    policy: BuildRetentionPolicy,
+) -> Result<Option<BuildRetentionReport>> {
+    let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+        db,
+        BUILD_RETENTION_LEASE_NAME,
+        BUILD_RETENTION_LEASE_TTL_SECS,
+    )
+    .await
+    else {
+        tracing::debug!("Another replica owns the build retention lease");
+        return Ok(None);
+    };
+    let (renewal, lost) =
+        lease.spawn_renewal_with_cancellation(db.clone(), BUILD_RETENTION_LEASE_TTL_SECS);
+    let result = match db.acquire().await {
+        Ok(mut conn) => {
+            apply_retention(&mut conn, policy, BUILD_RETENTION_BATCH_SIZE, Some(&lost)).await
+        }
+        Err(e) => Err(AppError::Database(e.to_string())),
+    };
+    drop(renewal);
+    lease.release(db).await;
+    let report = result?;
+    crate::services::metrics_service::record_cleanup(
+        "builds",
+        report.deleted_by_age + report.deleted_by_count,
+    );
+    tracing::info!(
+        retention_days = policy.days,
+        keep_last = policy.keep_last,
+        deleted_by_age = report.deleted_by_age,
+        deleted_by_count = report.deleted_by_count,
+        batches = report.batches,
+        interrupted = report.interrupted,
+        "Build retention pass"
+    );
+    Ok(Some(report))
 }
 
 /// The startup line stating the limits in force
@@ -411,5 +455,56 @@ mod tests {
         assert!(configured_policy(&mut *pool).await.expect("read").is_off());
 
         tx.rollback().await.expect("rollback");
+    }
+
+    /// A scheduled pass deletes what the policy matches and releases its
+    /// lease, and skips while another replica holds the lease
+    #[tokio::test]
+    async fn run_pass_applies_under_the_lease_and_skips_a_held_one() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // The pass is instance-wide, so the policy only matches builds older
+        // than 100 years, which no other test seeds
+        let policy = BuildRetentionPolicy {
+            days: Some(36500),
+            keep_last: None,
+        };
+        let p = format!("ph-618-ret-pass-{}", Uuid::new_v4());
+        let mut conn = pool.acquire().await.expect("conn");
+        seed(&mut conn, &p, 1, "success", 40000).await;
+        seed(&mut conn, &p, 2, "success", 0).await;
+
+        let other = crate::services::cluster_work::try_acquire_scheduler_lease(
+            &pool,
+            BUILD_RETENTION_LEASE_NAME,
+            &format!("other-replica-{p}"),
+            60.0,
+        )
+        .await
+        .expect("claim")
+        .expect("lease free");
+        assert_eq!(run_pass(&pool, policy).await.expect("held"), None);
+        assert_eq!(
+            surviving(&mut conn, &p).await,
+            [(p.clone(), 1), (p.clone(), 2)]
+        );
+        other.release(&pool).await;
+
+        let report = run_pass(&pool, policy)
+            .await
+            .expect("pass")
+            .expect("lease taken");
+        assert!(report.deleted_by_age >= 1, "{report:?}");
+        assert!(!report.interrupted, "{report:?}");
+        assert_eq!(surviving(&mut conn, &p).await, [(p.clone(), 2)]);
+        // released, so the next pass takes it again
+        assert!(run_pass(&pool, policy).await.expect("again").is_some());
+
+        sqlx::query("DELETE FROM builds WHERE name = $1")
+            .bind(&p)
+            .execute(&mut *conn)
+            .await
+            .expect("cleanup");
     }
 }

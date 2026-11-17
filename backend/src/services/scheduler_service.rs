@@ -1183,63 +1183,17 @@ pub fn spawn_all(
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
-                let policy = match retention::configured_policy(&db).await {
+                match retention::configured_policy(&db).await {
                     Ok(policy) if policy.is_off() => {
-                        tracing::debug!("Build retention is off, skipping");
-                        continue;
+                        tracing::debug!("Build retention is off, skipping")
                     }
-                    Ok(policy) => policy,
-                    Err(e) => {
-                        tracing::warn!("Build retention: could not read the settings: {}", e);
-                        continue;
+                    Ok(policy) => {
+                        if let Err(e) = retention::run_pass(&db, policy).await {
+                            tracing::warn!("Build retention pass failed: {}", e);
+                        }
                     }
-                };
-                let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
-                    &db,
-                    retention::BUILD_RETENTION_LEASE_NAME,
-                    retention::BUILD_RETENTION_LEASE_TTL_SECS,
-                )
-                .await
-                else {
-                    tracing::debug!("Another replica owns the build retention lease");
-                    continue;
-                };
-                let (renewal, lost) = lease.spawn_renewal_with_cancellation(
-                    db.clone(),
-                    retention::BUILD_RETENTION_LEASE_TTL_SECS,
-                );
-                let result = match db.acquire().await {
-                    Ok(mut conn) => {
-                        retention::apply_retention(
-                            &mut conn,
-                            policy,
-                            retention::BUILD_RETENTION_BATCH_SIZE,
-                            Some(&lost),
-                        )
-                        .await
-                    }
-                    Err(e) => Err(crate::error::AppError::Database(e.to_string())),
-                };
-                match result {
-                    Ok(r) => {
-                        crate::services::metrics_service::record_cleanup(
-                            "builds",
-                            r.deleted_by_age + r.deleted_by_count,
-                        );
-                        tracing::info!(
-                            retention_days = policy.days,
-                            keep_last = policy.keep_last,
-                            deleted_by_age = r.deleted_by_age,
-                            deleted_by_count = r.deleted_by_count,
-                            batches = r.batches,
-                            interrupted = r.interrupted,
-                            "Build retention pass"
-                        )
-                    }
-                    Err(e) => tracing::warn!("Build retention pass failed: {}", e),
+                    Err(e) => tracing::warn!("Build retention: could not read the settings: {}", e),
                 }
-                drop(renewal);
-                lease.release(&db).await;
             }
         });
     }
