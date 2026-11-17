@@ -7830,6 +7830,73 @@ mod tests {
         assert_eq!(held.as_deref(), Some("quarantined"));
     }
 
+    /// #5188: a chunked re-upload with new bytes to a mutable repository
+    /// replaces the artifact under a new id, so an approval recorded for the
+    /// old bytes does not carry over and no SHA-1/MD5 of the old bytes is left
+    /// describing the new ones. The same bytes again keep the id.
+    #[tokio::test]
+    async fn chunked_overwrite_on_mutable_repo_gets_a_new_id_5188() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET allow_overwrite = true WHERE id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let path = "snap/thing-1.0.bin";
+        let row = || async {
+            sqlx::query_as::<_, (Uuid, Option<String>, Option<String>)>(
+                "SELECT id, checksum_sha1, checksum_md5 FROM artifacts \
+                 WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(f.repo_id)
+            .bind(path)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap()
+        };
+
+        let (s1, b1) = f
+            .chunked_upload(path, b"build one", serde_json::json!({}), false)
+            .await;
+        assert_eq!(s1, StatusCode::OK, "{}", String::from_utf8_lossy(&b1));
+        let (first_id, _, _) = row().await;
+        // Digests recorded for build one (as a whole-body upload stores them).
+        sqlx::query(
+            "UPDATE artifacts SET checksum_sha1 = repeat('a', 40), checksum_md5 = repeat('b', 32) \
+             WHERE id = $1",
+        )
+        .bind(first_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let (same, _) = f
+            .chunked_upload(path, b"build one", serde_json::json!({}), false)
+            .await;
+        let after_same = row().await;
+
+        let (s2, b2) = f
+            .chunked_upload(path, b"build two", serde_json::json!({}), false)
+            .await;
+        let (new_id, sha1, md5) = row().await;
+        f.teardown().await;
+
+        assert_eq!(same, StatusCode::OK);
+        assert_eq!(
+            after_same,
+            (first_id, Some("a".repeat(40)), Some("b".repeat(32))),
+            "identical bytes keep the id and their digests"
+        );
+        assert_eq!(s2, StatusCode::OK, "{}", String::from_utf8_lossy(&b2));
+        assert_ne!(new_id, first_id, "new bytes must get a new artifact id");
+        assert_eq!(
+            (sha1, md5),
+            (None, None),
+            "no digest of the old bytes survives"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // #5455: the replication header is not a peer identity (chunked path)
     // -----------------------------------------------------------------------

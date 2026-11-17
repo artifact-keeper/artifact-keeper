@@ -38,7 +38,7 @@ pub const SECRET_EGRESS_PROXY: &str = "egress_proxy";
 const IMMUTABLE_FIELDS: [&str; 3] = ["format", "format_key", "repo_type"];
 
 /// Fields `apply` writes through `PATCH /api/v1/repositories/{key}`.
-const PATCH_FIELDS: [&str; 13] = [
+const PATCH_FIELDS: [&str; 14] = [
     "name",
     "description",
     "visibility",
@@ -48,6 +48,7 @@ const PATCH_FIELDS: [&str; 13] = [
     "quota_bytes",
     "promotion_only",
     "versioning_enabled",
+    "mutable",
     "custom_user_agent",
     "curation_enabled",
     "curation_default_action",
@@ -119,6 +120,10 @@ pub struct ConfigRepository {
     pub promotion_only: bool,
     #[serde(default)]
     pub versioning_enabled: bool,
+    /// Re-uploading an existing path replaces it instead of answering 409
+    /// (#5188). Same name as the repositories API field.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mutable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_user_agent: Option<String>,
     #[serde(default)]
@@ -628,6 +633,7 @@ pub fn create_body(
     for (field, value) in [
         ("promotion_only", desired.promotion_only),
         ("versioning_enabled", desired.versioning_enabled),
+        ("mutable", desired.mutable),
         (
             "allow_public_with_upstream_credentials",
             desired.allow_public_with_upstream_credentials,
@@ -690,6 +696,7 @@ pub fn patch_body(
     for (field, value) in [
         ("promotion_only", desired.promotion_only),
         ("versioning_enabled", desired.versioning_enabled),
+        ("mutable", desired.mutable),
         ("curation_enabled", desired.curation_enabled),
     ] {
         if changed(field) {
@@ -1037,6 +1044,41 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// #5188: repository mutability round-trips through the document under
+    /// its API name: absent reads as immutable, a change is planned and
+    /// written by `PATCH` both ways, and a create carries it when set.
+    #[test]
+    fn mutable_flag_is_planned_patched_and_created() {
+        let current: ConfigRepository = serde_json::from_value(serde_json::json!({
+            "key": "pypi-dev", "name": "pypi-dev", "format": "pypi",
+            "repo_type": "local", "visibility": "private",
+        }))
+        .expect("fixture");
+        assert!(!current.mutable);
+        assert!(!serde_json::to_string(&current).unwrap().contains("mutable"));
+        let mut desired = current.clone();
+        desired.mutable = true;
+
+        let changes: BTreeSet<String> = changed_fields(&desired, &current).into_iter().collect();
+        assert_eq!(changes, keys(&["mutable"]));
+        let patch = patch_body(&desired, &changes, &BTreeMap::new())
+            .unwrap()
+            .expect("a PATCH");
+        assert_eq!(patch["mutable"], true);
+        let back = patch_body(&current, &changes, &BTreeMap::new())
+            .unwrap()
+            .expect("a PATCH");
+        assert_eq!(back["mutable"], false);
+        assert_eq!(
+            create_body(&desired, &BTreeMap::new()).unwrap()["mutable"],
+            true
+        );
+        assert!(create_body(&current, &BTreeMap::new())
+            .unwrap()
+            .get("mutable")
+            .is_none());
     }
 
     /// #5207: the curation source round-trips through the document. It is

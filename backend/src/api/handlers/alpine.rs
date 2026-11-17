@@ -2098,23 +2098,13 @@ async fn store_apk(
     .await
     .map_err(crate::api::handlers::db_err)?;
 
-    if existing.is_some() {
-        if !repo.allow_overwrite {
-            return Err((StatusCode::CONFLICT, "Package already exists").into_response());
-        }
-        // Mutable repo (#5188): drop the live row so the INSERT below replaces
-        // it instead of colliding on UNIQUE(repository_id, path). The APK
-        // storage key is path-addressed, so the stored bytes are overwritten in
-        // place by the `storage.put` below — no orphan to collect.
-        sqlx::query(
-            "DELETE FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
-        )
-        .bind(repo.id)
-        .bind(&artifact_path)
-        .execute(&state.db)
-        .await
-        .map_err(crate::api::handlers::db_err)?;
+    if existing.is_some() && !repo.allow_overwrite {
+        return Err((StatusCode::CONFLICT, "Package already exists").into_response());
     }
+    // #5188: a mutable repository replaces the live row. It is retired in the
+    // publish transaction below, never before, so a failure on quota, storage
+    // or the INSERT leaves the old package and its scan / approval state.
+    let replacing = existing.is_some();
 
     // Refuse an over-quota upload before a soft-deleted row at this path is
     // purged (#4422).
@@ -2129,7 +2119,13 @@ async fn store_apk(
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
     // Store the file
-    let storage_key = build_alpine_storage_key(repo.id, &artifact_path);
+    // A replacement never writes the key the live row still serves.
+    let storage_key = match build_alpine_storage_key(repo.id, &artifact_path) {
+        key if replacing => {
+            crate::services::artifact_service::overwrite_storage_key(&key, &computed_sha256)
+        }
+        key => key,
+    };
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
@@ -2148,6 +2144,20 @@ async fn store_apk(
         size_bytes,
     )
     .await?;
+    let retired = if replacing {
+        crate::services::artifact_service::retire_overwritten_artifact(
+            &mut tx,
+            repo.id,
+            &repo.storage_location(),
+            &artifact_path,
+            None,
+            &storage_key,
+        )
+        .await
+        .map_err(|e| e.into_response())?
+    } else {
+        None
+    };
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -2171,6 +2181,10 @@ async fn store_apk(
     .await
     .map_err(crate::api::handlers::db_err)?;
     tx.commit().await.map_err(crate::api::handlers::db_err)?;
+    crate::services::artifact_service::forget_retired_artifact(
+        state.search_service.as_ref(),
+        retired.as_ref(),
+    );
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
@@ -5268,9 +5282,9 @@ mod db_cov_tests {
     }
 
     /// #5188: re-uploading an occupied .apk path is a 409 by default, and once
-    /// the repository is mutable the re-upload replaces the stored package.
-    /// The path-addressed APK key means the bytes are overwritten in place and
-    /// the superseded row is dropped, so exactly one live row remains.
+    /// the repository is mutable the re-upload replaces the stored package
+    /// under a new artifact id, so exactly one live row remains and the old
+    /// object is handed to storage GC.
     #[tokio::test]
     async fn test_apk_reupload_conflicts_unless_repo_allows_overwrite() {
         let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
@@ -5329,18 +5343,116 @@ mod db_cov_tests {
         .await
         .expect("live rows");
         assert_eq!(live.len(), 1, "a mutable overwrite must leave one live row");
-        assert_ne!(live[0], first_id, "the superseded row must have been removed");
+        assert_ne!(
+            live[0], first_id,
+            "the superseded row must have been removed"
+        );
 
         // The stored bytes are the replacement.
         let stored = tokio::fs::read(stored_package_path(&fx).await)
             .await
             .expect("read stored bytes");
+        let journaled: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_gc_candidates WHERE source_repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("gc candidates");
+        let _ = sqlx::query("DELETE FROM oci_gc_candidates WHERE source_repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
         fx.teardown().await;
         assert_eq!(
             stored,
             super::MARKER_APK,
             "the stored package must be the replacement, not the original"
         );
+        assert_eq!(
+            journaled, 1,
+            "the replaced object must be handed to storage GC"
+        );
+    }
+
+    /// #5188: a mutable re-upload that fails (here on the repository quota)
+    /// leaves the old package exactly as it was: same row id, same bytes, and
+    /// the scan result recorded for it. The live row is only retired inside
+    /// the publish transaction, and the replacement never writes the key the
+    /// live row serves.
+    #[tokio::test]
+    async fn test_apk_mutable_reupload_failing_on_quota_keeps_old_package() {
+        let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET allow_overwrite = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set allow_overwrite");
+        let path = format!("/{}/v3.21/main/aarch64/dtf-marker-1.0-r0.apk", fx.repo_key);
+        let put = |bytes: &'static [u8]| {
+            tdh::send(
+                fx.router_with_auth(super::router()),
+                tdh::put(path.clone(), bytes::Bytes::from_static(bytes)),
+            )
+        };
+
+        let original: &'static [u8] = &[7u8; 64];
+        let (first, _) = put(original).await;
+        assert_eq!(first, axum::http::StatusCode::CREATED);
+        let first_id: uuid::Uuid = sqlx::query_scalar(
+            "SELECT id FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("first row");
+        sqlx::query(
+            "INSERT INTO scan_results (id, artifact_id, repository_id, scan_type, status, \
+             findings_count, started_at, completed_at) \
+             VALUES ($1, $2, $3, 'dependency', 'completed', 0, NOW(), NOW())",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(first_id)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed scan");
+
+        // Room for the original, not for the replacement.
+        sqlx::query("UPDATE repositories SET quota_bytes = 1024 WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set quota");
+        let (replaced, _) = put(&[9u8; 4096]).await;
+
+        let live: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("live rows");
+        let scans: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM scan_results WHERE artifact_id = $1")
+                .bind(first_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("scans");
+        let stored = tokio::fs::read(stored_package_path(&fx).await)
+            .await
+            .expect("read stored bytes");
+        fx.teardown().await;
+
+        assert!(
+            replaced.is_client_error(),
+            "an over-quota replacement must be refused, got {replaced}"
+        );
+        assert_eq!(live, vec![first_id], "the old package must survive");
+        assert_eq!(scans, 1, "the old package's scan result must survive");
+        assert_eq!(stored, original, "the old package's bytes must survive");
     }
 }
 

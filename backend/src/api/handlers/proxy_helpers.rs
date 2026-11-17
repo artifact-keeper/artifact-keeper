@@ -9633,11 +9633,47 @@ pub struct NewArtifact<'a> {
 /// 500 "Database error" response.
 #[allow(clippy::result_large_err)]
 pub async fn insert_artifact(db: &PgPool, art: NewArtifact<'_>) -> Result<Uuid, Response> {
+    insert_artifact_replacing(db, art, None)
+        .await
+        .map(|(id, _)| id)
+}
+
+/// [`insert_artifact`] for a mutable-repository overwrite (#5188). With
+/// `replace` set (the repository's storage location), the row at the path is
+/// retired in the same transaction as the quota admission and the INSERT, so
+/// the replacement gets a new id and a failed publish leaves the old row (and
+/// everything recorded against it) in place. Returns the retired row so the
+/// caller can drop it from the search index once committed.
+#[allow(clippy::result_large_err)]
+pub async fn insert_artifact_replacing(
+    db: &PgPool,
+    art: NewArtifact<'_>,
+    replace: Option<&crate::storage::StorageLocation>,
+) -> Result<
+    (
+        Uuid,
+        Option<crate::services::artifact_service::RetiredArtifact>,
+    ),
+    Response,
+> {
     let repository_id = art.repository_id;
 
     let mut tx =
         super::publish_quota::begin_admitted_publish(db, repository_id, art.path, art.size_bytes)
             .await?;
+    let retired = match replace {
+        Some(location) => crate::services::artifact_service::retire_overwritten_artifact(
+            &mut tx,
+            repository_id,
+            location,
+            art.path,
+            None,
+            art.storage_key,
+        )
+        .await
+        .map_err(IntoResponse::into_response)?,
+        None => None,
+    };
     let id = insert_artifact_row(&mut tx, art).await?;
     tx.commit()
         .await
@@ -9650,7 +9686,7 @@ pub async fn insert_artifact(db: &PgPool, art: NewArtifact<'_>) -> Result<Uuid, 
     // double-held. Best-effort: never fails the insert.
     crate::services::quarantine_service::apply_upload_hold_hosted(db, repository_id, id).await;
 
-    Ok(id)
+    Ok((id, retired))
 }
 
 /// Insert a row into `artifacts` on a caller-supplied connection or
@@ -9707,18 +9743,20 @@ pub async fn ensure_unique_artifact_path(
     artifact_path: &str,
     conflict_message: &str,
 ) -> Result<(), Response> {
-    ensure_unique_artifact_path_mutable(db, repo_id, artifact_path, conflict_message, false).await
+    ensure_unique_artifact_path_mutable(db, repo_id, artifact_path, conflict_message, false)
+        .await
+        .map(|_| ())
 }
 
 /// [`ensure_unique_artifact_path`] for file-drop formats that carry their own
-/// publish-time 409 (Debian/RPM/Alpine/Pacman). When `allow_overwrite` is true
-/// the path's live row is treated as replaceable: the duplicate 409 is skipped
-/// and the existing live row is removed so the caller's INSERT does not trip the
-/// `UNIQUE(repository_id, path)` constraint and replaces the content at the path
-/// (#5188). These formats key storage by path (alpine/pacman) or content-address
-/// with an `ON CONFLICT DO UPDATE` upsert (rpm), so the prior object is either
-/// overwritten in place or handed to storage GC's candidate sweep. Default
-/// `false` keeps every other caller write-once.
+/// publish-time 409 (RPM, Pacman). On a mutable repository (#5188,
+/// `allow_overwrite`) a live row at the path is not a conflict: `Ok(true)`
+/// tells the caller it is replacing one. Nothing is removed here. The caller
+/// retires the live row inside its publish transaction
+/// ([`insert_artifact_replacing`] /
+/// [`retire_overwritten_artifact`](crate::services::artifact_service::retire_overwritten_artifact)),
+/// so a publish that fails on quota, storage or the INSERT leaves the old
+/// package, its scan results and its approvals untouched.
 #[allow(clippy::result_large_err)]
 pub async fn ensure_unique_artifact_path_mutable(
     db: &PgPool,
@@ -9726,7 +9764,7 @@ pub async fn ensure_unique_artifact_path_mutable(
     artifact_path: &str,
     conflict_message: &str,
     allow_overwrite: bool,
-) -> Result<(), Response> {
+) -> Result<bool, Response> {
     let existing: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
     )
@@ -9736,24 +9774,12 @@ pub async fn ensure_unique_artifact_path_mutable(
     .await
     .map_err(|e| internal_error("Database", e))?;
 
-    if existing.is_some() {
-        if !allow_overwrite {
-            return Err((StatusCode::CONFLICT, conflict_message.to_string()).into_response());
-        }
-        // Mutable repo: drop the live row so the re-upload's INSERT replaces it
-        // instead of colliding on UNIQUE(repository_id, path).
-        sqlx::query(
-            "DELETE FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
-        )
-        .bind(repo_id)
-        .bind(artifact_path)
-        .execute(db)
-        .await
-        .map_err(|e| internal_error("Database", e))?;
+    if existing.is_some() && !allow_overwrite {
+        return Err((StatusCode::CONFLICT, conflict_message.to_string()).into_response());
     }
 
     super::cleanup_soft_deleted_artifact(db, repo_id, artifact_path).await;
-    Ok(())
+    Ok(existing.is_some())
 }
 
 /// Upsert format-specific metadata for a freshly-uploaded artifact and bump
@@ -22420,10 +22446,11 @@ mod tests {
     }
 
     // #5188: a mutable (allow_overwrite) file-drop repo must NOT 409 on a
-    // re-upload to an occupied path, and must drop the live row so the
-    // caller's INSERT replaces it instead of colliding on UNIQUE(path).
+    // re-upload to an occupied path, and must NOT remove the live row either:
+    // the caller retires it inside its publish transaction, so a publish that
+    // fails afterwards leaves the old package in place.
     #[tokio::test]
-    async fn test_ensure_unique_artifact_path_mutable_replaces_live_row() {
+    async fn test_ensure_unique_artifact_path_mutable_keeps_live_row_for_the_publish() {
         let Some(pool) = db_helpers::try_pool().await else {
             return;
         };
@@ -22460,10 +22487,17 @@ mod tests {
         .expect_err("conflict expected when immutable");
         assert_eq!(err.status(), StatusCode::CONFLICT);
 
-        // allow_overwrite = true → passes AND the prior live row is gone.
-        ensure_unique_artifact_path_mutable(&pool, repo_id, path, "Package already exists", true)
-            .await
-            .expect("mutable repo must not conflict");
+        // allow_overwrite = true → passes, reports a replacement, removes nothing.
+        let replacing = ensure_unique_artifact_path_mutable(
+            &pool,
+            repo_id,
+            path,
+            "Package already exists",
+            true,
+        )
+        .await
+        .expect("mutable repo must not conflict");
+        assert!(replacing, "a live row at the path is a replacement");
 
         let still_live: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
@@ -22473,9 +22507,16 @@ mod tests {
         .fetch_optional(&pool)
         .await
         .expect("query");
+        assert_eq!(
+            still_live,
+            Some(live),
+            "the live row must survive until the publish transaction retires it"
+        );
         assert!(
-            still_live != Some(live),
-            "the superseded live row must be removed so the re-upload's INSERT does not collide"
+            !ensure_unique_artifact_path_mutable(&pool, repo_id, "x86_64/other.apk", "x", true)
+                .await
+                .expect("free path"),
+            "a free path is not a replacement"
         );
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
@@ -29188,11 +29229,19 @@ mod scan_on_upload_coverage_tests {
     /// Raw SQL inserts, tolerant of case, line breaks and a schema prefix.
     const INSERT_SQL: &str = r"(?i)INSERT\s+INTO\s+(public\.)?artifacts\b";
     /// Calls of the shared insert primitives.
-    const INSERT_CALLS: &[&str] = &["insert_artifact(", "insert_artifact_row("];
+    const INSERT_CALLS: &[&str] = &[
+        "insert_artifact(",
+        "insert_artifact_row(",
+        "insert_artifact_replacing(",
+    ];
     const TRIGGER: &str = "trigger_scan_on_upload(";
     const MARKER: &str = "NO-SCAN-ON-UPLOAD:";
     /// The shared insert primitives in this file: their callers are checked.
-    const PRIMITIVES: &[&str] = &["insert_artifact", "insert_artifact_row"];
+    const PRIMITIVES: &[&str] = &[
+        "insert_artifact",
+        "insert_artifact_row",
+        "insert_artifact_replacing",
+    ];
     /// Test-fixture-only sources.
     const EXEMPT_FILES: &[&str] = &["test_db_helpers.rs"];
 
@@ -29512,7 +29561,7 @@ mod scan_on_upload_coverage_tests {
             "check_quota_locked(",
         ],
         marker: QUOTA_MARKER,
-        self_covering: &["insert_artifact("],
+        self_covering: &["insert_artifact(", "insert_artifact_replacing("],
     };
     const QUOTA_MARKER: &str = "NO-QUOTA-ADMISSION:";
 

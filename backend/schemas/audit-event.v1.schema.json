@@ -207,6 +207,16 @@
             "previous_upstream_mode": { "type": "string", "enum": ["online", "cache_only"] },
             "upstream_mode": { "type": "string", "enum": ["online", "cache_only"] }
           }
+        },
+        "mutable_change": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["previous_mutable", "mutable"],
+          "description": "Present when PATCH /api/v1/repositories/{key} changed whether re-uploading an existing path replaces it (#5188).",
+          "properties": {
+            "previous_mutable": { "type": "boolean" },
+            "mutable": { "type": "boolean" }
+          }
         }
       }
     },

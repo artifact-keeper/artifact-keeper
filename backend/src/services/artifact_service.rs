@@ -273,7 +273,7 @@ pub(crate) fn overwrite_applies(repo: &Repository) -> bool {
 /// The row a mutable-repository overwrite (#5188) retired, returned by
 /// [`retire_overwritten_artifact`].
 #[derive(Debug, Clone)]
-pub(crate) struct RetiredArtifact {
+pub struct RetiredArtifact {
     pub id: Uuid,
     pub storage_key: String,
 }
@@ -6643,9 +6643,11 @@ mod tests {
     }
 
     /// #5188: on a repository with `allow_overwrite`, a different-bytes
-    /// re-upload to a released coordinate replaces it in place, and the
+    /// re-upload to a released coordinate replaces it under a NEW artifact id:
+    /// the scan results and promotion approvals recorded for the old bytes go
+    /// with the old row instead of staying attached to the new bytes, and the
     /// object it pointed at is handed to storage GC. Identical bytes keep the
-    /// same key and journal nothing.
+    /// id (and what was recorded for them) and journal nothing.
     #[tokio::test]
     async fn allow_overwrite_replaces_released_coordinate_db() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -6655,6 +6657,7 @@ mod tests {
         };
         let (user_id, _username) = tdh::create_user(&pool).await;
         let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        let (target_id, _target_key, target_dir) = tdh::create_repo(&pool, "local", "pypi").await;
         sqlx::query("UPDATE repositories SET allow_overwrite = true WHERE id = $1")
             .bind(repo_id)
             .execute(&pool)
@@ -6678,17 +6681,94 @@ mod tests {
                 false,
             )
         };
+        let count = |sql: &'static str, id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(sql)
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count")
+            }
+        };
+        const SCANS: &str = "SELECT COUNT(*) FROM scan_results WHERE artifact_id = $1";
+        const APPROVALS: &str = "SELECT COUNT(*) FROM promotion_approvals WHERE artifact_id = $1";
 
         let first = upload(b"build-1").await.expect("first upload");
+        // State recorded for build-1's bytes: a completed scan and an approval.
+        sqlx::query(
+            "INSERT INTO scan_results (id, artifact_id, repository_id, scan_type, status, \
+             findings_count, started_at, completed_at) \
+             VALUES ($1, $2, $3, 'dependency', 'completed', 0, NOW(), NOW())",
+        )
+        .bind(Uuid::new_v4())
+        .bind(first.id)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("seed scan");
+        sqlx::query(
+            "INSERT INTO promotion_approvals (id, artifact_id, source_repo_id, target_repo_id, \
+             requested_by, status, skip_policy_check) \
+             VALUES ($1, $2, $3, $4, $5, 'approved', false)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(first.id)
+        .bind(repo_id)
+        .bind(target_id)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("seed approval");
+
+        // Identical bytes: not a replacement. Same id, approval kept.
+        let replay = upload(b"build-1").await.expect("identical re-upload");
+        assert_eq!(replay.id, first.id, "identical bytes keep the artifact id");
+        assert_eq!(count(APPROVALS, first.id).await, 1);
+
         let second = upload(b"build-2")
             .await
             .expect("different-bytes re-upload must replace, not 409");
-        assert_eq!(second.id, first.id, "same row is replaced in place");
+        assert_ne!(second.id, first.id, "new bytes must get a new artifact id");
         assert_eq!(
             second.checksum_sha256,
             ArtifactService::calculate_sha256(b"build-2")
         );
+        assert_eq!(
+            second.checksum_sha1.as_deref(),
+            Some(ArtifactService::calculate_sha1(b"build-2").as_str()),
+            "sha1 must describe the new bytes"
+        );
         assert_ne!(second.storage_key, first.storage_key);
+        assert_eq!(
+            count(SCANS, first.id).await,
+            0,
+            "old scans must not survive"
+        );
+        assert_eq!(
+            count(APPROVALS, first.id).await,
+            0,
+            "old approvals must not survive"
+        );
+        assert_eq!(
+            count(SCANS, second.id).await,
+            0,
+            "the new id starts unscanned"
+        );
+        assert_eq!(
+            count(APPROVALS, second.id).await,
+            0,
+            "the new id starts unapproved"
+        );
+        let live: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .fetch_one(&pool)
+        .await
+        .expect("rows at path");
+        assert_eq!(live, 1, "exactly one row holds the path");
 
         let journaled = |key: String| {
             let pool = pool.clone();
@@ -6724,7 +6804,12 @@ mod tests {
             .await
             .ok();
         tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(target_id)
+            .execute(&pool)
+            .await;
         let _ = std::fs::remove_dir_all(&storage_dir);
+        let _ = std::fs::remove_dir_all(&target_dir);
     }
 
     /// PF-007 (#2523): two concurrent uploads that each fit but together exceed

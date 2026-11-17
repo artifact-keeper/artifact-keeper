@@ -5367,6 +5367,7 @@ pub async fn create_repository(
                 upstream_auth_change: None,
                 age_gate_change: None,
                 upstream_mode_change: born_remote.upstream_mode_audit(),
+                mutable_change: None,
             }),
     )
     .await;
@@ -6889,6 +6890,12 @@ pub async fn update_repository(
                 upstream_auth_change: None,
                 age_gate_change: None,
                 upstream_mode_change: None,
+                mutable_change: (existing.allow_overwrite != repo.allow_overwrite).then_some(
+                    audit_details::MutableChangeAudit {
+                        previous_mutable: existing.allow_overwrite,
+                        mutable: repo.allow_overwrite,
+                    },
+                ),
             }),
     )
     .await;
@@ -7653,6 +7660,7 @@ pub async fn delete_repository(
                     upstream_auth_change: None,
                     age_gate_change: None,
                     upstream_mode_change: None,
+                    mutable_change: None,
                 }),
         )
         .await;
@@ -15085,6 +15093,7 @@ async fn audit_remote_setting_change(
         upstream_auth_change: None,
         age_gate_change: None,
         upstream_mode_change: None,
+        mutable_change: None,
     };
     fill(&mut details);
     audit_fire_and_forget(
@@ -20077,6 +20086,7 @@ mod tests {
             repodata_depth_editable: false,
             repodata_mode: None,
             versioning_enabled: false,
+            allow_overwrite: false,
             has_trusted_gpg_key: false,
             id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
             key: "my-repo".to_string(),

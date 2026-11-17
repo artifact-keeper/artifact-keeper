@@ -3026,6 +3026,7 @@ fn scan_config_change_audit(
                 upstream_auth_change: None,
                 age_gate_change: None,
                 upstream_mode_change: None,
+                mutable_change: None,
             }),
     )
 }

@@ -3546,7 +3546,10 @@ async fn store_rpm(
         )
     };
 
-    proxy_helpers::ensure_unique_artifact_path_mutable(
+    // #5188: on a mutable repository `replacing` is true when a live row holds
+    // the path. It is retired in the publish transaction below (the
+    // nested-layout branch: inside `upload_with_sync_options`), never before.
+    let replacing = proxy_helpers::ensure_unique_artifact_path_mutable(
         &state.db,
         repo.id,
         &artifact_path,
@@ -3579,9 +3582,16 @@ async fn store_rpm(
             .map_err(IntoResponse::into_response)?
             .id
     } else {
-        let storage_key = build_rpm_storage_key(&repo.id, filename);
+        let base_key = build_rpm_storage_key(&repo.id, filename);
+        // A replacement never writes the key the live row still serves.
+        let storage_key = if replacing {
+            crate::services::artifact_service::overwrite_storage_key(&base_key, &computed_sha256)
+        } else {
+            base_key
+        };
+        let location = repo.storage_location();
         proxy_helpers::put_artifact_bytes(state, repo, &storage_key, content.clone()).await?;
-        let id = proxy_helpers::insert_artifact(
+        let (id, retired) = proxy_helpers::insert_artifact_replacing(
             &state.db,
             proxy_helpers::NewArtifact {
                 repository_id: repo.id,
@@ -3594,8 +3604,13 @@ async fn store_rpm(
                 storage_key: &storage_key,
                 uploaded_by: user_id,
             },
+            replacing.then_some(&location),
         )
         .await?;
+        crate::services::artifact_service::forget_retired_artifact(
+            state.search_service.as_ref(),
+            retired.as_ref(),
+        );
         // #4166: the ArtifactService branch above scans via finalize_upload;
         // this direct insert has to trigger scan-on-upload itself.
         crate::services::scanner_service::trigger_scan_on_upload(
@@ -5800,6 +5815,91 @@ mod tests {
             vec!["build-a/repl-rpm-1.0-1.noarch.rpm".to_string()],
             "only the client upload queues a push task; the replicated one must not"
         );
+    }
+
+    /// #5188: a mutable RPM re-upload replaces the package under a new id and
+    /// hands the replaced object to storage GC, at both layouts. The nested
+    /// one (`repodata_depth > 0`) used to delete the row before
+    /// `upload_with_sync_options` ran, so its old blob was never journalled.
+    #[tokio::test]
+    async fn rpm_mutable_reupload_journals_replaced_object_5188() {
+        for depth in [0, 1] {
+            let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+                return;
+            };
+            sqlx::query("UPDATE repositories SET allow_overwrite = true WHERE id = $1")
+                .bind(f.repo_id)
+                .execute(&f.pool)
+                .await
+                .expect("set allow_overwrite");
+            let mut conn = f.pool.acquire().await.unwrap();
+            crate::services::rpm_layout::set_depth(&mut conn, f.repo_id, depth)
+                .await
+                .unwrap();
+            drop(conn);
+            let url = match depth {
+                0 => format!("/{}/packages/ow-rpm-1.0-1.noarch.rpm", f.repo_key),
+                _ => format!("/{}/build-a/ow-rpm-1.0-1.noarch.rpm", f.repo_key),
+            };
+            let row = || async {
+                sqlx::query_as::<_, (uuid::Uuid, String)>(
+                    "SELECT id, storage_key FROM artifacts \
+                     WHERE repository_id = $1 AND is_deleted = false",
+                )
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("one live row")
+            };
+
+            let put = |body: &'static [u8]| {
+                tdh::send(
+                    f.router_with_auth(super::router()),
+                    tdh::put(url.clone(), bytes::Bytes::from_static(body)),
+                )
+            };
+            let (s1, b1) = put(b"rpm build one").await;
+            assert!(
+                s1.is_success(),
+                "depth {depth}: {s1} {}",
+                String::from_utf8_lossy(&b1)
+            );
+            let (first_id, first_key) = row().await;
+            let (s2, _) = put(b"rpm build two").await;
+            let statuses = [s1, s2];
+            let (new_id, new_key) = row().await;
+            let journaled: Vec<String> = sqlx::query_scalar(
+                "SELECT storage_key FROM oci_gc_candidates WHERE source_repository_id = $1",
+            )
+            .bind(f.repo_id)
+            .fetch_all(&f.pool)
+            .await
+            .expect("gc candidates");
+            let ids: Vec<uuid::Uuid> =
+                sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1")
+                    .bind(f.repo_id)
+                    .fetch_all(&f.pool)
+                    .await
+                    .expect("rows");
+            let _ = sqlx::query("DELETE FROM oci_gc_candidates WHERE source_repository_id = $1")
+                .bind(f.repo_id)
+                .execute(&f.pool)
+                .await;
+            f.teardown().await;
+
+            assert!(
+                statuses.iter().all(|s| s.is_success()),
+                "depth {depth}: both uploads must succeed: {statuses:?}"
+            );
+            assert_eq!(ids, vec![new_id], "depth {depth}: one row holds the path");
+            assert_ne!(new_id, first_id, "depth {depth}: new bytes get a new id");
+            assert_eq!(
+                journaled,
+                vec![first_key],
+                "depth {depth}: old object journalled"
+            );
+            assert_ne!(new_key, journaled[0], "depth {depth}: the live key is kept");
+        }
     }
 
     #[tokio::test]
