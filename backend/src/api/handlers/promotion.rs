@@ -1457,6 +1457,17 @@ pub async fn promote_artifact(
     // approval, only a pending request, or a concurrent double-spend) returns 409
     // and the target is constrained to the approved pair. Done after the
     // gate/policy/rule checks so a rejected promotion never spends the approval.
+    // #5872: the target's Maven version policy holds for a promoted artifact,
+    // checked before an approval is spent on a copy that would be refused
+    crate::services::maven_version_policy::check_write(
+        &state.db,
+        target_repo.id,
+        &target_key,
+        target_repo.format.as_key(),
+        &artifact.path,
+    )
+    .await?;
+
     if approval_required {
         super::approval::require_and_consume_approval(
             &state.db,
@@ -1905,6 +1916,23 @@ pub async fn promote_artifacts_bulk(
         // own APPROVED + unconsumed approval row before copying. Runs after the
         // rule check so a rule-blocked item never spends an approval, and fails
         // the item (not the batch) when no consumable approval exists.
+        // #5872: the target's Maven version policy fails just this item
+        if let Err(e) = crate::services::maven_version_policy::check_write(
+            &state.db,
+            target_repo.id,
+            &target_key,
+            target_repo.format.as_key(),
+            &artifact.path,
+        )
+        .await
+        {
+            failed += 1;
+            let resp = failed_response(source_display, target_display, e.to_string());
+            audit.record(*artifact_id, &artifact.path, &resp).await;
+            results.push(resp);
+            continue;
+        }
+
         if approval_required {
             if let Err(e) = super::approval::require_and_consume_approval(
                 &state.db,
