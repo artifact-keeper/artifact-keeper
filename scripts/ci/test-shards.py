@@ -725,8 +725,8 @@ def cmd_archive_filter(src, shard):
 def cmd_partition_check(listing_dir):
     """Every test in the archive is selected by exactly one leg's filter.
     `listing_dir` holds `<shard>.json` per shard: the output of
-    `cargo nextest list --archive-file A -E "$(archive-filter <shard>)"
-    --message-format json`, whose testcases carry nextest's own verdict
+    `cargo nextest list -E "$(archive-filter <shard>)" --message-format
+    json` over the binaries that were archived, whose testcases carry nextest's own verdict
     (`filter-match.status`). Prints the per-leg counts."""
     seen = {}
     ignored = set()

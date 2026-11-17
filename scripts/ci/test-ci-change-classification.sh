@@ -564,6 +564,7 @@ unit "a skipped shard -> fails"                                         1 skippe
 unit "legs green from the archive"                                       0 success skipped false success ok
 unit "build-once failed, legs built for themselves and passed"           0 success skipped false failure ""
 unit "legs passed, but the archive partition was wrong -> fails"         1 success skipped false failure bad
+unit "listing the archive failed (infrastructure) -> legs decide"       0 success skipped false failure error
 # INTEGRATION_WANTED must be the integration job's own condition, verbatim:
 # if the two drift, a skip could pass that the job did not intend.
 wanted="$(cat "$WORK/wanted.txt")"
@@ -611,7 +612,7 @@ ub() { # <label> <want> [VAR=value ...]
   if [ "$got" = "$want" ]; then pass "$label -> $want"; else fail "$label: got '${got}', want $want"; sed 's/^/        /' "$UB/log" >&2; fi
 }
 SAME=HEAD_REPO=artifact-keeper/artifact-keeper
-ub "push, pool idle" beefy
+ub "push (Docker Publish takes the slot; no API call made)" hosted GH_FAIL=/
 ub "same-repo pull request, pool idle" beefy EVENT_NAME=pull_request "$SAME" PR_AUTHOR=someone
 ub "manual dispatch, pool idle" beefy EVENT_NAME=workflow_dispatch
 ub "fork pull request (no API call made)" hosted EVENT_NAME=pull_request HEAD_REPO=someone/artifact-keeper GH_FAIL=/
@@ -619,12 +620,12 @@ ub "pull request from a deleted fork" hosted EVENT_NAME=pull_request HEAD_REPO= 
 ub "Dependabot pull request from a repo branch" hosted EVENT_NAME=pull_request "$SAME" "PR_AUTHOR=dependabot[bot]" GH_FAIL=/
 ub "merge group" hosted EVENT_NAME=merge_group GH_FAIL=/
 ub "AK_UNIT_BUILD_ONCE=off" hosted SWITCH=off GH_FAIL=/
-ub "Docker Publish holds the slot" hosted "RUNS=docker-publish.yml:in_progress:101" BEEFY_101=1
-ub "another CI run waits for the slot" hosted "RUNS=ci.yml:queued:202" BEEFY_202=1
-ub "runs in flight, none on the pool" beefy "RUNS=docker-publish.yml:in_progress:101 ci.yml:in_progress:202"
-ub "this run itself is not counted" beefy "RUNS=ci.yml:in_progress:999" BEEFY_999=1
-ub "listing the runs fails" hosted GH_FAIL=/workflows/
-ub "listing a run's jobs fails" hosted "RUNS=ci.yml:in_progress:202" GH_FAIL=/jobs
+ub "Docker Publish holds the slot" hosted EVENT_NAME=workflow_dispatch "RUNS=docker-publish.yml:in_progress:101" BEEFY_101=1
+ub "another CI run waits for the slot" hosted EVENT_NAME=workflow_dispatch "RUNS=ci.yml:queued:202" BEEFY_202=1
+ub "runs in flight, none on the pool" beefy EVENT_NAME=workflow_dispatch "RUNS=docker-publish.yml:in_progress:101 ci.yml:in_progress:202"
+ub "this run itself is not counted" beefy EVENT_NAME=workflow_dispatch "RUNS=ci.yml:in_progress:999" BEEFY_999=1
+ub "listing the runs fails" hosted EVENT_NAME=workflow_dispatch GH_FAIL=/workflows/
+ub "listing a run's jobs fails" hosted EVENT_NAME=workflow_dispatch "RUNS=ci.yml:in_progress:202" GH_FAIL=/jobs
 if [ "$(cat "$WORK/build_runs_on.txt")" = ak-beefy-runners ] \
     && grep -qF "needs.changes.outputs.unit_build == 'beefy'" "$WORK/build_if.txt"; then
   pass "the build-once job runs on ak-beefy-runners only when the gate said beefy"

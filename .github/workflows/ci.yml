@@ -428,13 +428,18 @@ jobs:
       # runner holds, and a shard build at 13-18 GiB, which is why the legs
       # need their swapfile.
       #
-      # `beefy` only for code this repository's own members wrote: a push,
-      # a manual dispatch, or a pull request from a branch of this
-      # repository that Dependabot did not open. A self-hosted runner must
+      # `beefy` only for code this repository's own members wrote: a manual
+      # dispatch, or a pull request from a branch of this repository that
+      # Dependabot did not open. A self-hosted runner must
       # never execute a fork's code (its build scripts and tests run with
       # whatever the pod can reach), and a Dependabot PR is unreviewed
       # upstream code. A merge-group run stays hosted, so the queue never
-      # waits on rocky.
+      # waits on rocky. A push stays hosted too: every push to main, master
+      # or release/** also starts Docker Publish, whose amd64 leg wants the
+      # same slot within seconds, before the jobs API lists it (a job
+      # waiting on `needs` is not listed yet), so the slot check below
+      # cannot see the race. The hosted legs' push runs are also what keeps
+      # the shared dependency cache fresh.
       #
       # And only while the pool has a free slot. ak-beefy-runners has
       # BEEFY_SLOTS runners (maxRunners in artifact-keeper-arc-runners'
@@ -447,8 +452,13 @@ jobs:
       # second then waits for one build (~15 min), not for a release
       # image. Any API error means `hosted`.
       #
-      # Repository variable AK_UNIT_BUILD_ONCE=off turns `beefy` off without
-      # a PR, e.g. while rocky is down.
+      # A queued build is not bounded by its timeout-minutes (GitHub waits up
+      # to 24 h for a self-hosted runner), and the legs wait with it. The
+      # check below cannot see other repositories' jobs on the same
+      # org-level scale set (artifact-keeper-iac's helm-ci). If rocky or its
+      # ARC listener is down, set the repository variable
+      # AK_UNIT_BUILD_ONCE=off (turns `beefy` off without a PR), cancel the
+      # stuck run and re-run it.
       - name: Decide where the unit-test binaries are built
         id: unit_build
         env:
@@ -465,7 +475,8 @@ jobs:
             exit 0
           }
           case "$EVENT_NAME" in
-            push|workflow_dispatch) ;;
+            workflow_dispatch) ;;
+            push) decide hosted "push: Docker Publish takes the ak-beefy-runners slot for this commit" ;;
             pull_request)
               [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" = "$GITHUB_REPOSITORY" ] \
                 || decide hosted "pull request from ${HEAD_REPO:-a deleted fork}: no self-hosted runner"
@@ -852,13 +863,14 @@ jobs:
   # bin test binaries. Each leg downloads that archive and runs its share.
   #
   # WHEN: only when the `changes` job says `unit_build == 'beefy'`: trusted
-  # code (a push, a dispatch, or a pull request from a branch of this
-  # repository that Dependabot did not open) and a free slot in the pool.
-  # Everything else (fork and Dependabot pull requests, merge groups, a
-  # busy pool, AK_UNIT_BUILD_ONCE=off) skips this job, and the legs build
+  # code (a dispatch, or a pull request from a branch of this repository
+  # that Dependabot did not open) and a free slot in the pool. Everything
+  # else (pushes, fork and Dependabot pull requests, merge groups, a busy
+  # pool, AK_UNIT_BUILD_ONCE=off) skips this job, and the legs build
   # their own shard on the hosted runner exactly as before. So does a
-  # FAILED build here: the legs then build for themselves, and only the
-  # partition check below can turn the run red from this job.
+  # FAILED build here (continue-on-error: the run stays green): the legs
+  # then build for themselves, and only a bad partition (below) turns the
+  # run red, through test-backend-unit.
   #
   # WHERE ON DISK: /home/runner/work/<repo>/<repo>, the hosted runners'
   # workspace path, not this pod's /home/runner/_work. The pool mounts a
@@ -871,8 +883,9 @@ jobs:
   # absolute target path, and by the CARGO*/RUST* variables, which are set
   # to the hosted runner's values below.
   #
-  # The cache is written only by push runs, as for the legs; a pull request
-  # restores main's entry and writes nothing, and fork code never reaches
+  # The cache is written only outside pull requests and merge groups (in
+  # practice by a dispatch; pushes build hosted and the router leg saves);
+  # a pull request restores main's entry and writes nothing, and fork code never reaches
   # this job, so nothing untrusted can seed what it or a later push
   # restores. The archive goes to the run's own artifacts (one day).
   test-backend-unit-build:
@@ -881,11 +894,19 @@ jobs:
     # Measured on the PR (#6158): see the PR description. The ceiling is
     # for a cold dependency cache on rocky's 8 CPUs.
     timeout-minutes: 50
+    # A failure here (a pod without the limit or volume, an OOM, a lost
+    # runner) only means the legs build for themselves, so it must not turn
+    # the run red; the legs read `archive`, not this job's result. A bad
+    # partition still fails the run, through test-backend-unit.
+    continue-on-error: true
     needs: [changes, release-bump]
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' && needs.changes.outputs.unit_build == 'beefy' }}
     outputs:
-      # ok | bad | empty (the check never ran): read by test-backend-unit.
+      # ok | bad | error | empty (never ran): read by test-backend-unit,
+      # which fails only on `bad`.
       partition: ${{ steps.partition.outputs.verdict }}
+      # `ready` once the archive is uploaded: the legs' FROM_ARCHIVE.
+      archive: ${{ steps.ready.outputs.archive }}
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
@@ -945,12 +966,14 @@ jobs:
 
       # The pod is the generic runner image: no compiler, no protoc, none of
       # the -dev packages the hosted image ships and the build scripts in
-      # the dependency tree (openssl-sys, libgit2-sys, prost) need.
+      # the dependency tree (openssl-sys, libgit2-sys, prost) need. And no
+      # zstd: without it @actions/cache falls back to gzip, which is part of
+      # the cache version, so the legs' (zstd) entry would never restore.
       - name: Install the build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config libssl-dev zlib1g-dev cmake protobuf-compiler
+            build-essential pkg-config libssl-dev zlib1g-dev cmake protobuf-compiler zstd
 
       - name: Install cargo-llvm-cov and cargo-nextest
         uses: taiki-e/install-action@v2
@@ -1012,13 +1035,17 @@ jobs:
           set -uo pipefail
           source <(cargo llvm-cov show-env --sh)
           mkdir -p "$RUNNER_TEMP/listing"
-          ok=true
           for shard in $(python3 scripts/ci/test-shards.py shards); do
-            filter="$(python3 scripts/ci/test-shards.py archive-filter "$shard")" || ok=false
-            cargo nextest list --workspace --lib --bins -E "$filter" --message-format json \
-              >"$RUNNER_TEMP/listing/${shard}.json" || ok=false
+            if ! filter="$(python3 scripts/ci/test-shards.py archive-filter "$shard")" \
+                || ! cargo nextest list --workspace --lib --bins -E "$filter" --message-format json \
+                  >"$RUNNER_TEMP/listing/${shard}.json"; then
+              # Not a verdict on the partition: the legs build for themselves.
+              echo "verdict=error" >> "$GITHUB_OUTPUT"
+              echo "::error title=Could not list the archive::listing shard ${shard} failed; the unit-test legs build for themselves."
+              exit 1
+            fi
           done
-          if [ "$ok" = true ] && python3 scripts/ci/test-shards.py partition-check "$RUNNER_TEMP/listing"; then
+          if python3 scripts/ci/test-shards.py partition-check "$RUNNER_TEMP/listing"; then
             echo "verdict=ok" >> "$GITHUB_OUTPUT"
           else
             echo "verdict=bad" >> "$GITHUB_OUTPUT"
@@ -1034,8 +1061,14 @@ jobs:
           if-no-files-found: error
           # Already zstd; a re-run of this job replaces it.
           compression-level: 0
-          retention-days: 1
+          # Long enough for "Re-run failed jobs" on a leg days later: the
+          # build job's result is kept, so the leg looks for this archive.
+          retention-days: 5
           overwrite: true
+
+      - name: Mark the archive ready
+        id: ready
+        run: echo "archive=ready" >> "$GITHUB_OUTPUT"
 
       # The pod's memory high-water mark and disk, on every run (report
       # only). rocky runs cgroup v1, the hosted runners v2; both are read.
@@ -1096,8 +1129,8 @@ jobs:
     # (20-core aarch64 host; a 4-vCPU hosted runner is slower), ~2-4 min of
     # tests, plus the instrumented dependency graph when the cache misses.
     timeout-minutes: 60
-    # The build job's result picks the leg's mode (FROM_ARCHIVE); skipped
-    # or failed, the leg builds for itself. `!cancelled()` runs it either way.
+    # The build job's `archive` output picks the leg's mode (FROM_ARCHIVE);
+    # skipped or failed, the leg builds for itself. `!cancelled()` runs it either way.
     needs: [changes, release-bump, test-backend-unit-build]
     # Skip on docs-only PRs and version-bump-only release PRs -- see check-rust.
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
@@ -1126,7 +1159,7 @@ jobs:
       # test-shards.py `check` fails if this is not the shard they carry.
       BIN_SHARD: router
       # true: run this shard's tests from test-backend-unit-build's archive.
-      FROM_ARCHIVE: ${{ needs.test-backend-unit-build.result == 'success' }}
+      FROM_ARCHIVE: ${{ needs.test-backend-unit-build.outputs.archive == 'ready' }}
       ARCHIVE: ${{ github.workspace }}/../unit-test-archive/unit-tests.tar.zst
     services:
       # DB-backed lib tests need it; one fresh database per leg also means
