@@ -21645,7 +21645,7 @@ mod tests {
         use crate::api::{AppState, SharedState};
         use crate::config::Config;
 
-        pub async fn try_pool() -> Option<PgPool> {
+        pub(crate) async fn try_pool() -> Option<PgPool> {
             // Skip only when no DB is configured/reachable AND not required; a
             // connect failure under AK_TESTS_REQUIRE_DB panics (no fiction-green,
             // #2924).
@@ -21874,7 +21874,7 @@ mod tests {
             Arc::new(AppState::new(config, pool, redirect_backend, registry))
         }
 
-        pub async fn create_user(pool: &PgPool) -> Uuid {
+        pub(crate) async fn create_user(pool: &PgPool) -> Uuid {
             let id = Uuid::new_v4();
             let username = format!("ph-test-u-{}", id);
             let _ = sqlx::query(
@@ -21892,7 +21892,7 @@ mod tests {
             id
         }
 
-        pub async fn create_repo(
+        pub(crate) async fn create_repo(
             pool: &PgPool,
             repo_type: &str,
             format: &str,
@@ -21927,7 +21927,7 @@ mod tests {
 
         /// Insert a `virtual_repo_members` row so `fetch_virtual_members`
         /// returns `member_repo_id` when resolving `virtual_repo_id`.
-        pub async fn link_member(
+        pub(crate) async fn link_member(
             pool: &PgPool,
             virtual_repo_id: Uuid,
             member_repo_id: Uuid,
@@ -21945,7 +21945,7 @@ mod tests {
             .expect("link virtual member");
         }
 
-        pub async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
+        pub(crate) async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
             let _ = sqlx::query(
                 "DELETE FROM artifact_metadata WHERE artifact_id IN \
                  (SELECT id FROM artifacts WHERE repository_id = $1)",

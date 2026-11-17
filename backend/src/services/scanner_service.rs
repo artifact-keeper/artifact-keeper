@@ -12218,7 +12218,7 @@ pub(crate) mod test_helpers {
     /// Hold every scan-extraction permit, so that a scan queues until the guard
     /// drops (#5231). The semaphore is process-wide, which nextest's one process
     /// per test keeps to the test that calls this.
-    pub async fn hold_all_scan_permits() -> tokio::sync::OwnedSemaphorePermit {
+    pub(crate) async fn hold_all_scan_permits() -> tokio::sync::OwnedSemaphorePermit {
         super::scan_extraction_semaphore()
             .clone()
             .acquire_many_owned(super::max_concurrent_scan_extractions() as u32)
