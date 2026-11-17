@@ -1157,6 +1157,10 @@ New entries go in [`changes/unreleased/`](changes/unreleased/), one file per PR;
 
   The new `Scheduled curl Advisory Watch` workflow checks each pin against https://curl.se/docs/vuln.json every day. When a pin is affected, the workflow fails and opens or updates a `type:security` tracking issue.
 
+### Tests
+
+- **The backend unit-test build no longer generates code for the whole router in every CI shard** (#6143, #6144). One test helper was declared `pub async fn` and called `create_router`. rustc builds a `pub async fn` and everything it calls into every test binary that compiles it, whether or not a test calls it, so each of the five unit-test legs built every handler. Test code now uses `pub(crate) async fn`, and `scripts/ci/test-shards.py check` refuses the old form. Test-only change: production builds and binaries are unaffected.
+
 ### CI / Release Assurance
 
 These change how releases are built, gated and certified. Nothing that ships changes.
