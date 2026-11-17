@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 New entries go in [`changes/unreleased/`](changes/unreleased/), one file per PR; see [`changes/README.md`](changes/README.md).
 
-## [1.11.14] - 2026-11-15
+## [1.11.14] - 2026-11-17
 
 ### Sponsors
 
@@ -65,6 +65,10 @@ Thank you to our sponsors for supporting ongoing development of Artifact Keeper.
 
 - **The quota pre-check now checks write permission first, so a caller who cannot write a repository gets the permission refusal, not the quota refusal** (#5912, #6031, #6038). The check that refuses an over-quota upload on its `Content-Length` before the body is read ran ahead of the write authorization on the repository artifact API and on OCI `/v2`. A caller without write permission on a public repository who declared an over-quota upload was answered `403 QUOTA_EXCEEDED` with the repository's `limit_bytes`, `used_bytes`, `scope`, `repository` and `project`, instead of the refusal it got before. The pre-check now answers a quota refusal only to a caller who passes the repository's write gate. Anyone else gets the answer from before the pre-check existed: `401` for an anonymous caller and `403 FORBIDDEN` (`DENIED` on `/v2`) for a signed-in caller who may not write. A caller who may write is still refused before the body is read.
 
+- **A proxy-cache quarantine release that answers 200 is no longer followed by a 409** (#6043, #6059, #6064). When an admin released a held proxied path while its background fetch was still running, the next download could still be refused with `409 "Artifact is quarantined and pending security review"`, intermittently. The fetch's commit wrote the cached entry with its hold first and only dropped the hold once it saw the release, so a download in between read the hold. A download that came in before the commit fetched the package again and put a new hold on it. Now the commit checks for a release before it writes the entry and is serialized with the release on the same server. A download that arrives during the fetch also honours a release already made, so every download after the release is served.
+
+- **A format-route read that cannot check repository permissions during a database outage now answers `503` with `Retry-After: 1`** (#6052, #6053, #6054). When the repository's permission-rules entry had left its 30 second cache, a read such as a Git LFS batch or an npm metadata GET answered a bare `503` with no `Retry-After` header, while writes and every other outage path already sent `Retry-After: 1`. Reads now send the same retryable answer, so clients back off and retry.
+
 ### Security
 
 - **A destination sent through an environment proxy is now checked against the outbound address policy, whatever the case of the proxy variable** (#5704, #5781, backport of #5459, #5109, #5511). Under `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` (upper or lower case) the backend handed a Remote's host name to the proxy without checking where it resolved, because a proxied request never reaches the connect-time resolver guard; with private upstreams disabled, a repository administrator could have a sync accept loopback content fetched through the proxy. The SSRF-guarded clients (Remote fetches, webhooks, SSO discovery, internal services) now read the proxy variables with the same rules `reqwest` uses, and before a destination goes to the proxy they resolve it (with a 5-second limit) and refuse it when it does not resolve or when the direct path would refuse any of its addresses. The check runs on every new connection, every redirect hop and every plain-HTTP Remote request (a forward-proxied `http://` connection is reused per host); webhook and SSO clients keep no idle plain-HTTP proxy connection. `NO_PROXY` destinations connect directly and stay checked at connect time. `AK_UPSTREAM_ENV_PROXY=ignore` keeps Remote and other upstream fetches off the environment proxy altogether, and the backend warns at startup when it inherits a proxy with `UPSTREAM_ALLOW_PRIVATE_IPS=false`.
@@ -93,6 +97,22 @@ Thank you to our sponsors for supporting ongoing development of Artifact Keeper.
 - **Docker Publish publishes again: the backend and OpenSCAP images carry a time-boxed exception for 14 `krb5-libs` CVEs whose fix is not yet in the UBI 9 repositories** (#5995, #5991, #5996, #5997). Since 2026-11-14 the publish gate has reported CVE-2026-107364 and 13 sibling CVEs (all HIGH) against `krb5-libs-1.21.1-10.el9_8.1` in both UBI images, fixed in `1.21.1-10.el9_9.2`. Red Hat has shipped that build to the entitled RHEL 9 repositories but not to the UBI 9 BaseOS repository the images build from, and `ubi9/ubi:9.9` still ships `el9_8.1`, so neither a base bump nor the rootfs `dnf upgrade` can install it yet. `krb5-libs` is in the images only as a shared-library dependency of `libcurl`. Neither image ships a KDC or `kadmind`, and nothing uses Kerberos. Every one of the 14 CVEs is a KDC or `kadmind` server-side bug. The 14 IDs are listed in `.trivyignore` with an expiry of 2026-12-14. The rootfs upgrade picks up `el9_9.2` on the first build after Red Hat syncs it to UBI, and the entries are retired then. If the fix has not reached UBI by the expiry date, the gate fails again.
 
 - **The manual `publish-binaries.yml` workflow is retired** (#5960, #6036). It was a `workflow_dispatch` job with `contents: write` and a free-text tag input that reached the checkout ref, inline shell steps and `gh release upload --clobber`, so one dispatch could replace a published release's binaries with an unsigned rebuild from another ref. `release.yml` is the only path that builds and uploads release binaries on this line too, so the workflow is removed rather than hardened. Nothing that ships changes.
+
+### CI / Release Assurance
+
+These change how 1.11.x releases are built and certified. Nothing that ships changes.
+
+- **`release.yml` ends green when the release was published** (#5709, #6079, #6082, #6105). It ended `completed/failure` on every release since 1.11.10 although the GitHub Release was published: the AMI build was dispatched although `ami-build.yml` is disabled (`422`), and the Discord announcement failed on a webhook that answers `404`. A disabled AMI workflow is now skipped with a notice, and an announcement the webhook does not accept is skipped with a one-line message. Both apply to tags cut from this line from now on, since release.yml runs from the tag's copy.
+
+- **A Release Candidate whose gate failed on a flake can rerun only its failed gate groups** (#6076, #6087, #6106). A new dispatch with `rerun_of=<run id>` and a `reason` re-checks everything before the gate and then runs only the gate jobs and legs the original did not pass. It is allowed once per candidate, within 72 hours, on the same commit, digests and tests, and the certification records both runs, the reason and both actors. `release-candidate.yml` on this line stays byte-identical to main's.
+
+- **A merge can no longer cancel a candidate's image build** (#6080, #6083, #6118). Docker Publish on a branch push now has a concurrency group per commit, so a newer push no longer replaces a still-queued run for the commit a candidate is waiting on.
+
+- **A PR to this line labelled `behaviour-change` or `breaking-change` must name the artifact-keeper-test PR that moves the release gate with it, or give a `Gate-Exempt:` reason** (#6074, #6085, #6107). The new `Require gate test for behaviour changes` check enforces it, so a deliberate behaviour change no longer turns red only on the release candidate.
+
+- **A workflow- or script-only PR skips the Rust compile, unit and integration tiers** (#6115, #6116, #6129). It runs the workflow contract tests and actionlint instead. The push after the merge still runs every Rust job.
+
+- **The bin-target unit tests run on the shortest unit-test leg** (#6133, #6138, #6140). They moved from `services-2`, the critical path, to `router`, and `test-shards.py` refuses a bin-target test module gated to any other shard, so those tests cannot silently stop running. Build Backend Image also reads a `ci`-profile registry cache.
 
 ## [1.11.13] - 2026-11-09
 
