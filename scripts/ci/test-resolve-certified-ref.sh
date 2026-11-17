@@ -53,6 +53,8 @@ STUB="$WORK/bin"; mkdir -p "$STUB"
 #                 read of main's copy is a loud 64: the resolver never
 #                 compares the commit's copy with main's (#6122)
 #   W_FAIL        a path fragment whose call fails as a non-404 error
+#   W_CERT_SHA    the certified commit (set by expect): the only ref at which
+#                 release-candidate.yml may be read
 cat > "$STUB/gh" <<'STUBGH'
 #!/usr/bin/env bash
 [ "${1:-}" = "api" ] || { echo "stub gh: unexpected '${1:-}'" >&2; exit 64; }
@@ -77,8 +79,10 @@ case "$path" in
     [ "$raw" = 1 ] || { echo "stub gh: Cargo.toml must be read raw" >&2; exit 64; }
     printf '[package]\nname = "artifact-keeper"\nversion = "%s"\n' "${W_VERSION}" ;;
   */contents/.github/workflows/release-candidate.yml*)
-    ref="${path##*ref=}"
-    [ "$ref" != main ] || { echo "stub gh: the resolver read main's release-candidate.yml; it must not compare against it (#6122)" >&2; exit 64; }
+    # Only the certified commit's copy may be read. Any other ref (main,
+    # refs/heads/main, or none = the default branch) means the resolver is
+    # comparing against main's copy again (#6122): a loud 64.
+    case "$path" in *"ref=${W_CERT_SHA:?}") ;; *) echo "stub gh: the resolver read release-candidate.yml at something other than the certified commit (${path}); it must not compare against main's copy (#6122)" >&2; exit 64 ;; esac
     b="${W_BLOB_SHA}"
     [ -n "$b" ] || notfound
     emit "$(jq -nc --arg s "$b" '{sha:$s}')" ;;
@@ -108,7 +112,7 @@ reset_world() {
 # <label> <expected-exit> <expected-substring>; world from exported W_*.
 expect() {
   local label="$1" want="$2" needle="$3" got=0 out
-  out="$( PATH="$STUB:$PATH" CERTREF_REPO=artifact-keeper/artifact-keeper \
+  out="$( PATH="$STUB:$PATH" CERTREF_REPO=artifact-keeper/artifact-keeper W_CERT_SHA="${SHA:-$SHA_A}" \
       GITHUB_OUTPUT="" bash "$RESOLVER" "${SHA:-$SHA_A}" 2>&1 )" || got=$?
   if [ "$got" = "$want" ] && printf '%s' "$out" | grep -qF -- "$needle"; then
     pass "$label"
@@ -219,6 +223,14 @@ expect "an unreadable workflow blob is INFRA, never a pass" 2 "could not read"
 reset_world
 SHA=abc expect "a short sha is INFRA (exit 2)" 2 "40-character"
 unset SHA
+
+# The demand must not come back on the workflow side either (#6122).
+echo "release-candidate.yml does not demand main's copy"
+if grep -q 'CERTREF_REQUIRE_MAIN_WORKFLOW=' "$WORKFLOW"; then
+  fail "release-candidate.yml sets CERTREF_REQUIRE_MAIN_WORKFLOW again (#6122)"
+else
+  pass "release-candidate.yml sets no CERTREF_REQUIRE_MAIN_WORKFLOW"
+fi
 
 # ── the dispatch-ref guard in release-candidate.yml ─────────────────────────
 # The candidate certifies maintenance commits FROM MAIN, so the guard must

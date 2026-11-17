@@ -212,6 +212,7 @@ jobs:
       certified_ref: ${{ steps.resolve.outputs.certified_ref }}
       certified_branch: ${{ steps.resolve.outputs.certified_branch }}
       workflow_blob: ${{ steps.resolve.outputs.workflow_blob }}
+      candidate_workflow_blob: ${{ steps.resolve.outputs.candidate_workflow_blob }}
       # Rerun (#6076): all empty for a full candidate.
       rerun_of: ${{ steps.rerun_inputs.outputs.rerun_of }}
       rerun_reason: ${{ steps.rerun_inputs.outputs.reason }}
@@ -351,7 +352,11 @@ jobs:
           # Information only (#6122): a maintenance line's copy of this file
           # lags main's after any main edit. It is never executed, so that is
           # expected and nothing has to be backported.
-          RUNNING_BLOB="$(git rev-parse "HEAD:.github/workflows/release-candidate.yml")"
+          # The copy RUNNING here is the one at GITHUB_WORKFLOW_SHA, not main's
+          # checked-out tip, which can be newer if main moved after dispatch.
+          # Recorded for a later rerun of the failed groups to compare (#6076):
+          # a rerun under a different candidate workflow is refused.
+          RUNNING_BLOB="$(git rev-parse "${GITHUB_WORKFLOW_SHA}:.github/workflows/release-candidate.yml")"
           if [[ "$CERTIFIED_REF" != "refs/heads/main" && "$WORKFLOW_BLOB" != "$RUNNING_BLOB" ]]; then
             echo "::notice title=Release-branch copy of release-candidate.yml differs from main's::${CERTIFIED_REF#refs/heads/} carries blob ${WORKFLOW_BLOB:0:12}; main's copy running here is ${RUNNING_BLOB:0:12}. Expected and inert: that copy never runs, and its blob is only recorded in the certification (#6122)."
           fi
@@ -396,6 +401,7 @@ jobs:
             echo "certified_ref=${CERTIFIED_REF}"
             echo "certified_branch=${CERTIFIED_REF#refs/heads/}"
             echo "workflow_blob=${WORKFLOW_BLOB}"
+            echo "candidate_workflow_blob=${RUNNING_BLOB}"
           } >> "$GITHUB_OUTPUT"
 
       # Which gate jobs the rerun runs, and whether it may run at all: read
@@ -948,6 +954,7 @@ jobs:
       VERSION: ${{ needs.resolve.outputs.version }}
       CERTIFIED_REF: ${{ needs.resolve.outputs.certified_ref }}
       WORKFLOW_BLOB: ${{ needs.resolve.outputs.workflow_blob }}
+      CANDIDATE_WORKFLOW_BLOB: ${{ needs.resolve.outputs.candidate_workflow_blob }}
       BACKEND_DIGEST: ${{ needs.images.outputs.backend_digest }}
       OPENSCAP_DIGEST: ${{ needs.images.outputs.openscap_digest }}
       ADAPTER_DIGEST: ${{ needs.images.outputs.adapter_digest }}
@@ -985,6 +992,11 @@ jobs:
           same version               "$(o .version)"                        "$VERSION"
           same certified_ref         "$(o .certified_ref)"                  "$CERTIFIED_REF"
           same workflow_blob         "$(o .certified_workflow_blob)"        "$WORKFLOW_BLOB"
+          # The candidate workflow itself (#6122): the commit's own copy above
+          # is fixed per commit, so this is what catches release-candidate.yml
+          # changing on main between the original and the rerun. An original
+          # recorded before this field existed has none, and is refused.
+          same candidate_workflow    "$(o .candidate_workflow_blob)"        "$CANDIDATE_WORKFLOW_BLOB"
           same backend_digest        "$(o .digests.backend)"                "$BACKEND_DIGEST"
           same openscap_digest       "$(o .digests.openscap)"               "$OPENSCAP_DIGEST"
           same scanner_adapter_digest "$(o .digests.scanner_adapter)"       "$ADAPTER_DIGEST"
@@ -1044,6 +1056,7 @@ jobs:
           mkdir -p record
           jq -n \
             --arg sha "$SHA" --arg version "$VERSION" --arg certified_ref "$CERTIFIED_REF" --arg blob "$WORKFLOW_BLOB" \
+            --arg cblob "$CANDIDATE_WORKFLOW_BLOB" \
             --arg run "$GITHUB_RUN_ID" --arg publish_run "$PUBLISH_RUN_ID" \
             --arg backend "$BACKEND_DIGEST" --arg openscap "$OPENSCAP_DIGEST" --arg adapter "$ADAPTER_DIGEST" \
             --arg adapter_decision "$ADAPTER_DECISION" --arg adapter_owner "$ADAPTER_OWNER_REV" --arg adapter_tag "$ADAPTER_TAG" \
@@ -1052,6 +1065,7 @@ jobs:
             '{
               schema: 1,
               commit_sha: $sha, version: $version, certified_ref: $certified_ref, certified_workflow_blob: $blob,
+              candidate_workflow_blob: $cblob,
               candidate_run_id: $run, docker_publish_run_id: $publish_run,
               digests: { backend: $backend, openscap: $openscap, scanner_adapter: $adapter },
               scanner_adapter_decision: { decision: $adapter_decision, owner_rev: $adapter_owner, tag: $adapter_tag },

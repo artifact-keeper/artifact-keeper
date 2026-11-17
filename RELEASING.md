@@ -429,7 +429,8 @@ names the same commit.
      Publish): there is nothing to rerun, and the rerun says so;
    - Docker Publish has rebuilt the commit's images since (the digests
      differ), the line's test branch moved with `tests=same`, or
-     `release-candidate.yml` changed on main since;
+     `release-candidate.yml` changed on main since (the record carries the
+     blob of the candidate workflow that ran, compared on the rerun);
    - the original started more than 72 hours ago (`RERUN_MAX_AGE_HOURS`):
      the gate's chart (`iac@main`), web image (`:latest`) and runners are not
      pinned between runs, so two runs' results only add up while they are
