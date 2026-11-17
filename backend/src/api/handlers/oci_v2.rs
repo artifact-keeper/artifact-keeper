@@ -12350,10 +12350,19 @@ fn oci_manifest_synthetic_artifact(
 ///   what `spec.md` provides that member for — parity with the `reason` every
 ///   non-OCI format already reports.
 ///
-/// The status is fixed at 403: the shared seam's only block verdict is
-/// `curation_blocked_response`, which is unconditionally `FORBIDDEN`.
+/// A rule verdict is 403. An unreadable policy is not a verdict: the shared
+/// seam fails closed with `CurationBlock::unavailable`, rendered here as a
+/// retryable 503 so a `docker pull` during a database error is told to retry
+/// instead of reading a permanent denial
 /// Sibling of [`oci_scan_deny_response`].
 fn oci_curation_deny_response(block: &proxy_helpers::CurationBlock) -> Response {
+    if block.unavailable {
+        return oci_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "UNAVAILABLE",
+            "curation policy temporarily unavailable, retry shortly",
+        );
+    }
     oci_error_detail(
         StatusCode::FORBIDDEN,
         "DENIED",
@@ -16952,6 +16961,7 @@ mod tests {
         let resp = oci_curation_deny_response(&proxy_helpers::CurationBlock {
             package: "someimage".to_string(),
             reason: "blocked by test rule".to_string(),
+            unavailable: false,
         });
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
@@ -16981,6 +16991,24 @@ mod tests {
             parsed["errors"][0]["detail"]["package"].as_str(),
             Some("someimage"),
             "detail must carry the blocked package: {parsed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oci_curation_unavailable_is_a_retryable_503() {
+        // docker and containerd treat 403 as final, so an unreadable policy
+        // must not look like a rule verdict. It is not an allow either
+        let resp =
+            oci_curation_deny_response(&proxy_helpers::CurationBlock::unavailable("someimage"));
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().contains_key(axum::http::header::RETRY_AFTER));
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).expect("OCI error body must be valid JSON");
+        assert_eq!(parsed["errors"][0]["code"].as_str(), Some("UNAVAILABLE"));
+        assert!(
+            parsed["errors"][0]["detail"].is_null(),
+            "no rule fired, so no rule detail: {parsed}"
         );
     }
 
