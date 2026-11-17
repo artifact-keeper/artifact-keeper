@@ -10783,6 +10783,92 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// A Nexus npm tarball whose version is a numeric prerelease
+    /// (`1.1.6-4`) must land under its real package name, show in that
+    /// package's packument and download from the advertised tarball URL.
+    /// Splitting the filename at its last hyphen filed it as package
+    /// `@acme/acme-core-1.1.6` version `4`, invisible to npm.
+    #[tokio::test]
+    async fn test_npm_prerelease_import_lands_in_its_packument() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::io::Write;
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(fx.storage_dir.to_str().unwrap()),
+        );
+        let worker = MigrationWorker::new(
+            fx.pool.clone(),
+            Arc::new(StorageRegistry::new(
+                std::collections::HashMap::new(),
+                "filesystem".to_string(),
+            )),
+            WorkerConfig::default(),
+            CancellationToken::new(),
+        );
+
+        let package_json = br#"{"name":"@acme/acme-core","version":"1.1.6-4"}"#;
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(package_json.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "package/package.json", &package_json[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tar_buf).unwrap();
+        let body = bytes::Bytes::from(gz.finish().unwrap());
+
+        let path = "@acme/acme-core/-/acme-core-1.1.6-4.tgz";
+        let mut files = std::collections::HashMap::new();
+        files.insert(path.to_string(), body.clone());
+        transfer_one(&worker, &storage, &files, &fx.repo_key, "npm", path)
+            .await
+            .expect("npm transfer must succeed");
+
+        let (name, version): (String, Option<String>) = sqlx::query_as(
+            "SELECT name, version FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("one artifact row");
+        assert_eq!(name, "@acme/acme-core");
+        assert_eq!(version.as_deref(), Some("1.1.6-4"));
+
+        let router = fx.router_with_auth(crate::api::handlers::npm::router());
+        let (status, packument) = tdh::send(
+            router,
+            tdh::get(format!("/{}/@acme%2Facme-core", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "packument");
+        let packument: serde_json::Value = serde_json::from_slice(&packument).unwrap();
+        let tarball = packument["versions"]["1.1.6-4"]["dist"]["tarball"]
+            .as_str()
+            .unwrap_or_else(|| panic!("1.1.6-4 missing from the packument: {packument}"));
+        let repo_prefix = format!("/{}/", fx.repo_key);
+        let tarball_path = &tarball[tarball.find(&repo_prefix).expect("repo in tarball URL")..];
+        assert_eq!(
+            tarball_path,
+            format!("/{}/{}", fx.repo_key, path),
+            "the advertised tarball URL is the npm registry path"
+        );
+
+        let router = fx.router_with_auth(crate::api::handlers::npm::router());
+        let (status, served) = tdh::send(router, tdh::get(tarball_path.to_string())).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "tarball download");
+        assert_eq!(&served[..], &body[..]);
+
+        fx.teardown().await;
+    }
+
     /// Repair on re-run, the way #3533 repairs a pre-fix Docker import: a
     /// legacy `<repo_key>/<path>` row must NOT count as a duplicate of the
     /// canonical `<path>` row (otherwise "re-run the migration" is a silent
