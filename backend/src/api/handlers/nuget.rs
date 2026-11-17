@@ -4064,7 +4064,14 @@ where
                 {
                     return Some(Err(proxy_helpers::member_unavailable_response()));
                 }
-                Err(_) => {}
+                // #5504: a non-strict run carries a policy block or an
+                // unavailable member to the scan walk so it can surface the
+                // block, or answer 503 when no later member serves.
+                Err(resp) => {
+                    if let Some(failure) = proxy_helpers::unscanned_run_failure(resp) {
+                        return Some(failure);
+                    }
+                }
             }
             continue;
         }
@@ -4093,11 +4100,13 @@ where
             }
             // A member refusing what it HOLDS is terminal (#3220): falling
             // through would serve the blocked package from a later member or
-            // upstream instead.
-            Err(resp) if proxy_helpers::is_member_policy_block_response(&resp) => {
-                return Some(Err(resp))
+            // upstream instead. A hosted member's storage fault is carried
+            // too (#5574), so a walk nothing else serves answers 503.
+            Err(resp) => {
+                if let Some(failure) = proxy_helpers::unscanned_run_failure(resp) {
+                    return Some(failure);
+                }
             }
-            Err(_) => {}
         }
     }
     None
