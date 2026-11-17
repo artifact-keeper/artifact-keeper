@@ -53,6 +53,15 @@ steps = [s for s in wf['jobs']['changes']['steps'] if s.get('id') == 'filter']
 if len(steps) != 1:
     sys.exit('expected exactly one step with id: filter in jobs.changes')
 open(f'{work}/filter.sh', 'w').write(steps[0]['run'])
+# Where the unit-test binaries are built (#6158), and the env it reads.
+ub = [s for s in wf['jobs']['changes']['steps'] if s.get('id') == 'unit_build']
+if len(ub) != 1:
+    sys.exit('expected exactly one step with id: unit_build in jobs.changes')
+open(f'{work}/unit_build.sh', 'w').write(ub[0]['run'])
+open(f'{work}/beefy_slots.txt', 'w').write(str(ub[0].get('env', {}).get('BEEFY_SLOTS', '')) + '\n')
+build_if = str(wf['jobs']['test-backend-unit-build'].get('if', ''))
+open(f'{work}/build_if.txt', 'w').write(build_if + '\n')
+open(f'{work}/build_runs_on.txt', 'w').write(str(wf['jobs']['test-backend-unit-build'].get('runs-on')) + '\n')
 # Every repository path a Rust-gated job's steps mention.
 refs = set()
 gated = []
@@ -537,6 +546,7 @@ echo "ci.yml Backend Unit Tests: the integration job may skip only by design"
 unit() {
   local label="$1" want="$2" rc=0
   ( RESULT_SHARDS="$3" RESULT_INTEGRATION="$4" INTEGRATION_WANTED="$5" \
+      RESULT_BUILD="${6:-skipped}" PARTITION="${7:-}" \
       bash --noprofile --norc -eo pipefail "$WORK/unit.sh" >"$WORK/log" 2>&1 ) || rc=$?
   if [ "$rc" = "$want" ]; then pass "$label"; else fail "$label: exited $rc, want $want"; sed 's/^/        /' "$WORK/log" >&2; fi
 }
@@ -549,6 +559,11 @@ unit "integration cancelled though not wanted -> fails"                 1 succes
 unit "a failing unit shard -> fails"                                    1 failure success true
 unit "a failing unit shard with integration skipped by design -> fails" 1 failure skipped false
 unit "a skipped shard -> fails"                                         1 skipped skipped false
+# The build-once job (#6158): its result never decides (the legs fall back to
+# their own builds), its partition check does.
+unit "legs green from the archive"                                       0 success skipped false success ok
+unit "build-once failed, legs built for themselves and passed"           0 success skipped false failure ""
+unit "legs passed, but the archive partition was wrong -> fails"         1 success skipped false failure bad
 # INTEGRATION_WANTED must be the integration job's own condition, verbatim:
 # if the two drift, a skip could pass that the job did not intend.
 wanted="$(cat "$WORK/wanted.txt")"
@@ -562,6 +577,60 @@ case "$wanted" in
     pass "the integration condition covers merge_group, the tests filter (fail-open) and ci:full" ;;
   *) fail "the integration condition lost a clause: $wanted" ;;
 esac
+
+echo "ci.yml changes gate: where the unit-test binaries are built (#6158)"
+# A stub gh: a workflow's runs come from RUNS ("<workflow>:<status>:<id> ..."),
+# a run's count of unfinished ak-beefy-runners jobs from BEEFY_<id> (what
+# the step's --jq prints). GH_FAIL makes any URL containing it fail; with
+# GH_FAIL=/ every call fails, which also proves a decision made no call.
+UB="$WORK/ub"; mkdir -p "$UB/bin"
+cat >"$UB/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+url="$2"
+if [ -n "${GH_FAIL:-}" ] && [[ "$url" == *"$GH_FAIL"* ]]; then exit 1; fi
+if [[ "$url" =~ /actions/workflows/([^/]+)/runs\?status=([a-z_]+) ]]; then
+  for r in ${RUNS:-}; do
+    [[ "$r" == "${BASH_REMATCH[1]}:${BASH_REMATCH[2]}:"* ]] && echo "${r##*:}"
+  done
+  exit 0
+fi
+if [[ "$url" =~ /actions/runs/([0-9]+)/jobs ]]; then
+  v="BEEFY_${BASH_REMATCH[1]}"; echo "${!v:-0}"; exit 0
+fi
+echo "stub gh: unexpected $url" >&2; exit 1
+STUB
+chmod +x "$UB/bin/gh"
+ub() { # <label> <want> [VAR=value ...]
+  local label="$1" want="$2"; shift 2
+  : >"$UB/out"
+  ( export PATH="$UB/bin:$PATH" GITHUB_OUTPUT="$UB/out" GITHUB_REPOSITORY=artifact-keeper/artifact-keeper \
+      GITHUB_RUN_ID=999 BEEFY_SLOTS="$(cat "$WORK/beefy_slots.txt")" EVENT_NAME=push HEAD_REPO= PR_AUTHOR= SWITCH=
+    for kv in "$@"; do export "${kv?}"; done
+    bash --noprofile --norc -eo pipefail "$WORK/unit_build.sh" >"$UB/log" 2>&1 ) || { fail "$label: the step failed"; sed 's/^/        /' "$UB/log" >&2; return; }
+  got="$(sed -n 's/^where=//p' "$UB/out")"
+  if [ "$got" = "$want" ]; then pass "$label -> $want"; else fail "$label: got '${got}', want $want"; sed 's/^/        /' "$UB/log" >&2; fi
+}
+SAME=HEAD_REPO=artifact-keeper/artifact-keeper
+ub "push, pool idle" beefy
+ub "same-repo pull request, pool idle" beefy EVENT_NAME=pull_request "$SAME" PR_AUTHOR=someone
+ub "manual dispatch, pool idle" beefy EVENT_NAME=workflow_dispatch
+ub "fork pull request (no API call made)" hosted EVENT_NAME=pull_request HEAD_REPO=someone/artifact-keeper GH_FAIL=/
+ub "pull request from a deleted fork" hosted EVENT_NAME=pull_request HEAD_REPO= GH_FAIL=/
+ub "Dependabot pull request from a repo branch" hosted EVENT_NAME=pull_request "$SAME" "PR_AUTHOR=dependabot[bot]" GH_FAIL=/
+ub "merge group" hosted EVENT_NAME=merge_group GH_FAIL=/
+ub "AK_UNIT_BUILD_ONCE=off" hosted SWITCH=off GH_FAIL=/
+ub "Docker Publish holds the slot" hosted "RUNS=docker-publish.yml:in_progress:101" BEEFY_101=1
+ub "another CI run waits for the slot" hosted "RUNS=ci.yml:queued:202" BEEFY_202=1
+ub "runs in flight, none on the pool" beefy "RUNS=docker-publish.yml:in_progress:101 ci.yml:in_progress:202"
+ub "this run itself is not counted" beefy "RUNS=ci.yml:in_progress:999" BEEFY_999=1
+ub "listing the runs fails" hosted GH_FAIL=/workflows/
+ub "listing a run's jobs fails" hosted "RUNS=ci.yml:in_progress:202" GH_FAIL=/jobs
+if [ "$(cat "$WORK/build_runs_on.txt")" = ak-beefy-runners ] \
+    && grep -qF "needs.changes.outputs.unit_build == 'beefy'" "$WORK/build_if.txt"; then
+  pass "the build-once job runs on ak-beefy-runners only when the gate said beefy"
+else
+  fail "test-backend-unit-build: runs-on $(cat "$WORK/build_runs_on.txt"), if: $(cat "$WORK/build_if.txt")"
+fi
 
 echo "ci.yml merge path: layout"
 fact() { sed -n "s/^$1=//p" "$WORK/facts.txt"; }

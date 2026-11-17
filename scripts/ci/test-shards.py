@@ -119,11 +119,18 @@ USAGE
                                        the nextest `-E` filterset for SHARD's
                                        leg: skip the tests of ungated modules
                                        assigned to another shard
+    test-shards.py archive-filter [--src DIR] SHARD
+                                       the `-E` filterset for SHARD's leg when
+                                       every leg runs from one build of all
+                                       the tests (ci.yml's build-once job)
+    test-shards.py partition-check DIR every test in DIR/<shard>.json (nextest
+                                       listings) is selected by one leg
     test-shards.py shards              the shard names, one per line (the CI
                                        matrix is checked against this)
 """
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -594,24 +601,168 @@ def cmd_check(src, repo):
     return 0
 
 
+def lib_owners(src):
+    """{module path: the shard whose leg runs the tests written directly in
+    it} for every lib test module. A gated module runs where its gate says
+    (even when `plan` wants it elsewhere: that is only a warning); an
+    ungated one where `plan` assigns it. A test belongs to the DEEPEST test
+    module whose path prefixes its name, so a module nested in another one
+    (an out-of-line `#[cfg(test)] mod x;` file holding `mod tests`) can
+    belong to a different shard than its parent. The bin targets are left
+    out: their tests run in the BIN_SHARD leg whatever their gate."""
+    modules, _stray, per_file = scan(src)
+    owners = {}
+    for it in plan(modules, per_file).values():
+        if is_bin(it["mod"]["file"]):
+            continue
+        have = shard_attr_of(per_file[it["mod"]["file"]][0], it["mod"])[1]
+        owners[test_name_prefix(it["path"])] = have or it["run"]
+    return owners
+
+
+MODULE_PATH = re.compile(r"^(?:r#)?\w+(?:::(?:r#)?\w+)*$")
+
+# A module named after a keyword (`formats/pub.rs`) is `r#pub` in the crate,
+# and in the test names nextest prints.
+RUST_KEYWORDS = frozenset(
+    "as async await break const continue crate dyn else enum extern false fn "
+    "for if impl in let loop match mod move mut pub ref return static struct "
+    "super trait true type unsafe use where while abstract become box do final "
+    "gen macro override priv try typeof unsized virtual yield".split())
+
+
+def test_name_prefix(path):
+    """`path` as nextest spells it: keyword segments get their `r#`."""
+    return "::".join(f"r#{seg}" if seg in RUST_KEYWORDS else seg
+                     for seg in path.split("::"))
+
+
+def _prefixes(paths):
+    """One nextest `test()` predicate matching the tests under any of
+    `paths`. One regex per predicate, not one predicate per path: nextest
+    evaluates every predicate against every test, and ~800 of them
+    against ~22k tests is measurable."""
+    for path in paths:
+        if not MODULE_PATH.match(path):
+            raise ValueError(f"unexpected module path {path!r}")
+    return f"test(/^(?:{'|'.join(sorted(paths))})::/)"
+
+
+def _owned_by(owners, shard):
+    """nextest filterset for the lib tests `owners` assigns to `shard`, in a
+    build that compiles EVERY test module: each test module of that shard,
+    minus the test modules nested in it that belong to another one."""
+    simple, carved = [], []
+    for path in sorted(p for p, s in owners.items() if s == shard):
+        others = [q for q, s in owners.items() if s != shard and q.startswith(path + "::")]
+        if others:
+            carved.append(f"({_prefixes([path])} & not {_prefixes(others)})")
+        else:
+            simple.append(path)
+    terms = ([_prefixes(simple)] if simple else []) + carved
+    if not terms:
+        return None
+    return f"(kind(lib) & ({' | '.join(terms)}))"
+
+
 def cmd_filter(src, shard):
-    """The nextest filterset for `shard`'s leg. Every shard build compiles
+    """The nextest filterset for `shard`'s leg when that leg builds its own
+    test binary (`--features test-shard-<shard>`). Every shard build compiles
     every ungated test module; this keeps each one's tests to the single
     leg `plan` assigns it. `kind(lib)`, and the bin targets left out: the
     bin-target tests are built and run in one leg only (BIN_SHARD) whatever
-    their gate."""
+    their gate. A test module nested in a skipped one that belongs to THIS
+    shard is carved back out of the skip (before that, such a module ran in
+    no leg at all: `api::handlers::test_db_helpers::poll_tests`)."""
     if shard not in SHARDS:
         print(f"test-shards: unknown shard {shard!r}; one of {SHARDS}", file=sys.stderr)
         return 2
     modules, _stray, per_file = scan(src)
-    skip = sorted(it["path"] for it in plan(modules, per_file).values()
+    owners = lib_owners(src)
+    skip = sorted(test_name_prefix(it["path"]) for it in plan(modules, per_file).values()
                   if it["run"] != shard and not is_bin(it["mod"]["file"])
                   and shard_attr_of(per_file[it["mod"]["file"]][0], it["mod"])[1] is None)
     if not skip:
         print("all()")
-    else:
-        tests = " | ".join(f"test(/^{p}::/)" for p in skip)
-        print(f"not (kind(lib) & ({tests}))")
+        return 0
+    terms = []
+    for p in skip:
+        mine = [q for q, s in owners.items() if s == shard and q.startswith(p + "::")]
+        if mine:
+            terms.append(f"(test(/^{p}::/) & not {_prefixes(mine)})")
+        else:
+            terms.append(f"test(/^{p}::/)")
+    print(f"not (kind(lib) & ({' | '.join(terms)}))")
+    return 0
+
+
+def archive_filter(src, shard):
+    """The nextest filterset for `shard`'s leg when every leg runs from ONE
+    build that compiled every test module (ci.yml's build-once job:
+    `cargo nextest archive` with no `test-shard-*` feature, so build.rs
+    turns every gate on). Each lib test runs in the leg that owns it
+    (`lib_owners`). The BIN_SHARD leg takes everything no other leg claims:
+    the bin-target tests, its own modules, and any test the scan above
+    does not know about (a macro-generated module, say), so the five
+    filters partition the archive by construction and no test can be
+    dropped by all of them. ci.yml checks that partition against nextest's
+    own listing (`partition-check`) before any leg runs."""
+    owners = lib_owners(src)
+    if shard == BIN_SHARD:
+        others = [e for e in (_owned_by(owners, s) for s in SHARDS if s != BIN_SHARD) if e]
+        return f"not ({' | '.join(others)})" if others else "all()"
+    return _owned_by(owners, shard) or "none()"
+
+
+def cmd_archive_filter(src, shard):
+    if shard not in SHARDS:
+        print(f"test-shards: unknown shard {shard!r}; one of {SHARDS}", file=sys.stderr)
+        return 2
+    print(archive_filter(src, shard))
+    return 0
+
+
+def cmd_partition_check(listing_dir):
+    """Every test in the archive is selected by exactly one leg's filter.
+    `listing_dir` holds `<shard>.json` per shard: the output of
+    `cargo nextest list --archive-file A -E "$(archive-filter <shard>)"
+    --message-format json`, whose testcases carry nextest's own verdict
+    (`filter-match.status`). Prints the per-leg counts."""
+    seen = {}
+    ignored = set()
+    for shard in SHARDS:
+        path = os.path.join(listing_dir, f"{shard}.json")
+        with open(path, encoding="utf-8") as fh:
+            listing = json.load(fh)
+        for binary, suite in listing.get("rust-suites", {}).items():
+            for name, case in suite.get("testcases", {}).items():
+                legs = seen.setdefault((binary, name), [])
+                match = case.get("filter-match", {})
+                if match.get("status") == "matches":
+                    legs.append(shard)
+                elif match.get("reason") == "ignored":
+                    # `#[ignore]`: no leg runs it by default, whatever the
+                    # filter (the live S3 suites and friends).
+                    ignored.add((binary, name))
+    for key in ignored:
+        seen.pop(key, None)
+    counts = {s: 0 for s in SHARDS}
+    problems = []
+    for (binary, name), legs in sorted(seen.items()):
+        if len(legs) == 1:
+            counts[legs[0]] += 1
+        else:
+            problems.append(f"{binary} {name}: selected by {legs or 'no leg'}")
+    print("test-shards: tests per leg: "
+          + ", ".join(f"{s} {n}" for s, n in counts.items())
+          + f"; {len(seen)} in all, {len(ignored)} #[ignore]d")
+    if not seen:
+        problems.append("the listings hold no test at all")
+    if problems:
+        print(f"test-shards: {len(problems)} test(s) not run by exactly one leg:")
+        for p in problems[:50]:
+            print(f"  {p}")
+        return 1
     return 0
 
 
@@ -683,8 +834,11 @@ def cmd_list(src):
 
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("command", choices=["check", "apply", "list", "shards", "filter"])
-    parser.add_argument("shard", nargs="?", help="filter: the leg's shard")
+    parser.add_argument("command", choices=["check", "apply", "list", "shards", "filter",
+                                            "archive-filter", "partition-check"])
+    parser.add_argument("shard", nargs="?",
+                        help="filter, archive-filter: the leg's shard; "
+                             "partition-check: the directory of listings")
     here = os.path.dirname(os.path.abspath(__file__))
     repo = os.path.normpath(os.path.join(here, "..", ".."))
     parser.add_argument("--src", default=os.path.join(repo, "backend", "src"))
@@ -697,10 +851,16 @@ def main(argv):
         return cmd_apply(args.src)
     if args.command == "list":
         return cmd_list(args.src)
-    if args.command == "filter":
+    if args.command in ("filter", "archive-filter"):
         if not args.shard:
-            parser.error("filter needs a shard")
-        return cmd_filter(args.src, args.shard)
+            parser.error(f"{args.command} needs a shard")
+        if args.command == "filter":
+            return cmd_filter(args.src, args.shard)
+        return cmd_archive_filter(args.src, args.shard)
+    if args.command == "partition-check":
+        if not args.shard:
+            parser.error("partition-check needs the listing directory")
+        return cmd_partition_check(args.shard)
     return cmd_check(args.src, args.repo)
 
 
