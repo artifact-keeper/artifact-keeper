@@ -363,6 +363,61 @@ impl_repo_type_eq!(str, &str, String);
 /// and WRONG on the write pre-gate (`require_repo_write_access`), where
 /// `internal` must behave exactly as `private`. Every call site therefore has to
 /// name the question it is actually asking.
+/// Which Maven versions a hosted Maven or Gradle repository accepts (#5872),
+/// Nexus' version policy. `Mixed` is the behaviour before the policy existed
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum MavenVersionPolicy {
+    /// Release and SNAPSHOT versions
+    #[default]
+    Mixed,
+    /// Release versions only
+    Release,
+    /// SNAPSHOT versions only
+    Snapshot,
+}
+
+impl MavenVersionPolicy {
+    /// The value stored in `repositories.version_policy`
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Mixed => "mixed",
+            Self::Release => "release",
+            Self::Snapshot => "snapshot",
+        }
+    }
+
+    /// Parse a stored value, `None` for anything else
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "mixed" => Some(Self::Mixed),
+            "release" => Some(Self::Release),
+            "snapshot" => Some(Self::Snapshot),
+            _ => None,
+        }
+    }
+
+    /// Artifactory's `handleReleases` / `handleSnapshots` pair. Both on, or
+    /// both off, is mixed
+    pub fn from_artifactory(handle_releases: bool, handle_snapshots: bool) -> Self {
+        match (handle_releases, handle_snapshots) {
+            (true, false) => Self::Release,
+            (false, true) => Self::Snapshot,
+            _ => Self::Mixed,
+        }
+    }
+
+    /// Nexus' `maven.versionPolicy` (`RELEASE`, `SNAPSHOT`, `MIXED`), mixed for
+    /// anything else
+    pub fn from_nexus(value: &str) -> Self {
+        match value.to_ascii_uppercase().as_str() {
+            "RELEASE" => Self::Release,
+            "SNAPSHOT" => Self::Snapshot,
+            _ => Self::Mixed,
+        }
+    }
+}
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema,
 )]

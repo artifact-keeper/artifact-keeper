@@ -994,6 +994,16 @@ pub async fn approve_promotion(
     )
     .await?;
 
+    // #5872: the target's Maven version policy holds for an approved promotion
+    crate::services::maven_version_policy::check_write(
+        &state.db,
+        target_repo.id,
+        &target_repo.key,
+        target_repo.format.as_key(),
+        &artifact.path,
+    )
+    .await?;
+
     // Cross-repository write guard (#2511): the approval-execute copy re-uses the
     // SOURCE artifact's flat storage key when writing into the TARGET repo. On a
     // shared-namespace cloud backend that key may already be owned by a third

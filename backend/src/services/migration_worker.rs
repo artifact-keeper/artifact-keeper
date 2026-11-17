@@ -2250,6 +2250,16 @@ impl MigrationWorker {
         // writes below (repo-id lookup, stored path) use keys.target.
         let repo_key = keys.source.as_str();
 
+        // #5872: a version the destination's Maven policy refuses fails the
+        // item before its bytes are downloaded
+        crate::services::maven_version_policy::check_write_by_key(
+            &self.db,
+            keys.target.as_str(),
+            artifact_path,
+        )
+        .await
+        .map_err(|e| MigrationError::Other(e.to_string()))?;
+
         // Open the source as a chunked stream rather than `download_artifact`,
         // which buffers the whole body in memory (#1422).
         let mut stream = client

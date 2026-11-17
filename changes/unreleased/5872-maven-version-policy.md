@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#5872]
+---
+- **Maven and Gradle hosted repositories take a version policy: release, snapshot or mixed** (#5872). A releases repository accepted a SNAPSHOT deploy and a snapshots repository accepted a release, so a misrouted deploy made a releases repository mutable or put a release under snapshot cleanup. `version_policy` (`mixed` by default, today's behaviour) is set on create and update and returned on GET for Maven and Gradle repositories. Under `release` a path in a `-SNAPSHOT` version directory is refused with 400 `Repository '<key>' accepts release versions only`, under `snapshot` a release version is refused the same way, artifacts, POMs, checksums and version-level metadata alike. Group and artifact level `maven-metadata.xml` is accepted under every policy. The policy holds on the Maven deploy route, the generic artifact upload (which peer replication also uses), promotion and approval, and the migration import. Setting a policy other than `mixed` on a Remote, a Virtual or another format is a 400.
