@@ -2679,7 +2679,14 @@ async fn download(
         } else {
             None
         };
-        if checksum_compute_eligible(&repo.repo_type) {
+        // #5773: a stored sidecar shares its base artifact's tombstone. The
+        // bytes stay in storage for the trash/restore window, so neither the
+        // scoped nor the legacy flat sidecar may answer for a withdrawn
+        // artifact; the request falls through to the computed-checksum path,
+        // whose `hosted_target` is live-only and therefore absent.
+        let stored_sidecar_readable = checksum_compute_eligible(&repo.repo_type)
+            && !soft_deleted_row_exists(&state.db, repo.id, base_path).await;
+        if stored_sidecar_readable {
             if let Some(scoped_key) =
                 key_scheme.scoped_read_key(&repo.storage_backend, "maven", repo.id, &path)
             {
@@ -2693,7 +2700,7 @@ async fn download(
             }
         }
         let checksum_storage_key = format!("maven/{}", path);
-        if checksum_compute_eligible(&repo.repo_type)
+        if stored_sidecar_readable
             && crate::services::maven_flat_attribution::flat_key_readable(
                 &state.db,
                 repo.id,
@@ -4102,6 +4109,33 @@ async fn load_maven_metadata_entry(
     }))
 }
 
+/// Whether `repository_id` holds a soft-deleted `artifacts` row at `path`.
+///
+/// The legacy flat-key fallbacks read a bare `maven/{path}` object when no
+/// LIVE row describes the path. That is meant for pre-catalog data. A
+/// soft-deleted row is different: the artifact was withdrawn and its bytes
+/// remain in storage only for the trash/restore window, so serving them would
+/// resurrect the deletion until the purge (#5773). Filesystem backends made
+/// that reachable for every reader — `flat_key_readable` short-circuits to
+/// `true` there — and on cloud backends a soft-deleted key stays attributed
+/// to its repository.
+///
+/// A query failure reports `true` (fail closed), like `flat_key_readable`, so
+/// an unreadable catalog never re-exposes withdrawn bytes.
+async fn soft_deleted_row_exists(db: &PgPool, repository_id: Uuid, path: &str) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS ( \
+           SELECT 1 FROM artifacts \
+           WHERE repository_id = $1 AND path = $2 AND is_deleted = true \
+         )",
+    )
+    .bind(repository_id)
+    .bind(path)
+    .fetch_one(db)
+    .await
+    .unwrap_or(true)
+}
+
 async fn serve_artifact(
     state: &SharedState,
     repo: &RepoInfo,
@@ -4608,6 +4642,11 @@ async fn serve_artifact(
             let legacy_storage_key = format!("maven/{}", path);
             if (repo.repo_type == RepositoryType::Local
                 || repo.repo_type == RepositoryType::Staging)
+                // #5773: a soft-deleted row tombstones the path. The object is
+                // still in storage for the trash/restore window, but the
+                // deletion must hold on every read route, so the legacy
+                // fallback serves only objects the catalog has never seen.
+                && !soft_deleted_row_exists(&state.db, repo.id, path).await
                 && crate::services::maven_flat_attribution::flat_key_readable(
                     &state.db,
                     repo.id,
@@ -9692,6 +9731,136 @@ mod tests {
         assert_eq!(body, sha1);
 
         tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// #5773: a soft-deleted artifact must stay gone on the hosted native
+    /// route.
+    ///
+    /// The live-row lookup correctly misses a tombstoned artifact, but on a
+    /// filesystem backend `flat_key_readable` short-circuits to `true`, so the
+    /// legacy flat-key fallback served the bytes the delete kept only for the
+    /// trash/restore window. The artifact and its stored checksum sidecar must
+    /// answer 404 until the purge, while an object with no catalog row at all
+    /// (true pre-catalog data) keeps being served.
+    #[tokio::test]
+    async fn test_soft_deleted_artifact_stays_404_on_legacy_flat_fallback_5773() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+        use sha1::Sha1;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let router = fx.router_with_auth(super::router());
+
+        let path = "com/example/withdrawn/1.0/withdrawn-1.0.jar";
+        let jar = bytes::Bytes::from_static(b"withdrawn jar bytes 5773");
+        let (status, body) = tdh::send(
+            router.clone(),
+            tdh::put(format!("/{}/{}", fx.repo_key, path), jar.clone()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "jar PUT failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let sidecar_path = format!("{path}.sha1");
+        let sidecar = bytes::Bytes::from(format!("{:x}", Sha1::digest(&jar)));
+        let (status, body) = tdh::send(
+            router.clone(),
+            tdh::put(
+                format!("/{}/{}", fx.repo_key, sidecar_path),
+                sidecar.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "sidecar PUT failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // Sanity: both are served while the artifact row is live.
+        let (status, body) = tdh::send(
+            router.clone(),
+            tdh::get(format!("/{}/{}", fx.repo_key, path)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, jar);
+        let (status, body) = tdh::send(
+            router.clone(),
+            tdh::get(format!("/{}/{}", fx.repo_key, sidecar_path)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, sidecar);
+
+        // Withdraw it exactly as the artifact delete route does; the bytes stay
+        // in storage for the trash/restore window.
+        sqlx::query(
+            "UPDATE artifacts SET is_deleted = true WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(path)
+        .execute(&fx.pool)
+        .await
+        .expect("soft-delete the artifact");
+
+        let (status, body) = tdh::send(
+            router.clone(),
+            tdh::get(format!("/{}/{}", fx.repo_key, path)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a withdrawn artifact must not be served by the legacy flat-key fallback; body={}",
+            String::from_utf8_lossy(&body)
+        );
+        let (status, body) = tdh::send(
+            router.clone(),
+            tdh::get(format!("/{}/{}", fx.repo_key, sidecar_path)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a withdrawn artifact's stored checksum must not be served either; body={}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // The fallback still serves true pre-catalog data: an object at the flat
+        // key with no artifacts row at all.
+        let legacy_path = "com/example/precatalog/1.0/precatalog-1.0.jar";
+        let legacy = bytes::Bytes::from_static(b"pre-catalog jar bytes 5773");
+        fx.state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: fx.storage_dir.to_string_lossy().into_owned(),
+            })
+            .expect("storage_for_repo")
+            .put(&format!("maven/{legacy_path}"), legacy.clone())
+            .await
+            .expect("seed a pre-catalog flat-key object");
+        let (status, body) = tdh::send(
+            router,
+            tdh::get(format!("/{}/{}", fx.repo_key, legacy_path)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "pre-catalog flat-key objects must stay readable; body={}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(body, legacy);
+
+        fx.teardown().await;
     }
 
     /// Direct Maven uploads bypass the generic ArtifactService upload path, so
