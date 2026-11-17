@@ -248,6 +248,46 @@ pub fn quarantine_until_from_release(
     release_date.unwrap_or(now) + Duration::minutes(config.duration_minutes)
 }
 
+/// Leave out of an npm packument the versions whose files the policy still
+/// holds (#5933), so a range resolves to a version it can download instead of
+/// stopping at the young version's 409.
+///
+/// A proxied file is held until its release time plus the window
+/// ([`quarantine_until_from_release`]), and a version's `time` entry is that
+/// release, so the same versions drop out here. A version without a readable
+/// `time` entry stays: nothing says it is young, and its tarball keeps its
+/// own hold. The rewrite is the Age Gate's (`apply_npm_packument_blocks`),
+/// which also moves `latest` back to the newest version left. Returns whether
+/// any version was left out.
+pub fn hide_held_npm_versions(
+    config: &QuarantineConfig,
+    packument: &mut serde_json::Value,
+    now: DateTime<Utc>,
+) -> bool {
+    use crate::services::age_gate_service::{
+        apply_npm_packument_blocks, collect_npm_packument_versions,
+    };
+    use crate::services::upstream_metadata::UpstreamMetadataCache;
+
+    if !should_quarantine(config) {
+        return false;
+    }
+    let times = UpstreamMetadataCache::parse_npm_publish_times(packument);
+    let held: std::collections::HashSet<String> = collect_npm_packument_versions(packument, &times)
+        .into_iter()
+        .filter_map(|(version, released)| {
+            released
+                .is_some_and(|r| now < quarantine_until_from_release(config, Some(r), now))
+                .then_some(version)
+        })
+        .collect();
+    if held.is_empty() {
+        return false;
+    }
+    apply_npm_packument_blocks(packument, &held);
+    true
+}
+
 /// Decide whether a download should be blocked based on quarantine state.
 ///
 /// Returns `Ok(())` if the download is allowed, or `Err` with a 409 Conflict
@@ -343,14 +383,19 @@ pub async fn repo_settings(db: &PgPool, repository_id: Uuid) -> (Option<bool>, O
     (enabled, duration)
 }
 
+/// The `QUARANTINE_ENABLED` default for repositories without their own setting.
+pub fn globally_enabled() -> bool {
+    matches!(
+        std::env::var("QUARANTINE_ENABLED").as_deref(),
+        Ok("true" | "1")
+    )
+}
+
 /// Resolve the effective quarantine config for a repository.
 ///
 /// Checks `repository_config` first, then falls back to env vars, then defaults.
 pub async fn resolve_config(db: &PgPool, repository_id: Uuid) -> QuarantineConfig {
-    let global_enabled = matches!(
-        std::env::var("QUARANTINE_ENABLED").as_deref(),
-        Ok("true" | "1")
-    );
+    let global_enabled = globally_enabled();
     let global_duration: i64 = std::env::var("QUARANTINE_DURATION_MINUTES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1620,6 +1665,93 @@ mod tests {
         };
         let until = quarantine_until(&config, now);
         assert_eq!(until, now);
+    }
+
+    // -----------------------------------------------------------------------
+    // hide_held_npm_versions (#5933)
+    // -----------------------------------------------------------------------
+
+    fn axios_packument(now: DateTime<Utc>) -> serde_json::Value {
+        serde_json::json!({
+            "dist-tags": {"latest": "1.21.1", "next": "1.22.0-beta.1"},
+            "versions": {"1.20.0": {}, "1.21.0": {}, "1.21.1": {}, "1.22.0-beta.1": {}},
+            "time": {
+                "created": (now - Duration::days(400)).to_rfc3339(),
+                "modified": now.to_rfc3339(),
+                "1.20.0": (now - Duration::days(60)).to_rfc3339(),
+                "1.21.0": (now - Duration::days(21)).to_rfc3339(),
+                "1.21.1": (now - Duration::days(7)).to_rfc3339(),
+                "1.22.0-beta.1": (now - Duration::days(1)).to_rfc3339(),
+            }
+        })
+    }
+
+    fn eight_days(enabled: bool) -> QuarantineConfig {
+        QuarantineConfig {
+            enabled,
+            duration_minutes: 8 * 24 * 60,
+        }
+    }
+
+    #[test]
+    fn test_hide_held_npm_versions_leaves_out_the_window_and_moves_latest() {
+        let now = Utc::now();
+        let mut doc = axios_packument(now);
+        assert!(hide_held_npm_versions(&eight_days(true), &mut doc, now));
+        let versions: Vec<&String> = doc["versions"].as_object().unwrap().keys().collect();
+        assert_eq!(versions, ["1.20.0", "1.21.0"]);
+        assert!(doc["time"].get("1.21.1").is_none());
+        assert!(doc["time"].get("1.22.0-beta.1").is_none());
+        assert!(doc["time"].get("modified").is_some());
+        assert_eq!(doc["dist-tags"], serde_json::json!({"latest": "1.21.0"}));
+    }
+
+    #[test]
+    fn test_hide_held_npm_versions_lists_a_version_again_after_its_window() {
+        let now = Utc::now();
+        let mut doc = axios_packument(now);
+        let later = now + Duration::days(2);
+        assert!(hide_held_npm_versions(&eight_days(true), &mut doc, later));
+        assert!(doc["versions"].get("1.21.1").is_some());
+        assert_eq!(doc["dist-tags"]["latest"], "1.21.1");
+    }
+
+    #[test]
+    fn test_hide_held_npm_versions_off_or_outside_every_window_changes_nothing() {
+        let now = Utc::now();
+        let mut doc = axios_packument(now);
+        assert!(!hide_held_npm_versions(&eight_days(false), &mut doc, now));
+        assert_eq!(doc, axios_packument(now));
+        let mut doc = axios_packument(now);
+        let later = now + Duration::days(30);
+        assert!(!hide_held_npm_versions(&eight_days(true), &mut doc, later));
+        assert_eq!(doc, axios_packument(now));
+    }
+
+    #[test]
+    fn test_hide_held_npm_versions_keeps_a_version_without_a_time_entry() {
+        let now = Utc::now();
+        let mut doc = axios_packument(now);
+        doc["time"].as_object_mut().unwrap().remove("1.21.1");
+        doc["time"]["1.22.0-beta.1"] = serde_json::json!("not a date");
+        assert!(!hide_held_npm_versions(&eight_days(true), &mut doc, now));
+        assert!(doc["versions"].get("1.21.1").is_some());
+        assert!(doc["versions"].get("1.22.0-beta.1").is_some());
+        assert_eq!(doc["dist-tags"]["latest"], "1.21.1");
+    }
+
+    #[test]
+    fn test_hide_held_npm_versions_with_every_version_held_keeps_a_valid_document() {
+        let now = Utc::now();
+        let mut doc = axios_packument(now);
+        let window = QuarantineConfig {
+            enabled: true,
+            duration_minutes: 365 * 24 * 60,
+        };
+        assert!(hide_held_npm_versions(&window, &mut doc, now));
+        assert_eq!(doc["versions"], serde_json::json!({}));
+        assert_eq!(doc["dist-tags"], serde_json::json!({}));
+        assert!(doc["time"].get("created").is_some());
     }
 
     // -----------------------------------------------------------------------

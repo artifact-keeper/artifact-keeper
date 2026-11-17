@@ -6708,6 +6708,39 @@ pub async fn virtual_has_age_gated_member(db: &PgPool, virtual_repo_id: Uuid) ->
     .unwrap_or(true)
 }
 
+/// True when the Package Age Policy is on for any Remote a virtual repository
+/// reaches, its own `quarantine_enabled` or else the `QUARANTINE_ENABLED`
+/// default, as [`quarantine_service::resolve_config`] reads them (#5933).
+///
+/// Caller-independent and recursive for the same reasons as
+/// [`virtual_has_age_gated_member`], and `true` if the lookup fails.
+///
+/// [`quarantine_service::resolve_config`]: crate::services::quarantine_service::resolve_config
+pub async fn virtual_has_quarantine_member(db: &PgPool, virtual_repo_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "WITH RECURSIVE reach(repo_id) AS ( \
+            SELECT vrm.member_repo_id FROM virtual_repo_members vrm \
+             WHERE vrm.virtual_repo_id = $1 \
+            UNION \
+            SELECT vrm.member_repo_id FROM reach \
+              JOIN repositories parent \
+                ON parent.id = reach.repo_id AND parent.repo_type = 'virtual' \
+              JOIN virtual_repo_members vrm ON vrm.virtual_repo_id = reach.repo_id \
+         ) \
+         SELECT EXISTS( \
+            SELECT 1 FROM reach \
+            JOIN repositories r ON r.id = reach.repo_id AND r.repo_type = 'remote' \
+            LEFT JOIN repository_config c \
+              ON c.repository_id = r.id AND c.key = 'quarantine_enabled' \
+            WHERE COALESCE(c.value IN ('true', '1'), $2))",
+    )
+    .bind(virtual_repo_id)
+    .bind(crate::services::quarantine_service::globally_enabled())
+    .fetch_one(db)
+    .await
+    .unwrap_or(true)
+}
+
 /// Single-member form of [`authorize_virtual_members`]; see it for the access
 /// model, the #1804 / #3178 background and the #4559 parent term
 /// (`virtual_repo_id` is the virtual the request was routed through).

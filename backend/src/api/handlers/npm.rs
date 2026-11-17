@@ -52,6 +52,7 @@ use crate::services::npm_attestation_cache::{self as attestation_cache, CachedMe
 use crate::services::npm_packument_cache::{
     self as packument_cache, CachedPackument, NpmPackumentCache,
 };
+use crate::services::quarantine_service;
 use crate::services::upstream_tracing::send_upstream;
 
 // ---------------------------------------------------------------------------
@@ -488,6 +489,22 @@ async fn age_gate_bypasses_packument_cache(state: &SharedState, repo: &RepoInfo)
     }
 }
 
+/// Whether the Package Age Policy can leave versions out of this repo's
+/// packuments (#5933). Like the age gate's, that view moves with the clock (a
+/// held version comes back when its window ends), so it is computed per
+/// request rather than cached. A Virtual checks every member it can reach.
+async fn hold_bypasses_packument_cache(state: &SharedState, repo: &RepoInfo) -> bool {
+    if repo.repo_type == RepositoryType::Remote {
+        quarantine_service::should_quarantine(
+            &quarantine_service::resolve_config(&state.db, repo.id).await,
+        )
+    } else if repo.repo_type == RepositoryType::Virtual {
+        proxy_helpers::virtual_has_quarantine_member(&state.db, repo.id).await
+    } else {
+        false
+    }
+}
+
 /// Pure part of the packument cache-eligibility decision.
 ///
 /// The one remaining reason to bypass the computed-packument cache is the age
@@ -643,7 +660,8 @@ async fn get_package_metadata_cached(
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
     let cache_eligible = packument_cache_eligible(
         repo.repo_type.as_str(),
-        age_gate_bypasses_packument_cache(state, &repo).await,
+        age_gate_bypasses_packument_cache(state, &repo).await
+            || hold_bypasses_packument_cache(state, &repo).await,
     );
     // Server-side caching is safe for Remote AND Virtual, because #2490's
     // LISTEN/NOTIFY fanout (`invalidate_package_and_virtuals`, which explicitly
@@ -4112,28 +4130,35 @@ async fn npm_age_gated_tag_view(
     packument: &serde_json::Value,
 ) -> Result<Option<serde_json::Value>, Response> {
     if repo.repo_type == RepositoryType::Remote {
-        let Some(svc) = state.age_gate_service.as_ref() else {
-            return Ok(None);
-        };
-        if !AgeGateService::is_applicable(&proxy_helpers::age_gate_params(repo)) {
-            return Ok(None);
-        }
-        let params = crate::services::age_gate_service::resolve_repo_params(&state.db, repo.id)
-            .await
-            .map_err(IntoResponse::into_response)?;
-        if !AgeGateService::is_applicable(&params) {
-            return Ok(None);
-        }
-        let mut view = packument.clone();
-        svc.filter_npm_packument(&params, package_name, &mut view)
-            .await
-            .map_err(IntoResponse::into_response)?;
-        Ok(Some(view))
-    } else if repo.repo_type == RepositoryType::Virtual {
-        // Without a gated member the gated merge equals the one already built.
-        if state.age_gate_service.is_none()
-            || !proxy_helpers::virtual_has_age_gated_member(&state.db, repo.id).await
+        let mut view = None;
+        if let Some(svc) = state
+            .age_gate_service
+            .as_ref()
+            .filter(|_| AgeGateService::is_applicable(&proxy_helpers::age_gate_params(repo)))
         {
+            let params = crate::services::age_gate_service::resolve_repo_params(&state.db, repo.id)
+                .await
+                .map_err(IntoResponse::into_response)?;
+            if AgeGateService::is_applicable(&params) {
+                let mut gated = packument.clone();
+                svc.filter_npm_packument(&params, package_name, &mut gated)
+                    .await
+                    .map_err(IntoResponse::into_response)?;
+                view = Some(gated);
+            }
+        }
+        // The Package Age Policy leaves its held versions out too (#5933).
+        let hold = quarantine_service::resolve_config(&state.db, repo.id).await;
+        if quarantine_service::should_quarantine(&hold) {
+            let held = view.get_or_insert_with(|| packument.clone());
+            quarantine_service::hide_held_npm_versions(&hold, held, chrono::Utc::now());
+        }
+        Ok(view)
+    } else if repo.repo_type == RepositoryType::Virtual {
+        // Without a gated or held member the merge equals the one already built.
+        let gated = state.age_gate_service.is_some()
+            && proxy_helpers::virtual_has_age_gated_member(&state.db, repo.id).await;
+        if !gated && !proxy_helpers::virtual_has_quarantine_member(&state.db, repo.id).await {
             return Ok(None);
         }
         Ok(Some(
@@ -4239,6 +4264,12 @@ async fn remote_member_packument_value(
                     .map_err(|e| e.into_response())?;
             }
         }
+        // The member's Package Age Policy leaves its held versions out (#5933).
+        quarantine_service::hide_held_npm_versions(
+            &quarantine_service::resolve_config(&state.db, member_id).await,
+            &mut json,
+            chrono::Utc::now(),
+        );
     }
     rewrite_npm_tarball_urls(&mut json, base_url, repo_key, Some(upstream_url));
     Ok(Some(json))
@@ -4912,14 +4943,21 @@ async fn rewrite_and_respond_with_age_gate_params(
     want_abbreviated: bool,
 ) -> Result<Response, Response> {
     let mut filtered = content.clone();
-    if let (Some(svc), Ok(mut json)) = (
-        state.age_gate_service.as_ref(),
-        serde_json::from_slice::<serde_json::Value>(&content),
-    ) {
-        if AgeGateService::is_applicable(params) {
-            svc.filter_npm_packument(params, package_name, &mut json)
-                .await
-                .map_err(|e| e.into_response())?;
+    let age_gate = state
+        .age_gate_service
+        .as_ref()
+        .filter(|_| AgeGateService::is_applicable(params));
+    // The Package Age Policy holds a young version's tarball, so the
+    // packument leaves that version out too (#5933).
+    let hold = quarantine_service::resolve_config(&state.db, params.id).await;
+    if age_gate.is_some() || quarantine_service::should_quarantine(&hold) {
+        if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&content) {
+            if let Some(svc) = age_gate {
+                svc.filter_npm_packument(params, package_name, &mut json)
+                    .await
+                    .map_err(|e| e.into_response())?;
+            }
+            quarantine_service::hide_held_npm_versions(&hold, &mut json, chrono::Utc::now());
             filtered = Bytes::from(serde_json::to_vec(&json).unwrap_or_default());
         }
     }
@@ -14512,6 +14550,175 @@ mod tests {
             StatusCode::CONFLICT,
             "the young version's tarball stays held"
         );
+    }
+
+    /// The version `npm install <range>` picks from a served packument.
+    fn npm_range_pick(packument: &serde_json::Value, range: &str) -> Option<String> {
+        let req = semver::VersionReq::parse(range).expect("range");
+        packument["versions"]
+            .as_object()?
+            .keys()
+            .filter_map(|v| semver::Version::parse(v).ok())
+            .filter(|v| req.matches(v))
+            .max()
+            .map(|v| v.to_string())
+    }
+
+    /// #5933: with the Package Age Policy on, the packument leaves out the
+    /// version whose tarball is still held and moves `latest` back, so
+    /// `^1.21.0` resolves to 1.21.0 rather than stopping at 1.21.1's 409. When
+    /// the window ends the version is listed again, so the view is not cached.
+    #[tokio::test]
+    async fn test_age_policy_hides_the_held_version_from_the_packument_5933_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        let released = chrono::Utc::now() - chrono::Duration::hours(2);
+        let released_http = released.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let packument = serde_json::json!({
+            "name": "heldpkg",
+            "dist-tags": {"latest": "1.21.1"},
+            "versions": {
+                "1.21.0": {"name": "heldpkg", "version": "1.21.0", "dist": {
+                    "tarball": format!("{}/heldpkg/-/heldpkg-1.21.0.tgz", upstream.uri())}},
+                "1.21.1": {"name": "heldpkg", "version": "1.21.1", "dist": {
+                    "tarball": format!("{}/heldpkg/-/heldpkg-1.21.1.tgz", upstream.uri())}},
+            },
+            "time": {
+                "created": "2015-10-21T07:28:00.000Z",
+                "modified": released.to_rfc3339(),
+                "1.21.0": "2015-10-21T07:28:00.000Z",
+                "1.21.1": released.to_rfc3339()
+            }
+        });
+        Mock::given(method("GET"))
+            .and(path("/heldpkg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("last-modified", released_http.as_str())
+                    .set_body_json(&packument),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/heldpkg/-/heldpkg-1.21.1.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .insert_header("last-modified", released_http.as_str())
+                    .set_body_bytes(b"young-tarball".as_ref()),
+            )
+            .mount(&upstream)
+            .await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("point the remote at wiremock");
+        async fn set_window(pool: &PgPool, repo_id: uuid::Uuid, minutes: &str) {
+            sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+                .bind(repo_id)
+                .execute(pool)
+                .await
+                .expect("clear the policy");
+            sqlx::query(
+                "INSERT INTO repository_config (repository_id, key, value) \
+                 VALUES ($1, 'quarantine_enabled', 'true'), \
+                        ($1, 'quarantine_duration_minutes', $2)",
+            )
+            .bind(repo_id)
+            .bind(minutes)
+            .execute(pool)
+            .await
+            .expect("set the Package Age Policy");
+            crate::services::quarantine_service::invalidate_config_cache(repo_id);
+        }
+        async fn serve(
+            state: &SharedState,
+            auth: Option<&AuthExtension>,
+            repo_key: &str,
+        ) -> (StatusCode, Option<serde_json::Value>) {
+            let response = super::get_package_metadata_cached(
+                state,
+                auth,
+                repo_key,
+                "heldpkg",
+                "http://localhost",
+                &HeaderMap::new(),
+            )
+            .await;
+            let response = match response {
+                Ok(r) => r,
+                Err(r) => r,
+            };
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("read packument");
+            (status, serde_json::from_slice(&body).ok())
+        }
+
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage, proxy);
+        assert!(
+            state.npm_packument_cache.is_some(),
+            "the packument cache is on"
+        );
+        let auth = tdh::admin_auth_ext();
+
+        // A day's window holds the 2 hour old 1.21.1.
+        set_window(&fx.pool, fx.repo_id, "1440").await;
+        let held = serve(&state, auth.as_ref(), &fx.repo_key).await;
+        let tarball = super::download_tarball(
+            axum::extract::State(state.clone()),
+            axum::Extension(auth.clone()),
+            axum::extract::Path((
+                fx.repo_key.clone(),
+                "heldpkg".to_string(),
+                "heldpkg-1.21.1.tgz".to_string(),
+            )),
+            Default::default(),
+        )
+        .await;
+        // An hour's window has passed for it.
+        set_window(&fx.pool, fx.repo_id, "60").await;
+        let after = serve(&state, auth.as_ref(), &fx.repo_key).await;
+
+        let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        crate::services::quarantine_service::invalidate_config_cache(fx.repo_id);
+        tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        let (status, held) = held;
+        assert_eq!(status, StatusCode::OK);
+        let held = held.expect("packument JSON");
+        assert!(held["versions"].get("1.21.1").is_none(), "{held}");
+        assert!(held["time"].get("1.21.1").is_none(), "{held}");
+        assert!(held["versions"].get("1.21.0").is_some(), "{held}");
+        assert_eq!(held["dist-tags"]["latest"], "1.21.0");
+        assert_eq!(npm_range_pick(&held, "^1.21.0").as_deref(), Some("1.21.0"));
+        let status = match tarball {
+            Ok(r) => r.status(),
+            Err(r) => r.status(),
+        };
+        assert_eq!(status, StatusCode::CONFLICT, "1.21.1's tarball stays held");
+
+        let (status, after) = after;
+        assert_eq!(status, StatusCode::OK);
+        let after = after.expect("packument JSON");
+        assert!(after["versions"].get("1.21.1").is_some(), "{after}");
+        assert_eq!(after["dist-tags"]["latest"], "1.21.1");
+        assert_eq!(npm_range_pick(&after, "^1.21.0").as_deref(), Some("1.21.1"));
     }
 
     /// GHSA-qxv7-p3mq-88fv: a remote npm tarball whose bytes disagree with
