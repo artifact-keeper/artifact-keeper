@@ -171,12 +171,23 @@ pub(crate) fn io_storage_error(err: &std::io::Error, message: String) -> AppErro
     }
 }
 
-/// `AppError::Storage("{context}: {err}")` with the request URL left out of
-/// `err` (it names the endpoint, bucket and key), tagged unavailable when
-/// `err` is a failed connect or a timeout.
+/// `AppError::Storage("{context}: {err}: {source}: ...")` with the request
+/// URL left out of `err` (it names the endpoint, bucket and key), tagged
+/// unavailable when `err` is a failed connect or a timeout.
+///
+/// reqwest's own message for a failed request is only "error sending
+/// request"; the cause (a timeout, a reset, a refused connection) is in its
+/// source chain, so that is appended (#5932).
 pub(crate) fn transport_storage_error(context: &str, err: reqwest::Error) -> AppError {
     let class = StorageFailure::from_reqwest(&err);
-    let message = format!("{context}: {}", err.without_url());
+    let err = err.without_url();
+    let mut message = format!("{context}: {err}");
+    let mut source = std::error::Error::source(&err);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
     match class {
         Some(class) => AppError::Storage(class.tag(message)),
         None => AppError::Storage(message),
@@ -348,6 +359,37 @@ mod tests {
         assert_eq!(
             StorageFailure::from_message(&tagged.to_string()),
             Some(StorageFailure::Unavailable)
+        );
+    }
+
+    /// #5932: the cause in reqwest's source chain reaches the message, so a
+    /// read timeout no longer surfaces as a bare "error sending request".
+    #[tokio::test]
+    async fn transport_storage_error_names_the_cause_of_a_timeout() {
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(201).set_delay(Duration::from_secs(5)))
+            .mount(&server)
+            .await;
+        let err = reqwest::Client::builder()
+            .read_timeout(Duration::from_millis(100))
+            .build()
+            .unwrap()
+            .put(server.uri())
+            .body("x")
+            .send()
+            .await
+            .expect_err("the response is slower than the read timeout");
+        let message = transport_storage_error("Azure upload failed", err).to_string();
+        assert!(
+            message.to_ascii_lowercase().contains("timed out"),
+            "the timeout must be named: {message}"
+        );
+        assert!(
+            !message.contains(&server.uri()),
+            "no URL in the message: {message}"
         );
     }
 }
