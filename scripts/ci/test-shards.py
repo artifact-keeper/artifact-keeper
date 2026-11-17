@@ -137,6 +137,21 @@ OVERRIDES = {
     ),
 }
 
+# The bin targets' sources: main.rs (the `artifact-keeper` binary) and
+# bin/** (ak-mcp-introspector). Their tests are the bin-target tests, which
+# ci.yml builds and runs in ONE leg (BIN_SHARD) with `--bins`. That leg also
+# builds the non-test library, about 7 min on a hosted runner, so they go to
+# the leg with the least other work: router, a median 9.6 min per job
+# (services-1 12.2, handlers-2 12.7, handlers-1 17.8; 52 PR runs,
+# 2026-11-14..16), against services-2's 21.2, which was the critical path
+# while it carried them (#6133). Single runs vary by several minutes.
+BIN_SHARD = "router"
+
+
+def is_bin(rel):
+    """Whether `rel` (path under src/) belongs to a bin target, not the lib."""
+    return rel == "main.rs" or rel.startswith("bin/")
+
 
 # A test module that builds the WHOLE application router goes to the
 # `router` shard, wherever it lives. In a test harness (an executable) rustc
@@ -154,12 +169,14 @@ RANGES = [
     ("api/handlers/", [("o", "handlers-1"), ("z", "handlers-2")]),
     ("services/", [("q", "services-1"), ("z", "services-2")]),
 ]
-# formats, middleware, storage, models, config, main.rs, ...
+# formats, middleware, storage, models, config, ... (bin targets: BIN_SHARD)
 DEFAULT_SHARD = "services-2"
 
 
 def shard_for(rel, body=""):
     """The shard of a test module declared in `rel` (path under src/)."""
+    if is_bin(rel):
+        return BIN_SHARD
     if rel in OVERRIDES:
         return OVERRIDES[rel][0]
     if ROUTER_MARKER.search(body):
@@ -312,8 +329,9 @@ def plan(modules, per_file):
       or None: deliberately ungated), run (the one leg its tests run in),
       uses (keys of the test modules it references), users (the reverse)).
 
-    main.rs is left out of the graph: it is the bin crate, whose `crate::`
-    is not the library's, and its tests are built in one leg anyway."""
+    The bin targets (main.rs, bin/**) are left out of the graph: each is a
+    bin crate, whose `crate::` is not the library's, and its tests are
+    built in one leg anyway."""
     info = {}
     by_path = {}
     for mod in modules:
@@ -323,10 +341,10 @@ def plan(modules, per_file):
         path = module_path(mod["file"], per_file[mod["file"]][0], mod)
         info[key] = dict(mod=mod, path=path, base=shard_for(mod["file"], mod["body"]),
                          uses=set(), users=set())
-        if mod["file"] != "main.rs":
+        if not is_bin(mod["file"]):
             by_path[path] = key
     for key, it in info.items():
-        if it["mod"]["file"] == "main.rs":
+        if is_bin(it["mod"]["file"]):
             continue
         parts = it["path"].split("::")
         targets = set()
@@ -403,7 +421,7 @@ def check_manifest(repo):
 
 def check_workflow(repo, bin_shard):
     """ci.yml's unit-test matrix runs exactly SHARDS, and its BIN_SHARD leg
-    (the one that builds and runs `--bins`) is the shard main.rs's tests
+    (the one that builds and runs `--bins`) is the shard the bin-target tests
     are gated to. A shard missing from the matrix is a slice of the suite
     that never runs; a wrong BIN_SHARD is main.rs's tests never running."""
     path = os.path.join(repo, ".github/workflows/ci.yml")
@@ -419,7 +437,7 @@ def check_workflow(repo, bin_shard):
     declared = m.group(1) if m else None
     if bin_shard and declared != bin_shard:
         problems.append(f".github/workflows/ci.yml BIN_SHARD is {declared!r}, but "
-                        f"backend/src/main.rs's tests are gated to {bin_shard!r}")
+                        f"the bin-target tests (main.rs, bin/) are gated to {bin_shard!r}")
     return problems
 
 
@@ -428,9 +446,9 @@ def cmd_check(src, repo):
     problems = check_manifest(repo)
     warnings = []  # (file, line, title, message)
     info = plan(modules, per_file)
-    bin_shards = {it["run"] for it in info.values() if it["mod"]["file"] == "main.rs"}
+    bin_shards = {it["run"] for it in info.values() if is_bin(it["mod"]["file"])}
     if len(bin_shards) > 1:
-        problems.append(f"main.rs test modules span shards {sorted(bin_shards)}; "
+        problems.append(f"bin-target (main.rs, bin/) test modules span shards {sorted(bin_shards)}; "
                         "CI runs `--bins` in one leg only")
     problems += check_workflow(repo, next(iter(bin_shards), None))
     for mod in modules:
@@ -455,6 +473,12 @@ def cmd_check(src, repo):
         elif have not in SHARDS:
             problems.append(f"{where}: gated to {have!r}, which is not a shard -- its "
                             f"tests would never run (expected {want!r})")
+        elif is_bin(mod["file"]) and have != BIN_SHARD:
+            # Only the BIN_SHARD leg builds `--bins`: anywhere else these
+            # tests are compiled out of the one build that has them (#6133).
+            problems.append(f"{where}: a bin-target test module gated to {have!r}; "
+                            f"only the {BIN_SHARD!r} leg runs `--bins`, so its tests "
+                            "never run")
         elif want is None:
             pass  # a user in another shard: reported by the reference check below
         elif have != want:
@@ -514,7 +538,7 @@ def cmd_check(src, repo):
 def cmd_filter(src, shard):
     """The nextest filterset for `shard`'s leg. Every shard build compiles
     every ungated test module; this keeps each one's tests to the single
-    leg `plan` assigns it. `kind(lib)`, and main.rs left out: the
+    leg `plan` assigns it. `kind(lib)`, and the bin targets left out: the
     bin-target tests are built and run in one leg only (BIN_SHARD) whatever
     their gate."""
     if shard not in SHARDS:
@@ -522,7 +546,7 @@ def cmd_filter(src, shard):
         return 2
     modules, _stray, per_file = scan(src)
     skip = sorted(it["path"] for it in plan(modules, per_file).values()
-                  if it["run"] != shard and it["mod"]["file"] != "main.rs"
+                  if it["run"] != shard and not is_bin(it["mod"]["file"])
                   and shard_attr_of(per_file[it["mod"]["file"]][0], it["mod"])[1] is None)
     if not skip:
         print("all()")

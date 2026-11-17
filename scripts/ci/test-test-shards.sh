@@ -223,10 +223,22 @@ run_check "$r" && bad "matrix missing a shard must fail" || {
     || { bad "matrix message"; cat "$tmp/out"; }
 }
 
+# A bin target's test module (bin/**) runs only in the BIN_SHARD leg, the
+# one that builds `--bins`; gated anywhere else, it never runs (#6133).
+r="$tmp/rbin"; mkrepo "$r"; python3 "$SHARDS_PY" apply --src "$r/backend/src" >/dev/null
+mkdir -p "$r/backend/src/bin/tool"
+printf '%s\n' 'fn main() {}' '' '#[cfg(ak_test_shard = "services-2")]' '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn t() {}' '}' >"$r/backend/src/bin/tool/main.rs"
+run_check "$r" && bad "bin/ test module outside BIN_SHARD must fail" || {
+  grep -q "bin-target test module gated to 'services-2'" "$tmp/out" && ok "bin/ test module outside BIN_SHARD is refused" \
+    || { bad "bin/ gate message"; cat "$tmp/out"; }
+}
+sed -i 's/ak_test_shard = "services-2"/ak_test_shard = "router"/' "$r/backend/src/bin/tool/main.rs"
+run_check "$r" && ok "bin/ test module in BIN_SHARD passes" || { bad "bin/ test module in BIN_SHARD"; cat "$tmp/out"; }
+
 r="$tmp/r2"; mkrepo "$r"; python3 "$SHARDS_PY" apply --src "$r/backend/src" >/dev/null
-sed -i 's/BIN_SHARD: .*/BIN_SHARD: router/' "$r/.github/workflows/ci.yml"
+sed -i 's/BIN_SHARD: .*/BIN_SHARD: services-2/' "$r/.github/workflows/ci.yml"
 run_check "$r" && bad "wrong BIN_SHARD must fail" || {
-  grep -q "BIN_SHARD is 'router'" "$tmp/out" && ok "BIN_SHARD not matching main.rs's shard is refused" \
+  grep -q "BIN_SHARD is 'services-2'" "$tmp/out" && ok "BIN_SHARD not matching main.rs's shard is refused" \
     || { bad "BIN_SHARD message"; cat "$tmp/out"; }
 }
 
