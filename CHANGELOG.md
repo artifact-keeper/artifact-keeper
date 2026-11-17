@@ -98,6 +98,10 @@ Thank you to our sponsors for supporting ongoing development of Artifact Keeper.
 
 - **The manual `publish-binaries.yml` workflow is retired** (#5960, #6036). It was a `workflow_dispatch` job with `contents: write` and a free-text tag input that reached the checkout ref, inline shell steps and `gh release upload --clobber`, so one dispatch could replace a published release's binaries with an unsigned rebuild from another ref. `release.yml` is the only path that builds and uploads release binaries on this line too, so the workflow is removed rather than hardened. Nothing that ships changes.
 
+### Tests
+
+- **The backend unit-test build no longer generates code for the whole router in every CI shard** (#6150, backport of #6143, #6144, #6151). One test helper was declared `pub async fn` and called `create_router`. rustc builds a `pub async fn` and everything it calls into every test binary that compiles it, whether or not a test calls it, so each of the five unit-test legs built every handler. Test code now uses `pub(crate) async fn`, and `scripts/ci/test-shards.py check` refuses the old form. Test-only change: production builds and binaries are unaffected.
+
 ### CI / Release Assurance
 
 These change how 1.11.x releases are built and certified. Nothing that ships changes.
