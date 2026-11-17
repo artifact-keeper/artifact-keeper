@@ -410,49 +410,85 @@ else
   # docker-publish.yml in PROMOTE mode on main, and a dispatch's head_sha is
   # main's tip at that moment, so the promote of an older certified commit
   # lands on HEAD's sha too. PROMOTE builds and scans nothing (Security Scan
-  # is skipped) while its re-tag job is green; taking "the newest run for the
-  # sha" read that as HEAD's build and failed preflight permanently on
-  # e808fdac after the 1.11.14 promote (run 44116256357 over push run
-  # 44080746556). So, in order:
-  #   1. the commit's push run: a branch push builds each commit once (#6080);
-  #   2. no push run (e.g. a docs-only tip someone dispatched by hand): the
-  #      newest dispatch whose Security Scan did not skip, i.e. one that built;
+  # skipped, no job fails) while its re-tag job is green; taking "the newest
+  # run for the sha" read that as HEAD's build and failed preflight
+  # permanently on e808fdac after the 1.11.14 promote (run 44116256357 over
+  # push run 44080746556). So, among runs ON THE AUDITED BRANCH:
+  #   1. the commit's push run (a branch push builds each commit once,
+  #      #6080), unless it is red and a NEWER dispatched build is green
+  #      (someone rebuilt the commit by hand);
+  #   2. no push run (e.g. a docs-only tip, #3629): the newest dispatch that
+  #      built, or one still in flight;
   #   3. neither: not built.
+  # A dispatch "built nothing" only when Security Scan skipped AND no job
+  # failed: Security Scan is also skipped when an earlier build job fails,
+  # and that failed build must stay the verdict.
   # `event=push` alone is not the fix: resolve-candidate-publish-run.sh
   # documents how that filter deadlocked a re-tagged release (#3640).
-  if ! runs="$(gh api "repos/$REPO/actions/workflows/docker-publish.yml/runs?head_sha=$head_sha&per_page=20" \
-                 --jq '.workflow_runs[] | select(.event != "schedule") | "\(.id) \(.status) \(.event)"' 2>/dev/null)"; then
+  # shellcheck disable=SC2016 # jq programs, not shell
+  if ! runs="$(gh api "repos/$REPO/actions/workflows/docker-publish.yml/runs?head_sha=$head_sha&per_page=50" \
+                 --jq '.workflow_runs[] | select(.event != "schedule") | "\(.id) \(.status) \(.event) \(.head_branch)"' 2>/dev/null)"; then
     # gh is present but the query failed (auth, network, API). We could not
     # measure, so we must not render a readiness verdict either way.
     echo "INFRA: could not query Docker Publish runs for $head_sha" >&2
     infra_exit
   fi
+  # The same sha pushed to another branch (or tagged) is another build that
+  # publishes other tags; it must not decide this ref's verdict.
+  audit_branch="${AUDIT_REF#refs/tags/}"
+  case "$audit_branch" in
+    ''|'?'|HEAD) ;;
+    *) runs="$(awk -v b="$audit_branch" '$4 == b' <<< "$runs")" ;;
+  esac
   sec_of() { # <run id> -> the Security Scan conclusion, "?" when unreadable
     gh run view "$1" --repo "$REPO" --json jobs \
       --jq '[.jobs[]|select(.name=="Security Scan")|(.conclusion//"?")]|first//"?"' 2>/dev/null || echo '?'
   }
-  run_info="$(awk '$3 == "push" { print $1, $2; exit }' <<< "$runs")"
-  if [[ -z "$run_info" ]]; then
-    while read -r c_id c_status c_event; do
-      [[ -n "$c_id" ]] || continue
-      if [[ "$c_status" != "completed" ]]; then
-        # An unfinished dispatch may be a build or a promote; we cannot tell
-        # which until it ends, so it is the verdict (blocks as in flight).
-        run_info="$c_id $c_status"; break
-      fi
-      c_sec="$(sec_of "$c_id")"
-      if [[ "$c_sec" == "?" ]]; then
-        echo "INFRA: could not read job conclusions from run $c_id" >&2
-        infra_exit
-      fi
-      if [[ "$c_sec" == "skipped" ]]; then
-        note "run $c_id ($c_event) built nothing (Security Scan skipped: a PROMOTE or re-tag run); not this commit's build"
-        continue
-      fi
-      run_info="$c_id $c_status"; break
-    done <<< "$runs"
-  elif awk '$3 != "push"' <<< "$runs" | grep -q .; then
-    note "using push run ${run_info%% *}; ignoring dispatched run(s) for the same sha (promote or manual)"
+  man_of() { # <run id> -> the backend manifest conclusion, "?" when unreadable
+    gh run view "$1" --repo "$REPO" --json jobs \
+      --jq '[.jobs[]|select(.name|test("Backend Multi-Arch Manifest"))|(.conclusion//"skipped")]|first//"?"' 2>/dev/null || echo '?'
+  }
+  kind_of() { # <run id> -> built | promote | ?
+    local k
+    # shellcheck disable=SC2016 # a jq program, not shell
+    k="$(gh run view "$1" --repo "$REPO" --json jobs --jq '
+          ([.jobs[] | select(.name == "Security Scan") | (.conclusion // "?")] | first // "?") as $s
+          | ([.jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out")] | length) as $f
+          | if $s == "?" then "?" elif $s == "skipped" and $f == 0 then "promote" else "built" end' 2>/dev/null)" || k='?'
+    echo "${k:-?}"
+  }
+  green() { [[ "$(sec_of "$1")" == success && "$(man_of "$1")" == success ]]; }
+  push_info="$(awk '$3 == "push" { print $1, $2; exit }' <<< "$runs")"
+  disp_info=""
+  while read -r c_id c_status c_event _; do
+    [[ -n "$c_id" && "$c_event" != push ]] || continue
+    if [[ "$c_status" != "completed" ]]; then
+      # An unfinished dispatch may be a build or a promote; we cannot tell
+      # which until it ends.
+      disp_info="$c_id $c_status"; break
+    fi
+    case "$(kind_of "$c_id")" in
+      '?') echo "INFRA: could not read job conclusions from run $c_id" >&2
+           infra_exit ;;
+      promote) note "run $c_id ($c_event) built nothing (Security Scan skipped, no job failed: a PROMOTE or re-tag run); not this commit's build"
+               continue ;;
+    esac
+    disp_info="$c_id $c_status"; break
+  done <<< "$runs"
+  run_info="$push_info"
+  if [[ -z "$push_info" ]]; then
+    # In flight blocks below, exactly as an unfinished push run does.
+    run_info="$disp_info"
+  else
+    read -r p_id p_status <<< "$push_info"
+    read -r d_id d_status <<< "${disp_info:-0 none}"
+    if [[ -n "$disp_info" && "$p_status" == completed && "$d_status" == completed ]] && (( d_id > p_id )) \
+       && ! green "$p_id" && green "$d_id"; then
+      note "push run $p_id is red; a newer build dispatched on ${audit_branch}, run $d_id, is green and decides"
+      run_info="$disp_info"
+    elif awk '$3 != "push"' <<< "$runs" | grep -q .; then
+      note "using push run $p_id; ignoring dispatched run(s) for the same sha (promote or manual)"
+    fi
   fi
   if [[ -z "$run_info" ]]; then
     # A fourth outcome, distinct from "ran and failed" (#3338): the query
@@ -480,8 +516,7 @@ else
       note "  -> wait for it to complete, then re-run preflight. Do not tag ahead of the gate."
     else
       sec="$(sec_of "$run_id")"
-      man="$(gh run view "$run_id" --repo "$REPO" --json jobs \
-              --jq '[.jobs[]|select(.name|test("Backend Multi-Arch Manifest"))|(.conclusion//"skipped")]|first//"?"' 2>/dev/null || echo '?')"
+      man="$(man_of "$run_id")"
       note "run $run_id: Security Scan=$sec, Backend Multi-Arch Manifest=$man"
       if [[ "$sec" == "?" || "$man" == "?" ]]; then
         echo "INFRA: could not read job conclusions from run $run_id" >&2
