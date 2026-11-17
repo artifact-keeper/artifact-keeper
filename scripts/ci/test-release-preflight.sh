@@ -106,8 +106,12 @@ case "$1" in
         ;;
       *actions/workflows/docker-publish.yml/runs*)
         [ "${FAKE_API_FAIL-0}" = "1" ] && exit 1
+        # $FAKE_RUNS (one "<id> <status> <event>" per line, newest first)
+        # replays several runs for one sha (#6163 follow-up: a PROMOTE
+        # dispatch sharing HEAD's sha). Otherwise one push run.
+        if [ -n "${FAKE_RUNS-}" ]; then printf '%s\n' "$FAKE_RUNS"; exit 0; fi
         run_id="${FAKE_RUN_ID-12345}"
-        [ -n "$run_id" ] && echo "$run_id ${FAKE_RUN_STATUS-completed}"
+        [ -n "$run_id" ] && echo "$run_id ${FAKE_RUN_STATUS-completed} push"
         exit 0
         ;;
       *commits/*/statuses*)
@@ -132,10 +136,13 @@ case "$1" in
       view)
         # Which of the two `gh run view` calls is this? The jq for Security
         # Scan mentions that name; the other is the manifest.
+        # Per-run overrides FAKE_SECURITY_SCAN_<id> / FAKE_MANIFEST_<id>
+        # fall back to the global answers.
+        sv="FAKE_SECURITY_SCAN_$3"; mv="FAKE_MANIFEST_$3"
         if printf '%s ' "$@" | grep -q 'Security Scan'; then
-          echo "${FAKE_SECURITY_SCAN-success}"
+          echo "${!sv-${FAKE_SECURITY_SCAN-success}}"
         else
-          echo "${FAKE_MANIFEST-success}"
+          echo "${!mv-${FAKE_MANIFEST-success}}"
         fi
         ;;
     esac
@@ -204,6 +211,36 @@ FAKE_RUN_ID="" FAKE_SECURITY_SCAN=success FAKE_MANIFEST=success \
 #     measurement (#3338).
 FAKE_RUN_STATUS=in_progress FAKE_SECURITY_SCAN=success FAKE_MANIFEST=success \
   expect "run still in progress -> NOT READY (wait)" 1 "still 'in_progress'"
+
+# 4d. THE 1.11.14 PROMOTE REGRESSION (run 44116256357 over push run
+#     44080746556 on e808fdac). release-promote.yml dispatches a PROMOTE on
+#     main; its head_sha is HEAD's. It skips Security Scan and its re-tag
+#     manifest job is green. Taking "the newest run for the sha" read it as
+#     HEAD's build and refused every cut. The push run is the build.
+FAKE_RUNS=$'900 completed workflow_dispatch\n800 completed push' \
+FAKE_SECURITY_SCAN_900=skipped FAKE_MANIFEST_900=success \
+FAKE_SECURITY_SCAN_800=success FAKE_MANIFEST_800=success \
+  expect "newer PROMOTE dispatch on HEAD's sha -> push run decides, READY" 0 "using push run 800"
+
+# 4e. ...and the push run still decides when it is RED: a green promote must
+#     not launder a failed build.
+FAKE_RUNS=$'900 completed workflow_dispatch\n800 completed push' \
+FAKE_SECURITY_SCAN_900=success FAKE_MANIFEST_900=success \
+FAKE_SECURITY_SCAN_800=failure FAKE_MANIFEST_800=skipped \
+  expect "red push run beside a green dispatch -> NOT READY" 1 "NOT READY"
+
+# 4f. No push run (a docs-only tip, #3629) and only a PROMOTE: nothing built
+#     HEAD. Not a pass.
+FAKE_RUNS='900 completed workflow_dispatch' \
+FAKE_SECURITY_SCAN_900=skipped FAKE_MANIFEST_900=success \
+  expect "only a PROMOTE dispatch for HEAD -> NOT READY (not built)" 1 "NOT been built"
+
+# 4g. No push run, a hand-dispatched BUILD older than a PROMOTE: the build
+#     decides (the documented "trigger Docker Publish on this commit" path).
+FAKE_RUNS=$'901 completed workflow_dispatch\n700 completed workflow_dispatch' \
+FAKE_SECURITY_SCAN_901=skipped FAKE_MANIFEST_901=success \
+FAKE_SECURITY_SCAN_700=success FAKE_MANIFEST_700=success \
+  expect "hand-dispatched build under a PROMOTE -> READY" 0 "run 901 (workflow_dispatch) built nothing"
 
 # 5. The explicit human override reports the red but does not block. Separate
 #    from PREFLIGHT_SKIP_DOCKER_HEALTH on purpose: "I looked, it is red,

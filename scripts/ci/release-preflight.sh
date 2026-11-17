@@ -404,21 +404,62 @@ else
   # Select the run for THIS commit, never "the latest run" (#3338): recency
   # is a proxy that diverges when main has moved, a publish is in flight, or
   # the list API answers stalely -- and the divergence produced a blocking
-  # false red on the v1.7.2 cut. head_sha resolves to at most one run and
-  # needs no new machinery.
-  if ! run_info="$(gh api "repos/$REPO/actions/workflows/docker-publish.yml/runs?head_sha=$head_sha&per_page=1" \
-                    --jq '.workflow_runs[0] // empty | "\(.id) \(.status)"' 2>/dev/null)"; then
+  # false red on the v1.7.2 cut.
+  #
+  # head_sha alone is NOT one run, though. release-promote.yml dispatches
+  # docker-publish.yml in PROMOTE mode on main, and a dispatch's head_sha is
+  # main's tip at that moment, so the promote of an older certified commit
+  # lands on HEAD's sha too. PROMOTE builds and scans nothing (Security Scan
+  # is skipped) while its re-tag job is green; taking "the newest run for the
+  # sha" read that as HEAD's build and failed preflight permanently on
+  # e808fdac after the 1.11.14 promote (run 44116256357 over push run
+  # 44080746556). So, in order:
+  #   1. the commit's push run: a branch push builds each commit once (#6080);
+  #   2. no push run (e.g. a docs-only tip someone dispatched by hand): the
+  #      newest dispatch whose Security Scan did not skip, i.e. one that built;
+  #   3. neither: not built.
+  # `event=push` alone is not the fix: resolve-candidate-publish-run.sh
+  # documents how that filter deadlocked a re-tagged release (#3640).
+  if ! runs="$(gh api "repos/$REPO/actions/workflows/docker-publish.yml/runs?head_sha=$head_sha&per_page=20" \
+                 --jq '.workflow_runs[] | select(.event != "schedule") | "\(.id) \(.status) \(.event)"' 2>/dev/null)"; then
     # gh is present but the query failed (auth, network, API). We could not
     # measure, so we must not render a readiness verdict either way.
     echo "INFRA: could not query Docker Publish runs for $head_sha" >&2
     infra_exit
+  fi
+  sec_of() { # <run id> -> the Security Scan conclusion, "?" when unreadable
+    gh run view "$1" --repo "$REPO" --json jobs \
+      --jq '[.jobs[]|select(.name=="Security Scan")|(.conclusion//"?")]|first//"?"' 2>/dev/null || echo '?'
+  }
+  run_info="$(awk '$3 == "push" { print $1, $2; exit }' <<< "$runs")"
+  if [[ -z "$run_info" ]]; then
+    while read -r c_id c_status c_event; do
+      [[ -n "$c_id" ]] || continue
+      if [[ "$c_status" != "completed" ]]; then
+        # An unfinished dispatch may be a build or a promote; we cannot tell
+        # which until it ends, so it is the verdict (blocks as in flight).
+        run_info="$c_id $c_status"; break
+      fi
+      c_sec="$(sec_of "$c_id")"
+      if [[ "$c_sec" == "?" ]]; then
+        echo "INFRA: could not read job conclusions from run $c_id" >&2
+        infra_exit
+      fi
+      if [[ "$c_sec" == "skipped" ]]; then
+        note "run $c_id ($c_event) built nothing (Security Scan skipped: a PROMOTE or re-tag run); not this commit's build"
+        continue
+      fi
+      run_info="$c_id $c_status"; break
+    done <<< "$runs"
+  elif awk '$3 != "push"' <<< "$runs" | grep -q .; then
+    note "using push run ${run_info%% *}; ignoring dispatched run(s) for the same sha (promote or manual)"
   fi
   if [[ -z "$run_info" ]]; then
     # A fourth outcome, distinct from "ran and failed" (#3338): the query
     # succeeded and there is NO run for this commit. The images a tag cut
     # would pin do not exist, so resolve-candidate-digest has nothing to
     # resolve. Not a pass; also not an infra retry.
-    bad "no Docker Publish run exists for HEAD ($(git rev-parse --short HEAD)) -- the images for this commit have NOT been built."
+    bad "no Docker Publish run built HEAD ($(git rev-parse --short HEAD)) -- the images for this commit have NOT been built."
     note "  -> a tag cut from this commit has no manifest to resolve a digest from."
     note "  -> docker-publish.yml skips a commit that touches only markdown other"
     note "     than CHANGELOG.md, or only .beads/** or LICENSE (#3629). A"
@@ -438,8 +479,7 @@ else
       note "  -> run: $(printf '%s/actions/runs/%s' "https://github.com/$REPO" "$run_id")"
       note "  -> wait for it to complete, then re-run preflight. Do not tag ahead of the gate."
     else
-      sec="$(gh run view "$run_id" --repo "$REPO" --json jobs \
-              --jq '[.jobs[]|select(.name=="Security Scan")|(.conclusion//"?")]|first//"?"' 2>/dev/null || echo '?')"
+      sec="$(sec_of "$run_id")"
       man="$(gh run view "$run_id" --repo "$REPO" --json jobs \
               --jq '[.jobs[]|select(.name|test("Backend Multi-Arch Manifest"))|(.conclusion//"skipped")]|first//"?"' 2>/dev/null || echo '?')"
       note "run $run_id: Security Scan=$sec, Backend Multi-Arch Manifest=$man"

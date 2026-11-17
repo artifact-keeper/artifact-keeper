@@ -252,6 +252,17 @@ reset_case; CASE_MODE=coverage
 expect "every gate job of the rerun ran in the original" 0 "also ran in the original"
 edit self_jobs.json ".jobs += [$(job "$G / dtf-gate (brand-new-group)" success), $(job "$G / brand-new-tests" success)]"
 expect "a gate job or leg the original never ran -> BLOCKED" 1 "brand-new-tests dtf-gate/brand-new-group"
+# #6163, the first real rerun (44106249514): only_jobs named a suite and no
+# dtf-gate leg, so GitHub listed the whole matrix as ONE skipped job with its
+# name unexpanded. It is not a leg and must not refuse certification.
+reset_case; CASE_MODE=coverage
+printf '%s' '{"jobs":[]}' > "$F/self_jobs.json"
+edit self_jobs.json ".jobs += [$(job "$G / version-set-integrity" success), $(job "$G / webhook-tests" success), $(job "$G / collect-results" success), $(job "$G / dtf-gate (\${{ matrix.group }})" skipped)]"
+expect "suite-only rerun: the skipped unexpanded dtf-gate matrix is not a new leg" 0 "also ran in the original"
+# ...but only the PLACEHOLDER is dropped. A real job the gate gained since the
+# original, skipped by this rerun, was tested by neither run: still refused.
+edit self_jobs.json ".jobs += [$(job "$G / brand-new-tests" skipped)]"
+expect "a skipped job the original never ran is still BLOCKED" 1 "brand-new-tests"
 
 if [ "$fails" -ne 0 ]; then
   echo "candidate rerun resolver: $fails case(s) FAILED"
