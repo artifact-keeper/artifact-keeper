@@ -90,7 +90,9 @@ name: Nightly Release Gate
 #   `if: always()` jobs.
 #   Each lane reports through nightly-gate-report.js with REPORT_LANE set:
 #   issues keyed "<line>~<lane>|<tier>" (never closed by a gate result and
-#   vice versa), its own `nightly-lane-verdict-<lane>` artifact, no status.
+#   vice versa) and labelled `automated` and `nightly-lane`, not
+#   `release-gate` (a red lane is not a gate failure), its own
+#   `nightly-lane-verdict-<lane>` artifact, no status.
 #   Which run: a dispatch's `lanes` input (empty = the gate only); a
 #   scheduled night's NIGHTLY_LANES repository variable (a kill switch
 #   without a PR), else "gate s3". An unknown word is dropped with a warning,
