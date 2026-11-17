@@ -2259,7 +2259,7 @@ impl StorageBackend for AzureBackend {
     /// `RequestBodyTooLarge`), and Azure sends no response byte before it has
     /// the whole body, so the large-object client's 30 s `read_timeout`
     /// aborts any upload that takes longer than that ("error sending
-    /// request"), at about 1.2 GB on a 40 MB/s link. Staged 4 MiB Put Block
+    /// request"). Staged 4 MiB Put Block
     /// requests each answer within the timeout, have no 5000 MiB limit, and
     /// reuse `put_stream`'s per-upload block-ID nonce and lost-commit-race
     /// handling (#3920). Peak heap stays O(block size).
@@ -3014,9 +3014,6 @@ mod tests {
         );
     }
 
-    /// #5932: `put_file` must stage blocks rather than send the file as one
-    /// Put Blob, which Azure caps at 5000 MiB and which outlives the client's
-    /// read timeout on large files.
     #[tokio::test]
     async fn test_put_file_uses_block_upload_instead_of_single_put_blob() {
         use crate::storage::StorageBackend as StorageBackendTrait;

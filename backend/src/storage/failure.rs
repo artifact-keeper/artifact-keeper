@@ -177,7 +177,7 @@ pub(crate) fn io_storage_error(err: &std::io::Error, message: String) -> AppErro
 ///
 /// reqwest's own message for a failed request is only "error sending
 /// request"; the cause (a timeout, a reset, a refused connection) is in its
-/// source chain, so that is appended (#5932).
+/// source chain, so that is appended.
 pub(crate) fn transport_storage_error(context: &str, err: reqwest::Error) -> AppError {
     let class = StorageFailure::from_reqwest(&err);
     let err = err.without_url();
@@ -362,8 +362,6 @@ mod tests {
         );
     }
 
-    /// #5932: the cause in reqwest's source chain reaches the message, so a
-    /// read timeout no longer surfaces as a bare "error sending request".
     #[tokio::test]
     async fn transport_storage_error_names_the_cause_of_a_timeout() {
         use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
