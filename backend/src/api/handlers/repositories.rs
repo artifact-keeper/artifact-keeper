@@ -7791,11 +7791,12 @@ pub struct ListArtifactsQuery {
     /// the authoritative "is there a next page" signal either way, so walk
     /// pages until it is false rather than up to a lower-bound `total_pages`.
     pub count: Option<String>,
-    /// Order of the flat listing of hosted and virtual repositories (#5040):
-    /// `path` (the default), `size` or `created_at`, ties broken by row id,
-    /// applied before paging. A `next_cursor` is only valid for the order
-    /// that produced it. Any other order answers 400 with `group_by` and on
-    /// Remote repositories, which list by path only.
+    /// Order of the flat listing of a hosted repository or a Virtual with one
+    /// member (#5040): `path` (the default), `size` or `created_at`, ties
+    /// broken by row id, applied before paging. A `next_cursor` is only valid
+    /// for the order that produced it. Any other order answers 400 with
+    /// `group_by`, on Remote repositories and on a Virtual with more than one
+    /// member, which list by path only.
     pub sort_by: Option<String>,
     /// `asc` (the default) or `desc`.
     pub sort_order: Option<String>,
@@ -8338,6 +8339,11 @@ pub async fn list_artifacts(
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id)
             .await
             .map_err(|resp| proxy_helpers::member_walk_app_error(&resp))?;
+        // Sorting the de-duplicated union of several members reads every
+        // member's rows on every page, no index can serve it.
+        if members.len() > 1 {
+            path_order_only("A Virtual repository with more than one member")?;
+        }
 
         // #3163: `fetch_virtual_members` applies NO access predicate — only
         // the virtual PARENT was `require_visible`d above. Aggregating over
@@ -8401,9 +8407,14 @@ pub async fn list_artifacts(
             let after = after_sorted
                 .as_ref()
                 .map(|(value, id)| (value.as_str(), *id));
-            artifact_service
-                .list_sorted_page(&scope_ids, prefix, q, sort, after, offset, fetch)
-                .await?
+            match scope_ids.first() {
+                Some(&repo_id) => {
+                    artifact_service
+                        .list_sorted_page(repo_id, prefix, q, sort, after, offset, fetch)
+                        .await?
+                }
+                None => Vec::new(),
+            }
         } else if is_virtual {
             artifact_service
                 .list_for_repos_page(&scope_ids, prefix, q, after_path, offset, fetch)
@@ -45153,35 +45164,59 @@ mod artifact_sort_5040_tests {
         fx.teardown().await;
     }
 
+    async fn add_member(pool: &PgPool, virtual_repo: Uuid, member: Uuid, priority: i32) {
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(virtual_repo)
+        .bind(member)
+        .bind(priority)
+        .execute(pool)
+        .await
+        .expect("add virtual member");
+    }
+
     #[tokio::test]
-    async fn virtual_listing_sorts_its_members_together_5040() {
+    async fn one_member_virtual_sorts_its_member_5040() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "generic").await else {
+            return;
+        };
+        let (member, _, _) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        add_member(&fx.pool, fx.repo_id, member, 1).await;
+        // path order is the reverse of the expected size order
+        seed(&fx.pool, member, "a-small.bin", 1, 1).await;
+        seed(&fx.pool, member, "b-mid.bin", 50, 1).await;
+        seed(&fx.pool, member, "c-big.bin", 100, 1).await;
+
+        assert_eq!(
+            walk(&fx, &fx.repo_key.clone(), "sort_by=size&sort_order=desc").await,
+            ["c-big.bin", "b-mid.bin", "a-small.bin"]
+        );
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn multi_member_virtual_refuses_a_sort_5040() {
         let Some(fx) = tdh::Fixture::setup("virtual", "generic").await else {
             return;
         };
         let (first, _, _) = tdh::create_repo(&fx.pool, "local", "generic").await;
         let (second, _, _) = tdh::create_repo(&fx.pool, "local", "generic").await;
-        for (member, priority) in [(first, 1), (second, 2)] {
-            sqlx::query(
-                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
-                 VALUES ($1, $2, $3)",
-            )
-            .bind(fx.repo_id)
-            .bind(member)
-            .bind(priority)
-            .execute(&fx.pool)
-            .await
-            .unwrap();
-        }
-        // path order is the reverse of the expected size order
-        seed(&fx.pool, first, "a-small.bin", 1, 1).await;
-        seed(&fx.pool, first, "b-shadowed.bin", 2, 1).await;
-        seed(&fx.pool, second, "b-shadowed.bin", 900, 1).await;
-        seed(&fx.pool, second, "c-big.bin", 100, 1).await;
+        add_member(&fx.pool, fx.repo_id, first, 1).await;
+        add_member(&fx.pool, fx.repo_id, second, 2).await;
+        seed(&fx.pool, first, "a.bin", 1, 1).await;
+        seed(&fx.pool, second, "b.bin", 2, 1).await;
+        let key = fx.repo_key.clone();
 
+        for query in ["sort_by=size", "sort_by=created_at&sort_order=desc"] {
+            let (status, body) = list(&fx, &key, query).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        }
         assert_eq!(
-            walk(&fx, &fx.repo_key.clone(), "sort_by=size&sort_order=desc").await,
-            ["c-big.bin", "b-shadowed.bin", "a-small.bin"],
-            "the higher-priority member's copy of a path is the one sorted"
+            walk(&fx, &key, "sort_by=path").await,
+            ["a.bin", "b.bin"],
+            "the default order still lists the union"
         );
         fx.teardown().await;
     }

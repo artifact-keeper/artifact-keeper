@@ -2745,19 +2745,16 @@ impl ArtifactService {
         Ok(artifacts)
     }
 
-    /// One keyset page of the flat artifact listing in an order other than
-    /// the default `path` ascending (#5040), over one repository or a
-    /// Virtual's members (de-duplicated by path like
-    /// [`list_for_repos_page`], higher-priority member first). Ties break on
-    /// `id`, so `after` (the last row's sort value as text and its id) is an
-    /// exact position. Filters match [`list_page`].
+    /// One keyset page of one repository's flat artifact listing in an order
+    /// other than the default `path` ascending (#5040). Ties break on `id`,
+    /// so `after` (the last row's sort value as text and its id) is an exact
+    /// position the sort index can seek to. Filters match [`list_page`].
     ///
     /// [`list_page`]: Self::list_page
-    /// [`list_for_repos_page`]: Self::list_for_repos_page
     #[allow(clippy::too_many_arguments)]
     pub async fn list_sorted_page(
         &self,
-        repo_ids: &[Uuid],
+        repo_id: Uuid,
         path_prefix: Option<&str>,
         search_query: Option<&str>,
         sort: ArtifactSort,
@@ -2765,9 +2762,6 @@ impl ArtifactService {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<Artifact>> {
-        if repo_ids.is_empty() {
-            return Ok(Vec::new());
-        }
         let prefix_pattern = path_prefix.map(|p| format!("{}%", escape_like_literal(p)));
         let search_pattern =
             search_query.map(|q| format!("%{}%", escape_like_literal(&q.to_lowercase())));
@@ -2778,25 +2772,14 @@ impl ArtifactService {
             AND ($2::text IS NULL OR path LIKE $2 ESCAPE '\\') \
             AND ($3::text IS NULL OR LOWER(name) LIKE $3 ESCAPE '\\' OR LOWER(path) LIKE $3 ESCAPE '\\')";
         let (order, keyset) = sort.sql();
-        let sql = if repo_ids.len() > 1 {
-            format!(
-                "SELECT {COLUMNS} FROM (\
-                   SELECT DISTINCT ON (path) {COLUMNS} FROM artifacts \
-                   WHERE repository_id = ANY($1) {FILTERS} \
-                   ORDER BY path, array_position($1::uuid[], repository_id)\
-                 ) sub \
-                 WHERE ($4::text IS NULL OR {keyset}) ORDER BY {order} LIMIT $6 OFFSET $7"
-            )
-        } else {
-            format!(
-                "SELECT {COLUMNS} FROM artifacts \
-                 WHERE repository_id = ($1::uuid[])[1] {FILTERS} \
-                   AND ($4::text IS NULL OR {keyset}) \
-                 ORDER BY {order} LIMIT $6 OFFSET $7"
-            )
-        };
+        let sql = format!(
+            "SELECT {COLUMNS} FROM artifacts \
+             WHERE repository_id = $1 {FILTERS} \
+               AND ($4::text IS NULL OR {keyset}) \
+             ORDER BY {order} LIMIT $6 OFFSET $7"
+        );
         sqlx::query_as(sqlx::AssertSqlSafe(sql))
-            .bind(repo_ids)
+            .bind(repo_id)
             .bind(&prefix_pattern)
             .bind(&search_pattern)
             .bind(after.map(|(value, _)| value))
