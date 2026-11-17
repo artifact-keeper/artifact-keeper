@@ -95,7 +95,6 @@ on:
           - auth
           - stress
           - resilience
-          - mesh
           - security
           - compatibility
           - pullthrough
