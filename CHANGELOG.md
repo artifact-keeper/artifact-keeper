@@ -104,13 +104,13 @@ These change how 1.11.x releases are built and certified. Nothing that ships cha
 
 - **`release.yml` ends green when the release was published** (#5709, #6079, #6082, #6105). It ended `completed/failure` on every release since 1.11.10 although the GitHub Release was published: the AMI build was dispatched although `ami-build.yml` is disabled (`422`), and the Discord announcement failed on a webhook that answers `404`. A disabled AMI workflow is now skipped with a notice, and an announcement the webhook does not accept is skipped with a one-line message. Both apply to tags cut from this line from now on, since release.yml runs from the tag's copy.
 
-- **A Release Candidate whose gate failed on a flake can rerun only its failed gate groups** (#6076, #6087, #6106). A new dispatch with `rerun_of=<run id>` and a `reason` re-checks everything before the gate and then runs only the gate jobs and legs the original did not pass. It is allowed once per candidate, within 72 hours, on the same commit, digests and tests, and the certification records both runs, the reason and both actors. `release-candidate.yml` on this line stays byte-identical to main's.
+- **A Release Candidate whose gate failed on a flake can rerun only its failed gate groups** (#6076, #6087, #6106). A new dispatch with `rerun_of=<run id>` and a `reason` re-checks everything before the gate and then runs only the gate jobs and legs the original did not pass. It is allowed once per candidate, within 72 hours, on the same commit and digests and by default the same tests, and the certification records both runs, the reason and both actors. `release-candidate.yml` on this line stays byte-identical to main's.
 
 - **A merge can no longer cancel a candidate's image build** (#6080, #6083, #6118). Docker Publish on a branch push now has a concurrency group per commit, so a newer push no longer replaces a still-queued run for the commit a candidate is waiting on.
 
 - **A PR to this line labelled `behaviour-change` or `breaking-change` must name the artifact-keeper-test PR that moves the release gate with it, or give a `Gate-Exempt:` reason** (#6074, #6085, #6107). The new `Require gate test for behaviour changes` check enforces it, so a deliberate behaviour change no longer turns red only on the release candidate.
 
-- **A workflow- or script-only PR skips the Rust compile, unit and integration tiers** (#6115, #6116, #6129). It runs the workflow contract tests and actionlint instead. The push after the merge still runs every Rust job.
+- **A workflow- or script-only PR skips the Rust compile, unit and integration tiers** (#6115, #6116, #6129). A workflow change runs the workflow contract tests and actionlint instead. The push after the merge still runs every Rust job.
 
 - **The bin-target unit tests run on the shortest unit-test leg** (#6133, #6138, #6140). They moved from `services-2`, the critical path, to `router`, and `test-shards.py` refuses a bin-target test module gated to any other shard, so those tests cannot silently stop running. Build Backend Image also reads a `ci`-profile registry cache.
 
