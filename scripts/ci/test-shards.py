@@ -33,6 +33,15 @@ Those modules therefore share one shard (`router`) instead of lifting all
 of them. Five shards keep every leg at or under ~10 GiB, inside a standard
 16 GB GitHub-hosted runner with room for Postgres and the OS.
 
+"Can reach" includes every `pub async fn` the build compiles, whether or not
+anything calls it: rustc makes the body of a `pub async fn` a codegen root
+even in an executable. By November 2026 one ungated test helper declared that
+way called `create_router`, so every leg built the whole router. Even a
+harness with no test modules peaked at 14.7 GiB, and all five legs ran at
+15.3-18.1 GiB, into swap (#6143). `check` therefore refuses `pub async fn`
+anywhere in test code, and `apply` rewrites it to `pub(crate) async fn`,
+which means the same there.
+
 HOW
 ---
 Each test module carries one extra attribute, directly ABOVE its
@@ -197,6 +206,19 @@ ANY_SHARD = re.compile(r"ak_test_shard")
 MOD_ITEM = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*([{;])")
 INLINE_MOD = re.compile(r"^(\s*)(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*\{")
 TEST_ATTR = re.compile(r"^\s*#\[(?:tokio::)?test(?:\(|\])")
+# A `pub async fn` in test code is a monomorphization ROOT of every test
+# harness that compiles it, called or not: rustc treats the body of a free
+# `pub async fn` as reachable even in an executable (a `pub(crate)` one, or a
+# plain `pub fn`, is only generated when something calls it). Test code is
+# never visible outside the crate, so `pub(crate)` means the same there and
+# costs nothing; see PUB_ASYNC_WHY.
+PUB_ASYNC = re.compile(r'^(\s*)pub\s+async\s+(?:unsafe\s+)?(?:extern\s+"[^"]*"\s+)?fn\b')
+PUB_ASYNC_WHY = (
+    "rustc generates code for a `pub async fn` and everything it calls in "
+    "every test build that compiles it, called or not (#6143: one such "
+    "helper that calls create_router put the whole router into every "
+    "unit-test leg, +4.2 GiB of rustc peak each); in test code `pub(crate)` "
+    "means the same and is generated only where a test calls it")
 
 
 def count_tests(lines):
@@ -401,6 +423,38 @@ def shard_attr_of(lines, mod):
     return None, None
 
 
+def pub_async_in_test_code(src, modules):
+    """[(file, line index)] of every `pub async fn` in test code: inside a
+    `#[cfg(test)]` module (its own lines, or the whole file of an out-of-line
+    one), or itself carrying `#[cfg(test)]`. (A `pub async` method in an
+    `impl` block is not a root, but `pub(crate)` costs nothing there either,
+    so the rule stays one regex.)"""
+    found = set()
+    for rel in rust_files(src):
+        with open(os.path.join(src, rel), encoding="utf-8") as fh:
+            lines = fh.read().split("\n")
+        for n, line in enumerate(lines):
+            if not CFG_TEST.match(line):
+                continue
+            j = n + 1
+            while j < len(lines) and (lines[j].strip().startswith("#[")
+                                      or lines[j].strip().startswith("//")):
+                j += 1
+            if j < len(lines) and PUB_ASYNC.match(lines[j]):
+                found.add((rel, j))
+    for mod in modules:
+        if mod["body_file"]:
+            rel, lo, hi = mod["body_file"], 0, None
+        else:
+            rel, lo, hi = mod["file"], mod["start"], mod["end"]
+        with open(os.path.join(src, rel), encoding="utf-8") as fh:
+            lines = fh.read().split("\n")
+        for n in range(lo, len(lines) if hi is None else hi + 1):
+            if PUB_ASYNC.match(lines[n]):
+                found.add((rel, n))
+    return sorted(found)
+
+
 def check_manifest(repo):
     """The shard list here, the Cargo features and build.rs must agree."""
     problems = []
@@ -513,6 +567,9 @@ def cmd_check(src, repo):
                 "lib.rs", "main.rs"):
                 problems.append(f"{rel}:{n + 1}: unexpected ak_test_shard form "
                                 "(use exactly #[cfg(ak_test_shard = \"<shard>\")])")
+    for rel, n in pub_async_in_test_code(src, modules):
+        problems.append(f"{rel}:{n + 1}: `pub async fn` in test code: make it "
+                        "`pub(crate) async fn` (`apply` does)")
     for where in stray:
         problems.append(f"{where}: test attribute outside any #[cfg(test)] mod -- it "
                         "would run in EVERY shard; move it into a test module")
@@ -525,6 +582,8 @@ def cmd_check(src, repo):
         print(f"test-shards: {len(problems)} problem(s):")
         for p in problems:
             print(f"  {p}")
+        if any("`pub async fn` in test code" in p for p in problems):
+            print(f"Why `pub(crate)`: {PUB_ASYNC_WHY}.")
         print("Module attributes: fix with `python3 scripts/ci/test-shards.py apply`.\n"
               "Shard lists (Cargo.toml, build.rs, ci.yml): edit them to match SHARDS.")
         return 1
@@ -559,7 +618,7 @@ def cmd_filter(src, shard):
 def cmd_apply(src):
     modules, stray, per_file = scan(src)
     info = plan(modules, per_file)
-    changed = 0
+    changed = set()
     by_file = {}
     for mod in modules:
         by_file.setdefault(mod["file"], []).append(mod)
@@ -583,8 +642,22 @@ def cmd_apply(src):
         if edits:
             with open(os.path.join(src, rel), "w", encoding="utf-8") as fh:
                 fh.write("\n".join(lines))
-            changed += 1
-    print(f"test-shards: updated {changed} file(s)")
+            changed.add(rel)
+    # After the attribute edits (which shift lines), so rescan.
+    modules, _stray, _per_file = scan(src)
+    by_rel = {}
+    for rel, n in pub_async_in_test_code(src, modules):
+        by_rel.setdefault(rel, []).append(n)
+    for rel, idxs in by_rel.items():
+        path = os.path.join(src, rel)
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().split("\n")
+        for n in idxs:
+            lines[n] = re.sub(r"^(\s*)pub(\s)", r"\1pub(crate)\2", lines[n], count=1)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines))
+        changed.add(rel)
+    print(f"test-shards: updated {len(changed)} file(s); run `cargo fmt` after it")
     for where in stray:
         print(f"  WARNING {where}: test outside any #[cfg(test)] mod (not handled)")
     return 0
