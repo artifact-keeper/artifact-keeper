@@ -2251,8 +2251,7 @@ impl StorageBackend for AzureBackend {
         }))
     }
 
-    /// Upload a file on disk through [`Self::put_stream`]'s block upload
-    /// (#5932).
+    /// Upload a file on disk through [`Self::put_stream`]'s block upload.
     ///
     /// This used to send the whole file as one Put Blob request. That fails
     /// twice over for large files: Put Blob accepts at most 5000 MiB (413
