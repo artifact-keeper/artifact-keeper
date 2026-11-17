@@ -140,18 +140,18 @@ if [[ "$MODE" == coverage ]]; then
   # skips the whole matrix and GitHub lists ONE skipped job with the
   # unexpanded name `dtf-gate (${{ matrix.group }})`. That is not a leg; it
   # keyed as `dtf-gate/${{ matrix.group }}` and refused every suite-only
-  # rerun. Drop exactly that placeholder. Every OTHER skipped job stays a key
-  # on purpose: a suite the gate gained since the original and that this
-  # rerun skipped was tested by neither run, and must still refuse.
+  # rerun. Drop exactly that placeholder, by its full name. Every OTHER
+  # skipped job stays a key on purpose, including another matrix skipped as
+  # a whole: a job the gate gained since the original and that this rerun
+  # skipped was tested by neither run, and must still refuse.
   # shellcheck disable=SC2016 # a jq program, not shell
-  placeholder_jq='.[] | select(.conclusion == "skipped" and (.name | contains("${{"))) | .name'
-  dropped="$(jq -r "$placeholder_jq" <<<"$self_jobs")"
+  placeholder="${GATE_JOB} / dtf-gate (\${{ matrix.group }})"
+  dropped="$(jq -r --arg p "$placeholder" '.[] | select(.conclusion == "skipped" and .name == $p) | .name' <<<"$self_jobs")"
   if [[ -n "$dropped" ]]; then
     while IFS= read -r d; do
       echo "coverage: ignoring '${d}': an unexpanded matrix this rerun skipped as a whole (#6163)."
     done <<<"$dropped"
-    # shellcheck disable=SC2016 # a jq program, not shell
-    self_jobs="$(jq -c '[.[] | select((.conclusion == "skipped" and (.name | contains("${{"))) | not)]' <<<"$self_jobs")"
+    self_jobs="$(jq -c --arg p "$placeholder" '[.[] | select((.conclusion == "skipped" and .name == $p) | not)]' <<<"$self_jobs")"
   fi
   self_keys="$(jq --arg gate "$GATE_JOB" "$KEYS_JQ" <<<"$self_jobs")"
   [[ "$(jq length <<<"$self_keys")" -gt 0 ]] || infra "this run lists no '${GATE_JOB} / ...' jobs."

@@ -263,6 +263,15 @@ expect "suite-only rerun: the skipped unexpanded dtf-gate matrix is not a new le
 # original, skipped by this rerun, was tested by neither run: still refused.
 edit self_jobs.json ".jobs += [$(job "$G / brand-new-tests" skipped)]"
 expect "a skipped job the original never ran is still BLOCKED" 1 "brand-new-tests"
+# ...nor a skipped dtf-gate LEG the original never ran (the matrix expanded),
+reset_case; CASE_MODE=coverage
+edit self_jobs.json ".jobs += [$(job "$G / dtf-gate (brand-new-group)" skipped)]"
+expect "a skipped dtf-gate leg the original never ran is still BLOCKED" 1 "dtf-gate/brand-new-group"
+# ...nor ANOTHER matrix skipped as a whole: only the dtf-gate placeholder is
+# dropped, by its exact name.
+reset_case; CASE_MODE=coverage
+edit self_jobs.json ".jobs += [$(job "$G / brand-new-matrix (\${{ matrix.x }})" skipped)]"
+expect "another unexpanded matrix the original never ran is still BLOCKED" 1 "brand-new-matrix"
 
 if [ "$fails" -ne 0 ]; then
   echo "candidate rerun resolver: $fails case(s) FAILED"

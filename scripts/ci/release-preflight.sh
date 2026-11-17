@@ -406,23 +406,30 @@ else
   # the list API answers stalely -- and the divergence produced a blocking
   # false red on the v1.7.2 cut.
   #
-  # head_sha alone is NOT one run, though. release-promote.yml dispatches
-  # docker-publish.yml in PROMOTE mode on main, and a dispatch's head_sha is
-  # main's tip at that moment, so the promote of an older certified commit
-  # lands on HEAD's sha too. PROMOTE builds and scans nothing (Security Scan
-  # skipped, no job fails) while its re-tag job is green; taking "the newest
-  # run for the sha" read that as HEAD's build and failed preflight
-  # permanently on e808fdac after the 1.11.14 promote (run 44116256357 over
-  # push run 44080746556). So, among runs ON THE AUDITED BRANCH:
-  #   1. the commit's push run (a branch push builds each commit once,
-  #      #6080), unless it is red and a NEWER dispatched build is green
-  #      (someone rebuilt the commit by hand);
-  #   2. no push run (e.g. a docs-only tip, #3629): the newest dispatch that
-  #      built, or one still in flight;
-  #   3. neither: not built.
-  # A dispatch "built nothing" only when Security Scan skipped AND no job
-  # failed: Security Scan is also skipped when an earlier build job fails,
-  # and that failed build must stay the verdict.
+  # head_sha alone is NOT one run, though (#6168). release-promote.yml
+  # dispatches docker-publish.yml in PROMOTE mode on main, and a dispatch's
+  # head_sha is main's tip at that moment, so the promote of an older
+  # certified commit lands on HEAD's sha too. PROMOTE builds and scans
+  # nothing while its re-tag job is green; "the newest run for the sha" read
+  # it as HEAD's build and failed preflight permanently on e808fdac after the
+  # 1.11.14 promote (run 44116256357 over push run 44080746556).
+  #
+  # So: among the sha's runs ON THE AUDITED BRANCH, newest first, the first
+  # run that BUILT decides, red or green; a run still in flight blocks (it
+  # cannot be classified until it ends). A completed dispatch "built nothing"
+  # when it lists no jobs (cancelled before starting) or when Security Scan
+  # skipped and no job failed (PROMOTE). Security Scan is also skipped when an
+  # earlier build job fails, and that failed build stays the verdict. A push
+  # run always built (a branch push builds each commit once, #6080).
+  #
+  # The branch: PREFLIGHT_BRANCH, else a branch-shaped PREFLIGHT_REF. The
+  # Release Candidate passes the commit sha as PREFLIGHT_REF
+  # (release-candidate.yml, "Dispatch the Release Preflight"), and a detached
+  # checkout says HEAD; then the branch is the one the sha's push runs are
+  # on, and runs on several branches are INFRA (set PREFLIGHT_BRANCH) rather
+  # than a guess. The same sha pushed to another branch or tagged is another
+  # build that publishes other tags.
+  #
   # `event=push` alone is not the fix: resolve-candidate-publish-run.sh
   # documents how that filter deadlocked a re-tagged release (#3640).
   # shellcheck disable=SC2016 # jq programs, not shell
@@ -433,13 +440,21 @@ else
     echo "INFRA: could not query Docker Publish runs for $head_sha" >&2
     infra_exit
   fi
-  # The same sha pushed to another branch (or tagged) is another build that
-  # publishes other tags; it must not decide this ref's verdict.
-  audit_branch="${AUDIT_REF#refs/tags/}"
-  case "$audit_branch" in
-    ''|'?'|HEAD) ;;
-    *) runs="$(awk -v b="$audit_branch" '$4 == b' <<< "$runs")" ;;
-  esac
+  audit_branch="${PREFLIGHT_BRANCH:-${AUDIT_REF#refs/tags/}}"
+  audit_branch="${audit_branch#refs/heads/}"
+  if [[ -z "$audit_branch" || "$audit_branch" == '?' || "$audit_branch" == HEAD || "$audit_branch" =~ ^[0-9a-f]{7,40}$ ]]; then
+    push_branches="$(awk '$3 == "push" { print $4 }' <<< "$runs" | sort -u)"
+    case "$(grep -c . <<< "$push_branches")" in
+      0) audit_branch="" ;;  # no push run: dispatches only, any branch
+      1) audit_branch="$push_branches"
+         note "branch not named (ref '${AUDIT_REF}'); the sha's push run is on ${audit_branch}" ;;
+      *) echo "INFRA: HEAD's sha has push runs on several branches ($(tr '\n' ' ' <<< "$push_branches")) and ref '${AUDIT_REF}' names none; set PREFLIGHT_BRANCH" >&2
+         infra_exit ;;
+    esac
+  fi
+  if [[ -n "$audit_branch" ]]; then
+    runs="$(awk -v b="$audit_branch" '$4 == b' <<< "$runs")"
+  fi
   sec_of() { # <run id> -> the Security Scan conclusion, "?" when unreadable
     gh run view "$1" --repo "$REPO" --json jobs \
       --jq '[.jobs[]|select(.name=="Security Scan")|(.conclusion//"?")]|first//"?"' 2>/dev/null || echo '?'
@@ -448,48 +463,36 @@ else
     gh run view "$1" --repo "$REPO" --json jobs \
       --jq '[.jobs[]|select(.name|test("Backend Multi-Arch Manifest"))|(.conclusion//"skipped")]|first//"?"' 2>/dev/null || echo '?'
   }
-  kind_of() { # <run id> -> built | promote | ?
+  kind_of() { # <run id> -> built | nothing | ?
     local k
     # shellcheck disable=SC2016 # a jq program, not shell
     k="$(gh run view "$1" --repo "$REPO" --json jobs --jq '
+          if (.jobs | length) == 0 then "nothing" else
           ([.jobs[] | select(.name == "Security Scan") | (.conclusion // "?")] | first // "?") as $s
           | ([.jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out")] | length) as $f
-          | if $s == "?" then "?" elif $s == "skipped" and $f == 0 then "promote" else "built" end' 2>/dev/null)" || k='?'
+          | if $s == "skipped" and $f == 0 then "nothing" elif $s == "?" and $f == 0 then "?" else "built" end
+          end' 2>/dev/null)" || k='?'
     echo "${k:-?}"
   }
-  green() { [[ "$(sec_of "$1")" == success && "$(man_of "$1")" == success ]]; }
-  push_info="$(awk '$3 == "push" { print $1, $2; exit }' <<< "$runs")"
-  disp_info=""
+  run_info=""
   while read -r c_id c_status c_event _; do
-    [[ -n "$c_id" && "$c_event" != push ]] || continue
+    [[ -n "$c_id" ]] || continue
     if [[ "$c_status" != "completed" ]]; then
-      # An unfinished dispatch may be a build or a promote; we cannot tell
-      # which until it ends.
-      disp_info="$c_id $c_status"; break
+      # In flight: no verdict yet, and a dispatch cannot be classified until
+      # it ends. Blocks below.
+      run_info="$c_id $c_status"; break
     fi
-    case "$(kind_of "$c_id")" in
-      '?') echo "INFRA: could not read job conclusions from run $c_id" >&2
-           infra_exit ;;
-      promote) note "run $c_id ($c_event) built nothing (Security Scan skipped, no job failed: a PROMOTE or re-tag run); not this commit's build"
-               continue ;;
-    esac
-    disp_info="$c_id $c_status"; break
+    if [[ "$c_event" != push ]]; then
+      case "$(kind_of "$c_id")" in
+        '?') echo "INFRA: could not read job conclusions from run $c_id" >&2
+             infra_exit ;;
+        nothing) note "run $c_id ($c_event) built nothing (a PROMOTE or re-tag run, or cancelled before any job); not this commit's build"
+                 continue ;;
+      esac
+    fi
+    note "run $c_id ($c_event) is the newest build of this sha${audit_branch:+ on ${audit_branch}}"
+    run_info="$c_id $c_status"; break
   done <<< "$runs"
-  run_info="$push_info"
-  if [[ -z "$push_info" ]]; then
-    # In flight blocks below, exactly as an unfinished push run does.
-    run_info="$disp_info"
-  else
-    read -r p_id p_status <<< "$push_info"
-    read -r d_id d_status <<< "${disp_info:-0 none}"
-    if [[ -n "$disp_info" && "$p_status" == completed && "$d_status" == completed ]] && (( d_id > p_id )) \
-       && ! green "$p_id" && green "$d_id"; then
-      note "push run $p_id is red; a newer build dispatched on ${audit_branch}, run $d_id, is green and decides"
-      run_info="$disp_info"
-    elif awk '$3 != "push"' <<< "$runs" | grep -q .; then
-      note "using push run $p_id; ignoring dispatched run(s) for the same sha (promote or manual)"
-    fi
-  fi
   if [[ -z "$run_info" ]]; then
     # A fourth outcome, distinct from "ran and failed" (#3338): the query
     # succeeded and there is NO run for this commit. The images a tag cut
