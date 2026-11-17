@@ -414,9 +414,10 @@ else
   # it as HEAD's build and failed preflight permanently on e808fdac after the
   # 1.11.14 promote (run 44116256357 over push run 44080746556).
   #
-  # So: among the sha's runs ON THE AUDITED BRANCH, newest first, the first
-  # run that BUILT decides, red or green; a run still in flight blocks (it
-  # cannot be classified until it ends). A completed dispatch "built nothing"
+  # So: among the sha's runs ON THE AUDITED BRANCH, newest first by run id,
+  # the first run that BUILT decides, red or green; a run still in flight
+  # ABOVE it blocks (it cannot be classified until it ends). Runs older than
+  # the deciding build do not matter, in flight or not. A completed dispatch "built nothing"
   # when it lists no jobs (cancelled before starting) or when Security Scan
   # skipped and no job failed (PROMOTE). Security Scan is also skipped when an
   # earlier build job fails, and that failed build stays the verdict. A push
@@ -440,21 +441,10 @@ else
     echo "INFRA: could not query Docker Publish runs for $head_sha" >&2
     infra_exit
   fi
+  # Newest first by run id, not by the API's answer order.
+  runs="$(sort -k1,1nr <<< "$runs")"
   audit_branch="${PREFLIGHT_BRANCH:-${AUDIT_REF#refs/tags/}}"
   audit_branch="${audit_branch#refs/heads/}"
-  if [[ -z "$audit_branch" || "$audit_branch" == '?' || "$audit_branch" == HEAD || "$audit_branch" =~ ^[0-9a-f]{7,40}$ ]]; then
-    push_branches="$(awk '$3 == "push" { print $4 }' <<< "$runs" | sort -u)"
-    case "$(grep -c . <<< "$push_branches")" in
-      0) audit_branch="" ;;  # no push run: dispatches only, any branch
-      1) audit_branch="$push_branches"
-         note "branch not named (ref '${AUDIT_REF}'); the sha's push run is on ${audit_branch}" ;;
-      *) echo "INFRA: HEAD's sha has push runs on several branches ($(tr '\n' ' ' <<< "$push_branches")) and ref '${AUDIT_REF}' names none; set PREFLIGHT_BRANCH" >&2
-         infra_exit ;;
-    esac
-  fi
-  if [[ -n "$audit_branch" ]]; then
-    runs="$(awk -v b="$audit_branch" '$4 == b' <<< "$runs")"
-  fi
   sec_of() { # <run id> -> the Security Scan conclusion, "?" when unreadable
     gh run view "$1" --repo "$REPO" --json jobs \
       --jq '[.jobs[]|select(.name=="Security Scan")|(.conclusion//"?")]|first//"?"' 2>/dev/null || echo '?'
@@ -463,36 +453,83 @@ else
     gh run view "$1" --repo "$REPO" --json jobs \
       --jq '[.jobs[]|select(.name|test("Backend Multi-Arch Manifest"))|(.conclusion//"skipped")]|first//"?"' 2>/dev/null || echo '?'
   }
-  kind_of() { # <run id> -> built | nothing | ?
+  green() { [[ "$(sec_of "$1")" == success && "$(man_of "$1")" == success ]]; }
+  # built | nothing | ?. A run BUILT when an image build job ran: "Backend (",
+  # "Backend Alpine (", "OpenSCAP (" or "Scanner Adapter (" with a conclusion
+  # other than skipped (a failed build counts). PROMOTE skips all of them,
+  # so a promote that fails in a re-tag job still built nothing. No jobs at
+  # all (cancelled before starting) is "nothing"; jobs but none of those
+  # names is a shape we don't know: "?" (INFRA), never a guess.
+  kind_of() {
     local k
     # shellcheck disable=SC2016 # a jq program, not shell
     k="$(gh run view "$1" --repo "$REPO" --json jobs --jq '
           if (.jobs | length) == 0 then "nothing" else
-          ([.jobs[] | select(.name == "Security Scan") | (.conclusion // "?")] | first // "?") as $s
-          | ([.jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out")] | length) as $f
-          | if $s == "skipped" and $f == 0 then "nothing" elif $s == "?" and $f == 0 then "?" else "built" end
+          [.jobs[] | select(.name | test("^(Backend|Backend Alpine|OpenSCAP|Scanner Adapter) \\("))] as $b
+          | if ($b | length) == 0 then "?"
+            elif any($b[]; .conclusion != "skipped") then "built"
+            else "nothing" end
           end' 2>/dev/null)" || k='?'
     echo "${k:-?}"
   }
+  PICK=""
+  pick() { # stdin: runs on ONE branch, newest first -> PICK="<id> <status>" or ""
+    local c_id c_status c_event
+    PICK=""
+    while read -r c_id c_status c_event _; do
+      [[ -n "$c_id" ]] || continue
+      if [[ "$c_status" != "completed" ]]; then
+        # In flight: no verdict yet, and a dispatch cannot be classified
+        # until it ends. Blocks below.
+        PICK="$c_id $c_status"; return
+      fi
+      if [[ "$c_event" != push ]]; then
+        case "$(kind_of "$c_id")" in
+          '?') echo "INFRA: could not read job conclusions from run $c_id" >&2
+               infra_exit ;;
+          nothing) note "run $c_id ($c_event) built nothing (a PROMOTE or re-tag run, or cancelled before any build); not this commit's build"
+                   continue ;;
+        esac
+      fi
+      note "run $c_id ($c_event) is the newest build of this sha${1:+ on $1}"
+      PICK="$c_id $c_status"; return
+    done
+  }
   run_info=""
-  while read -r c_id c_status c_event _; do
-    [[ -n "$c_id" ]] || continue
-    if [[ "$c_status" != "completed" ]]; then
-      # In flight: no verdict yet, and a dispatch cannot be classified until
-      # it ends. Blocks below.
-      run_info="$c_id $c_status"; break
+  if [[ -z "$audit_branch" || "$audit_branch" == '?' || "$audit_branch" == HEAD || "$audit_branch" =~ ^[0-9a-f]{7,40}$ ]]; then
+    # No branch named. Branches from the push runs; with none (dispatches
+    # only), from all the runs.
+    inferred="$(awk '$3 == "push" { print $4 }' <<< "$runs" | sort -u)"
+    [[ -n "$inferred" ]] || inferred="$(awk 'NF { print $4 }' <<< "$runs" | sort -u)"
+    if [[ "$(grep -c . <<< "$inferred")" -le 1 ]]; then
+      audit_branch="$inferred"
+      [[ -z "$audit_branch" ]] || note "branch not named (ref '${AUDIT_REF}'); the sha's runs are on ${audit_branch}"
+    else
+      # Built on several branches (e.g. right after a release line is cut
+      # from this commit). Fail closed without guessing: READY only if the
+      # newest build on EVERY branch is green; otherwise the first one that
+      # is not decides. PREFLIGHT_BRANCH (workflow input `branch`) audits one.
+      note "branch not named (ref '${AUDIT_REF}') and the sha was built on several branches: $(tr '\n' ' ' <<< "$inferred")"
+      note "  -> every branch's newest build must be green; set PREFLIGHT_BRANCH to audit one branch"
+      first_bad=""
+      while read -r b; do
+        pick "$b" <<< "$(awk -v b="$b" '$4 == b' <<< "$runs")"
+        [[ -n "$PICK" ]] || continue
+        read -r i s <<< "$PICK"
+        if [[ "$s" != completed ]] || ! green "$i"; then first_bad="${first_bad:-$PICK}"; fi
+        run_info="${run_info:-$PICK}"
+      done <<< "$inferred"
+      [[ -z "$first_bad" ]] || run_info="$first_bad"
+      audit_branch="(several)"
     fi
-    if [[ "$c_event" != push ]]; then
-      case "$(kind_of "$c_id")" in
-        '?') echo "INFRA: could not read job conclusions from run $c_id" >&2
-             infra_exit ;;
-        nothing) note "run $c_id ($c_event) built nothing (a PROMOTE or re-tag run, or cancelled before any job); not this commit's build"
-                 continue ;;
-      esac
+  fi
+  if [[ "$audit_branch" != "(several)" ]]; then
+    if [[ -n "$audit_branch" ]]; then
+      runs="$(awk -v b="$audit_branch" '$4 == b' <<< "$runs")"
     fi
-    note "run $c_id ($c_event) is the newest build of this sha${audit_branch:+ on ${audit_branch}}"
-    run_info="$c_id $c_status"; break
-  done <<< "$runs"
+    pick "$audit_branch" <<< "$runs"
+    run_info="$PICK"
+  fi
   if [[ -z "$run_info" ]]; then
     # A fourth outcome, distinct from "ran and failed" (#3338): the query
     # succeeded and there is NO run for this commit. The images a tag cut
