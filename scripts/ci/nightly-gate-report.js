@@ -16,7 +16,7 @@
 // when the line has no collect-results job (the leg never ran). Red TIERS are
 // every gate job that ended failure, timed_out, cancelled or
 // startup_failure, blocking or not: a red non-blocking tier (stress-tests,
-// mesh-tests, a dtf-advisory group) is still drift someone has to look at.
+// cli-smoke, a dtf-advisory group) is still drift someone has to look at.
 // collect-results itself is only a tier when the verdict is red and no
 // other job is, so it never duplicates the tier that turned it red.
 //
