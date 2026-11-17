@@ -68,6 +68,21 @@ eq(acts.map((a) => [a.type, a.number]).sort(), [['close', 1], ['close', 2], ['cl
 // ... but not after a narrow suite, where an absent tier simply did not run
 acts = r.planIssues({ ...ctx, suite: 'search' }, { ...line, verdict: 'green', red: [], tiers: {} }, open, range);
 eq(acts, []);
+// lanes (#6120, #6121): own key space, own artifact
+eq([r.laneLine('main', 's3'), r.laneLine('main', ''), r.artifactName('s3'), r.artifactName('')],
+  ['main~s3', 'main', 'nightly-lane-verdict-s3', 'nightly-gate-verdict']);
+const laneIssues = [issue(7, 'main~s3|format-tests-s3/node'), issue(8, 'main~s3|gone')];
+// the gate's complete green night never closes a lane issue ...
+acts = r.planIssues(ctx, { ...line, verdict: 'green', red: [], tiers: {} }, laneIssues, range);
+eq(acts, []);
+// ... and a lane never touches a gate issue, but closes its own absent tier after a complete green
+const lctx = { ...ctx, lane: 's3' };
+const lline = { line: 'main~s3', branch: 'main', sha: cur.sha, verdict: 'green', red: [], tiers: { 'format-tests-s3/node': { conclusion: 'success' } } };
+acts = r.planIssues(lctx, lline, [...open, ...laneIssues], range);
+eq(acts.map((a) => [a.type, a.number]).sort(), [['close', 7], ['close', 8]]);
+acts = r.planIssues(lctx, { ...lline, verdict: 'red', red: ['format-tests-s3/jvm'], tiers: { 'format-tests-s3/jvm': { conclusion: 'failure' } } }, [], range);
+eq([acts[0].type, acts[0].key, acts[0].title], ['open', 'main~s3|format-tests-s3/jvm', 'Nightly s3 lane [main]: format-tests-s3/jvm is red']);
+assert.match(acts[0].body, /The nightly s3 lane is red on `format-tests-s3\/jvm`/);
 NODE
 then pass "tier keys, verdicts, red ranges and issue plans"; else fail "pure-function assertions (see the stack above)"; fi
 
@@ -168,6 +183,19 @@ report FAKE_ISSUES='' REPORT_TRACK=false REPORT_STATUS=false
 if [ "$(grep -c -E 'issues|statuses/' "$WORK/log")" = 0 ] && [ -s "$WORK/verdict.json" ]; then
   pass "an untracked dispatch still records a verdict, touches no issue"
 else fail "untracked: $(cat "$WORK/log")"; fi
+
+LANE_JOBS="$(printf '{"name":"S3 [main] / %s","conclusion":"%s","html_url":"u"}\n' 'format-tests-s3 (node)' failure collect-results failure; job repo-tests failure)"
+LANE_ISSUES="$(printf '{"number":31,"title":"x","body":"<!-- nightly-gate-tier: main|repo-tests -->"}')"
+JOBS="$LANE_JOBS" report FAKE_ISSUES="$LANE_ISSUES" REPORT_TRACK=true REPORT_STATUS=true REPORT_LANE=s3 REPORT_JOB_PREFIX='S3 [{line}]'
+if [ "$RC" = 0 ] && [ "$(calls 'title=Nightly s3 lane \[main\]: format-tests-s3/node is red')" = 1 ] && [ "$(calls statuses/)" = 0 ] \
+   && [ "$(calls 'issues/31')" = 0 ] \
+   && [ "$(calls '-n nightly-lane-verdict-s3')" -ge 1 ] && [ "$(calls '-n nightly-gate-verdict')" = 0 ] \
+   && [ "$(jq -r '.kind, .lane, .lines[0].line, .lines[1].line, .lines[0].verdict, (.lines[0].tiers | keys | join(","))' "$WORK/verdict.json" | tr '\n' ' ')" = "nightly-lane s3 main~s3 1.11.x~s3 red collect-results,format-tests-s3/node " ]; then
+  pass "a lane opens its own issue, ignores gate jobs and gate issues, reads only its own records, and writes no commit status"
+else fail "lane (rc=$RC): $OUT $(cat "$WORK/log")"; fi
+
+report FAKE_ISSUES='' REPORT_LANE='Mesh;rm'
+if [ "$RC" = 2 ]; then pass "a malformed lane name is refused"; else fail "bad lane accepted (rc=$RC)"; fi
 
 echo
 if [ "$fails" -ne 0 ]; then echo "$fails check(s) failed"; exit 1; fi

@@ -19,11 +19,14 @@
 #            the first time one of their runs is not completed, cancels the
 #            nightly run (SENTINEL_RUN_ID). Cancelling is safe: the gate's
 #            teardown and every cleanup step are `if: always()`, so they still
-#            run and no namespace leaks. A cancelled nightly records nothing:
-#            it opens, updates and closes no issue and writes no status.
+#            run and no namespace leaks. A nightly cancelled during the gate
+#            records nothing: it opens, updates and closes no issue and writes
+#            no status. One cancelled during a lane outside the gate (#6121)
+#            keeps the gate's report, which ran before the lane started, and
+#            records nothing for the lane.
 #            The watch ends when the job named SENTINEL_DONE_JOB appears in
-#            the nightly run (the report job, which starts only after every
-#            gate leg has finished), or when the budget runs out (GitHub's
+#            the nightly run (`Nightly finished`, which starts only after the
+#            gate and every lane are reported), or when the budget runs out (GitHub's
 #            6-hour hosted-job limit), in which case it hands over to the
 #            next sentinel job.
 #
@@ -120,9 +123,9 @@ case "$MODE" in
       if [[ "$rc" -eq 0 ]]; then
         emit "result=preempted"
         emit "outranked_by=${hit##* }"
-        echo "::warning title=Nightly gate pre-empted::a release candidate started (${hit}). Cancelling this nightly so the candidate has the pool; teardown still runs. Nothing is recorded for tonight." >&2
+        echo "::warning title=Nightly gate pre-empted::a release candidate started (${hit}). Cancelling this nightly so the candidate has the pool; teardown still runs. Nothing more is recorded for tonight." >&2
         if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-          printf '## Nightly gate pre-empted\n\nA release candidate started: %s\n\nThis run was cancelled so the candidate gets the self-hosted pool. It records no verdict, opens or closes no issue and writes no commit status.\n' "${hit##* }" >> "$GITHUB_STEP_SUMMARY"
+          printf '## Nightly gate pre-empted\n\nA release candidate started: %s\n\nThis run was cancelled so the candidate gets the self-hosted pool. Whatever had not been reported yet (the gate's verdict, issues and status during the gate; the lane's during a lane) is not recorded.\n' "${hit##* }" >> "$GITHUB_STEP_SUMMARY"
         fi
         if ! gh api -X POST "repos/${REPO}/actions/runs/${SENTINEL_RUN_ID}/cancel" >/dev/null 2>&1; then
           echo "::error title=Could not cancel the nightly::POST runs/${SENTINEL_RUN_ID}/cancel failed. Cancel it by hand so the candidate gets the pool." >&2

@@ -66,7 +66,22 @@
 //   REPORT_HISTORY_RUNS    how many earlier runs the walk may read (default 20)
 //   REPORT_OUT             where verdict.json goes (default ./verdict.json)
 //   REPORT_SERVER_URL      default https://github.com
+//   REPORT_LANE            a nightly LANE outside the gate (#6121: s3),
+//                          lowercase [a-z0-9-]: see LANES below
 //   GITHUB_STEP_SUMMARY    appended to when set
+//
+// LANES. The nightly also runs lanes that are not part of the release gate
+// (the S3 format matrix, #6121). Each lane is reported by its
+// own run of this script with REPORT_LANE set, and is kept apart from the
+// gate everywhere a gate result could act on it:
+//   * its issues are keyed by the line "<line>~<lane>" (marker
+//     `main~s3|<tier>`), so the gate's "tier no longer exists" closing,
+//     which only looks at "<line>|" keys, never closes a lane issue, and a
+//     lane never closes a gate issue;
+//   * its record goes to the artifact `nightly-lane-verdict-<lane>` (kind
+//     nightly-lane), and its history walk reads only that artifact, so
+//     #6075 and preflight, which read `nightly-gate-verdict`, never see it;
+//   * it never writes the `release-gate/nightly` commit status.
 'use strict';
 
 const fs = require('fs');
@@ -76,6 +91,7 @@ const { execFileSync } = require('child_process');
 
 const SCHEMA = 1;
 const ARTIFACT = 'nightly-gate-verdict';
+const LANE_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const STATUS_CONTEXT = 'release-gate/nightly';
 const AGGREGATE = 'collect-results';
 const LABELS = ['automated', 'release-gate'];
@@ -124,6 +140,20 @@ function classifyLine(jobs, prefix) {
 
 function issueKey(line, tier) {
   return `${line}|${tier}`;
+}
+
+// The line key a lane's issues and records use: "main" -> "main~s3".
+function laneLine(line, lane) {
+  return lane ? `${line}~${lane}` : line;
+}
+
+function artifactName(lane) {
+  return lane ? `nightly-lane-verdict-${lane}` : ARTIFACT;
+}
+
+// "the nightly full release gate" or "the nightly s3 lane".
+function what(ctx) {
+  return ctx.lane ? `nightly ${ctx.lane} lane` : 'nightly full release gate';
 }
 
 function markerOf(body) {
@@ -181,17 +211,18 @@ function openBody(ctx, line, tier, range) {
   const job = line.tiers[tier] && line.tiers[tier].url;
   return [
     `<!-- nightly-gate-tier: ${issueKey(line.line, tier)} -->`,
-    `The nightly full release gate is red on \`${tier}\` for \`${line.branch}\`.`,
+    `The ${what(ctx)} is red on \`${tier}\` for \`${line.branch}\`.`,
     '',
     '| | |',
     '|---|---|',
     ...rows,
     `| Failing job | ${job || run(ctx.runId)} |`,
-    `| Gate verdict that night | ${line.verdict} |`,
+    `| ${ctx.lane ? 'Lane' : 'Gate'} verdict that night | ${line.verdict} |`,
     '',
     'The cause is in the backend range, the tests range, or neither (a flake or a runner problem). ' +
       'This issue is managed by `nightly-release-gate.yml` (#6073): it gets a comment each night the tier is still red ' +
-      'and is closed the first night it is green. It is advisory and blocks nothing. ' +
+      'and is closed the first night it is green. It is advisory and blocks nothing' +
+      `${ctx.lane ? `, and the ${ctx.lane} lane is not part of the release gate` : ''}. ` +
       'Close it by hand if the tier was renamed or removed and no complete green run has closed it yet.',
     '',
   ].join('\n');
@@ -221,7 +252,9 @@ function planIssues(ctx, line, openIssues, rangeFor) {
       actions.push({
         type: 'open',
         key: issueKey(line.line, tier),
-        title: `Nightly gate [${line.line}]: ${tier} is red`,
+        title: ctx.lane
+          ? `Nightly ${ctx.lane} lane [${line.line.replace(/~[^~]*$/, '')}]: ${tier} is red`
+          : `Nightly gate [${line.line}]: ${tier} is red`,
         body: openBody(ctx, line, tier, range),
       });
     }
@@ -240,7 +273,7 @@ function planIssues(ctx, line, openIssues, rangeFor) {
       actions.push({
         type: 'close',
         number,
-        body: `\`${tier}\` is no longer part of the gate for \`${line.branch}\`, and the full gate was green at \`${short(line.sha)}\` (${runLink}). Closing.`,
+        body: `\`${tier}\` is no longer part of the ${ctx.lane ? `${ctx.lane} lane` : 'gate'} for \`${line.branch}\`, and the ${ctx.lane ? 'lane' : 'full gate'} was green at \`${short(line.sha)}\` (${runLink}). Closing.`,
       });
     }
   }
@@ -270,7 +303,7 @@ function listOpenIssues(repo) {
 }
 
 // Lazily reads earlier runs' verdict records, newest first.
-function historyReader(repo, workflow, currentRunId, limit) {
+function historyReader(repo, workflow, currentRunId, limit, artifact = ARTIFACT) {
   let ids = null;
   const records = [];
   let next = 0;
@@ -293,7 +326,7 @@ function historyReader(repo, workflow, currentRunId, limit) {
           const id = ids[next++];
           const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nightly-verdict-'));
           try {
-            gh(['run', 'download', id, '-R', repo, '-n', ARTIFACT, '-D', dir], { stdio: ['ignore', 'pipe', 'pipe'] });
+            gh(['run', 'download', id, '-R', repo, '-n', artifact, '-D', dir], { stdio: ['ignore', 'pipe', 'pipe'] });
             const rec = JSON.parse(fs.readFileSync(path.join(dir, 'verdict.json'), 'utf8'));
             if (rec.schema === SCHEMA && !rec.self_test) records.push(rec);
           } catch (e) {
@@ -337,6 +370,11 @@ function main() {
     process.exit(2);
   }
   const truthy = (v) => v === 'true';
+  const lane = env.REPORT_LANE || '';
+  if (lane && !LANE_RE.test(lane)) {
+    console.error(`nightly-gate-report: REPORT_LANE '${lane}' is not [a-z0-9-]`);
+    process.exit(2);
+  }
   const selfTest = truthy(env.REPORT_SELF_TEST);
   const dry = selfTest || truthy(env.REPORT_DRY_RUN);
   const ctx = {
@@ -344,6 +382,7 @@ function main() {
     runId,
     server: env.REPORT_SERVER_URL || 'https://github.com',
     suite: env.REPORT_SUITE || 'all',
+    lane,
   };
   const attempt = Number(env.REPORT_RUN_ATTEMPT || '1');
   const prefixTpl = env.REPORT_JOB_PREFIX || 'Gate [{line}]';
@@ -351,14 +390,17 @@ function main() {
   const jobs = listJobs(repo, env.REPORT_JOBS_RUN_ID || runId);
 
   const lines = resolved.map((l) => {
-    if (l.error) return { ...l, verdict: 'unresolved', tiers: {}, red: [] };
+    // The job prefix names the plain line ("S3 [main]"); issues and records
+    // use the lane's key ("main~s3").
+    if (l.error) return { ...l, line: laneLine(l.line, lane), verdict: 'unresolved', tiers: {}, red: [] };
     const c = classifyLine(jobs, prefixTpl.replace('{line}', l.line));
-    return { ...l, ...c };
+    return { ...l, ...c, line: laneLine(l.line, lane) };
   });
 
   const record = {
     schema: SCHEMA,
-    kind: 'nightly-release-gate',
+    kind: lane ? 'nightly-lane' : 'nightly-release-gate',
+    lane: lane || null,
     certification: false,
     run_id: Number(runId),
     run_attempt: attempt,
@@ -385,7 +427,7 @@ function main() {
   fs.writeFileSync(out, `${JSON.stringify(record, null, 2)}\n`);
   console.log(`wrote ${out}`);
 
-  const summary = ['## Nightly release gate', '', '_Advisory. Not a release certification._', '',
+  const summary = [lane ? `## Nightly ${lane} lane` : '## Nightly release gate', '', '_Advisory. Not a release certification._', '',
     '| Line | Commit | Tests | Verdict | Red tiers |', '|---|---|---|---|---|'];
   for (const l of lines) {
     summary.push(`| \`${l.branch}\` | ${l.sha ? `\`${short(l.sha)}\`` : '-'} | ${l.tests_ref ? `\`${l.tests_ref}@${short(l.tests_sha)}\`` : '-'} | ${l.verdict}${l.error ? ` (${l.error})` : ''} | ${l.red.map((t) => `\`${t}\``).join(', ') || '-'} |`);
@@ -396,7 +438,7 @@ function main() {
   } else if (truthy(env.REPORT_TRACK) || selfTest) {
     const open = listOpenIssues(repo);
     const history = historyReader(repo, env.REPORT_WORKFLOW || 'nightly-release-gate.yml', runId,
-      Number(env.REPORT_HISTORY_RUNS || '20'));
+      Number(env.REPORT_HISTORY_RUNS || '20'), artifactName(lane));
     summary.push('', '### Tracking issues', '');
     for (const l of lines) {
       if (l.verdict !== 'green' && l.verdict !== 'red') continue;
@@ -409,7 +451,8 @@ function main() {
     }
   }
 
-  if (truthy(env.REPORT_STATUS) && attempt === 1 && ctx.suite === 'all' && !selfTest) {
+  // A lane is not the gate: the release-gate/nightly status is the gate's alone.
+  if (truthy(env.REPORT_STATUS) && attempt === 1 && ctx.suite === 'all' && !selfTest && !lane) {
     for (const l of lines) {
       if (l.verdict !== 'green' && l.verdict !== 'red') continue;
       const desc = l.verdict === 'green'
@@ -429,6 +472,6 @@ function main() {
   console.log(summary.join('\n'));
 }
 
-module.exports = { tierKey, classifyLine, redRange, planIssues, markerOf, issueKey, openBody };
+module.exports = { tierKey, classifyLine, redRange, planIssues, markerOf, issueKey, openBody, laneLine, artifactName };
 
 if (require.main === module) main();
