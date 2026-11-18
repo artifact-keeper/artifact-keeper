@@ -339,7 +339,12 @@ async fn run_claimed_job(state: SharedState, queue: ScanQueue, job: Claimed<Scan
             );
             return;
         }
-        result = tokio::time::timeout(DEFAULT_JOB_BUDGET, execute(&state, &job)) => match result {
+        // #6232: rows the scan creates carry this claim, so recovery can close
+        // them if the claim lapses.
+        result = tokio::time::timeout(
+            DEFAULT_JOB_BUDGET,
+            crate::services::scan_queue::under_claim(claim_token, execute(&state, &job)),
+        ) => match result {
             Ok(r) => r,
             Err(_) => Err(JobFailure::Retryable(format!(
                 "scan exceeded the {}s queued-job budget",

@@ -87,6 +87,23 @@ fn parse_backfill_aging(raw: Option<&str>) -> std::time::Duration {
 tokio::task_local! {
     static BACKGROUND_BAND: ();
     static ENGINE_UNAVAILABLE: std::cell::Cell<bool>;
+    static JOB_CLAIM: Uuid;
+}
+
+/// Run `fut` as the holder of one job claim (#6232). A `running` scan_results
+/// row created inside it records the claim token, so when the claim lapses
+/// [`ScanQueue::recover_expired_claims`] can close the rows that claim left
+/// behind, and only those.
+pub async fn under_claim<F: std::future::Future>(claim_token: Uuid, fut: F) -> F::Output {
+    JOB_CLAIM.scope(claim_token, fut).await
+}
+
+/// The claim token of the queued job the current task runs (see
+/// [`under_claim`]). `None` outside a queued job, so an in-process scan
+/// records none. Task-local: a task spawned from inside the scan does not
+/// inherit it.
+pub fn current_claim() -> Option<Uuid> {
+    JOB_CLAIM.try_with(|t| *t).ok()
 }
 
 /// Run `fut`, reporting whether a scanner engine said it was unavailable while
@@ -131,6 +148,11 @@ pub const BACKGROUND_PRIORITY_FIELD: (&str, &str) = ("priority", "background");
 /// `(name, value)` sent on an adapter filesystem upload for a background-band
 /// scan. Absent means interactive.
 pub const BACKGROUND_PRIORITY_HEADER: (&str, &str) = ("X-Scan-Priority", "background");
+
+/// `error_message` of a scan_results row whose queued job was recovered from a
+/// lapsed claim (#6232). The rerun records its verdict in a new row.
+pub const RECOVERED_SCAN_REASON: &str = "scan worker vanished mid-scan (its scan-job claim \
+     lapsed); the recovered job reruns the scan";
 
 /// Claim extension for one job. Binds `$1 = id`, `$2 = token`, `$3 = ttl`.
 pub const RENEW_CLAIM_SQL: &str = r#"
@@ -883,34 +905,70 @@ impl ScanQueue {
 
     /// Requeue work abandoned by a crashed replica, charging the lost attempt so a
     /// job that kills its worker cannot spin forever. Safe from every replica.
+    ///
+    /// The same statement fails each `running` scan_results row the lapsed
+    /// claim created (#6232), since the rerun writes rows of its own. Rows are
+    /// matched on the claim token, which this statement revokes, so a row a
+    /// live claim is writing, or one an in-process scan created, is never
+    /// touched. The lock skips a job another replica is recovering or
+    /// finalizing right now, and the `running` guard makes a repeat a no-op.
     pub async fn recover_expired_claims(&self, backoff_secs: f64) -> Result<u64> {
-        let result = sqlx::query(
+        let (jobs, rows): (i64, i64) = sqlx::query_as(
             r#"
-            UPDATE scan_queue
-            SET attempts = CASE WHEN requeue THEN 0 ELSE attempts + 1 END,
-                state = CASE
-                    WHEN requeue OR attempts + 1 < max_attempts THEN 'pending'
-                    ELSE 'failed'
-                END,
-                requeue = false,
-                last_error = COALESCE(last_error, 'claim expired; worker vanished mid-scan'),
-                next_attempt_at = NOW() + make_interval(secs => $1),
-                claimed_by = NULL,
-                claim_token = NULL,
-                claim_expires_at = NULL,
-                updated_at = NOW()
-            WHERE state = 'running'
-              AND (claim_expires_at IS NULL OR claim_expires_at <= NOW())
+            WITH lapsed AS (
+                SELECT id, claim_token
+                FROM scan_queue
+                WHERE state = 'running'
+                  AND (claim_expires_at IS NULL OR claim_expires_at <= NOW())
+                FOR UPDATE SKIP LOCKED
+            ),
+            recovered AS (
+                UPDATE scan_queue q
+                SET attempts = CASE WHEN q.requeue THEN 0 ELSE q.attempts + 1 END,
+                    state = CASE
+                        WHEN q.requeue OR q.attempts + 1 < q.max_attempts THEN 'pending'
+                        ELSE 'failed'
+                    END,
+                    requeue = false,
+                    last_error = COALESCE(q.last_error, 'claim expired; worker vanished mid-scan'),
+                    next_attempt_at = NOW() + make_interval(secs => $1),
+                    claimed_by = NULL,
+                    claim_token = NULL,
+                    claim_expires_at = NULL,
+                    updated_at = NOW()
+                FROM lapsed l
+                WHERE q.id = l.id
+                RETURNING q.id
+            ),
+            closed AS (
+                UPDATE scan_results r
+                SET status = 'failed',
+                    error_message = $2,
+                    completed_at = NOW()
+                WHERE r.status = 'running'
+                  AND r.queue_claim_token IN (
+                      SELECT claim_token FROM lapsed WHERE claim_token IS NOT NULL
+                  )
+                RETURNING r.id
+            )
+            SELECT (SELECT COUNT(*) FROM recovered), (SELECT COUNT(*) FROM closed)
             "#,
         )
         .bind(backoff_secs)
-        .execute(&self.db)
+        .bind(RECOVERED_SCAN_REASON)
+        .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-        Ok(result.rows_affected())
+        if rows > 0 {
+            tracing::info!(
+                jobs,
+                scans = rows,
+                "failed the scans a lapsed scan-job claim left running; the recovered job reruns them"
+            );
+        }
+        Ok(jobs as u64)
     }
 
-    /// One page of live queue rows. A completed job is deleted, so never history.
     pub async fn list_jobs(
         &self,
         state_filter: Option<&str>,
@@ -2055,6 +2113,101 @@ mod tests {
                 .await
                 .expect("kinds");
         assert_eq!(kinds, vec!["hosted_artifact", "hosted_upload"]);
+
+        drop_repo(&pool, repo).await;
+    }
+
+    async fn scan_row(pool: &sqlx::PgPool, id: Uuid) -> (String, Option<String>) {
+        sqlx::query_as("SELECT status, error_message FROM scan_results WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("scan row")
+    }
+
+    /// #6232: recovering a lapsed claim fails the `running` scan row that claim
+    /// created, at once, instead of leaving it for the 1800 s janitor. A row a
+    /// live claim is writing, and one an in-process scan created, stay
+    /// `running`, and a second sweep (another replica racing) changes nothing.
+    #[tokio::test]
+    async fn recovering_a_lapsed_claim_fails_the_scan_row_it_left_running() {
+        use crate::services::scan_result_service::ScanResultService;
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        let scans = ScanResultService::new(pool.clone());
+
+        let dead_art = seed_artifact(&pool, repo, "orphan-6232.jar").await;
+        let live_art = seed_artifact(&pool, repo, "live-6232.jar").await;
+        q.enqueue_hosted_upload(dead_art, PRIORITY_HOSTED)
+            .await
+            .expect("enqueue");
+        let dead = q
+            .claim(1, "doomed-pod", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("one job");
+        q.enqueue_hosted_upload(live_art, PRIORITY_HOSTED)
+            .await
+            .expect("enqueue");
+        let live = q
+            .claim(1, "healthy-pod", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("one job");
+
+        // Each worker opens its scan row under its own claim, as the worker does.
+        let orphan = under_claim(
+            dead.claim_token(),
+            scans.create_scan_result_with_checksum(dead_art, repo, "grype", None),
+        )
+        .await
+        .expect("orphan row");
+        let in_flight = under_claim(
+            live.claim_token(),
+            scans.create_scan_result_with_checksum(live_art, repo, "grype", None),
+        )
+        .await
+        .expect("live row");
+        // An in-process scan of the same artifact: no claim, not the queue's.
+        let inline = scans
+            .create_scan_result_with_checksum(dead_art, repo, "grype", None)
+            .await
+            .expect("inline row");
+
+        // The doomed pod dies: its claim lapses.
+        sqlx::query(
+            "UPDATE scan_queue SET claim_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+        )
+        .bind(dead.id)
+        .execute(&pool)
+        .await
+        .expect("expire the claim");
+
+        assert_eq!(q.recover_expired_claims(0.0).await.expect("recover"), 1);
+        let (status, reason) = scan_row(&pool, orphan.id).await;
+        assert_eq!(
+            status, "failed",
+            "the dead claim's row is closed by recovery"
+        );
+        assert_eq!(reason.as_deref(), Some(RECOVERED_SCAN_REASON));
+        assert_eq!(
+            scan_row(&pool, in_flight.id).await.0,
+            "running",
+            "a live claim's row is never closed"
+        );
+        assert_eq!(
+            scan_row(&pool, inline.id).await.0,
+            "running",
+            "a row no queued job created is left to its writer"
+        );
+
+        // A racing or later sweep finds nothing left to do.
+        assert_eq!(q.recover_expired_claims(0.0).await.expect("recover"), 0);
+        assert_eq!(scan_row(&pool, in_flight.id).await.0, "running");
+        assert_eq!(scan_row(&pool, inline.id).await.0, "running");
 
         drop_repo(&pool, repo).await;
     }
