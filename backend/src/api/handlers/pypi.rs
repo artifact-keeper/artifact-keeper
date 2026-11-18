@@ -2288,7 +2288,7 @@ async fn serve_remote_metadata(
             // CPU work on upstream-controlled bytes, so they are admission-
             // controlled together, and the decode is bounded by the same
             // decompression-bomb budget the zip walk uses.
-            let metadata = crate::util::bounded_archive::with_ingest_extraction(|| {
+            let metadata = crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
                 match crate::util::content_coding::strip_content_coding(
                     &wheel,
                     wheel_encoding.as_deref(),
@@ -2316,6 +2316,7 @@ async fn serve_remote_metadata(
                     Err(e) => Err(e),
                 }
             })
+            .await
             .map_err(|e| e.into_response())?
             .map_err(|e| e.into_response())?
             .ok_or_else(|| {
@@ -4520,17 +4521,20 @@ async fn serve_metadata(
         Err(other) => return Err(map_storage_err(other)),
     };
 
-    // #2561: permit-scoped decode on the serve path, fast-fail 503 on
-    // saturation. Only taken for the branches that actually decode an archive.
+    // #2561: permit-scoped decode on the serve path; on saturation it waits
+    // briefly for a slot, then sheds 503 (#6230). Only taken for the
+    // branches that actually decode an archive.
     let metadata_text = if filename.ends_with(".whl") {
-        crate::util::bounded_archive::with_ingest_extraction(|| {
+        crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
             extract_metadata_from_wheel(&content)
         })
+        .await
         .map_err(|e| e.into_response())?
     } else if filename.ends_with(".tar.gz") {
-        crate::util::bounded_archive::with_ingest_extraction(|| {
+        crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
             extract_metadata_from_sdist(&content)
         })
+        .await
         .map_err(|e| e.into_response())?
     } else {
         None
