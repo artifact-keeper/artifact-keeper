@@ -3267,13 +3267,28 @@ impl CacheStore {
         keys: &CacheKeys,
         mutability: Option<cache_classifier::Mutability>,
     ) -> bool {
+        self.fresh_size(keys, mutability).await.is_some()
+    }
+
+    /// [`Self::is_fresh`], returning the size the sidecar records for a fresh
+    /// entry (`None` when not fresh). A presigned-redirect fast path tags its
+    /// 302 with this size for the transfer meter (#6035), so the sidecar is
+    /// read once per redirect rather than once for freshness and again for
+    /// the size.
+    async fn fresh_size(
+        &self,
+        keys: &CacheKeys,
+        mutability: Option<cache_classifier::Mutability>,
+    ) -> Option<i64> {
         let cache_key = &keys.content;
 
         let Ok(Some(metadata)) = self.load_metadata(&keys.metadata).await else {
-            return false;
+            return None;
         };
+        let size_bytes = metadata.size_bytes;
+        let fresh = |ok: bool| ok.then_some(size_bytes);
         if Utc::now() > metadata.expires_under(mutability) {
-            return false;
+            return None;
         }
 
         // #4630: refuse to presign a redirect to an object the sidecar itself
@@ -3289,7 +3304,7 @@ impl CacheStore {
                 "proxy cache sidecar pins the ETag of an empty object while claiming a \
                  non-zero size; not fresh (#4630)"
             );
-            return false;
+            return None;
         }
 
         // ETag-based integrity revalidation (#1051). Only meaningful when
@@ -3338,7 +3353,7 @@ impl CacheStore {
                             // describes, which is also what the caller's own
                             // `Content-Length` already claims it is.
                             return match self.storage.size(cache_key).await {
-                                Ok(len) => len == metadata.size_bytes as u64,
+                                Ok(len) => fresh(len == metadata.size_bytes as u64),
                                 Err(e) => {
                                     // Includes NotFound (object gone). Not
                                     // fresh: the slow path re-fetches and
@@ -3350,7 +3365,7 @@ impl CacheStore {
                                         error = %e,
                                         "proxy cache size probe failed during multipart fallback; treating as not fresh"
                                     );
-                                    false
+                                    None
                                 }
                             };
                         }
@@ -3360,28 +3375,28 @@ impl CacheStore {
                             current_etag = %current,
                             "proxy cache ETag mismatch on fast-path revalidation; falling back to slow path"
                         );
-                        return false;
+                        return None;
                     }
                     // ETag matched → object is present and unchanged
                     // since cache write. Skip the redundant exists() call.
-                    true
+                    fresh(true)
                 }
                 // Backend lost the object (None) or errored: treat as
                 // not-fresh. The slow path will re-fetch and re-cache.
-                Ok(None) => false,
+                Ok(None) => None,
                 Err(e) => {
                     tracing::warn!(
                         cache_key = %cache_key,
                         error = %e,
                         "proxy cache head_etag failed during revalidation; treating as not fresh"
                     );
-                    false
+                    None
                 }
             },
             None => {
                 // No pinned ETag (filesystem / legacy entry). Preserve
                 // pre-#1051 semantics: existence check only.
-                matches!(self.storage.exists(cache_key).await, Ok(true))
+                fresh(matches!(self.storage.exists(cache_key).await, Ok(true)))
             }
         }
     }
@@ -6626,6 +6641,17 @@ impl ProxyService {
         self.cache_store.is_fresh(&keys, mutability).await
     }
 
+    /// [`Self::is_cache_fresh`] for a presigned-redirect fast path: the size
+    /// the cache sidecar records when the entry is fresh, `None` otherwise.
+    /// The fast path tags its 302 with that size so the transfer meter counts
+    /// the object when the URL is issued (#6035), without a second sidecar
+    /// read after the freshness probe.
+    pub async fn fresh_cache_redirect_size(&self, repo_key: &str, path: &str) -> Option<i64> {
+        let keys = CacheKeys::derive(&self.cache_scope, repo_key, path).ok()?;
+        let mutability = self.effective_mutability_by_key(repo_key, path).await;
+        self.cache_store.fresh_size(&keys, mutability).await
+    }
+
     /// Gate a presigned-redirect fast path on the Remote's origin policy
     /// (#4506), the sibling of [`Self::cache_quarantine_gate`]. A redirect
     /// hands out the cached object without the body passing through the
@@ -6663,25 +6689,6 @@ impl ProxyService {
             check_quarantine_until(metadata.quarantine_until)?;
         }
         Ok(())
-    }
-
-    /// Size of the cached body at `(repo_key, path)` as its sidecar records
-    /// it, for a presigned-redirect fast path: the transfer meter counts the
-    /// object when the URL is issued (#6035). `None` when the sidecar is
-    /// missing or unreadable; a fast path then streams instead, so a redirect
-    /// is never issued for an object of unknown size.
-    ///
-    /// Read from storage, as [`Self::is_cache_fresh`] reads it, not through
-    /// the in-process metadata cache: that cache can still hold a miss, or the
-    /// previous sidecar, for an entry another replica has just written.
-    pub async fn cached_size_bytes(&self, repo_key: &str, path: &str) -> Option<i64> {
-        let metadata_key = Self::cache_metadata_key(&self.cache_scope, repo_key, path).ok()?;
-        self.cache_store
-            .load_metadata(&metadata_key)
-            .await
-            .ok()
-            .flatten()
-            .map(|m| m.size_bytes)
     }
 
     /// Gate a presigned-redirect fast path on the stored scan verdict of the

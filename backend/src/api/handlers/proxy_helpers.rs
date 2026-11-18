@@ -2079,9 +2079,12 @@ async fn try_member_cache_redirect(
     }
     let storage = proxy.cache_storage_backend();
     let cache_key = ProxyService::cache_storage_key(proxy.cache_scope(), &member.key, path).ok()?;
-    if !(storage.supports_redirect() && proxy.is_cache_fresh(&member.key, path).await) {
+    if !storage.supports_redirect() {
         return None;
     }
+    // #6035: the freshness probe also yields the size its sidecar records,
+    // which the transfer meter counts when the URL is issued.
+    let size_bytes = proxy.fresh_cache_redirect_size(&member.key, path).await?;
     // #2075: gate the redirect on the hold window (mirrors the gate in
     // `proxy_fetch_or_redirect`). A held entry must not be handed out as a
     // 302; falling through routes it onto the quarantine-surfacing path.
@@ -2097,9 +2100,6 @@ async fn try_member_cache_redirect(
     if proxy.cache_origin_policy_gate(&member.key).await.is_err() {
         return None;
     }
-    // #6035: the transfer meter counts the cached object's size when the URL
-    // is issued; with no sidecar size the member streams instead.
-    let size_bytes = proxy.cached_size_bytes(&member.key, path).await?;
     let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
     try_proxy_cache_redirect(
         storage.as_ref(),
@@ -2270,9 +2270,17 @@ pub(crate) async fn proxy_cache_fresh_redirect(
     // #1555: the freshness probe reads the cache-meta sidecar, so skip it when
     // the proxy's own (no-prefix) backend cannot presign anyway.
     let storage = proxy_service.cache_storage_backend();
-    if !storage.supports_redirect() || !proxy_service.is_cache_fresh(repo_key, cache_path).await {
+    if !storage.supports_redirect() {
         return Ok(None);
     }
+    // #6035: the freshness probe also yields the size its sidecar records,
+    // which the transfer meter counts when the URL is issued.
+    let Some(size_bytes) = proxy_service
+        .fresh_cache_redirect_size(repo_key, cache_path)
+        .await
+    else {
+        return Ok(None);
+    };
     let refused = |e| map_proxy_error(repo_key, cache_path, e);
     proxy_service
         .cache_quarantine_gate(repo_key, cache_path)
@@ -2299,11 +2307,6 @@ pub(crate) async fn proxy_cache_fresh_redirect(
     let cache_key =
         ProxyService::cache_storage_key(proxy_service.cache_scope(), repo_key, cache_path)
             .map_err(refused)?;
-    // #6035: the transfer meter counts the cached object's size when the URL
-    // is issued; with no sidecar size the caller serves the request itself.
-    let Some(size_bytes) = proxy_service.cached_size_bytes(repo_key, cache_path).await else {
-        return Ok(None);
-    };
     let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
     Ok(try_proxy_cache_redirect(
         storage.as_ref(),
@@ -18878,6 +18881,65 @@ mod tests {
         assert!(redirect(&unsigned, PATH, &get_ctx()).await.is_none());
     }
 
+    /// #6035 review: the redirect fast paths take the size the transfer meter
+    /// counts from the freshness probe's own sidecar read, so a fresh entry
+    /// whose sidecar is gone by the time the 302 is built (evicted by another
+    /// replica after the probe) is still redirected, tagged with the probed
+    /// size, with the meter off. A second sidecar GET for the size made that
+    /// request stream instead, and cost one storage round trip per redirect.
+    #[tokio::test]
+    async fn fresh_redirects_read_the_sidecar_once_6035() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::lazy_pool();
+        let scope = scoped_test_scope();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let state = tdh::build_state_with_proxy_presigned(
+            pool,
+            dir.path().to_str().unwrap(),
+            proxy.clone(),
+        );
+        assert!(
+            !state.transfer_meter.enabled(),
+            "the meter must be off here"
+        );
+        let ctx = get_ctx();
+        let seed = |repo_key: &str, path: &str| {
+            let content_key = ProxyService::cache_storage_key(&scope, repo_key, path).unwrap();
+            let meta_key = ProxyService::cache_metadata_key(&scope, repo_key, path).unwrap();
+            backend.seed_fresh_entry(&content_key, &meta_key);
+            backend.evict_after_read.lock().unwrap().insert(meta_key);
+        };
+        let tagged = |resp: &Response| {
+            resp.extensions()
+                .get::<crate::services::quota::http::PresignedDownload>()
+                .copied()
+        };
+
+        const PATH: &str = "ns/ty/1.0.0/linux/amd64/p.zip";
+        seed("tf-proxy", PATH);
+        let resp =
+            proxy_cache_fresh_redirect(proxy.as_ref(), state.as_ref(), "tf-proxy", PATH, &ctx)
+                .await
+                .unwrap()
+                .expect("a fresh entry must be redirected without a second sidecar read");
+        assert_eq!(
+            tagged(&resp),
+            Some(crate::services::quota::http::PresignedDownload(11))
+        );
+
+        let member = test_local_member("maven-proxy");
+        let path = "org/example/lib/1.0/lib-1.0.jar";
+        seed(&member.key, path);
+        let resp = try_member_cache_redirect(state.as_ref(), proxy.as_ref(), &member, path, &ctx)
+            .await
+            .expect("a fresh member entry must be redirected without a second sidecar read");
+        assert_eq!(
+            tagged(&resp),
+            Some(crate::services::quota::http::PresignedDownload(11))
+        );
+    }
+
     /// #4514: the package-file redirect fast paths of a Remote that scans on
     /// proxy consult the verdict stored for the cached body's digest. A
     /// refusing verdict is the scan gate's 403 (the PyPI helper declines);
@@ -24048,17 +24110,18 @@ mod tests {
         );
 
         // The redirect helper itself must call `try_proxy_cache_redirect(` and
-        // gate on a metadata-only `is_cache_fresh(` probe so it never pulls the
-        // body just to decide whether to redirect (#1555).
+        // gate on a metadata-only freshness probe so it never pulls the body
+        // just to decide whether to redirect (#1555). Since #6035 that probe is
+        // `fresh_cache_redirect_size(`, which also returns the sidecar's size.
         let helper_start = src
             .find("async fn try_member_cache_redirect(")
             .expect("try_member_cache_redirect must exist");
         let helper_window = item_body(src, helper_start);
         assert!(
             helper_window.contains("try_proxy_cache_redirect(")
-                && helper_window.contains("is_cache_fresh("),
+                && helper_window.contains("fresh_cache_redirect_size("),
             "`try_member_cache_redirect` MUST attempt `try_proxy_cache_redirect(` \
-             gated on a metadata-only `is_cache_fresh(` probe (#1555).",
+             gated on the metadata-only `fresh_cache_redirect_size(` probe (#1555).",
         );
     }
 

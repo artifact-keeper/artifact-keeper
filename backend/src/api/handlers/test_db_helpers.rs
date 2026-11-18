@@ -3133,6 +3133,10 @@ impl Fixture {
 #[derive(Default)]
 pub struct PresignMemBackend {
     pub objects: std::sync::Mutex<std::collections::HashMap<String, Bytes>>,
+    /// Keys removed right after their first successful `get`, to model an
+    /// entry evicted (by another replica, or a lifecycle rule) between two
+    /// reads of the same request.
+    pub evict_after_read: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl PresignMemBackend {
@@ -3156,12 +3160,15 @@ impl crate::services::storage_service::StorageBackend for PresignMemBackend {
         Ok(())
     }
     async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
-        self.objects
-            .lock()
-            .unwrap()
+        let mut objects = self.objects.lock().unwrap();
+        let found = objects
             .get(key)
             .cloned()
-            .ok_or_else(|| crate::error::AppError::NotFound(key.to_string()))
+            .ok_or_else(|| crate::error::AppError::NotFound(key.to_string()))?;
+        if self.evict_after_read.lock().unwrap().contains(key) {
+            objects.remove(key);
+        }
+        Ok(found)
     }
     async fn exists(&self, key: &str) -> crate::error::Result<bool> {
         Ok(self.objects.lock().unwrap().contains_key(key))
