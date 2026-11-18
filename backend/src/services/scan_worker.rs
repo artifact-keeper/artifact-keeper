@@ -23,12 +23,20 @@ use crate::services::scan_queue::{
 /// feels this. An enqueue in this process wakes us sooner.
 const DEFAULT_TICK: Duration = Duration::from_millis(1000);
 
+/// Unset `SCAN_WORKER_CONCURRENCY` keeps the pre-1.12.2 default of 4.
+const DEFAULT_WORKER_CONCURRENCY: usize = 4;
+
 /// Jobs in flight per pod: `SCAN_WORKER_CONCURRENCY` when set, otherwise the
-/// extraction semaphore's size (`MAX_CONCURRENT_SCAN_EXTRACTIONS`), so a worker
-/// does not claim more jobs than it can extract at once (#6033). A claimed job
-/// waiting on an extraction permit holds its lease and shows as `running`.
+/// default of 4 capped at the extraction semaphore's size
+/// (`MAX_CONCURRENT_SCAN_EXTRACTIONS`), so a worker does not claim more jobs
+/// than it can extract at once (#6033). Capped, not equal: a pod that raised the
+/// permits for in-process scans must not also get more queued jobs by default,
+/// a memory jump in a patch release. A claimed job waiting on an extraction
+/// permit holds its lease and shows as `running`.
 fn resolve_concurrency(configured: Option<usize>, extraction_permits: usize) -> usize {
-    configured.unwrap_or(extraction_permits).max(1)
+    configured
+        .unwrap_or_else(|| DEFAULT_WORKER_CONCURRENCY.min(extraction_permits))
+        .max(1)
 }
 
 /// Ceiling for one queued scan: well above the inline budgets it replaces, since
@@ -1073,14 +1081,16 @@ mod tests {
         assert_eq!(permits.available_permits(), concurrency);
     }
 
-    /// #6033: unset, the worker runs as many jobs as the extraction semaphore
-    /// has permits, not a fixed 4, so lowering `MAX_CONCURRENT_SCAN_EXTRACTIONS`
-    /// lowers the claims too. A set value wins either way.
+    /// #6033: unset, the worker runs at most as many jobs as the extraction
+    /// semaphore has permits, so lowering `MAX_CONCURRENT_SCAN_EXTRACTIONS`
+    /// lowers the claims too; raising it does not raise them past the default
+    /// of 4. A set value wins either way.
     #[test]
     fn unset_concurrency_follows_the_extraction_permits() {
         assert_eq!(resolve_concurrency(None, 1), 1);
         assert_eq!(resolve_concurrency(None, 4), 4);
-        assert_eq!(resolve_concurrency(None, 9), 9);
+        assert_eq!(resolve_concurrency(None, 9), 4);
+        assert_eq!(resolve_concurrency(None, 16), 4);
         assert_eq!(resolve_concurrency(Some(2), 1), 2);
         assert_eq!(resolve_concurrency(Some(8), 4), 8);
         // Never zero slots, whatever the inputs.
