@@ -4064,17 +4064,75 @@ pub(crate) fn classify_streaming_cache_probe(
     }
 }
 
+/// Whether a Local/Staging member's failed fetch `Response` is transient
+/// (#5574): the `Response`-level counterpart of
+/// [`crate::services::proxy_service::classify_member_fetch_failure`].
+///
+/// A hosted member's `local_fetch` maps its own faults to responses:
+/// [`local_lookup_artifact`] answers `404` when no row matches, `403`/`409`
+/// (or the #4323 integrity `502`) when its download gate refuses an artifact
+/// it holds, and `open_local_stream` maps a storage fault with
+/// [`map_storage_err`] (`500`, or the `503` of an unreachable backend) while
+/// its coordinated hydration path answers `507` when the object is still
+/// absent. A `404` or another permanent client error means the member does not
+/// hold the artifact; anything else means it could not answer and may.
+fn is_transient_local_failure(resp: &Response) -> bool {
+    if is_member_unavailable_response(resp) {
+        return true;
+    }
+    let status = resp.status();
+    !status.is_client_error()
+        || matches!(
+            status,
+            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_EARLY | StatusCode::TOO_MANY_REQUESTS
+        )
+}
+
+/// Pass-1 classification of a Local/Staging member's failed fetch (#5574):
+/// the hosted counterpart of [`classify_cache_probe`], shared by the buffered
+/// and streaming resolvers so every format reading a hosted member sees the
+/// same answer.
+///
+/// #3220: a `403`/`409` (or the #4323 integrity `502`) from `local_fetch` is
+/// the member's own download gate (quarantine hold or scan policy) refusing an
+/// artifact it DOES hold — see [`local_lookup_artifact`]. That is terminal,
+/// not a miss: classifying it `DefiniteMiss` would let resolution continue to
+/// a lower-priority member or upstream and serve the very bytes the policy
+/// blocked, with no 403 anywhere in the response. It is returned as
+/// [`MemberResolveOutcome::Quarantine`] under `DefiniteHit` so Pass 1 stops
+/// here and the block surfaces.
+///
+/// A storage or database fault is [`MemberResolveOutcome::Unavailable`] under
+/// `DefiniteMiss` (#5574), so the walk remembers it and a request no other
+/// member serves answers the retryable `503` instead of the `404` a build tool
+/// caches. Only a permanent answer (a missing row, a rejected path) stays a
+/// plain miss.
+pub(crate) fn classify_local_fetch_failure<T>(
+    resp: Response,
+) -> (MemberCacheClass, Option<MemberResolveOutcome<T, Response>>) {
+    if is_member_policy_block_response(&resp) {
+        return (
+            MemberCacheClass::DefiniteHit,
+            Some(MemberResolveOutcome::Quarantine(resp)),
+        );
+    }
+    if is_transient_local_failure(&resp) {
+        tracing::warn!(
+            status = %resp.status(),
+            "hosted virtual member could not answer, trying the next member"
+        );
+        return (
+            MemberCacheClass::DefiniteMiss,
+            Some(MemberResolveOutcome::Unavailable),
+        );
+    }
+    (MemberCacheClass::DefiniteMiss, None)
+}
+
 /// Classify a Local/Staging member's buffered fetch for the streaming resolver
 /// (#2069): build the streaming response on a hit (or serve a 500 if header
-/// building fails — that member still "wins" with an error), else a miss.
-///
-/// #3220: a 403/409 from `local_fetch` is the member's own download gate
-/// (quarantine hold or scan policy) refusing an artifact it DOES hold — see
-/// [`local_lookup_artifact`]. That is terminal, not a miss: classifying it
-/// `DefiniteMiss` would let resolution continue to a lower-priority member or
-/// upstream and serve the very bytes the policy blocked, with no 403 anywhere
-/// in the response. It is returned as [`MemberResolveOutcome::Quarantine`]
-/// under `DefiniteHit` so Pass 1 stops here and the block surfaces.
+/// building fails — that member still "wins" with an error), else the shared
+/// pass-1 classification of [`classify_local_fetch_failure`] (#5574).
 pub(crate) fn classify_streaming_local(
     fetched: Result<StreamingFetchResult, Response>,
     default_content_type: &str,
@@ -4100,11 +4158,7 @@ pub(crate) fn classify_streaming_local(
                 )),
             ),
         },
-        Err(resp) if is_member_policy_block_response(&resp) => (
-            MemberCacheClass::DefiniteHit,
-            Some(MemberResolveOutcome::Quarantine(resp)),
-        ),
-        Err(_) => (MemberCacheClass::DefiniteMiss, None),
+        Err(resp) => classify_local_fetch_failure(resp),
     }
 }
 
@@ -4379,17 +4433,12 @@ where
                                 Some(MemberResolveOutcome::Hit((result, origin))),
                             )
                         }
-                        // #3220: the member's own download gate (quarantine /
-                        // scan policy) refused an artifact it HOLDS. Terminal,
-                        // not a miss — otherwise the block silently falls
-                        // through to the next member or upstream and the client
-                        // gets the bytes anyway. Fail closed on the member that
-                        // would have served.
-                        Err(resp) if is_member_policy_block_response(&resp) => (
-                            MemberCacheClass::DefiniteHit,
-                            Some(MemberResolveOutcome::Quarantine(resp)),
-                        ),
-                        Err(_) => (MemberCacheClass::DefiniteMiss, None),
+                        // #3220 / #5574: a policy block is the member's own
+                        // download gate refusing an artifact it HOLDS, and a
+                        // storage fault means it could not answer; both are
+                        // carried by the shared classifier instead of being
+                        // flattened into a miss.
+                        Err(resp) => classify_local_fetch_failure(resp),
                     }
                 }
                 VirtualMemberFetchStrategy::Proxy => match proxy_service {
@@ -18788,9 +18837,11 @@ mod tests {
     /// Pass 1 (so no lower-priority member is even probed) and surfaces the
     /// status the gate produced.
     ///
-    /// The 404/500 arms are the control: they must STAY `DefiniteMiss`, or a
-    /// member that genuinely lacks the artifact would fail the whole virtual
-    /// request instead of deferring to a sibling that has it.
+    /// The 404 arm is the control: a member that genuinely lacks the artifact
+    /// must stay a plain miss so the walk defers to a sibling that has it. A
+    /// 500/507 is a fault the member may recover from, so it is a miss with an
+    /// `Unavailable` outcome (#5574): the walk still defers, but answers 503
+    /// if nothing serves.
     #[test]
     fn classify_streaming_local_policy_block_is_terminal_3220() {
         for status in [StatusCode::FORBIDDEN, StatusCode::CONFLICT] {
@@ -18811,24 +18862,35 @@ mod tests {
             }
         }
 
-        // Controls: a real miss and a real infrastructure failure must still
-        // defer to the next member.
+        // A genuine miss defers without earning a 503.
+        let (class, outcome) = classify_streaming_local(
+            Err((StatusCode::NOT_FOUND, "not a policy decision").into_response()),
+            "application/json",
+            None,
+        );
+        assert_eq!(
+            class,
+            MemberCacheClass::DefiniteMiss,
+            "a 404 is not a policy block and must remain a plain member miss"
+        );
+        assert!(outcome.is_none());
+
+        // A storage fault must still defer to the next member, but is
+        // remembered so nothing else serving answers 503 (#5574).
         for status in [
-            StatusCode::NOT_FOUND,
             StatusCode::INTERNAL_SERVER_ERROR,
             StatusCode::INSUFFICIENT_STORAGE,
         ] {
             let (class, outcome) = classify_streaming_local(
-                Err((status, "not a policy decision").into_response()),
+                Err((status, "storage is down").into_response()),
                 "application/json",
                 None,
             );
-            assert_eq!(
-                class,
-                MemberCacheClass::DefiniteMiss,
-                "a {status} is not a policy block and must remain a member miss"
+            assert_eq!(class, MemberCacheClass::DefiniteMiss);
+            assert!(
+                matches!(outcome, Some(MemberResolveOutcome::Unavailable)),
+                "a {status} storage fault must be an unavailable member, not a miss"
             );
-            assert!(outcome.is_none());
         }
     }
 

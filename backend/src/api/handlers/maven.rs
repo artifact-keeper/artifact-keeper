@@ -11978,6 +11978,68 @@ mod tests {
         );
     }
 
+    /// #5574: the artifact walk reads a hosted member's storage fault the same
+    /// way the checksum walk does (#5504). Through a member whose stored object
+    /// cannot be read, `lib-1.0.jar` answers the retryable 503, not the 404 a
+    /// build tool caches; once the row is gone the same request is a genuine
+    /// miss and answers 404.
+    #[tokio::test]
+    async fn test_virtual_artifact_503s_when_a_hosted_member_storage_fails_5574() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let path = "com/hosted5574/lib/1.0/lib-1.0.jar";
+        let (local_id, _, local_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (virtual_id, virtual_key, virtual_dir) =
+            tdh::create_repo(&pool, "virtual", "maven").await;
+        tdh::publish_repo(&pool, local_id).await;
+        tdh::publish_repo(&pool, virtual_id).await;
+        tdh::link_virtual_member(&pool, virtual_id, local_id, 0).await;
+        // The row names a storage key no object exists under: every read of
+        // the bytes fails, as on a storage outage.
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, version, size_bytes, checksum_sha256, \
+              content_type, storage_key) \
+             VALUES ($1, $2, 'lib', '1.0', 3, $3, 'application/java-archive', $4)",
+        )
+        .bind(local_id)
+        .bind(path)
+        .bind("ab".repeat(32))
+        .bind(format!("maven/{path}.unreadable"))
+        .execute(&pool)
+        .await
+        .expect("seed hosted artifact row");
+
+        let state = tdh::build_state(pool.clone(), virtual_dir.to_str().unwrap());
+        let request = || tdh::get(format!("/{virtual_key}/{path}"));
+        let (unreadable, _) = tdh::send(tdh::router_anon(router(), state.clone()), request()).await;
+
+        // A missing row is still a miss, not an outage.
+        sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(local_id)
+            .execute(&pool)
+            .await
+            .expect("drop hosted artifact row");
+        let (missing, _) = tdh::send(tdh::router_anon(router(), state.clone()), request()).await;
+
+        for id in [virtual_id, local_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        let _ = std::fs::remove_dir_all(&local_dir);
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+
+        assert_eq!(
+            (unreadable, missing),
+            (StatusCode::SERVICE_UNAVAILABLE, StatusCode::NOT_FOUND),
+            "a hosted member's storage fault must answer 503, a missing row 404"
+        );
+    }
+
     #[tokio::test]
     async fn test_virtual_prefixes_bails_on_upstream_unsupported_marker() {
         // `@ unsupported` is RRF's "I can't answer", not "I have nothing" —
