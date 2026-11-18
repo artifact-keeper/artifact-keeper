@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#6035]
----
-- **Every presigned redirect download now counts toward the transfer quota, so `TRANSFER_QUOTA_BYTES` means the same thing with redirects on and off** (#6035). With `PRESIGNED_DOWNLOADS_ENABLED=true` on a backend that can sign URLs, several download routes answered with a presigned redirect without adding the object's size to the transfer meter: the repository download API (`GET /api/v1/repositories/<key>/download/<path>`), an OCI blob of a virtual repository's local member, an OCI blob already in a remote repository's proxy cache, and every proxy-cache redirect (virtual-member cache hits, PyPI remote cache hits, Terraform provider mirror archives). A client could download past the monthly transfer quota on those routes. The size is now part of the redirect itself, taken from the artifact row, the `oci_blobs` row or the proxy-cache entry's recorded size, so every redirect is counted once when its URL is issued. A proxy-cache entry whose recorded size cannot be read is streamed instead of redirected.
