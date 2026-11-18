@@ -1423,6 +1423,26 @@ impl ScanResultService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // #6232: a row a queued job creates records the job's claim, so if the
+        // worker dies the claim's recovery fails this row instead of leaving it
+        // `running` for the janitor. Best-effort: unstamped, the janitor still
+        // reaps it.
+        if let Some(claim) = crate::services::scan_queue::current_claim() {
+            if let Err(e) =
+                sqlx::query("UPDATE scan_results SET queue_claim_token = $2 WHERE id = $1")
+                    .bind(result.id)
+                    .bind(claim)
+                    .execute(&self.db)
+                    .await
+            {
+                tracing::warn!(
+                    scan_id = %result.id, error = %e,
+                    "failed to record the scan-job claim on a scan row; the stuck-scan janitor \
+                     reaps it if the worker dies"
+                );
+            }
+        }
+
         Ok(result)
     }
 
