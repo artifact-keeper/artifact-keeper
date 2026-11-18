@@ -148,6 +148,9 @@ fn check_zip_entry_count_limited(entry_count: u64, max_entries: u64) -> Result<(
 // latency SLA and must complete), ingestion decode happens on the request path,
 // so the guard is acquired FAST-FAIL: on saturation it sheds the request with a
 // 503 ([`AppError::ServiceUnavailable`]) instead of queueing more decode work.
+// The async seam ([`with_ingest_extraction_async`]) first waits a short,
+// bounded time with a capped queue before it sheds (#6221; see "Bounded wait
+// before shedding" below); a waiter holds no permit, so the bound is unchanged.
 // It is a *separate* semaphore from the scanner's, so ingestion and scan
 // extractions do not double-count against one shared budget.
 
@@ -300,13 +303,15 @@ fn with_ingest_extraction_from<T>(sem: &Arc<Semaphore>, decode: impl FnOnce() ->
 
 /// Like [`with_ingest_extraction`] but holds the slot across an `.await` — for
 /// decodes that hop to a blocking thread (`spawn_blocking`) so the permit must
-/// span the join. Same fast-fail-503 semantics; the future is never constructed
-/// when the server is saturated.
+/// span the join. Being async, it waits a bounded time for a slot before
+/// shedding (#6221, [`acquire_ingest_extraction_waiting`]): a short burst of
+/// uploads queues instead of failing, and a flood still gets the same 503. The
+/// future is never constructed when the request is shed.
 pub async fn with_ingest_extraction_async<T, F>(decode: impl FnOnce() -> F) -> Result<T>
 where
     F: std::future::Future<Output = T>,
 {
-    let _permit = acquire_ingest_extraction()?;
+    let _permit = acquire_ingest_extraction_waiting().await?;
     Ok(decode().await)
 }
 
@@ -479,11 +484,10 @@ fn acquire_ingest_extraction_paired(
     global_sem: &Arc<Semaphore>,
     tenant_sem: &Arc<Semaphore>,
 ) -> Result<IngestExtractionGuard> {
-    let tenant_permit = tenant_sem.clone().try_acquire_owned().map_err(|_| {
-        AppError::ServiceUnavailable(
-            "Too many concurrent uploads for this repository; please retry shortly".to_string(),
-        )
-    })?;
+    let tenant_permit = tenant_sem
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| tenant_ingest_busy_err())?;
     let global_permit = global_sem
         .clone()
         .try_acquire_owned()
@@ -504,6 +508,286 @@ fn acquire_ingest_extraction_keyed(
 ) -> Result<IngestExtractionGuard> {
     let tenant_sem = tenant_semaphore_for(key, per_tenant);
     acquire_ingest_extraction_paired(global_sem, &tenant_sem)
+}
+
+// ---------------------------------------------------------------------------
+// Bounded wait before shedding (#6221)
+// ---------------------------------------------------------------------------
+//
+// Fast-fail sheds a request the moment the caps are full, even when a permit
+// will free up a few hundred milliseconds later. Clients that retry a 503 on
+// POST cope with that, but twine (urllib3 retries GET only) and poetry do not,
+// so a CI matrix publishing five wheels to one repository at once failed the
+// fifth publish against a healthy server.
+//
+// The async acquire therefore waits a short, bounded time for a permit before
+// shedding the same 503 as before. The caps themselves do not change: a
+// waiting request holds no permit and decodes nothing, so concurrent decode
+// memory/CPU is still bounded by `global cap x per-archive budget` (#2561) and
+// one repository still gets at most its sub-limit (#2598). What a waiter does
+// hold is its connection and its request body. The upload handlers on this
+// path stage the body to a scratch file before decoding, so for most formats
+// that is a file descriptor and disk, not memory, but a few (pacman, the MCP
+// and agent-plugin uploads) hold the body as `Bytes`. The number of waiters is
+// therefore capped too, per repository and globally, and a request that finds
+// its queue full sheds at once, exactly as today. tokio's `Semaphore` is FIFO,
+// so waiters are admitted in arrival order and a fresh `try_acquire` cannot
+// overtake them.
+//
+// Only the async seam waits. The synchronous `with_ingest_extraction` /
+// `acquire_ingest_extraction` cannot wait without blocking a runtime worker,
+// so they keep fast-failing.
+
+/// Default time, in seconds, an upload waits for an ingest-extraction permit
+/// before it is shed with 503. A single metadata decode takes milliseconds to a
+/// few seconds, so 15 s drains a queue of several uploads per slot, and it stays
+/// well inside the 120 s `GLOBAL_REQUEST_TIMEOUT_SECS` and the 60 s
+/// `UPLOAD_PROGRESS_WINDOW_SECS`, so a waiter is never killed by another
+/// timeout first.
+#[cfg(not(test))]
+pub const DEFAULT_INGEST_EXTRACTION_WAIT_SECS: u64 = 15;
+
+/// #6221: the handler tests that deliberately saturate a repository's bucket
+/// to observe the shed would otherwise sit for the full production wait. The
+/// test binary waits 2 s instead; the env override and the queue caps are the
+/// same as in production.
+#[cfg(test)]
+pub const DEFAULT_INGEST_EXTRACTION_WAIT_SECS: u64 = 2;
+
+/// Env var overriding [`DEFAULT_INGEST_EXTRACTION_WAIT_SECS`]. `0` turns the
+/// wait off (the pre-#6221 fast-fail); blank or non-numeric falls back to the
+/// default. Values above [`MAX_INGEST_EXTRACTION_WAIT_SECS`] are clamped.
+pub const INGEST_EXTRACTION_WAIT_SECS_ENV: &str = "INGEST_EXTRACTION_WAIT_SECS";
+
+/// Ceiling on the configurable wait. A waiter holds a connection and its body;
+/// past a couple of minutes the request timeouts in front of it fire anyway.
+pub const MAX_INGEST_EXTRACTION_WAIT_SECS: u64 = 120;
+
+/// Default number of requests that may wait for a permit for ONE repository.
+/// Twice the per-repository sub-limit: a burst of up to 12 uploads to one
+/// repository (4 decoding, 8 queued) is absorbed, a larger flood is shed.
+pub const DEFAULT_MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT: usize = 8;
+
+/// Env var overriding [`DEFAULT_MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT`].
+/// `0` disables queueing for every repository (fast-fail); blank or
+/// non-numeric falls back to the default.
+pub const MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT_ENV: &str =
+    "MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT";
+
+/// Default number of requests that may wait for a permit across ALL
+/// repositories (the global ceiling's queue). Four times the global cap.
+pub const DEFAULT_MAX_QUEUED_INGEST_EXTRACTIONS: usize = 32;
+
+/// Env var overriding [`DEFAULT_MAX_QUEUED_INGEST_EXTRACTIONS`]. Same rules as
+/// the per-repository queue cap.
+pub const MAX_QUEUED_INGEST_EXTRACTIONS_ENV: &str = "MAX_QUEUED_INGEST_EXTRACTIONS";
+
+/// Read a non-negative integer env var: unset, blank or non-numeric gives
+/// `default`; unlike [`positive_env_or`], `0` is a valid value (it switches the
+/// wait or the queue off).
+fn non_negative_env_or(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+/// The wait and queue limits one acquire runs under. Pure data so the
+/// deterministic test seam can pass its own.
+#[derive(Clone, Copy, Debug)]
+struct IngestWaitPolicy {
+    wait: std::time::Duration,
+    max_tenant_waiters: usize,
+    max_global_waiters: usize,
+}
+
+impl IngestWaitPolicy {
+    /// The effective policy from the env overrides and defaults.
+    fn from_env() -> Self {
+        let wait_secs = non_negative_env_or(
+            INGEST_EXTRACTION_WAIT_SECS_ENV,
+            DEFAULT_INGEST_EXTRACTION_WAIT_SECS,
+        )
+        .min(MAX_INGEST_EXTRACTION_WAIT_SECS);
+        let queue = |name, default: usize| {
+            usize::try_from(non_negative_env_or(name, default as u64)).unwrap_or(usize::MAX)
+        };
+        Self {
+            wait: std::time::Duration::from_secs(wait_secs),
+            max_tenant_waiters: queue(
+                MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT_ENV,
+                DEFAULT_MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT,
+            ),
+            max_global_waiters: queue(
+                MAX_QUEUED_INGEST_EXTRACTIONS_ENV,
+                DEFAULT_MAX_QUEUED_INGEST_EXTRACTIONS,
+            ),
+        }
+    }
+}
+
+/// Counts the requests waiting on one semaphore, so the queue can be capped.
+#[derive(Debug, Default)]
+struct WaitLine {
+    waiting: std::sync::atomic::AtomicUsize,
+}
+
+/// One place in a [`WaitLine`]; leaving (drop, including when the request
+/// future is cancelled) frees the place.
+#[derive(Debug)]
+struct WaitTicket {
+    line: Arc<WaitLine>,
+}
+
+impl WaitLine {
+    /// Take a place in the line, or `None` when `max` requests already wait.
+    fn join(line: &Arc<WaitLine>, max: usize) -> Option<WaitTicket> {
+        use std::sync::atomic::Ordering;
+        line.waiting
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < max).then_some(n + 1)
+            })
+            .ok()?;
+        Some(WaitTicket {
+            line: Arc::clone(line),
+        })
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.waiting.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl Drop for WaitTicket {
+    fn drop(&mut self) {
+        self.line
+            .waiting
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// The global ceiling's wait line.
+fn global_wait_line() -> &'static Arc<WaitLine> {
+    static LINE: OnceLock<Arc<WaitLine>> = OnceLock::new();
+    LINE.get_or_init(|| Arc::new(WaitLine::default()))
+}
+
+/// Per-repository wait lines, `Weak`-valued like the tenant semaphores: a line
+/// lives only while some request waits in it, so the map is bounded by the set
+/// of repositories that currently have a waiter.
+fn tenant_wait_line_registry() -> &'static Mutex<HashMap<TenantKey, Weak<WaitLine>>> {
+    static REG: OnceLock<Mutex<HashMap<TenantKey, Weak<WaitLine>>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Get (or create) the wait line for `key`.
+fn tenant_wait_line_for(key: &TenantKey) -> Arc<WaitLine> {
+    let mut map = tenant_wait_line_registry()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some(existing) = map.get(key).and_then(Weak::upgrade) {
+        return existing;
+    }
+    map.retain(|_, w| w.strong_count() > 0);
+    let line = Arc::new(WaitLine::default());
+    map.insert(key.clone(), Arc::downgrade(&line));
+    line
+}
+
+/// How many requests wait for `key`'s per-repository permit right now.
+#[cfg(test)]
+pub(crate) fn queued_ingest_extractions_for(key: &TenantKey) -> usize {
+    tenant_wait_line_registry()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get(key)
+        .and_then(Weak::upgrade)
+        .map_or(0, |line| line.len())
+}
+
+/// Take a permit from `sem`, waiting until `deadline` if none is free and a
+/// place in `line` (at most `max_waiters` long) is available. Sheds with
+/// `busy()` when the line is full or the deadline passes. The fast path (a
+/// permit is free) does not yield.
+async fn acquire_or_wait(
+    sem: &Arc<Semaphore>,
+    line: &Arc<WaitLine>,
+    max_waiters: usize,
+    deadline: tokio::time::Instant,
+    busy: fn() -> AppError,
+) -> Result<OwnedSemaphorePermit> {
+    if let Ok(permit) = sem.clone().try_acquire_owned() {
+        return Ok(permit);
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return Err(busy());
+    }
+    let Some(_ticket) = WaitLine::join(line, max_waiters) else {
+        return Err(busy());
+    };
+    match tokio::time::timeout_at(deadline, sem.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        // Elapsed, or closed (never happens: the semaphores live for the
+        // process). Either way the same 503 as the fast-fail path.
+        _ => Err(busy()),
+    }
+}
+
+/// The 503 shed when a repository's own sub-limit is saturated.
+fn tenant_ingest_busy_err() -> AppError {
+    AppError::ServiceUnavailable(
+        "Too many concurrent uploads for this repository; please retry shortly".to_string(),
+    )
+}
+
+/// Waiting counterpart of [`acquire_ingest_extraction_paired`]: tenant permit
+/// first, then the global one, both under ONE deadline so the total wait never
+/// exceeds `policy.wait`. A shed while waiting for the global permit drops the
+/// tenant permit already taken, so nothing leaks. This explicit-argument form
+/// is the deterministic unit-test seam.
+async fn acquire_ingest_extraction_paired_waiting(
+    global: (&Arc<Semaphore>, &Arc<WaitLine>),
+    tenant: (&Arc<Semaphore>, &Arc<WaitLine>),
+    policy: IngestWaitPolicy,
+) -> Result<IngestExtractionGuard> {
+    let deadline = tokio::time::Instant::now() + policy.wait;
+    let tenant_permit = acquire_or_wait(
+        tenant.0,
+        tenant.1,
+        policy.max_tenant_waiters,
+        deadline,
+        tenant_ingest_busy_err,
+    )
+    .await?;
+    let global_permit = acquire_or_wait(
+        global.0,
+        global.1,
+        policy.max_global_waiters,
+        deadline,
+        global_ingest_busy_err,
+    )
+    .await?;
+    Ok(IngestExtractionGuard {
+        _global: global_permit,
+        _tenant: Some(tenant_permit),
+    })
+}
+
+/// Reserve one ingestion-decompression slot for the ambient tenant, waiting a
+/// bounded time for one to free up before shedding with the same 503 as
+/// [`acquire_ingest_extraction`] (#6221). See the section note above for the
+/// limits and why they keep the #2561/#2598 bounds intact.
+pub async fn acquire_ingest_extraction_waiting() -> Result<IngestExtractionGuard> {
+    let key = current_tenant();
+    let tenant_sem = tenant_semaphore_for(&key, max_concurrent_ingest_extractions_per_tenant());
+    let tenant_line = tenant_wait_line_for(&key);
+    acquire_ingest_extraction_paired_waiting(
+        (ingest_extraction_semaphore(), global_wait_line()),
+        (&tenant_sem, &tenant_line),
+        IngestWaitPolicy::from_env(),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -2040,5 +2324,300 @@ mod tests {
             assert_eq!(out, 42);
         })
         .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #6221: bounded wait before shedding
+    // -----------------------------------------------------------------------
+
+    fn policy(wait_secs: u64, tenant_q: usize, global_q: usize) -> IngestWaitPolicy {
+        IngestWaitPolicy {
+            wait: std::time::Duration::from_secs(wait_secs),
+            max_tenant_waiters: tenant_q,
+            max_global_waiters: global_q,
+        }
+    }
+
+    /// Local semaphores and lines, so these tests never touch the singletons.
+    struct Budget {
+        global: Arc<Semaphore>,
+        global_line: Arc<WaitLine>,
+        tenant: Arc<Semaphore>,
+        tenant_line: Arc<WaitLine>,
+    }
+
+    impl Budget {
+        fn new(global: usize, tenant: usize) -> Arc<Self> {
+            Arc::new(Self {
+                global: Arc::new(Semaphore::new(global)),
+                global_line: Arc::new(WaitLine::default()),
+                tenant: Arc::new(Semaphore::new(tenant)),
+                tenant_line: Arc::new(WaitLine::default()),
+            })
+        }
+
+        async fn acquire(&self, p: IngestWaitPolicy) -> Result<IngestExtractionGuard> {
+            acquire_ingest_extraction_paired_waiting(
+                (&self.global, &self.global_line),
+                (&self.tenant, &self.tenant_line),
+                p,
+            )
+            .await
+        }
+    }
+
+    /// Spin (without advancing the paused clock) until `cond` holds.
+    async fn until(cond: impl Fn() -> bool) {
+        for _ in 0..10_000 {
+            if cond() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("condition never became true");
+    }
+
+    fn message(err: &AppError) -> String {
+        match err {
+            AppError::ServiceUnavailable(m) => m.clone(),
+            other => panic!("expected a 503 ServiceUnavailable, got {other:?}"),
+        }
+    }
+
+    /// A request that finds the repository's sub-limit full waits, and is
+    /// admitted as soon as a permit is released, well before the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn waiting_acquire_is_admitted_when_a_permit_frees_6221() {
+        let b = Budget::new(8, 1);
+        let held = b.acquire(policy(15, 8, 32)).await.expect("first is free");
+
+        let start = tokio::time::Instant::now();
+        let bb = Arc::clone(&b);
+        let waiter = tokio::spawn(async move { bb.acquire(policy(15, 8, 32)).await });
+        until(|| b.tenant_line.len() == 1).await;
+        drop(held);
+
+        let guard = waiter
+            .await
+            .unwrap()
+            .expect("admitted once the permit frees");
+        assert!(start.elapsed() < std::time::Duration::from_secs(15));
+        assert_eq!(
+            b.tenant_line.len(),
+            0,
+            "the ticket is returned on admission"
+        );
+        drop(guard);
+        assert_eq!(b.tenant.available_permits(), 1, "tenant permit released");
+        assert_eq!(b.global.available_permits(), 8, "global permit released");
+    }
+
+    /// When no permit frees within the wait, the request gets the SAME 503 as
+    /// the fast-fail path, which `AppError` renders with `Retry-After`.
+    #[tokio::test(start_paused = true)]
+    async fn waiting_acquire_times_out_with_the_same_503_6221() {
+        let b = Budget::new(8, 1);
+        let _held = b.acquire(policy(15, 8, 32)).await.expect("first is free");
+
+        let fast_fail =
+            acquire_ingest_extraction_paired(&b.global, &b.tenant).expect_err("fast-fail sheds");
+
+        let start = tokio::time::Instant::now();
+        let err = b
+            .acquire(policy(15, 8, 32))
+            .await
+            .expect_err("no permit freed within the wait");
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(15));
+        assert_eq!(message(&err), message(&fast_fail), "same body as before");
+        assert_eq!(b.tenant_line.len(), 0, "a timed-out waiter leaves the line");
+
+        let resp = axum::response::IntoResponse::into_response(err);
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            resp.headers().contains_key(axum::http::header::RETRY_AFTER),
+            "the shed still carries Retry-After"
+        );
+    }
+
+    /// The queue is bounded: past `max_tenant_waiters` a request sheds at once
+    /// without waiting. The queued ones are still admitted, in arrival order.
+    #[tokio::test(start_paused = true)]
+    async fn full_queue_fast_fails_and_queued_waiters_are_admitted_in_order_6221() {
+        let b = Budget::new(8, 1);
+        let held = b.acquire(policy(15, 2, 32)).await.expect("first is free");
+
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut waiters = Vec::new();
+        for i in 0..2 {
+            let (bb, order) = (Arc::clone(&b), Arc::clone(&order));
+            waiters.push(tokio::spawn(async move {
+                let g = bb.acquire(policy(15, 2, 32)).await?;
+                order.lock().unwrap().push(i);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                drop(g);
+                Ok::<_, AppError>(())
+            }));
+            let want = i + 1;
+            until(|| b.tenant_line.len() == want).await;
+        }
+
+        let start = tokio::time::Instant::now();
+        let err = b
+            .acquire(policy(15, 2, 32))
+            .await
+            .expect_err("the queue is full");
+        assert_eq!(
+            start.elapsed(),
+            std::time::Duration::ZERO,
+            "overflow does not wait"
+        );
+        assert!(message(&err).contains("this repository"));
+
+        drop(held);
+        for w in waiters {
+            w.await.unwrap().expect("queued waiter admitted");
+        }
+        assert_eq!(*order.lock().unwrap(), vec![0, 1], "FIFO admission");
+        assert_eq!(b.tenant_line.len(), 0);
+        assert_eq!(b.tenant.available_permits(), 1);
+    }
+
+    /// The #6221 reproduction: six concurrent uploads to one repository with the
+    /// production caps (4 per repository, 8 global) all succeed, and no more
+    /// than four ever decode at once.
+    #[tokio::test(start_paused = true)]
+    async fn six_concurrent_uploads_to_one_repository_all_succeed_6221() {
+        let b = Budget::new(8, 4);
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tasks: Vec<_> = (0..6)
+            .map(|_| {
+                let (b, in_flight, peak) =
+                    (Arc::clone(&b), Arc::clone(&in_flight), Arc::clone(&peak));
+                tokio::spawn(async move {
+                    use std::sync::atomic::Ordering::SeqCst;
+                    let _g = b
+                        .acquire(policy(
+                            15,
+                            DEFAULT_MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT,
+                            DEFAULT_MAX_QUEUED_INGEST_EXTRACTIONS,
+                        ))
+                        .await?;
+                    let now = in_flight.fetch_add(1, SeqCst) + 1;
+                    peak.fetch_max(now, SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    in_flight.fetch_sub(1, SeqCst);
+                    Ok::<_, AppError>(())
+                })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap().expect("every upload is admitted");
+        }
+        assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(b.tenant.available_permits(), 4);
+        assert_eq!(b.global.available_permits(), 8);
+    }
+
+    /// A wait on the GLOBAL ceiling shares the one deadline, and its shed
+    /// drops the tenant permit already taken.
+    #[tokio::test(start_paused = true)]
+    async fn global_wait_timeout_releases_the_tenant_permit_6221() {
+        let b = Budget::new(1, 4);
+        let _held = b.acquire(policy(15, 8, 32)).await.expect("first is free");
+
+        let start = tokio::time::Instant::now();
+        let err = b.acquire(policy(15, 8, 32)).await.expect_err("global full");
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(15));
+        assert_eq!(message(&err), message(&global_ingest_busy_err()));
+        assert_eq!(
+            b.tenant.available_permits(),
+            3,
+            "only the holder's permit is out"
+        );
+        assert_eq!(b.global_line.len(), 0);
+
+        // A full GLOBAL queue also fast-fails.
+        let err = b
+            .acquire(policy(15, 8, 0))
+            .await
+            .expect_err("no global queue");
+        assert_eq!(message(&err), message(&global_ingest_busy_err()));
+        assert_eq!(b.tenant.available_permits(), 3);
+    }
+
+    /// `INGEST_EXTRACTION_WAIT_SECS=0` (or a zero queue) is the old fast-fail.
+    #[tokio::test(start_paused = true)]
+    async fn zero_wait_or_zero_queue_is_fast_fail_6221() {
+        let b = Budget::new(8, 1);
+        let _held = b.acquire(policy(15, 8, 32)).await.expect("first is free");
+        let start = tokio::time::Instant::now();
+        b.acquire(policy(0, 8, 32)).await.expect_err("zero wait");
+        b.acquire(policy(15, 0, 32)).await.expect_err("zero queue");
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+        assert_eq!(b.tenant_line.len(), 0);
+    }
+
+    /// A waiter whose request is dropped (client disconnect) leaves the line.
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_waiter_leaves_the_line_6221() {
+        let b = Budget::new(8, 1);
+        let held = b.acquire(policy(15, 1, 32)).await.expect("first is free");
+        let bb = Arc::clone(&b);
+        let waiter = tokio::spawn(async move { bb.acquire(policy(15, 1, 32)).await });
+        until(|| b.tenant_line.len() == 1).await;
+        waiter.abort();
+        let _ = waiter.await;
+        assert_eq!(b.tenant_line.len(), 0, "cancellation frees the place");
+        drop(held);
+        let _g = b.acquire(policy(15, 1, 32)).await.expect("slot free again");
+    }
+
+    #[test]
+    fn ingest_wait_policy_env_overrides_6221() {
+        let keys = [
+            INGEST_EXTRACTION_WAIT_SECS_ENV,
+            MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT_ENV,
+            MAX_QUEUED_INGEST_EXTRACTIONS_ENV,
+        ];
+        let saved: Vec<_> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        let p = IngestWaitPolicy::from_env();
+        assert_eq!(p.wait.as_secs(), DEFAULT_INGEST_EXTRACTION_WAIT_SECS);
+        assert_eq!(
+            p.max_tenant_waiters,
+            DEFAULT_MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT
+        );
+        assert_eq!(p.max_global_waiters, DEFAULT_MAX_QUEUED_INGEST_EXTRACTIONS);
+
+        // Zero is honoured (switches the wait/queue off) ...
+        for k in keys {
+            std::env::set_var(k, "0");
+        }
+        let p = IngestWaitPolicy::from_env();
+        assert_eq!(p.wait, std::time::Duration::ZERO);
+        assert_eq!((p.max_tenant_waiters, p.max_global_waiters), (0, 0));
+
+        // ... blank / non-numeric fall back, and the wait is clamped.
+        std::env::set_var(INGEST_EXTRACTION_WAIT_SECS_ENV, "100000");
+        std::env::set_var(MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT_ENV, " ");
+        std::env::set_var(MAX_QUEUED_INGEST_EXTRACTIONS_ENV, "lots");
+        let p = IngestWaitPolicy::from_env();
+        assert_eq!(p.wait.as_secs(), MAX_INGEST_EXTRACTION_WAIT_SECS);
+        assert_eq!(
+            p.max_tenant_waiters,
+            DEFAULT_MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT
+        );
+        assert_eq!(p.max_global_waiters, DEFAULT_MAX_QUEUED_INGEST_EXTRACTIONS);
+
+        for (k, v) in keys.iter().zip(saved) {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 }

@@ -13152,6 +13152,10 @@ mod tests {
     /// sub-limit exhausted the upload is shed with a 503 rather than decoding;
     /// once the permits are released the same upload succeeds. Only this
     /// repository's bucket is held, so no other test's decodes are affected.
+    ///
+    /// Since #6221 the shed arrives only after the bounded wait
+    /// (`DEFAULT_INGEST_EXTRACTION_WAIT_SECS`, 2 s in the test binary) rather
+    /// than at once; the status and body are unchanged.
     #[tokio::test]
     async fn test_upload_validation_holds_ingest_permit_3672() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -13213,6 +13217,150 @@ mod tests {
             "upload must succeed once permits are released; body: {}",
             String::from_utf8_lossy(&ok_body)
         );
+    }
+
+    /// Hold `n` of `tenant`'s per-repository permits. Holding all but four
+    /// makes the repository behave as if its sub-limit were the production 4
+    /// (the test binary's own sub-limit is far larger, #3407).
+    async fn hold_tenant_permits_6221(
+        tenant: &crate::util::bounded_archive::TenantKey,
+        n: usize,
+    ) -> Vec<crate::util::bounded_archive::IngestExtractionGuard> {
+        use crate::util::bounded_archive::{acquire_ingest_extraction, run_with_tenant_scope};
+        run_with_tenant_scope(tenant.clone(), async {
+            (0..n)
+                .map(|_| acquire_ingest_extraction().expect("permit"))
+                .collect::<Vec<_>>()
+        })
+        .await
+    }
+
+    /// #6221: an upload that finds its repository's sub-limit full now waits
+    /// for a permit instead of getting an immediate 503, and succeeds once one
+    /// is released.
+    #[tokio::test]
+    async fn test_upload_waits_for_ingest_permit_6221() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::formats::pypi::tests::{build_tgz, PKG_INFO};
+        use crate::util::bounded_archive::{
+            queued_ingest_extractions_for, run_with_tenant_scope, TenantKey,
+            DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT,
+        };
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        let tenant = TenantKey::Repo(fx.repo_id);
+        let held = hold_tenant_permits_6221(
+            &tenant,
+            DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT,
+        )
+        .await;
+
+        let sdist = build_tgz(&[("pkg-1.0/PKG-INFO", PKG_INFO)]);
+        let (content_type, body) =
+            pypi_upload_multipart("pkg", "1.0", "pkg-1.0.tar.gz", &sdist, "ok", ">=3.8");
+        let app = fx.router_with_auth(super::router());
+        let upload = tokio::spawn(run_with_tenant_scope(
+            tenant.clone(),
+            tdh::send(
+                app,
+                tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
+            ),
+        ));
+
+        // Release the permits only once the upload is queued for one.
+        let mut queued = false;
+        for _ in 0..1_000 {
+            if queued_ingest_extractions_for(&tenant) > 0 {
+                queued = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        drop(held);
+        let (status, resp_body) = upload.await.expect("upload task");
+
+        fx.teardown().await;
+
+        assert!(queued, "the upload must have waited for a permit");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a queued upload must succeed once a permit frees; body: {}",
+            String::from_utf8_lossy(&resp_body)
+        );
+    }
+
+    /// #6221 reproduction: six concurrent uploads of distinct packages to one
+    /// repository whose per-repository sub-limit is the production 4. Before
+    /// the bounded wait the fifth and sixth were shed with 503. To make the
+    /// overlap deterministic, all of the repository's permits are held until
+    /// every upload is queued; then four are released, so the six drain
+    /// through four slots.
+    #[tokio::test]
+    async fn test_six_concurrent_uploads_to_one_repository_succeed_6221() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::formats::pypi::tests::build_tgz;
+        use crate::util::bounded_archive::{
+            queued_ingest_extractions_for, run_with_tenant_scope, TenantKey,
+            DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT,
+        };
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        let tenant = TenantKey::Repo(fx.repo_id);
+        let _held = hold_tenant_permits_6221(
+            &tenant,
+            DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT - 4,
+        )
+        .await;
+        let last_four = hold_tenant_permits_6221(&tenant, 4).await;
+
+        let uploads = (0..6).map(|i| {
+            let name = format!("concurrent-pkg-{i}");
+            let pkg_info = format!("Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n");
+            let filename = format!("concurrent_pkg_{i}-1.0.tar.gz");
+            let entry = format!("concurrent_pkg_{i}-1.0/PKG-INFO");
+            let sdist = build_tgz(&[(entry.as_str(), pkg_info.as_bytes())]);
+            let (content_type, body) =
+                pypi_upload_multipart(&name, "1.0", &filename, &sdist, "ok", ">=3.8");
+            let app = fx.router_with_auth(super::router());
+            run_with_tenant_scope(
+                tenant.clone(),
+                tdh::send(
+                    app,
+                    tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
+                ),
+            )
+        });
+        let release = async {
+            let mut queued = 0;
+            for _ in 0..2_000 {
+                queued = queued_ingest_extractions_for(&tenant);
+                if queued == 6 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            drop(last_four);
+            queued
+        };
+        let (results, queued) = tokio::join!(futures::future::join_all(uploads), release);
+
+        fx.teardown().await;
+
+        assert_eq!(queued, 6, "all six uploads must have queued for a permit");
+
+        for (i, (status, body)) in results.into_iter().enumerate() {
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "upload {i} of 6 must succeed; body: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
