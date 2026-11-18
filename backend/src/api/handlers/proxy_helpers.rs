@@ -10361,11 +10361,31 @@ pub struct CurationBlock {
     /// Human-readable statement of which rule fired, from
     /// `CurationService::evaluate_pep503_package`.
     pub reason: String,
+    /// The policy could not be read, so the pull is refused as retryable
+    /// rather than denied by a rule
+    pub unavailable: bool,
 }
 
 impl CurationBlock {
+    /// Refusal for a curation config or rule read that errored
+    pub fn unavailable(package: &str) -> Self {
+        CurationBlock {
+            package: package.to_string(),
+            reason: "curation policy temporarily unavailable".to_string(),
+            unavailable: true,
+        }
+    }
+
     /// The shared REST-shaped 403 body every non-OCI proxy format serves.
+    /// An unreadable policy is a server fault, not a verdict, so it renders
+    /// as a 503 the client retries instead of a final 403
     pub fn into_rest_response(&self) -> Response {
+        if self.unavailable {
+            return AppError::ServiceUnavailable(
+                "Curation policy is temporarily unavailable, retry shortly".to_string(),
+            )
+            .into_response();
+        }
         curation_blocked_response(&self.package, &self.reason)
     }
 }
@@ -10431,8 +10451,8 @@ impl<'a> From<&'a RepoInfo> for CurationTarget<'a> {
 /// `virtual` proxy repo: curation rules describe what may be pulled from
 /// upstream, so applying them to a hosted (`local` / `staging`) repo would 403
 /// that repository's own published packages. On a rule-evaluation error it
-/// fails OPEN (logged with repo + package so the unenforced request is
-/// greppable) rather than taking the proxy down — identical to the pypi seam.
+/// fails CLOSED with a retryable 503 (logged with repo + package), so a
+/// database error never turns a `block` rule into an allow
 ///
 /// `pattern` rules are consulted here (via
 /// [`CurationService::evaluate_pep503_package`]), and so are the name-only
@@ -10488,14 +10508,11 @@ pub async fn evaluate_curation<'a>(
                 repo_key = %target.key,
                 package = %package,
                 error = %e,
-                "curation evaluation failed; failing open"
+                "curation evaluation failed; failing closed"
             );
-        })
-        .ok();
-    match eval {
-        Some(eval) => curation_verdict(&target, package, eval),
-        None => Ok(()),
-    }
+            CurationBlock::unavailable(package)
+        })?;
+    curation_verdict(&target, package, eval)
 }
 
 /// Map a proxy-path rule evaluation onto the download outcome: `block`
@@ -10515,9 +10532,10 @@ fn curation_verdict(
         ("block", _) => Err(CurationBlock {
             package: package.to_string(),
             reason: eval.reason,
+            unavailable: false,
         }),
         ("review", Some(rule_id)) => {
-            // `warn`, like the fail-open line above: a flagged download is
+            // `warn`, like the failed-evaluation line above: a flagged download is
             // served, so deployments that log at warn must still see it.
             tracing::warn!(
                 repo_id = %target.id,
@@ -10542,7 +10560,8 @@ fn curation_verdict(
 /// hand, so a `local` / `staging` pull costs no extra query. On the
 /// remote/virtual path it is one small primary-key SELECT, comparable to the
 /// per-request repo resolution these handlers already perform. A lookup error
-/// fails OPEN (logged), matching the evaluation-error stance of the seam.
+/// fails CLOSED with a retryable 503, matching the evaluation-error stance of
+/// the seam
 #[allow(clippy::result_large_err)]
 pub async fn enforce_curation_lookup(
     db: &PgPool,
@@ -10571,32 +10590,28 @@ pub async fn evaluate_curation_lookup(
     if !matches!(repo_type, "remote" | "virtual") {
         return Ok(());
     }
-    use sqlx::Row;
-    let row = sqlx::query(
+    let row = sqlx::query_as::<_, (bool, String)>(
         "SELECT curation_enabled, curation_default_action FROM repositories WHERE id = $1",
     )
     .bind(repo_id)
     .fetch_optional(db)
     .await;
     let (curation_enabled, default_action) = match row {
-        Ok(Some(r)) => (
-            r.try_get::<bool, _>("curation_enabled").unwrap_or(false),
-            r.try_get::<String, _>("curation_default_action")
-                .unwrap_or_else(|_| "allow".to_string()),
-        ),
-        // Row missing or query failed: fail open (the pull proceeds unenforced),
-        // logged so the gap is greppable — never take the proxy down on a
-        // curation-config read error.
+        Ok(Some(r)) => r,
+        // No row: the repository was deleted after the handler resolved it,
+        // so there is no policy left to enforce and the request fails later on
         Ok(None) => return Ok(()),
+        // A failed read or decode is not "curation off": refuse the pull
+        // rather than serve it unenforced
         Err(e) => {
             tracing::warn!(
                 repo_id = %repo_id,
                 repo_key = %repo_key,
                 package = %package,
                 error = %e,
-                "curation config lookup failed; failing open"
+                "curation config lookup failed; failing closed"
             );
-            return Ok(());
+            return Err(CurationBlock::unavailable(package));
         }
     };
     let target = CurationTarget {
@@ -10796,8 +10811,8 @@ pub async fn enqueue_curation_on_demand(
 /// 503 response when a repository's age gate is enabled but cannot be
 /// evaluated (service unwired, config unreadable, or no evidence resolution
 /// at the calling seam). The age gate fails CLOSED (#2264): an evaluation
-/// error must refuse the download rather than impersonate a disabled gate —
-/// the deliberate divergence from the curation seam above, which fails open.
+/// error must refuse the download rather than impersonate a disabled gate,
+/// the same stance as the curation seam above for an unreadable policy
 pub fn age_gate_unavailable_response(repo_key: &str, package: &str) -> Response {
     let body = serde_json::json!({
         "error": "age_gate_unavailable",
@@ -16733,6 +16748,106 @@ mod tests {
         assert!(stored_verdict_blocks_under_gate(None, high));
     }
 
+    // ── Curation fails closed on an unreadable policy ────────────────
+    //
+    // A failed read of the curation config or rules must refuse the pull as a
+    // retryable 503, never serve it unenforced. No database needed: the point
+    // is the failure, so the pool can never connect
+
+    fn unreachable_curation_pool() -> PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+            .expect("lazy pool")
+    }
+
+    #[tokio::test]
+    async fn curation_lookup_fails_closed_when_the_config_is_unreadable() {
+        let block = evaluate_curation_lookup(
+            &unreachable_curation_pool(),
+            Uuid::nil(),
+            "r",
+            "remote",
+            "left-pad",
+            None,
+        )
+        .await
+        .expect_err("an unreadable curation config must not let the pull through");
+        assert_eq!(
+            block.into_rest_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let resp = enforce_curation_lookup(
+            &unreachable_curation_pool(),
+            Uuid::nil(),
+            "r",
+            "virtual",
+            "left-pad",
+            None,
+        )
+        .await
+        .expect_err("the rendered seam must refuse too");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn curation_evaluation_fails_closed_when_the_rules_are_unreadable() {
+        let target = || CurationTarget {
+            id: Uuid::nil(),
+            key: "r",
+            repo_type: "remote",
+            curation_enabled: true,
+            default_action: "allow",
+            format: Some("npm"),
+        };
+        let block = evaluate_curation(&unreachable_curation_pool(), target(), "left-pad", None)
+            .await
+            .expect_err("unreadable curation rules must not let the pull through");
+        assert_eq!(
+            block.into_rest_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let resp = enforce_curation(&unreachable_curation_pool(), target(), "left-pad", None)
+            .await
+            .expect_err("the rendered seam must refuse too");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().contains_key(axum::http::header::RETRY_AFTER));
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            !body.contains("curation_blocked"),
+            "an unreadable policy is not a rule verdict: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn curation_off_or_hosted_never_reads_the_policy() {
+        // The unreachable pool would fail any read, so Ok proves no read
+        let off = CurationTarget {
+            id: Uuid::nil(),
+            key: "r",
+            repo_type: "remote",
+            curation_enabled: false,
+            default_action: "allow",
+            format: Some("npm"),
+        };
+        assert!(
+            evaluate_curation(&unreachable_curation_pool(), off, "left-pad", None)
+                .await
+                .is_ok()
+        );
+        assert!(evaluate_curation_lookup(
+            &unreachable_curation_pool(),
+            Uuid::nil(),
+            "r",
+            "local",
+            "left-pad",
+            None,
+        )
+        .await
+        .is_ok());
+    }
+
     // ── Curation block rendering (#2930 body, #3110 structured verdict) ──
     //
     // Splitting the curation seam into `evaluate_*` (structured
@@ -16745,6 +16860,7 @@ mod tests {
         let block = CurationBlock {
             package: "left-pad".to_string(),
             reason: "#2930 tier block".to_string(),
+            unavailable: false,
         };
         let resp = block.into_rest_response();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -28496,6 +28612,7 @@ mod tests {
             CurationBlock {
                 package: "pkg".to_string(),
                 reason: "test reason".to_string(),
+                unavailable: false,
             }
         );
         // A flagged rule and the review default stance both serve.
@@ -28575,8 +28692,8 @@ mod tests {
     #[tokio::test]
     async fn test_enforce_age_gate_applicable_without_service_fails_closed() {
         // An enabled, applicable gate with no wired service must refuse the
-        // download (503), never impersonate a disabled gate. Divergence from
-        // the curation seam, which fails open — deliberate (#2264).
+        // download (503), never impersonate a disabled gate, the same stance
+        // as the curation seam (#2264)
         let params = age_gate_params_for(uuid::Uuid::new_v4(), "ag-seam", "remote", "npm", true, 7);
         let out = enforce_age_gate(None, &params, "left-pad", "1.0.0", None).await;
         let resp = out.expect_err("must fail closed");
