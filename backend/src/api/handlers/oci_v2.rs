@@ -3619,6 +3619,74 @@ fn default_docker_mirror_repo() -> Option<&'static str> {
         .as_deref()
 }
 
+tokio::task_local! {
+    /// The `ns` query parameter of the `/v2` request being served. containerd's
+    /// registry-mirror protocol sends a pull of `<registry>/<image>` to a mirror
+    /// as `/v2/<image>/...?ns=<registry>`
+    /// (<https://github.com/containerd/containerd/blob/main/docs/hosts.md>).
+    static MIRROR_NAMESPACE: Option<String>;
+}
+
+/// `/v2` middleware: expose the request's `ns` to repository resolution.
+async fn scope_mirror_namespace(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let ns = url::form_urlencoded::parse(req.uri().query().unwrap_or_default().as_bytes())
+        .find(|(key, _)| key == "ns")
+        .map(|(_, value)| value.to_ascii_lowercase());
+    MIRROR_NAMESPACE.scope(ns, next.run(req)).await
+}
+
+/// Whether a Remote whose upstream is `upstream_url` proxies the registry `ns`.
+/// Docker Hub's hosts (`docker.io`, `registry-1.docker.io`, ...) match each
+/// other; any other registry matches on its exact `host[:port]`.
+fn upstream_serves_namespace(upstream_url: &str, ns: &str) -> bool {
+    if is_docker_hub(ns) {
+        return is_docker_hub(upstream_url);
+    }
+    url::Url::parse(upstream_url).is_ok_and(|url| match url.port() {
+        Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()) == ns,
+        None => url.host_str() == Some(ns),
+    })
+}
+
+/// The repository a read carrying `?ns=<registry>` falls back to when its path
+/// names no repository: the one OCI Remote whose upstream is that registry or,
+/// for Docker Hub with no such Remote, `AK_DEFAULT_DOCKER_MIRROR_REPO`.
+/// `None` (no Remote, or several, for the registry) is answered as a key
+/// naming no repository, so another registry's image is never served.
+async fn ns_mirror_repo_key(db: &PgPool, ns: &str) -> Result<Option<String>, sqlx::Error> {
+    let remotes: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT key, format::text, upstream_url FROM repositories \
+         WHERE repo_type = 'remote' AND upstream_url IS NOT NULL \
+         AND key NOT LIKE '~deleting~%'",
+    )
+    .fetch_all(db)
+    .await?;
+    let keys: Vec<String> = remotes
+        .into_iter()
+        .filter(|(_, format, upstream_url)| {
+            parse_format_str(format).is_some_and(|format| format_handler_key(&format) == "oci")
+                && upstream_serves_namespace(upstream_url, ns)
+        })
+        .map(|(key, _, _)| key)
+        .collect();
+    Ok(match keys.as_slice() {
+        [key] => Some(key.clone()),
+        [] if is_docker_hub(ns) => default_docker_mirror_repo().map(str::to_owned),
+        [] => None,
+        _ => {
+            warn!(
+                ns,
+                repositories = ?keys,
+                "several Remote repositories proxy this registry; refusing `?ns=` reads for it"
+            );
+            None
+        }
+    })
+}
+
 /// Resolve a repository for a READ request (`GET`/`HEAD` manifests, blobs and
 /// tag listings).
 ///
@@ -3848,16 +3916,19 @@ async fn resolve_repo_inner_with(
     //    misses, fallback re-resolves the configured proxy repo (e.g.
     //    `docker-hub-cache`), and the proxy code path (`is_docker_hub`,
     //    `normalize_docker_image`, blob/manifest cache) takes over with
-    //    image="library/postgres".
+    //    image="library/postgres". A containerd mirror request names its
+    //    registry in `?ns=` and is routed by it instead
+    //    ([`ns_mirror_repo_key`]).
     if repo.is_none() && mirror_fallback {
-        if let Some(mirror_key) = default_docker_mirror_repo() {
+        let mirror_key = match MIRROR_NAMESPACE.try_with(Clone::clone).ok().flatten() {
+            Some(ns) => ns_mirror_repo_key(db, &ns).await.map_err(map_db_err)?,
+            None => default_docker_mirror_repo().map(str::to_owned),
+        };
+        if let Some(mirror_key) = mirror_key {
             // Don't infinitely recurse: only attempt the fallback when the
             // miss was on a different key than the mirror itself.
             if mirror_key != repo_key {
-                if let Some(row) = select_repo_by_key(mirror_key.to_string())
-                    .await
-                    .map_err(map_db_err)?
-                {
+                if let Some(row) = select_repo_by_key(mirror_key).await.map_err(map_db_err)? {
                     repo = Some(row);
                     effective_image = image_name.to_string();
                 }
@@ -16078,6 +16149,7 @@ pub fn router(token_rate_limit: Option<LoginRateLimitState>) -> Router<SharedSta
         .route("/token", token_route)
         .route("/_catalog", get(handle_catalog))
         .fallback(catch_all)
+        .layer(axum::middleware::from_fn(scope_mirror_namespace))
         .layer(DefaultBodyLimit::disable())
 }
 
@@ -19833,6 +19905,35 @@ mod tests {
         };
         assert_eq!(repo_key, mirror_key);
         // The handler must take the literal path, not the fallback.
+    }
+
+    #[test]
+    fn test_upstream_serves_namespace() {
+        for upstream in ["https://registry-1.docker.io", "https://index.docker.io/"] {
+            assert!(
+                upstream_serves_namespace(upstream, "docker.io"),
+                "{upstream}"
+            );
+        }
+        assert!(upstream_serves_namespace("https://Quay.io/v2/", "quay.io"));
+        assert!(upstream_serves_namespace(
+            "https://registry.example:5000",
+            "registry.example:5000"
+        ));
+        // containerd names the host without the scheme's default port.
+        assert!(upstream_serves_namespace(
+            "https://registry.example:443",
+            "registry.example"
+        ));
+        assert!(!upstream_serves_namespace(
+            "https://registry.example:5000",
+            "registry.example"
+        ));
+        assert!(!upstream_serves_namespace("https://quay.io", "docker.io"));
+        assert!(!upstream_serves_namespace(
+            "https://ghcr.io.attacker.example",
+            "ghcr.io"
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -48900,6 +49001,98 @@ mod oci_read_authz_tests {
             "#3716 review F1: in mirror mode an ungranted caller must get the SAME \
              (status, content-type, body) for an existing private repository and for an \
              unknown key, once the client's own key string is normalised out"
+        );
+    }
+
+    /// containerd's registry-mirror protocol sends `/v2/<image>/...?ns=<registry>`.
+    /// Through the real `/v2` router: a path naming no repository is served by
+    /// the one OCI Remote whose upstream is that registry; a path naming a
+    /// repository is served as addressed; an unknown registry, a registry two
+    /// Remotes proxy, and a write fail closed as a key naming no repository.
+    #[tokio::test]
+    async fn test_ns_routes_containerd_mirror_reads_to_the_matching_remote() {
+        let Some(mut f) = ReadFixture::setup().await else {
+            return;
+        };
+        let host = format!("ns-{}.example.test", Uuid::new_v4());
+        let shared = format!("ns-shared-{}.example.test", Uuid::new_v4());
+        // The fixture repository, with its stored blob, becomes a public
+        // Remote of `host`.
+        sqlx::query(
+            "UPDATE repositories SET repo_type = 'remote', upstream_url = $2, is_public = true \
+             WHERE id = $1",
+        )
+        .bind(f.repo_id)
+        .bind(format!("https://{host}"))
+        .execute(&f.pool)
+        .await
+        .expect("make the fixture a remote");
+        // A non-OCI Remote of the same registry is no candidate; two OCI
+        // Remotes of one registry are ambiguous.
+        let mut others = Vec::new();
+        for (format, upstream) in [("pypi", &host), ("docker", &shared), ("docker", &shared)] {
+            let (id, _, dir) = tdh::create_repo(&f.pool, "remote", format).await;
+            sqlx::query("UPDATE repositories SET upstream_url = $2 WHERE id = $1")
+                .bind(id)
+                .bind(format!("https://{upstream}"))
+                .execute(&f.pool)
+                .await
+                .expect("set upstream_url");
+            others.push((id, dir));
+        }
+        let admin = f.add_user(true).await;
+        let admin_bearer = f.bearer(admin).await;
+        let anon = format!("Bearer {ANONYMOUS_TOKEN}");
+        let blob = |ns: &str| format!("/library/{IMAGE}/blobs/{}?ns={ns}", f.blob_digest);
+
+        let routed = f.call("GET", blob(&host), &anon).await;
+        let addressed = f
+            .call(
+                "GET",
+                format!("{}?ns=unknown.example.test", f.blob_path()),
+                &anon,
+            )
+            .await;
+        let unknown = f.call("GET", blob("unknown.example.test"), &anon).await;
+        let ambiguous = f.call("GET", blob(&shared), &anon).await;
+        let push = f
+            .call(
+                "POST",
+                format!("/library/{IMAGE}/blobs/uploads/?ns={host}"),
+                &admin_bearer,
+            )
+            .await;
+
+        for (id, dir) in &others {
+            tdh::cleanup_member_repo(&f.pool, *id, dir).await;
+        }
+        f.teardown().await;
+
+        assert_eq!(
+            routed.0,
+            StatusCode::OK,
+            "served by the Remote of the `ns` registry"
+        );
+        assert_eq!(routed.1.as_ref(), LAYER_BODY);
+        assert_eq!(
+            addressed.0,
+            StatusCode::OK,
+            "a path naming a repository is served as addressed, whatever `ns` says"
+        );
+        assert_eq!(
+            unknown.0,
+            StatusCode::UNAUTHORIZED,
+            "a registry no Remote proxies is answered as an unknown key"
+        );
+        assert_eq!(
+            ambiguous.0,
+            StatusCode::UNAUTHORIZED,
+            "a registry two Remotes proxy fails closed"
+        );
+        assert_eq!(
+            push.0,
+            StatusCode::NOT_FOUND,
+            "writes are never routed by `ns`"
         );
     }
 
