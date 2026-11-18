@@ -53,41 +53,30 @@ pub(crate) fn peer_degraded_failure_threshold() -> i32 {
     )
 }
 
-/// The status a failing peer moves to, `None` to leave it. `offline` stays
-/// with the stale-heartbeat sweep, a good probe brings any of them back
-pub(crate) fn demoted_status(current: &str, failures: i32, threshold: i32) -> Option<&'static str> {
-    match current {
-        "online" | "syncing" if failures >= threshold => Some("degraded"),
-        _ => None,
-    }
-}
-
+/// Mark an online or syncing peer `degraded` once it has failed `threshold`
+/// consecutive probes or transfers; `offline` stays with the stale-heartbeat
+/// sweep, and a good probe brings any of them back. Returns whether the peer
+/// was demoted.
+///
+/// One conditional UPDATE, so the failure count and status it acts on are
+/// the ones current when the row is written: a probe on another replica that
+/// has just reset the peer to online with 0 failures leaves it online, where
+/// a read followed by a status-matched write would still demote it.
 async fn demote_failing_peer(
     db: &PgPool,
     peer_id: Uuid,
     threshold: i32,
-) -> Result<(), sqlx::Error> {
-    let row: Option<(String, i32)> = sqlx::query_as(
-        "SELECT status::TEXT, consecutive_failures FROM peer_instances WHERE id = $1",
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE peer_instances SET status = 'degraded', updated_at = NOW() \
+         WHERE id = $1 AND status IN ('online', 'syncing') \
+           AND consecutive_failures >= $2",
     )
     .bind(peer_id)
-    .fetch_optional(db)
+    .bind(threshold)
+    .execute(db)
     .await?;
-    let Some((current, failures)) = row else {
-        return Ok(());
-    };
-    if let Some(next) = demoted_status(&current, failures, threshold) {
-        sqlx::query(
-            "UPDATE peer_instances SET status = $2::instance_status, updated_at = NOW() \
-             WHERE id = $1 AND status::TEXT = $3",
-        )
-        .bind(peer_id)
-        .bind(next)
-        .bind(&current)
-        .execute(db)
-        .await?;
-    }
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }
 
 /// Read the configured stale-peer threshold (minutes) from
@@ -637,7 +626,8 @@ async fn mark_peer_probe_failed(db: &PgPool, peer_id: Uuid) -> Result<(), sqlx::
     .execute(db)
     .await?;
 
-    demote_failing_peer(db, peer_id, peer_degraded_failure_threshold()).await
+    demote_failing_peer(db, peer_id, peer_degraded_failure_threshold()).await?;
+    Ok(())
 }
 
 fn env_bool(key: &str, default: bool) -> bool {
@@ -5410,15 +5400,6 @@ mod tests {
     }
 
     #[test]
-    fn test_demoted_status_6030() {
-        assert_eq!(demoted_status("online", 3, 3), Some("degraded"));
-        assert_eq!(demoted_status("syncing", 4, 3), Some("degraded"));
-        assert_eq!(demoted_status("syncing", 2, 3), None);
-        assert_eq!(demoted_status("degraded", 9, 3), None);
-        assert_eq!(demoted_status("offline", 9, 3), None);
-    }
-
-    #[test]
     fn test_peer_degraded_failure_threshold_env_6030() {
         std::env::remove_var("PEER_DEGRADED_FAILURE_THRESHOLD");
         assert_eq!(
@@ -5503,6 +5484,112 @@ mod tests {
         drop_peer(&pool, peer_id).await;
 
         assert_eq!(seen, ["syncing", "syncing", "degraded"]);
+        assert_eq!(after, ("online".to_string(), 0));
+    }
+
+    #[tokio::test]
+    async fn demotion_only_needs_the_threshold_on_online_or_syncing_6030() {
+        let Some((pool, peer_id)) = demotion_peer("online").await else {
+            return;
+        };
+        let set = |status: &'static str, failures: i32| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "UPDATE peer_instances SET status = $2::instance_status, \
+                     consecutive_failures = $3 WHERE id = $1",
+                )
+                .bind(peer_id)
+                .bind(status)
+                .bind(failures)
+                .execute(&pool)
+                .await
+                .expect("seed peer");
+            }
+        };
+        let mut got = Vec::new();
+        for (status, failures) in [
+            ("online", 3),
+            ("syncing", 4),
+            ("syncing", 2),
+            ("degraded", 9),
+            ("offline", 9),
+        ] {
+            set(status, failures).await;
+            let demoted = demote_failing_peer(&pool, peer_id, 3)
+                .await
+                .expect("demote");
+            got.push((demoted, peer_state(&pool, peer_id).await.0));
+        }
+        drop_peer(&pool, peer_id).await;
+
+        let want: Vec<(bool, String)> = [
+            (true, "degraded"),
+            (true, "degraded"),
+            (false, "syncing"),
+            (false, "degraded"),
+            (false, "offline"),
+        ]
+        .into_iter()
+        .map(|(d, s)| (d, s.to_string()))
+        .collect();
+        assert_eq!(got, want);
+    }
+
+    /// A probe on another replica resets the peer to online with 0 failures
+    /// while this replica is demoting it on the count it saw a moment ago.
+    /// The reset holds the row lock until it commits, so the demotion runs
+    /// against the reset row and must leave the recovered peer online. A
+    /// demotion that read `(online, 3)` first and then matched only on
+    /// `status = 'online'` wrote `degraded` over it.
+    #[tokio::test]
+    async fn demotion_skips_a_peer_reset_meanwhile_6030() {
+        let Some((pool, peer_id)) = demotion_peer("online").await else {
+            return;
+        };
+        sqlx::query("UPDATE peer_instances SET consecutive_failures = 3 WHERE id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await
+            .expect("seed failures");
+
+        let mut reset = pool.begin().await.expect("begin");
+        sqlx::query(
+            "UPDATE peer_instances SET status = 'online', consecutive_failures = 0 \
+             WHERE id = $1",
+        )
+        .bind(peer_id)
+        .execute(&mut *reset)
+        .await
+        .expect("reset");
+
+        let demotion = tokio::spawn({
+            let pool = pool.clone();
+            async move { demote_failing_peer(&pool, peer_id, 3).await }
+        });
+        // Let the demotion reach the locked row before the reset commits.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity \
+                 WHERE wait_event_type = 'Lock' \
+                   AND query LIKE 'UPDATE peer_instances SET status%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("pg_stat_activity");
+            if waiting > 0 || std::time::Instant::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        reset.commit().await.expect("commit reset");
+
+        let demoted = demotion.await.expect("join").expect("demote");
+        let after = peer_state(&pool, peer_id).await;
+        drop_peer(&pool, peer_id).await;
+
+        assert!(!demoted, "a peer reset to 0 failures must not be demoted");
         assert_eq!(after, ("online".to_string(), 0));
     }
 
