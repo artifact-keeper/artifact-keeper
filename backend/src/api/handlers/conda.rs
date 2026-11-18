@@ -10310,17 +10310,6 @@ async fn store_conda_package(
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
 
-    // #4159: scan_on_upload trigger — format-native upload paths bypass
-    // `ArtifactService::upload`'s auto-scan gate, so mirror it here. No-op when
-    // the scanner_service is None or `scan_on_upload`/`scan_enabled` is false.
-    crate::services::scanner_service::trigger_scan_on_upload(
-        &state.db,
-        state.scanner_service.clone(),
-        repo.id,
-        artifact_id,
-    )
-    .await;
-
     // Extract metadata from package contents. #2561: permit-scoped decode; the
     // artifact row is already committed, so a saturated server skips this
     // best-effort enrichment rather than failing the stored upload.
@@ -10396,6 +10385,19 @@ async fn store_conda_package(
 
     count_conda_install_script_findings(&repo.key, &install_scripts);
     record_conda_package_analysis(state, artifact_id, extracted.as_ref(), install_scripts).await;
+
+    // #4159: scan_on_upload trigger — format-native upload paths bypass
+    // `ArtifactService::upload`'s auto-scan gate, so mirror it here. #5692: it
+    // must come after the metadata and analysis writes above, because the
+    // dependency scanner reads the stored identity to query PyPI aliases.
+    // No-op when the scanner_service is None or `scan_on_upload` is false.
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     // Surface the package on the Packages page (#3659), keyed on the conda
     // package's own name/version (the build string stays in metadata), with
@@ -21407,8 +21409,14 @@ mod repodata_byte_stability_tests {
 #[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod scan_on_upload_tests {
+    use std::sync::{Arc, Mutex};
+
+    use bytes::Bytes;
+
     use crate::api::handlers::test_db_helpers as tdh;
+    use crate::models::artifact::{Artifact, ArtifactMetadata};
     use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+    use crate::services::scanner_service::{ScanOutput, Scanner};
 
     /// Build a minimal but valid conda v1 package: a bzip2 tar carrying
     /// `info/index.json` whose fields agree with the filename.
@@ -21548,6 +21556,116 @@ mod scan_on_upload_tests {
         assert_eq!(
             count, 0,
             "scan_on_upload is disabled, so the upload must not enqueue a scan"
+        );
+    }
+
+    /// Captures the metadata snapshot a scan was handed at its start (#5692).
+    #[derive(Clone, Default)]
+    struct MetadataRecorder {
+        seen: Arc<Mutex<Vec<Option<ArtifactMetadata>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Scanner for MetadataRecorder {
+        fn name(&self) -> &str {
+            "conda-metadata-recorder"
+        }
+
+        fn scan_type(&self) -> &str {
+            "dependency"
+        }
+
+        async fn scan(
+            &self,
+            _artifact: &Artifact,
+            metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> crate::error::Result<ScanOutput> {
+            self.seen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(metadata.cloned());
+            Ok(ScanOutput::default())
+        }
+    }
+
+    /// Runs the upload's scan inside the trigger, so what the recorder sees is
+    /// the handler's state at that exact point rather than a race with the
+    /// metadata write that follows it.
+    struct InlineScanGuard;
+
+    impl InlineScanGuard {
+        fn install() -> Self {
+            crate::services::scanner_service::TEST_INLINE_SCAN_ON_UPLOAD
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for InlineScanGuard {
+        fn drop(&mut self) {
+            crate::services::scanner_service::TEST_INLINE_SCAN_ON_UPLOAD
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// #5692: the trigger used to run before the metadata upsert, so a scan
+    /// could start before the conda identity was stored and grade the package
+    /// as uncataloged. An inline scan makes the snapshot deterministic: on the
+    /// fixed handler the identity is already in `artifact_metadata`.
+    #[tokio::test]
+    async fn native_put_upload_scan_sees_stored_conda_identity() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        set_scan_on_upload(&fx.pool, fx.repo_id, true).await;
+
+        let recorder = Arc::new(MetadataRecorder::default());
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state =
+            tdh::build_scan_state_with_leaf_scanners(&fx, &storage_path, vec![recorder.clone()]);
+        let router = tdh::router_with_auth(
+            super::router(),
+            state,
+            tdh::make_auth(fx.user_id, &fx.username),
+        );
+
+        let _inline = InlineScanGuard::install();
+        let body = conda_v1_package("py-opencv", "4.9.0", "py_0");
+        let (status, resp) = tdh::send(
+            router,
+            tdh::put(
+                format!("/{}/noarch/py-opencv-4.9.0-py_0.tar.bz2", fx.repo_key),
+                Bytes::from(body),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "conda PUT upload failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let seen = recorder
+            .seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        fx.teardown().await;
+
+        assert_eq!(seen.len(), 1, "the upload must trigger exactly one scan");
+        let metadata = seen
+            .into_iter()
+            .next()
+            .flatten()
+            .expect("the first scan must see the stored artifact metadata");
+        assert_eq!(metadata.format, "conda");
+        let identity = crate::services::conda_identity::read_identity(&metadata.metadata)
+            .expect("the scan-time metadata must carry the conda identity");
+        assert_eq!(identity.status(), "mapped");
+        assert_eq!(
+            identity.pypi_advisory_targets(),
+            vec![("opencv-python".to_string(), "4.9.0".to_string())]
         );
     }
 }
