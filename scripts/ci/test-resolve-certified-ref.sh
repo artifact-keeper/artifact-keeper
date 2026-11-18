@@ -469,6 +469,8 @@ else
       echo 'ADAPTER_IMAGE=ghcr.io/o/r-scanner-adapter'
       # A rerun of the failed gate groups (#6076): the richest shape.
       echo 'GATE_WORKFLOW_SHA=dddddddddddddddddddddddddddddddddddddddd'
+      # The pinned `uses:` ref GitHub recorded (#6170), not a hardcoded @main.
+      echo 'GATE_WORKFLOW=artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@dddddddddddddddddddddddddddddddddddddddd'
       echo 'TESTS_SHA=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
       echo 'TESTS_BRANCH=release/1.9.x'
       echo "CONTRIBUTING_RUNS='[{\"run_id\":\"4141\",\"role\":\"original\"},{\"run_id\":\"4242\",\"role\":\"rerun\",\"reason\":\"it is the flake\"}]'"
@@ -498,6 +500,7 @@ else
         '.scanner_adapter_version == "2.3.4"' \
         '.scanner_adapter_decision == {"decision":"stays","owner_rev":"cccccccccccccccccccccccccccccccccccccccc","tag":"2.3.4"}' \
         '.gate_workflow_sha == "dddddddddddddddddddddddddddddddddddddddd"' \
+        '.gate_workflow == "artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@dddddddddddddddddddddddddddddddddddddddd"' \
         '.tests == {"sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","branch":"release/1.9.x"}' \
         '.gate_scope == "rerun"' \
         '.rerun.of == "4141" and .rerun.reason == "it is the flake (#1)" and .rerun.actor == "someone"' \

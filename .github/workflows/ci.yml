@@ -1916,6 +1916,21 @@ jobs:
       - name: Check the candidate rerun resolver selects and blocks correctly
         run: bash scripts/ci/test-resolve-candidate-rerun.sh
 
+      # The release gate is pinned by sha (#6170): every caller of an
+      # artifact-keeper-test reusable workflow names one 40-hex commit, and a
+      # newly pinned commit must be on artifact-keeper-test main (a public
+      # repository, so the default token reads the compare API; a PR that
+      # changes no pin makes no call). The self-test stubs `gh`; offline, ~2s.
+      - name: Check the gate pin guard catches what it must
+        run: bash scripts/ci/test-check-gate-workflow-pins.sh
+      - name: Every gate caller pins one artifact-keeper-test commit
+        run: bash scripts/ci/check-gate-workflow-pins.sh check
+      - name: A newly pinned gate commit is on artifact-keeper-test main
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci/check-gate-workflow-pins.sh reachable "origin/${GITHUB_BASE_REF}"
+
       # The nightly release gate (#6073): which lines and images it tests,
       # how it gives way to a release candidate on the shared pool, and the
       # one-issue-per-red-tier tracking plus the verdict record #6075 reads.

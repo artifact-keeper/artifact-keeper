@@ -9,6 +9,11 @@ pull_request_rules:
       - author=dependabot[bot]
       - "title~=^Bump .* from .* to .*"
       - "-title~=major"
+      # A release-gate pin bump (#6170) is never auto-merged: it changes what
+      # certifies a release, so it needs a code-owner review. The body check
+      # catches it inside a grouped update whose title does not name it.
+      - "-title~=artifact-keeper-test"
+      - "-body~=artifact-keeper/artifact-keeper-test"
       - check-success=check-rust
       - check-success=test-backend-unit
       - check-success=ci-complete

@@ -721,7 +721,8 @@ asked for the line. An **existing** line needs none of this — only creating
 one, and deleting one, do.
 
 **A line is created in both repositories (#4372).** The Release Gate is
-`artifact-keeper-test`'s `release-gate.yml@main`, and every job in it runs
+`artifact-keeper-test`'s `release-gate.yml`, pinned to one `main` commit
+(#6170), and every job in it runs
 that repository's `scripts/switch-tests-ref.sh` (artifact-keeper-test#420):
 when `artifact-keeper-test` has a `release/X.Y.x` for the candidate's
 version, the suite runs from that branch, otherwise from `main`. Without it,
@@ -917,7 +918,7 @@ for at all, rather than being bounded by argument.
 
 Nothing in the workflow depended on the dispatched ref for this to work: the
 reusable Release Gate is an absolute cross-repository reference
-(`artifact-keeper-test/.../release-gate.yml@main`) that takes the images by
+(`artifact-keeper-test/.../release-gate.yml@<sha>`) that takes the images by
 digest, and no job needs the certified commit on disk (see "What runs from the
 certified commit" below — the answer is nothing).
 
