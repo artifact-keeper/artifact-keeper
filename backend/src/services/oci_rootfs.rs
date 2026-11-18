@@ -793,12 +793,15 @@ pub(crate) fn normalize_entry_path(path: &Path) -> Option<Vec<OsString>> {
 }
 
 fn create_dir(path: &Path) -> Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
         builder.mode(0o755);
-    }
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
     builder
         .create(path)
         .map_err(|e| io_err("Failed to create directory", path, e))
