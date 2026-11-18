@@ -1,0 +1,20 @@
+-- #6232: the scan-job claim that created a `running` scan_results row.
+--
+-- A queued scan creates its row under the job's claim. When the worker dies
+-- the claim lapses, recovery requeues the job, and the rerun writes a new row,
+-- so the old one stayed `running` until the stuck-scan janitor failed it 30
+-- minutes later. Recovery now fails the rows stamped with the claim it
+-- revokes. Rows created outside a queued job keep NULL and are untouched.
+--
+-- Additive and nullable, no default, no backfill and no index: a catalog-only
+-- change that rewrites nothing. A replica on the previous release neither
+-- writes nor reads it, and its rows fall back to the janitor. The short lock
+-- timeout keeps the brief ACCESS EXCLUSIVE lock from queueing behind a long
+-- scan_results reader and stalling writers; a busy table fails the migration
+-- fast instead, and it is retried on the next start.
+SET LOCAL lock_timeout = '5s';
+
+ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS queue_claim_token UUID;
+
+COMMENT ON COLUMN scan_results.queue_claim_token IS
+    'Claim token of the scan_queue job that created this row; recovery of a lapsed claim fails its running rows';

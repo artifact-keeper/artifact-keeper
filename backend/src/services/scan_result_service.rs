@@ -1444,6 +1444,26 @@ impl ScanResultService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // #6232: a row a queued job creates records the job's claim, so if the
+        // worker dies the claim's recovery fails this row instead of leaving it
+        // `running` for the janitor. Best-effort: unstamped, the janitor still
+        // reaps it.
+        if let Some(claim) = crate::services::scan_queue::current_claim() {
+            if let Err(e) =
+                sqlx::query("UPDATE scan_results SET queue_claim_token = $2 WHERE id = $1")
+                    .bind(result.id)
+                    .bind(claim)
+                    .execute(&self.db)
+                    .await
+            {
+                tracing::warn!(
+                    scan_id = %result.id, error = %e,
+                    "failed to record the scan-job claim on a scan row; the stuck-scan janitor \
+                     reaps it if the worker dies"
+                );
+            }
+        }
+
         Ok(result)
     }
 
@@ -2099,6 +2119,11 @@ impl ScanResultService {
             .begin()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
+        // #6232: a queued job settles its rows only while it holds its claim;
+        // taken before the row locks below, in the order recovery takes them.
+        if !crate::services::scan_queue::claim_still_held(&mut tx).await? {
+            return self.get_scan(target_scan_id).await;
+        }
 
         // Pull source counts so we can copy them onto the target. The SELECT
         // runs inside the txn with `FOR SHARE` to close the TOCTOU window
@@ -2268,6 +2293,15 @@ impl ScanResultService {
         scan_completeness_reason: Option<&str>,
         vuln_db: Option<&VulnDbProvenance>,
     ) -> Result<()> {
+        // #6232: a queued job settles its rows only while it holds its claim.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        if !crate::services::scan_queue::claim_still_held(&mut tx).await? {
+            return Ok(());
+        }
         sqlx::query!(
             r#"
             UPDATE scan_results
@@ -2298,7 +2332,7 @@ impl ScanResultService {
             vuln_db.map(|p| p.version.as_str()),
             vuln_db.and_then(|p| p.published_at),
         )
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -2310,9 +2344,12 @@ impl ScanResultService {
         )
         .bind(scan_id)
         .bind(crate::services::scan_state::RETRYING_AFTER_FAILURE_PREFIX)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         scan_completed();
         Ok(())
@@ -2330,6 +2367,15 @@ impl ScanResultService {
         scanner_version: Option<&str>,
         started_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<()> {
+        // #6232: a queued job settles its rows only while it holds its claim.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        if !crate::services::scan_queue::claim_still_held(&mut tx).await? {
+            return Ok(());
+        }
         sqlx::query!(
             r#"
             UPDATE scan_results
@@ -2343,9 +2389,12 @@ impl ScanResultService {
             scanner_version,
             started_at,
         )
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         scan_completed();
         Ok(())
@@ -2366,6 +2415,15 @@ impl ScanResultService {
         scan_id: Uuid,
         error: &str,
     ) -> Result<Option<Option<String>>> {
+        // #6232: a queued job settles its rows only while it holds its claim.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        if !crate::services::scan_queue::claim_still_held(&mut tx).await? {
+            return Ok(None);
+        }
         // Runtime query (not `query!`) so the `.sqlx/` offline cache needs
         // no new entry, as in `cleanup_stuck_scans_with_limit`.
         let row: Option<(Option<String>,)> = sqlx::query_as(
@@ -2379,9 +2437,12 @@ impl ScanResultService {
         )
         .bind(scan_id)
         .bind(error)
-        .fetch_optional(&self.db)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         if row.is_some() {
             scan_completed();
@@ -2415,6 +2476,15 @@ impl ScanResultService {
     ///
     /// A row in any other state is left alone. Returns whether it was reopened.
     pub async fn reopen_failed_scan(&self, scan_id: Uuid) -> Result<bool> {
+        // #6232: a queued job settles its rows only while it holds its claim.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        if !crate::services::scan_queue::claim_still_held(&mut tx).await? {
+            return Ok(false);
+        }
         // Runtime query, as in `fail_scan_if_running`.
         let reopened = sqlx::query(
             r#"
@@ -2427,10 +2497,13 @@ impl ScanResultService {
         )
         .bind(scan_id)
         .bind(crate::services::scan_state::RETRYING_AFTER_FAILURE_PREFIX)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         .rows_affected();
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
         Ok(reopened > 0)
     }
 
@@ -2511,6 +2584,15 @@ impl ScanResultService {
         reason: &str,
         started_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<()> {
+        // #6232: a queued job settles its rows only while it holds its claim.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        if !crate::services::scan_queue::claim_still_held(&mut tx).await? {
+            return Ok(());
+        }
         sqlx::query!(
             r#"
             UPDATE scan_results
@@ -2522,9 +2604,12 @@ impl ScanResultService {
             reason,
             started_at,
         )
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         scan_completed();
         Ok(())
