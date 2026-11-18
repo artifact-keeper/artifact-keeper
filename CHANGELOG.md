@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 New entries go in [`changes/unreleased/`](changes/unreleased/), one file per PR; see [`changes/README.md`](changes/README.md).
 
+## [1.12.1] - 2026-11-18
+
+**1.12.1 is the first published 1.12 release; upgrade from 1.11.x straight to it.** `v1.12.0` was tagged and its certified images published as `:1.12.0`, but the release workflow could not build the Windows binary (an OCI root filesystem unpacker added in 1.12.0 used Unix-only file APIs, #6022), so 1.12.0 has no GitHub Release and `:latest` never moved to it. 1.12.1 is 1.12.0 plus the Windows build fix and the dependency update below. Everything in the [1.12.0] section, including its upgrade notes, applies.
+
+### Sponsors
+
+Thank you to our sponsors for supporting ongoing development of Artifact Keeper.
+
+**Backers**
+
+- **Advailo, SIA** ([@advailo](https://github.com/advailo))
+- **Ash A.** ([@dragonpaw](https://github.com/dragonpaw))
+- **Mike** ([@huylv95](https://github.com/huylv95))
+- **Gabriel Rodriguez** ([@injectedfusion](https://github.com/injectedfusion))
+- **Narek Engibaryan** ([@narek01](https://github.com/narek01))
+- and one sponsor who chose to stay private
+
+[Become a sponsor](https://github.com/sponsors/artifact-keeper) to support the project and get your name listed here.
+
+### Security
+
+- **libz-sys moves to 1.1.33 for RUSTSEC-2026-0544** (#6156). The two zip advisories of the same batch (RUSTSEC-2026-0545, 0548) only hit the zip 2.4.2 that utoipa-swagger-ui uses at build time, through code paths it never calls, and are ignored next to the existing zip 2.4.2 entries until the utoipa 6 move (#5176)
+
 ## [1.12.0] - 2026-11-17
 
 ### Added
