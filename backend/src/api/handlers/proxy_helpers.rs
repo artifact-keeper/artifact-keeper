@@ -4852,6 +4852,70 @@ where
     F: Fn(Bytes, Option<String>, Option<String>, Option<DateTime<Utc>>, String) -> Fut,
     Fut: std::future::Future<Output = Result<Response, Response>>,
 {
+    resolve_virtual_metadata_walk(
+        db,
+        auth,
+        proxy_service,
+        virtual_repo_id,
+        path,
+        transform,
+        false,
+    )
+    .await
+}
+
+/// [`resolve_virtual_metadata`] for a caller that must tell an outage from a
+/// miss (#6214): when no member served and at least one Remote member could
+/// not answer (an upstream 5xx or 429, a transport failure, a fault on this
+/// server's side, see
+/// [`crate::services::proxy_service::classify_member_fetch_failure`]), the walk
+/// answers the retryable [`member_unavailable_response`] (503 +
+/// `Retry-After`) instead of a 404. A member whose upstream answered 404 or
+/// 410 is still a miss, so a module no member knows stays a 404.
+///
+/// The Go `.info` route needs it because `go` reads a 404 as "this proxy does
+/// not have the module" and falls through to the next `GOPROXY` entry. The
+/// other callers keep the plain form until their own routes are moved (#5620).
+pub async fn resolve_virtual_metadata_reporting_unavailable<F, Fut>(
+    db: &PgPool,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
+    proxy_service: Option<&ProxyService>,
+    virtual_repo_id: Uuid,
+    path: &str,
+    transform: F,
+) -> Result<Response, Response>
+where
+    F: Fn(Bytes, Option<String>, Option<String>, Option<DateTime<Utc>>, String) -> Fut,
+    Fut: std::future::Future<Output = Result<Response, Response>>,
+{
+    resolve_virtual_metadata_walk(
+        db,
+        auth,
+        proxy_service,
+        virtual_repo_id,
+        path,
+        transform,
+        true,
+    )
+    .await
+}
+
+/// The walk behind [`resolve_virtual_metadata`] and
+/// [`resolve_virtual_metadata_reporting_unavailable`]; `report_unavailable`
+/// selects the second's 503.
+async fn resolve_virtual_metadata_walk<F, Fut>(
+    db: &PgPool,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
+    proxy_service: Option<&ProxyService>,
+    virtual_repo_id: Uuid,
+    path: &str,
+    transform: F,
+    report_unavailable: bool,
+) -> Result<Response, Response>
+where
+    F: Fn(Bytes, Option<String>, Option<String>, Option<DateTime<Utc>>, String) -> Fut,
+    Fut: std::future::Future<Output = Result<Response, Response>>,
+{
     let members = authorized_virtual_members(db, auth, virtual_repo_id).await?;
 
     if members.is_empty() {
@@ -4987,6 +5051,14 @@ where
                         MemberResolveOutcome::Miss
                     }
                 },
+                Err(resp) if report_unavailable && is_member_unavailable_response(&resp) => {
+                    tracing::debug!(
+                        member = %member.key,
+                        path = %path,
+                        "virtual metadata upstream fetch failed; member unavailable"
+                    );
+                    MemberResolveOutcome::Unavailable
+                }
                 Err(_) => {
                     tracing::debug!(
                         member = %member.key,
@@ -5015,6 +5087,9 @@ where
         // that intent is enforced: if metadata quarantine surfacing is ever
         // added, the 409/403 propagates instead of silently collapsing to 404.
         Some(MemberResolveOutcome::Quarantine(response)) => Err(response),
+        Some(MemberResolveOutcome::Unavailable) if report_unavailable => {
+            Err(member_unavailable_response())
+        }
         _ => Err((
             StatusCode::NOT_FOUND,
             "Metadata not found in any member repository",
