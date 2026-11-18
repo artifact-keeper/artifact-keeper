@@ -134,8 +134,9 @@ message says so, and the body carries the upload's declared size:
 
 The code and fields are the same in both cases. A client tells them apart
 with `used_bytes < limit_bytes`. Repository and project refusals follow the
-same rule ("This upload (...) would exceed the storage quota of repository
-'libs': ...").
+same rule, keeping their usual leading phrase ("Repository storage quota
+exceeded: this upload (...) does not fit in the space left; repository 'libs'
+uses ...").
 
 | Refusal | Status | `code` | Extra fields |
 |---|---|---|---|

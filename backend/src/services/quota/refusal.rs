@@ -186,11 +186,15 @@ impl QuotaRefusal {
                     ),
                 };
                 let message = match does_not_fit(limit, used, denial.additional_bytes) {
+                    // Led by the scope's usual phrase, which clients and the
+                    // replication worker match on, then why this upload is
+                    // refused while smaller ones still fit (#5919).
                     Some(upload) => format!(
-                        "This upload ({}) would exceed the storage quota of {subject}: it uses \
+                        "{}: this upload ({}) does not fit in the space left; {subject} uses \
                          {} of its {} quota, {} free. Smaller uploads still fit; delete \
                          artifacts from it or raise its quota to upload this one. Downloads \
                          are not affected.",
+                        denial.scope.exceeded_message(),
                         format_bytes(upload),
                         format_bytes(used),
                         format_bytes(limit),
@@ -551,11 +555,18 @@ mod tests {
         assert_eq!(refusal.code(), "QUOTA_EXCEEDED");
         assert_eq!(
             refusal.message,
-            "This upload (50 bytes) would exceed the storage quota of repository 'libs': it \
-             uses 60 bytes of its 100 bytes quota, 40 bytes free. Smaller uploads still fit; \
-             delete artifacts from it or raise its quota to upload this one. Downloads are not \
-             affected."
+            "Repository storage quota exceeded: this upload (50 bytes) does not fit in the \
+             space left; repository 'libs' uses 60 bytes of its 100 bytes quota, 40 bytes \
+             free. Smaller uploads still fit; delete artifacts from it or raise its quota to \
+             upload this one. Downloads are not affected."
         );
+        // A project below its quota keeps its leading phrase too.
+        let mut denial = QuotaDenial::new(QuotaScope::Project, 100, 60).with_additional(50);
+        denial.project = Some("team".into());
+        assert!(denial.refusal().message.starts_with(
+            "Project storage quota exceeded: this upload (50 bytes) does not fit in the space \
+             left; project 'team' uses 60 bytes"
+        ));
         let refusal = refusal.with_content_length(Some(50));
         assert_eq!(refusal.body()["content_length"], 50);
         assert_eq!(refusal.body()["used_bytes"], 60);
