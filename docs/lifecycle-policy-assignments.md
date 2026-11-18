@@ -80,6 +80,23 @@ rather than failing part-way. Fix the policy with
 Scope and exclusions filter before `min_keep` / `max_versions` count their kept
 versions, so out-of-scope and excluded versions never take a kept slot.
 
+How `max_versions` and `min_keep` count versions depends on the format:
+
+- **Maven and Gradle** repositories count versions of each
+  groupId:artifactId (the `<group>/<artifact>/` directory). One version is
+  every file in its `<version>/` directory (pom, jar, classifier jars such as
+  `-sources.jar`, Gradle `.module`), and those files are kept or deleted
+  together. A `-SNAPSHOT` version counts as one version with all its
+  timestamped builds. Files outside a version directory are not counted.
+- **Container images** (`docker`, `podman`, `buildx`, `oras`, `wasm_oci`,
+  `helm_oci`) count tags of each image. Digest references and cosign
+  signatures/attestations are never counted or deleted by this ranking.
+- **Other formats** count artifact files of each package name.
+
+"Newest" means most recently uploaded, not highest version number. A Maven
+version is as new as its most recent file; an image tag is as new as its
+last push.
+
 `composite` deletes artifacts that meet **every** condition in `conditions`:
 
 ```json
