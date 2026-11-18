@@ -588,8 +588,12 @@ jobs:
     # dependency graph, and the job has been cancelled at 20 with every step
     # green, once inside the cache-save step itself (#3944). A cancellation
     # at the ceiling throws the whole run away; ten more minutes of headroom
-    # cost nothing on a green run.
-    timeout-minutes: 30
+    # cost nothing on a green run. 45, not 30 (2026-11-18): with the crate's
+    # growth the hosted 16 GB VM now runs clippy past 30 under memory pressure
+    # (cancelled at the ceiling on main and five PRs that day, 6-12 min
+    # otherwise). A hang still dies well inside 45; root cause tracked
+    # separately.
+    timeout-minutes: 45
     needs: [changes, release-bump]
     # Skip (reported as success for required checks) on docs-only PRs and on
     # version-bump-only release PRs; `!cancelled()` + `!= 'false'` /
@@ -3625,7 +3629,7 @@ jobs:
     # Not smoke-e2e, build-backend-image or build-openscap-image: they are
     # advisory (see the container-chain note in the step below), and a
     # `needs` edge would make this required context wait ~25 min for them.
-    needs: [changes, detect-changes, release-bump, check-rust, windows-cross-check, test-backend-unit-shard, test-backend-unit, workflow-contracts, shell-tests, version-pin-bump, scanner-adapter-go, go-floor-agreement, coverage-gates, security-audit]
+    needs: [changes, detect-changes, release-bump, check-rust, test-backend-unit-shard, test-backend-unit, workflow-contracts, shell-tests, version-pin-bump, scanner-adapter-go, go-floor-agreement, coverage-gates, security-audit]
     if: always()
     # The coverage decision reads the PR's live labels/draft state, the
     # override label's `labeled` events and `/coverage-override` comments,
@@ -3650,7 +3654,6 @@ jobs:
         # the shell control flow.
         env:
           RESULT_CHECK_RUST: ${{ needs.check-rust.result }}
-          RESULT_WINDOWS_CHECK: ${{ needs.windows-cross-check.result }}
           RESULT_UNIT: ${{ needs.test-backend-unit.result }}
           RESULT_UNIT_SHARDS: ${{ needs.test-backend-unit-shard.result }}
           RESULT_WORKFLOW_CONTRACTS: ${{ needs.workflow-contracts.result }}
@@ -3780,9 +3783,13 @@ jobs:
           }
 
           require_success "check-rust" "$RESULT_CHECK_RUST"
-          # The Windows cross-check (#6022) has check-rust's condition, so it
-          # may skip exactly where check-rust may.
-          require_success "windows-cross-check" "$RESULT_WINDOWS_CHECK"
+          # The Windows cross-check (#6022) is advisory for now: it has no
+          # rust-cache (a cache for it would push the repo over its 10 GB
+          # quota and evict the release cli-* caches), so a cold check runs
+          # past its ceiling on a loaded day. It still runs on every Rust PR
+          # and main push, and a release is not tagged until it is green on
+          # the release-prep commit. Back to required once it has a cache or
+          # a faster form.
           require_success "test-backend-unit" "$RESULT_UNIT"
           require_success "shell-tests" "$RESULT_SHELL"
 

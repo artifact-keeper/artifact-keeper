@@ -484,7 +484,7 @@ complete() {
   if [ "$rc" = "$want" ]; then pass "$label"; else fail "$label: CI Complete exited $rc, want $want"; sed 's/^/        /' "$WORK/summary" >&2; fi
   : > "$WORK/summary"
 }
-SKIP_RUST=(RESULT_CHECK_RUST=skipped RESULT_WINDOWS_CHECK=skipped RESULT_UNIT=skipped RESULT_COVERAGE=skipped)
+SKIP_RUST=(RESULT_CHECK_RUST=skipped RESULT_UNIT=skipped RESULT_COVERAGE=skipped)
 complete "CI-only PR: skipped Rust jobs pass"                       0 pull_request true false false "${SKIP_RUST[@]}"
 complete "Rust inputs changed: a skipped Check Rust fails"          1 pull_request true false true  "${SKIP_RUST[@]}"
 complete "gate output missing: a skipped Check Rust fails"          1 pull_request true false ""    "${SKIP_RUST[@]}"
@@ -493,19 +493,14 @@ complete "CI-only PR: a failed Rust job still fails"                1 pull_reque
 complete "proven push: skipped Rust jobs pass"                      0 push true true false "${SKIP_RUST[@]}" RESULT_VERSION_PIN=skipped
 complete "unproven push: a skipped unit job fails"                  1 push true true true RESULT_UNIT=skipped RESULT_VERSION_PIN=skipped
 
-echo "ci.yml CI Complete: the Windows cross-check (#6022)"
-complete "Rust inputs changed: Windows check red -> fails"          1 pull_request true true true RESULT_WINDOWS_CHECK=failure
-complete "Rust inputs changed: Windows check skipped -> fails"      1 pull_request true true true RESULT_WINDOWS_CHECK=skipped
-complete "Rust inputs changed: Windows check cancelled -> fails"    1 pull_request true true true RESULT_WINDOWS_CHECK=cancelled
-complete "gate output missing: Windows check skipped -> fails"      1 pull_request true false "" "${SKIP_RUST[@]}"
-complete "merge group: Windows check red -> fails"                  1 merge_group true true true RESULT_VERSION_PIN=skipped RESULT_COVERAGE=skipped RESULT_WINDOWS_CHECK=failure
-complete "unproven push: Windows check skipped -> fails"            1 push true true true RESULT_VERSION_PIN=skipped RESULT_WINDOWS_CHECK=skipped
-complete "CI-only PR: a failed Windows check still fails"           1 pull_request true false false "${SKIP_RUST[@]}" RESULT_WINDOWS_CHECK=failure
-complete "docs-only PR: Windows check skipped -> passes"            0 pull_request false false false "${SKIP_RUST[@]}" RESULT_SHELL=skipped RESULT_SECURITY=skipped
+echo "ci.yml CI Complete: the Windows cross-check (#6022) is advisory (#6242)"
+complete "Rust inputs changed: a red Windows check does not fail CI Complete"  0 pull_request true true true RESULT_WINDOWS_CHECK=failure
+complete "Rust inputs changed: a cancelled Windows check does not fail it"     0 pull_request true true true RESULT_WINDOWS_CHECK=cancelled
+complete "docs-only PR: skipped Rust jobs pass"                                0 pull_request false false false "${SKIP_RUST[@]}" RESULT_SHELL=skipped RESULT_SECURITY=skipped
 if grep -qx RESULT_WINDOWS_CHECK "$WORK/results.txt"; then
-  pass "CI Complete reads the Windows cross-check's result"
+  fail "CI Complete still reads RESULT_WINDOWS_CHECK while the Windows check is advisory"
 else
-  fail "CI Complete does not read RESULT_WINDOWS_CHECK"
+  pass "CI Complete ignores the advisory Windows cross-check"
 fi
 
 echo "ci.yml CI Complete: the Workflow Contract Tests (#6115)"
@@ -593,7 +588,7 @@ done
 for j in smoke-e2e build-backend-image build-openscap-image; do
   want_fact "cc_needs_$j" false "CI Complete does not wait for advisory $j"
 done
-want_fact cc_needs_windows-cross-check true "CI Complete waits for the Windows cross-check (#6022)"
+want_fact cc_needs_windows-cross-check false "CI Complete does not wait for the Windows cross-check while it is advisory (#6022)"
 want_fact windows_if_matches_check_rust true "the Windows cross-check's condition is Check Rust's, verbatim"
 want_fact ubuntu_latest false "no job floats on ubuntu-latest"
 want_fact cache_saves_off_main none "every rust-cache saves only outside pull requests and merge groups"
