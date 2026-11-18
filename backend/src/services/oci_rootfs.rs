@@ -877,6 +877,7 @@ fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
 
     /// Build a tar in memory with raw headers, so entries the `tar` crate's
