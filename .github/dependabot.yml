@@ -47,8 +47,11 @@ updates:
     commit-message:
       prefix: "chore"
     # The release-gate pin (#6170) arrives as its own PR, never inside the
-    # weekly group: it changes what certifies a release, needs a code-owner
-    # review, and Mergify does not auto-merge it. A dependency goes to the
+    # weekly group: it changes what certifies a release, and Mergify does not
+    # auto-merge it. CODEOWNERS marks the callers' ownership; a code-owner
+    # review is enforced only once branch protection on main and release/*
+    # requires it (#6216). Dependabot does not update the callers'
+    # `# ... as of DATE` comment. A dependency goes to the
     # first group it matches. (artifact-keeper-test has no release tags;
     # whether Dependabot moves a tagless sha pin to main's head is not
     # guaranteed, see check-gate-workflow-pins.sh BUMPING THE PIN.)

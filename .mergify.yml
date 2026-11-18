@@ -10,8 +10,12 @@ pull_request_rules:
       - "title~=^Bump .* from .* to .*"
       - "-title~=major"
       # A release-gate pin bump (#6170) is never auto-merged: it changes what
-      # certifies a release, so it needs a code-owner review. The body check
-      # catches it inside a grouped update whose title does not name it.
+      # certifies a release. The body check catches it inside a grouped
+      # update whose title does not name it. NOTE: this rule is effectively
+      # dead today: Dependabot titles here are `chore: bump ...` (the
+      # commit-message prefix, e.g. #5981, #5138), not `^Bump`, and the
+      # check-success names below are job ids, not check names. The
+      # exclusion is kept so it still holds if the rule is ever fixed.
       - "-title~=artifact-keeper-test"
       - "-body~=artifact-keeper/artifact-keeper-test"
       - check-success=check-rust

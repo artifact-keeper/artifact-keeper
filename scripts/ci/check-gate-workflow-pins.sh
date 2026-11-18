@@ -34,8 +34,19 @@
 #   Replace the sha in every caller (`grep -rn artifact-keeper-test/.github/
 #   workflows/ .github/workflows`) with artifact-keeper-test main's head,
 #   `gh api repos/artifact-keeper/artifact-keeper-test/commits/main --jq .sha`,
-#   and date the trailing comment. It is an ordinary pipeline change: the
-#   callers are under CODEOWNERS and Mergify does not auto-merge it.
+#   and date the trailing comment (Dependabot, if it ever opens the bump,
+#   does not update that `# ... as of DATE` comment: fix it by hand). It is an
+#   ordinary pipeline change, and Mergify does not auto-merge it. CODEOWNERS
+#   lists the callers to mark ownership only: a code-owner review is enforced
+#   once branch protection on main and release/* requires it (#6216).
+#
+#   The pin covers only the workflow YAML. The gate's jobs still check out
+#   artifact-keeper-test's default branch and run its scripts, and tests_sha
+#   resolves from the branch tip. So:
+#     * bump promptly after any artifact-keeper-test change to
+#       release-gate.yml: until then the old YAML runs against new scripts;
+#     * before merging a bump, dispatch the release-gate rehearsal
+#       (release-gate-rehearsal.yml, mode release-gate) on the bump branch.
 #
 # Env:
 #   GATE_PIN_TEST_REPO  default artifact-keeper/artifact-keeper-test
@@ -70,7 +81,8 @@ if src.startswith("git:"):
                                capture_output=True, text=True).stdout for n in names}
 else:
     files = {n: open(os.path.join(src, n), encoding="utf-8").read() for n in os.listdir(src)}
-raw = re.compile(r"^\s*-?\s*uses:\s*['\"]?" + re.escape(prefix), re.M)
+# GitHub resolves owner/repo case-insensitively, so the match does too.
+raw = re.compile(r"^\s*-?\s*uses:\s*['\"]?" + re.escape(prefix), re.M | re.I)
 lines = 0
 for name in sorted(files):
     if not name.endswith((".yml", ".yaml")):
@@ -80,7 +92,7 @@ for name in sorted(files):
     doc = yaml.safe_load(text) or {}
     for job_id, job in (doc.get("jobs") or {}).items():
         uses = job.get("uses") if isinstance(job, dict) else None
-        if not isinstance(uses, str) or not uses.startswith(prefix):
+        if not isinstance(uses, str) or not uses.lower().startswith(prefix.lower()):
             continue
         wf, _, ref = uses[len(prefix):].partition("@")
         w = job.get("with") or {}

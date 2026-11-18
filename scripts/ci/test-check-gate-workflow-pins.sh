@@ -72,6 +72,12 @@ wf "$D" a.yml "$(caller gate release-gate.yml "$A")
 $(caller s3 nightly-s3-formats.yml main)"
 expect "a caller back on @main -> BLOCKED" 1 "at '@main', not a 40-hex commit" -- bash "$SCRIPT" check "$D"
 
+D="$WORK/case"
+wf "$D" a.yml "$(caller gate release-gate.yml "$A")
+  odd:
+    uses: Artifact-Keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main"
+expect "Artifact-Keeper/artifact-keeper-test...@main (other case) -> BLOCKED" 1 "at '@main', not a 40-hex commit" -- bash "$SCRIPT" check "$D"
+
 D="$WORK/short"
 wf "$D" a.yml "$(caller gate release-gate.yml "${A:0:12}")"
 expect "a short sha -> BLOCKED" 1 "not a 40-hex commit" -- bash "$SCRIPT" check "$D"
