@@ -9,7 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 New entries go in [`changes/unreleased/`](changes/unreleased/), one file per PR; see [`changes/README.md`](changes/README.md).
 
-## [1.12.0] - 2026-11-10
+## [1.12.1] - 2026-11-18
+
+**1.12.1 is the first published 1.12 release; upgrade from 1.11.x straight to it.** `v1.12.0` was tagged and its certified images published as `:1.12.0`, but the release workflow could not build the Windows binary (an OCI root filesystem unpacker added in 1.12.0 used Unix-only file APIs, #6022), so 1.12.0 has no GitHub Release and `:latest` never moved to it. 1.12.1 is 1.12.0 plus the Windows build fix and the dependency update below. Everything in the [1.12.0] section, including its upgrade notes, applies.
+
+### Sponsors
+
+Thank you to our sponsors for supporting ongoing development of Artifact Keeper.
+
+**Backers**
+
+- **Advailo, SIA** ([@advailo](https://github.com/advailo))
+- **Ash A.** ([@dragonpaw](https://github.com/dragonpaw))
+- **Mike** ([@huylv95](https://github.com/huylv95))
+- **Gabriel Rodriguez** ([@injectedfusion](https://github.com/injectedfusion))
+- **Narek Engibaryan** ([@narek01](https://github.com/narek01))
+- and one sponsor who chose to stay private
+
+[Become a sponsor](https://github.com/sponsors/artifact-keeper) to support the project and get your name listed here.
+
+### Security
+
+- **libz-sys moves to 1.1.33 for RUSTSEC-2026-0544** (#6156). The two zip advisories of the same batch (RUSTSEC-2026-0545, 0548) only hit the zip 2.4.2 that utoipa-swagger-ui uses at build time, through code paths it never calls, and are ignored next to the existing zip 2.4.2 entries until the utoipa 6 move (#5176)
+
+## [1.12.0] - 2026-11-17
 
 ### Added
 
@@ -934,6 +957,10 @@ New entries go in [`changes/unreleased/`](changes/unreleased/), one file per PR;
 
 - **The quota pre-check now checks write permission first, so a caller who cannot write a repository gets the permission refusal, not the quota refusal** (#5912). The check that refuses an over-quota upload on its `Content-Length` before the body is read ran ahead of the write authorization on the repository artifact API and on OCI `/v2`. A caller without write permission on a public repository who declared an over-quota upload was answered `403 QUOTA_EXCEEDED` with the repository's `limit_bytes`, `used_bytes`, `scope`, `repository` and `project`, instead of the refusal it got before. The pre-check now answers a quota refusal only to a caller who passes the repository's write gate. Anyone else gets the answer from before the pre-check existed: `401` for an anonymous caller, `403 FORBIDDEN` (`DENIED` on `/v2`) for a caller who can read but not write, and the unknown-key `404` for a caller who cannot read the repository either. A caller who may write is still refused before the body is read.
 
+- **A proxy-cache quarantine release that answers 200 is no longer followed by a 409** (#6043, #6059). When an admin released a held proxied path while its background fetch was still running, the next download could still be refused with `409 "Artifact is quarantined and pending security review"`, intermittently. The fetch's commit wrote the cached entry with its hold first and only dropped the hold once it saw the release, so a download in between read the hold. A download that came in before the commit fetched the package again and put a new hold on it. Now the commit checks for a release before it writes the entry and is serialized with the release on the same server. A download that arrives during the fetch also honours a release already made, so every download that server answers after the release is served.
+
+- **A format-route read that cannot check repository permissions during a database outage now answers `503` with `Retry-After: 1`** (#6052, #6053). When the repository's permission-rules entry had left its 30 second cache, a read such as a Git LFS batch or an npm metadata GET answered a bare `503` with no `Retry-After` header, while writes and every other outage path already sent `Retry-After: 1`. Reads now send the same retryable answer, so clients back off and retry.
+
 ### Security
 
 - **Plugin installs and reloads fetch git sources through the SSRF-guarded HTTP client, so the connection goes only to an address the outbound policy admits at connect time** (#4827, GHSA-p28r-8m4q-w9pg). Previously libgit2 resolved the source host again after the URL check. Plugin git fetches now also honor the `HTTP_PROXY`/`HTTPS_PROXY` environment and `CUSTOM_CA_CERT_PATH` like the other outbound requests.
@@ -1152,6 +1179,30 @@ New entries go in [`changes/unreleased/`](changes/unreleased/), one file per PR;
 - **The backend and OpenSCAP images now list their source-built curl and libcurl in an embedded CycloneDX SBOM, and a daily check compares those curl pins with curl's advisory feed** (#6003). Both images build curl or libcurl from source at a pinned `CURL_VERSION` instead of installing the RPM. Scanners that read the RPM database, such as Trivy, can't see that copy. Each image now carries `/usr/share/sbom/curl.cdx.json`, generated at build time from the same `CURL_VERSION`. It has the CPEs `cpe:2.3:a:haxx:libcurl:<version>` (and `haxx:curl` in the backend image) and `pkg:generic` purls, so scanners that read embedded SBOMs and match by CPE, such as grype, report curl CVEs against these images.
 
   The new `Scheduled curl Advisory Watch` workflow checks each pin against https://curl.se/docs/vuln.json every day. When a pin is affected, the workflow fails and opens or updates a `type:security` tracking issue.
+
+### Tests
+
+- **The backend unit-test build no longer generates code for the whole router in every CI shard** (#6143, #6144). One test helper was declared `pub async fn` and called `create_router`. rustc builds a `pub async fn` and everything it calls into every test binary that compiles it, whether or not a test calls it, so each of the five unit-test legs built every handler. Test code now uses `pub(crate) async fn`, and `scripts/ci/test-shards.py check` refuses the old form. Test-only change: production builds and binaries are unaffected.
+
+### CI / Release Assurance
+
+These change how releases are built, gated and certified. Nothing that ships changes.
+
+- **`release.yml` ends green when the release was published** (#5709, #6079, #6082). It ended `completed/failure` on every release since 1.11.10 although the GitHub Release was published: the AMI build was dispatched although `ami-build.yml` is disabled (`422`), and the Discord announcement failed on a webhook that answers `404`. A disabled AMI workflow is now skipped with a notice, and an announcement the webhook does not accept is skipped with a one-line message.
+
+- **A Release Candidate whose gate failed on a flake can rerun only its failed gate groups** (#6076, #6087). A new dispatch with `rerun_of=<run id>` and a `reason` re-checks everything before the gate and then runs only the gate jobs and legs the original did not pass. It is allowed once per candidate, within 72 hours, on the same commit and digests, and with the same tests unless the dispatch passes `tests=moved`, and the certification records both runs, the reason and both actors.
+
+- **The full release gate runs every night on main and each active release line, and release preflight reports its result** (#6073, #6075, #6084, #6086). `nightly-release-gate.yml` runs at 08:00 UTC, writes an advisory `release-gate/nightly` status on the commit it tested and keeps one tracking issue per red tier. Preflight check 8 reads that status on the commit being cut, or on the commit it differs from only in release bookkeeping, and warns (it never blocks) when it is red or missing, naming the newest nightly-green commit instead.
+
+- **A merge can no longer cancel a candidate's image build** (#6080, #6083). Docker Publish on a branch push now has a concurrency group per commit, so a newer push no longer replaces a still-queued run for the commit a candidate is waiting on.
+
+- **A PR labelled `behaviour-change` or `breaking-change` must name the artifact-keeper-test PR that moves the release gate with it, or give a `Gate-Exempt:` reason** (#6074, #6085). The new `Require gate test for behaviour changes` check enforces it, so a deliberate behaviour change no longer turns red only on the release candidate.
+
+- **Two self-hosted Docker Publish legs build in a throwaway KVM VM per job** (#6072, #6110, #6093, #6094, #6111). The new `ak-vm-runner` service boots each job in its own VM with its own kernel and `dockerd`, from a read-only golden image, and destroys it with its disk afterwards, with an append-only audit log of every VM. Docker Publish's amd64 OpenSCAP and scanner-adapter legs moved there from the privileged docker-in-docker pool. The build inputs, signing and provenance are unchanged.
+
+- **A workflow- or script-only PR skips Check Rust, the instrumented unit shards and the integration tests** (#6115, #6116). It runs actionlint, and a workflow change also runs the workflow contract tests on one uninstrumented build. The push to main after the merge still runs every Rust job.
+
+- **The bin-target unit tests run on the shortest unit-test leg** (#6133, #6138). They moved from `services-2`, the critical path, to `router`, and `test-shards.py` refuses a bin-target test module gated to any other shard, so those tests cannot silently stop running. Build Backend Image reads a new `ci`-profile registry cache, warmed on every push to main.
 
 ### Sponsors
 

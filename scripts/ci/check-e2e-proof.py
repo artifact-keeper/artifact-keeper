@@ -17,6 +17,13 @@ SUBCOMMANDS (exit 0 ok, 1 missing or invalid proof, 2 usage/infra)
       (the workflow's GITHUB_EVENT_PATH); --pr N reads the PR from the API.
       With a deferred proof (label needs-e2e-test, no proof line) the label is
       copied to the linked issues unless --no-write.
+  gate [--event F | --pr N] [--repo R] [--test-repo R]
+      #6074: a PR labelled behaviour-change or breaking-change cites the
+      artifact-keeper-test PR that moves the release gate with it
+      (`Gate: artifact-keeper-test#N`, or an `E2E:` line of that form), or
+      says why the gate needs no change (`Gate-Exempt: <reason>`). The test
+      PR must be open or merged, target the same-named branch, touch tiers
+      or tests/**, and name this PR or one of its linked issues.
   milestone --milestone X (--tests-ref REF | --tests-dir D) [--repo R]
             [--test-repo R] [--exemptions F]
       The release backstop: every closed type:bug issue in milestone X needs
@@ -476,18 +483,24 @@ def inherited_exemption(pr, repo, allow_automatic=True):
     return None
 
 
-def run_pr(args):
-    repo, test_repo = args.repo, args.test_repo
+def load_pr(args):
+    """The pull request from --event (the workflow payload) or --pr N."""
     if args.event:
         with open(args.event, encoding="utf-8") as fh:
             pr = json.load(fh).get("pull_request")
         if not pr:
             print("usage: the event has no pull_request", file=sys.stderr)
-            return 2
-    elif args.pr:
-        pr = gh_api(f"repos/{repo}/pulls/{args.pr}")
-    else:
-        print("usage: pr needs --event or --pr", file=sys.stderr)
+        return pr or None
+    if args.pr:
+        return gh_api(f"repos/{args.repo}/pulls/{args.pr}")
+    print(f"usage: {args.cmd} needs --event or --pr", file=sys.stderr)
+    return None
+
+
+def run_pr(args):
+    repo, test_repo = args.repo, args.test_repo
+    pr = load_pr(args)
+    if pr is None:
         return 2
 
     v = Verdict()
@@ -605,7 +618,7 @@ def run_pr(args):
     return finish(v, "end-to-end proof declared and checked", 0)
 
 
-def finish(v, headline, code):
+def finish(v, headline, code, title="E2E proof", policy="End-to-end proof for bug fixes"):
     status = "PASS" if code == 0 else "FAIL"
     print(f"{status}: {headline}")
     for m in v.ok:
@@ -617,15 +630,115 @@ def finish(v, headline, code):
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as fh:
-            fh.write(f"### E2E proof: {status}\n\n{headline}\n\n")
+            fh.write(f"### {title}: {status}\n\n{headline}\n\n")
             for m in v.ok:
                 fh.write(f"- ok: {m}\n")
             for m in v.problems:
                 fh.write(f"- **problem**: {m}\n")
             for m in v.notes:
                 fh.write(f"- note: {m}\n")
-            fh.write("\nPolicy: CONTRIBUTING.md, \"End-to-end proof for bug fixes\".\n")
+            fh.write(f"\nPolicy: CONTRIBUTING.md, \"{policy}\".\n")
     return code
+
+
+# --- the gate subcommand ------------------------------------------------------
+#
+# #6074: a PR that deliberately changes observable behaviour (a status code, a
+# default, a response shape, a default policy) must move the release gate with
+# it, or the gate goes red only at release time on a stale expectation. A
+# reviewer turns the rule on with a label; the PR then cites the test-repo PR
+# that updates the gate, or says why the gate needs no change.
+
+GATE_LABELS = ("behaviour-change", "breaking-change")
+GATE_POLICY = "Gate tests for behaviour changes"
+GATE_PROOF_RE = re.compile(r"^\s*(?:[-*]\s+)?Gate\s*:\s*(.+?)\s*$", re.MULTILINE)
+GATE_EXEMPT_RE = re.compile(r"^\s*(?:[-*]\s+)?Gate-Exempt\s*:\s*(.*?)\s*$", re.MULTILINE)
+
+
+def check_gate_test_pr(num, pr, issues, test_repo, v):
+    """A test PR that moves the gate: open or merged, same-named base, touches
+    tiers or suites, and names this PR or one of its linked issues."""
+    try:
+        tpr = gh_api(f"repos/{test_repo}/pulls/{num}")
+    except NotFound:
+        v.bad(f"{test_repo}#{num} is not a pull request in {test_repo}")
+        return False
+    ok = True
+    if tpr.get("state") != "open" and not tpr.get("merged"):
+        v.bad(f"{test_repo}#{num} was closed without merging")
+        ok = False
+    base = (pr.get("base") or {}).get("ref") or "main"
+    got_base = (tpr.get("base") or {}).get("ref")
+    if got_base != base:
+        v.bad(f"{test_repo}#{num} targets '{got_base}', but this PR targets '{base}': the test PR must target the same-named branch")
+        ok = False
+    files = [f["filename"] for f in gh_list(f"repos/{test_repo}/pulls/{num}/files")]
+    if not any(p.startswith(TIERS_DIR + "/") or p.startswith("tests/") for p in files):
+        v.bad(f"{test_repo}#{num} touches neither {TIERS_DIR}/** nor tests/**")
+        ok = False
+    text = f"{tpr.get('title') or ''}\n{tpr.get('body') or ''}"
+    wanted = [pr["number"]] + [i for i in issues if i != pr["number"]]
+    if not any(names_issue(text, i) for i in wanted):
+        v.bad(f"{test_repo}#{num} does not name " + " or ".join(f"artifact-keeper#{i}" for i in wanted))
+        ok = False
+    if ok:
+        v.good(f"{test_repo}#{num} ({tpr.get('state')}{', merged' if tpr.get('merged') else ''}) updates the gate")
+    return ok
+
+
+def run_gate(args):
+    repo, test_repo = args.repo, args.test_repo
+    pr = load_pr(args)
+    if pr is None:
+        return 2
+    v = Verdict()
+
+    def done(headline, code):
+        return finish(v, headline, code, title="Gate test", policy=GATE_POLICY)
+
+    labels = label_names(pr)
+    print(f"PR #{pr['number']}: {pr.get('title') or ''}")
+    on = [lbl for lbl in GATE_LABELS if lbl in labels]
+    if not on:
+        return done(f"not labelled {' or '.join(GATE_LABELS)}: no gate test needed", 0)
+    print(f"  labelled {', '.join(on)}: the PR must update the release gate or say why not")
+    body = sanitize(pr.get("body"))
+
+    ex = GATE_EXEMPT_RE.search(body)
+    if ex:
+        reason = ex.group(1)
+        if len(reason) < 10:
+            v.bad("`Gate-Exempt:` needs a reason (10+ characters)")
+            return done("the Gate-Exempt line is not valid", 1)
+        return done(f"exempt: {reason}", 0)
+
+    # The test-PR form of an E2E proof line moves the gate too, so a bug fix
+    # that changes behaviour does not have to cite its test PR twice.
+    cited = []
+    for text in GATE_PROOF_RE.findall(body):
+        m = TEST_PR_RE.match(text)
+        if m:
+            cited.append(int(m.group(1)))
+        else:
+            v.bad(f"unrecognised gate line `Gate: {text}` (expected `Gate: artifact-keeper-test#N`)")
+    for text in PROOF_RE.findall(body):
+        m = TEST_PR_RE.match(text)
+        if m:
+            cited.append(int(m.group(1)))
+    cited = list(dict.fromkeys(cited))
+    if v.problems:
+        return done("the Gate line is not valid", 1)
+    if not cited:
+        v.bad(
+            "no gate test declared. Add `Gate: artifact-keeper-test#N` (the test PR that updates the "
+            "release-gate tier or suite) or `Gate-Exempt: <reason>`"
+        )
+        return done("missing gate test", 1)
+    issues = linked_issues(body, repo)
+    results = [check_gate_test_pr(n, pr, issues, test_repo, v) for n in cited]
+    if not all(results):
+        return done("the cited test PR does not update the gate", 1)
+    return done("gate test declared and checked", 0)
 
 
 # --- the milestone subcommand ------------------------------------------------
@@ -945,6 +1058,11 @@ def main(argv=None):
     p.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", DEFAULT_REPO))
     p.add_argument("--test-repo", default=DEFAULT_TEST_REPO)
     p.add_argument("--no-write", action="store_true")
+    g = sub.add_parser("gate")
+    g.add_argument("--event")
+    g.add_argument("--pr", type=int)
+    g.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", DEFAULT_REPO))
+    g.add_argument("--test-repo", default=DEFAULT_TEST_REPO)
     m = sub.add_parser("milestone")
     m.add_argument("--milestone", required=True)
     m.add_argument("--tests-ref", help="artifact-keeper-test branch/tag/sha to fetch")
@@ -958,7 +1076,7 @@ def main(argv=None):
     if args.cmd == "milestone" and not (args.tests_ref or args.tests_dir):
         ap.error("milestone needs --tests-ref or --tests-dir")
     try:
-        return run_pr(args) if args.cmd == "pr" else run_milestone(args)
+        return {"pr": run_pr, "gate": run_gate, "milestone": run_milestone}[args.cmd](args)
     except Infra as e:
         print(f"INFRA: {e}", file=sys.stderr)
         return 2

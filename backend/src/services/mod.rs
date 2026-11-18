@@ -145,6 +145,7 @@ pub mod scan_state;
 pub mod scan_worker;
 pub mod scanner_adapter_client;
 pub mod scanner_service;
+pub mod search_indexer;
 pub mod search_service;
 pub mod service_account_service;
 pub mod signing_service;

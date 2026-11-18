@@ -520,15 +520,30 @@ costs rows rather than memory.
 
 `GET /api/v1/admin/security/scan-queue` (admin only, and refused to a
 repository-scoped token, since it lists every repository's jobs) lists the outstanding jobs
-and the depth per kind and state. Hosted scans share the queue at the lowest
-priority, so a rescan of a whole repository cannot starve a waiting pull.
+and the depth per kind and state.
+
+**Claim order.** A worker claims a `fail_closed` pull's job first, since a
+client is parked on it. Hosted scans (`scan_on_upload`, pushed images and
+`POST /api/v1/security/scan`) come next, ahead of the `fail_open` and
+`record_only` backfill, so a burst of cold proxy fetches does not hold back
+upload verdicts. Backfill ages: a backfill job is claimed as though it were a
+hosted job queued `SCAN_QUEUE_BACKFILL_AGING_SECS` (default `600`) after it, so
+it still goes ahead of any hosted scan queued more than that later, and a steady
+stream of uploads cannot starve it either. `0` claims hosted and backfill jobs
+in plain age order. The window bounds the head start, not an upload's wait:
+once a backlog is older than the window, uploads queue behind the part of it
+queued more than the window before them, so a backlog that keeps growing still
+needs more worker slots. Rescans come after everything else. Each kind's
+`ak_scan_queue_oldest_pending_seconds` shows how long its oldest due job has
+waited.
 
 **Running the worker separately.** With the queue on, `SCAN_WORKER_ENABLED`
 (default `true`) has each instance drain it. In a multi-replica deployment set
 it `false` on the API pods and run the same image with it on as a scan worker.
 The worker has to read what an API pod wrote: object storage, or a filesystem
 volume both can mount. `SCAN_WORKER_CONCURRENCY` sets how many jobs one worker
-runs at once and defaults to `MAX_CONCURRENT_SCAN_EXTRACTIONS`. Each job takes
+runs at once and defaults to 4, or `MAX_CONCURRENT_SCAN_EXTRACTIONS` if that is
+lower. Each job takes
 an extraction permit, so raise the two together. `SCAN_WORKER_TRIVY_ADAPTER_URL`
 gives the scans a worker runs their own scanner-adapter URL in place of
 `TRIVY_ADAPTER_URL`, so a worker pod can use an adapter running next to it while

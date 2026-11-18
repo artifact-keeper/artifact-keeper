@@ -33,6 +33,15 @@ Those modules therefore share one shard (`router`) instead of lifting all
 of them. Five shards keep every leg at or under ~10 GiB, inside a standard
 16 GB GitHub-hosted runner with room for Postgres and the OS.
 
+"Can reach" includes every `pub async fn` the build compiles, whether or not
+anything calls it: rustc makes the body of a `pub async fn` a codegen root
+even in an executable. By November 2026 one ungated test helper declared that
+way called `create_router`, so every leg built the whole router. Even a
+harness with no test modules peaked at 14.7 GiB, and all five legs ran at
+15.3-18.1 GiB, into swap (#6143). `check` therefore refuses `pub async fn`
+anywhere in test code, and `apply` rewrites it to `pub(crate) async fn`,
+which means the same there.
+
 HOW
 ---
 Each test module carries one extra attribute, directly ABOVE its
@@ -137,6 +146,21 @@ OVERRIDES = {
     ),
 }
 
+# The bin targets' sources: main.rs (the `artifact-keeper` binary) and
+# bin/** (ak-mcp-introspector). Their tests are the bin-target tests, which
+# ci.yml builds and runs in ONE leg (BIN_SHARD) with `--bins`. That leg also
+# builds the non-test library, about 7 min on a hosted runner, so they go to
+# the leg with the least other work: router, a median 9.6 min per job
+# (services-1 12.2, handlers-2 12.7, handlers-1 17.8; 52 PR runs,
+# 2026-11-14..16), against services-2's 21.2, which was the critical path
+# while it carried them (#6133). Single runs vary by several minutes.
+BIN_SHARD = "router"
+
+
+def is_bin(rel):
+    """Whether `rel` (path under src/) belongs to a bin target, not the lib."""
+    return rel == "main.rs" or rel.startswith("bin/")
+
 
 # A test module that builds the WHOLE application router goes to the
 # `router` shard, wherever it lives. In a test harness (an executable) rustc
@@ -154,12 +178,14 @@ RANGES = [
     ("api/handlers/", [("o", "handlers-1"), ("z", "handlers-2")]),
     ("services/", [("q", "services-1"), ("z", "services-2")]),
 ]
-# formats, middleware, storage, models, config, main.rs, ...
+# formats, middleware, storage, models, config, ... (bin targets: BIN_SHARD)
 DEFAULT_SHARD = "services-2"
 
 
 def shard_for(rel, body=""):
     """The shard of a test module declared in `rel` (path under src/)."""
+    if is_bin(rel):
+        return BIN_SHARD
     if rel in OVERRIDES:
         return OVERRIDES[rel][0]
     if ROUTER_MARKER.search(body):
@@ -180,6 +206,19 @@ ANY_SHARD = re.compile(r"ak_test_shard")
 MOD_ITEM = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*([{;])")
 INLINE_MOD = re.compile(r"^(\s*)(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*\{")
 TEST_ATTR = re.compile(r"^\s*#\[(?:tokio::)?test(?:\(|\])")
+# A `pub async fn` in test code is a monomorphization ROOT of every test
+# harness that compiles it, called or not: rustc treats the body of a free
+# `pub async fn` as reachable even in an executable (a `pub(crate)` one, or a
+# plain `pub fn`, is only generated when something calls it). Test code is
+# never visible outside the crate, so `pub(crate)` means the same there and
+# costs nothing; see PUB_ASYNC_WHY.
+PUB_ASYNC = re.compile(r'^(\s*)pub\s+async\s+(?:unsafe\s+)?(?:extern\s+"[^"]*"\s+)?fn\b')
+PUB_ASYNC_WHY = (
+    "rustc generates code for a `pub async fn` and everything it calls in "
+    "every test build that compiles it, called or not (#6143: one such "
+    "helper that calls create_router put the whole router into every "
+    "unit-test leg, +4.2 GiB of rustc peak each); in test code `pub(crate)` "
+    "means the same and is generated only where a test calls it")
 
 
 def count_tests(lines):
@@ -312,8 +351,9 @@ def plan(modules, per_file):
       or None: deliberately ungated), run (the one leg its tests run in),
       uses (keys of the test modules it references), users (the reverse)).
 
-    main.rs is left out of the graph: it is the bin crate, whose `crate::`
-    is not the library's, and its tests are built in one leg anyway."""
+    The bin targets (main.rs, bin/**) are left out of the graph: each is a
+    bin crate, whose `crate::` is not the library's, and its tests are
+    built in one leg anyway."""
     info = {}
     by_path = {}
     for mod in modules:
@@ -323,10 +363,10 @@ def plan(modules, per_file):
         path = module_path(mod["file"], per_file[mod["file"]][0], mod)
         info[key] = dict(mod=mod, path=path, base=shard_for(mod["file"], mod["body"]),
                          uses=set(), users=set())
-        if mod["file"] != "main.rs":
+        if not is_bin(mod["file"]):
             by_path[path] = key
     for key, it in info.items():
-        if it["mod"]["file"] == "main.rs":
+        if is_bin(it["mod"]["file"]):
             continue
         parts = it["path"].split("::")
         targets = set()
@@ -383,6 +423,38 @@ def shard_attr_of(lines, mod):
     return None, None
 
 
+def pub_async_in_test_code(src, modules):
+    """[(file, line index)] of every `pub async fn` in test code: inside a
+    `#[cfg(test)]` module (its own lines, or the whole file of an out-of-line
+    one), or itself carrying `#[cfg(test)]`. (A `pub async` method in an
+    `impl` block is not a root, but `pub(crate)` costs nothing there either,
+    so the rule stays one regex.)"""
+    found = set()
+    for rel in rust_files(src):
+        with open(os.path.join(src, rel), encoding="utf-8") as fh:
+            lines = fh.read().split("\n")
+        for n, line in enumerate(lines):
+            if not CFG_TEST.match(line):
+                continue
+            j = n + 1
+            while j < len(lines) and (lines[j].strip().startswith("#[")
+                                      or lines[j].strip().startswith("//")):
+                j += 1
+            if j < len(lines) and PUB_ASYNC.match(lines[j]):
+                found.add((rel, j))
+    for mod in modules:
+        if mod["body_file"]:
+            rel, lo, hi = mod["body_file"], 0, None
+        else:
+            rel, lo, hi = mod["file"], mod["start"], mod["end"]
+        with open(os.path.join(src, rel), encoding="utf-8") as fh:
+            lines = fh.read().split("\n")
+        for n in range(lo, len(lines) if hi is None else hi + 1):
+            if PUB_ASYNC.match(lines[n]):
+                found.add((rel, n))
+    return sorted(found)
+
+
 def check_manifest(repo):
     """The shard list here, the Cargo features and build.rs must agree."""
     problems = []
@@ -403,7 +475,7 @@ def check_manifest(repo):
 
 def check_workflow(repo, bin_shard):
     """ci.yml's unit-test matrix runs exactly SHARDS, and its BIN_SHARD leg
-    (the one that builds and runs `--bins`) is the shard main.rs's tests
+    (the one that builds and runs `--bins`) is the shard the bin-target tests
     are gated to. A shard missing from the matrix is a slice of the suite
     that never runs; a wrong BIN_SHARD is main.rs's tests never running."""
     path = os.path.join(repo, ".github/workflows/ci.yml")
@@ -419,7 +491,7 @@ def check_workflow(repo, bin_shard):
     declared = m.group(1) if m else None
     if bin_shard and declared != bin_shard:
         problems.append(f".github/workflows/ci.yml BIN_SHARD is {declared!r}, but "
-                        f"backend/src/main.rs's tests are gated to {bin_shard!r}")
+                        f"the bin-target tests (main.rs, bin/) are gated to {bin_shard!r}")
     return problems
 
 
@@ -428,9 +500,9 @@ def cmd_check(src, repo):
     problems = check_manifest(repo)
     warnings = []  # (file, line, title, message)
     info = plan(modules, per_file)
-    bin_shards = {it["run"] for it in info.values() if it["mod"]["file"] == "main.rs"}
+    bin_shards = {it["run"] for it in info.values() if is_bin(it["mod"]["file"])}
     if len(bin_shards) > 1:
-        problems.append(f"main.rs test modules span shards {sorted(bin_shards)}; "
+        problems.append(f"bin-target (main.rs, bin/) test modules span shards {sorted(bin_shards)}; "
                         "CI runs `--bins` in one leg only")
     problems += check_workflow(repo, next(iter(bin_shards), None))
     for mod in modules:
@@ -455,6 +527,12 @@ def cmd_check(src, repo):
         elif have not in SHARDS:
             problems.append(f"{where}: gated to {have!r}, which is not a shard -- its "
                             f"tests would never run (expected {want!r})")
+        elif is_bin(mod["file"]) and have != BIN_SHARD:
+            # Only the BIN_SHARD leg builds `--bins`: anywhere else these
+            # tests are compiled out of the one build that has them (#6133).
+            problems.append(f"{where}: a bin-target test module gated to {have!r}; "
+                            f"only the {BIN_SHARD!r} leg runs `--bins`, so its tests "
+                            "never run")
         elif want is None:
             pass  # a user in another shard: reported by the reference check below
         elif have != want:
@@ -489,6 +567,9 @@ def cmd_check(src, repo):
                 "lib.rs", "main.rs"):
                 problems.append(f"{rel}:{n + 1}: unexpected ak_test_shard form "
                                 "(use exactly #[cfg(ak_test_shard = \"<shard>\")])")
+    for rel, n in pub_async_in_test_code(src, modules):
+        problems.append(f"{rel}:{n + 1}: `pub async fn` in test code: make it "
+                        "`pub(crate) async fn` (`apply` does)")
     for where in stray:
         problems.append(f"{where}: test attribute outside any #[cfg(test)] mod -- it "
                         "would run in EVERY shard; move it into a test module")
@@ -501,6 +582,8 @@ def cmd_check(src, repo):
         print(f"test-shards: {len(problems)} problem(s):")
         for p in problems:
             print(f"  {p}")
+        if any("`pub async fn` in test code" in p for p in problems):
+            print(f"Why `pub(crate)`: {PUB_ASYNC_WHY}.")
         print("Module attributes: fix with `python3 scripts/ci/test-shards.py apply`.\n"
               "Shard lists (Cargo.toml, build.rs, ci.yml): edit them to match SHARDS.")
         return 1
@@ -514,7 +597,7 @@ def cmd_check(src, repo):
 def cmd_filter(src, shard):
     """The nextest filterset for `shard`'s leg. Every shard build compiles
     every ungated test module; this keeps each one's tests to the single
-    leg `plan` assigns it. `kind(lib)`, and main.rs left out: the
+    leg `plan` assigns it. `kind(lib)`, and the bin targets left out: the
     bin-target tests are built and run in one leg only (BIN_SHARD) whatever
     their gate."""
     if shard not in SHARDS:
@@ -522,7 +605,7 @@ def cmd_filter(src, shard):
         return 2
     modules, _stray, per_file = scan(src)
     skip = sorted(it["path"] for it in plan(modules, per_file).values()
-                  if it["run"] != shard and it["mod"]["file"] != "main.rs"
+                  if it["run"] != shard and not is_bin(it["mod"]["file"])
                   and shard_attr_of(per_file[it["mod"]["file"]][0], it["mod"])[1] is None)
     if not skip:
         print("all()")
@@ -535,7 +618,7 @@ def cmd_filter(src, shard):
 def cmd_apply(src):
     modules, stray, per_file = scan(src)
     info = plan(modules, per_file)
-    changed = 0
+    changed = set()
     by_file = {}
     for mod in modules:
         by_file.setdefault(mod["file"], []).append(mod)
@@ -559,8 +642,22 @@ def cmd_apply(src):
         if edits:
             with open(os.path.join(src, rel), "w", encoding="utf-8") as fh:
                 fh.write("\n".join(lines))
-            changed += 1
-    print(f"test-shards: updated {changed} file(s)")
+            changed.add(rel)
+    # After the attribute edits (which shift lines), so rescan.
+    modules, _stray, _per_file = scan(src)
+    by_rel = {}
+    for rel, n in pub_async_in_test_code(src, modules):
+        by_rel.setdefault(rel, []).append(n)
+    for rel, idxs in by_rel.items():
+        path = os.path.join(src, rel)
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().split("\n")
+        for n in idxs:
+            lines[n] = re.sub(r"^(\s*)pub(\s)", r"\1pub(crate)\2", lines[n], count=1)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines))
+        changed.add(rel)
+    print(f"test-shards: updated {len(changed)} file(s); run `cargo fmt` after it")
     for where in stray:
         print(f"  WARNING {where}: test outside any #[cfg(test)] mod (not handled)")
     return 0

@@ -556,6 +556,29 @@ const ALLOWLIST: &[(&str, &str, &str, usize, &str)] = &[
          16/18 (heap and TOAST relfilenodes unchanged, verified); the lock is \
          taken with a 5s lock_timeout and retried",
     ),
+    (
+        "385_packages_version_text_columns.sql",
+        KIND_COLUMN_REWRITE,
+        "packages",
+        1,
+        "version VARCHAR(128) -> TEXT so a 150-character PyPI version cannot \
+         fail the best-effort catalog upsert and silently drop the version from \
+         the listing (#5641). Binary coercible with no USING clause, and \
+         `packages` has no index on `version` (its UNIQUE constraint is \
+         (repository_id, name), 113), so it is catalog-only on PG 16/18 (heap \
+         and TOAST relfilenodes unchanged, verified); the lock is taken with a \
+         5s lock_timeout and retried",
+    ),
+    (
+        "385_packages_version_text_columns.sql",
+        KIND_COLUMN_REWRITE,
+        "package_versions",
+        1,
+        "same VARCHAR(128) -> TEXT widening on package_versions.version; the \
+         UNIQUE btree index (package_id, version) keeps its relfilenode, so it \
+         is catalog-only on PG 16/18 (#5641). Bounded by the same 5s \
+         lock_timeout and retry",
+    ),
 ];
 
 /// Blank out `--` line comments, `/* … */` block comments and `'…'` string
