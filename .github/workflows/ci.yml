@@ -810,14 +810,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler pkg-config libssl-dev mingw-w64
 
-      # Its own key: the artifacts are for another target, and sharing
-      # clippy's entry would make each job evict the other's. Saved only
-      # from main and release/** pushes, as for every rust-cache here.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          prefix-key: v2-rust
-          shared-key: windows-check
-          save-if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
+      # No rust-cache, on purpose. The repo cache is over its 10 GiB quota,
+      # so a windows-check entry would evict release.yml's cli-* entries
+      # (least recently used) and make release builds cold (#6218). Most main
+      # pushes skip the Rust jobs anyway, so the entry would rarely be fresh.
+      # A cold check is ~5-15 min, in parallel, off the critical path.
 
       # The workspace crate's rustc is the one heavy step here, as in
       # check-rust, whose cgroup peaks at ~15 GiB on the same VM. Same
@@ -3634,8 +3631,8 @@ jobs:
           fi
           # The `changes` job found nothing a Rust job reads (a CI-only PR),
           # or, on a push, a merged PR already proved this exact tree green.
-          # Same allowance as the bump path: check-rust and test-backend-unit
-          # may skip; shell-tests and security-audit still run and must
+          # Same allowance as the bump path: check-rust, windows-cross-check
+          # and test-backend-unit may skip; shell-tests and security-audit still run and must
           # succeed. Only an explicit "false" counts -- an empty output (the
           # gate died) makes a skip fatal, matching the jobs' own fail-open
           # `!= 'false'` condition.
@@ -3658,7 +3655,7 @@ jobs:
             elif [[ "$result" == "skipped" && "$bump_only" == "true" \
                     && ( "$name" == "check-rust" || "$name" == "windows-cross-check" \
                          || "$name" == "test-backend-unit" ) ]]; then
-              # Only the two heavy Rust jobs are skippable on the bump path.
+              # Only the heavy Rust jobs are skippable on the bump path.
               # shell-tests and security-audit still run and must succeed.
               echo "⏭️ $name (version-bump-only release PR)" >> "$GITHUB_STEP_SUMMARY"
             elif [[ "$result" == "skipped" && "$rust_skipped" == "true" \
