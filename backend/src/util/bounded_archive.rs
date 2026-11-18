@@ -546,6 +546,9 @@ fn acquire_ingest_extraction_keyed(
 // 32 + (8 + 32) / 4 * 8 = 112 parked requests, well under
 // `GLOBAL_MAX_CONCURRENCY` (512); one principal is further held to
 // `UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL` (64).
+// The 112 assumes the default per-repo cap of 4: with a lower per-repo cap and
+// both queue ceilings the formula can exceed `GLOBAL_MAX_CONCURRENCY` (512),
+// which still bounds it.
 //
 // Only the async seam waits. The synchronous `with_ingest_extraction` /
 // `acquire_ingest_extraction` cannot wait without blocking a runtime worker,

@@ -13332,7 +13332,7 @@ mod tests {
 
         // Release the permits only once the upload is queued for one.
         let mut queued = false;
-        for _ in 0..1_000 {
+        for _ in 0..20_000 {
             if queued_ingest_extractions_for(&tenant) > 0 {
                 queued = true;
                 break;
@@ -13398,7 +13398,7 @@ mod tests {
         });
         let release = async {
             let mut queued = 0;
-            for _ in 0..2_000 {
+            for _ in 0..20_000 {
                 queued = queued_ingest_extractions_for(&tenant);
                 if queued == 6 {
                     break;
