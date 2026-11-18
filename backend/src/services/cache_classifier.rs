@@ -1056,11 +1056,10 @@ pub fn is_version_listing(format: &RepositoryFormat, path: &str) -> bool {
     let lower = path.trim_start_matches('/').to_ascii_lowercase();
     match format {
         RepositoryFormat::Npm | RepositoryFormat::Yarn | RepositoryFormat::Pnpm => {
-            !lower.is_empty() && !lower.ends_with(".tgz")
+            is_npm_packument_path(&lower)
         }
         RepositoryFormat::Pypi | RepositoryFormat::Poetry | RepositoryFormat::Jupyter => {
-            (lower == "simple" || lower.starts_with("simple/"))
-                && !is_pypi_package_file(leaf(&lower), true)
+            is_pypi_simple_page_path(&lower)
         }
         RepositoryFormat::Maven | RepositoryFormat::Gradle | RepositoryFormat::Sbt => {
             leaf(&lower).starts_with("maven-metadata.xml")
@@ -1068,6 +1067,34 @@ pub fn is_version_listing(format: &RepositoryFormat, path: &str) -> bool {
         RepositoryFormat::Cargo => {
             is_cargo_sparse_index_path(lower.strip_prefix("index/").unwrap_or(&lower))
         }
+        _ => false,
+    }
+}
+
+/// A packument key: `<name>`, `@scope/<name>` or `@scope%2f<name>`, with no
+/// `-` segment. Positive on purpose (#5933): a tarball (`<name>/-/<file>`),
+/// a registry endpoint (`-/...`) or any other shape stays under the hold.
+fn is_npm_packument_path(lower: &str) -> bool {
+    let valid_name = |name: &str| !name.is_empty() && name != "-" && !name.ends_with(".tgz");
+    match lower.split('/').collect::<Vec<_>>().as_slice() {
+        [name] => valid_name(name) && !name.starts_with('-'),
+        [scope, name] => scope.len() > 1 && scope.starts_with('@') && valid_name(name),
+        _ => false,
+    }
+}
+
+/// A PEP 503 simple page or its PEP 691 JSON sibling: `simple`, `simple/`,
+/// `simple/<project>`, `simple/<project>/`, and `simple/index.v1+json` or
+/// `simple/<project>/index.v1+json`. Positive on purpose (#5933): any other
+/// file under `simple/<project>/`, whatever its extension, stays under the
+/// hold.
+fn is_pypi_simple_page_path(lower: &str) -> bool {
+    const JSON: &str = "index.v1+json";
+    let project = |p: &str| !p.is_empty() && p != JSON && !is_pypi_package_file(p, true);
+    match lower.split('/').collect::<Vec<_>>().as_slice() {
+        ["simple"] | ["simple", ""] | ["simple", "index.v1+json"] => true,
+        ["simple", p] | ["simple", p, ""] => project(p),
+        ["simple", p, leaf] => project(p) && *leaf == JSON,
         _ => false,
     }
 }
@@ -1195,6 +1222,11 @@ mod tests {
             (RepositoryFormat::Pypi, "simple/requests/"),
             (RepositoryFormat::Pypi, "simple/"),
             (RepositoryFormat::Poetry, "/simple/flask/"),
+            (RepositoryFormat::Pypi, "simple"),
+            (RepositoryFormat::Pypi, "simple/requests"),
+            (RepositoryFormat::Pypi, "simple/index.v1+json"),
+            (RepositoryFormat::Pypi, "simple/requests/index.v1+json"),
+            (RepositoryFormat::Npm, "@types/node"),
             (
                 RepositoryFormat::Maven,
                 "org/example/app/maven-metadata.xml",
@@ -1217,6 +1249,20 @@ mod tests {
             (RepositoryFormat::Npm, "lodash/-/lodash-4.17.21.tgz"),
             (RepositoryFormat::Npm, "@babel/core/-/core-8.0.0.tgz"),
             (RepositoryFormat::Npm, ""),
+            // Positive rules (#5933): these used to fail open.
+            (RepositoryFormat::Npm, "lodash/-/lodash-4.17.21.tar.gz"),
+            (RepositoryFormat::Npm, "lodash/-/lodash-4.17.21"),
+            (RepositoryFormat::Npm, "@scope/pkg/-/pkg-1.0.0.bin"),
+            (RepositoryFormat::Npm, "-/npm/v1/security/advisories/bulk"),
+            (RepositoryFormat::Npm, "-/v1/search"),
+            (RepositoryFormat::Npm, "pkg/download/pkg-1.0.0"),
+            (RepositoryFormat::Pypi, "simple/foo/foo-1.0.tar.xz"),
+            (RepositoryFormat::Pypi, "simple/foo/foo-1.0.exe"),
+            (RepositoryFormat::Pypi, "simple/foo/foo-1.0.msi"),
+            (RepositoryFormat::Pypi, "simple/foo/foo-1.0-1.noarch.rpm"),
+            (RepositoryFormat::Pypi, "simple/foo/sub/foo-1.0.tar.gz"),
+            (RepositoryFormat::Pypi, "simple//"),
+            (RepositoryFormat::Poetry, "simple/foo/foo-1.0.tar.xz"),
             (
                 RepositoryFormat::Pypi,
                 "packages/ab/cd/requests-2.32.0.tar.gz",
