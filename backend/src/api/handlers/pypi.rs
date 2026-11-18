@@ -3859,6 +3859,11 @@ static RESOLVER_INDEX_MEMO: Lazy<
 /// Only successful reads are memoized — an upstream error must not be pinned
 /// for the window, and the negative-cache behaviour of the fetch path is left
 /// exactly as it was.
+///
+/// Concurrent cold misses for one key share a single upstream read (#5983),
+/// `uv` and pip ask for several sidecars of one project at once. The request
+/// that did the read keeps its own error, the ones that waited on it get
+/// [`shared_resolver_index_error`]
 async fn fetch_resolver_index(
     proxy: &crate::services::proxy_service::ProxyService,
     repo_id: uuid::Uuid,
@@ -3872,26 +3877,43 @@ async fn fetch_resolver_index(
         normalized.to_string(),
         upstream_index_path.to_string(),
     );
-    if let Some(hit) = RESOLVER_INDEX_MEMO.get(&key).await {
-        return Ok((hit.0.clone(), hit.1.clone()));
-    }
-
-    let (index_bytes, _ct, effective_url) = proxy_helpers::proxy_fetch_uncached(
-        proxy,
-        repo_id,
-        repo_key,
-        effective_upstream,
-        upstream_index_path,
-    )
-    .await?;
-
-    RESOLVER_INDEX_MEMO
-        .insert(
-            key,
-            std::sync::Arc::new((index_bytes.clone(), effective_url.clone())),
-        )
+    let mut leader_error: Option<Response> = None;
+    let read = RESOLVER_INDEX_MEMO
+        .try_get_with(key, async {
+            match proxy_helpers::proxy_fetch_uncached(
+                proxy,
+                repo_id,
+                repo_key,
+                effective_upstream,
+                upstream_index_path,
+            )
+            .await
+            {
+                Ok((index_bytes, _ct, effective_url)) => {
+                    Ok(std::sync::Arc::new((index_bytes, effective_url)))
+                }
+                Err(resp) => {
+                    let status = resp.status();
+                    leader_error = Some(resp);
+                    Err(status)
+                }
+            }
+        })
         .await;
-    Ok((index_bytes, effective_url))
+    match read {
+        Ok(hit) => Ok((hit.0.clone(), hit.1.clone())),
+        Err(status) => Err(leader_error.unwrap_or_else(|| shared_resolver_index_error(*status))),
+    }
+}
+
+/// Error for a request that waited on another request's failed index read
+fn shared_resolver_index_error(status: StatusCode) -> Response {
+    let body = if status == StatusCode::NOT_FOUND {
+        "Artifact not found upstream"
+    } else {
+        "Upstream index fetch failed"
+    };
+    (status, body).into_response()
 }
 
 /// Resolve the real download URL for a file hosted by a remote PyPI
@@ -3952,15 +3974,6 @@ async fn resolve_pypi_remote_fetch_target(
     let file_url = find_upstream_url_for_file(&index_html, filename, Some(&full_index_url))
         .or_else(|| find_upstream_metadata_url(&index_html, filename, Some(&full_index_url)));
 
-    let fallback = || {
-        let (base, path) = pypi_upstream_url_and_path(
-            upstream_url,
-            &format!("{}/{}", normalized, filename),
-            index_path,
-        );
-        (base, path)
-    };
-
     // Validate resolved URL against SSRF before making the outbound request.
     // A malicious upstream index could contain hrefs pointing to internal
     // addresses (169.254.169.254, localhost, Docker service names, etc.).
@@ -3990,7 +4003,7 @@ async fn resolve_pypi_remote_fetch_target(
 
     let (fetch_base, fetch_path) = match file_url.as_deref().and_then(split_url_base_and_path) {
         Some(pair) => pair,
-        None => fallback(),
+        None => pypi_direct_file_location(upstream_url, project, filename, index_path),
     };
 
     // GHSA-qxv7-p3mq-88fv: the same index page that vouched for the download
@@ -4007,6 +4020,41 @@ async fn resolve_pypi_remote_fetch_target(
         cache_path,
         expected_sha256,
     })
+}
+
+/// The conventional `{index}/{project}/{filename}` location of a file on a
+/// PyPI upstream, used when the simple index names no download URL for it
+fn pypi_direct_file_location(
+    upstream_url: &str,
+    project: &NormalizedProjectName,
+    filename: &str,
+    index_path: &str,
+) -> (String, String) {
+    let normalized = PypiHandler::normalize_name(project.as_str());
+    pypi_upstream_url_and_path(
+        upstream_url,
+        &format!("{}/{}", normalized, filename),
+        index_path,
+    )
+}
+
+/// The fetch target for a file whose proxy-cache entry is fresh (#5875). The
+/// fetch is answered from the cache, so the simple index is not read and no
+/// index digest is pinned
+fn pypi_cached_fetch_target(
+    upstream_url: &str,
+    project: &NormalizedProjectName,
+    filename: &str,
+    index_path: &str,
+) -> PypiRemoteFetchTarget {
+    let (fetch_base, fetch_path) =
+        pypi_direct_file_location(upstream_url, project, filename, index_path);
+    PypiRemoteFetchTarget {
+        fetch_base,
+        fetch_path,
+        cache_path: build_pypi_proxy_cache_path(project, filename),
+        expected_sha256: None,
+    }
 }
 
 /// #1555: presigned-redirect fast path for a fresh proxy-cache hit on a remote
@@ -4235,6 +4283,30 @@ async fn serve_scanned_pypi_file(
     ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
 ) -> Result<Response, Response> {
     let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
+    // #5875: a fresh cached file is served without reading the simple index,
+    // so a cached wheel stays downloadable while the index is unreachable. The
+    // scan gate still runs on the cached bytes and their digest. An entry
+    // evicted between this probe and the fetch makes the direct location miss
+    // upstream, and that miss goes through the index like a cold pull
+    let scan = PypiScanRequest {
+        repo_id,
+        repo_key,
+        upstream_url,
+        project,
+        filename,
+        index_path: &index_path,
+        action,
+        severity_gate,
+        ctx,
+    };
+    let cache_path = build_pypi_proxy_cache_path(project, filename);
+    if proxy.is_cache_fresh(repo_key, &cache_path).await {
+        let target = pypi_cached_fetch_target(upstream_url, project, filename, &index_path);
+        match serve_scanned_pypi_target(state, proxy, &scan, &target).await {
+            Err(resp) if resp.status() == StatusCode::NOT_FOUND => {}
+            served => return served,
+        }
+    }
     let target = resolve_pypi_remote_fetch_target(
         proxy,
         repo_id,
@@ -4245,6 +4317,39 @@ async fn serve_scanned_pypi_file(
         &index_path,
     )
     .await?;
+    serve_scanned_pypi_target(state, proxy, &scan, &target).await
+}
+
+/// One scanned PyPI file request, whatever target it is fetched from
+struct PypiScanRequest<'a> {
+    repo_id: uuid::Uuid,
+    repo_key: &'a str,
+    upstream_url: &'a str,
+    project: &'a NormalizedProjectName,
+    filename: &'a str,
+    index_path: &'a str,
+    action: crate::services::proxy_scan_service::ProxyScanAction,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
+    ctx: Option<&'a crate::api::middleware::download_telemetry::DownloadContext>,
+}
+
+async fn serve_scanned_pypi_target(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    scan: &PypiScanRequest<'_>,
+    target: &PypiRemoteFetchTarget,
+) -> Result<Response, Response> {
+    let PypiScanRequest {
+        repo_id,
+        repo_key,
+        upstream_url,
+        project,
+        filename,
+        index_path,
+        action,
+        severity_gate,
+        ctx,
+    } = *scan;
     let req = proxy_helpers::ScannedProxyRequest {
         repo_id,
         repo_key,
@@ -4261,7 +4366,7 @@ async fn serve_scanned_pypi_file(
         proxy,
         upstream_url,
         project,
-        index_path: &index_path,
+        index_path,
     };
     proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
 }
@@ -17096,6 +17201,97 @@ mod tests {
         );
     }
 
+    /// #5983: four cold sidecars of one project requested at once read the
+    /// simple index once, not once each. The index answers slowly so all four
+    /// are in flight before the first read lands
+    #[tokio::test]
+    async fn test_resolver_index_concurrent_cold_misses_share_one_read_5983() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+
+        let project = "fanout5983";
+        let wheels: Vec<String> = (1..=4)
+            .map(|i| format!("fanout5983-1.{i}-py3-none-any.whl"))
+            .collect();
+        let anchors: String = wheels
+            .iter()
+            .map(|w| {
+                format!(
+                    "<a href=\"/packages/{w}\" data-dist-info-metadata=\"sha256=deadbeef\">{w}</a>"
+                )
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(format!("<html><body>{anchors}</body></html>"))
+                    .set_delay(std::time::Duration::from_millis(300)),
+            )
+            .mount(&upstream)
+            .await;
+        for w in &wheels {
+            Mock::given(method("GET"))
+                .and(path(format!("/packages/{w}.metadata")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(format!("Metadata-Version: 2.1\nName: {w}\n")),
+                )
+                .mount(&upstream)
+                .await;
+        }
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let send = |w: &str| {
+            tdh::send_with_headers(
+                tdh::router_anon(super::router(), state.clone()),
+                tdh::get(format!("/{}/simple/{project}/{w}.metadata", fx.repo_key)),
+            )
+        };
+        let (a, b, c, d) = tokio::join!(
+            send(&wheels[0]),
+            send(&wheels[1]),
+            send(&wheels[2]),
+            send(&wheels[3])
+        );
+        let reads = upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == format!("/simple/{project}/"))
+            .count();
+
+        fx.teardown().await;
+
+        for (status, body, _) in [&a, &b, &c, &d] {
+            assert_eq!(
+                *status,
+                StatusCode::OK,
+                "body: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        assert_eq!(
+            reads, 1,
+            "concurrent cold sidecars must share one index read"
+        );
+    }
+
+    #[test]
+    fn test_shared_resolver_index_error_keeps_status_5983() {
+        let not_found = shared_resolver_index_error(StatusCode::NOT_FOUND);
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+        let unavailable = shared_resolver_index_error(StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     /// #3356 item 3. The #3333 regression test above covers the HANDLER half of
     /// the #3300 fix (probe ahead of target resolution) but not the CLASSIFIER
     /// half: its warm request follows its cold one within milliseconds, so a
@@ -19932,6 +20128,244 @@ mod tests {
             "a verdict-backed serve must be marked clean, not pending"
         );
         assert_eq!(&body[..], wheel);
+    }
+
+    // #5875: a scanning Remote answers a fresh cached file without reading
+    // the simple index, so a cached wheel survives an upstream outage. The
+    // resolver index read is memoised for 30 s after a success, the tests drop
+    // that entry to stand for an outage that outlasts it
+
+    async fn forget_resolver_index(repo_id: uuid::Uuid, project: &str) {
+        RESOLVER_INDEX_MEMO
+            .invalidate(&(repo_id, project.to_string(), format!("simple/{project}/")))
+            .await;
+    }
+
+    async fn take_upstream_down(upstream: &wiremock::MockServer) {
+        use wiremock::{matchers::any, Mock, ResponseTemplate};
+        upstream.reset().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(503))
+            .mount(upstream)
+            .await;
+    }
+
+    async fn index_reads(upstream: &wiremock::MockServer, project: &str) -> usize {
+        let index = format!("/simple/{project}/");
+        upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == index)
+            .count()
+    }
+
+    async fn seed_clean_proxy_verdict(
+        pool: &sqlx::PgPool,
+        digest: &str,
+        repo_id: uuid::Uuid,
+        project: &str,
+    ) {
+        crate::services::proxy_scan_service::ProxyScanService::new(pool.clone())
+            .record_verdict(
+                digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-1.0.0-test"),
+                Some(repo_id),
+            )
+            .await
+            .expect("seed clean verdict");
+        crate::api::handlers::test_db_helpers::pin_proxy_verdict(
+            pool,
+            digest,
+            &crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Python,
+                project,
+                "1.0.0",
+            ),
+        )
+        .await;
+    }
+
+    async fn read_scanned_serve(
+        result: Result<Response, Response>,
+    ) -> (StatusCode, Option<String>, Bytes) {
+        let resp = result.unwrap_or_else(|r| r);
+        let status = resp.status();
+        let scan = resp
+            .headers()
+            .get("X-AK-Scan")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .unwrap_or_default();
+        (status, scan, body)
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_serves_fresh_cache_with_index_down_5875() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "cachedpkg";
+        let filename = "cachedpkg-1.0.0-py3-none-any.whl";
+        let wheel: &'static [u8] = b"PK\x03\x04 cachedpkg-wheel-5875";
+        let digest = sha256_hex(&Bytes::from_static(wheel));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+        seed_clean_proxy_verdict(&fx.pool, &digest, fx.repo_id, project).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+        let name = proj(project);
+        let ctx = Default::default();
+
+        let warm = read_scanned_serve(
+            super::serve_file(
+                &state,
+                &repo_info,
+                &fx.repo_key,
+                &name,
+                filename,
+                None,
+                &ctx,
+            )
+            .await,
+        )
+        .await;
+        take_upstream_down(&upstream).await;
+        forget_resolver_index(fx.repo_id, project).await;
+        let cached = read_scanned_serve(
+            super::serve_file(
+                &state,
+                &repo_info,
+                &fx.repo_key,
+                &name,
+                filename,
+                None,
+                &ctx,
+            )
+            .await,
+        )
+        .await;
+        let reads = index_reads(&upstream, project).await;
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .ok();
+        fx.teardown().await;
+
+        assert_eq!(warm.0, StatusCode::OK, "the first pull warms the cache");
+        assert_eq!(
+            cached.0,
+            StatusCode::OK,
+            "a fresh cached wheel must serve while the index is down"
+        );
+        assert_eq!(
+            cached.1.as_deref(),
+            Some("clean"),
+            "the scan gate still ran"
+        );
+        assert_eq!(&cached.2[..], wheel);
+        assert_eq!(reads, 0, "a fresh cache hit must not read the simple index");
+    }
+
+    #[tokio::test]
+    async fn test_virtual_serve_file_serves_fresh_member_cache_with_index_down_5875() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "vcachedpkg";
+        let filename = "vcachedpkg-1.0.0-py3-none-any.whl";
+        let wheel: &'static [u8] = b"PK\x03\x04 vcachedpkg-wheel-5875";
+        let digest = sha256_hex(&Bytes::from_static(wheel));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        let (member_id, _member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+        enable_proxy_scan(&fx.pool, member_id, "fail_open").await;
+        seed_clean_proxy_verdict(&fx.pool, &digest, member_id, project).await;
+
+        let virtual_info = fx.repo_info("virtual", None);
+        let name = proj(project);
+        let ctx = Default::default();
+
+        let warm = read_scanned_serve(
+            super::serve_file(
+                &state,
+                &virtual_info,
+                &fx.repo_key,
+                &name,
+                filename,
+                None,
+                &ctx,
+            )
+            .await,
+        )
+        .await;
+        take_upstream_down(&upstream).await;
+        forget_resolver_index(member_id, project).await;
+        let cached = read_scanned_serve(
+            super::serve_file(
+                &state,
+                &virtual_info,
+                &fx.repo_key,
+                &name,
+                filename,
+                None,
+                &ctx,
+            )
+            .await,
+        )
+        .await;
+        let reads = index_reads(&upstream, project).await;
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .ok();
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            warm.0,
+            StatusCode::OK,
+            "the first pull warms the member cache"
+        );
+        assert_eq!(
+            cached.0,
+            StatusCode::OK,
+            "a fresh cached member wheel must serve through the Virtual while the index is down"
+        );
+        assert_eq!(
+            cached.1.as_deref(),
+            Some("clean"),
+            "the scan gate still ran"
+        );
+        assert_eq!(&cached.2[..], wheel);
+        assert_eq!(reads, 0, "a fresh cache hit must not read the simple index");
     }
 
     // -----------------------------------------------------------------------

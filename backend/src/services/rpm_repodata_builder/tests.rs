@@ -356,6 +356,62 @@ async fn fold_marks_drops_marks_predating_the_build_5128() {
         .unwrap();
 }
 
+/// The production fold (`fold_marks`, the non-waiting path every tick runs)
+/// checks the queue before opening its transaction. A queued mark must still
+/// be folded through that path, with the root's `dirty_since` set to the
+/// mark's own `marked_at`, so the early exit cannot move the debounce.
+#[tokio::test]
+async fn tick_fold_still_folds_a_queued_mark_after_the_empty_check() {
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    let marked: DateTime<Utc> = sqlx::query_scalar(
+        "INSERT INTO rpm_repodata_dirty (repository_id, root, marked_at) \
+         VALUES ($1, '', now() - interval '5 seconds') RETURNING marked_at",
+    )
+    .bind(f.repo_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    // `fold_marks` skips (returns 0) while another test's fold holds the
+    // fold lock, and can hit its 1 s `lock_timeout` behind another test's
+    // claim, exactly as a replica would; retry the way the next tick does.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let dirty = loop {
+        let _ = fold_marks(&f.pool).await;
+        let dirty: Option<Option<DateTime<Utc>>> = sqlx::query_scalar(
+            "SELECT dirty_since FROM rpm_repodata_roots \
+              WHERE repository_id = $1 AND root = ''",
+        )
+        .bind(f.repo_id)
+        .fetch_optional(&f.pool)
+        .await
+        .unwrap();
+        if let Some(Some(d)) = dirty {
+            break d;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "queued mark never folded"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(dirty, marked, "dirty_since is the mark's own time");
+    let left: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM rpm_repodata_dirty WHERE repository_id = $1")
+            .bind(f.repo_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(left, 0, "the mark was consumed");
+    f.teardown().await;
+    sqlx::query("DELETE FROM rpm_repodata_roots WHERE repository_id = $1")
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+}
+
 /// Heal bookkeeping does not dirty a root; any other metadata change does.
 /// A change the triggers missed is found by the reconcile (#4544).
 #[tokio::test]

@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Extension;
@@ -1271,10 +1271,27 @@ async fn maven_remote_stream(
         };
         // #4573: the cached `.sha1` is read alongside the content open, not
         // after it (the #3982/#4289 rule), and from the cache only.
-        let (result, sha1) = tokio::join!(
-            content,
-            maven_remote_sha1(proxy, repo_id, repo_key, upstream_url, path, is_head),
-        );
+        //
+        // #6069: both reach the Remote's origin gate; inside this memo the
+        // sidecar read reuses the content fetch's pass instead of looking the
+        // Remote up and loading its policies again. The scope is this pair
+        // only: the sidecar decides nothing but the checksum header on a body
+        // the content fetch's own gate already decided. Boxed: the pair's
+        // future would otherwise sit inline in this handler's, which is already
+        // near the layout depth the proxy fetch boxes against.
+        let pair = Box::pin(async {
+            tokio::join!(
+                content,
+                maven_remote_sha1(proxy, repo_id, repo_key, upstream_url, path, is_head),
+            )
+        });
+        // GET only: a HEAD's fall-back GET and its cold `.sha1` fetch contact
+        // the upstream and commit to the cache, so a HEAD evaluates every time.
+        let (result, sha1) = if is_head {
+            pair.await
+        } else {
+            crate::services::proxy_service::ProxyService::with_origin_gate_memo(pair).await
+        };
         let result = result.map_err(IntoResponse::into_response)?;
         let mut response = proxy_helpers::build_streaming_response_with_disposition(
             result,
@@ -2952,7 +2969,16 @@ async fn download(
     // honours the client's `Range` through the shared helper (#5668): a
     // segmented download (Maven Resolver's, a download manager's) of a
     // 200-with-the-whole-body otherwise stitches the file together wrong.
-    let served = serve_artifact(&state, &repo, &repo_key, &path, auth.as_ref(), &ctx).await?;
+    let served = serve_artifact(
+        &state,
+        &repo,
+        &repo_key,
+        &path,
+        auth.as_ref(),
+        &headers,
+        &ctx,
+    )
+    .await?;
     proxy_helpers::apply_range_to_streamed_serve(served, &headers, ctx.is_head)
 }
 
@@ -3580,14 +3606,16 @@ const MAVEN_PREFIXES_PATH: &str = ".meta/prefixes.txt";
 
 /// Fetch and parse one virtual member's `.meta/prefixes.txt`.
 ///
-/// `Ok(Some(lines))`: member answered with a valid `2.0` body.
-/// `Ok(None)`: member answered 404 — it genuinely publishes no prefixes file,
-/// contributes nothing to the union, and that's fine (#3382 review finding 2).
-/// `Err`: anything else — timeout, 5xx, non-UTF8, or the upstream's own
-/// `@ unsupported` marker (RRF's "I can't answer", not "I have nothing" —
-/// finding 2 and finding 10's "turns 'I can't answer' into 'I have nothing'"
-/// are the same bug). The full set can't be determined, so the caller must
-/// bail rather than publish a partial union.
+/// `Ok(lines)`: member answered with a valid `2.0` body.
+/// `Err`: the union cannot be completed. That is the member having no
+/// upstream/proxy configured, answering 404, timing out, answering 5xx or
+/// non-UTF8, or carrying the upstream's own `@ unsupported` marker (RRF's "I
+/// can't answer", not "I have nothing" — #3382 findings 2 and 10). A 404 is
+/// included because a Remote that publishes no prefix file can serve ANY
+/// groupId: its contribution is unknowable, not empty, and merging the other
+/// members alone would publish an allowlist that denies everything behind it
+/// (#5743). In every case the caller must bail rather than publish a partial
+/// union.
 ///
 /// Caps the buffer at [`proxy_helpers::DEFAULT_METADATA_MAX_BYTES`] (8 MiB),
 /// not the artifact-sized [`proxy_helpers::LARGE_METADATA_MAX_BYTES`] (128
@@ -3596,7 +3624,7 @@ const MAVEN_PREFIXES_PATH: &str = ".meta/prefixes.txt";
 async fn fetch_remote_member_prefixes(
     state: &SharedState,
     member: &crate::models::repository::Repository,
-) -> Result<Option<Vec<String>>, Response> {
+) -> Result<Vec<String>, Response> {
     let unavailable =
         || AppError::NotFound("Prefix file not available".to_string()).into_response();
     let upstream_url = member.upstream_url.as_deref().ok_or_else(unavailable)?;
@@ -3618,11 +3646,11 @@ async fn fetch_remote_member_prefixes(
     match fetched {
         Ok((content, _, _permit)) => {
             let text = std::str::from_utf8(&content).map_err(|_| unavailable())?;
-            parse_member_prefixes_body(text)
-                .map(Some)
-                .ok_or_else(unavailable)
+            parse_member_prefixes_body(text).ok_or_else(unavailable)
         }
-        Err(resp) if resp.status() == StatusCode::NOT_FOUND => Ok(None),
+        // A 404 used to read as "contributes nothing". It does not: bail with
+        // the member's response, exactly like any other member failure, so the
+        // virtual answers 404 and Maven Resolver does not filter (#5743).
         Err(resp) => Err(resp),
     }
 }
@@ -3673,10 +3701,12 @@ fn parse_prefixes_lines(text: &str) -> Vec<String> {
 
 /// The three ways [`fetch_maven_prefixes_bytes_uncached`] fails.
 enum PrefixesError {
-    /// Locally-decided "no complete answer" (unknown repo_type, or an
-    /// upstream/remote-member unavailability that leaves the virtual union
-    /// incomplete), or a complete set that is empty (#5668). Cacheable: a
-    /// publish invalidates the entry.
+    /// Locally-decided "no complete answer" (unknown repo_type, or the
+    /// fail-closed Virtual-member guard), or a complete set that is empty
+    /// (#5668). A Remote member that cannot answer — including one whose
+    /// upstream answers 404 (#5743) — passes its own `Response` through as
+    /// `Proxied` instead, so it is not cached. Cacheable: a publish
+    /// invalidates the entry.
     NotFound(String),
     /// A DB error from `collect_local_group_prefixes`. `sqlx::Error` isn't
     /// `Clone`, so it's stringified at the call site — the same information
@@ -3786,12 +3816,14 @@ async fn fetch_maven_prefixes_bytes(
 /// the union of members' prefixes (Local/Staging members generated from
 /// stored groupIds, Remote members proxied) and refuse to publish a partial
 /// union (#3382 review findings 2/3); Local/Staging repos generate it from
-/// their own stored groupIds. An unrecognized `repo_type` fails closed
-/// (finding 4) instead of falling through to the hosted generator. A
-/// COMPLETE-but-empty set (a hosted repo with no artifacts yet, or a virtual
-/// whose members all confirmably contributed nothing) is 404 as well, since a
-/// header-only file denies every path (#5668); see
-/// [`prefixes_or_not_published`].
+/// their own stored groupIds. A Remote member that publishes no prefix file
+/// can serve any groupId, so its absence makes the union unknowable too and
+/// the virtual bails rather than list the other members alone (#5743). An
+/// unrecognized `repo_type` fails closed (finding 4) instead of falling
+/// through to the hosted generator. A COMPLETE-but-empty set (a hosted repo
+/// with no artifacts yet, or a virtual whose members all confirmably
+/// contributed nothing) is 404 as well, since a header-only file denies every
+/// path (#5668); see [`prefixes_or_not_published`].
 async fn fetch_maven_prefixes_bytes_uncached(
     state: &SharedState,
     repo: &RepoInfo,
@@ -3847,21 +3879,19 @@ async fn fetch_maven_prefixes_bytes_uncached(
                         )),
                         _ => collect_local_group_prefixes(&state.db, member.id)
                             .await
-                            .map(Some)
                             .map_err(|e| PrefixesError::Db(e.to_string())),
                     }
                 }))
                 .await;
                 for result in batch {
-                    // A member that ERRORED (unknown/timeout/`@ unsupported`)
-                    // already returned `Err` above and bailed the whole merge
-                    // via `?` — this loop only ever sees confirmed
-                    // contributions, including a confirmed-empty one, so an
-                    // empty `prefixes` here means the union is COMPLETE and
-                    // genuinely has nothing, not that it's incomplete.
-                    if let Some(lines) = result? {
-                        prefixes.extend(lines);
-                    }
+                    // A member that could not answer (unknown/timeout/5xx/
+                    // `@ unsupported`/404) already returned `Err` above and
+                    // bailed the whole merge via `?` — this loop only ever
+                    // sees members that confirmed their contribution,
+                    // including a hosted member that confirmed it has none,
+                    // so an empty `prefixes` here means the union is COMPLETE
+                    // and genuinely has nothing, not that it's incomplete.
+                    prefixes.extend(result?);
                 }
             }
             // A complete-but-empty union is 404 too (#5668): a header-only
@@ -4108,6 +4138,7 @@ async fn serve_artifact(
     repo_key: &str,
     path: &str,
     auth: Option<&AuthExtension>,
+    request_headers: &HeaderMap,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     // Only a HOSTED repo owns rows in the `artifacts` table. Remote (proxy)
@@ -4161,6 +4192,11 @@ async fn serve_artifact(
                     )
                     .await
                     .map_err(|e| e.into_response())?;
+                    if let Some(not_modified) =
+                        hosted_artifact_not_modified(request_headers, &resolved.checksum_sha256)
+                    {
+                        return Ok(not_modified);
+                    }
                     let storage = state
                         .storage_for_repo(&repo.storage_location())
                         .map_err(|e| e.into_response())?;
@@ -4194,14 +4230,14 @@ async fn serve_artifact(
                         || format!("{repo_key}/{}", resolved.path),
                     )?;
 
-                    let ct = content_type_for_path(path);
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, ct)
-                        .header(CONTENT_LENGTH, content.len().to_string())
-                        .header("X-Checksum-SHA256", &resolved.checksum_sha256)
-                        .body(Body::from(content))
-                        .unwrap());
+                    let headers = hosted_artifact_headers(
+                        path,
+                        content.len() as i64,
+                        &resolved.checksum_sha256,
+                        None,
+                        None,
+                    );
+                    return Ok((StatusCode::OK, headers, Body::from(content)).into_response());
                 }
                 None
             }
@@ -4638,6 +4674,12 @@ async fn serve_artifact(
         .await
         .map_err(|e| e.into_response())?;
 
+    if let Some(not_modified) =
+        hosted_artifact_not_modified(request_headers, &artifact.checksum_sha256)
+    {
+        return Ok(not_modified);
+    }
+
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
@@ -4678,21 +4720,79 @@ async fn serve_artifact(
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, ctx).await;
 
-    let ct = content_type_for_path(path);
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, ct)
-        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
-        .header("X-Checksum-SHA256", &artifact.checksum_sha256);
+    let headers = hosted_artifact_headers(
+        path,
+        artifact.size_bytes,
+        &artifact.checksum_sha256,
+        artifact.checksum_md5.as_deref(),
+        artifact.checksum_sha1.as_deref(),
+    );
+    Ok((StatusCode::OK, headers, Body::from_stream(stream)).into_response())
+}
 
-    if let Some(ref md5) = artifact.checksum_md5 {
-        builder = builder.header("X-Checksum-MD5", md5);
-    }
-    if let Some(ref sha1) = artifact.checksum_sha1 {
-        builder = builder.header("X-Checksum-SHA1", sha1);
-    }
+/// `Cache-Control` of a hosted artifact. A SNAPSHOT alias can point at new
+/// bytes at any time, so a client may keep a copy but revalidates it, which
+/// the ETag makes a 304
+const HOSTED_ARTIFACT_CACHE_CONTROL: &str = "no-cache";
 
-    Ok(builder.body(Body::from_stream(stream)).unwrap())
+/// The strong ETag of a hosted artifact, its quoted SHA-256 (#5871)
+fn hosted_artifact_etag(checksum_sha256: &str) -> String {
+    format!("\"{checksum_sha256}\"")
+}
+
+/// The 304 for a hosted artifact the client already holds (#5871). Only
+/// called once the download gate passed, so a blocked artifact stays 403
+fn hosted_artifact_not_modified(
+    request_headers: &HeaderMap,
+    checksum_sha256: &str,
+) -> Option<Response> {
+    cache_headers::check_conditional_request_with(
+        request_headers,
+        &hosted_artifact_etag(checksum_sha256),
+        HOSTED_ARTIFACT_CACHE_CONTROL,
+        None,
+    )
+}
+
+/// Response headers of a hosted artifact: type, length, ETag and checksums
+fn hosted_artifact_headers(
+    path: &str,
+    size_bytes: i64,
+    checksum_sha256: &str,
+    checksum_md5: Option<&str>,
+    checksum_sha1: Option<&str>,
+) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static(content_type_for_path(path)),
+    );
+    headers.insert(CONTENT_LENGTH, HeaderValue::from(size_bytes));
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static(HOSTED_ARTIFACT_CACHE_CONTROL),
+    );
+    let checksums = [
+        (ETAG, Some(hosted_artifact_etag(checksum_sha256))),
+        (
+            HeaderName::from_static("x-checksum-sha256"),
+            Some(checksum_sha256.to_string()),
+        ),
+        (
+            HeaderName::from_static("x-checksum-md5"),
+            checksum_md5.map(str::to_string),
+        ),
+        (
+            HeaderName::from_static("x-checksum-sha1"),
+            checksum_sha1.map(str::to_string),
+        ),
+    ];
+    for (name, value) in checksums {
+        if let Some(value) = value.and_then(|v| HeaderValue::from_str(&v).ok()) {
+            headers.insert(name, value);
+        }
+    }
+    headers
 }
 
 /// Whether a Maven checksum (`*.md5` / `*.sha1`) for an artifact should be
@@ -5630,8 +5730,10 @@ fn sidecar_digest_token(body: &[u8]) -> Option<String> {
 ///   else is 409, exactly what re-uploading the released file answers.
 /// * The body does not name the digest the artifact row stores for this
 ///   algorithm: 400. Maven and Gradle upload each sidecar after its file, so
-///   the row is there to compare against. SHA-512 has no stored digest and
-///   is not compared.
+///   the row is there to compare against. SHA-512 has no stored digest, so a
+///   `.sha512` naming a digest is held to a hash of the stored artifact
+///   (#5776), up to [`MAX_SHA512_ON_DEMAND_BYTES`]. Above that, or when the
+///   artifact cannot be read, it is not compared and a stored one keeps its 409.
 async fn check_checksum_sidecar_upload(
     db: &PgPool,
     storage: &dyn crate::storage::StorageBackend,
@@ -5647,8 +5749,8 @@ async fn check_checksum_sidecar_upload(
         return Ok(SidecarUpload::Store);
     }
     let row = sqlx::query(
-        "SELECT checksum_sha256, checksum_sha1, checksum_md5 FROM artifacts \
-         WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        "SELECT checksum_sha256, checksum_sha1, checksum_md5, storage_key, size_bytes \
+         FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
     )
     .bind(repo_id)
     .bind(base_path)
@@ -5671,7 +5773,7 @@ async fn check_checksum_sidecar_upload(
             .flatten(),
         ChecksumType::Sha512 => None,
     };
-    let expected = expected.map(|e| e.trim().to_ascii_lowercase());
+    let mut expected = expected.map(|e| e.trim().to_ascii_lowercase());
     let suffix = checksum_suffix(checksum_type);
     let uploaded = if staged.size_bytes() <= MAX_CHECKSUM_SIDECAR_BYTES {
         let body = staged
@@ -5682,6 +5784,8 @@ async fn check_checksum_sidecar_upload(
     } else {
         None
     };
+    // Hashed at most once, and only once an upload names a digest to compare
+    let mut sha512_pending = matches!(checksum_type, ChecksumType::Sha512) && uploaded.is_some();
 
     if !crate::services::cache_classifier::maven_coordinate_is_republishable(base_path)
         && storage
@@ -5693,6 +5797,9 @@ async fn check_checksum_sidecar_upload(
         if uploaded.is_some() && uploaded == stored {
             return Ok(SidecarUpload::AlreadyStored);
         }
+        if std::mem::take(&mut sha512_pending) {
+            expected = stored_artifact_sha512(storage, &row).await;
+        }
         let corrects_stored = expected.is_some() && uploaded == expected && stored != expected;
         if !corrects_stored {
             return Err(AppError::Conflict(format!(
@@ -5703,6 +5810,9 @@ async fn check_checksum_sidecar_upload(
         }
     }
 
+    if sha512_pending {
+        expected = stored_artifact_sha512(storage, &row).await;
+    }
     let Some(expected) = expected else {
         return Ok(SidecarUpload::Store);
     };
@@ -5714,6 +5824,36 @@ async fn check_checksum_sidecar_upload(
         .into_response());
     }
     Ok(SidecarUpload::Store)
+}
+
+/// Largest artifact a `.sha512` upload is checked against by hashing it (#5776)
+const MAX_SHA512_ON_DEMAND_BYTES: i64 = 512 * 1024 * 1024;
+
+/// SHA-512 of the stored artifact behind a sidecar's `artifacts` row, `None`
+/// when it is over [`MAX_SHA512_ON_DEMAND_BYTES`] or cannot be read
+async fn stored_artifact_sha512(
+    storage: &dyn crate::storage::StorageBackend,
+    row: &sqlx::postgres::PgRow,
+) -> Option<String> {
+    use sqlx::Row;
+
+    let size: i64 = row.try_get("size_bytes").ok()?;
+    if size > MAX_SHA512_ON_DEMAND_BYTES {
+        return None;
+    }
+    let key: String = row.try_get("storage_key").ok()?;
+    let mut stream = storage.get_stream(&key).await.ok()?;
+    let mut hasher = sha2::Sha512::new();
+    let mut read = 0usize;
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        let chunk = chunk.ok()?;
+        read += chunk.len();
+        if read as i64 > MAX_SHA512_ON_DEMAND_BYTES {
+            return None;
+        }
+        hasher.update(&chunk);
+    }
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 /// What [`check_checksum_sidecar_upload`] decided for an allowed upload.
@@ -10480,6 +10620,135 @@ mod tests {
         }
     }
 
+    /// #5871: a hosted artifact carries its SHA-256 as a strong ETag on the
+    /// exact path and on the SNAPSHOT alias, and a matching If-None-Match
+    /// answers 304 with no body. A blocked artifact stays 403 whatever the
+    /// client holds
+    #[tokio::test]
+    async fn test_hosted_download_etag_and_not_modified_5871() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (hosted_id, hosted_key, hosted_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        tdh::publish_repo(&pool, hosted_id).await;
+        let state = tdh::build_state(pool.clone(), hosted_dir.to_str().unwrap());
+        let hosted = tdh::make_repo_info(hosted_id, &hosted_key, &hosted_dir, "local", None);
+        let jar_path = "com/example/etag5871/lib/1.0/lib-1.0.jar";
+        let snap_path = "com/example/etag5871/snap/1.0-SNAPSHOT/snap-1.0-20260101.120000-1.jar";
+        let snap_alias = "com/example/etag5871/snap/1.0-SNAPSHOT/snap-1.0-SNAPSHOT.jar";
+        let mut probes = Vec::new();
+        for (path, version, route) in [
+            (jar_path, "1.0", jar_path),
+            (snap_path, "1.0-SNAPSHOT", snap_alias),
+        ] {
+            let id = tdh::seed_artifact(
+                &state,
+                &pool,
+                &hosted,
+                &format!("maven/{path}"),
+                path,
+                "etag5871",
+                version,
+                "application/java-archive",
+                Bytes::from(format!("bytes:{path}")),
+                user_id,
+            )
+            .await;
+            let sha256: String =
+                sqlx::query_scalar("SELECT checksum_sha256 FROM artifacts WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("stored sha256");
+            probes.push((format!("/{hosted_key}/{route}"), format!("\"{sha256}\"")));
+        }
+        let app = tdh::router_anon(super::router(), state);
+        let conditional = |route: &str, tag: &str| {
+            axum::http::Request::builder()
+                .method("GET")
+                .uri(route)
+                .header(axum::http::header::IF_NONE_MATCH, tag)
+                .body(Body::empty())
+                .expect("conditional GET")
+        };
+
+        let mut observed = Vec::new();
+        for (route, etag) in &probes {
+            let (plain, _, headers) =
+                tdh::send_with_headers(app.clone(), tdh::get(route.clone())).await;
+            let served_etag = headers
+                .get(axum::http::header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let (matched, matched_body, _) =
+                tdh::send_with_headers(app.clone(), conditional(route, etag)).await;
+            let (other, _, _) =
+                tdh::send_with_headers(app.clone(), conditional(route, "\"stale\"")).await;
+            observed.push((
+                route.clone(),
+                etag.clone(),
+                plain,
+                served_etag,
+                matched,
+                matched_body,
+                other,
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', true, false, true)",
+        )
+        .bind(format!("etag-5871-maven-{hosted_id}"))
+        .bind(hosted_id)
+        .execute(&pool)
+        .await
+        .expect("insert block_unscanned policy");
+        let mut blocked = Vec::new();
+        for (route, etag) in &probes {
+            let (status, _, _) =
+                tdh::send_with_headers(app.clone(), conditional(route, etag)).await;
+            blocked.push((route.clone(), status));
+        }
+
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(hosted_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_member_repo(&pool, hosted_id, &hosted_dir).await;
+        tdh::cleanup_user(&pool, user_id).await;
+
+        for (route, etag, plain, served_etag, matched, matched_body, other) in observed {
+            assert_eq!(plain, StatusCode::OK, "GET {route}");
+            assert_eq!(
+                served_etag.as_deref(),
+                Some(etag.as_str()),
+                "ETag of {route}"
+            );
+            assert_eq!(
+                matched,
+                StatusCode::NOT_MODIFIED,
+                "If-None-Match {etag} on {route}"
+            );
+            assert!(matched_body.is_empty(), "a 304 has no body ({route})");
+            assert_eq!(
+                other,
+                StatusCode::OK,
+                "a stale tag gets the bytes ({route})"
+            );
+        }
+        for (route, status) in blocked {
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "a blocked artifact must stay 403, never 304 ({route})"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // `.meta/prefixes.txt` (repository prefix file)
     // -----------------------------------------------------------------------
@@ -11308,10 +11577,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_virtual_prefixes_when_a_member_has_no_prefixes_file() {
-        // A remote member confirmed 404 for `.meta/prefixes.txt` genuinely
-        // publishes nothing and contributes nothing to the union — the
-        // virtual must still answer from its other (local) member rather
-        // than bailing (#3382 review finding 2).
+        // #5743: a remote member whose upstream confirms 404 for
+        // `.meta/prefixes.txt` publishes no allowlist, so it can hold ANY
+        // groupId. Merging the other members alone would publish a file that
+        // Maven Resolver reads as authoritative and that denies everything
+        // behind this remote ("prefixes file denies" / "appears stale"). The
+        // union is unknowable, so the virtual must answer 404 — the same bail
+        // an errored member produces — rather than a partial allowlist. (This
+        // replaces the pre-#5743 expectation of a 200 built from the local
+        // member alone.)
         use crate::api::handlers::test_db_helpers as tdh;
 
         let Some(pool) = tdh::try_pool().await else {
@@ -11359,15 +11633,10 @@ mod tests {
 
         assert_eq!(
             status,
-            StatusCode::OK,
-            "a confirmed-empty member must not bail the merge"
-        );
-        let text = String::from_utf8_lossy(&body);
-        assert_eq!(
-            text.lines().collect::<Vec<_>>(),
-            ["## repository-prefixes/2.0", "/com/local/prfxnone"],
-            "expected only the local member's prefixes: {}",
-            text
+            StatusCode::NOT_FOUND,
+            "a remote member with no prefix file makes the union unknowable, so \
+             the virtual must not publish a partial allowlist: {}",
+            String::from_utf8_lossy(&body)
         );
     }
 
@@ -15164,6 +15433,86 @@ mod tests {
             good_sha1,
             "the served .sha1 is the deploy's, never the forged one"
         );
+    }
+
+    /// #5776. FAILS BEFORE THE FIX: with no stored SHA-512 the deploy's own
+    /// `.sha512` got 409 behind a wrong one sent before the jar, and a wrong
+    /// `.sha512` after the jar was stored unchecked
+    #[tokio::test]
+    async fn test_sha512_sidecar_is_checked_against_the_stored_jar_5776() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let dir = "com/example/shop5776/shop-core";
+        let jar_at = |version: &str| format!("{dir}/{version}/shop-core-{version}.jar");
+        let jar = bytes::Bytes::from_static(b"released shop-core jar bytes 5776");
+        let good = compute_checksum(&jar, ChecksumType::Sha512);
+        let wrong = "0".repeat(128);
+        let other = "1".repeat(128);
+
+        let put = |path: String, body: bytes::Bytes| {
+            let app = fx.router_with_auth(super::router());
+            let uri = format!("/{}/{path}", fx.repo_key);
+            async move {
+                let (status, body) = tdh::send(app, tdh::put(uri, body)).await;
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+        let text = |v: &str| bytes::Bytes::from(v.to_string());
+
+        let mut steps: Vec<(&str, StatusCode, StatusCode, String)> = Vec::new();
+        let (s, b) = put(format!("{}.sha512", jar_at("1.0.0")), text(&wrong)).await;
+        steps.push(("a wrong .sha512 before its jar", StatusCode::CREATED, s, b));
+        let (s, b) = put(jar_at("1.0.0"), jar.clone()).await;
+        steps.push(("deploy the release jar", StatusCode::CREATED, s, b));
+        let (s, b) = put(format!("{}.sha512", jar_at("1.0.0")), text(&good)).await;
+        steps.push(("the deploy's own .sha512", StatusCode::CREATED, s, b));
+        let (s, b) = put(format!("{}.sha512", jar_at("1.0.0")), text(&good)).await;
+        steps.push(("a retried .sha512", StatusCode::OK, s, b));
+        let (s, b) = put(format!("{}.sha512", jar_at("1.0.0")), text(&other)).await;
+        steps.push(("a different .sha512", StatusCode::CONFLICT, s, b));
+
+        let (s, b) = put(jar_at("1.0.1"), jar.clone()).await;
+        steps.push(("deploy a second release jar", StatusCode::CREATED, s, b));
+        let (s, b) = put(format!("{}.sha512", jar_at("1.0.1")), text(&wrong)).await;
+        let mismatch = b.clone();
+        steps.push((
+            "a wrong .sha512 after its jar",
+            StatusCode::BAD_REQUEST,
+            s,
+            b,
+        ));
+
+        // Over the cap nothing is hashed, the sidecar is stored as before
+        let (s, b) = put(jar_at("1.0.2"), jar.clone()).await;
+        steps.push(("deploy a third release jar", StatusCode::CREATED, s, b));
+        sqlx::query("UPDATE artifacts SET size_bytes = $3 WHERE repository_id = $1 AND path = $2")
+            .bind(fx.repo_id)
+            .bind(jar_at("1.0.2"))
+            .bind(MAX_SHA512_ON_DEMAND_BYTES + 1)
+            .execute(&fx.pool)
+            .await
+            .expect("mark the jar as over the hashing cap");
+        let (s, b) = put(format!("{}.sha512", jar_at("1.0.2")), text(&wrong)).await;
+        steps.push(("a .sha512 of a jar over the cap", StatusCode::CREATED, s, b));
+
+        let app = fx.router_with_auth(super::router());
+        let (gs, served) = tdh::send(
+            app,
+            tdh::get(format!("/{}/{}.sha512", fx.repo_key, jar_at("1.0.0"))),
+        )
+        .await;
+        fx.teardown().await;
+
+        for (what, want, got, body) in &steps {
+            assert_eq!(got, want, "{what}: body={body}");
+        }
+        assert!(mismatch.contains("Checksum mismatch"), "{mismatch}");
+        assert_eq!(gs, StatusCode::OK);
+        assert_eq!(String::from_utf8_lossy(&served).trim(), good);
     }
 
     /// #5678: a released artifact's stored sidecar answered 409 even to a
