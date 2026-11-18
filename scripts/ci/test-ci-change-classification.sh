@@ -593,7 +593,7 @@ done
 for j in smoke-e2e build-backend-image build-openscap-image; do
   want_fact "cc_needs_$j" false "CI Complete does not wait for advisory $j"
 done
-want_fact cc_needs_windows-cross-check true "CI Complete waits for the Windows cross-check (#6022)"
+want_fact cc_needs_windows-cross-check false "CI Complete does not wait for the Windows cross-check while it is advisory (#6022)"
 want_fact windows_if_matches_check_rust true "the Windows cross-check's condition is Check Rust's, verbatim"
 want_fact ubuntu_latest false "no job floats on ubuntu-latest"
 want_fact cache_saves_off_main none "every rust-cache saves only outside pull requests and merge groups"
