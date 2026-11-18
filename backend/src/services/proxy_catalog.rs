@@ -173,8 +173,10 @@ pub async fn upsert_fill(
 /// * a placeholder row is another fill of this path still in flight; a
 ///   release already made against it is kept, so this fill does not undo it.
 ///
-/// The commit then calls [`upsert_fill`] with `keep_release`. Returns the
-/// affected-row count.
+/// The commit then calls [`upsert_fill`] with `keep_release`. Returns whether
+/// the row reads released afterwards: a release already made against another
+/// fill of this path still in flight, which this fill must honour instead of
+/// refusing the download again (#6043).
 pub async fn mark_hold_fetching(
     db: &PgPool,
     repository_id: Uuid,
@@ -182,8 +184,8 @@ pub async fn mark_hold_fetching(
     storage_key: &str,
     metadata_key: &str,
     quarantine_until: chrono::DateTime<chrono::Utc>,
-) -> Result<u64> {
-    let res = sqlx::query(
+) -> Result<bool> {
+    sqlx::query_scalar::<_, bool>(
         r#"
         INSERT INTO proxy_cache_artifacts
             (repository_id, path, storage_key, metadata_key, size_bytes,
@@ -202,6 +204,7 @@ pub async fn mark_hold_fetching(
                 THEN proxy_cache_artifacts.quarantine_released_at
                 ELSE NULL END,
             last_accessed_at = now()
+        RETURNING quarantine_released_at IS NOT NULL
         "#,
     )
     .bind(repository_id)
@@ -209,10 +212,9 @@ pub async fn mark_hold_fetching(
     .bind(storage_key)
     .bind(metadata_key)
     .bind(quarantine_until)
-    .execute(db)
+    .fetch_one(db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-    Ok(res.rows_affected())
+    .map_err(|e| AppError::Database(e.to_string()))
 }
 
 /// True when a stored catalog row is the transient placeholder
@@ -2305,10 +2307,11 @@ mod tests {
             .expect("the held fill is recorded before its 409");
         assert_eq!(mark_quarantine_released(&pool, row.id).await.unwrap(), 1);
 
-        // A concurrent fill of the same path records its own hold.
-        mark_hold_fetching(&pool, repo, path, "k", "m", until)
+        // A concurrent fill of the same path records its own hold, and is
+        // told the path is already released (#6043).
+        assert!(mark_hold_fetching(&pool, repo, path, "k", "m", until)
             .await
-            .unwrap();
+            .unwrap());
         let (held, released) = hold_cols(&pool, repo, path).await;
         assert!(
             held.is_none() && released.is_some(),

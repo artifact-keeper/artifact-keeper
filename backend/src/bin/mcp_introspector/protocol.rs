@@ -719,7 +719,7 @@ async fn list_all(
     Ok(())
 }
 
-#[cfg(ak_test_shard = "services-2")]
+#[cfg(ak_test_shard = "router")]
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

@@ -2401,9 +2401,12 @@ async fn download(
                     }
                 }
 
+                // #5810: no member scans; the virtual's member-fallback policy.
+                let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
                 let result = resolve_unscanned_crate_members(
                     &state,
                     members,
+                    fallback,
                     proxy_for_virtual,
                     &member_fetch_urls,
                     &coordinate,
@@ -2740,6 +2743,7 @@ async fn serve_scanned_crate(
 async fn resolve_unscanned_crate_members(
     state: &SharedState,
     members: Vec<crate::models::repository::Repository>,
+    fallback: proxy_helpers::VirtualMemberFallback,
     proxy: Option<&crate::services::proxy_service::ProxyService>,
     member_fetch_urls: &HashMap<uuid::Uuid, String>,
     coordinate: &CrateCoordinate<'_>,
@@ -2747,6 +2751,7 @@ async fn resolve_unscanned_crate_members(
     let (name, version) = (coordinate.name, coordinate.version);
     proxy_helpers::resolve_virtual_download_from_members_with_fetch_urls(
         members,
+        fallback,
         proxy,
         coordinate.cache_path,
         member_fetch_urls,
@@ -2800,7 +2805,9 @@ async fn serve_scanned_virtual_crate(
         .collect();
     let index_overrides = fetch_index_upstream_overrides(&state.db, &scanning_ids).await;
 
-    let mut failures = proxy_helpers::MemberWalkFailures::default();
+    // #5810: the virtual's member-fallback policy, for every member below.
+    let fallback = proxy_helpers::virtual_member_fallback(&state.db, virtual_id).await;
+    let mut failures = proxy_helpers::MemberWalkFailures::new(fallback);
     let mut unscanned = Vec::new();
     for (member, policy) in members.iter().zip(policies) {
         let Some(policy) = policy else {
@@ -2809,7 +2816,8 @@ async fn serve_scanned_virtual_crate(
         };
         let run = std::mem::take(&mut unscanned);
         if let Some(served) = failures.run_answer(
-            resolve_unscanned_crate_run(state, proxy, run, member_fetch_urls, coordinate).await,
+            resolve_unscanned_crate_run(state, proxy, run, fallback, member_fetch_urls, coordinate)
+                .await,
         ) {
             return Some(served);
         }
@@ -2844,7 +2852,9 @@ async fn serve_scanned_virtual_crate(
                 return Some(Err(resp))
             }
             Err(resp) => {
-                failures.note(&resp);
+                if let Some(ended) = failures.note(&resp) {
+                    return Some(ended);
+                }
                 tracing::debug!(
                     member_key = %member.key, status = %resp.status(),
                     "scanned cargo virtual member did not serve; trying next member"
@@ -2852,9 +2862,19 @@ async fn serve_scanned_virtual_crate(
             }
         }
     }
-    Some(failures.finish(
-        resolve_unscanned_crate_run(state, proxy, unscanned, member_fetch_urls, coordinate).await,
-    ))
+    Some(
+        failures.finish(
+            resolve_unscanned_crate_run(
+                state,
+                proxy,
+                unscanned,
+                fallback,
+                member_fetch_urls,
+                coordinate,
+            )
+            .await,
+        ),
+    )
 }
 
 /// [`resolve_unscanned_crate_members`] inside the scanned walk: `None` is a
@@ -2864,14 +2884,22 @@ async fn resolve_unscanned_crate_run(
     state: &SharedState,
     proxy: &crate::services::proxy_service::ProxyService,
     run: Vec<crate::models::repository::Repository>,
+    fallback: proxy_helpers::VirtualMemberFallback,
     member_fetch_urls: &HashMap<uuid::Uuid, String>,
     coordinate: &CrateCoordinate<'_>,
 ) -> Option<Result<Response, Response>> {
     if run.is_empty() {
         return None;
     }
-    match resolve_unscanned_crate_members(state, run, Some(proxy), member_fetch_urls, coordinate)
-        .await
+    match resolve_unscanned_crate_members(
+        state,
+        run,
+        fallback,
+        Some(proxy),
+        member_fetch_urls,
+        coordinate,
+    )
+    .await
     {
         Ok(result) => Some(Ok(virtual_crate_response(coordinate.filename, result))),
         Err(resp) => proxy_helpers::unscanned_run_failure(resp),
@@ -7221,11 +7249,7 @@ mod catalog_registration_tests {
         fx.teardown().await;
 
         let body = String::from_utf8_lossy(&body);
-        assert_eq!(
-            status,
-            axum::http::StatusCode::INSUFFICIENT_STORAGE,
-            "{body}"
-        );
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
         assert!(body.contains("Repository storage quota exceeded"), "{body}");
         assert_eq!(rows, 0, "a refused publish must leave no artifact row");
     }
@@ -9863,6 +9887,70 @@ mod age_gate_tests {
             assert_eq!(&served[..], &body[..]);
             assert_eq!(rig.recorded(name, version).await, 1);
             rig.teardown().await;
+        }
+
+        /// A crate whose `Cargo.toml` does not declare what it is served as
+        /// is never scanned or queued, so every pull lands on the same arm.
+        /// Each one is served pending under its own WARN, never fail-open's
+        /// "scanning async" line, and counted in
+        /// `ak_proxy_scan_unscannable_total`
+        #[test]
+        fn remote_unestablished_crate_is_served_and_counted_unscannable() {
+            let (name, version) = ("scan-unestablished", "0.4.0");
+            let logs = tdh::LogCapture::default();
+            let _guard = logs.install(tracing::Level::WARN);
+            let (keys, counted) =
+                crate::services::metrics_service::capture_counters_async(|| async {
+                    let mut keys = Vec::new();
+                    for action in ["fail_open", "record_only"] {
+                        let rig = RemoteRig::new(Some(action)).await?;
+                        let body = crate_bytes_declaring("evil-crate", version);
+                        rig.mount_download(name, version, &body, 1).await;
+                        for pull in 1..=2 {
+                            let (status, served, headers) =
+                                rig.get(rig.download_uri(name, version)).await;
+                            assert_eq!(status, StatusCode::OK, "{action} pull {pull}");
+                            assert_eq!(scan_header(&headers), Some("pending"), "{action}");
+                            assert_eq!(&served[..], &body[..]);
+                        }
+                        let queued: i64 = sqlx::query_scalar(
+                            "SELECT COUNT(*) FROM scan_queue WHERE repository_id = $1",
+                        )
+                        .bind(rig.fx.repo_id)
+                        .fetch_one(&rig.fx.pool)
+                        .await
+                        .unwrap();
+                        assert_eq!(queued, 0, "{action}: nothing queued");
+                        keys.push(rig.fx.repo_key.clone());
+                        rig.teardown().await;
+                    }
+                    Some(keys)
+                });
+            let Some(keys) = keys else {
+                return;
+            };
+            for key in &keys {
+                assert_eq!(
+                    counted.get(
+                        "ak_proxy_scan_unscannable_total",
+                        &[
+                            ("repository", key),
+                            ("format", "cargo"),
+                            ("reason", "identity_not_established"),
+                        ],
+                    ),
+                    2,
+                    "{key}: once per pull"
+                );
+            }
+            let text = logs.text();
+            assert_eq!(
+                text.matches("served, will not be scanned: identity not established")
+                    .count(),
+                4,
+                "{text}"
+            );
+            assert!(!text.contains("fail-open proxy scan"), "{text}");
         }
 
         /// The control: with scan-on-proxy off the crate still streams through

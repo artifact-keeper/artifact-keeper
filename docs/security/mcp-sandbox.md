@@ -330,20 +330,27 @@ and on demand. On a GitHub-hosted Ubuntu runner it does the following:
    The job passes only if the guest answered under gVisor: the outcome is
    `ok`, the tool `echo` was listed, and the kernel the guest reports is not
    the runner's (gVisor implements its own).
-4. It checks that the same probe is refused without a runtime.
-5. It checks that a container on an internal network cannot reach the
+4. It runs `sandbox-check/source-refusal-check.sh` under `runsc`: npm and
+   PyPI jobs whose `registryBaseUrl` is not this AK instance (another origin,
+   userinfo, a query, dot segments, the wrong scheme or port, or none), and
+   OCI jobs with a malformed or non-canonical reference or a source-changing
+   field, each answer `unsupported` and start no guest container (#5446,
+   #5448). The probe job from step 3 is its control: an allowed job does
+   start a guest, so the check can see one.
+5. It checks that the same probe is refused without a runtime.
+6. It checks that a container on an internal network cannot reach the
    internet.
-6. It runs `sandbox-check/guest-isolation-check.sh` under `runsc`: a guest
+7. It runs `sandbox-check/guest-isolation-check.sh` under `runsc`: a guest
    on its own network reaches the forwarder and nothing else, and the same
    check fails with both guests on one network, because the second guest
    was reached (the step asserts that line, so a check that could not run
    does not count as the expected failure).
-7. It runs `sandbox-probe` on an npm job with the real Docker CLI and a
+8. It runs `sandbox-probe` on an npm job with the real Docker CLI and a
    stand-in forwarder: the guest reaches the forwarder under the AK host
    name, and afterwards no guest container or guest network is left and
    the forwarder is back on its egress network only. It also checks that
    a worker with `AK_MCP_SANDBOX_NETWORK` set refuses to run.
-8. It validates the compose file and the Kubernetes manifests.
+9. It validates the compose file and the Kubernetes manifests.
 
 The workflow does not cover npm or PyPI guests, which need a running AK to
 install from, or the Kubernetes launcher, which needs a cluster with a gVisor

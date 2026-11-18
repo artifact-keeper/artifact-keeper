@@ -895,6 +895,11 @@ mod tests {
     #[test]
     fn test_oidc_config_from_env() {
         let config = Config {
+            scan_worker_enabled: true,
+            scan_queue_enabled: false,
+            scan_worker_concurrency: None,
+            scan_worker_trivy_adapter_url: None,
+            scan_rescan_max_per_day: 0,
             database_url: "postgres://localhost/test".into(),
             bind_address: "0.0.0.0:8080".into(),
             log_level: "info".into(),
@@ -964,6 +969,7 @@ mod tests {
             stuck_scan_check_interval_secs: 600,
             stuck_scan_reap_limit: 1000,
             max_upload_size_bytes: 10_737_418_240,
+            quotas: Default::default(),
             allow_local_admin_login: false,
             sso_disable_admin_break_glass: false,
             oidc_silent_sso_enabled: true,
@@ -1074,6 +1080,11 @@ mod tests {
 
     fn make_test_config() -> Config {
         Config {
+            scan_worker_enabled: true,
+            scan_queue_enabled: false,
+            scan_worker_concurrency: None,
+            scan_worker_trivy_adapter_url: None,
+            scan_rescan_max_per_day: 0,
             database_url: "postgres://localhost/test".into(),
             bind_address: "0.0.0.0:8080".into(),
             log_level: "info".into(),
@@ -1143,6 +1154,7 @@ mod tests {
             stuck_scan_check_interval_secs: 600,
             stuck_scan_reap_limit: 1000,
             max_upload_size_bytes: 10_737_418_240,
+            quotas: Default::default(),
             allow_local_admin_login: false,
             sso_disable_admin_break_glass: false,
             oidc_silent_sso_enabled: true,

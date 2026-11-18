@@ -1,0 +1,1042 @@
+#!/usr/bin/env bash
+#
+# ak-vm-runner: one throwaway KVM virtual machine per GitHub Actions job
+# (#6072).
+#
+# The controller keeps AKVM_VM_COUNT idle VMs booted from a read-only golden
+# image. Each VM gets a single-use just-in-time (JIT) runner registration,
+# runs exactly one job with its own kernel and its own dockerd, powers itself
+# off, and is then undefined and its disk deleted. Nothing is shared between
+# jobs except the golden image (read-only qcow2 backing file) and, if
+# configured, a read-only cache disk.
+#
+# Subcommands:
+#   reconcile     run the control loop (what ak-vm-runner.service runs)
+#   once          run one reconcile pass and exit
+#   build-image   build a new golden image (ak-vm-runner-image.service)
+#   status        print the VMs this service owns
+#   drain         no new VMs, idle ones recycled; running jobs finish (undrain)
+#   undrain       resume creating VMs
+#   destroy-all   destroy every job VM now and remove its runner registration
+#
+# Configuration comes from the environment, normally
+# /etc/ak-vm-runner/config.env (see config.env.example). Documentation:
+# docs/ci/vm-runners.md.
+#
+# Audit trail: every lifecycle event is one JSON line appended to
+# $AKVM_STATE_DIR/log/audit.jsonl and mirrored to stdout (journald). Lines
+# that came from inside a VM are tagged source=guest: once a job starts, the
+# guest is under the job's control, so those fields are claims, not facts.
+set -euo pipefail
+
+AKVM_ORG="${AKVM_ORG:-artifact-keeper}"
+AKVM_RUNNER_GROUP_ID="${AKVM_RUNNER_GROUP_ID:-1}"
+AKVM_LABELS="${AKVM_LABELS:-ak-vm}"
+AKVM_HOST_TAG="${AKVM_HOST_TAG:-$(hostname -s 2>/dev/null || echo host)}"
+AKVM_VM_COUNT="${AKVM_VM_COUNT:-1}"
+AKVM_VM_VCPUS="${AKVM_VM_VCPUS:-8}"
+AKVM_VM_MEMORY_MIB="${AKVM_VM_MEMORY_MIB:-14336}"
+AKVM_VM_DISK_GB="${AKVM_VM_DISK_GB:-80}"
+AKVM_STATE_DIR="${AKVM_STATE_DIR:-/home/ak-vm-runner}"
+AKVM_TOKEN_FILE="${AKVM_TOKEN_FILE:-/etc/ak-vm-runner/github-token}"
+AKVM_LIBVIRT_URI="${AKVM_LIBVIRT_URI:-qemu:///system}"
+AKVM_NETWORK="${AKVM_NETWORK:-ak-vm}"
+AKVM_NWFILTER="${AKVM_NWFILTER:-ak-vm-egress}"
+AKVM_PARTITION="${AKVM_PARTITION:-/machine/akvm}"
+AKVM_POLL_SECONDS="${AKVM_POLL_SECONDS:-15}"
+AKVM_BOOT_TIMEOUT="${AKVM_BOOT_TIMEOUT:-600}"
+AKVM_IDLE_RECYCLE_SECONDS="${AKVM_IDLE_RECYCLE_SECONDS:-14400}"
+AKVM_MAX_VM_SECONDS="${AKVM_MAX_VM_SECONDS:-28800}"
+AKVM_MIN_FREE_PCT="${AKVM_MIN_FREE_PCT:-35}"
+AKVM_CRIT_FREE_PCT="${AKVM_CRIT_FREE_PCT:-25}"
+AKVM_MIN_HOST_AVAIL_MIB="${AKVM_MIN_HOST_AVAIL_MIB:-24576}"
+AKVM_CACHE_IMAGE="${AKVM_CACHE_IMAGE:-}"
+AKVM_KEEP_IMAGES="${AKVM_KEEP_IMAGES:-3}"
+AKVM_CONSOLE_RETENTION_DAYS="${AKVM_CONSOLE_RETENTION_DAYS:-30}"
+AKVM_IMAGE_TIMEOUT="${AKVM_IMAGE_TIMEOUT:-2400}"
+AKVM_IMAGE_DISK_GB="${AKVM_IMAGE_DISK_GB:-24}"
+# How long build-image waits for room in the slice (a job VM to finish) before
+# it gives up. Default: the longest a job VM can live (AKVM_MAX_VM_SECONDS).
+AKVM_IMAGE_WAIT_SECONDS="${AKVM_IMAGE_WAIT_SECONDS:-28800}"
+# The systemd slice behind AKVM_PARTITION, and its memory cap in MiB. Empty =
+# read the cap from systemd on every check; "infinity" = no cap.
+AKVM_SLICE="${AKVM_SLICE:-machine-akvm.slice}"
+AKVM_SLICE_MEMORY_MIB="${AKVM_SLICE_MEMORY_MIB:-}"
+# What one VM costs the slice beyond its guest memory (qemu itself, its page
+# cache for the disk images), so the cap is never hit by the sum of guests.
+AKVM_VM_OVERHEAD_MIB="${AKVM_VM_OVERHEAD_MIB:-1024}"
+AKVM_BASE_IMAGE_URL="${AKVM_BASE_IMAGE_URL:-https://cloud-images.ubuntu.com/releases/noble/release-20261017/ubuntu-24.04-server-cloudimg-amd64.img}"
+AKVM_BASE_IMAGE_SHA256="${AKVM_BASE_IMAGE_SHA256:-04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94}"
+AKVM_RUNNER_VERSION="${AKVM_RUNNER_VERSION:-2.338.2}"
+AKVM_RUNNER_SHA256="${AKVM_RUNNER_SHA256:-baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c40}"
+AKVM_GITHUB_API="${AKVM_GITHUB_API:-https://api.github.com}"
+AKVM_CODE_DIR="${AKVM_CODE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+
+JOB_PREFIX="akvm-${AKVM_HOST_TAG}-"
+IMAGE_PREFIX="akvm-image-"
+# The image-build VM's shape.
+IMAGE_VM_MEMORY_MIB=4096
+IMAGE_VM_VCPUS=4
+
+VMS_DIR="$AKVM_STATE_DIR/vms"
+IMAGES_DIR="$AKVM_STATE_DIR/images"
+LOG_DIR="$AKVM_STATE_DIR/log"
+CONSOLE_DIR="$LOG_DIR/console"
+AUDIT_LOG="$LOG_DIR/audit.jsonl"
+DRAIN_FLAG="$AKVM_STATE_DIR/drain"
+
+# ---------------------------------------------------------------------------
+# Logging and audit
+
+now() { date +%s; }
+
+log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
+
+# audit <event> [key=value ...]
+# Values are kept as strings. Keys that start with guest_ came from inside a
+# VM and are passed through sanitize() first.
+audit() {
+  local event="$1"
+  shift
+  local args=(--arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg host "$AKVM_HOST_TAG" --arg event "$event")
+  # shellcheck disable=SC2016 # jq variables, not shell ones
+  local filter='{ts: $ts, host: $host, event: $event}'
+  local kv k v i=0
+  for kv in "$@"; do
+    k="${kv%%=*}"
+    v="${kv#*=}"
+    [[ "$k" =~ ^[a-z_][a-z0-9_]*$ ]] || continue
+    args+=(--arg "v$i" "$v")
+    filter+=" + {\"$k\": \$v$i}"
+    i=$((i + 1))
+  done
+  local line
+  line="$(jq -nc "${args[@]}" "$filter")"
+  mkdir -p "$LOG_DIR"
+  printf '%s\n' "$line" >> "$AUDIT_LOG"
+  printf 'audit %s\n' "$line" >&2
+}
+
+# Guest-supplied text: keep only characters that cannot break a log line or
+# a JSON key, and cap the length.
+sanitize() {
+  local s="${1//[^A-Za-z0-9._\/@:+=,-]/_}"
+  printf '%s' "${s:0:200}"
+}
+
+# ---------------------------------------------------------------------------
+# Thin wrappers (stubbed in scripts/ci/test-vm-runner.sh)
+
+v() { virsh -q -c "$AKVM_LIBVIRT_URI" "$@"; }
+
+# gh_api <METHOD> <path> [json body]; prints the body, then the HTTP status
+# on the last line. The token is read from a curl config file so it never
+# appears in a process listing.
+gh_api() {
+  local method="$1" path="$2" body="${3:-}"
+  [[ -r "$AKVM_TOKEN_FILE" ]] || {
+    log "cannot read token file $AKVM_TOKEN_FILE"
+    printf '\n000'
+    return 0
+  }
+  local curl_args=(-sS -X "$method" -H "Accept: application/vnd.github+json"
+    -H "X-GitHub-Api-Version: 2022-11-28" -w '\n%{http_code}' "$AKVM_GITHUB_API$path")
+  if [[ -n "$body" ]]; then
+    curl_args+=(-H "Content-Type: application/json" --data-binary "$body")
+  fi
+  # The <(...) must be on curl's own command line: in an array assignment
+  # bash closes the pipe before curl could read it.
+  curl -K <(auth_config) "${curl_args[@]}" || printf '\n000'
+}
+
+# The curl config with the token, read fresh on every call (a rotated token
+# takes effect at once) and handed to curl through a pipe, so it is never
+# written to disk or shown in a process listing.
+auth_config() {
+  printf 'header = "Authorization: Bearer %s"\n' "$(tr -d '[:space:]' < "$AKVM_TOKEN_FILE")"
+}
+
+http_status() { tail -n1 <<< "$1"; }
+http_body() { sed '$d' <<< "$1"; }
+
+# ---------------------------------------------------------------------------
+# Host guards
+
+disk_free_pct() { # <path>
+  df -P "$1" | awk 'NR==2 { gsub("%","",$5); print 100 - $5 }'
+}
+
+mem_available_mib() {
+  awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo
+}
+
+# Memory cap of $AKVM_SLICE in MiB, or "infinity". Read at runtime so a
+# changed slice takes effect without a restart. On cgroup v1 (el8) the cap is
+# MemoryLimit= and MemoryMax= reads infinity; on cgroup v2 it is the other
+# way round, so the smaller of the two that is set wins.
+slice_memory_limit_mib() {
+  if [[ -n "$AKVM_SLICE_MEMORY_MIB" ]]; then
+    printf '%s' "$AKVM_SLICE_MEMORY_MIB"
+    return 0
+  fi
+  local vals val mib lim=""
+  vals="$(systemctl show -p MemoryLimit -p MemoryMax --value "$AKVM_SLICE" 2> /dev/null)" || vals=""
+  for val in $vals; do
+    # Plain byte counts only; 19+ digits (2^64-1 = unset) overflow bash.
+    [[ "$val" =~ ^[0-9]{1,18}$ ]] || continue
+    mib=$((val / 1048576))
+    if [[ -z "$lim" ]] || ((mib < lim)); then lim="$mib"; fi
+  done
+  printf '%s' "${lim:-infinity}"
+}
+
+# Guest memory in MiB of a defined domain (from libvirt, so it is true for a
+# VM created by an older version of this script too).
+domain_memory_mib() { # <domain>
+  v dominfo "$1" 2> /dev/null | awk '/^Max memory:/ { print int($3 / 1024); f = 1 } END { exit !f }'
+}
+
+domain_vcpus() { # <domain>
+  v dominfo "$1" 2> /dev/null | awk '/^CPU\(s\):/ { print $2; f = 1 } END { exit !f }'
+}
+
+# What the running ak-vm domains (job VMs of any host tag and image-build VMs,
+# all in AKVM_PARTITION) hold of the slice: guest memory plus overhead each.
+slice_committed_mib() {
+  local names name state mem total=0
+  names="$(v list --all --name)" || return 1
+  for name in $names; do
+    [[ "$name" == akvm-* ]] || continue
+    state="$(v domstate "$name" 2> /dev/null)" || continue
+    case "$state" in "" | "shut off" | crashed) continue ;; esac
+    mem="$(domain_memory_mib "$name")" || continue
+    total=$((total + mem + AKVM_VM_OVERHEAD_MIB))
+  done
+  printf '%s' "$total"
+}
+
+# Prints a reason and returns 1 when a VM of <memory MiB> does not fit in the
+# slice beside the VMs already running there. Past the cap the kernel would
+# OOM-kill a qemu, i.e. someone's job, so the VM is not started at all.
+slice_has_room() { # <memory MiB>
+  local lim committed
+  lim="$(slice_memory_limit_mib)"
+  if [[ ! "$lim" =~ ^[0-9]+$ ]]; then
+    log "no memory cap found for $AKVM_SLICE (unset or unreadable: ${lim}); not checking slice room"
+    return 0
+  fi
+  if ! committed="$(slice_committed_mib)"; then
+    echo "cannot list libvirt domains to count $AKVM_SLICE memory"
+    return 1
+  fi
+  if ((committed + $1 + AKVM_VM_OVERHEAD_MIB > lim)); then
+    echo "slice_committed_mib=$committed + vm $1 + overhead $AKVM_VM_OVERHEAD_MIB above $AKVM_SLICE limit ${lim} MiB"
+    return 1
+  fi
+  return 0
+}
+
+# Prints a reason and returns 1 when the host cannot take one more VM.
+host_has_room() {
+  local free avail
+  free="$(disk_free_pct "$AKVM_STATE_DIR")"
+  if ((free < AKVM_MIN_FREE_PCT)); then
+    echo "disk_free_pct=$free below AKVM_MIN_FREE_PCT=$AKVM_MIN_FREE_PCT"
+    return 1
+  fi
+  avail="$(mem_available_mib)"
+  if ((avail < AKVM_VM_MEMORY_MIB + AKVM_MIN_HOST_AVAIL_MIB)); then
+    echo "mem_available_mib=$avail below vm ${AKVM_VM_MEMORY_MIB} + reserve ${AKVM_MIN_HOST_AVAIL_MIB}"
+    return 1
+  fi
+  slice_has_room "$AKVM_VM_MEMORY_MIB"
+}
+
+# ---------------------------------------------------------------------------
+# Names, templates
+
+new_vm_name() { # <prefix>
+  printf '%s%s-%s' "$1" "$(date -u +%Y%m%d%H%M%S)" "$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')"
+}
+
+current_image() {
+  local link="$IMAGES_DIR/golden/current.qcow2"
+  [[ -e "$link" ]] || return 1
+  readlink -f "$link"
+}
+
+# render_domain_xml <name> <memory MiB> <vcpus> <disk> <seed iso> <console log> [cache image]
+render_domain_xml() {
+  local name="$1" mem="$2" vcpus="$3" disk="$4" seed="$5" console="$6" cache="${7:-}"
+  cat << EOF
+<domain type='kvm'>
+  <name>${name}</name>
+  <description>ak-vm-runner (artifact-keeper#6072): one GitHub Actions job, destroyed after it</description>
+  <memory unit='MiB'>${mem}</memory>
+  <currentMemory unit='MiB'>${mem}</currentMemory>
+  <vcpu placement='static'>${vcpus}</vcpu>
+  <resource>
+    <partition>${AKVM_PARTITION}</partition>
+  </resource>
+  <os>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+  </features>
+  <cpu mode='host-passthrough' check='none'/>
+  <clock offset='utc'/>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>destroy</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' cache='unsafe' discard='unmap'/>
+      <source file='${disk}'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='${seed}'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+    </disk>
+EOF
+  if [[ -n "$cache" ]]; then
+    cat << EOF
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='raw'/>
+      <source file='${cache}'/>
+      <target dev='vdb' bus='virtio'/>
+      <readonly/>
+      <shareable/>
+    </disk>
+EOF
+  fi
+  cat << EOF
+    <interface type='network'>
+      <source network='${AKVM_NETWORK}'/>
+      <model type='virtio'/>
+      <port isolated='yes'/>
+      <filterref filter='${AKVM_NWFILTER}'/>
+    </interface>
+    <serial type='file'>
+      <source path='${console}' append='on'/>
+      <target port='0'/>
+    </serial>
+    <rng model='virtio'>
+      <backend model='random'>/dev/urandom</backend>
+    </rng>
+    <memballoon model='none'/>
+  </devices>
+</domain>
+EOF
+}
+
+# Emits a cloud-config write_files entry for a local file.
+write_file_entry() { # <guest path> <permissions> <local file>
+  printf '  - path: %s\n    permissions: "%s"\n    owner: root:root\n    encoding: b64\n    content: %s\n' \
+    "$1" "$2" "$(base64 -w0 < "$3")"
+}
+
+# Per-job user-data. The JIT config is a single-use registration for one
+# runner; it is written to the guest's /etc/ak-vm/jitconfig (0600, root) and
+# the guest deletes it before the runner starts.
+render_job_user_data() { # <vm name> <encoded jit config>
+  cat << EOF
+#cloud-config
+hostname: $1
+package_update: false
+package_upgrade: false
+ssh_pwauth: false
+disable_root: true
+write_files:
+  - path: /etc/ak-vm/jitconfig
+    permissions: "0600"
+    owner: root:root
+    content: $2
+runcmd:
+  - [systemctl, start, --no-block, ak-vm-job.service]
+EOF
+}
+
+render_image_user_data() {
+  local g="$AKVM_CODE_DIR/guest"
+  local tmp
+  tmp="$(mktemp)"
+  sed -e "s/@RUNNER_VERSION@/${AKVM_RUNNER_VERSION}/g" -e "s/@RUNNER_SHA256@/${AKVM_RUNNER_SHA256}/g" \
+    "$g/build-image.sh" > "$tmp"
+  cat << EOF
+#cloud-config
+hostname: akvm-image
+package_update: true
+package_upgrade: true
+ssh_pwauth: false
+disable_root: true
+users:
+  - name: runner
+    uid: 1001
+    shell: /bin/bash
+    lock_passwd: true
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+write_files:
+EOF
+  write_file_entry /usr/local/libexec/ak-vm/build-image.sh 0755 "$tmp"
+  write_file_entry /usr/local/sbin/ak-vm-run-job 0755 "$g/run-job.sh"
+  write_file_entry /usr/local/libexec/ak-vm/job-started.sh 0755 "$g/job-started.sh"
+  write_file_entry /usr/local/libexec/ak-vm/job-completed.sh 0755 "$g/job-completed.sh"
+  write_file_entry /etc/systemd/system/ak-vm-job.service 0644 "$g/ak-vm-job.service"
+  write_file_entry /etc/docker/daemon.json 0644 "$g/daemon.json"
+  cat << 'EOF'
+runcmd:
+  - [bash, /usr/local/libexec/ak-vm/build-image.sh]
+EOF
+  rm -f "$tmp"
+}
+
+make_seed_iso() { # <dir> <vm name> ; user-data must already be in <dir>
+  printf 'instance-id: %s\nlocal-hostname: %s\n' "$2" "$2" > "$1/meta-data"
+  genisoimage -quiet -output "$1/seed.iso" -volid cidata -joliet -rock "$1/user-data" "$1/meta-data"
+  rm -f "$1/user-data" "$1/meta-data"
+  chmod 0600 "$1/seed.iso"
+}
+
+# ---------------------------------------------------------------------------
+# Guest console: lines the guest prints as "AKVM key=value ..."
+
+console_log() { printf '%s/%s.log' "$CONSOLE_DIR" "$1"; }
+
+# Prints the sanitized key=value pairs of one AKVM record with the given
+# event, prefixed guest_, one per line. Nothing if there is none. For
+# job_started the FIRST record is used: the runner's hook prints it before
+# any job step runs, so a later copy can only be a job forging its identity.
+# For other events the last record is used.
+guest_event() { # <vm> <event>
+  local pick=(tail -n1)
+  [[ "$2" == job_started ]] && pick=(head -n1)
+  local line
+  line="$(guest_lines "$1" | grep -a "^AKVM event=$2\( \|$\)" | "${pick[@]}")" || true
+  [[ -n "$line" ]] || return 0
+  local tok k toks=()
+  read -ra toks <<< "${line#AKVM }"
+  for tok in "${toks[@]}"; do
+    [[ "$tok" == *=* ]] || continue
+    k="${tok%%=*}"
+    [[ "$k" =~ ^[a-z_][a-z0-9_]{0,40}$ ]] || continue
+    [[ "$k" == event ]] && continue
+    printf 'guest_%s=%s\n' "$k" "$(sanitize "${tok#*=}")"
+  done
+}
+
+# True once the guest has printed <event>. The first sighting is recorded in
+# vm.env, so a decision never depends on the console file staying readable
+# (virtlogd rotates it at 2 MiB, and the new file is root-only).
+guest_has() { # <vm> <event>
+  [[ "$(meta_get "$1" "seen_$2")" == 1 ]] && return 0
+  if guest_lines "$1" | grep -aq "^AKVM event=$2\( \|$\)"; then
+    [[ -d "$VMS_DIR/$1" ]] && meta_set "$1" "seen_$2" 1
+    return 0
+  fi
+  return 1
+}
+
+guest_count() { # <vm> <event>
+  guest_lines "$1" | grep -ac "^AKVM event=$2\( \|$\)" || true
+}
+
+# Every "AKVM event=..." record on the console, one per line. A record can
+# follow other output on the same console line (the serial getty's login
+# prompt, a kernel message), so it is matched anywhere, not only at column 0.
+guest_lines() { # <vm>
+  local base f
+  base="$(console_log "$1")"
+  # Rotated files first (oldest first), then the live one; unreadable ones
+  # are skipped.
+  for f in $(ls -1r "$base".[0-9]* 2> /dev/null) "$base"; do
+    [[ -r "$f" ]] || continue
+    tr -d '\r' < "$f" | grep -ao 'AKVM event=[^[:cntrl:]]*' || true
+  done
+}
+
+# ---------------------------------------------------------------------------
+# VM metadata kept next to the disk
+
+meta_get() { # <vm> <key>
+  local f="$VMS_DIR/$1/vm.env"
+  [[ -r "$f" ]] || return 0
+  sed -n "s/^$2=//p" "$f" | tail -n1
+}
+
+meta_set() { # <vm> <key> <value>
+  printf '%s=%s\n' "$2" "$3" >> "$VMS_DIR/$1/vm.env"
+}
+
+# ---------------------------------------------------------------------------
+# Lifecycle
+
+# Prints "<name> <state>" for every domain this host's controller owns.
+# Fails (and prints nothing) when libvirt cannot be asked: callers must then
+# skip the pass rather than treat "no answer" as "no VMs".
+job_vms() {
+  local names name state out=""
+  names="$(v list --all --name)" || return 1
+  for name in $names; do
+    [[ "$name" == "$JOB_PREFIX"* ]] || continue
+    state="$(v domstate "$name" 2> /dev/null | tr ' ' '_')" || state=unknown
+    out+="$name ${state:-unknown}"$'\n'
+  done
+  printf '%s' "$out"
+}
+
+create_job_vm() {
+  local image name dir resp status body runner_id jit
+  image="$(current_image)" || {
+    log "no golden image at $IMAGES_DIR/golden/current.qcow2; run build-image"
+    return 1
+  }
+  name="$(new_vm_name "$JOB_PREFIX")"
+  dir="$VMS_DIR/$name"
+  mkdir -p "$dir" "$CONSOLE_DIR"
+  chmod 0711 "$dir"
+
+  local labels_json
+  labels_json="$(jq -nc --arg l "$AKVM_LABELS" '$l | split(",") | map(select(length > 0))')"
+  resp="$(gh_api POST "/orgs/$AKVM_ORG/actions/runners/generate-jitconfig" \
+    "$(jq -nc --arg n "$name" --argjson g "$AKVM_RUNNER_GROUP_ID" --argjson l "$labels_json" \
+      '{name: $n, runner_group_id: $g, labels: $l, work_folder: "_work"}')")"
+  status="$(http_status "$resp")"
+  body="$(http_body "$resp")"
+  if [[ "$status" != 201 ]]; then
+    # Back off (1, 2, 4 ... 30 min) so a bad token or an outage cannot burn
+    # the GitHub rate limit, which is shared with everything else using it.
+    local failures backoff
+    failures=$(($(cat "$AKVM_STATE_DIR/jit-failures" 2> /dev/null || echo 0) + 1))
+    backoff=$((60 * (1 << (failures > 5 ? 5 : failures - 1))))
+    ((backoff > 1800)) && backoff=1800
+    echo "$failures" > "$AKVM_STATE_DIR/jit-failures"
+    echo $(($(now) + backoff)) > "$AKVM_STATE_DIR/jit-backoff-until"
+    audit jit_failed vm="$name" http_status="$status" retry_in_s="$backoff" \
+      message="$(jq -r '.message? // empty' <<< "$body" 2> /dev/null | head -c 200)"
+    rm -rf "$dir"
+    return 1
+  fi
+  rm -f "$AKVM_STATE_DIR/jit-failures" "$AKVM_STATE_DIR/jit-backoff-until"
+  runner_id="$(jq -r '.runner.id' <<< "$body")"
+  jit="$(jq -r '.encoded_jit_config' <<< "$body")"
+  body=""
+  resp=""
+
+  {
+    printf 'name=%s\nrunner_id=%s\ncreated=%s\nimage=%s\nlabels=%s\nvcpus=%s\nmemory_mib=%s\n' \
+      "$name" "$runner_id" "$(now)" "$image" "$AKVM_LABELS" "$AKVM_VM_VCPUS" "$AKVM_VM_MEMORY_MIB"
+  } > "$dir/vm.env"
+
+  qemu-img create -q -f qcow2 -F qcow2 -b "$image" "$dir/disk.qcow2" "${AKVM_VM_DISK_GB}G"
+  (umask 077 && render_job_user_data "$name" "$jit" > "$dir/user-data")
+  jit=""
+  make_seed_iso "$dir" "$name"
+  : > "$(console_log "$name")"
+  chmod 0640 "$(console_log "$name")"
+
+  render_domain_xml "$name" "$AKVM_VM_MEMORY_MIB" "$AKVM_VM_VCPUS" "$dir/disk.qcow2" \
+    "$dir/seed.iso" "$(console_log "$name")" "$AKVM_CACHE_IMAGE" > "$dir/domain.xml"
+  if ! v define "$dir/domain.xml" > /dev/null || ! v start "$name" > /dev/null; then
+    audit vm_start_failed vm="$name" runner_id="$runner_id"
+    remove_runner "$name" "$runner_id" > /dev/null || true
+    v undefine "$name" > /dev/null 2>&1 || true
+    rm -rf "$dir"
+    return 1
+  fi
+  audit vm_created vm="$name" runner_name="$name" runner_id="$runner_id" labels="$AKVM_LABELS" \
+    image="$(basename "$image")" image_sha256="$(cat "$image.sha256" 2> /dev/null || true)" \
+    vcpus="$AKVM_VM_VCPUS" memory_mib="$AKVM_VM_MEMORY_MIB" disk_gb="$AKVM_VM_DISK_GB" \
+    cache_image="$AKVM_CACHE_IMAGE"
+}
+
+# Removes a runner registration. 204 = removed, 404 = already gone (an
+# ephemeral runner deletes itself after its job). 422 = busy with a job.
+remove_runner() { # <vm> <runner id>
+  [[ -n "$2" && "$2" != null ]] || {
+    echo none
+    return 0
+  }
+  local status
+  status="$(http_status "$(gh_api DELETE "/orgs/$AKVM_ORG/actions/runners/$2")")"
+  echo "$status"
+  [[ "$status" == 204 || "$status" == 404 ]]
+}
+
+# destroy_vm <vm> <reason>: stop (if running), remove the runner if it never
+# ran a job, record the outcome, undefine, delete the disk.
+destroy_vm() {
+  local name="$1" reason="$2" runner_id created runner_status
+  runner_id="$(meta_get "$name" runner_id)"
+  created="$(meta_get "$name" created)"
+  v destroy "$name" > /dev/null 2>&1 || true
+  if ! runner_status="$(remove_runner "$name" "$runner_id")"; then
+    # Keep trying on later passes: an offline registration must not leak.
+    echo "$runner_id" >> "$AKVM_STATE_DIR/runner-deletes-pending"
+  fi
+  local guest=()
+  mapfile -t guest < <(guest_event "$name" job_started)
+  local exitinfo=()
+  mapfile -t exitinfo < <(guest_event "$name" runner_exit)
+  audit vm_destroyed vm="$name" runner_id="$runner_id" reason="$reason" \
+    lifetime_s="$(($(now) - ${created:-$(now)}))" runner_delete_http="$runner_status" \
+    guest_job_started_records="$(guest_count "$name" job_started)" \
+    "${guest[@]}" "${exitinfo[@]}"
+  v undefine "$name" > /dev/null 2>&1 || true
+  # Keep the disk and metadata while libvirt still knows the domain (it may
+  # be running); the next pass retries.
+  if v dominfo "$name" > /dev/null 2>&1; then
+    log "destroy of $name incomplete; keeping its directory"
+    return 1
+  fi
+  rm -rf "${VMS_DIR:?}/$name"
+}
+
+# Retries runner removals that failed earlier (a GitHub outage, a bad token).
+retry_runner_deletes() {
+  local f="$AKVM_STATE_DIR/runner-deletes-pending" id left=() st
+  [[ -s "$f" ]] || return 0
+  while read -r id; do
+    [[ -n "$id" ]] || continue
+    if st="$(remove_runner retry "$id")"; then
+      audit runner_delete_retried runner_id="$id" http_status="$st"
+    else
+      left+=("$id")
+    fi
+  done < <(sort -u "$f" | head -n 20)
+  { printf '%s\n' "${left[@]}"; sort -u "$f" | tail -n +21; } | grep -v '^$' > "$f.new" || true
+  mv "$f.new" "$f"
+}
+
+# Recycles an idle VM (runner started, no job): removes the registration
+# first, and GitHub refuses that (422) while the runner holds a job, which
+# closes the race with a job assigned just now. Destroys only on success.
+recycle_idle() { # <vm> <reason>
+  remove_runner "$1" "$(meta_get "$1" runner_id)" > /dev/null || return 1
+  destroy_vm "$1" "$2" || true
+}
+
+# True when an idle VM was created with another vcpus/memory shape than the
+# config now asks for. VMs created before vm.env recorded the shape are asked
+# about through libvirt once, and the answer is recorded.
+vm_shape_stale() { # <vm>
+  local mem cpus
+  mem="$(meta_get "$1" memory_mib)"
+  cpus="$(meta_get "$1" vcpus)"
+  if [[ -z "$mem" ]] && mem="$(domain_memory_mib "$1")"; then
+    [[ -d "$VMS_DIR/$1" ]] && meta_set "$1" memory_mib "$mem"
+  fi
+  if [[ -z "$cpus" ]] && cpus="$(domain_vcpus "$1")"; then
+    [[ -d "$VMS_DIR/$1" ]] && meta_set "$1" vcpus "$cpus"
+  fi
+  if [[ -n "$mem" && "$mem" != "$AKVM_VM_MEMORY_MIB" ]] || [[ -n "$cpus" && "$cpus" != "$AKVM_VM_VCPUS" ]]; then
+    log "$1 has vcpus=${cpus:-?} memory_mib=${mem:-?}; config wants vcpus=$AKVM_VM_VCPUS memory_mib=$AKVM_VM_MEMORY_MIB"
+    return 0
+  fi
+  return 1
+}
+
+# One pass of the control loop.
+reconcile_once() {
+  mkdir -p "$VMS_DIR" "$CONSOLE_DIR"
+  local name state age created active=0 t vms idle=() counted
+  t="$(now)"
+  if ! vms="$(job_vms)"; then
+    log "cannot list libvirt domains; skipping this pass"
+    return 1
+  fi
+  disk_critical "$vms"
+  retry_runner_deletes
+  while read -r name state; do
+    [[ -n "$name" ]] || continue
+    created="$(meta_get "$name" created)"
+    age=$((t - ${created:-$t}))
+    case "$state" in
+      shut_off | crashed)
+        if guest_has "$name" runner_exit; then
+          destroy_vm "$name" job_finished
+        else
+          destroy_vm "$name" "guest_stopped_$state"
+        fi
+        continue
+        ;;
+    esac
+    # The JIT config is consumed once the runner has started: take the seed
+    # ISO away from the guest.
+    if guest_has "$name" runner_start && [[ "$(meta_get "$name" seed_ejected)" != 1 ]]; then
+      if v change-media "$name" sda --eject --live > /dev/null 2>&1; then
+        meta_set "$name" seed_ejected 1
+        rm -f "$VMS_DIR/$name/seed.iso"
+      fi
+    fi
+    if ((age > AKVM_MAX_VM_SECONDS)); then
+      destroy_vm "$name" max_age
+      continue
+    fi
+    if ! guest_has "$name" runner_start; then
+      if ((age > AKVM_BOOT_TIMEOUT)); then
+        destroy_vm "$name" boot_timeout
+        continue
+      fi
+    elif ! guest_has "$name" job_started; then
+      # A busy VM is never touched here: it keeps its shape until its job
+      # ends. An idle one is replaced when it is old or has a stale shape
+      # (a config change rolls the idle pool without killing a job).
+      if ((age > AKVM_IDLE_RECYCLE_SECONDS)); then
+        recycle_idle "$name" idle_recycle && continue
+      elif vm_shape_stale "$name"; then
+        recycle_idle "$name" stale_shape && continue
+      elif [[ "$state" == running ]]; then
+        idle+=("$name")
+      fi
+    fi
+    if [[ "$state" == running || "$state" == paused || "$state" == in_shutdown ]]; then
+      active=$((active + 1))
+    fi
+  done <<< "$vms"
+
+  # Scale down: more VMs than the target (AKVM_VM_COUNT was lowered, or the
+  # drain flag makes the target 0). Surplus idle VMs go the idle-recycle way,
+  # one per pass; a busy VM finishes its job and a booting one is left to
+  # reach runner_start (or the boot timeout) first.
+  local target="$AKVM_VM_COUNT"
+  [[ -e "$DRAIN_FLAG" ]] && target=0
+  if ((active > target)); then
+    for counted in "${idle[@]}"; do
+      if recycle_idle "$counted" scale_down; then
+        active=$((active - 1))
+        break
+      fi
+    done
+  fi
+
+  # Orphaned VM directories (a crash between mkdir and define). Only names
+  # absent from the listing that just succeeded, and only once vm.env says
+  # they are old enough: a directory without vm.env is still being created.
+  local d
+  for d in "$VMS_DIR"/"$JOB_PREFIX"*; do
+    [[ -d "$d" ]] || continue
+    name="$(basename "$d")"
+    if ! grep -q "^$name " <<< "$vms"; then
+      created="$(meta_get "$name" created)"
+      if [[ -z "$created" ]]; then
+        # No vm.env: interrupted before the runner was registered. Safe to
+        # drop once it is clearly not a creation in progress.
+        if [[ -n "$(find "$d" -maxdepth 0 -mmin +10)" ]] && ! v dominfo "$name" > /dev/null 2>&1; then
+          audit vm_orphan_removed vm="$name" detail=no_vm_env
+          rm -rf "$d"
+        fi
+        continue
+      fi
+      if ((t - created > 120)) && ! v dominfo "$name" > /dev/null 2>&1; then
+        remove_runner "$name" "$(meta_get "$name" runner_id)" > /dev/null || true
+        audit vm_orphan_removed vm="$name"
+        rm -rf "$d"
+      fi
+    fi
+  done
+
+  if [[ -e "$DRAIN_FLAG" ]]; then
+    return 0
+  fi
+  local until_ts
+  until_ts="$(cat "$AKVM_STATE_DIR/jit-backoff-until" 2> /dev/null || echo 0)"
+  if ((t < until_ts)); then
+    return 0
+  fi
+  if ((active < target)); then
+    local why
+    if why="$(host_has_room)"; then
+      create_job_vm || true
+    else
+      log "not creating a VM: $why"
+    fi
+  fi
+}
+
+# Below AKVM_CRIT_FREE_PCT the host is at risk (the kubelet evicts pods at
+# 20 % on rocky's /home): destroy paused VMs (qemu pauses a guest on ENOSPC)
+# and idle VMs. A VM running a job is left alone.
+disk_critical() { # <job_vms output>
+  local free name state
+  free="$(disk_free_pct "$AKVM_STATE_DIR")"
+  ((free < AKVM_CRIT_FREE_PCT)) || return 0
+  log "disk_free_pct=$free below AKVM_CRIT_FREE_PCT=$AKVM_CRIT_FREE_PCT"
+  while read -r name state; do
+    [[ -n "$name" ]] || continue
+    if [[ "$state" == paused ]]; then
+      destroy_vm "$name" disk_critical_paused || true
+    elif ! guest_has "$name" job_started; then
+      destroy_vm "$name" disk_critical_idle || true
+    fi
+  done <<< "$1"
+}
+
+prune_console_logs() {
+  find "$CONSOLE_DIR" -name "*.log*" -type f -mtime "+$AKVM_CONSOLE_RETENTION_DAYS" -delete 2> /dev/null || true
+}
+
+take_reconcile_lock() { # [flock wait args]
+  exec 8> "$AKVM_STATE_DIR/reconcile.lock"
+  flock "$@" 8 || {
+    log "another ak-vm-runner process holds $AKVM_STATE_DIR/reconcile.lock"
+    exit 1
+  }
+}
+
+# One-off commands share the loop's lock: the loop holds it only while a
+# pass runs, so they wait for the pass in flight instead of racing it.
+with_lock() {
+  take_reconcile_lock -w 120
+  "$@"
+}
+
+cmd_reconcile() {
+  exec 9> "$AKVM_STATE_DIR/loop.lock"
+  flock -n 9 || {
+    log "another reconcile loop is running ($AKVM_STATE_DIR/loop.lock)"
+    exit 1
+  }
+  audit controller_started vm_count="$AKVM_VM_COUNT" labels="$AKVM_LABELS" org="$AKVM_ORG" \
+    vcpus="$AKVM_VM_VCPUS" memory_mib="$AKVM_VM_MEMORY_MIB"
+  trap 'audit controller_stopped; exit 0' TERM INT
+  local pass=0
+  while true; do
+    take_reconcile_lock -w 300
+    reconcile_once || log "reconcile pass failed (will retry)"
+    exec 8>&-
+    pass=$((pass + 1))
+    if ((pass % 240 == 0)); then prune_console_logs; fi
+    sleep "$AKVM_POLL_SECONDS" &
+    wait $! || true
+  done
+}
+
+cmd_status() {
+  printf '%-36s %-10s %8s %-10s %s\n' VM STATE AGE_MIN RUNNER_ID LAST_GUEST_EVENT
+  local name state created t last
+  t="$(now)"
+  while read -r name state; do
+    [[ -n "$name" ]] || continue
+    created="$(meta_get "$name" created)"
+    last="$(guest_lines "$name" | tail -n1 | sed 's/^AKVM //' | cut -c1-80)"
+    printf '%-36s %-10s %8s %-10s %s\n' "$name" "$state" "$(((t - ${created:-$t}) / 60))" \
+      "$(meta_get "$name" runner_id)" "${last:--}"
+  done <<< "$(job_vms)"
+  printf '\ngolden image: %s\n' "$(current_image 2> /dev/null || echo none)"
+  [[ -e "$DRAIN_FLAG" ]] && printf 'DRAINING: no new VMs are created (ak-vm-runner undrain)\n'
+  return 0
+}
+
+cmd_destroy_all() {
+  local name state vms
+  vms="$(job_vms)" || {
+    log "cannot list libvirt domains"
+    return 1
+  }
+  while read -r name state; do
+    [[ -n "$name" ]] || continue
+    destroy_vm "$name" operator_destroy_all || true
+  done <<< "$vms"
+}
+
+# ---------------------------------------------------------------------------
+# Golden image
+
+fetch_base_image() {
+  local dir="$IMAGES_DIR/base" file
+  file="$dir/$(basename "$AKVM_BASE_IMAGE_URL")"
+  mkdir -p "$dir"
+  if [[ ! -s "$file" ]] || ! echo "$AKVM_BASE_IMAGE_SHA256  $file" | sha256sum -c --quiet - > /dev/null 2>&1; then
+    log "downloading $AKVM_BASE_IMAGE_URL"
+    curl -fsSL -o "$file.part" "$AKVM_BASE_IMAGE_URL"
+    echo "$AKVM_BASE_IMAGE_SHA256  $file.part" | sha256sum -c --quiet - || {
+      rm -f "$file.part"
+      log "base image checksum mismatch"
+      return 1
+    }
+    mv "$file.part" "$file"
+    chmod 0444 "$file"
+  fi
+  printf '%s' "$file"
+}
+
+images_in_use() {
+  local d
+  for d in "$VMS_DIR"/*/; do
+    if [[ -f "$d/vm.env" ]]; then sed -n 's/^image=//p' "$d/vm.env"; fi
+  done | sort -u
+}
+
+prune_images() {
+  local keep="$AKVM_KEEP_IMAGES" current in_use img n=0
+  current="$(current_image 2> /dev/null || true)"
+  in_use="$(images_in_use)"
+  while read -r img; do
+    [[ -n "$img" ]] || continue
+    n=$((n + 1))
+    ((n <= keep)) && continue
+    [[ "$img" == "$current" ]] && continue
+    grep -qxF "$img" <<< "$in_use" && continue
+    rm -f "$img" "$img.sha256" "${img%.qcow2}.manifest"
+    audit image_pruned image="$(basename "$img")"
+  done < <(find "$IMAGES_DIR/golden" -maxdepth 1 -name 'ak-vm-*.qcow2' -type f -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)
+}
+
+# Set to 1 by wait_for_image_room when it, not the operator, set the drain
+# flag; build_image_cleanup then removes it again.
+IMAGE_BUILD_SET_DRAIN=0
+
+build_image_cleanup() {
+  if ((IMAGE_BUILD_SET_DRAIN == 1)); then
+    rm -f "$DRAIN_FLAG"
+    IMAGE_BUILD_SET_DRAIN=0
+    audit drain_off by=build-image
+  fi
+}
+
+# Waits until the image-build VM fits in the slice beside the running VMs,
+# and returns holding the reconcile lock (fd 8) so the loop cannot start a
+# job VM in the room just found before the build VM is defined. While it
+# waits it holds no lock (the loop keeps running) and sets the drain flag:
+# the loop then creates no VM and recycles the idle ones, and a busy one
+# finishes its job.
+wait_for_image_room() {
+  local start why waiting=0
+  start="$(now)"
+  while true; do
+    take_reconcile_lock -w 300
+    if why="$(slice_has_room "$IMAGE_VM_MEMORY_MIB")"; then
+      return 0
+    fi
+    exec 8>&-
+    if ((waiting == 0)); then
+      waiting=1
+      if [[ ! -e "$DRAIN_FLAG" ]]; then
+        touch "$DRAIN_FLAG"
+        IMAGE_BUILD_SET_DRAIN=1
+        audit drain_on by=build-image
+      fi
+      audit image_build_waiting reason="$why" drain_set_by_build="$IMAGE_BUILD_SET_DRAIN" \
+        max_wait_s="$AKVM_IMAGE_WAIT_SECONDS"
+    fi
+    if (($(now) - start > AKVM_IMAGE_WAIT_SECONDS)); then
+      audit image_build_failed reason=no_slice_room detail="$why"
+      return 1
+    fi
+    sleep "$AKVM_POLL_SECONDS"
+  done
+}
+
+cmd_build_image() {
+  exec 7> "$AKVM_STATE_DIR/build-image.lock"
+  flock -n 7 || {
+    log "another image build is running"
+    exit 1
+  }
+  local stale
+  while read -r stale; do
+    [[ "$stale" == "$IMAGE_PREFIX"* ]] || continue
+    v destroy "$stale" > /dev/null 2>&1 || true
+    v undefine "$stale" > /dev/null 2>&1 || true
+    rm -rf "${VMS_DIR:?}/$stale"
+    audit image_build_stale_removed vm="$stale"
+  done < <(v list --all --name)
+
+  local base name dir console start state
+  base="$(fetch_base_image)"
+  name="$(new_vm_name "$IMAGE_PREFIX")"
+  dir="$VMS_DIR/$name"
+  mkdir -p "$dir" "$CONSOLE_DIR" "$IMAGES_DIR/golden"
+  chmod 0711 "$dir"
+  console="$(console_log "$name")"
+  : > "$console"
+  chmod 0640 "$console"
+  printf 'name=%s\ncreated=%s\nimage=%s\n' "$name" "$(now)" "$base" > "$dir/vm.env"
+  qemu-img create -q -f qcow2 -F qcow2 -b "$base" "$dir/disk.qcow2" "${AKVM_IMAGE_DISK_GB}G"
+  render_image_user_data > "$dir/user-data"
+  make_seed_iso "$dir" "$name"
+  render_domain_xml "$name" "$IMAGE_VM_MEMORY_MIB" "$IMAGE_VM_VCPUS" "$dir/disk.qcow2" "$dir/seed.iso" \
+    "$console" > "$dir/domain.xml"
+  # A build that cannot start must not leave the loop drained.
+  trap build_image_cleanup EXIT
+  trap 'exit 143' TERM INT
+  if ! wait_for_image_room; then
+    rm -rf "$dir"
+    return 1
+  fi
+  audit image_build_started vm="$name" base="$(basename "$base")" base_sha256="$AKVM_BASE_IMAGE_SHA256" \
+    runner_version="$AKVM_RUNNER_VERSION"
+  v define "$dir/domain.xml" > /dev/null
+  v start "$name" > /dev/null
+  # The build VM now counts against the slice; the loop may run again.
+  exec 8>&-
+  start="$(now)"
+  while true; do
+    state="$(v domstate "$name" 2> /dev/null || echo gone)"
+    [[ "$state" == running* ]] || break
+    if (($(now) - start > AKVM_IMAGE_TIMEOUT)); then
+      v destroy "$name" > /dev/null 2>&1 || true
+      audit image_build_failed vm="$name" reason=timeout
+      v undefine "$name" > /dev/null 2>&1 || true
+      rm -rf "$dir"
+      return 1
+    fi
+    sleep 10
+  done
+  v undefine "$name" > /dev/null 2>&1 || true
+  if ! tr -d '\r' < "$console" | grep -aq '^AKVM-IMAGE-OK'; then
+    audit image_build_failed vm="$name" reason=no_ok_marker \
+      detail="$(sanitize "$(tr -d '\r' < "$console" | grep -a '^AKVM-IMAGE-FAIL' | tail -n1)")"
+    rm -rf "$dir"
+    return 1
+  fi
+  local stamp out sha
+  stamp="$(date -u +%Y%m%d%H%M%S)"
+  out="$IMAGES_DIR/golden/ak-vm-$stamp.qcow2"
+  qemu-img convert -O qcow2 "$dir/disk.qcow2" "$out.part"
+  mv "$out.part" "$out"
+  chmod 0444 "$out"
+  sha="$(sha256sum "$out" | cut -d' ' -f1)"
+  printf '%s\n' "$sha" > "$out.sha256"
+  tr -d '\r' < "$console" | grep -a '^AKVM-IMAGE-MANIFEST' | sed 's/^AKVM-IMAGE-MANIFEST //' > "${out%.qcow2}.manifest" || true
+  ln -sfn "$(basename "$out")" "$IMAGES_DIR/golden/current.qcow2.new"
+  mv -T "$IMAGES_DIR/golden/current.qcow2.new" "$IMAGES_DIR/golden/current.qcow2"
+  rm -rf "$dir"
+  audit image_built image="$(basename "$out")" image_sha256="$sha" \
+    manifest="$(sanitize "$(tr -s '\n ' ',' < "${out%.qcow2}.manifest" | sed 's/,$//')")"
+  prune_images
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    reconcile) cmd_reconcile ;;
+    once) with_lock reconcile_once ;;
+    build-image) cmd_build_image ;;
+    status) cmd_status ;;
+    drain)
+      touch "$DRAIN_FLAG"
+      audit drain_on
+      ;;
+    undrain)
+      rm -f "$DRAIN_FLAG"
+      audit drain_off
+      ;;
+    destroy-all) with_lock cmd_destroy_all ;;
+    *)
+      sed -n '3,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      [[ -z "$cmd" || "$cmd" == -h || "$cmd" == --help ]] && return 0
+      return 2
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

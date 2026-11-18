@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Self-test for scripts/ci/check-e2e-proof.py (the end-to-end proof policy for
-# bug fixes: require-e2e-proof.yml and release-preflight.sh check 7).
+# bug fixes: require-e2e-proof.yml and release-preflight.sh check 7; and the
+# gate-test rule for behaviour changes, #6074).
 #
 # WHY THIS EXISTS
 #   The check is silent on every PR that is not a bug fix, and on most bug
@@ -316,6 +317,10 @@ jobs:
             tiers: advisory
 YML
 printf '# header\n4814\ttest-only\tFlaky unit test; the fix changes only the test.\n' > "$WORK/ledger.tsv"
+# Facet rows (fourth column `facet`) are notes, never exemptions.
+printf '200\tinternal-unreachable\tThe signed metadata facet: alpine.rs test_extract_pkginfo_reads_a_signed_apk_5170.\tfacet\n' >> "$WORK/ledger.tsv"
+printf '202\tinternal-unreachable\tOne facet only: covered by some_module::a_facet_unit_test.\tfacet\n' >> "$WORK/ledger.tsv"
+printf '# none\n' > "$WORK/fixprs.tsv"
 
 # issue <n> <labels-json> <closing PRs json> [stateReason]
 issue() { printf '{"number":%s,"title":"bug %s","stateReason":"%s","labels":{"nodes":%s},"closedByPullRequestsReferences":{"nodes":%s}}' \
@@ -335,7 +340,7 @@ ms_world() { # <issue nodes, comma separated> [extra jq]
 run_ms() {
   ( PATH="$STUB:$PATH" GH_WORLD="$WORK/world.json" GH_WRITES="$WORK/writes.log" \
       python3 "$SCRIPT" milestone --milestone "${MS:-1.12.0}" --tests-dir "$TESTS" --repo "$R" \
-      --exemptions "${LEDGER_FILE:-$WORK/ledger.tsv}" >"$WORK/out.txt" 2>&1 )
+      --exemptions "${LEDGER_FILE:-$WORK/ledger.tsv}" --fix-prs "${FIXPRS_FILE:-$WORK/fixprs.tsv}" >"$WORK/out.txt" 2>&1 )
   echo $?
 }
 expect_ms() { # <label> <want> <needle> <nodes> [extra jq]
@@ -378,6 +383,130 @@ expect_ms "graphql failure is INFRA" 2 "INFRA" "$(issue 200 "$BUG" '[]')" '.grap
 printf '4980\trace-window\tthe window is a few microseconds wide\n' > "$WORK/bad.tsv"
 LEDGER_FILE="$WORK/bad.tsv" expect_ms "ledger race-window row naming no test is refused" 2 "must name its test" "$(issue 200 "$BUG" '[]')"
 LEDGER_FILE="$LEDGER" expect_ms "the real ledger parses" 0 "READY" "$(issue 200 "$BUG" "[$P300]")"
+FIXPRS_FILE="$HERE/e2e-fix-prs.tsv" expect_ms "the real fix-PR overrides parse" 0 "READY" "$(issue 200 "$BUG" "[$P300]")"
+
+echo
+echo "check-e2e-proof.py milestone: facet rows and fix-PR overrides"
+expect_ms "facet row on a wired-tier issue -> covered, with the facet noted" 0 "facet without e2e, internal-unreachable" \
+  "$(issue 200 "$BUG" "[$P300]")"
+expect_ms "facet row alone does not exempt the issue -> MISSING" 1 "MISSING" "$(issue 202 "$BUG" "[$P300]")"
+printf '4814\ttest-only\tFlaky unit test; the fix changes only the test.\twhole\n' > "$WORK/badscope.tsv"
+LEDGER_FILE="$WORK/badscope.tsv" expect_ms "unknown ledger scope is refused" 2 "unknown scope 'whole'" "$(issue 200 "$BUG" '[]')"
+cp "$WORK/ledger.tsv" "$WORK/twofacets.tsv"
+printf '200\trace-window\tA second facet: forced by db.rs real_deadlock_answers_503_with_retry_after_5168.\tfacet\n' >> "$WORK/twofacets.tsv"
+LEDGER_FILE="$WORK/twofacets.tsv" expect_ms "two facet rows on one issue are both noted" 0 "facet without e2e, race-window" "$(issue 200 "$BUG" "[$P300]")"
+printf '4814\ttest-only\tA facet of a fully exempt issue makes no sense.\tfacet\n' >> "$WORK/twofacets.tsv"
+LEDGER_FILE="$WORK/twofacets.tsv" expect_ms "an issue row plus a facet row is refused" 2 "has an issue row and" "$(issue 200 "$BUG" '[]')"
+# #5461's shape: GitHub's closing reference is a test-only PR; the fix PR
+# named in the override carries the exemption the backstop must read.
+printf '208\t310\tThe fix landed in #310; #300 only added the regression test.\n' > "$WORK/fixprs-208.tsv"
+FIXPRS_FILE="$WORK/fixprs-208.tsv" expect_ms "fix-PR override: the named PR's exemption counts" 0 "#310: deps" \
+  "$(issue 208 "$BUG" "[$P300]")" \
+  '.GET["repos/\(env.R)/pulls/310"] = {number: 310, title: "fix(deps): x", body: "E2E-Exempt: deps: bump for RUSTSEC-2026-0002", merged: true, head: {ref: "fix/x"}, base: {ref: "main"}, labels: [{name: "no-e2e-required"}]}'
+expect_ms "without the override the closing PR is used -> MISSING via #300" 1 "(#300)" "$(issue 208 "$BUG" "[$P300]")"
+FIXPRS_FILE="$WORK/fixprs-208.tsv" expect_ms "override naming a PR that does not exist -> INFRA" 2 "INFRA" "$(issue 208 "$BUG" "[$P300]")"
+printf '208\tabc\tThe fix landed somewhere else entirely.\n' > "$WORK/fixprs-bad.tsv"
+FIXPRS_FILE="$WORK/fixprs-bad.tsv" expect_ms "malformed override file is refused" 2 "PR numbers must be" "$(issue 200 "$BUG" '[]')"
+
+# --- gate (#6074) --------------------------------------------------------------
+echo
+echo "check-e2e-proof.py gate: behaviour changes move the release gate"
+# Test PR 9 updates the gate for backend PR #1 (the PR itself, not an issue).
+GATE_WORLD='.GET["repos/\(env.T)/pulls/9"] = {number: 9, state: "open", merged: false, base: {ref: "main"},
+              title: "test(dtf): quota refusals answer 403 (artifact-keeper#1)", body: "Moves the oracle to 403."}
+  | .GET["repos/\(env.T)/pulls/9/files"] = [{filename: "deploy-test/harness/tiers/quota/oracle.sh"}]'
+run_gate() {
+  ( PATH="$STUB:$PATH" GH_WORLD="$WORK/world.json" GH_WRITES="$WORK/writes.log" \
+      python3 "$SCRIPT" gate --event "$WORK/event.json" --repo "$R" >"$WORK/out.txt" 2>&1 )
+  echo $?
+}
+# <label> <expected-exit> <expected-substring> <event-jq> <world-jq>
+expect_gate() {
+  local label="$1" want="$2" needle="$3" got
+  setup "$4" "$GATE_WORLD | $5"
+  got="$(run_gate)"
+  if [ "$got" != "$want" ]; then
+    fail "$label: expected exit $want, got $got"; sed 's/^/        /' "$WORK/out.txt" >&2
+  elif ! grep -qF -- "$needle" "$WORK/out.txt"; then
+    fail "$label: exit $got correct but output lacks '$needle'"; sed 's/^/        /' "$WORK/out.txt" >&2
+  else
+    pass "$label (exit $got)"
+  fi
+}
+BC='| .pull_request.labels = [{name: "behaviour-change"}]'
+expect_gate "unlabelled PR -> no gate test needed" 0 "no gate test needed" '.' '.'
+expect_gate "behaviour-change, no line -> FAIL" 1 "missing gate test" ". $BC" '.'
+expect_gate "breaking-change turns the rule on too" 1 "missing gate test" \
+  '.pull_request.labels = [{name: "breaking-change"}]' '.'
+expect_gate "Gate: test PR naming this PR -> PASS" 0 "updates the gate" "$(body $'Closes #101\nGate: artifact-keeper-test#9') $BC" '.'
+expect_gate "bulleted, owner-qualified Gate line -> PASS" 0 "updates the gate" \
+  "$(body $'Closes #101\n- Gate: artifact-keeper/artifact-keeper-test#9') $BC" '.'
+expect_gate "test PR naming a linked issue instead -> PASS" 0 "updates the gate" \
+  "$(body $'Closes #101\nGate: artifact-keeper-test#9') $BC" '.GET["repos/\(env.T)/pulls/9"].title = "test(dtf): x (artifact-keeper#101)"'
+expect_gate "an E2E: test-PR line counts as the gate test" 0 "updates the gate" \
+  "$(body $'Closes #101\nE2E: artifact-keeper-test#9') $BC" '.'
+expect_gate "E2E: tier line is not a gate update -> FAIL" 1 "missing gate test" \
+  "$(body $'Closes #101\nE2E: tier range-serves-1120') $BC" '.'
+expect_gate "Gate line inside an HTML comment does not count" 1 "missing gate test" \
+  "$(body $'Closes #101\n<!--\nGate: artifact-keeper-test#9\n-->') $BC" '.'
+expect_gate "Gate line inside a code block does not count" 1 "missing gate test" \
+  "$(body $'Closes #101\n```\nGate: artifact-keeper-test#9\n```') $BC" '.'
+expect_gate "Gate-Exempt inside inline code does not count" 1 "missing gate test" \
+  "$(body $'Closes #101\n`Gate-Exempt: the gate never asserted this field`') $BC" '.'
+expect_gate "unrecognised Gate line -> FAIL" 1 "unrecognised gate line" \
+  "$(body $'Closes #101\nGate: tier quota') $BC" '.'
+expect_gate "test PR that does not exist -> FAIL" 1 "is not a pull request" \
+  "$(body $'Closes #101\nGate: artifact-keeper-test#8') $BC" '.'
+expect_gate "test PR closed without merging -> FAIL" 1 "closed without merging" \
+  "$(body $'Closes #101\nGate: artifact-keeper-test#9') $BC" '.GET["repos/\(env.T)/pulls/9"].state = "closed"'
+expect_gate "merged test PR -> PASS" 0 "merged" \
+  "$(body $'Closes #101\nGate: artifact-keeper-test#9') $BC" '.GET["repos/\(env.T)/pulls/9"] |= (.state = "closed" | .merged = true)'
+expect_gate "test PR touching neither tiers nor tests -> FAIL" 1 "touches neither" \
+  "$(body $'Closes #101\nGate: artifact-keeper-test#9') $BC" '.GET["repos/\(env.T)/pulls/9/files"] = [{filename: "README.md"}]'
+expect_gate "test PR naming neither this PR nor its issues -> FAIL" 1 "does not name artifact-keeper#1 or artifact-keeper#101" \
+  "$(body $'Closes #101\nGate: artifact-keeper-test#9') $BC" '.GET["repos/\(env.T)/pulls/9"].title = "test(dtf): x (artifact-keeper#999)"'
+expect_gate "release-line PR citing a main test PR -> FAIL" 1 "must target the same-named branch" \
+  "$(body $'Closes #101\nGate: artifact-keeper-test#9') $BC | .pull_request.base.ref = \"release/1.11.x\"" '.'
+expect_gate "two Gate lines, one bad -> FAIL" 1 "is not a pull request" \
+  "$(body $'Closes #101\nGate: artifact-keeper-test#9\nGate: artifact-keeper-test#8') $BC" '.'
+expect_gate "Gate-Exempt with a reason -> PASS" 0 "exempt: no gate tier asserts the old default" \
+  "$(body $'Closes #101\nGate-Exempt: no gate tier asserts the old default') $BC" '.'
+expect_gate "Gate-Exempt with no reason -> FAIL" 1 "needs a reason" \
+  "$(body $'Closes #101\nGate-Exempt: n/a') $BC" '.'
+expect_gate "API failure is INFRA, not a verdict" 2 "INFRA" \
+  "$(body $'Closes #101\nGate: artifact-keeper-test#9') $BC" '.GET["repos/\(env.T)/pulls/9"] = "__FAIL__"'
+
+# --- the workflow's checkout (#6112) ---------------------------------------------
+echo
+echo "require-e2e-proof.yml: the checker comes from the default branch"
+# pull_request_target runs the default branch's workflow for PRs into every
+# branch; checking the script out at the PR's base ran a release line's copy,
+# and a line without it failed every PR. Every checkout must take the default
+# branch, and none may name the PR head.
+WF="$HERE/../../.github/workflows/require-e2e-proof.yml"
+wf_refs="$(python3 - "$WF" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+steps = re.split(r"\n\s*- (?:name|uses):", text)
+for st in steps:
+    if "actions/checkout@" in st:
+        m = re.search(r"^\s*ref:\s*(.+?)\s*$", st, re.MULTILINE)
+        print(m.group(1) if m else "(none)")
+PY
+)"
+n_checkouts="$(printf '%s\n' "$wf_refs" | grep -c .)"
+if [ "$n_checkouts" -lt 2 ]; then
+  fail "expected a checkout in each of the two jobs, found $n_checkouts"
+elif printf '%s\n' "$wf_refs" | grep -vqxF '${{ github.event.repository.default_branch }}'; then
+  fail "a checkout does not take the default branch: $(printf '%s ' "$wf_refs")"
+else
+  pass "all $n_checkouts checkouts take the default branch"
+fi
+if grep -nE 'pull_request\.head|github\.head_ref' "$WF"; then
+  fail "the workflow names the PR head"
+else
+  pass "the workflow never names the PR head"
+fi
 
 echo
 if [ "$fails" -gt 0 ]; then

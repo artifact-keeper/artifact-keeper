@@ -332,6 +332,30 @@ impl Harness {
 }
 
 impl Harness {
+    /// The audit actions recorded against this repository, oldest first,
+    /// once every action in `want` is present. Audit writes are
+    /// fire-and-forget, so poll with a generous deadline instead of a fixed
+    /// sleep that a loaded runner can outlast (#5882); on timeout the last
+    /// read is returned for the caller's assertion to report.
+    async fn audit_actions_including(&self, want: &[&str]) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let actions: Vec<String> = sqlx::query_scalar(
+                "SELECT action FROM audit_log WHERE resource_id = $1 ORDER BY created_at",
+            )
+            .bind(self.repo_id)
+            .fetch_all(&self.pool)
+            .await
+            .unwrap();
+            if want.iter().all(|a| actions.iter().any(|x| x == a))
+                || tokio::time::Instant::now() >= deadline
+            {
+                return actions;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     /// The `path`s of `GET /api/v1/repositories/{key}/artifacts`, sorted.
     async fn artifact_paths(&self) -> Vec<String> {
         let uri = format!("/api/v1/repositories/{}/artifacts?per_page=100", self.key);
@@ -621,15 +645,11 @@ async fn unevaluable_gate_fails_closed_with_503() {
         assert_eq!(v["error"], "mcp_gate_unavailable");
     }
     assert!(h.listed_names().await.is_empty(), "listing fails closed");
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let audited: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM audit_log WHERE action = 'MCP_GATE_UNAVAILABLE' AND resource_id = $1",
-    )
-    .bind(h.repo_id)
-    .fetch_one(&h.pool)
-    .await
-    .unwrap();
-    assert!(audited >= 1);
+    let actions = h.audit_actions_including(&["MCP_GATE_UNAVAILABLE"]).await;
+    assert!(
+        actions.iter().any(|x| x == "MCP_GATE_UNAVAILABLE"),
+        "MCP_GATE_UNAVAILABLE in {actions:?}"
+    );
     h.teardown().await;
 }
 
@@ -750,19 +770,13 @@ async fn content_drift_revokes_and_requeues() {
         .await;
     let served: serde_json::Value = serde_json::from_slice(&b).unwrap();
     assert_eq!(served["server"]["description"], "Original");
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let actions: Vec<String> = sqlx::query_scalar(
-        "SELECT action FROM audit_log WHERE resource_id = $1 ORDER BY created_at",
-    )
-    .bind(h.repo_id)
-    .fetch_all(&h.pool)
-    .await
-    .unwrap();
-    for a in [
+    let expected = [
         "MCP_SERVER_CONTENT_DRIFT",
         "MCP_SERVER_REOPENED",
         "MCP_MIRROR_SYNCED",
-    ] {
+    ];
+    let actions = h.audit_actions_including(&expected).await;
+    for a in expected {
         assert!(actions.iter().any(|x| x == a), "{a} in {actions:?}");
     }
     h.teardown().await;

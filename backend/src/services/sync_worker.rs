@@ -2419,8 +2419,9 @@ pub(crate) enum FailureScope {
 /// Classify a non-success peer response (#4921).
 ///
 /// Only a 400 or 409 whose body names a checksum mismatch, an occupied
-/// immutable path or a refused delete of a released artifact, and a 413 or
-/// 507 whose body names a storage-quota refusal, are item rejections. Every
+/// immutable path or a refused delete of a released artifact, and a 403, 413
+/// or 507 whose body names a storage-quota refusal (a receiver answers 403
+/// since 1.12, older ones 413 or 507), are item rejections. Every
 /// other status, including a 409 for a chunk still in progress, stays a peer
 /// failure so it backs off and retries as before.
 ///
@@ -2436,7 +2437,11 @@ pub(crate) fn failure_scope_for_peer_response(status: u16, body: &str) -> Failur
                 || body.contains("already exists and is immutable")
                 || body.contains("cannot delete an immutable/released artifact")
         }
-        413 | 507 => body.contains("storage quota exceeded"),
+        403 | 413 | 507 => {
+            body.contains("storage quota exceeded")
+                || body.contains("\"code\":\"quota_exceeded\"")
+                || body.contains("\"code\":\"storage_quota_exceeded\"")
+        }
         _ => false,
     };
     if item {
@@ -5718,7 +5723,7 @@ mod tests {
             ),
             FailureScope::Item
         );
-        for status in [413, 507] {
+        for status in [403, 413, 507] {
             assert_eq!(
                 failure_scope_for_peer_response(
                     status,
@@ -5733,6 +5738,14 @@ mod tests {
                 "{status}: a full disk is the peer's problem"
             );
         }
+        // An instance at its storage quota refuses with its own code.
+        assert_eq!(
+            failure_scope_for_peer_response(
+                403,
+                r#"{"code":"STORAGE_QUOTA_EXCEEDED","message":"Storage quota reached: 1.0 GiB of 1.0 GiB used.","scope":"instance"}"#
+            ),
+            FailureScope::Item
+        );
         // A chunk still in progress is a transient 409.
         assert_eq!(
             failure_scope_for_peer_response(409, "Chunk 0 is already being uploaded"),

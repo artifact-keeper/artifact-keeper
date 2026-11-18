@@ -1,8 +1,22 @@
 //! OpenSCAP compliance scanner.
 //!
-//! Writes artifact content to the shared scan workspace, calls the OpenSCAP
-//! HTTP wrapper sidecar to run XCCDF evaluation, and converts results into
-//! RawFinding structs.
+//! Unpacks a stored container image's root filesystem into the shared scan
+//! workspace ([`crate::services::oci_rootfs`]), asks the OpenSCAP HTTP wrapper
+//! sidecar to evaluate THAT tree offline (`OSCAP_PROBE_ROOT`), and converts
+//! the failed rules into policy findings.
+//!
+//! What a scan evaluates (#6000): XCCDF profiles describe an operating
+//! system's configuration, so the target is the image's unpacked root
+//! filesystem. An RPM or DEB package is not a system and is not applicable;
+//! neither is an OCI artifact that is not a runnable image (Helm chart,
+//! signature, SBOM). Before #6000 the scanner wrote the raw artifact bytes
+//! into the workspace and every scan evaluated the sidecar's own filesystem.
+//!
+//! An image that cannot be evaluated meaningfully (layers not stored here, no
+//! `os-release`, no shipped datastream for its OS, no applicable rule, or a
+//! sidecar that cannot root its probes in the tree) is recorded
+//! `not_applicable` with the reason, through
+//! [`AppError::ScannerEngineUnavailable`]. It is never recorded as a pass.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -15,10 +29,19 @@ use tracing::{info, warn};
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
+use crate::services::oci_rootfs::{NotUnpackable, OciRootfsExtractor};
 use crate::services::scanner_service::{
-    cached_cli_version, fail_scan, sanitize_artifact_filename, ScanOutput, ScanWorkspace, Scanner,
-    VersionCache, WorkspaceGuard,
+    cached_cli_version, fail_scan, is_oci_image_artifact, oci_target_is_scannable_image,
+    ScanOutput, ScanTarget, ScanWorkspace, Scanner, VersionCache,
 };
+
+/// The profile evaluated when `OPENSCAP_PROFILE` is unset: CIS Level 1 -
+/// Server, a generic baseline present in every datastream the openscap image
+/// ships (`ssg-rhel9-ds.xml`, `ssg-cs9-ds.xml`). The previous default,
+/// `content_profile_standard`, is in neither, and the wrapper silently ran
+/// `profiles[0]` (`anssi_bp28_enhanced`) instead (#6000). Kept in step with
+/// `DEFAULT_PROFILE` in `scripts/openscap-wrapper.py`.
+pub const DEFAULT_OPENSCAP_PROFILE: &str = "xccdf_org.ssgproject.content_profile_cis_server_l1";
 
 /// Response shape from the OpenSCAP wrapper sidecar's `/health` endpoint.
 /// Used by `Scanner::version()` to capture the running `oscap` binary
@@ -33,12 +56,33 @@ struct OpenScapHealth {
 // OpenSCAP wrapper JSON response structures
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct OpenScapResponse {
+    /// `completed` or `not_applicable`. Absent from a wrapper that predates
+    /// #6000, which evaluated its own filesystem.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Why the target could not be evaluated (`not_applicable`).
+    #[serde(default)]
+    pub reason: Option<String>,
     #[serde(default)]
     pub findings: Vec<OpenScapFinding>,
+    /// The profile the wrapper actually evaluated.
     #[serde(default)]
     pub profile: Option<String>,
+    /// The datastream label the wrapper chose for the target's OS.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// `ID VERSION_ID` from the target's os-release.
+    #[serde(default)]
+    pub target_os: Option<String>,
+    /// Rules evaluated against the target (not notapplicable/notselected).
+    #[serde(default)]
+    pub evaluated: Option<u64>,
+    /// Ownership-dependent rules reported as not evaluated: the tree is
+    /// unpacked without root, so file ownership is not the image's.
+    #[serde(default)]
+    pub not_evaluated: Vec<String>,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -147,73 +191,20 @@ impl OpenScapScanner {
         }
     }
 
-    /// Returns true if this scanner applies to the given artifact.
-    /// OpenSCAP is relevant for container images, RPMs, and DEBs.
+    /// Returns true if this scanner applies to the given artifact: an OCI or
+    /// Docker image manifest (#6000). RPM and DEB packages are not operating
+    /// system root filesystems, so a compliance profile has nothing to
+    /// evaluate in them; they used to be applicable and were "scanned" by
+    /// evaluating the sidecar instead.
     fn is_applicable(artifact: &Artifact) -> bool {
-        let ct = artifact.content_type.to_lowercase();
-        let name_lower = artifact.name.to_lowercase();
-        let path_lower = artifact.path.to_lowercase();
-
-        let is_container = ct.contains("vnd.oci.image")
-            || ct.contains("vnd.docker.distribution")
-            || ct.contains("vnd.docker.container")
-            || path_lower.contains("/manifests/");
-
-        let is_rpm =
-            name_lower.ends_with(".rpm") || ct.contains("x-rpm") || path_lower.contains("/rpm/");
-
-        let is_deb =
-            name_lower.ends_with(".deb") || ct.contains("debian") || path_lower.contains("/deb/");
-
-        is_container || is_rpm || is_deb
+        is_oci_image_artifact(artifact)
     }
 
-    /// Prepare the scan workspace: create directory and write artifact content.
-    /// OpenSCAP does not extract archives (it scans the raw package).
-    async fn prepare_workspace(
-        &self,
-        artifact: &Artifact,
-        content: &Bytes,
-    ) -> Result<WorkspaceGuard> {
-        // Per scan job, not per artifact (#4668): two scans of one artifact
-        // must not share (and delete) one tree.
-        let workspace =
-            ScanWorkspace::job_workspace_dir(&self.scan_workspace, Some("openscap"), artifact);
-        // Create the base first (idempotent) so a missing/unwritable shared
-        // volume root surfaces as a clear, actionable error rather than a bare
-        // "Permission denied (os error 13)" against the per-scan subdir
-        // (issue #1563). The OpenSCAP sidecar reads this same volume read-only,
-        // so the path must stay under the configured base; we do not silently
-        // relocate it.
-        if let Err(e) = tokio::fs::create_dir_all(&self.scan_workspace).await {
-            return Err(workspace_create_error(&self.scan_workspace, &e));
-        }
-        tokio::fs::create_dir_all(&workspace)
-            .await
-            .map_err(|e| workspace_create_error(&self.scan_workspace, &e))?;
-
-        // The directory exists from here on, so the guard owns it and every
-        // later exit removes it -- including the wall-clock timeout that drops
-        // the scan future before it reaches cleanup (#3565).
-        let workspace = WorkspaceGuard::new(workspace);
-
-        let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
-        let safe_filename = sanitize_artifact_filename(original_filename);
-        let artifact_path = workspace.join(&safe_filename);
-
-        tokio::fs::write(&artifact_path, content)
-            .await
-            .map_err(|e| {
-                AppError::Internal(format!("Failed to write artifact to workspace: {}", e))
-            })?;
-
-        Ok(workspace)
-    }
-
-    async fn call_openscap(&self, workspace: &Path) -> Result<OpenScapResponse> {
-        let workspace_str = workspace.to_string_lossy().to_string();
+    /// Ask the wrapper to evaluate the unpacked tree at `root`.
+    async fn call_openscap(&self, root: &Path) -> Result<OpenScapResponse> {
+        let root_str = root.to_string_lossy().to_string();
         let scan_request = serde_json::json!({
-            "path": workspace_str,
+            "path": root_str,
             "profile": self.profile,
         });
 
@@ -232,16 +223,77 @@ impl OpenScapScanner {
             // it against the sidecar's OPENSCAP_ALLOWED_SCAN_DIRS allowlist
             // (issue #1466). Without this, debugging the "scan path not
             // found or not allowed" 400 requires turning on wrapper debug
-            // logs or guessing which path was sent.
+            // logs or guessing which path was sent. A 422 is an unknown
+            // profile (#6000); its body names the profiles that exist.
             return Err(AppError::Internal(format!(
                 "OpenSCAP scan failed (HTTP {}) for path {}: {}",
-                status, workspace_str, body
+                status, root_str, body
             )));
         }
 
         resp.json::<OpenScapResponse>()
             .await
             .map_err(|e| AppError::Internal(format!("Failed to parse OpenSCAP response: {}", e)))
+    }
+
+    /// Turn a wrapper response into findings, or into the error the
+    /// orchestrator records (#6000).
+    ///
+    /// * an `error` field fails the scan. It used to be logged and the scan
+    ///   completed with zero findings: a wrapper error read as a clean pass;
+    /// * `not_applicable` records the scan `not_applicable` with the reason;
+    /// * `completed` must name the profile that was requested, so a wrapper
+    ///   that substitutes another profile cannot pass its results off as the
+    ///   configured one;
+    /// * no status at all is a wrapper from before #6000, which evaluated its
+    ///   own filesystem; its findings are not about the artifact.
+    fn interpret_response(response: &OpenScapResponse, requested: &str) -> Result<Vec<RawFinding>> {
+        if let Some(err) = &response.error {
+            return Err(AppError::Internal(format!(
+                "OpenSCAP wrapper reported an error: {err}"
+            )));
+        }
+        match response.status.as_deref() {
+            Some("not_applicable") => Err(AppError::ScannerEngineUnavailable(format!(
+                "OpenSCAP: {}",
+                response
+                    .reason
+                    .as_deref()
+                    .unwrap_or("the image cannot be evaluated")
+            ))),
+            Some("completed") => {
+                if response.profile.as_deref() != Some(requested) {
+                    return Err(AppError::Internal(format!(
+                        "OpenSCAP evaluated profile {} instead of the configured {requested}",
+                        response.profile.as_deref().unwrap_or("(none)")
+                    )));
+                }
+                Ok(Self::convert_findings(response))
+            }
+            other => Err(AppError::Internal(format!(
+                "OpenSCAP sidecar returned scan status {other:?}: it predates the fix for \
+                 #6000 and evaluates its own filesystem, not the image. Run the openscap \
+                 image from the same release as the backend."
+            ))),
+        }
+    }
+
+    /// Evaluate the unpacked image root at `root` and return its findings.
+    async fn evaluate_root(&self, artifact: &Artifact, root: &Path) -> Result<Vec<RawFinding>> {
+        let response = self.call_openscap(root).await?;
+        let findings = Self::interpret_response(&response, &self.profile)?;
+        info!(
+            "OpenSCAP scan complete for {} ({} on {}, profile {}): {} rules evaluated, \
+             {} compliance issues, {} ownership rules not evaluated",
+            artifact.name,
+            response.content.as_deref().unwrap_or("?"),
+            response.target_os.as_deref().unwrap_or("?"),
+            self.profile,
+            response.evaluated.unwrap_or(0),
+            findings.len(),
+            response.not_evaluated.len(),
+        );
+        Ok(findings)
     }
 
     fn convert_findings(response: &OpenScapResponse) -> Vec<RawFinding> {
@@ -306,6 +358,13 @@ impl Scanner for OpenScapScanner {
         Self::is_applicable(artifact)
     }
 
+    /// With the manifest body in hand, also require a runnable image, so a
+    /// Helm chart, signature or SBOM stored as an OCI artifact is recorded
+    /// not applicable instead of failing to unpack (#1971's gate).
+    fn is_applicable_for_target(&self, target: &ScanTarget<'_>) -> bool {
+        Self::is_applicable(target.artifact) && oci_target_is_scannable_image(target)
+    }
+
     /// Probe the wrapper sidecar's `/health` endpoint once and cache the
     /// `oscap` version string. Returns `None` if the wrapper is unreachable
     /// or its response cannot be parsed.
@@ -316,15 +375,28 @@ impl Scanner for OpenScapScanner {
         .await
     }
 
+    /// The image's layers are read from repository storage, which only the
+    /// target-aware entry point carries. A caller without it cannot unpack
+    /// the image, so the scan is not applicable rather than a pass.
     async fn scan(
         &self,
-        artifact: &Artifact,
+        _artifact: &Artifact,
+        _metadata: Option<&ArtifactMetadata>,
+        _content: &Bytes,
+    ) -> Result<ScanOutput> {
+        Err(NotUnpackable::NoStorage.into())
+    }
+
+    async fn scan_target(
+        &self,
+        target: &ScanTarget<'_>,
         _metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
     ) -> Result<ScanOutput> {
+        let artifact = target.artifact;
         debug_assert!(
             Self::is_applicable(artifact),
-            "OpenScapScanner::scan called on a non-applicable artifact; the orchestrator must gate on is_applicable first"
+            "OpenScapScanner::scan_target called on a non-applicable artifact; the orchestrator must gate on is_applicable first"
         );
 
         info!(
@@ -332,28 +404,50 @@ impl Scanner for OpenScapScanner {
             artifact.name, artifact.id
         );
 
-        let mut workspace = self.prepare_workspace(artifact, content).await?;
+        // Create the base first (idempotent) so a missing/unwritable shared
+        // volume root surfaces as a clear, actionable error rather than a bare
+        // "Permission denied (os error 13)" against the per-scan subdir
+        // (issue #1563). The OpenSCAP sidecar reads this same volume read-only,
+        // so the path must stay under the configured base; we do not silently
+        // relocate it.
+        if let Err(e) = tokio::fs::create_dir_all(&self.scan_workspace).await {
+            return Err(workspace_create_error(&self.scan_workspace, &e));
+        }
+        // Per scan job, not per artifact (#4668). The guard removes the tree
+        // on every exit, the wall-clock timeout included (#3565).
+        let extractor = OciRootfsExtractor {
+            db: target.db,
+            storage: target.storage,
+            repository_id: artifact.repository_id,
+        };
+        let mut prepared = ScanWorkspace::prepare_with(
+            &self.scan_workspace,
+            Some("openscap"),
+            artifact,
+            content,
+            &extractor,
+        )
+        .await
+        .inspect_err(|e| {
+            if !matches!(e, AppError::ScannerEngineUnavailable(_)) {
+                warn!("OpenSCAP could not unpack {}: {}", artifact.name, e);
+            }
+        })?;
 
-        let response = match self.call_openscap(&workspace).await {
-            Ok(resp) => resp,
+        let findings = match self.evaluate_root(artifact, &prepared.scan_root).await {
+            Ok(findings) => findings,
+            Err(e @ AppError::ScannerEngineUnavailable(_)) => {
+                prepared.guard.cleanup().await;
+                return Err(e);
+            }
             Err(e) => {
-                return Err(fail_scan("OpenSCAP scan", artifact, &e, Some(&mut workspace)).await);
+                return Err(
+                    fail_scan("OpenSCAP scan", artifact, &e, Some(&mut prepared.guard)).await,
+                );
             }
         };
 
-        if let Some(err) = &response.error {
-            warn!("OpenSCAP returned error for {}: {}", artifact.name, err);
-        }
-
-        let findings = Self::convert_findings(&response);
-
-        info!(
-            "OpenSCAP scan complete for {}: {} compliance issues found",
-            artifact.name,
-            findings.len()
-        );
-
-        workspace.cleanup().await;
+        prepared.guard.cleanup().await;
 
         // OpenSCAP is a compliance scanner, not an inventory enumerator;
         // packages list intentionally empty.
@@ -365,26 +459,65 @@ impl Scanner for OpenScapScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::scanner_service::test_helpers::{assert_scan_failed, make_test_artifact};
+    use crate::services::scanner_service::test_helpers::make_test_artifact;
 
+    /// #6000: a package is not an operating system root filesystem. RPM and
+    /// DEB used to be applicable and were "scanned" by evaluating the
+    /// sidecar's own filesystem; they are now recorded not applicable.
     #[test]
-    fn test_is_applicable_rpm() {
+    fn test_not_applicable_rpm_6000() {
         let artifact = make_test_artifact(
             "nginx-1.24.0-1.el9.x86_64.rpm",
             "application/x-rpm",
             "rpm/nginx/nginx-1.24.0-1.el9.x86_64.rpm",
         );
-        assert!(OpenScapScanner::is_applicable(&artifact));
+        assert!(!OpenScapScanner::is_applicable(&artifact));
     }
 
     #[test]
-    fn test_is_applicable_deb() {
+    fn test_not_applicable_deb_6000() {
         let artifact = make_test_artifact(
             "nginx_1.24.0-1_amd64.deb",
             "application/vnd.debian.binary-package",
             "deb/nginx/nginx_1.24.0-1_amd64.deb",
         );
-        assert!(OpenScapScanner::is_applicable(&artifact));
+        assert!(!OpenScapScanner::is_applicable(&artifact));
+    }
+
+    /// A Helm chart pushed as an OCI artifact shares the manifest media type
+    /// with an image; with the body in hand it is not applicable.
+    #[test]
+    fn test_not_applicable_helm_oci_chart_with_body() {
+        let artifact = make_test_artifact(
+            "chart",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/charts/mychart/manifests/1.0.0",
+        );
+        let body = serde_json::json!({
+            "schemaVersion": 2,
+            "config": {"mediaType": "application/vnd.cncf.helm.config.v1+json",
+                       "digest": format!("sha256:{}", "a".repeat(64)), "size": 1},
+            "layers": [{"mediaType": "application/vnd.cncf.helm.chart.content.v1.tar+gzip",
+                        "digest": format!("sha256:{}", "b".repeat(64)), "size": 1}]
+        })
+        .to_string();
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "charts",
+            repository_type: "local",
+            db: None,
+            storage: None,
+            manifest_body: Some(body.as_bytes()),
+            expected_component: None,
+            require_nonempty_catalog: false,
+            repository_format: Some("docker"),
+        };
+        let scanner = OpenScapScanner::new(
+            "http://localhost:0".into(),
+            DEFAULT_OPENSCAP_PROFILE.into(),
+            "/tmp".into(),
+        );
+        assert!(!scanner.is_applicable_for_target(&target));
     }
 
     #[test]
@@ -444,6 +577,7 @@ mod tests {
             ],
             profile: Some("standard".into()),
             error: None,
+            ..Default::default()
         };
 
         let findings = OpenScapScanner::convert_findings(&response);
@@ -500,6 +634,7 @@ mod tests {
                 .collect(),
             profile: Some("standard".into()),
             error: None,
+            ..Default::default()
         }
     }
 
@@ -580,27 +715,326 @@ mod tests {
         assert_eq!(findings[2].severity, Severity::Info);
     }
 
-    /// When the OpenSCAP sidecar is unreachable, the scanner must return Err
-    /// so the orchestrator records the scan as failed. Previously it returned
-    /// Ok(vec![]), making the artifact appear clean.
+    // -----------------------------------------------------------------------
+    // #6000: what a scan evaluates, and how the wrapper's answer is read
+    // -----------------------------------------------------------------------
+
+    const STIG: &str = "xccdf_org.ssgproject.content_profile_stig";
+
+    fn image_artifact() -> Artifact {
+        make_test_artifact(
+            "myapp",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/myapp/manifests/1.0",
+        )
+    }
+
+    fn completed(profile: &str) -> OpenScapResponse {
+        OpenScapResponse {
+            status: Some("completed".into()),
+            profile: Some(profile.into()),
+            evaluated: Some(10),
+            findings: vec![OpenScapFinding {
+                rule_id: "xccdf_org.ssgproject.content_rule_accounts_umask_etc_profile".into(),
+                result: "fail".into(),
+                severity: "medium".into(),
+                title: "Ensure the Default Umask is Set Correctly in /etc/profile".into(),
+                description: None,
+                references: vec![],
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The backend default must be a profile the shipped wrapper also uses
+    /// as its own default, and not the `standard` profile no shipped
+    /// datastream defines.
+    #[test]
+    fn test_default_profile_matches_wrapper_6000() {
+        let wrapper = include_str!("../../../scripts/openscap-wrapper.py");
+        assert!(
+            wrapper.contains(&format!("DEFAULT_PROFILE = \"{DEFAULT_OPENSCAP_PROFILE}\"")),
+            "scripts/openscap-wrapper.py DEFAULT_PROFILE must equal {DEFAULT_OPENSCAP_PROFILE}"
+        );
+        assert!(!DEFAULT_OPENSCAP_PROFILE.ends_with("content_profile_standard"));
+        assert_eq!(
+            crate::config::Config::default().openscap_profile,
+            DEFAULT_OPENSCAP_PROFILE
+        );
+    }
+
+    #[test]
+    fn test_completed_response_keeps_configured_profile() {
+        let findings = OpenScapScanner::interpret_response(&completed(STIG), STIG).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Medium);
+    }
+
+    /// The old wrapper replaced an unknown profile with `profiles[0]`. A
+    /// response for any other profile than the configured one is an error.
+    #[test]
+    fn test_substituted_profile_is_an_error_6000() {
+        let resp = completed("xccdf_org.ssgproject.content_profile_anssi_bp28_enhanced");
+        let err = OpenScapScanner::interpret_response(&resp, DEFAULT_OPENSCAP_PROFILE).unwrap_err();
+        assert!(matches!(err, AppError::Internal(_)), "{err}");
+        assert!(
+            err.to_string().contains("instead of the configured"),
+            "{err}"
+        );
+    }
+
+    /// A wrapper error used to be logged and the scan completed with zero
+    /// findings, which read as a clean pass.
+    #[test]
+    fn test_wrapper_error_fails_the_scan_6000() {
+        let resp = OpenScapResponse {
+            error: Some("oscap exited with code 1".into()),
+            ..Default::default()
+        };
+        let err = OpenScapScanner::interpret_response(&resp, STIG).unwrap_err();
+        assert!(matches!(err, AppError::Internal(_)), "{err}");
+    }
+
+    #[test]
+    fn test_not_applicable_response_records_not_applicable_6000() {
+        let resp = OpenScapResponse {
+            status: Some("not_applicable".into()),
+            reason: Some("no SCAP content for debian 12 in this sidecar".into()),
+            ..Default::default()
+        };
+        match OpenScapScanner::interpret_response(&resp, STIG) {
+            Err(AppError::ScannerEngineUnavailable(reason)) => {
+                assert!(reason.contains("debian 12"), "{reason}")
+            }
+            other => panic!("expected not_applicable, got {other:?}"),
+        }
+    }
+
+    /// A wrapper from before #6000 answers without a status, after
+    /// evaluating its own filesystem. Its findings are not about the image.
+    #[test]
+    fn test_pre_fix_wrapper_response_is_refused_6000() {
+        let resp = OpenScapResponse {
+            profile: Some(STIG.into()),
+            findings: completed(STIG).findings,
+            ..Default::default()
+        };
+        let err = OpenScapScanner::interpret_response(&resp, STIG).unwrap_err();
+        assert!(err.to_string().contains("predates"), "{err}");
+    }
+
+    /// Without repository storage the image cannot be unpacked: not
+    /// applicable, and the job directory is gone afterwards. The base is
+    /// still created first (#1563).
+    #[tokio::test]
+    async fn test_scan_without_storage_is_not_applicable_6000() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("nested").join("scan-workspace");
+        let scanner = OpenScapScanner::new(
+            "http://localhost:0".into(),
+            STIG.into(),
+            base.to_string_lossy().to_string(),
+        );
+        let artifact = image_artifact();
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "docker-local",
+            repository_type: "local",
+            db: None,
+            storage: None,
+            manifest_body: None,
+            expected_component: None,
+            require_nonempty_catalog: false,
+            repository_format: Some("docker"),
+        };
+        let err = scanner
+            .scan_target(&target, None, &Bytes::from_static(b"{}"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::ScannerEngineUnavailable(_)),
+            "{err}"
+        );
+        assert!(base.is_dir(), "the shared base is created first");
+        assert_eq!(
+            std::fs::read_dir(&base).unwrap().count(),
+            0,
+            "job dir removed"
+        );
+
+        // The legacy entry point has no storage either.
+        let err = scanner
+            .scan(&artifact, None, &Bytes::from_static(b"{}"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::ScannerEngineUnavailable(_)),
+            "{err}"
+        );
+    }
+
+    /// End to end in process: two stored layers are unpacked in order into
+    /// `<workspace>/rootfs`, and THAT directory (holding the image's
+    /// os-release, not the raw manifest) is what the wrapper is asked to
+    /// evaluate, under the configured base (#1466) and with the configured
+    /// profile.
+    #[tokio::test]
+    async fn test_unpacked_rootfs_is_what_the_wrapper_evaluates_6000() {
+        use crate::services::oci_rootfs::{unpack_layers, ImageLayer, LayerCoding};
+        use crate::storage::StorageBackend;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        fn layer_tar(files: &[(&str, &[u8])]) -> Bytes {
+            let mut b = tar::Builder::new(Vec::new());
+            for (name, data) in files {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                b.append_data(&mut h, name, *data).unwrap();
+            }
+            Bytes::from(b.into_inner().unwrap())
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::filesystem::FilesystemStorage::new(dir.path().join("store"));
+        let l1 = layer_tar(&[
+            ("etc/os-release", b"ID=rhel\nVERSION_ID=9.6\n"),
+            ("etc/profile", b"umask 022\n"),
+        ]);
+        let l2 = layer_tar(&[("etc/profile", b"umask 077\n")]);
+        let d1 = format!("sha256:{}", "1".repeat(64));
+        let d2 = format!("sha256:{}", "2".repeat(64));
+        storage.put("blobs/l1", l1.clone()).await.unwrap();
+        storage.put("blobs/l2", l2.clone()).await.unwrap();
+        let layers = vec![
+            ImageLayer {
+                digest: d1.clone(),
+                coding: LayerCoding::Plain,
+                size: l1.len() as u64,
+            },
+            ImageLayer {
+                digest: d2.clone(),
+                coding: LayerCoding::Plain,
+                size: l2.len() as u64,
+            },
+        ];
+        let keys = [(d1, "blobs/l1".to_string()), (d2, "blobs/l2".to_string())]
+            .into_iter()
+            .collect();
+        let base = dir.path().join("ws");
+        let job = base.join("openscap-x-job");
+        std::fs::create_dir_all(&job).unwrap();
+        let root = unpack_layers(
+            &storage,
+            &layers,
+            &keys,
+            &job,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(root, job.join("rootfs"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("etc/profile")).unwrap(),
+            "umask 077\n"
+        );
+        assert!(root.join(".dockerenv").exists());
+        assert!(!job.join("layers").exists(), "staged blobs are removed");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/scan"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "completed",
+                "profile": STIG,
+                "content": "rhel9",
+                "target_os": "rhel 9.6",
+                "evaluated": 12,
+                "findings": [{
+                    "rule_id": "xccdf_org.ssgproject.content_rule_accounts_umask_etc_bashrc",
+                    "result": "fail",
+                    "severity": "medium",
+                    "title": "Ensure the Default Bash Umask is Set Correctly",
+                    "references": []
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let scanner =
+            OpenScapScanner::new(server.uri(), STIG.into(), base.to_string_lossy().into());
+        let findings = scanner
+            .evaluate_root(&image_artifact(), &root)
+            .await
+            .unwrap();
+        assert_eq!(findings.len(), 1);
+
+        let received: Vec<Request> = server.received_requests().await.unwrap_or_default();
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        let sent = body["path"].as_str().unwrap();
+        assert_eq!(sent, root.to_string_lossy());
+        assert!(
+            Path::new(sent).starts_with(&base),
+            "under the configured base (#1466)"
+        );
+        assert!(Path::new(sent).join("etc/os-release").is_file());
+        assert_eq!(body["profile"].as_str(), Some(STIG));
+    }
+
+    /// When the wrapper rejects the path with HTTP 400 (the exact symptom
+    /// in issue #1466), or the profile with HTTP 422 (#6000), the error
+    /// carries the path and the wrapper's body.
+    #[tokio::test]
+    async fn test_scan_error_includes_rejected_path() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("openscap-x-job").join("rootfs");
+        std::fs::create_dir_all(&root).unwrap();
+        for (status, body) in [
+            (400, "{\"error\": \"scan path not found or not allowed\"}"),
+            (422, "{\"error\": \"profile x is not defined in any shipped SCAP datastream\", \"code\": \"unknown_profile\"}"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/scan"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .mount(&server)
+                .await;
+            let scanner = OpenScapScanner::new(
+                server.uri(),
+                STIG.into(),
+                dir.path().to_string_lossy().to_string(),
+            );
+            let err = scanner
+                .evaluate_root(&image_artifact(), &root)
+                .await
+                .expect_err("scan must propagate the wrapper refusal");
+            let msg = err.to_string();
+            assert!(msg.contains("OpenSCAP scan failed"), "got: {}", msg);
+            assert!(msg.contains(&*root.to_string_lossy()), "path missing: {msg}");
+            assert!(msg.contains(&body[12..30]), "wrapper body missing: {msg}");
+        }
+    }
+
+    /// When the OpenSCAP sidecar is unreachable, evaluation must return Err
+    /// so the orchestrator records the scan as failed, never clean.
     #[tokio::test]
     async fn test_scan_returns_error_when_sidecar_unreachable() {
         let dir = tempfile::tempdir().unwrap();
         let scanner = OpenScapScanner::new(
-            // Port 0 ensures the connection will be refused
             "http://localhost:0".to_string(),
-            "standard".to_string(),
+            STIG.to_string(),
             dir.path().to_string_lossy().to_string(),
         );
-        let artifact = make_test_artifact(
-            "nginx-1.24.0-1.el9.x86_64.rpm",
-            "application/x-rpm",
-            "rpm/nginx/1.24.0/nginx-1.24.0-1.el9.x86_64.rpm",
-        );
-        let content = bytes::Bytes::from_static(b"fake rootfs tarball");
-
-        let result = scanner.scan(&artifact, None, &content).await;
-        assert_scan_failed(&result, "OpenSCAP scan");
+        let err = scanner
+            .evaluate_root(&image_artifact(), dir.path())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("OpenSCAP request failed"), "{err}");
     }
 
     /// Build an `OpenScapScanner` pointing at `url`, using a fresh tempdir
@@ -732,88 +1166,6 @@ mod tests {
         assert_eq!(scanner.version().await, None);
     }
 
-    // -----------------------------------------------------------------------
-    // prepare_workspace + call_openscap (issue #1466 regression coverage)
-    // -----------------------------------------------------------------------
-
-    /// `prepare_workspace` must place the artifact under a path that begins
-    /// with the configured `SCAN_WORKSPACE_PATH` base. The openscap wrapper
-    /// sidecar validates incoming paths against an allowlist that, by
-    /// default, includes `/scan-workspace/`. If the backend ever produces a
-    /// path outside this base, the wrapper rejects with
-    /// "scan path not found or not allowed" (issue #1466).
-    #[tokio::test]
-    async fn test_prepare_workspace_path_is_under_configured_base() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().to_string_lossy().to_string();
-        let scanner = OpenScapScanner::new(
-            "http://localhost:0".to_string(),
-            "standard".to_string(),
-            base.clone(),
-        );
-        let artifact = make_test_artifact(
-            "nginx-1.24.0-1.el9.x86_64.rpm",
-            "application/x-rpm",
-            "rpm/nginx/1.24.0/nginx-1.24.0-1.el9.x86_64.rpm",
-        );
-        let workspace = scanner
-            .prepare_workspace(&artifact, &bytes::Bytes::from_static(b"fake rpm"))
-            .await
-            .expect("prepare_workspace must succeed");
-
-        // The workspace must live under the configured base so the sidecar
-        // allowlist (which mirrors SCAN_WORKSPACE_PATH) accepts it.
-        assert!(
-            workspace.starts_with(dir.path()),
-            "workspace {:?} must be under base {:?}",
-            workspace,
-            dir.path()
-        );
-        // Prefix gives openscap its own subtree, separate from trivy/grype.
-        let name = workspace.file_name().and_then(|s| s.to_str()).unwrap();
-        assert!(
-            name.starts_with("openscap-"),
-            "workspace dir name {} must be prefixed with 'openscap-' so concurrent scanners don't collide",
-            name
-        );
-        assert!(workspace.is_dir(), "workspace must exist on disk");
-    }
-
-    /// Regression for issue #1563: `prepare_workspace` must create the
-    /// configured base directory itself if it does not yet exist, not just the
-    /// per-scan subdirectory. The original code only created the leaf via
-    /// `create_dir_all(<base>/openscap-<id>)`; while that also creates parents,
-    /// creating the base explicitly first lets us surface a clear,
-    /// actionable error (see `workspace_create_error`) when the shared volume
-    /// root is present but unwritable. Here the base does not exist, so the
-    /// scan must still succeed by creating it.
-    #[tokio::test]
-    async fn test_prepare_workspace_creates_missing_base() {
-        let dir = tempfile::tempdir().unwrap();
-        // Point the scanner at a not-yet-created subpath of the tempdir.
-        let base = dir.path().join("nested").join("scan-workspace");
-        let scanner = OpenScapScanner::new(
-            "http://localhost:0".to_string(),
-            "standard".to_string(),
-            base.to_string_lossy().to_string(),
-        );
-        let artifact = make_test_artifact(
-            "nginx-1.24.0-1.el9.x86_64.rpm",
-            "application/x-rpm",
-            "rpm/nginx/1.24.0/nginx-1.24.0-1.el9.x86_64.rpm",
-        );
-        let workspace = scanner
-            .prepare_workspace(&artifact, &bytes::Bytes::from_static(b"fake rpm"))
-            .await
-            .expect("prepare_workspace must create the missing base and succeed");
-        assert!(base.is_dir(), "base must have been created");
-        assert!(
-            workspace.starts_with(&base),
-            "workspace must live under base"
-        );
-        assert!(workspace.is_dir(), "per-scan workspace must exist on disk");
-    }
-
     /// `workspace_create_error` maps an EACCES (`PermissionDenied`) IO error to
     /// an actionable message that names the base path and points operators at
     /// the volume-ownership fix. This is the exact failure mode reported in
@@ -851,150 +1203,6 @@ mod tests {
         assert!(
             !msg.contains("1001"),
             "non-permission error must not mention UID-ownership advice, got: {msg}"
-        );
-    }
-
-    /// Happy path: when the wrapper sidecar accepts the path and returns
-    /// findings, `scan()` converts them into `RawFinding`s and the request
-    /// body it sent carries the workspace path (which the wrapper's
-    /// `validate_scan_path` matches against `OPENSCAP_ALLOWED_SCAN_DIRS`).
-    /// This is the prepare-and-scan flow that breaks in issue #1466.
-    #[tokio::test]
-    async fn test_scan_happy_path_sends_workspace_path_to_wrapper() {
-        use wiremock::matchers::{body_json, method, path};
-        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-
-        let dir = tempfile::tempdir().unwrap();
-        let server = MockServer::start().await;
-
-        let artifact = make_test_artifact(
-            "nginx-1.24.0-1.el9.x86_64.rpm",
-            "application/x-rpm",
-            "rpm/nginx/1.24.0/nginx-1.24.0-1.el9.x86_64.rpm",
-        );
-        // The job directory is unique per scan (#4668); fix this thread's
-        // suffix so the expected path is known in advance.
-        crate::services::scanner_service::test_scan_job_suffix::fix("openscap-job");
-        let expected_workspace = ScanWorkspace::job_workspace_dir(
-            &dir.path().to_string_lossy(),
-            Some("openscap"),
-            &artifact,
-        )
-        .to_string_lossy()
-        .to_string();
-        let expected_body = serde_json::json!({
-            "path": expected_workspace,
-            "profile": "standard",
-        });
-
-        Mock::given(method("POST"))
-            .and(path("/scan"))
-            .and(body_json(&expected_body))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "findings": [{
-                    "rule_id": "xccdf_org.ssgproject.content_rule_no_empty_passwords",
-                    "result": "fail",
-                    "severity": "high",
-                    "title": "Prevent Login to Accounts With Empty Password",
-                    "description": "Accounts should not have empty passwords",
-                    "references": ["CCE-27286-2"]
-                }],
-                "profile": "standard"
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let scanner = OpenScapScanner::new(
-            server.uri(),
-            "standard".to_string(),
-            dir.path().to_string_lossy().to_string(),
-        );
-
-        let output = scanner
-            .scan(&artifact, None, &bytes::Bytes::from_static(b"fake rpm"))
-            .await
-            .expect("happy path scan must succeed");
-
-        assert_eq!(output.findings.len(), 1);
-        assert_eq!(output.findings[0].severity, Severity::High);
-        assert_eq!(output.findings[0].source.as_deref(), Some("openscap"));
-
-        // Verify the wrapper actually received the workspace path we built;
-        // wiremock's body_json matcher above gated the 200, but pull the
-        // received request explicitly so a regression that changes the
-        // request shape produces a useful diff rather than a "no matching
-        // request" 404.
-        let received: Vec<Request> = server
-            .received_requests()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|r| r.url.path() == "/scan")
-            .collect();
-        assert_eq!(received.len(), 1, "exactly one /scan request expected");
-        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
-        assert_eq!(body["path"].as_str(), Some(expected_workspace.as_str()));
-        assert_eq!(body["profile"].as_str(), Some("standard"));
-    }
-
-    /// When the wrapper rejects the path with HTTP 400 (the exact symptom
-    /// in issue #1466), the error returned to the orchestrator must carry
-    /// the rejected path so operators can match it against the wrapper's
-    /// allowlist without enabling debug logs.
-    #[tokio::test]
-    async fn test_scan_error_includes_rejected_path() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let dir = tempfile::tempdir().unwrap();
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/scan"))
-            .respond_with(
-                ResponseTemplate::new(400)
-                    .set_body_string("{\"error\": \"scan path not found or not allowed\"}"),
-            )
-            .mount(&server)
-            .await;
-
-        let scanner = OpenScapScanner::new(
-            server.uri(),
-            "standard".to_string(),
-            dir.path().to_string_lossy().to_string(),
-        );
-        let artifact = make_test_artifact(
-            "nginx-1.24.0-1.el9.x86_64.rpm",
-            "application/x-rpm",
-            "rpm/nginx/1.24.0/nginx-1.24.0-1.el9.x86_64.rpm",
-        );
-        // The job directory is unique per scan (#4668); fix this thread's
-        // suffix so the expected path is known in advance.
-        crate::services::scanner_service::test_scan_job_suffix::fix("openscap-job");
-        let expected_path = ScanWorkspace::job_workspace_dir(
-            &dir.path().to_string_lossy(),
-            Some("openscap"),
-            &artifact,
-        )
-        .to_string_lossy()
-        .to_string();
-
-        let err = scanner
-            .scan(&artifact, None, &bytes::Bytes::from_static(b"fake rpm"))
-            .await
-            .expect_err("scan must propagate wrapper 400");
-        let msg = err.to_string();
-        assert!(msg.contains("OpenSCAP scan failed"), "got: {}", msg);
-        assert!(
-            msg.contains(&expected_path),
-            "error must include rejected path {} for operator debugging (issue #1466), got: {}",
-            expected_path,
-            msg
-        );
-        assert!(
-            msg.contains("scan path not found or not allowed"),
-            "wrapper body must be surfaced, got: {}",
-            msg
         );
     }
 }

@@ -549,7 +549,7 @@ mod tests {
         assert!(levels.contains(&tracing::Level::WARN), "{levels:?}");
     }
 
-    /// #5701: a quota refusal (`507`) is an expected answer too; an
+    /// #5701: a quota refusal (a `403` since 1.12) is an expected answer; an
     /// unexpected `500` still logs ERROR from both the error path and the
     /// trace layer.
     #[test]
@@ -557,7 +557,7 @@ mod tests {
         use axum::response::IntoResponse;
         let (quota, quota_levels) =
             traced(|| crate::error::AppError::QuotaExceeded("over quota".into()).into_response());
-        assert_eq!(quota, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(quota, StatusCode::FORBIDDEN);
         assert!(
             !quota_levels.contains(&tracing::Level::ERROR),
             "{quota_levels:?}"

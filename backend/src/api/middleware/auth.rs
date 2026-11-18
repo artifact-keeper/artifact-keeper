@@ -2427,6 +2427,13 @@ pub async fn admin_middleware(
         }
     };
 
+    // The full path, `request.uri()` is what is left after the `/api/v1/admin` nest (#5603)
+    let gate_path = request
+        .extensions()
+        .get::<OriginalUri>()
+        .map(|o| o.0.path().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
+
     if !auth_ext.is_admin {
         // Best-effort RBAC-deny audit event (#2366): an authenticated non-admin
         // reaching an admin-only route is exactly the kind of authorization
@@ -2443,7 +2450,7 @@ pub async fn admin_middleware(
                 .actor_name(auth_ext.username.clone())
                 .details_typed(
                     crate::services::audit_export::details::AuthDetails::permission_denied(
-                        request.uri().path(),
+                        &gate_path,
                         request.method().as_str(),
                         "admin_privileges_required",
                     ),
@@ -2458,11 +2465,6 @@ pub async fn admin_middleware(
     // ever changed, say -- could use every admin route while `auth_middleware`
     // refused it everywhere else. Same path exemptions, same 428, same
     // `OriginalUri` reasoning as in `auth_middleware`.
-    let gate_path = request
-        .extensions()
-        .get::<OriginalUri>()
-        .map(|o| o.0.path().to_string())
-        .unwrap_or_else(|| request.uri().path().to_string());
     if !path_exempt_from_password_change(&gate_path)
         && principal_must_change_password(auth_service.db(), auth_ext.user_id).await
     {
@@ -2852,7 +2854,7 @@ fn is_write_method(method: &Method) -> bool {
 /// The narrower question "may an ANONYMOUS caller issue this POST against a
 /// public repository?" is answered by [`is_anonymous_readable_format_post`],
 /// which is deliberately a strict subset.
-fn is_non_mutating_format_post(path: &str) -> bool {
+pub(crate) fn is_non_mutating_format_post(path: &str) -> bool {
     let trimmed = path.trim_start_matches('/');
     let mut segments = trimmed.split('/');
     match segments.next() {
@@ -3151,6 +3153,27 @@ fn permission_unavailable_response() -> Response {
             "permission service temporarily unavailable",
         ))
         .unwrap()
+}
+
+/// Whether any fine-grained rule targets the repository, for the read arm of
+/// [`repo_visibility_middleware`]. A failed lookup (the database is
+/// unreachable once the 30 s rules cache entry has expired) fails closed with
+/// the same retryable 503 + `Retry-After: 1` as the write arm, so a package
+/// client backs off and retries instead of treating the outage as final.
+async fn read_rules_exist(
+    permission_service: &crate::services::permission_service::PermissionService,
+    repo_id: uuid::Uuid,
+) -> std::result::Result<bool, Response> {
+    permission_service
+        .has_any_rules_for_target("repository", repo_id)
+        .await
+        .map_err(|_| {
+            tracing::error!(
+                repository_id = %repo_id,
+                "permission check failed: database unreachable"
+            );
+            permission_unavailable_response()
+        })
 }
 
 /// The answer to a write or delete the caller may not make (#5458).
@@ -3809,22 +3832,10 @@ pub async fn repo_visibility_middleware(
                 // sufficient for public repos; private repos still require a
                 // role assignment). If rules do exist, the user must hold the
                 // read action.
-                let has_rules = match vis_state
-                    .permission_service
-                    .has_any_rules_for_target("repository", repo.id)
-                    .await
+                let has_rules = match read_rules_exist(&vis_state.permission_service, repo.id).await
                 {
                     Ok(v) => v,
-                    Err(_) => {
-                        // DB error on permission check: fail closed.
-                        tracing::error!("permission check failed: database unreachable");
-                        return Response::builder()
-                            .status(StatusCode::SERVICE_UNAVAILABLE)
-                            .body(axum::body::Body::from(
-                                "permission service temporarily unavailable",
-                            ))
-                            .unwrap();
-                    }
+                    Err(resp) => return resp,
                 };
 
                 if has_rules {
@@ -7321,6 +7332,24 @@ mod tests {
                     .password("invalid")
                     .database("invalid"),
             )
+    }
+
+    #[tokio::test]
+    async fn test_read_rules_lookup_db_outage_is_503_with_retry_after() {
+        // A read whose rules-existence entry has left the 30 s cache must
+        // query the database; during an outage that answer is a retryable 503
+        // carrying Retry-After: 1, like the write arm, never a bare 503.
+        let svc = crate::services::permission_service::PermissionService::new(lazy_pool());
+        let resp = read_rules_exist(&svc, uuid::Uuid::new_v4())
+            .await
+            .expect_err("an unreachable database must fail closed");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
     }
 
     #[tokio::test]
@@ -11802,6 +11831,49 @@ mod tests {
         );
     }
 
+    /// #5603: a non-admin refused on a nested admin route is audited with
+    /// the full request path, not what is left after the nest
+    #[tokio::test]
+    async fn admin_denial_audits_the_full_request_path_5603() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::{middleware, routing::any, Router};
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            make_test_config_for_middleware(),
+        ));
+        let app = Router::new().nest(
+            "/api/v1/admin",
+            Router::new()
+                .route("/settings", any(|| async { (StatusCode::OK, "settings") }))
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    admin_middleware,
+                )),
+        );
+        let (user_id, bearer) = mint_bearer_for_flagged_user(&pool, &auth_service, false).await;
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/admin/settings")
+                    .header("Authorization", &bearer)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let audit = tdh::audit_row_eventually(&pool, user_id, "PERMISSION_DENIED").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(audit.details["path"], "/api/v1/admin/settings");
+        assert_eq!(audit.details["method"], "GET");
+    }
+
     // -----------------------------------------------------------------------
     // #3387 / #3386 / #3452: role assignments are part of the native READ
     // decision, exactly as they already are for writes and for REST reads.
@@ -14363,6 +14435,133 @@ mod tests {
                 Some(StatusCode::UNAUTHORIZED)
             );
             assert_eq!(allowed.ok(), Some(plain));
+        }
+    }
+}
+
+/// The laws proved in formal/ArtifactKeeper/Auth/MintRepoCeiling.lean, checked
+/// on the real mint path: `mint_repo_ceiling`, the selector a mint stores
+/// (`inherited_token_selector`, or the request's own after
+/// `validate_token_repo_selector`), and how that selector reads back as the
+/// new token's scope (`resolve_token_scope`'s branches, through the real
+/// `parse_token_selector_strict` and `RepoSelectorService::is_empty`).
+///
+/// The one step simulated is the database lookup of a `match_repos` selector
+/// (`WHERE id = ANY($1)`): the listed ids that exist.
+#[cfg(ak_test_shard = "services-2")]
+#[cfg(test)]
+mod mint_repo_ceiling_laws {
+    use super::AuthExtension;
+    use crate::models::access_scope::AccessScope;
+    use crate::services::repo_selector_service::{
+        inherited_token_selector, parse_token_selector_strict, validate_token_repo_selector,
+        RepoSelectorService,
+    };
+    use proptest::prelude::*;
+    use uuid::Uuid;
+
+    /// The repositories that exist.
+    fn universe() -> Vec<Uuid> {
+        (1..=4u128).map(Uuid::from_u128).collect()
+    }
+
+    fn credential(scope: AccessScope) -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::from_u128(99),
+            username: "minter".into(),
+            is_api_token: true,
+            allowed_repo_ids: scope,
+            ..Default::default()
+        }
+    }
+
+    /// A stored `repo_selector` read back as the token's scope, branch for
+    /// branch with `RepoSelectorService::resolve_token_scope`.
+    fn read_back(selector: Option<&serde_json::Value>) -> AccessScope {
+        let Some(value) = selector else {
+            return AccessScope::Admin;
+        };
+        match parse_token_selector_strict(value) {
+            Err(_) => AccessScope::Restricted(Vec::new()),
+            Ok(selector) if RepoSelectorService::is_empty(&selector) => AccessScope::Admin,
+            Ok(selector) => AccessScope::Restricted(
+                universe()
+                    .into_iter()
+                    .filter(|id| selector.match_repos.contains(id))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// One mint by `cred`, optionally naming its own restriction. `None` is a
+    /// refusal (the 403 from the ceiling, or the 400 for a selector that does
+    /// not restrict); otherwise the new token's scope.
+    fn mint(cred: &AccessScope, requested: Option<&[Uuid]>) -> Option<AccessScope> {
+        let ceiling = credential(cred.clone())
+            .mint_repo_ceiling(requested.is_some())
+            .ok()?;
+        let stored = match (ceiling, requested) {
+            (Some(ids), _) => Some(inherited_token_selector(&ids)),
+            (None, Some(ids)) => {
+                let selector = serde_json::json!({ "match_repos": ids });
+                validate_token_repo_selector(&selector).ok()?;
+                Some(selector)
+            }
+            (None, None) => None,
+        };
+        Some(read_back(stored.as_ref()))
+    }
+
+    fn any_ids() -> impl Strategy<Value = Vec<Uuid>> {
+        proptest::collection::vec(0u128..6, 0..4)
+            .prop_map(|v| v.into_iter().map(Uuid::from_u128).collect())
+    }
+
+    fn any_scope() -> impl Strategy<Value = AccessScope> {
+        prop_oneof![
+            Just(AccessScope::Admin),
+            any_ids().prop_map(AccessScope::Restricted)
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4000))]
+
+        /// Lean `mint_chain_never_widens`: through any chain of mints, the
+        /// last token reaches only repositories the original credential
+        /// reached.
+        #[test]
+        fn mint_chain_never_widens(
+            cred in any_scope(),
+            chain in proptest::collection::vec(proptest::option::of(any_ids()), 0..6),
+        ) {
+            let mut token = cred.clone();
+            for requested in &chain {
+                match mint(&token, requested.as_deref()) {
+                    Some(next) => token = next,
+                    None => break,
+                }
+            }
+            for repo in universe() {
+                prop_assert!(
+                    !token.grants(repo) || cred.grants(repo),
+                    "chain {:?} from {:?} widened to {:?}", chain, cred, token
+                );
+            }
+        }
+    }
+
+    /// Lean `restricted_to_nothing_cannot_mint`, and why it matters: the
+    /// selector such a mint would store reads back as no restriction at all
+    /// (`without_the_check_nothing_becomes_everything`).
+    #[test]
+    fn restricted_to_nothing_cannot_mint() {
+        assert_eq!(
+            read_back(Some(&inherited_token_selector(&[]))),
+            AccessScope::Admin
+        );
+        for requested in [None, Some(&universe()[..1])] {
+            assert!(mint(&AccessScope::Restricted(Vec::new()), requested).is_none());
         }
     }
 }

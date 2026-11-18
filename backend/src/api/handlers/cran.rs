@@ -1181,6 +1181,48 @@ mod tests {
         );
     }
 
+    /// #5946: with the queue on, a native upload queues one `hosted_upload`
+    /// job instead of scanning in-process; a worker completes it with the
+    /// findings the in-process trigger records. With it off, nothing queues.
+    #[tokio::test]
+    async fn cran_upload_scans_through_one_hosted_upload_job_queued() {
+        async fn run(queued: bool) -> Option<tdh::ScanOnUploadProbe> {
+            let f = tdh::Fixture::setup("local", "cran").await?;
+            let key = f.repo_key.clone();
+            let probe = tdh::scan_on_upload_probe(
+                &f,
+                super::router(),
+                || {
+                    tdh::put(
+                        format!("/{key}/src/contrib/queued_1.0.tar.gz"),
+                        Bytes::from_static(b"fake-r-pkg-5946"),
+                    )
+                },
+                1,
+                queued,
+                std::time::Duration::from_secs(60),
+            )
+            .await;
+            f.teardown().await;
+            Some(probe)
+        }
+        let Some(queued) = run(true).await else {
+            return;
+        };
+        assert_eq!(
+            queued.jobs_before_worker,
+            vec![("hosted_upload".to_string(), "pending".to_string())]
+        );
+        assert_eq!(queued.scans_before_worker, 0, "nothing scans in-process");
+        assert_eq!(queued.jobs_left, 0, "the worker must complete the job");
+        let Some(spawned) = run(false).await else {
+            return;
+        };
+        assert!(spawned.jobs_before_worker.is_empty(), "queue off: no job");
+        assert!(!spawned.rows.is_empty(), "queue off: the scan still runs");
+        assert_eq!(queued.rows, spawned.rows);
+    }
+
     /// #4725: a native CRAN upload to a hosted repository must queue a push
     /// sync task for a subscribed push peer, and an upload that arrives as peer
     /// replication must not be fanned back out. Fails on `main` (nothing queued).

@@ -81,6 +81,17 @@ pub fn build_state_with_config(pool: PgPool, cfg: Config) -> SharedState {
     Arc::new(AppState::new(cfg, pool, storage, registry))
 }
 
+/// The `Cookie` header value of the browser that started the SSO login whose
+/// `state` (OIDC) or AuthnRequest id (SAML) is `sso_state` (#5486): the
+/// binding cookie the login response set, derived the same way.
+pub fn sso_binding_cookie(state: &SharedState, sso_state: &str) -> String {
+    let (name, value) = artifact_keeper_backend::api::handlers::sso_binding::binding_cookie(
+        &state.config.jwt_secret,
+        sso_state,
+    );
+    format!("{name}={value}")
+}
+
 /// Wrap the public SSO router in `with_state` (no auth layer — these are
 /// pre-auth public endpoints).
 pub fn sso_app(state: SharedState) -> axum::Router {

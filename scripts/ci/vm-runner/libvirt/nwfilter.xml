@@ -1,0 +1,63 @@
+<!--
+  Egress filter for every ak-vm-runner VM interface (#6072).
+
+  A job VM may talk to the internet and to the network's dnsmasq (DHCP and
+  DNS on the gateway). It may NOT open connections to the host itself, the
+  host's LAN, Kubernetes pod/service networks, tailscale, link-local or
+  other job VMs. Only iptables/ip6tables-backed rules are used, so the
+  filter needs no ebtables on the host. Layer 2 between VMs (ARP, DHCP
+  replies, IPv6 link-local) is cut by the isolated bridge port every job VM
+  interface gets (<port isolated='yes'/> in the domain XML).
+-->
+<filter name='ak-vm-egress' chain='root'>
+  <!-- A VM never answers DHCP: no rogue DHCP server for a sibling. -->
+  <rule action='drop' direction='out' priority='90'>
+    <udp srcportstart='67' srcportend='67'/>
+  </rule>
+  <rule action='accept' direction='out' priority='100'>
+    <udp dstipaddr='192.168.151.1' dstportstart='53'/>
+  </rule>
+  <rule action='accept' direction='out' priority='100'>
+    <tcp dstipaddr='192.168.151.1' dstportstart='53'/>
+  </rule>
+  <rule action='accept' direction='out' priority='100'>
+    <udp dstportstart='67' dstportend='67'/>
+  </rule>
+  <rule action='drop' direction='out' priority='200'>
+    <all dstipaddr='10.0.0.0' dstipmask='8'/>
+  </rule>
+  <rule action='drop' direction='out' priority='200'>
+    <all dstipaddr='172.16.0.0' dstipmask='12'/>
+  </rule>
+  <rule action='drop' direction='out' priority='200'>
+    <all dstipaddr='192.168.0.0' dstipmask='16'/>
+  </rule>
+  <rule action='drop' direction='out' priority='200'>
+    <all dstipaddr='100.64.0.0' dstipmask='10'/>
+  </rule>
+  <rule action='drop' direction='out' priority='200'>
+    <all dstipaddr='169.254.0.0' dstipmask='16'/>
+  </rule>
+  <rule action='drop' direction='out' priority='200'>
+    <all dstipaddr='127.0.0.0' dstipmask='8'/>
+  </rule>
+  <rule action='drop' direction='out' priority='200'>
+    <all dstipaddr='224.0.0.0' dstipmask='4'/>
+  </rule>
+  <!-- Reserved and limited broadcast (255.255.255.255 is in 240/4): only the
+       DHCP request above may be broadcast. This also keeps broadcasts off
+       host sockets bound to 0.0.0.0 (flannel VXLAN, rpcbind, tailscaled). -->
+  <rule action='drop' direction='out' priority='200'>
+    <all dstipaddr='240.0.0.0' dstipmask='4'/>
+  </rule>
+  <rule action='drop' direction='out' priority='200'>
+    <all dstipaddr='0.0.0.0' dstipmask='8'/>
+  </rule>
+  <!-- The network has no IPv6; the guest also boots with ipv6.disable=1. -->
+  <rule action='drop' direction='out' priority='300'>
+    <all-ipv6/>
+  </rule>
+  <rule action='drop' direction='in' priority='300'>
+    <all-ipv6/>
+  </rule>
+</filter>

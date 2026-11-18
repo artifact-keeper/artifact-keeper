@@ -1380,6 +1380,9 @@ async fn virtual_module_download(
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+    // #5810: in strict mode a Remote member that could not answer ends the
+    // walk with the retryable 503 instead of letting a lower member serve.
+    let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
     let mut upstream_err: Option<Response> = None;
     for member in &members {
         let info = proxy_helpers::repo_info_from_member(member);
@@ -1410,6 +1413,11 @@ async fn virtual_module_download(
         match remote_module_location(&remote, coords, &repo.key).await {
             Ok(location) => return Ok(module_location_response(location)),
             Err(resp) if resp.status() == StatusCode::NOT_FOUND => {}
+            Err(resp)
+                if fallback.is_strict() && proxy_helpers::is_member_unavailable_response(&resp) =>
+            {
+                return Err(proxy_helpers::member_unavailable_response());
+            }
             Err(resp) => {
                 upstream_err.get_or_insert(resp);
             }
@@ -1431,6 +1439,9 @@ async fn virtual_module_archive(
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+    // #5810: in strict mode a Remote member that could not answer ends the
+    // walk with the retryable 503 instead of letting a lower member serve.
+    let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
     let mut upstream_err: Option<Response> = None;
     for member in &members {
         let info = proxy_helpers::repo_info_from_member(member);
@@ -1468,6 +1479,11 @@ async fn virtual_module_archive(
         match remote_module_archive(state, &remote, coords, ctx).await {
             Ok(response) => return Ok(response),
             Err(resp) if resp.status() == StatusCode::NOT_FOUND => {}
+            Err(resp)
+                if fallback.is_strict() && proxy_helpers::is_member_unavailable_response(&resp) =>
+            {
+                return Err(proxy_helpers::member_unavailable_response());
+            }
             Err(resp) => {
                 upstream_err.get_or_insert(resp);
             }

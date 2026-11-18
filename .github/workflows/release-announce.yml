@@ -16,8 +16,9 @@
 # `gh workflow run release-announce.yml --ref vX.Y.Z -f tag=vX.Y.Z` after the
 # Release is published -- prereleases included, which get the amber
 # "pre-release" embed below -- and follows the run to a verdict with
-# scripts/ci/follow-dispatched-run.sh, so a missing or red announcement is a
-# red release run. workflow_dispatch is also the manual path, e.g. to announce
+# scripts/ci/follow-dispatched-run.sh, so a missing or red announcement run is
+# a red release run. Posting is optional: a missing or failing webhook skips
+# the post and the run stays green (#6079). workflow_dispatch is also the manual path, e.g. to announce
 # a release whose automatic run failed:
 #
 #   gh workflow run release-announce.yml --ref vX.Y.Z -f tag=vX.Y.Z
@@ -104,8 +105,10 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Discord announcements are optional (#6079): a missing or failing
+          # webhook skips the post and never fails the run.
           if [ -z "${WEBHOOK:-}" ]; then
-            echo "::warning title=Not announced::DISCORD_RELEASE_WEBHOOK is not set; ${TAG} was not announced."
+            echo "DISCORD_RELEASE_WEBHOOK is not set; skipping the Discord announcement of ${TAG}."
             exit 0
           fi
 
@@ -144,7 +147,10 @@ jobs:
               } ]
             }')
 
-          curl -sfSL -X POST -H "Content-Type: application/json" \
-            -d "$PAYLOAD" "$WEBHOOK"
+          if ! curl -sfSL -X POST -H "Content-Type: application/json" \
+              -d "$PAYLOAD" "$WEBHOOK"; then
+            echo "The Discord webhook did not accept the post; skipping the announcement of ${TAG}."
+            exit 0
+          fi
 
           echo "Announced ${TAG} to Discord."

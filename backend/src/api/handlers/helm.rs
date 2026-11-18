@@ -798,6 +798,8 @@ async fn download_chart_via_index(
         // A denied member is simply skipped, indistinguishable from a miss.
         let members =
             proxy_helpers::try_authorize_virtual_members(&state.db, auth, repo.id, members).await?;
+        // #5810: the virtual's member-fallback policy.
+        let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
         for member in &members {
             if member.repo_type != RepositoryType::Remote {
                 // Hosted / staging member: check local storage.
@@ -854,6 +856,15 @@ async fn download_chart_via_index(
             {
                 Ok(response) => {
                     return Ok(Some(response));
+                }
+                // #5810: in strict mode a member that could not answer (its
+                // index or the chart) ends the walk with the retryable 503
+                // instead of letting a lower member serve.
+                Err(resp)
+                    if fallback.is_strict()
+                        && proxy_helpers::is_member_unavailable_response(&resp) =>
+                {
+                    return Err(proxy_helpers::member_unavailable_response());
                 }
                 Err(_) => {
                     tracing::debug!(
@@ -1222,13 +1233,6 @@ async fn upload_chart(
     // through the pool, so it can only run once the rows are visible; metadata
     // recording is best-effort by contract.
     quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id).await;
-    crate::services::scanner_service::trigger_scan_on_upload(
-        &state.db,
-        state.scanner_service.clone(),
-        repo.id,
-        artifact_id,
-    )
-    .await;
 
     // Build metadata JSON including the full Chart.yaml data
     let helm_metadata = serde_json::json!({
@@ -1243,6 +1247,16 @@ async fn upload_chart(
         repo.id,
         "helm",
         &helm_metadata,
+    )
+    .await;
+
+    // #5692: the scan reads the chart metadata above for declared dependencies,
+    // so enqueue it only once that write has landed.
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
     )
     .await;
 
@@ -2617,7 +2631,7 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         let (status, body) = upload_parts(&f, parts).await;
         assert_eq!(
             status,
-            StatusCode::INSUFFICIENT_STORAGE,
+            StatusCode::FORBIDDEN,
             "{}",
             String::from_utf8_lossy(&body)
         );

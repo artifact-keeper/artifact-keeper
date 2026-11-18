@@ -287,4 +287,98 @@ mod tests {
 
         rig.teardown().await;
     }
+
+    /// #6069: a released-jar GET reaches the origin gate twice for the same
+    /// Remote (the content fetch and the cached `.sha1` read behind
+    /// `X-Checksum-SHA1`, #4573), and the per-request memo evaluates it once.
+    /// The header still rides on an allowed jar; once the upstream is denied
+    /// the jar is a 403 with no checksum header and no upstream contact.
+    #[tokio::test]
+    async fn maven_jar_get_evaluates_the_origin_gate_once_6069() {
+        use sha1::Digest as _;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let rig = Rig::new(pool).await;
+        let sha1_hex = hex::encode(sha1::Sha1::digest(BYTES));
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{MAVEN_PATH}.sha1")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sha1_hex.clone()))
+            .mount(&rig.upstream)
+            .await;
+        let maven_uri = format!("/maven/{}/{MAVEN_PATH}", rig.maven.1);
+        let get = |uri: String| async {
+            let req = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("authorization", &rig.bearer)
+                .body(Body::empty())
+                .expect("request");
+            tdh::send_with_headers(crate::api::routes::create_router(rig.state.clone()), req).await
+        };
+        let sha1_header = |h: &axum::http::HeaderMap| {
+            h.get("x-checksum-sha1")
+                .map(|v| v.to_str().expect("ascii header").to_string())
+        };
+
+        // Cold GET commits the jar and, through its digest gate, the `.sha1`.
+        let (status, body, _) = get(maven_uri.clone()).await;
+        assert_served("maven cold fetch", (status, body));
+        let cache = rig._root.path().join("proxy-cache").join(&rig.maven.1);
+        tdh::await_proxy_sidecar(&cache.join(MAVEN_PATH).join("__cache_meta__.json")).await;
+        tdh::await_proxy_sidecar(
+            &cache
+                .join(format!("{MAVEN_PATH}.sha1"))
+                .join("__cache_meta__.json"),
+        )
+        .await;
+
+        use crate::services::proxy_service::origin_gate_evaluations;
+        let evaluations_before = origin_gate_evaluations::count(rig.maven.0);
+        let lookups_before = origin_gate_evaluations::key_lookups(&rig.maven.1);
+        let (status, body, headers) = get(maven_uri.clone()).await;
+        let warm_key_lookups = origin_gate_evaluations::key_lookups(&rig.maven.1) - lookups_before;
+        let warm_evaluations = origin_gate_evaluations::count(rig.maven.0) - evaluations_before;
+        assert_served("maven warm fetch", (status, body));
+        assert_eq!(
+            warm_evaluations, 1,
+            "one warm jar GET evaluates the Remote's origin gate once, not once per read"
+        );
+        assert_eq!(
+            warm_key_lookups, 0,
+            "the jar fetch gates first and the sidecar read reuses its pass, so the \
+             Remote is never looked up again by key"
+        );
+        assert_eq!(
+            sha1_header(&headers).as_deref(),
+            Some(sha1_hex.as_str()),
+            "a warm allowed jar carries the SHA-1 of its cached `.sha1`"
+        );
+
+        rig.policy(
+            rig.maven.0,
+            OriginPolicyPredicates {
+                denied_upstreams: vec![rig.upstream.uri()],
+                ..Default::default()
+            },
+        )
+        .await;
+        let hits_before = rig.upstream_hits(MAVEN_PATH).await
+            + rig.upstream_hits(&format!("{MAVEN_PATH}.sha1")).await;
+        let (status, body, headers) = get(maven_uri).await;
+        let hits_after = rig.upstream_hits(MAVEN_PATH).await
+            + rig.upstream_hits(&format!("{MAVEN_PATH}.sha1")).await;
+        rig.teardown().await;
+
+        assert_blocked("maven, cached, denied upstream", (status, body));
+        assert_eq!(
+            sha1_header(&headers),
+            None,
+            "a refused jar must not carry its cached sidecar's checksum"
+        );
+        assert_eq!(
+            hits_after, hits_before,
+            "a refused jar never contacts the upstream"
+        );
+    }
 }

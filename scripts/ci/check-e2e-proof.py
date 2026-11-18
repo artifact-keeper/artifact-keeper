@@ -17,6 +17,13 @@ SUBCOMMANDS (exit 0 ok, 1 missing or invalid proof, 2 usage/infra)
       (the workflow's GITHUB_EVENT_PATH); --pr N reads the PR from the API.
       With a deferred proof (label needs-e2e-test, no proof line) the label is
       copied to the linked issues unless --no-write.
+  gate [--event F | --pr N] [--repo R] [--test-repo R]
+      #6074: a PR labelled behaviour-change or breaking-change cites the
+      artifact-keeper-test PR that moves the release gate with it
+      (`Gate: artifact-keeper-test#N`, or an `E2E:` line of that form), or
+      says why the gate needs no change (`Gate-Exempt: <reason>`). The test
+      PR must be open or merged, target the same-named branch, touch tiers
+      or tests/**, and name this PR or one of its linked issues.
   milestone --milestone X (--tests-ref REF | --tests-dir D) [--repo R]
             [--test-repo R] [--exemptions F]
       The release backstop: every closed type:bug issue in milestone X needs
@@ -476,18 +483,24 @@ def inherited_exemption(pr, repo, allow_automatic=True):
     return None
 
 
-def run_pr(args):
-    repo, test_repo = args.repo, args.test_repo
+def load_pr(args):
+    """The pull request from --event (the workflow payload) or --pr N."""
     if args.event:
         with open(args.event, encoding="utf-8") as fh:
             pr = json.load(fh).get("pull_request")
         if not pr:
             print("usage: the event has no pull_request", file=sys.stderr)
-            return 2
-    elif args.pr:
-        pr = gh_api(f"repos/{repo}/pulls/{args.pr}")
-    else:
-        print("usage: pr needs --event or --pr", file=sys.stderr)
+        return pr or None
+    if args.pr:
+        return gh_api(f"repos/{args.repo}/pulls/{args.pr}")
+    print(f"usage: {args.cmd} needs --event or --pr", file=sys.stderr)
+    return None
+
+
+def run_pr(args):
+    repo, test_repo = args.repo, args.test_repo
+    pr = load_pr(args)
+    if pr is None:
         return 2
 
     v = Verdict()
@@ -605,7 +618,7 @@ def run_pr(args):
     return finish(v, "end-to-end proof declared and checked", 0)
 
 
-def finish(v, headline, code):
+def finish(v, headline, code, title="E2E proof", policy="End-to-end proof for bug fixes"):
     status = "PASS" if code == 0 else "FAIL"
     print(f"{status}: {headline}")
     for m in v.ok:
@@ -617,15 +630,115 @@ def finish(v, headline, code):
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as fh:
-            fh.write(f"### E2E proof: {status}\n\n{headline}\n\n")
+            fh.write(f"### {title}: {status}\n\n{headline}\n\n")
             for m in v.ok:
                 fh.write(f"- ok: {m}\n")
             for m in v.problems:
                 fh.write(f"- **problem**: {m}\n")
             for m in v.notes:
                 fh.write(f"- note: {m}\n")
-            fh.write("\nPolicy: CONTRIBUTING.md, \"End-to-end proof for bug fixes\".\n")
+            fh.write(f"\nPolicy: CONTRIBUTING.md, \"{policy}\".\n")
     return code
+
+
+# --- the gate subcommand ------------------------------------------------------
+#
+# #6074: a PR that deliberately changes observable behaviour (a status code, a
+# default, a response shape, a default policy) must move the release gate with
+# it, or the gate goes red only at release time on a stale expectation. A
+# reviewer turns the rule on with a label; the PR then cites the test-repo PR
+# that updates the gate, or says why the gate needs no change.
+
+GATE_LABELS = ("behaviour-change", "breaking-change")
+GATE_POLICY = "Gate tests for behaviour changes"
+GATE_PROOF_RE = re.compile(r"^\s*(?:[-*]\s+)?Gate\s*:\s*(.+?)\s*$", re.MULTILINE)
+GATE_EXEMPT_RE = re.compile(r"^\s*(?:[-*]\s+)?Gate-Exempt\s*:\s*(.*?)\s*$", re.MULTILINE)
+
+
+def check_gate_test_pr(num, pr, issues, test_repo, v):
+    """A test PR that moves the gate: open or merged, same-named base, touches
+    tiers or suites, and names this PR or one of its linked issues."""
+    try:
+        tpr = gh_api(f"repos/{test_repo}/pulls/{num}")
+    except NotFound:
+        v.bad(f"{test_repo}#{num} is not a pull request in {test_repo}")
+        return False
+    ok = True
+    if tpr.get("state") != "open" and not tpr.get("merged"):
+        v.bad(f"{test_repo}#{num} was closed without merging")
+        ok = False
+    base = (pr.get("base") or {}).get("ref") or "main"
+    got_base = (tpr.get("base") or {}).get("ref")
+    if got_base != base:
+        v.bad(f"{test_repo}#{num} targets '{got_base}', but this PR targets '{base}': the test PR must target the same-named branch")
+        ok = False
+    files = [f["filename"] for f in gh_list(f"repos/{test_repo}/pulls/{num}/files")]
+    if not any(p.startswith(TIERS_DIR + "/") or p.startswith("tests/") for p in files):
+        v.bad(f"{test_repo}#{num} touches neither {TIERS_DIR}/** nor tests/**")
+        ok = False
+    text = f"{tpr.get('title') or ''}\n{tpr.get('body') or ''}"
+    wanted = [pr["number"]] + [i for i in issues if i != pr["number"]]
+    if not any(names_issue(text, i) for i in wanted):
+        v.bad(f"{test_repo}#{num} does not name " + " or ".join(f"artifact-keeper#{i}" for i in wanted))
+        ok = False
+    if ok:
+        v.good(f"{test_repo}#{num} ({tpr.get('state')}{', merged' if tpr.get('merged') else ''}) updates the gate")
+    return ok
+
+
+def run_gate(args):
+    repo, test_repo = args.repo, args.test_repo
+    pr = load_pr(args)
+    if pr is None:
+        return 2
+    v = Verdict()
+
+    def done(headline, code):
+        return finish(v, headline, code, title="Gate test", policy=GATE_POLICY)
+
+    labels = label_names(pr)
+    print(f"PR #{pr['number']}: {pr.get('title') or ''}")
+    on = [lbl for lbl in GATE_LABELS if lbl in labels]
+    if not on:
+        return done(f"not labelled {' or '.join(GATE_LABELS)}: no gate test needed", 0)
+    print(f"  labelled {', '.join(on)}: the PR must update the release gate or say why not")
+    body = sanitize(pr.get("body"))
+
+    ex = GATE_EXEMPT_RE.search(body)
+    if ex:
+        reason = ex.group(1)
+        if len(reason) < 10:
+            v.bad("`Gate-Exempt:` needs a reason (10+ characters)")
+            return done("the Gate-Exempt line is not valid", 1)
+        return done(f"exempt: {reason}", 0)
+
+    # The test-PR form of an E2E proof line moves the gate too, so a bug fix
+    # that changes behaviour does not have to cite its test PR twice.
+    cited = []
+    for text in GATE_PROOF_RE.findall(body):
+        m = TEST_PR_RE.match(text)
+        if m:
+            cited.append(int(m.group(1)))
+        else:
+            v.bad(f"unrecognised gate line `Gate: {text}` (expected `Gate: artifact-keeper-test#N`)")
+    for text in PROOF_RE.findall(body):
+        m = TEST_PR_RE.match(text)
+        if m:
+            cited.append(int(m.group(1)))
+    cited = list(dict.fromkeys(cited))
+    if v.problems:
+        return done("the Gate line is not valid", 1)
+    if not cited:
+        v.bad(
+            "no gate test declared. Add `Gate: artifact-keeper-test#N` (the test PR that updates the "
+            "release-gate tier or suite) or `Gate-Exempt: <reason>`"
+        )
+        return done("missing gate test", 1)
+    issues = linked_issues(body, repo)
+    results = [check_gate_test_pr(n, pr, issues, test_repo, v) for n in cited]
+    if not all(results):
+        return done("the cited test PR does not update the gate", 1)
+    return done("gate test declared and checked", 0)
 
 
 # --- the milestone subcommand ------------------------------------------------
@@ -660,8 +773,19 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
 """
 
 
+LEDGER_SCOPES = ("issue", "facet")
+
+
 def read_ledger(path):
-    """issue -> (category, reason) from the TSV ledger."""
+    """issue -> {"issue": (category, reason) | None, "facets": [(category, reason)]}.
+
+    An optional fourth column is the scope: `issue` (the default) exempts the
+    whole issue; `facet` records that ONE facet of an otherwise end-to-end
+    covered issue has no end-to-end test, and why. A facet row never exempts
+    the issue: the backstop still needs a wired tier, and prints the row as a
+    note next to it. An issue may have several facet rows, but at most one
+    `issue` row, and not both.
+    """
     out = {}
     with open(path, encoding="utf-8") as fh:
         for lineno, line in enumerate(fh, 1):
@@ -669,19 +793,75 @@ def read_ledger(path):
             if not line.strip() or line.startswith("#"):
                 continue
             cols = line.split("\t")
-            if len(cols) != 3 or not cols[0].strip().isdigit():
-                raise ValueError(f"{path}:{lineno}: want `issue<TAB>category<TAB>reason`")
+            if len(cols) not in (3, 4) or not cols[0].strip().isdigit():
+                raise ValueError(f"{path}:{lineno}: want `issue<TAB>category<TAB>reason[<TAB>scope]`")
             n, cat, reason = int(cols[0]), cols[1].strip(), cols[2].strip()
+            scope = cols[3].strip() if len(cols) == 4 else "issue"
+            if scope not in LEDGER_SCOPES:
+                raise ValueError(f"{path}:{lineno}: unknown scope '{scope}' (one of: {', '.join(LEDGER_SCOPES)})")
             if cat not in LEDGER_CATEGORIES:
                 raise ValueError(f"{path}:{lineno}: unknown category '{cat}'")
             if len(reason) < 10:
                 raise ValueError(f"{path}:{lineno}: #{n} needs a reason")
             if cat in NAMES_A_TEST and not TEST_NAME_RE.search(reason):
                 raise ValueError(f"{path}:{lineno}: #{n} '{cat}' must name its test")
+            entry = out.setdefault(n, {"issue": None, "facets": []})
+            if scope == "issue":
+                if entry["issue"] or entry["facets"]:
+                    raise ValueError(f"{path}:{lineno}: #{n} has an issue row and another row")
+                entry["issue"] = (cat, reason)
+            else:
+                if entry["issue"]:
+                    raise ValueError(f"{path}:{lineno}: #{n} has an issue row and a facet row")
+                entry["facets"].append((cat, reason))
+    return out
+
+
+def read_fix_prs(path):
+    """issue -> [PR numbers] from the fix-PR override file.
+
+    The backstop reads an issue's closing PRs from GitHub's closing
+    references, which name the PR whose body said `Closes #N`. When the fix
+    landed elsewhere (another PR fixed it and the closing PR only added a
+    test), a row here names the PR(s) whose body and labels count instead.
+    Columns: issue, comma-separated PR numbers, reason. A missing file is an
+    empty table.
+    """
+    out = {}
+    if not os.path.exists(path):
+        return out
+    with open(path, encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, 1):
+            line = line.rstrip("\n")
+            if not line.strip() or line.startswith("#"):
+                continue
+            cols = line.split("\t")
+            if len(cols) != 3 or not cols[0].strip().isdigit():
+                raise ValueError(f"{path}:{lineno}: want `issue<TAB>pr[,pr]<TAB>reason`")
+            prs = [p.strip().lstrip("#") for p in cols[1].split(",") if p.strip()]
+            if not prs or not all(p.isdigit() for p in prs):
+                raise ValueError(f"{path}:{lineno}: PR numbers must be `N` or `N,M`")
+            if len(cols[2].strip()) < 10:
+                raise ValueError(f"{path}:{lineno}: #{cols[0]} needs a reason")
+            n = int(cols[0])
             if n in out:
                 raise ValueError(f"{path}:{lineno}: #{n} listed twice")
-            out[n] = (cat, reason)
+            out[n] = [int(p) for p in prs]
     return out
+
+
+def fetch_pr_node(repo, number):
+    """A PR in the GraphQL node shape the milestone query returns."""
+    pr = gh_api(f"repos/{repo}/pulls/{number}")
+    return {
+        "number": pr["number"],
+        "title": pr.get("title") or "",
+        "body": pr.get("body") or "",
+        "merged": bool(pr.get("merged")),
+        "headRefName": (pr.get("head") or {}).get("ref") or "",
+        "baseRefName": (pr.get("base") or {}).get("ref") or "",
+        "labels": {"nodes": [{"name": n} for n in label_names(pr)]},
+    }
 
 
 def gate_tiers(workflow_text):
@@ -739,6 +919,7 @@ def run_milestone(args):
     repo, test_repo = args.repo, args.test_repo
     try:
         ledger = read_ledger(args.exemptions)
+        fix_prs = read_fix_prs(args.fix_prs)
     except (OSError, ValueError) as e:
         print(f"INFRA: exemption ledger: {e}", file=sys.stderr)
         return 2
@@ -784,6 +965,9 @@ def run_milestone(args):
             rows.append((n, "skip", f"closed as {issue['stateReason'].lower()}"))
             continue
         ilabels = [lbl["name"] for lbl in issue["labels"]["nodes"]]
+        if n in fix_prs:
+            issue = dict(issue)
+            issue["closedByPullRequestsReferences"] = {"nodes": [fetch_pr_node(repo, p) for p in fix_prs[n]]}
         status, detail = proof_for_issue(n, issue, ilabels, ledger, by_issue, fixes, gate, tree, repo)
         if status in ("MISSING", "DEFERRED", "UNWIRED"):
             blocking += 1
@@ -807,6 +991,13 @@ def proof_for_issue(n, issue, ilabels, ledger, by_issue, fixes, gate, tree, repo
     # Every issue here is type:bug, so the closing PR's title type and diff
     # paths never exempt it (the rule run_pr applies): a bug closed by a
     # `test: ...` PR still needs a tier, a suite, or an explicit exemption.
+    status, detail = _proof_for_issue(n, issue, ilabels, ledger, by_issue, fixes, gate, tree)
+    for cat, reason in (ledger.get(n) or {}).get("facets", []):
+        detail += f" [facet without e2e, {cat}: {reason[:70]}]"
+    return status, detail
+
+
+def _proof_for_issue(n, issue, ilabels, ledger, by_issue, fixes, gate, tree):
     tiers = by_issue.get(n, [])
     wired = [t for t in tiers if t in gate]
     if wired:
@@ -814,8 +1005,9 @@ def proof_for_issue(n, issue, ilabels, ledger, by_issue, fixes, gate, tree, repo
         extra = "" if n in fixes.get(t, set()) else " (warning: no `FIX #N` case)"
         stale = f"; remove {DEFER_LABEL}" if DEFER_LABEL in ilabels else ""
         return "covered", f"tier {t} ({gate[t]}){extra}{stale}"
-    if n in ledger:
-        return "exempt", f"ledger: {ledger[n][0]}: {ledger[n][1][:80]}"
+    row = (ledger.get(n) or {}).get("issue")
+    if row:
+        return "exempt", f"ledger: {row[0]}: {row[1][:80]}"
     prs = issue["closedByPullRequestsReferences"]["nodes"]
     for pr in prs:
         body = sanitize(pr.get("body"))
@@ -866,6 +1058,11 @@ def main(argv=None):
     p.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", DEFAULT_REPO))
     p.add_argument("--test-repo", default=DEFAULT_TEST_REPO)
     p.add_argument("--no-write", action="store_true")
+    g = sub.add_parser("gate")
+    g.add_argument("--event")
+    g.add_argument("--pr", type=int)
+    g.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", DEFAULT_REPO))
+    g.add_argument("--test-repo", default=DEFAULT_TEST_REPO)
     m = sub.add_parser("milestone")
     m.add_argument("--milestone", required=True)
     m.add_argument("--tests-ref", help="artifact-keeper-test branch/tag/sha to fetch")
@@ -874,11 +1071,12 @@ def main(argv=None):
     m.add_argument("--test-repo", default=DEFAULT_TEST_REPO)
     here = os.path.dirname(os.path.abspath(__file__))
     m.add_argument("--exemptions", default=os.path.join(here, "e2e-exemptions.tsv"))
+    m.add_argument("--fix-prs", default=os.path.join(here, "e2e-fix-prs.tsv"))
     args = ap.parse_args(argv)
     if args.cmd == "milestone" and not (args.tests_ref or args.tests_dir):
         ap.error("milestone needs --tests-ref or --tests-dir")
     try:
-        return run_pr(args) if args.cmd == "pr" else run_milestone(args)
+        return {"pr": run_pr, "gate": run_gate, "milestone": run_milestone}[args.cmd](args)
     except Infra as e:
         print(f"INFRA: {e}", file=sys.stderr)
         return 2

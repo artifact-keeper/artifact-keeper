@@ -221,8 +221,17 @@ pub enum AppError {
     #[error("Unprocessable entity: {0}")]
     UnprocessableEntity(String),
 
+    /// A storage quota refused the request, described only by its message.
+    /// `403 QUOTA_EXCEEDED`: a client reaching its quota is not a server
+    /// fault, so it is never a 5xx (which clients retry and monitoring reads
+    /// as an outage).
     #[error("Quota exceeded: {0}")]
     QuotaExceeded(String),
+
+    /// A quota refusal with its figures (storage, repository, transfer or
+    /// upload size); rendered by [`crate::services::quota::QuotaRefusal`].
+    #[error("Quota refused: {}", .0.message)]
+    QuotaRefused(Box<crate::services::quota::QuotaRefusal>),
 
     #[error("Storage error: {0}")]
     Storage(String),
@@ -427,10 +436,16 @@ impl AppError {
             Self::UnprocessableEntity(_) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "UNPROCESSABLE_ENTITY")
             }
-            Self::QuotaExceeded(_) => (StatusCode::INSUFFICIENT_STORAGE, "QUOTA_EXCEEDED"),
+            Self::QuotaExceeded(_) => (StatusCode::FORBIDDEN, "QUOTA_EXCEEDED"),
+            Self::QuotaRefused(refusal) => (refusal.status(), refusal.code()),
             // #5650: the storage backend refused the write for lack of space
             // (a MinIO bucket quota, a full volume). Not a server bug and not
             // retryable until an operator frees space.
+            //
+            // This stays `507`: unlike a quota refusal, which is the client
+            // reaching a limit it was given, a full backend is the server
+            // failing to store what it accepted to store (RFC 4918 507), and
+            // the operator, not the client, has to act.
             e if e.storage_failure() == Some(crate::storage::StorageFailure::Full) => {
                 (StatusCode::INSUFFICIENT_STORAGE, "STORAGE_FULL")
             }
@@ -498,8 +513,8 @@ impl AppError {
     /// - Credential failures (`Authentication`/`Unauthorized`/`Authorization`)
     ///   can signal credential stuffing or a broken client, not purely
     ///   routine even though the client caused them -- `warn`.
-    /// - `QuotaExceeded` maps to 507, outside the 4xx range, but is a client
-    ///   condition (they hit their quota), so it's called out explicitly.
+    /// - `QuotaExceeded` / `QuotaRefused` are client conditions (they hit
+    ///   their quota), called out explicitly.
     fn log_level(&self) -> tracing::Level {
         if self.is_pool_timeout() {
             return tracing::Level::WARN;
@@ -511,7 +526,7 @@ impl AppError {
             // #5623: an upstream outage behind a virtual repository is an
             // expected, retryable answer, not a fault of this server.
             Self::MemberUnavailable(_) => tracing::Level::WARN,
-            Self::QuotaExceeded(_) => tracing::Level::INFO,
+            Self::QuotaExceeded(_) | Self::QuotaRefused(_) => tracing::Level::INFO,
             // A 5xx by status, but an intentional, documented gap: nothing
             // failed, so it must not read as a server fault in the logs.
             Self::NotImplemented(_) => tracing::Level::INFO,
@@ -579,6 +594,7 @@ impl AppError {
             Self::CodedValidation { message, .. }
             | Self::CodedConflict { message, .. }
             | Self::CodedBadGateway { message, .. } => message.clone(),
+            Self::QuotaRefused(refusal) => refusal.message.clone(),
             Self::Json(_) => "Invalid JSON".to_string(),
         }
     }
@@ -619,6 +635,9 @@ impl IntoResponse for AppError {
         };
         if let Some(error) = layout_error {
             return error.into_response();
+        }
+        if let Self::QuotaRefused(refusal) = self {
+            return refusal.into_response();
         }
         let (status, code) = self.status_and_code();
         let message = self.user_message();
@@ -1071,8 +1090,17 @@ mod tests {
         );
         assert_eq!(
             AppError::QuotaExceeded("x".into()).status_and_code().0,
-            StatusCode::INSUFFICIENT_STORAGE
+            StatusCode::FORBIDDEN
         );
+        // A quota refusal is never a 5xx.
+        for refusal in [
+            crate::services::quota::QuotaRefusal::instance_storage(1, 1, None),
+            crate::services::quota::QuotaRefusal::upload_size(1, None),
+        ] {
+            let err = AppError::QuotaRefused(Box::new(refusal));
+            assert!(err.status_and_code().0.is_client_error());
+            assert_eq!(err.log_level(), tracing::Level::INFO);
+        }
         assert_eq!(
             AppError::BadGateway("x".into()).status_and_code().0,
             StatusCode::BAD_GATEWAY

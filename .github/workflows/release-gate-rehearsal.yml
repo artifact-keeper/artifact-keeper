@@ -6,17 +6,17 @@ name: Release Gate Rehearsal
 # (release-gate.yml). It reads `secrets.GHCR_DOCKER_CONFIG` -- the registry
 # pull-secret its in-cluster deploys need for private candidate images -- but
 # that secret only resolves on the caller path: release.yml in THIS repo calls
-# the gate with `secrets: inherit`, and the secret is scoped to this repo's
-# context. A standalone `workflow_dispatch` of release-gate.yml runs in the
-# artifact-keeper-test context, where the secret is empty, so private pulls
-# fail with ImagePullBackOff and the gate -- including the pull-by-digest +
-# pod-imageID assertion added for #2696 -- could not be rehearsed without
-# cutting a real release.
+# the gate passing GHCR_DOCKER_CONFIG by name, and the secret is scoped to
+# this repo's context. A standalone `workflow_dispatch` of release-gate.yml
+# runs in the artifact-keeper-test context, where the secret is empty, so
+# private pulls fail with ImagePullBackOff and the gate -- including the
+# pull-by-digest + pod-imageID assertion added for #2696 -- could not be
+# rehearsed without cutting a real release.
 #
 # This workflow is the dispatch front door, relocated into the repo that holds
 # the secret: it mirrors the gate's input surface, resolves (or verifies) the
 # candidate digest exactly like release.yml's resolve-candidate-digest job,
-# and invokes the SAME reusable gate with the SAME `secrets: inherit`. Secret
+# and invokes the SAME reusable gate with the SAME named secret. Secret
 # exposure is therefore identical to the existing release path -- no secret is
 # copied to another repo, broadened in visibility, or printed.
 #
@@ -95,7 +95,6 @@ on:
           - auth
           - stress
           - resilience
-          - mesh
           - security
           - compatibility
           - pullthrough
@@ -250,10 +249,11 @@ jobs:
           echo "Rehearsal candidate: ${NAME}:${BACKEND_TAG}@${RESOLVED}"
 
   # The same reusable gate the real release runs, with the same secrets
-  # plumbing. `secrets: inherit` resolves GHCR_DOCKER_CONFIG from this repo's
-  # context exactly as release.yml's release-gate job does; nothing downstream
-  # of the gate (build-binaries, verify-images-published, the Release object)
-  # exists here, so a rehearsal can never publish anything.
+  # plumbing: GHCR_DOCKER_CONFIG, the one secret the gate declares, is passed
+  # by name from this repo's context exactly as release.yml's release-gate job
+  # does; nothing downstream of the gate (build-binaries,
+  # verify-images-published, the Release object) exists here, so a rehearsal
+  # can never publish anything.
   release-gate-rehearsal:
     name: Release Gate (Rehearsal)
     needs: [resolve-rehearsal-digest]
@@ -261,7 +261,16 @@ jobs:
     permissions:
       contents: read
       packages: read
-    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main
+    # Pinned to an artifact-keeper-test commit, not @main (#6170): a gate
+    # change reaches a candidate only through a bump PR in this repo, which
+    # Mergify does not auto-merge. CODEOWNERS lists this file to mark
+    # ownership; a code-owner review is enforced only once branch protection
+    # on main and release/* requires it (#6216). The pin does not wait on
+    # protection for artifact-keeper-test (#6178). All five callers carry ONE
+    # sha, and
+    # scripts/ci/check-gate-workflow-pins.sh enforces both that and that the
+    # sha is on artifact-keeper-test main.
+    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@987bccd15df3fd4c9c24bf78436ce12fb5bd5783 # artifact-keeper-test main as of 2026-11-18
     with:
       backend_tag: ${{ inputs.backend_tag }}
       backend_digest: ${{ needs.resolve-rehearsal-digest.outputs.backend_digest }}
@@ -270,7 +279,9 @@ jobs:
       iac_ref: ${{ inputs.iac_ref }}
       skip_teardown: ${{ inputs.skip_teardown }}
       run_smoke_with_deps: ${{ inputs.run_smoke_with_deps }}
-    secrets: inherit
+    # Only the one secret the gate declares, not every secret this repo holds.
+    secrets:
+      GHCR_DOCKER_CONFIG: ${{ secrets.GHCR_DOCKER_CONFIG }}
 
   # ══════════════════════════════════════════════════════════════════════════
   # PUBLISHED-ATTESTATION GATE REHEARSAL (#3519)

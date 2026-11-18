@@ -11,6 +11,10 @@ an environment from scratch.
 It is the only form that survives a database wipe. See
 [Pinning the URL with a slug](#pinning-the-url-with-a-slug).
 
+Since 1.12.0 the ACS no longer sets the session itself: it redirects (`303`)
+to `/api/v1/auth/sso/complete`, which finishes the sign-in only in the browser
+that started it. See [sso-login-binding.md](sso-login-binding.md).
+
 ## The URL shape
 
 ```text

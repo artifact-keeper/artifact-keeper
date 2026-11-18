@@ -608,7 +608,13 @@ fn store_failure(key: &str, status: axum::http::StatusCode) -> crate::error::App
             code: "PAYLOAD_TOO_LARGE",
             message,
         },
-        StatusCode::INSUFFICIENT_STORAGE => AppError::QuotaExceeded(message),
+        // A storage quota refused the write (`403 QUOTA_EXCEEDED` /
+        // `STORAGE_QUOTA_EXCEEDED`; the only 403 the put answers).
+        StatusCode::FORBIDDEN => AppError::QuotaExceeded(message),
+        // The store itself is full: a server-side `507 STORAGE_FULL`.
+        StatusCode::INSUFFICIENT_STORAGE => {
+            AppError::Storage(crate::storage::StorageFailure::Full.tag(message))
+        }
         _ => AppError::Storage(message),
     }
 }
@@ -2458,8 +2464,9 @@ mod tests {
         }
     }
 
-    /// #5675: a storage `413` is a size cap with its own `400` code, not
-    /// `507 QUOTA_EXCEEDED`; a full store (`507`) stays a quota refusal.
+    /// #5675: a storage `413` is a size cap with its own `400` code, not a
+    /// quota refusal; a quota refusal (`403`) stays one, and a full store
+    /// (`507`) stays the server-side `STORAGE_FULL`.
     #[test]
     fn store_failure_maps_413_to_its_own_code_5675() {
         use crate::error::AppError;
@@ -2476,9 +2483,15 @@ mod tests {
             "{too_large:?}"
         );
         assert!(matches!(
-            store_failure("k", StatusCode::INSUFFICIENT_STORAGE),
+            store_failure("k", StatusCode::FORBIDDEN),
             AppError::QuotaExceeded(_)
         ));
+        let full = store_failure("k", StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(
+            full.storage_failure(),
+            Some(crate::storage::StorageFailure::Full),
+            "{full:?}"
+        );
         assert!(matches!(
             store_failure("k", StatusCode::CONFLICT),
             AppError::Conflict(_)

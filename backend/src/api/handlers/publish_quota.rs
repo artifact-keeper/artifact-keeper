@@ -19,10 +19,18 @@
 //!    consumed the headroom after the preflight; the object already written
 //!    is left for storage GC, exactly as the npm and chunked paths do.
 //!
-//! A denial answers the generic route's `507 QUOTA_EXCEEDED`, naming the
-//! scope (repository or project) that refused the upload. Unlimited
-//! repositories and projects (no quota, or a non-positive sentinel) take no
-//! lock and pay one extra primary-key read per publish.
+//! Both halves also apply the instance-wide storage quota
+//! (`STORAGE_QUOTA_BYTES`, [`crate::services::quota::storage`]), so every
+//! format's publish is covered by it through this one path; the HTTP
+//! admission refuses a declared `Content-Length` before the body is read, and
+//! these checks cover a body without one.
+//!
+//! A denial answers `403`: `QUOTA_EXCEEDED` naming the repository or project
+//! quota that refused the upload, or `STORAGE_QUOTA_EXCEEDED` for the
+//! instance quota, with the limit and the usage in the body (it was `507`
+//! before 1.12, a 5xx that clients retried). Unlimited repositories and
+//! projects (no quota, or a non-positive sentinel) take no lock and pay one
+//! extra primary-key read per publish.
 //!
 //! The `every_format_publish_runs_quota_admission_4422` gate in `proxy_helpers.rs` reads every
 //! handler source and fails when a production `artifacts` insert neither runs
@@ -34,18 +42,18 @@ use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::api::handlers::error_helpers::map_db_err;
-use crate::services::repository_service::{QuotaScope, RepositoryService};
+use crate::services::repository_service::{QuotaDenial, RepositoryService};
 
-/// The response a publish refused by a storage quota answers: the generic
-/// upload API's `507 QUOTA_EXCEEDED`, naming the scope that refused it.
-pub fn quota_denied(scope: QuotaScope) -> Response {
-    scope.into_error().into_response()
+/// The response a publish refused by a storage quota answers: `403`, naming
+/// the scope that refused it with its limit and usage.
+pub fn quota_denied(denial: QuotaDenial) -> Response {
+    denial.into_error().into_response()
 }
 
-/// `Ok(())` when nothing refused the upload, else the 507 for the scope.
+/// `Ok(())` when nothing refused the upload, else the 403 for the denial.
 #[allow(clippy::result_large_err)]
-fn admit(denied_by: Option<QuotaScope>) -> Result<(), Response> {
-    denied_by.map_or(Ok(()), |scope| Err(quota_denied(scope)))
+fn admit(denied_by: Option<QuotaDenial>) -> Result<(), Response> {
+    denied_by.map_or(Ok(()), |denial| Err(quota_denied(denial)))
 }
 
 /// Where a publish lands, so the preflight can net out the bytes already
@@ -96,7 +104,7 @@ pub async fn preflight_quota_denial(
     repo_id: Uuid,
     at: PublishAt<'_>,
     size_bytes: i64,
-) -> crate::error::Result<Option<QuotaScope>> {
+) -> crate::error::Result<Option<QuotaDenial>> {
     let service = RepositoryService::new(db.clone());
     // The common case (fits, or no quota) costs no extra query; only a
     // would-be refusal looks up what the publish replaces.
@@ -138,7 +146,7 @@ pub async fn locked_quota_denial(
     repo_id: Uuid,
     path: &str,
     size_bytes: i64,
-) -> crate::error::Result<Option<QuotaScope>> {
+) -> crate::error::Result<Option<QuotaDenial>> {
     let admission = RepositoryService::new(db.clone())
         .check_quota_locked(tx, repo_id, path, size_bytes)
         .await?;
@@ -205,7 +213,7 @@ pub async fn locked_oci_blob_denial(
     repo_id: Uuid,
     digest: &str,
     size_bytes: i64,
-) -> crate::error::Result<Option<QuotaScope>> {
+) -> crate::error::Result<Option<QuotaDenial>> {
     // An `oci_blobs` row has no `artifacts` path; this key matches none, so
     // check_quota_locked nets nothing out.
     let path = format!("oci-blob:{digest}");
@@ -228,11 +236,17 @@ mod tests {
     use axum::http::StatusCode;
 
     #[test]
-    fn denial_is_the_generic_routes_507_naming_the_scope() {
+    fn denial_is_a_403_naming_the_scope() {
+        use crate::services::repository_service::QuotaScope;
         assert!(admit(None).is_ok());
-        for scope in [QuotaScope::Repository, QuotaScope::Project] {
-            let resp = admit(Some(scope)).expect_err("a denied scope refuses");
-            assert_eq!(resp.status(), StatusCode::INSUFFICIENT_STORAGE);
+        for scope in [
+            QuotaScope::Repository,
+            QuotaScope::Project,
+            QuotaScope::Instance,
+        ] {
+            let resp =
+                admit(Some(QuotaDenial::new(scope, 10, 10))).expect_err("a denied scope refuses");
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         }
     }
 
@@ -290,7 +304,7 @@ mod tests {
                 .unwrap_err(),
         )
         .await;
-        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(body.contains("Repository storage quota exceeded"), "{body}");
 
         let mut tx = begin_admitted_publish(&pool, repo_id, "a.bin", 60)
@@ -302,7 +316,7 @@ mod tests {
         let err = begin_admitted_publish(&pool, repo_id, "b.bin", 50)
             .await
             .expect_err("60 + 50 exceeds 100");
-        assert_eq!(err.status(), StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
         assert!(
             preflight_publish_quota(&pool, repo_id, PublishAt::Path("b.bin"), 50)
                 .await
@@ -316,7 +330,7 @@ mod tests {
         let err = begin_admitted_publish(&pool, repo_id, "a.bin", 150)
             .await
             .expect_err("an overwrite whose increase exceeds the quota");
-        assert_eq!(err.status(), StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
         assert!(
             preflight_publish_quota(&pool, repo_id, PublishAt::Path("a.bin"), 150)
                 .await
@@ -435,7 +449,7 @@ mod tests {
                 .unwrap_err(),
         )
         .await;
-        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(body.contains("Project storage quota exceeded"), "{body}");
 
         let digest = format!("sha256:{}", "ab".repeat(32));
@@ -443,8 +457,9 @@ mod tests {
         assert_eq!(
             locked_oci_blob_denial(&mut tx, &pool, b, &digest, 30)
                 .await
-                .unwrap(),
-            Some(QuotaScope::Project),
+                .unwrap()
+                .map(|d| d.scope),
+            Some(crate::services::repository_service::QuotaScope::Project),
             "a new 30-byte blob exceeds the project cap"
         );
         assert_eq!(

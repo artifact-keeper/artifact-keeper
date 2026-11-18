@@ -1,0 +1,29 @@
+# Builds the next ak-vm-runner golden image (#6072). Running VMs keep the
+# image they booted from; new VMs use the new one.
+[Unit]
+Description=ak-vm-runner: build a new golden VM image
+Documentation=https://github.com/artifact-keeper/artifact-keeper/blob/main/docs/ci/vm-runners.md
+Wants=libvirtd.service
+After=network-online.target libvirtd.service
+
+[Service]
+Type=oneshot
+User=akvm
+Group=akvm
+SupplementaryGroups=libvirt
+EnvironmentFile=/etc/ak-vm-runner/config.env
+ExecStart=/opt/ak-vm-runner/ak-vm-runner build-image
+# The build VM only starts once it fits in machine-akvm.slice beside the job
+# VMs, so build-image may first wait for a running job to end: up to
+# AKVM_IMAGE_WAIT_SECONDS (8 h, the longest a job VM lives) plus the build
+# itself (AKVM_IMAGE_TIMEOUT, 40 min) and slack.
+TimeoutStartSec=36000
+UMask=0027
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ak-vm-runner
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
