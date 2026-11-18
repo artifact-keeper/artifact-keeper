@@ -4017,8 +4017,9 @@ const DEFAULT_MAX_CONCURRENT_SCAN_EXTRACTIONS: usize = 4;
 const MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV: &str = "MAX_CONCURRENT_SCAN_EXTRACTIONS";
 
 /// Effective concurrent-extraction cap, honouring
-/// [`MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV`] over the default.
-fn max_concurrent_scan_extractions() -> usize {
+/// [`MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV`] over the default. The queue
+/// worker's default concurrency reads it too (#6033).
+pub(crate) fn max_concurrent_scan_extractions() -> usize {
     positive_env_or(
         MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV,
         DEFAULT_MAX_CONCURRENT_SCAN_EXTRACTIONS as u64,
@@ -10437,10 +10438,19 @@ impl ScannerService {
             // for dedup-checking and may sit briefly before scan invocation).
             // See issue #902.
             let started_at = chrono::Utc::now();
-            match scanner
-                .scan_target(&target, metadata.as_ref(), &content)
-                .await
-            {
+            let budget = crate::config::scanner_timeout();
+            match tokio::time::timeout(
+                budget,
+                scanner.scan_target(&target, metadata.as_ref(), &content),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(AppError::Internal(format!(
+                    "scanner {} timed out after {}s",
+                    scanner.name(),
+                    budget.as_secs()
+                )))
+            }) {
                 Ok(ScanOutput {
                     findings,
                     packages,
@@ -12398,6 +12408,25 @@ pub(crate) mod test_helpers {
     }
 }
 
+/// Test override: run an upload's scan inline in the triggering task (#5692).
+///
+/// Production fan-out stays fire-and-forget. A regression test that asserts
+/// which metadata the scan saw at its start needs the scan to run inside
+/// `trigger_scan_on_upload`, before the handler can proceed to its next write.
+#[cfg(test)]
+pub(crate) static TEST_INLINE_SCAN_ON_UPLOAD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn scan_on_upload_runs_inline() -> bool {
+    TEST_INLINE_SCAN_ON_UPLOAD.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(test))]
+fn scan_on_upload_runs_inline() -> bool {
+    false
+}
+
 /// Fire-and-forget `scan_on_upload` trigger for a freshly-inserted artifact.
 ///
 /// Mirrors the gate already inlined in [`ArtifactService::upload`] so that
@@ -12465,6 +12494,7 @@ pub async fn scan_on_upload_enabled(db: &PgPool, repository_id: Uuid) -> bool {
 /// the upload response is not delayed. Call it AFTER the row is committed
 /// (and after format metadata is written, where the handler writes any), so
 /// the scan sees the finished artifact. Returns whether a scan was spawned.
+/// Unit tests can set `TEST_INLINE_SCAN_ON_UPLOAD` to run it synchronously.
 ///
 /// The `every_format_upload_triggers_scan_on_upload` ratchet test in
 /// `api::handlers::proxy_helpers` requires every handler that inserts an
@@ -12493,11 +12523,16 @@ pub async fn trigger_scan_on_upload(
             ),
         }
     }
-    spawn_scan_on_upload(should_scan, artifact_id, move |aid| async move {
+    let scan = move |aid| async move {
         if let Err(e) = scanner.scan_artifact(aid).await {
             tracing::warn!(artifact_id = %aid, error = %e, "scan_on_upload trigger failed");
         }
-    })
+    };
+    if scan_on_upload_runs_inline() {
+        scan(artifact_id).await;
+        return true;
+    }
+    spawn_scan_on_upload(should_scan, artifact_id, scan)
 }
 
 /// Queue a committed upload's scan at the hosted band (#5946). A pushed OCI
@@ -29885,6 +29920,93 @@ tonic-build = "0.12"
 
         cleanup_scan_state(&fx.pool, fx.repo_id).await;
         fx.teardown().await;
+    }
+
+    /// #5942: a scanner that never returns is cut off at
+    /// `SCANNER_TIMEOUT_SECS` and its row is recorded `failed`, while the
+    /// other scanner's row completes in the same scan. Real time, not a
+    /// paused clock: the scan does Postgres I/O between the scanners (see
+    /// `rescan_uses_its_own_wider_budget_not_the_inline_file_gate_budget`).
+    #[tokio::test]
+    async fn test_scan_artifact_fails_a_hung_scanner_at_its_timeout() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = Uuid::new_v4();
+        let checksum = fresh_checksum();
+        let storage_key = format!("scanner-timeout/{artifact_id}.bin");
+        fx.state
+            .storage
+            .put(&storage_key, Bytes::from_static(b"data"))
+            .await
+            .expect("store artifact bytes");
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, checksum_sha256, \
+                                    content_type, storage_key, is_deleted) \
+             VALUES ($1, $2, 'pkg.bin', 'pkg.bin', 4, $3, 'application/octet-stream', $4, false)",
+        )
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(&checksum)
+        .bind(&storage_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert artifact");
+        let mut scanner = scanner_for_fixture(&fx);
+        scanner.scanners = vec![
+            Arc::new(inline_proxy_scan_fixtures::TrivialDependencyScanner),
+            Arc::new(VersionedCveScanner::new(
+                Some("grype-test"),
+                MockCveRescan::Hang(std::time::Duration::from_secs(3600)),
+            )),
+        ];
+
+        let saved = std::env::var("SCANNER_TIMEOUT_SECS").ok();
+        std::env::set_var("SCANNER_TIMEOUT_SECS", "1");
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            scanner.scan_artifact_with_options(artifact_id, true, true),
+        )
+        .await;
+        match saved {
+            Some(v) => std::env::set_var("SCANNER_TIMEOUT_SECS", v),
+            None => std::env::remove_var("SCANNER_TIMEOUT_SECS"),
+        }
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT scan_type, status, error_message FROM scan_results \
+             WHERE artifact_id = $1 ORDER BY scan_type",
+        )
+        .bind(artifact_id)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("read scan rows");
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        outcome
+            .expect("the scan must return once the hung scanner times out")
+            .expect("scan orchestration succeeds");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(
+            (rows[0].0.as_str(), rows[0].1.as_str()),
+            ("dependency", "completed"),
+            "{rows:?}"
+        );
+        assert_eq!(
+            (rows[1].0.as_str(), rows[1].1.as_str()),
+            ("grype", "failed"),
+            "{rows:?}"
+        );
+        assert!(
+            rows[1]
+                .2
+                .as_deref()
+                .unwrap_or_default()
+                .contains("timed out after 1s"),
+            "{rows:?}"
+        );
     }
 
     /// Records the [`ScanTarget::expected_component`] the orchestration hands

@@ -17,22 +17,72 @@ use crate::services::cluster_work::Claimed;
 /// jobs sit idle, not how long a scan may take.
 pub const CLAIM_TTL_SECS: f64 = 120.0;
 
-/// Priority bands. A client is parked on a fail-closed job, so it outranks
-/// fail-open backfill, which outranks work nobody waits on.
+/// Priority bands, claimed in this order (see [`ScanQueue::claim_filtered`]):
+///
+/// - [`PRIORITY_CLIENT_WAITING`] and above: a client is parked on a
+///   fail-closed job, so it always goes first.
+/// - [`PRIORITY_HOSTED`] up to the waiting band: hosted uploads, pushed images
+///   and manual scans, which a user, a promotion rule or a CI job waits on.
+/// - [`PRIORITY_BACKFILL`] up to the hosted band: fail-open proxy scans
+///   nobody waits on. They age into the hosted band (#6032): a backfill job is
+///   claimed as though it were a hosted job queued the aging window
+///   ([`backfill_aging`]) after it, so hosted work goes ahead of a backfill
+///   burst, and a backfill job still goes ahead of hosted work queued more
+///   than the window after it. Neither band can starve the other.
+/// - A non-rescan job below [`PRIORITY_BACKFILL`] is claimed as hosted: 1.12.0
+///   queued hosted scans at [`PRIORITY_HOSTED_1_12_0`], and those rows (and
+///   the ones a 1.12.0 pod still queues during a rolling upgrade) must not
+///   fall behind the backfill.
+/// - `rescan` jobs (#5947), after everything else.
 pub const PRIORITY_CLIENT_WAITING: i16 = 100;
+pub const PRIORITY_HOSTED: i16 = 75;
 pub const PRIORITY_BACKFILL: i16 = 50;
-pub const PRIORITY_HOSTED: i16 = 10;
 /// Rescans after a vulnerability-database update (#5947): below everything a
 /// user or a pull is waiting on, so a backlog of them never delays those.
 pub const PRIORITY_RESCAN: i16 = 5;
+/// What 1.12.0 queued hosted scans at, below the backfill. The claim treats
+/// every non-rescan row between [`PRIORITY_RESCAN`] and [`PRIORITY_BACKFILL`]
+/// as hosted; nothing queues a non-rescan job at or below [`PRIORITY_RESCAN`].
+pub const PRIORITY_HOSTED_1_12_0: i16 = 10;
 
-/// The claim CTE sorts on these, and getting the order wrong is a silent
-/// latency regression rather than a failure, so assert it at compile time.
+/// The claim CTE splits the bands on these, and getting the order wrong is a
+/// silent latency regression rather than a failure, so assert it at compile
+/// time.
 const _: () = {
-    assert!(PRIORITY_CLIENT_WAITING > PRIORITY_BACKFILL);
-    assert!(PRIORITY_BACKFILL > PRIORITY_HOSTED);
-    assert!(PRIORITY_HOSTED > PRIORITY_RESCAN);
+    assert!(PRIORITY_CLIENT_WAITING > PRIORITY_HOSTED);
+    assert!(PRIORITY_HOSTED > PRIORITY_BACKFILL);
+    assert!(PRIORITY_BACKFILL > PRIORITY_RESCAN);
+    assert!(PRIORITY_BACKFILL > PRIORITY_HOSTED_1_12_0);
+    assert!(PRIORITY_HOSTED_1_12_0 > PRIORITY_RESCAN);
 };
+
+/// Default backfill aging window (#6032): how long a fail-open proxy scan
+/// waits before it competes with hosted scans on age alone.
+pub const DEFAULT_BACKFILL_AGING: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Env var overriding [`DEFAULT_BACKFILL_AGING`], in seconds. `0` claims the
+/// two bands in plain age order. Blank or unparsable keeps the default; more
+/// than [`MAX_BACKFILL_AGING`] is clamped to it.
+pub const BACKFILL_AGING_ENV: &str = "SCAN_QUEUE_BACKFILL_AGING_SECS";
+
+/// Ceiling for the aging window: 30 days is "hosted always first" in practice,
+/// and `created_at + window` past PostgreSQL's timestamp range would fail
+/// every claim, `fail_closed` pulls included.
+pub const MAX_BACKFILL_AGING: std::time::Duration =
+    std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+/// The backfill aging window this process claims with, from
+/// [`BACKFILL_AGING_ENV`].
+pub fn backfill_aging() -> std::time::Duration {
+    parse_backfill_aging(std::env::var(BACKFILL_AGING_ENV).ok().as_deref())
+}
+
+fn parse_backfill_aging(raw: Option<&str>) -> std::time::Duration {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(DEFAULT_BACKFILL_AGING)
+        .min(MAX_BACKFILL_AGING)
+}
 
 tokio::task_local! {
     static BACKGROUND_BAND: ();
@@ -279,11 +329,22 @@ pub struct ScanQueueJobRow {
 #[derive(Clone)]
 pub struct ScanQueue {
     db: PgPool,
+    backfill_aging: std::time::Duration,
 }
 
 impl ScanQueue {
     pub fn new(db: PgPool) -> Self {
-        Self { db }
+        Self {
+            db,
+            backfill_aging: DEFAULT_BACKFILL_AGING,
+        }
+    }
+
+    /// Claim with this backfill aging window instead of
+    /// [`DEFAULT_BACKFILL_AGING`] (see [`PRIORITY_HOSTED`]).
+    pub fn with_backfill_aging(mut self, aging: std::time::Duration) -> Self {
+        self.backfill_aging = aging.min(MAX_BACKFILL_AGING);
+        self
     }
 
     /// Queue a scan of the proxy object cached at `cache_path`. Returns
@@ -472,6 +533,14 @@ impl ScanQueue {
     /// [`Self::claim`], taking at most `max_rescans` of the `rescan` jobs: a
     /// worker claims no more rescans than it has free rescan slots (#5947),
     /// so it never claims one just to hand it back.
+    ///
+    /// Order (#6032, see [`PRIORITY_HOSTED`]): the waiting band first, then
+    /// the hosted band (and anything below the backfill) merged with the
+    /// backfill band on `created_at`, a backfill job's pushed back by the aging
+    /// window, then rescans. The key does not move
+    /// with `NOW()`, so each band is still a range of
+    /// `idx_scan_queue_pending_claim` read in index order: every band CTE
+    /// reads at most `limit` rows and the merge sorts at most five times that.
     pub async fn claim_filtered(
         &self,
         limit: i64,
@@ -483,18 +552,66 @@ impl ScanQueue {
 
         let rows = sqlx::query(
             r#"
-            WITH other AS (
-                SELECT q.id, q.priority, q.created_at
+            WITH waiting AS (
+                SELECT q.id, q.priority, q.created_at,
+                       0 AS band, q.created_at AS claim_at
                 FROM scan_queue q
                 WHERE q.state = 'pending'
                   AND q.next_attempt_at <= NOW()
                   AND q.kind <> 'rescan'
+                  AND q.priority >= $5
+                ORDER BY q.priority DESC, q.created_at ASC
+                LIMIT $1
+                FOR UPDATE OF q SKIP LOCKED
+            ),
+            hosted AS (
+                SELECT q.id, q.priority, q.created_at,
+                       1 AS band, q.created_at AS claim_at
+                FROM scan_queue q
+                WHERE q.state = 'pending'
+                  AND q.next_attempt_at <= NOW()
+                  AND q.kind <> 'rescan'
+                  AND q.priority < $5
+                  AND q.priority >= $6
+                ORDER BY q.priority DESC, q.created_at ASC
+                LIMIT $1
+                FOR UPDATE OF q SKIP LOCKED
+            ),
+            -- #6032: backfill ages into the hosted band. Same band as
+            -- `hosted`, keyed `aging` later than it was queued.
+            backfill AS (
+                SELECT q.id, q.priority, q.created_at,
+                       1 AS band, q.created_at + make_interval(secs => $7) AS claim_at
+                FROM scan_queue q
+                WHERE q.state = 'pending'
+                  AND q.next_attempt_at <= NOW()
+                  AND q.kind <> 'rescan'
+                  AND q.priority < $6
+                  AND q.priority >= $8
+                ORDER BY q.priority DESC, q.created_at ASC
+                LIMIT $1
+                FOR UPDATE OF q SKIP LOCKED
+            ),
+            -- Below the backfill: hosted scans 1.12.0 queued at 10. Claimed
+            -- as hosted, so an upgrade does not leave them behind the backfill.
+            -- Bounded above the rescans (5), so an empty range does not read
+            -- through a rescan backlog on every claim.
+            below AS (
+                SELECT q.id, q.priority, q.created_at,
+                       1 AS band, q.created_at AS claim_at
+                FROM scan_queue q
+                WHERE q.state = 'pending'
+                  AND q.next_attempt_at <= NOW()
+                  AND q.kind <> 'rescan'
+                  AND q.priority < $8
+                  AND q.priority > $9
                 ORDER BY q.priority DESC, q.created_at ASC
                 LIMIT $1
                 FOR UPDATE OF q SKIP LOCKED
             ),
             rescans AS (
-                SELECT q.id, q.priority, q.created_at
+                SELECT q.id, q.priority, q.created_at,
+                       2 AS band, q.created_at AS claim_at
                 FROM scan_queue q
                 WHERE q.state = 'pending'
                   AND q.next_attempt_at <= NOW()
@@ -503,12 +620,21 @@ impl ScanQueue {
                 LIMIT GREATEST($4, 0)
                 FOR UPDATE OF q SKIP LOCKED
             ),
-            -- The best `limit` of both, in the one claim order. A rescan row
+            -- The best `limit` of all four, in the one claim order. A row
             -- locked above but not chosen stays pending.
             candidate AS (
-                SELECT c.id
-                FROM (SELECT * FROM other UNION ALL SELECT * FROM rescans) c
-                ORDER BY c.priority DESC, c.created_at ASC
+                SELECT c.id,
+                       row_number() OVER (
+                           ORDER BY c.band, c.claim_at, c.priority DESC, c.created_at, c.id
+                       ) AS ord
+                FROM (
+                    SELECT * FROM waiting
+                    UNION ALL SELECT * FROM hosted
+                    UNION ALL SELECT * FROM backfill
+                    UNION ALL SELECT * FROM below
+                    UNION ALL SELECT * FROM rescans
+                ) c
+                ORDER BY ord
                 LIMIT $1
             ),
             claimed AS (
@@ -520,8 +646,9 @@ impl ScanQueue {
                     claim_token = gen_random_uuid(),
                     claim_expires_at = NOW() + make_interval(secs => $3),
                     updated_at = NOW()
-                FROM candidate
-                WHERE q.id = candidate.id
+                -- An id array, not a join: a generic plan cannot size
+                -- `LIMIT $1` and hash-joined the whole table.
+                WHERE q.id = ANY(ARRAY(SELECT id FROM candidate))
                 RETURNING q.*
             )
             SELECT
@@ -532,13 +659,19 @@ impl ScanQueue {
                 c.attempts, c.max_attempts, c.created_at,
                 c.claim_token, c.claimed_by, c.claim_expires_at
             FROM claimed c
-            ORDER BY c.priority DESC, c.created_at ASC
+            JOIN candidate ON candidate.id = c.id
+            ORDER BY candidate.ord
             "#,
         )
         .bind(limit)
         .bind(claimed_by)
         .bind(claim_ttl_secs)
         .bind(max_rescans)
+        .bind(PRIORITY_CLIENT_WAITING)
+        .bind(PRIORITY_HOSTED)
+        .bind(self.backfill_aging.as_secs_f64())
+        .bind(PRIORITY_BACKFILL)
+        .bind(PRIORITY_RESCAN)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -959,6 +1092,24 @@ mod tests {
         assert!(!job_with_attempts(0, 1).will_retry_after_failure());
     }
 
+    /// #6032: the aging window env var. Unset, blank or garbage keeps the
+    /// default; `0` is honoured (plain age order across the two bands).
+    #[test]
+    fn backfill_aging_parses_seconds_and_falls_back_to_the_default() {
+        use std::time::Duration;
+        assert_eq!(parse_backfill_aging(None), DEFAULT_BACKFILL_AGING);
+        assert_eq!(parse_backfill_aging(Some("")), DEFAULT_BACKFILL_AGING);
+        assert_eq!(parse_backfill_aging(Some("soon")), DEFAULT_BACKFILL_AGING);
+        assert_eq!(parse_backfill_aging(Some("-5")), DEFAULT_BACKFILL_AGING);
+        assert_eq!(parse_backfill_aging(Some(" 90 ")), Duration::from_secs(90));
+        assert_eq!(parse_backfill_aging(Some("0")), Duration::ZERO);
+        // Past the timestamp range every claim would fail: clamped.
+        assert_eq!(
+            parse_backfill_aging(Some("99999999999999")),
+            MAX_BACKFILL_AGING
+        );
+    }
+
     /// #5994: the unavailable signal is seen only inside a tracking scope,
     /// and noting it outside one (an in-process scan) does nothing.
     #[tokio::test]
@@ -1319,7 +1470,7 @@ mod tests {
         }
         assert_eq!(
             picked,
-            vec!["waiting01", "backfill1", "hosted01"],
+            vec!["waiting01", "hosted01", "backfill1"],
             "each single-slot claim must take the highest-priority job left"
         );
 
@@ -1908,6 +2059,217 @@ mod tests {
         drop_repo(&pool, repo).await;
     }
 
+    /// Seed one artifact row in `repo` for a `hosted_upload` job.
+    async fn seed_artifact(pool: &sqlx::PgPool, repo: Uuid, name: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, path, name, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, $4, 1, $5, 'application/java-archive', $3)",
+        )
+        .bind(id)
+        .bind(repo)
+        .bind(format!("p/{name}"))
+        .bind(name)
+        .bind(format!("sha-{id}"))
+        .execute(pool)
+        .await
+        .expect("seed artifact");
+        id
+    }
+
+    /// Queue `n` fail-open proxy scans, the oldest `oldest_secs` ago and one
+    /// second apart, as a cold-proxy burst leaves them.
+    async fn seed_backfill(
+        pool: &sqlx::PgPool,
+        repo: Uuid,
+        prefix: &str,
+        n: i32,
+        oldest_secs: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO scan_queue (kind, priority, repository_id, cache_path, digest, created_at) \
+             SELECT 'proxy_file', $1, $2, $3 || g, $3 || g, \
+                    NOW() - make_interval(secs => ($4 - g + 1)::float8) \
+             FROM generate_series(1, $5) g",
+        )
+        .bind(PRIORITY_BACKFILL)
+        .bind(repo)
+        .bind(prefix)
+        .bind(oldest_secs)
+        .bind(n)
+        .execute(pool)
+        .await
+        .expect("seed backfill");
+    }
+
+    async fn claim_one(q: &ScanQueue) -> ScanJob {
+        q.claim(1, "w", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("a job is due")
+            .into_row()
+    }
+
+    /// #6032: a hosted upload and a pushed image queued behind a fail-open
+    /// proxy backlog are claimed before it, as long as the backlog is younger
+    /// than the aging window. The backlog then drains oldest first.
+    #[tokio::test]
+    async fn a_fresh_upload_is_claimed_before_an_older_proxy_backlog() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        // 200 backfill jobs, 1 to 200 seconds old: all inside the window.
+        seed_backfill(&pool, repo, "burst", 200, 200).await;
+        let upload = seed_artifact(&pool, repo, "fresh.jar").await;
+        assert!(q
+            .enqueue_hosted_upload(upload, PRIORITY_HOSTED)
+            .await
+            .expect("upload"));
+        assert!(q
+            .enqueue_hosted_image(repo, "img6032", PRIORITY_HOSTED)
+            .await
+            .expect("image"));
+
+        let first = claim_one(&q).await;
+        assert_eq!(first.kind, "hosted_upload");
+        assert_eq!(first.artifact_id, Some(upload));
+        let second = claim_one(&q).await;
+        assert_eq!(second.kind, "hosted_image");
+        // Then the backlog, oldest first.
+        let third = claim_one(&q).await;
+        assert_eq!(third.digest.as_deref(), Some("burst1"));
+
+        // A multi-slot claim takes the same order in one statement.
+        sqlx::query("DELETE FROM scan_queue")
+            .execute(&pool)
+            .await
+            .expect("reset");
+        seed_backfill(&pool, repo, "burst", 200, 200).await;
+        q.enqueue_hosted_upload(upload, PRIORITY_HOSTED)
+            .await
+            .expect("upload");
+        q.enqueue_hosted_image(repo, "img6032", PRIORITY_HOSTED)
+            .await
+            .expect("image");
+        let batch: Vec<String> = q
+            .claim(3, "w", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .into_iter()
+            .map(|c| c.into_row().kind)
+            .collect();
+        assert_eq!(batch, vec!["hosted_upload", "hosted_image", "proxy_file"]);
+
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #6032: aging. A proxy job queued more than the window before a new
+    /// upload is claimed ahead of it, so a steady stream of uploads cannot
+    /// starve the backlog; a proxy job inside the window still waits.
+    #[tokio::test]
+    async fn a_proxy_job_older_than_the_aging_window_is_claimed_before_a_new_upload() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        let window = DEFAULT_BACKFILL_AGING.as_secs() as i64;
+        // One job a minute past the window, one well inside it.
+        seed_backfill(&pool, repo, "aged", 1, window + 60).await;
+        seed_backfill(&pool, repo, "young", 1, 30).await;
+        let upload = seed_artifact(&pool, repo, "new.jar").await;
+        q.enqueue_hosted_upload(upload, PRIORITY_HOSTED)
+            .await
+            .expect("upload");
+
+        let picked: Vec<String> = [
+            claim_one(&q).await,
+            claim_one(&q).await,
+            claim_one(&q).await,
+        ]
+        .into_iter()
+        .map(|j| j.digest.unwrap_or(j.kind))
+        .collect();
+        assert_eq!(picked, vec!["aged1", "hosted_upload", "young1"]);
+
+        // The window is the knob: with none, plain age order.
+        sqlx::query("DELETE FROM scan_queue")
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_backfill(&pool, repo, "older", 1, 30).await;
+        let upload = seed_artifact(&pool, repo, "newer.jar").await;
+        q.enqueue_hosted_upload(upload, PRIORITY_HOSTED)
+            .await
+            .expect("upload");
+        let fifo = q.clone().with_backfill_aging(std::time::Duration::ZERO);
+        assert_eq!(claim_one(&fifo).await.digest.as_deref(), Some("older1"));
+
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #6032 review: a hosted job 1.12.0 queued at priority 10 is claimed as
+    /// hosted, not behind the backfill, at every batch size.
+    #[tokio::test]
+    async fn a_hosted_job_queued_by_1_12_0_is_not_left_behind_the_backfill() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        seed_backfill(&pool, repo, "fresh", 5, 5).await;
+        q.enqueue_hosted_image(repo, "legacy01", PRIORITY_HOSTED_1_12_0)
+            .await
+            .expect("legacy hosted");
+        sqlx::query(
+            "UPDATE scan_queue SET created_at = NOW() - interval '1 minute' WHERE digest = 'legacy01'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(claim_one(&q).await.digest.as_deref(), Some("legacy01"));
+
+        sqlx::query("UPDATE scan_queue SET state = 'pending', claim_token = NULL, claimed_by = NULL, claim_expires_at = NULL WHERE digest = 'legacy01'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let batch = q.claim(6, "w", CLAIM_TTL_SECS).await.expect("claim");
+        assert_eq!(batch.len(), 6);
+        assert_eq!(batch[0].digest.as_deref(), Some("legacy01"));
+
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #6032: a fail-closed pull still goes ahead of everything, however old
+    /// the hosted and backfill jobs are.
+    #[tokio::test]
+    async fn a_waiting_client_still_goes_ahead_of_aged_jobs() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        seed_backfill(&pool, repo, "ancient", 1, 86_400).await;
+        let upload = seed_artifact(&pool, repo, "old.jar").await;
+        q.enqueue_hosted_upload(upload, PRIORITY_HOSTED)
+            .await
+            .expect("upload");
+        sqlx::query("UPDATE scan_queue SET created_at = NOW() - interval '1 day' WHERE kind = 'hosted_upload'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        q.enqueue_proxy_file(
+            repo,
+            "w",
+            "wait6032",
+            None,
+            1,
+            None,
+            PRIORITY_CLIENT_WAITING,
+        )
+        .await
+        .expect("waiting");
+        assert_eq!(claim_one(&q).await.digest.as_deref(), Some("wait6032"));
+
+        drop_repo(&pool, repo).await;
+    }
+
     async fn enqueue_rescan(pool: &sqlx::PgPool, digest: &str) {
         sqlx::query("INSERT INTO scan_queue (kind, priority, digest) VALUES ('rescan', $1, $2)")
             .bind(PRIORITY_RESCAN)
@@ -1946,7 +2308,7 @@ mod tests {
                 .expect("due");
             picked.push(job.digest.clone().unwrap_or_default());
         }
-        assert_eq!(picked, vec!["wait01", "back01", "host01", "resc01"]);
+        assert_eq!(picked, vec!["wait01", "host01", "back01", "resc01"]);
 
         sqlx::query("DELETE FROM scan_queue")
             .execute(&pool)

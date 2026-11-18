@@ -1150,11 +1150,7 @@ impl MigrationWorker {
                 let should_skip_duplicate = self
                     .check_artifact_duplicate(
                         keys.target.as_str(),
-                        &duplicate_lookup_path(
-                            package_type,
-                            &artifact_path,
-                            debian_component.as_deref(),
-                        ),
+                        &artifact_path,
                         &source_path,
                         &ExpectedChecksums {
                             sha256: expected_sha256.clone(),
@@ -1162,6 +1158,7 @@ impl MigrationWorker {
                         },
                         conflict_resolution,
                         package_type,
+                        debian_component.as_deref(),
                     )
                     .await?;
 
@@ -1344,11 +1341,12 @@ impl MigrationWorker {
         let should_skip = self
             .check_artifact_duplicate(
                 keys.target.as_str(),
-                &duplicate_lookup_path(package_type, artifact_path, debian_component),
+                artifact_path,
                 source_path,
                 &expected,
                 conflict_resolution,
                 package_type,
+                debian_component,
             )
             .await?;
         // #4657: a `.deb` imported before the importer registered Debian
@@ -1786,6 +1784,7 @@ impl MigrationWorker {
     /// its referenced content is complete; otherwise it falls through so the
     /// walker can fetch the missing pieces (registered content is deduped, so
     /// genuinely-complete items stay idempotent).
+    #[allow(clippy::too_many_arguments)]
     async fn check_artifact_duplicate(
         &self,
         repo_key: &str,
@@ -1794,6 +1793,7 @@ impl MigrationWorker {
         expected: &ExpectedChecksums,
         conflict_resolution: ConflictResolution,
         package_type: &str,
+        debian_component: Option<&str>,
     ) -> Result<bool, MigrationError> {
         // Docker/OCI blobs no longer produce an `artifacts` row (they live
         // only in `oci_blobs`, matching the live push path), so their
@@ -1870,12 +1870,13 @@ impl MigrationWorker {
                 // no-op. Same rule #3533 applied to Docker/OCI manifests,
                 // reached here through the shared path helper rather than a
                 // second copy of the shape.
-                let legacy_candidate: Option<&str> =
-                    if migration_destination_path(package_type, artifact_path) == artifact_path {
-                        None
-                    } else {
-                        Some(legacy_source_path)
-                    };
+                let lookup_path =
+                    duplicate_lookup_path(package_type, artifact_path, debian_component);
+                let legacy_candidate: Option<&str> = if lookup_path == artifact_path {
+                    None
+                } else {
+                    Some(legacy_source_path)
+                };
                 sqlx::query_as(
                     r#"
                     SELECT a.checksum_sha256, a.checksum_sha1
@@ -1889,7 +1890,7 @@ impl MigrationWorker {
                     "#,
                 )
                 .bind(repo_key)
-                .bind(artifact_path)
+                .bind(&lookup_path)
                 .bind(legacy_candidate)
                 .fetch_optional(&self.db)
                 .await?
@@ -3909,10 +3910,10 @@ pub(crate) fn debian_destination_path(artifact_path: &str, component: Option<&st
 }
 
 /// The path the duplicate check looks an item up under: a `.deb`'s
-/// destination (#4740), since a re-run must find a package under the
-/// component it is now filed in, and must re-import (and retire) one an
-/// earlier run stored under the wrong component. Every other item keeps its
-/// source-relative path.
+/// destination (#4740) or the destination path composed by
+/// [`migration_destination_path`] (#6197), so re-runs for formats whose
+/// stored layout differs from the source path (such as PyPI or npm) match
+/// the already-imported `artifacts.path`.
 fn duplicate_lookup_path(
     package_type: &str,
     artifact_path: &str,
@@ -3921,7 +3922,7 @@ fn duplicate_lookup_path(
     if package_type.eq_ignore_ascii_case("debian") {
         debian_destination_path(artifact_path, debian_component)
     } else {
-        artifact_path.to_string()
+        migration_destination_path(package_type, artifact_path)
     }
 }
 
@@ -4996,6 +4997,26 @@ mod tests {
         assert_eq!(
             migration_destination_path("npm", "lodash/-/lodash-4.17.21.tgz"),
             "lodash/4.17.21/lodash-4.17.21.tgz"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_lookup_path_matches_destination_6197() {
+        assert_eq!(
+            duplicate_lookup_path(
+                "pypi",
+                "packages/example-pkg/1.1.0/example-pkg-1.1.0.tar.gz",
+                None,
+            ),
+            "example-pkg/1.1.0/example-pkg-1.1.0.tar.gz"
+        );
+        assert_eq!(
+            duplicate_lookup_path("npm", "lodash/-/lodash-4.17.21.tgz", None),
+            "lodash/4.17.21/lodash-4.17.21.tgz"
+        );
+        assert_eq!(
+            duplicate_lookup_path("maven", "org/ex/lib/1.0/lib-1.0.jar", None),
+            "org/ex/lib/1.0/lib-1.0.jar"
         );
     }
 
@@ -9446,6 +9467,190 @@ mod tests {
         assert_eq!(count, 1);
     }
 
+    /// A Nexus repository of plain files has no components, only assets. The
+    /// real Nexus client lists them through `/assets`, and the worker stores
+    /// each at its Nexus path in a generic repository, verified against the
+    /// sha256/sha1 Nexus advertises. A file whose advertised digest does not
+    /// match the bytes fails, so the digests really are checked.
+    #[tokio::test]
+    async fn test_nexus_component_less_assets_migrate_with_checksums() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::nexus_client::{NexusAuth, NexusClient, NexusClientConfig};
+        use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, target_key) =
+            setup_repo_for_import(&pool, "mig-nexus-assets", "generic").await;
+        let (_unused_key, conn_id, job_id) = seed_single_repo_job(&pool, "mig-nexus-assets").await;
+
+        // (Nexus path, body, sha1 of the body as Nexus reports it)
+        let files: [(&str, &[u8], &str); 3] = [
+            (
+                "/fixtures/ios/fixture.json",
+                b"{\"mail\":\"ios\"}",
+                "27c590b03e18d9bbcab5f5684fd82aa249543f39",
+            ),
+            (
+                "docs/web/top.ics",
+                b"BEGIN:VCALENDAR",
+                "a6df46ec8e5798b513895443c777dba0a415e0fd",
+            ),
+            (
+                "fixtures/users/corrupt.bin",
+                b"bytes nexus did not hash",
+                "2123e63b02c25aa279da791dee2614480bb34dbb",
+            ),
+        ];
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/components"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "items": [], "continuationToken": null })),
+            )
+            .mount(&server)
+            .await;
+        let asset = |(p, body, sha1): (&str, &[u8], &str), sha256: String| {
+            serde_json::json!({
+                "id": p,
+                "format": "raw",
+                "path": p,
+                "checksum": {
+                    "sha1": sha1,
+                    "sha256": sha256,
+                    "md5": "00000000000000000000000000000000"
+                },
+                "fileSize": body.len()
+            })
+        };
+        let pages = [
+            (
+                None,
+                Some("a1"),
+                vec![asset(files[0], sha256_hex_of(files[0].1))],
+            ),
+            (
+                Some("a1"),
+                None,
+                vec![
+                    asset(files[1], sha256_hex_of(files[1].1)),
+                    asset(files[2], sha256_hex_of(b"other bytes")),
+                ],
+            ),
+        ];
+        for (token, next, items) in pages {
+            let route = Mock::given(method("GET"))
+                .and(path("/service/rest/v1/assets"))
+                .and(query_param("repository", "test-data"));
+            let route = match token {
+                Some(t) => route.and(query_param("continuationToken", t)),
+                None => route.and(query_param_is_missing("continuationToken")),
+            };
+            route
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "items": items, "continuationToken": next }),
+                ))
+                .mount(&server)
+                .await;
+        }
+        for (p, body, _) in files {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/repository/test-data/{}",
+                    p.trim_start_matches('/')
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+                .mount(&server)
+                .await;
+        }
+
+        let client = NexusClient::new(NexusClientConfig {
+            base_url: server.uri(),
+            auth: NexusAuth {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            throttle_delay_ms: 0,
+            ..Default::default()
+        })
+        .expect("build nexus client");
+
+        let keys = RepoKeys {
+            source: "test-data".to_string(),
+            target: target_key.clone(),
+        };
+        let (mut completed, mut failed, mut skipped, mut transferred) = (0i32, 0i32, 0i32, 0i64);
+        let (mut discovered, mut discovered_bytes) = (0i32, 0i64);
+        let outcome = worker
+            .process_repository_artifacts(
+                job_id,
+                Arc::new(client),
+                storage.clone(),
+                &keys,
+                "generic",
+                None,
+                None,
+                ConflictResolution::Skip,
+                false,
+                &mut completed,
+                &mut failed,
+                &mut skipped,
+                &mut transferred,
+                &mut discovered,
+                &mut discovered_bytes,
+                None,
+            )
+            .await
+            .expect("process the Nexus repository");
+
+        assert!(matches!(outcome, RepoProcessOutcome::Completed));
+        assert_eq!(discovered, 3, "all three component-less assets are listed");
+        assert_eq!(
+            (completed, failed, skipped),
+            (2, 1, 0),
+            "two files migrate, the one with a wrong advertised sha256 fails"
+        );
+
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT path, checksum_sha256, checksum_sha1 FROM artifacts \
+             WHERE repository_id = $1 AND is_deleted = false ORDER BY path",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read migrated artifacts");
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "docs/web/top.ics".to_string(),
+                    sha256_hex_of(files[1].1),
+                    Some(files[1].2.to_string()),
+                ),
+                (
+                    "fixtures/ios/fixture.json".to_string(),
+                    sha256_hex_of(files[0].1),
+                    Some(files[0].2.to_string()),
+                ),
+            ],
+            "each file lands at its Nexus path with its digests"
+        );
+
+        sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM source_connections WHERE id = $1")
+            .bind(conn_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
     /// End-to-end #2457 import over the Artifactory source layout: a config
     /// blob, a layer blob, and a tagged image manifest must land in the OCI
     /// index (oci_blobs + oci_tags + manifest_blob_refs) with bytes at the
@@ -9980,6 +10185,7 @@ mod tests {
                 &expected,
                 ConflictResolution::Skip,
                 "docker",
+                None,
             )
             .await
             .expect("duplicate check");
@@ -10035,6 +10241,7 @@ mod tests {
                 &expected,
                 ConflictResolution::Skip,
                 "docker",
+                None,
             )
             .await
             .expect("duplicate check after repair");
@@ -10129,6 +10336,7 @@ mod tests {
                 &index_expected,
                 ConflictResolution::Skip,
                 "docker",
+                None,
             )
             .await
             .unwrap();
@@ -10151,6 +10359,7 @@ mod tests {
                 &index_expected,
                 ConflictResolution::Skip,
                 "docker",
+                None,
             )
             .await
             .unwrap();
@@ -10172,6 +10381,7 @@ mod tests {
                 },
                 ConflictResolution::Skip,
                 "docker",
+                None,
             )
             .await
             .unwrap();
@@ -10253,6 +10463,7 @@ mod tests {
                 },
                 ConflictResolution::Skip,
                 "docker",
+                None,
             )
             .await
             .expect("duplicate check");
@@ -10305,6 +10516,7 @@ mod tests {
                 },
                 ConflictResolution::Skip,
                 "docker",
+                None,
             )
             .await
             .expect("duplicate check");
@@ -10783,6 +10995,92 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// A Nexus npm tarball whose version is a numeric prerelease
+    /// (`1.1.6-4`) must land under its real package name, show in that
+    /// package's packument and download from the advertised tarball URL.
+    /// Splitting the filename at its last hyphen filed it as package
+    /// `@acme/acme-core-1.1.6` version `4`, invisible to npm.
+    #[tokio::test]
+    async fn test_npm_prerelease_import_lands_in_its_packument() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::io::Write;
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(fx.storage_dir.to_str().unwrap()),
+        );
+        let worker = MigrationWorker::new(
+            fx.pool.clone(),
+            Arc::new(StorageRegistry::new(
+                std::collections::HashMap::new(),
+                "filesystem".to_string(),
+            )),
+            WorkerConfig::default(),
+            CancellationToken::new(),
+        );
+
+        let package_json = br#"{"name":"@acme/acme-core","version":"1.1.6-4"}"#;
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(package_json.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "package/package.json", &package_json[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tar_buf).unwrap();
+        let body = bytes::Bytes::from(gz.finish().unwrap());
+
+        let path = "@acme/acme-core/-/acme-core-1.1.6-4.tgz";
+        let mut files = std::collections::HashMap::new();
+        files.insert(path.to_string(), body.clone());
+        transfer_one(&worker, &storage, &files, &fx.repo_key, "npm", path)
+            .await
+            .expect("npm transfer must succeed");
+
+        let (name, version): (String, Option<String>) = sqlx::query_as(
+            "SELECT name, version FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("one artifact row");
+        assert_eq!(name, "@acme/acme-core");
+        assert_eq!(version.as_deref(), Some("1.1.6-4"));
+
+        let router = fx.router_with_auth(crate::api::handlers::npm::router());
+        let (status, packument) = tdh::send(
+            router,
+            tdh::get(format!("/{}/@acme%2Facme-core", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "packument");
+        let packument: serde_json::Value = serde_json::from_slice(&packument).unwrap();
+        let tarball = packument["versions"]["1.1.6-4"]["dist"]["tarball"]
+            .as_str()
+            .unwrap_or_else(|| panic!("1.1.6-4 missing from the packument: {packument}"));
+        let repo_prefix = format!("/{}/", fx.repo_key);
+        let tarball_path = &tarball[tarball.find(&repo_prefix).expect("repo in tarball URL")..];
+        assert_eq!(
+            tarball_path,
+            format!("/{}/{}", fx.repo_key, path),
+            "the advertised tarball URL is the npm registry path"
+        );
+
+        let router = fx.router_with_auth(crate::api::handlers::npm::router());
+        let (status, served) = tdh::send(router, tdh::get(tarball_path.to_string())).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "tarball download");
+        assert_eq!(&served[..], &body[..]);
+
+        fx.teardown().await;
+    }
+
     /// Repair on re-run, the way #3533 repairs a pre-fix Docker import: a
     /// legacy `<repo_key>/<path>` row must NOT count as a duplicate of the
     /// canonical `<path>` row (otherwise "re-run the migration" is a silent
@@ -10838,6 +11136,7 @@ mod tests {
                     &expected,
                     ConflictResolution::Skip,
                     "generic",
+                    None,
                 )
                 .await
                 .expect("duplicate check"),
@@ -10896,6 +11195,7 @@ mod tests {
                     &expected,
                     ConflictResolution::Skip,
                     "generic",
+                    None,
                 )
                 .await
                 .expect("duplicate check"),
@@ -11963,6 +12263,66 @@ mod tests {
         // Once registered, a further re-run skips it as before.
         let again = run().await;
         assert_eq!((again.0, again.1, again.2), (0, 0, 1));
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// #6197: formats whose stored destination path differs from the source
+    /// path (e.g. Nexus PyPI `packages/<name>/<ver>/<file>` stored as
+    /// `<name>/<ver>/<file>`) must still match in `check_artifact_duplicate`
+    /// under `ConflictResolution::Skip`.
+    #[tokio::test]
+    async fn test_pypi_reimport_skips_with_conflict_resolution_skip_6197() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig6197-pypi", "pypi").await;
+        let source_rel = "packages/example-pkg/1.1.0/example-pkg-1.1.0.tar.gz";
+        let body = bytes::Bytes::from_static(b"pypi-sdist-payload");
+        let body_hex = sha256_hex_of(&body);
+        let mut files = std::collections::HashMap::new();
+        files.insert(source_rel.to_string(), body.clone());
+
+        transfer_one(&worker, &storage, &files, &repo_key, "pypi", source_rel)
+            .await
+            .expect("first import");
+
+        let keys = RepoKeys {
+            source: repo_key.clone(),
+            target: repo_key.clone(),
+        };
+        let mut counters = (0i32, 0i32, 0i32, 0i64);
+        worker
+            .process_single_artifact(
+                Uuid::new_v4(),
+                Arc::new(MapSource { files }),
+                storage,
+                &keys,
+                "pypi",
+                source_rel,
+                &build_source_path(&repo_key, source_rel),
+                body.len() as i64,
+                ExpectedChecksums {
+                    sha256: Some(body_hex),
+                    sha1: None,
+                },
+                ConflictResolution::Skip,
+                false,
+                &mut counters.0,
+                &mut counters.1,
+                &mut counters.2,
+                &mut counters.3,
+                None,
+            )
+            .await
+            .expect("process_single_artifact");
+        assert_eq!(
+            (counters.0, counters.1, counters.2),
+            (0, 0, 1),
+            "re-running with ConflictResolution::Skip must skip existing rewritten-path artifacts"
+        );
 
         cleanup_repo(&pool, repo_id).await;
     }
