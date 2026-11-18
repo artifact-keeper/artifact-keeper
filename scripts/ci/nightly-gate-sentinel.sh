@@ -7,10 +7,8 @@
 # self-hosted pool (ak-e2e-runners). The pool fits one gate at a time. A
 # candidate is release work and the nightly is advisory, so the candidate
 # always wins. GitHub concurrency groups cannot express that: they work within
-# one group, they have no priority, and release-candidate.yml cannot be
-# changed to cancel the nightly, because a maintenance line's candidate
-# requires its release-candidate.yml to be byte-identical to main's. So the
-# nightly gives way by itself, in two places:
+# one group and they have no priority. Rather than teach release-candidate.yml
+# to cancel the nightly, the nightly gives way by itself, in two places:
 #
 #   --once   before the gate starts. Exit 3 when a run of a watched workflow
 #            (default release-candidate.yml) is queued, waiting or running,

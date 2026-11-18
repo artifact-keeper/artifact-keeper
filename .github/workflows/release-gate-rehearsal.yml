@@ -261,9 +261,16 @@ jobs:
     permissions:
       contents: read
       packages: read
-    # Still @main: SHA-pinning waits on branch protection for
-    # artifact-keeper-test, and on the 1.12.0 gate wiring landing there.
-    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main
+    # Pinned to an artifact-keeper-test commit, not @main (#6170): a gate
+    # change reaches a candidate only through a bump PR in this repo, which
+    # Mergify does not auto-merge. CODEOWNERS lists this file to mark
+    # ownership; a code-owner review is enforced only once branch protection
+    # on main and release/* requires it (#6216). The pin does not wait on
+    # protection for artifact-keeper-test (#6178). All five callers carry ONE
+    # sha, and
+    # scripts/ci/check-gate-workflow-pins.sh enforces both that and that the
+    # sha is on artifact-keeper-test main.
+    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@987bccd15df3fd4c9c24bf78436ce12fb5bd5783 # artifact-keeper-test main as of 2026-11-18
     with:
       backend_tag: ${{ inputs.backend_tag }}
       backend_digest: ${{ needs.resolve-rehearsal-digest.outputs.backend_digest }}

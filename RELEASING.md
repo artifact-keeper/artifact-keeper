@@ -365,11 +365,13 @@ names the same commit.
    tag), the verifier anchors the adapter at that tag, and the promote's tag
    message and summary print the certified adapter digest and decision.
 
-   Until artifact-keeper-test#380 lands (tracked here as #4439), the
-   adapter's attestation is **provenance of what ships, not proof that the
-   gate exercised those bytes**: the Release Gate takes no adapter input and deploys the chart's
-   pinned adapter, for "new" and "stays" alike. The candidate exposes the
-   value to pass (`needs.images.outputs.adapter_image_ref`) for when it can.
+   The Release Gate runs **that** adapter, for "new" and "stays" alike
+   (#4439, artifact-keeper-test#380). The candidate passes the certified
+   tag and digest (`scanner_adapter_tag`, `scanner_adapter_digest`). The
+   gate's k8s stack deploys `<tag>@<digest>` in place of the chart's pinned
+   adapter and asserts that the adapter pod runs that digest. Its
+   candidate-adapter DTF tiers pull it by digest. The adapter's attestation
+   is therefore proof that the gate exercised those bytes.
 
    **Maintenance lines need the #4076 verifier before their next cut.**
    `release.yml` runs the *tagged* commit's copy of
@@ -380,8 +382,7 @@ names the same commit.
    predates #4076, with an error naming the line. To cut a patch on a
    `release/X.Y.x` whose adapter version is already published, first backport
    #4076 to that line (`scripts/ci/assert-candidate-certified.sh`, its
-   self-test, and main's current `release-candidate.yml`, which the line
-   needs byte-identical anyway), then certify the backport commit. A
+   self-test), then certify the backport commit. A
    `release-candidate-<sha>` artifact and a `release-candidate/certified`
    status on the commit are written for humans; the release path verifies
    the attestation (`scripts/ci/assert-candidate-certified.sh`, pinned to
@@ -430,7 +431,8 @@ names the same commit.
      Publish): there is nothing to rerun, and the rerun says so;
    - Docker Publish has rebuilt the commit's images since (the digests
      differ), the line's test branch moved with `tests=same`, or
-     `release-candidate.yml` changed on main since;
+     `release-candidate.yml` changed on main since (the record carries the
+     blob of the candidate workflow that ran, compared on the rerun);
    - the original started more than 72 hours ago (`RERUN_MAX_AGE_HOURS`):
      the gate's chart (`iac@main`), web image (`:latest`) and runners are not
      pinned between runs, so two runs' results only add up while they are
@@ -719,7 +721,8 @@ asked for the line. An **existing** line needs none of this — only creating
 one, and deleting one, do.
 
 **A line is created in both repositories (#4372).** The Release Gate is
-`artifact-keeper-test`'s `release-gate.yml@main`, and every job in it runs
+`artifact-keeper-test`'s `release-gate.yml`, pinned to one `main` commit
+(#6170), and every job in it runs
 that repository's `scripts/switch-tests-ref.sh` (artifact-keeper-test#420):
 when `artifact-keeper-test` has a `release/X.Y.x` for the candidate's
 version, the suite runs from that branch, otherwise from `main`. Without it,
@@ -915,7 +918,7 @@ for at all, rather than being bounded by argument.
 
 Nothing in the workflow depended on the dispatched ref for this to work: the
 reusable Release Gate is an absolute cross-repository reference
-(`artifact-keeper-test/.../release-gate.yml@main`) that takes the images by
+(`artifact-keeper-test/.../release-gate.yml@<sha>`) that takes the images by
 digest, and no job needs the certified commit on disk (see "What runs from the
 certified commit" below — the answer is nothing).
 
@@ -935,25 +938,25 @@ records the resolved line as `certified_ref`, and the verifier asks the
 repository the same question again at promote time — a disagreement is never
 promoted.
 
-For a commit on a maintenance line the candidate also **blesses the content**
-of `release-candidate.yml` once, at certification time: it must be
-byte-identical (same git blob id) to the copy `main` carries then. The blob is
-recorded in the signed predicate, and every later consumer compares against
-**that record**, never against main's tip — otherwise any merge to main that
-touched the workflow would strand an already-certified commit permanently, and
-recovery would mean a new commit and a full gate re-run. Not to the copy at the merge base — the merge
-base is a function of the commit's own ancestry, so whoever chooses the
-commit's parent would be choosing which historical copy gets blessed,
-including one from before a guard existed, permanently. Main's current copy is
-the only copy nobody but main can choose, and cherry-picking it forward was
-already the documented remedy. So: if the candidate refuses with "not main's
-current copy", do **not** edit the workflow on the branch — cherry-pick main's
-copy across and dispatch a new candidate. (Nothing is demanded, explicitly,
-for a commit on `main`, where comparing main to itself decides nothing.)
+The candidate also **records** the git blob id of `release-candidate.yml` at
+the certified commit in the signed predicate (`certified_workflow_blob`), and
+the verifier compares the commit against that record, never against main's
+tip. It is **not** required to match main's copy (#6122), and an edit to
+`release-candidate.yml` on main needs **no backport** to any `release/X.Y.x`.
+A line's copy lags main's after every such edit, and the candidate prints a
+notice saying so. That is expected: the copy is inert. The candidate is
+dispatched on main (its guard refuses any other ref), every checkout in it is
+`refs/heads/main` (next section), and only main's signing identity is
+accepted, so nothing ever runs a release branch's copy.
 
-The blessing is no longer load-bearing for the identity; it backstops the
-window in which an admin has the release ruleset toggled off to create a
-line.
+Until #6122 the candidate demanded that a maintenance commit carry main's
+**current** copy byte for byte (#3821). It was meant as a backstop for the
+window in which an admin has the release ruleset toggled off to create a line.
+It protected nothing that runs. An attacker with a commit on the line passed
+it for free by copying main's file, while the files the tag side really runs
+(`scripts/ci/*`, `release.yml`, `docker-publish.yml`) were never pinned by it.
+What it did do was refuse every maintenance candidate after each main edit to
+the file, until someone backported the edit by hand.
 
 ### What runs from the certified commit
 
@@ -1167,8 +1170,8 @@ scanned bytes; deleting it breaks every chart that pins it.
   Candidate is always
   dispatched on `main`, including for a maintenance release, so the signing
   identity is always `...release-candidate.yml@refs/heads/main` and never
-  widens; `release-candidate.yml` at the certified commit must additionally be
-  byte-identical to a copy that lives on `main`. See "Patch releases from a
+  widens. The copy of `release-candidate.yml` on a release branch never runs
+  and needs no backport (#6122). See "Patch releases from a
   `release/X.Y.x` branch".
 - Floating tags (`:latest`, `:X.Y`) are applied ONLY after the release gate
   and the GitHub Release, by a build-free promotion that re-points them at the

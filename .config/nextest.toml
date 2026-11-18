@@ -197,3 +197,36 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 [[profile.default.overrides]]
 filter = 'test(/^services::signing_service::tests::/)'
 slow-timeout = { period = "60s", terminate-after = 15 }
+
+# ── CI and nightly profiles (#6172, first slice) ─────────────────────────────
+#
+# A named profile inherits everything above: `[profile.default]` settings and
+# every `[[profile.default.overrides]]` entry (the db-serial groups, the
+# timeouts) still apply under `--profile ci` and `--profile nightly`.
+#
+# `ci` is the BLOCKING profile every unit-test shard and integration step in
+# ci.yml runs. It does not retry: past "flakes" here were real races (#4004,
+# #3946, #3957), and a retry would have turned each one silently green
+# (#6172, "Settled: retries = 0 in blocking profiles"). What it adds is the
+# record: a JUnit report per run, at target/nextest/ci/junit.xml, which
+# ci.yml uploads and summarises.
+[profile.ci]
+fail-fast = false
+retries = 0
+
+[profile.ci.junit]
+path = "junit.xml"
+
+# `nightly` is the flake DETECTOR. A test that fails and then passes on a
+# retry is reported FLAKY on the console and as a `<flakyFailure>` in JUnit
+# (target/nextest/nightly/junit.xml); the run stays green.
+# scripts/ci/nextest-junit-summary.py lists those tests. Backoff spaces the
+# retries out so a test racing a slow neighbour is not retried into the same
+# window. No workflow runs this profile yet: wiring it into a nightly job,
+# filing `flaky` issues from it and the quarantine file are later slices.
+[profile.nightly]
+fail-fast = false
+retries = { backoff = "exponential", count = 2, delay = "2s", max-delay = "10s", jitter = true }
+
+[profile.nightly.junit]
+path = "junit.xml"

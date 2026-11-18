@@ -9889,6 +9889,70 @@ mod age_gate_tests {
             rig.teardown().await;
         }
 
+        /// A crate whose `Cargo.toml` does not declare what it is served as
+        /// is never scanned or queued, so every pull lands on the same arm.
+        /// Each one is served pending under its own WARN, never fail-open's
+        /// "scanning async" line, and counted in
+        /// `ak_proxy_scan_unscannable_total`
+        #[test]
+        fn remote_unestablished_crate_is_served_and_counted_unscannable() {
+            let (name, version) = ("scan-unestablished", "0.4.0");
+            let logs = tdh::LogCapture::default();
+            let _guard = logs.install(tracing::Level::WARN);
+            let (keys, counted) =
+                crate::services::metrics_service::capture_counters_async(|| async {
+                    let mut keys = Vec::new();
+                    for action in ["fail_open", "record_only"] {
+                        let rig = RemoteRig::new(Some(action)).await?;
+                        let body = crate_bytes_declaring("evil-crate", version);
+                        rig.mount_download(name, version, &body, 1).await;
+                        for pull in 1..=2 {
+                            let (status, served, headers) =
+                                rig.get(rig.download_uri(name, version)).await;
+                            assert_eq!(status, StatusCode::OK, "{action} pull {pull}");
+                            assert_eq!(scan_header(&headers), Some("pending"), "{action}");
+                            assert_eq!(&served[..], &body[..]);
+                        }
+                        let queued: i64 = sqlx::query_scalar(
+                            "SELECT COUNT(*) FROM scan_queue WHERE repository_id = $1",
+                        )
+                        .bind(rig.fx.repo_id)
+                        .fetch_one(&rig.fx.pool)
+                        .await
+                        .unwrap();
+                        assert_eq!(queued, 0, "{action}: nothing queued");
+                        keys.push(rig.fx.repo_key.clone());
+                        rig.teardown().await;
+                    }
+                    Some(keys)
+                });
+            let Some(keys) = keys else {
+                return;
+            };
+            for key in &keys {
+                assert_eq!(
+                    counted.get(
+                        "ak_proxy_scan_unscannable_total",
+                        &[
+                            ("repository", key),
+                            ("format", "cargo"),
+                            ("reason", "identity_not_established"),
+                        ],
+                    ),
+                    2,
+                    "{key}: once per pull"
+                );
+            }
+            let text = logs.text();
+            assert_eq!(
+                text.matches("served, will not be scanned: identity not established")
+                    .count(),
+                4,
+                "{text}"
+            );
+            assert!(!text.contains("fail-open proxy scan"), "{text}");
+        }
+
         /// The control: with scan-on-proxy off the crate still streams through
         /// the untouched path (no scan header, no verdict consulted).
         #[tokio::test]

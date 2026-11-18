@@ -3174,6 +3174,19 @@ async fn get_scoped_metadata(
 ) -> Result<Response, Response> {
     let scope = normalize_package_name(&scope);
     let package = normalize_package_name(&package);
+    if let Some((scope_part, name_part)) = encoded_scoped_version_parts(&scope) {
+        let full_name = build_scoped_package_name(scope_part, name_part);
+        validate_package_name(&full_name)?;
+        return get_package_version_metadata(
+            &state,
+            auth.as_ref(),
+            &repo_key,
+            &full_name,
+            &package,
+            base_url.as_str(),
+        )
+        .await;
+    }
     let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
     get_package_metadata_cached(
@@ -3252,6 +3265,7 @@ struct NpmMetadataArtifact {
     version: Option<String>,
     checksum_sha256: String,
     metadata: Option<serde_json::Value>,
+    created_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Build an npm package metadata JSON response from a set of artifacts.
@@ -3277,6 +3291,30 @@ fn build_npm_metadata_response(
         ),
         want_abbreviated,
     ))
+}
+
+/// The packument `time` map, each live version's publish time plus `created` and `modified`
+/// Yarn's age gate and `npm install --before` read it (#5789)
+fn npm_packument_time(artifacts: &[NpmMetadataArtifact]) -> serde_json::Value {
+    let stamp = |t: &chrono::DateTime<chrono::Utc>| {
+        serde_json::Value::String(t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    };
+    let mut time = serde_json::Map::new();
+    let mut created: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut modified: Option<chrono::DateTime<chrono::Utc>> = None;
+    for artifact in artifacts {
+        let Some(version) = &artifact.version else {
+            continue;
+        };
+        time.insert(version.clone(), stamp(&artifact.created_at));
+        created = Some(created.map_or(artifact.created_at, |c| c.min(artifact.created_at)));
+        modified = Some(modified.map_or(artifact.created_at, |m| m.max(artifact.created_at)));
+    }
+    if let (Some(created), Some(modified)) = (created, modified) {
+        time.insert("created".to_string(), stamp(&created));
+        time.insert("modified".to_string(), stamp(&modified));
+    }
+    serde_json::Value::Object(time)
 }
 
 /// Build the FULL packument JSON value from a set of stored artifacts — the
@@ -3339,6 +3377,7 @@ fn build_npm_metadata_value(
         "name": package_name,
         "versions": versions,
         "dist-tags": serde_json::Value::Object(dist_tags),
+        "time": npm_packument_time(artifacts),
     })
 }
 
@@ -3489,6 +3528,7 @@ async fn fetch_npm_artifacts(
             version: a.version,
             checksum_sha256: a.checksum_sha256,
             metadata: a.metadata,
+            created_at: a.created_at,
         })
         .collect())
 }
@@ -7821,6 +7861,15 @@ fn build_npm_storage_key(
     scheme.write_key(storage_backend, "npm", repo_id, artifact_path)
 }
 
+/// Split the decoded scope of an encoded scoped version request (#5790)
+///
+/// `GET /{repo}/@scope%2fname/{version}` matches the scoped packument route
+/// with the decoded scope `scope/name` and the version as the package,
+/// so this returns `(scope, name)` for that shape and `None` for a plain `@scope/name`
+fn encoded_scoped_version_parts(decoded_scope: &str) -> Option<(&str, &str)> {
+    decoded_scope.split_once('/')
+}
+
 /// Build a scoped package name from scope and package.
 fn build_scoped_package_name(scope: &str, package: &str) -> String {
     format!("@{}/{}", scope, package)
@@ -11508,6 +11557,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_encoded_scoped_version_parts_5790() {
+        assert_eq!(
+            encoded_scoped_version_parts("acme/lib"),
+            Some(("acme", "lib"))
+        );
+        assert_eq!(encoded_scoped_version_parts("acme"), None);
+        let (scope, name) = encoded_scoped_version_parts("acme/lib/x").unwrap();
+        assert!(validate_package_name(&build_scoped_package_name(scope, name)).is_err());
+        let (scope, name) = encoded_scoped_version_parts("../lib").unwrap();
+        assert!(validate_package_name(&build_scoped_package_name(scope, name)).is_err());
+    }
+
     // -----------------------------------------------------------------------
     // validate_npm_package_name
     // -----------------------------------------------------------------------
@@ -12240,6 +12302,7 @@ mod tests {
             version: Some(version.to_string()),
             checksum_sha256: sha256.to_string(),
             metadata: None,
+            created_at: chrono::DateTime::UNIX_EPOCH,
         }
     }
 
@@ -12369,6 +12432,7 @@ mod tests {
                     "main": "index.js"
                 }
             })),
+            created_at: chrono::DateTime::UNIX_EPOCH,
         }];
 
         let body =
@@ -12392,6 +12456,7 @@ mod tests {
                 version: None,
                 checksum_sha256: SHA256_ABCD.to_string(),
                 metadata: None,
+                created_at: chrono::DateTime::UNIX_EPOCH,
             },
         ];
 
@@ -12401,6 +12466,48 @@ mod tests {
         let versions = body["versions"].as_object().unwrap();
         assert_eq!(versions.len(), 1);
         assert!(versions.contains_key("1.0.0"));
+    }
+
+    #[test]
+    fn test_build_npm_metadata_value_emits_time_5789() {
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let artifacts = vec![
+            NpmMetadataArtifact {
+                created_at: at("2024-03-01T10:00:00.123Z"),
+                ..make_artifact("pkg/1.0.0/pkg-1.0.0.tgz", "1.0.0", SHA256_ZEROS)
+            },
+            NpmMetadataArtifact {
+                created_at: at("2024-03-02T11:30:00Z"),
+                ..make_artifact("pkg/1.0.1/pkg-1.0.1.tgz", "1.0.1", SHA256_ABCD)
+            },
+            NpmMetadataArtifact {
+                version: None,
+                created_at: at("2025-01-01T00:00:00Z"),
+                ..make_artifact("pkg/x/pkg-x.tgz", "x", SHA256_ABCD)
+            },
+        ];
+
+        let full = build_npm_metadata_value(
+            &artifacts,
+            "pkg",
+            "http://localhost:8080",
+            "npm-hosted",
+            &serde_json::Map::new(),
+        );
+
+        assert_eq!(full["time"]["1.0.0"], "2024-03-01T10:00:00.123Z");
+        assert_eq!(full["time"]["1.0.1"], "2024-03-02T11:30:00.000Z");
+        assert_eq!(full["time"]["created"], "2024-03-01T10:00:00.123Z");
+        assert_eq!(full["time"]["modified"], "2024-03-02T11:30:00.000Z");
+        assert_eq!(full["time"].as_object().unwrap().len(), 4);
+        assert_eq!(
+            abbreviate_packument(&full)["modified"],
+            "2024-03-02T11:30:00.000Z"
+        );
     }
 
     // Integrity preservation tests (issue #745)
@@ -12615,6 +12722,7 @@ mod tests {
             checksum_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 .to_string(),
             metadata: None,
+            created_at: chrono::DateTime::UNIX_EPOCH,
         }];
         let scoped = vec![NpmMetadataArtifact {
             path: "@types/mdurl/2.0.0/mdurl-2.0.0.tgz".to_string(),
@@ -12622,6 +12730,7 @@ mod tests {
             checksum_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 .to_string(),
             metadata: None,
+            created_at: chrono::DateTime::UNIX_EPOCH,
         }];
 
         let resp_unscoped = build_npm_metadata_response(
@@ -18653,6 +18762,50 @@ mod db_cov_tests {
         fx.teardown().await;
     }
 
+    /// #5790: `@scope%2fname/<version>` is a version document, not a 400
+    #[tokio::test]
+    async fn test_encoded_scoped_version_metadata_5790() {
+        use axum::http::{HeaderMap, StatusCode};
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let published = super::publish_package(
+            &fx.state,
+            Some(tdh::make_auth(fx.user_id, &fx.username)),
+            &fx.repo_key,
+            "@acme/lib",
+            &HeaderMap::new(),
+            publish_body("@acme/lib", "1.0.0"),
+        )
+        .await;
+        assert!(published.is_ok(), "publish must succeed");
+
+        let k = fx.repo_key.clone();
+        for uri in [
+            format!("/{k}/@acme%2flib/1.0.0"),
+            format!("/{k}/@acme%2Flib/latest"),
+            format!("/{k}/@acme/lib/1.0.0"),
+        ] {
+            let app = fx.router_with_auth(super::router());
+            let (status, body) = tdh::send(app, tdh::get(uri.clone())).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{uri}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let doc: serde_json::Value = serde_json::from_slice(&body).expect("version json");
+            assert_eq!(doc["name"], "@acme/lib", "{uri}");
+            assert_eq!(doc["version"], "1.0.0", "{uri}");
+        }
+
+        let app = fx.router_with_auth(super::router());
+        let (status, _) = tdh::send(app, tdh::get(format!("/{k}/@acme%2flib%2fx/1.0.0"))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        fx.teardown().await;
+    }
+
     // -----------------------------------------------------------------------
     // Age-gate packument-cache bypass: virtual member lookup
     // -----------------------------------------------------------------------
@@ -18727,6 +18880,55 @@ mod db_cov_tests {
             .expect("read packument body");
         let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
         (status, cache_control, json)
+    }
+
+    /// #5789: a hosted packument carries `time`, so Yarn's age gate and
+    /// `npm install --before` can see when each version was published
+    #[tokio::test]
+    async fn test_local_packument_has_publish_time_5789() {
+        use axum::http::{HeaderMap, StatusCode};
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        for version in ["1.0.0", "1.0.1"] {
+            let published = super::publish_package(
+                &fx.state,
+                Some(tdh::make_auth(fx.user_id, &fx.username)),
+                &fx.repo_key,
+                "timepkg",
+                &HeaderMap::new(),
+                publish_body("timepkg", version),
+            )
+            .await;
+            assert!(published.is_ok(), "publish {version} must succeed");
+        }
+        for (version, at) in [
+            ("1.0.0", "2024-03-01T10:00:00Z"),
+            ("1.0.1", "2024-03-02T11:30:00Z"),
+        ] {
+            sqlx::query(
+                "UPDATE artifacts SET created_at = $3::timestamptz \
+                 WHERE repository_id = $1 AND name = 'timepkg' AND version = $2",
+            )
+            .bind(fx.repo_id)
+            .bind(version)
+            .bind(at)
+            .execute(&fx.pool)
+            .await
+            .expect("pin created_at");
+        }
+
+        let (status, _, body) = fetch_packument_json(&fx.state, &fx.repo_key, "timepkg").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["time"]["1.0.0"], "2024-03-01T10:00:00.000Z",
+            "got {body:?}"
+        );
+        assert_eq!(body["time"]["1.0.1"], "2024-03-02T11:30:00.000Z");
+        assert_eq!(body["time"]["created"], "2024-03-01T10:00:00.000Z");
+        assert_eq!(body["time"]["modified"], "2024-03-02T11:30:00.000Z");
+        fx.teardown().await;
     }
 
     /// Minimal `npm publish` body for one version.
@@ -19446,6 +19648,144 @@ mod db_cov_tests {
             .expect("update upstream_url");
         std::fs::remove_dir_all(&fx.storage_dir).expect("wipe proxy cache");
         std::fs::create_dir_all(&fx.storage_dir).expect("recreate storage dir");
+    }
+
+    /// Admin auth for the trash and lifecycle handlers
+    fn admin_auth(fx: &tdh::Fixture) -> crate::api::middleware::auth::AuthExtension {
+        let mut auth = tdh::make_auth(fx.user_id, &fx.username);
+        auth.is_admin = true;
+        auth
+    }
+
+    /// A Virtual over one published Local with `package` 1.0.0 and 2.0.0
+    async fn virtual_with_two_versions(
+        fx: &tdh::Fixture,
+        package: &str,
+    ) -> (uuid::Uuid, String, std::path::PathBuf) {
+        let (member_id, member_key, member_dir) = attach_local_member(fx).await;
+        for version in ["1.0.0", "2.0.0"] {
+            let published = super::publish_package(
+                &fx.state,
+                Some(tdh::make_auth(fx.user_id, &fx.username)),
+                &member_key,
+                package,
+                &axum::http::HeaderMap::new(),
+                publish_body(package, version),
+            )
+            .await;
+            assert!(published.is_ok(), "publish {version} must succeed");
+        }
+        (member_id, member_key, member_dir)
+    }
+
+    /// #5779. FAILS BEFORE THE FIX: a version restored from the trash stayed
+    /// out of the Virtual's cached packument until the entry expired
+    #[tokio::test]
+    async fn trash_restore_invalidates_the_virtual_packument_5779() {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "trash-restore-5779";
+        let (member_id, member_key, member_dir) = virtual_with_two_versions(&fx, package).await;
+
+        // Into the trash behind the handlers' back, then a fresh Virtual entry without it
+        let trashed: uuid::Uuid = sqlx::query_scalar(
+            "UPDATE artifacts SET is_deleted = true \
+             WHERE repository_id = $1 AND name = $2 AND version = '1.0.0' RETURNING id",
+        )
+        .bind(member_id)
+        .bind(package)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("trash 1.0.0");
+        super::invalidate_packument_caches(&fx.state, member_id, &member_key, package).await;
+        let (_, _, warm) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
+        assert!(warm["versions"]["1.0.0"].is_null(), "got {warm:?}");
+        assert!(warm["versions"]["2.0.0"].is_object(), "got {warm:?}");
+
+        let restored = crate::api::handlers::trash::restore_trashed_artifact(
+            State(fx.state.clone()),
+            Extension(admin_auth(&fx)),
+            Path(trashed),
+        )
+        .await;
+        assert!(restored.is_ok(), "trash restore must succeed");
+        let (_, _, after) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
+        assert!(
+            after["versions"]["1.0.0"].is_object(),
+            "a trash restore must invalidate the Virtual packument; got {after:?}"
+        );
+
+        cleanup_member(&fx, member_id, &member_dir).await;
+        fx.teardown().await;
+    }
+
+    /// #5779. FAILS BEFORE THE FIX: a retention sweep left the swept version
+    /// in the Virtual's cached packument until the entry expired
+    #[tokio::test]
+    async fn retention_sweep_invalidates_the_virtual_packument_5779() {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "retention-sweep-5779";
+        let (member_id, _, member_dir) = virtual_with_two_versions(&fx, package).await;
+        sqlx::query(
+            "UPDATE artifacts SET created_at = NOW() - INTERVAL '30 days', \
+             updated_at = NOW() - INTERVAL '30 days' \
+             WHERE repository_id = $1 AND name = $2 AND version = '1.0.0'",
+        )
+        .bind(member_id)
+        .bind(package)
+        .execute(&fx.pool)
+        .await
+        .expect("age 1.0.0");
+        let (_, _, warm) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
+        assert!(warm["versions"]["1.0.0"].is_object(), "got {warm:?}");
+
+        let policy = crate::services::lifecycle_service::LifecycleService::new(fx.pool.clone())
+            .create_policy(
+                crate::services::lifecycle_service::CreateLifecyclePolicyRequest {
+                    applies_to_all: false,
+                    repository_ids: None,
+                    repository_id: Some(member_id),
+                    name: format!("expire-7d-{}", member_id.simple()),
+                    description: None,
+                    policy_type: "max_age_days".to_string(),
+                    config: serde_json::json!({"days": 7}),
+                    priority: None,
+                    cron_schedule: None,
+                    enabled: None,
+                },
+            )
+            .await
+            .expect("create lifecycle policy");
+        let run = crate::api::handlers::lifecycle::execute_policy(
+            State(fx.state.clone()),
+            Extension(admin_auth(&fx)),
+            Path(policy.id),
+        )
+        .await
+        .expect("execute policy");
+        assert_eq!(run.0.artifacts_removed, 1, "{:?}", run.0);
+        let (_, _, after) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
+        assert!(
+            after["versions"]["1.0.0"].is_null(),
+            "a retention sweep must invalidate the Virtual packument; got {after:?}"
+        );
+        assert!(after["versions"]["2.0.0"].is_object(), "got {after:?}");
+
+        let _ = sqlx::query("DELETE FROM lifecycle_policies WHERE id = $1")
+            .bind(policy.id)
+            .execute(&fx.pool)
+            .await;
+        cleanup_member(&fx, member_id, &member_dir).await;
+        fx.teardown().await;
     }
 
     /// End-to-end #2162 stale-while-revalidate on a remote repo: with a zero

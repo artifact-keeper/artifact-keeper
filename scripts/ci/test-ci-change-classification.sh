@@ -88,11 +88,14 @@ open(f'{work}/integ_if.txt', 'w').write(integ_if + '\n')
 on = wf.get('on', wf.get(True, {}))
 facts = []
 facts.append('trigger_merge_group=' + str('merge_group' in (on or {})).lower())
-for j in ('check-rust', 'test-backend-integration', 'test-backend-unit', 'ci-complete'):
+for j in ('check-rust', 'windows-cross-check', 'test-backend-integration', 'test-backend-unit', 'ci-complete'):
     facts.append(f'runs_on_{j}=' + str(wf['jobs'][j].get('runs-on')))
 cc_needs = wf['jobs']['ci-complete'].get('needs', [])
-for j in ('smoke-e2e', 'build-backend-image', 'build-openscap-image'):
+for j in ('smoke-e2e', 'build-backend-image', 'build-openscap-image', 'windows-cross-check'):
     facts.append(f'cc_needs_{j}=' + str(j in cc_needs).lower())
+# The Windows cross-check (#6022) must run exactly when Check Rust does.
+facts.append('windows_if_matches_check_rust=' + str(
+    str(wf['jobs']['windows-cross-check'].get('if')) == str(wf['jobs']['check-rust'].get('if'))).lower())
 facts.append('ubuntu_latest=' + str('ubuntu-latest' in open(sys.argv[1]).read()).lower())
 # rust-cache entries saved under a PR or merge-group ref are never restored
 # by anyone else and push `main`'s own entries out of the 10 GiB quota.
@@ -156,7 +159,7 @@ open(f'{work}/readers.txt', 'w').write(''.join(f'{r}\t{p}\n' for r, p in sorted(
 PY
 
 grep -q . "$WORK/gated.txt" || { fail "no job in ci.yml is gated on needs.changes.outputs.rust"; }
-for required in check-rust test-backend-unit; do
+for required in check-rust windows-cross-check test-backend-unit; do
   grep -qx "$required" "$WORK/gated.txt" \
     || fail "required job $required is not gated on needs.changes.outputs.rust"
 done
@@ -490,6 +493,16 @@ complete "CI-only PR: a failed Rust job still fails"                1 pull_reque
 complete "proven push: skipped Rust jobs pass"                      0 push true true false "${SKIP_RUST[@]}" RESULT_VERSION_PIN=skipped
 complete "unproven push: a skipped unit job fails"                  1 push true true true RESULT_UNIT=skipped RESULT_VERSION_PIN=skipped
 
+echo "ci.yml CI Complete: the Windows cross-check (#6022) is advisory (#6242)"
+complete "Rust inputs changed: a red Windows check does not fail CI Complete"  0 pull_request true true true RESULT_WINDOWS_CHECK=failure
+complete "Rust inputs changed: a cancelled Windows check does not fail it"     0 pull_request true true true RESULT_WINDOWS_CHECK=cancelled
+complete "docs-only PR: skipped Rust jobs pass"                                0 pull_request false false false "${SKIP_RUST[@]}" RESULT_SHELL=skipped RESULT_SECURITY=skipped
+if grep -qx RESULT_WINDOWS_CHECK "$WORK/results.txt"; then
+  fail "CI Complete still reads RESULT_WINDOWS_CHECK while the Windows check is advisory"
+else
+  pass "CI Complete ignores the advisory Windows cross-check"
+fi
+
 echo "ci.yml CI Complete: the Workflow Contract Tests (#6115)"
 complete "workflow-only PR: contract tests green -> passes"          0 pull_request true false false "${SKIP_RUST[@]}" WORKFLOW_CONTRACTS=true
 complete "workflow-only PR: contract tests red -> fails"             1 pull_request true false false "${SKIP_RUST[@]}" WORKFLOW_CONTRACTS=true RESULT_WORKFLOW_CONTRACTS=failure
@@ -569,12 +582,14 @@ want_fact() {
   if [ "$(fact "$1")" = "$2" ]; then pass "$3"; else fail "$3: $1=$(fact "$1"), want $2"; fi
 }
 want_fact trigger_merge_group true "ci.yml triggers on merge_group (required checks must report in the queue)"
-for j in check-rust test-backend-integration test-backend-unit ci-complete; do
+for j in check-rust windows-cross-check test-backend-integration test-backend-unit ci-complete; do
   want_fact "runs_on_$j" ubuntu-24.04 "$j runs on pinned GitHub-hosted ubuntu-24.04"
 done
 for j in smoke-e2e build-backend-image build-openscap-image; do
   want_fact "cc_needs_$j" false "CI Complete does not wait for advisory $j"
 done
+want_fact cc_needs_windows-cross-check false "CI Complete does not wait for the Windows cross-check while it is advisory (#6022)"
+want_fact windows_if_matches_check_rust true "the Windows cross-check's condition is Check Rust's, verbatim"
 want_fact ubuntu_latest false "no job floats on ubuntu-latest"
 want_fact cache_saves_off_main none "every rust-cache saves only outside pull requests and merge groups"
 # ci_test_surface reads every `--test <name>` in the workflow text, comments
