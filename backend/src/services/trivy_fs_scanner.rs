@@ -575,6 +575,57 @@ pub(crate) async fn write_embedded_jar_inventory(workspace: &Path) -> usize {
     }
 }
 
+/// Whether `rel` (a workspace-relative path) is a build POM a Maven-built
+/// archive embeds, `**/META-INF/maven/**/pom.xml` (#6233): the same files
+/// grype's directory scan excludes (`GRYPE_DIR_EXCLUDES`, #5262).
+fn is_embedded_build_pom(rel: &Path) -> bool {
+    let parts: Vec<&std::ffi::OsStr> = rel.iter().collect();
+    parts.last().is_some_and(|last| *last == "pom.xml")
+        && parts[..parts.len() - 1]
+            .windows(2)
+            .any(|w| w[0] == "META-INF" && w[1] == "maven")
+}
+
+/// Delete every embedded build POM from the extracted workspace before trivy
+/// runs, and return how many were removed (#6233, the trivy half of #5262).
+///
+/// A Maven-built JAR embeds its own build POM at
+/// `META-INF/maven/<groupId>/<artifactId>/pom.xml`. Once the workspace
+/// unpacks the archive, trivy's `pom.xml` analyzer reads that file and grades
+/// every DECLARED dependency, `provided` and `test` scope included, as though
+/// the archive shipped it. A declaration does not show the code is bundled.
+///
+/// Pruning the workspace rather than passing `--skip-files` keeps the files
+/// out of both engines: the local CLI scans this directory and the adapter
+/// path uploads it, so a running adapter of any version gets the fix.
+///
+/// Nothing that grades the archive's real contents is lost. Bundled and
+/// shaded components are named, at the version they ship, by the inventory
+/// POM built from their `pom.properties` ([`write_embedded_jar_inventory`],
+/// which must run first and never reads a `pom.xml`); `pom.properties` and
+/// the archives themselves stay. Symlinks are not followed, and a link at a
+/// matching path is removed as a link, never written through.
+fn prune_embedded_build_poms(root: &Path) -> usize {
+    let walker = walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| e.depth() != 1 || e.file_name() != JAR_INVENTORY_SUBDIR)
+        .filter_map(|e| e.ok());
+    let mut removed = 0;
+    for entry in walker {
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        if is_embedded_build_pom(rel) && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// Remove the inventory POM's own `root` package from the report: it names
 /// no real component, and leaving it would put a fabricated package in the
 /// SBOM inventory.
@@ -686,6 +737,20 @@ impl TrivyFsScanner {
                 "Cataloged {} bundled Maven coordinates for {} from their pom.properties",
                 bundled, artifact.name
             );
+        }
+        // #6233: the build POMs the archive embeds declare what it was built
+        // against, not what it ships; keep them out of the trivy target, as
+        // grype's directory scan does (#5262). After the inventory, which
+        // reads only `pom.properties`.
+        let workspace_root = workspace.to_path_buf();
+        match tokio::task::spawn_blocking(move || prune_embedded_build_poms(&workspace_root)).await
+        {
+            Ok(0) => {}
+            Ok(n) => info!(
+                "Excluded {} embedded build POMs of {} from the Trivy filesystem scan",
+                n, artifact.name
+            ),
+            Err(e) => warn!("Embedded build POM prune failed: {}", e),
         }
 
         // Run the scan engine: legacy CLI (server-then-standalone) or the
@@ -1442,6 +1507,194 @@ mod tests {
             }
         }
         assert_inventory_names_bundled(&pom.expect("the upload must carry the jar inventory"));
+    }
+
+    /// #6233: the prune matches exactly what grype's directory scan excludes
+    /// (`**/META-INF/maven/**/pom.xml`, #5262) and never `pom.properties`,
+    /// which is how the archive and its shaded components are identified.
+    #[test]
+    fn test_embedded_build_pom_matcher_6233() {
+        for hit in [
+            "META-INF/maven/com.acme/acme-maven-plugin/pom.xml",
+            "lib/inner/META-INF/maven/g/a/pom.xml",
+            "META-INF/maven/pom.xml",
+        ] {
+            assert!(is_embedded_build_pom(Path::new(hit)), "{hit}");
+        }
+        for miss in [
+            "META-INF/maven/com.acme/acme-maven-plugin/pom.properties",
+            "pom.xml",
+            ".ak-scan-jar-inventory/pom.xml",
+            "META-INF/pom.xml",
+            "maven/META-INF/g/a/pom.xml",
+            "META-INF/maven/g/a/pom.xml.bak",
+        ] {
+            assert!(!is_embedded_build_pom(Path::new(miss)), "{miss}");
+        }
+    }
+
+    /// The #5262 fixture: a Maven-plugin-shaped JAR with its own
+    /// `pom.properties`, a build POM declaring `provided` and `test`
+    /// dependencies that are not bundled, one shaded component carrying its
+    /// own `pom.properties`, and one nested JAR.
+    fn maven_plugin_jar_with_embedded_pom() -> Bytes {
+        Bytes::from(zip_of(&[
+            ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n".to_vec()),
+            (
+                "META-INF/maven/com.acme/acme-maven-plugin/pom.properties",
+                b"groupId=com.acme\nartifactId=acme-maven-plugin\nversion=1.0.0\n".to_vec(),
+            ),
+            (
+                "META-INF/maven/com.acme/acme-maven-plugin/pom.xml",
+                br#"<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.acme</groupId>
+  <artifactId>acme-maven-plugin</artifactId>
+  <version>1.0.0</version>
+  <dependencies>
+    <dependency><groupId>org.apache.logging.log4j</groupId><artifactId>log4j-core</artifactId><version>2.14.1</version></dependency>
+    <dependency><groupId>org.apache.maven</groupId><artifactId>maven-core</artifactId><version>3.2.5</version><scope>provided</scope></dependency>
+    <dependency><groupId>org.apache.maven</groupId><artifactId>maven-compat</artifactId><version>3.2.5</version><scope>test</scope></dependency>
+  </dependencies>
+</project>
+"#
+                .to_vec(),
+            ),
+            (
+                "META-INF/maven/com.google.code.gson/gson/pom.properties",
+                b"groupId=com.google.code.gson\nartifactId=gson\nversion=2.8.0\n".to_vec(),
+            ),
+            ("com/acme/plugin/Mojo.class", b"\xca\xfe\xba\xbe".to_vec()),
+            (
+                "lib/commons-text-1.9.jar",
+                library_jar("org.apache.commons", "commons-text", "1.9"),
+            ),
+        ]))
+    }
+
+    /// Workspace-relative paths of every file in `ws` that trivy's
+    /// `pom.xml` analyzer would read as a build POM.
+    fn embedded_build_poms_in(ws: &Path) -> Vec<String> {
+        walkdir::WalkDir::new(ws)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .filter_map(|e| {
+                let rel = e.path().strip_prefix(ws).ok()?.to_path_buf();
+                is_embedded_build_pom(&rel).then(|| rel.to_string_lossy().into_owned())
+            })
+            .collect()
+    }
+
+    /// #6233 end to end in adapter mode (the setup the issue reports): the
+    /// workspace uploaded for the trivy filesystem scan carries no embedded
+    /// build POM, so trivy cannot grade the dependencies it merely
+    /// DECLARES, while the inventory still names the archive itself, its
+    /// shaded component and its nested JAR. The CLI path scans the same
+    /// pruned workspace directory.
+    #[tokio::test]
+    async fn test_adapter_scan_excludes_embedded_build_pom_declarations_6233() {
+        let server = wiremock::MockServer::start().await;
+        crate::services::scanner_adapter_client::test_support::mount_fs_scan_success(
+            &server,
+            "fs-plugin",
+            serde_json::json!({"report": {"Results": []}, "stderr": ""}),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = TrivyFsScanner::new_with_adapter(
+            server.uri(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        let artifact = make_test_artifact(
+            "acme-maven-plugin-1.0.0.jar",
+            "application/java-archive",
+            "maven/com/acme/acme-maven-plugin/1.0.0/acme-maven-plugin-1.0.0.jar",
+        );
+        scanner
+            .scan(&artifact, None, &maven_plugin_jar_with_embedded_pom())
+            .await
+            .expect("adapter-backed scan should complete");
+
+        let upload = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.method == wiremock::http::Method::POST)
+            .expect("workspace upload");
+        let mut archive = tar::Archive::new(std::io::Cursor::new(upload.body));
+        let mut paths = Vec::new();
+        let mut inventory = None;
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().into_owned();
+            if path == Path::new(JAR_INVENTORY_SUBDIR).join("pom.xml") {
+                let mut s = String::new();
+                std::io::Read::read_to_string(&mut entry, &mut s).unwrap();
+                inventory = Some(s);
+            }
+            paths.push(path.to_string_lossy().into_owned());
+        }
+        assert!(
+            !paths.iter().any(|p| is_embedded_build_pom(Path::new(p))),
+            "no embedded build POM may reach trivy: {paths:?}"
+        );
+        // pom.properties stay: they identify what the archive ships.
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.ends_with("META-INF/maven/com.acme/acme-maven-plugin/pom.properties")),
+            "{paths:?}"
+        );
+        let inventory = inventory.expect("the upload must carry the jar inventory");
+        for shipped in ["acme-maven-plugin", "gson", "commons-text"] {
+            assert!(
+                inventory.contains(&format!("<artifactId>{shipped}</artifactId>")),
+                "{shipped} is in the archive and must stay graded:\n{inventory}"
+            );
+        }
+        for declared in ["log4j-core", "maven-core", "maven-compat"] {
+            assert!(
+                !inventory.contains(declared),
+                "{declared} is only declared in the build POM:\n{inventory}"
+            );
+        }
+    }
+
+    /// #6233: a fat jar keeps every bundled library in the trivy target. Its
+    /// build POMs (outer and per library) are pruned, but the inventory read
+    /// from their `pom.properties` is unchanged, so its findings are too.
+    #[tokio::test]
+    async fn test_prune_keeps_fat_jar_bundled_inventory_6233() {
+        let tmp = tempfile::tempdir().unwrap();
+        let artifact = make_test_artifact(
+            "fatapp-1.0.0.jar",
+            "application/java-archive",
+            "maven/com/example/fatapp/1.0.0/fatapp-1.0.0.jar",
+        );
+        let ws = ScanWorkspace::prepare_pinned(
+            tmp.path().to_str().unwrap(),
+            None,
+            &artifact,
+            &fat_jar(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(write_embedded_jar_inventory(&ws).await, BUNDLED.len() + 1);
+        assert!(!embedded_build_poms_in(&ws).is_empty(), "fixture sanity");
+
+        assert!(prune_embedded_build_poms(&ws) >= 1);
+        assert!(embedded_build_poms_in(&ws).is_empty());
+        assert!(ws
+            .join("META-INF/maven/com.example/fatapp/pom.properties")
+            .is_file());
+        assert!(ws.join("BOOT-INF/lib/log4j-core-2.14.1.jar").is_file());
+        let pom = std::fs::read_to_string(ws.join(JAR_INVENTORY_SUBDIR).join("pom.xml")).unwrap();
+        assert_inventory_names_bundled(&pom);
+        // Re-running the inventory after the prune names the same set.
+        assert_eq!(write_embedded_jar_inventory(&ws).await, BUNDLED.len() + 1);
     }
 
     /// `version()` exercises the TTL-backed cached probe path. We do not
