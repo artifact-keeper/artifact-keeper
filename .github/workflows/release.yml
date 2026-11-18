@@ -763,12 +763,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Per leg, p100 over 25-27 successful legs (2026-08..2026-11):
     #   linux-amd64 ~34m, linux-arm64 ~35m, windows-amd64 ~56m (cross-builds
-    #   on ubuntu-latest) -> 120, about 2.2x the slowest of them.
+    #   on ubuntu-latest) -> 180, about 3x: 1.12 is memory-bound (legs died of
+    #   OOM before the swap step) and a leg that swaps hard runs long.
     #   darwin-amd64 ~157m, darwin-arm64 ~167m (both v1.12.1; ~80-90m through
-    #   v1.11.14, ~108-156m on v1.12.0) -> 340, about 2x. That is close to the
-    #   hosted 360m ceiling: if macOS keeps growing, fix the build time, not
-    #   this number. Almost all of it is the `Build` step.
-    timeout-minutes: ${{ startsWith(matrix.os, 'macos') && 340 || 120 }}
+    #   v1.11.14, ~108-156m on v1.12.0) -> 360, the hosted maximum: anything
+    #   lower only kills a build that would have finished. Fix the build time,
+    #   not this number (#6218). Almost all of it is the `Build` step.
+    timeout-minutes: ${{ startsWith(matrix.os, 'macos') && 360 || 180 }}
     # The gate must be green -- or, for a certified stable tag, skipped
     # because it already passed on these digests in the candidate (#3772).
     # Stated explicitly with `!cancelled()` rather than left to the default
