@@ -1,0 +1,36 @@
+# ak-vm-runner control loop (#6072): keeps AKVM_VM_COUNT throwaway job VMs.
+# Logs: journalctl -u ak-vm-runner; audit trail /home/ak-vm-runner/log/audit.jsonl
+[Unit]
+Description=ak-vm-runner: one throwaway KVM VM per GitHub Actions job
+Documentation=https://github.com/artifact-keeper/artifact-keeper/blob/main/docs/ci/vm-runners.md
+Wants=libvirtd.service
+After=network-online.target libvirtd.service
+
+[Service]
+Type=simple
+User=akvm
+Group=akvm
+SupplementaryGroups=libvirt
+EnvironmentFile=/etc/ak-vm-runner/config.env
+ExecStart=/opt/ak-vm-runner/ak-vm-runner reconcile
+# Stopping the service leaves running VMs alone (a job in flight finishes);
+# the next start adopts them. To stop everything: ak-vm-runner destroy-all.
+KillMode=mixed
+Restart=on-failure
+RestartSec=30
+RuntimeDirectory=ak-vm-runner
+RuntimeDirectoryMode=0700
+UMask=0027
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ak-vm-runner
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

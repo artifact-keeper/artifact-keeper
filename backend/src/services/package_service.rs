@@ -1583,6 +1583,55 @@ mod tests {
         assert_eq!(ver_rows.0, 3);
     }
 
+    /// #5641: `packages.version` / `package_versions.version` were
+    /// `VARCHAR(128)` (211). A PyPI PEP 440 local version longer than that
+    /// uploaded and served, but the best-effort catalog upsert failed with
+    /// `value too long for type character varying(128)`, so the version was
+    /// silently missing from `GET /api/v1/packages/{id}/versions`. Both
+    /// columns are `TEXT` now, so the version is cataloged whole.
+    #[tokio::test]
+    async fn test_long_version_is_cataloged_whole() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+
+        let service = PackageService::new(fx.pool.clone());
+        let package = "long-version-package";
+        // A local version segment is `[A-Za-z0-9._]`, so a long one is a valid
+        // version, not a malformed coordinate.
+        let version = format!("1.0.0+{}", "a".repeat(150));
+        assert!(version.len() > 128, "the fixture must exceed the old bound");
+        let checksum = "f".repeat(64);
+
+        service
+            .create_or_update_from_artifact(
+                fx.repo_id, package, &version, 512, &checksum, None, None,
+            )
+            .await
+            .expect("a version past the old VARCHAR(128) must still be cataloged");
+
+        let stored: (String, String) = sqlx::query_as(
+            r#"
+            SELECT p.version, pv.version
+            FROM packages p
+            JOIN package_versions pv ON pv.package_id = p.id
+            WHERE p.repository_id = $1 AND p.name = $2
+            "#,
+        )
+        .bind(fx.repo_id)
+        .bind(package)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read the catalog row back");
+
+        fx.teardown().await;
+
+        assert_eq!(stored.0, version);
+        assert_eq!(stored.1, version);
+    }
+
     // -----------------------------------------------------------------------
     // Parameter validation concepts
     // -----------------------------------------------------------------------

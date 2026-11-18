@@ -23,8 +23,8 @@ use crate::services::scanner_adapter_client::{
     ScannerAdapterFsClient, TrivyEngine, TrivyFsBackend,
 };
 use crate::services::scanner_service::{
-    fail_scan, IncusScannerCapability, ScanOutput, ScanWorkspace, Scanner, VersionCache,
-    WorkspaceExtraction, WorkspaceExtractor, WorkspaceGuard,
+    fail_scan, IncusScannerCapability, ScanOutput, ScanTarget, ScanWorkspace, Scanner,
+    VersionCache, WorkspaceExtraction, WorkspaceExtractor, WorkspaceGuard,
 };
 
 /// Default ceiling on compressed input size we will attempt to extract
@@ -452,6 +452,17 @@ pub(crate) fn open_tree_for_owner(root: &Path) -> Result<()> {
 /// `<base>/incus-<artifact.id>-<job>`.
 const INCUS_WORKSPACE_PREFIX: &str = "incus";
 
+/// Repository formats whose artifacts the Incus scanner may scan.
+///
+/// `lxc` shares the Incus format handler (`RepositoryFormat::handler_key`
+/// maps it to `incus`), so it is an Incus image repository too. `generic` is
+/// deliberately excluded: its artifacts carry no evidence that a
+/// `<product>/<version>/<file>` path is an image rather than a package sdist
+/// (#5644).
+pub(crate) fn serves_incus_images(repository_format: &str) -> bool {
+    matches!(repository_format, "incus" | "lxc")
+}
+
 /// The Incus extraction step of the shared scan-workspace lifecycle (#1429).
 ///
 /// [`ScanWorkspace::prepare_with`] owns the job directory, its guard and its
@@ -529,7 +540,15 @@ impl IncusScanner {
         }
     }
 
-    /// Check if this scanner is applicable to the given artifact.
+    /// Path-shape half of applicability: the artifact names a scannable image
+    /// file (`incus.tar.xz`, `rootfs.squashfs`, ...) under
+    /// `<product>/<version>/`.
+    ///
+    /// This alone is NOT the decision. A PyPI sdist's
+    /// `pyyaml/5.3.1/PyYAML-5.3.1.tar.gz` has exactly the same shape as an
+    /// Incus image and was extracted as a rootfs before the repository format
+    /// was consulted (#5644). Callers that have repository context must use
+    /// [`Self::is_applicable_for_target`], which adds that gate.
     pub fn is_applicable(artifact: &Artifact) -> bool {
         let path = &artifact.path;
         // Only scan Incus image files (not SimpleStreams index files)
@@ -543,6 +562,19 @@ impl IncusScanner {
                 )
             })
             .unwrap_or(false)
+    }
+
+    /// Whether the scanner applies to `target`, which requires BOTH an
+    /// image-shaped path and an Incus-owned repository format (#5644).
+    ///
+    /// The admission test is `target.repository_format`, checked by
+    /// [`serves_incus_images`]. A caller with no format in hand (inline proxy
+    /// scans of single-file artifacts, legacy callers, unit tests) keeps the
+    /// path-only decision, mirroring the image scanners' #1971 fallback so an
+    /// unknown context never flips an artifact from applicable to not.
+    fn target_is_applicable(target: &ScanTarget<'_>) -> bool {
+        Self::is_applicable(target.artifact)
+            && target.repository_format.is_none_or(serves_incus_images)
     }
 
     /// Build the base workspace directory path for a given artifact
@@ -1144,9 +1176,18 @@ impl Scanner for IncusScanner {
 
     /// Surface the inherent applicability check through the trait so the
     /// orchestrator can gate on it without creating a `scan_results` row
-    /// (issues #961, #994).
+    /// (issues #961, #994). Only the path-shape half; the orchestrator gates
+    /// on [`Self::is_applicable_for_target`], which also checks the repository
+    /// format (#5644).
     fn is_applicable(&self, artifact: &Artifact) -> bool {
         Self::is_applicable(artifact)
+    }
+
+    /// The orchestrator's applicability gate: an image-shaped path in an
+    /// Incus/LXC repository (#5644). Without this, a PyPI sdist at
+    /// `pyyaml/5.3.1/PyYAML-5.3.1.tar.gz` was extracted and rootfs-scanned.
+    fn is_applicable_for_target(&self, target: &ScanTarget<'_>) -> bool {
+        Self::target_is_applicable(target)
     }
 
     /// CLI mode: probe `trivy --version` once and cache the parsed version
@@ -1241,6 +1282,20 @@ mod tests {
         make_test_artifact(name, "application/octet-stream", path)
     }
 
+    fn target_with_format<'a>(artifact: &'a Artifact, format: Option<&'a str>) -> ScanTarget<'a> {
+        ScanTarget {
+            artifact,
+            repository_key: "repo",
+            repository_type: "local",
+            db: None,
+            storage: None,
+            manifest_body: None,
+            expected_component: None,
+            require_nonempty_catalog: false,
+            repository_format: format,
+        }
+    }
+
     #[test]
     fn test_is_applicable_unified_tarball() {
         let artifact = make_incus_artifact("incus.tar.xz", "ubuntu-noble/20240215/incus.tar.xz");
@@ -1278,6 +1333,56 @@ mod tests {
         // Path with only one segment is not a valid Incus path (needs product/version/file)
         let artifact = make_incus_artifact("package.tar.gz", "package.tar.gz");
         assert!(!IncusScanner::is_applicable(&artifact));
+    }
+
+    /// #5644: a PyPI sdist's `<name>/<version>/<file>.tar.gz` is shaped like
+    /// an Incus image, so the path predicate alone admits it. The repository
+    /// format must decide, and a pypi/generic repository is not an image
+    /// repository.
+    #[test]
+    fn test_pypi_sdist_path_is_not_applicable_in_a_package_repository_5644() {
+        let sdist = make_incus_artifact("PyYAML-5.3.1.tar.gz", "pyyaml/5.3.1/PyYAML-5.3.1.tar.gz");
+        assert!(
+            IncusScanner::is_applicable(&sdist),
+            "the path-shape half must still recognise the sdist's shape"
+        );
+
+        for format in ["pypi", "generic", "npm", "docker"] {
+            assert!(
+                !IncusScanner::target_is_applicable(&target_with_format(&sdist, Some(format))),
+                "format {format} must not route a package archive to the rootfs scanner"
+            );
+        }
+        assert!(
+            IncusScanner::target_is_applicable(&target_with_format(&sdist, None)),
+            "a caller without repository context keeps the path-only fallback"
+        );
+    }
+
+    /// The positive half of #5644: the same image-shaped path is scanned when
+    /// it belongs to an Incus/LXC repository, including the no-context
+    /// fallback used by callers that only have an artifact.
+    #[test]
+    fn test_image_shaped_path_is_applicable_in_incus_and_lxc_repositories_5644() {
+        let image = make_incus_artifact("incus.tar.xz", "ubuntu-noble/20240215/incus.tar.xz");
+
+        for format in [Some("incus"), Some("lxc")] {
+            assert!(
+                IncusScanner::target_is_applicable(&target_with_format(&image, format)),
+                "format {format:?} must route the image to the rootfs scanner"
+            );
+        }
+        assert!(
+            IncusScanner::target_is_applicable(&target_with_format(&image, None)),
+            "a caller without repository context keeps the path-only decision"
+        );
+        assert!(
+            !IncusScanner::target_is_applicable(&target_with_format(
+                &make_incus_artifact("index.json", "streams/v1/index.json"),
+                Some("incus"),
+            )),
+            "an Incus repository's index file is not a scannable image"
+        );
     }
 
     #[test]

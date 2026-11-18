@@ -1,0 +1,188 @@
+name: Scheduled curl Advisory Watch
+
+# The backend image (docker/Dockerfile.backend, curl-bin stage) and the
+# OpenSCAP image (docker/Dockerfile.openscap, curl-builder stage) build curl /
+# libcurl from source at a hand-maintained `ARG CURL_VERSION` (#5991, #6002).
+# That copy is not an RPM, so Trivy, the Docker Publish gate and code scanning
+# never see it, and Dependabot does not read ARGs. This workflow is the control
+# for that blind spot (#6003): once a day it checks each pin against curl's own
+# advisory feed, https://curl.se/docs/vuln.json, and keeps one `type:security`
+# tracking issue open while a pin is affected.
+#
+# The check itself is scripts/ci/check-curl-advisories.py; its self-test,
+# scripts/ci/test-check-curl-advisories.sh, runs in ci.yml's shell-tests job.
+
+on:
+  schedule:
+    # Daily 05:30 UTC: ahead of scheduled-container-scan.yml (Monday 06:00)
+    # and scheduled-base-image-watch.yml (Wednesday 07:00), so the three
+    # reports never land in the same hour.
+    - cron: '30 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: curl-advisory-watch
+  cancel-in-progress: false
+
+jobs:
+  curl-advisory-watch:
+    name: Source-built curl advisory watch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # exit 0 = every pin clean, 1 = a pin is affected, 2 = something could
+      # not be measured (feed unreachable or malformed, a pin missing). They
+      # are kept apart so an unmeasured pin is never reported as a clean one.
+      - name: Check the curl pins against curl's advisory feed
+        id: watch
+        run: |
+          set +e
+          python3 -I scripts/ci/check-curl-advisories.py 2>&1 | tee curl-advisory-watch.txt
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Source-built curl advisory watch"
+            echo
+            echo '```'
+            cat curl-advisory-watch.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: curl-advisory-watch-report
+          path: curl-advisory-watch.txt
+          retention-days: 90
+
+      # One tracking issue, updated in place, found by a stable title
+      # substring among open `type:security` issues (the same mechanism as
+      # scheduled-base-image-watch.yml). A daily job that filed a fresh issue
+      # every run would turn one standing condition into a pile of duplicates.
+      - name: Open or update the tracking issue
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          WATCH_STATUS: ${{ steps.watch.outputs.status }}
+        with:
+          script: |
+            const fs = require('fs');
+            const status = process.env.WATCH_STATUS;
+            const TITLE_KEY = 'Source-built curl advisory watch';
+            const report = fs.existsSync('curl-advisory-watch.txt')
+              ? fs.readFileSync('curl-advisory-watch.txt', 'utf8')
+              : '(the check produced no report)';
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'type:security',
+              per_page: 100,
+            });
+            const tracker = existing.data.find(i => i.title.includes(TITLE_KEY));
+
+            // status 2 is INFRA: curl.se unreachable or a feed shape the
+            // script does not understand. That is not a finding about our
+            // images, so no security issue is written; the job fails loudly
+            // below instead.
+            if (status !== '1') {
+              if (status === '0' && tracker) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: tracker.number,
+                  body: [
+                    'Every source-built curl pin is now clean against',
+                    'https://curl.se/docs/vuln.json. Closing; the daily watch opens a',
+                    'new tracker if a pin becomes affected again.',
+                    '',
+                    '```',
+                    report.trim(),
+                    '```',
+                    '',
+                    `[View run](${runUrl})`,
+                  ].join('\n'),
+                });
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: tracker.number,
+                  state: 'closed',
+                });
+              }
+              return;
+            }
+
+            const body = [
+              '## A source-built curl pin is affected by a curl advisory',
+              '',
+              'curl / libcurl is built from source in `docker/Dockerfile.backend`',
+              '(`curl-bin` stage) and `docker/Dockerfile.openscap` (`curl-builder`',
+              'stage). Trivy and the Docker Publish gate cannot see that copy, so this',
+              'watch is the only control that reports it (#6003). At least one',
+              '`CURL_VERSION` pin falls in an affected range of',
+              'https://curl.se/docs/vuln.json:',
+              '',
+              '```',
+              report.trim(),
+              '```',
+              '',
+              '### Remedy',
+              '',
+              '1. Pick the newest curl release from https://curl.se/download/.',
+              '2. In each Dockerfile named above, set `CURL_VERSION` and put the',
+              '   tarball\'s `sha256sum` in `CURL_SHA256`; verify the `.asc` against',
+              '   the release key, as the comment above each stage describes.',
+              '3. Some advisories cover features those builds compile out (SSH, LDAP,',
+              '   GSSAPI, NTLM and others); the advisory page says which. Bump anyway',
+              '   unless there is a reason not to: the check matches versions, not',
+              '   build options.',
+              '',
+              `[View run](${runUrl}) · updated ${new Date().toISOString().split('T')[0]}`,
+            ].join('\n');
+
+            if (tracker) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: tracker.number,
+                body,
+              });
+              console.log(`Updated tracking issue #${tracker.number}`);
+            } else {
+              const created = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `${TITLE_KEY}: bump CURL_VERSION in docker/`,
+                body,
+                labels: ['type:security'],
+              });
+              console.log(`Opened tracking issue #${created.data.number}`);
+            }
+
+      - name: Fail on an affected or unmeasurable pin
+        if: always()
+        env:
+          WATCH_STATUS: ${{ steps.watch.outputs.status }}
+        run: |
+          case "${WATCH_STATUS}" in
+            0) echo "Every source-built curl pin is clean against curl's advisory feed." ;;
+            1) echo "::error title=Source-built curl affected::A CURL_VERSION pin in docker/ is affected by a curl advisory; see the tracking issue."; exit 1 ;;
+            *) echo "::error title=curl advisory watch could not measure::The curl pins could not be checked against https://curl.se/docs/vuln.json. Unmeasured is not clean; re-run once the cause is cleared."; exit 1 ;;
+          esac

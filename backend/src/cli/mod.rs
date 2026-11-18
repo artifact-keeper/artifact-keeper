@@ -1,5 +1,6 @@
 //! CLI modules for Artifact Keeper.
 
+pub mod healthcheck;
 pub mod migrate;
 pub mod migrate_runner;
 

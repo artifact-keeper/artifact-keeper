@@ -895,6 +895,11 @@ mod tests {
     #[test]
     fn test_oidc_config_from_env() {
         let config = Config {
+            scan_worker_enabled: true,
+            scan_queue_enabled: false,
+            scan_worker_concurrency: None,
+            scan_worker_trivy_adapter_url: None,
+            scan_rescan_max_per_day: 0,
             database_url: "postgres://localhost/test".into(),
             bind_address: "0.0.0.0:8080".into(),
             log_level: "info".into(),
@@ -1075,6 +1080,11 @@ mod tests {
 
     fn make_test_config() -> Config {
         Config {
+            scan_worker_enabled: true,
+            scan_queue_enabled: false,
+            scan_worker_concurrency: None,
+            scan_worker_trivy_adapter_url: None,
+            scan_rescan_max_per_day: 0,
             database_url: "postgres://localhost/test".into(),
             bind_address: "0.0.0.0:8080".into(),
             log_level: "info".into(),

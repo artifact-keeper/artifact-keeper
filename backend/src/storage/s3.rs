@@ -1422,6 +1422,10 @@ fn s3_failure_class(err: &object_store::Error) -> Option<crate::storage::Storage
 pub(crate) fn classify_s3_error(err: &object_store::Error) -> String {
     let full = err.to_string();
     let l = full.to_lowercase();
+    // object_store prints its retry settings (`retry_timeout: 15s`) on every
+    // retried error, so that text says nothing about why the request failed
+    // and must not make a reset connection read as a timeout (#5858).
+    let cause = l.replace("retry_timeout", "");
     // The raw text is kept for searchability, minus any request URL (#3954):
     // object_store embeds the endpoint, bucket and key URL in generic and
     // retry errors, and this message now reaches INFO logs and exported span
@@ -1459,10 +1463,20 @@ pub(crate) fn classify_s3_error(err: &object_store::Error) -> String {
     {
         "S3 network unreachable. No route from the container to the \
          endpoint. Likely a NetworkPolicy, firewall, or egress rule."
-    } else if l.contains("timeout") || l.contains("timed out") {
+    } else if cause.contains("timeout") || cause.contains("timed out") {
         "S3 connection timed out. Endpoint dropped packets or is behind \
          a stalled proxy. If you use a custom CA, also confirm S3_CA_CERT_PATH \
          is set so TLS does not fall back to system trust."
+    } else if cause.contains("connection reset")
+        || cause.contains("broken pipe")
+        || cause.contains("connection closed")
+        || cause.contains("unexpected eof")
+        || cause.contains("error sending request")
+    {
+        "S3 connection reset. The endpoint, or a load balancer or proxy in \
+         front of it, closed the connection before the request completed. \
+         Check the endpoint's health and logs, and the idle and request \
+         timeouts of any proxy in between."
     } else if l.contains("403") || l.contains("access denied") || l.contains("forbidden") {
         "S3 access denied (403). Credentials are reaching the endpoint \
          but lack permission on the bucket. Confirm S3_BUCKET, the IAM \
@@ -8011,6 +8025,29 @@ mod tests {
             msg.contains("S3_CA_CERT_PATH"),
             "should mention CA fallback hint for timeout: {msg}"
         );
+    }
+
+    /// A reset connection is not a timeout, even though object_store prints
+    /// its `retry_timeout` setting on every retried error (#5858).
+    #[test]
+    fn test_classify_reset_connection_is_not_a_timeout_5858() {
+        let e = generic_err(
+            "Error performing HEAD <url> in 3.27s, after 10 retries, max_retries: 10, \
+             retry_timeout: 15s  - HTTP error: error sending request",
+        );
+        let msg = classify_s3_error(&e);
+        assert!(msg.starts_with("S3 connection reset"), "got: {msg}");
+        assert!(!msg.contains("timed out"), "got: {msg}");
+
+        let e = generic_err("connection reset by peer (os error 104)");
+        assert!(classify_s3_error(&e).starts_with("S3 connection reset"));
+
+        // A real timeout behind the same retry text is still a timeout.
+        let e = generic_err(
+            "Error performing GET <url> after 3 retries, retry_timeout: 15s - \
+             HTTP error: error sending request: operation timed out",
+        );
+        assert!(classify_s3_error(&e).starts_with("S3 connection timed out"));
     }
 
     #[test]

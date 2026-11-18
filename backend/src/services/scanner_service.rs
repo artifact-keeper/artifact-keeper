@@ -3390,6 +3390,23 @@ fn generic_archive_expects_catalog(lower_filename: &str) -> bool {
     ScanWorkspace::is_archive(lower_filename)
 }
 
+/// Why the CVE engine cannot grade a hosted `filename` of `repository_format`,
+/// for the files it could only ever report zero findings on. A Helm chart
+/// ships templates and values, no packages: the images it names carry them
+/// and are graded where they are pulled. The scan is recorded
+/// `not_applicable` with this reason rather than as a clean grade
+pub(crate) fn hosted_cve_ungradeable_reason(
+    repository_format: &str,
+    filename: &str,
+) -> Option<&'static str> {
+    let lower = filename.to_ascii_lowercase();
+    (repository_format == "helm" && (lower.ends_with(".tgz") || lower.ends_with(".tar.gz")))
+        .then_some(
+            "not scannable: a Helm chart ships no packages the CVE engine can grade, \
+             the images it names are graded where they are pulled",
+        )
+}
+
 /// Package-shaped archive extensions: files that are packages by
 /// construction, so an empty catalog means a package nobody could read.
 const PACKAGE_SHAPED_ARCHIVE_SUFFIXES: &[&str] = &[
@@ -4000,8 +4017,9 @@ const DEFAULT_MAX_CONCURRENT_SCAN_EXTRACTIONS: usize = 4;
 const MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV: &str = "MAX_CONCURRENT_SCAN_EXTRACTIONS";
 
 /// Effective concurrent-extraction cap, honouring
-/// [`MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV`] over the default.
-fn max_concurrent_scan_extractions() -> usize {
+/// [`MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV`] over the default. The queue
+/// worker's default concurrency reads it too (#6033).
+pub(crate) fn max_concurrent_scan_extractions() -> usize {
     positive_env_or(
         MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV,
         DEFAULT_MAX_CONCURRENT_SCAN_EXTRACTIONS as u64,
@@ -5459,6 +5477,22 @@ impl ComponentEcosystem {
     /// runs, and bytes that disagree with the file name are still withheld.
     pub fn engine_catalogs_the_package(self) -> bool {
         !matches!(self, ComponentEcosystem::Conda)
+    }
+
+    /// Stored token for a queued scan job: the
+    /// [`ExpectedComponent::pin_identity`] prefix, already persisted, so a
+    /// worker on a different build reads it back.
+    pub fn as_db_str(self) -> &'static str {
+        self.identity_token()
+    }
+
+    /// `None` for a token this build does not know. A wrong ecosystem writes
+    /// the wrong pin file, and the engine then grades nothing while reporting
+    /// clean, so callers must refuse rather than guess.
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|eco| eco.identity_token() == value)
     }
 }
 
@@ -9253,6 +9287,13 @@ fn completeness_for_feeds(degraded: bool) -> ScanCompleteness {
 // Scanner orchestrator
 // ---------------------------------------------------------------------------
 
+/// What a DB-update rescan (#5947) changes in a scan: which scanners run, and
+/// that only a result graded at or after `fresh_since` may be reused.
+struct RescanScope<'a> {
+    fresh_since: DateTime<Utc>,
+    scan_types: &'a [String],
+}
+
 pub struct ScannerService {
     db: PgPool,
     scanners: Vec<Arc<dyn Scanner>>,
@@ -9266,6 +9307,10 @@ pub struct ScannerService {
     scan_workspace_path: String,
     dependency_track:
         Option<Arc<crate::services::dependency_track_service::DependencyTrackService>>,
+    /// `SCAN_QUEUE_ENABLED`, mirrored here because the scan_on_upload trigger
+    /// is handed the scanner, not the config. Set by
+    /// [`crate::api::AppState::set_scanner_service`].
+    scan_queue_enabled: std::sync::atomic::AtomicBool,
 }
 
 /// Construction-only types and the scanner-registry owner.
@@ -9438,6 +9483,7 @@ mod construction {
                 storage_base_path,
                 scan_workspace_path,
                 dependency_track: None,
+                scan_queue_enabled: Default::default(),
             }
         }
     }
@@ -9452,6 +9498,18 @@ impl ScannerService {
         dt: Arc<crate::services::dependency_track_service::DependencyTrackService>,
     ) {
         self.dependency_track = Some(dt);
+    }
+
+    /// Route `scan_on_upload` through the durable scan queue (#5946).
+    pub fn set_scan_queue_enabled(&self, enabled: bool) {
+        self.scan_queue_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether `scan_on_upload` queues its scan instead of spawning it.
+    pub fn scan_queue_enabled(&self) -> bool {
+        self.scan_queue_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Synchronously create one placeholder `running` scan_result row per
@@ -9594,7 +9652,7 @@ impl ScannerService {
             .map(|(scan_type, id)| (scan_type.clone(), *id))
             .collect();
         let result = self
-            .scan_artifact_inner(artifact_id, force, bypass_dedup, Some(prepared))
+            .scan_artifact_inner(artifact_id, force, bypass_dedup, Some(prepared), None)
             .await;
         self.fail_unfinished_prepared_scans(artifact_id, prepared_ids, result.as_ref().err())
             .await;
@@ -9806,6 +9864,7 @@ impl ScannerService {
             storage_base_path,
             scan_workspace_path,
             dependency_track: None,
+            scan_queue_enabled: Default::default(),
         }
     }
 
@@ -9821,8 +9880,55 @@ impl ScannerService {
         force: bool,
         bypass_dedup: bool,
     ) -> Result<()> {
-        self.scan_artifact_inner(artifact_id, force, bypass_dedup, None)
+        self.scan_artifact_inner(artifact_id, force, bypass_dedup, None, None)
             .await
+    }
+
+    /// Rescan one artifact after a vulnerability-database update (#5947).
+    ///
+    /// Reuses only a result graded at or after `fresh_since` (the rescan's
+    /// start, on the database clock): the first row of a digest scans fresh,
+    /// every later row of that digest copies that fresh result as an
+    /// `is_reused` row instead of scanning the same bytes again. Earlier rows
+    /// are never touched, a rescan only adds results. Honours the repository's
+    /// scan config like [`Self::scan_artifact`].
+    ///
+    /// Only the scanners whose `scan_type` is in `scan_types` run: the ones
+    /// with a vulnerability database. A license or compliance result does not
+    /// go stale when a CVE database updates.
+    pub async fn rescan_artifact_graded_since(
+        &self,
+        artifact_id: Uuid,
+        fresh_since: DateTime<Utc>,
+        scan_types: &[String],
+    ) -> Result<()> {
+        self.scan_artifact_inner(
+            artifact_id,
+            false,
+            false,
+            None,
+            Some(RescanScope {
+                fresh_since,
+                scan_types,
+            }),
+        )
+        .await
+    }
+
+    /// The vulnerability-database build each registered scanner reports right
+    /// now (#5947), as `(scan_type, built_at)`. Live-API scanners (the
+    /// dependency scanner's `live:*` feeds) are left out: they have no build,
+    /// their "published" time is the query time.
+    pub async fn current_vuln_db_builds(&self) -> Vec<(String, DateTime<Utc>)> {
+        let mut builds = Vec::new();
+        for scanner in &self.scanners {
+            if let Some(p) = scanner.vuln_db().await {
+                if let (false, Some(at)) = (p.version.starts_with("live:"), p.published_at) {
+                    builds.push((scanner.scan_type().to_string(), at));
+                }
+            }
+        }
+        builds
     }
 
     async fn scan_artifact_inner(
@@ -9831,7 +9937,9 @@ impl ScannerService {
         force: bool,
         bypass_dedup: bool,
         prepared: Option<HashMap<String, Uuid>>,
+        rescan: Option<RescanScope<'_>>,
     ) -> Result<()> {
+        let fresh_since = rescan.as_ref().map(|r| r.fresh_since);
         // Fetch artifact and content
         let artifact = sqlx::query_as!(
             Artifact,
@@ -10008,6 +10116,12 @@ impl ScannerService {
         );
 
         for scanner in &self.scanners {
+            // #5947: a DB-update rescan runs only the database-backed scanners.
+            if let Some(r) = rescan.as_ref() {
+                if !r.scan_types.iter().any(|t| t == scanner.scan_type()) {
+                    continue;
+                }
+            }
             // Take any pre-allocated row id committed by the trigger handler.
             // The id was already returned to the client in TriggerScanResponse,
             // so we must keep the same row alive (UPDATE rather than INSERT).
@@ -10031,7 +10145,11 @@ impl ScannerService {
             // was falsely BLOCKED (#1648). We now INSERT a terminal
             // `not_applicable` row so the artifact classifies as scanned-OK
             // (not unscanned) and the operator sees a deterministic record.
-            if !scanner.is_applicable_for_target(&target) {
+            let ungradeable = scanner
+                .is_cve_authoritative()
+                .then(|| hosted_cve_ungradeable_reason(&repository_format, upload_filename))
+                .flatten();
+            if ungradeable.is_some() || !scanner.is_applicable_for_target(&target) {
                 info!(
                     "Scanner {} not applicable for artifact {} (content_type={}, path={}), skipping",
                     scanner.name(),
@@ -10039,10 +10157,12 @@ impl ScannerService {
                     artifact.content_type,
                     artifact.path,
                 );
-                let reason = format!(
-                    "Scanner {} does not apply to this artifact format",
-                    scanner.name(),
-                );
+                let reason = ungradeable.map(str::to_string).unwrap_or_else(|| {
+                    format!(
+                        "Scanner {} does not apply to this artifact format",
+                        scanner.name(),
+                    )
+                });
                 match prepared_action {
                     PreparedScanAction::Reuse(target_id) => {
                         if let Err(e) = self
@@ -10105,6 +10225,12 @@ impl ScannerService {
                     .ok()
                     .flatten()
             };
+            // #5947: a DB-update rescan reuses only what was graded after it
+            // started; anything older is the stale verdict it exists to replace.
+            let reusable = match fresh_since {
+                Some(since) => reusable.filter(|r| r.completed_at.is_some_and(|c| c >= since)),
+                None => reusable,
+            };
             if let Some(mut source_scan) = reusable {
                 // #4425: `find_reusable_scan` only returns ORIGINAL scans, so
                 // an artifact whose own row is a reused copy is handed the
@@ -10115,7 +10241,11 @@ impl ScannerService {
                 // (pin, not_cataloged, TTL), so the #1373 branch below treats
                 // it as already scanned. A lookup error falls through to the
                 // copy, the pre-#4425 behaviour.
-                if needs_own_scan_lookup(source_scan.artifact_id, artifact_id, &prepared_action) {
+                // A rescan's fresh source must not be traded for this
+                // artifact's own (stale) row.
+                if fresh_since.is_none()
+                    && needs_own_scan_lookup(source_scan.artifact_id, artifact_id, &prepared_action)
+                {
                     match self
                         .scan_result_service
                         .find_own_reusable_scan(
@@ -12089,7 +12219,7 @@ pub(crate) mod test_helpers {
     /// Hold every scan-extraction permit, so that a scan queues until the guard
     /// drops (#5231). The semaphore is process-wide, which nextest's one process
     /// per test keeps to the test that calls this.
-    pub async fn hold_all_scan_permits() -> tokio::sync::OwnedSemaphorePermit {
+    pub(crate) async fn hold_all_scan_permits() -> tokio::sync::OwnedSemaphorePermit {
         super::scan_extraction_semaphore()
             .clone()
             .acquire_many_owned(super::max_concurrent_scan_extractions() as u32)
@@ -12269,6 +12399,25 @@ pub(crate) mod test_helpers {
     }
 }
 
+/// Test override: run an upload's scan inline in the triggering task (#5692).
+///
+/// Production fan-out stays fire-and-forget. A regression test that asserts
+/// which metadata the scan saw at its start needs the scan to run inside
+/// `trigger_scan_on_upload`, before the handler can proceed to its next write.
+#[cfg(test)]
+pub(crate) static TEST_INLINE_SCAN_ON_UPLOAD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn scan_on_upload_runs_inline() -> bool {
+    TEST_INLINE_SCAN_ON_UPLOAD.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(test))]
+fn scan_on_upload_runs_inline() -> bool {
+    false
+}
+
 /// Fire-and-forget `scan_on_upload` trigger for a freshly-inserted artifact.
 ///
 /// Mirrors the gate already inlined in [`ArtifactService::upload`] so that
@@ -12336,6 +12485,7 @@ pub async fn scan_on_upload_enabled(db: &PgPool, repository_id: Uuid) -> bool {
 /// the upload response is not delayed. Call it AFTER the row is committed
 /// (and after format metadata is written, where the handler writes any), so
 /// the scan sees the finished artifact. Returns whether a scan was spawned.
+/// Unit tests can set `TEST_INLINE_SCAN_ON_UPLOAD` to run it synchronously.
 ///
 /// The `every_format_upload_triggers_scan_on_upload` ratchet test in
 /// `api::handlers::proxy_helpers` requires every handler that inserts an
@@ -12354,11 +12504,59 @@ pub async fn trigger_scan_on_upload(
         return false;
     };
     let should_scan = scan_on_upload_enabled(db, repository_id).await;
-    spawn_scan_on_upload(should_scan, artifact_id, move |aid| async move {
+    if should_scan && scanner.scan_queue_enabled() {
+        match enqueue_scan_on_upload(db, repository_id, artifact_id).await {
+            Ok(()) => return true,
+            // The upload committed; a lost scan is worse than an in-process one.
+            Err(e) => tracing::warn!(
+                artifact_id = %artifact_id, error = %e,
+                "could not queue the scan_on_upload; running it in this process"
+            ),
+        }
+    }
+    let scan = move |aid| async move {
         if let Err(e) = scanner.scan_artifact(aid).await {
             tracing::warn!(artifact_id = %aid, error = %e, "scan_on_upload trigger failed");
         }
-    })
+    };
+    if scan_on_upload_runs_inline() {
+        scan(artifact_id).await;
+        return true;
+    }
+    spawn_scan_on_upload(should_scan, artifact_id, scan)
+}
+
+/// Queue a committed upload's scan at the hosted band (#5946). A pushed OCI
+/// manifest becomes one `hosted_image` job per (repository, digest); every
+/// other artifact one `hosted_upload` job.
+pub(crate) async fn enqueue_scan_on_upload(
+    db: &PgPool,
+    repository_id: Uuid,
+    artifact_id: Uuid,
+) -> Result<()> {
+    use crate::services::scan_queue::{ScanQueue, PRIORITY_HOSTED};
+    // The worker selects manifest rows with the same predicate (#5946).
+    let row: Option<(String, bool)> =
+        sqlx::query_as(crate::services::scan_queue::UPLOAD_SCAN_TARGET_SQL)
+            .bind(artifact_id)
+            .bind(repository_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    let queue = ScanQueue::new(db.clone());
+    match row {
+        Some((digest, true)) => {
+            queue
+                .enqueue_hosted_image(repository_id, &digest, PRIORITY_HOSTED)
+                .await?;
+        }
+        _ => {
+            queue
+                .enqueue_hosted_upload(artifact_id, PRIORITY_HOSTED)
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 /// Count one committed upload (#4642), labelled by the artifact's repository
@@ -13621,6 +13819,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             dependency_track: None,
+            scan_queue_enabled: Default::default(),
         }
     }
 
@@ -14066,6 +14265,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             dependency_track: None,
+            scan_queue_enabled: Default::default(),
         };
 
         // A clean rescan (0 findings) must not release/downgrade the rejection.
@@ -14147,6 +14347,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             dependency_track: None,
+            scan_queue_enabled: Default::default(),
         };
 
         // A clean rescan (0 findings) must not release the admin/policy hold.
@@ -28271,6 +28472,18 @@ tonic-build = "0.12"
         assert!(!ComponentEcosystem::Conda.engine_catalogs_the_package());
     }
 
+    /// A queued job stores the ecosystem as a token a worker on another build
+    /// decodes. A rename that updates only one side silently drops the pin,
+    /// and an unpinned scan grades nothing while recording `clean`.
+    #[test]
+    fn test_ecosystem_db_token_round_trips() {
+        for eco in ComponentEcosystem::ALL {
+            assert_eq!(ComponentEcosystem::from_db_str(eco.as_db_str()), Some(eco));
+        }
+        assert_eq!(ComponentEcosystem::from_db_str("java"), None);
+        assert_eq!(ComponentEcosystem::from_db_str(""), None);
+    }
+
     /// #4594: a conda package the engine scanned to completion and cataloged
     /// nothing for is a clean verdict graded on file contents, with
     /// `components_cataloged = 0`.
@@ -29501,6 +29714,117 @@ tonic-build = "0.12"
         }
     }
 
+    /// CVE-authoritative and applicable, so only the format rule can keep it
+    /// from running
+    struct CveScannerThatMustNotRun;
+
+    #[async_trait]
+    impl Scanner for CveScannerThatMustNotRun {
+        fn name(&self) -> &str {
+            "cve-must-not-run"
+        }
+
+        fn scan_type(&self) -> &str {
+            "grype"
+        }
+
+        fn is_cve_authoritative(&self) -> bool {
+            true
+        }
+
+        fn is_applicable(&self, _artifact: &Artifact) -> bool {
+            true
+        }
+
+        async fn scan(
+            &self,
+            _artifact: &Artifact,
+            _metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> Result<ScanOutput> {
+            panic!("the CVE engine must not grade a Helm chart");
+        }
+    }
+
+    #[test]
+    fn test_hosted_cve_ungradeable_reason_names_helm_charts_only() {
+        assert!(hosted_cve_ungradeable_reason("helm", "nginx-1.0.0.tgz").is_some());
+        assert!(hosted_cve_ungradeable_reason("helm", "charts/NGINX-1.0.0.TAR.GZ").is_some());
+        assert!(hosted_cve_ungradeable_reason("helm", "index.yaml").is_none());
+        assert!(hosted_cve_ungradeable_reason("npm", "nginx-1.0.0.tgz").is_none());
+        assert!(hosted_cve_ungradeable_reason("generic", "nginx-1.0.0.tgz").is_none());
+    }
+
+    /// A Helm chart uploaded with scan-on-upload records the CVE engine as
+    /// `not_applicable`, saying why, instead of a zero-finding clean
+    #[tokio::test]
+    async fn test_hosted_helm_chart_records_the_cve_engine_not_applicable() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let artifact_id = Uuid::new_v4();
+        let checksum = fresh_checksum();
+        let storage_key = format!("helm-chart/{artifact_id}.tgz");
+        fx.state
+            .storage
+            .put(&storage_key, Bytes::from_static(b"chart"))
+            .await
+            .expect("store chart bytes");
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, checksum_sha256, \
+                                    content_type, storage_key, is_deleted) \
+             VALUES ($1, $2, 'nginx', 'nginx-1.0.0.tgz', 5, $3, 'application/gzip', $4, false)",
+        )
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(&checksum)
+        .bind(&storage_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert chart");
+        let scanner = ScannerService {
+            db: fx.pool.clone(),
+            scanners: vec![Arc::new(CveScannerThatMustNotRun)],
+            scan_result_service: Arc::new(ScanResultService::new(fx.pool.clone())),
+            scan_config_service: Arc::new(ScanConfigService::new(fx.pool.clone())),
+            storage: fx.state.storage.clone(),
+            storage_registry: fx.state.storage_registry.clone(),
+            storage_base_path: fx.storage_dir.to_string_lossy().into_owned(),
+            scan_workspace_path: fx
+                .storage_dir
+                .join("scan-workspace")
+                .to_string_lossy()
+                .into_owned(),
+            dependency_track: None,
+            scan_queue_enabled: Default::default(),
+        };
+
+        scanner
+            .scan_artifact_with_options(artifact_id, true, true)
+            .await
+            .expect("scan orchestration succeeds");
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT status, error_message FROM scan_results WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .fetch_all(&fx.pool)
+                .await
+                .expect("read scan rows");
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, "not_applicable");
+        assert!(
+            rows[0]
+                .1
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Helm chart"),
+            "{rows:?}"
+        );
+    }
+
     /// #1470 regression: on the InsertFresh path (auto-scan-on-upload, no
     /// pre-allocated row), a scanner that does not apply must persist a single
     /// terminal `not_applicable` scan_results row -- NOT `failed`, and NOT zero
@@ -29555,6 +29879,7 @@ tonic-build = "0.12"
                 .to_string_lossy()
                 .into_owned(),
             dependency_track: None,
+            scan_queue_enabled: Default::default(),
         };
 
         // prepared=None -> InsertFresh path.
@@ -29683,6 +30008,7 @@ tonic-build = "0.12"
                 .to_string_lossy()
                 .into_owned(),
             dependency_track: None,
+            scan_queue_enabled: Default::default(),
         }
     }
 
@@ -30570,6 +30896,7 @@ tonic-build = "0.12"
                 .to_string_lossy()
                 .into_owned(),
             dependency_track: None,
+            scan_queue_enabled: Default::default(),
         };
 
         scanner
@@ -30661,6 +30988,7 @@ tonic-build = "0.12"
                 .to_string_lossy()
                 .into_owned(),
             dependency_track: None,
+            scan_queue_enabled: Default::default(),
         };
 
         let mut prepared = HashMap::new();
@@ -30711,6 +31039,7 @@ tonic-build = "0.12"
                 .to_string_lossy()
                 .into_owned(),
             dependency_track: None,
+            scan_queue_enabled: Default::default(),
         }
     }
 
@@ -30893,6 +31222,7 @@ tonic-build = "0.12"
                 .to_string_lossy()
                 .into_owned(),
             dependency_track: None,
+            scan_queue_enabled: Default::default(),
         };
 
         scanner
@@ -31838,6 +32168,7 @@ tonic-build = "0.12"
                     .to_string_lossy()
                     .into_owned(),
                 dependency_track,
+                scan_queue_enabled: Default::default(),
             }
         }
 

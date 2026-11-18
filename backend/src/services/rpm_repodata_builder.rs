@@ -290,13 +290,30 @@ pub async fn fold_marks(db: &PgPool) -> Result<u64> {
 }
 
 /// [`fold_marks`], but waiting for another replica's fold instead of
-/// skipping (tests read `dirty_since` right after a write).
+/// skipping (tests read `dirty_since` right after a write). It still returns
+/// at once when nothing is queued: a fold in flight elsewhere keeps its marks
+/// visible until it commits, so the check sees them and this waits.
 #[cfg(test)]
 pub(crate) async fn fold_marks_waiting(db: &PgPool) -> Result<u64> {
     fold_marks_inner(db, true).await
 }
 
 async fn fold_marks_inner(db: &PgPool, wait: bool) -> Result<u64> {
+    // Every replica calls this every tick, and the queue is empty almost all
+    // the time (always, on an instance with no hosted RPM repository). The
+    // fold below costs a transaction, an advisory lock and a
+    // `CREATE TEMP TABLE`, whose catalog rows are WAL-logged: on a shared
+    // Postgres server that is catalog churn from every instance every tick
+    // with nothing to move. Look first. A mark committed after this check is folded at the
+    // next tick, which is no later than a mark committed just after the
+    // `DELETE` below would be, and the root's `dirty_since` is the mark's own
+    // `marked_at`, so the debounce does not move.
+    let queued: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM rpm_repodata_dirty)")
+        .fetch_one(db)
+        .await?;
+    if !queued {
+        return Ok(0);
+    }
     let mut tx = db.begin().await?;
     if wait {
         sqlx::query("SELECT pg_advisory_xact_lock($1)")

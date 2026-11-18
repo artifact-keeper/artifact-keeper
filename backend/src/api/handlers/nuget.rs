@@ -3155,6 +3155,7 @@ async fn search_packages(
         FROM artifacts a
         WHERE a.repository_id = ANY($1::uuid[])
           AND a.is_deleted = false
+          AND a.version IS NOT NULL
           AND LOWER(a.name) LIKE $2 ESCAPE '\'
         GROUP BY LOWER(a.name), a.name
         ORDER BY LOWER(a.name)
@@ -3176,6 +3177,7 @@ async fn search_packages(
         FROM artifacts
         WHERE repository_id = ANY($1::uuid[])
           AND is_deleted = false
+          AND version IS NOT NULL
           AND LOWER(name) LIKE $2 ESCAPE '\'
         "#,
     )
@@ -3937,8 +3939,8 @@ async fn virtual_member_download(
         surface,
         ctx,
     };
-    let unscanned_run = |run: Vec<crate::models::repository::Repository>| {
-        walk_unscanned_nuget_members(&walk, run, &local_fetch)
+    let unscanned_run = |run: Vec<crate::models::repository::Repository>, fallback| {
+        walk_unscanned_nuget_members(&walk, run, fallback, &local_fetch)
     };
 
     if let Some(proxy) = state.proxy_service.as_deref() {
@@ -3960,7 +3962,9 @@ async fn virtual_member_download(
         }
     }
 
-    unscanned_run(members)
+    // #5810: no member scans; the virtual's member-fallback policy.
+    let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo_id).await;
+    unscanned_run(members, fallback)
         .await
         .unwrap_or_else(|| Err(proxy_helpers::member_miss_response()))
 }
@@ -4031,6 +4035,7 @@ impl NugetMemberWalk<'_> {
 async fn walk_unscanned_nuget_members<F, Fut>(
     walk: &NugetMemberWalk<'_>,
     members: Vec<crate::models::repository::Repository>,
+    fallback: proxy_helpers::VirtualMemberFallback,
     local_fetch: &F,
 ) -> Option<Result<Response, Response>>
 where
@@ -4051,8 +4056,17 @@ where
             ) else {
                 continue;
             };
-            if let Ok(resp) = walk.remote_download(proxy, member, None).await {
-                return Some(Ok(resp));
+            match walk.remote_download(proxy, member, None).await {
+                Ok(resp) => return Some(Ok(resp)),
+                // #5810: in strict mode a member that could not answer ends
+                // the walk instead of letting a lower member serve.
+                Err(resp)
+                    if fallback.is_strict()
+                        && proxy_helpers::is_member_unavailable_response(&resp) =>
+                {
+                    return Some(Err(proxy_helpers::member_unavailable_response()));
+                }
+                Err(_) => {}
             }
             continue;
         }
@@ -4064,6 +4078,7 @@ where
         // the resolver never reaches its proxy leg.
         match proxy_helpers::resolve_virtual_download_from_members(
             members[run_start..idx].to_vec(),
+            fallback,
             None,
             walk.upstream_path,
             None,
@@ -7672,6 +7687,38 @@ mod read_db_tests {
             json["data"][0]["version"], "2.0.0-beta.1",
             "prerelease=true must surface the pre-release; body={json}"
         );
+
+        f.teardown().await;
+    }
+
+    // A file uploaded at the repository root has no version, it made the
+    // versions aggregate NULL and the whole search failed to decode (#6062)
+    #[tokio::test]
+    async fn search_skips_a_package_without_a_version() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        push_pkg(&f, &f.repo_key, "Qa.RootPkg", "1.0.0", "versioned").await;
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $2, NULL, 4, $3, 'application/octet-stream', $2, $4)",
+        )
+        .bind(f.repo_id)
+        .bind("qa.rootonly.1.0.0.nupkg")
+        .bind("seed-qa-rootonly")
+        .bind(f.user_id)
+        .execute(&f.pool)
+        .await
+        .expect("seed a root upload");
+
+        let (status, json) = get_json(&f, format!("/{}/v3/search?q=qa.r", f.repo_key)).await;
+        assert_eq!(status, StatusCode::OK, "body={json}");
+        assert_eq!(json["totalHits"], 1, "body={json}");
+        let data = json["data"].as_array().expect("data array");
+        assert_eq!(data.len(), 1, "body={json}");
+        assert_eq!(data[0]["version"], "1.0.0", "body={json}");
 
         f.teardown().await;
     }

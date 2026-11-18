@@ -186,6 +186,24 @@ where
 /// Older adapters send no such header; their pending jobs count as running.
 pub(crate) const ADAPTER_SCAN_STATUS_HEADER: &str = "X-Scan-Status";
 
+/// `X-Scan-Status` value of a job the adapter refused because the image is
+/// over its `SCANNER_MAX_IMAGE_BYTES` (#5909). It comes on a terminal `422`.
+pub(crate) const ADAPTER_SCAN_STATUS_TOO_LARGE: &str = "TooLarge";
+
+/// Whether a terminal report response says the adapter refused the image as
+/// too large to scan (#5909), as opposed to a scan that ran and failed. Such
+/// a job is never resubmitted: the image is the same size the next time.
+pub(crate) fn adapter_reports_too_large(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> bool {
+    status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        && headers
+            .get(ADAPTER_SCAN_STATUS_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case(ADAPTER_SCAN_STATUS_TOO_LARGE))
+}
+
 /// Longest a job may wait in the adapter's queue on top of a client's own
 /// poll budget. Time spent `Queued` is not charged to that budget, which is
 /// sized for one trivy run, so a burst of scans waits for a slot instead of
@@ -310,6 +328,410 @@ impl AdapterPollClock {
         Some(ADAPTER_UNREACHABLE_POLL)
     }
 }
+
+/// Env var: total wall-clock budget, in seconds, for the scanner-adapter
+/// readiness gate (#5945). Set it when the adapter is started on demand
+/// (scaled to zero behind a request-holding proxy, for example), so the gate
+/// waits for a slower start instead of failing the scan. Unset keeps the
+/// earlier fixed gate exactly.
+// Unit-test builds start clients on a short fixed budget instead.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) const ADAPTER_READY_TIMEOUT_ENV: &str = "SCANNER_ADAPTER_READY_TIMEOUT_SECS";
+
+/// Attempts of the fixed gate used while [`ADAPTER_READY_TIMEOUT_ENV`] is
+/// unset: three `/probe/ready` calls, 5 s each, 500 ms apart (at most about
+/// 16 s), as before #5945.
+const ADAPTER_READY_LEGACY_ATTEMPTS: u32 = 3;
+/// Timeout of one `/probe/ready` attempt, capped by what is left of a budget.
+const ADAPTER_READY_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// First delay between readiness attempts. The fixed gate keeps it; under a
+/// budget it doubles after each failure up to [`ADAPTER_READY_BACKOFF_CAP`].
+const ADAPTER_READY_BACKOFF_START: std::time::Duration = std::time::Duration::from_millis(500);
+const ADAPTER_READY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ceiling on [`ADAPTER_READY_TIMEOUT_ENV`]: an hour. A larger value is
+/// clamped to it (with a warning) rather than overflowing the deadline.
+pub(crate) const MAX_ADAPTER_READY_TIMEOUT_SECS: u64 = 3600;
+
+/// Slack the outer per-attempt timeout gives reqwest's own, so that reqwest
+/// (with its familiar error text) is the one that gives up on a hanging
+/// probe, as it was before #5945.
+const ADAPTER_READY_TIMEOUT_SLACK: std::time::Duration = std::time::Duration::from_millis(100);
+
+tokio::task_local! {
+    /// Set while an inline proxy scan or a proxy rescan runs (#5945). Those
+    /// scans have their own wall-clock budget (30 s, or 120 s for OCI images
+    /// and rescans) shared by every scanner, so a long readiness wait would
+    /// spend it all; there the gate keeps the fixed three attempts.
+    static FIXED_READY_GATE: ();
+}
+
+/// Run `fut` with the fixed readiness gate, whatever
+/// [`ADAPTER_READY_TIMEOUT_ENV`] says (see [`FIXED_READY_GATE`]).
+///
+/// A plain function, not an `async fn`: an `async fn` would keep its own
+/// copy of `fut` next to the scope future's, and the proxy scan future this
+/// wraps is large enough that every extra copy shows up on the stack of each
+/// download handler above it.
+pub(crate) fn with_fixed_ready_gate<F: std::future::Future>(
+    fut: F,
+) -> tokio::task::futures::TaskLocalFuture<(), F> {
+    FIXED_READY_GATE.scope((), fut)
+}
+
+/// The readiness wait a gate uses now: `configured`, or the fixed gate
+/// inside [`with_fixed_ready_gate`].
+pub(crate) fn effective_ready_wait(configured: AdapterReadyWait) -> AdapterReadyWait {
+    if FIXED_READY_GATE.try_with(|_| ()).is_ok() {
+        AdapterReadyWait::Fixed
+    } else {
+        configured
+    }
+}
+
+/// How long the readiness gate keeps trying before it fails the scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdapterReadyWait {
+    /// [`ADAPTER_READY_TIMEOUT_ENV`] unset: the fixed three-attempt gate.
+    Fixed,
+    /// [`ADAPTER_READY_TIMEOUT_ENV`] set: keep probing until this much time
+    /// has passed.
+    Budget(std::time::Duration),
+}
+
+/// Parse a [`ADAPTER_READY_TIMEOUT_ENV`] value. Unset or empty keeps the
+/// fixed gate; so does an unparseable or zero value (with a warning), so a
+/// typo never disables the gate or changes it unannounced.
+pub(crate) fn parse_adapter_ready_wait(raw: Option<&str>) -> AdapterReadyWait {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return AdapterReadyWait::Fixed;
+    };
+    match raw.parse::<u64>() {
+        Ok(secs) if secs > MAX_ADAPTER_READY_TIMEOUT_SECS => {
+            tracing::warn!(
+                "{ADAPTER_READY_TIMEOUT_ENV}={secs} is over the {MAX_ADAPTER_READY_TIMEOUT_SECS} s \
+                 ceiling; waiting {MAX_ADAPTER_READY_TIMEOUT_SECS} s"
+            );
+            AdapterReadyWait::Budget(std::time::Duration::from_secs(
+                MAX_ADAPTER_READY_TIMEOUT_SECS,
+            ))
+        }
+        Ok(secs) if secs > 0 => AdapterReadyWait::Budget(std::time::Duration::from_secs(secs)),
+        _ => {
+            tracing::warn!(
+                "{ADAPTER_READY_TIMEOUT_ENV}={raw:?} is not a positive number of seconds; \
+                 keeping the default readiness gate (3 attempts, about 16 s)"
+            );
+            AdapterReadyWait::Fixed
+        }
+    }
+}
+
+/// The configured readiness wait ([`ADAPTER_READY_TIMEOUT_ENV`]).
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn adapter_ready_wait() -> AdapterReadyWait {
+    parse_adapter_ready_wait(std::env::var(ADAPTER_READY_TIMEOUT_ENV).ok().as_deref())
+}
+
+/// Readiness wait a newly built adapter client starts with. Unit tests that
+/// never configure one use a short budget so an unreachable mock fails in a
+/// second; the gate logic itself is tested with explicit waits.
+pub(crate) fn initial_adapter_ready_wait() -> AdapterReadyWait {
+    #[cfg(test)]
+    {
+        AdapterReadyWait::Budget(std::time::Duration::from_secs(1))
+    }
+    #[cfg(not(test))]
+    {
+        adapter_ready_wait()
+    }
+}
+
+/// Outcome of one readiness attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReadyProbe {
+    /// `/probe/ready` answered 2xx.
+    Ready,
+    /// The adapter answered, but not 2xx (it is starting, or its
+    /// vulnerability DB is not loaded yet). Carries the status line.
+    NotReady(String),
+    /// No answer: connection refused or reset, DNS failure, or the attempt
+    /// timed out.
+    Unreachable(String),
+}
+
+/// Why the readiness gate gave up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdapterReadyFailure {
+    Unreachable,
+    NotReady,
+}
+
+impl AdapterReadyFailure {
+    /// `reason` label of `ak_scanner_health_check_failures_total`, unchanged
+    /// since the metric was introduced.
+    pub(crate) fn metric_reason(self) -> &'static str {
+        match self {
+            Self::Unreachable => "unreachable",
+            Self::NotReady => "unhealthy",
+        }
+    }
+
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::Unreachable => "unreachable",
+            Self::NotReady => "not ready",
+        }
+    }
+}
+
+/// The readiness gate gave up. `kind` and `detail` come from the last
+/// attempt.
+#[derive(Debug, Clone)]
+pub(crate) struct AdapterNotReady {
+    pub kind: AdapterReadyFailure,
+    pub detail: String,
+    pub attempts: u32,
+    pub wait: AdapterReadyWait,
+}
+
+impl AdapterNotReady {
+    /// What the budget adds to the error text; empty for the fixed gate, so
+    /// its messages read as before.
+    pub(crate) fn budget_note(&self) -> String {
+        match self.wait {
+            AdapterReadyWait::Fixed => String::new(),
+            AdapterReadyWait::Budget(budget) => format!(
+                " after waiting {}s for readiness ({} attempts; {ADAPTER_READY_TIMEOUT_ENV} sets the wait)",
+                budget.as_secs(),
+                self.attempts
+            ),
+        }
+    }
+}
+
+/// Retry `probe` until it reports [`ReadyProbe::Ready`] or `wait` runs out
+/// (#5945), calling `on_failure(attempt, kind, detail)` after each failed
+/// attempt. Each attempt gets [`ADAPTER_READY_ATTEMPT_TIMEOUT`].
+///
+/// * [`AdapterReadyWait::Fixed`]: three attempts, 500 ms apart, as before.
+/// * [`AdapterReadyWait::Budget`]: attempts until the budget is spent (the
+///   last one cut to what is left), the delay doubling from 500 ms to at
+///   most 5 s. It gives up at the budget, not before it and not a full
+///   attempt after it.
+pub(crate) async fn wait_until_adapter_ready<F, Fut, L>(
+    wait: AdapterReadyWait,
+    mut probe: F,
+    mut on_failure: L,
+) -> std::result::Result<u32, AdapterNotReady>
+where
+    F: FnMut(std::time::Duration) -> Fut,
+    Fut: std::future::Future<Output = ReadyProbe>,
+    L: FnMut(u32, AdapterReadyFailure, &str),
+{
+    let deadline = match wait {
+        AdapterReadyWait::Fixed => None,
+        AdapterReadyWait::Budget(b) => {
+            let now = tokio::time::Instant::now();
+            Some(now.checked_add(b).unwrap_or_else(|| {
+                now + std::time::Duration::from_secs(MAX_ADAPTER_READY_TIMEOUT_SECS)
+            }))
+        }
+    };
+    let remaining = || deadline.map(|d| d.saturating_duration_since(tokio::time::Instant::now()));
+    let mut backoff = ADAPTER_READY_BACKOFF_START;
+    let mut attempts = 0u32;
+    let mut last = (
+        AdapterReadyFailure::Unreachable,
+        "no readiness attempt fit in the budget".to_string(),
+    );
+
+    loop {
+        let per_attempt = match remaining() {
+            Some(left) if left.is_zero() => break,
+            Some(left) => ADAPTER_READY_ATTEMPT_TIMEOUT.min(left),
+            None => ADAPTER_READY_ATTEMPT_TIMEOUT,
+        };
+        attempts += 1;
+        let outcome = match tokio::time::timeout(
+            per_attempt + ADAPTER_READY_TIMEOUT_SLACK,
+            probe(per_attempt),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                ReadyProbe::Unreachable(format!("no answer within {}ms", per_attempt.as_millis()))
+            }
+        };
+        last = match outcome {
+            ReadyProbe::Ready => return Ok(attempts),
+            ReadyProbe::NotReady(d) => (AdapterReadyFailure::NotReady, d),
+            ReadyProbe::Unreachable(d) => (AdapterReadyFailure::Unreachable, d),
+        };
+        on_failure(attempts, last.0, &last.1);
+        match remaining() {
+            None if attempts >= ADAPTER_READY_LEGACY_ATTEMPTS => break,
+            None => tokio::time::sleep(ADAPTER_READY_BACKOFF_START).await,
+            Some(left) => {
+                tokio::time::sleep(backoff.min(left)).await;
+                backoff = (backoff * 2).min(ADAPTER_READY_BACKOFF_CAP);
+            }
+        }
+    }
+    Err(AdapterNotReady {
+        kind: last.0,
+        detail: last.1,
+        attempts,
+        wait,
+    })
+}
+
+/// One `GET {adapter_url}/probe/ready` attempt.
+pub(crate) async fn probe_adapter_ready(
+    http: &reqwest::Client,
+    url: &str,
+    timeout: std::time::Duration,
+) -> ReadyProbe {
+    match http.get(url).timeout(timeout).send().await {
+        Ok(resp) if resp.status().is_success() => ReadyProbe::Ready,
+        Ok(resp) => ReadyProbe::NotReady(format!("HTTP {}", resp.status())),
+        Err(e) => ReadyProbe::Unreachable(e.to_string()),
+    }
+}
+
+/// Log the outcome of a readiness gate that needed more than one attempt or
+/// failed. The fixed gate logged every failed attempt; a budget logs once.
+pub(crate) fn log_adapter_ready_outcome(
+    adapter_url: &str,
+    started: tokio::time::Instant,
+    outcome: &std::result::Result<u32, AdapterNotReady>,
+) {
+    match outcome {
+        Ok(attempts) if *attempts > 1 => tracing::info!(
+            "scanner-adapter at {} became ready after {}ms ({} attempts)",
+            adapter_url,
+            started.elapsed().as_millis(),
+            attempts
+        ),
+        Ok(_) => {}
+        Err(failure) => tracing::warn!(
+            "scanner-adapter at {} is {}{}: {}",
+            adapter_url,
+            failure.kind.describe(),
+            failure.budget_note(),
+            failure.detail
+        ),
+    }
+}
+
+/// Env var naming the bearer token the backend sends on every
+/// scanner-adapter request (#5948), image and filesystem alike; also read as
+/// `TRIVY_ADAPTER_TOKEN_FILE` (a mounted secret, #4142). It matches the
+/// adapter's `SCANNER_SCAN_TOKEN` (or one line of its
+/// `SCANNER_SCAN_TOKENS_FILE`). The Harbor request body's
+/// `registry.authorization` stays the separate image-pull credential.
+pub(crate) const ADAPTER_TOKEN_ENV: &str = "TRIVY_ADAPTER_TOKEN";
+
+/// How the backend authenticates to the scanner-adapter. The token is held
+/// only as a sensitive header value: `Debug` never prints it, and it is never
+/// put in a log line or an error message.
+#[derive(Clone)]
+pub(crate) enum AdapterAuth {
+    /// No token configured: requests carry no `Authorization` header.
+    None,
+    /// `Authorization: Bearer <token>` on every request.
+    Bearer(reqwest::header::HeaderValue),
+    /// A token was configured but cannot be used (an unreadable or empty
+    /// `TRIVY_ADAPTER_TOKEN_FILE`, or characters a header cannot carry).
+    /// Every scan fails at the readiness gate with this reason rather than
+    /// going out unauthenticated. The text names the variable and the path,
+    /// never the value.
+    Unusable(String),
+}
+
+impl std::fmt::Debug for AdapterAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("AdapterAuth::None"),
+            Self::Bearer(_) => f.write_str("AdapterAuth::Bearer([redacted])"),
+            Self::Unusable(why) => write!(f, "AdapterAuth::Unusable({why})"),
+        }
+    }
+}
+
+impl AdapterAuth {
+    /// A bearer token. Surrounding whitespace is trimmed; an empty token
+    /// means no token.
+    pub(crate) fn bearer(token: &str) -> Self {
+        let token = token.trim();
+        if token.is_empty() {
+            return Self::None;
+        }
+        match reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
+            Ok(mut value) => {
+                value.set_sensitive(true);
+                Self::Bearer(value)
+            }
+            Err(_) => Self::Unusable(format!(
+                "{ADAPTER_TOKEN_ENV} contains characters an HTTP header cannot carry"
+            )),
+        }
+    }
+
+    /// Resolve [`ADAPTER_TOKEN_ENV`] / `TRIVY_ADAPTER_TOKEN_FILE`.
+    pub(crate) fn from_env() -> Self {
+        Self::resolve(crate::config::secret_or_env(ADAPTER_TOKEN_ENV))
+    }
+
+    fn resolve(found: std::result::Result<Option<String>, String>) -> Self {
+        let auth = match found {
+            Ok(Some(token)) => Self::bearer(&token),
+            Ok(None) => Self::None,
+            Err(why) => Self::Unusable(why),
+        };
+        if let Self::Unusable(why) = &auth {
+            tracing::error!("scanner-adapter token unusable; adapter scans will fail: {why}");
+        }
+        auth
+    }
+
+    /// Add the header to every request a client built from `builder` sends.
+    pub(crate) fn apply(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        match self {
+            Self::Bearer(value) => {
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(reqwest::header::AUTHORIZATION, value.clone());
+                builder.default_headers(headers)
+            }
+            Self::None | Self::Unusable(_) => builder,
+        }
+    }
+
+    /// The reason scans cannot be sent, if a configured token is unusable.
+    pub(crate) fn unusable(&self) -> Option<&str> {
+        match self {
+            Self::Unusable(why) => Some(why),
+            _ => None,
+        }
+    }
+}
+
+/// Body text of a non-success adapter response, for an error message. A 401
+/// gets a fixed text instead of whatever the adapter (or a proxy in front of
+/// it) sent back, so a reflected credential can never reach a scan error
+/// (#5948).
+pub(crate) async fn adapter_error_text(resp: reqwest::Response) -> String {
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return ADAPTER_UNAUTHORIZED_TEXT.to_string();
+    }
+    resp.text().await.unwrap_or_default()
+}
+
+/// What a scan error says when the adapter answers 401.
+pub(crate) const ADAPTER_UNAUTHORIZED_TEXT: &str =
+    "the scanner-adapter refused the request; check that TRIVY_ADAPTER_TOKEN matches \
+     the adapter's SCANNER_SCAN_TOKEN or a line of its SCANNER_SCAN_TOKENS_FILE";
 
 /// Which engine a trivy-based filesystem scanner drives: the legacy local CLI
 /// (back-compat for deployments that bundle `trivy` and set `TRIVY_URL`) or
@@ -445,6 +867,11 @@ struct FsScanSubmitResponse {
 /// the error-mapping contract.
 pub(crate) struct ScannerAdapterFsClient {
     adapter_url: String,
+    /// Bearer token sent on every request (#5948).
+    auth: AdapterAuth,
+    /// How long to wait for `/probe/ready` before a scan (#5945,
+    /// `SCANNER_ADAPTER_READY_TIMEOUT_SECS`).
+    ready_wait: AdapterReadyWait,
     http: reqwest::Client,
     /// Redirects disabled so a `302 Found` "report not ready" is observed
     /// rather than followed.
@@ -452,11 +879,6 @@ pub(crate) struct ScannerAdapterFsClient {
 }
 
 impl ScannerAdapterFsClient {
-    /// Readiness probe attempts before declaring the adapter unavailable.
-    const READY_ATTEMPTS: u32 = 3;
-    const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-    const READY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
-
     /// Wall-clock budget for polling the filesystem report. Sized above the
     /// adapter's 10m trivy filesystem timeout so a slow-but-live scan is not
     /// abandoned client-side first.
@@ -465,19 +887,28 @@ impl ScannerAdapterFsClient {
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
     pub fn new(adapter_url: String) -> Self {
+        Self::with_auth(adapter_url, AdapterAuth::from_env())
+    }
+
+    /// Build a client that authenticates with `auth` (#5948).
+    pub(crate) fn with_auth(adapter_url: String, auth: AdapterAuth) -> Self {
         Self {
             adapter_url,
-            http: crate::services::http_client::internal_service_client_builder()
+            ready_wait: initial_adapter_ready_wait(),
+            http: auth
+                .apply(crate::services::http_client::internal_service_client_builder())
                 // Generous: the body is the tarred workspace, potentially GBs
                 // for an incus rootfs.
                 .timeout(std::time::Duration::from_secs(900))
                 .build()
                 .unwrap_or_default(),
-            poll_http: crate::services::http_client::internal_service_client_builder()
+            poll_http: auth
+                .apply(crate::services::http_client::internal_service_client_builder())
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_default(),
+            auth,
         }
     }
 
@@ -496,6 +927,14 @@ impl ScannerAdapterFsClient {
         .await
     }
 
+    /// [`Self::unavailable`] for an adapter that is unreachable or not ready,
+    /// which a queued scan retries once it is back (#5994). A no-op signal for
+    /// an in-process scan. Misconfiguration (an unusable token) is not this.
+    fn unreachable(&self, detail: impl std::fmt::Display) -> AppError {
+        crate::services::scan_queue::note_engine_unavailable();
+        self.unavailable(detail)
+    }
+
     /// Availability-class error: the sidecar is down/unready, which degrades
     /// the scan to `not_applicable` (#2324) instead of failing it closed.
     fn unavailable(&self, detail: impl std::fmt::Display) -> AppError {
@@ -506,36 +945,58 @@ impl ScannerAdapterFsClient {
         ))
     }
 
-    /// Gate on `/probe/ready` with bounded retries. Any failure here is an
-    /// availability state, not a scan failure.
+    /// Override the readiness wait (tests).
+    #[cfg(test)]
+    pub(crate) fn with_ready_wait(mut self, wait: AdapterReadyWait) -> Self {
+        self.ready_wait = wait;
+        self
+    }
+
+    /// Gate on `/probe/ready`: three attempts, or within
+    /// `SCANNER_ADAPTER_READY_TIMEOUT_SECS` when set (#5945). Any failure
+    /// here is an availability state, not a scan failure.
     async fn ensure_ready(&self) -> Result<()> {
-        let url = format!("{}/probe/ready", self.adapter_url);
-        let mut last: Option<String> = None;
-
-        for attempt in 1..=Self::READY_ATTEMPTS {
-            let outcome = self
-                .http
-                .get(&url)
-                .timeout(Self::READY_TIMEOUT)
-                .send()
-                .await;
-            match outcome {
-                Ok(resp) if resp.status().is_success() => return Ok(()),
-                Ok(resp) => last = Some(format!("not ready (HTTP {})", resp.status())),
-                Err(e) => last = Some(format!("unreachable ({})", e)),
-            }
-            tracing::warn!(
-                "scanner-adapter fs readiness attempt {}/{} failed: {}",
-                attempt,
-                Self::READY_ATTEMPTS,
-                last.as_deref().unwrap_or("unknown")
-            );
-            if attempt < Self::READY_ATTEMPTS {
-                tokio::time::sleep(Self::READY_BACKOFF).await;
-            }
+        if let Some(why) = self.auth.unusable() {
+            return Err(self.unavailable(why));
         }
-
-        Err(self.unavailable(last.unwrap_or_else(|| "readiness probe failed".to_string())))
+        let url = format!("{}/probe/ready", self.adapter_url);
+        let wait = effective_ready_wait(self.ready_wait);
+        let fixed = wait == AdapterReadyWait::Fixed;
+        let started = tokio::time::Instant::now();
+        let outcome = wait_until_adapter_ready(
+            wait,
+            |t| probe_adapter_ready(&self.http, &url, t),
+            |attempt, kind, detail| {
+                if fixed {
+                    tracing::warn!(
+                        "scanner-adapter fs readiness attempt {}/{} failed: {} ({})",
+                        attempt,
+                        ADAPTER_READY_LEGACY_ATTEMPTS,
+                        kind.describe(),
+                        detail
+                    );
+                } else {
+                    tracing::debug!(
+                        "scanner-adapter fs readiness attempt {} failed: {} ({})",
+                        attempt,
+                        kind.describe(),
+                        detail
+                    );
+                }
+            },
+        )
+        .await;
+        if !fixed {
+            log_adapter_ready_outcome(&self.adapter_url, started, &outcome);
+        }
+        outcome.map(|_| ()).map_err(|f| {
+            self.unreachable(format!(
+                "{}{} ({})",
+                f.kind.describe(),
+                f.budget_note(),
+                f.detail
+            ))
+        })
     }
 
     /// POST the tar body; returns the adapter-assigned job id. Transport
@@ -543,21 +1004,27 @@ impl ScannerAdapterFsClient {
     /// not a valid accepted job is fail-closed `Internal`.
     async fn submit(&self, tar: bytes::Bytes) -> Result<String> {
         let url = format!("{}/api/v1/filesystem/scan", self.adapter_url);
-        let resp = self
+        let mut req = self
             .http
             .post(&url)
-            .header(reqwest::header::CONTENT_TYPE, "application/x-tar")
+            .header(reqwest::header::CONTENT_TYPE, "application/x-tar");
+        // #5947: a DB-update rescan asks the adapter for its background band.
+        if crate::services::scan_queue::in_background_band() {
+            let (name, value) = crate::services::scan_queue::BACKGROUND_PRIORITY_HEADER;
+            req = req.header(name, value);
+        }
+        let resp = req
             .body(tar)
             .send()
             .await
-            .map_err(|e| self.unavailable(format!("workspace upload failed: {}", e)))?;
+            .map_err(|e| self.unreachable(format!("workspace upload failed: {}", e)))?;
 
         let status = resp.status();
         if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-            return Err(self.unavailable("adapter answered 503 on submit"));
+            return Err(self.unreachable("adapter answered 503 on submit"));
         }
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
+            let text = adapter_error_text(resp).await;
             return Err(AppError::Internal(format!(
                 "Scanner-adapter rejected the filesystem scan submit with {}: {}",
                 status, text
@@ -612,7 +1079,7 @@ impl ScannerAdapterFsClient {
                             tokio::time::sleep(wait).await;
                             continue;
                         }
-                        None => return Err(self.unavailable(detail).into()),
+                        None => return Err(self.unreachable(detail).into()),
                     }
                 }
             };
@@ -628,7 +1095,7 @@ impl ScannerAdapterFsClient {
                 });
             }
             if status != reqwest::StatusCode::FOUND {
-                let text = resp.text().await.unwrap_or_default();
+                let text = adapter_error_text(resp).await;
                 return Err(AdapterAttemptError {
                     resubmit: AdapterResubmit::classify(status, &text),
                     error: AppError::Internal(format!(
@@ -768,6 +1235,447 @@ mod tests {
     use wiremock::matchers::{method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    // ---- readiness wait (#5945) ---------------------------------------
+
+    /// A probe for an adapter that turns ready `after` the first attempt.
+    /// `holding` models a request-holding proxy in front of an adapter
+    /// scaled to zero: each probe hangs until the adapter is up (and is cut
+    /// by the per-attempt timeout); otherwise the adapter answers 503 until
+    /// then.
+    fn adapter_ready_after(
+        after: std::time::Duration,
+        holding: bool,
+    ) -> impl FnMut(
+        std::time::Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ReadyProbe>>> {
+        let up_at = tokio::time::Instant::now() + after;
+        move |timeout| {
+            Box::pin(async move {
+                let now = tokio::time::Instant::now();
+                if now >= up_at {
+                    ReadyProbe::Ready
+                } else if holding {
+                    // Like reqwest: give up at the attempt's own timeout.
+                    tokio::time::sleep_until(up_at.min(now + timeout)).await;
+                    if tokio::time::Instant::now() >= up_at {
+                        ReadyProbe::Ready
+                    } else {
+                        ReadyProbe::Unreachable("operation timed out".to_string())
+                    }
+                } else {
+                    ReadyProbe::NotReady("HTTP 503 Service Unavailable".to_string())
+                }
+            })
+        }
+    }
+
+    fn secs(n: u64) -> std::time::Duration {
+        std::time::Duration::from_secs(n)
+    }
+
+    fn budget(n: u64) -> AdapterReadyWait {
+        AdapterReadyWait::Budget(secs(n))
+    }
+
+    fn no_log(_: u32, _: AdapterReadyFailure, _: &str) {}
+
+    #[test]
+    fn test_ready_wait_parsing() {
+        // Unset, empty or invalid: the fixed gate, exactly as before.
+        assert_eq!(parse_adapter_ready_wait(None), AdapterReadyWait::Fixed);
+        for bad in ["", "  ", "0", "-5", "ten", "1.5"] {
+            assert_eq!(
+                parse_adapter_ready_wait(Some(bad)),
+                AdapterReadyWait::Fixed,
+                "{bad:?}"
+            );
+        }
+        assert_eq!(parse_adapter_ready_wait(Some(" 60 ")), budget(60));
+        assert_eq!(parse_adapter_ready_wait(Some("16")), budget(16));
+    }
+
+    /// Compatibility: with the variable unset the gate is the earlier one,
+    /// attempt for attempt: three probes 500 ms apart, failing after about
+    /// 1 s against an adapter that answers 503 and after 16 s against one
+    /// that never answers (three 5 s timeouts).
+    #[tokio::test(start_paused = true)]
+    async fn test_unset_keeps_the_fixed_three_attempt_gate() {
+        for (holding, took, kind) in [
+            (
+                false,
+                std::time::Duration::from_millis(1000),
+                AdapterReadyFailure::NotReady,
+            ),
+            (
+                true,
+                std::time::Duration::from_millis(16_000),
+                AdapterReadyFailure::Unreachable,
+            ),
+        ] {
+            let mut seen = Vec::new();
+            let start = tokio::time::Instant::now();
+            let err = wait_until_adapter_ready(
+                AdapterReadyWait::Fixed,
+                adapter_ready_after(secs(100_000), holding),
+                |n, k, _| seen.push((n, k)),
+            )
+            .await
+            .expect_err("never ready must fail");
+            assert_eq!(start.elapsed(), took, "holding={holding}");
+            assert_eq!(err.attempts, 3);
+            assert_eq!(err.kind, kind);
+            assert_eq!(seen, vec![(1, kind), (2, kind), (3, kind)]);
+            // The error text carries no budget wording.
+            assert_eq!(err.budget_note(), "");
+        }
+        // And a slow start inside those 16 s still passes, as before.
+        wait_until_adapter_ready(
+            AdapterReadyWait::Fixed,
+            adapter_ready_after(secs(8), true),
+            no_log,
+        )
+        .await
+        .expect("ready on the second attempt");
+    }
+
+    /// A huge value is clamped to the ceiling instead of overflowing the
+    /// deadline (which panicked every scan).
+    #[tokio::test(start_paused = true)]
+    async fn test_huge_ready_timeout_is_clamped_and_never_panics() {
+        for raw in ["18446744073709551615", "9300000000000000000", "3601"] {
+            assert_eq!(
+                parse_adapter_ready_wait(Some(raw)),
+                budget(MAX_ADAPTER_READY_TIMEOUT_SECS),
+                "{raw}"
+            );
+        }
+        assert_eq!(parse_adapter_ready_wait(Some("3600")), budget(3600));
+        // Even an unclamped duration that overflows the clock does not panic.
+        let attempts = wait_until_adapter_ready(
+            AdapterReadyWait::Budget(std::time::Duration::MAX),
+            |_| async { ReadyProbe::Ready },
+            no_log,
+        )
+        .await
+        .expect("ready");
+        assert_eq!(attempts, 1);
+        let err = wait_until_adapter_ready(
+            AdapterReadyWait::Budget(std::time::Duration::MAX),
+            adapter_ready_after(secs(100_000), false),
+            no_log,
+        );
+        let started = tokio::time::Instant::now();
+        let err = err.await.expect_err("never ready");
+        assert_eq!(started.elapsed(), secs(MAX_ADAPTER_READY_TIMEOUT_SECS));
+        assert_eq!(err.kind, AdapterReadyFailure::NotReady);
+    }
+
+    /// The probe's own timeout (reqwest's, in production) answers a hanging
+    /// adapter, not the outer guard, so the fixed gate's error text is the
+    /// one it always had.
+    #[tokio::test(start_paused = true)]
+    async fn test_probe_timeout_wins_over_outer_guard() {
+        let err = wait_until_adapter_ready(
+            AdapterReadyWait::Fixed,
+            // reqwest notices its own timeout a little late (scheduling);
+            // the outer guard's slack must cover that, or it answers first
+            // with different text.
+            |timeout| async move {
+                tokio::time::sleep(timeout + std::time::Duration::from_millis(50)).await;
+                ReadyProbe::Unreachable("error sending request: operation timed out".to_string())
+            },
+            no_log,
+        )
+        .await
+        .expect_err("hangs");
+        assert_eq!(err.detail, "error sending request: operation timed out");
+    }
+
+    /// Inline proxy scans keep the fixed gate whatever the configured wait.
+    #[tokio::test]
+    async fn test_fixed_ready_gate_scope() {
+        assert_eq!(effective_ready_wait(budget(60)), budget(60));
+        let inside = with_fixed_ready_gate(async { effective_ready_wait(budget(60)) }).await;
+        assert_eq!(inside, AdapterReadyWait::Fixed);
+        assert_eq!(effective_ready_wait(budget(60)), budget(60));
+    }
+
+    /// The issue's case: an adapter that turns ready after 25 s passes the
+    /// gate with a 60 s budget and fails it with the default, whether it
+    /// answers 503 meanwhile or a proxy holds the probe.
+    #[tokio::test(start_paused = true)]
+    async fn test_ready_after_25s_passes_60s_budget_fails_default() {
+        let after = secs(25);
+        for holding in [false, true] {
+            let start = tokio::time::Instant::now();
+            wait_until_adapter_ready(budget(60), adapter_ready_after(after, holding), no_log)
+                .await
+                .unwrap_or_else(|e| panic!("holding={holding}: 60s budget must pass: {e:?}"));
+            let took = start.elapsed();
+            assert!(
+                took >= after,
+                "holding={holding}: ready before it was up: {took:?}"
+            );
+            // Capped backoff: never more than one 5 s step late.
+            assert!(
+                took <= after + secs(5),
+                "holding={holding}: noticed readiness late: {took:?}"
+            );
+
+            for default in [AdapterReadyWait::Fixed, parse_adapter_ready_wait(None)] {
+                let start = tokio::time::Instant::now();
+                let err =
+                    wait_until_adapter_ready(default, adapter_ready_after(after, holding), no_log)
+                        .await
+                        .expect_err("the default gate must fail as before");
+                assert!(start.elapsed() <= secs(16), "holding={holding}");
+                let want = if holding {
+                    AdapterReadyFailure::Unreachable
+                } else {
+                    AdapterReadyFailure::NotReady
+                };
+                assert_eq!(err.kind, want, "holding={holding}");
+            }
+        }
+    }
+
+    /// A never-ready adapter fails at the budget: not earlier, not later.
+    #[tokio::test(start_paused = true)]
+    async fn test_never_ready_fails_at_budget() {
+        for n in [1u64, 16, 60, 300] {
+            for holding in [false, true] {
+                let start = tokio::time::Instant::now();
+                let err = wait_until_adapter_ready(
+                    budget(n),
+                    adapter_ready_after(secs(100_000), holding),
+                    no_log,
+                )
+                .await
+                .expect_err("never ready must fail");
+                assert_eq!(start.elapsed(), secs(n), "budget={n}s holding={holding}");
+                assert!(err.attempts >= 1);
+                assert_eq!(err.wait, budget(n));
+            }
+        }
+    }
+
+    /// The failure names the kind and, under a budget, the knob; the metric
+    /// reasons are the ones the metric has always used.
+    #[tokio::test(start_paused = true)]
+    async fn test_not_ready_note_and_metric_reason() {
+        let err = wait_until_adapter_ready(
+            budget(3),
+            |_| async { ReadyProbe::NotReady("HTTP 503".to_string()) },
+            no_log,
+        )
+        .await
+        .unwrap_err();
+        let note = err.budget_note();
+        assert!(
+            note.starts_with(" after waiting 3s for readiness"),
+            "{note}"
+        );
+        assert!(
+            note.contains("SCANNER_ADAPTER_READY_TIMEOUT_SECS"),
+            "{note}"
+        );
+        assert_eq!(err.kind.describe(), "not ready");
+        assert_eq!(err.kind.metric_reason(), "unhealthy");
+        assert_eq!(
+            AdapterReadyFailure::Unreachable.metric_reason(),
+            "unreachable"
+        );
+    }
+
+    /// Compatibility: the fixed gate's fs error text is the earlier one.
+    #[tokio::test]
+    async fn test_fs_fixed_gate_error_text_unchanged() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/probe/ready"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let err = ScannerAdapterFsClient::new(server.uri())
+            .with_ready_wait(AdapterReadyWait::Fixed)
+            .scan_workspace_tar(tiny_tar())
+            .await
+            .expect_err("not ready");
+        assert_eq!(
+            err.to_string(),
+            AppError::ScannerEngineUnavailable(format!(
+                "Trivy scanner-adapter at {} is unavailable for filesystem scans: \
+                 not ready (HTTP 503 Service Unavailable). Grype continues to cover these artifacts.",
+                server.uri()
+            ))
+            .to_string()
+        );
+    }
+
+    /// The filesystem path through the adapter waits within the same budget.
+    #[tokio::test]
+    async fn test_fs_scan_waits_for_slow_start_within_budget() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/probe/ready"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        mount_fs_scan_success(
+            &server,
+            "fs-slow",
+            serde_json::json!({"report": {"Results": []}, "stderr": ""}),
+        )
+        .await;
+        ScannerAdapterFsClient::new(server.uri())
+            .with_ready_wait(budget(10))
+            .scan_workspace_tar(tiny_tar())
+            .await
+            .expect("a slow start inside the budget must not fail the fs scan");
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/probe/ready"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let err = ScannerAdapterFsClient::new(server.uri())
+            .with_ready_wait(budget(1))
+            .scan_workspace_tar(tiny_tar())
+            .await
+            .expect_err("not ready within the budget");
+        match err {
+            AppError::ScannerEngineUnavailable(msg) => {
+                assert!(msg.contains("not ready after waiting 1s"), "{msg}")
+            }
+            other => panic!("expected ScannerEngineUnavailable, got {other:?}"),
+        }
+    }
+
+    // ---- adapter bearer token (#5948) ---------------------------------
+
+    const FS_TOKEN_5948: &str = "tok-5948-fs-9876543210";
+
+    #[test]
+    fn test_adapter_auth_resolution_and_redaction() {
+        assert!(matches!(AdapterAuth::resolve(Ok(None)), AdapterAuth::None));
+        assert!(matches!(AdapterAuth::bearer("   "), AdapterAuth::None));
+        let auth = AdapterAuth::resolve(Ok(Some(format!("  {FS_TOKEN_5948}\n"))));
+        match &auth {
+            AdapterAuth::Bearer(v) => {
+                assert!(v.is_sensitive());
+                assert_eq!(v.to_str().unwrap(), format!("Bearer {FS_TOKEN_5948}"));
+            }
+            other => panic!("expected Bearer, got {other:?}"),
+        }
+        assert!(!format!("{auth:?}").contains(FS_TOKEN_5948));
+        let broken = AdapterAuth::resolve(Err(
+            "TRIVY_ADAPTER_TOKEN_FILE points at /nope, but the file could not be read".into(),
+        ));
+        assert!(broken.unusable().unwrap().contains("/nope"));
+        let bad = AdapterAuth::bearer("line\nbreak");
+        assert!(bad.unusable().is_some());
+        assert!(!format!("{bad:?}").contains("break"));
+    }
+
+    /// The `_FILE` form (#4142) reaches the header.
+    #[test]
+    fn test_adapter_token_file_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("adapter-token");
+        std::fs::write(&file, format!("{FS_TOKEN_5948}\n")).unwrap();
+        let var = "TEST_ADAPTER_TOKEN_5948";
+        // A variable name no other test uses.
+        std::env::remove_var(var);
+        std::env::set_var(format!("{var}_FILE"), &file);
+        let auth = AdapterAuth::resolve(crate::config::secret_or_env(var));
+        std::env::remove_var(format!("{var}_FILE"));
+        match auth {
+            AdapterAuth::Bearer(v) => {
+                assert_eq!(v.to_str().unwrap(), format!("Bearer {FS_TOKEN_5948}"))
+            }
+            other => panic!("expected Bearer, got {other:?}"),
+        }
+    }
+
+    /// Filesystem scans send the token on the probe, the upload and the
+    /// polls; a refused token fails the scan and stays out of the error.
+    #[tokio::test]
+    async fn test_fs_requests_carry_bearer_token() {
+        use wiremock::matchers::header;
+        let bearer = format!("Bearer {FS_TOKEN_5948}");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/probe/ready"))
+            .and(header("authorization", bearer.as_str()))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/filesystem/scan"))
+            .and(header("authorization", bearer.as_str()))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({"id": "f1"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/v1/filesystem/scan/.+/report$"))
+            .and(header("authorization", bearer.as_str()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"report": {"Results": []}, "stderr": ""})),
+            )
+            .mount(&server)
+            .await;
+        ScannerAdapterFsClient::with_auth(server.uri(), AdapterAuth::bearer(FS_TOKEN_5948))
+            .scan_workspace_tar(tiny_tar())
+            .await
+            .expect("an authenticated fs scan must complete");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        for r in &requests {
+            assert_eq!(
+                r.headers.get("authorization").and_then(|v| v.to_str().ok()),
+                Some(bearer.as_str())
+            );
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/probe/ready"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/filesystem/scan"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("invalid token wrong-one"))
+            .mount(&server)
+            .await;
+        let err = ScannerAdapterFsClient::with_auth(server.uri(), AdapterAuth::bearer("wrong-one"))
+            .scan_workspace_tar(tiny_tar())
+            .await
+            .expect_err("a refused token fails the fs scan");
+        let msg = err.to_string();
+        assert!(msg.contains("401"), "{msg}");
+        assert!(msg.contains(ADAPTER_UNAUTHORIZED_TEXT), "{msg}");
+        assert!(!msg.contains("wrong-one"), "{msg}");
+
+        let err = ScannerAdapterFsClient::with_auth(
+            server.uri(),
+            AdapterAuth::Unusable(
+                "TRIVY_ADAPTER_TOKEN_FILE points at /x, but the file is empty".into(),
+            ),
+        )
+        .scan_workspace_tar(tiny_tar())
+        .await
+        .expect_err("an unusable token fails before any request");
+        assert!(
+            matches!(err, AppError::ScannerEngineUnavailable(_)),
+            "{err:?}"
+        );
+    }
+
     fn tiny_tar() -> Vec<u8> {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("composer.lock"), b"{}").unwrap();
@@ -821,6 +1729,39 @@ mod tests {
         );
     }
 
+    /// #5947: a background-band upload carries `X-Scan-Priority: background`;
+    /// an ordinary one carries no priority header.
+    #[tokio::test]
+    async fn test_fs_upload_priority_header_only_in_the_background_band() {
+        let body = serde_json::json!({ "report": {"Results": []} });
+        for background in [false, true] {
+            let server = MockServer::start().await;
+            mount_fs_scan_success(&server, "fs-prio", body.clone()).await;
+            let client = ScannerAdapterFsClient::new(server.uri());
+            let scan = client.scan_workspace_tar(tiny_tar());
+            if background {
+                crate::services::scan_queue::in_background(scan)
+                    .await
+                    .expect("scan");
+            } else {
+                scan.await.expect("scan");
+            }
+            let requests = server.received_requests().await.unwrap_or_default();
+            let submit = requests
+                .iter()
+                .find(|r| r.method == wiremock::http::Method::POST)
+                .expect("an upload");
+            assert_eq!(
+                submit
+                    .headers
+                    .get("x-scan-priority")
+                    .and_then(|v| v.to_str().ok()),
+                background.then_some("background"),
+                "background={background}"
+            );
+        }
+    }
+
     /// An unreachable adapter is an availability state: the scan must degrade
     /// (ScannerEngineUnavailable -> not_applicable, #2324), NOT fail closed.
     #[tokio::test]
@@ -831,6 +1772,19 @@ mod tests {
             matches!(err, AppError::ScannerEngineUnavailable(_)),
             "unreachable adapter must be ScannerEngineUnavailable, got {err:?}"
         );
+    }
+
+    /// #5994: an unreachable adapter on the filesystem path also reports the
+    /// engine unavailable, so a queued scan retries it like an image scan.
+    #[tokio::test]
+    async fn test_unreachable_adapter_reports_the_engine_unavailable() {
+        let client = ScannerAdapterFsClient::new("http://127.0.0.1:1".to_string());
+        let (result, unavailable) = crate::services::scan_queue::tracking_engine_unavailable(
+            client.scan_workspace_tar(tiny_tar()),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::ScannerEngineUnavailable(_))));
+        assert!(unavailable);
     }
 
     /// A 503 from /probe/ready (adapter starting / DB not loaded) is also an

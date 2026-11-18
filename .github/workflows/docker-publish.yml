@@ -111,6 +111,22 @@ permissions: {}
 # - The group is keyed by `event_name` + `ref` so push and workflow_dispatch
 #   for the same branch are in DIFFERENT groups. A manual run (`workflow_dispatch`)
 #   never gets cancelled by an auto run, and vice versa.
+# - A BRANCH PUSH is additionally keyed by its commit (#6080): every pushed
+#   commit is a group of its own. GitHub keeps only ONE pending run per group
+#   and a newer one REPLACES it, so in a per-ref group a merge landing while
+#   the previous commit's run was still waiting cancelled that run outright
+#   (zero jobs, no `sha-<sha>` images). When that commit was a Release
+#   Candidate the candidate died with it (57a8ac57, 2026-11-10), which is why
+#   every cut needed a merge freeze on main; and a run stuck queued with no
+#   runner held the group for every later commit (ea9425b6, 75 min). Per
+#   commit, neither can happen. The order the per-ref queue used to impose on
+#   the branch's floating tags (`:main`, `:dev`, `:X.Y-dev`) is kept by
+#   scripts/ci/decide-branch-floating-tags.sh in each merge job instead: a run
+#   whose commit is older than the one those tags already name publishes its
+#   `sha-<sha>` tag and leaves them alone. Tag pushes, dispatches (the
+#   promote) and the schedule keep their per-ref groups.
+#   .github/workflows/docker-publish-watchdog.yml cancels, loudly, any run
+#   that is still queued with no runner after 30 minutes.
 # - `cancel-in-progress` is ALWAYS false. Runs queue behind each other and
 #   every one of them finishes.
 #
@@ -135,7 +151,7 @@ permissions: {}
 # those minutes by gambling that the *next* run completes — and when merges
 # arrive faster than the amd64 build takes, that gamble loses every time.
 concurrency:
-  group: docker-publish-${{ github.event_name }}-${{ github.ref }}
+  group: docker-publish-${{ github.event_name }}-${{ github.ref }}${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')) && format('-{0}', github.sha) || '' }}
   cancel-in-progress: false
 
 env:
@@ -346,13 +362,11 @@ jobs:
             # copies) while the certified commit may live on a maintenance
             # branch. Deriving it here rather than accepting it as an input is
             # the point: an attacker who could name the branch would only have
-            # to put their version in Cargo.toml. The same call refuses a
-            # commit whose release-candidate.yml is not byte-identical to a
-            # copy that lives on main.
+            # to put their version in Cargo.toml.
             rc=0
             resolved="$(GITHUB_OUTPUT='' scripts/ci/resolve-certified-ref.sh "$SRC")" || rc=$?
             if [[ "$rc" -ne 0 ]]; then
-              echo "::error title=promote_source_sha is on no releasable branch::${SRC} is on neither main nor the maintenance branch its Cargo.toml names, or its release-candidate.yml is not a copy that lives on main (resolver exit ${rc}; its message is above). Nothing is promoted."
+              echo "::error title=promote_source_sha is on no releasable branch::${SRC} is on neither main nor the maintenance branch its Cargo.toml names (resolver exit ${rc}; its message is above). Nothing is promoted."
               exit 1
             fi
             SRC_BRANCH="$(sed -n 's/^certified_branch=//p' <<<"$resolved" | head -1)"
@@ -545,10 +559,15 @@ jobs:
           # docker/Dockerfile.backend): 4 on both, each runner's core count.
           # The job count does not change the output; the profile, LTO and
           # codegen units are the same on both legs.
+          # amd64 runs on the self-hosted ak-beefy-runners scale set (dind
+          # limit 32Gi): the fat-LTO link of the 1.12 backend peaks near 18 GB
+          # and repeatedly cost the 16 GB hosted runner its heartbeat
+          # ("lost communication") even with the 20 GiB swapfile. Docker
+          # Publish has no pull_request trigger, so no fork code reaches it.
           - platform: linux/amd64
-            runner: ubuntu-24.04
+            runner: ak-beefy-runners
             cache-tag: amd64
-            cargo-build-jobs: 4
+            cargo-build-jobs: 8
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
             cache-tag: arm64
@@ -591,6 +610,30 @@ jobs:
       # hosted runners used to have. The current ubuntu-24.04 image has a
       # 145 GB root with 86 GB free before the build (run 42089930178), and
       # the arm64 leg never needed it.
+
+      # The release-profile compile of the artifact-keeper-backend lib (one
+      # codegen unit, opt-level 3, linker-plugin LTO) is one rustc that no
+      # longer fits the hosted amd64 VM's ~15 GiB of RAM and 2-3 GiB of
+      # swapfile: runs 43673124373 and 43677325227 on main were SIGKILLed
+      # 6.3 min into that crate (buildx `ResourceExhausted`). setup-buildx
+      # uses the docker-container driver with no memory limit, so BuildKit
+      # compiles in the host's memory and host swap applies. The root disk
+      # has ~86 GB free (see above), so add 20 GiB of swap on it before the
+      # build. Best effort: a failure is a ::warning::, never a red job. It
+      # also runs on arm64, where it is harmless.
+      - name: Add swap
+        run: |
+          if sudo fallocate -l 20G /ak-ci-swapfile \
+             && sudo chmod 600 /ak-ci-swapfile \
+             && sudo mkswap /ak-ci-swapfile >/dev/null \
+             && sudo swapon /ak-ci-swapfile; then
+            echo "added a 20 GiB swapfile"
+          else
+            echo "::warning title=No extra swap::could not add /ak-ci-swapfile; this build runs with the image's default swap only."
+          fi
+          swapon --show
+          free -m
+          df -h / | tail -1
 
       - name: Build and push by digest
         id: build
@@ -639,6 +682,14 @@ jobs:
             CARGO_BUILD_JOBS=${{ matrix.cargo-build-jobs }}
             CARGO_FEATURES=jemalloc
 
+      # Report only, so the next run shows how much of the swap the build used.
+      - name: Memory and disk report
+        if: always()
+        run: |
+          swapon --show
+          free -m
+          df -h / | tail -1
+
       - name: Export digest
         run: |
           mkdir -p /tmp/digests
@@ -666,9 +717,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Runner split as in build-backend.
+          # amd64 builds in a throwaway per-job KVM VM (`ak-vm`, #6072,
+          # docs/ci/vm-runners.md) instead of the privileged dind sidecar of
+          # ak-docker-runners: the job gets its own kernel and dockerd, and
+          # the VM and its disk are destroyed after the job. Signing and
+          # attestation happen later in merge-*, on GitHub-hosted runners,
+          # unchanged. arm64 stays as in build-backend.
           - platform: linux/amd64
-            runner: ak-docker-runners
+            runner: ak-vm
             cache-tag: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
@@ -749,9 +805,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Runner split as in build-backend.
+          # amd64 builds in a throwaway per-job KVM VM (`ak-vm`, #6072,
+          # docs/ci/vm-runners.md) instead of the privileged dind sidecar of
+          # ak-docker-runners: the job gets its own kernel and dockerd, and
+          # the VM and its disk are destroyed after the job. Signing and
+          # attestation happen later in merge-*, on GitHub-hosted runners,
+          # unchanged. arm64 stays as in build-backend.
           - platform: linux/amd64
-            runner: ak-docker-runners
+            runner: ak-vm
             cache-tag: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
@@ -1427,6 +1488,20 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # BRANCH FLOATING TAGS STAY MONOTONIC (#6080). Push runs no longer
+      # queue per branch, so an older commit's run can finish after a newer
+      # one's. This reads the commit `:dev` / `:X.Y-dev` already names for
+      # this image; when that commit is NEWER than this one, the branch tags
+      # are left off the tag sets below and only `sha-<sha>` is published.
+      # Any doubt means "move", which is the behaviour before the guard.
+      - name: Decide whether this run may move the branch floating tags
+        id: floating
+        if: ${{ env.PROMOTE_VERSION == '' && startsWith(github.ref, 'refs/heads/') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci/decide-branch-floating-tags.sh "${{ env.BACKEND_IMAGE }}"
+
       - name: Extract metadata (ghcr.io)
         id: meta
         if: ${{ env.PROMOTE_VERSION == '' }}
@@ -1434,12 +1509,12 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
           tags: |
-            type=ref,event=branch
+            type=ref,event=branch,enable=${{ steps.floating.outputs.move != 'false' }}
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=sha
-            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') && steps.floating.outputs.move != 'false' }}
+            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' && steps.floating.outputs.move != 'false' }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       - name: Extract metadata (Docker Hub)
@@ -1449,12 +1524,12 @@ jobs:
         with:
           images: docker.io/${{ env.DOCKERHUB_BACKEND }}
           tags: |
-            type=ref,event=branch
+            type=ref,event=branch,enable=${{ steps.floating.outputs.move != 'false' }}
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=sha
-            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') && steps.floating.outputs.move != 'false' }}
+            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' && steps.floating.outputs.move != 'false' }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       # Resolve, for BOTH modes, the full ghcr + Docker Hub tag sets and the
@@ -1834,6 +1909,20 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # BRANCH FLOATING TAGS STAY MONOTONIC (#6080). Push runs no longer
+      # queue per branch, so an older commit's run can finish after a newer
+      # one's. This reads the commit `:dev` / `:X.Y-dev` already names for
+      # this image; when that commit is NEWER than this one, the branch tags
+      # are left off the tag sets below and only `sha-<sha>` is published.
+      # Any doubt means "move", which is the behaviour before the guard.
+      - name: Decide whether this run may move the branch floating tags
+        id: floating
+        if: ${{ env.PROMOTE_VERSION == '' && startsWith(github.ref, 'refs/heads/') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci/decide-branch-floating-tags.sh "${{ env.OPENSCAP_IMAGE }}"
+
       - name: Extract metadata (ghcr.io)
         id: meta
         if: ${{ env.PROMOTE_VERSION == '' }}
@@ -1841,12 +1930,12 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}
           tags: |
-            type=ref,event=branch
+            type=ref,event=branch,enable=${{ steps.floating.outputs.move != 'false' }}
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=sha
-            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') && steps.floating.outputs.move != 'false' }}
+            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' && steps.floating.outputs.move != 'false' }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       - name: Extract metadata (Docker Hub)
@@ -1856,12 +1945,12 @@ jobs:
         with:
           images: docker.io/${{ env.DOCKERHUB_OPENSCAP }}
           tags: |
-            type=ref,event=branch
+            type=ref,event=branch,enable=${{ steps.floating.outputs.move != 'false' }}
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=sha
-            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') && steps.floating.outputs.move != 'false' }}
+            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' && steps.floating.outputs.move != 'false' }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       # See merge-backend for the full rationale of the plan/anchor/guard/apply/
@@ -2240,6 +2329,20 @@ jobs:
           echo "Keeping the exact ${ADAPTER_VERSION} tag on its published digest; this rebuild publishes sha tags only. The floating tags name the published ${ADAPTER_VERSION} digest and move only through the post-gate promotion (#3770)."
           finish
 
+      # BRANCH FLOATING TAGS STAY MONOTONIC (#6080). Push runs no longer
+      # queue per branch, so an older commit's run can finish after a newer
+      # one's. This reads the commit `:dev` / `:X.Y-dev` already names for
+      # this image; when that commit is NEWER than this one, the branch tags
+      # are left off the tag sets below and only `sha-<sha>` is published.
+      # Any doubt means "move", which is the behaviour before the guard.
+      - name: Decide whether this run may move the branch floating tags
+        id: floating
+        if: ${{ env.PROMOTE_VERSION == '' && startsWith(github.ref, 'refs/heads/') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci/decide-branch-floating-tags.sh "${{ env.SCANNER_ADAPTER_IMAGE }}"
+
       - name: Extract metadata (ghcr.io)
         id: meta
         if: ${{ env.PROMOTE_VERSION == '' }}
@@ -2255,8 +2358,8 @@ jobs:
           tags: |
             type=raw,value=${{ steps.adapter_version.outputs.version }},enable=${{ steps.adapter_publish.outputs.publish_exact == 'true' }}
             type=sha
-            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') && steps.floating.outputs.move != 'false' }}
+            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' && steps.floating.outputs.move != 'false' }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       - name: Extract metadata (Docker Hub)
@@ -2271,8 +2374,8 @@ jobs:
           tags: |
             type=raw,value=${{ steps.adapter_version.outputs.version }},enable=${{ steps.adapter_publish.outputs.publish_exact == 'true' }}
             type=sha
-            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') && steps.floating.outputs.move != 'false' }}
+            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' && steps.floating.outputs.move != 'false' }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       - name: Create manifest list and push (ghcr.io)

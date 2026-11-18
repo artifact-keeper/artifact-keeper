@@ -28,7 +28,7 @@ Bearer header. The one `/api/v1` route that shares this contract is the reposito
 accepts the API token as the Basic password and answers an anonymous request on a non-public repository \
 with `401` and a `WWW-Authenticate` challenge, like they do. Every other `/api/v1/*` route refuses the \
 Basic-with-token fallback.",
-        version = "1.12.0",
+        version = "1.12.1",
         license(name = "MIT", url = "https://opensource.org/licenses/MIT"),
         contact(name = "Artifact Keeper", url = "https://artifactkeeper.com")
     ),
@@ -710,6 +710,36 @@ mod tests {
             assert!(
                 props["visibility"]["deprecated"].is_null(),
                 "{schema}.visibility must not be deprecated"
+            );
+        }
+    }
+
+    /// #5810: `virtual_member_fallback` is published as the
+    /// `VirtualMemberFallback` enum (`available` / `strict`) on the create
+    /// and update requests and the repository response, so generated clients
+    /// get the two values instead of a free-form string.
+    #[test]
+    fn test_virtual_member_fallback_in_spec_5810() {
+        let spec = serde_json::to_value(build_openapi()).expect("serialize spec");
+        let schemas = &spec["components"]["schemas"];
+        let values: Vec<&str> = schemas["VirtualMemberFallback"]["enum"]
+            .as_array()
+            .expect("VirtualMemberFallback is an enum schema")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(values, ["available", "strict"]);
+        for schema in [
+            "CreateRepositoryRequest",
+            "UpdateRepositoryRequest",
+            "RepositoryResponse",
+        ] {
+            let field =
+                serde_json::to_string(&schemas[schema]["properties"]["virtual_member_fallback"])
+                    .unwrap();
+            assert!(
+                field.contains("#/components/schemas/VirtualMemberFallback"),
+                "{schema}.virtual_member_fallback must reference the enum: {field}"
             );
         }
     }

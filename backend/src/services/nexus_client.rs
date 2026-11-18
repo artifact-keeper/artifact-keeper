@@ -110,8 +110,36 @@ struct ListCursor {
     /// page of *components*, each carrying one or more assets, so a page
     /// boundary almost never lands on the requested `limit`.
     pending: std::collections::VecDeque<AqlResult>,
-    /// Upstream answered without a continuation token: the listing is over.
+    /// Which Nexus listing `token` belongs to.
+    phase: ListPhase,
+    /// Paths already handed out, so the asset walk skips every asset a
+    /// component already listed.
+    listed_paths: std::collections::HashSet<String>,
+    /// Both listings answered without a continuation token: the walk is over.
     exhausted: bool,
+}
+
+/// A repository is walked through `/components` first, then through
+/// `/assets` for the assets no component owns (a file uploaded to a raw or
+/// Maven repository without coordinates). The components API never lists
+/// those, so a repository holding only such files migrated nothing and the
+/// job still reported success.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum ListPhase {
+    #[default]
+    Components,
+    Assets,
+}
+
+impl ListCursor {
+    /// The listing in the current phase has no more pages.
+    fn finish_phase(&mut self) {
+        self.token = None;
+        match self.phase {
+            ListPhase::Components => self.phase = ListPhase::Assets,
+            ListPhase::Assets => self.exhausted = true,
+        }
+    }
 }
 
 /// Nexus REST API client
@@ -193,6 +221,13 @@ pub struct NexusComponentsResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct NexusAssetsResponse {
+    pub items: Vec<NexusAsset>,
+    #[serde(rename = "continuationToken")]
+    pub continuation_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct NexusComponent {
     pub id: String,
     pub repository: String,
@@ -214,6 +249,8 @@ pub struct NexusAsset {
     pub content_type: Option<String>,
     #[serde(rename = "fileSize")]
     pub file_size: Option<i64>,
+    /// Nexus repository format of the asset (`raw`, `maven2`, `npm`, ...).
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -225,7 +262,9 @@ pub struct NexusChecksum {
 
 impl NexusClient {
     /// Create a new Nexus client
-    pub fn new(config: NexusClientConfig) -> Result<Self, ArtifactoryError> {
+    pub fn new(mut config: NexusClientConfig) -> Result<Self, ArtifactoryError> {
+        // every request appends a path, and Nexus 404s the `//` a trailing slash gives
+        config.base_url = config.base_url.trim().trim_end_matches('/').to_string();
         // `timeout()` covers reading the body, so it killed any download that
         // took longer than it, reported as "error decoding response body". That
         // made the real size limit depend on throughput. Bound the connect and
@@ -576,30 +615,73 @@ impl NexusClient {
                         component.version.as_deref().unwrap_or("0")
                     )
                 });
-                let path_str = path_str.trim_start_matches('/').to_string();
-                let (dir, name) = match path_str.rsplit_once('/') {
-                    Some((d, n)) => (d.to_string(), n.to_string()),
-                    None => (".".to_string(), path_str),
-                };
-
-                results.push(AqlResult {
-                    repo: repo_name.to_string(),
-                    path: dir,
-                    name,
-                    size: asset.file_size,
-                    created: None,
-                    modified: None,
-                    sha256: asset.checksum.as_ref().and_then(|c| c.sha256.clone()),
-                    actual_sha1: asset.checksum.as_ref().and_then(|c| c.sha1.clone()),
-                });
+                results.push(Self::asset_to_result(repo_name, &path_str, asset));
             }
         }
         results
     }
 
+    /// One asset as the AQL row the worker reads, split into the directory
+    /// and file name `build_artifact_path` joins back together.
+    fn asset_to_result(repo_name: &str, path: &str, asset: &NexusAsset) -> AqlResult {
+        let path_str = path.trim_start_matches('/').to_string();
+        let (dir, name) = match path_str.rsplit_once('/') {
+            Some((d, n)) => (d.to_string(), n.to_string()),
+            None => (".".to_string(), path_str),
+        };
+
+        AqlResult {
+            repo: repo_name.to_string(),
+            path: dir,
+            name,
+            size: asset.file_size,
+            created: None,
+            modified: None,
+            sha256: asset.checksum.as_ref().and_then(|c| c.sha256.clone()),
+            actual_sha1: asset.checksum.as_ref().and_then(|c| c.sha1.clone()),
+        }
+    }
+
+    /// Whether an asset outside every component is a file someone stored, not
+    /// one Nexus generates. Only raw files and Maven files without coordinates
+    /// are: Nexus keeps generated metadata as component-less assets too (the
+    /// npm packument at the package root, `maven-metadata.xml`, PyPI simple
+    /// pages, Helm `index.yaml`, ...), and serves it rewritten, so it never
+    /// matches its stored checksum and the destination builds its own anyway.
+    fn is_component_less_content(path: &str, asset: &NexusAsset) -> bool {
+        match asset.format.as_deref() {
+            Some("raw") => true,
+            Some("maven2") => {
+                let name = path.rsplit('/').next().unwrap_or(path);
+                !matches!(
+                    name,
+                    "maven-metadata.xml"
+                        | "maven-metadata.xml.md5"
+                        | "maven-metadata.xml.sha1"
+                        | "maven-metadata.xml.sha256"
+                        | "maven-metadata.xml.sha512"
+                )
+            }
+            _ => false,
+        }
+    }
+
+    /// The repository-relative path a row was listed under, the key the asset
+    /// walk dedupes on.
+    fn listed_path(result: &AqlResult) -> String {
+        if result.path == "." {
+            result.name.clone()
+        } else {
+            format!("{}/{}", result.path, result.name)
+        }
+    }
+
     /// List artifacts (components + assets) with pagination.
     /// Returns data in the same AqlResponse format as the Artifactory client
     /// so the migration worker can process either source.
+    ///
+    /// The component listing comes first, then the assets no component
+    /// owns, deduplicated by path ([`ListPhase`]).
     ///
     /// Nexus has no offset paging, so the `offset`/`limit` contract is served
     /// from a per-repository [`ListCursor`] that keeps the upstream
@@ -635,35 +717,72 @@ impl NexusClient {
 
         let target = to_discard.saturating_add(want);
         while cursor.pending.len() < target && !cursor.exhausted {
+            let endpoint = match cursor.phase {
+                ListPhase::Components => "components",
+                ListPhase::Assets => "assets",
+            };
             let path = match &cursor.token {
                 Some(t) => format!(
-                    "/service/rest/v1/components?repository={}&continuationToken={}",
-                    repo_name, t
+                    "/service/rest/v1/{}?repository={}&continuationToken={}",
+                    endpoint, repo_name, t
                 ),
-                None => format!("/service/rest/v1/components?repository={}", repo_name),
+                None => format!("/service/rest/v1/{}?repository={}", endpoint, repo_name),
             };
 
-            let page: NexusComponentsResponse = self.get(&path).await?;
-            cursor
-                .pending
-                .extend(Self::page_to_results(repo_name, &page));
+            let next_token = match cursor.phase {
+                ListPhase::Components => {
+                    let page: NexusComponentsResponse = self.get(&path).await?;
+                    let results = Self::page_to_results(repo_name, &page);
+                    cursor
+                        .listed_paths
+                        .extend(results.iter().map(Self::listed_path));
+                    cursor.pending.extend(results);
+                    page.continuation_token
+                }
+                ListPhase::Assets => match self.get::<NexusAssetsResponse>(&path).await {
+                    Ok(page) => {
+                        for asset in &page.items {
+                            let Some(asset_path) = asset.path.as_deref() else {
+                                continue;
+                            };
+                            if !Self::is_component_less_content(asset_path, asset) {
+                                continue;
+                            }
+                            let result = Self::asset_to_result(repo_name, asset_path, asset);
+                            if cursor.listed_paths.insert(Self::listed_path(&result)) {
+                                cursor.pending.push_back(result);
+                            }
+                        }
+                        page.continuation_token
+                    }
+                    Err(ArtifactoryError::NotFound(_)) => {
+                        tracing::warn!(
+                            repo = %repo_name,
+                            "Nexus has no assets API; assets without a component are not listed"
+                        );
+                        None
+                    }
+                    Err(e) => return Err(e),
+                },
+            };
 
-            match page.continuation_token {
+            match next_token {
                 // A source that hands back the token it was just given never
                 // advances, and this loop would spin on it forever inside a
                 // single call, where the worker's `MAX_ARTIFACT_PAGES` guard
                 // cannot see it. Treat a cursor that does not move as the end
-                // of the listing.
+                // of that listing.
                 Some(token) if cursor.token.as_deref() == Some(token.as_str()) => {
                     tracing::warn!(
                         repo = %repo_name,
+                        endpoint,
                         "Nexus returned the same continuationToken it was given; \
                          stopping the listing to avoid an unbounded walk"
                     );
-                    cursor.exhausted = true;
+                    cursor.finish_phase();
                 }
                 Some(token) => cursor.token = Some(token),
-                None => cursor.exhausted = true,
+                None => cursor.finish_phase(),
             }
         }
 
@@ -1521,6 +1640,38 @@ mod tests {
         assert_eq!(client.get_version().await.unwrap().version, "3.61.0-02");
     }
 
+    #[tokio::test]
+    async fn test_trailing_slash_base_url_requests_single_slash_paths_5479() {
+        let (server, _) = setup_nexus_mock(
+            "/service/rest/v1/status/writable",
+            ResponseTemplate::new(200),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/repository/raw-hosted/a/b.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"x".to_vec()))
+            .mount(&server)
+            .await;
+        let client = NexusClient::new(NexusClientConfig {
+            base_url: format!(" {}/ ", server.uri()),
+            throttle_delay_ms: 0,
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(
+            client.ping().await.unwrap(),
+            "ping must hit the single-slash path"
+        );
+        assert_eq!(
+            client
+                .download_artifact("raw-hosted", "a/b.txt")
+                .await
+                .unwrap(),
+            bytes::Bytes::from_static(b"x")
+        );
+    }
+
     #[test]
     fn test_nexus_components_response_deserialization() {
         let json = r#"{
@@ -1920,12 +2071,21 @@ mod tests {
         (server, client)
     }
 
-    async fn upstream_request_count(server: &MockServer) -> usize {
+    /// Requests the client sent to one listing endpoint.
+    async fn request_count(server: &MockServer, endpoint: &str) -> usize {
         server
             .received_requests()
             .await
             .expect("wiremock records requests")
-            .len()
+            .iter()
+            .filter(|r| r.url.path() == endpoint)
+            .count()
+    }
+
+    /// Component listing requests. The asset walk that follows it is counted
+    /// on its own.
+    async fn upstream_request_count(server: &MockServer) -> usize {
+        request_count(server, "/service/rest/v1/components").await
     }
 
     /// Walking a repository forward — what `process_repository_artifacts` does
@@ -2181,5 +2341,376 @@ mod tests {
             !page.results.is_empty(),
             "what the source did serve is still returned"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Assets no component owns are listed through `/assets`
+    // -----------------------------------------------------------------------
+
+    fn nexus_client_for(server: &MockServer) -> NexusClient {
+        NexusClient::new(NexusClientConfig {
+            base_url: server.uri(),
+            auth: NexusAuth {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            timeout_secs: 30,
+            throttle_delay_ms: 0,
+            ..Default::default()
+        })
+        .expect("build nexus client")
+    }
+
+    /// One `/assets` item the way Nexus reports it.
+    fn fixture_asset(path: &str, n: usize) -> serde_json::Value {
+        fixture_asset_of("raw", path, n)
+    }
+
+    fn fixture_asset_of(format: &str, path: &str, n: usize) -> serde_json::Value {
+        serde_json::json!({
+            "id": format!("asset-{n}"),
+            "format": format,
+            "path": path,
+            "downloadUrl": format!("http://nexus.local/repository/r/{}", path.trim_start_matches('/')),
+            "checksum": {
+                "sha1": format!("{n:040x}"),
+                "sha256": format!("{n:064x}"),
+                "md5": format!("{n:032x}")
+            },
+            "contentType": "application/octet-stream",
+            "fileSize": 10 + n as i64
+        })
+    }
+
+    /// Serve `pages` from `/assets` for `repo`, chained by continuation token.
+    async fn mount_asset_pages(
+        server: &MockServer,
+        repo: &str,
+        pages: Vec<Vec<serde_json::Value>>,
+    ) {
+        use wiremock::matchers::{query_param, query_param_is_missing};
+
+        let count = pages.len();
+        for (page_index, items) in pages.into_iter().enumerate() {
+            let next = (page_index + 1 < count).then(|| format!("a{}", page_index + 1));
+            let response = ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "items": items, "continuationToken": next }));
+            let route = Mock::given(method("GET"))
+                .and(path("/service/rest/v1/assets"))
+                .and(query_param("repository", repo));
+            if page_index == 0 {
+                route
+                    .and(query_param_is_missing("continuationToken"))
+                    .respond_with(response)
+                    .mount(server)
+                    .await;
+            } else {
+                route
+                    .and(query_param("continuationToken", format!("a{page_index}")))
+                    .respond_with(response)
+                    .mount(server)
+                    .await;
+            }
+        }
+    }
+
+    /// Walk a whole repository the way the migration worker does.
+    async fn walk_all(client: &NexusClient, repo: &str, limit: i64) -> Vec<AqlResult> {
+        let mut rows = Vec::new();
+        let mut offset = 0i64;
+        loop {
+            let page = client
+                .list_artifacts(repo, offset, limit)
+                .await
+                .expect("list a page");
+            let page_len = page.results.len();
+            rows.extend(page.results);
+            if page_len < limit as usize {
+                break;
+            }
+            offset += page_len as i64;
+        }
+        rows
+    }
+
+    /// A repository of plain files has no components at all: `/components`
+    /// answers `[]` and only `/assets` lists the files. Before the asset walk
+    /// the listing was empty and the migration completed with 0 items.
+    #[tokio::test]
+    async fn test_list_artifacts_lists_assets_without_a_component() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/components"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "items": [], "continuationToken": null })),
+            )
+            .mount(&server)
+            .await;
+        mount_asset_pages(
+            &server,
+            "plain-files",
+            vec![
+                vec![fixture_asset("/fixtures/ios/fixture.json", 1)],
+                vec![fixture_asset("docs/web/top.ics", 2)],
+            ],
+        )
+        .await;
+        let client = nexus_client_for(&server);
+
+        let rows = walk_all(&client, "plain-files", 1).await;
+
+        let listed: Vec<(String, String)> = rows
+            .iter()
+            .map(|r| (r.path.clone(), r.name.clone()))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                ("fixtures/ios".to_string(), "fixture.json".to_string()),
+                ("docs/web".to_string(), "top.ics".to_string()),
+            ],
+            "both pages of component-less assets must be listed, at their Nexus paths"
+        );
+        for (row, n) in rows.iter().zip([1usize, 2]) {
+            assert_eq!(row.repo, "plain-files");
+            assert_eq!(row.sha256.as_deref(), Some(format!("{n:064x}").as_str()));
+            assert_eq!(
+                row.actual_sha1.as_deref(),
+                Some(format!("{n:040x}").as_str())
+            );
+            assert_eq!(row.size, Some(10 + n as i64));
+        }
+        assert_eq!(
+            request_count(&server, "/service/rest/v1/assets").await,
+            2,
+            "each asset page is fetched once"
+        );
+    }
+
+    /// The asset walk lists every asset of the repository, component-backed
+    /// ones included. Those were already listed by the component walk and must
+    /// not be listed (and migrated) a second time, whatever their leading `/`.
+    #[tokio::test]
+    async fn test_list_artifacts_does_not_list_component_assets_twice() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/components"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [{
+                    "id": "comp-1",
+                    "repository": "maven-hosted",
+                    "format": "maven2",
+                    "group": "com.example",
+                    "name": "lib",
+                    "version": "1.0",
+                    "assets": [
+                        fixture_asset_of("maven2", "/com/example/lib/1.0/lib-1.0.jar", 1),
+                        fixture_asset_of("maven2", "com/example/lib/1.0/lib-1.0.pom", 2)
+                    ]
+                }],
+                "continuationToken": null
+            })))
+            .mount(&server)
+            .await;
+        mount_asset_pages(
+            &server,
+            "maven-hosted",
+            vec![
+                vec![
+                    fixture_asset_of("maven2", "com/example/lib/1.0/lib-1.0.jar", 1),
+                    fixture_asset_of("maven2", "/com/example/docs/install.txt", 3),
+                ],
+                vec![fixture_asset_of(
+                    "maven2",
+                    "/com/example/lib/1.0/lib-1.0.pom",
+                    2,
+                )],
+            ],
+        )
+        .await;
+        let client = nexus_client_for(&server);
+
+        let rows = walk_all(&client, "maven-hosted", 2).await;
+
+        let listed: Vec<String> = rows
+            .iter()
+            .map(|r| format!("{}/{}", r.path, r.name))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                "com/example/lib/1.0/lib-1.0.jar".to_string(),
+                "com/example/lib/1.0/lib-1.0.pom".to_string(),
+                "com/example/docs/install.txt".to_string(),
+            ],
+            "component assets once, then only the asset no component owns"
+        );
+    }
+
+    /// Nexus keeps an npm package's packument at the package root as an asset
+    /// with no component and serves it rewritten, so its stored sha1 never
+    /// matches. The asset walk must not list it, nor any other npm asset.
+    #[tokio::test]
+    async fn test_list_artifacts_skips_the_npm_packument() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/components"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [{
+                    "id": "comp-1",
+                    "repository": "npm-hosted",
+                    "format": "npm",
+                    "group": "scope",
+                    "name": "pkg",
+                    "version": "1.0.0-1",
+                    "assets": [fixture_asset_of("npm", "/@scope/pkg/-/pkg-1.0.0-1.tgz", 1)]
+                }],
+                "continuationToken": null
+            })))
+            .mount(&server)
+            .await;
+        mount_asset_pages(
+            &server,
+            "npm-hosted",
+            vec![vec![
+                fixture_asset_of("npm", "/@scope/pkg/-/pkg-1.0.0-1.tgz", 1),
+                fixture_asset_of("npm", "/@scope/pkg", 2),
+                fixture_asset_of("npm", "/plain", 3),
+            ]],
+        )
+        .await;
+        let client = nexus_client_for(&server);
+
+        let rows = walk_all(&client, "npm-hosted", 10).await;
+
+        let listed: Vec<String> = rows
+            .iter()
+            .map(|r| format!("{}/{}", r.path, r.name))
+            .collect();
+        assert_eq!(
+            listed,
+            vec!["@scope/pkg/-/pkg-1.0.0-1.tgz".to_string()],
+            "only the component's tarball, no packument"
+        );
+    }
+
+    /// `maven-metadata.xml` and its checksum sidecars have no component and
+    /// Nexus regenerates them. A Maven file without coordinates next to them is
+    /// real content and is listed.
+    #[tokio::test]
+    async fn test_list_artifacts_skips_maven_metadata() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/components"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "items": [], "continuationToken": null })),
+            )
+            .mount(&server)
+            .await;
+        let mut assets = vec![fixture_asset_of(
+            "maven2",
+            "/com/example/lib/maven-metadata.xml",
+            1,
+        )];
+        for (n, ext) in ["md5", "sha1", "sha256", "sha512"].iter().enumerate() {
+            assets.push(fixture_asset_of(
+                "maven2",
+                &format!("/com/example/lib/maven-metadata.xml.{ext}"),
+                2 + n,
+            ));
+        }
+        assets.push(fixture_asset_of("maven2", "/fixtures/ios/fixture.json", 9));
+        assets.push(fixture_asset_of("pypi", "/simple/pkg/", 10));
+        assets.push(serde_json::json!({
+            "id": "no-format",
+            "path": "/unknown/file.bin",
+            "checksum": { "sha1": format!("{:040x}", 11) }
+        }));
+        mount_asset_pages(&server, "maven-plain", vec![assets]).await;
+        let client = nexus_client_for(&server);
+
+        let rows = walk_all(&client, "maven-plain", 10).await;
+
+        let listed: Vec<String> = rows
+            .iter()
+            .map(|r| format!("{}/{}", r.path, r.name))
+            .collect();
+        assert_eq!(
+            listed,
+            vec!["fixtures/ios/fixture.json".to_string()],
+            "metadata, other formats and assets without a format are skipped"
+        );
+    }
+
+    /// A repository whose assets all belong to components lists exactly what
+    /// the component walk lists, the asset walk adds nothing.
+    #[tokio::test]
+    async fn test_list_artifacts_unchanged_when_every_asset_has_a_component() {
+        let (server, client) = paged_components_server().await;
+        let all: Vec<serde_json::Value> = (0..FIXTURE_PAGES * FIXTURE_PAGE_SIZE)
+            .map(|n| fixture_asset(&format!("pkg-{n}/1.0.0/pkg-{n}-1.0.0.tgz"), n))
+            .collect();
+        mount_asset_pages(&server, "nexus-paged", vec![all]).await;
+
+        let rows = walk_all(&client, "nexus-paged", 4).await;
+
+        let expected: Vec<String> = (0..FIXTURE_PAGES * FIXTURE_PAGE_SIZE)
+            .map(|n| format!("pkg-{n}-1.0.0.tgz"))
+            .collect();
+        let names: Vec<String> = rows.into_iter().map(|r| r.name).collect();
+        assert_eq!(names, expected);
+        assert_eq!(upstream_request_count(&server).await, FIXTURE_PAGES);
+        assert_eq!(request_count(&server, "/service/rest/v1/assets").await, 1);
+    }
+
+    /// A Nexus without the assets API still migrates its components.
+    #[tokio::test]
+    async fn test_list_artifacts_tolerates_a_missing_assets_api() {
+        let (server, client) = paged_components_server().await;
+
+        let rows = walk_all(&client, "nexus-paged", 100).await;
+
+        assert_eq!(rows.len(), FIXTURE_PAGES * FIXTURE_PAGE_SIZE);
+        assert_eq!(
+            request_count(&server, "/service/rest/v1/assets").await,
+            1,
+            "a 404 on /assets ends the listing instead of failing it"
+        );
+    }
+
+    /// A stuck token on `/assets` ends the walk like a stuck `/components` one.
+    #[tokio::test]
+    async fn test_list_artifacts_stops_when_the_assets_token_does_not_advance() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/components"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "items": [], "continuationToken": null })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/assets"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [fixture_asset("stuck.bin", 1)],
+                "continuationToken": "stuck"
+            })))
+            .mount(&server)
+            .await;
+        let client = nexus_client_for(&server);
+
+        let page = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.list_artifacts("stuck-assets", 0, 100),
+        )
+        .await
+        .expect("a stuck asset cursor must not hang the listing")
+        .expect("list the stuck repository");
+
+        assert_eq!(request_count(&server, "/service/rest/v1/assets").await, 2);
+        assert_eq!(page.results.len(), 1, "the repeated asset is listed once");
     }
 }

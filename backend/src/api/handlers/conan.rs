@@ -5426,7 +5426,7 @@ mod tests {
         /// running). All DB-backed tests start with
         /// `let Some(pool) = try_pool().await else { return; };` so the suite
         /// is a no-op in environments without Postgres.
-        pub async fn try_pool() -> Option<PgPool> {
+        pub(crate) async fn try_pool() -> Option<PgPool> {
             // Skip only when no DB is configured/reachable AND not required; a
             // connect failure under AK_TESTS_REQUIRE_DB panics (no fiction-green,
             // #2924).
@@ -5439,6 +5439,11 @@ mod tests {
 
         fn test_config(storage_path: &str) -> Config {
             Config {
+                scan_worker_enabled: true,
+                scan_queue_enabled: false,
+                scan_worker_concurrency: None,
+                scan_worker_trivy_adapter_url: None,
+                scan_rescan_max_per_day: 0,
                 database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
                 bind_address: "127.0.0.1:0".into(),
                 log_level: "error".into(),
@@ -5643,7 +5648,7 @@ mod tests {
         /// Insert a test user with a bcrypt-hashed password (cost=4 for speed).
         /// Returns `(user_id, username, password)`. Username is UUID-suffixed
         /// so parallel tests on the same DB do not collide.
-        pub async fn create_user(pool: &PgPool) -> (Uuid, String, String) {
+        pub(crate) async fn create_user(pool: &PgPool) -> (Uuid, String, String) {
             let id = Uuid::new_v4();
             let username = format!("conan-test-u-{}", id);
             let password = "conan-test-pw".to_string();
@@ -5673,7 +5678,10 @@ mod tests {
         /// Insert a test Conan repository. Returns `(repo_id, repo_key, storage_dir)`.
         /// `repo_type` is `"local"` | `"remote"` | `"virtual"`. The repo key is
         /// UUID-suffixed so parallel tests on the same DB do not collide.
-        pub async fn create_conan_repo(pool: &PgPool, repo_type: &str) -> (Uuid, String, PathBuf) {
+        pub(crate) async fn create_conan_repo(
+            pool: &PgPool,
+            repo_type: &str,
+        ) -> (Uuid, String, PathBuf) {
             let id = Uuid::new_v4();
             let key = format!("conan-test-{}", id);
             let storage_dir = std::env::temp_dir().join(format!("conan-test-{}", id));
@@ -5764,7 +5772,7 @@ mod tests {
         }
 
         /// Dispatch a request through the router and collect the full body.
-        pub async fn send(app: Router, req: Request<Body>) -> (StatusCode, Bytes) {
+        pub(crate) async fn send(app: Router, req: Request<Body>) -> (StatusCode, Bytes) {
             let resp = app.oneshot(req).await.expect("router oneshot failed");
             let status = resp.status();
             let body = to_bytes(resp.into_body(), 16 * 1024 * 1024)
@@ -5779,7 +5787,7 @@ mod tests {
 
         /// PUT a recipe file through the router and return the status code.
         #[allow(clippy::too_many_arguments)]
-        pub async fn upload_recipe_file(
+        pub(crate) async fn upload_recipe_file(
             state: &SharedState,
             auth: &AuthExtension,
             repo_key: &str,
@@ -5808,7 +5816,7 @@ mod tests {
 
         /// PUT a package file through the router and return the status code.
         #[allow(clippy::too_many_arguments)]
-        pub async fn upload_package_file(
+        pub(crate) async fn upload_package_file(
             state: &SharedState,
             auth: &AuthExtension,
             repo_key: &str,
@@ -5854,7 +5862,7 @@ mod tests {
         // ------------------------------------------------------------------
 
         #[allow(clippy::too_many_arguments)]
-        pub async fn seed_recipe_row(
+        pub(crate) async fn seed_recipe_row(
             pool: &PgPool,
             repo_id: Uuid,
             name: &str,
@@ -5935,7 +5943,7 @@ mod tests {
         }
 
         #[allow(clippy::too_many_arguments)]
-        pub async fn seed_package_row(
+        pub(crate) async fn seed_package_row(
             pool: &PgPool,
             repo_id: Uuid,
             name: &str,
@@ -6052,7 +6060,7 @@ mod tests {
 
         /// Delete all test rows in FK-order: artifact_metadata → artifacts →
         /// repositories → users.
-        pub async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
+        pub(crate) async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
             let _ = sqlx::query(
                 "DELETE FROM artifact_metadata WHERE artifact_id IN \
                  (SELECT id FROM artifacts WHERE repository_id = $1)",
@@ -6097,7 +6105,7 @@ mod tests {
         impl TestFixture {
             /// Create a full test environment: pool, user, repo, state, auth.
             /// Returns `None` when `DATABASE_URL` is absent (the test skips).
-            pub async fn setup(repo_type: &str) -> Option<Self> {
+            pub(crate) async fn setup(repo_type: &str) -> Option<Self> {
                 let pool = try_pool().await?;
                 let (user_id, username, _pw) = create_user(&pool).await;
                 let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, repo_type).await;
@@ -6116,7 +6124,7 @@ mod tests {
             }
 
             /// Clean up all test data and remove the storage directory.
-            pub async fn teardown(&self) {
+            pub(crate) async fn teardown(&self) {
                 cleanup(&self.pool, self.repo_id, self.user_id).await;
                 let _ = std::fs::remove_dir_all(&self.storage_dir);
             }
@@ -6127,7 +6135,7 @@ mod tests {
             }
 
             /// Shorthand: GET request with basic auth, returns (status, body).
-            pub async fn get(&self, uri: String) -> (StatusCode, Bytes) {
+            pub(crate) async fn get(&self, uri: String) -> (StatusCode, Bytes) {
                 let app = self.router();
                 let req = Request::builder()
                     .method("GET")
