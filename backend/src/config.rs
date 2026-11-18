@@ -4075,6 +4075,56 @@ mod tests {
         }
     }
 
+    /// #6193: a release.yml job with no `timeout-minutes` inherits GitHub's
+    /// 6-hour default, so a hung cross-build or poll holds the release for
+    /// hours before anything turns red. Every job must state its own
+    /// ceiling. A reusable-workflow call (`uses:`) cannot take one, so its
+    /// called jobs carry their own.
+    #[test]
+    fn release_jobs_declare_timeouts_6193() {
+        let workflow = include_str!("../../.github/workflows/release.yml");
+        let (_, jobs) = workflow
+            .split_once("\njobs:\n")
+            .expect("release.yml must have a top-level jobs: map");
+        let mut job_names = Vec::new();
+        let mut missing = Vec::new();
+        let mut current: Option<(&str, bool)> = None;
+        for line in jobs.lines() {
+            if !line.starts_with(' ') && !line.is_empty() && !line.starts_with('#') {
+                break; // the next top-level key ends the jobs map
+            }
+            let header = line
+                .strip_prefix("  ")
+                .filter(|rest| !rest.starts_with(' ') && !rest.starts_with('#'))
+                .and_then(|rest| rest.strip_suffix(':'));
+            if let Some(name) = header {
+                if let Some((prev, false)) = current {
+                    missing.push(prev);
+                }
+                job_names.push(name);
+                current = Some((name, false));
+            } else if line.starts_with("    timeout-minutes:") || line.starts_with("    uses:") {
+                if let Some((_, bounded)) = current.as_mut() {
+                    *bounded = true;
+                }
+            }
+        }
+        if let Some((prev, false)) = current {
+            missing.push(prev);
+        }
+        assert!(
+            job_names.contains(&"build-binaries") && job_names.contains(&"release"),
+            "release.yml job parsing found {job_names:?}; the test no longer \
+             sees the jobs it is meant to bound"
+        );
+        assert!(
+            missing.is_empty(),
+            "release.yml jobs without timeout-minutes (#6193): {missing:?}. \
+             Size one from recent run durations, about 2-3x the slowest \
+             observed, with a `# p100 ...` comment."
+        );
+    }
+
     #[test]
     fn secret_env_present_checks_both_forms() {
         env::remove_var("TEST_SECRET_4142");
