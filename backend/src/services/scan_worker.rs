@@ -23,9 +23,13 @@ use crate::services::scan_queue::{
 /// feels this. An enqueue in this process wakes us sooner.
 const DEFAULT_TICK: Duration = Duration::from_millis(1000);
 
-/// Jobs in flight per pod, matching the extraction semaphore so a default install
-/// cannot claim more than it can decompress.
-const DEFAULT_CONCURRENCY: usize = 4;
+/// Jobs in flight per pod: `SCAN_WORKER_CONCURRENCY` when set, otherwise the
+/// extraction semaphore's size (`MAX_CONCURRENT_SCAN_EXTRACTIONS`), so a worker
+/// does not claim more jobs than it can extract at once (#6033). A claimed job
+/// waiting on an extraction permit holds its lease and shows as `running`.
+fn resolve_concurrency(configured: Option<usize>, extraction_permits: usize) -> usize {
+    configured.unwrap_or(extraction_permits).max(1)
+}
 
 /// Ceiling for one queued scan: well above the inline budgets it replaces, since
 /// nobody holds a socket, but bounded so a wedged grype releases its permit.
@@ -91,20 +95,24 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
         return;
     }
 
-    let concurrency = state
-        .config
-        .scan_worker_concurrency
-        .unwrap_or(DEFAULT_CONCURRENCY)
-        .max(1);
-    let queue = ScanQueue::new(state.db.clone());
+    let concurrency = resolve_concurrency(
+        state.config.scan_worker_concurrency,
+        crate::services::scanner_service::max_concurrent_scan_extractions(),
+    );
+    // #6032: how long a fail-open proxy scan waits before it competes with
+    // hosted scans on age alone. Read once, like the extraction limit.
+    let backfill_aging = crate::services::scan_queue::backfill_aging();
+    let queue = ScanQueue::new(state.db.clone()).with_backfill_aging(backfill_aging);
     let permits = Arc::new(Semaphore::new(concurrency));
     // #5947: rescans take at most half the slots (one on a single-slot
-    // worker), so a hosted or waiting job always finds one free.
+    // worker), so on two or more slots a hosted or waiting job always finds
+    // one free. A single-slot worker can be busy with a rescan.
     let rescan_permits = Arc::new(Semaphore::new(rescan_slots(concurrency)));
     let identity = WorkerIdentity::for_process().as_str().to_string();
 
     tracing::info!(
         concurrency,
+        backfill_aging_secs = backfill_aging.as_secs(),
         worker = %identity,
         "Scan worker started (SCAN_WORKER_ENABLED)"
     );
@@ -1056,12 +1064,28 @@ mod tests {
     /// Never claim more than we hold permits for.
     #[test]
     fn claim_batch_is_bounded_by_available_permits() {
-        let permits = Semaphore::new(DEFAULT_CONCURRENCY);
-        assert_eq!(permits.available_permits(), DEFAULT_CONCURRENCY);
+        let concurrency = resolve_concurrency(None, 4);
+        let permits = Semaphore::new(concurrency);
+        assert_eq!(permits.available_permits(), concurrency);
         let held = permits.try_acquire().expect("permit");
-        assert_eq!(permits.available_permits(), DEFAULT_CONCURRENCY - 1);
+        assert_eq!(permits.available_permits(), concurrency - 1);
         drop(held);
-        assert_eq!(permits.available_permits(), DEFAULT_CONCURRENCY);
+        assert_eq!(permits.available_permits(), concurrency);
+    }
+
+    /// #6033: unset, the worker runs as many jobs as the extraction semaphore
+    /// has permits, not a fixed 4, so lowering `MAX_CONCURRENT_SCAN_EXTRACTIONS`
+    /// lowers the claims too. A set value wins either way.
+    #[test]
+    fn unset_concurrency_follows_the_extraction_permits() {
+        assert_eq!(resolve_concurrency(None, 1), 1);
+        assert_eq!(resolve_concurrency(None, 4), 4);
+        assert_eq!(resolve_concurrency(None, 9), 9);
+        assert_eq!(resolve_concurrency(Some(2), 1), 2);
+        assert_eq!(resolve_concurrency(Some(8), 4), 8);
+        // Never zero slots, whatever the inputs.
+        assert_eq!(resolve_concurrency(None, 0), 1);
+        assert_eq!(resolve_concurrency(Some(0), 4), 1);
     }
 
     /// Above the inline budgets, or the queue reproduces the timeout it
