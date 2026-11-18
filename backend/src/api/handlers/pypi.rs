@@ -4080,9 +4080,11 @@ async fn pypi_proxy_cache_redirect(
     if !storage.supports_redirect() {
         return None;
     }
-    if !proxy.is_cache_fresh(repo_key, cache_path).await {
-        return None;
-    }
+    // #6035: the freshness probe also yields the size its sidecar records,
+    // which the transfer meter counts when the URL is issued.
+    let size_bytes = proxy
+        .fresh_cache_redirect_size(repo_key, cache_path)
+        .await?;
     // #4506: a Remote whose origin policy refuses its content gets no
     // redirect; the gated fetch below answers the 403.
     if proxy.cache_origin_policy_gate(repo_key).await.is_err() {
@@ -4106,6 +4108,7 @@ async fn pypi_proxy_cache_redirect(
         /* presigned_enabled = */ true,
         expiry,
         /* cache_is_fresh = */ true,
+        size_bytes,
     )
     .await
 }
@@ -17602,9 +17605,12 @@ mod tests {
             "pypi_proxy_cache_redirect MUST sign via cache_storage_backend() \
              (no-prefix handle), not a prefixed repo handle (#1555).",
         );
+        // #6035: `fresh_cache_redirect_size(` is the same metadata-only probe,
+        // returning the sidecar's size alongside the verdict.
         assert!(
-            window.contains("is_cache_fresh("),
-            "pypi_proxy_cache_redirect MUST gate on is_cache_fresh (#1555).",
+            window.contains("fresh_cache_redirect_size("),
+            "pypi_proxy_cache_redirect MUST gate on the metadata-only freshness \
+             probe `fresh_cache_redirect_size` (#1555).",
         );
     }
 
@@ -17686,6 +17692,12 @@ mod tests {
         assert!(
             loc.contains("proxy-cache/prod-eu/pypi-remote/"),
             "pypi redirect signed a non-scoped key (a revert to unscoped drops the scope): {loc}"
+        );
+        // #6035: tagged with the sidecar's size for the transfer meter.
+        assert_eq!(
+            resp.extensions()
+                .get::<crate::services::quota::http::PresignedDownload>(),
+            Some(&crate::services::quota::http::PresignedDownload(11))
         );
     }
 

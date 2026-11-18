@@ -13840,10 +13840,11 @@ pub async fn download_artifact(
         struct ArtifactRow {
             id: Uuid,
             storage_key: String,
+            size_bytes: i64,
         }
         if let Some(artifact) = sqlx::query_as::<_, ArtifactRow>(
             r#"
-            SELECT id, storage_key
+            SELECT id, storage_key, size_bytes
             FROM artifacts
             WHERE repository_id = $1 AND path = $2 AND is_deleted = false
             "#,
@@ -13882,7 +13883,11 @@ pub async fn download_artifact(
                     source = ?presigned.source,
                     "Serving artifact via redirect"
                 );
-                return Ok(DownloadResponse::redirect(presigned).into_response());
+                // #6035: the transfer meter counts the row's size when the
+                // URL is issued.
+                return Ok(
+                    DownloadResponse::redirect(presigned, artifact.size_bytes).into_response()
+                );
             }
         }
     }

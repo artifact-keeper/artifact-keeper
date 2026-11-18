@@ -15,11 +15,14 @@
 //!   own answer (401, 403, or the unknown-key 404), never quota figures.
 //! * [`transfer_meter`] runs on the routers that serve artifact bytes. It
 //!   counts the body bytes of every successful `GET` (and the object size of
-//!   a presigned redirect when it is issued), and once the monthly transfer
+//!   a presigned redirect when it is issued: every redirect is built by
+//!   [`DownloadResponse::redirect`](crate::api::download_response::DownloadResponse::redirect),
+//!   which takes the size, #6035), and once the monthly transfer
 //!   quota's hard limit is reached it answers `429` instead of an artifact
 //!   download. Metadata responses (JSON, XML, HTML, text and YAML indexes)
 //!   are still served, so publishing clients that read metadata first keep
-//!   working.
+//!   working. A redirected `GET` with `Range` counts the whole object,
+//!   since the object store, not the backend, answers the range.
 //! * [`quota_envelope`] wraps the whole router. It re-renders a refusal in
 //!   the OCI error envelope on `/v2` and with npm's `error` field on `/npm`,
 //!   and turns the plain-text `413` of a body limit into the JSON refusal.
