@@ -1150,11 +1150,7 @@ impl MigrationWorker {
                 let should_skip_duplicate = self
                     .check_artifact_duplicate(
                         keys.target.as_str(),
-                        &duplicate_lookup_path(
-                            package_type,
-                            &artifact_path,
-                            debian_component.as_deref(),
-                        ),
+                        &artifact_path,
                         &source_path,
                         &ExpectedChecksums {
                             sha256: expected_sha256.clone(),
@@ -1162,6 +1158,7 @@ impl MigrationWorker {
                         },
                         conflict_resolution,
                         package_type,
+                        debian_component.as_deref(),
                     )
                     .await?;
 
@@ -1344,11 +1341,12 @@ impl MigrationWorker {
         let should_skip = self
             .check_artifact_duplicate(
                 keys.target.as_str(),
-                &duplicate_lookup_path(package_type, artifact_path, debian_component),
+                artifact_path,
                 source_path,
                 &expected,
                 conflict_resolution,
                 package_type,
+                debian_component,
             )
             .await?;
         // #4657: a `.deb` imported before the importer registered Debian
@@ -1786,6 +1784,7 @@ impl MigrationWorker {
     /// its referenced content is complete; otherwise it falls through so the
     /// walker can fetch the missing pieces (registered content is deduped, so
     /// genuinely-complete items stay idempotent).
+    #[allow(clippy::too_many_arguments)]
     async fn check_artifact_duplicate(
         &self,
         repo_key: &str,
@@ -1794,6 +1793,7 @@ impl MigrationWorker {
         expected: &ExpectedChecksums,
         conflict_resolution: ConflictResolution,
         package_type: &str,
+        debian_component: Option<&str>,
     ) -> Result<bool, MigrationError> {
         // Docker/OCI blobs no longer produce an `artifacts` row (they live
         // only in `oci_blobs`, matching the live push path), so their
@@ -1870,12 +1870,13 @@ impl MigrationWorker {
                 // no-op. Same rule #3533 applied to Docker/OCI manifests,
                 // reached here through the shared path helper rather than a
                 // second copy of the shape.
-                let legacy_candidate: Option<&str> =
-                    if migration_destination_path(package_type, artifact_path) == artifact_path {
-                        None
-                    } else {
-                        Some(legacy_source_path)
-                    };
+                let lookup_path =
+                    duplicate_lookup_path(package_type, artifact_path, debian_component);
+                let legacy_candidate: Option<&str> = if lookup_path == artifact_path {
+                    None
+                } else {
+                    Some(legacy_source_path)
+                };
                 sqlx::query_as(
                     r#"
                     SELECT a.checksum_sha256, a.checksum_sha1
@@ -1889,7 +1890,7 @@ impl MigrationWorker {
                     "#,
                 )
                 .bind(repo_key)
-                .bind(artifact_path)
+                .bind(&lookup_path)
                 .bind(legacy_candidate)
                 .fetch_optional(&self.db)
                 .await?
@@ -3909,10 +3910,10 @@ pub(crate) fn debian_destination_path(artifact_path: &str, component: Option<&st
 }
 
 /// The path the duplicate check looks an item up under: a `.deb`'s
-/// destination (#4740), since a re-run must find a package under the
-/// component it is now filed in, and must re-import (and retire) one an
-/// earlier run stored under the wrong component. Every other item keeps its
-/// source-relative path.
+/// destination (#4740) or the destination path composed by
+/// [`migration_destination_path`] (#6197), so re-runs for formats whose
+/// stored layout differs from the source path (such as PyPI or npm) match
+/// the already-imported `artifacts.path`.
 fn duplicate_lookup_path(
     package_type: &str,
     artifact_path: &str,
@@ -3921,7 +3922,7 @@ fn duplicate_lookup_path(
     if package_type.eq_ignore_ascii_case("debian") {
         debian_destination_path(artifact_path, debian_component)
     } else {
-        artifact_path.to_string()
+        migration_destination_path(package_type, artifact_path)
     }
 }
 
@@ -4996,6 +4997,26 @@ mod tests {
         assert_eq!(
             migration_destination_path("npm", "lodash/-/lodash-4.17.21.tgz"),
             "lodash/4.17.21/lodash-4.17.21.tgz"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_lookup_path_matches_destination_6197() {
+        assert_eq!(
+            duplicate_lookup_path(
+                "pypi",
+                "packages/example-pkg/1.1.0/example-pkg-1.1.0.tar.gz",
+                None,
+            ),
+            "example-pkg/1.1.0/example-pkg-1.1.0.tar.gz"
+        );
+        assert_eq!(
+            duplicate_lookup_path("npm", "lodash/-/lodash-4.17.21.tgz", None),
+            "lodash/4.17.21/lodash-4.17.21.tgz"
+        );
+        assert_eq!(
+            duplicate_lookup_path("maven", "org/ex/lib/1.0/lib-1.0.jar", None),
+            "org/ex/lib/1.0/lib-1.0.jar"
         );
     }
 
@@ -9980,6 +10001,7 @@ mod tests {
                 &expected,
                 ConflictResolution::Skip,
                 "docker",
+                None,
             )
             .await
             .expect("duplicate check");
@@ -10035,6 +10057,7 @@ mod tests {
                 &expected,
                 ConflictResolution::Skip,
                 "docker",
+                None,
             )
             .await
             .expect("duplicate check after repair");
@@ -10129,6 +10152,7 @@ mod tests {
                 &index_expected,
                 ConflictResolution::Skip,
                 "docker",
+                None,
             )
             .await
             .unwrap();
@@ -10151,6 +10175,7 @@ mod tests {
                 &index_expected,
                 ConflictResolution::Skip,
                 "docker",
+                None,
             )
             .await
             .unwrap();
@@ -10172,6 +10197,7 @@ mod tests {
                 },
                 ConflictResolution::Skip,
                 "docker",
+                None,
             )
             .await
             .unwrap();
@@ -10253,6 +10279,7 @@ mod tests {
                 },
                 ConflictResolution::Skip,
                 "docker",
+                None,
             )
             .await
             .expect("duplicate check");
@@ -10305,6 +10332,7 @@ mod tests {
                 },
                 ConflictResolution::Skip,
                 "docker",
+                None,
             )
             .await
             .expect("duplicate check");
@@ -10838,6 +10866,7 @@ mod tests {
                     &expected,
                     ConflictResolution::Skip,
                     "generic",
+                    None,
                 )
                 .await
                 .expect("duplicate check"),
@@ -10896,6 +10925,7 @@ mod tests {
                     &expected,
                     ConflictResolution::Skip,
                     "generic",
+                    None,
                 )
                 .await
                 .expect("duplicate check"),
@@ -11963,6 +11993,66 @@ mod tests {
         // Once registered, a further re-run skips it as before.
         let again = run().await;
         assert_eq!((again.0, again.1, again.2), (0, 0, 1));
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// #6197: formats whose stored destination path differs from the source
+    /// path (e.g. Nexus PyPI `packages/<name>/<ver>/<file>` stored as
+    /// `<name>/<ver>/<file>`) must still match in `check_artifact_duplicate`
+    /// under `ConflictResolution::Skip`.
+    #[tokio::test]
+    async fn test_pypi_reimport_skips_with_conflict_resolution_skip_6197() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig6197-pypi", "pypi").await;
+        let source_rel = "packages/example-pkg/1.1.0/example-pkg-1.1.0.tar.gz";
+        let body = bytes::Bytes::from_static(b"pypi-sdist-payload");
+        let body_hex = sha256_hex_of(&body);
+        let mut files = std::collections::HashMap::new();
+        files.insert(source_rel.to_string(), body.clone());
+
+        transfer_one(&worker, &storage, &files, &repo_key, "pypi", source_rel)
+            .await
+            .expect("first import");
+
+        let keys = RepoKeys {
+            source: repo_key.clone(),
+            target: repo_key.clone(),
+        };
+        let mut counters = (0i32, 0i32, 0i32, 0i64);
+        worker
+            .process_single_artifact(
+                Uuid::new_v4(),
+                Arc::new(MapSource { files }),
+                storage,
+                &keys,
+                "pypi",
+                source_rel,
+                &build_source_path(&repo_key, source_rel),
+                body.len() as i64,
+                ExpectedChecksums {
+                    sha256: Some(body_hex),
+                    sha1: None,
+                },
+                ConflictResolution::Skip,
+                false,
+                &mut counters.0,
+                &mut counters.1,
+                &mut counters.2,
+                &mut counters.3,
+                None,
+            )
+            .await
+            .expect("process_single_artifact");
+        assert_eq!(
+            (counters.0, counters.1, counters.2),
+            (0, 0, 1),
+            "re-running with ConflictResolution::Skip must skip existing rewritten-path artifacts"
+        );
 
         cleanup_repo(&pool, repo_id).await;
     }
