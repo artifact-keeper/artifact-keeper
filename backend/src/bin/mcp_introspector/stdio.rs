@@ -113,7 +113,7 @@ impl<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin + Send> Transport for St
     }
 }
 
-#[cfg(ak_test_shard = "services-2")]
+#[cfg(ak_test_shard = "router")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -42,9 +42,7 @@
 #   release-candidate.yml. Which commits main may certify is a separate,
 #   independent control: scripts/ci/resolve-certified-ref.sh derives the line
 #   a commit belongs to from repository state (main, else the
-#   `release/<X>.<Y>.x` its own Cargo.toml names) and refuses a commit whose
-#   `release-candidate.yml` is not byte-identical to a copy that lives on
-#   main. The predicate's `certified_ref` is checked against that derivation
+#   `release/<X>.<Y>.x` its own Cargo.toml names). The predicate's `certified_ref` is checked against that derivation
 #   below: it says which line the certified commit came from, and a
 #   certification whose line disagrees with the repository is not promoted.
 #   Nothing that can write an artifact or a commit status can forge it:
@@ -322,9 +320,8 @@ if [[ -n "$EXPECT_VERSION" && "$cert_version" != "$EXPECT_VERSION" ]]; then
 fi
 
 # WHICH LINE the commit belongs to -- main, or the `release/X.Y.x` its own
-# Cargo.toml names -- derived from repository state, never from a caller. The
-# same call refuses a commit whose release-candidate.yml is not byte-identical
-# to a copy that lives on main. This is the second, independent control: the
+# Cargo.toml names -- derived from repository state, never from a caller.
+# This is the second, independent control: the
 # identity pin above says only main's workflow may certify; this says which
 # commits it may certify. GITHUB_OUTPUT is withheld from the child so its keys
 # do not land in this job's outputs alongside the gate's own.
@@ -332,7 +329,7 @@ rc=0
 resolved="$(GITHUB_OUTPUT='' "$RESOLVE_CMD" "$SHA")" || rc=$?
 case "$rc" in
   0) ;;
-  1) blocked "${SHA} is on no line that may be released, or its ${WORKFLOW} is not a copy that lives on main (see the resolver's message above)." ;;
+  1) blocked "${SHA} is on no line that may be released (see the resolver's message above)." ;;
   *) infra "could not resolve which line ${SHA} belongs to (resolver exit ${rc})." ;;
 esac
 derived_ref="$(sed -n 's/^certified_ref=//p' <<<"$resolved" | head -1)"
@@ -371,13 +368,14 @@ else
   echo "  line:      ${derived_ref}"
 fi
 
-# The workflow the certification was BLESSED with. The candidate demanded, at
-# signing time, that release-candidate.yml at this commit be main's copy, and
-# recorded its blob id here. Comparing against that record rather than against
-# main's tip is deliberate: main moves, and re-deciding the question at every
-# promote would strand an already-certified commit on an unrelated merge (r2,
-# finding N1). Both sides of this comparison are fixed by the commit, so it
-# cannot rot. Absent is tolerated only for main, where nothing was demanded.
+# The workflow blob the certification RECORDED: release-candidate.yml at this
+# commit, as the candidate read it at signing time. (Until #6122 the candidate
+# also demanded that it be main's copy; that copy never runs, so it no longer
+# does.) Comparing against that record rather than against main's tip is
+# deliberate: main moves, and re-deciding the question at every promote would
+# strand an already-certified commit on an unrelated merge (r2, finding N1).
+# Both sides of this comparison are fixed by the commit, so it cannot rot.
+# Absent is tolerated only for a legacy main certification.
 cert_blob="$(jq -r '.certified_workflow_blob // empty' <<<"$p0")"
 if [[ -z "$cert_blob" ]]; then
   # A LEGACY certification carries NEITHER field -- both were added together.
@@ -393,7 +391,7 @@ if [[ -z "$cert_blob" ]]; then
 elif [[ "$cert_blob" != "$derived_blob" ]]; then
   blocked "the certification was made with ${WORKFLOW} blob ${cert_blob:0:12}, but ${SHA} carries ${derived_blob:0:12}. The commit's own tree cannot change, so this means the certification does not describe this commit."
 else
-  echo "  workflow:  ${derived_blob:0:12} (as blessed at certification time)"
+  echo "  workflow:  ${derived_blob:0:12} (as recorded at certification time)"
 fi
 
 adapter_decision=""; adapter_owner=""

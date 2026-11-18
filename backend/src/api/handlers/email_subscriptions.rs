@@ -213,10 +213,9 @@ async fn authorize_subscription_repo(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(key).await?;
     if !auth.can_access_repo(repo.id) {
-        return Err(AppError::NotFound(format!(
-            "Repository '{}' not found",
-            key
-        )));
+        return Err(AppError::NotFound(
+            crate::api::handlers::repositories::REPOSITORY_NOT_FOUND.to_string(),
+        ));
     }
     require_repo_write_access(&auth, &repo, &repo_service).await?;
     // The tenant gate above is a no-op on a public repository and admits any
@@ -963,6 +962,60 @@ mod tests {
         let r: EmailSubscriptionResponse = row.into();
         assert_eq!(r.created_at, now);
         assert_eq!(r.updated_at, now);
+    }
+
+    /// #5611: a token whose repository list leaves a private repository out
+    /// gets the unknown-key answer from the email-subscription routes, not a
+    /// body that names the key (a byte-level existence oracle).
+    #[tokio::test]
+    async fn subscription_routes_answer_a_hidden_repository_like_an_unknown_key_5611() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let unknown = format!("ak5611-unknown-{}", Uuid::new_v4());
+        let mut scoped_elsewhere = tdh::make_auth(user_id, &username);
+        scoped_elsewhere.is_api_token = true;
+        scoped_elsewhere.scopes = Some(vec!["write:repositories".to_string()]);
+        scoped_elsewhere.allowed_repo_ids =
+            crate::models::access_scope::AccessScope::Restricted(vec![Uuid::new_v4()]);
+        let subscription_id = Uuid::new_v4();
+
+        let send = |method: &str, uri: String| {
+            let req = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            tdh::send(
+                tdh::router_with_auth(router(), state.clone(), scoped_elsewhere.clone()),
+                req,
+            )
+        };
+        let mut answers = Vec::new();
+        for (method, tail) in [
+            ("GET", "/email-subscriptions".to_string()),
+            ("DELETE", format!("/email-subscriptions/{subscription_id}")),
+        ] {
+            let existing = send(method, format!("/{key}{tail}")).await;
+            let missing = send(method, format!("/{unknown}{tail}")).await;
+            answers.push((format!("{method} {tail}"), existing, missing));
+        }
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        for (case, existing, missing) in &answers {
+            assert_eq!(
+                existing.0,
+                axum::http::StatusCode::NOT_FOUND,
+                "{case}: {existing:?}"
+            );
+            assert_eq!(existing, missing, "{case}: existing private vs unknown key");
+            let body = String::from_utf8_lossy(&existing.1);
+            assert!(!body.contains(&key), "{case}: {body}");
+        }
     }
 
     /// GHSA-mvmh-g8wm-r3cp #4: email subscriptions are repository

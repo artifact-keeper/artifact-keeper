@@ -86,16 +86,28 @@ jobs:
   # integration job and the test-backend-unit aggregate over them); `code`
   # still gates the cheap hosted jobs (shell-tests, security-audit,
   # coverage-gates via its `needs`). A PR whose files are all docs or
-  # CI-only (release notes, scripts/release, docs/, and the scripts/ci/*.sh
-  # gates no Rust job executes) runs the shell gates and skips the Rust
-  # jobs. `rust` is a superset of `backend` and a subset
-  # of `code`. Other workflow files deliberately stay on the Rust side: the
-  # lib tests in backend/src/ci_test_surface.rs and backend/src/config.rs and
-  # the workflow_scan_gate_tests target read every file under
-  # .github/workflows/, so a workflow-only change can turn the unit job red.
+  # CI-only (release notes, scripts/release, docs/, the scripts/ci/*.sh
+  # gates no Rust job executes, and .github/ apart from a few files the Rust
+  # jobs read) runs the shell gates and skips the Rust jobs. `rust` is a
+  # superset of `backend` and a subset of `code`.
+  #
+  # Workflow files, ci.yml included, are CI-only too (#6115). They used to
+  # run every Rust job, because the lib tests in backend/src/ci_test_surface.rs
+  # and backend/src/config.rs and the workflow_scan_gate_tests target read
+  # .github/workflows/ as text, so a workflow-only change can turn them red.
+  # A workflow-only PR now runs just those tests, in the Workflow Contract
+  # Tests job (`workflow_contracts`; the integration target only when
+  # docker-publish.yml changed, `workflow_scan_gate`), plus actionlint and
+  # the shell gates in Shell Tests. The push to main after the merge still
+  # runs every Rust job: such a PR's integration job never ran, so it proves
+  # no tree. A ci.yml change to the Rust jobs' own steps can take the label
+  # `ci:full` to run them all on the PR.
+  #
   # scripts/ci/test-ci-change-classification.sh runs this step's script
-  # against fixture file lists and fails if a Rust job starts executing a
-  # script this arm would skip.
+  # against fixture file lists. It fails if a Rust job starts executing a
+  # script this arm would skip, if a backend source reads a file outside
+  # backend/ that a PR could change without running a test that reads it,
+  # or if a workflow reader falls outside the contract job's filter.
   #
   # On a push, `rust` is "false" when the pushed commit's tree is the exact
   # tree a merged pull request already proved green (see
@@ -145,6 +157,8 @@ jobs:
       ci_full: ${{ steps.filter.outputs.ci_full }}
       ci_image: ${{ steps.filter.outputs.ci_image }}
       scanner_adapter: ${{ steps.filter.outputs.scanner_adapter }}
+      workflow_contracts: ${{ steps.filter.outputs.workflow_contracts }}
+      workflow_scan_gate: ${{ steps.filter.outputs.workflow_scan_gate }}
     steps:
       # Push only, and only the tree-check script: on a push the checkout is
       # the protected branch's own commit. Pull requests are classified from
@@ -189,6 +203,11 @@ jobs:
             echo "manifest=true" >> "$GITHUB_OUTPUT"
             echo "tests=true" >> "$GITHUB_OUTPUT"
             echo "scanner_adapter=true" >> "$GITHUB_OUTPUT"
+            # The contract job stands in for the Rust jobs on a pull request
+            # only. Here `rust` is true (they run) or the tree was proven by
+            # a PR whose Rust jobs, integration included, all ran green.
+            echo "workflow_contracts=false" >> "$GITHUB_OUTPUT"
+            echo "workflow_scan_gate=false" >> "$GITHUB_OUTPUT"
             rust=true
             if [ "$EVENT_NAME" = "push" ] && [ -f scripts/ci/resolve-verified-tree.sh ]; then
               # Fails open: a non-zero exit or anything but an explicit
@@ -212,6 +231,8 @@ jobs:
             echo "rust=true" >> "$GITHUB_OUTPUT"
             echo "tests=true" >> "$GITHUB_OUTPUT"
             echo "scanner_adapter=true" >> "$GITHUB_OUTPUT"
+            echo "workflow_contracts=true" >> "$GITHUB_OUTPUT"
+            echo "workflow_scan_gate=true" >> "$GITHUB_OUTPUT"
             exit 0
           }
           # One line per changed file: its path, then a tab and the path it
@@ -252,6 +273,8 @@ jobs:
           rust=false
           tests=false
           scanner_adapter=false
+          workflow_contracts=false
+          workflow_scan_gate=false
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             # What the integration job reads that the unit shards do not:
@@ -270,6 +293,13 @@ jobs:
               *.md) ;;
               docker/scanner-adapter/*|docker/Dockerfile.scanner-adapter|.github/workflows/ci.yml)
                 scanner_adapter=true
+                ;;
+            esac
+            # The one workflow the workflow_scan_gate_tests integration
+            # target reads. Only the Workflow Contract Tests job uses this.
+            case "$f" in
+              .github/workflows/docker-publish.yml)
+                workflow_scan_gate=true
                 ;;
             esac
             # First arm: keep in sync with the `push` trigger's paths-ignore
@@ -300,6 +330,16 @@ jobs:
             # Fifth arm: CI-only files no Rust job reads. The shell gates
             # still run (`code`), the Rust jobs skip (`rust` stays false).
             case "$f" in
+              # Docs the Rust tests read (include_str! or read at test time):
+              # changing one can turn a unit leg red, so it is a Rust input
+              # despite being Markdown. Before the docs arm, which would
+              # swallow them. The shell test fails if a backend source reads
+              # a path outside backend/ that this gate would skip.
+              docs/air-gapped.md|docs/huggingface.md|docs/mcp-registry.md|\
+              docs/security/scan-on-proxy.md|docs/upstream-filter.md)
+                code=true
+                rust=true
+                ;;
               site/*|*.md|.beads/*|LICENSE)
                 ;;
               Cargo.toml|Cargo.lock|*/Cargo.toml|*/Cargo.lock)
@@ -308,7 +348,7 @@ jobs:
                 manifest=true
                 rust=true
                 ;;
-              backend/*|Cargo.toml|Cargo.lock|.sqlx/*|.github/workflows/ci.yml|\
+              backend/*|Cargo.toml|Cargo.lock|.sqlx/*|\
               .config/nextest.toml|\
               scripts/ci/run-measured-build.sh)
                 code=true
@@ -329,24 +369,51 @@ jobs:
               .github/release-notes/*|scripts/ci/*.sh|scripts/release/*|docs/*)
                 code=true
                 ;;
+              # Workflow files (ci.yml included): no Rust job builds or runs
+              # them, but a few lib tests and one integration target read
+              # them as text, so the Workflow Contract Tests job runs those
+              # instead of the whole suite (`workflow_contracts`).
+              .github/workflows/*)
+                code=true
+                workflow_contracts=true
+                ;;
+              # The rest of .github/ that only GitHub or the shell gates
+              # read. Not .github/actions/ (a composite action can run in a
+              # Rust job), coverage-gate.json or duplication-baseline.json
+              # (they set the Rust jobs' coverage verdict): those fall to
+              # the default arm.
+              .github/scripts/*|.github/ISSUE_TEMPLATE/*|.github/CODEOWNERS|\
+              .github/dependabot.yml|.github/FUNDING.yml|.github/actionlint.yaml)
+                code=true
+                ;;
               *)
                 code=true
                 rust=true
                 ;;
             esac
           done <<< "$files"
+          # `ci:full` on a pull request runs every Rust job whatever the
+          # files, e.g. for a ci.yml change to the Rust jobs' own steps.
+          if [ "$ci_full" = true ] && [ "$code" = true ]; then
+            rust=true
+            backend=true
+          fi
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "backend=$backend" >> "$GITHUB_OUTPUT"
           echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
           echo "rust=$rust" >> "$GITHUB_OUTPUT"
           echo "tests=$tests" >> "$GITHUB_OUTPUT"
           echo "scanner_adapter=$scanner_adapter" >> "$GITHUB_OUTPUT"
+          echo "workflow_contracts=$workflow_contracts" >> "$GITHUB_OUTPUT"
+          echo "workflow_scan_gate=$workflow_scan_gate" >> "$GITHUB_OUTPUT"
           echo "non-docs changes: $code"
           echo "backend changes: $backend"
           echo "manifest/lockfile changes: $manifest"
           echo "rust-job inputs changed: $rust"
           echo "integration-job inputs changed: $tests"
           echo "scanner-adapter Go inputs changed: $scanner_adapter"
+          echo "workflow files changed (contract tests): $workflow_contracts"
+          echo "docker-publish.yml changed (workflow_scan_gate_tests): $workflow_scan_gate"
 
   # ════════════════════════════════════════════════════════════════════════════
   # RELEASE-BUMP GATE
@@ -692,6 +759,86 @@ jobs:
           df -h / | tail -1
           du -sh target 2>/dev/null || true
 
+  # WINDOWS CROSS-CHECK (#6022). Every other Rust job here compiles for
+  # Linux only, so code that needs a Unix-only API without a cfg guard
+  # (`std::os::unix::*`, `PermissionsExt`, `symlink`) passed every PR check.
+  # The first build that saw it was release.yml's x86_64-pc-windows-gnu leg
+  # at tag time: v1.12.0's unpacker (#6005, backend/src/services/oci_rootfs.rs)
+  # stopped that leg, and 1.12.0 shipped no GitHub Release (fixed in #6201).
+  # The nightly 🪟 Windows Cross-Build (scheduled-tests.yml) only catches it
+  # after the merge.
+  #
+  # `cargo check`, not a build: type and name resolution is where Unix-only
+  # code fails, and a check emits metadata only, so there is no codegen and
+  # no link. The release-profile link is what fills the hosted VM and gets
+  # the runner killed with exit 143 (release.yml's "Add swap" note). Same
+  # target and features as release.yml's windows leg, and the same mingw-w64
+  # install: build scripts still run for a check, and openssl-src
+  # (`vendored-openssl`) compiles OpenSSL with the mingw C compiler.
+  # Library and binary targets only: the inline test modules are the
+  # 15 GiB lib-test rustc the unit legs shard, and tests do not ship.
+  #
+  # Reported through ✅ CI Complete, like Version Pin Bump, rather than as a
+  # new required context, so it blocks a merge with no branch-protection
+  # change. It runs and may skip exactly when Check Rust does.
+  windows-cross-check:
+    name: 🪟 Windows Cross-Check
+    runs-on: ubuntu-24.04
+    # Cold, a check of the whole graph is about as long as a cold clippy
+    # (see check-rust's 30-minute note); warm, only the workspace crate.
+    timeout-minutes: 30
+    needs: [changes, release-bump]
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_NET_RETRY: "10"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # rust-toolchain.toml already lists the target; naming it here as
+      # well keeps the job self-describing, as release.yml's leg does.
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Assert the pinned Rust toolchain is in force
+        run: ./scripts/ci/check-toolchain-pin.sh --active
+
+      # release.yml's two install steps for this leg, in one.
+      - name: Install protoc and mingw-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev mingw-w64
+
+      # No rust-cache, on purpose. The repo cache is over its 10 GiB quota,
+      # so a windows-check entry would evict release.yml's cli-* entries
+      # (least recently used) and make release builds cold (#6218). Most main
+      # pushes skip the Rust jobs anyway, so the entry would rarely be fresh.
+      # A cold check is ~5-15 min, in parallel, off the critical path.
+
+      # The workspace crate's rustc is the one heavy step here, as in
+      # check-rust, whose cgroup peaks at ~15 GiB on the same VM. Same
+      # best-effort swapfile; it costs seconds.
+      - name: Add swap
+        run: |
+          if sudo fallocate -l 12G /ak-ci-swapfile \
+             && sudo chmod 600 /ak-ci-swapfile \
+             && sudo mkswap /ak-ci-swapfile >/dev/null \
+             && sudo swapon /ak-ci-swapfile; then
+            echo "added a 12 GiB swapfile"
+          else
+            echo "::warning title=No extra swap::could not add /ak-ci-swapfile; this job runs with the image's default swap only."
+          fi
+          swapon --show
+          free -m
+
+      - name: Check the backend compiles for Windows
+        env:
+          SQLX_OFFLINE: true
+          CARGO_BUILD_JOBS: "4"
+          CARGO_INCREMENTAL: "0"
+        run: cargo check --locked --workspace --target x86_64-pc-windows-gnu --features vendored-openssl
+
   # UNIT TESTS + COVERAGE, SHARDED ACROSS GITHUB-HOSTED RUNNERS.
   #
   # The instrumented lib-test target used to be ONE rustc invocation holding
@@ -750,9 +897,9 @@ jobs:
       CARGO_NET_RETRY: "10"
       SQLX_OFFLINE: true
       # The shard whose leg also builds and runs the bin-target tests
-      # (backend/src/main.rs's test module is gated to it). test-shards.py
-      # `check` fails if this is not the shard main.rs's tests carry.
-      BIN_SHARD: services-2
+      # (main.rs and bin/**; their test modules are gated to it, #6133).
+      # test-shards.py `check` fails if this is not the shard they carry.
+      BIN_SHARD: router
     services:
       # DB-backed lib tests need it; one fresh database per leg also means
       # the `db-serial` groups in .config/nextest.toml only have to
@@ -911,6 +1058,9 @@ jobs:
       # `test-shards.py filter` skips its tests in all but the one leg its
       # file maps to, so each still runs exactly once (`all()` when every
       # module is gated, the normal case).
+      #
+      # `--profile ci` (.config/nextest.toml): no retries, and a JUnit report
+      # at target/nextest/ci/junit.xml for the two steps below (#6172).
       - name: Run unit tests
         id: unit
         env:
@@ -927,10 +1077,29 @@ jobs:
           filter="$(python3 scripts/ci/test-shards.py filter "${{ matrix.shard }}")"
           echo "nextest filter for this leg: ${filter}"
           if [ "${{ matrix.shard }}" = "$BIN_SHARD" ]; then
-            cargo nextest run --workspace --lib --bins --features "test-shard-${{ matrix.shard }}" -E "$filter" --test-threads 8 --no-fail-fast
+            cargo nextest run --workspace --lib --bins --features "test-shard-${{ matrix.shard }}" -E "$filter" --test-threads 8 --no-fail-fast --profile ci
           else
-            cargo nextest run --workspace --lib --features "test-shard-${{ matrix.shard }}" -E "$filter" --test-threads 8 --no-fail-fast
+            cargo nextest run --workspace --lib --features "test-shard-${{ matrix.shard }}" -E "$filter" --test-threads 8 --no-fail-fast --profile ci
           fi
+
+      # Report only: lists the leg's failed and flaky tests in the job
+      # summary, with an annotation each, and never changes the verdict
+      # (#6172). The `ci` profile does not retry, so "flaky" stays empty
+      # here until a retrying profile runs; the JUnit is the per-test record.
+      - name: Summarise unit test results
+        if: ${{ !cancelled() && steps.unit.outcome != 'skipped' }}
+        run: python3 scripts/ci/nextest-junit-summary.py "Unit tests (${{ matrix.shard }})" target/nextest/ci/junit.xml >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload unit test JUnit report
+        if: always()
+        # Report-only: an artifact-storage outage must not fail a green job.
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: junit-unit-${{ matrix.shard }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 7
 
       # This leg's share of the report. Only a fully green run yields one (a
       # failed run's counters are partial); `coverage-gates` then reports
@@ -1197,7 +1366,9 @@ jobs:
           AK_TESTS_REQUIRE_DB: "1"
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: |
-          cargo nextest run --workspace --no-tests=fail --test-threads 8 \
+          rm -f target/nextest/ci/junit.xml
+          trap 'mkdir -p junit && cp target/nextest/ci/junit.xml junit/tier1.xml 2>/dev/null || true' EXIT
+          cargo nextest run --workspace --no-tests=fail --test-threads 8 --profile ci \
             --test workflow_scan_gate_tests \
             --test security_tests \
             --test security_regression_tests \
@@ -1367,7 +1538,9 @@ jobs:
           AK_TESTS_REQUIRE_DB: "1"
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: |
-          cargo nextest run --workspace --no-tests=fail --no-fail-fast --test-threads 8 \
+          rm -f target/nextest/ci/junit.xml
+          trap 'mkdir -p junit && cp target/nextest/ci/junit.xml junit/tier2.xml 2>/dev/null || true' EXIT
+          cargo nextest run --workspace --no-tests=fail --no-fail-fast --test-threads 8 --profile ci \
             --run-ignored ignored-only \
             --test lifecycle_policy_tests \
             --test api_token_cache_flush_tests \
@@ -1445,10 +1618,31 @@ jobs:
           AK_TESTS_REQUIRE_DB: "1"
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: |
-          cargo nextest run --workspace --no-tests=fail \
+          rm -f target/nextest/ci/junit.xml
+          trap 'mkdir -p junit && cp target/nextest/ci/junit.xml junit/incus.xml 2>/dev/null || true' EXIT
+          cargo nextest run --workspace --no-tests=fail --profile ci \
             --run-ignored ignored-only \
             --test incus_upload_tests \
             test_chunked_upload_cross_repo_session_rejected
+
+      # Report only, as in the unit shards (#6172). Each nextest step above
+      # overwrites target/nextest/ci/junit.xml, so each copies its report to
+      # junit/ on exit; a step that did not run leaves no file, and the
+      # summary names it.
+      - name: Summarise integration test results
+        if: ${{ !cancelled() && steps.build.outcome != 'skipped' }}
+        run: python3 scripts/ci/nextest-junit-summary.py "Integration tests" junit/tier1.xml junit/tier2.xml junit/incus.xml >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload integration test JUnit reports
+        if: always()
+        # Report-only: an artifact-storage outage must not fail a green job.
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: junit-integration
+          path: junit/
+          if-no-files-found: warn
+          retention-days: 7
 
       # The acceptance numbers for keeping this job on hosted PR runs: the
       # per-process peak RSS of each build pass is already in the job
@@ -1470,6 +1664,128 @@ jobs:
           free -g
           df -h / | tail -1
           du -sh target 2>/dev/null || true
+
+  # WORKFLOW CONTRACT TESTS (#6115), GitHub-hosted.
+  #
+  # A pull request whose only Rust-relevant change is a workflow file skips
+  # the Rust jobs (`rust` is "false"). No Rust job builds or runs a workflow,
+  # but some tests read workflows as text and can turn red on a workflow-only
+  # change:
+  #
+  #   - `ci_test_surface::` (backend/src/ci_test_surface.rs) reads every
+  #     workflow and pins how ci.yml invokes nextest;
+  #   - `config::` (backend/src/config.rs) pins docker-publish.yml,
+  #     release.yml, release-cli-caches.yml and the cancel-in-progress
+  #     setting of every image-publishing workflow;
+  #   - `workflow_scan_gate_tests` (backend/tests/) reads docker-publish.yml;
+  #   - `test-shards.py check` (Check Rust) compares ci.yml's unit-test matrix
+  #     with its shard list.
+  #
+  # This job runs just those: one uninstrumented build of the services-2 lib
+  # tests, which both modules are gated to, instead of Check Rust, five
+  # instrumented shards and the integration job. The integration target is
+  # built only when docker-publish.yml changed (`workflow_scan_gate`), as it
+  # needs a second build of the library. CI Complete requires this job
+  # whenever the gate asks for it. scripts/ci/test-ci-change-classification.sh
+  # fails if a backend source that reads .github/workflows is not covered by
+  # CONTRACT_FILTER or the integration targets named below.
+  workflow-contracts:
+    name: 🧾 Workflow Contract Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    needs: [changes, release-bump]
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'false' && needs.changes.outputs.workflow_contracts != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_BUILD_JOBS: "4"
+      CARGO_INCREMENTAL: "0"
+      CARGO_NET_RETRY: "10"
+      # Module prefixes of the lib tests that read workflow files.
+      CONTRACT_FILTER: "test(/^(ci_test_surface|config)::/)"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@1.98.0
+
+      - name: Assert the pinned Rust toolchain is in force
+        run: ./scripts/ci/check-toolchain-pin.sh --active
+
+      - name: Check unit-test shard gates
+        run: python3 scripts/ci/test-shards.py check
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # The integration job's entry: the same uninstrumented dev-profile
+      # dependency graph, dev-dependencies included. Restore only.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: v2-rust
+          shared-key: integration
+          save-if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
+
+      - name: Fetch dependencies
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if cargo fetch; then
+              exit 0
+            fi
+            echo "cargo fetch failed (attempt ${attempt}/3) — retrying" >&2
+            sleep $(( attempt * 10 ))
+          done
+          echo "ERROR: cargo fetch failed after 3 attempts" >&2
+          exit 1
+
+      # The lib-test rustc peaks near the hosted VM's 15 GiB, as in the unit
+      # legs; see the note on their swap step.
+      - name: Add swap
+        run: |
+          if sudo fallocate -l 12G /ak-ci-swapfile \
+             && sudo chmod 600 /ak-ci-swapfile \
+             && sudo mkswap /ak-ci-swapfile >/dev/null \
+             && sudo swapon /ak-ci-swapfile; then
+            echo "added a 12 GiB swapfile"
+          else
+            echo "::warning title=No extra swap::could not add /ak-ci-swapfile; this job runs with the image's default swap only."
+          fi
+          swapon --show
+          free -m
+
+      - name: Build the contract test binaries
+        id: build
+        env:
+          SCAN_GATE: ${{ needs.changes.outputs.workflow_scan_gate }}
+        run: |
+          ok=true
+          ./scripts/ci/run-measured-build.sh "lib (services-2, contracts)" \
+            cargo nextest run -p artifact-keeper-backend --lib --no-run --features "test-shard-services-2" || ok=false
+          if [ "$ok" = true ] && [ "$SCAN_GATE" != "false" ]; then
+            ./scripts/ci/run-measured-build.sh workflow_scan_gate_tests \
+              cargo nextest run -p artifact-keeper-backend --no-run --test workflow_scan_gate_tests || ok=false
+          fi
+          if [ "$ok" != true ]; then
+            echo "::error title=Contract test BUILD failed — no test ran::cargo could not build the workflow contract tests. This PR changes no Rust input, so main's tip probably fails to build too: check the latest CI run on main."
+            exit 1
+          fi
+
+      - name: Run the workflow contract tests
+        env:
+          SCAN_GATE: ${{ needs.changes.outputs.workflow_scan_gate }}
+          JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
+        run: |
+          set -euo pipefail
+          echo "nextest filter: ${CONTRACT_FILTER}"
+          cargo nextest run -p artifact-keeper-backend --lib --features "test-shard-services-2" -E "$CONTRACT_FILTER" --no-tests=fail --no-fail-fast
+          if [ "$SCAN_GATE" != "false" ]; then
+            cargo nextest run -p artifact-keeper-backend --test workflow_scan_gate_tests --no-tests=fail --no-fail-fast
+          fi
 
   # The REQUIRED branch-protection context "🧪 Backend Unit Tests" -- do not
   # rename it. Its job used to do all of the work; the work is now the
@@ -1546,6 +1862,30 @@ jobs:
       - name: Fetch the base ref
         if: ${{ github.event_name == 'pull_request' }}
         run: git fetch --no-tags origin "+refs/heads/${GITHUB_BASE_REF}:refs/remotes/origin/${GITHUB_BASE_REF}"
+
+      # Every workflow, ci.yml included, is linted on every non-docs PR
+      # (#6115): a workflow-only PR no longer runs the Rust jobs, so this
+      # and the contract tests are what a workflow change has to pass.
+      # Expressions, job graph, `needs` outputs, runner labels
+      # (.github/actionlint.yaml) and action inputs; embedded shell is not
+      # shellchecked here (`-shellcheck=`: the tree has known findings).
+      # The ignore is the deliberate `if: false` on disabled
+      # docker-publish.yml jobs. Pinned release, checksum-verified.
+      - name: Lint workflows (actionlint)
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/actionlint"
+          mkdir -p "$dir"
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 -o "$dir/$tarball" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
+          echo "${ACTIONLINT_SHA256}  $dir/$tarball" | sha256sum -c -
+          tar -xzf "$dir/$tarball" -C "$dir" actionlint
+          "$dir/actionlint" -color -shellcheck= -pyflakes= \
+            -ignore 'constant expression "false" in condition'
 
       - name: dtrack-init regression test
         run: bash docker/test-init-dtrack.sh
@@ -1658,9 +1998,7 @@ jobs:
       #     once a patch release can be cut from release/X.Y.x. Its
       #     permissive direction hands an attacker-controlled branch the
       #     right to sign, so it must refuse an arbitrary branch, a case
-      #     variant of a real one, a commit on neither, and a
-      #     release-candidate.yml that is not byte-identical to a copy that
-      #     lives on main;
+      #     variant of a real one and a commit on neither;
       #   * registry-tag-digest.sh -- the digest probe the certification is
       #     compared against; must never invent a digest or read a 404 from
       #     an unreadable repository as absence;
@@ -1683,6 +2021,8 @@ jobs:
         run: bash scripts/ci/test-pin-adapter-digest.sh
       - name: Check the dispatched-run follower selects the right run
         run: bash scripts/ci/test-follow-dispatched-run.sh
+      - name: Check the ak-vm runner controller destroys and audits what it must
+        run: bash scripts/ci/test-vm-runner.sh
       - name: Check the CHANGELOG-documents-version gate
         run: bash scripts/ci/test-assert-changelog-documents-version.sh
 
@@ -1695,6 +2035,48 @@ jobs:
       # ~1s.
       - name: Check the candidate publish-run resolver selects and blocks correctly
         run: bash scripts/ci/test-resolve-candidate-publish-run.sh
+
+      # What a Release Candidate rerun of the failed gate groups runs, and
+      # whether it may run at all (#6076): the wrong commit, a non-candidate
+      # original, a replaced record or a dropped failed group must BLOCK.
+      # Stubs `gh`; offline, ~1s.
+      - name: Check the candidate rerun resolver selects and blocks correctly
+        run: bash scripts/ci/test-resolve-candidate-rerun.sh
+
+      # The release gate is pinned by sha (#6170): every caller of an
+      # artifact-keeper-test reusable workflow names one 40-hex commit, and a
+      # newly pinned commit must be on artifact-keeper-test main (a public
+      # repository, so the default token reads the compare API; a PR that
+      # changes no pin makes no call). The self-test stubs `gh`; offline, ~2s.
+      - name: Check the gate pin guard catches what it must
+        run: bash scripts/ci/test-check-gate-workflow-pins.sh
+      - name: Every gate caller pins one artifact-keeper-test commit
+        run: bash scripts/ci/check-gate-workflow-pins.sh check
+      - name: A newly pinned gate commit is on artifact-keeper-test main
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci/check-gate-workflow-pins.sh reachable "origin/${GITHUB_BASE_REF}"
+
+      # The nightly release gate (#6073): which lines and images it tests,
+      # how it gives way to a release candidate on the shared pool, and the
+      # one-issue-per-red-tier tracking plus the verdict record #6075 reads.
+      # Stubs `gh`; offline, ~2s.
+      - name: Check the nightly release gate's line resolver, sentinel and report
+        run: |
+          bash scripts/ci/test-nightly-gate-lines.sh
+          bash scripts/ci/test-nightly-gate-sentinel.sh
+          bash scripts/ci/test-nightly-gate-report.sh
+
+      # #6080: no merge freeze during a candidate. The stale-run finder
+      # cancels only runs that are queued with no runner past its threshold,
+      # never a moving one; the floating-tag guard withholds :dev / :X.Y-dev
+      # only from a run whose commit is provably older than the one they
+      # name. Stubs `gh`; offline.
+      - name: Check the stale Docker Publish run finder
+        run: bash scripts/ci/test-find-stale-docker-publish-runs.sh
+      - name: Check the branch floating-tag guard
+        run: bash scripts/ci/test-decide-branch-floating-tags.sh
 
       # The other half of #3640: when the accepted run is a promote dispatch,
       # the published bytes were built from a DIFFERENT commit than the tag,
@@ -1767,6 +2149,14 @@ jobs:
 
       - name: Check the conflict-marker gate catches what it must
         run: bash scripts/ci/test-check-conflict-markers.sh
+
+      # A native test that writes ~/.npmrc, ~/.cargo or ~/.m2 leaves the test
+      # registry and its credentials on the developer's machine (#5940).
+      - name: Check native tests keep client config in their work dir
+        run: bash scripts/ci/check-native-tests-user-config.sh
+
+      - name: Check the native-test config gate catches what it must
+        run: bash scripts/ci/test-check-native-tests-user-config.sh
 
       # Stock compose version pins (#4481): openscap and web were hardcoded to
       # :latest, so setting ARTIFACT_KEEPER_VERSION still left two images
@@ -2080,6 +2470,12 @@ jobs:
       # percentage. Throwaway trees, no cargo, ~1s.
       - name: Check the test-shard gates and the coverage merge
         run: bash scripts/ci/test-test-shards.sh
+
+      # The unit and integration jobs' JUnit summary is the only place a
+      # flaky pass shows (#6172); a parser that missed `<flakyFailure>`
+      # would hide it. Real nextest reports, no cargo, ~1s.
+      - name: Check the nextest JUnit summary names flaky and failed tests
+        run: bash scripts/ci/test-nextest-junit-summary.sh
 
       # The coverage merge gate (coverage-gates -> CI Complete). Three ways it
       # can silently stop measuring what it claims: counting inline
@@ -2994,8 +3390,8 @@ jobs:
     runs-on: ubuntu-24.04
     # The release profile's cold-cook worst case (60-90 min on a hosted
     # runner, per the schedule note in docker-publish.yml) set this ceiling.
-    # With the `ci` profile the cook is always cold here (see the build
-    # step), so every run is the ~20-25 min case; 90 stays as headroom
+    # The `ci` cook is cached by the Warm CI Image Cache job (see the build
+    # step); a cold one is the ~35 min case; 90 stays as headroom
     # until hosted runs confirm the figure, since a cancellation at the
     # ceiling wastes the whole build.
     timeout-minutes: 90
@@ -3020,7 +3416,8 @@ jobs:
           push: false
           load: true
           tags: artifact-keeper-backend:pr-test
-          # Read-only registry cache, warmed by docker-publish.yml on main.
+          # Read-only registry cache, warmed on main by docker-publish.yml
+          # and by the Warm CI Image Cache job below.
           # No cache-to of any kind:
           #   - registry: PR-triggered jobs must not get packages:write (fork
           #     PRs would inherit it — pwn-request risk), and anonymous GHCR
@@ -3034,9 +3431,13 @@ jobs:
           #     type=gha for (~7.7 GB of the 10 GB Actions quota, evicting the
           #     Rust caches daily), and that quota is already full.
           # The registry cache still covers the non-Rust stages (base images,
-          # rootfs-builder, the grype build, grype-db-seed); the Rust cook
-          # misses it because it is warmed with `release` (see below).
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-amd64
+          # rootfs-builder, the grype build, grype-db-seed). The Rust cook
+          # misses `buildcache-amd64`, which is warmed with `release` (see
+          # below); `buildcache-ci-amd64`, warmed on `main` by the Warm CI
+          # Image Cache job below, holds the `ci` cook (#6133).
+          cache-from: |
+            type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-ci-amd64
+            type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-amd64
           # CARGO_BUILD_JOBS=4: the hosted runner's core count, which is what
           # cargo would use anyway; passed explicitly because the Dockerfile
           # defaults to 8 for the self-hosted pools (see
@@ -3049,11 +3450,10 @@ jobs:
           # -j8 the compile is 317 s vs 601 s, at the same peak memory. This
           # is the ONLY build of the Dockerfile that passes it:
           # docker-publish.yml (whose output release.yml certifies) and
-          # e2e.yml keep the default `release`. The registry cache above is
-          # warmed with `release`, so the cook layer never hits it for this
-          # profile and is always cold here; a whole `ci` build is still
-          # shorter than the `release` builder stage alone on a warm cook
-          # (317 s vs 318 s + 191 s for the release lib and LTO'd bin).
+          # e2e.yml keep the default `release`. `buildcache-amd64` is warmed
+          # with `release`, so this profile's cook only hits
+          # `buildcache-ci-amd64` (#6133); before that tag existed it was
+          # always cold here (cook ~13.5 min on 2026-11-16, run 43852119667).
           build-args: |
             CARGO_BUILD_JOBS=4
             CARGO_PROFILE=ci
@@ -3087,6 +3487,62 @@ jobs:
           name: backend-image
           path: /tmp/backend-image.tar.gz
           retention-days: 1
+
+  # Warms the registry cache for the `ci`-profile dependency cook (#6133).
+  # The Build Backend Image job above builds with CARGO_PROFILE=ci, and
+  # docker-publish.yml warms `buildcache-amd64` with `release`, so that
+  # job's cook (`deps` stage, ~13.5 min on a hosted runner) never hit the
+  # cache and always ran cold. This job builds only the `deps` stage, with
+  # the same build args, and exports it to a tag of its own,
+  # `buildcache-ci-amd64`, which Build Backend Image reads.
+  #
+  # It is a job of its own because writing the registry needs
+  # packages:write. Build Backend Image also runs on pull requests, and
+  # their code must not run with that token (see its build step). This one
+  # runs only on a push to `main`, where the tree is a merged commit.
+  # When the cook is already cached (the lockfile, the manifests, the base
+  # image and the Dockerfile up to the `deps` stage are unchanged), every
+  # layer is CACHED and the job takes a minute or two. Advisory, like the
+  # rest of the container chain: CI Complete does not wait for it.
+  warm-ci-image-cache:
+    name: 🐳 Warm CI Image Cache
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    needs: [detect-changes]
+    if: ${{ !cancelled() && github.repository == 'artifact-keeper/artifact-keeper' && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.detect-changes.result == 'success' && needs.detect-changes.outputs.backend == 'true' }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build args must equal Build Backend Image's: they are part of the
+      # cook layer's cache key.
+      - name: Cook the ci-profile dependencies into the registry cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: ./docker/Dockerfile.backend
+          target: deps
+          platforms: linux/amd64
+          push: false
+          cache-from: |
+            type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-ci-amd64
+            type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-amd64
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-ci-amd64,mode=max,image-manifest=true,oci-mediatypes=true
+          build-args: |
+            CARGO_BUILD_JOBS=4
+            CARGO_PROFILE=ci
 
   build-openscap-image:
     name: 🐳 Build OpenSCAP Image
@@ -3169,7 +3625,7 @@ jobs:
     # Not smoke-e2e, build-backend-image or build-openscap-image: they are
     # advisory (see the container-chain note in the step below), and a
     # `needs` edge would make this required context wait ~25 min for them.
-    needs: [changes, detect-changes, release-bump, check-rust, test-backend-unit-shard, test-backend-unit, shell-tests, version-pin-bump, scanner-adapter-go, go-floor-agreement, coverage-gates, security-audit]
+    needs: [changes, detect-changes, release-bump, check-rust, windows-cross-check, test-backend-unit-shard, test-backend-unit, workflow-contracts, shell-tests, version-pin-bump, scanner-adapter-go, go-floor-agreement, coverage-gates, security-audit]
     if: always()
     # The coverage decision reads the PR's live labels/draft state, the
     # override label's `labeled` events and `/coverage-override` comments,
@@ -3194,8 +3650,10 @@ jobs:
         # the shell control flow.
         env:
           RESULT_CHECK_RUST: ${{ needs.check-rust.result }}
+          RESULT_WINDOWS_CHECK: ${{ needs.windows-cross-check.result }}
           RESULT_UNIT: ${{ needs.test-backend-unit.result }}
           RESULT_UNIT_SHARDS: ${{ needs.test-backend-unit-shard.result }}
+          RESULT_WORKFLOW_CONTRACTS: ${{ needs.workflow-contracts.result }}
           RESULT_SHELL: ${{ needs.shell-tests.result }}
           RESULT_VERSION_PIN: ${{ needs.version-pin-bump.result }}
           RESULT_GO_FLOOR: ${{ needs.go-floor-agreement.result }}
@@ -3208,6 +3666,7 @@ jobs:
           RUST_SKIP_REASON: ${{ needs.changes.outputs.rust_skip_reason }}
           MANIFEST_CHANGED: ${{ needs.changes.outputs.manifest }}
           SCANNER_ADAPTER_CHANGED: ${{ needs.changes.outputs.scanner_adapter }}
+          WORKFLOW_CONTRACTS: ${{ needs.changes.outputs.workflow_contracts }}
           DOCKER_CHANGED: ${{ needs.detect-changes.outputs.docker }}
           BUMP_ONLY: ${{ needs.release-bump.outputs.bump_only }}
           COVERAGE_FLOOR: ${{ needs.coverage-gates.outputs.floor }}
@@ -3229,7 +3688,8 @@ jobs:
 
           # Docs-only PRs legitimately skip the Tier 1 jobs (see the
           # `changes` job). Version-bump-only release PRs legitimately skip
-          # the heavy Rust jobs — check-rust and test-backend-unit, but NOT
+          # the heavy Rust jobs — check-rust, windows-cross-check and
+          # test-backend-unit, but NOT
           # shell-tests, which still runs on that path (see the
           # `release-bump` job). Any other skip/failure of a Tier 1 job is
           # fatal.
@@ -3245,8 +3705,8 @@ jobs:
           fi
           # The `changes` job found nothing a Rust job reads (a CI-only PR),
           # or, on a push, a merged PR already proved this exact tree green.
-          # Same allowance as the bump path: check-rust and test-backend-unit
-          # may skip; shell-tests and security-audit still run and must
+          # Same allowance as the bump path: check-rust, windows-cross-check
+          # and test-backend-unit may skip; shell-tests and security-audit still run and must
           # succeed. Only an explicit "false" counts -- an empty output (the
           # gate died) makes a skip fatal, matching the jobs' own fail-open
           # `!= 'false'` condition.
@@ -3267,12 +3727,14 @@ jobs:
             elif [[ "$result" == "skipped" && "$docs_only" == "true" ]]; then
               echo "⏭️ $name (docs-only)" >> "$GITHUB_STEP_SUMMARY"
             elif [[ "$result" == "skipped" && "$bump_only" == "true" \
-                    && ( "$name" == "check-rust" || "$name" == "test-backend-unit" ) ]]; then
-              # Only the two heavy Rust jobs are skippable on the bump path.
+                    && ( "$name" == "check-rust" || "$name" == "windows-cross-check" \
+                         || "$name" == "test-backend-unit" ) ]]; then
+              # Only the heavy Rust jobs are skippable on the bump path.
               # shell-tests and security-audit still run and must succeed.
               echo "⏭️ $name (version-bump-only release PR)" >> "$GITHUB_STEP_SUMMARY"
             elif [[ "$result" == "skipped" && "$rust_skipped" == "true" \
-                    && ( "$name" == "check-rust" || "$name" == "test-backend-unit" ) ]]; then
+                    && ( "$name" == "check-rust" || "$name" == "windows-cross-check" \
+                         || "$name" == "test-backend-unit" ) ]]; then
               echo "⏭️ $name (no Rust-job inputs to re-verify)" >> "$GITHUB_STEP_SUMMARY"
             else
               echo "❌ $name: ${result:-missing}" >> "$GITHUB_STEP_SUMMARY"
@@ -3318,8 +3780,23 @@ jobs:
           }
 
           require_success "check-rust" "$RESULT_CHECK_RUST"
+          # The Windows cross-check (#6022) has check-rust's condition, so it
+          # may skip exactly where check-rust may.
+          require_success "windows-cross-check" "$RESULT_WINDOWS_CHECK"
           require_success "test-backend-unit" "$RESULT_UNIT"
           require_success "shell-tests" "$RESULT_SHELL"
+
+          # The Workflow Contract Tests stand in for the Rust jobs on a PR
+          # that changes workflow files and no Rust input (#6115). When the
+          # Rust jobs were skipped by design, the contract job is required
+          # unless the gate said explicitly that no workflow changed (an
+          # empty output fails closed). Whenever the Rust jobs ran, they
+          # ran these tests too, so its skip passes; a failure never does.
+          if [[ "$rust_skipped" == "true" && "${WORKFLOW_CONTRACTS:-}" != "false" ]]; then
+            require_success "workflow-contracts" "$RESULT_WORKFLOW_CONTRACTS"
+          else
+            allow_skip "workflow-contracts" "$RESULT_WORKFLOW_CONTRACTS"
+          fi
 
           # Security Audit blocks a pull request or a merge group only when
           # the change itself touches what `cargo audit` reads (Cargo.toml /

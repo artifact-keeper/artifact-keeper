@@ -245,6 +245,26 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler pkg-config libssl-dev mingw-w64
 
+      # The 1.12 backend's release build fills the hosted VM's 15 GiB of RAM
+      # and 2 GiB of swap. Over it, the runner stops answering instead of
+      # being OOM-killed: "The runner has received a shutdown signal", exit
+      # 143. That killed v1.12.0's aarch64 and Windows legs (run 44223297721)
+      # and the Windows cross-build twice (run 44236328312), while 1.11.14,
+      # a smaller tree, built every target. Same remedy as ci.yml's unit
+      # legs ("Add swap"): a 12 GiB swapfile on the ~80 GB disk. Best effort.
+      - name: Add swap
+        run: |
+          if sudo fallocate -l 12G /ak-ci-swapfile \
+             && sudo chmod 600 /ak-ci-swapfile \
+             && sudo mkswap /ak-ci-swapfile >/dev/null \
+             && sudo swapon /ak-ci-swapfile; then
+            echo "added a 12 GiB swapfile"
+          else
+            echo "::warning title=No extra swap::could not add /ak-ci-swapfile; this job runs with the image's default swap only."
+          fi
+          swapon --show
+          free -m
+
       - name: Build Windows binary (cross-compile)
         env:
           SQLX_OFFLINE: true
