@@ -184,22 +184,6 @@ impl BuildService {
         Ok(build)
     }
 
-    /// The artifacts attached to any of `build_ids`, oldest first
-    pub async fn list_artifacts(&self, build_ids: &[Uuid]) -> Result<Vec<BuildArtifact>> {
-        sqlx::query_as(
-            r#"
-            SELECT id, build_id, module_name, name, path, checksum_sha256, size_bytes, created_at
-            FROM build_artifacts
-            WHERE build_id = ANY($1)
-            ORDER BY created_at, id
-            "#,
-        )
-        .bind(build_ids)
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))
-    }
-
     /// Bulk insert artifacts for a build and update the artifact_count.
     pub async fn add_artifacts(
         &self,
