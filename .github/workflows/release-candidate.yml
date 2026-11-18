@@ -947,6 +947,7 @@ jobs:
     outputs:
       tests_sha: ${{ steps.record.outputs.tests_sha }}
       gate_workflow_sha: ${{ steps.record.outputs.gate_workflow_sha }}
+      gate_workflow: ${{ steps.record.outputs.gate_workflow }}
       tests_moved: ${{ steps.record.outputs.tests_moved }}
       contributing_runs: ${{ steps.record.outputs.contributing_runs }}
       rerun: ${{ steps.record.outputs.rerun }}
@@ -1018,8 +1019,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          GATE_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
-            --jq '[.referenced_workflows[]? | select(.path | startswith("artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@")) | .sha] | first // empty')"
+          # GitHub's record of the gate this run called: `path` is the
+          # `uses:` value with its ref (the pinned sha, #6170), `sha` the
+          # commit that ref resolved to.
+          gate_ref="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --jq '[.referenced_workflows[]? | select(.path | startswith("artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@"))] | first // {} | [.path // "", .sha // ""] | join(" ")')"
+          GATE_WORKFLOW="${gate_ref% *}"
+          GATE_SHA="${gate_ref##* }"
           if [[ ! "$GATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error title=Gate commit unknown::this run records no artifact-keeper-test release-gate.yml commit (got '${GATE_SHA}')."
             exit 1
@@ -1080,6 +1086,7 @@ jobs:
           {
             echo "tests_sha=${TESTS_SHA}"
             echo "gate_workflow_sha=${GATE_SHA}"
+            echo "gate_workflow=${GATE_WORKFLOW}"
             echo "tests_moved=${tests_moved}"
             echo "contributing_runs=${runs}"
             echo "rerun=${rerun}"
@@ -1114,9 +1121,16 @@ jobs:
     permissions:
       contents: read
       packages: read
-    # Still @main: SHA-pinning waits on branch protection for
-    # artifact-keeper-test, and on the 1.12.0 gate wiring landing there.
-    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main
+    # Pinned to an artifact-keeper-test commit, not @main (#6170): a gate
+    # change reaches a candidate only through a bump PR in this repo, which
+    # Mergify does not auto-merge. CODEOWNERS lists this file to mark
+    # ownership; a code-owner review is enforced only once branch protection
+    # on main and release/* requires it (#6216). The pin does not wait on
+    # protection for artifact-keeper-test (#6178). All five callers carry ONE
+    # sha, and
+    # scripts/ci/check-gate-workflow-pins.sh enforces both that and that the
+    # sha is on artifact-keeper-test main.
+    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@987bccd15df3fd4c9c24bf78436ce12fb5bd5783 # artifact-keeper-test main as of 2026-11-18
     with:
       backend_tag: sha-${{ needs.resolve.outputs.short }}
       # The chart ref the gate deploys. `bookkeeping` renders the chart at this
@@ -1233,6 +1247,7 @@ jobs:
           ADAPTER_TAG: ${{ needs.images.outputs.adapter_tag }}
           PUBLISH_RUN_ID: ${{ needs.images.outputs.publish_run_id }}
           GATE_WORKFLOW_SHA: ${{ needs.record.outputs.gate_workflow_sha }}
+          GATE_WORKFLOW: ${{ needs.record.outputs.gate_workflow }}
           TESTS_SHA: ${{ needs.bookkeeping.outputs.tests_sha }}
           TESTS_BRANCH: ${{ needs.bookkeeping.outputs.tests_branch }}
           CONTRIBUTING_RUNS: ${{ needs.record.outputs.contributing_runs }}
@@ -1251,7 +1266,7 @@ jobs:
             --arg backend "$BACKEND_DIGEST" --arg openscap "$OPENSCAP_DIGEST" --arg adapter "$ADAPTER_DIGEST" \
             --arg backend_image "$BACKEND_IMAGE" --arg openscap_image "$OPENSCAP_IMAGE" --arg adapter_image "$ADAPTER_IMAGE" \
             --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --arg gate_sha "$GATE_WORKFLOW_SHA" --arg tests_sha "$TESTS_SHA" --arg tests_branch "$TESTS_BRANCH" \
+            --arg gate_workflow "$GATE_WORKFLOW" --arg gate_sha "$GATE_WORKFLOW_SHA" --arg tests_sha "$TESTS_SHA" --arg tests_branch "$TESTS_BRANCH" \
             --argjson runs "$CONTRIBUTING_RUNS" --argjson rerun "$RERUN" \
             '{
               commit_sha: $sha,
@@ -1273,7 +1288,9 @@ jobs:
               # The gate is a reusable workflow called by this run, so its
               # jobs live under this run id.
               gate_run_id: $run,
-              gate_workflow: "artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main",
+              # The `uses:` ref the gate was called by, as GitHub recorded it
+              # for this run: the pinned artifact-keeper-test sha (#6170).
+              gate_workflow: $gate_workflow,
               # What the gate ran (#6076): the release-gate.yml commit GitHub
               # resolved for this run, and the one tests tree every gate job
               # checked out (the gate input tests_sha).

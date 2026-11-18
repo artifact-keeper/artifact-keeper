@@ -159,6 +159,19 @@ expect "release-gate.yml changed, tests=same -> BLOCKED" 1 "dispatch again with 
 CASE_TESTS=moved
 expect "release-gate.yml changed, tests=moved -> allowed and flagged" 0 "gate_changed=true"
 expect "tests=moved pins nothing" 0 "pin_tests_sha="$'\n'
+# The callers pin release-gate.yml by sha (#6170): referenced_workflows then
+# records `...release-gate.yml@<sha>`, and an original from before the pin
+# recorded `@main`. The resolver matches the path by prefix and compares the
+# file's blob, so a pin bump between original and rerun is judged exactly
+# like main moving was: same blob -> same; different blob -> tests=moved.
+pin_self() { edit self_run.json ".referenced_workflows[0] = {path: \"artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@$1\", sha: \"$1\"}"; }
+reset_case; pin_self "$GATE_A"
+expect "original @main, rerun pinned to the same commit: same" 0 "gate_changed=false"
+reset_case; edit orig_run.json ".referenced_workflows[0] = {path: \"artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@$GATE_A\", sha: \"$GATE_A\"}"
+pin_self "$GATE_B"; echo '{"sha":"blobB"}' > "$F/blob_${GATE_B}.json"
+expect "a pin bump that changed release-gate.yml, tests=same -> BLOCKED" 1 "dispatch again with tests=moved"
+CASE_TESTS=moved
+expect "a pin bump that changed release-gate.yml, tests=moved -> allowed and flagged" 0 "gate_changed=true"
 reset_case; CASE_TESTS=sideways
 expect "an unknown tests mode -> BLOCKED" 1 "tests must be 'same' or 'moved'"
 

@@ -3,3 +3,9 @@ backend/migrations/ @artifact-keeper/backend
 backend/src/api/ @artifact-keeper/backend @artifact-keeper/platform-sdk
 backend/src/formats/ @artifact-keeper/backend
 scripts/ @artifact-keeper/backend
+# The callers of artifact-keeper-test's reusable gate workflows. Each pins one
+# artifact-keeper-test commit (#6170); a bump changes what certifies a release.
+.github/workflows/release-candidate.yml @artifact-keeper/backend
+.github/workflows/release.yml @artifact-keeper/backend
+.github/workflows/nightly-release-gate.yml @artifact-keeper/backend
+.github/workflows/release-gate-rehearsal.yml @artifact-keeper/backend
