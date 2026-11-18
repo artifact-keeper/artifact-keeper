@@ -28,6 +28,7 @@ formal/
 | `AgeGate/PolicyRelaxation.lean` | `AgeGatePolicy::is_relaxed_by` (`backend/src/services/age_gate_service.rs`) | Holds over time: any run of individually allowed changes to an enabled gate leaves it enabled, in the same mode, with a minimum age that never drops. |
 | `Auth/MintRepoCeiling.lean` | `AuthExtension::mint_repo_ceiling` (`backend/src/api/middleware/auth.rs`) and `AccessScope::grants` (`backend/src/models/access_scope.rs`) | Holds over time: through any chain of mints, a token reaches only repositories the original credential reached. Shows the empty-allowlist refusal is load-bearing: without it, "restricted to nothing" mints "unrestricted". |
 | `Curation/RuleEvaluation.lean` | `CurationService::evaluate_rules` (`backend/src/services/curation_service.rs`) | First-match evaluation shared by PyPI, npm, conda and every curated format: the first applicable rule decides, rules below a matching block cannot unblock, and no applicable rule gives the default. States the cost of skipping undecidable rules: a constraint that blocks every version still admits a request that names no version. |
+| `Proxy/OriginGateMemo.lean` | `gate_through_memo` and its by-id and by-key callers (`backend/src/services/proxy_service.rs`), scoped in `maven_remote_stream` (`backend/src/api/handlers/maven.rs`) | Holds over the gate calls in one memo scope, with policies that may change part-way: a caller by id is allowed only by its own evaluation or an earlier one for the same Remote; nothing is allowed when no evaluation allows; the memo never evaluates more often; with steady policies callers by id get their own answers. For the Maven jar GET's scope, what is served is decided by the content fetch's own evaluation, and the sidecar read can differ only on an allowed jar. Records both differences: a deny written mid-scope, and the key re-pointed to another Remote, which change only the checksum header there. Liveness is not modelled. |
 | `Quarantine/DownloadGate.lean` | `check_download_allowed`, `admin_quarantine_allowed` (`backend/src/services/quarantine_service.rs`) | A rejection never downloads; a hold with no expiry never lapses; a timed hold blocks for exactly its window and, once lapsed, stays lapsed; quarantine-now always blocks and is refused on a rejection. Records that an unrecognised status downloads (safe only while the column constraint holds). |
 | `Scan/ScanState.lean` | `classify_scan_state` and `ScanState::is_unscanned` (`backend/src/services/scan_state.rs`) | The original fall-through passes a row with an unrecognised status (counterexample included). With the fall-through closed, the gate is passed exactly when a scan completed or every row is "not applicable". |
 
@@ -79,4 +80,8 @@ changes.
 3. State the guarantee the rule exists for as a theorem and prove it.
 4. If the guarantee is false, keep the counterexample as a theorem (`by decide`)
    rather than weakening the statement, then model the fix and prove that.
-5. Add the import to `ArtifactKeeper.lean` and a row to the table above.
+5. Pair it with a Rust test that checks the same statements on the real code
+   (usually a property test), and name that test in the model's doc comment.
+   The Lean job runs only when `formal/` changes, so the paired test is what
+   fails when the Rust drifts from the model.
+6. Add the import to `ArtifactKeeper.lean` and a row to the table above.
