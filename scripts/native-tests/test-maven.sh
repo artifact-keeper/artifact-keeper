@@ -18,6 +18,7 @@ echo "Version: $TEST_VERSION"
 echo "==> Generating test project..."
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
+mvn() { command mvn -s "$WORK_DIR/settings.xml" "$@"; }
 
 cd "$WORK_DIR"
 mkdir -p src/main/java/com/test
@@ -60,8 +61,7 @@ EOF
 
 # Configure Maven settings
 echo "==> Configuring Maven settings..."
-mkdir -p ~/.m2
-cat > ~/.m2/settings.xml << EOF
+cat > "$WORK_DIR/settings.xml" << EOF
 <settings>
   <servers>
     <server>

@@ -3858,6 +3858,11 @@ static RESOLVER_INDEX_MEMO: Lazy<
 /// Only successful reads are memoized — an upstream error must not be pinned
 /// for the window, and the negative-cache behaviour of the fetch path is left
 /// exactly as it was.
+///
+/// Concurrent cold misses for one key share a single upstream read (#5983),
+/// `uv` and pip ask for several sidecars of one project at once. The request
+/// that did the read keeps its own error, the ones that waited on it get
+/// [`shared_resolver_index_error`]
 async fn fetch_resolver_index(
     proxy: &crate::services::proxy_service::ProxyService,
     repo_id: uuid::Uuid,
@@ -3871,26 +3876,43 @@ async fn fetch_resolver_index(
         normalized.to_string(),
         upstream_index_path.to_string(),
     );
-    if let Some(hit) = RESOLVER_INDEX_MEMO.get(&key).await {
-        return Ok((hit.0.clone(), hit.1.clone()));
-    }
-
-    let (index_bytes, _ct, effective_url) = proxy_helpers::proxy_fetch_uncached(
-        proxy,
-        repo_id,
-        repo_key,
-        effective_upstream,
-        upstream_index_path,
-    )
-    .await?;
-
-    RESOLVER_INDEX_MEMO
-        .insert(
-            key,
-            std::sync::Arc::new((index_bytes.clone(), effective_url.clone())),
-        )
+    let mut leader_error: Option<Response> = None;
+    let read = RESOLVER_INDEX_MEMO
+        .try_get_with(key, async {
+            match proxy_helpers::proxy_fetch_uncached(
+                proxy,
+                repo_id,
+                repo_key,
+                effective_upstream,
+                upstream_index_path,
+            )
+            .await
+            {
+                Ok((index_bytes, _ct, effective_url)) => {
+                    Ok(std::sync::Arc::new((index_bytes, effective_url)))
+                }
+                Err(resp) => {
+                    let status = resp.status();
+                    leader_error = Some(resp);
+                    Err(status)
+                }
+            }
+        })
         .await;
-    Ok((index_bytes, effective_url))
+    match read {
+        Ok(hit) => Ok((hit.0.clone(), hit.1.clone())),
+        Err(status) => Err(leader_error.unwrap_or_else(|| shared_resolver_index_error(*status))),
+    }
+}
+
+/// Error for a request that waited on another request's failed index read
+fn shared_resolver_index_error(status: StatusCode) -> Response {
+    let body = if status == StatusCode::NOT_FOUND {
+        "Artifact not found upstream"
+    } else {
+        "Upstream index fetch failed"
+    };
+    (status, body).into_response()
 }
 
 /// Resolve the real download URL for a file hosted by a remote PyPI
@@ -3951,15 +3973,6 @@ async fn resolve_pypi_remote_fetch_target(
     let file_url = find_upstream_url_for_file(&index_html, filename, Some(&full_index_url))
         .or_else(|| find_upstream_metadata_url(&index_html, filename, Some(&full_index_url)));
 
-    let fallback = || {
-        let (base, path) = pypi_upstream_url_and_path(
-            upstream_url,
-            &format!("{}/{}", normalized, filename),
-            index_path,
-        );
-        (base, path)
-    };
-
     // Validate resolved URL against SSRF before making the outbound request.
     // A malicious upstream index could contain hrefs pointing to internal
     // addresses (169.254.169.254, localhost, Docker service names, etc.).
@@ -3989,7 +4002,7 @@ async fn resolve_pypi_remote_fetch_target(
 
     let (fetch_base, fetch_path) = match file_url.as_deref().and_then(split_url_base_and_path) {
         Some(pair) => pair,
-        None => fallback(),
+        None => pypi_direct_file_location(upstream_url, project, filename, index_path),
     };
 
     // GHSA-qxv7-p3mq-88fv: the same index page that vouched for the download
@@ -4006,6 +4019,41 @@ async fn resolve_pypi_remote_fetch_target(
         cache_path,
         expected_sha256,
     })
+}
+
+/// The conventional `{index}/{project}/{filename}` location of a file on a
+/// PyPI upstream, used when the simple index names no download URL for it
+fn pypi_direct_file_location(
+    upstream_url: &str,
+    project: &NormalizedProjectName,
+    filename: &str,
+    index_path: &str,
+) -> (String, String) {
+    let normalized = PypiHandler::normalize_name(project.as_str());
+    pypi_upstream_url_and_path(
+        upstream_url,
+        &format!("{}/{}", normalized, filename),
+        index_path,
+    )
+}
+
+/// The fetch target for a file whose proxy-cache entry is fresh (#5875). The
+/// fetch is answered from the cache, so the simple index is not read and no
+/// index digest is pinned
+fn pypi_cached_fetch_target(
+    upstream_url: &str,
+    project: &NormalizedProjectName,
+    filename: &str,
+    index_path: &str,
+) -> PypiRemoteFetchTarget {
+    let (fetch_base, fetch_path) =
+        pypi_direct_file_location(upstream_url, project, filename, index_path);
+    PypiRemoteFetchTarget {
+        fetch_base,
+        fetch_path,
+        cache_path: build_pypi_proxy_cache_path(project, filename),
+        expected_sha256: None,
+    }
 }
 
 /// #1555: presigned-redirect fast path for a fresh proxy-cache hit on a remote
@@ -4234,6 +4282,30 @@ async fn serve_scanned_pypi_file(
     ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
 ) -> Result<Response, Response> {
     let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
+    // #5875: a fresh cached file is served without reading the simple index,
+    // so a cached wheel stays downloadable while the index is unreachable. The
+    // scan gate still runs on the cached bytes and their digest. An entry
+    // evicted between this probe and the fetch makes the direct location miss
+    // upstream, and that miss goes through the index like a cold pull
+    let scan = PypiScanRequest {
+        repo_id,
+        repo_key,
+        upstream_url,
+        project,
+        filename,
+        index_path: &index_path,
+        action,
+        severity_gate,
+        ctx,
+    };
+    let cache_path = build_pypi_proxy_cache_path(project, filename);
+    if proxy.is_cache_fresh(repo_key, &cache_path).await {
+        let target = pypi_cached_fetch_target(upstream_url, project, filename, &index_path);
+        match serve_scanned_pypi_target(state, proxy, &scan, &target).await {
+            Err(resp) if resp.status() == StatusCode::NOT_FOUND => {}
+            served => return served,
+        }
+    }
     let target = resolve_pypi_remote_fetch_target(
         proxy,
         repo_id,
@@ -4244,6 +4316,39 @@ async fn serve_scanned_pypi_file(
         &index_path,
     )
     .await?;
+    serve_scanned_pypi_target(state, proxy, &scan, &target).await
+}
+
+/// One scanned PyPI file request, whatever target it is fetched from
+struct PypiScanRequest<'a> {
+    repo_id: uuid::Uuid,
+    repo_key: &'a str,
+    upstream_url: &'a str,
+    project: &'a NormalizedProjectName,
+    filename: &'a str,
+    index_path: &'a str,
+    action: crate::services::proxy_scan_service::ProxyScanAction,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
+    ctx: Option<&'a crate::api::middleware::download_telemetry::DownloadContext>,
+}
+
+async fn serve_scanned_pypi_target(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    scan: &PypiScanRequest<'_>,
+    target: &PypiRemoteFetchTarget,
+) -> Result<Response, Response> {
+    let PypiScanRequest {
+        repo_id,
+        repo_key,
+        upstream_url,
+        project,
+        filename,
+        index_path,
+        action,
+        severity_gate,
+        ctx,
+    } = *scan;
     let req = proxy_helpers::ScannedProxyRequest {
         repo_id,
         repo_key,
@@ -4260,7 +4365,7 @@ async fn serve_scanned_pypi_file(
         proxy,
         upstream_url,
         project,
-        index_path: &index_path,
+        index_path,
     };
     proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
 }
@@ -6559,10 +6664,9 @@ async fn upload(
     // `max_upload_size_bytes`, 10 GiB by default); re-open that file and read
     // only the metadata entry rather than buffering the whole distribution.
     // ZIP/tar parsing is blocking, so it runs on the blocking pool.
-    // #2561: permit held across the blocking decode, fast-fail 503 on
-    // saturation — the same seam the helm/protobuf/conda/rubygems uploads use,
-    // so N concurrent sdist uploads cannot each inflate up to the ingest
-    // budget at once (#3672).
+    // #2561: permit held across the blocking decode, so N concurrent sdist
+    // uploads cannot each inflate up to the ingest budget at once (#3672).
+    // On saturation it waits a bounded time, then sheds 503 (#6221).
     // The identity gate parses the archive's METADATA / PKG-INFO; keep what it
     // parsed so the stored `pkg_info` carries the distribution's classifiers
     // and URLs (#3783) without a second walk.
@@ -6573,26 +6677,29 @@ async fn upload(
     let staged_local =
         super::repositories::materialize_staged_for_repo(&state, &repo, &staged_content).await?;
     let staged_path = staged_local.path().to_path_buf();
+    // #6221: ONE ingest permit covers both the identity gate and the content
+    // analysis below, so a queued upload waits for a slot once, and
+    // best-effort analysis never takes a second place in the wait queue.
+    let ingest_permit = crate::util::bounded_archive::acquire_ingest_extraction_waiting()
+        .await
+        .map_err(|e| e.into_response())?;
     let extracted_pkg_info: Option<PkgInfo> = {
         let expected_name = normalized.clone();
         let expected_version = pkg_version.clone();
         let dist_filename = filename.clone();
         let staged_path = staged_path.clone();
-        crate::util::bounded_archive::with_ingest_extraction_async(|| {
-            tokio::task::spawn_blocking(move || {
-                let file = std::fs::File::open(&staged_path).map_err(|e| {
-                    AppError::Internal(format!("re-open staged upload for validation: {e}"))
-                })?;
-                PypiHandler::validate_upload_file(
-                    &expected_name,
-                    &expected_version,
-                    &dist_filename,
-                    file,
-                )
-            })
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&staged_path).map_err(|e| {
+                AppError::Internal(format!("re-open staged upload for validation: {e}"))
+            })?;
+            PypiHandler::validate_upload_file(
+                &expected_name,
+                &expected_version,
+                &dist_filename,
+                file,
+            )
         })
         .await
-        .map_err(|e| e.into_response())?
         .map_err(|e| {
             AppError::Internal(format!("upload validation task failed: {e}")).into_response()
         })?
@@ -6604,7 +6711,8 @@ async fn upload(
     // and the `setup.py` an sdist install executes. Done here, while the
     // staged local copy still exists (it is consumed and dropped further
     // down); the row it produces is written after the artifact is committed.
-    let content_analysis = analyze_pypi_upload(staged_path, filename.clone()).await;
+    let content_analysis = analyze_pypi_upload(&ingest_permit, staged_path, filename.clone()).await;
+    drop(ingest_permit);
     drop(staged_local);
 
     // SHA-256 was computed incrementally while the body was spooled to disk.
@@ -6759,36 +6867,35 @@ async fn upload(
 /// Read the staged distribution and report what is inside it.
 ///
 /// Re-opens the scratch file the body was spooled to rather than buffering the
-/// distribution, and holds an ingest-extraction permit across the blocking
-/// archive walk — the same seam the identity gate above uses, so N concurrent
-/// wheel uploads cannot each decode without bound (#2561).
+/// distribution. The caller passes the ingest-extraction permit it already
+/// holds for the identity gate, and keeps it across this blocking archive
+/// walk, so N concurrent wheel uploads cannot each decode without bound
+/// (#2561). Analysis never acquires a permit of its own: a second acquire
+/// would make a queued upload wait twice and let best-effort analysis take
+/// places in the wait queue from real uploads (#6221).
 ///
 /// Never returns an error. Every failure path resolves to a
 /// [`Completeness::NotRead`] analysis carrying the reason, because "we could
 /// not read it" is a result the user is entitled to see, and because analysis
 /// must not be able to fail an otherwise-valid upload.
 pub(crate) async fn analyze_pypi_upload(
+    _held: &crate::util::bounded_archive::IngestExtractionGuard,
     staged_path: std::path::PathBuf,
     filename: String,
 ) -> crate::services::pypi_analysis::PypiAnalysis {
     use crate::services::pypi_analysis::{analyze_distribution, PypiAnalysis};
 
-    let joined = crate::util::bounded_archive::with_ingest_extraction_async(|| {
-        tokio::task::spawn_blocking(move || match std::fs::File::open(&staged_path) {
-            Ok(file) => analyze_distribution(&filename, std::io::BufReader::new(file)),
-            Err(e) => PypiAnalysis::not_read(format!(
-                "Staged upload could not be re-opened for analysis: {e}"
-            )),
-        })
+    let joined = tokio::task::spawn_blocking(move || match std::fs::File::open(&staged_path) {
+        Ok(file) => analyze_distribution(&filename, std::io::BufReader::new(file)),
+        Err(e) => PypiAnalysis::not_read(format!(
+            "Staged upload could not be re-opened for analysis: {e}"
+        )),
     })
     .await;
 
     match joined {
-        // Saturation shed the decode slot (503-equivalent). The upload itself
-        // is fine; we simply did not look, and the row must say so.
-        Err(e) => PypiAnalysis::not_read(format!("Package analysis was not run: {e}")),
-        Ok(Ok(analysis)) => analysis,
-        Ok(Err(e)) => PypiAnalysis::not_read(format!("Package analysis task failed: {e}")),
+        Ok(analysis) => analysis,
+        Err(e) => PypiAnalysis::not_read(format!("Package analysis task failed: {e}")),
     }
 }
 
@@ -6883,7 +6990,9 @@ mod content_analysis_tests {
             ("PIL/__init__.py", b"" as &[u8]),
             ("Pillow.libs/libwebp-850e2bec.so.7.1.3", b"\x7fELF"),
         ]);
+        let held = crate::util::bounded_archive::acquire_ingest_extraction().unwrap();
         let a = analyze_pypi_upload(
+            &held,
             f.path().to_path_buf(),
             "Pillow-10.0.0-cp311-cp311-manylinux_x86_64.whl".to_string(),
         )
@@ -6895,7 +7004,9 @@ mod content_analysis_tests {
     #[tokio::test]
     async fn pypi_upload_analysis_reports_not_read_when_the_staged_file_is_gone() {
         // The failure mode that must never render as a clean bill of health.
+        let held = crate::util::bounded_archive::acquire_ingest_extraction().unwrap();
         let a = analyze_pypi_upload(
+            &held,
             std::path::PathBuf::from("/nonexistent/scratch/pkg.whl"),
             "pkg-1.0-py3-none-any.whl".to_string(),
         )
@@ -6912,8 +7023,58 @@ mod content_analysis_tests {
     #[tokio::test]
     async fn pypi_upload_analysis_is_unsupported_for_an_unknown_extension() {
         let f = staged_wheel(&[("x", b"" as &[u8])]);
-        let a = analyze_pypi_upload(f.path().to_path_buf(), "pkg-1.0-py3.7.egg".to_string()).await;
+        let held = crate::util::bounded_archive::acquire_ingest_extraction().unwrap();
+        let a = analyze_pypi_upload(
+            &held,
+            f.path().to_path_buf(),
+            "pkg-1.0-py3.7.egg".to_string(),
+        )
+        .await;
         assert!(matches!(a.completeness, Completeness::Unsupported { .. }));
+    }
+
+    /// #6221: analysis runs under the permit its caller already holds. With
+    /// every other slot of the repository taken it neither queues nor sheds:
+    /// it reads the distribution, and the repository's wait line stays empty.
+    #[tokio::test]
+    async fn pypi_upload_analysis_never_enters_the_wait_queue_6221() {
+        use crate::util::bounded_archive::{
+            acquire_ingest_extraction, queued_ingest_extractions_for, run_with_tenant_scope,
+            TenantKey, DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT,
+        };
+        let tenant = TenantKey::Repo(uuid::Uuid::new_v4());
+        let f = staged_wheel(&[
+            ("PIL/__init__.py", b"" as &[u8]),
+            ("Pillow.libs/libwebp-850e2bec.so.7.1.3", b"\x7fELF"),
+        ]);
+        let (a, queued) = run_with_tenant_scope(tenant.clone(), async {
+            // The caller's own permit plus every other slot: the bucket is full.
+            let held: Vec<_> = (0..DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT)
+                .map(|_| acquire_ingest_extraction().expect("permit"))
+                .collect();
+            let analysis = analyze_pypi_upload(
+                &held[0],
+                f.path().to_path_buf(),
+                "Pillow-10.0.0-cp311-cp311-manylinux_x86_64.whl".to_string(),
+            );
+            let watch = async {
+                let mut max = 0;
+                for _ in 0..50 {
+                    max = max.max(queued_ingest_extractions_for(&tenant));
+                    tokio::task::yield_now().await;
+                }
+                max
+            };
+            tokio::join!(analysis, watch)
+        })
+        .await;
+        assert_eq!(queued, 0, "analysis must not queue for a second permit");
+        assert!(
+            !matches!(a.completeness, Completeness::NotRead { .. }),
+            "analysis must run under the held permit, got {:?}",
+            a.completeness
+        );
+        assert_eq!(a.components.len(), 1);
     }
 }
 
@@ -13152,6 +13313,11 @@ mod tests {
     /// sub-limit exhausted the upload is shed with a 503 rather than decoding;
     /// once the permits are released the same upload succeeds. Only this
     /// repository's bucket is held, so no other test's decodes are affected.
+    ///
+    /// Since #6221 the shed arrives only after the bounded wait rather than at
+    /// once; the status and body are unchanged. The shed request is run under
+    /// a 1 s wait (`test_support::with_ingest_wait`) so the test does not sit
+    /// out the test binary's 30 s default.
     #[tokio::test]
     async fn test_upload_validation_holds_ingest_permit_3672() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -13177,14 +13343,18 @@ mod tests {
         let (content_type, body) =
             pypi_upload_multipart("pkg", "1.0", "pkg-1.0.tar.gz", &sdist, "ok", ">=3.8");
         let app = fx.router_with_auth(super::router());
-        let (shed_status, shed_body) = run_with_tenant_scope(
-            tenant.clone(),
-            tdh::send(
-                app,
-                tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
-            ),
-        )
-        .await;
+        let (shed_status, shed_body) =
+            crate::util::bounded_archive::test_support::with_ingest_wait(
+                std::time::Duration::from_secs(1),
+                run_with_tenant_scope(
+                    tenant.clone(),
+                    tdh::send(
+                        app,
+                        tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
+                    ),
+                ),
+            )
+            .await;
 
         drop(held);
         let (content_type, body) =
@@ -13213,6 +13383,150 @@ mod tests {
             "upload must succeed once permits are released; body: {}",
             String::from_utf8_lossy(&ok_body)
         );
+    }
+
+    /// Hold `n` of `tenant`'s per-repository permits. Holding all but four
+    /// makes the repository behave as if its sub-limit were the production 4
+    /// (the test binary's own sub-limit is far larger, #3407).
+    async fn hold_tenant_permits_6221(
+        tenant: &crate::util::bounded_archive::TenantKey,
+        n: usize,
+    ) -> Vec<crate::util::bounded_archive::IngestExtractionGuard> {
+        use crate::util::bounded_archive::{acquire_ingest_extraction, run_with_tenant_scope};
+        run_with_tenant_scope(tenant.clone(), async {
+            (0..n)
+                .map(|_| acquire_ingest_extraction().expect("permit"))
+                .collect::<Vec<_>>()
+        })
+        .await
+    }
+
+    /// #6221: an upload that finds its repository's sub-limit full now waits
+    /// for a permit instead of getting an immediate 503, and succeeds once one
+    /// is released.
+    #[tokio::test]
+    async fn test_upload_waits_for_ingest_permit_6221() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::formats::pypi::tests::{build_tgz, PKG_INFO};
+        use crate::util::bounded_archive::{
+            queued_ingest_extractions_for, run_with_tenant_scope, TenantKey,
+            DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT,
+        };
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        let tenant = TenantKey::Repo(fx.repo_id);
+        let held = hold_tenant_permits_6221(
+            &tenant,
+            DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT,
+        )
+        .await;
+
+        let sdist = build_tgz(&[("pkg-1.0/PKG-INFO", PKG_INFO)]);
+        let (content_type, body) =
+            pypi_upload_multipart("pkg", "1.0", "pkg-1.0.tar.gz", &sdist, "ok", ">=3.8");
+        let app = fx.router_with_auth(super::router());
+        let upload = tokio::spawn(run_with_tenant_scope(
+            tenant.clone(),
+            tdh::send(
+                app,
+                tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
+            ),
+        ));
+
+        // Release the permits only once the upload is queued for one.
+        let mut queued = false;
+        for _ in 0..20_000 {
+            if queued_ingest_extractions_for(&tenant) > 0 {
+                queued = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        drop(held);
+        let (status, resp_body) = upload.await.expect("upload task");
+
+        fx.teardown().await;
+
+        assert!(queued, "the upload must have waited for a permit");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a queued upload must succeed once a permit frees; body: {}",
+            String::from_utf8_lossy(&resp_body)
+        );
+    }
+
+    /// #6221 reproduction: six concurrent uploads of distinct packages to one
+    /// repository whose per-repository sub-limit is the production 4. Before
+    /// the bounded wait the fifth and sixth were shed with 503. To make the
+    /// overlap deterministic, all of the repository's permits are held until
+    /// every upload is queued; then four are released, so the six drain
+    /// through four slots.
+    #[tokio::test]
+    async fn test_six_concurrent_uploads_to_one_repository_succeed_6221() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::formats::pypi::tests::build_tgz;
+        use crate::util::bounded_archive::{
+            queued_ingest_extractions_for, run_with_tenant_scope, TenantKey,
+            DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT,
+        };
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        let tenant = TenantKey::Repo(fx.repo_id);
+        let _held = hold_tenant_permits_6221(
+            &tenant,
+            DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT - 4,
+        )
+        .await;
+        let last_four = hold_tenant_permits_6221(&tenant, 4).await;
+
+        let uploads = (0..6).map(|i| {
+            let name = format!("concurrent-pkg-{i}");
+            let pkg_info = format!("Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n");
+            let filename = format!("concurrent_pkg_{i}-1.0.tar.gz");
+            let entry = format!("concurrent_pkg_{i}-1.0/PKG-INFO");
+            let sdist = build_tgz(&[(entry.as_str(), pkg_info.as_bytes())]);
+            let (content_type, body) =
+                pypi_upload_multipart(&name, "1.0", &filename, &sdist, "ok", ">=3.8");
+            let app = fx.router_with_auth(super::router());
+            run_with_tenant_scope(
+                tenant.clone(),
+                tdh::send(
+                    app,
+                    tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
+                ),
+            )
+        });
+        let release = async {
+            let mut queued = 0;
+            for _ in 0..20_000 {
+                queued = queued_ingest_extractions_for(&tenant);
+                if queued == 6 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            drop(last_four);
+            queued
+        };
+        let (results, queued) = tokio::join!(futures::future::join_all(uploads), release);
+
+        fx.teardown().await;
+
+        assert_eq!(queued, 6, "all six uploads must have queued for a permit");
+
+        for (i, (status, body)) in results.into_iter().enumerate() {
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "upload {i} of 6 must succeed; body: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -16883,6 +17197,97 @@ mod tests {
         );
     }
 
+    /// #5983: four cold sidecars of one project requested at once read the
+    /// simple index once, not once each. The index answers slowly so all four
+    /// are in flight before the first read lands
+    #[tokio::test]
+    async fn test_resolver_index_concurrent_cold_misses_share_one_read_5983() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+
+        let project = "fanout5983";
+        let wheels: Vec<String> = (1..=4)
+            .map(|i| format!("fanout5983-1.{i}-py3-none-any.whl"))
+            .collect();
+        let anchors: String = wheels
+            .iter()
+            .map(|w| {
+                format!(
+                    "<a href=\"/packages/{w}\" data-dist-info-metadata=\"sha256=deadbeef\">{w}</a>"
+                )
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(format!("<html><body>{anchors}</body></html>"))
+                    .set_delay(std::time::Duration::from_millis(300)),
+            )
+            .mount(&upstream)
+            .await;
+        for w in &wheels {
+            Mock::given(method("GET"))
+                .and(path(format!("/packages/{w}.metadata")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(format!("Metadata-Version: 2.1\nName: {w}\n")),
+                )
+                .mount(&upstream)
+                .await;
+        }
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let send = |w: &str| {
+            tdh::send_with_headers(
+                tdh::router_anon(super::router(), state.clone()),
+                tdh::get(format!("/{}/simple/{project}/{w}.metadata", fx.repo_key)),
+            )
+        };
+        let (a, b, c, d) = tokio::join!(
+            send(&wheels[0]),
+            send(&wheels[1]),
+            send(&wheels[2]),
+            send(&wheels[3])
+        );
+        let reads = upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == format!("/simple/{project}/"))
+            .count();
+
+        fx.teardown().await;
+
+        for (status, body, _) in [&a, &b, &c, &d] {
+            assert_eq!(
+                *status,
+                StatusCode::OK,
+                "body: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        assert_eq!(
+            reads, 1,
+            "concurrent cold sidecars must share one index read"
+        );
+    }
+
+    #[test]
+    fn test_shared_resolver_index_error_keeps_status_5983() {
+        let not_found = shared_resolver_index_error(StatusCode::NOT_FOUND);
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+        let unavailable = shared_resolver_index_error(StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     /// #3356 item 3. The #3333 regression test above covers the HANDLER half of
     /// the #3300 fix (probe ahead of target resolution) but not the CLASSIFIER
     /// half: its warm request follows its cold one within milliseconds, so a
@@ -19719,6 +20124,244 @@ mod tests {
             "a verdict-backed serve must be marked clean, not pending"
         );
         assert_eq!(&body[..], wheel);
+    }
+
+    // #5875: a scanning Remote answers a fresh cached file without reading
+    // the simple index, so a cached wheel survives an upstream outage. The
+    // resolver index read is memoised for 30 s after a success, the tests drop
+    // that entry to stand for an outage that outlasts it
+
+    async fn forget_resolver_index(repo_id: uuid::Uuid, project: &str) {
+        RESOLVER_INDEX_MEMO
+            .invalidate(&(repo_id, project.to_string(), format!("simple/{project}/")))
+            .await;
+    }
+
+    async fn take_upstream_down(upstream: &wiremock::MockServer) {
+        use wiremock::{matchers::any, Mock, ResponseTemplate};
+        upstream.reset().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(503))
+            .mount(upstream)
+            .await;
+    }
+
+    async fn index_reads(upstream: &wiremock::MockServer, project: &str) -> usize {
+        let index = format!("/simple/{project}/");
+        upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == index)
+            .count()
+    }
+
+    async fn seed_clean_proxy_verdict(
+        pool: &sqlx::PgPool,
+        digest: &str,
+        repo_id: uuid::Uuid,
+        project: &str,
+    ) {
+        crate::services::proxy_scan_service::ProxyScanService::new(pool.clone())
+            .record_verdict(
+                digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-1.0.0-test"),
+                Some(repo_id),
+            )
+            .await
+            .expect("seed clean verdict");
+        crate::api::handlers::test_db_helpers::pin_proxy_verdict(
+            pool,
+            digest,
+            &crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Python,
+                project,
+                "1.0.0",
+            ),
+        )
+        .await;
+    }
+
+    async fn read_scanned_serve(
+        result: Result<Response, Response>,
+    ) -> (StatusCode, Option<String>, Bytes) {
+        let resp = result.unwrap_or_else(|r| r);
+        let status = resp.status();
+        let scan = resp
+            .headers()
+            .get("X-AK-Scan")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .unwrap_or_default();
+        (status, scan, body)
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_serves_fresh_cache_with_index_down_5875() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "cachedpkg";
+        let filename = "cachedpkg-1.0.0-py3-none-any.whl";
+        let wheel: &'static [u8] = b"PK\x03\x04 cachedpkg-wheel-5875";
+        let digest = sha256_hex(&Bytes::from_static(wheel));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+        seed_clean_proxy_verdict(&fx.pool, &digest, fx.repo_id, project).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+        let name = proj(project);
+        let ctx = Default::default();
+
+        let warm = read_scanned_serve(
+            super::serve_file(
+                &state,
+                &repo_info,
+                &fx.repo_key,
+                &name,
+                filename,
+                None,
+                &ctx,
+            )
+            .await,
+        )
+        .await;
+        take_upstream_down(&upstream).await;
+        forget_resolver_index(fx.repo_id, project).await;
+        let cached = read_scanned_serve(
+            super::serve_file(
+                &state,
+                &repo_info,
+                &fx.repo_key,
+                &name,
+                filename,
+                None,
+                &ctx,
+            )
+            .await,
+        )
+        .await;
+        let reads = index_reads(&upstream, project).await;
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .ok();
+        fx.teardown().await;
+
+        assert_eq!(warm.0, StatusCode::OK, "the first pull warms the cache");
+        assert_eq!(
+            cached.0,
+            StatusCode::OK,
+            "a fresh cached wheel must serve while the index is down"
+        );
+        assert_eq!(
+            cached.1.as_deref(),
+            Some("clean"),
+            "the scan gate still ran"
+        );
+        assert_eq!(&cached.2[..], wheel);
+        assert_eq!(reads, 0, "a fresh cache hit must not read the simple index");
+    }
+
+    #[tokio::test]
+    async fn test_virtual_serve_file_serves_fresh_member_cache_with_index_down_5875() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "vcachedpkg";
+        let filename = "vcachedpkg-1.0.0-py3-none-any.whl";
+        let wheel: &'static [u8] = b"PK\x03\x04 vcachedpkg-wheel-5875";
+        let digest = sha256_hex(&Bytes::from_static(wheel));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        let (member_id, _member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+        enable_proxy_scan(&fx.pool, member_id, "fail_open").await;
+        seed_clean_proxy_verdict(&fx.pool, &digest, member_id, project).await;
+
+        let virtual_info = fx.repo_info("virtual", None);
+        let name = proj(project);
+        let ctx = Default::default();
+
+        let warm = read_scanned_serve(
+            super::serve_file(
+                &state,
+                &virtual_info,
+                &fx.repo_key,
+                &name,
+                filename,
+                None,
+                &ctx,
+            )
+            .await,
+        )
+        .await;
+        take_upstream_down(&upstream).await;
+        forget_resolver_index(member_id, project).await;
+        let cached = read_scanned_serve(
+            super::serve_file(
+                &state,
+                &virtual_info,
+                &fx.repo_key,
+                &name,
+                filename,
+                None,
+                &ctx,
+            )
+            .await,
+        )
+        .await;
+        let reads = index_reads(&upstream, project).await;
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .ok();
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            warm.0,
+            StatusCode::OK,
+            "the first pull warms the member cache"
+        );
+        assert_eq!(
+            cached.0,
+            StatusCode::OK,
+            "a fresh cached member wheel must serve through the Virtual while the index is down"
+        );
+        assert_eq!(
+            cached.1.as_deref(),
+            Some("clean"),
+            "the scan gate still ran"
+        );
+        assert_eq!(&cached.2[..], wheel);
+        assert_eq!(reads, 0, "a fresh cache hit must not read the simple index");
     }
 
     // -----------------------------------------------------------------------

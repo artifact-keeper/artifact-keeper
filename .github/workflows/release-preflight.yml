@@ -46,6 +46,11 @@ on:
         required: false
         type: string
         default: ''
+      branch:
+        description: 'Branch whose Docker Publish build decides check 3 when ref is a sha that was built on several branches. Empty = infer it from the runs.'
+        required: false
+        type: string
+        default: ''
   # Also surface drift proactively on a schedule so a stale main is caught
   # before anyone even tries to cut. Advisory only -- never blocks a merge.
   # A schedule always fires on the default branch, so this leg audits main.
@@ -112,6 +117,9 @@ jobs:
           # The ref this run is a statement about. It names the verdict line
           # and it decides whether check 1 (a main-centric invariant) applies.
           PREFLIGHT_REF: ${{ inputs.ref || github.ref }}
+          # Check 3's branch when PREFLIGHT_REF is a sha built on several
+          # branches; empty infers it (#6168).
+          PREFLIGHT_BRANCH: ${{ inputs.branch }}
           # Used by check 4's registry probes. The checkout is depth-1, so the
           # commit a published tag was built from is not local; the check
           # fetches just that commit when it needs it, and reports INFRA if it

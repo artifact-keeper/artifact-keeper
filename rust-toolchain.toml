@@ -29,7 +29,9 @@
 [toolchain]
 channel = "1.98.0"
 components = ["clippy", "rustfmt"]
-# `🪟 Windows Cross-Build` (ci.yml) cross-compiles with no toolchain-install
-# step of its own, so the target must come from here or that job loses its std.
+# The Windows jobs (`🪟 Windows Cross-Check` in ci.yml, `🪟 Windows
+# Cross-Build` in scheduled-tests.yml, release.yml's windows leg) also pass the
+# target to dtolnay/rust-toolchain; listing it here keeps a plain `cargo check
+# --target x86_64-pc-windows-gnu` working locally with no extra rustup step.
 targets = ["x86_64-pc-windows-gnu"]
 profile = "minimal"

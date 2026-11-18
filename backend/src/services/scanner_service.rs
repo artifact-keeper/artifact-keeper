@@ -4017,8 +4017,9 @@ const DEFAULT_MAX_CONCURRENT_SCAN_EXTRACTIONS: usize = 4;
 const MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV: &str = "MAX_CONCURRENT_SCAN_EXTRACTIONS";
 
 /// Effective concurrent-extraction cap, honouring
-/// [`MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV`] over the default.
-fn max_concurrent_scan_extractions() -> usize {
+/// [`MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV`] over the default. The queue
+/// worker's default concurrency reads it too (#6033).
+pub(crate) fn max_concurrent_scan_extractions() -> usize {
     positive_env_or(
         MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV,
         DEFAULT_MAX_CONCURRENT_SCAN_EXTRACTIONS as u64,
@@ -12218,7 +12219,7 @@ pub(crate) mod test_helpers {
     /// Hold every scan-extraction permit, so that a scan queues until the guard
     /// drops (#5231). The semaphore is process-wide, which nextest's one process
     /// per test keeps to the test that calls this.
-    pub async fn hold_all_scan_permits() -> tokio::sync::OwnedSemaphorePermit {
+    pub(crate) async fn hold_all_scan_permits() -> tokio::sync::OwnedSemaphorePermit {
         super::scan_extraction_semaphore()
             .clone()
             .acquire_many_owned(super::max_concurrent_scan_extractions() as u32)
@@ -12398,6 +12399,25 @@ pub(crate) mod test_helpers {
     }
 }
 
+/// Test override: run an upload's scan inline in the triggering task (#5692).
+///
+/// Production fan-out stays fire-and-forget. A regression test that asserts
+/// which metadata the scan saw at its start needs the scan to run inside
+/// `trigger_scan_on_upload`, before the handler can proceed to its next write.
+#[cfg(test)]
+pub(crate) static TEST_INLINE_SCAN_ON_UPLOAD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn scan_on_upload_runs_inline() -> bool {
+    TEST_INLINE_SCAN_ON_UPLOAD.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(test))]
+fn scan_on_upload_runs_inline() -> bool {
+    false
+}
+
 /// Fire-and-forget `scan_on_upload` trigger for a freshly-inserted artifact.
 ///
 /// Mirrors the gate already inlined in [`ArtifactService::upload`] so that
@@ -12465,6 +12485,7 @@ pub async fn scan_on_upload_enabled(db: &PgPool, repository_id: Uuid) -> bool {
 /// the upload response is not delayed. Call it AFTER the row is committed
 /// (and after format metadata is written, where the handler writes any), so
 /// the scan sees the finished artifact. Returns whether a scan was spawned.
+/// Unit tests can set `TEST_INLINE_SCAN_ON_UPLOAD` to run it synchronously.
 ///
 /// The `every_format_upload_triggers_scan_on_upload` ratchet test in
 /// `api::handlers::proxy_helpers` requires every handler that inserts an
@@ -12493,11 +12514,16 @@ pub async fn trigger_scan_on_upload(
             ),
         }
     }
-    spawn_scan_on_upload(should_scan, artifact_id, move |aid| async move {
+    let scan = move |aid| async move {
         if let Err(e) = scanner.scan_artifact(aid).await {
             tracing::warn!(artifact_id = %aid, error = %e, "scan_on_upload trigger failed");
         }
-    })
+    };
+    if scan_on_upload_runs_inline() {
+        scan(artifact_id).await;
+        return true;
+    }
+    spawn_scan_on_upload(should_scan, artifact_id, scan)
 }
 
 /// Queue a committed upload's scan at the hosted band (#5946). A pushed OCI

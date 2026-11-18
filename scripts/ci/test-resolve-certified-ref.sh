@@ -16,11 +16,11 @@
 #   ids -- is stubbed behind a `gh` on PATH, and this runs offline in ~1s.
 #
 #   Most cases assert a REFUSAL, because that is the failure direction that
-#   matters: an arbitrary branch, a case variant of a real release branch, a
-#   commit on neither branch, and -- the backstop for the window in which an
-#   admin has the release ruleset toggled off -- a commit whose
-#   release-candidate.yml is not the copy main carries. The guard section at
-#   the end pins the decision that keeps the signing identity unwidened.
+#   matters: an arbitrary branch, a case variant of a real release branch and
+#   a commit on neither branch. A maintenance commit's release-candidate.yml
+#   is REPORTED, never compared with main's (#6122): the sections at the end
+#   pin what makes that safe -- the main-only dispatch guard, and no code from
+#   the certified commit running in the candidate.
 #
 # Usage: bash scripts/ci/test-resolve-certified-ref.sh
 set -uo pipefail
@@ -49,10 +49,12 @@ STUB="$WORK/bin"; mkdir -p "$STUB"
 #   W_MERGE_BASE  merge_base_commit.sha of that comparison
 #   W_REL_REF     what the refs API answers for the derived branch ('' = 404)
 #   W_REL_STATUS  status of compare <branch>...<sha>
-#   W_BLOB_SHA / W_BLOB_MAIN
-#                 release-candidate.yml's blob id at the commit ('' = 404) and
-#                 on main's tip
+#   W_BLOB_SHA    release-candidate.yml's blob id at the commit ('' = 404). A
+#                 read of main's copy is a loud 64: the resolver never
+#                 compares the commit's copy with main's (#6122)
 #   W_FAIL        a path fragment whose call fails as a non-404 error
+#   W_CERT_SHA    the certified commit (set by expect): the only ref at which
+#                 release-candidate.yml may be read
 cat > "$STUB/gh" <<'STUBGH'
 #!/usr/bin/env bash
 [ "${1:-}" = "api" ] || { echo "stub gh: unexpected '${1:-}'" >&2; exit 64; }
@@ -77,11 +79,11 @@ case "$path" in
     [ "$raw" = 1 ] || { echo "stub gh: Cargo.toml must be read raw" >&2; exit 64; }
     printf '[package]\nname = "artifact-keeper"\nversion = "%s"\n' "${W_VERSION}" ;;
   */contents/.github/workflows/release-candidate.yml*)
-    ref="${path##*ref=}"
-    case "$ref" in
-      main) b="${W_BLOB_MAIN}" ;;
-      *)    b="${W_BLOB_SHA}" ;;
-    esac
+    # Only the certified commit's copy may be read. Any other ref (main,
+    # refs/heads/main, or none = the default branch) means the resolver is
+    # comparing against main's copy again (#6122): a loud 64.
+    case "$path" in *"ref=${W_CERT_SHA:?}") ;; *) echo "stub gh: the resolver read release-candidate.yml at something other than the certified commit (${path}); it must not compare against main's copy (#6122)" >&2; exit 64 ;; esac
+    b="${W_BLOB_SHA}"
     [ -n "$b" ] || notfound
     emit "$(jq -nc --arg s "$b" '{sha:$s}')" ;;
   */git/ref/heads/*)
@@ -96,7 +98,7 @@ esac
 STUBGH
 chmod +x "$STUB/gh"
 
-# A world where the commit sits on release/1.9.x with main's workflow file.
+# A world where the commit sits on release/1.9.x.
 reset_world() {
   export W_VERSION=1.9.1
   export W_MAIN_STATUS=diverged
@@ -104,17 +106,13 @@ reset_world() {
   export W_REL_REF=refs/heads/release/1.9.x
   export W_REL_STATUS=behind
   export W_BLOB_SHA=blob1111
-  export W_BLOB_MAIN=blob1111
-  # Most content cases are about the moment of BLESSING, which is the only
-  # time main's current copy is demanded.
-  export CERTREF_REQUIRE_MAIN_WORKFLOW=1
   export W_FAIL=""
 }
 
 # <label> <expected-exit> <expected-substring>; world from exported W_*.
 expect() {
   local label="$1" want="$2" needle="$3" got=0 out
-  out="$( PATH="$STUB:$PATH" CERTREF_REPO=artifact-keeper/artifact-keeper \
+  out="$( PATH="$STUB:$PATH" CERTREF_REPO=artifact-keeper/artifact-keeper W_CERT_SHA="${SHA:-$SHA_A}" \
       GITHUB_OUTPUT="" bash "$RESOLVER" "${SHA:-$SHA_A}" 2>&1 )" || got=$?
   if [ "$got" = "$want" ] && printf '%s' "$out" | grep -qF -- "$needle"; then
     pass "$label"
@@ -166,34 +164,33 @@ expect "the refs API answering a longer name is refused" 1 "case-sensitive"
 reset_world; W_REL_REF=""
 expect "a version whose release line does not exist is refused" 1 "does not exist"
 
-# THE CONTENT PIN: an edited release-candidate.yml on a line that would
-# otherwise be allowed to certify -- and, since finding 3, a STALE one too.
-# Only main's CURRENT copy is accepted, because the merge base is chosen by
-# whoever chose the commit's parent.
-reset_world; W_BLOB_SHA=blobEVIL
-expect "an edited release-candidate.yml on a line is refused at blessing" 1 "is not main's current copy"
+# THE CONTENT IS RECORDED, NOT DEMANDED (#6122). The copy of
+# release-candidate.yml on a maintenance line never runs (see the guard and
+# FINDING 1 sections below), so a line whose copy differs from main's -- stale
+# after any main edit, or edited -- resolves, and its blob is reported for
+# the predicate. Before #6122 both were refused and every main edit to the
+# file needed a hand backport to every line.
+reset_world; W_BLOB_SHA=blobOLD
+expect "a line whose release-candidate.yml lags main's still resolves" 0 "certified_ref=refs/heads/release/1.9.x"
 
 reset_world; W_BLOB_SHA=blobOLD
-expect "a STALE release-candidate.yml on a line is refused at blessing" 1 "cherry-pick"
+expect "the line's own blob is reported, whatever main carries" 0 "workflow_blob=blobOLD"
+
+reset_world; W_BLOB_SHA=blobOLD
+expect "the report says the copy is never executed" 0 "never executed"
 
 reset_world; W_BLOB_SHA=""
 expect "a line with no release-candidate.yml at all is refused" 1 "does not exist at"
 
-# BLESSED ONCE (r2, finding N1). Outside the candidate the resolver only
-# REPORTS the blob; main's tip moving must never invalidate a certification
-# that already exists, or an unrelated merge strands it permanently.
-reset_world; CERTREF_REQUIRE_MAIN_WORKFLOW=0; W_BLOB_MAIN=blobMAINMOVED
-expect "main's workflow moving does not invalidate a certified commit" 0 "certified_ref=refs/heads/release/1.9.x"
-
-reset_world; CERTREF_REQUIRE_MAIN_WORKFLOW=0; W_BLOB_MAIN=blobMAINMOVED
+reset_world
 expect "the blob at the commit is reported for the verifier to compare" 0 "workflow_blob=blob1111"
 
-reset_world
-expect "blessing reports the same blob it demanded" 0 "workflow_blob=blob1111"
-
-# On main the pin decides nothing and says so, rather than passing vacuously.
 reset_world; W_MAIN_STATUS=behind; W_BLOB_SHA=blobANYTHING
-expect "on main nothing is demanded, explicitly, rather than vacuously passed" 0 "nothing to demand"
+expect "a commit on main reports its own blob" 0 "workflow_blob=blobANYTHING"
+
+# The demand must not come back through the environment.
+reset_world; W_BLOB_SHA=blobOLD
+CERTREF_REQUIRE_MAIN_WORKFLOW=1 expect "the retired CERTREF_REQUIRE_MAIN_WORKFLOW demands nothing" 0 "certified_ref=refs/heads/release/1.9.x"
 
 # ── shape and measurement ───────────────────────────────────────────────────
 reset_world; W_VERSION=1.9.1-rc.1
@@ -226,6 +223,14 @@ expect "an unreadable workflow blob is INFRA, never a pass" 2 "could not read"
 reset_world
 SHA=abc expect "a short sha is INFRA (exit 2)" 2 "40-character"
 unset SHA
+
+# The demand must not come back on the workflow side either (#6122).
+echo "release-candidate.yml does not demand main's copy"
+if grep -q 'CERTREF_REQUIRE_MAIN_WORKFLOW=' "$WORKFLOW"; then
+  fail "release-candidate.yml sets CERTREF_REQUIRE_MAIN_WORKFLOW again (#6122)"
+else
+  pass "release-candidate.yml sets no CERTREF_REQUIRE_MAIN_WORKFLOW"
+fi
 
 # ── the dispatch-ref guard in release-candidate.yml ─────────────────────────
 # The candidate certifies maintenance commits FROM MAIN, so the guard must
@@ -464,6 +469,8 @@ else
       echo 'ADAPTER_IMAGE=ghcr.io/o/r-scanner-adapter'
       # A rerun of the failed gate groups (#6076): the richest shape.
       echo 'GATE_WORKFLOW_SHA=dddddddddddddddddddddddddddddddddddddddd'
+      # The pinned `uses:` ref GitHub recorded (#6170), not a hardcoded @main.
+      echo 'GATE_WORKFLOW=artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@dddddddddddddddddddddddddddddddddddddddd'
       echo 'TESTS_SHA=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
       echo 'TESTS_BRANCH=release/1.9.x'
       echo "CONTRIBUTING_RUNS='[{\"run_id\":\"4141\",\"role\":\"original\"},{\"run_id\":\"4242\",\"role\":\"rerun\",\"reason\":\"it is the flake\"}]'"
@@ -493,6 +500,7 @@ else
         '.scanner_adapter_version == "2.3.4"' \
         '.scanner_adapter_decision == {"decision":"stays","owner_rev":"cccccccccccccccccccccccccccccccccccccccc","tag":"2.3.4"}' \
         '.gate_workflow_sha == "dddddddddddddddddddddddddddddddddddddddd"' \
+        '.gate_workflow == "artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@dddddddddddddddddddddddddddddddddddddddd"' \
         '.tests == {"sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","branch":"release/1.9.x"}' \
         '.gate_scope == "rerun"' \
         '.rerun.of == "4141" and .rerun.reason == "it is the flake (#1)" and .rerun.actor == "someone"' \
