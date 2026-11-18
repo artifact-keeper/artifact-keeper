@@ -10438,10 +10438,19 @@ impl ScannerService {
             // for dedup-checking and may sit briefly before scan invocation).
             // See issue #902.
             let started_at = chrono::Utc::now();
-            match scanner
-                .scan_target(&target, metadata.as_ref(), &content)
-                .await
-            {
+            let budget = crate::config::scanner_timeout();
+            match tokio::time::timeout(
+                budget,
+                scanner.scan_target(&target, metadata.as_ref(), &content),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(AppError::Internal(format!(
+                    "scanner {} timed out after {}s",
+                    scanner.name(),
+                    budget.as_secs()
+                )))
+            }) {
                 Ok(ScanOutput {
                     findings,
                     packages,
@@ -29886,6 +29895,93 @@ tonic-build = "0.12"
 
         cleanup_scan_state(&fx.pool, fx.repo_id).await;
         fx.teardown().await;
+    }
+
+    /// #5942: a scanner that never returns is cut off at
+    /// `SCANNER_TIMEOUT_SECS` and its row is recorded `failed`, while the
+    /// other scanner's row completes in the same scan. Real time, not a
+    /// paused clock: the scan does Postgres I/O between the scanners (see
+    /// `rescan_uses_its_own_wider_budget_not_the_inline_file_gate_budget`).
+    #[tokio::test]
+    async fn test_scan_artifact_fails_a_hung_scanner_at_its_timeout() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = Uuid::new_v4();
+        let checksum = fresh_checksum();
+        let storage_key = format!("scanner-timeout/{artifact_id}.bin");
+        fx.state
+            .storage
+            .put(&storage_key, Bytes::from_static(b"data"))
+            .await
+            .expect("store artifact bytes");
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, checksum_sha256, \
+                                    content_type, storage_key, is_deleted) \
+             VALUES ($1, $2, 'pkg.bin', 'pkg.bin', 4, $3, 'application/octet-stream', $4, false)",
+        )
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(&checksum)
+        .bind(&storage_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert artifact");
+        let mut scanner = scanner_for_fixture(&fx);
+        scanner.scanners = vec![
+            Arc::new(inline_proxy_scan_fixtures::TrivialDependencyScanner),
+            Arc::new(VersionedCveScanner::new(
+                Some("grype-test"),
+                MockCveRescan::Hang(std::time::Duration::from_secs(3600)),
+            )),
+        ];
+
+        let saved = std::env::var("SCANNER_TIMEOUT_SECS").ok();
+        std::env::set_var("SCANNER_TIMEOUT_SECS", "1");
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            scanner.scan_artifact_with_options(artifact_id, true, true),
+        )
+        .await;
+        match saved {
+            Some(v) => std::env::set_var("SCANNER_TIMEOUT_SECS", v),
+            None => std::env::remove_var("SCANNER_TIMEOUT_SECS"),
+        }
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT scan_type, status, error_message FROM scan_results \
+             WHERE artifact_id = $1 ORDER BY scan_type",
+        )
+        .bind(artifact_id)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("read scan rows");
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        outcome
+            .expect("the scan must return once the hung scanner times out")
+            .expect("scan orchestration succeeds");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(
+            (rows[0].0.as_str(), rows[0].1.as_str()),
+            ("dependency", "completed"),
+            "{rows:?}"
+        );
+        assert_eq!(
+            (rows[1].0.as_str(), rows[1].1.as_str()),
+            ("grype", "failed"),
+            "{rows:?}"
+        );
+        assert!(
+            rows[1]
+                .2
+                .as_deref()
+                .unwrap_or_default()
+                .contains("timed out after 1s"),
+            "{rows:?}"
+        );
     }
 
     /// Records the [`ScanTarget::expected_component`] the orchestration hands
