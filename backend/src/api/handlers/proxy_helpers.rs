@@ -12543,6 +12543,34 @@ fn record_proxy_scan_outcome(outcome: &ProxyScanServeOutcome) {
     crate::services::metrics_service::record_proxy_scan_verdict(verdict, action);
 }
 
+/// A pull served pending that no scan will ever conclude: nothing is scanned
+/// or queued, so every later pull of the same bytes lands here again. Logged
+/// and counted apart from fail-open's async scans, so a format that stops
+/// establishing identity shows up on its own, not inside the fail-open share
+async fn record_unscannable_serve(
+    state: &crate::api::SharedState,
+    repo_id: Uuid,
+    filename: &str,
+    version: Option<&str>,
+    digest: &str,
+) {
+    const REASON: &str = "identity_not_established";
+    let (repo_key, format): (String, String) =
+        sqlx::query_as("SELECT key, format::text FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
+    tracing::warn!(
+        repo_id = %repo_id, repository = %repo_key, file = %filename, version,
+        digest = %digest, reason = REASON,
+        "served, will not be scanned: identity not established"
+    );
+    crate::services::metrics_service::record_proxy_scan_unscannable(&repo_key, &format, REASON);
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn decide_proxy_scan_serve(
     state: &crate::api::SharedState,
@@ -12714,10 +12742,6 @@ async fn decide_proxy_scan_serve(
             // header. Operators who cannot tolerate serving an unscanned byte
             // must use `proxy_scan_action=fail_closed`. Do NOT "fix" this by
             // turning fail-open into fail-closed here.
-            tracing::warn!(
-                repo_id = %repo_id, file = %filename, digest = %digest,
-                "fail-open proxy scan: serving unscanned bytes with X-AK-Scan: pending; scanning async"
-            );
             let state_bg = state.clone();
             let digest_bg = digest.to_string();
             let bytes_bg = bytes.clone();
@@ -12726,11 +12750,23 @@ async fn decide_proxy_scan_serve(
                 // posture) but do not run a scan whose only possible result
                 // would be an unfounded `clean` row for this digest.
                 ProxyScanIdentity::Unestablished => {
-                    return ProxyScanServeOutcome::Serve(ProxyScanServed::Pending)
+                    record_unscannable_serve(
+                        state,
+                        repo_id,
+                        filename,
+                        synthetic.version.as_deref(),
+                        digest,
+                    )
+                    .await;
+                    return ProxyScanServeOutcome::Serve(ProxyScanServed::Pending);
                 }
                 ProxyScanIdentity::Established(e) => Some(e),
                 ProxyScanIdentity::NotApplicable => None,
             };
+            tracing::warn!(
+                repo_id = %repo_id, file = %filename, digest = %digest,
+                "fail-open proxy scan: serving unscanned bytes with X-AK-Scan: pending; scanning async"
+            );
             // No cache probe here: nobody waits on the verdict, and this is the
             // hot path. A dangling reference shows up as a failed job. A digest
             // claimed in the last minute is already queued, and an enqueue that
