@@ -4814,6 +4814,9 @@ pub async fn create_repository(
     let (format, plugin_format_key) = service.resolve_format(&payload.format).await?;
     let repo_type = parse_repo_type(&payload.repo_type)?;
     validate_format_supports_repo_type(&format, &repo_type, &payload.key)?;
+    // #6063: refuse a versioning opt-in the upload path cannot honour, before
+    // the row exists so a rejected request leaves no orphaned repository.
+    validate_versioning_enabled(&format, payload.versioning_enabled)?;
     let is_apt_hosted = repo_type.is_hosted() && matches!(format, RepositoryFormat::Debian);
     // Computed before `format` is moved into the create request below.
     let is_hex_hosted = repo_type.is_hosted() && matches!(format, RepositoryFormat::Hex);
@@ -6315,6 +6318,21 @@ async fn persist_curation_source(
     Ok(())
 }
 
+/// #6063: only Generic and Mlmodel repositories append immutable revisions on
+/// upload. Refuse a `versioning_enabled` opt-in on every other format instead
+/// of storing a flag the upload path ignores. Omitting the flag or setting it
+/// to `false` stays valid, so an existing row that already holds `true` can be
+/// turned back off.
+fn validate_versioning_enabled(format: &RepositoryFormat, requested: Option<bool>) -> Result<()> {
+    if requested == Some(true) && !crate::services::artifact_service::versioning_supported(format) {
+        return Err(AppError::Validation(
+            "versioning_enabled=true is only valid for Generic and Mlmodel repositories"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Reject the `PATCH /repositories/{key}` fields that do not apply to this
 /// repository, or carry a bad value, before anything is written (#5201).
 /// The update handler used to check them one by one after the repository row
@@ -6332,6 +6350,9 @@ fn validate_update_config_fields(
         payload.npm_allow_unscoped,
         payload.npm_allowed_name_patterns.as_deref(),
     )?;
+    // #6063: the format is immutable here, so `existing` decides as it does
+    // for every other field in this validator.
+    validate_versioning_enabled(format, payload.versioning_enabled)?;
     // Quarantine and `virtual_metadata_partial`: the same rules as on create
     // (#3647, #5324).
     SharedRepoConfigSettings::from(payload).validate(repo_type)?;
@@ -34029,6 +34050,71 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // #6063: a versioning opt-in is refused on formats the upload path cannot
+    // version, before the repository row exists.
+    // -----------------------------------------------------------------------
+
+    /// Fails on `main`: a local Debian create with the flag set to `true`
+    /// succeeds and stores it, although Debian uploads still answer 409 on a
+    /// re-upload. Setting it to `false` stays valid on the same format.
+    #[tokio::test]
+    async fn create_refuses_versioning_opt_in_on_unsupported_format_6063_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("rv-6063-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let admin = admin_auth(user_id, &username);
+
+        let key = format!("rv-6063-deb-{}", Uuid::new_v4().simple());
+        let err = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &key,
+                "versioned debian",
+                "debian",
+                serde_json::json!({ "versioning_enabled": true }),
+            ),
+        )
+        .await
+        .expect_err("a versioning opt-in on Debian must be refused");
+        assert!(
+            matches!(err, AppError::Validation(ref m) if m.contains("versioning_enabled=true")),
+            "expected the versioning Validation error, got {err:?}",
+        );
+        let orphaned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repositories WHERE key = $1")
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .expect("count repositories");
+        assert_eq!(orphaned, 0, "a refused create must not persist a row");
+
+        // Control: `false` is accepted on the very same format.
+        let key = format!("rv-6063-deb-off-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin)),
+            make_create_request(
+                &key,
+                "unversioned debian",
+                "debian",
+                serde_json::json!({ "versioning_enabled": false }),
+            ),
+        )
+        .await
+        .expect("versioning_enabled=false must be accepted for Debian");
+        assert!(!created.versioning_enabled);
+        tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -----------------------------------------------------------------------
     // #3855: public create/update while guest access is disabled is an
     // explicit 400, never a silent rewrite to private.
     // -----------------------------------------------------------------------
@@ -36097,12 +36183,15 @@ mod tests {
         let check = |repo_type: RepositoryType, format: RepositoryFormat, json: &str| {
             validate_update_config_fields(&repo_type, &format, &req(json))
         };
-        use RepositoryFormat::{Debian, Generic};
+        use RepositoryFormat::{Debian, Generic, Maven, Mlmodel};
         use RepositoryType::{Local, Remote, Staging, Virtual};
 
         // Accepted where they apply.
         for (repo_type, format, json) in [
             (Local, Generic, r#"{"name":"x"}"#),
+            (Local, Generic, r#"{"versioning_enabled":true}"#),
+            (Local, Mlmodel, r#"{"versioning_enabled":true}"#),
+            (Local, Debian, r#"{"versioning_enabled":false}"#),
             (
                 Local,
                 Debian,
@@ -36144,11 +36233,39 @@ mod tests {
             (Local, Generic, r#"{"quarantine_duration_minutes":-1}"#),
             (Virtual, Generic, r#"{"quarantine_enabled":true}"#),
             (Local, Generic, r#"{"npm_allowed_scopes":["@acme"]}"#),
+            (Local, Debian, r#"{"versioning_enabled":true}"#),
+            (Local, Maven, r#"{"versioning_enabled":true}"#),
         ] {
             assert!(
                 matches!(check(repo_type, format, json), Err(AppError::Validation(_))),
                 "{json} must be refused"
             );
+        }
+    }
+
+    /// #6063: an unsupported format refuses an opt-in, but keeps `false` and
+    /// an omitted field writable so an existing row can be turned back off.
+    /// The create and PATCH handlers share this check.
+    #[test]
+    fn versioning_enabled_opt_in_is_format_gated_6063() {
+        let check = |format: &RepositoryFormat, value: Option<bool>| {
+            validate_versioning_enabled(format, value)
+        };
+        for format in [RepositoryFormat::Generic, RepositoryFormat::Mlmodel] {
+            assert!(check(&format, Some(true)).is_ok(), "{format:?}");
+        }
+        for format in RepositoryFormat::ALL {
+            if crate::services::artifact_service::versioning_supported(format) {
+                continue;
+            }
+            let err = check(format, Some(true))
+                .expect_err("an unsupported format must refuse the opt-in");
+            assert!(
+                matches!(err, AppError::Validation(ref m) if m.contains("versioning_enabled=true")),
+                "{format:?}: {err:?}"
+            );
+            assert!(check(format, Some(false)).is_ok(), "{format:?}");
+            assert!(check(format, None).is_ok(), "{format:?}");
         }
     }
 
@@ -36215,10 +36332,12 @@ mod tests {
             r#""curation_default_action":"block""#,
             r#""quota_bytes":-1"#,
         ];
-        let cases = generic_cases
-            .iter()
-            .map(|c| (generic, *c))
-            .chain([(deb, deb_case)]);
+        let cases = generic_cases.iter().map(|c| (generic, *c)).chain([
+            (deb, deb_case),
+            // #6063: on Debian the flag is a silent no-op on `main`; the
+            // patch must be refused and leave the row as it was.
+            (deb, r#""versioning_enabled":true"#),
+        ]);
         for ((repo_id, repo_key), rejected) in cases {
             let before = snapshot(&pool, repo_id).await;
             let json = format!("{{{early},{rejected}}}");
