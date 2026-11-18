@@ -166,7 +166,7 @@ fn hydrate_select(from_clause: &str) -> String {
 /// A rule is live only while its principal row exists (#5608).
 ///
 /// `permissions` carries no foreign key on its polymorphic principal pair, so
-/// rows left by a principal deleted before migration 386 would otherwise
+/// rows left by a principal deleted before migration 398 would otherwise
 /// resolve to `principal_name: null` and clutter the admin listing.
 /// `anonymous` names no table row by design and is always live. Kept as one
 /// predicate so the page and its total cannot disagree about which rows exist.
