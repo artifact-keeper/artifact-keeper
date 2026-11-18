@@ -248,7 +248,8 @@ fn parse_conda(filename: &str, artifact_path: &str) -> ParsedArtifact {
 /// require a different reconciliation step that's out of scope here).
 fn parse_helm(filename: &str) -> ParsedArtifact {
     if let Some(stem) = filename.strip_suffix(".tgz") {
-        if let Some((name, version)) = rsplit_name_version(stem) {
+        if let Some((name, version)) = split_name_semver(stem).or_else(|| rsplit_name_version(stem))
+        {
             return ParsedArtifact {
                 name,
                 version: Some(version),
@@ -326,20 +327,25 @@ fn go_unescape_module_path(encoded: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// npm tarballs are `<name>-<version>.tgz` for unscoped packages, or
-/// `@scope/<name>/-/<name>-<version>.tgz` in JFrog's storage layout. The
-/// scope is recovered from the path when present.
+/// `@scope/<name>/-/<name>-<version>.tgz` in the registry layout npm, Nexus
+/// and JFrog store them under. When the path has that `<name>/-/` folder the
+/// name comes from it and the version is the rest of the filename, so a
+/// prerelease or build suffix (`1.1.6-4`, `0.5.0-preview-1`, `1.0.0+build`)
+/// stays in the version. Without the folder the filename is split at the
+/// last hyphen before a version-shaped token, and the scope is recovered
+/// from the path when present.
 fn parse_npm(filename: &str, artifact_path: &str) -> ParsedArtifact {
-    let (base_name, version) = if let Some(stem) = filename.strip_suffix(".tgz") {
-        match rsplit_name_version(stem) {
-            Some((n, v)) => (n, Some(v)),
-            None => (stem.to_string(), None),
-        }
-    } else {
+    let Some(stem) = filename.strip_suffix(".tgz") else {
         return fallback(filename);
     };
+    if let Some(parsed) = parse_npm_registry_layout(stem, artifact_path) {
+        return parsed;
+    }
+    let (base_name, version) = match rsplit_name_version(stem) {
+        Some((n, v)) => (n, Some(v)),
+        None => (stem.to_string(), None),
+    };
 
-    // Recover scope (e.g. "@careem") from the path when present — JFrog
-    // stores scoped npm tarballs under `<scope>/<name>/-/<name>-<version>.tgz`.
     if let Some(scope) = artifact_path.split('/').find(|seg| seg.starts_with('@')) {
         return ParsedArtifact {
             name: format!("{}/{}", scope, base_name),
@@ -350,6 +356,29 @@ fn parse_npm(filename: &str, artifact_path: &str) -> ParsedArtifact {
         name: base_name,
         version,
     }
+}
+
+/// `[@scope/]<name>/-/<name>-<version>.tgz`: the package name is the folder
+/// before `-`, the version is whatever follows `<name>-` in the filename.
+/// `None` when the path has no such folder or the filename doesn't belong
+/// to it.
+fn parse_npm_registry_layout(stem: &str, artifact_path: &str) -> Option<ParsedArtifact> {
+    let segs: Vec<&str> = artifact_path.split('/').filter(|s| !s.is_empty()).collect();
+    let [.., folder, "-", _file] = segs.as_slice() else {
+        return None;
+    };
+    let version = stem.strip_prefix(*folder)?.strip_prefix('-')?;
+    if !looks_like_version(version) {
+        return None;
+    }
+    let name = match segs.len().checked_sub(4).map(|i| segs[i]) {
+        Some(scope) if scope.starts_with('@') => format!("{scope}/{folder}"),
+        _ => folder.to_string(),
+    };
+    Some(ParsedArtifact {
+        name,
+        version: Some(version.to_string()),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -501,6 +530,42 @@ fn rsplit_name_version(stem: &str) -> Option<(String, String)> {
         i = pos;
     }
     None
+}
+
+/// Split `<name>-<semver>` at the leftmost hyphen followed by a full SemVer 2
+/// version (optional `v`), so a prerelease with hyphens or a numeric part
+/// (`1.2.3-4`, `0.1.0-rc-1`) stays in the version. Chart versions are SemVer
+/// 2, a chart name never holds a `-<major>.<minor>.<patch>` segment.
+fn split_name_semver(stem: &str) -> Option<(String, String)> {
+    stem.match_indices('-').find_map(|(pos, _)| {
+        let (name, version) = (&stem[..pos], &stem[pos + 1..]);
+        (!name.is_empty() && is_semver(version)).then(|| (name.to_string(), version.to_string()))
+    })
+}
+
+/// `[v]MAJOR.MINOR.PATCH[-prerelease][+build]`, numeric core, dot-separated
+/// alphanumeric or hyphen identifiers after it.
+fn is_semver(s: &str) -> bool {
+    let s = s.strip_prefix(['v', 'V']).unwrap_or(s);
+    let (rest, build) = match s.split_once('+') {
+        Some((rest, build)) => (rest, Some(build)),
+        None => (s, None),
+    };
+    let (core, pre) = match rest.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (rest, None),
+    };
+    let numeric = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    let ident = |p: &str| {
+        !p.is_empty()
+            && p.split('.')
+                .all(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+    };
+    let parts: Vec<&str> = core.split('.').collect();
+    parts.len() == 3
+        && parts.iter().all(|p| numeric(p))
+        && pre.is_none_or(ident)
+        && build.is_none_or(ident)
 }
 
 /// True if `s` looks like the start of a PEP 440 / SemVer / Helm-style version:
@@ -669,6 +734,61 @@ mod tests {
     }
 
     #[test]
+    fn helm_chart_prerelease_stays_in_the_version() {
+        for (file, name, version) in [
+            ("mychart-1.2.3-4.tgz", "mychart", "1.2.3-4"),
+            ("my-chart-0.1.0-rc-1.tgz", "my-chart", "0.1.0-rc-1"),
+            ("my-chart-0.1.0-rc.1.tgz", "my-chart", "0.1.0-rc.1"),
+            (
+                "k8s-2-app-2.0.0-20231010.tgz",
+                "k8s-2-app",
+                "2.0.0-20231010",
+            ),
+            (
+                "svc-v1.9.1-beta-2+build.3.tgz",
+                "svc",
+                "v1.9.1-beta-2+build.3",
+            ),
+        ] {
+            let p = parse_name_and_version("helm", file, file);
+            assert_eq!(p.name, name, "{file}");
+            assert_eq!(p.version.as_deref(), Some(version), "{file}");
+        }
+        // Not SemVer: the last-hyphen split still applies.
+        let p = parse_name_and_version("helm", "legacy-1.2.tgz", "legacy-1.2.tgz");
+        assert_eq!(
+            (p.name.as_str(), p.version.as_deref()),
+            ("legacy", Some("1.2"))
+        );
+    }
+
+    #[test]
+    fn is_semver_smoke() {
+        for ok in [
+            "1.2.3",
+            "v1.2.3",
+            "1.2.3-4",
+            "1.2.3-rc-1",
+            "1.2.3+b.1",
+            "0.0.0-a.b-c+d",
+        ] {
+            assert!(is_semver(ok), "{ok}");
+        }
+        for bad in [
+            "1.2",
+            "1.2.3.4",
+            "1.2.x",
+            "1.2.3-",
+            "1.2.3+",
+            "1.2.3-a..b",
+            "x1.2.3",
+            "",
+        ] {
+            assert!(!is_semver(bad), "{bad}");
+        }
+    }
+
+    #[test]
     fn helm_chart_no_version_in_filename() {
         // Some charts in older registries are stored as just `<chart>.tgz`
         // and rely on the path for version. We surface name without version
@@ -694,6 +814,70 @@ mod tests {
         );
         assert_eq!(p.name, "@careem/logger");
         assert_eq!(p.version.as_deref(), Some("2.3.0"));
+    }
+
+    #[test]
+    fn npm_prerelease_takes_the_name_from_the_registry_folder() {
+        for (path, name, version) in [
+            (
+                "@acme/acme-core/-/acme-core-1.1.6-4.tgz",
+                "@acme/acme-core",
+                "1.1.6-4",
+            ),
+            (
+                "@acme/acme-search/-/acme-search-0.5.0-preview-1.tgz",
+                "@acme/acme-search",
+                "0.5.0-preview-1",
+            ),
+            ("pkg/-/pkg-1.0.0-rc.1.tgz", "pkg", "1.0.0-rc.1"),
+            ("pkg/-/pkg-1.0.0-4.tgz", "pkg", "1.0.0-4"),
+            ("pkg/-/pkg-1.0.0+build.7.tgz", "pkg", "1.0.0+build.7"),
+            (
+                "pkg/-/pkg-2.0.0-beta-3+exp.sha.5114f85.tgz",
+                "pkg",
+                "2.0.0-beta-3+exp.sha.5114f85",
+            ),
+            (
+                "@s/k8s-2-client/-/k8s-2-client-3.0.0-2.tgz",
+                "@s/k8s-2-client",
+                "3.0.0-2",
+            ),
+            ("ui-v2/-/ui-v2-1.0.0-0.tgz", "ui-v2", "1.0.0-0"),
+            ("repo/@s/a-1/-/a-1-1.2.3-1.tgz", "@s/a-1", "1.2.3-1"),
+        ] {
+            let file = path.rsplit('/').next().unwrap();
+            let p = parse_name_and_version("npm", file, path);
+            assert_eq!(p.name, name, "{path}");
+            assert_eq!(p.version.as_deref(), Some(version), "{path}");
+        }
+    }
+
+    #[test]
+    fn npm_without_registry_folder_keeps_the_filename_split() {
+        let p = parse_name_and_version("npm", "lodash-4.17.21.tgz", "lodash-4.17.21.tgz");
+        assert_eq!(
+            (p.name.as_str(), p.version.as_deref()),
+            ("lodash", Some("4.17.21"))
+        );
+
+        let p = parse_name_and_version("npm", "logger-2.3.0.tgz", "@careem/logger-2.3.0.tgz");
+        assert_eq!(
+            (p.name.as_str(), p.version.as_deref()),
+            ("@careem/logger", Some("2.3.0"))
+        );
+
+        // A folder the filename doesn't belong to is not trusted for the name.
+        let p = parse_name_and_version("npm", "pkg-1.0.0.tgz", "other/-/pkg-1.0.0.tgz");
+        assert_eq!(
+            (p.name.as_str(), p.version.as_deref()),
+            ("pkg", Some("1.0.0"))
+        );
+
+        let p = parse_name_and_version("npm", "pkg-latest.tgz", "pkg/-/pkg-latest.tgz");
+        assert_eq!(
+            (p.name.as_str(), p.version.as_deref()),
+            ("pkg-latest", None)
+        );
     }
 
     #[test]

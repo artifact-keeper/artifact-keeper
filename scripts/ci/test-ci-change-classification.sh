@@ -17,7 +17,11 @@
 #   against fixture file lists. Then the drift check: every script referenced
 #   by a job gated on `needs.changes.outputs.rust` must classify as a Rust
 #   input, so wiring a new scripts/ci/*.sh into a Rust job without listing it
-#   in the gate fails here. Last, CI Complete's own step and the "Backend
+#   in the gate fails here. A second drift check (#6115) scans the backend
+#   sources for files outside backend/ that a test reads (include_str!,
+#   relative paths, .github/workflows): each must be a Rust input, or a
+#   workflow covered by the Workflow Contract Tests job. Last, CI Complete's
+#   own step and the "Backend
 #   Unit Tests" aggregate's step are run against job results: a gate-skipped
 #   Rust job passes there only when the gate said so, an integration job
 #   skipped by its path filter passes only when that filter was off, and the
@@ -84,11 +88,14 @@ open(f'{work}/integ_if.txt', 'w').write(integ_if + '\n')
 on = wf.get('on', wf.get(True, {}))
 facts = []
 facts.append('trigger_merge_group=' + str('merge_group' in (on or {})).lower())
-for j in ('check-rust', 'test-backend-integration', 'test-backend-unit', 'ci-complete'):
+for j in ('check-rust', 'windows-cross-check', 'test-backend-integration', 'test-backend-unit', 'ci-complete'):
     facts.append(f'runs_on_{j}=' + str(wf['jobs'][j].get('runs-on')))
 cc_needs = wf['jobs']['ci-complete'].get('needs', [])
-for j in ('smoke-e2e', 'build-backend-image', 'build-openscap-image'):
+for j in ('smoke-e2e', 'build-backend-image', 'build-openscap-image', 'windows-cross-check'):
     facts.append(f'cc_needs_{j}=' + str(j in cc_needs).lower())
+# The Windows cross-check (#6022) must run exactly when Check Rust does.
+facts.append('windows_if_matches_check_rust=' + str(
+    str(wf['jobs']['windows-cross-check'].get('if')) == str(wf['jobs']['check-rust'].get('if'))).lower())
 facts.append('ubuntu_latest=' + str('ubuntu-latest' in open(sys.argv[1]).read()).lower())
 # rust-cache entries saved under a PR or merge-group ref are never restored
 # by anyone else and push `main`'s own entries out of the 10 GiB quota.
@@ -102,10 +109,57 @@ for name, job in wf['jobs'].items():
 facts.append('cache_saves_off_main=' + (','.join(sorted(set(leaky))) or 'none'))
 open(f'{work}/facts.txt', 'w').write('\n'.join(facts) + '\n')
 open(f'{work}/refs.txt', 'w').write('\n'.join(sorted(refs)) + '\n')
+# The Workflow Contract Tests job (#6115): its condition, the lib-test
+# module prefixes in CONTRACT_FILTER, the shard it builds and the
+# integration targets it names.
+wc = wf['jobs'].get('workflow-contracts') or {}
+flt = str((wc.get('env') or {}).get('CONTRACT_FILTER', ''))
+m = re.fullmatch(r'test\(/\^\(([A-Za-z0-9_:|]+)\)::/\)', flt.strip())
+mods = m.group(1).split('|') if m else []
+open(f'{work}/contract_modules.txt', 'w').write('\n'.join(mods) + '\n')
+wc_text = yaml.safe_dump(wc.get('steps', []))
+open(f'{work}/contract_targets.txt', 'w').write('\n'.join(sorted(set(re.findall(r'--test ([A-Za-z0-9_]+)', wc_text)))) + '\n')
+open(f'{work}/contract_shards.txt', 'w').write('\n'.join(sorted(set(re.findall(r'test-shard-([a-z0-9-]+)', wc_text)))) + '\n')
+open(f'{work}/contract_if.txt', 'w').write(str(wc.get('if', '')) + '\n')
+PY
+
+# Every file outside backend/ that a backend source reads, one
+# `reader<TAB>path` per line, `.github/workflows/*` for a directory read:
+# relative path literals (include_str!, include_bytes!, a read at test time)
+# resolved against the source's directory, or backend/ for a
+# CARGO_MANIFEST_DIR-relative "/../x", and the joins onto .github/workflows.
+python3 - "$ROOT" "$WORK" <<'PY' || { echo "INFRA: could not scan the backend sources" >&2; exit 2; }
+import os, re, sys
+root, work = sys.argv[1], sys.argv[2]
+rel_lit = re.compile(r'"(/?(?:\.\./)+[A-Za-z0-9_.@/-]+)"')
+wf_join = re.compile(r'join\("\.github/workflows(/[A-Za-z0-9_.-]+)?"\)')
+wf_chain = re.compile(r'join\("\.github"\)\s*\.join\("workflows"\)(?:\s*\.join\("([A-Za-z0-9_.-]+)"\))?')
+pairs = set()
+for top in ('backend/src', 'backend/tests', 'backend/build.rs'):
+    base = os.path.join(root, top)
+    if os.path.isfile(base):
+        paths = [base]
+    else:
+        paths = [os.path.join(d, f) for d, _, fs in os.walk(base) for f in fs if f.endswith('.rs')]
+    for path in paths:
+        reader = os.path.relpath(path, root)
+        src = open(path, encoding='utf-8', errors='replace').read()
+        for lit in rel_lit.findall(src):
+            start = os.path.join(root, 'backend') if lit.startswith('/') else os.path.dirname(path)
+            target = os.path.normpath(os.path.join(start, lit.lstrip('/')))
+            rel = os.path.relpath(target, root)
+            if rel.startswith('..') or rel.startswith('backend/') or not os.path.isfile(target):
+                continue
+            pairs.add((reader, rel))
+        for sub in wf_join.findall(src):
+            pairs.add((reader, '.github/workflows' + sub if sub else '.github/workflows/*'))
+        for name in wf_chain.findall(src):
+            pairs.add((reader, '.github/workflows/' + name if name else '.github/workflows/*'))
+open(f'{work}/readers.txt', 'w').write(''.join(f'{r}\t{p}\n' for r, p in sorted(pairs)))
 PY
 
 grep -q . "$WORK/gated.txt" || { fail "no job in ci.yml is gated on needs.changes.outputs.rust"; }
-for required in check-rust test-backend-unit; do
+for required in check-rust windows-cross-check test-backend-unit; do
   grep -qx "$required" "$WORK/gated.txt" \
     || fail "required job $required is not gated on needs.changes.outputs.rust"
 done
@@ -192,8 +246,18 @@ expect "docs/ non-markdown asset"                  "true false false false"  pul
 expect "a shell gate no Rust job runs"             "true false false false"  pull_request scripts/ci/check-conflict-markers.sh scripts/ci/test-check-conflict-markers.sh
 expect "release scripts"                           "true false false false"  pull_request scripts/release/create-release-line.sh
 expect "CI-only mix plus docs"                     "true false false false"  pull_request scripts/ci/test-foo.sh CHANGELOG.md docs/x.png
-expect "ci.yml itself"                             "true true false true"    pull_request .github/workflows/ci.yml
-expect "another workflow (Rust tests read them)"   "true false false true"   pull_request .github/workflows/docker-publish.yml
+expect "ci.yml itself (contract tests, #6115)"     "true false false false"  pull_request .github/workflows/ci.yml
+expect "another workflow (contract tests)"         "true false false false"  pull_request .github/workflows/docker-publish.yml
+expect "workflows plus CI scripts and docs"        "true false false false"  pull_request .github/workflows/release.yml scripts/ci/test-foo.sh scripts/release/x.sh docs/guide.md
+expect "workflow plus backend code"                "true true false true"    pull_request .github/workflows/ci.yml backend/src/main.rs
+expect ".github/scripts"                           "true false false false"  pull_request .github/scripts/floating-tag-plan.sh
+expect "dependabot, CODEOWNERS, issue templates"   "true false false false"  pull_request .github/dependabot.yml .github/CODEOWNERS .github/ISSUE_TEMPLATE/bug_report.yml .github/actionlint.yaml
+expect "coverage policy (sets the Rust verdict)"   "true false false true"   pull_request .github/coverage-gate.json
+expect "duplication baseline"                      "true false false true"   pull_request .github/duplication-baseline.json
+expect "a composite action could run in a Rust job" "true false false true"  pull_request .github/actions/setup/action.yml
+expect "a .github file nobody listed"              "true false false true"   pull_request .github/new-thing.json
+expect "a doc a Rust test reads"                   "true false false true"   pull_request docs/air-gapped.md
+expect "another doc a Rust test reads"             "true false false true"   pull_request docs/security/scan-on-proxy.md
 expect "rust-toolchain.toml"                       "true false false true"   pull_request rust-toolchain.toml
 expect "toolchain setup script"                    "true false false true"   pull_request scripts/ci/setup-pinned-toolchain.sh
 expect "nextest config (Tier 2 test groups)"       "true true false true"    pull_request .config/nextest.toml
@@ -242,7 +306,7 @@ expect_kv "backend/src only: integration not needed"   "tests=false rust=true"  
 expect_kv "a backend/tests change"                     "tests=true"              pull_request backend/tests/age_gate_tests.rs
 expect_kv "a migration"                                "tests=true backend=true" pull_request backend/migrations/200_x.sql
 expect_kv "ci.yml itself"                              "tests=true"              pull_request .github/workflows/ci.yml
-expect_kv "another workflow is not an integration input" "tests=false rust=true" pull_request .github/workflows/docker-publish.yml
+expect_kv "another workflow is not an integration input" "tests=false rust=false" pull_request .github/workflows/docker-publish.yml
 expect_kv "Markdown under backend/tests/ is docs"      "tests=false code=false"  pull_request backend/tests/README.md
 expect_kv "docs only"                                  "tests=false"             pull_request README.md
 FAKE_GH_FAIL=1 expect_kv "file listing fails -> integration runs" "tests=true rust=true" pull_request whatever
@@ -252,6 +316,19 @@ FAKE_LABELS="ci:image" expect_kv "live label ci:image"        "ci_full=false ci_
 FAKE_LABELS="ci:fullish,xci:image" expect_kv "labels match exactly" "ci_full=false ci_image=false" pull_request backend/src/main.rs
 FAKE_LABELS_FAIL=1 PR_LABELS="ci:image,ci:full" \
   expect_kv "live label read fails -> the payload's labels" "ci_full=true ci_image=true" pull_request backend/src/main.rs
+
+echo "ci.yml changes gate: workflow contract tests and ci:full (#6115)"
+expect_kv "ci.yml: contract tests, no scan gate"       "workflow_contracts=true workflow_scan_gate=false rust=false" pull_request .github/workflows/ci.yml
+expect_kv "docker-publish.yml: the scan gate target too" "workflow_contracts=true workflow_scan_gate=true rust=false" pull_request .github/workflows/docker-publish.yml
+expect_kv "scripts only: no contract tests"            "workflow_contracts=false workflow_scan_gate=false rust=false" pull_request scripts/ci/test-foo.sh
+expect_kv "backend code: contract flag off"            "workflow_contracts=false rust=true" pull_request backend/src/main.rs
+expect_kv "workflow + backend: Rust jobs run"          "workflow_contracts=true rust=true" pull_request .github/workflows/ci.yml backend/src/main.rs
+expect_kv "workflow README is docs"                    "workflow_contracts=false code=false" pull_request .github/workflows/README.md
+FAKE_LABELS="ci:full" expect_kv "ci:full on a workflow PR runs the Rust jobs" "rust=true backend=true ci_full=true" pull_request .github/workflows/release.yml
+FAKE_LABELS="ci:full" expect_kv "ci:full on a docs-only PR stays docs-only"   "code=false rust=false" pull_request README.md
+FAKE_GH_FAIL=1 expect_kv "file listing fails -> contract flags on, Rust on" "rust=true workflow_contracts=true workflow_scan_gate=true" pull_request whatever
+expect_kv "merge group, workflow only"                 "rust=false workflow_contracts=true" merge_group .github/workflows/ci.yml
+expect_kv "workflow_dispatch: Rust jobs, no contract job" "rust=true workflow_contracts=false workflow_scan_gate=false" workflow_dispatch
 
 echo "ci.yml changes gate: the scanner adapter's Go job (scanner_adapter, #4437)"
 expect_kv "adapter Go source"                          "scanner_adapter=true"  pull_request docker/scanner-adapter/scan.go
@@ -321,17 +398,72 @@ while IFS= read -r ref; do
 done < "$WORK/refs.txt"
 [ "$n" -gt 0 ] || fail "found no script references in the Rust jobs -- the extraction is broken"
 
-# The Rust test suite reads workflow files directly (ci_test_surface.rs,
-# config.rs, workflow_scan_gate_tests.rs). While it does, a workflow-only PR
-# must run the Rust jobs.
-if grep -rqE '\.github/workflows|join\("\.github"\)' "$ROOT/backend/src" "$ROOT/backend/tests" 2>/dev/null; then
-  run_filter pull_request .github/workflows/stale.yml
-  if [ "$(get rust)" = true ]; then
-    pass "workflow files are Rust inputs while backend tests read .github/workflows"
-  else
-    fail "backend tests read .github/workflows, yet a workflow-only PR skips the Rust jobs"
-  fi
+echo "ci.yml changes gate: every file a backend test reads runs a test that reads it (#6115)"
+# A path read from outside backend/ must make a PR run the Rust jobs, or be a
+# workflow the Workflow Contract Tests job reads with the same test.
+contract_if="$(cat "$WORK/contract_if.txt")"
+case "$contract_if" in
+  *"needs.changes.outputs.rust == 'false'"*"needs.changes.outputs.workflow_contracts != 'false'"*)
+    pass "the contract job runs exactly when the Rust jobs skip and a workflow changed (fail-open)" ;;
+  *) fail "workflow-contracts' condition lost a clause: $contract_if" ;;
+esac
+if [ "$(grep -c . "$WORK/contract_shards.txt")" = 1 ]; then
+  contract_shard="$(cat "$WORK/contract_shards.txt")"
+  pass "the contract job builds one shard ($contract_shard)"
+else
+  contract_shard=""
+  fail "the contract job must build exactly one test shard: $(tr '\n' ' ' < "$WORK/contract_shards.txt")"
 fi
+# module_of backend/src/a/b.rs -> a::b ; a/mod.rs -> a
+module_of() {
+  local m="${1#backend/src/}"; m="${m%.rs}"; m="${m%/mod}"; printf '%s\n' "${m//\//::}"
+}
+covered_module() {
+  local mod="$1" p
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    case "$mod" in "$p"|"$p"::*) return 0 ;; esac
+  done < "$WORK/contract_modules.txt"
+  return 1
+}
+n=0
+while IFS=$'\t' read -r reader path; do
+  [ -n "$reader" ] || continue
+  n=$((n + 1))
+  probe="$path"; [ "$path" = ".github/workflows/*" ] && probe=".github/workflows/zz-any.yml"
+  run_filter pull_request "$probe" || { fail "$path: step failed"; continue; }
+  if [ "$(get rust)" = true ]; then
+    pass "$reader reads $path, a Rust input"
+    continue
+  fi
+  if [ "$(get workflow_contracts)" != true ]; then
+    fail "$reader reads $path, but a PR changing only $path runs no Rust test; add it to the Rust-input arm of the changes gate"
+    continue
+  fi
+  case "$reader" in
+    backend/src/*)
+      mod="$(module_of "$reader")"
+      gate="$(grep -oE 'ak_test_shard = "[a-z0-9-]+"' "$ROOT/$reader" | sort -u | sed 's/.*"\(.*\)"/\1/' | tr '\n' ' ')"
+      if ! covered_module "$mod"; then
+        fail "$reader ($mod) reads $path; add $mod to CONTRACT_FILTER in the workflow-contracts job"
+      elif [ -n "$gate" ] && [ "$gate" != "$contract_shard " ]; then
+        fail "$reader reads $path, but its tests are gated to shard(s) [$gate], not the contract job's $contract_shard"
+      else
+        pass "$reader reads $path; the contract job runs $mod"
+      fi ;;
+    backend/tests/*)
+      target="$(basename "$reader" .rs)"
+      if ! grep -qx "$target" "$WORK/contract_targets.txt"; then
+        fail "$reader reads $path; add --test $target to the workflow-contracts job"
+      elif [ "$(get workflow_scan_gate)" != true ]; then
+        fail "$reader reads $path, but the contract job builds --test $target only when docker-publish.yml changes; widen workflow_scan_gate"
+      else
+        pass "$reader reads $path; the contract job runs --test $target"
+      fi ;;
+    *) fail "$reader reads $path; only backend/src and backend/tests readers can be covered by the contract job" ;;
+  esac
+done < "$WORK/readers.txt"
+[ "$n" -gt 0 ] || fail "found no backend source reading a file outside backend/ -- the scan is broken"
 
 echo "ci.yml CI Complete: skipped Rust jobs pass only when the gate said so"
 # complete <label> <want rc 0|1> <event> <code> <backend> <rust> [RESULT_X=value ...]
@@ -360,6 +492,27 @@ complete "CI-only PR: shell-tests must still succeed"               1 pull_reque
 complete "CI-only PR: a failed Rust job still fails"                1 pull_request true false false RESULT_CHECK_RUST=failure
 complete "proven push: skipped Rust jobs pass"                      0 push true true false "${SKIP_RUST[@]}" RESULT_VERSION_PIN=skipped
 complete "unproven push: a skipped unit job fails"                  1 push true true true RESULT_UNIT=skipped RESULT_VERSION_PIN=skipped
+
+echo "ci.yml CI Complete: the Windows cross-check (#6022) is advisory (#6242)"
+complete "Rust inputs changed: a red Windows check does not fail CI Complete"  0 pull_request true true true RESULT_WINDOWS_CHECK=failure
+complete "Rust inputs changed: a cancelled Windows check does not fail it"     0 pull_request true true true RESULT_WINDOWS_CHECK=cancelled
+complete "docs-only PR: skipped Rust jobs pass"                                0 pull_request false false false "${SKIP_RUST[@]}" RESULT_SHELL=skipped RESULT_SECURITY=skipped
+if grep -qx RESULT_WINDOWS_CHECK "$WORK/results.txt"; then
+  fail "CI Complete still reads RESULT_WINDOWS_CHECK while the Windows check is advisory"
+else
+  pass "CI Complete ignores the advisory Windows cross-check"
+fi
+
+echo "ci.yml CI Complete: the Workflow Contract Tests (#6115)"
+complete "workflow-only PR: contract tests green -> passes"          0 pull_request true false false "${SKIP_RUST[@]}" WORKFLOW_CONTRACTS=true
+complete "workflow-only PR: contract tests red -> fails"             1 pull_request true false false "${SKIP_RUST[@]}" WORKFLOW_CONTRACTS=true RESULT_WORKFLOW_CONTRACTS=failure
+complete "workflow-only PR: contract tests skipped -> fails"         1 pull_request true false false "${SKIP_RUST[@]}" WORKFLOW_CONTRACTS=true RESULT_WORKFLOW_CONTRACTS=skipped
+complete "Rust skipped, workflow flag missing: skip -> fails"        1 pull_request true false false "${SKIP_RUST[@]}" WORKFLOW_CONTRACTS= RESULT_WORKFLOW_CONTRACTS=skipped
+complete "scripts-only PR: contract tests skipped -> passes"         0 pull_request true false false "${SKIP_RUST[@]}" WORKFLOW_CONTRACTS=false RESULT_WORKFLOW_CONTRACTS=skipped
+complete "Rust jobs ran: contract tests skipped -> passes"           0 pull_request true true true WORKFLOW_CONTRACTS=true RESULT_WORKFLOW_CONTRACTS=skipped
+complete "Rust jobs ran, contract tests somehow red -> fails"        1 pull_request true true true WORKFLOW_CONTRACTS=true RESULT_WORKFLOW_CONTRACTS=failure
+complete "proven push: contract tests skipped -> passes"             0 push true true false "${SKIP_RUST[@]}" RESULT_VERSION_PIN=skipped WORKFLOW_CONTRACTS=false RESULT_WORKFLOW_CONTRACTS=skipped
+complete "docs-only PR: contract tests skipped -> passes"            0 pull_request false false false "${SKIP_RUST[@]}" RESULT_SHELL=skipped RESULT_SECURITY=skipped WORKFLOW_CONTRACTS=false RESULT_WORKFLOW_CONTRACTS=skipped
 
 echo "ci.yml CI Complete: the Security Audit rule"
 NOPIN=(RESULT_VERSION_PIN=skipped RESULT_COVERAGE=skipped)
@@ -429,14 +582,28 @@ want_fact() {
   if [ "$(fact "$1")" = "$2" ]; then pass "$3"; else fail "$3: $1=$(fact "$1"), want $2"; fi
 }
 want_fact trigger_merge_group true "ci.yml triggers on merge_group (required checks must report in the queue)"
-for j in check-rust test-backend-integration test-backend-unit ci-complete; do
+for j in check-rust windows-cross-check test-backend-integration test-backend-unit ci-complete; do
   want_fact "runs_on_$j" ubuntu-24.04 "$j runs on pinned GitHub-hosted ubuntu-24.04"
 done
 for j in smoke-e2e build-backend-image build-openscap-image; do
   want_fact "cc_needs_$j" false "CI Complete does not wait for advisory $j"
 done
+want_fact cc_needs_windows-cross-check false "CI Complete does not wait for the Windows cross-check while it is advisory (#6022)"
+want_fact windows_if_matches_check_rust true "the Windows cross-check's condition is Check Rust's, verbatim"
 want_fact ubuntu_latest false "no job floats on ubuntu-latest"
 want_fact cache_saves_off_main none "every rust-cache saves only outside pull requests and merge groups"
+# ci_test_surface reads every `--test <name>` in the workflow text, comments
+# included, as a target: a dangling one turns the contract tests red, and on
+# a workflow-only PR nothing else would show it before they run.
+dangling=""
+while IFS= read -r t; do
+  [ -n "$t" ] && [ ! -f "$ROOT/backend/tests/$t.rs" ] && dangling="$dangling $t"
+done < <(grep -oE -- '--test [A-Za-z0-9_]+' "$WORKFLOW" | awk '{print $2}' | sort -u)
+if [ -z "$dangling" ]; then
+  pass "every --test name in ci.yml is a backend/tests target"
+else
+  fail "ci.yml names --test targets with no backend/tests/<name>.rs (comments count):$dangling"
+fi
 
 echo
 if [ "$fails" -gt 0 ]; then

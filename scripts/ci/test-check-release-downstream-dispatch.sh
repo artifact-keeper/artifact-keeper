@@ -95,15 +95,15 @@ mutate "$d" release-announce.yml "s.replace('''on:\n  release:\n    types: [publ
 check "announce without the release trigger is refused" 1 "$d" "lost \`on.release.types"
 
 d="$(fresh)"
-mutate "$d" release.yml "s.replace('gh workflow run ami-build.yml', 'echo skipped ami-build.yml', 1)"
+mutate "$d" release.yml "re.sub(r'(?m)^(\s*)gh workflow run ami-build\.yml', r'\1echo skipped ami-build.yml', s, count=1)"
 check "release.yml not dispatching the AMI build is refused" 1 "$d" "no job running \`gh workflow run ami-build.yml\`"
 
 d="$(fresh)"
-mutate "$d" release.yml "s.replace('gh workflow run release-announce.yml', 'echo skipped release-announce.yml', 1)"
+mutate "$d" release.yml "re.sub(r'(?m)^(\s*)gh workflow run release-announce\.yml', r'\1echo skipped release-announce.yml', s, count=1)"
 check "release.yml not dispatching the announcement is refused" 1 "$d" "no job running \`gh workflow run release-announce.yml\`"
 
 d="$(fresh)"
-mutate "$d" release.yml "s.replace('gh workflow run sync-openapi-spec.yml', 'echo skipped sync-openapi-spec.yml', 1)"
+mutate "$d" release.yml "re.sub(r'(?m)^(\s*)gh workflow run sync-openapi-spec\.yml', r'\1echo skipped sync-openapi-spec.yml', s, count=1)"
 check "release.yml not dispatching the spec sync is refused" 1 "$d" "no job running \`gh workflow run sync-openapi-spec.yml\`"
 
 d="$(fresh)"

@@ -40,7 +40,7 @@ use crate::models::user::User;
 /// `DATABASE_URL` or a connect failure PANICS instead of skipping, so an
 /// unreachable database can no longer silently "fiction-green" the suite
 /// (#2924).
-pub async fn try_pool() -> Option<PgPool> {
+pub(crate) async fn try_pool() -> Option<PgPool> {
     crate::testing::try_pool_with(3).await
 }
 
@@ -81,7 +81,7 @@ pub struct SilentUpstream {
 
 impl SilentUpstream {
     /// Bind `127.0.0.1` on an ephemeral port.
-    pub async fn start() -> Self {
+    pub(crate) async fn start() -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the silent upstream");
@@ -109,7 +109,7 @@ impl Drop for SilentUpstream {
 
 /// Start wiremock on a non-loopback interface accepted by the upstream SSRF
 /// policy, returning a guard that restores the process environment on drop.
-pub async fn non_loopback_mock_server() -> (wiremock::MockServer, SsrfTestAllowlistGuard) {
+pub(crate) async fn non_loopback_mock_server() -> (wiremock::MockServer, SsrfTestAllowlistGuard) {
     let lock =
         crate::api::validation::lock_outbound_policy_env("tdh::non_loopback_mock_server").await;
     let previous = std::env::var("AK_SSRF_ALLOW_PRIVATE_CIDRS").ok();
@@ -196,7 +196,7 @@ pub struct ScanDedupSerialGuard {
 /// database is unreachable, mirroring [`try_pool`] so DB-free environments
 /// still no-op cleanly. Call this as the first line of a scan-dedup DB test
 /// and bind the result for the whole test body.
-pub async fn scan_dedup_serial_lock() -> ScanDedupSerialGuard {
+pub(crate) async fn scan_dedup_serial_lock() -> ScanDedupSerialGuard {
     ScanDedupSerialGuard {
         _conn: serial_lock_session(SCAN_DEDUP_TEST_LOCK_KEY).await,
     }
@@ -231,7 +231,7 @@ pub struct BlobGcSerialGuard {
 /// database is unreachable, mirroring [`try_pool`] so DB-free environments
 /// still no-op cleanly. Call this as the first line of a DB-backed blob-GC
 /// test and bind the result for the whole test body.
-pub async fn blob_gc_serial_lock() -> BlobGcSerialGuard {
+pub(crate) async fn blob_gc_serial_lock() -> BlobGcSerialGuard {
     BlobGcSerialGuard {
         _conn: serial_lock_session(BLOB_GC_TEST_LOCK_KEY).await,
     }
@@ -273,7 +273,7 @@ pub struct OciReindexSerialGuard {
 /// database is unreachable, mirroring [`try_pool`]. Call this as the first line
 /// of a DB-backed `oci_migration_reindex` test and bind the result for the
 /// whole test body.
-pub async fn oci_reindex_serial_lock() -> OciReindexSerialGuard {
+pub(crate) async fn oci_reindex_serial_lock() -> OciReindexSerialGuard {
     OciReindexSerialGuard {
         _conn: serial_lock_session(OCI_REINDEX_TEST_LOCK_KEY).await,
     }
@@ -302,7 +302,7 @@ pub struct TotpPolicySerialGuard {
 ///
 /// Returns an inert guard (no lock held) when `DATABASE_URL` is unset or the
 /// database is unreachable, mirroring [`try_pool`].
-pub async fn totp_policy_serial_lock() -> TotpPolicySerialGuard {
+pub(crate) async fn totp_policy_serial_lock() -> TotpPolicySerialGuard {
     TotpPolicySerialGuard {
         _conn: serial_lock_session(TOTP_POLICY_TEST_LOCK_KEY).await,
     }
@@ -327,7 +327,7 @@ pub struct TokenPolicySerialGuard {
 /// Acquire the process-wide token-expiry-policy test lock, blocking until it
 /// is free. Returns an inert guard (no lock held) when `DATABASE_URL` is unset
 /// or the database is unreachable, mirroring [`try_pool`].
-pub async fn token_policy_serial_lock() -> TokenPolicySerialGuard {
+pub(crate) async fn token_policy_serial_lock() -> TokenPolicySerialGuard {
     TokenPolicySerialGuard {
         _conn: serial_lock_session(TOKEN_POLICY_TEST_LOCK_KEY).await,
     }
@@ -348,7 +348,7 @@ pub struct HiddenNavItemsSerialGuard {
 /// Acquire the hidden-navigation-items test lock, blocking until it is free.
 /// Returns an inert guard when the database is unreachable, mirroring
 /// [`try_pool`].
-pub async fn hidden_nav_items_serial_lock() -> HiddenNavItemsSerialGuard {
+pub(crate) async fn hidden_nav_items_serial_lock() -> HiddenNavItemsSerialGuard {
     HiddenNavItemsSerialGuard {
         _conn: serial_lock_session(HIDDEN_NAV_ITEMS_TEST_LOCK_KEY).await,
     }
@@ -367,7 +367,7 @@ pub struct AdminSettingsSerialGuard {
 
 /// Acquire the admin-settings test lock, blocking until it is free. Returns an
 /// inert guard when the database is unreachable, mirroring [`try_pool`].
-pub async fn admin_settings_serial_lock() -> AdminSettingsSerialGuard {
+pub(crate) async fn admin_settings_serial_lock() -> AdminSettingsSerialGuard {
     AdminSettingsSerialGuard {
         _conn: serial_lock_session(ADMIN_SETTINGS_TEST_LOCK_KEY).await,
     }
@@ -402,7 +402,7 @@ pub struct UsageLedgerSerialGuard {
 /// database is unreachable, mirroring [`try_pool`] so DB-free environments
 /// still no-op cleanly. Call this as the first line of a DB-backed
 /// usage-ledger test and bind the result for the whole test body.
-pub async fn usage_ledger_serial_lock() -> UsageLedgerSerialGuard {
+pub(crate) async fn usage_ledger_serial_lock() -> UsageLedgerSerialGuard {
     UsageLedgerSerialGuard {
         _conn: serial_lock_session(USAGE_LEDGER_TEST_LOCK_KEY).await,
     }
@@ -437,7 +437,7 @@ pub struct SsoProviderSerialGuard {
 /// still no-op cleanly. Call this as the first line of any DB-backed test
 /// that seeds or asserts on enabled SSO providers and bind the result for the
 /// whole test body.
-pub async fn sso_provider_serial_lock() -> SsoProviderSerialGuard {
+pub(crate) async fn sso_provider_serial_lock() -> SsoProviderSerialGuard {
     SsoProviderSerialGuard {
         _conn: serial_lock_session(SSO_PROVIDER_TEST_LOCK_KEY).await,
     }
@@ -474,7 +474,7 @@ pub struct CurationGlobalSerialGuard {
 /// still no-op cleanly. Call this as the first line of any DB-backed test
 /// that seeds global curation rules and asserts on rule evaluation, and bind
 /// the result for the whole test body.
-pub async fn curation_global_serial_lock() -> CurationGlobalSerialGuard {
+pub(crate) async fn curation_global_serial_lock() -> CurationGlobalSerialGuard {
     CurationGlobalSerialGuard {
         _conn: serial_lock_session(CURATION_GLOBAL_TEST_LOCK_KEY).await,
     }
@@ -512,7 +512,7 @@ pub struct PathStatsSerialGuard {
 /// database is unreachable, mirroring [`try_pool`] so DB-free environments
 /// still no-op cleanly. Call this as the first line of a DB-backed path-stats
 /// test and bind the result for the whole test body.
-pub async fn path_stats_serial_lock() -> PathStatsSerialGuard {
+pub(crate) async fn path_stats_serial_lock() -> PathStatsSerialGuard {
     PathStatsSerialGuard {
         _conn: serial_lock_session(PATH_STATS_TEST_LOCK_KEY).await,
     }
@@ -547,7 +547,7 @@ pub struct FormatRegistrySerialGuard {
 /// database is unreachable, mirroring [`try_pool`] so DB-free environments
 /// still no-op cleanly. Call this as the first line of a DB-backed
 /// format-registry test and bind the result for the whole test body.
-pub async fn format_registry_serial_lock() -> FormatRegistrySerialGuard {
+pub(crate) async fn format_registry_serial_lock() -> FormatRegistrySerialGuard {
     FormatRegistrySerialGuard {
         _conn: serial_lock_session(FORMAT_REGISTRY_TEST_LOCK_KEY).await,
     }
@@ -592,7 +592,7 @@ pub struct OciBlobDigestSerialGuard {
 /// still no-op cleanly. Call this as the first line of any DB-backed OCI
 /// upload test that completes a blob under bytes a sibling test also
 /// completes, and bind the result for the whole test body.
-pub async fn oci_blob_digest_serial_lock() -> OciBlobDigestSerialGuard {
+pub(crate) async fn oci_blob_digest_serial_lock() -> OciBlobDigestSerialGuard {
     OciBlobDigestSerialGuard {
         _conn: serial_lock_session(OCI_BLOB_DIGEST_TEST_LOCK_KEY).await,
     }
@@ -615,7 +615,7 @@ pub struct DeviceExpirySerialGuard {
 
 /// Acquire the device-expiry test lock, blocking until it is free. Inert
 /// when no database is configured, like [`try_pool`].
-pub async fn device_expiry_serial_lock() -> DeviceExpirySerialGuard {
+pub(crate) async fn device_expiry_serial_lock() -> DeviceExpirySerialGuard {
     DeviceExpirySerialGuard {
         _conn: serial_lock_session(DEVICE_EXPIRY_TEST_LOCK_KEY).await,
     }
@@ -632,7 +632,7 @@ pub async fn device_expiry_serial_lock() -> DeviceExpirySerialGuard {
 /// the next tick), so the test helper retries a few times rather than letting
 /// unrelated suite noise flake these assertions. `full` additionally runs the
 /// repo-level persist (`recompute_all`), covering the #2601 chaining change.
-pub async fn recompute_storage_stats_with_retry(pool: &PgPool, full: bool) {
+pub(crate) async fn recompute_storage_stats_with_retry(pool: &PgPool, full: bool) {
     let service = crate::services::storage_stats_service::StorageStatsService::new(
         pool.clone(),
         "filesystem",
@@ -1138,7 +1138,7 @@ impl crate::storage::StorageBackend for FailingStorage {
 /// `state` with its registry replaced by one whose `"s3"` backend is a
 /// [`FailingStorage`] failing with `message`, plus the repository moved onto
 /// it. Every request against `repo_id` then reaches the failing store.
-pub async fn route_repo_to_failing_storage(
+pub(crate) async fn route_repo_to_failing_storage(
     pool: &PgPool,
     state: &SharedState,
     repo_id: Uuid,
@@ -1148,7 +1148,7 @@ pub async fn route_repo_to_failing_storage(
 }
 
 /// [`route_repo_to_failing_storage`] with the failing backend given.
-pub async fn route_repo_to_storage(
+pub(crate) async fn route_repo_to_storage(
     pool: &PgPool,
     state: &SharedState,
     repo_id: Uuid,
@@ -1320,7 +1320,7 @@ pub struct CloudPublishCase<'a> {
 
 /// A hosted `format` repository on the in-memory `s3` backend of
 /// [`build_state_with_cloud`], with `user_id` granted developer access.
-pub async fn create_cloud_repo(
+pub(crate) async fn create_cloud_repo(
     pool: &PgPool,
     format: &str,
     user_id: Uuid,
@@ -1347,7 +1347,7 @@ pub async fn create_cloud_repo(
 /// publishes: its scoped objects move to the flat key the row then records,
 /// exactly the shape a pre-fix publish left, and the download must still
 /// answer the same bytes.
-pub async fn assert_cloud_publish_is_repo_scoped(case: CloudPublishCase<'_>) {
+pub(crate) async fn assert_cloud_publish_is_repo_scoped(case: CloudPublishCase<'_>) {
     let Some(pool) = try_pool().await else {
         return;
     };
@@ -1468,7 +1468,7 @@ pub async fn assert_cloud_publish_is_repo_scoped(case: CloudPublishCase<'_>) {
     assert_eq!(&legacy_fetch.1[..], case.expected, "{format}: legacy bytes");
 }
 
-pub async fn create_user(pool: &PgPool) -> (Uuid, String) {
+pub(crate) async fn create_user(pool: &PgPool) -> (Uuid, String) {
     let id = Uuid::new_v4();
     let username = format!("ph-test-u-{}", id);
     sqlx::query(
@@ -1491,7 +1491,7 @@ pub async fn create_user(pool: &PgPool) -> (Uuid, String) {
 /// #2826 permission-name hydration tests, and any legacy-grant test that
 /// needs a `principal_type = 'user'` row naming a service account) don't
 /// each hand-roll the same INSERT.
-pub async fn create_service_account(pool: &PgPool) -> (Uuid, String) {
+pub(crate) async fn create_service_account(pool: &PgPool) -> (Uuid, String) {
     let id = Uuid::new_v4();
     let username = format!("ph-test-sa-{}", id);
     sqlx::query(
@@ -1513,7 +1513,7 @@ pub async fn create_service_account(pool: &PgPool) -> (Uuid, String) {
 
 /// Insert a bare `groups` row (id + name only). Shared by DB-backed tests
 /// that need a group principal but not the full `GroupService` create flow.
-pub async fn create_group(pool: &PgPool) -> (Uuid, String) {
+pub(crate) async fn create_group(pool: &PgPool) -> (Uuid, String) {
     let id = Uuid::new_v4();
     let name = format!("ph-test-group-{}", id);
     sqlx::query("INSERT INTO groups (id, name) VALUES ($1, $2)")
@@ -1527,7 +1527,11 @@ pub async fn create_group(pool: &PgPool) -> (Uuid, String) {
 
 /// Insert a repository row of the given type and format. `format` must be
 /// a valid `repository_format` enum value (e.g. "ansible", "helm", "rpm").
-pub async fn create_repo(pool: &PgPool, repo_type: &str, format: &str) -> (Uuid, String, PathBuf) {
+pub(crate) async fn create_repo(
+    pool: &PgPool,
+    repo_type: &str,
+    format: &str,
+) -> (Uuid, String, PathBuf) {
     let id = Uuid::new_v4();
     let key = format!("ph-test-{}-{}", format, id);
     let storage_dir = std::env::temp_dir().join(format!("ph-test-{}", id));
@@ -1564,7 +1568,7 @@ pub async fn create_repo(pool: &PgPool, repo_type: &str, format: &str) -> (Uuid,
 /// yields is exactly what a legacy pre-#1280 leftover row, or migration
 /// 228's backfill of one, carries. The scaffolding repository is removed
 /// before returning: only the document survives.
-pub async fn mint_proxy_origin(pool: &PgPool) -> serde_json::Value {
+pub(crate) async fn mint_proxy_origin(pool: &PgPool) -> serde_json::Value {
     let (repo_id, _key, dir) = create_repo(pool, "remote", "generic").await;
     let origin: Option<serde_json::Value> = sqlx::query_scalar(
         "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
@@ -1593,7 +1597,7 @@ pub async fn mint_proxy_origin(pool: &PgPool) -> serde_json::Value {
 /// The `origin` document recorded on the live artifact at `path` in `repo`.
 /// Panics when the row is missing or carries no origin — since migration 229
 /// validated the `artifacts_origin_recorded` CHECK, neither can happen.
-pub async fn origin_at(pool: &PgPool, repo: Uuid, path: &str) -> serde_json::Value {
+pub(crate) async fn origin_at(pool: &PgPool, repo: Uuid, path: &str) -> serde_json::Value {
     let origin: Option<serde_json::Value> = sqlx::query_scalar(
         "SELECT origin FROM artifacts \
          WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
@@ -1618,7 +1622,7 @@ pub async fn origin_at(pool: &PgPool, repo: Uuid, path: &str) -> serde_json::Val
 /// probes with a caller, prefer [`grant_repo_access`] instead: it keeps the
 /// member private and exercises the full read predicate rather than the
 /// public-repository short-circuit.
-pub async fn publish_repo(pool: &PgPool, repo_id: Uuid) {
+pub(crate) async fn publish_repo(pool: &PgPool, repo_id: Uuid) {
     sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
         .bind(repo_id)
         .execute(pool)
@@ -1708,7 +1712,7 @@ pub fn request_from_peer(uri: &str, body: serde_json::Value, peer: &str) -> Requ
 /// Poll for the (fire-and-forget) audit row of `action` on `resource_id` and
 /// return its `ip_address`. `None` when no row appeared; `Some(None)` when the
 /// row was written without a client IP.
-pub async fn audit_row_ip(
+pub(crate) async fn audit_row_ip(
     pool: &PgPool,
     action: &str,
     resource_id: Uuid,
@@ -1736,7 +1740,7 @@ pub async fn audit_row_ip(
 /// not collide (e.g. "probe", "labels-authz", "map-err"). Centralizes the
 /// `register(RegisterPeerInstanceRequest { .. })` boilerplate shared by every
 /// DB-backed peer test module.
-pub async fn register_test_peer(pool: &PgPool, name_prefix: &str, tag: &str) -> Uuid {
+pub(crate) async fn register_test_peer(pool: &PgPool, name_prefix: &str, tag: &str) -> Uuid {
     use crate::services::peer_instance_service::{
         PeerInstanceService, RegisterPeerInstanceRequest,
     };
@@ -1755,7 +1759,7 @@ pub async fn register_test_peer(pool: &PgPool, name_prefix: &str, tag: &str) -> 
     .id
 }
 
-pub async fn send(app: Router, req: Request<Body>) -> (StatusCode, Bytes) {
+pub(crate) async fn send(app: Router, req: Request<Body>) -> (StatusCode, Bytes) {
     let resp = app.oneshot(req).await.expect("oneshot");
     let status = resp.status();
     let body = to_bytes(resp.into_body(), 16 * 1024 * 1024)
@@ -1770,7 +1774,7 @@ pub async fn send(app: Router, req: Request<Body>) -> (StatusCode, Bytes) {
 /// module-level `disallowed_methods` exemption above covers test scaffolding,
 /// so a header-asserting test does not have to punch its own hole in the
 /// streaming lint (#1608).
-pub async fn send_with_headers(
+pub(crate) async fn send_with_headers(
     app: Router,
     req: Request<Body>,
 ) -> (StatusCode, Bytes, axum::http::HeaderMap) {
@@ -1786,13 +1790,13 @@ pub async fn send_with_headers(
 /// Grant `user_id` the `developer` role scoped to `repo_id`. Handler smoke
 /// tests use this for an ordinary read/write repository member; owner-specific
 /// tests should grant the `repository-owner` role explicitly.
-pub async fn grant_repo_access(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
+pub(crate) async fn grant_repo_access(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
     grant_repo_role(pool, repo_id, user_id, "developer").await;
 }
 
 /// Grant `user_id` the built-in role `role` (e.g. `reader`, `developer`,
 /// `repository-owner`) scoped to `repo_id`. Cleaned up by [`cleanup`].
-pub async fn grant_repo_role(pool: &PgPool, repo_id: Uuid, user_id: Uuid, role: &str) {
+pub(crate) async fn grant_repo_role(pool: &PgPool, repo_id: Uuid, user_id: Uuid, role: &str) {
     sqlx::query(
         "INSERT INTO role_assignments (user_id, role_id, repository_id) \
          SELECT $1, r.id, $2 FROM roles r WHERE r.name = $3 \
@@ -1821,7 +1825,7 @@ pub fn admin_auth(user_id: Uuid, username: &str) -> AuthExtension {
 /// `grant_repo_access` inserts). Repo-admin-gated handlers (`set_cache_ttl`,
 /// `invalidate_cache`) require this for non-admins; the smoke tests that assert
 /// a successful admin-tier call grant it here. Cleaned up by `cleanup`.
-pub async fn grant_repo_admin(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
+pub(crate) async fn grant_repo_admin(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
     grant_permission(pool, "user", user_id, "repository", repo_id, &["admin"]).await;
 }
 
@@ -1835,7 +1839,12 @@ pub async fn grant_repo_admin(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
 /// through, so a destructive test that expects success must grant the exact
 /// action it exercises. Rows are cleaned up by `cleanup` (which deletes all
 /// `permissions WHERE target_id = repo_id`).
-pub async fn grant_repo_actions(pool: &PgPool, repo_id: Uuid, user_id: Uuid, actions: &[&str]) {
+pub(crate) async fn grant_repo_actions(
+    pool: &PgPool,
+    repo_id: Uuid,
+    user_id: Uuid,
+    actions: &[&str],
+) {
     grant_permission(pool, "user", user_id, "repository", repo_id, actions).await;
 }
 
@@ -1848,7 +1857,7 @@ pub async fn grant_repo_actions(pool: &PgPool, repo_id: Uuid, user_id: Uuid, act
 /// #2826 permission-name hydration tests). Rows are cleaned up by
 /// [`cleanup`]'s `target_id = repo_id` delete when the target is a
 /// repository; other targets need their own teardown.
-pub async fn grant_permission(
+pub(crate) async fn grant_permission(
     pool: &PgPool,
     principal_type: &str,
     principal_id: Uuid,
@@ -1877,7 +1886,7 @@ pub async fn grant_permission(
 /// `AuthService` the handlers validate against (the state's DB + config). Shared
 /// so authz tests that need a SECOND authenticated identity don't copy-paste the
 /// user-row SELECT + token mint (keeps the jscpd dedup gate green).
-pub async fn bearer_for(state: &SharedState, user_id: Uuid) -> String {
+pub(crate) async fn bearer_for(state: &SharedState, user_id: Uuid) -> String {
     let auth_service = crate::services::auth_service::AuthService::new(
         state.db.clone(),
         Arc::new(state.config.clone()),
@@ -1925,7 +1934,7 @@ fn dir_max_file_size(dir: &std::path::Path) -> u64 {
 /// commits the cache asynchronously after the response body drains, so tests
 /// that assert a WARM second request must wait for the commit deterministically
 /// instead of racing it (#2192 / #1608 Phase 4c).
-pub async fn wait_for_cached_blob(dir: &std::path::Path, min_size: u64) {
+pub(crate) async fn wait_for_cached_blob(dir: &std::path::Path, min_size: u64) {
     for _ in 0..200 {
         if dir_max_file_size(dir) >= min_size {
             return;
@@ -1983,7 +1992,7 @@ pub fn committed_cache_entry_exists(dir: &std::path::Path, min_size: u64) -> boo
 /// on it race the sidecar write and observe a second upstream fetch under
 /// parallel test load. This waits for the matching sidecar as well — the
 /// same commit marker the production hit path requires.
-pub async fn wait_for_cache_commit(dir: &std::path::Path, min_size: u64) {
+pub(crate) async fn wait_for_cache_commit(dir: &std::path::Path, min_size: u64) {
     for _ in 0..2400 {
         if committed_cache_entry_exists(dir, min_size) {
             return;
@@ -2013,7 +2022,7 @@ pub async fn wait_for_cache_commit(dir: &std::path::Path, min_size: u64) {
 /// land the budget on exactly zero. Yielding first ends the poll, and the next
 /// one starts with a fresh budget. Use this instead of `drop(server)` after
 /// reading such a body.
-pub async fn drop_mock_server(server: wiremock::MockServer) {
+pub(crate) async fn drop_mock_server(server: wiremock::MockServer) {
     tokio::task::yield_now().await;
     drop(server);
 }
@@ -2023,7 +2032,7 @@ pub async fn drop_mock_server(server: wiremock::MockServer) {
 /// with `headers` and `body`. Each mock expects exactly ONE request, verified
 /// when `server` is dropped, so a test that sends a HEAD and two GETs proves
 /// the body left the upstream once and the HEAD was answered by a HEAD.
-pub async fn mount_head_and_get_once(
+pub(crate) async fn mount_head_and_get_once(
     server: &wiremock::MockServer,
     path: &str,
     headers: &[(&str, &str)],
@@ -2059,7 +2068,7 @@ pub async fn mount_head_and_get_once(
 /// uri`, then `GET uri`, then (once the proxy cache has committed the body)
 /// `GET uri` again. Returns the three `(status, body, headers)` answers.
 /// `app` builds a fresh router per request, as `oneshot` consumes it.
-pub async fn cold_head_then_two_gets(
+pub(crate) async fn cold_head_then_two_gets(
     app: impl Fn() -> Router,
     uri: &str,
     cache_dir: &std::path::Path,
@@ -2088,7 +2097,7 @@ pub async fn cold_head_then_two_gets(
 /// that the upstream saw exactly one `HEAD` and one `GET` of the body.
 /// Returns the HEAD's headers for the format's own header assertions.
 #[allow(clippy::too_many_arguments)]
-pub async fn assert_cold_head_fetches_body_once(
+pub(crate) async fn assert_cold_head_fetches_body_once(
     fx: Fixture,
     server: wiremock::MockServer,
     router: fn() -> Router<SharedState>,
@@ -2180,7 +2189,7 @@ pub fn proxy_sidecar_ttl_secs(sidecar: &std::path::Path) -> i64 {
 /// asserted: for a TTL regression test BOTH the fixed and the pre-fix code
 /// write this sidecar (they differ only in its TTL), so a revert must fail on
 /// the claim under test rather than on the barrier.
-pub async fn await_proxy_sidecar(sidecar: &std::path::Path) {
+pub(crate) async fn await_proxy_sidecar(sidecar: &std::path::Path) {
     for _ in 0..200 {
         if sidecar.exists() {
             return;
@@ -2203,7 +2212,7 @@ pub fn proxy_sidecar_path(
 
 /// Read the TTL a proxy fetch wrote for `cache_path`, waiting for the
 /// streaming tee to commit the sidecar first.
-pub async fn written_proxy_ttl_secs(
+pub(crate) async fn written_proxy_ttl_secs(
     storage_dir: &std::path::Path,
     repo_key: &str,
     cache_path: &str,
@@ -2222,7 +2231,7 @@ pub async fn written_proxy_ttl_secs(
 /// `test_expand_maven_secondary_files_emits_each_file`. Shared by the
 /// repository-delete and GC flat-object guard tests (#3156) so the two do not
 /// carry independent copies of the same seed.
-pub async fn attach_maven_files_metadata(
+pub(crate) async fn attach_maven_files_metadata(
     pool: &PgPool,
     parent_key: &str,
     json_key_name: &str,
@@ -2246,7 +2255,7 @@ pub async fn attach_maven_files_metadata(
     .expect("attach maven files[] metadata");
 }
 
-pub async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
+pub(crate) async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
     let _ = sqlx::query("DELETE FROM role_assignments WHERE repository_id = $1")
         .bind(repo_id)
         .execute(pool)
@@ -2283,7 +2292,12 @@ pub async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
 /// Link `member_id` into virtual repository `virtual_id`'s member set at
 /// `priority`. Shared by the virtual-member authorization tests (#3324) so
 /// each format module does not hand-roll the same INSERT.
-pub async fn link_virtual_member(pool: &PgPool, virtual_id: Uuid, member_id: Uuid, priority: i32) {
+pub(crate) async fn link_virtual_member(
+    pool: &PgPool,
+    virtual_id: Uuid,
+    member_id: Uuid,
+    priority: i32,
+) {
     sqlx::query(
         "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
          VALUES ($1, $2, $3)",
@@ -2300,7 +2314,7 @@ pub async fn link_virtual_member(pool: &PgPool, virtual_id: Uuid, member_id: Uui
 /// test, along with everything the test seeded under it (membership rows,
 /// grants, artifacts + their metadata) and its storage directory. Shared by
 /// the virtual-member authorization tests (#3324).
-pub async fn cleanup_member_repo(pool: &PgPool, member_id: Uuid, dir: &std::path::Path) {
+pub(crate) async fn cleanup_member_repo(pool: &PgPool, member_id: Uuid, dir: &std::path::Path) {
     for sql in [
         "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
         "DELETE FROM role_assignments WHERE repository_id = $1",
@@ -2323,7 +2337,7 @@ pub async fn cleanup_member_repo(pool: &PgPool, member_id: Uuid, dir: &std::path
 /// the `profile`, `totp`, and `users` handler modules so the identical
 /// count-query is defined once rather than copy-pasted into each DB-backed
 /// test module (keeps the jscpd duplication gate green).
-pub async fn audit_count(pool: &PgPool, resource_id: Uuid, action: &str) -> i64 {
+pub(crate) async fn audit_count(pool: &PgPool, resource_id: Uuid, action: &str) -> i64 {
     sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM audit_log WHERE resource_id = $1 AND action = $2",
     )
@@ -2362,7 +2376,7 @@ where
 /// the "an event was emitted" (count reaches N) assertions; a subsequent
 /// "not emitted" (count stays 0) assertion can then read [`audit_count`]
 /// directly, since the spawned writes for this resource have already drained.
-pub async fn audit_count_eventually(
+pub(crate) async fn audit_count_eventually(
     pool: &PgPool,
     resource_id: Uuid,
     action: &str,
@@ -2384,7 +2398,7 @@ pub struct AuditRow {
 }
 
 /// The newest `audit_log` row with this `resource_id` and `action`, if any.
-pub async fn audit_row(pool: &PgPool, resource_id: Uuid, action: &str) -> Option<AuditRow> {
+pub(crate) async fn audit_row(pool: &PgPool, resource_id: Uuid, action: &str) -> Option<AuditRow> {
     let row: Option<(Option<Uuid>, String, Option<serde_json::Value>)> = sqlx::query_as(
         "SELECT user_id, resource_type, details FROM audit_log \
          WHERE resource_id = $1 AND action = $2 ORDER BY created_at DESC LIMIT 1",
@@ -2406,14 +2420,18 @@ pub async fn audit_row(pool: &PgPool, resource_id: Uuid, action: &str) -> Option
 /// appears. The handler-level audit tests use it to assert the actor, target
 /// and `details` a fire-and-forget emitter recorded. Read it BEFORE deleting
 /// the acting user: `audit_log.user_id` is `ON DELETE SET NULL`.
-pub async fn audit_row_eventually(pool: &PgPool, resource_id: Uuid, action: &str) -> AuditRow {
+pub(crate) async fn audit_row_eventually(
+    pool: &PgPool,
+    resource_id: Uuid,
+    action: &str,
+) -> AuditRow {
     poll_until(|| audit_row(pool, resource_id, action), Option::is_some)
         .await
         .unwrap_or_else(|| panic!("no {action} audit row for resource {resource_id}"))
 }
 
 /// Count `download_statistics` rows for `artifact_id`.
-pub async fn download_count(pool: &PgPool, artifact_id: Uuid) -> i64 {
+pub(crate) async fn download_count(pool: &PgPool, artifact_id: Uuid) -> i64 {
     sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1")
         .bind(artifact_id)
         .fetch_one(pool)
@@ -2427,7 +2445,11 @@ pub async fn download_count(pool: &PgPool, artifact_id: Uuid) -> i64 {
 /// Since #2522 `record_download` SPAWNS the `download_statistics` INSERT off the
 /// synchronous download hot path, so a test that serves a body and then reads
 /// the count must tolerate the detached write's async timing.
-pub async fn download_count_eventually(pool: &PgPool, artifact_id: Uuid, expected: i64) -> i64 {
+pub(crate) async fn download_count_eventually(
+    pool: &PgPool,
+    artifact_id: Uuid,
+    expected: i64,
+) -> i64 {
     poll_until(|| download_count(pool, artifact_id), |n| *n >= expected).await
 }
 
@@ -2435,7 +2457,7 @@ pub async fn download_count_eventually(pool: &PgPool, artifact_id: Uuid, expecte
 /// create for it (audit_log, refresh/pending jti, password history). Shared
 /// teardown so the identical cleanup block isn't copy-pasted across the #386
 /// audit test modules (jscpd dedup).
-pub async fn cleanup_user(pool: &PgPool, user_id: Uuid) {
+pub(crate) async fn cleanup_user(pool: &PgPool, user_id: Uuid) {
     let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
         .bind(user_id)
         .execute(pool)
@@ -2472,7 +2494,7 @@ pub struct TotpUserFixture {
 /// dedup). `password_hash` is seeded to the sentinel `"unused"`; tests that
 /// exercise the password-verify path (e.g. `disable_totp`) overwrite it with a
 /// real bcrypt hash.
-pub async fn create_totp_user(pool: &PgPool, backup_hashes: &[String]) -> TotpUserFixture {
+pub(crate) async fn create_totp_user(pool: &PgPool, backup_hashes: &[String]) -> TotpUserFixture {
     let (user_id, username) = create_user(pool).await;
     let secret = totp_rs::Secret::generate_secret();
     let secret_b32 = secret.to_encoded().to_string();
@@ -2564,7 +2586,7 @@ pub fn make_repo_info(
 /// The row's checksum is the placeholder `test-seed`; use
 /// [`seed_artifact_with_checksum`] when the test matches on the digest.
 #[allow(clippy::too_many_arguments)]
-pub async fn seed_artifact(
+pub(crate) async fn seed_artifact(
     state: &SharedState,
     pool: &PgPool,
     repo: &crate::api::handlers::proxy_helpers::RepoInfo,
@@ -2595,7 +2617,7 @@ pub async fn seed_artifact(
 /// [`seed_artifact`] with an explicit `checksum_sha256` for the row, for
 /// tests whose behaviour depends on the stored digest (e.g. presence checks).
 #[allow(clippy::too_many_arguments)]
-pub async fn seed_artifact_with_checksum(
+pub(crate) async fn seed_artifact_with_checksum(
     state: &SharedState,
     pool: &PgPool,
     repo: &crate::api::handlers::proxy_helpers::RepoInfo,
@@ -2639,7 +2661,7 @@ pub async fn seed_artifact_with_checksum(
 /// serve-time verification tests (#4323, #4989). Give `stored` the length of
 /// `recorded` so only the digest differs.
 #[allow(clippy::too_many_arguments)]
-pub async fn seed_corrupt_artifact(
+pub(crate) async fn seed_corrupt_artifact(
     fx: &Fixture,
     path: &str,
     name: &str,
@@ -2754,7 +2776,7 @@ pub struct CatalogRow {
 /// Shared by the per-format publish tests so they all assert the same shape:
 /// one `packages` row keyed on the format's own coordinates, with a
 /// `package_versions` row per published version.
-pub async fn catalog_row(pool: &PgPool, repo_id: Uuid, name: &str) -> Option<CatalogRow> {
+pub(crate) async fn catalog_row(pool: &PgPool, repo_id: Uuid, name: &str) -> Option<CatalogRow> {
     let row: Option<(Uuid, String, Option<String>)> = sqlx::query_as(
         "SELECT id, version, description FROM packages WHERE repository_id = $1 AND name = $2",
     )
@@ -2786,7 +2808,7 @@ pub async fn catalog_row(pool: &PgPool, repo_id: Uuid, name: &str) -> Option<Cat
 /// The peer's row cascades to `peer_repo_subscriptions` and `sync_tasks` on
 /// delete, so tests must delete it — [`delete_push_peer`] — before
 /// `fx.teardown()` or the repository delete trips the subscription FK.
-pub async fn subscribe_push_peer(pool: &PgPool, repo_id: Uuid, label: &str) -> Uuid {
+pub(crate) async fn subscribe_push_peer(pool: &PgPool, repo_id: Uuid, label: &str) -> Uuid {
     let peer_service =
         crate::services::peer_instance_service::PeerInstanceService::new(pool.clone());
     let peer = peer_service
@@ -2821,7 +2843,7 @@ pub async fn subscribe_push_peer(pool: &PgPool, repo_id: Uuid, label: &str) -> U
 /// collation, under which `en_US.UTF-8` sorts `commits/...` before `_labels`).
 /// A native-format hosted upload that forgot to queue replication yields an
 /// empty vector.
-pub async fn queued_push_paths(pool: &PgPool, peer_id: Uuid, repo_id: Uuid) -> Vec<String> {
+pub(crate) async fn queued_push_paths(pool: &PgPool, peer_id: Uuid, repo_id: Uuid) -> Vec<String> {
     sqlx::query_scalar(
         "SELECT a.path FROM sync_tasks st \
          JOIN artifacts a ON a.id = st.artifact_id \
@@ -2842,7 +2864,7 @@ pub async fn queued_push_paths(pool: &PgPool, peer_id: Uuid, repo_id: Uuid) -> V
 /// Polls (up to 5s) until `expected` is queued, then waits a short grace
 /// period and reads again, so a task wrongly queued by a later upload in the
 /// same test still shows up in the result.
-pub async fn queued_push_paths_settled(
+pub(crate) async fn queued_push_paths_settled(
     pool: &PgPool,
     peer_id: Uuid,
     repo_id: Uuid,
@@ -2862,7 +2884,7 @@ pub async fn queued_push_paths_settled(
 
 /// #4725: delete the peer registered by [`subscribe_push_peer`] (and with it
 /// its subscriptions and queued tasks). No-op when the peer is already gone.
-pub async fn delete_push_peer(pool: &PgPool, peer_id: Uuid) {
+pub(crate) async fn delete_push_peer(pool: &PgPool, peer_id: Uuid) {
     let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
         .bind(peer_id)
         .execute(pool)
@@ -2877,7 +2899,7 @@ pub async fn delete_push_peer(pool: &PgPool, peer_id: Uuid) {
 /// and call this before tearing the fixture down (it reads the row). Shared by
 /// the per-format publish tests so a format that stops emitting, or starts
 /// emitting twice (a second producer on the same path), fails the same way.
-pub async fn assert_one_artifact_uploaded(
+pub(crate) async fn assert_one_artifact_uploaded(
     events: &mut tokio::sync::broadcast::Receiver<crate::services::event_bus::DomainEvent>,
     pool: &PgPool,
     repo_id: Uuid,
@@ -2922,7 +2944,7 @@ pub fn assert_one_artifact_uploaded_event(
 }
 
 /// Id of the live `artifacts` row at `(repository, path)`.
-pub async fn artifact_id_at(pool: &PgPool, repo_id: Uuid, path: &str) -> Uuid {
+pub(crate) async fn artifact_id_at(pool: &PgPool, repo_id: Uuid, path: &str) -> Uuid {
     sqlx::query_scalar(
         "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
     )
@@ -2951,7 +2973,7 @@ impl Fixture {
     /// when no `DATABASE_URL` is available so the test no-ops gracefully.
     /// `repo_type` is "local" / "remote" / "virtual"; `format` matches a
     /// `repository_format` enum value (e.g. "ansible", "cran").
-    pub async fn setup(repo_type: &str, format: &str) -> Option<Self> {
+    pub(crate) async fn setup(repo_type: &str, format: &str) -> Option<Self> {
         let pool = try_pool().await?;
         let (user_id, username) = create_user(&pool).await;
         let (repo_id, repo_key, storage_dir) = create_repo(&pool, repo_type, format).await;
@@ -2974,7 +2996,7 @@ impl Fixture {
     /// Flag the fixture repository as `promotion_only` (or clear the flag).
     /// Used by the format-native publish-gate tests to assert that a direct
     /// upload to a promotion_only repository is rejected.
-    pub async fn set_promotion_only(&self, value: bool) {
+    pub(crate) async fn set_promotion_only(&self, value: bool) {
         sqlx::query("UPDATE repositories SET promotion_only = $1 WHERE id = $2")
             .bind(value)
             .bind(self.repo_id)
@@ -3017,7 +3039,7 @@ impl Fixture {
     /// `replication` sets the replication header on create and complete.
     /// Returns the completion's status and body; panics if create or the
     /// chunk fails.
-    pub async fn chunked_upload(
+    pub(crate) async fn chunked_upload(
         &self,
         path: &str,
         payload: &[u8],
@@ -3031,7 +3053,7 @@ impl Fixture {
 
     /// [`Self::chunked_upload`] as `auth` (e.g. [`admin_auth`] for a trusted
     /// replication session).
-    pub async fn chunked_upload_as(
+    pub(crate) async fn chunked_upload_as(
         &self,
         auth: AuthExtension,
         path: &str,
@@ -3108,7 +3130,7 @@ impl Fixture {
     }
 
     /// Drop all rows owned by this fixture and remove the storage dir.
-    pub async fn teardown(&self) {
+    pub(crate) async fn teardown(&self) {
         cleanup(&self.pool, self.repo_id, self.user_id).await;
         let _ = std::fs::remove_dir_all(&self.storage_dir);
     }
@@ -3355,7 +3377,7 @@ pub fn build_state_with_proxy_and_scanner(
 /// Only rows that exist fault, so the repository under test needs a
 /// `scan_configs` row ([`enable_proxy_scan`]). Returns the pool and the
 /// schema to pass to [`drop_unreadable_scan_configs`]. `None` without a DB.
-pub async fn pool_with_unreadable_scan_configs() -> Option<(PgPool, String)> {
+pub(crate) async fn pool_with_unreadable_scan_configs() -> Option<(PgPool, String)> {
     let base = try_pool().await?;
     let url = crate::testing::require_db_url()?;
     let schema = format!("ak_fault_{}", Uuid::new_v4().simple());
@@ -3392,7 +3414,7 @@ pub async fn pool_with_unreadable_scan_configs() -> Option<(PgPool, String)> {
 }
 
 /// Drop the schema [`pool_with_unreadable_scan_configs`] created.
-pub async fn drop_unreadable_scan_configs(pool: &PgPool, schema: &str) {
+pub(crate) async fn drop_unreadable_scan_configs(pool: &PgPool, schema: &str) {
     let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
         "DROP SCHEMA IF EXISTS {schema} CASCADE"
     )))
@@ -3400,7 +3422,7 @@ pub async fn drop_unreadable_scan_configs(pool: &PgPool, schema: &str) {
     .await;
 }
 
-pub async fn enable_proxy_scan(pool: &PgPool, repo_id: Uuid, action: &str) {
+pub(crate) async fn enable_proxy_scan(pool: &PgPool, repo_id: Uuid, action: &str) {
     sqlx::query(
         "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
              scan_on_proxy, block_on_policy_violation, severity_threshold, \
@@ -3440,7 +3462,7 @@ pub fn maven_jar_fixture(group: &str, artifact: &str, version: &str) -> Vec<u8> 
 
 /// Seed a `vulnerable` (one critical) or `clean` proxy scan verdict for
 /// `bytes`, returning its digest for [`drop_proxy_verdicts`].
-pub async fn seed_proxy_verdict(
+pub(crate) async fn seed_proxy_verdict(
     pool: &PgPool,
     bytes: &[u8],
     repo_id: Uuid,
@@ -3475,7 +3497,7 @@ pub async fn seed_proxy_verdict(
 /// as the inline gate records it (#4952). A pinned pull reuses a `clean`
 /// verdict only when it carries a pin (#3396), so a test that seeds one for a
 /// pinned format and expects it reused records the pin with it.
-pub async fn pin_proxy_verdict(
+pub(crate) async fn pin_proxy_verdict(
     pool: &PgPool,
     digest: &str,
     pin: &crate::services::scanner_service::ExpectedComponent,
@@ -3489,7 +3511,7 @@ pub async fn pin_proxy_verdict(
 }
 
 /// Remove the verdicts [`seed_proxy_verdict`] wrote.
-pub async fn drop_proxy_verdicts(pool: &PgPool, digests: &[String]) {
+pub(crate) async fn drop_proxy_verdicts(pool: &PgPool, digests: &[String]) {
     sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = ANY($1)")
         .bind(digests)
         .execute(pool)
@@ -3499,7 +3521,7 @@ pub async fn drop_proxy_verdicts(pool: &PgPool, digests: &[String]) {
 
 /// Proxy downloads recorded for `path` on `repo_id` (#3446 / #4100
 /// exactly-once assertions).
-pub async fn proxy_downloads_recorded(pool: &PgPool, repo_id: Uuid, path: &str) -> i64 {
+pub(crate) async fn proxy_downloads_recorded(pool: &PgPool, repo_id: Uuid, path: &str) -> i64 {
     crate::services::proxy_catalog::download_counts_by_paths(pool, repo_id, &[path.to_string()])
         .await
         .expect("download counts")
@@ -3510,7 +3532,7 @@ pub async fn proxy_downloads_recorded(pool: &PgPool, repo_id: Uuid, path: &str) 
 
 /// Attach a new public Remote repository of `format`, proxying `upstream`, to
 /// `virtual_id` at `priority`. Returns `(id, key, storage dir)`.
-pub async fn attach_remote_member(
+pub(crate) async fn attach_remote_member(
     pool: &PgPool,
     virtual_id: Uuid,
     format: &str,
@@ -3530,7 +3552,7 @@ pub async fn attach_remote_member(
 
 /// Turn on the Package Age Policy hold (#1770) for a Remote repository, so
 /// every freshly proxied object is held (`409`) for `minutes`.
-pub async fn enable_proxy_quarantine(pool: &PgPool, repo_id: Uuid, minutes: i64) {
+pub(crate) async fn enable_proxy_quarantine(pool: &PgPool, repo_id: Uuid, minutes: i64) {
     sqlx::query(
         "INSERT INTO repository_config (repository_id, key, value) \
          VALUES ($1, 'quarantine_enabled', 'true'), \
@@ -3598,7 +3620,7 @@ impl crate::services::scanner_service::Scanner for UploadProbeScanner {
 /// with scanning enabled and `scan_on_upload = on_upload`, then return how many
 /// probe (`malware`) scan rows the repository has once `budget` elapses or the
 /// first row lands. Shared by the per-format scan-on-upload tests.
-pub async fn native_upload_probe_scans(
+pub(crate) async fn native_upload_probe_scans(
     fx: &Fixture,
     router: Router<SharedState>,
     req: Request<Body>,
@@ -3744,7 +3766,7 @@ async fn repository_scan_jobs(pool: &PgPool, repo_id: Uuid) -> Vec<(String, Stri
 ///
 /// A `queued` caller belongs in nextest's `db-serial` group (name it
 /// `*_queued`): the worker it starts claims every due job.
-pub async fn scan_on_upload_probe(
+pub(crate) async fn scan_on_upload_probe(
     fx: &Fixture,
     router: Router<SharedState>,
     make_req: impl Fn() -> Request<Body>,
@@ -3855,7 +3877,7 @@ pub fn build_state_with_proxy_presigned(
 /// regression tests (#1608 Phase 4): they mount a wiremock upstream, call this
 /// to wire the proxy in, then drive the handler router end-to-end to exercise
 /// the streaming pull-through branch (`proxy_fetch_streaming`).
-pub async fn rewire_remote_proxy(
+pub(crate) async fn rewire_remote_proxy(
     fx: &Fixture,
     upstream_url: &str,
 ) -> (crate::api::SharedState, tempfile::TempDir) {
@@ -3937,7 +3959,7 @@ pub fn code_bytes(encoding: &str, plain: &[u8]) -> Vec<u8> {
 /// [`assert_plain_forward`]). Shared so the goproxy / rubygems / hex suites
 /// do not each carry a probe wrapper (the jscpd duplication gate scores
 /// changed files).
-pub async fn probe_ok(app: Router, uri: String) -> (Bytes, axum::http::HeaderMap) {
+pub(crate) async fn probe_ok(app: Router, uri: String) -> (Bytes, axum::http::HeaderMap) {
     let (status, body, headers) = send_with_headers(app, get(uri)).await;
     assert_eq!(status, StatusCode::OK, "probe must proxy 200");
     (body, headers)
@@ -3980,7 +4002,7 @@ pub struct CodedUpstreams {
 /// coding — see its doc for why a gzip fixture proves less — and the suites
 /// should not all pass the SAME coding, or a hardcoded literal of that one
 /// coding satisfies every assertion in the tree.
-pub async fn coded_and_plain_upstreams(
+pub(crate) async fn coded_and_plain_upstreams(
     encoding: &str,
     content_type: &str,
     seed: &[u8],
@@ -4076,7 +4098,7 @@ impl CodedUpstreams {
     /// the proxy cache, so the assertions that follow are about the cache-hit
     /// arm and not a second cold fan-out. Both the fixed and the broken shape
     /// of that arm reach this barrier, so it cannot mask a regression.
-    pub async fn coded_hits(&self, path: &str) -> usize {
+    pub(crate) async fn coded_hits(&self, path: &str) -> usize {
         self.coded_mock
             .received_requests()
             .await
@@ -4091,7 +4113,7 @@ impl CodedUpstreams {
 /// Virtual repository of the same format whose sole member is that remote.
 /// Returns `(remote_id, remote_key, virtual_id, virtual_key)`; the caller
 /// cleans both up by deleting the repository rows (members cascade).
-pub async fn create_remote_and_virtual(
+pub(crate) async fn create_remote_and_virtual(
     pool: &PgPool,
     format: &str,
     upstream_url: &str,
@@ -4135,7 +4157,7 @@ pub struct MissAndBrokenVirtual {
 }
 
 impl MissAndBrokenVirtual {
-    pub async fn new(pool: &PgPool, format: &str, broken_status: u16) -> Self {
+    pub(crate) async fn new(pool: &PgPool, format: &str, broken_status: u16) -> Self {
         use wiremock::matchers::path_regex;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -4170,7 +4192,7 @@ impl MissAndBrokenVirtual {
         }
     }
 
-    pub async fn cleanup(self, pool: &PgPool) {
+    pub(crate) async fn cleanup(self, pool: &PgPool) {
         for id in &self.repo_ids {
             let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
                 .bind(id)
@@ -4221,7 +4243,7 @@ pub const CT_3281_TYPED: &str = "application/x-artifact-keeper-test-3281";
 /// Mount an upstream that answers every GET with `body` and, when given,
 /// declares `content_type`. Never declares a coding. `set_body_bytes` sets no
 /// `Content-Type` of its own, so `None` yields a genuinely untyped response.
-pub async fn upstream_with_optional_ct(
+pub(crate) async fn upstream_with_optional_ct(
     content_type: Option<&str>,
     body: &[u8],
 ) -> wiremock::MockServer {
@@ -4263,7 +4285,7 @@ pub struct Ct3281Rig {
 
 /// Build a [`Ct3281Rig`] for `format`, serving `body` from both member
 /// upstreams. `fx` supplies only the DB + proxy-carrying state.
-pub async fn setup_ct_3281_rig(fx: &Fixture, format: &str, body: &[u8]) -> Ct3281Rig {
+pub(crate) async fn setup_ct_3281_rig(fx: &Fixture, format: &str, body: &[u8]) -> Ct3281Rig {
     let typed_mock = upstream_with_optional_ct(Some(CT_3281_TYPED), body).await;
     let untyped_mock = upstream_with_optional_ct(None, body).await;
     let (state, cache_dir) = rewire_remote_proxy(fx, &typed_mock.uri()).await;
@@ -4292,7 +4314,7 @@ impl Ct3281Rig {
     /// served `Content-Type`: the member's own [`CT_3281_TYPED`] through the
     /// typed pair, and `default_ct` (the caller's format literal) through the
     /// untyped pair. `uri_for` builds the URI from a virtual repo key.
-    pub async fn assert_member_ct_forwarded(
+    pub(crate) async fn assert_member_ct_forwarded(
         &self,
         router: Router<SharedState>,
         uri_for: impl Fn(&str) -> String,
@@ -4320,7 +4342,7 @@ impl Ct3281Rig {
 
     /// Delete the rig's repositories (members cascade out of the virtual
     /// membership table via FK).
-    pub async fn cleanup(self, pool: &PgPool) {
+    pub(crate) async fn cleanup(self, pool: &PgPool) {
         for id in &self.repo_ids {
             let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
                 .bind(id)
@@ -4376,7 +4398,7 @@ pub fn header_str(
 /// a bare `Response`. Body buffering lives here because `.clippy.toml`
 /// disallows `axum::body::to_bytes` at call sites under the #1608 streaming
 /// invariant, and this module carries the documented exemption.
-pub async fn collect_response(
+pub(crate) async fn collect_response(
     resp: axum::response::Response,
 ) -> (StatusCode, Bytes, axum::http::HeaderMap) {
     let status = resp.status();
@@ -4522,7 +4544,7 @@ pub struct AuthzQueryOutage {
 }
 
 impl AuthzQueryOutage {
-    pub async fn start(lock_pool: &PgPool) -> Option<Self> {
+    pub(crate) async fn start(lock_pool: &PgPool) -> Option<Self> {
         use std::str::FromStr;
         let url = crate::testing::require_db_url()?;
         let opts = sqlx::postgres::PgConnectOptions::from_str(&url)
@@ -4546,7 +4568,7 @@ impl AuthzQueryOutage {
     }
 
     /// Release the lock (rolls the holding transaction back).
-    pub async fn end(mut self) {
+    pub(crate) async fn end(mut self) {
         if let Some(tx) = self.lock.take() {
             let _ = tx.rollback().await;
         }
@@ -4572,7 +4594,7 @@ pub struct TableQueryOutage {
 }
 
 impl TableQueryOutage {
-    pub async fn start(admin: &PgPool, tables: &[&str]) -> Option<Self> {
+    pub(crate) async fn start(admin: &PgPool, tables: &[&str]) -> Option<Self> {
         Self::start_with(admin, tables, true).await
     }
 
@@ -4581,7 +4603,7 @@ impl TableQueryOutage {
     /// `UPDATE` or `DELETE` on them fails (`cannot insert into view`: the
     /// shadow is a view with `OFFSET`, which PostgreSQL never updates through).
     /// That reaches a write that follows a read of the same table.
-    pub async fn start_read_only(admin: &PgPool, tables: &[&str]) -> Option<Self> {
+    pub(crate) async fn start_read_only(admin: &PgPool, tables: &[&str]) -> Option<Self> {
         Self::start_with(admin, tables, false).await
     }
 
@@ -4639,7 +4661,7 @@ impl TableQueryOutage {
     }
 
     /// Close the pool and drop the schema.
-    pub async fn end(self) {
+    pub(crate) async fn end(self) {
         self.pool.close().await;
         let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
             "DROP SCHEMA IF EXISTS {} CASCADE",
@@ -4650,7 +4672,7 @@ impl TableQueryOutage {
     }
 }
 
-pub use admin_gate::assert_admin_routes_refuse_repo_scoped_tokens;
+pub(crate) use admin_gate::assert_admin_routes_refuse_repo_scoped_tokens;
 
 // ---------------------------------------------------------------------------
 // #4642: metric capture for async, DB-backed tests.
@@ -4751,7 +4773,7 @@ pub struct ManualPeerFixture {
     pub peers: Vec<Uuid>,
 }
 
-pub async fn setup_manual_peer_fixture(
+pub(crate) async fn setup_manual_peer_fixture(
     pool: PgPool,
     user_id: Uuid,
     repo_id: Uuid,
@@ -4822,7 +4844,7 @@ pub async fn setup_manual_peer_fixture(
 
 impl ManualPeerFixture {
     /// Per peer: `(push status, delete status, delete error, delete retries)`.
-    pub async fn task_states(&self) -> Vec<(String, String, Option<String>, i32)> {
+    pub(crate) async fn task_states(&self) -> Vec<(String, String, Option<String>, i32)> {
         let mut states = Vec::new();
         for peer in &self.peers {
             let push: String = sqlx::query_scalar(
@@ -4848,7 +4870,7 @@ impl ManualPeerFixture {
         states
     }
 
-    pub async fn teardown(&self) {
+    pub(crate) async fn teardown(&self) {
         let _ = sqlx::query("DELETE FROM sync_tasks WHERE peer_instance_id = ANY($1)")
             .bind(&self.peers)
             .execute(&self.pool)
@@ -4893,7 +4915,7 @@ pub fn expected_after_label_write_5625() -> Vec<(String, String, Option<String>,
 /// trigger parks it with its row already in the unique index, so a competing
 /// insert of the same path waits for it instead of committing first. Returns
 /// the SQL that removes it again.
-pub async fn install_artifact_row_fault(
+pub(crate) async fn install_artifact_row_fault(
     pool: &sqlx::PgPool,
     suffix: &str,
     checksum_sha256: &str,
@@ -4935,7 +4957,10 @@ mod admin_gate {
     /// non-admin JWT, 200 to an admin JWT and to an unrestricted admin API token,
     /// and 403 to a repository-scoped admin API token and a repository-scoped
     /// admin JWT. Creates and removes its own admin user and tokens.
-    pub async fn assert_admin_routes_refuse_repo_scoped_tokens(fx: &Fixture, routes: &[&str]) {
+    pub(crate) async fn assert_admin_routes_refuse_repo_scoped_tokens(
+        fx: &Fixture,
+        routes: &[&str],
+    ) {
         async fn statuses(
             state: &SharedState,
             routes: &[&str],
