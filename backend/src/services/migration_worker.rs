@@ -9446,6 +9446,190 @@ mod tests {
         assert_eq!(count, 1);
     }
 
+    /// A Nexus repository of plain files has no components, only assets. The
+    /// real Nexus client lists them through `/assets`, and the worker stores
+    /// each at its Nexus path in a generic repository, verified against the
+    /// sha256/sha1 Nexus advertises. A file whose advertised digest does not
+    /// match the bytes fails, so the digests really are checked.
+    #[tokio::test]
+    async fn test_nexus_component_less_assets_migrate_with_checksums() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::nexus_client::{NexusAuth, NexusClient, NexusClientConfig};
+        use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, target_key) =
+            setup_repo_for_import(&pool, "mig-nexus-assets", "generic").await;
+        let (_unused_key, conn_id, job_id) = seed_single_repo_job(&pool, "mig-nexus-assets").await;
+
+        // (Nexus path, body, sha1 of the body as Nexus reports it)
+        let files: [(&str, &[u8], &str); 3] = [
+            (
+                "/fixtures/ios/fixture.json",
+                b"{\"mail\":\"ios\"}",
+                "27c590b03e18d9bbcab5f5684fd82aa249543f39",
+            ),
+            (
+                "docs/web/top.ics",
+                b"BEGIN:VCALENDAR",
+                "a6df46ec8e5798b513895443c777dba0a415e0fd",
+            ),
+            (
+                "fixtures/users/corrupt.bin",
+                b"bytes nexus did not hash",
+                "2123e63b02c25aa279da791dee2614480bb34dbb",
+            ),
+        ];
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/components"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "items": [], "continuationToken": null })),
+            )
+            .mount(&server)
+            .await;
+        let asset = |(p, body, sha1): (&str, &[u8], &str), sha256: String| {
+            serde_json::json!({
+                "id": p,
+                "format": "raw",
+                "path": p,
+                "checksum": {
+                    "sha1": sha1,
+                    "sha256": sha256,
+                    "md5": "00000000000000000000000000000000"
+                },
+                "fileSize": body.len()
+            })
+        };
+        let pages = [
+            (
+                None,
+                Some("a1"),
+                vec![asset(files[0], sha256_hex_of(files[0].1))],
+            ),
+            (
+                Some("a1"),
+                None,
+                vec![
+                    asset(files[1], sha256_hex_of(files[1].1)),
+                    asset(files[2], sha256_hex_of(b"other bytes")),
+                ],
+            ),
+        ];
+        for (token, next, items) in pages {
+            let route = Mock::given(method("GET"))
+                .and(path("/service/rest/v1/assets"))
+                .and(query_param("repository", "test-data"));
+            let route = match token {
+                Some(t) => route.and(query_param("continuationToken", t)),
+                None => route.and(query_param_is_missing("continuationToken")),
+            };
+            route
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "items": items, "continuationToken": next }),
+                ))
+                .mount(&server)
+                .await;
+        }
+        for (p, body, _) in files {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/repository/test-data/{}",
+                    p.trim_start_matches('/')
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+                .mount(&server)
+                .await;
+        }
+
+        let client = NexusClient::new(NexusClientConfig {
+            base_url: server.uri(),
+            auth: NexusAuth {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            throttle_delay_ms: 0,
+            ..Default::default()
+        })
+        .expect("build nexus client");
+
+        let keys = RepoKeys {
+            source: "test-data".to_string(),
+            target: target_key.clone(),
+        };
+        let (mut completed, mut failed, mut skipped, mut transferred) = (0i32, 0i32, 0i32, 0i64);
+        let (mut discovered, mut discovered_bytes) = (0i32, 0i64);
+        let outcome = worker
+            .process_repository_artifacts(
+                job_id,
+                Arc::new(client),
+                storage.clone(),
+                &keys,
+                "generic",
+                None,
+                None,
+                ConflictResolution::Skip,
+                false,
+                &mut completed,
+                &mut failed,
+                &mut skipped,
+                &mut transferred,
+                &mut discovered,
+                &mut discovered_bytes,
+                None,
+            )
+            .await
+            .expect("process the Nexus repository");
+
+        assert!(matches!(outcome, RepoProcessOutcome::Completed));
+        assert_eq!(discovered, 3, "all three component-less assets are listed");
+        assert_eq!(
+            (completed, failed, skipped),
+            (2, 1, 0),
+            "two files migrate, the one with a wrong advertised sha256 fails"
+        );
+
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT path, checksum_sha256, checksum_sha1 FROM artifacts \
+             WHERE repository_id = $1 AND is_deleted = false ORDER BY path",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read migrated artifacts");
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "docs/web/top.ics".to_string(),
+                    sha256_hex_of(files[1].1),
+                    Some(files[1].2.to_string()),
+                ),
+                (
+                    "fixtures/ios/fixture.json".to_string(),
+                    sha256_hex_of(files[0].1),
+                    Some(files[0].2.to_string()),
+                ),
+            ],
+            "each file lands at its Nexus path with its digests"
+        );
+
+        sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM source_connections WHERE id = $1")
+            .bind(conn_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
     /// End-to-end #2457 import over the Artifactory source layout: a config
     /// blob, a layer blob, and a tagged image manifest must land in the OCI
     /// index (oci_blobs + oci_tags + manifest_blob_refs) with bytes at the
