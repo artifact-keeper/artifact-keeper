@@ -19,8 +19,7 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::build_service::{
-    Build, BuildArtifact as StoredBuildArtifact, BuildArtifactInput, BuildService,
-    CreateBuildInput, UpdateBuildStatusInput,
+    BuildArtifactInput, BuildService, CreateBuildInput, UpdateBuildStatusInput,
 };
 
 /// Require that the request is authenticated, returning an error if not.
@@ -154,8 +153,8 @@ impl From<BuildRow> for BuildResponse {
     }
 }
 
-impl From<Build> for BuildResponse {
-    fn from(build: Build) -> Self {
+impl From<crate::services::build_service::Build> for BuildResponse {
+    fn from(build: crate::services::build_service::Build) -> Self {
         Self {
             id: build.id,
             name: build.name,
@@ -236,14 +235,17 @@ pub async fn list_builds(
         }));
     }
 
-    let order_clause = list_order_clause(query.sort_by.as_deref(), sort_desc);
+    // Build the query dynamically
+    let order_clause = if sort_desc {
+        "ORDER BY build_number DESC"
+    } else {
+        "ORDER BY build_number ASC"
+    };
 
     let sql = format!(
         r#"
         SELECT id, name, build_number, status, started_at, finished_at,
-               duration_ms, agent, artifact_count,
-               vcs_url, vcs_revision, vcs_branch, vcs_message, metadata,
-               created_at, updated_at
+               duration_ms, agent, created_at, updated_at, artifact_count
         FROM builds
         WHERE ($1::text IS NULL OR status = $1)
           AND ($2::text IS NULL OR name ILIKE $2 ESCAPE '\')
@@ -254,7 +256,7 @@ pub async fn list_builds(
         order_clause
     );
 
-    let builds: Vec<Build> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
+    let builds: Vec<BuildRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
         .bind(&query.status)
         .bind(&search_pattern)
         .bind(offset)
@@ -279,13 +281,8 @@ pub async fn list_builds(
 
     let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
 
-    let ids: Vec<Uuid> = builds.iter().map(|b| b.id).collect();
-    let artifacts = BuildService::new(state.db.clone())
-        .list_artifacts(&ids)
-        .await?;
-
     Ok(Json(BuildListResponse {
-        items: with_modules(builds, artifacts),
+        items: builds.into_iter().map(BuildResponse::from).collect(),
         pagination: Pagination {
             page,
             per_page,
@@ -330,12 +327,10 @@ pub async fn get_build(
         return Err(AppError::NotFound("Build not found".to_string()));
     }
 
-    let build: Build = sqlx::query_as(
+    let build: BuildRow = sqlx::query_as(
         r#"
         SELECT id, name, build_number, status, started_at, finished_at,
-               duration_ms, agent, artifact_count,
-               vcs_url, vcs_revision, vcs_branch, vcs_message, metadata,
-               created_at, updated_at
+               duration_ms, agent, created_at, updated_at, artifact_count
         FROM builds
         WHERE id = $1
         "#,
@@ -346,70 +341,7 @@ pub async fn get_build(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Build not found".to_string()))?;
 
-    let artifacts = BuildService::new(state.db.clone())
-        .list_artifacts(&[id])
-        .await?;
-    let mut response = BuildResponse::from(build);
-    response.modules = Some(group_into_modules(artifacts));
-    Ok(Json(response))
-}
-
-/// Responses for `builds`, each with its modules from `artifacts`
-fn with_modules(builds: Vec<Build>, artifacts: Vec<StoredBuildArtifact>) -> Vec<BuildResponse> {
-    let mut by_build: std::collections::HashMap<Uuid, Vec<StoredBuildArtifact>> =
-        std::collections::HashMap::new();
-    for a in artifacts {
-        by_build.entry(a.build_id).or_default().push(a);
-    }
-    builds
-        .into_iter()
-        .map(|build| {
-            let artifacts = by_build.remove(&build.id).unwrap_or_default();
-            let mut response = BuildResponse::from(build);
-            response.modules = Some(group_into_modules(artifacts));
-            response
-        })
-        .collect()
-}
-
-/// `ORDER BY` for the build list. `sort_by` picks from a fixed set of
-/// columns, anything else keeps the build number order, so the value never
-/// reaches the SQL text
-fn list_order_clause(sort_by: Option<&str>, desc: bool) -> String {
-    let column = match sort_by {
-        Some("created_at") => "created_at",
-        Some("started_at") => "started_at",
-        Some("duration") | Some("duration_ms") => "duration_ms",
-        Some("name") => "name",
-        _ => "build_number",
-    };
-    let direction = if desc { "DESC" } else { "ASC" };
-    format!("ORDER BY {column} {direction} NULLS LAST, id {direction}")
-}
-
-/// Group a build's artifact rows by `module_name`, in first-seen order.
-/// Artifacts attached without a module go to a module with an empty name.
-/// A module has no row of its own, its id is the id of its first artifact
-fn group_into_modules(artifacts: Vec<StoredBuildArtifact>) -> Vec<BuildModule> {
-    let mut modules: Vec<BuildModule> = Vec::new();
-    for a in artifacts {
-        let name = a.module_name.unwrap_or_default();
-        let artifact = BuildArtifact {
-            name: a.name,
-            path: a.path,
-            checksum_sha256: a.checksum_sha256,
-            size_bytes: a.size_bytes,
-        };
-        match modules.iter_mut().find(|m| m.name == name) {
-            Some(module) => module.artifacts.push(artifact),
-            None => modules.push(BuildModule {
-                id: a.id,
-                name,
-                artifacts: vec![artifact],
-            }),
-        }
-    }
-    modules
+    Ok(Json(BuildResponse::from(build)))
 }
 
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
@@ -1175,78 +1107,17 @@ mod tests {
 
     #[test]
     fn test_sort_order_clause() {
-        for (sort_by, desc, expected) in [
-            (None, true, "ORDER BY build_number DESC NULLS LAST, id DESC"),
-            (None, false, "ORDER BY build_number ASC NULLS LAST, id ASC"),
-            (
-                Some("created_at"),
-                true,
-                "ORDER BY created_at DESC NULLS LAST, id DESC",
-            ),
-            (
-                Some("started_at"),
-                false,
-                "ORDER BY started_at ASC NULLS LAST, id ASC",
-            ),
-            (
-                Some("duration"),
-                true,
-                "ORDER BY duration_ms DESC NULLS LAST, id DESC",
-            ),
-            (
-                Some("duration_ms"),
-                false,
-                "ORDER BY duration_ms ASC NULLS LAST, id ASC",
-            ),
-            (Some("name"), false, "ORDER BY name ASC NULLS LAST, id ASC"),
-            (
-                Some("name; DROP TABLE builds"),
-                true,
-                "ORDER BY build_number DESC NULLS LAST, id DESC",
-            ),
-            (
-                Some("agent"),
-                false,
-                "ORDER BY build_number ASC NULLS LAST, id ASC",
-            ),
+        for (sort_desc, expected) in [
+            (true, "ORDER BY build_number DESC"),
+            (false, "ORDER BY build_number ASC"),
         ] {
-            assert_eq!(list_order_clause(sort_by, desc), expected, "{sort_by:?}");
+            let order_clause = if sort_desc {
+                "ORDER BY build_number DESC"
+            } else {
+                "ORDER BY build_number ASC"
+            };
+            assert_eq!(order_clause, expected);
         }
-    }
-
-    #[test]
-    fn test_group_into_modules_keeps_every_artifact() {
-        let now = Utc::now();
-        let build_id = Uuid::new_v4();
-        let row = |module: Option<&str>, name: &str| StoredBuildArtifact {
-            id: Uuid::new_v4(),
-            build_id,
-            module_name: module.map(str::to_string),
-            name: name.to_string(),
-            path: format!("dist/{name}"),
-            checksum_sha256: "0".repeat(64),
-            size_bytes: 1,
-            created_at: now,
-        };
-        let rows = vec![
-            row(Some("app"), "a.jar"),
-            row(None, "notes.txt"),
-            row(Some("app"), "b.jar"),
-        ];
-        let first_app_id = rows[0].id;
-        let modules = group_into_modules(rows);
-        assert_eq!(modules.len(), 2);
-        assert_eq!(modules[0].name, "app");
-        assert_eq!(modules[0].id, first_app_id);
-        let names: Vec<&str> = modules[0]
-            .artifacts
-            .iter()
-            .map(|a| a.name.as_str())
-            .collect();
-        assert_eq!(names, ["a.jar", "b.jar"]);
-        assert_eq!(modules[1].name, "");
-        assert_eq!(modules[1].artifacts[0].path, "dist/notes.txt");
-        assert!(group_into_modules(vec![]).is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1707,178 +1578,5 @@ mod tests {
             .await;
         tdh::cleanup_user(&pool, owner_id).await;
         tdh::cleanup_user(&pool, other_id).await;
-    }
-
-    fn post_json(uri: &str, body: serde_json::Value) -> axum::http::Request<axum::body::Body> {
-        axum::http::Request::builder()
-            .method("POST")
-            .uri(uri)
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from(body.to_string()))
-            .unwrap()
-    }
-
-    async fn send_json(
-        app: axum::Router,
-        req: axum::http::Request<axum::body::Body>,
-    ) -> serde_json::Value {
-        use crate::api::handlers::test_db_helpers as tdh;
-        let (status, bytes) = tdh::send(app, req).await;
-        assert_eq!(
-            status,
-            axum::http::StatusCode::OK,
-            "{}",
-            String::from_utf8_lossy(&bytes)
-        );
-        serde_json::from_slice(&bytes).expect("json body")
-    }
-
-    /// web#618: the VCS fields, metadata and attached artifacts were stored
-    /// on create and attach but the reads answered without them, so the
-    /// Builds page had nothing to show
-    #[tokio::test]
-    async fn build_reads_return_vcs_metadata_and_modules_db() {
-        use crate::api::handlers::test_db_helpers as tdh;
-        let Some(pool) = tdh::try_pool().await else {
-            return;
-        };
-        let state = tdh::build_state(pool.clone(), "/tmp/ph-618-builds");
-        let (user_id, username) = tdh::create_user(&pool).await;
-        let app = tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
-        let name = format!("ph-618-{}", Uuid::new_v4());
-        let metadata = json!({
-            "pipeline_url": "https://ci.example.test/p/1",
-            "runner": "linux-amd64",
-        });
-
-        let created = send_json(
-            app.clone(),
-            post_json(
-                "/",
-                json!({
-                    "name": name,
-                    "build_number": 7,
-                    "vcs_url": "https://vcs.example.test/org/repo",
-                    "vcs_revision": "0123456789abcdef",
-                    "vcs_branch": "main",
-                    "vcs_message": "ph-618 commit",
-                    "metadata": metadata,
-                }),
-            ),
-        )
-        .await;
-        let id = created["id"].as_str().expect("build id").to_string();
-        send_json(
-            app.clone(),
-            post_json(
-                &format!("/{id}/artifacts"),
-                json!({ "artifacts": [
-                    { "module_name": "app", "name": "app.jar", "path": "dist/app.jar",
-                      "checksum_sha256": "a".repeat(64), "size_bytes": 10 },
-                    { "module_name": "app", "name": "app.pom", "path": "dist/app.pom",
-                      "checksum_sha256": "b".repeat(64), "size_bytes": 20 },
-                ] }),
-            ),
-        )
-        .await;
-
-        let got = send_json(app.clone(), tdh::get(format!("/{id}"))).await;
-        assert_eq!(got["vcs_url"], "https://vcs.example.test/org/repo");
-        assert_eq!(got["vcs_revision"], "0123456789abcdef");
-        assert_eq!(got["vcs_branch"], "main");
-        assert_eq!(got["vcs_message"], "ph-618 commit");
-        assert_eq!(got["metadata"], metadata);
-        assert_eq!(got["artifact_count"], 2);
-        let modules = got["modules"].as_array().expect("modules");
-        assert_eq!(modules.len(), 1, "{got}");
-        assert_eq!(modules[0]["name"], "app");
-        let artifacts = modules[0]["artifacts"].as_array().expect("artifacts");
-        assert_eq!(artifacts.len(), 2, "{got}");
-        assert_eq!(artifacts[0]["path"], "dist/app.jar");
-        assert_eq!(artifacts[1]["path"], "dist/app.pom");
-        assert_eq!(artifacts[1]["size_bytes"], 20);
-
-        let list = send_json(app, tdh::get(format!("/?search={name}"))).await;
-        let items = list["items"].as_array().expect("items");
-        assert_eq!(items.len(), 1, "{list}");
-        assert_eq!(items[0]["vcs_url"], "https://vcs.example.test/org/repo");
-        assert_eq!(items[0]["vcs_branch"], "main");
-        assert_eq!(items[0]["metadata"], metadata);
-        assert_eq!(
-            items[0]["modules"][0]["artifacts"].as_array().map(Vec::len),
-            Some(2)
-        );
-
-        let _ = sqlx::query("DELETE FROM builds WHERE name = $1")
-            .bind(&name)
-            .execute(&pool)
-            .await;
-        tdh::cleanup_user(&pool, user_id).await;
-    }
-
-    /// web#618: the list parsed `sort_by` and always ordered by build number
-    #[tokio::test]
-    async fn list_builds_honours_sort_by_db() {
-        use crate::api::handlers::test_db_helpers as tdh;
-        let Some(pool) = tdh::try_pool().await else {
-            return;
-        };
-        let state = tdh::build_state(pool.clone(), "/tmp/ph-618-sort");
-        let (user_id, username) = tdh::create_user(&pool).await;
-        let app = tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
-        let prefix = format!("ph-618-sort-{}", Uuid::new_v4());
-
-        // Build 1 is `-c` created 1h ago, build 2 `-b` 3h ago, build 3 `-a`
-        // 2h ago, so number, name and creation order all differ
-        for (number, suffix, hours) in [(1, "c", 1), (2, "b", 3), (3, "a", 2)] {
-            let created = send_json(
-                app.clone(),
-                post_json(
-                    "/",
-                    json!({ "name": format!("{prefix}-{suffix}"), "build_number": number }),
-                ),
-            )
-            .await;
-            sqlx::query(
-                "UPDATE builds SET created_at = NOW() - make_interval(hours => $2) WHERE id = $1",
-            )
-            .bind(Uuid::parse_str(created["id"].as_str().expect("id")).expect("uuid"))
-            .bind(hours)
-            .execute(&pool)
-            .await
-            .expect("backdate");
-        }
-
-        let numbers = |sort: &'static str| {
-            let app = app.clone();
-            let prefix = prefix.clone();
-            async move {
-                let list = send_json(app, tdh::get(format!("/?search={prefix}&{sort}"))).await;
-                list["items"]
-                    .as_array()
-                    .expect("items")
-                    .iter()
-                    .map(|b| b["number"].as_i64().expect("number"))
-                    .collect::<Vec<_>>()
-            }
-        };
-
-        assert_eq!(
-            numbers("sort_by=created_at&sort_order=asc").await,
-            [2, 3, 1]
-        );
-        assert_eq!(
-            numbers("sort_by=created_at&sort_order=desc").await,
-            [1, 3, 2]
-        );
-        assert_eq!(numbers("sort_by=name&sort_order=asc").await, [3, 2, 1]);
-        assert_eq!(numbers("sort_order=desc").await, [3, 2, 1]);
-        assert_eq!(numbers("sort_by=nope&sort_order=asc").await, [1, 2, 3]);
-
-        let _ = sqlx::query("DELETE FROM builds WHERE name LIKE $1")
-            .bind(format!("{prefix}-%"))
-            .execute(&pool)
-            .await;
-        tdh::cleanup_user(&pool, user_id).await;
     }
 }

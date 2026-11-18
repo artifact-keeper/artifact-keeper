@@ -542,7 +542,8 @@ waited.
 it `false` on the API pods and run the same image with it on as a scan worker.
 The worker has to read what an API pod wrote: object storage, or a filesystem
 volume both can mount. `SCAN_WORKER_CONCURRENCY` sets how many jobs one worker
-runs at once and defaults to `MAX_CONCURRENT_SCAN_EXTRACTIONS`. Each job takes
+runs at once and defaults to 4, or `MAX_CONCURRENT_SCAN_EXTRACTIONS` if that is
+lower. Each job takes
 an extraction permit, so raise the two together. `SCAN_WORKER_TRIVY_ADAPTER_URL`
 gives the scans a worker runs their own scanner-adapter URL in place of
 `TRIVY_ADAPTER_URL`, so a worker pod can use an adapter running next to it while

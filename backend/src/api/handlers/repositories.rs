@@ -6377,6 +6377,17 @@ fn validate_update_config_fields(
     Ok(())
 }
 
+async fn may_rename_repository(
+    state: &SharedState,
+    auth: &AuthExtension,
+    project_id: Option<Uuid>,
+) -> Result<bool> {
+    match project_id {
+        Some(id) => projects::can_assign_to_project(state, auth, id).await,
+        None => projects::has_system_repo_admin(state, auth).await,
+    }
+}
+
 /// Update repository
 #[utoipa::path(
     patch,
@@ -6392,7 +6403,7 @@ fn validate_update_config_fields(
         (status = 200, description = "Repository updated", body = RepositoryResponse),
         (status = 400, description = "Invalid repository configuration, repodata_depth outside 0..1023, or a renamed/reassigned key using another project's `<project.key>-` prefix"),
         (status = 401, description = "Authentication required"),
-        (status = 403, description = "Insufficient permissions: needs repository admin, plus project admin of the destination project when changing project_id, or of the current project when clearing it with null"),
+        (status = 403, description = "Insufficient permissions: needs repository admin, plus project admin of the destination project when changing project_id, or of the current project when clearing it with null, and admin (or project admin of the project the repository ends up in) to change the key"),
         (status = 404, description = "Repository not found"),
         (status = 409, description = "Repository key conflict, nonempty repository depth change, concurrent layout change, or an upstream_url origin change while upstream-auth credentials are configured"),
         (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository; a bare namespace in mcp_server_deny or mcp_auto_approve_namespaces (write `com.acme/*`)"),
@@ -6491,6 +6502,15 @@ pub async fn update_repository(
         }
     }
     let key_changed = payload.key.as_deref().is_some_and(|k| k != existing.key);
+    // A rename claims a new key and frees the old one, so it needs the authority to create a repository there.
+    // That authority is judged against the project the repository ends up in, so a rename combined with
+    // `project_id: null` needs a system repository admin and a rename plus move needs the destination's admin.
+    let resulting_project = project_change.unwrap_or(existing.project_id);
+    if key_changed && !may_rename_repository(&state, &auth, resulting_project).await? {
+        return Err(AppError::Authorization(
+            "Renaming a repository requires an admin or the project admin".to_string(),
+        ));
+    }
     // The create-time format rules (#5251: an Agent Plugins repository may
     // not take the key `t`, which is its token route) hold for a rename too.
     if let Some(new_key) = payload.key.as_deref().filter(|_| key_changed) {
@@ -24776,6 +24796,170 @@ mod tests {
         tdh::cleanup(&pool, local.id, user_id).await;
         tdh::cleanup(&pool, remote.id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// A repository-admin grant may edit settings but not rename, the project admin of the
+    /// repository's project may rename
+    #[tokio::test]
+    async fn rename_needs_more_than_repository_admin_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (owner_id, owner_name) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let project_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO projects (key, name) VALUES ($1, $1) RETURNING id",
+        )
+        .bind(format!("prj-rename-{}", Uuid::new_v4()))
+        .fetch_one(&pool)
+        .await
+        .expect("create project");
+        sqlx::query("UPDATE repositories SET project_id = $2 WHERE id = $1")
+            .bind(repo_id)
+            .bind(project_id)
+            .execute(&pool)
+            .await
+            .expect("assign repo to project");
+        sqlx::query(
+            "INSERT INTO permissions (principal_type, principal_id, target_type, target_id, actions) \
+             VALUES ('user', $1, 'project', $2, $3)",
+        )
+        .bind(owner_id)
+        .bind(project_id)
+        .bind(vec!["read".to_string(), "admin".to_string()])
+        .execute(&pool)
+        .await
+        .expect("grant project admin");
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["admin"]).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let maintainer = tdh::make_auth(user_id, &username);
+        let renamed = format!("{key}-renamed");
+        let patch = |v: serde_json::Value| -> UpdateRepositoryRequest {
+            serde_json::from_value(v).expect("deserialize update payload")
+        };
+
+        let edit = update_repository(
+            State(state.clone()),
+            Extension(Some(maintainer.clone())),
+            Path(key.clone()),
+            Json(patch(
+                serde_json::json!({"key": key, "description": "edited"}),
+            )),
+        )
+        .await;
+        let rename = update_repository(
+            State(state.clone()),
+            Extension(Some(maintainer)),
+            Path(key.clone()),
+            Json(patch(serde_json::json!({"key": renamed}))),
+        )
+        .await;
+        let owner_rename = update_repository(
+            State(state.clone()),
+            Extension(Some(tdh::make_auth(owner_id, &owner_name))),
+            Path(key.clone()),
+            Json(patch(serde_json::json!({"key": renamed}))),
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = ANY($1)")
+            .bind(vec![user_id, owner_id])
+            .execute(&pool)
+            .await;
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
+            .bind(project_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, user_id).await;
+        tdh::cleanup_user(&pool, owner_id).await;
+
+        assert!(edit.is_ok(), "same key is not a rename: {:?}", edit.err());
+        assert!(
+            matches!(rename, Err(AppError::Authorization(ref m)) if m.contains("Renaming")),
+            "repository admin must not rename: {:?}",
+            rename.map(|r| r.0.key)
+        );
+        assert_eq!(owner_rename.expect("project admin rename").0.key, renamed);
+    }
+
+    /// A project admin may clear the assignment and may rename inside the project, but a rename that
+    /// also clears `project_id` lands the repository outside any project, so it needs a system repo admin
+    #[tokio::test]
+    async fn rename_plus_unassign_needs_system_repo_admin_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (owner_id, owner_name) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let project_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO projects (key, name) VALUES ($1, $1) RETURNING id",
+        )
+        .bind(format!("prj-unassign-{}", Uuid::new_v4()))
+        .fetch_one(&pool)
+        .await
+        .expect("create project");
+        sqlx::query("UPDATE repositories SET project_id = $2 WHERE id = $1")
+            .bind(repo_id)
+            .bind(project_id)
+            .execute(&pool)
+            .await
+            .expect("assign repo to project");
+        sqlx::query(
+            "INSERT INTO permissions (principal_type, principal_id, target_type, target_id, actions) \
+             VALUES ('user', $1, 'project', $2, $3)",
+        )
+        .bind(owner_id)
+        .bind(project_id)
+        .bind(vec!["read".to_string(), "admin".to_string()])
+        .execute(&pool)
+        .await
+        .expect("grant project admin");
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let owner = tdh::make_auth(owner_id, &owner_name);
+        let renamed = format!("{key}-renamed");
+        let patch = |v: serde_json::Value| -> UpdateRepositoryRequest {
+            serde_json::from_value(v).expect("deserialize update payload")
+        };
+
+        let rename_unassign = update_repository(
+            State(state.clone()),
+            Extension(Some(owner)),
+            Path(key.clone()),
+            Json(patch(
+                serde_json::json!({"key": renamed, "project_id": null}),
+            )),
+        )
+        .await;
+        let after = sqlx::query_as::<_, (String, Option<Uuid>)>(
+            "SELECT key, project_id FROM repositories WHERE id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("reload repo");
+
+        let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = $1")
+            .bind(owner_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
+            .bind(project_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, owner_id).await;
+
+        assert!(
+            matches!(rename_unassign, Err(AppError::Authorization(ref m)) if m.contains("Renaming")),
+            "project admin must not rename while unassigning: {:?}",
+            rename_unassign.map(|r| r.0.key)
+        );
+        assert_eq!(after, (key, Some(project_id)), "repository is unchanged");
     }
 
     /// #4420: the generic PUT and both multipart upload entry points refuse a
