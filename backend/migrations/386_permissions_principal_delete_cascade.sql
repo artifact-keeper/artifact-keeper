@@ -32,13 +32,11 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS ak_user_permission_rules_delete ON users;
 CREATE TRIGGER ak_user_permission_rules_delete
     AFTER DELETE ON users
     FOR EACH ROW
     EXECUTE FUNCTION ak_delete_principal_permission_rules('user', 'service_account');
 
-DROP TRIGGER IF EXISTS ak_group_permission_rules_delete ON groups;
 CREATE TRIGGER ak_group_permission_rules_delete
     AFTER DELETE ON groups
     FOR EACH ROW
