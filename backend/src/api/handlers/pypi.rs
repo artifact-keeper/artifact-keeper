@@ -6559,10 +6559,9 @@ async fn upload(
     // `max_upload_size_bytes`, 10 GiB by default); re-open that file and read
     // only the metadata entry rather than buffering the whole distribution.
     // ZIP/tar parsing is blocking, so it runs on the blocking pool.
-    // #2561: permit held across the blocking decode, fast-fail 503 on
-    // saturation — the same seam the helm/protobuf/conda/rubygems uploads use,
-    // so N concurrent sdist uploads cannot each inflate up to the ingest
-    // budget at once (#3672).
+    // #2561: permit held across the blocking decode, so N concurrent sdist
+    // uploads cannot each inflate up to the ingest budget at once (#3672).
+    // On saturation it waits a bounded time, then sheds 503 (#6221).
     // The identity gate parses the archive's METADATA / PKG-INFO; keep what it
     // parsed so the stored `pkg_info` carries the distribution's classifiers
     // and URLs (#3783) without a second walk.
@@ -6573,26 +6572,29 @@ async fn upload(
     let staged_local =
         super::repositories::materialize_staged_for_repo(&state, &repo, &staged_content).await?;
     let staged_path = staged_local.path().to_path_buf();
+    // #6221: ONE ingest permit covers both the identity gate and the content
+    // analysis below, so a queued upload waits for a slot once, and
+    // best-effort analysis never takes a second place in the wait queue.
+    let ingest_permit = crate::util::bounded_archive::acquire_ingest_extraction_waiting()
+        .await
+        .map_err(|e| e.into_response())?;
     let extracted_pkg_info: Option<PkgInfo> = {
         let expected_name = normalized.clone();
         let expected_version = pkg_version.clone();
         let dist_filename = filename.clone();
         let staged_path = staged_path.clone();
-        crate::util::bounded_archive::with_ingest_extraction_async(|| {
-            tokio::task::spawn_blocking(move || {
-                let file = std::fs::File::open(&staged_path).map_err(|e| {
-                    AppError::Internal(format!("re-open staged upload for validation: {e}"))
-                })?;
-                PypiHandler::validate_upload_file(
-                    &expected_name,
-                    &expected_version,
-                    &dist_filename,
-                    file,
-                )
-            })
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&staged_path).map_err(|e| {
+                AppError::Internal(format!("re-open staged upload for validation: {e}"))
+            })?;
+            PypiHandler::validate_upload_file(
+                &expected_name,
+                &expected_version,
+                &dist_filename,
+                file,
+            )
         })
         .await
-        .map_err(|e| e.into_response())?
         .map_err(|e| {
             AppError::Internal(format!("upload validation task failed: {e}")).into_response()
         })?
@@ -6604,7 +6606,8 @@ async fn upload(
     // and the `setup.py` an sdist install executes. Done here, while the
     // staged local copy still exists (it is consumed and dropped further
     // down); the row it produces is written after the artifact is committed.
-    let content_analysis = analyze_pypi_upload(staged_path, filename.clone()).await;
+    let content_analysis = analyze_pypi_upload(&ingest_permit, staged_path, filename.clone()).await;
+    drop(ingest_permit);
     drop(staged_local);
 
     // SHA-256 was computed incrementally while the body was spooled to disk.
@@ -6759,36 +6762,35 @@ async fn upload(
 /// Read the staged distribution and report what is inside it.
 ///
 /// Re-opens the scratch file the body was spooled to rather than buffering the
-/// distribution, and holds an ingest-extraction permit across the blocking
-/// archive walk — the same seam the identity gate above uses, so N concurrent
-/// wheel uploads cannot each decode without bound (#2561).
+/// distribution. The caller passes the ingest-extraction permit it already
+/// holds for the identity gate, and keeps it across this blocking archive
+/// walk, so N concurrent wheel uploads cannot each decode without bound
+/// (#2561). Analysis never acquires a permit of its own: a second acquire
+/// would make a queued upload wait twice and let best-effort analysis take
+/// places in the wait queue from real uploads (#6221).
 ///
 /// Never returns an error. Every failure path resolves to a
 /// [`Completeness::NotRead`] analysis carrying the reason, because "we could
 /// not read it" is a result the user is entitled to see, and because analysis
 /// must not be able to fail an otherwise-valid upload.
 pub(crate) async fn analyze_pypi_upload(
+    _held: &crate::util::bounded_archive::IngestExtractionGuard,
     staged_path: std::path::PathBuf,
     filename: String,
 ) -> crate::services::pypi_analysis::PypiAnalysis {
     use crate::services::pypi_analysis::{analyze_distribution, PypiAnalysis};
 
-    let joined = crate::util::bounded_archive::with_ingest_extraction_async(|| {
-        tokio::task::spawn_blocking(move || match std::fs::File::open(&staged_path) {
-            Ok(file) => analyze_distribution(&filename, std::io::BufReader::new(file)),
-            Err(e) => PypiAnalysis::not_read(format!(
-                "Staged upload could not be re-opened for analysis: {e}"
-            )),
-        })
+    let joined = tokio::task::spawn_blocking(move || match std::fs::File::open(&staged_path) {
+        Ok(file) => analyze_distribution(&filename, std::io::BufReader::new(file)),
+        Err(e) => PypiAnalysis::not_read(format!(
+            "Staged upload could not be re-opened for analysis: {e}"
+        )),
     })
     .await;
 
     match joined {
-        // Saturation shed the decode slot (503-equivalent). The upload itself
-        // is fine; we simply did not look, and the row must say so.
-        Err(e) => PypiAnalysis::not_read(format!("Package analysis was not run: {e}")),
-        Ok(Ok(analysis)) => analysis,
-        Ok(Err(e)) => PypiAnalysis::not_read(format!("Package analysis task failed: {e}")),
+        Ok(analysis) => analysis,
+        Err(e) => PypiAnalysis::not_read(format!("Package analysis task failed: {e}")),
     }
 }
 
@@ -6883,7 +6885,9 @@ mod content_analysis_tests {
             ("PIL/__init__.py", b"" as &[u8]),
             ("Pillow.libs/libwebp-850e2bec.so.7.1.3", b"\x7fELF"),
         ]);
+        let held = crate::util::bounded_archive::acquire_ingest_extraction().unwrap();
         let a = analyze_pypi_upload(
+            &held,
             f.path().to_path_buf(),
             "Pillow-10.0.0-cp311-cp311-manylinux_x86_64.whl".to_string(),
         )
@@ -6895,7 +6899,9 @@ mod content_analysis_tests {
     #[tokio::test]
     async fn pypi_upload_analysis_reports_not_read_when_the_staged_file_is_gone() {
         // The failure mode that must never render as a clean bill of health.
+        let held = crate::util::bounded_archive::acquire_ingest_extraction().unwrap();
         let a = analyze_pypi_upload(
+            &held,
             std::path::PathBuf::from("/nonexistent/scratch/pkg.whl"),
             "pkg-1.0-py3-none-any.whl".to_string(),
         )
@@ -6912,8 +6918,58 @@ mod content_analysis_tests {
     #[tokio::test]
     async fn pypi_upload_analysis_is_unsupported_for_an_unknown_extension() {
         let f = staged_wheel(&[("x", b"" as &[u8])]);
-        let a = analyze_pypi_upload(f.path().to_path_buf(), "pkg-1.0-py3.7.egg".to_string()).await;
+        let held = crate::util::bounded_archive::acquire_ingest_extraction().unwrap();
+        let a = analyze_pypi_upload(
+            &held,
+            f.path().to_path_buf(),
+            "pkg-1.0-py3.7.egg".to_string(),
+        )
+        .await;
         assert!(matches!(a.completeness, Completeness::Unsupported { .. }));
+    }
+
+    /// #6221: analysis runs under the permit its caller already holds. With
+    /// every other slot of the repository taken it neither queues nor sheds:
+    /// it reads the distribution, and the repository's wait line stays empty.
+    #[tokio::test]
+    async fn pypi_upload_analysis_never_enters_the_wait_queue_6221() {
+        use crate::util::bounded_archive::{
+            acquire_ingest_extraction, queued_ingest_extractions_for, run_with_tenant_scope,
+            TenantKey, DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT,
+        };
+        let tenant = TenantKey::Repo(uuid::Uuid::new_v4());
+        let f = staged_wheel(&[
+            ("PIL/__init__.py", b"" as &[u8]),
+            ("Pillow.libs/libwebp-850e2bec.so.7.1.3", b"\x7fELF"),
+        ]);
+        let (a, queued) = run_with_tenant_scope(tenant.clone(), async {
+            // The caller's own permit plus every other slot: the bucket is full.
+            let held: Vec<_> = (0..DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT)
+                .map(|_| acquire_ingest_extraction().expect("permit"))
+                .collect();
+            let analysis = analyze_pypi_upload(
+                &held[0],
+                f.path().to_path_buf(),
+                "Pillow-10.0.0-cp311-cp311-manylinux_x86_64.whl".to_string(),
+            );
+            let watch = async {
+                let mut max = 0;
+                for _ in 0..50 {
+                    max = max.max(queued_ingest_extractions_for(&tenant));
+                    tokio::task::yield_now().await;
+                }
+                max
+            };
+            tokio::join!(analysis, watch)
+        })
+        .await;
+        assert_eq!(queued, 0, "analysis must not queue for a second permit");
+        assert!(
+            !matches!(a.completeness, Completeness::NotRead { .. }),
+            "analysis must run under the held permit, got {:?}",
+            a.completeness
+        );
+        assert_eq!(a.components.len(), 1);
     }
 }
 
@@ -13152,6 +13208,11 @@ mod tests {
     /// sub-limit exhausted the upload is shed with a 503 rather than decoding;
     /// once the permits are released the same upload succeeds. Only this
     /// repository's bucket is held, so no other test's decodes are affected.
+    ///
+    /// Since #6221 the shed arrives only after the bounded wait rather than at
+    /// once; the status and body are unchanged. The shed request is run under
+    /// a 1 s wait (`test_support::with_ingest_wait`) so the test does not sit
+    /// out the test binary's 30 s default.
     #[tokio::test]
     async fn test_upload_validation_holds_ingest_permit_3672() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -13177,14 +13238,18 @@ mod tests {
         let (content_type, body) =
             pypi_upload_multipart("pkg", "1.0", "pkg-1.0.tar.gz", &sdist, "ok", ">=3.8");
         let app = fx.router_with_auth(super::router());
-        let (shed_status, shed_body) = run_with_tenant_scope(
-            tenant.clone(),
-            tdh::send(
-                app,
-                tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
-            ),
-        )
-        .await;
+        let (shed_status, shed_body) =
+            crate::util::bounded_archive::test_support::with_ingest_wait(
+                std::time::Duration::from_secs(1),
+                run_with_tenant_scope(
+                    tenant.clone(),
+                    tdh::send(
+                        app,
+                        tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
+                    ),
+                ),
+            )
+            .await;
 
         drop(held);
         let (content_type, body) =
@@ -13213,6 +13278,150 @@ mod tests {
             "upload must succeed once permits are released; body: {}",
             String::from_utf8_lossy(&ok_body)
         );
+    }
+
+    /// Hold `n` of `tenant`'s per-repository permits. Holding all but four
+    /// makes the repository behave as if its sub-limit were the production 4
+    /// (the test binary's own sub-limit is far larger, #3407).
+    async fn hold_tenant_permits_6221(
+        tenant: &crate::util::bounded_archive::TenantKey,
+        n: usize,
+    ) -> Vec<crate::util::bounded_archive::IngestExtractionGuard> {
+        use crate::util::bounded_archive::{acquire_ingest_extraction, run_with_tenant_scope};
+        run_with_tenant_scope(tenant.clone(), async {
+            (0..n)
+                .map(|_| acquire_ingest_extraction().expect("permit"))
+                .collect::<Vec<_>>()
+        })
+        .await
+    }
+
+    /// #6221: an upload that finds its repository's sub-limit full now waits
+    /// for a permit instead of getting an immediate 503, and succeeds once one
+    /// is released.
+    #[tokio::test]
+    async fn test_upload_waits_for_ingest_permit_6221() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::formats::pypi::tests::{build_tgz, PKG_INFO};
+        use crate::util::bounded_archive::{
+            queued_ingest_extractions_for, run_with_tenant_scope, TenantKey,
+            DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT,
+        };
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        let tenant = TenantKey::Repo(fx.repo_id);
+        let held = hold_tenant_permits_6221(
+            &tenant,
+            DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT,
+        )
+        .await;
+
+        let sdist = build_tgz(&[("pkg-1.0/PKG-INFO", PKG_INFO)]);
+        let (content_type, body) =
+            pypi_upload_multipart("pkg", "1.0", "pkg-1.0.tar.gz", &sdist, "ok", ">=3.8");
+        let app = fx.router_with_auth(super::router());
+        let upload = tokio::spawn(run_with_tenant_scope(
+            tenant.clone(),
+            tdh::send(
+                app,
+                tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
+            ),
+        ));
+
+        // Release the permits only once the upload is queued for one.
+        let mut queued = false;
+        for _ in 0..20_000 {
+            if queued_ingest_extractions_for(&tenant) > 0 {
+                queued = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        drop(held);
+        let (status, resp_body) = upload.await.expect("upload task");
+
+        fx.teardown().await;
+
+        assert!(queued, "the upload must have waited for a permit");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a queued upload must succeed once a permit frees; body: {}",
+            String::from_utf8_lossy(&resp_body)
+        );
+    }
+
+    /// #6221 reproduction: six concurrent uploads of distinct packages to one
+    /// repository whose per-repository sub-limit is the production 4. Before
+    /// the bounded wait the fifth and sixth were shed with 503. To make the
+    /// overlap deterministic, all of the repository's permits are held until
+    /// every upload is queued; then four are released, so the six drain
+    /// through four slots.
+    #[tokio::test]
+    async fn test_six_concurrent_uploads_to_one_repository_succeed_6221() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::formats::pypi::tests::build_tgz;
+        use crate::util::bounded_archive::{
+            queued_ingest_extractions_for, run_with_tenant_scope, TenantKey,
+            DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT,
+        };
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        let tenant = TenantKey::Repo(fx.repo_id);
+        let _held = hold_tenant_permits_6221(
+            &tenant,
+            DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT - 4,
+        )
+        .await;
+        let last_four = hold_tenant_permits_6221(&tenant, 4).await;
+
+        let uploads = (0..6).map(|i| {
+            let name = format!("concurrent-pkg-{i}");
+            let pkg_info = format!("Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n");
+            let filename = format!("concurrent_pkg_{i}-1.0.tar.gz");
+            let entry = format!("concurrent_pkg_{i}-1.0/PKG-INFO");
+            let sdist = build_tgz(&[(entry.as_str(), pkg_info.as_bytes())]);
+            let (content_type, body) =
+                pypi_upload_multipart(&name, "1.0", &filename, &sdist, "ok", ">=3.8");
+            let app = fx.router_with_auth(super::router());
+            run_with_tenant_scope(
+                tenant.clone(),
+                tdh::send(
+                    app,
+                    tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
+                ),
+            )
+        });
+        let release = async {
+            let mut queued = 0;
+            for _ in 0..20_000 {
+                queued = queued_ingest_extractions_for(&tenant);
+                if queued == 6 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            drop(last_four);
+            queued
+        };
+        let (results, queued) = tokio::join!(futures::future::join_all(uploads), release);
+
+        fx.teardown().await;
+
+        assert_eq!(queued, 6, "all six uploads must have queued for a permit");
+
+        for (i, (status, body)) in results.into_iter().enumerate() {
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "upload {i} of 6 must succeed; body: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
