@@ -1575,6 +1575,29 @@ fn manifest_digest_reference_matches(reference: &str, computed_digest: &str) -> 
     !reference.starts_with("sha256:") || reference.eq_ignore_ascii_case(computed_digest)
 }
 
+/// An OCI tag, per the distribution spec: `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`.
+///
+/// Checked against the raw reference text, so a percent-escape (`a%20b`) is
+/// not a tag: this registry does not percent-decode references, so accepting
+/// one would store a name no conforming client can address (#5869).
+fn is_valid_oci_tag(tag: &str) -> bool {
+    let bytes = tag.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && (bytes[0].is_ascii_alphanumeric() || bytes[0] == b'_')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Whether a manifest PUT reference may be stored: a `sha256:` digest (whose
+/// hash [`manifest_digest_reference_matches`] verifies against the body) or a
+/// valid tag. Anything else, such as `bad!tag`, `-lead`, a 129-character name
+/// or a non-sha256 digest, answers `400 TAG_INVALID` instead of `201` (#5869).
+fn manifest_put_reference_is_valid(reference: &str) -> bool {
+    reference.starts_with("sha256:") || is_valid_oci_tag(reference)
+}
+
 fn upload_storage_key(uuid: &Uuid) -> String {
     format!("oci-uploads/{}", uuid)
 }
@@ -13607,16 +13630,7 @@ fn is_valid_replication_image_name(name: &str) -> bool {
 /// own digest (a by-digest child), or an OCI tag
 /// (`[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`).
 fn is_valid_replication_reference(reference: &str, digest: &str) -> bool {
-    if reference == digest {
-        return true;
-    }
-    let bytes = reference.as_bytes();
-    !bytes.is_empty()
-        && bytes.len() <= 128
-        && (bytes[0].is_ascii_alphanumeric() || bytes[0] == b'_')
-        && bytes
-            .iter()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    reference == digest || is_valid_oci_tag(reference)
 }
 
 /// Receive one image blob from a replication peer (#4790).
@@ -14031,6 +14045,17 @@ async fn handle_put_manifest(
             StatusCode::CONFLICT,
             "DENIED",
             "Direct uploads are disabled for this repository; publish via promotion",
+        );
+    }
+    // #5869: a reference that is neither a digest nor a valid tag is refused
+    // before anything is read or stored, so `tags/list` never advertises a
+    // name no conforming client can pull or delete.
+    if !manifest_put_reference_is_valid(reference) {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "TAG_INVALID",
+            "manifest reference must be a digest or a tag matching \
+             [a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}",
         );
     }
     let repo_id = repo.id;
@@ -37075,6 +37100,54 @@ mod cross_repo_session_regression_tests {
         cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
     }
 
+    /// #5869: a manifest PUT whose reference is neither a digest nor a valid
+    /// tag is refused with 400 `TAG_INVALID` and stores nothing, instead of
+    /// answering 201 and advertising a name no conforming client can address.
+    #[tokio::test]
+    async fn manifest_put_with_an_invalid_tag_is_refused_5869() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) =
+            create_typed_oci_repo(&pool, "local", "tag5869").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+
+        let too_long = "x".repeat(129);
+        for bad in [
+            "bad%21tag",
+            "-lead",
+            ".lead",
+            "a%20b",
+            "Spatny%3ATag",
+            too_long.as_str(),
+        ] {
+            let manifest = br#"{"config":{"digest":"sha256:cfg"},"layers":[]}"#.to_vec();
+            let req = Request::builder()
+                .method("PUT")
+                .uri(format!("/{}/myimage/manifests/{}", repo_key, bad))
+                .header("Authorization", &auth)
+                .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+                .body(Body::from(manifest))
+                .unwrap();
+            let (status, body) = tdh::send(router(None).with_state(state.clone()), req).await;
+            let body = String::from_utf8_lossy(&body);
+            assert_eq!(status, StatusCode::BAD_REQUEST, "tag {bad:?}: {body}");
+            assert!(body.contains("TAG_INVALID"), "tag {bad:?}: {body}");
+        }
+
+        let tag_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM oci_tags WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(tag_rows, 0, "an invalid tag must not be stored");
+
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
+
     /// #4568: an anonymous manifest PUT is refused with 401 and the push
     /// challenge BEFORE the body is read. crane's bearer retry resends the
     /// request with a spent body (`Content-Length` set, 0 bytes written), so
@@ -46636,6 +46709,62 @@ mod virtual_scan_gate_tests {
     }
 
     // Review: the manifest push-by-digest integrity guard (previously untested).
+    #[test]
+    fn test_oci_tag_grammar_5869() {
+        for ok in [
+            "latest",
+            "v1.0.0",
+            "_private",
+            "0",
+            "a",
+            "UPPER",
+            "my-tag_1.2",
+            &"x".repeat(128),
+        ] {
+            assert!(is_valid_oci_tag(ok), "{ok} is a valid tag");
+        }
+        for bad in [
+            "",
+            "-lead",
+            ".lead",
+            "bad!tag",
+            "a b",
+            "a%20b",
+            "bad%21tag",
+            "Spatny%3ATag",
+            "a:b",
+            "a/b",
+            "tag+plus",
+            &"x".repeat(129),
+        ] {
+            assert!(!is_valid_oci_tag(bad), "{bad:?} is not a valid tag");
+        }
+    }
+
+    #[test]
+    fn test_manifest_put_reference_is_valid_5869() {
+        assert!(manifest_put_reference_is_valid("latest"));
+        assert!(manifest_put_reference_is_valid(&format!(
+            "sha256:{}",
+            "a".repeat(64)
+        )));
+        // A mismatching sha256 reference is refused later with DIGEST_INVALID,
+        // so it is not a TAG_INVALID here.
+        assert!(manifest_put_reference_is_valid("sha256:deadbeef"));
+        for bad in ["-lead", "bad!tag", "sha512:abc", "a:b", ""] {
+            assert!(!manifest_put_reference_is_valid(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_replication_reference_still_accepts_its_digest_and_tags_5869() {
+        let d = "sha256:abc";
+        assert!(is_valid_replication_reference(d, d));
+        assert!(is_valid_replication_reference("v1", d));
+        assert!(!is_valid_replication_reference("-bad", d));
+        assert!(!is_valid_replication_reference("", d));
+    }
+
     #[test]
     fn test_manifest_digest_reference_matches() {
         let d = "sha256:abcdef";
