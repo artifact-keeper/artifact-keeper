@@ -31,6 +31,34 @@ formal/
 | `Quarantine/DownloadGate.lean` | `check_download_allowed`, `admin_quarantine_allowed` (`backend/src/services/quarantine_service.rs`) | A rejection never downloads; a hold with no expiry never lapses; a timed hold blocks for exactly its window and, once lapsed, stays lapsed; quarantine-now always blocks and is refused on a rejection. Records that an unrecognised status downloads (safe only while the column constraint holds). |
 | `Scan/ScanState.lean` | `classify_scan_state` and `ScanState::is_unscanned` (`backend/src/services/scan_state.rs`) | The original fall-through passes a row with an unrecognised status (counterexample included). With the fall-through closed, the gate is passed exactly when a scan completed or every row is "not applicable". |
 
+## Oracle vectors
+
+A proof says a rule is sound; it does not say the Rust still matches the
+rule. Where a model's decision is a computable function, the Rust test can be
+checked against the model's own answers instead of a hand-written copy of
+them:
+
+```bash
+cd formal && lake exe ak-oracle emit quarantine_download_gate
+```
+
+`Oracle.lean` builds the `ak-oracle` executable, and each model gets a codec in
+`ArtifactKeeper/Oracle/<Model>.lean` that only parses an input line, calls the
+model, and prints the answer, plus the list of cases to emit (exhaustive up to
+a bound that reaches every case the model distinguishes). The output is
+committed under `vectors/<model>.txt`, and the paired Rust test reads it with
+`include_str!` and replays every line through the real code, so the Rust jobs
+need no Lean toolchain.
+
+The vectors are never edited by hand. The Lean job regenerates them and fails
+on any difference. When the Rust test disagrees with a vector, either the Rust
+change was unintended (fix the Rust) or the rule is meant to change (change the
+model, re-prove it, regenerate the vectors in the same change).
+
+| Model | Vectors | Paired Rust test |
+|---|---|---|
+| `Quarantine/DownloadGate.lean` | `vectors/quarantine_download_gate.txt` | `matches_the_vectors_generated_from_the_lean_model` in `backend/src/services/quarantine_service.rs` |
+
 ## Checking
 
 ```bash
