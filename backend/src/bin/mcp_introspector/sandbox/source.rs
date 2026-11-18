@@ -385,7 +385,7 @@ pub fn check_env(kind: &str, package: &Value) -> Result<(), SandboxError> {
     Ok(())
 }
 
-#[cfg(ak_test_shard = "services-2")]
+#[cfg(ak_test_shard = "router")]
 #[cfg(test)]
 mod tests {
     //! The sanitized RT-06 fixture matrix (#5446): every form the

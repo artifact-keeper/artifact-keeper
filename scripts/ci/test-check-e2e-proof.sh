@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Self-test for scripts/ci/check-e2e-proof.py (the end-to-end proof policy for
-# bug fixes: require-e2e-proof.yml and release-preflight.sh check 7).
+# bug fixes: require-e2e-proof.yml and release-preflight.sh check 7; and the
+# gate-test rule for behaviour changes, #6074).
 #
 # WHY THIS EXISTS
 #   The check is silent on every PR that is not a bug fix, and on most bug
@@ -406,6 +407,106 @@ expect_ms "without the override the closing PR is used -> MISSING via #300" 1 "(
 FIXPRS_FILE="$WORK/fixprs-208.tsv" expect_ms "override naming a PR that does not exist -> INFRA" 2 "INFRA" "$(issue 208 "$BUG" "[$P300]")"
 printf '208\tabc\tThe fix landed somewhere else entirely.\n' > "$WORK/fixprs-bad.tsv"
 FIXPRS_FILE="$WORK/fixprs-bad.tsv" expect_ms "malformed override file is refused" 2 "PR numbers must be" "$(issue 200 "$BUG" '[]')"
+
+# --- gate (#6074) --------------------------------------------------------------
+echo
+echo "check-e2e-proof.py gate: behaviour changes move the release gate"
+# Test PR 9 updates the gate for backend PR #1 (the PR itself, not an issue).
+GATE_WORLD='.GET["repos/\(env.T)/pulls/9"] = {number: 9, state: "open", merged: false, base: {ref: "main"},
+              title: "test(dtf): quota refusals answer 403 (artifact-keeper#1)", body: "Moves the oracle to 403."}
+  | .GET["repos/\(env.T)/pulls/9/files"] = [{filename: "deploy-test/harness/tiers/quota/oracle.sh"}]'
+run_gate() {
+  ( PATH="$STUB:$PATH" GH_WORLD="$WORK/world.json" GH_WRITES="$WORK/writes.log" \
+      python3 "$SCRIPT" gate --event "$WORK/event.json" --repo "$R" >"$WORK/out.txt" 2>&1 )
+  echo $?
+}
+# <label> <expected-exit> <expected-substring> <event-jq> <world-jq>
+expect_gate() {
+  local label="$1" want="$2" needle="$3" got
+  setup "$4" "$GATE_WORLD | $5"
+  got="$(run_gate)"
+  if [ "$got" != "$want" ]; then
+    fail "$label: expected exit $want, got $got"; sed 's/^/        /' "$WORK/out.txt" >&2
+  elif ! grep -qF -- "$needle" "$WORK/out.txt"; then
+    fail "$label: exit $got correct but output lacks '$needle'"; sed 's/^/        /' "$WORK/out.txt" >&2
+  else
+    pass "$label (exit $got)"
+  fi
+}
+BC='| .pull_request.labels = [{name: "behaviour-change"}]'
+expect_gate "unlabelled PR -> no gate test needed" 0 "no gate test needed" '.' '.'
+expect_gate "behaviour-change, no line -> FAIL" 1 "missing gate test" ". $BC" '.'
+expect_gate "breaking-change turns the rule on too" 1 "missing gate test" \
+  '.pull_request.labels = [{name: "breaking-change"}]' '.'
+expect_gate "Gate: test PR naming this PR -> PASS" 0 "updates the gate" "$(body $'Closes #101\nGate: artifact-keeper-test#9') $BC" '.'
+expect_gate "bulleted, owner-qualified Gate line -> PASS" 0 "updates the gate" \
+  "$(body $'Closes #101\n- Gate: artifact-keeper/artifact-keeper-test#9') $BC" '.'
+expect_gate "test PR naming a linked issue instead -> PASS" 0 "updates the gate" \
+  "$(body $'Closes #101\nGate: artifact-keeper-test#9') $BC" '.GET["repos/\(env.T)/pulls/9"].title = "test(dtf): x (artifact-keeper#101)"'
+expect_gate "an E2E: test-PR line counts as the gate test" 0 "updates the gate" \
+  "$(body $'Closes #101\nE2E: artifact-keeper-test#9') $BC" '.'
+expect_gate "E2E: tier line is not a gate update -> FAIL" 1 "missing gate test" \
+  "$(body $'Closes #101\nE2E: tier range-serves-1120') $BC" '.'
+expect_gate "Gate line inside an HTML comment does not count" 1 "missing gate test" \
+  "$(body $'Closes #101\n<!--\nGate: artifact-keeper-test#9\n-->') $BC" '.'
+expect_gate "Gate line inside a code block does not count" 1 "missing gate test" \
+  "$(body $'Closes #101\n```\nGate: artifact-keeper-test#9\n```') $BC" '.'
+expect_gate "Gate-Exempt inside inline code does not count" 1 "missing gate test" \
+  "$(body $'Closes #101\n`Gate-Exempt: the gate never asserted this field`') $BC" '.'
+expect_gate "unrecognised Gate line -> FAIL" 1 "unrecognised gate line" \
+  "$(body $'Closes #101\nGate: tier quota') $BC" '.'
+expect_gate "test PR that does not exist -> FAIL" 1 "is not a pull request" \
+  "$(body $'Closes #101\nGate: artifact-keeper-test#8') $BC" '.'
+expect_gate "test PR closed without merging -> FAIL" 1 "closed without merging" \
+  "$(body $'Closes #101\nGate: artifact-keeper-test#9') $BC" '.GET["repos/\(env.T)/pulls/9"].state = "closed"'
+expect_gate "merged test PR -> PASS" 0 "merged" \
+  "$(body $'Closes #101\nGate: artifact-keeper-test#9') $BC" '.GET["repos/\(env.T)/pulls/9"] |= (.state = "closed" | .merged = true)'
+expect_gate "test PR touching neither tiers nor tests -> FAIL" 1 "touches neither" \
+  "$(body $'Closes #101\nGate: artifact-keeper-test#9') $BC" '.GET["repos/\(env.T)/pulls/9/files"] = [{filename: "README.md"}]'
+expect_gate "test PR naming neither this PR nor its issues -> FAIL" 1 "does not name artifact-keeper#1 or artifact-keeper#101" \
+  "$(body $'Closes #101\nGate: artifact-keeper-test#9') $BC" '.GET["repos/\(env.T)/pulls/9"].title = "test(dtf): x (artifact-keeper#999)"'
+expect_gate "release-line PR citing a main test PR -> FAIL" 1 "must target the same-named branch" \
+  "$(body $'Closes #101\nGate: artifact-keeper-test#9') $BC | .pull_request.base.ref = \"release/1.11.x\"" '.'
+expect_gate "two Gate lines, one bad -> FAIL" 1 "is not a pull request" \
+  "$(body $'Closes #101\nGate: artifact-keeper-test#9\nGate: artifact-keeper-test#8') $BC" '.'
+expect_gate "Gate-Exempt with a reason -> PASS" 0 "exempt: no gate tier asserts the old default" \
+  "$(body $'Closes #101\nGate-Exempt: no gate tier asserts the old default') $BC" '.'
+expect_gate "Gate-Exempt with no reason -> FAIL" 1 "needs a reason" \
+  "$(body $'Closes #101\nGate-Exempt: n/a') $BC" '.'
+expect_gate "API failure is INFRA, not a verdict" 2 "INFRA" \
+  "$(body $'Closes #101\nGate: artifact-keeper-test#9') $BC" '.GET["repos/\(env.T)/pulls/9"] = "__FAIL__"'
+
+# --- the workflow's checkout (#6112) ---------------------------------------------
+echo
+echo "require-e2e-proof.yml: the checker comes from the default branch"
+# pull_request_target runs the default branch's workflow for PRs into every
+# branch; checking the script out at the PR's base ran a release line's copy,
+# and a line without it failed every PR. Every checkout must take the default
+# branch, and none may name the PR head.
+WF="$HERE/../../.github/workflows/require-e2e-proof.yml"
+wf_refs="$(python3 - "$WF" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+steps = re.split(r"\n\s*- (?:name|uses):", text)
+for st in steps:
+    if "actions/checkout@" in st:
+        m = re.search(r"^\s*ref:\s*(.+?)\s*$", st, re.MULTILINE)
+        print(m.group(1) if m else "(none)")
+PY
+)"
+n_checkouts="$(printf '%s\n' "$wf_refs" | grep -c .)"
+if [ "$n_checkouts" -lt 2 ]; then
+  fail "expected a checkout in each of the two jobs, found $n_checkouts"
+elif printf '%s\n' "$wf_refs" | grep -vqxF '${{ github.event.repository.default_branch }}'; then
+  fail "a checkout does not take the default branch: $(printf '%s ' "$wf_refs")"
+else
+  pass "all $n_checkouts checkouts take the default branch"
+fi
+if grep -nE 'pull_request\.head|github\.head_ref' "$WF"; then
+  fail "the workflow names the PR head"
+else
+  pass "the workflow never names the PR head"
+fi
 
 echo
 if [ "$fails" -gt 0 ]; then

@@ -1,0 +1,15 @@
+<!--
+  NAT network for ak-vm-runner job VMs (#6072). VMs reach the internet
+  through the host's NAT; the ak-vm-egress filter (nwfilter.xml) stops them
+  reaching the host, the LAN, the cluster or each other.
+-->
+<network>
+  <name>ak-vm</name>
+  <forward mode='nat'/>
+  <bridge name='virbr-akvm' stp='on' delay='0'/>
+  <ip address='192.168.151.1' netmask='255.255.255.0'>
+    <dhcp>
+      <range start='192.168.151.10' end='192.168.151.250'/>
+    </dhcp>
+  </ip>
+</network>

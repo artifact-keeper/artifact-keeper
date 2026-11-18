@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Self-test for scripts/ci/release-preflight.sh checks 1, 3, 4, 5, 6 and 7
+# Self-test for scripts/ci/release-preflight.sh checks 1, 3, 4, 5, 6, 7 and 8
 # (issues #3308, #3309, #3338 and #3339).
 #
 # WHY THIS EXISTS
@@ -106,8 +106,35 @@ case "$1" in
         ;;
       *actions/workflows/docker-publish.yml/runs*)
         [ "${FAKE_API_FAIL-0}" = "1" ] && exit 1
-        run_id="${FAKE_RUN_ID-12345}"
-        [ -n "$run_id" ] && echo "$run_id ${FAKE_RUN_STATUS-completed}"
+        # Answers as the API does (a workflow_runs JSON document) and applies
+        # the caller's REAL --jq, so the script's filters are exercised.
+        # $FAKE_RUNS, one "<id> <status> <event> [<branch>]" per line, newest
+        # first, replays several runs for one sha (a PROMOTE dispatch sharing
+        # HEAD's sha, #6168). Otherwise one push run. <branch> defaults to
+        # the audited branch.
+        jqx=""; prev=""
+        for a in "$@"; do [ "$prev" = "--jq" ] && jqx="$a"; prev="$a"; done
+        br="${PREFLIGHT_REF:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null)}"; br="${br#refs/heads/}"
+        lines="${FAKE_RUNS-}"
+        if [ -z "${FAKE_RUNS+x}" ] || [ -z "$lines" ]; then
+          run_id="${FAKE_RUN_ID-12345}"
+          lines=""; [ -n "$run_id" ] && lines="$run_id ${FAKE_RUN_STATUS-completed} push"
+        fi
+        printf '%s\n' "$lines" | awk -v b="$br" 'NF { printf "%s\t%s\t%s\t%s\n", $1, $2, $3, (NF >= 4 ? $4 : b) }' \
+          | jq -R -s 'split("\n") | map(select(length > 0) | split("\t")
+                      | {id: (.[0] | tonumber), status: .[1], event: .[2], head_branch: .[3]})
+                      | {workflow_runs: .}' \
+          | jq --argjson n "$(sed -n 's/.*[?&]per_page=\([0-9]*\).*/\1/p' <<< "$2" | grep . || echo 30)" \
+               '.workflow_runs |= .[:$n]' \
+          | jq -r "$jqx"
+        exit 0
+        ;;
+      *commits/*/statuses*)
+        # Check 8's release-gate/nightly lookup. FAKE_NIGHTLY_<sha> is the
+        # "<state> <url>" the real --jq prints; unset means no status.
+        [ "${FAKE_NIGHTLY_FAIL-0}" = "1" ] && exit 1
+        sha="${2#*commits/}"; sha="${sha%%/*}"; v="FAKE_NIGHTLY_${sha}"
+        [ -n "${!v-}" ] && printf '%s\n' "${!v}"
         exit 0
         ;;
       *contents/.trivyignore*)
@@ -122,13 +149,36 @@ case "$1" in
   run)
     case "$2" in
       view)
-        # Which of the two `gh run view` calls is this? The jq for Security
-        # Scan mentions that name; the other is the manifest.
-        if printf '%s ' "$@" | grep -q 'Security Scan'; then
-          echo "${FAKE_SECURITY_SCAN-success}"
-        else
-          echo "${FAKE_MANIFEST-success}"
+        # Builds the run's jobs document and applies the caller's REAL --jq.
+        # Per-run FAKE_SECURITY_SCAN_<id> / FAKE_MANIFEST_<id> fall back to
+        # the global answers; FAKE_FAILED_JOB_<id> adds a failed build job.
+        jqx=""; prev=""
+        for a in "$@"; do [ "$prev" = "--jq" ] && jqx="$a"; prev="$a"; done
+        # FAKE_FAILED_CONCLUSION_<id> (default failure) is that job's
+        # conclusion; FAKE_NO_JOBS_<id>=1 lists no jobs (a run cancelled
+        # before starting); FAKE_VIEW_FAIL_<id>=1 makes the call fail.
+        sv="FAKE_SECURITY_SCAN_$3"; mv="FAKE_MANIFEST_$3"; fv="FAKE_FAILED_JOB_$3"
+        cv="FAKE_FAILED_CONCLUSION_$3"; nv="FAKE_NO_JOBS_$3"; xv="FAKE_VIEW_FAIL_$3"
+        ov="FAKE_NO_SCAN_JOB_$3"  # =1: the run lists jobs but no Security Scan
+        [ "${!xv-0}" = "1" ] && exit 1
+        if [ "${!nv-0}" = "1" ]; then echo '{"jobs":[]}' | jq -r "$jqx"; exit 0; fi
+        if [ "${!ov-0}" = "1" ]; then
+          echo '{"jobs":[{"name":"Resolve inputs","conclusion":"success"}]}' | jq -r "$jqx"; exit 0
         fi
+        # The image build job: FAKE_FAILED_JOB_<id> names a failed one;
+        # otherwise a PROMOTE shape (Security Scan skipped) skips it under
+        # its unexpanded matrix name, and anything else built it.
+        # FAKE_EXTRA_FAILED_<id> adds a failed non-build job (e.g. a re-tag).
+        ev="FAKE_EXTRA_FAILED_$3"
+        jq -nc --arg s "${!sv-${FAKE_SECURITY_SCAN-success}}" --arg m "${!mv-${FAKE_MANIFEST-success}}" \
+               --arg f "${!fv-}" --arg fc "${!cv-failure}" --arg e "${!ev-}" \
+          '{jobs: ([{name: "Security Scan", conclusion: $s},
+                    {name: "Backend Multi-Arch Manifest", conclusion: $m}]
+                   + (if $f != "" then [{name: $f, conclusion: $fc}]
+                      elif $s == "skipped" then [{name: "Backend (${{ matrix.platform }})", conclusion: "skipped"}]
+                      else [{name: "Backend (linux/amd64)", conclusion: "success"}] end)
+                   + (if $e == "" then [] else [{name: $e, conclusion: "failure"}] end))}' \
+          | jq -r "$jqx"
         ;;
     esac
     ;;
@@ -196,6 +246,182 @@ FAKE_RUN_ID="" FAKE_SECURITY_SCAN=success FAKE_MANIFEST=success \
 #     measurement (#3338).
 FAKE_RUN_STATUS=in_progress FAKE_SECURITY_SCAN=success FAKE_MANIFEST=success \
   expect "run still in progress -> NOT READY (wait)" 1 "still 'in_progress'"
+
+# 4d. THE 1.11.14 PROMOTE REGRESSION (#6168: run 44116256357 over push run
+#     44080746556 on e808fdac). release-promote.yml dispatches a PROMOTE on
+#     main; its head_sha is HEAD's. It skips Security Scan, fails no job, and
+#     its re-tag manifest job is green. Taking "the newest run for the sha"
+#     read it as HEAD's build and refused every cut. The push run is the build.
+FAKE_RUNS=$'900 completed workflow_dispatch\n800 completed push' \
+FAKE_SECURITY_SCAN_900=skipped FAKE_MANIFEST_900=success \
+FAKE_SECURITY_SCAN_800=success FAKE_MANIFEST_800=success \
+  expect "newer PROMOTE dispatch on HEAD's sha -> push run decides, READY" 0 "run 800 (push) is the newest build"
+
+# 4e. ...and a RED push run still decides beside a green PROMOTE: a re-tag
+#     must not launder a failed build.
+FAKE_RUNS=$'900 completed workflow_dispatch\n800 completed push' \
+FAKE_SECURITY_SCAN_900=skipped FAKE_MANIFEST_900=success \
+FAKE_SECURITY_SCAN_800=failure FAKE_MANIFEST_800=skipped \
+  expect "red push run beside a green PROMOTE -> NOT READY" 1 "did NOT cleanly publish"
+
+# 4f. No push run (a docs-only tip, #3629) and only a PROMOTE: nothing built
+#     HEAD. Not a pass.
+FAKE_RUNS='900 completed workflow_dispatch' \
+FAKE_SECURITY_SCAN_900=skipped FAKE_MANIFEST_900=success \
+  expect "only a PROMOTE dispatch for HEAD -> NOT READY (not built)" 1 "NOT been built"
+
+# 4g. No push run, a hand-dispatched BUILD older than a PROMOTE: the build
+#     decides (the documented "trigger Docker Publish on this commit" path).
+FAKE_RUNS=$'901 completed workflow_dispatch\n700 completed workflow_dispatch' \
+FAKE_SECURITY_SCAN_901=skipped FAKE_MANIFEST_901=success \
+FAKE_SECURITY_SCAN_700=success FAKE_MANIFEST_700=success \
+  expect "hand-dispatched build under a PROMOTE -> READY" 0 "run 901 (workflow_dispatch) built nothing"
+
+# 4h. A FAILED hand-dispatched build also has Security Scan skipped (its build
+#     job failed first). It is a build, not a promote: it stays the verdict,
+#     and must not read as "not built" or fall through to an older run.
+FAKE_RUNS=$'902 completed workflow_dispatch\n700 completed workflow_dispatch' \
+FAKE_SECURITY_SCAN_902=skipped FAKE_MANIFEST_902=skipped FAKE_FAILED_JOB_902="Backend (linux/amd64)" \
+FAKE_SECURITY_SCAN_700=success FAKE_MANIFEST_700=success \
+  expect "failed hand-dispatched build (scan skipped) -> its red decides" 1 "run 902: Security Scan=skipped"
+
+# 4i. A red push run, then a NEWER green build dispatched on the same branch:
+#     someone rebuilt the commit; the green rebuild decides.
+FAKE_RUNS=$'903 completed workflow_dispatch\n800 completed push' \
+FAKE_SECURITY_SCAN_903=success FAKE_MANIFEST_903=success \
+FAKE_SECURITY_SCAN_800=failure FAKE_MANIFEST_800=skipped \
+  expect "red push run, newer green rebuild -> READY" 0 "run 903 (workflow_dispatch) is the newest build"
+
+# 4j. The same sha pushed to ANOTHER branch is not this ref's build, and a
+#     scheduled run never counts (the real --jq filter drops it).
+FAKE_RUNS=$'905 completed schedule\n904 completed push release/1.11.x' \
+FAKE_SECURITY_SCAN_904=success FAKE_MANIFEST_904=success \
+FAKE_SECURITY_SCAN_905=success FAKE_MANIFEST_905=success \
+  expect "only another branch's push and a schedule run -> NOT READY (not built)" 1 "NOT been built"
+
+# 4k. ...while a green build of the sha on another branch does not mask a
+#     red one on this branch.
+FAKE_RUNS=$'904 completed push release/1.11.x\n800 completed push' \
+FAKE_SECURITY_SCAN_904=success FAKE_MANIFEST_904=success \
+FAKE_SECURITY_SCAN_800=failure FAKE_MANIFEST_800=skipped \
+  expect "green push on another branch, red here -> NOT READY" 1 "run 800: Security Scan=failure"
+
+# 4l. THE RELEASE CANDIDATE PATH: release-candidate.yml dispatches preflight
+#     with ref=<sha>, so PREFLIGHT_REF names no branch. The branch is the one
+#     the sha's push run is on; a review of #6167 caught a version that
+#     filtered on the sha and reported every candidate "not built".
+PREFLIGHT_REF=0123456789abcdef0123456789abcdef01234567 \
+FAKE_RUNS=$'900 completed workflow_dispatch main\n800 completed push main' \
+FAKE_SECURITY_SCAN_900=skipped FAKE_MANIFEST_900=success \
+FAKE_SECURITY_SCAN_800=success FAKE_MANIFEST_800=success \
+  expect "candidate path: sha ref, push run on main -> READY" 0 "the sha's runs are on main"
+
+# 4m. ...and with push runs on SEVERAL branches and no branch named, every
+#     branch's newest build must be green: a green release/* build must not
+#     vouch for a red main.
+PREFLIGHT_REF=HEAD \
+FAKE_RUNS=$'904 completed push release/1.11.x\n800 completed push main' \
+FAKE_SECURITY_SCAN_904=success FAKE_MANIFEST_904=success \
+FAKE_SECURITY_SCAN_800=failure FAKE_MANIFEST_800=skipped \
+  expect "no branch named, push runs on two branches, one red -> NOT READY" 1 "run 800: Security Scan=failure"
+
+# 4n. PREFLIGHT_BRANCH resolves it.
+PREFLIGHT_REF=HEAD PREFLIGHT_BRANCH=main \
+FAKE_RUNS=$'904 completed push release/1.11.x\n800 completed push main' \
+FAKE_SECURITY_SCAN_904=success FAKE_MANIFEST_904=success \
+FAKE_SECURITY_SCAN_800=failure FAKE_MANIFEST_800=skipped \
+  expect "PREFLIGHT_BRANCH names the branch -> its red decides" 1 "run 800: Security Scan=failure"
+
+# 4o. A NEWER red rebuild over a green push run: the newest build decides,
+#     in either direction.
+FAKE_RUNS=$'906 completed workflow_dispatch\n800 completed push' \
+FAKE_SECURITY_SCAN_906=failure FAKE_MANIFEST_906=skipped \
+FAKE_SECURITY_SCAN_800=success FAKE_MANIFEST_800=success \
+  expect "newer red rebuild over a green push run -> NOT READY" 1 "run 906: Security Scan=failure"
+
+# 4p. An OLDER green dispatch under a red push run does not rescue it.
+FAKE_RUNS=$'800 completed push\n700 completed workflow_dispatch' \
+FAKE_SECURITY_SCAN_800=failure FAKE_MANIFEST_800=skipped \
+FAKE_SECURITY_SCAN_700=success FAKE_MANIFEST_700=success \
+  expect "older green dispatch under a red push run -> NOT READY" 1 "run 800: Security Scan=failure"
+
+# 4q. A dispatch cancelled before any job (it lists no jobs) built nothing;
+#     it must not block the sha with INFRA forever.
+FAKE_RUNS=$'907 completed workflow_dispatch\n800 completed push' \
+FAKE_NO_JOBS_907=1 \
+FAKE_SECURITY_SCAN_800=success FAKE_MANIFEST_800=success \
+  expect "jobless cancelled dispatch over a green push run -> READY" 0 "run 907 (workflow_dispatch) built nothing"
+
+# 4r. A newer dispatch whose jobs cannot be read is INFRA, not a skip.
+FAKE_RUNS=$'908 completed workflow_dispatch\n800 completed push' \
+FAKE_VIEW_FAIL_908=1 \
+FAKE_SECURITY_SCAN_800=success FAKE_MANIFEST_800=success \
+  expect "unreadable newer dispatch -> INFRA" 2 "could not read job conclusions from run 908"
+
+# 4s. A build job CANCELLED (or timed out) also skips Security Scan; that run
+#     built, and its result decides.
+FAKE_RUNS=$'909 completed workflow_dispatch\n800 completed push' \
+FAKE_SECURITY_SCAN_909=skipped FAKE_MANIFEST_909=skipped \
+FAKE_FAILED_JOB_909="Backend (linux/amd64)" FAKE_FAILED_CONCLUSION_909=cancelled \
+FAKE_SECURITY_SCAN_800=success FAKE_MANIFEST_800=success \
+  expect "newer rebuild with a cancelled build job -> NOT READY" 1 "run 909: Security Scan=skipped"
+
+# 4t. A run still in flight above a completed build blocks (no verdict yet).
+FAKE_RUNS=$'910 in_progress workflow_dispatch\n800 completed push' \
+FAKE_SECURITY_SCAN_800=success FAKE_MANIFEST_800=success \
+  expect "in-flight dispatch above a green push run -> NOT READY (wait)" 1 "still 'in_progress'"
+
+# 4u. A dispatch that lists jobs but NO Security Scan job cannot be
+#     classified: INFRA, never skipped as "built nothing" (that would let an
+#     older run decide).
+FAKE_RUNS=$'911 completed workflow_dispatch\n700 completed workflow_dispatch' \
+FAKE_NO_SCAN_JOB_911=1 \
+FAKE_SECURITY_SCAN_700=success FAKE_MANIFEST_700=success \
+  expect "dispatch with no Security Scan job -> INFRA" 2 "could not read job conclusions from run 911"
+
+# 4v. A build job that TIMED OUT, like a failed or cancelled one, means the
+#     run built.
+FAKE_RUNS=$'912 completed workflow_dispatch\n800 completed push' \
+FAKE_SECURITY_SCAN_912=skipped FAKE_MANIFEST_912=skipped \
+FAKE_FAILED_JOB_912="Backend (linux/amd64)" FAKE_FAILED_CONCLUSION_912=timed_out \
+FAKE_SECURITY_SCAN_800=success FAKE_MANIFEST_800=success \
+  expect "newer rebuild with a timed-out build job -> NOT READY" 1 "run 912: Security Scan=skipped"
+
+# 4w. A tag ref audits the tag's own runs (head_branch is the tag name).
+PREFLIGHT_REF=refs/tags/v9.9.9 \
+FAKE_RUNS=$'913 completed push v9.9.9\n800 completed push main' \
+FAKE_SECURITY_SCAN_913=success FAKE_MANIFEST_913=success \
+FAKE_SECURITY_SCAN_800=failure FAKE_MANIFEST_800=skipped \
+  expect "tag ref: the tag's run decides, main's red does not" 0 "run 913 (push) is the newest build of this sha on v9.9.9"
+
+# 4x. No branch named and dispatch-only runs on two branches: the same
+#     every-branch rule.
+PREFLIGHT_REF=HEAD \
+FAKE_RUNS=$'914 completed workflow_dispatch release/1.11.x\n915 completed workflow_dispatch main' \
+FAKE_SECURITY_SCAN_914=success FAKE_MANIFEST_914=success \
+FAKE_SECURITY_SCAN_915=failure FAKE_MANIFEST_915=skipped \
+  expect "no branch named, dispatches on two branches, one red -> NOT READY" 1 "run 915: Security Scan=failure"
+
+# 4y. Order is by run id, not by the API's answer order.
+FAKE_RUNS=$'800 completed push\n916 completed workflow_dispatch' \
+FAKE_SECURITY_SCAN_916=failure FAKE_MANIFEST_916=skipped \
+FAKE_SECURITY_SCAN_800=success FAKE_MANIFEST_800=success \
+  expect "answer listed oldest first -> the newer red rebuild still decides" 1 "run 916: Security Scan=failure"
+
+# 4z. Right after a release line is cut from this commit, its push runs on
+#     both branches are green: READY, not a dead end.
+PREFLIGHT_REF=0123456789abcdef0123456789abcdef01234567 \
+FAKE_RUNS=$'917 completed push release/1.12.x\n800 completed push main' \
+FAKE_SECURITY_SCAN_917=success FAKE_MANIFEST_917=success \
+FAKE_SECURITY_SCAN_800=success FAKE_MANIFEST_800=success \
+  expect "sha built green on two branches -> READY" 0 "every branch's newest build must be green"
+
+# 4aa. A PROMOTE that FAILS in a re-tag job still built nothing: the green
+#      push run decides (the #6168 class, from a review of #6167).
+FAKE_RUNS=$'918 completed workflow_dispatch\n800 completed push' \
+FAKE_SECURITY_SCAN_918=skipped FAKE_MANIFEST_918=success FAKE_EXTRA_FAILED_918="Apply Floating Tags" \
+FAKE_SECURITY_SCAN_800=success FAKE_MANIFEST_800=success \
+  expect "failed PROMOTE over a green push run -> READY" 0 "run 918 (workflow_dispatch) built nothing"
 
 # 5. The explicit human override reports the red but does not block. Separate
 #    from PREFLIGHT_SKIP_DOCKER_HEALTH on purpose: "I looked, it is red,
@@ -1041,6 +1267,49 @@ PREFLIGHT_E2E_PROOF_MODE=enforce PREFLIGHT_E2E_PROOF_CMD="$REAL_E2E" PREFLIGHT_T
 PREFLIGHT_E2E_PROOF_MODE=enforce PREFLIGHT_E2E_PROOF_CMD="$REAL_E2E" PREFLIGHT_TESTS_DIR="$TESTS7" \
   FAKE_E2E_MILESTONES='[{"number":9,"title":"9.9.9"}]' FAKE_E2E_GRAPHQL="$(e2e_graphql "$(e2e_issue 300)")" \
   expect "7k. real script: every bug covered by a wired tier -> READY" 0 "every closed bug in 9.9.9"
+
+echo "release-preflight check 8 (nightly full gate result, #6075)"
+
+# A fixture line: GREEN (code, measured green by the nightly) <- PREP (only
+# CHANGELOG, release notes and the X.Y.Z bump) <- CODE (a real change).
+# Check 8 is advisory, so every case exits 0; the assertions are about what
+# it says.
+REPO8="$WORK/repo8"
+git clone -q "$REPO_DIR" "$REPO8"
+git -C "$REPO8" remote set-url origin https://github.com/artifact-keeper/artifact-keeper.git
+c8() { git -C "$REPO8" -c user.email=t@t -c user.name=t commit -qam "$1" && git -C "$REPO8" rev-parse HEAD; }
+echo 'fn a() {}' > "$REPO8/lib.rs"; git -C "$REPO8" add lib.rs
+SHA_GREEN="$(c8 'code: measured green')"
+mkdir -p "$REPO8/.github/release-notes"; echo notes > "$REPO8/.github/release-notes/9.9.10.md"
+echo '## [9.9.10]' > "$REPO8/CHANGELOG.md"; git -C "$REPO8" add -A
+for f in Cargo.toml backend/src/api/openapi.rs Cargo.lock; do sed -i 's/9\.9\.9/9.9.10/' "$REPO8/$f"; done
+SHA_PREP="$(c8 'chore(release): 9.9.10')"
+SAVED_REPO_DIR="$REPO_DIR"; REPO_DIR="$REPO8"
+U=https://g/runs/1
+# with_nightly <sha> <state> <expect args...>: the nightly status on one commit.
+with_nightly() {
+  local v="FAKE_NIGHTLY_$1"; export "$v=$2 $U"; shift 2
+  expect "$@"; unset "$v"
+}
+
+with_nightly "$SHA_PREP" success "8a. green on HEAD -> ok" 0 "the nightly full gate was green on this commit"
+with_nightly "$SHA_GREEN" success "8b. a bookkeeping-only prep on a green commit -> ok" 0 "differs from it only in release bookkeeping"
+with_nightly "$SHA_GREEN" failure "8c. red on the commit the prep sits on -> warn, still READY" 0 "the nightly full gate was FAILURE on ${SHA_GREEN:0:7}"
+
+echo 'fn b() {}' >> "$REPO8/lib.rs"; SHA_CODE="$(c8 'code after the prep')"
+with_nightly "$SHA_GREEN" success "8d. a code change since the green commit -> warn, names the commit to cut from" 0 "is ${SHA_GREEN:0:7} (code: measured green)"
+if grep -qF "no nightly full gate result for this commit" "$WORK/out.txt"; then pass "8d. says HEAD itself is not covered"; else fail "8d. no 'not covered' warning"; fi
+
+git -C "$REPO8" reset -q --hard "$SHA_GREEN"
+sed -i 's/^version = "9.9.9"$/version = "9.9.9"\nserde = "1"/' "$REPO8/Cargo.toml"; SHA_DEP="$(c8 'deps: add serde')"
+with_nightly "$SHA_GREEN" success "8e. a Cargo.toml change that is not the version line is not bookkeeping" 0 "no nightly full gate result for this commit"
+[ -n "$SHA_DEP" ] && [ -n "$SHA_CODE" ] || fail "8. fixture commits"
+
+FAKE_NIGHTLY_FAIL=1 \
+  expect "8f. the statuses API fails -> warn, never INFRA" 0 "check 8 not measured (advisory)"
+PREFLIGHT_SKIP_NIGHTLY_GATE=1 FAKE_NIGHTLY_FAIL=1 \
+  expect "8g. PREFLIGHT_SKIP_NIGHTLY_GATE=1 -> not run" 0 "PREFLIGHT_SKIP_NIGHTLY_GATE=1; skipped."
+REPO_DIR="$SAVED_REPO_DIR"
 
 echo
 if [ "$fails" -eq 0 ]; then

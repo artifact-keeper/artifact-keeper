@@ -18,6 +18,7 @@ echo "Version: $TEST_VERSION"
 echo "==> Generating test package..."
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
+export NPM_CONFIG_USERCONFIG="$WORK_DIR/.npmrc"
 
 cd "$WORK_DIR"
 
