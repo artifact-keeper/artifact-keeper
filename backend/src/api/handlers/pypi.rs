@@ -3858,6 +3858,11 @@ static RESOLVER_INDEX_MEMO: Lazy<
 /// Only successful reads are memoized — an upstream error must not be pinned
 /// for the window, and the negative-cache behaviour of the fetch path is left
 /// exactly as it was.
+///
+/// Concurrent cold misses for one key share a single upstream read (#5983),
+/// `uv` and pip ask for several sidecars of one project at once. The request
+/// that did the read keeps its own error, the ones that waited on it get
+/// [`shared_resolver_index_error`]
 async fn fetch_resolver_index(
     proxy: &crate::services::proxy_service::ProxyService,
     repo_id: uuid::Uuid,
@@ -3871,26 +3876,43 @@ async fn fetch_resolver_index(
         normalized.to_string(),
         upstream_index_path.to_string(),
     );
-    if let Some(hit) = RESOLVER_INDEX_MEMO.get(&key).await {
-        return Ok((hit.0.clone(), hit.1.clone()));
-    }
-
-    let (index_bytes, _ct, effective_url) = proxy_helpers::proxy_fetch_uncached(
-        proxy,
-        repo_id,
-        repo_key,
-        effective_upstream,
-        upstream_index_path,
-    )
-    .await?;
-
-    RESOLVER_INDEX_MEMO
-        .insert(
-            key,
-            std::sync::Arc::new((index_bytes.clone(), effective_url.clone())),
-        )
+    let mut leader_error: Option<Response> = None;
+    let read = RESOLVER_INDEX_MEMO
+        .try_get_with(key, async {
+            match proxy_helpers::proxy_fetch_uncached(
+                proxy,
+                repo_id,
+                repo_key,
+                effective_upstream,
+                upstream_index_path,
+            )
+            .await
+            {
+                Ok((index_bytes, _ct, effective_url)) => {
+                    Ok(std::sync::Arc::new((index_bytes, effective_url)))
+                }
+                Err(resp) => {
+                    let status = resp.status();
+                    leader_error = Some(resp);
+                    Err(status)
+                }
+            }
+        })
         .await;
-    Ok((index_bytes, effective_url))
+    match read {
+        Ok(hit) => Ok((hit.0.clone(), hit.1.clone())),
+        Err(status) => Err(leader_error.unwrap_or_else(|| shared_resolver_index_error(*status))),
+    }
+}
+
+/// Error for a request that waited on another request's failed index read
+fn shared_resolver_index_error(status: StatusCode) -> Response {
+    let body = if status == StatusCode::NOT_FOUND {
+        "Artifact not found upstream"
+    } else {
+        "Upstream index fetch failed"
+    };
+    (status, body).into_response()
 }
 
 /// Resolve the real download URL for a file hosted by a remote PyPI
@@ -17090,6 +17112,97 @@ mod tests {
             cold_headers.get(CONTENT_ENCODING),
             "cached sidecar must carry the same Content-Encoding"
         );
+    }
+
+    /// #5983: four cold sidecars of one project requested at once read the
+    /// simple index once, not once each. The index answers slowly so all four
+    /// are in flight before the first read lands
+    #[tokio::test]
+    async fn test_resolver_index_concurrent_cold_misses_share_one_read_5983() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+
+        let project = "fanout5983";
+        let wheels: Vec<String> = (1..=4)
+            .map(|i| format!("fanout5983-1.{i}-py3-none-any.whl"))
+            .collect();
+        let anchors: String = wheels
+            .iter()
+            .map(|w| {
+                format!(
+                    "<a href=\"/packages/{w}\" data-dist-info-metadata=\"sha256=deadbeef\">{w}</a>"
+                )
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(format!("<html><body>{anchors}</body></html>"))
+                    .set_delay(std::time::Duration::from_millis(300)),
+            )
+            .mount(&upstream)
+            .await;
+        for w in &wheels {
+            Mock::given(method("GET"))
+                .and(path(format!("/packages/{w}.metadata")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(format!("Metadata-Version: 2.1\nName: {w}\n")),
+                )
+                .mount(&upstream)
+                .await;
+        }
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let send = |w: &str| {
+            tdh::send_with_headers(
+                tdh::router_anon(super::router(), state.clone()),
+                tdh::get(format!("/{}/simple/{project}/{w}.metadata", fx.repo_key)),
+            )
+        };
+        let (a, b, c, d) = tokio::join!(
+            send(&wheels[0]),
+            send(&wheels[1]),
+            send(&wheels[2]),
+            send(&wheels[3])
+        );
+        let reads = upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == format!("/simple/{project}/"))
+            .count();
+
+        fx.teardown().await;
+
+        for (status, body, _) in [&a, &b, &c, &d] {
+            assert_eq!(
+                *status,
+                StatusCode::OK,
+                "body: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        assert_eq!(
+            reads, 1,
+            "concurrent cold sidecars must share one index read"
+        );
+    }
+
+    #[test]
+    fn test_shared_resolver_index_error_keeps_status_5983() {
+        let not_found = shared_resolver_index_error(StatusCode::NOT_FOUND);
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+        let unavailable = shared_resolver_index_error(StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     /// #3356 item 3. The #3333 regression test above covers the HANDLER half of
