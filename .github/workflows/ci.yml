@@ -978,6 +978,9 @@ jobs:
       # `test-shards.py filter` skips its tests in all but the one leg its
       # file maps to, so each still runs exactly once (`all()` when every
       # module is gated, the normal case).
+      #
+      # `--profile ci` (.config/nextest.toml): no retries, and a JUnit report
+      # at target/nextest/ci/junit.xml for the two steps below (#6172).
       - name: Run unit tests
         id: unit
         env:
@@ -994,10 +997,27 @@ jobs:
           filter="$(python3 scripts/ci/test-shards.py filter "${{ matrix.shard }}")"
           echo "nextest filter for this leg: ${filter}"
           if [ "${{ matrix.shard }}" = "$BIN_SHARD" ]; then
-            cargo nextest run --workspace --lib --bins --features "test-shard-${{ matrix.shard }}" -E "$filter" --test-threads 8 --no-fail-fast
+            cargo nextest run --workspace --lib --bins --features "test-shard-${{ matrix.shard }}" -E "$filter" --test-threads 8 --no-fail-fast --profile ci
           else
-            cargo nextest run --workspace --lib --features "test-shard-${{ matrix.shard }}" -E "$filter" --test-threads 8 --no-fail-fast
+            cargo nextest run --workspace --lib --features "test-shard-${{ matrix.shard }}" -E "$filter" --test-threads 8 --no-fail-fast --profile ci
           fi
+
+      # Report only: lists the leg's failed and flaky tests in the job
+      # summary, with an annotation each, and never changes the verdict
+      # (#6172). The `ci` profile does not retry, so "flaky" stays empty
+      # here until a retrying profile runs; the JUnit is the per-test record.
+      - name: Summarise unit test results
+        if: ${{ !cancelled() && steps.unit.outcome != 'skipped' }}
+        run: python3 scripts/ci/nextest-junit-summary.py "Unit tests (${{ matrix.shard }})" target/nextest/ci/junit.xml >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload unit test JUnit report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: junit-unit-${{ matrix.shard }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 7
 
       # This leg's share of the report. Only a fully green run yields one (a
       # failed run's counters are partial); `coverage-gates` then reports
@@ -1264,7 +1284,9 @@ jobs:
           AK_TESTS_REQUIRE_DB: "1"
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: |
-          cargo nextest run --workspace --no-tests=fail --test-threads 8 \
+          rm -f target/nextest/ci/junit.xml
+          trap 'mkdir -p junit && cp target/nextest/ci/junit.xml junit/tier1.xml 2>/dev/null || true' EXIT
+          cargo nextest run --workspace --no-tests=fail --test-threads 8 --profile ci \
             --test workflow_scan_gate_tests \
             --test security_tests \
             --test security_regression_tests \
@@ -1434,7 +1456,9 @@ jobs:
           AK_TESTS_REQUIRE_DB: "1"
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: |
-          cargo nextest run --workspace --no-tests=fail --no-fail-fast --test-threads 8 \
+          rm -f target/nextest/ci/junit.xml
+          trap 'mkdir -p junit && cp target/nextest/ci/junit.xml junit/tier2.xml 2>/dev/null || true' EXIT
+          cargo nextest run --workspace --no-tests=fail --no-fail-fast --test-threads 8 --profile ci \
             --run-ignored ignored-only \
             --test lifecycle_policy_tests \
             --test api_token_cache_flush_tests \
@@ -1512,10 +1536,29 @@ jobs:
           AK_TESTS_REQUIRE_DB: "1"
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: |
-          cargo nextest run --workspace --no-tests=fail \
+          rm -f target/nextest/ci/junit.xml
+          trap 'mkdir -p junit && cp target/nextest/ci/junit.xml junit/incus.xml 2>/dev/null || true' EXIT
+          cargo nextest run --workspace --no-tests=fail --profile ci \
             --run-ignored ignored-only \
             --test incus_upload_tests \
             test_chunked_upload_cross_repo_session_rejected
+
+      # Report only, as in the unit shards (#6172). Each nextest step above
+      # overwrites target/nextest/ci/junit.xml, so each copies its report to
+      # junit/ on exit; a step that did not run leaves no file, and the
+      # summary names it.
+      - name: Summarise integration test results
+        if: ${{ !cancelled() && steps.build.outcome != 'skipped' }}
+        run: python3 scripts/ci/nextest-junit-summary.py "Integration tests" junit/tier1.xml junit/tier2.xml junit/incus.xml >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload integration test JUnit reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: junit-integration
+          path: junit/
+          if-no-files-found: warn
+          retention-days: 7
 
       # The acceptance numbers for keeping this job on hosted PR runs: the
       # per-process peak RSS of each build pass is already in the job
@@ -2322,6 +2365,12 @@ jobs:
       # percentage. Throwaway trees, no cargo, ~1s.
       - name: Check the test-shard gates and the coverage merge
         run: bash scripts/ci/test-test-shards.sh
+
+      # The unit and integration jobs' JUnit summary is the only place a
+      # flaky pass shows (#6172); a parser that missed `<flakyFailure>`
+      # would hide it. Real nextest reports, no cargo, ~1s.
+      - name: Check the nextest JUnit summary names flaky and failed tests
+        run: bash scripts/ci/test-nextest-junit-summary.sh
 
       # The coverage merge gate (coverage-gates -> CI Complete). Three ways it
       # can silently stop measuring what it claims: counting inline
