@@ -38,7 +38,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -515,14 +514,17 @@ impl RootfsBuilder {
         let (name, parent_rel) = rel.split_last().expect("normalized path is non-empty");
         // Whiteouts (OCI image-spec layer.md). Matched on raw bytes so a
         // non-UTF-8 name still hides its lower-layer file.
-        if let Some(hidden) = name.as_bytes().strip_prefix(b".wh.") {
+        if let Some(hidden) = name.as_encoded_bytes().strip_prefix(b".wh.") {
             let Some(parent) = self.resolve(parent_rel, true, false)? else {
                 return Ok(());
             };
             if hidden == b".wh..opq" {
                 self.clear_lower(&parent, created)?;
-            } else if !hidden.is_empty() && hidden != b"." && hidden != b".." {
-                let victim = parent.join(OsStr::from_bytes(hidden));
+            } else if let Some(hidden) = (!hidden.is_empty() && hidden != b"." && hidden != b"..")
+                .then(|| os_str_from_bytes(hidden))
+                .flatten()
+            {
+                let victim = parent.join(hidden);
                 // A whiteout hides only what LOWER layers put there.
                 if !created.contains(&victim) {
                     remove_any(&victim)?;
@@ -558,7 +560,7 @@ impl RootfsBuilder {
             };
             let rewritten = self.confined_link_target(&parent, &link);
             remove_any(&target)?;
-            std::os::unix::fs::symlink(&rewritten, &target)
+            make_symlink(&rewritten, &target)
                 .map_err(|e| io_err("Failed to create symlink", &target, e))?;
             return Ok(());
         }
@@ -586,14 +588,8 @@ impl RootfsBuilder {
 
         if kind.is_file() || kind == tar::EntryType::Continuous {
             remove_any(&target)?;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut out = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc_o_nofollow())
-                .open(&target)
-                .map_err(|e| io_err("Failed to create", &target, e))?;
+            let mut out =
+                create_private(&target).map_err(|e| io_err("Failed to create", &target, e))?;
             std::io::copy(data, &mut out).map_err(|e| {
                 if e.to_string().contains(BUDGET_BREACH) {
                     budget_error()
@@ -776,7 +772,7 @@ fn libc_o_nofollow() -> i32 {
     libc::O_NOFOLLOW
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn libc_o_nofollow() -> i32 {
     0
 }
@@ -797,11 +793,54 @@ pub(crate) fn normalize_entry_path(path: &Path) -> Option<Vec<OsString>> {
 }
 
 fn create_dir(path: &Path) -> Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new()
-        .mode(0o755)
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o755);
+    }
+    builder
         .create(path)
         .map_err(|e| io_err("Failed to create directory", path, e))
+}
+
+// Platform seams (#6022). The unpacker runs for the OpenSCAP scanner, which
+// needs a Unix host; these keep the backend compiling for the Windows release
+// target. On Unix each one is exactly the code it replaced.
+
+/// The raw bytes of a whiteout's hidden name as an `OsStr`. On Unix any byte
+/// string is a valid name; elsewhere only UTF-8 is, and anything else is
+/// skipped.
+#[cfg(unix)]
+fn os_str_from_bytes(bytes: &[u8]) -> Option<&OsStr> {
+    use std::os::unix::ffi::OsStrExt;
+    Some(OsStr::from_bytes(bytes))
+}
+#[cfg(not(unix))]
+fn os_str_from_bytes(bytes: &[u8]) -> Option<&OsStr> {
+    std::str::from_utf8(bytes).ok().map(OsStr::new)
+}
+
+#[cfg(unix)]
+fn make_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+#[cfg(windows)]
+fn make_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+/// Create a new file the unpacker owns: 0600, refusing to follow a symlink
+/// at the final component.
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc_o_nofollow());
+    }
+    options.open(path)
 }
 
 /// Remove whatever is at `path` without following a symlink there.
@@ -819,10 +858,15 @@ fn remove_any(path: &Path) -> Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
         .map_err(|e| io_err("Failed to set mode on", path, e))
+}
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(ak_test_shard = "services-1")]
