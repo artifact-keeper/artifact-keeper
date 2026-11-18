@@ -80,7 +80,7 @@ case "$DECISION" in
       || refuse "Certified commit unknown" "CERT_SHA must be the full 40-character sha of the certified commit (got '${CERT_SHA}')."
     verifier="$(git show "${CERT_SHA}:${VERIFIER}" 2>/dev/null || true)"
     grep -q 'scanner_adapter_decision' <<<"$verifier" \
-      || refuse "Tagged commit cannot verify this certification" "scanner-adapter ${VERSION} stays, so the certification names the published :${VERSION} digest, but ${VERIFIER} at ${CERT_SHA:0:7} predates #4076 and would refuse it in release.yml AFTER the tag exists (a burned version). Backport #4076 to ${LINE} first (the verifier, its self-test and release-candidate.yml), then certify the backport commit."
+      || refuse "Tagged commit cannot verify this certification" "scanner-adapter ${VERSION} stays, so the certification names the published :${VERSION} digest, but ${VERIFIER} at ${CERT_SHA:0:7} predates #4076 and would refuse it in release.yml AFTER the tag exists (a burned version). Backport #4076 to ${LINE} first (the verifier and its self-test), then certify the backport commit."
     digest="$("$DIGEST_CMD" ghcr.io "$name" "$VERSION" 2>/dev/null || true)"
     [[ "$digest" =~ ^sha256: ]] \
       || refuse "Published scanner adapter unreadable" "ghcr.io/${name}:${VERSION} is '${digest:-unreadable}', though the decision found it published."

@@ -64,10 +64,8 @@ name: Nightly Release Gate
 #     deliberately NOT shared with release-candidate.yml, whose group is per
 #     commit (`release-candidate-<sha>`): a shared group would make a
 #     candidate wait for the nightly, which is the wrong way round, and
-#     GitHub groups have no priority. The candidate cannot cancel the nightly
-#     itself either: a maintenance line's candidate requires its
-#     release-candidate.yml to be byte-identical to main's, so touching that
-#     file costs a forward-port on every line. Hence the sentinel: the
+#     GitHub groups have no priority. Nor does the candidate cancel the
+#     nightly: the sentinel keeps that logic out of the candidate's file. The
 #     nightly yields, the candidate does nothing.
 #
 # TRACKING ISSUES (scripts/ci/nightly-gate-report.js)
