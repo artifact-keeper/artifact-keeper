@@ -524,44 +524,69 @@ fn acquire_ingest_extraction_keyed(
 // shedding the same 503 as before. The caps themselves do not change: a
 // waiting request holds no permit and decodes nothing, so concurrent decode
 // memory/CPU is still bounded by `global cap x per-archive budget` (#2561) and
-// one repository still gets at most its sub-limit (#2598). What a waiter does
-// hold is its connection and its request body. The upload handlers on this
-// path stage the body to a scratch file before decoding, so for most formats
-// that is a file descriptor and disk, not memory, but a few (pacman, the MCP
-// and agent-plugin uploads) hold the body as `Bytes`. The number of waiters is
-// therefore capped too, per repository and globally, and a request that finds
-// its queue full sheds at once, exactly as today. tokio's `Semaphore` is FIFO,
-// so waiters are admitted in arrival order and a fresh `try_acquire` cannot
-// overtake them.
+// one repository still gets at most its sub-limit (#2598). tokio's `Semaphore`
+// is FIFO, so waiters are admitted in arrival order and a fresh `try_acquire`
+// cannot overtake them.
+//
+// What a waiter does hold is its connection and its staged request body. The
+// upload handlers on this path stage the body to a scratch file before they
+// decode, so for almost every format that is a file descriptor and disk. Only
+// pacman holds the body as `Bytes`, and that buffer is already charged to
+// `UPLOAD_MEMORY_BUDGET_BYTES` before the handler runs. The number of waiters
+// is capped anyway, per repository and globally, and a request that finds its
+// line full sheds at once, exactly as before. A request waits in at most one
+// line at a time (its repository's, then the global one), and the lines are
+// separate, so the bound on parked requests is
+//
+//     global_queue + (global_cap + global_queue) / per_repo_cap * per_repo_queue
+//
+// because a repository's line is non-empty only while that repository holds
+// all `per_repo_cap` of its permits, and the permits held at once are at most
+// the decoding ones plus the global-line waiters. With the defaults that is
+// 32 + (8 + 32) / 4 * 8 = 112 parked requests, well under
+// `GLOBAL_MAX_CONCURRENCY` (512); one principal is further held to
+// `UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL` (64).
 //
 // Only the async seam waits. The synchronous `with_ingest_extraction` /
 // `acquire_ingest_extraction` cannot wait without blocking a runtime worker,
-// so they keep fast-failing.
+// so they keep fast-failing. Because tokio hands a freed permit to a queued
+// waiter before any `try_acquire` can see it, those synchronous callers
+// (RubyGems, conda, Debian, Hex, Composer, CocoaPods, VS Code, protobuf,
+// Incus, and the PyPI proxy/serve metadata paths) always shed while a line
+// they need is non-empty, i.e. during a burst of async uploads. Converting
+// them to the waiting seam is #6230.
 
 /// Default time, in seconds, an upload waits for an ingest-extraction permit
 /// before it is shed with 503. A single metadata decode takes milliseconds to a
-/// few seconds, so 15 s drains a queue of several uploads per slot, and it stays
-/// well inside the 120 s `GLOBAL_REQUEST_TIMEOUT_SECS` and the 60 s
-/// `UPLOAD_PROGRESS_WINDOW_SECS`, so a waiter is never killed by another
-/// timeout first.
+/// few seconds, so 15 s drains a queue of several uploads per slot.
+///
+/// The wait is NOT exempt from other timeouts. The native format upload routes
+/// (`/pypi/...`, `/pacman/...`, and most others) are not byte-transfer routes
+/// (`api::routes::is_byte_transfer_path`), so `GLOBAL_REQUEST_TIMEOUT_SECS`
+/// (default 120 s) covers the body transfer, this wait and everything after
+/// it together. [`MAX_INGEST_EXTRACTION_WAIT_SECS`] keeps the wait to a
+/// quarter of that default; an operator who lowers the request timeout should
+/// lower this wait with it, or a slow upload can hit the request timeout
+/// (a dropped connection) instead of the 503.
 #[cfg(not(test))]
 pub const DEFAULT_INGEST_EXTRACTION_WAIT_SECS: u64 = 15;
 
-/// #6221: the handler tests that deliberately saturate a repository's bucket
-/// to observe the shed would otherwise sit for the full production wait. The
-/// test binary waits 2 s instead; the env override and the queue caps are the
-/// same as in production.
+/// #6221: in the test binary the waiting handler tests run on real time and
+/// CI does not retry, so they get a wait they never reach when correct. The
+/// one test that wants the shed scopes a short wait with
+/// [`test_support::with_ingest_wait`].
 #[cfg(test)]
-pub const DEFAULT_INGEST_EXTRACTION_WAIT_SECS: u64 = 2;
+pub const DEFAULT_INGEST_EXTRACTION_WAIT_SECS: u64 = 30;
 
 /// Env var overriding [`DEFAULT_INGEST_EXTRACTION_WAIT_SECS`]. `0` turns the
 /// wait off (the pre-#6221 fast-fail); blank or non-numeric falls back to the
 /// default. Values above [`MAX_INGEST_EXTRACTION_WAIT_SECS`] are clamped.
 pub const INGEST_EXTRACTION_WAIT_SECS_ENV: &str = "INGEST_EXTRACTION_WAIT_SECS";
 
-/// Ceiling on the configurable wait. A waiter holds a connection and its body;
-/// past a couple of minutes the request timeouts in front of it fire anyway.
-pub const MAX_INGEST_EXTRACTION_WAIT_SECS: u64 = 120;
+/// Ceiling on the configurable wait: a quarter of the default
+/// `GLOBAL_REQUEST_TIMEOUT_SECS`, which also covers the body transfer on the
+/// format upload routes (see [`DEFAULT_INGEST_EXTRACTION_WAIT_SECS`]).
+pub const MAX_INGEST_EXTRACTION_WAIT_SECS: u64 = 30;
 
 /// Default number of requests that may wait for a permit for ONE repository.
 /// Twice the per-repository sub-limit: a burst of up to 12 uploads to one
@@ -570,7 +595,8 @@ pub const DEFAULT_MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT: usize = 8;
 
 /// Env var overriding [`DEFAULT_MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT`].
 /// `0` disables queueing for every repository (fast-fail); blank or
-/// non-numeric falls back to the default.
+/// non-numeric falls back to the default; values above
+/// [`MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT_LIMIT`] are clamped.
 pub const MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT_ENV: &str =
     "MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT";
 
@@ -579,8 +605,18 @@ pub const MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT_ENV: &str =
 pub const DEFAULT_MAX_QUEUED_INGEST_EXTRACTIONS: usize = 32;
 
 /// Env var overriding [`DEFAULT_MAX_QUEUED_INGEST_EXTRACTIONS`]. Same rules as
-/// the per-repository queue cap.
+/// the per-repository queue cap; clamped to
+/// [`MAX_QUEUED_INGEST_EXTRACTIONS_LIMIT`].
 pub const MAX_QUEUED_INGEST_EXTRACTIONS_ENV: &str = "MAX_QUEUED_INGEST_EXTRACTIONS";
+
+/// Ceiling on [`MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT_ENV`].
+pub const MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT_LIMIT: usize = 32;
+
+/// Ceiling on [`MAX_QUEUED_INGEST_EXTRACTIONS_ENV`]. Even at both ceilings,
+/// with the default caps, the parked-request bound from the section note is
+/// 128 + (8 + 128) / 4 * 32 = 1216; operators raising these should raise
+/// `GLOBAL_MAX_CONCURRENCY` to match.
+pub const MAX_QUEUED_INGEST_EXTRACTIONS_LIMIT: usize = 128;
 
 /// Read a non-negative integer env var: unset, blank or non-numeric gives
 /// `default`; unlike [`positive_env_or`], `0` is a valid value (it switches the
@@ -609,18 +645,28 @@ impl IngestWaitPolicy {
             DEFAULT_INGEST_EXTRACTION_WAIT_SECS,
         )
         .min(MAX_INGEST_EXTRACTION_WAIT_SECS);
-        let queue = |name, default: usize| {
-            usize::try_from(non_negative_env_or(name, default as u64)).unwrap_or(usize::MAX)
+        let queue = |name, default: usize, limit: usize| {
+            usize::try_from(non_negative_env_or(name, default as u64))
+                .unwrap_or(usize::MAX)
+                .min(limit)
         };
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut wait = std::time::Duration::from_secs(wait_secs);
+        #[cfg(test)]
+        if let Ok(scoped) = test_support::INGEST_WAIT.try_with(|w| *w) {
+            wait = scoped;
+        }
         Self {
-            wait: std::time::Duration::from_secs(wait_secs),
+            wait,
             max_tenant_waiters: queue(
                 MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT_ENV,
                 DEFAULT_MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT,
+                MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT_LIMIT,
             ),
             max_global_waiters: queue(
                 MAX_QUEUED_INGEST_EXTRACTIONS_ENV,
                 DEFAULT_MAX_QUEUED_INGEST_EXTRACTIONS,
+                MAX_QUEUED_INGEST_EXTRACTIONS_LIMIT,
             ),
         }
     }
@@ -883,6 +929,20 @@ pub(crate) mod test_support {
     /// Take the lock from an async test; safe to hold across `.await`.
     pub(crate) async fn lock_singletons_async() -> tokio::sync::MutexGuard<'static, ()> {
         SINGLETON_SEM_LOCK.lock().await
+    }
+
+    tokio::task_local! {
+        /// #6221: a per-test override of the ingest wait, so a test that
+        /// wants the shed need not change the default the others rely on.
+        pub(crate) static INGEST_WAIT: std::time::Duration;
+    }
+
+    /// Run `fut` with every ingest wait inside it set to `wait`.
+    pub(crate) async fn with_ingest_wait<F: std::future::Future>(
+        wait: std::time::Duration,
+        fut: F,
+    ) -> F::Output {
+        INGEST_WAIT.scope(wait, fut).await
     }
 }
 
@@ -2612,6 +2672,16 @@ mod tests {
             DEFAULT_MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT
         );
         assert_eq!(p.max_global_waiters, DEFAULT_MAX_QUEUED_INGEST_EXTRACTIONS);
+
+        // ... and the queue caps are clamped too.
+        std::env::set_var(MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT_ENV, "100000");
+        std::env::set_var(MAX_QUEUED_INGEST_EXTRACTIONS_ENV, "18446744073709551615");
+        let p = IngestWaitPolicy::from_env();
+        assert_eq!(
+            p.max_tenant_waiters,
+            MAX_QUEUED_INGEST_EXTRACTIONS_PER_TENANT_LIMIT
+        );
+        assert_eq!(p.max_global_waiters, MAX_QUEUED_INGEST_EXTRACTIONS_LIMIT);
 
         for (k, v) in keys.iter().zip(saved) {
             match v {
