@@ -399,37 +399,6 @@ fn parse_opt_out_flag(value: Option<&str>) -> bool {
     )
 }
 
-/// Default for `SCANNER_TIMEOUT_SECS` (#5942).
-pub const DEFAULT_SCANNER_TIMEOUT_SECS: u64 = 300;
-
-/// Ceiling for `SCANNER_TIMEOUT_SECS`, under the scan worker's 600 s job
-/// budget so a timed-out scanner is recorded as failed inside the job instead
-/// of the whole job being dropped with every other scanner's result.
-pub const MAX_SCANNER_TIMEOUT_SECS: u64 = 540;
-
-/// `SCANNER_TIMEOUT_SECS`: wall-clock limit for one scanner's run on an
-/// artifact scan (#5942). Read at call time, not a `Config` field.
-pub fn scanner_timeout() -> std::time::Duration {
-    std::time::Duration::from_secs(parse_scanner_timeout_secs(
-        env::var("SCANNER_TIMEOUT_SECS").ok().as_deref(),
-    ))
-}
-
-fn parse_scanner_timeout_secs(value: Option<&str>) -> u64 {
-    let Some(secs) = value.and_then(|v| v.trim().parse::<u64>().ok()) else {
-        return DEFAULT_SCANNER_TIMEOUT_SECS;
-    };
-    let clamped = secs.clamp(1, MAX_SCANNER_TIMEOUT_SECS);
-    if clamped != secs {
-        tracing::warn!(
-            value = secs,
-            clamped,
-            "SCANNER_TIMEOUT_SECS out of range; clamping"
-        );
-    }
-    clamped
-}
-
 /// Parse the `TOTP_POLICY` env pin (#2805).
 ///
 /// `None` (unset, or set to something unrecognized) means "no pin": the stored
@@ -3231,36 +3200,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // parse_opt_in_flag (pure; blob GC opt-in, #1408)
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn scanner_timeout_defaults_and_clamps_below_the_job_budget() {
-        assert_eq!(
-            parse_scanner_timeout_secs(None),
-            DEFAULT_SCANNER_TIMEOUT_SECS
-        );
-        assert_eq!(
-            parse_scanner_timeout_secs(Some("")),
-            DEFAULT_SCANNER_TIMEOUT_SECS
-        );
-        assert_eq!(
-            parse_scanner_timeout_secs(Some("soon")),
-            DEFAULT_SCANNER_TIMEOUT_SECS
-        );
-        assert_eq!(parse_scanner_timeout_secs(Some(" 120 ")), 120);
-        assert_eq!(parse_scanner_timeout_secs(Some("0")), 1);
-        assert_eq!(
-            parse_scanner_timeout_secs(Some("3600")),
-            MAX_SCANNER_TIMEOUT_SECS
-        );
-
-        env::set_var("SCANNER_TIMEOUT_SECS", "45");
-        assert_eq!(scanner_timeout(), std::time::Duration::from_secs(45));
-        env::remove_var("SCANNER_TIMEOUT_SECS");
-        assert_eq!(
-            scanner_timeout(),
-            std::time::Duration::from_secs(DEFAULT_SCANNER_TIMEOUT_SECS)
-        );
-    }
 
     #[test]
     fn parse_opt_in_flag_truth_table() {
