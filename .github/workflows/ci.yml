@@ -1012,6 +1012,8 @@ jobs:
 
       - name: Upload unit test JUnit report
         if: always()
+        # Report-only: an artifact-storage outage must not fail a green job.
+        continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: junit-unit-${{ matrix.shard }}
@@ -1553,6 +1555,8 @@ jobs:
 
       - name: Upload integration test JUnit reports
         if: always()
+        # Report-only: an artifact-storage outage must not fail a green job.
+        continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: junit-integration
