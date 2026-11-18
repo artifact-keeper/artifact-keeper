@@ -44,13 +44,15 @@ pub struct SsrfGuardResolver {
     mode: ResolverMode,
     /// EXACT (case-insensitive, full-host) allow-set of the operator-configured
     /// egress-proxy host(s), read once at construction from the proxy env
-    /// (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`, upper and lower case). A host in
+    /// (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`, whichever of the upper/lower
+    /// case variables the environment matcher would use). A host in
     /// this set skips the SSRF filter entirely — the proxy's own (often
     /// private) address must be reachable or every outbound fetch fails closed
-    /// with a 502/500 (issue #2570). The set is EMPTY when no proxy env is set,
-    /// in which case the resolver is byte-for-byte the pre-existing
-    /// fail-closed guard. Matching is exact full-host equality only; it never
-    /// relaxes any other target and never does subdomain/suffix/prefix matching.
+    /// with a 502/500 (issue #2570). The set is EMPTY when the environment
+    /// proxy is not in effect, in which case the resolver is byte-for-byte the
+    /// pre-existing fail-closed guard. Matching is exact full-host equality
+    /// only; it never relaxes any other target and never does
+    /// subdomain/suffix/prefix matching.
     exempt_proxy_hosts: HashSet<String>,
 }
 
@@ -132,28 +134,41 @@ fn proxy_host_token(value: &str) -> Option<String> {
     }
 }
 
-/// Read the set of configured egress-proxy host tokens from the environment,
-/// covering all six proxy vars (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` in
-/// upper and lower case). Hosts are lowercased for case-insensitive exact
-/// matching. Empty when no proxy env is set (resolver stays fail-closed).
+/// The first of `names` that is set, as `hyper-util`'s environment matcher
+/// reads the proxy variables: an upper-case variable that is set, even to the
+/// empty string, hides the lower-case one.
+pub(crate) fn first_set_env(names: [&str; 2]) -> String {
+    names
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .unwrap_or_default()
+}
+
+/// Read the set of egress-proxy host tokens the environment proxy would use,
+/// following the same matcher precedence `hyper-util` (and therefore
+/// `reqwest`) applies: upper case first, an upper-case variable set to the
+/// empty string hides its lower-case twin, and a CGI process (`REQUEST_METHOD`
+/// set) uses no environment proxy at all. Hosts are lowercased for
+/// case-insensitive exact matching; an empty set keeps the resolver
+/// fail-closed.
+///
+/// A variable that names a proxy but is shadowed by an empty upper-case one is
+/// NOT exempt (issue #5704): nothing routes through it, and exempting its host
+/// would let a direct connection to that name skip the SSRF filter.
 pub(crate) fn configured_proxy_hosts() -> HashSet<String> {
-    const VARS: [&str; 6] = [
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
+    const PAIRS: [[&str; 2]; 3] = [
+        ["HTTP_PROXY", "http_proxy"],
+        ["HTTPS_PROXY", "https_proxy"],
+        ["ALL_PROXY", "all_proxy"],
     ];
-    let mut set = HashSet::new();
-    for var in VARS {
-        if let Ok(val) = std::env::var(var) {
-            if let Some(host) = proxy_host_token(&val) {
-                set.insert(host);
-            }
-        }
+    if std::env::var_os("REQUEST_METHOD").is_some() {
+        return HashSet::new();
     }
-    set
+    PAIRS
+        .iter()
+        .map(|names| first_set_env(*names))
+        .filter_map(|value| proxy_host_token(&value))
+        .collect()
 }
 
 /// EXACT full-host, case-insensitive membership test against the proxy
@@ -766,21 +781,22 @@ mod tests {
 
     // ---- Proxy-host exemption (issue #2570) ----------------------------
 
-    /// All six proxy env vars, so `with_proxy_env` can clear the full set
-    /// before applying the ones a test cares about.
-    const PROXY_VARS: [&str; 6] = [
+    /// Every proxy variable plus the CGI marker, so `with_proxy_env` can
+    /// clear the full set before applying the ones a test cares about.
+    const PROXY_VARS: [&str; 7] = [
         "HTTP_PROXY",
         "http_proxy",
         "HTTPS_PROXY",
         "https_proxy",
         "ALL_PROXY",
         "all_proxy",
+        "REQUEST_METHOD",
     ];
 
-    /// Run `f` with ONLY the given proxy env vars set (all six cleared
-    /// first), restoring the prior values afterwards. Shares [`ENV_LOCK`]
-    /// with `with_toggles` so proxy-env and private-IP-toggle tests never
-    /// race each other's process-wide env under `cargo test`.
+    /// Run `f` with ONLY the given proxy env vars set (all of [`PROXY_VARS`]
+    /// cleared first), restoring the prior values afterwards. Shares
+    /// [`ENV_LOCK`] with `with_toggles` so proxy-env and private-IP-toggle
+    /// tests never race each other's process-wide env under `cargo test`.
     fn with_proxy_env<R>(set: &[(&str, &str)], f: impl FnOnce() -> R) -> R {
         let _lock = ENV_LOCK.lock().unwrap();
         let prev: Vec<(&str, Option<String>)> = PROXY_VARS
@@ -840,29 +856,79 @@ mod tests {
         assert_eq!(proxy_host_token("   ").as_deref(), None);
     }
 
+    /// Each proxy variable is read when its upper-case twin is unset.
     #[test]
-    fn configured_proxy_hosts_reads_all_six_vars() {
+    fn configured_proxy_hosts_reads_every_case_variant() {
         with_proxy_env(
             &[
-                ("HTTP_PROXY", "http://a.example:3128"),
                 ("http_proxy", "http://b.example:3128"),
-                ("HTTPS_PROXY", "https://c.example:3128"),
                 ("https_proxy", "https://d.example:3128"),
-                ("ALL_PROXY", "socks5://e.example:1080"),
                 ("all_proxy", "socks5://f.example:1080"),
             ],
             || {
                 let hosts = configured_proxy_hosts();
-                for h in [
-                    "a.example",
-                    "b.example",
-                    "c.example",
-                    "d.example",
-                    "e.example",
-                    "f.example",
-                ] {
+                for h in ["b.example", "d.example", "f.example"] {
                     assert!(hosts.contains(h), "expected {h} in {hosts:?}");
                 }
+            },
+        );
+        with_proxy_env(
+            &[
+                ("HTTP_PROXY", "http://a.example:3128"),
+                ("HTTPS_PROXY", "https://c.example:3128"),
+                ("ALL_PROXY", "socks5://e.example:1080"),
+            ],
+            || {
+                let hosts = configured_proxy_hosts();
+                for h in ["a.example", "c.example", "e.example"] {
+                    assert!(hosts.contains(h), "expected {h} in {hosts:?}");
+                }
+            },
+        );
+    }
+
+    /// #5704: the exempt-set follows the environment matcher's precedence.
+    /// An upper-case variable shadows its lower-case twin even when empty, and
+    /// a CGI process uses no environment proxy, so a host named only by an
+    /// ignored variable must not stay exempt from the connect-time filter.
+    #[test]
+    fn configured_proxy_hosts_follow_matcher_precedence_5704() {
+        with_proxy_env(
+            &[
+                ("HTTP_PROXY", ""),
+                ("http_proxy", "http://shadowed.example:3128"),
+            ],
+            || {
+                assert!(
+                    configured_proxy_hosts().is_empty(),
+                    "an empty HTTP_PROXY hides http_proxy, so nothing is exempt"
+                );
+            },
+        );
+        with_proxy_env(
+            &[
+                ("HTTP_PROXY", "http://upper.example:3128"),
+                ("http_proxy", "http://lower.example:3128"),
+            ],
+            || {
+                let hosts = configured_proxy_hosts();
+                assert!(hosts.contains("upper.example"), "{hosts:?}");
+                assert!(
+                    !hosts.contains("lower.example"),
+                    "the shadowed lower-case variable must not be exempt: {hosts:?}"
+                );
+            },
+        );
+        with_proxy_env(
+            &[
+                ("HTTP_PROXY", "http://proxy.example:3128"),
+                ("REQUEST_METHOD", "GET"),
+            ],
+            || {
+                assert!(
+                    configured_proxy_hosts().is_empty(),
+                    "a CGI process uses no environment proxy"
+                );
             },
         );
     }
@@ -957,6 +1023,23 @@ mod tests {
         assert!(
             result.is_err(),
             "a non-proxy private target must stay blocked when only the proxy host is exempt"
+        );
+    }
+
+    /// #5704: a proxy host named only by a variable the environment matcher
+    /// ignores (here `http_proxy`, hidden by an empty `HTTP_PROXY`) is not
+    /// exempt, so a direct connection to that name stays behind the
+    /// fail-closed filter.
+    #[tokio::test]
+    async fn shadowed_proxy_host_is_not_exempt_5704() {
+        let name: Name = "10.0.0.5".parse().expect("valid dns name");
+        let resolver = with_proxy_env(
+            &[("HTTP_PROXY", ""), ("http_proxy", "http://10.0.0.5:3128")],
+            || SsrfGuardResolver::with_mode(ResolverMode::Upstream),
+        );
+        assert!(
+            resolver.resolve(name).await.is_err(),
+            "a shadowed proxy host must stay behind the SSRF filter"
         );
     }
 }

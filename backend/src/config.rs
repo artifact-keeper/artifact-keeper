@@ -1211,8 +1211,9 @@ pub struct Config {
     /// Env var: `SCAN_WORKER_ENABLED`. Default: true.
     pub scan_worker_enabled: bool,
 
-    /// Scan jobs this instance runs concurrently. `None` matches
-    /// `MAX_CONCURRENT_SCAN_EXTRACTIONS`. Raise both together on worker pods.
+    /// Scan jobs this instance runs concurrently. `None` is 4, or
+    /// `MAX_CONCURRENT_SCAN_EXTRACTIONS` if that is lower. Raise both together
+    /// on worker pods.
     /// Env var: `SCAN_WORKER_CONCURRENCY`. Default: unset.
     pub scan_worker_concurrency: Option<usize>,
 

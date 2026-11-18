@@ -226,10 +226,9 @@ async fn authorize_repo_for_tokens(
     let repo = repo_service.get_by_key(key).await?;
 
     if !auth.can_access_repo(repo.id) {
-        return Err(AppError::NotFound(format!(
-            "Repository '{}' not found",
-            key
-        )));
+        return Err(AppError::NotFound(
+            crate::api::handlers::repositories::REPOSITORY_NOT_FOUND.to_string(),
+        ));
     }
 
     // Existence hiding (mirrors `require_visible`): a private repository the
@@ -260,10 +259,9 @@ async fn authorize_repo_for_tokens(
             )
             .await?
     {
-        return Err(AppError::NotFound(format!(
-            "Repository '{}' not found",
-            key
-        )));
+        return Err(AppError::NotFound(
+            crate::api::handlers::repositories::REPOSITORY_NOT_FOUND.to_string(),
+        ));
     }
 
     Ok((auth, repo))
@@ -1514,6 +1512,59 @@ mod ownership_gate_tests {
             .uri(format!("/{}/tokens/{}", repo_key, token_id))
             .body(Body::empty())
             .unwrap()
+    }
+
+    /// #5611: a repository the caller cannot see (no grant on a private
+    /// repository, or a token whose repository list leaves it out) answers the
+    /// token routes byte for byte like an unknown key. The body used to carry
+    /// `Repository '<key>' not found`, so a non-reader comparing bodies could
+    /// tell a private key from a nonexistent one.
+    #[tokio::test]
+    async fn token_routes_answer_a_hidden_repository_like_an_unknown_key_5611() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let (stranger, stranger_name) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), &dir.to_string_lossy());
+        let unknown = format!("ak5611-unknown-{}", Uuid::new_v4());
+        let token_id = Uuid::new_v4();
+
+        let no_grant = member_auth(stranger, &stranger_name);
+        let mut scoped_elsewhere = member_auth(stranger, &stranger_name);
+        scoped_elsewhere.allowed_repo_ids =
+            crate::models::access_scope::AccessScope::Restricted(vec![Uuid::new_v4()]);
+
+        type Build = Box<dyn Fn(&str) -> Request<Body>>;
+        let ops: [(&str, Build); 3] = [
+            ("list", Box::new(list_tokens_req)),
+            ("get", Box::new(move |k| get_token_req(k, token_id))),
+            ("delete", Box::new(move |k| delete_token_req(k, token_id))),
+        ];
+        let mut answers = Vec::new();
+        for (caller, auth) in [
+            ("no grant", no_grant),
+            ("token scoped elsewhere", scoped_elsewhere),
+        ] {
+            for (op, build) in &ops {
+                let existing =
+                    tdh::send(app_as(state.clone(), auth.clone()), build(&repo_key)).await;
+                let missing = tdh::send(app_as(state.clone(), auth.clone()), build(&unknown)).await;
+                answers.push((format!("{caller} {op}"), existing, missing));
+            }
+        }
+        tdh::cleanup_user(&pool, stranger).await;
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+
+        for (case, existing, missing) in &answers {
+            assert_eq!(existing.0, StatusCode::NOT_FOUND, "{case}: {existing:?}");
+            assert_eq!(existing, missing, "{case}: existing private vs unknown key");
+            let body = String::from_utf8_lossy(&existing.1);
+            assert!(
+                body.contains("Repository not found") && !body.contains(&repo_key),
+                "{case}: {body}"
+            );
+        }
     }
 
     fn list_tokens_req(repo_key: &str) -> Request<Body> {
