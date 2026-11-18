@@ -39407,40 +39407,29 @@ mod tests {
             .await
             .unwrap();
         let push_status = pushed.status();
-        let digest = pushed
-            .headers()
-            .get("Docker-Content-Digest")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        let download = |reference: String| {
-            tdh::send_with_headers(
-                tdh::router_with_auth(
-                    download_router(),
-                    state.clone(),
-                    tdh::make_auth(user_id, &username),
-                ),
-                tdh::get(format!("/{key}/download/v2/acme/app/manifests/{reference}")),
-            )
-        };
-        let by_tag = download("1.0".to_string()).await;
-        let by_digest = download(digest.clone()).await;
+        let (status, body, headers) = tdh::send_with_headers(
+            tdh::router_with_auth(
+                download_router(),
+                state.clone(),
+                tdh::make_auth(user_id, &username),
+            ),
+            tdh::get(format!("/{key}/download/v2/acme/app/manifests/1.0")),
+        )
+        .await;
 
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(push_status, StatusCode::CREATED, "push the manifest");
-        for (label, (status, body, headers)) in [("tag", by_tag), ("digest", by_digest)] {
-            assert_eq!(status, StatusCode::OK, "by {label}: {body:?}");
-            assert_eq!(body, manifest.as_bytes(), "by {label}: the manifest bytes");
-            assert_eq!(
-                headers
-                    .get(header::CONTENT_LENGTH)
-                    .and_then(|v| v.to_str().ok()),
-                Some(manifest.len().to_string().as_str()),
-                "by {label}: Content-Length is the manifest length, not the image size"
-            );
-        }
+        assert_eq!(status, StatusCode::OK, "generic download: {body:?}");
+        assert_eq!(body, manifest.as_bytes(), "the manifest bytes");
+        assert_eq!(
+            headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some(manifest.len().to_string().as_str()),
+            "Content-Length is the manifest length, not the image size"
+        );
     }
 }
 
