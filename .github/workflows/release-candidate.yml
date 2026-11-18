@@ -437,26 +437,30 @@ jobs:
   # on: nobody gets to choose what executes in a run that writes main's caches
   # (see that file's header). The key follows the lockfile, not the commit, so
   # main's tip serves any candidate with the same dependencies. This job only
-  # DISPATCHES: nothing here waits for the build, nothing needs this job, and
-  # `continue-on-error` keeps a failed dispatch from failing the candidate. A
-  # missing cache costs build time at the tag, not correctness.
+  # DISPATCHES: nothing here waits for the build and nothing needs this job. A
+  # missing cache costs build time at the tag, not correctness, so the script
+  # retries a 5xx or 429 and then only warns (#6089). Any other error fails the
+  # job: a missing workflow or a lost permission does not fix itself.
   warm-cli-caches:
     name: Dispatch the CLI build cache warm-up
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    continue-on-error: true
     permissions:
+      contents: read
       actions: write   # gh workflow run
     steps:
+      - name: Checkout main's tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          sparse-checkout: scripts/ci
+
       - name: Dispatch release-cli-caches.yml on main
         env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ needs.resolve.outputs.sha }}
-        run: |
-          set -euo pipefail
-          gh workflow run release-cli-caches.yml --repo "${GITHUB_REPOSITORY}" --ref main
-          echo "Dispatched Release CLI Caches on main's tip for candidate ${SHA}. Let it finish before the promote, or the tag run builds cold."
+        run: bash scripts/ci/dispatch-cli-cache-warmup.sh
 
   # ── Docker Publish must be green before anything reads its result ──────────
   # Its own job, ahead of BOTH consumers (#4372). `preflight` used to start

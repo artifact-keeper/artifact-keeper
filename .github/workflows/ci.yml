@@ -2232,6 +2232,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: bash scripts/ci/check-gate-workflow-pins.sh reachable "origin/${GITHUB_BASE_REF}"
 
+      # The CLI cache warm-up dispatch (#6089): a 5xx or 429 is retried and
+      # then only warns, any other error still fails. Stubs `gh`; offline, ~1s.
+      - name: Check the CLI cache warm-up dispatch retries only transient errors
+        run: bash scripts/ci/test-dispatch-cli-cache-warmup.sh
+
       # The nightly release gate (#6073): which lines and images it tests,
       # how it gives way to a release candidate on the shared pool, and the
       # one-issue-per-red-tier tracking plus the verdict record #6075 reads.
