@@ -759,6 +759,89 @@ jobs:
           df -h / | tail -1
           du -sh target 2>/dev/null || true
 
+  # WINDOWS CROSS-CHECK (#6022). Every other Rust job here compiles for
+  # Linux only, so code that needs a Unix-only API without a cfg guard
+  # (`std::os::unix::*`, `PermissionsExt`, `symlink`) passed every PR check.
+  # The first build that saw it was release.yml's x86_64-pc-windows-gnu leg
+  # at tag time: v1.12.0's unpacker (#6005, backend/src/services/oci_rootfs.rs)
+  # stopped that leg, and 1.12.0 shipped no GitHub Release (fixed in #6201).
+  # The nightly 🪟 Windows Cross-Build (scheduled-tests.yml) only catches it
+  # after the merge.
+  #
+  # `cargo check`, not a build: type and name resolution is where Unix-only
+  # code fails, and a check emits metadata only, so there is no codegen and
+  # no link. The release-profile link is what fills the hosted VM and gets
+  # the runner killed with exit 143 (release.yml's "Add swap" note). Same
+  # target and features as release.yml's windows leg, and the same mingw-w64
+  # install: build scripts still run for a check, and openssl-src
+  # (`vendored-openssl`) compiles OpenSSL with the mingw C compiler.
+  # Library and binary targets only: the inline test modules are the
+  # 15 GiB lib-test rustc the unit legs shard, and tests do not ship.
+  #
+  # Reported through ✅ CI Complete, like Version Pin Bump, rather than as a
+  # new required context, so it blocks a merge with no branch-protection
+  # change. It runs and may skip exactly when Check Rust does.
+  windows-cross-check:
+    name: 🪟 Windows Cross-Check
+    runs-on: ubuntu-24.04
+    # Cold, a check of the whole graph is about as long as a cold clippy
+    # (see check-rust's 30-minute note); warm, only the workspace crate.
+    timeout-minutes: 30
+    needs: [changes, release-bump]
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_NET_RETRY: "10"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # rust-toolchain.toml already lists the target; naming it here as
+      # well keeps the job self-describing, as release.yml's leg does.
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Assert the pinned Rust toolchain is in force
+        run: ./scripts/ci/check-toolchain-pin.sh --active
+
+      # release.yml's two install steps for this leg, in one.
+      - name: Install protoc and mingw-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev mingw-w64
+
+      # Its own key: the artifacts are for another target, and sharing
+      # clippy's entry would make each job evict the other's. Saved only
+      # from main and release/** pushes, as for every rust-cache here.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: v2-rust
+          shared-key: windows-check
+          save-if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
+
+      # The workspace crate's rustc is the one heavy step here, as in
+      # check-rust, whose cgroup peaks at ~15 GiB on the same VM. Same
+      # best-effort swapfile; it costs seconds.
+      - name: Add swap
+        run: |
+          if sudo fallocate -l 12G /ak-ci-swapfile \
+             && sudo chmod 600 /ak-ci-swapfile \
+             && sudo mkswap /ak-ci-swapfile >/dev/null \
+             && sudo swapon /ak-ci-swapfile; then
+            echo "added a 12 GiB swapfile"
+          else
+            echo "::warning title=No extra swap::could not add /ak-ci-swapfile; this job runs with the image's default swap only."
+          fi
+          swapon --show
+          free -m
+
+      - name: Check the backend compiles for Windows
+        env:
+          SQLX_OFFLINE: true
+          CARGO_BUILD_JOBS: "4"
+          CARGO_INCREMENTAL: "0"
+        run: cargo check --locked --workspace --target x86_64-pc-windows-gnu --features vendored-openssl
+
   # UNIT TESTS + COVERAGE, SHARDED ACROSS GITHUB-HOSTED RUNNERS.
   #
   # The instrumented lib-test target used to be ONE rustc invocation holding
@@ -3471,7 +3554,7 @@ jobs:
     # Not smoke-e2e, build-backend-image or build-openscap-image: they are
     # advisory (see the container-chain note in the step below), and a
     # `needs` edge would make this required context wait ~25 min for them.
-    needs: [changes, detect-changes, release-bump, check-rust, test-backend-unit-shard, test-backend-unit, workflow-contracts, shell-tests, version-pin-bump, scanner-adapter-go, go-floor-agreement, coverage-gates, security-audit]
+    needs: [changes, detect-changes, release-bump, check-rust, windows-cross-check, test-backend-unit-shard, test-backend-unit, workflow-contracts, shell-tests, version-pin-bump, scanner-adapter-go, go-floor-agreement, coverage-gates, security-audit]
     if: always()
     # The coverage decision reads the PR's live labels/draft state, the
     # override label's `labeled` events and `/coverage-override` comments,
@@ -3496,6 +3579,7 @@ jobs:
         # the shell control flow.
         env:
           RESULT_CHECK_RUST: ${{ needs.check-rust.result }}
+          RESULT_WINDOWS_CHECK: ${{ needs.windows-cross-check.result }}
           RESULT_UNIT: ${{ needs.test-backend-unit.result }}
           RESULT_UNIT_SHARDS: ${{ needs.test-backend-unit-shard.result }}
           RESULT_WORKFLOW_CONTRACTS: ${{ needs.workflow-contracts.result }}
@@ -3533,7 +3617,8 @@ jobs:
 
           # Docs-only PRs legitimately skip the Tier 1 jobs (see the
           # `changes` job). Version-bump-only release PRs legitimately skip
-          # the heavy Rust jobs — check-rust and test-backend-unit, but NOT
+          # the heavy Rust jobs — check-rust, windows-cross-check and
+          # test-backend-unit, but NOT
           # shell-tests, which still runs on that path (see the
           # `release-bump` job). Any other skip/failure of a Tier 1 job is
           # fatal.
@@ -3571,12 +3656,14 @@ jobs:
             elif [[ "$result" == "skipped" && "$docs_only" == "true" ]]; then
               echo "⏭️ $name (docs-only)" >> "$GITHUB_STEP_SUMMARY"
             elif [[ "$result" == "skipped" && "$bump_only" == "true" \
-                    && ( "$name" == "check-rust" || "$name" == "test-backend-unit" ) ]]; then
+                    && ( "$name" == "check-rust" || "$name" == "windows-cross-check" \
+                         || "$name" == "test-backend-unit" ) ]]; then
               # Only the two heavy Rust jobs are skippable on the bump path.
               # shell-tests and security-audit still run and must succeed.
               echo "⏭️ $name (version-bump-only release PR)" >> "$GITHUB_STEP_SUMMARY"
             elif [[ "$result" == "skipped" && "$rust_skipped" == "true" \
-                    && ( "$name" == "check-rust" || "$name" == "test-backend-unit" ) ]]; then
+                    && ( "$name" == "check-rust" || "$name" == "windows-cross-check" \
+                         || "$name" == "test-backend-unit" ) ]]; then
               echo "⏭️ $name (no Rust-job inputs to re-verify)" >> "$GITHUB_STEP_SUMMARY"
             else
               echo "❌ $name: ${result:-missing}" >> "$GITHUB_STEP_SUMMARY"
@@ -3622,6 +3709,9 @@ jobs:
           }
 
           require_success "check-rust" "$RESULT_CHECK_RUST"
+          # The Windows cross-check (#6022) has check-rust's condition, so it
+          # may skip exactly where check-rust may.
+          require_success "windows-cross-check" "$RESULT_WINDOWS_CHECK"
           require_success "test-backend-unit" "$RESULT_UNIT"
           require_success "shell-tests" "$RESULT_SHELL"
 
