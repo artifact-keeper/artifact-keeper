@@ -315,6 +315,21 @@ where
     Ok(decode().await)
 }
 
+/// Waiting counterpart of [`with_ingest_extraction`] for an async caller whose
+/// decode is synchronous (#6230). It waits for a slot exactly as
+/// [`with_ingest_extraction_async`] does, then runs `decode` and releases the
+/// permit as it returns, before any DB/storage work in the caller. `decode` is
+/// never invoked when the request is shed.
+///
+/// Every request-path caller that can `.await` uses this rather than the
+/// fast-fail [`with_ingest_extraction`]: tokio hands a freed permit to a
+/// queued waiter before any `try_acquire` can see it, so a fast-fail caller
+/// always sheds while an async upload waits in a line it needs.
+pub async fn with_ingest_extraction_waiting<T>(decode: impl FnOnce() -> T) -> Result<T> {
+    let _permit = acquire_ingest_extraction_waiting().await?;
+    Ok(decode())
+}
+
 // ---------------------------------------------------------------------------
 // Per-tenant fairness sub-limit (#2598)
 // ---------------------------------------------------------------------------
@@ -550,14 +565,16 @@ fn acquire_ingest_extraction_keyed(
 // both queue ceilings the formula can exceed `GLOBAL_MAX_CONCURRENCY` (512),
 // which still bounds it.
 //
-// Only the async seam waits. The synchronous `with_ingest_extraction` /
+// Only the async seams wait. The synchronous `with_ingest_extraction` /
 // `acquire_ingest_extraction` cannot wait without blocking a runtime worker,
 // so they keep fast-failing. Because tokio hands a freed permit to a queued
-// waiter before any `try_acquire` can see it, those synchronous callers
-// (RubyGems, conda, Debian, Hex, Composer, CocoaPods, VS Code, protobuf,
-// Incus, and the PyPI proxy/serve metadata paths) always shed while a line
-// they need is non-empty, i.e. during a burst of async uploads. Converting
-// them to the waiting seam is #6230.
+// waiter before any `try_acquire` can see it, a synchronous caller always
+// sheds while a line it needs is non-empty, i.e. during a burst of async
+// uploads. Every request-path caller therefore uses a waiting seam
+// ([`with_ingest_extraction_async`], [`with_ingest_extraction_waiting`] or
+// [`acquire_ingest_extraction_waiting`]) (#6230); the fast-fail one is left
+// to the background scheduler and migration worker, which have no client
+// waiting and retry on their next pass.
 
 /// Default time, in seconds, an upload waits for an ingest-extraction permit
 /// before it is shed with 503. A single metadata decode takes milliseconds to a
@@ -946,6 +963,52 @@ pub(crate) mod test_support {
         fut: F,
     ) -> F::Output {
         INGEST_WAIT.scope(wait, fut).await
+    }
+
+    /// #6230: take every one of `tenant`'s per-repository permits, and NO
+    /// global ones. Holding real guards would also take a global permit each,
+    /// and a few tests doing so in parallel exhaust the test binary's global
+    /// cap, so they would shed one another.
+    pub(crate) fn hold_full_tenant_bucket(
+        tenant: &super::TenantKey,
+    ) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+        let cap = super::max_concurrent_ingest_extractions_per_tenant();
+        let sem = super::tenant_semaphore_for(tenant, cap);
+        (0..cap)
+            .map(|_| sem.clone().try_acquire_owned().expect("tenant permit"))
+            .collect()
+    }
+
+    /// #6230: run `request` (a handler call) attributed to `tenant` while
+    /// every one of that repository's ingest permits is held, and release them
+    /// only once the request is queued for one. Returns the request's output
+    /// and whether it queued. A request that sheds instead of waiting (the
+    /// fast-fail acquire) never queues, gets its 503 before the permits are
+    /// released, and reports `false`. Only `tenant`'s bucket is filled, so
+    /// other tests' decodes are unaffected.
+    pub(crate) async fn run_queued_behind_full_tenant<F>(
+        tenant: super::TenantKey,
+        request: F,
+    ) -> (F::Output, bool)
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let held = hold_full_tenant_bucket(&tenant);
+        let task = tokio::spawn(super::run_with_tenant_scope(tenant.clone(), request));
+        let mut queued = false;
+        for _ in 0..20_000 {
+            if super::queued_ingest_extractions_for(&tenant) > 0 {
+                queued = true;
+                break;
+            }
+            if task.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        drop(held);
+        (task.await.expect("request task"), queued)
     }
 }
 
@@ -2692,5 +2755,91 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #6230: the inline (synchronous-decode) callers wait too
+    // -----------------------------------------------------------------------
+
+    /// The inline seam no longer sheds a request whose repository bucket is
+    /// full: it queues, and its decode runs once a permit frees. With the
+    /// fast-fail `with_ingest_extraction` the request never queued and got
+    /// the 503 while the permits were still held.
+    #[tokio::test]
+    async fn waiting_inline_decode_is_admitted_when_a_permit_frees_6230() {
+        let tenant = TenantKey::Repo(uuid::Uuid::new_v4());
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = Arc::clone(&ran);
+        let (out, queued) = test_support::run_queued_behind_full_tenant(tenant, async move {
+            with_ingest_extraction_waiting(|| {
+                r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                "decoded"
+            })
+            .await
+        })
+        .await;
+        assert!(queued, "the inline decode must wait for a permit");
+        assert_eq!(out.expect("admitted once a permit frees"), "decoded");
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Fairness with the async seam restored: an inline decode that arrives
+    /// while an async upload already waits for the same repository is admitted
+    /// after it (FIFO) instead of shedding at once.
+    #[tokio::test]
+    async fn inline_decode_queues_behind_an_async_waiter_6230() {
+        let tenant = TenantKey::Repo(uuid::Uuid::new_v4());
+        let mut held = test_support::hold_full_tenant_bucket(&tenant);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let o = Arc::clone(&order);
+        let async_upload = tokio::spawn(run_with_tenant_scope(tenant.clone(), async move {
+            with_ingest_extraction_async(|| async { o.lock().unwrap().push("async") }).await
+        }));
+        until_queued(&tenant, 1).await;
+        let o = Arc::clone(&order);
+        let inline = tokio::spawn(run_with_tenant_scope(tenant.clone(), async move {
+            with_ingest_extraction_waiting(|| o.lock().unwrap().push("inline")).await
+        }));
+        until_queued(&tenant, 2).await;
+        // Free ONE permit: it goes to the async upload, the first in line;
+        // the inline decode is admitted when the async upload releases it.
+        drop(held.pop());
+        async_upload.await.unwrap().expect("async upload admitted");
+        inline
+            .await
+            .unwrap()
+            .expect("inline decode admitted, not shed");
+        drop(held);
+        assert_eq!(*order.lock().unwrap(), vec!["async", "inline"]);
+        assert_eq!(queued_ingest_extractions_for(&tenant), 0);
+    }
+
+    /// A shed inline request never runs its decode, and gets the same 503.
+    #[tokio::test]
+    async fn waiting_inline_decode_shed_skips_the_decode_6230() {
+        let tenant = TenantKey::Repo(uuid::Uuid::new_v4());
+        let _held = test_support::hold_full_tenant_bucket(&tenant);
+        let err = run_with_tenant_scope(tenant, async {
+            test_support::with_ingest_wait(
+                std::time::Duration::from_millis(50),
+                with_ingest_extraction_waiting::<()>(|| {
+                    panic!("decode must not run when the request is shed")
+                }),
+            )
+            .await
+        })
+        .await
+        .expect_err("no permit freed within the wait");
+        assert_eq!(message(&err), message(&tenant_ingest_busy_err()));
+    }
+
+    async fn until_queued(tenant: &TenantKey, n: usize) {
+        for _ in 0..20_000 {
+            if queued_ingest_extractions_for(tenant) >= n {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("never saw {n} queued");
     }
 }

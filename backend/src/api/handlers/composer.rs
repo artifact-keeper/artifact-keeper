@@ -2023,10 +2023,12 @@ async fn upload(
     }
 
     // Parse composer.json from the archive to extract metadata
-    // #2561: permit-scoped decode, fast-fail 503 on saturation.
-    let composer_json = crate::util::bounded_archive::with_ingest_extraction(|| {
+    // #2561: permit-scoped decode; on saturation it waits briefly
+    // for a slot, then sheds 503 (#6230).
+    let composer_json = crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
         ComposerHandler::parse_composer_json(&body)
     })
+    .await
     .map_err(|e| e.into_response())?
     .map_err(|e| {
         (
@@ -4214,6 +4216,38 @@ mod upload_db_tests {
         );
 
         f.teardown().await;
+    }
+
+    /// #6230: a Composer publish whose repository's ingest bucket is full
+    /// waits for a permit instead of shedding 503 at once, and succeeds once
+    /// one frees.
+    #[tokio::test]
+    async fn upload_waits_for_ingest_permit_6230() {
+        let Some(f) = tdh::Fixture::setup("local", "composer").await else {
+            return;
+        };
+        let zip = build_composer_zip("acme/queuedpkg", "1.0.0", "queued behind a burst");
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/packages", f.repo_key))
+            .header("content-type", "application/zip")
+            .body(axum::body::Body::from(zip))
+            .expect("build POST request");
+        let ((status, body), queued) =
+            crate::util::bounded_archive::test_support::run_queued_behind_full_tenant(
+                crate::util::bounded_archive::TenantKey::Repo(f.repo_id),
+                tdh::send(app, req),
+            )
+            .await;
+        f.teardown().await;
+        assert!(queued, "the publish must have waited for a permit");
+        assert!(
+            status.is_success(),
+            "a queued Composer publish must succeed once a permit frees: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
     }
 
     /// #4725: a Composer publish to a hosted repository must queue a push sync
