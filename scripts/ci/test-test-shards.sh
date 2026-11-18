@@ -402,6 +402,187 @@ grep -q '^pub async fn production_handler' "$r/backend/src/api/handlers/echo.rs"
   && ok "apply touches only pub async fn inside test code" \
   || { bad "pub async rewrite scope"; cat "$r/backend/src/api/handlers/echo.rs" "$r/backend/src/api/handlers/echo/helpers.rs"; }
 
+# ── archive-filter / partition-check: one build of every test (ci.yml's
+# build-once job), five legs selecting from it. The silent failure here is a
+# test no leg selects, or one two legs both run; the filters are evaluated
+# below with a small model of nextest's filterset language (the subset the
+# script emits), against test names laid out the way nextest names them.
+echo "archive-filter self-test"
+r="$tmp/r4"; mkrepo "$r"
+# A test helper module holding no tests of its own, out of line, with a test
+# module nested in it that belongs to another shard -- the shape of
+# api::handlers::test_db_helpers::poll_tests, which `filter` used to drop
+# from every leg.
+cat >>"$r/backend/src/api/handlers/zulu.rs" <<'RS'
+
+#[cfg(test)]
+pub(crate) mod db_helpers;
+RS
+mkdir -p "$r/backend/src/api/handlers/zulu"
+cat >"$r/backend/src/api/handlers/zulu/db_helpers.rs" <<'RS'
+pub(crate) fn helper() {}
+
+#[cfg(ak_test_shard = "services-2")]
+#[cfg(test)]
+mod poll_tests {
+    #[test]
+    fn polls() {}
+}
+RS
+# A module named after a keyword: nextest prints its tests as `r#pub::...`.
+mkdir -p "$r/backend/src/formats"
+cat >"$r/backend/src/formats/pub.rs" <<'RS'
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn p() {}
+}
+RS
+cat >"$tmp/evalfs.py" <<'PY'
+"""Evaluate a nextest filterset (the subset test-shards.py emits) against
+`<kind> <test name>` lines on stdin; print the names it selects."""
+import re, sys
+
+def parse(src):
+    toks = re.findall(r"/[^/]*/|\w+|[()&|]", src)
+    pos = [0]
+    def peek():
+        return toks[pos[0]] if pos[0] < len(toks) else None
+    def take(want=None):
+        t = toks[pos[0]]; pos[0] += 1
+        if want and t != want:
+            raise SystemExit(f"expected {want!r}, got {t!r}")
+        return t
+    def expr():
+        left = term()
+        while peek() == "|":
+            take(); right = term(); left = (lambda a, b: lambda k, n: a(k, n) or b(k, n))(left, right)
+        return left
+    def term():
+        left = factor()
+        while peek() == "&":
+            take(); right = factor(); left = (lambda a, b: lambda k, n: a(k, n) and b(k, n))(left, right)
+        return left
+    def factor():
+        t = take()
+        if t == "not":
+            inner = factor(); return lambda k, n: not inner(k, n)
+        if t == "(":
+            e = expr(); take(")"); return e
+        take("(")
+        if t in ("all", "none"):
+            take(")"); return (lambda k, n: True) if t == "all" else (lambda k, n: False)
+        arg = take(); take(")")
+        if t == "kind":
+            return lambda k, n: k == arg
+        if t == "test":
+            rx = re.compile(arg[1:-1]); return lambda k, n: bool(rx.search(n))
+        raise SystemExit(f"unknown predicate {t}")
+    e = expr()
+    if peek() is not None:
+        raise SystemExit(f"trailing {toks[pos[0]:]}")
+    return e
+
+f = parse(open(sys.argv[1]).read())
+for line in sys.stdin:
+    kind, name = line.split()
+    if f(kind, name):
+        print(name)
+PY
+# Test names as nextest lists them: module path, then the test function.
+cat >"$tmp/names" <<'NAMES'
+lib api::handlers::alpha::tests::a
+lib api::handlers::alpha::tests::nested::inherits_the_outer_gate
+lib api::handlers::zulu::tests::z
+lib api::handlers::zulu::db_helpers::poll_tests::polls
+lib services::beta::beta_tests::out_of_line
+lib services::gamma::inner::tests::g
+lib macro_generated::tests::unknown_to_the_scan
+lib formats::r#pub::tests::p
+bin tests::m
+NAMES
+declare -A owner=(
+  [api::handlers::alpha::tests::a]=handlers-1
+  [api::handlers::alpha::tests::nested::inherits_the_outer_gate]=handlers-1
+  [api::handlers::zulu::tests::z]=router
+  [api::handlers::zulu::db_helpers::poll_tests::polls]=services-2
+  [services::beta::beta_tests::out_of_line]=services-1
+  [services::gamma::inner::tests::g]=services-1
+  [macro_generated::tests::unknown_to_the_scan]=router
+  [formats::r#pub::tests::p]=services-2
+  [tests::m]=router
+)
+for when in ungated applied; do
+  if [ "$when" = applied ]; then
+    python3 "$SHARDS_PY" apply --src "$r/backend/src" >/dev/null
+    # apply moves the nested module's gate to where its file maps.
+    owner[api::handlers::zulu::db_helpers::poll_tests::polls]=handlers-2
+  fi
+  : >"$tmp/selected"
+  for s in "${shards[@]}"; do
+    python3 "$SHARDS_PY" archive-filter --src "$r/backend/src" "$s" >"$tmp/af-$s"
+    python3 "$tmp/evalfs.py" "$tmp/af-$s" <"$tmp/names" | sed "s/\$/ $s/" >>"$tmp/selected"
+  done
+  for name in "${!owner[@]}"; do
+    legs="$(awk -v n="$name" '$1 == n {printf " %s", $2}' "$tmp/selected")"
+    [ "$legs" = " ${owner[$name]}" ] && ok "archive-filter ($when): $name runs in ${owner[$name]} only" \
+      || bad "archive-filter ($when): $name runs in [${legs# }], expected [${owner[$name]}]"
+  done
+  if [ "$when" = ungated ]; then
+    # The per-shard build's filter must not drop the nested module either:
+    # its gate compiles it in services-2 only, and its ungated parent's
+    # tests run elsewhere, so services-2 must carve it out of that skip.
+    python3 "$SHARDS_PY" filter --src "$r/backend/src" services-2 >"$tmp/f-s2"
+    python3 "$tmp/evalfs.py" "$tmp/f-s2" <"$tmp/names" \
+      | grep -qx 'api::handlers::zulu::db_helpers::poll_tests::polls' \
+      && ok "filter: a test module nested in another shard's helper module still runs in its own leg" \
+      || { bad "filter drops the nested module"; cat "$tmp/f-s2"; }
+  fi
+done
+python3 "$SHARDS_PY" archive-filter --src "$r/backend/src" nope >/dev/null 2>&1 \
+  && bad "archive-filter must refuse an unknown shard" || ok "archive-filter refuses an unknown shard"
+
+# partition-check reads nextest's own verdicts.
+mkdir -p "$tmp/listing"
+listing() { # <shard> <matched name>...
+  local s="$1"; shift
+  python3 - "$tmp/listing/$s.json" "$@" <<'PY'
+import json, sys
+out, matched = sys.argv[1], set(sys.argv[2:])
+cases = {n: {"filter-match": {"status": "matches" if n in matched else "mismatch"}}
+         for n in ("tests::a", "tests::b", "tests::c")}
+json.dump({"rust-suites": {"artifact-keeper-backend": {"testcases": cases}}}, open(out, "w"))
+PY
+}
+listing handlers-1 tests::a; listing handlers-2 tests::b; listing services-1
+listing services-2; listing router tests::c
+python3 "$SHARDS_PY" partition-check "$tmp/listing" >"$tmp/out" 2>&1 \
+  && grep -q 'handlers-1 1, handlers-2 1, services-1 0, services-2 0, router 1; 3 in all, 0 #\[ignore\]d' "$tmp/out" \
+  && ok "partition-check accepts one leg per test and prints the counts" \
+  || { bad "partition-check on a partition"; cat "$tmp/out"; }
+listing router tests::c tests::a
+python3 "$SHARDS_PY" partition-check "$tmp/listing" >"$tmp/out" 2>&1 \
+  && bad "partition-check must refuse a test two legs run" \
+  || { grep -q "tests::a: selected by \['handlers-1', 'router'\]" "$tmp/out" \
+       && ok "partition-check refuses a test two legs run, naming them" || { bad "dup message"; cat "$tmp/out"; }; }
+listing router
+python3 "$SHARDS_PY" partition-check "$tmp/listing" >"$tmp/out" 2>&1 \
+  && bad "partition-check must refuse a test no leg runs" \
+  || { grep -q "tests::c: selected by no leg" "$tmp/out" \
+       && ok "partition-check refuses a test no leg runs" || { bad "missing message"; cat "$tmp/out"; }; }
+# An #[ignore]d test is in every listing and selected by none: not a gap.
+listing router tests::c
+python3 - "$tmp/listing/services-1.json" <<'PY2'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["rust-suites"]["artifact-keeper-backend"]["testcases"]["tests::live"] = {
+    "filter-match": {"status": "mismatch", "reason": "ignored"}}
+json.dump(d, open(sys.argv[1], "w"))
+PY2
+python3 "$SHARDS_PY" partition-check "$tmp/listing" >"$tmp/out" 2>&1 \
+  && grep -q '; 3 in all, 1 #\[ignore\]d' "$tmp/out" \
+  && ok "partition-check leaves #[ignore]d tests out" || { bad "ignored test"; cat "$tmp/out"; }
+
 echo "merge-lcov.py self-test"
 
 mkdir -p "$tmp/lcov"

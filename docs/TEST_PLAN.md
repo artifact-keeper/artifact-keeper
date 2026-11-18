@@ -73,8 +73,12 @@ DATABASE_URL="postgresql://registry:registry@localhost:30432/artifact_registry" 
 ```
 PR opened/pushed
   -> check-rust (cargo fmt + clippy)
-  -> test-backend-unit-shard (hosted matrix, one instrumented build per test
-     shard: that shard's unit tests + its lcov.info)
+  -> test-backend-unit-build (trusted code only, when ak-beefy-runners has
+     a free slot: ONE instrumented build of every shard's tests, archived
+     with `cargo nextest archive`)
+  -> test-backend-unit-shard (hosted matrix: each shard's unit tests + its
+     lcov.info, run from that archive, or from the leg's own build of its
+     shard when the build job was skipped or failed)
      -> coverage-gates (PR only: merge the shard reports, then floor,
         new-code and duplication gates)
   -> test-backend-integration (PostgreSQL integration suites on
