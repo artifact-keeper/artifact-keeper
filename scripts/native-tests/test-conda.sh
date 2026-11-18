@@ -560,9 +560,9 @@ if CONDARC="$CONDARC_TEST" conda search "e2e-v1-pkg" 2>&1 | grep -q "e2e-v1-pkg"
     pass "11.5: .condarc channel URL format works"
 else
     # Some conda versions don't respect CONDARC env var the same way
-    # Try configuring globally
-    conda config --prepend channels "$BACKEND_URL/conda/$REPO_KEY" 2>/dev/null
-    if conda search "e2e-v1-pkg" 2>&1 | grep -q "e2e-v1-pkg"; then
+    # Try a user-level ~/.condarc, kept inside the work dir
+    HOME="$WORK_DIR" conda config --prepend channels "$BACKEND_URL/conda/$REPO_KEY" 2>/dev/null
+    if HOME="$WORK_DIR" conda search "e2e-v1-pkg" 2>&1 | grep -q "e2e-v1-pkg"; then
         pass "11.5: .condarc channel URL format works (global config)"
     else
         fail "11.5: .condarc channel URL format failed"

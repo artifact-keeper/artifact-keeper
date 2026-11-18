@@ -239,12 +239,15 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         sqlx::query("SET lock_timeout = '5min'")
             .execute(&mut *conn)
             .await?;
-        // Clear INVALID leftovers of interrupted CREATE INDEX CONCURRENTLY
-        // migrations so the retry rebuilds them instead of skipping them
-        // (#4426). Under the migrator's own advisory lock, on this session.
-        artifact_keeper_backend::migration_repair::repair_invalid_concurrent_indexes(&mut conn)
-            .await?;
-        artifact_keeper_backend::MIGRATOR.run(&mut *conn).await?;
+        // Takes the migration lock without blocking in pg_advisory_lock (a
+        // blocked waiter deadlocks a CREATE INDEX CONCURRENTLY in the holder,
+        // #5993), repairs INVALID concurrent index leftovers under that lock
+        // (#4426, #5993), then applies pending migrations.
+        artifact_keeper_backend::migration_repair::run_startup_migrations(
+            &mut conn,
+            &artifact_keeper_backend::MIGRATOR,
+        )
+        .await?;
         tracing::info!("Database migrations complete");
     }
 
@@ -875,24 +878,39 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         }
     };
 
-    let mut scanner_service = ScannerService::new(
-        db_pool.clone(),
-        advisory_client.clone(),
-        scan_result_service,
-        scan_config_service,
-        config.trivy_url.clone(),
-        config.trivy_adapter_url.clone(),
-        config.incus_scanner_enabled,
-        primary_storage.clone(),
-        storage_registry.clone(),
-        config.storage_path.clone(),
-        config.scan_workspace_path.clone(),
-        config.openscap_url.clone(),
-        config.openscap_profile.clone(),
-        scanner_auth,
-        scanner_identity,
-        config.scan_token_ttl_seconds,
-    );
+    // #5946: the queue worker's scans may use their own adapter URL, so the
+    // scanner set is built once per URL.
+    let build_scanner_service = |trivy_adapter_url: Option<String>| {
+        ScannerService::new(
+            db_pool.clone(),
+            advisory_client.clone(),
+            scan_result_service.clone(),
+            scan_config_service.clone(),
+            config.trivy_url.clone(),
+            trivy_adapter_url,
+            config.incus_scanner_enabled,
+            primary_storage.clone(),
+            storage_registry.clone(),
+            config.storage_path.clone(),
+            config.scan_workspace_path.clone(),
+            config.openscap_url.clone(),
+            config.openscap_profile.clone(),
+            scanner_auth.clone(),
+            scanner_identity.clone(),
+            config.scan_token_ttl_seconds,
+        )
+    };
+    let mut scanner_service = build_scanner_service(config.trivy_adapter_url.clone());
+    let mut worker_scanner_service = match config.scan_worker_trivy_adapter_url.clone() {
+        Some(url) if config.scan_queue_enabled && config.scan_worker_enabled => {
+            tracing::info!(
+                adapter_url = %url,
+                "Queued scans on this instance use SCAN_WORKER_TRIVY_ADAPTER_URL"
+            );
+            Some(build_scanner_service(Some(url)))
+        }
+        _ => None,
+    };
 
     // Initialize Dependency-Track integration (before wrapping scanner in Arc,
     // so we can wire the DT service into the scan pipeline for SBOM submission).
@@ -911,9 +929,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     if let Some(ref dt) = dt_service_arc {
         scanner_service.set_dependency_track(dt.clone());
+        if let Some(worker) = worker_scanner_service.as_mut() {
+            worker.set_dependency_track(dt.clone());
+        }
     }
 
     let scanner_service = Arc::new(scanner_service);
+    let worker_scanner_service = worker_scanner_service.map(Arc::new);
 
     let scheduler_storage = primary_storage.clone();
     let mut app_state = match plugin_services {
@@ -943,6 +965,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     );
     app_state.set_quality_check_service(quality_check_service);
     if let Some(search) = search_service {
+        artifact_keeper_backend::services::search_indexer::start_search_indexer(
+            app_state.event_bus.clone(),
+            app_state.db.clone(),
+            search.clone(),
+        );
         app_state.set_search_service(search);
     }
     if let Some(dt) = dt_service_arc {
@@ -1298,12 +1325,20 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         state.event_bus.clone(),
         advisory_client.clone(),
         state.proxy_service.clone(),
+        state.npm_packument_cache.clone(),
     );
 
     // Drains the durable scan queue (migration 362) when SCAN_QUEUE_ENABLED and
     // SCAN_WORKER_ENABLED are both on, before the listeners bind
     artifact_keeper_backend::services::scan_worker::spawn_scan_worker(
-        state.clone(),
+        match worker_scanner_service {
+            Some(scanner) => {
+                artifact_keeper_backend::services::scan_worker::state_with_worker_scanner(
+                    &state, scanner,
+                )
+            }
+            None => state.clone(),
+        },
         runtime_shutdown_token.clone(),
     );
 
@@ -1753,16 +1788,32 @@ async fn assert_connect_info_wired(app: Router) {
 // Platform-specific entrypoints
 // ---------------------------------------------------------------------------
 
+/// `artifact-keeper healthcheck [URL]`: the image's HEALTHCHECK probe, run
+/// before any runtime or config is built (see `cli::healthcheck`). Exits the
+/// process when the subcommand is given; returns otherwise.
+fn run_healthcheck_subcommand_if_requested() {
+    use artifact_keeper_backend::cli::healthcheck;
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some(healthcheck::SUBCOMMAND) {
+        std::process::exit(healthcheck::run(&args[2..]));
+    }
+}
+
 #[cfg(not(windows))]
-#[tokio::main]
-async fn main() -> Result<()> {
-    run_server(None).await
+fn main() -> Result<()> {
+    run_healthcheck_subcommand_if_requested();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime")
+        .block_on(run_server(None))
 }
 
 #[cfg(windows)]
 fn main() -> Result<()> {
     use artifact_keeper_backend::error::AppError;
 
+    run_healthcheck_subcommand_if_requested();
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--service") {
@@ -3137,7 +3188,7 @@ async fn warn_unservable_remote_repositories(
     Ok(())
 }
 
-#[cfg(ak_test_shard = "services-2")]
+#[cfg(ak_test_shard = "router")]
 #[cfg(test)]
 mod tests {
     use super::*;

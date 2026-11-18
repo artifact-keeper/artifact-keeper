@@ -1,10 +1,92 @@
+# ---------- Stage 0: libcurl without Kerberos (#5991) ----------
+# libopenscap links libcurl unconditionally (src/common/oscap_acquire.c has no
+# build switch for it), and the UBI/CentOS libcurl links libgssapi_krb5,
+# libssh and libldap, which together drag in krb5-libs, libssh, openldap and
+# cyrus-sasl-lib. UBI 9 ships no fixed krb5-libs for the 14 HIGH CVEs Trivy
+# reports against krb5-libs-1.21.1-10.el9_8.1 (the fix, el9_9.2 from
+# RHSA-2026:99715, is in the entitled RHEL 9 repositories only), so instead the
+# rootfs below swaps in this libcurl, built with no GSSAPI, SSH or LDAP
+# support, and deletes the Kerberos stack outright.
+#
+# oscap only needs libcurl to download remote SCAP content or remote OVAL
+# resources (--fetch-remote-resources). openscap-wrapper.py never does either:
+# it evaluates the local scap-security-guide datastreams against a local
+# path. HTTPS fetches still work with this build; Negotiate/Kerberos, SCP/SFTP
+# and LDAP URLs do not.
+#
+# Retire this stage once UBI 9 carries a fixed krb5-libs: delete the stage and
+# the swap RUN in stage 1.
+#
+# ---------------------------------------------------------------------------
+# CURL_VERSION IS HAND-MAINTAINED. Nothing bumps it for you: Dependabot does
+# not read ARGs, the libcurl below is not an RPM so Trivy and the publish gate
+# cannot see it. scripts/ci/check-curl-advisories.py checks the pin against
+# https://curl.se/docs/vuln.json daily (scheduled-curl-advisory-watch.yml,
+# #6003), but nothing bumps it. When you touch this file, and at least once a
+# release:
+#   * New releases: https://curl.se/download/ (or the curl/curl GitHub
+#     releases). curl ships roughly every 8 weeks, with patch releases for
+#     security fixes in between.
+#   * CVEs: https://curl.se/docs/security.html and
+#     https://curl.se/docs/vuln-<version>.html list every advisory with the
+#     versions it affects. Most advisories are for features compiled out here
+#     (SSH, LDAP, GSSAPI, HTTP/2, IDN); check which ones apply.
+#   * To bump: set CURL_VERSION, download curl-<v>.tar.xz and its .asc, verify
+#     the signature against Daniel Stenberg's key (fingerprint
+#     27ED EAF2 2F3A BCEB 50DB 9A12 5CC9 08FD B71E 12C2, from
+#     https://daniel.haxx.se/mykey.asc), then put the tarball's sha256sum in
+#     CURL_SHA256. The build refuses a tarball whose hash does not match.
+# ---------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi9/ubi:9.8 AS curl-builder
+
+ARG CURL_VERSION=8.23.0
+ARG CURL_SHA256=8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5
+
+RUN dnf install -y --nodocs gcc make diffutils openssl-devel zlib-devel perl xz \
+    && dnf clean all
+
+RUN curl -fsSLo /tmp/curl.tar.xz "https://curl.se/download/curl-${CURL_VERSION}.tar.xz" \
+    && echo "${CURL_SHA256}  /tmp/curl.tar.xz" | sha256sum -c - \
+    && mkdir /src && tar -C /src --strip-components=1 -xJf /tmp/curl.tar.xz \
+    && cd /src \
+    && ./configure --prefix=/usr --libdir=/usr/lib64 \
+        --with-openssl --with-zlib \
+        --with-ca-bundle=/etc/pki/tls/certs/ca-bundle.crt \
+        --without-gssapi --without-libssh --without-libssh2 \
+        --disable-ldap --disable-ldaps \
+        --without-libidn2 --without-nghttp2 --without-libpsl \
+        --without-brotli --without-zstd \
+        --disable-static --disable-manual --disable-docs \
+        --enable-symbol-hiding \
+    && make -j"$(nproc)" -C lib \
+    && make -C lib install DESTDIR=/out \
+    && ! readelf -d /out/usr/lib64/libcurl.so.4 | grep -E 'krb5|gssapi|libssh|ldap|sasl'
+
+# CycloneDX entry for this libcurl (#6003), from the same CURL_VERSION, after
+# checking the unpacked source declares that version. Installed in the runtime
+# image as /usr/share/sbom/curl.cdx.json: RPM-database scanners cannot see a
+# source-built libcurl, CPE-matching ones (syft's sbom-cataloger, grype) can.
+COPY docker/curl-sbom.sh /usr/local/bin/curl-sbom.sh
+RUN grep -q "^#define LIBCURL_VERSION \"${CURL_VERSION}\"" /src/include/curl/curlver.h \
+    && mkdir -p /out/sbom \
+    && sh /usr/local/bin/curl-sbom.sh libcurl "${CURL_VERSION}" "${CURL_SHA256}" \
+        /usr/lib64/libcurl.so.4 > /out/sbom/curl.cdx.json
+
 # ---------- Stage 1: Build minimal rootfs with OpenSCAP ----------
 FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rootfs-builder
 
-# Add CentOS 9 Stream repo for scap-security-guide (not in UBI repos)
+# CentOS Stream 9 AppStream supplies scap-security-guide, which is not in the
+# UBI repositories. `includepkgs` limits that repository to the one data
+# package: without it, Stream's newer openscap, libcurl and curl won on version
+# and the image silently shipped Stream binaries instead of UBI ones.
 RUN ARCH=$(uname -m) && \
-    dnf install -y --nodocs 'dnf-command(config-manager)' && \
-    dnf config-manager --add-repo "https://mirror.stream.centos.org/9-stream/AppStream/${ARCH}/os/"
+    printf '%s\n' \
+      '[centos-stream-9-appstream]' \
+      'name=CentOS Stream 9 AppStream (scap-security-guide only)' \
+      "baseurl=https://mirror.stream.centos.org/9-stream/AppStream/${ARCH}/os/" \
+      'includepkgs=scap-security-guide' \
+      'enabled=1' \
+      > /etc/yum.repos.d/centos-stream-9-appstream.repo
 
 # Install OpenSCAP, SCAP content, and Python into a clean rootfs.
 # Then remove pip/setuptools wheel packages from RPM database (not needed
@@ -40,6 +122,29 @@ RUN mkdir -p /mnt/rootfs && \
     && rm -rf /mnt/rootfs/usr/lib/python3.9/ensurepip \
     && dnf --installroot /mnt/rootfs clean all \
     && rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
+
+# Swap in the Kerberos-free libcurl from stage 0 and remove the Kerberos
+# stack. `rpm -e --nodeps` because openscap and the curl CLI (curl-minimal,
+# required by rpm) still declare a dependency on the libcurl RPM; the replacement provides the
+# same libcurl.so.4 soname. The ldd sweep fails the build if anything in the
+# rootfs still needs a removed library.
+COPY --from=curl-builder /out/usr/lib64/ /tmp/newcurl/
+RUN set -e; \
+    drop=$(rpm --root /mnt/rootfs -q --qf '%{NAME}\n' \
+        libcurl libcurl-minimal krb5-libs libssh libssh-config openldap cyrus-sasl-lib \
+        | grep -v 'is not installed' || true); \
+    rpm --root /mnt/rootfs -e --nodeps $drop; \
+    cp -a /tmp/newcurl/libcurl.so.4* /mnt/rootfs/usr/lib64/; \
+    rm -rf /tmp/newcurl; \
+    if ls /mnt/rootfs/usr/lib64 | grep -E '^lib(krb5|gssapi_krb5|k5crypto|ldap|lber|sasl2|ssh)\.so'; then \
+        echo 'Kerberos/LDAP/SSH libraries left in rootfs' >&2; exit 1; fi; \
+    unresolved=$(for f in /mnt/rootfs/usr/bin/* /mnt/rootfs/usr/sbin/* \
+            /mnt/rootfs/usr/lib64/*.so* /mnt/rootfs/usr/lib64/python3.9/lib-dynload/*.so; do \
+        [ -f "$f" ] || continue; \
+        chroot /mnt/rootfs ldd "${f#/mnt/rootfs}" 2>/dev/null | grep 'not found' | sed "s|^|${f#/mnt/rootfs}: |"; \
+    done); \
+    if [ -n "$unresolved" ]; then echo "$unresolved" >&2; exit 1; fi; \
+    chroot /mnt/rootfs /usr/bin/oscap --version | head -1
 
 # Create non-root user and scan workspace.
 #
@@ -112,6 +217,9 @@ COPY --from=rootfs-builder /mnt/rootfs /
 
 COPY scripts/openscap-wrapper.py /usr/local/bin/openscap-wrapper.py
 
+# CycloneDX entry for the source-built libcurl (stage 0, #6003).
+COPY --from=curl-builder /out/sbom/curl.cdx.json /usr/share/sbom/curl.cdx.json
+
 # restricted-v2 runs this container as a UID with no /etc/passwd entry, so
 # glibc cannot resolve a home directory and HOME arrives as `/`, which the
 # process cannot write. Point it at the group-writable home the rootfs-builder
@@ -125,6 +233,6 @@ USER 1001
 EXPOSE 8091
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD ["python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8091/health')"]
+    CMD ["python3", "-I", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8091/health')"]
 
-CMD ["python3", "/usr/local/bin/openscap-wrapper.py"]
+CMD ["python3", "-I", "/usr/local/bin/openscap-wrapper.py"]

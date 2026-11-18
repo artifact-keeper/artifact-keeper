@@ -140,6 +140,7 @@ const QUEUE_REPOSITORY_SYNC_TASKS_SQL: &str = r#"
         SELECT $1, a.id, 100
         FROM artifacts a
         WHERE a.repository_id = $2
+          AND a.is_deleted = false
         ON CONFLICT (peer_instance_id, artifact_id, task_type) DO NOTHING
         RETURNING id
     )
@@ -1918,6 +1919,40 @@ mod tests {
         for peer_id in peers {
             cleanup_assign(&pool, peer_id, repo_id).await;
         }
+    }
+
+    #[tokio::test]
+    async fn run_subscription_now_skips_soft_deleted_artifacts() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4();
+        let svc = PeerInstanceService::new(pool.clone());
+        let peer_id = register_test_peer(&svc, &suffix).await;
+        let repo_id = insert_test_repo(&pool, &suffix).await;
+        svc.assign_repository(
+            peer_id,
+            repo_id,
+            true,
+            Some(ReplicationMode::Push),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let live = insert_test_artifact(&pool, repo_id, "pkg/live.tgz").await;
+        let deleted = insert_test_artifact(&pool, repo_id, "pkg/deleted.tgz").await;
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+            .bind(deleted)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(svc.run_subscription_now(peer_id, repo_id).await.unwrap(), 1);
+        assert_eq!(queued_push_peers(&pool, live).await, vec![peer_id]);
+        assert!(queued_push_peers(&pool, deleted).await.is_empty());
+
+        cleanup_assign(&pool, peer_id, repo_id).await;
     }
 
     #[tokio::test]

@@ -223,10 +223,22 @@ run_check "$r" && bad "matrix missing a shard must fail" || {
     || { bad "matrix message"; cat "$tmp/out"; }
 }
 
+# A bin target's test module (bin/**) runs only in the BIN_SHARD leg, the
+# one that builds `--bins`; gated anywhere else, it never runs (#6133).
+r="$tmp/rbin"; mkrepo "$r"; python3 "$SHARDS_PY" apply --src "$r/backend/src" >/dev/null
+mkdir -p "$r/backend/src/bin/tool"
+printf '%s\n' 'fn main() {}' '' '#[cfg(ak_test_shard = "services-2")]' '#[cfg(test)]' 'mod tests {' '    #[test]' '    fn t() {}' '}' >"$r/backend/src/bin/tool/main.rs"
+run_check "$r" && bad "bin/ test module outside BIN_SHARD must fail" || {
+  grep -q "bin-target test module gated to 'services-2'" "$tmp/out" && ok "bin/ test module outside BIN_SHARD is refused" \
+    || { bad "bin/ gate message"; cat "$tmp/out"; }
+}
+sed -i 's/ak_test_shard = "services-2"/ak_test_shard = "router"/' "$r/backend/src/bin/tool/main.rs"
+run_check "$r" && ok "bin/ test module in BIN_SHARD passes" || { bad "bin/ test module in BIN_SHARD"; cat "$tmp/out"; }
+
 r="$tmp/r2"; mkrepo "$r"; python3 "$SHARDS_PY" apply --src "$r/backend/src" >/dev/null
-sed -i 's/BIN_SHARD: .*/BIN_SHARD: router/' "$r/.github/workflows/ci.yml"
+sed -i 's/BIN_SHARD: .*/BIN_SHARD: services-2/' "$r/.github/workflows/ci.yml"
 run_check "$r" && bad "wrong BIN_SHARD must fail" || {
-  grep -q "BIN_SHARD is 'router'" "$tmp/out" && ok "BIN_SHARD not matching main.rs's shard is refused" \
+  grep -q "BIN_SHARD is 'services-2'" "$tmp/out" && ok "BIN_SHARD not matching main.rs's shard is refused" \
     || { bad "BIN_SHARD message"; cat "$tmp/out"; }
 }
 
@@ -326,6 +338,69 @@ run_check "$r" && bad "gating a module used from two shards must fail" || {
     && ok "gating a module its users need in several shards is refused" \
     || { bad "multi-shard gate message"; cat "$tmp/out"; }
 }
+
+# `pub async fn` in test code is a monomorphization root of every test build
+# that compiles it (#6143). check refuses it in an inline test module, in an
+# out-of-line helper module and on an item that is itself #[cfg(test)];
+# apply rewrites each to `pub(crate)` (keeping `unsafe`) and leaves
+# production code and `pub(crate)`/plain `pub fn` alone.
+r="$tmp/r5"; mkrepo "$r"; python3 "$SHARDS_PY" apply --src "$r/backend/src" >/dev/null
+cat >"$r/backend/src/api/handlers/echo.rs" <<'EOF'
+pub async fn production_handler() {}
+
+#[cfg(test)]
+/// A test-only free function outside any module is a root too.
+pub async fn standalone_helper() {}
+
+#[cfg(test)]
+pub(crate) mod helpers;
+
+#[cfg(test)]
+mod tests {
+    pub async fn inline_helper() {}
+    pub async unsafe fn unsafe_helper() {}
+    pub(crate) async fn already_crate() {}
+    pub fn sync_helper() {}
+
+    #[tokio::test]
+    async fn e() {
+        inline_helper().await;
+    }
+}
+EOF
+mkdir -p "$r/backend/src/api/handlers/echo"
+cat >"$r/backend/src/api/handlers/echo/helpers.rs" <<'EOF'
+pub async fn builds_the_router() {
+    let _app = crate::api::routes::create_router(todo!());
+}
+EOF
+if run_check "$r"; then
+  bad "pub async fn in test code must fail check"; cat "$tmp/out"
+else
+  grep -q "echo.rs:5: \`pub async fn\` in test code" "$tmp/out" \
+    && grep -q "echo.rs:12: \`pub async fn\` in test code" "$tmp/out" \
+    && grep -q "echo.rs:13: \`pub async fn\` in test code" "$tmp/out" \
+    && grep -q "echo/helpers.rs:1: \`pub async fn\` in test code" "$tmp/out" \
+    && [ "$(grep -c '`pub async fn` in test code:' "$tmp/out")" = 4 ] \
+    && grep -q "^Why \`pub(crate)\`:" "$tmp/out" \
+    && ok "pub async fn in test code (inline, out-of-line, #[cfg(test)] item, unsafe) is refused, nothing else" \
+    || { bad "pub async fn message"; cat "$tmp/out"; }
+fi
+python3 "$SHARDS_PY" apply --src "$r/backend/src" >/dev/null
+if run_check "$r"; then
+  ok "apply rewrites pub async fn in test code so check passes"
+else
+  bad "check after pub async rewrite"; cat "$tmp/out"
+fi
+grep -q '^pub async fn production_handler' "$r/backend/src/api/handlers/echo.rs" \
+  && grep -q '^    pub(crate) async fn inline_helper' "$r/backend/src/api/handlers/echo.rs" \
+  && grep -q '^    pub(crate) async unsafe fn unsafe_helper' "$r/backend/src/api/handlers/echo.rs" \
+  && grep -q '^pub(crate) async fn standalone_helper' "$r/backend/src/api/handlers/echo.rs" \
+  && grep -q '^    pub fn sync_helper' "$r/backend/src/api/handlers/echo.rs" \
+  && [ "$(grep -c 'pub(crate) async fn already_crate' "$r/backend/src/api/handlers/echo.rs")" = 1 ] \
+  && grep -q '^pub(crate) async fn builds_the_router' "$r/backend/src/api/handlers/echo/helpers.rs" \
+  && ok "apply touches only pub async fn inside test code" \
+  || { bad "pub async rewrite scope"; cat "$r/backend/src/api/handlers/echo.rs" "$r/backend/src/api/handlers/echo/helpers.rs"; }
 
 echo "merge-lcov.py self-test"
 

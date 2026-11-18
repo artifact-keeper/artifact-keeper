@@ -475,8 +475,8 @@ set the timeout on each proxy.
 The in-flight table above belongs to one backend process: a restart loses what
 it holds, a retry on another replica scans again, and the CVE engine runs on the
 pods that serve requests. `SCAN_QUEUE_ENABLED=true` (default `false`) moves
-proxy file scans and `POST /api/v1/security/scan` to a `scan_queue` table in
-Postgres instead. A worker claims a job, scans it and records the verdict, and a
+proxy file scans, `POST /api/v1/security/scan` and `scan_on_upload` to a
+`scan_queue` table in Postgres instead. A worker claims a job, scans it and records the verdict, and a
 job outlives the pod that queued it. Left off, nothing on this page changes.
 
 A job carries a reference to the proxy-cached object (repository, cache path,
@@ -504,6 +504,15 @@ costs rows rather than memory.
 - Nor is an empty body (the proxy cache never stores one) or one over the scan
   cap (a worker refuses it unread). Both take the in-flight table, as with the
   queue off
+- **`scan_on_upload`** queues a job at the hosted priority instead of scanning
+  in the process that took the upload. A pushed OCI manifest is one
+  `hosted_image` job per repository and manifest digest: pushing the same
+  manifest again, or under another tag, while the job is pending adds no second
+  job, and the worker scans every manifest row in the repository with that
+  digest, with the scanner adapter's image scan and grype as before. Every other
+  format is one `hosted_upload` job per artifact. An upload or push that arrives
+  while its job is running marks the job to run once more when it finishes. If
+  the job cannot be queued, the scan runs in-process.
 - A job is tried three times with backoff. A worker that dies mid-scan loses its
   claim when the lease lapses, and the attempt counts. A completed job is
   deleted, since the verdict row is the record. A job that failed for good is
@@ -511,8 +520,22 @@ costs rows rather than memory.
 
 `GET /api/v1/admin/security/scan-queue` (admin only, and refused to a
 repository-scoped token, since it lists every repository's jobs) lists the outstanding jobs
-and the depth per kind and state. Hosted scans share the queue at the lowest
-priority, so a rescan of a whole repository cannot starve a waiting pull.
+and the depth per kind and state.
+
+**Claim order.** A worker claims a `fail_closed` pull's job first, since a
+client is parked on it. Hosted scans (`scan_on_upload`, pushed images and
+`POST /api/v1/security/scan`) come next, ahead of the `fail_open` and
+`record_only` backfill, so a burst of cold proxy fetches does not hold back
+upload verdicts. Backfill ages: a backfill job is claimed as though it were a
+hosted job queued `SCAN_QUEUE_BACKFILL_AGING_SECS` (default `600`) after it, so
+it still goes ahead of any hosted scan queued more than that later, and a steady
+stream of uploads cannot starve it either. `0` claims hosted and backfill jobs
+in plain age order. The window bounds the head start, not an upload's wait:
+once a backlog is older than the window, uploads queue behind the part of it
+queued more than the window before them, so a backlog that keeps growing still
+needs more worker slots. Rescans come after everything else. Each kind's
+`ak_scan_queue_oldest_pending_seconds` shows how long its oldest due job has
+waited.
 
 **Running the worker separately.** With the queue on, `SCAN_WORKER_ENABLED`
 (default `true`) has each instance drain it. In a multi-replica deployment set
@@ -520,7 +543,44 @@ it `false` on the API pods and run the same image with it on as a scan worker.
 The worker has to read what an API pod wrote: object storage, or a filesystem
 volume both can mount. `SCAN_WORKER_CONCURRENCY` sets how many jobs one worker
 runs at once and defaults to `MAX_CONCURRENT_SCAN_EXTRACTIONS`. Each job takes
-an extraction permit, so raise the two together.
+an extraction permit, so raise the two together. `SCAN_WORKER_TRIVY_ADAPTER_URL`
+gives the scans a worker runs their own scanner-adapter URL in place of
+`TRIVY_ADAPTER_URL`, so a worker pod can use an adapter running next to it while
+the API pods keep the Service URL. It is read only with the queue and the worker
+on. Only the URL changes: the worker's adapter client sends the same credentials
+as the API pods' (for example a `TRIVY_ADAPTER_TOKEN`, where set), so the
+adapter next to the worker must accept them.
+
+**Rescans after a vulnerability-database update.** `SCAN_RESCAN_MAX_PER_DAY`
+(default `0`, off) has the worker look every 15 minutes for stored artifacts
+whose latest completed scan used an older database build than the one the
+scanner reports now: Grype's from `grype db status`, or for a scanner that
+reports its database only with a scan (the scanner adapter's Trivy), the newest
+build a scan recorded. Each scan type's last-known build is kept in
+`scan_vuln_db_builds`, so a quiet spell with no scans does not hide it. A build
+never moves backwards there; to forget one (for example after rolling a
+scanner's database back on purpose), delete its row,
+`DELETE FROM scan_vuln_db_builds WHERE scan_type = 'grype';`, and the next pass
+records the build the scanner reports now. A latest scan with no recorded build
+counts as older. Each such content digest, in a repository with scanning on,
+becomes one `rescan` job at the lowest priority, below hosted scans, so every
+other job is claimed first. The worker scans the digest once, with the scanners
+that have a vulnerability database, and gives every artifact row in this
+instance that holds it the fresh result (at most 1000 rows a job, newest first;
+in practice only the empty file's digest is that common); the earlier results
+stay. The copy follows the usual reuse rules, so a fresh result that cataloged
+nothing (`not_cataloged`, for example a package the CVE engine found no
+components in) is not copied: every row holding that digest is scanned on its
+own, as two uploads of those bytes would be. Rescans hold at most half a worker's `SCAN_WORKER_CONCURRENCY` slots (one
+on a single-slot worker), and the selection runs beside the claim loop, never in
+it. Most recently downloaded digests go first, at most
+`SCAN_RESCAN_MAX_PER_DAY` a day across all workers, and each digest once per
+database build, whether or not its rescan succeeded. Pending rescans and the
+oldest one's age are `ak_scan_queue_depth{kind="rescan",state="pending"}` and
+`ak_scan_queue_oldest_pending_seconds{kind="rescan"}`. A rescan asks the scanner
+adapter for its background band: `"priority": "background"` in an image scan
+request and `X-Scan-Priority: background` on a filesystem upload. Other scans
+send neither, and an adapter without that band ignores both and scans as usual.
 
 The worker publishes `ak_scan_queue_depth`,
 `ak_scan_queue_oldest_pending_seconds`, `ak_scan_queue_wait_seconds`,

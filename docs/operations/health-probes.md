@@ -16,6 +16,27 @@ probe. Do not use `/health` as a readiness probe: it turns `503` whenever
 OpenSearch or storage is unhealthy, which takes every replica out of rotation
 at once when a shared dependency fails.
 
+## Probing from inside the container
+
+The backend image's Docker `HEALTHCHECK` runs `artifact-keeper healthcheck`,
+which sends `GET /health` to the address in `BIND_ADDRESS` (default
+`0.0.0.0:8080`, probed on loopback). It exits `0` on a `2xx` answer and `1`
+otherwise, with a 9 second budget for the whole probe. Pass a path
+(`artifact-keeper healthcheck /livez`) or an `http://host:port/path` URL to
+probe something else, for example in a compose `healthcheck.test`:
+
+```yaml
+healthcheck:
+  test: ["CMD", "artifact-keeper", "healthcheck", "/livez"]
+```
+
+`artifact-keeper healthcheck` needs a 1.12.0 or later image. On an older image
+the binary ignores the argument and starts a second server, so a compose file
+pinned to an older tag must keep its curl-based healthcheck
+(`["CMD", "curl", "-f", "http://localhost:8080/health"]`). The image still
+ships `curl`, built without Kerberos, LDAP or SSH support (#5991), so such
+healthchecks keep working on 1.12.0 too.
+
 ## What `/readyz` checks
 
 `/readyz` is ready when:

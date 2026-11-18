@@ -25,6 +25,11 @@
 //! All read routes are also available with URL path token authentication:
 //!   GET  /conda/t/{token}/{repo_key}/...                     - Token-authenticated access
 //!   GET  /t/{token}/conda/{repo_key}/...                     - rattler/pixi `--conda-token` layout
+//!
+//! Classic conda cannot carry the `_` in an Artifact Keeper token (its URL
+//! token regex is `[a-zA-Z0-9-]*`), so on these routes it writes the token
+//! without the separator; both spellings are accepted (#5642). See
+//! [`token_router`] for the full caveat.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
@@ -780,6 +785,16 @@ fn privatize_cache_control(headers: &mut HeaderMap) {
 /// This is configured in `.condarc` as:
 ///   channels:
 ///     - https://host/conda/t/<TOKEN>/my-channel
+///
+/// **Classic conda:** its URL-token regex, `re.search(r"/t/([a-zA-Z0-9-]*)",
+/// url)` (`conda/common/url.py`), has no `_` in its alphabet, so it stops at
+/// the separator inside an Artifact Keeper token (`<8 hex>_<32 hex>`), drops
+/// the rest of the credential into the channel path and the read 401s
+/// (#5642). Classic conda users must write the token **without** the
+/// separator, `<8 hex><32 hex>`; the route accepts that spelling and restores
+/// the canonical form before validation. micromamba and rattler/pixi handle
+/// the canonical spelling as-is. A client that can only attach a header (or
+/// that prefers Basic) uses the canonical token unchanged.
 pub fn token_router() -> Router<SharedState> {
     token_routes("")
 }
@@ -5248,9 +5263,13 @@ enum ShardField<'a> {
 }
 
 /// A repodata record in CEP-16 shard form: every field as in `repodata.json`
-/// except the digests, which become `bin`. A digest field that is not valid
-/// hex of the right length (an empty `md5` on a row with no extracted
-/// metadata) is omitted rather than sent as a string a reader would reject.
+/// except `fn` and the digests. The enclosing map's key already is the
+/// filename, and conda 26.7 passes that key as `fn` when it builds a
+/// `PackageRecord`, so a record that also carries `fn` fails with "multiple
+/// values for keyword argument 'fn'" (#5432). The digests become `bin`; a
+/// digest field that is not valid hex of the right length (an empty `md5` on
+/// a row with no extracted metadata) is omitted rather than sent as a string
+/// a reader would reject.
 struct ShardRecord<'a>(&'a serde_json::Map<String, serde_json::Value>);
 
 impl serde::Serialize for ShardRecord<'_> {
@@ -5260,6 +5279,9 @@ impl serde::Serialize for ShardRecord<'_> {
             .0
             .iter()
             .filter_map(|(key, value)| {
+                if key == "fn" {
+                    return None;
+                }
                 match SHARD_DIGEST_KEYS.iter().find(|(k, _)| *k == key.as_str()) {
                     Some((_, len)) => value
                         .as_str()
@@ -7149,8 +7171,11 @@ async fn download_package(
                     }
                 }
 
+                // #5810: no member scans; the virtual's member-fallback policy.
+                let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
                 let result = proxy_helpers::resolve_virtual_download_from_members(
                     members,
+                    fallback,
                     proxy_service,
                     &serve_key.cache_key,
                     Some(&ctx),
@@ -7465,7 +7490,9 @@ where
     if policies.iter().all(Option::is_none) {
         return None;
     }
-    let mut failures = proxy_helpers::MemberWalkFailures::default();
+    // #5810: the virtual's member-fallback policy, for every member below.
+    let fallback = proxy_helpers::virtual_member_fallback(&state.db, virtual_id).await;
+    let mut failures = proxy_helpers::MemberWalkFailures::new(fallback);
     let mut unscanned = Vec::new();
     for (member, policy) in members.iter().zip(policies) {
         let (Some(policy), Some(upstream_url)) = (policy, member.upstream_url.as_deref()) else {
@@ -7473,9 +7500,9 @@ where
             continue;
         };
         let run = std::mem::take(&mut unscanned);
-        if let Some(served) =
-            failures.run_answer(resolve_unscanned_conda_run(proxy, run, target, local_fetch).await)
-        {
+        if let Some(served) = failures.run_answer(
+            resolve_unscanned_conda_run(proxy, run, fallback, target, local_fetch).await,
+        ) {
             return Some(served);
         }
         match serve_scanned_conda_package(
@@ -7496,7 +7523,9 @@ where
                 return Some(Err(resp))
             }
             Err(resp) => {
-                failures.note(&resp);
+                if let Some(ended) = failures.note(&resp) {
+                    return Some(ended);
+                }
                 tracing::debug!(
                     member_key = %member.key, status = %resp.status(),
                     "scanned conda virtual member did not serve; trying next member"
@@ -7504,7 +7533,11 @@ where
             }
         }
     }
-    Some(failures.finish(resolve_unscanned_conda_run(proxy, unscanned, target, local_fetch).await))
+    Some(
+        failures.finish(
+            resolve_unscanned_conda_run(proxy, unscanned, fallback, target, local_fetch).await,
+        ),
+    )
 }
 
 /// A run of non-scanning members inside the scanned walk, through the shared
@@ -7514,6 +7547,7 @@ where
 async fn resolve_unscanned_conda_run<F, Fut>(
     proxy: &crate::services::proxy_service::ProxyService,
     run: Vec<crate::models::repository::Repository>,
+    fallback: proxy_helpers::VirtualMemberFallback,
     target: &CondaPackageTarget<'_>,
     local_fetch: &F,
 ) -> Option<Result<Response, Response>>
@@ -7528,6 +7562,7 @@ where
     }
     match proxy_helpers::resolve_virtual_download_from_members(
         run,
+        fallback,
         Some(proxy),
         target.cache_key,
         Some(target.ctx),
@@ -9733,6 +9768,9 @@ async fn serve_sidecar(
         // uses; a refusal ends the walk, as it does for the package.
         let policies =
             proxy_helpers::virtual_member_scan_policies(&state.db, repo.id, &members).await?;
+        // #5810: in strict mode a Remote member that could not answer ends
+        // the walk with the retryable 503, as it does for the package.
+        let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
         for (member, policy) in members.iter().zip(policies) {
             if member.repo_type == RepositoryType::Remote {
                 if !remote_admitted {
@@ -9751,7 +9789,7 @@ async fn serve_sidecar(
                 {
                     return Err(blocked);
                 }
-                if let Ok(response) = proxy_sidecar(
+                match proxy_sidecar(
                     state,
                     member.id,
                     &member.key,
@@ -9761,7 +9799,14 @@ async fn serve_sidecar(
                 )
                 .await
                 {
-                    return Ok(response);
+                    Ok(response) => return Ok(response),
+                    Err(resp)
+                        if fallback.is_strict()
+                            && proxy_helpers::is_member_unavailable_response(&resp) =>
+                    {
+                        return Err(proxy_helpers::member_unavailable_response());
+                    }
+                    Err(_) => {}
                 }
                 continue;
             }
@@ -10280,17 +10325,6 @@ async fn store_conda_package(
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
 
-    // #4159: scan_on_upload trigger — format-native upload paths bypass
-    // `ArtifactService::upload`'s auto-scan gate, so mirror it here. No-op when
-    // the scanner_service is None or `scan_on_upload`/`scan_enabled` is false.
-    crate::services::scanner_service::trigger_scan_on_upload(
-        &state.db,
-        state.scanner_service.clone(),
-        repo.id,
-        artifact_id,
-    )
-    .await;
-
     // Extract metadata from package contents. #2561: permit-scoped decode; the
     // artifact row is already committed, so a saturated server skips this
     // best-effort enrichment rather than failing the stored upload.
@@ -10366,6 +10400,19 @@ async fn store_conda_package(
 
     count_conda_install_script_findings(&repo.key, &install_scripts);
     record_conda_package_analysis(state, artifact_id, extracted.as_ref(), install_scripts).await;
+
+    // #4159: scan_on_upload trigger — format-native upload paths bypass
+    // `ArtifactService::upload`'s auto-scan gate, so mirror it here. #5692: it
+    // must come after the metadata and analysis writes above, because the
+    // dependency scanner reads the stored identity to query PyPI aliases.
+    // No-op when the scanner_service is None or `scan_on_upload` is false.
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     // Surface the package on the Packages page (#3659), keyed on the conda
     // package's own name/version (the build string stays in metadata), with
@@ -14285,6 +14332,43 @@ mod tests {
             hex::encode(record.md5.expect("md5 present")),
             "cd".repeat(16)
         );
+    }
+
+    #[test]
+    fn shard_wire_records_do_not_duplicate_the_filename_5432() {
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            packages: BTreeMap<String, BTreeMap<String, serde::de::IgnoredAny>>,
+            #[serde(rename = "packages.conda")]
+            packages_conda: BTreeMap<String, BTreeMap<String, serde::de::IgnoredAny>>,
+        }
+
+        for (section, filename) in [
+            ("packages", "pkg-1.0-0.tar.bz2"),
+            ("packages.conda", "pkg-1.0-0.conda"),
+        ] {
+            // Also models records synthesized from a remote repodata.json:
+            // normalization belongs at the shared wire boundary.
+            let record = serde_json::json!({
+                "name": "pkg", "version": "1.0", "fn": filename,
+                "sha256": "ab".repeat(32), "vendor_metadata": "preserved"
+            });
+            let mut shard = serde_json::json!({"packages": {}, "packages.conda": {}});
+            shard[section][filename] = record;
+            let encoded = encode_shard(&shard).unwrap();
+            let decoded: Decoded =
+                rmp_serde::from_slice(&zstd::decode_all(&encoded[..]).unwrap()).unwrap();
+            let records = if section == "packages" {
+                decoded.packages
+            } else {
+                decoded.packages_conda
+            };
+            let record = &records[filename];
+            assert!(!record.contains_key("fn"));
+            assert!(record.contains_key("sha256"));
+            assert!(record.contains_key("vendor_metadata"));
+            assert_eq!(shard[section][filename]["fn"], filename);
+        }
     }
 
     #[test]
@@ -21340,8 +21424,14 @@ mod repodata_byte_stability_tests {
 #[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod scan_on_upload_tests {
+    use std::sync::{Arc, Mutex};
+
+    use bytes::Bytes;
+
     use crate::api::handlers::test_db_helpers as tdh;
+    use crate::models::artifact::{Artifact, ArtifactMetadata};
     use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+    use crate::services::scanner_service::{ScanOutput, Scanner};
 
     /// Build a minimal but valid conda v1 package: a bzip2 tar carrying
     /// `info/index.json` whose fields agree with the filename.
@@ -21481,6 +21571,116 @@ mod scan_on_upload_tests {
         assert_eq!(
             count, 0,
             "scan_on_upload is disabled, so the upload must not enqueue a scan"
+        );
+    }
+
+    /// Captures the metadata snapshot a scan was handed at its start (#5692).
+    #[derive(Clone, Default)]
+    struct MetadataRecorder {
+        seen: Arc<Mutex<Vec<Option<ArtifactMetadata>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Scanner for MetadataRecorder {
+        fn name(&self) -> &str {
+            "conda-metadata-recorder"
+        }
+
+        fn scan_type(&self) -> &str {
+            "dependency"
+        }
+
+        async fn scan(
+            &self,
+            _artifact: &Artifact,
+            metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> crate::error::Result<ScanOutput> {
+            self.seen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(metadata.cloned());
+            Ok(ScanOutput::default())
+        }
+    }
+
+    /// Runs the upload's scan inside the trigger, so what the recorder sees is
+    /// the handler's state at that exact point rather than a race with the
+    /// metadata write that follows it.
+    struct InlineScanGuard;
+
+    impl InlineScanGuard {
+        fn install() -> Self {
+            crate::services::scanner_service::TEST_INLINE_SCAN_ON_UPLOAD
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for InlineScanGuard {
+        fn drop(&mut self) {
+            crate::services::scanner_service::TEST_INLINE_SCAN_ON_UPLOAD
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// #5692: the trigger used to run before the metadata upsert, so a scan
+    /// could start before the conda identity was stored and grade the package
+    /// as uncataloged. An inline scan makes the snapshot deterministic: on the
+    /// fixed handler the identity is already in `artifact_metadata`.
+    #[tokio::test]
+    async fn native_put_upload_scan_sees_stored_conda_identity() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        set_scan_on_upload(&fx.pool, fx.repo_id, true).await;
+
+        let recorder = Arc::new(MetadataRecorder::default());
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state =
+            tdh::build_scan_state_with_leaf_scanners(&fx, &storage_path, vec![recorder.clone()]);
+        let router = tdh::router_with_auth(
+            super::router(),
+            state,
+            tdh::make_auth(fx.user_id, &fx.username),
+        );
+
+        let _inline = InlineScanGuard::install();
+        let body = conda_v1_package("py-opencv", "4.9.0", "py_0");
+        let (status, resp) = tdh::send(
+            router,
+            tdh::put(
+                format!("/{}/noarch/py-opencv-4.9.0-py_0.tar.bz2", fx.repo_key),
+                Bytes::from(body),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "conda PUT upload failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let seen = recorder
+            .seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        fx.teardown().await;
+
+        assert_eq!(seen.len(), 1, "the upload must trigger exactly one scan");
+        let metadata = seen
+            .into_iter()
+            .next()
+            .flatten()
+            .expect("the first scan must see the stored artifact metadata");
+        assert_eq!(metadata.format, "conda");
+        let identity = crate::services::conda_identity::read_identity(&metadata.metadata)
+            .expect("the scan-time metadata must carry the conda identity");
+        assert_eq!(identity.status(), "mapped");
+        assert_eq!(
+            identity.pypi_advisory_targets(),
+            vec![("opencv-python".to_string(), "4.9.0".to_string())]
         );
     }
 }
@@ -24419,6 +24619,77 @@ mod rattler_token_layout_tests {
             assert_eq!(package_status, StatusCode::OK, "{package_path}");
             assert_eq!(&package_body[..], &content[..]);
             assert_eq!(shard_status, StatusCode::OK, "{prefix} shard");
+        }
+    }
+
+    /// #5642: classic conda reads a channel token with
+    /// `re.search(r"/t/([a-zA-Z0-9-]*)", url)`, whose alphabet has no `_`, so
+    /// it cannot carry the canonical `<8 hex>_<32 hex>` spelling: it stops at
+    /// the separator, drops the rest of the credential into the channel path
+    /// and the read 401s. A classic-conda user writes the token without the
+    /// separator, and the token channel must resolve it to the same private
+    /// channel. The canonical spelling keeps working.
+    #[tokio::test]
+    async fn conda_token_url_accepts_the_separator_less_spelling_5642() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+        let filename = "pkg-1.0-0.tar.bz2";
+        let path = format!("noarch/{filename}");
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &format!("conda/{}/{path}", fx.repo_id),
+            &path,
+            "pkg",
+            "1.0",
+            "application/x-tar",
+            Bytes::from_static(b"fake-conda-package-bytes"),
+            fx.user_id,
+        )
+        .await;
+        let auth_service = AuthService::new(fx.pool.clone(), Arc::new(fx.state.config.clone()));
+        let (token, _id) = auth_service
+            .generate_api_token(
+                fx.user_id,
+                "conda-5642",
+                vec!["read:artifacts".to_string()],
+                None,
+            )
+            .await
+            .expect("mint API token");
+        let conda_token = format!("{}{}", &token[..8], &token[9..]);
+        assert!(!conda_token.contains('_'));
+
+        let app = crate::api::routes::create_router(fx.state.clone());
+        let key = fx.repo_key.clone();
+        let mut results = Vec::new();
+        for credential in [&token, &conda_token] {
+            // The `.condarc` layout and rattler's `--conda-token` layout both
+            // carry the credential in the path.
+            for uri in [
+                format!("/conda/t/{credential}/{key}/noarch/repodata.json"),
+                format!("/t/{credential}/conda/{key}/noarch/repodata.json"),
+            ] {
+                let response = tdh::send(app.clone(), tdh::get(uri.clone())).await;
+                results.push((uri, response));
+            }
+        }
+        fx.teardown().await;
+
+        for (uri, (status, body)) in results {
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{}: {}",
+                uri.replace(&token, "<token>")
+                    .replace(&conda_token, "<token>"),
+                String::from_utf8_lossy(&body)
+            );
+            let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(doc["packages"].get(filename).is_some(), "{doc}");
         }
     }
 }

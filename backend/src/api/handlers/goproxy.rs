@@ -1047,8 +1047,15 @@ async fn list_versions(
     // Virtual repo: COLLATE the version list across every member the caller may
     // read, rather than serving the first member that answers (#833).
     if repo.repo_type == RepositoryType::Virtual {
-        let collated = collate_virtual_version_list(state, auth, repo, module, &body).await?;
-        if collated.is_empty() {
+        let (collated, module_exists) =
+            collate_virtual_version_list(state, auth, repo, module, &body).await?;
+        // An empty collation is not by itself a miss: a module that exists but
+        // carries no tagged version has a legitimately empty `@v/list`, which
+        // the GOPROXY protocol answers with 200 and an empty body. Only a
+        // module no member could resolve is a 404, as on the non-virtual arm
+        // below, which serves the (possibly empty) upstream body and answers
+        // 404 solely on an upstream miss.
+        if virtual_list_is_not_found(&collated, module_exists) {
             return Err((StatusCode::NOT_FOUND, "module not found").into_response());
         }
         return Ok(Response::builder()
@@ -1141,13 +1148,22 @@ async fn list_versions(
 /// newline-separated list and the `go` toolchain reads every non-empty line as
 /// a version, so there is no comment syntax to carry a warning. The server log
 /// is the only channel.
+///
+/// Returns `(document, module_exists)`. `module_exists` is true when the
+/// document lists a version, or when a Remote member ANSWERED the listing, even
+/// with an empty body: that is how the caller tells "exists but has no tagged
+/// version" (200, empty) apart from "no member could resolve it" (404). A
+/// Remote member whose upstream answers 404 or fails contributes `None` and
+/// does not set it, so an unknown module still answers 404, and because only
+/// members this caller may read are asked, the flag is no existence oracle
+/// over a member it could not read directly.
 async fn collate_virtual_version_list(
     state: &SharedState,
     auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     module: &str,
     own_body: &str,
-) -> Result<String, Response> {
+) -> Result<(String, bool), Response> {
     let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
 
     // Seed with the virtual's own (age-gate-filtered) rows. A virtual holds no
@@ -1187,6 +1203,9 @@ async fn collate_virtual_version_list(
         .iter()
         .filter(|m| m.repo_type == RepositoryType::Remote)
         .collect();
+    // A Remote member that answers, even with an empty list, proves the module
+    // exists upstream. A miss or a failure is `None` and does not count.
+    let mut any_remote_answered = false;
     if !remote_members.is_empty() {
         let upstream_path = build_go_upstream_list_path(module);
         for chunk in remote_members.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
@@ -1196,12 +1215,14 @@ async fn collate_virtual_version_list(
                 }))
                 .await;
             for list in batch.into_iter().flatten() {
+                any_remote_answered = true;
                 merged.extend(parse_version_list(&list));
             }
         }
     }
 
-    Ok(dedup_version_list(merged))
+    let module_exists = any_remote_answered || !merged.is_empty();
+    Ok((dedup_version_list(merged), module_exists))
 }
 
 /// One Remote member's contribution to a collated `@v/list`, or `None` when it
@@ -1282,6 +1303,18 @@ fn dedup_version_list(versions: Vec<String>) -> String {
         .filter(|v| !v.is_empty() && seen.insert(v.clone()))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Whether a virtual repository's `@v/list` collation is a genuine 404.
+///
+/// A module that exists but has no tagged version (it is consumed by
+/// pseudo-version only) has an EMPTY `@v/list`, and the GOPROXY protocol
+/// answers it with 200 and an empty body: proxy.golang.org does, and so does
+/// the non-virtual arm of [`list_versions`]. `go install pkg@<pseudo-version>`
+/// reads `@v/list` and fails on a 404 there, so an empty collation is a miss
+/// only when no member could resolve the module at all.
+fn virtual_list_is_not_found(collated: &str, module_exists: bool) -> bool {
+    collated.is_empty() && !module_exists
 }
 
 // ---------------------------------------------------------------------------
@@ -1709,8 +1742,11 @@ async fn download_zip(
                 let db = state.db.clone();
                 let module_clone = module.to_string();
                 let version_clone = version.to_string();
+                // #5810: no member scans; the virtual's member-fallback policy.
+                let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
                 let result = proxy_helpers::resolve_virtual_download_from_members(
                     allowed,
+                    fallback,
                     state.proxy_service.as_deref(),
                     &upstream_path,
                     Some(ctx),
@@ -4529,6 +4565,94 @@ mod virtual_collation_tests {
             merged, "v1.2.3\nv1.0.0\nv2.0.0",
             "duplicates collapse to their first occurrence, empty lines are \
              dropped, and the order the members were walked in survives"
+        );
+    }
+
+    /// Only an empty collation that no member could resolve is a 404.
+    #[test]
+    fn test_virtual_list_is_not_found_only_when_no_member_resolved_the_module() {
+        assert!(super::virtual_list_is_not_found("", false));
+        assert!(
+            !super::virtual_list_is_not_found("", true),
+            "an existing module with no tagged version lists nothing and is not a miss"
+        );
+        assert!(!super::virtual_list_is_not_found("v1.0.0", true));
+    }
+
+    /// A module that exists upstream but has no tagged version has an empty
+    /// `@v/list`. The virtual must answer it as its Remote member does when
+    /// read directly, 200 with an empty body, and keep answering 404 for a
+    /// module the upstream does not know. Before the fix the virtual answered
+    /// 404 for both, so `go install pkg@latest` failed through a virtual
+    /// repository while it worked through the member behind it (#6211).
+    #[tokio::test]
+    async fn test_virtual_go_list_is_200_empty_for_an_untagged_module_db() {
+        const UNTAGGED: &str = "example.com/untagged-lib";
+        const ABSENT: &str = "example.com/absent-lib";
+
+        // The fixture repo is the Remote member.
+        let Some(fx) = tdh::Fixture::setup("remote", "go").await else {
+            return;
+        };
+        // Only the untagged module's listing is mounted, with an empty body;
+        // wiremock answers 404 for every other path.
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{UNTAGGED}/@v/list")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain; charset=utf-8")
+                    .set_body_bytes(Vec::new()),
+            )
+            .mount(&upstream)
+            .await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("point the remote member at its upstream");
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+
+        let (virtual_id, virtual_key, _vdir) = tdh::create_repo(&fx.pool, "virtual", "go").await;
+        tdh::publish_repo(&fx.pool, virtual_id).await;
+        tdh::link_virtual_member(&fx.pool, virtual_id, fx.repo_id, 0).await;
+
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), cache_dir.path().to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), &fx.storage_dir.to_string_lossy(), proxy);
+
+        let member_uri = format!("/{}/{UNTAGGED}/@v/list", fx.repo_key);
+        let virtual_uri = format!("/{virtual_key}/{UNTAGGED}/@v/list");
+        let absent_uri = format!("/{virtual_key}/{ABSENT}/@v/list");
+        let anon = || tdh::router_anon(super::router(), state.clone());
+        let (member_status, member_body) = tdh::send(anon(), tdh::get(member_uri)).await;
+        let (virtual_status, virtual_body) = tdh::send(anon(), tdh::get(virtual_uri)).await;
+        let (absent_status, _) = tdh::send(anon(), tdh::get(absent_uri)).await;
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virtual_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(member_status, axum::http::StatusCode::OK);
+        assert!(
+            member_body.is_empty(),
+            "the Remote member serves the upstream's empty list"
+        );
+        assert_eq!(
+            virtual_status,
+            axum::http::StatusCode::OK,
+            "a virtual must answer an existing untagged module as its member does, not 404"
+        );
+        assert!(virtual_body.is_empty());
+        assert_eq!(
+            absent_status,
+            axum::http::StatusCode::NOT_FOUND,
+            "a module no member can resolve is still a 404"
         );
     }
 }

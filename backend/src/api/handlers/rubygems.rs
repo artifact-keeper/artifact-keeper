@@ -34,7 +34,9 @@ use sqlx::{PgPool, Row};
 use std::io::Write as IoWrite;
 use tracing::info;
 
-use crate::api::handlers::proxy_helpers::{self, RepoInfo, LARGE_METADATA_MAX_BYTES};
+use crate::api::handlers::proxy_helpers::{
+    self, RepoInfo, DEFAULT_METADATA_MAX_BYTES, LARGE_METADATA_MAX_BYTES,
+};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::rubygems::{RubygemsHandler, SpecEntry};
@@ -61,6 +63,11 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/prerelease_specs.4.8.gz",
             get(prerelease_specs_index),
         )
+        // Compact Index (Bundler's first choice). Served for Remote repos only,
+        // see `serve_compact_index`.
+        .route("/:repo_key/versions", get(compact_versions))
+        .route("/:repo_key/names", get(compact_names))
+        .route("/:repo_key/info/:name", get(compact_info))
         // Quick gemspec (Marshal 4.8, zlib-deflated). `gem install` fetches this
         // to resolve a gem's dependencies before downloading the .gem.
         .route("/:repo_key/quick/Marshal.4.8/:spec_file", get(quick_spec))
@@ -843,7 +850,14 @@ async fn serve_specs_index(
     sql: &str,
 ) -> Result<Response, Response> {
     if repo.repo_type == RepositoryType::Remote {
-        return proxy_remote_index(state, repo, upstream_path).await;
+        return proxy_remote_document(
+            state,
+            repo,
+            upstream_path,
+            LARGE_METADATA_MAX_BYTES,
+            "application/gzip",
+        )
+        .await;
     }
     if repo.repo_type == RepositoryType::Virtual {
         return serve_virtual_specs_index(state, repo, auth, upstream_path, sql).await;
@@ -1418,6 +1432,21 @@ async fn quick_spec(
 
     match find_local_quick_spec(&state.db, repo.id, full_name).await? {
         Some(spec) => quick_spec_response(&spec),
+        // A Remote repo has no local row for a gem it has not cached yet, so
+        // the spec comes from upstream (already zlib-deflated Marshal).
+        None if repo.repo_type == RepositoryType::Remote => {
+            if !is_safe_path_segment(&spec_file) {
+                return Err((StatusCode::NOT_FOUND, "Gemspec not found").into_response());
+            }
+            proxy_remote_document(
+                &state,
+                &repo,
+                &format!("quick/Marshal.4.8/{spec_file}"),
+                DEFAULT_METADATA_MAX_BYTES,
+                "application/octet-stream",
+            )
+            .await
+        }
         None => Err((StatusCode::NOT_FOUND, "Gemspec not found").into_response()),
     }
 }
@@ -1437,6 +1466,14 @@ async fn dependencies(
     Query(query): Query<DependencyQuery>,
 ) -> Result<Response, Response> {
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
+
+    // This endpoint answers from local rows only. For a Remote repo that meant
+    // `[]` for every gem it had not cached, which tells a client the gem has no
+    // versions. rubygems.org has retired the Dependency API (it answers 404),
+    // so a Remote repo answers 404 too and Bundler uses the Compact Index.
+    if repo.repo_type == RepositoryType::Remote {
+        return Err(dependency_api_not_served());
+    }
 
     let gem_names: Vec<&str> = query
         .gems
@@ -1531,14 +1568,88 @@ fn index_bytes_response(bytes: Bytes, content_type: Option<&str>) -> Response {
         .unwrap()
 }
 
-/// Pass a Remote repo's upstream specs index through verbatim (#4280).
+/// Pass a document from a Remote repo's upstream through verbatim.
 ///
-/// Specs indexes from rubygems.org exceed [`proxy_helpers::DEFAULT_METADATA_MAX_BYTES`]
-/// (8 MiB), so the fetch uses [`LARGE_METADATA_MAX_BYTES`].
-async fn proxy_remote_index(
+/// Used for the specs indexes (#4280), the Compact Index and the quick
+/// gemspecs (#5686). Specs indexes and the Compact Index `versions` file from
+/// rubygems.org exceed [`DEFAULT_METADATA_MAX_BYTES`] (8 MiB), so those
+/// fetches pass [`LARGE_METADATA_MAX_BYTES`].
+///
+/// The body is the upstream (or cached) bytes as they arrived, so the
+/// upstream `Content-Encoding` is re-declared when present (RFC 9110 §8.4,
+/// #3149/#3260): a mirror that serves `versions` or `info/*` with a coding
+/// must not reach Bundler labelled as plain bytes, or its MD5 check of the
+/// `info/{name}` body fails. A body served under the `stale-if-error` grace
+/// carries the stale markers (#4581), as the Virtual paths already do.
+///
+/// The buffered document is charged against the RubyGems family's sub-budget
+/// as well as the shared metadata budget, inside a bounded wait (#5973): see
+/// [`RemoteDocumentBudget`].
+async fn proxy_remote_document(
     state: &SharedState,
     repo: &RepoInfo,
     path: &str,
+    max_bytes: usize,
+    default_content_type: &str,
+) -> Result<Response, Response> {
+    proxy_remote_document_in(
+        state,
+        repo,
+        path,
+        max_bytes,
+        default_content_type,
+        RemoteDocumentBudget::process(),
+    )
+    .await
+}
+
+/// Where a Remote document's buffered bytes are accounted (#5973).
+///
+/// Bundler fetches `/versions` (about 24 MB on rubygems.org) on every run, and
+/// the Remote routes are reachable anonymously on a public Remote. Each fetch
+/// of a cold or stale document reserves the full 128 MiB cap, so before #5973
+/// eight concurrent ones held the whole shared 1 GiB budget and every other
+/// format's metadata fetch queued behind them, without a bound.
+///
+/// * `family`: the [`MetadataBudgetFamily::RubygemsRemote`] sub-budget
+///   (a quarter of the shared budget by default), so RubyGems documents can
+///   never hold more of the shared budget than that share.
+/// * `wait`: how long a fetch queues for its reservation before it answers
+///   503 + `Retry-After`. A lone request reserves at most one cap, which the
+///   share always admits, so it never sheds against its own family.
+#[derive(Clone, Copy)]
+struct RemoteDocumentBudget {
+    shared: &'static proxy_helpers::ProxyMetadataBudget,
+    family: &'static proxy_helpers::MetadataSubBudget,
+    wait: std::time::Duration,
+}
+
+/// Longest a Remote document fetch queues for its share of the
+/// buffered-metadata budget before shedding (#5973). Longer than the VS Code
+/// gallery's 5 s, since the request it queues behind may be a cold fetch of a
+/// ~24 MB `/versions` from a slow upstream.
+const REMOTE_DOCUMENT_BUDGET_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl RemoteDocumentBudget {
+    fn process() -> Self {
+        Self {
+            shared: proxy_helpers::proxy_metadata_budget(),
+            family: proxy_helpers::metadata_sub_budget(
+                proxy_helpers::MetadataBudgetFamily::RubygemsRemote,
+            ),
+            wait: REMOTE_DOCUMENT_BUDGET_WAIT,
+        }
+    }
+}
+
+/// [`proxy_remote_document`] against the given budgets.
+async fn proxy_remote_document_in(
+    state: &SharedState,
+    repo: &RepoInfo,
+    path: &str,
+    max_bytes: usize,
+    default_content_type: &str,
+    budget: RemoteDocumentBudget,
 ) -> Result<Response, Response> {
     let (Some(proxy), Some(upstream)) =
         (state.proxy_service.as_deref(), repo.upstream_url.as_deref())
@@ -1549,23 +1660,154 @@ async fn proxy_remote_index(
         )
             .into_response());
     };
-    let (content, content_type, _permit) = proxy_helpers::proxy_fetch_capped_budgeted(
+    match proxy_helpers::proxy_fetch_capped_family_budgeted_in(
+        budget.shared,
+        budget.family,
+        budget.wait,
         proxy,
         repo.id,
         &repo.key,
         upstream,
         path,
-        LARGE_METADATA_MAX_BYTES,
-        RepositoryFormat::Rubygems,
+        max_bytes,
     )
-    .await?;
-    Ok(index_bytes_response(content, content_type.as_deref()))
+    .await?
+    {
+        // `_budget_permit` stays held until the response is built, as the
+        // pre-#5686 `proxy_fetch_capped_budgeted` permit did.
+        proxy_helpers::CappedMetadataGet::Buffered {
+            content,
+            content_type,
+            content_encoding,
+            stale_since,
+            budget_permit: _budget_permit,
+        } => Ok(proxy_helpers::forward_verbatim_metadata(
+            content,
+            content_type,
+            default_content_type,
+            content_encoding,
+            stale_since,
+        )),
+        // No streaming fallback for these documents: the same 502 the
+        // buffered helper rendered for an over-cap document.
+        proxy_helpers::CappedMetadataGet::OverCap => {
+            Err((StatusCode::BAD_GATEWAY, "Failed to fetch from upstream").into_response())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /gems/{repo_key}/versions, /names, /info/{name} — Compact Index
+// ---------------------------------------------------------------------------
+
+async fn compact_versions(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    serve_compact_index(&state, &repo_key, "versions", LARGE_METADATA_MAX_BYTES).await
+}
+
+async fn compact_names(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    serve_compact_index(&state, &repo_key, "names", LARGE_METADATA_MAX_BYTES).await
+}
+
+async fn compact_info(
+    State(state): State<SharedState>,
+    Path((repo_key, name)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    if !is_safe_path_segment(&name) {
+        return Err(compact_index_not_served());
+    }
+    serve_compact_index(
+        &state,
+        &repo_key,
+        &format!("info/{name}"),
+        DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+}
+
+/// Serve a Compact Index document.
+///
+/// * Remote: the upstream document, byte for byte. Bundler checks each
+///   `info/{name}` body against the MD5 the `versions` file lists for it, so
+///   neither document may be rewritten.
+/// * Hosted and Virtual: 404, so Bundler falls back to the Marshal specs
+///   indexes and quick gemspecs (#4272 review). Generating a conformant
+///   Compact Index from local rows is separate work.
+async fn serve_compact_index(
+    state: &SharedState,
+    repo_key: &str,
+    path: &str,
+    max_bytes: usize,
+) -> Result<Response, Response> {
+    let repo = resolve_rubygems_repo(&state.db, repo_key).await?;
+    if repo.repo_type != RepositoryType::Remote {
+        return Err(compact_index_not_served());
+    }
+    proxy_remote_document(state, &repo, path, max_bytes, "text/plain; charset=utf-8").await
+}
+
+fn compact_index_not_served() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        "Compact Index is served for Remote RubyGems repositories only",
+    )
+        .into_response()
+}
+
+fn dependency_api_not_served() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        "Dependency API is not served for Remote RubyGems repositories; use the Compact Index",
+    )
+        .into_response()
+}
+
+/// True when `segment` can be appended to an upstream URL as one path
+/// segment: gem names and `{name}-{version}[-{platform}].gemspec.rz` file
+/// names only use these characters.
+fn is_safe_path_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && !segment.starts_with('.')
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 #[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_safe_path_segment() {
+        for ok in [
+            "rexml",
+            "net-http",
+            "aws_sdk",
+            "rexml-3.4.4.gemspec.rz",
+            "Ab9",
+        ] {
+            assert!(is_safe_path_segment(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            ".hidden",
+            "../versions",
+            "a/b",
+            "a?b",
+            "a%2Fb",
+            "a b",
+        ] {
+            assert!(!is_safe_path_segment(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn test_push_artifact_path_traversal_rejected() {
@@ -2690,6 +2932,214 @@ mod db_cov_tests {
         );
     }
 
+    /// Mount `body` at the exact upstream `path` of `server`.
+    async fn mount_doc(server: &wiremock::MockServer, path: &str, ct: &str, body: &[u8]) {
+        use wiremock::matchers::{method, path as exact_path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(exact_path(path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body.to_vec())
+                    .insert_header("content-type", ct),
+            )
+            .mount(server)
+            .await;
+    }
+
+    const VERSIONS_DOC: &[u8] =
+        b"created_at: 2026-11-01T00:00:04Z\n---\nrexml 3.4.3,3.4.4 0123456789abcdef0123456789abcdef\n";
+    const NAMES_DOC: &[u8] = b"---\nrake\nrexml\n";
+    const INFO_DOC: &[u8] = b"---\n3.4.4 |checksum:abc,ruby:>= 2.5.0\n";
+    const QUICK_SPEC: &[u8] = b"x\x9c\x01\x02\x03 not-really-deflate";
+
+    /// A Remote repo had no Compact Index routes (404), its Dependency API
+    /// answered `[]` from local rows, and its quick gemspec only looked
+    /// locally (404), so Bundler could not resolve anything through
+    /// `/gems/{remote}`. The Compact Index and quick gemspecs now pass the
+    /// upstream through byte for byte, and the Dependency API answers 404 like
+    /// rubygems.org so Bundler does not read "no versions" from it.
+    #[tokio::test]
+    async fn test_rubygems_remote_serves_bundler_endpoints_from_upstream() {
+        let Some(fx) = tdh::Fixture::setup("remote", "rubygems").await else {
+            return;
+        };
+        let upstream = wiremock::MockServer::start().await;
+        let text = "text/plain; charset=utf-8";
+        mount_doc(&upstream, "/versions", text, VERSIONS_DOC).await;
+        mount_doc(&upstream, "/names", text, NAMES_DOC).await;
+        mount_doc(&upstream, "/info/rexml", text, INFO_DOC).await;
+        mount_doc(
+            &upstream,
+            "/quick/Marshal.4.8/rexml-3.4.4.gemspec.rz",
+            "application/octet-stream",
+            QUICK_SPEC,
+        )
+        .await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+
+        let k = fx.repo_key.clone();
+        let cases: Vec<(String, &[u8])> = vec![
+            (format!("/{k}/versions"), VERSIONS_DOC),
+            (format!("/{k}/names"), NAMES_DOC),
+            (format!("/{k}/info/rexml"), INFO_DOC),
+            (
+                format!("/{k}/quick/Marshal.4.8/rexml-3.4.4.gemspec.rz"),
+                QUICK_SPEC,
+            ),
+        ];
+        let mut got = Vec::new();
+        for (uri, _) in &cases {
+            let app = tdh::router_anon(super::router(), state.clone());
+            got.push(tdh::send(app, tdh::get(uri.clone())).await);
+        }
+        let mut refused = Vec::new();
+        for uri in [
+            format!("/{k}/api/v1/dependencies?gems=rexml"),
+            format!("/{k}/info/.rexml"),
+            format!("/{k}/info/..%2Fversions"),
+            format!("/{k}/quick/Marshal.4.8/..%2Fversions"),
+        ] {
+            let app = tdh::router_anon(super::router(), state.clone());
+            refused.push((uri.clone(), tdh::send(app, tdh::get(uri)).await.0));
+        }
+        fx.teardown().await;
+
+        for ((uri, want), (status, body)) in cases.iter().zip(got) {
+            assert_eq!(status, axum::http::StatusCode::OK, "{uri}");
+            assert_eq!(&body[..], *want, "{uri} must be the upstream bytes");
+        }
+        for (uri, status) in refused {
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+
+    /// The Compact Index is only proxied: a hosted repo still answers 404 on
+    /// every Compact Index path so Bundler falls back to the Marshal indexes.
+    #[tokio::test]
+    async fn test_rubygems_hosted_compact_index_stays_not_found() {
+        let Some(fx) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        let k = fx.repo_key.clone();
+        let mut got = Vec::new();
+        for uri in [
+            format!("/{k}/versions"),
+            format!("/{k}/names"),
+            format!("/{k}/info/rexml"),
+        ] {
+            let app = fx.router_with_auth(super::router());
+            got.push((uri.clone(), tdh::send(app, tdh::get(uri)).await.0));
+        }
+        fx.teardown().await;
+        for (uri, status) in got {
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+
+    /// A Remote passes its upstream bytes through without decoding them, so
+    /// an upstream `Content-Encoding` must be re-declared (#3149, #3260). A
+    /// mirror that serves `info/{name}` gzip-coded would otherwise reach
+    /// Bundler as plain bytes, and its MD5 check against `versions` fails.
+    /// The same holds for every document `proxy_remote_document` forwards:
+    /// the Compact Index, the quick gemspecs and the specs indexes.
+    #[tokio::test]
+    async fn test_rubygems_remote_documents_keep_upstream_content_encoding() {
+        use wiremock::matchers::{method, path as exact_path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "rubygems").await else {
+            return;
+        };
+        let upstream = wiremock::MockServer::start().await;
+        let coded_info = super::gzip_compress(INFO_DOC).expect("gzip info");
+        let coded_versions = super::gzip_compress(VERSIONS_DOC).expect("gzip versions");
+        let coded_spec = super::gzip_compress(QUICK_SPEC).expect("gzip spec");
+        let coded_specs_index = super::gzip_compress(b"\x04\x08[\x00").expect("gzip index");
+        let coded: Vec<(&str, &str, Vec<u8>)> = vec![
+            (
+                "/info/rexml",
+                "text/plain; charset=utf-8",
+                coded_info.clone(),
+            ),
+            (
+                "/versions",
+                "text/plain; charset=utf-8",
+                coded_versions.clone(),
+            ),
+            (
+                "/quick/Marshal.4.8/rexml-3.4.4.gemspec.rz",
+                "application/octet-stream",
+                coded_spec.clone(),
+            ),
+            (
+                "/specs.4.8.gz",
+                "application/octet-stream",
+                coded_specs_index.clone(),
+            ),
+        ];
+        for (p, ct, body) in &coded {
+            Mock::given(method("GET"))
+                .and(exact_path(*p))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(body.clone())
+                        .insert_header("content-type", *ct)
+                        .insert_header("content-encoding", "gzip"),
+                )
+                .mount(&upstream)
+                .await;
+        }
+        // A plain upstream document must not gain a coding it never had.
+        mount_doc(&upstream, "/names", "text/plain; charset=utf-8", NAMES_DOC).await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+
+        let k = fx.repo_key.clone();
+        let mut got = Vec::new();
+        for (p, ct, body) in &coded {
+            let uri = format!("/{k}{p}");
+            let app = tdh::router_anon(super::router(), state.clone());
+            let resp = tdh::send_with_headers(app, tdh::get(uri.clone())).await;
+            got.push((uri, *ct, body.clone(), resp));
+        }
+        let app = tdh::router_anon(super::router(), state.clone());
+        let plain = tdh::send_with_headers(app, tdh::get(format!("/{k}/names"))).await;
+        fx.teardown().await;
+
+        for (uri, ct, want, (status, body, headers)) in got {
+            assert_eq!(status, axum::http::StatusCode::OK, "{uri}");
+            assert_eq!(
+                &body[..],
+                &want[..],
+                "{uri} must be the coded upstream bytes"
+            );
+            assert_eq!(
+                headers
+                    .get("content-encoding")
+                    .and_then(|v| v.to_str().ok()),
+                Some("gzip"),
+                "{uri} must re-declare the upstream Content-Encoding"
+            );
+            assert_eq!(
+                headers.get("content-length").and_then(|v| v.to_str().ok()),
+                Some(want.len().to_string().as_str()),
+                "{uri}: Content-Length is the coded length"
+            );
+            assert_eq!(
+                headers.get("content-type").and_then(|v| v.to_str().ok()),
+                Some(ct),
+                "{uri} keeps the upstream Content-Type"
+            );
+        }
+        let (status, body, headers) = plain;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(&body[..], NAMES_DOC);
+        assert!(
+            headers.get("content-encoding").is_none(),
+            "a plain upstream document must not be labelled as coded"
+        );
+    }
+
     /// Seed `.gem` artifacts `(name, version)` into `repo`.
     async fn seed_gems(
         state: &crate::api::SharedState,
@@ -3328,6 +3778,7 @@ mod serve_key_4365_tests {
 /// Archives with two entries at one path (see `services::archive_entry_paths`):
 /// the format's reader takes the first copy and the scan extractor keeps the
 /// last, so the gate establishes no identity for them.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod duplicate_entry_tests {
     use super::*;
@@ -3373,5 +3824,375 @@ mod duplicate_entry_tests {
             check(&single).1,
             ProxyScanIdentity::Established(_)
         ));
+    }
+}
+
+/// #5973: RubyGems Remote documents draw on a family sub-budget of the shared
+/// buffered-metadata budget, wait for it within a bound, and reserve a cached
+/// document's own size rather than the full cap.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod remote_document_budget_5973 {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::{
+        metadata_sub_budget_bytes, MetadataBudgetFamily, MetadataSubBudget, ProxyMetadataBudget,
+        DEFAULT_PROXY_METADATA_BUDGET_BYTES,
+    };
+    use crate::api::handlers::test_db_helpers as tdh;
+    use std::time::Duration;
+
+    const VERSIONS_DOC: &[u8] =
+        b"created_at: 2026-11-01T00:00:04Z\n---\nrexml 3.4.3,3.4.4 0123456789abcdef0123456789abcdef\n";
+
+    /// A shared budget of the default size and a RubyGems sub-budget of its
+    /// default share, private to the test so the process-wide budgets that
+    /// other tests use are never held.
+    fn default_sized_budget(wait: Duration) -> RemoteDocumentBudget {
+        let total = DEFAULT_PROXY_METADATA_BUDGET_BYTES;
+        let family = MetadataBudgetFamily::RubygemsRemote;
+        RemoteDocumentBudget {
+            shared: Box::leak(Box::new(ProxyMetadataBudget::new(total))),
+            family: Box::leak(Box::new(MetadataSubBudget::new(
+                family,
+                metadata_sub_budget_bytes(family, None, total),
+            ))),
+            wait,
+        }
+    }
+
+    /// Mount `body` at `path`, answered after `delay` (a slow upstream).
+    async fn mount_slow(server: &wiremock::MockServer, path: &str, body: &[u8], delay: Duration) {
+        use wiremock::matchers::{method, path as exact_path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(exact_path(path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body.to_vec())
+                    .insert_header("content-type", "text/plain; charset=utf-8")
+                    .set_delay(delay),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// Start `n` concurrent fetches of the Remote's `path` against `budget`.
+    fn spawn_fetches(
+        n: usize,
+        state: &SharedState,
+        repo: &RepoInfo,
+        path: &'static str,
+        budget: RemoteDocumentBudget,
+    ) -> Vec<tokio::task::JoinHandle<Result<Response, Response>>> {
+        (0..n)
+            .map(|_| {
+                let (state, repo) = (state.clone(), repo.clone());
+                tokio::spawn(async move {
+                    proxy_remote_document_in(
+                        &state,
+                        &repo,
+                        path,
+                        LARGE_METADATA_MAX_BYTES,
+                        "text/plain; charset=utf-8",
+                        budget,
+                    )
+                    .await
+                })
+            })
+            .collect()
+    }
+
+    async fn statuses(
+        fetches: Vec<tokio::task::JoinHandle<Result<Response, Response>>>,
+    ) -> Vec<Response> {
+        let mut out = Vec::new();
+        for fetch in fetches {
+            out.push(match fetch.await.expect("fetch task") {
+                Ok(resp) | Err(resp) => resp,
+            });
+        }
+        out
+    }
+
+    /// The #5973 failure scenario: eight concurrent `/versions` fetches on a
+    /// cold cache with a slow upstream. Each reserves the 128 MiB cap, so
+    /// without the family sub-budget they held the whole 1 GiB and another
+    /// format's metadata fetch (npm, Maven, PyPI reserve the cap from the
+    /// shared budget and wait without a bound) queued behind them until the
+    /// upstream answered. With the sub-budget the burst holds at most its
+    /// share and the other format's fetch is admitted at once.
+    #[tokio::test]
+    async fn test_rubygems_remote_versions_burst_cannot_starve_other_formats_5973() {
+        let Some(fx) = tdh::Fixture::setup("remote", "rubygems").await else {
+            return;
+        };
+        let upstream = wiremock::MockServer::start().await;
+        mount_slow(&upstream, "/versions", VERSIONS_DOC, Duration::from_secs(3)).await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let repo = resolve_rubygems_repo(&state.db, &fx.repo_key)
+            .await
+            .unwrap_or_else(|_| panic!("remote repo resolves"));
+        let budget = default_sized_budget(Duration::from_secs(30));
+
+        let burst = spawn_fetches(8, &state, &repo, "versions", budget);
+        // Let the burst take every reservation it can while upstream stalls.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let share = budget.family.budget().total_bytes();
+        let held = budget.shared.total_bytes() - budget.shared.available_bytes();
+        let other_format = tokio::time::timeout(
+            Duration::from_secs(1),
+            budget.shared.reserve(LARGE_METADATA_MAX_BYTES),
+        )
+        .await;
+        let other_format_admitted = other_format.is_ok();
+        drop(other_format);
+        let responses = statuses(burst).await;
+        fx.teardown().await;
+
+        assert!(
+            held <= share,
+            "the /versions burst held {held} bytes of the shared budget, more than its \
+             {share}-byte family share"
+        );
+        assert!(
+            other_format_admitted,
+            "another format's 128 MiB metadata reservation must not queue behind a \
+             RubyGems /versions burst"
+        );
+        for resp in responses {
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "with a long enough wait every fetch of the burst is served"
+            );
+        }
+        assert_eq!(budget.shared.available_bytes(), budget.shared.total_bytes());
+        assert_eq!(budget.family.saturation(), 0.0);
+    }
+
+    /// A fetch that cannot be admitted to the family share within the wait
+    /// answers 503 with `Retry-After` instead of queueing without a bound,
+    /// while the fetches the share admitted are served normally.
+    #[tokio::test]
+    async fn test_rubygems_remote_versions_sheds_with_retry_after_5973() {
+        let Some(fx) = tdh::Fixture::setup("remote", "rubygems").await else {
+            return;
+        };
+        let upstream = wiremock::MockServer::start().await;
+        mount_slow(&upstream, "/versions", VERSIONS_DOC, Duration::from_secs(2)).await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let repo = resolve_rubygems_repo(&state.db, &fx.repo_key)
+            .await
+            .unwrap_or_else(|_| panic!("remote repo resolves"));
+        let budget = default_sized_budget(Duration::from_millis(300));
+        // The default share admits two cold fetches at the full cap.
+        assert_eq!(
+            budget.family.budget().total_bytes(),
+            2 * LARGE_METADATA_MAX_BYTES
+        );
+
+        let responses = statuses(spawn_fetches(4, &state, &repo, "versions", budget)).await;
+        fx.teardown().await;
+
+        let (mut served, mut shed) = (0, 0);
+        for resp in responses {
+            match resp.status() {
+                StatusCode::OK => served += 1,
+                StatusCode::SERVICE_UNAVAILABLE => {
+                    assert_eq!(resp.headers()[axum::http::header::RETRY_AFTER], "1");
+                    shed += 1;
+                }
+                other => panic!("unexpected status {other}"),
+            }
+        }
+        assert_eq!((served, shed), (2, 2));
+        assert_eq!(budget.shared.available_bytes(), budget.shared.total_bytes());
+    }
+
+    /// Fetch `path` through the family fetch with an up-front reservation of
+    /// `reserved` bytes, as a stale size lookup would choose it.
+    async fn fetch_reserving(
+        state: &SharedState,
+        repo: &RepoInfo,
+        budget: RemoteDocumentBudget,
+        path: &str,
+        reserved: usize,
+    ) -> Result<proxy_helpers::CappedMetadataGet<proxy_helpers::FamilyMetadataPermit>, Response>
+    {
+        proxy_helpers::proxy_fetch_capped_family_reserved_in(
+            budget.shared,
+            budget.family,
+            budget.wait,
+            state.proxy_service.as_deref().expect("proxy service"),
+            repo.id,
+            &repo.key,
+            repo.upstream_url.as_deref().expect("upstream"),
+            path,
+            LARGE_METADATA_MAX_BYTES,
+            reserved,
+        )
+        .await
+    }
+
+    fn reserved_bytes(budget: &proxy_helpers::ProxyMetadataBudget) -> usize {
+        budget.total_bytes() - budget.available_bytes()
+    }
+
+    /// A body larger than its up-front reservation (the cached entry grew
+    /// between the size lookup and the read) is topped up, so the reservation
+    /// covers every buffered byte while the body is held.
+    #[tokio::test]
+    async fn test_rubygems_remote_body_larger_than_its_reservation_is_topped_up_5973() {
+        let Some(fx) = tdh::Fixture::setup("remote", "rubygems").await else {
+            return;
+        };
+        let doc = vec![b'v'; 64 * 1024];
+        let upstream = wiremock::MockServer::start().await;
+        mount_slow(&upstream, "/versions", &doc, Duration::ZERO).await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let repo = resolve_rubygems_repo(&state.db, &fx.repo_key)
+            .await
+            .unwrap_or_else(|_| panic!("remote repo resolves"));
+        let budget = default_sized_budget(Duration::from_secs(10));
+
+        let fetched = fetch_reserving(&state, &repo, budget, "versions", 4096).await;
+        let held = (
+            reserved_bytes(budget.shared),
+            reserved_bytes(budget.family.budget()),
+        );
+        let served = matches!(
+            &fetched,
+            Ok(proxy_helpers::CappedMetadataGet::Buffered { content, .. }) if content.len() == doc.len()
+        );
+        drop(fetched);
+        fx.teardown().await;
+
+        assert!(served, "the grown body is served");
+        assert_eq!(
+            held,
+            (doc.len(), doc.len()),
+            "4 KiB reserved up front plus the 60 KiB top-up cover the 64 KiB body"
+        );
+        assert_eq!(budget.shared.available_bytes(), budget.shared.total_bytes());
+        assert_eq!(budget.family.saturation(), 0.0);
+    }
+
+    /// The top-up never waits on the request's own reservation: with a share
+    /// smaller than the document, the up-front reservation is clamped to the
+    /// whole share, so a blocking top-up could only be satisfied by this
+    /// request letting go. It used to wait out the 10 s bound and answer 503
+    /// for a body already fetched; it is now served at once, over-committed.
+    #[tokio::test]
+    async fn test_rubygems_remote_top_up_never_waits_on_its_own_reservation_5973() {
+        let Some(fx) = tdh::Fixture::setup("remote", "rubygems").await else {
+            return;
+        };
+        let doc = vec![b'v'; 64 * 1024];
+        let upstream = wiremock::MockServer::start().await;
+        mount_slow(&upstream, "/versions", &doc, Duration::ZERO).await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let repo = resolve_rubygems_repo(&state.db, &fx.repo_key)
+            .await
+            .unwrap_or_else(|_| panic!("remote repo resolves"));
+        let wait = Duration::from_secs(10);
+        let budget = RemoteDocumentBudget {
+            family: Box::leak(Box::new(MetadataSubBudget::new(
+                MetadataBudgetFamily::RubygemsRemote,
+                16 * 1024,
+            ))),
+            ..default_sized_budget(wait)
+        };
+
+        let started = std::time::Instant::now();
+        let fetched = fetch_reserving(&state, &repo, budget, "versions", 32 * 1024).await;
+        let elapsed = started.elapsed();
+        let share_held = budget.family.saturation();
+        let served = matches!(
+            &fetched,
+            Ok(proxy_helpers::CappedMetadataGet::Buffered { content, .. }) if content.len() == doc.len()
+        );
+        drop(fetched);
+        fx.teardown().await;
+
+        assert!(
+            served,
+            "a body this request already fetched is served, not shed"
+        );
+        assert!(
+            elapsed < wait / 2,
+            "the top-up waited {elapsed:?} on the request's own reservation"
+        );
+        assert_eq!(
+            share_held, 1.0,
+            "the up-front reservation took the whole share"
+        );
+        assert_eq!(budget.family.saturation(), 0.0);
+        assert_eq!(budget.shared.available_bytes(), budget.shared.total_bytes());
+    }
+
+    /// A fresh cached document reserves its own size, not the 128 MiB cap: with
+    /// all but 1 MiB of the family share held elsewhere, a cached `/versions`
+    /// is still served, while a document that is not cached yet (which must
+    /// reserve the cap) sheds.
+    #[tokio::test]
+    async fn test_rubygems_remote_cached_document_reserves_its_size_5973() {
+        let Some(fx) = tdh::Fixture::setup("remote", "rubygems").await else {
+            return;
+        };
+        let upstream = wiremock::MockServer::start().await;
+        mount_slow(&upstream, "/versions", VERSIONS_DOC, Duration::ZERO).await;
+        mount_slow(&upstream, "/names", b"---\nrexml\n", Duration::ZERO).await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let repo = resolve_rubygems_repo(&state.db, &fx.repo_key)
+            .await
+            .unwrap_or_else(|_| panic!("remote repo resolves"));
+        let budget = default_sized_budget(Duration::from_millis(300));
+
+        let fetch = |path: &'static str| {
+            let (state, repo) = (state.clone(), repo.clone());
+            async move {
+                match proxy_remote_document_in(
+                    &state,
+                    &repo,
+                    path,
+                    LARGE_METADATA_MAX_BYTES,
+                    "text/plain; charset=utf-8",
+                    budget,
+                )
+                .await
+                {
+                    Ok(resp) | Err(resp) => resp,
+                }
+            }
+        };
+        let cold = fetch("versions").await;
+        let share = budget.family.budget().total_bytes();
+        let elsewhere = budget
+            .family
+            .budget()
+            .try_reserve(share - 1024 * 1024)
+            .expect("the family share is idle");
+        let cached = fetch("versions").await;
+        let uncached = fetch("names").await;
+        drop(elsewhere);
+        fx.teardown().await;
+
+        assert_eq!(cold.status(), StatusCode::OK);
+        let cached_status = cached.status();
+        let body = http_body_util::BodyExt::collect(cached.into_body())
+            .await
+            .expect("cached body")
+            .to_bytes();
+        assert_eq!(
+            cached_status,
+            StatusCode::OK,
+            "a cached /versions reserves its size and fits the remaining 1 MiB"
+        );
+        assert_eq!(&body[..], VERSIONS_DOC);
+        assert_eq!(
+            uncached.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an uncached document reserves the full cap"
+        );
     }
 }
