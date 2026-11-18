@@ -965,6 +965,20 @@ pub(crate) mod test_support {
         INGEST_WAIT.scope(wait, fut).await
     }
 
+    /// #6230: take every one of `tenant`'s per-repository permits, and NO
+    /// global ones. Holding real guards would also take a global permit each,
+    /// and a few tests doing so in parallel exhaust the test binary's global
+    /// cap, so they would shed one another.
+    pub(crate) fn hold_full_tenant_bucket(
+        tenant: &super::TenantKey,
+    ) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+        let cap = super::max_concurrent_ingest_extractions_per_tenant();
+        let sem = super::tenant_semaphore_for(tenant, cap);
+        (0..cap)
+            .map(|_| sem.clone().try_acquire_owned().expect("tenant permit"))
+            .collect()
+    }
+
     /// #6230: run `request` (a handler call) attributed to `tenant` while
     /// every one of that repository's ingest permits is held, and release them
     /// only once the request is queued for one. Returns the request's output
@@ -980,12 +994,7 @@ pub(crate) mod test_support {
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let held = super::run_with_tenant_scope(tenant.clone(), async {
-            (0..super::max_concurrent_ingest_extractions_per_tenant())
-                .map(|_| super::acquire_ingest_extraction().expect("permit"))
-                .collect::<Vec<_>>()
-        })
-        .await;
+        let held = hold_full_tenant_bucket(&tenant);
         let task = tokio::spawn(super::run_with_tenant_scope(tenant.clone(), request));
         let mut queued = false;
         for _ in 0..20_000 {
@@ -2780,12 +2789,7 @@ mod tests {
     #[tokio::test]
     async fn inline_decode_queues_behind_an_async_waiter_6230() {
         let tenant = TenantKey::Repo(uuid::Uuid::new_v4());
-        let mut held = run_with_tenant_scope(tenant.clone(), async {
-            (0..max_concurrent_ingest_extractions_per_tenant())
-                .map(|_| acquire_ingest_extraction().expect("permit"))
-                .collect::<Vec<_>>()
-        })
-        .await;
+        let mut held = test_support::hold_full_tenant_bucket(&tenant);
         let order = Arc::new(Mutex::new(Vec::new()));
         let o = Arc::clone(&order);
         let async_upload = tokio::spawn(run_with_tenant_scope(tenant.clone(), async move {
@@ -2814,10 +2818,8 @@ mod tests {
     #[tokio::test]
     async fn waiting_inline_decode_shed_skips_the_decode_6230() {
         let tenant = TenantKey::Repo(uuid::Uuid::new_v4());
+        let _held = test_support::hold_full_tenant_bucket(&tenant);
         let err = run_with_tenant_scope(tenant, async {
-            let _held: Vec<_> = (0..max_concurrent_ingest_extractions_per_tenant())
-                .map(|_| acquire_ingest_extraction().expect("permit"))
-                .collect();
             test_support::with_ingest_wait(
                 std::time::Duration::from_millis(50),
                 with_ingest_extraction_waiting::<()>(|| {
