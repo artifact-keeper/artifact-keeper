@@ -189,7 +189,7 @@ pub fn convert(kind: Inventory, input: &Value) -> Result<Value, String> {
     Ok(body)
 }
 
-#[cfg(ak_test_shard = "services-2")]
+#[cfg(ak_test_shard = "router")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -141,6 +141,10 @@ if [ "$RC" = 0 ] && [ "$(calls 'repos/o/r/issues -f title=Nightly gate \[main\]:
    && [ "$(calls 'repos/o/r/issues -f')" = 1 ]; then
   pass "a red tier with no issue opens exactly one"
 else fail "open (rc=$RC): $OUT"; fi
+if [ "$(calls 'labels\[\]=automated -f labels\[\]=release-gate')" = 1 ] && [ "$(calls 'labels\[\]=nightly-lane')" = 0 ] \
+   && [ "$(calls 'issues?state=open&labels=release-gate&')" = 1 ] && [ "$(calls 'labels=nightly-lane')" = 0 ]; then
+  pass "a gate issue is labelled release-gate and the gate looks up only release-gate issues"
+else fail "gate label: $(grep issues "$WORK/log")"; fi
 if grep -q "compare/${OLD}...${MID}" "$WORK/log" && grep -q 'compare/t1...t2' "$WORK/log"; then
   pass "the issue names the first red range: last green ${OLD:0:7} .. first red ${MID:0:7}, tests t1..t2"
 else fail "range not in the issue body: $(grep -E "Last green|First red|range" "$WORK/log")"; fi
@@ -193,6 +197,10 @@ if [ "$RC" = 0 ] && [ "$(calls 'title=Nightly s3 lane \[main\]: format-tests-s3/
    && [ "$(jq -r '.kind, .lane, .lines[0].line, .lines[1].line, .lines[0].verdict, (.lines[0].tiers | keys | join(","))' "$WORK/verdict.json" | tr '\n' ' ')" = "nightly-lane s3 main~s3 1.11.x~s3 red collect-results,format-tests-s3/node " ]; then
   pass "a lane opens its own issue, ignores gate jobs and gate issues, reads only its own records, and writes no commit status"
 else fail "lane (rc=$RC): $OUT $(cat "$WORK/log")"; fi
+if [ "$(calls 'labels\[\]=automated -f labels\[\]=nightly-lane')" = 1 ] && [ "$(calls 'labels\[\]=release-gate')" = 0 ] \
+   && [ "$(calls 'issues?state=open&labels=nightly-lane&')" = 1 ] && [ "$(calls 'labels=release-gate')" = 0 ]; then
+  pass "a lane issue is labelled nightly-lane, not release-gate, and the lane looks up only nightly-lane issues"
+else fail "lane label: $(grep issues "$WORK/log")"; fi
 
 report FAKE_ISSUES='' REPORT_LANE='Mesh;rm'
 if [ "$RC" = 2 ]; then pass "a malformed lane name is refused"; else fail "bad lane accepted (rc=$RC)"; fi

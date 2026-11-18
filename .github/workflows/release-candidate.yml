@@ -908,10 +908,11 @@ jobs:
       # release.yml runs that copy on the tag and would refuse the
       # certification after the tag exists (backport first).
       #
-      # The Release Gate's scanner-adapter DTF tiers run this adapter: the job
-      # below passes `adapter_tag` as the gate's scanner_adapter_tag. The k8s
-      # deploy still uses the chart's pinned adapter
-      # (artifact-keeper-test#380).
+      # The Release Gate runs exactly this adapter: the job below passes
+      # `adapter_tag` and `adapter_digest`, the gate's k8s stack deploys
+      # `<tag>@<digest>` and asserts the pod runs that digest, and its
+      # candidate-adapter DTF tiers pull it by digest (#4439,
+      # artifact-keeper-test#380).
       - name: Pin the scanner-adapter digest that ships
         id: adapter
         env:
@@ -1124,8 +1125,10 @@ jobs:
       backend_digest: ${{ needs.images.outputs.backend_digest }}
       # The adapter this release ships (pin-adapter-digest.sh): this commit's
       # sha-<short> rebuild when its VERSION is new, the published :VERSION
-      # when it stays. The gate's scanner-adapter tiers run it.
+      # when it stays, pinned to the digest the certification names. The
+      # gate's k8s stack and its scanner-adapter tiers run it (#4439).
       scanner_adapter_tag: ${{ needs.images.outputs.adapter_tag }}
+      scanner_adapter_digest: ${{ needs.images.outputs.adapter_digest }}
       web_tag: latest
       test_suite: all
       # One tests tree for every gate job, the one `record` names (#6076).

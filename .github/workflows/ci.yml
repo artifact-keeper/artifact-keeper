@@ -817,9 +817,9 @@ jobs:
       CARGO_NET_RETRY: "10"
       SQLX_OFFLINE: true
       # The shard whose leg also builds and runs the bin-target tests
-      # (backend/src/main.rs's test module is gated to it). test-shards.py
-      # `check` fails if this is not the shard main.rs's tests carry.
-      BIN_SHARD: services-2
+      # (main.rs and bin/**; their test modules are gated to it, #6133).
+      # test-shards.py `check` fails if this is not the shard they carry.
+      BIN_SHARD: router
     services:
       # DB-backed lib tests need it; one fresh database per leg also means
       # the `db-serial` groups in .config/nextest.toml only have to
@@ -3234,8 +3234,8 @@ jobs:
     runs-on: ubuntu-24.04
     # The release profile's cold-cook worst case (60-90 min on a hosted
     # runner, per the schedule note in docker-publish.yml) set this ceiling.
-    # With the `ci` profile the cook is always cold here (see the build
-    # step), so every run is the ~20-25 min case; 90 stays as headroom
+    # The `ci` cook is cached by the Warm CI Image Cache job (see the build
+    # step); a cold one is the ~35 min case; 90 stays as headroom
     # until hosted runs confirm the figure, since a cancellation at the
     # ceiling wastes the whole build.
     timeout-minutes: 90
@@ -3260,7 +3260,8 @@ jobs:
           push: false
           load: true
           tags: artifact-keeper-backend:pr-test
-          # Read-only registry cache, warmed by docker-publish.yml on main.
+          # Read-only registry cache, warmed on main by docker-publish.yml
+          # and by the Warm CI Image Cache job below.
           # No cache-to of any kind:
           #   - registry: PR-triggered jobs must not get packages:write (fork
           #     PRs would inherit it — pwn-request risk), and anonymous GHCR
@@ -3274,9 +3275,13 @@ jobs:
           #     type=gha for (~7.7 GB of the 10 GB Actions quota, evicting the
           #     Rust caches daily), and that quota is already full.
           # The registry cache still covers the non-Rust stages (base images,
-          # rootfs-builder, the grype build, grype-db-seed); the Rust cook
-          # misses it because it is warmed with `release` (see below).
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-amd64
+          # rootfs-builder, the grype build, grype-db-seed). The Rust cook
+          # misses `buildcache-amd64`, which is warmed with `release` (see
+          # below); `buildcache-ci-amd64`, warmed on `main` by the Warm CI
+          # Image Cache job below, holds the `ci` cook (#6133).
+          cache-from: |
+            type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-ci-amd64
+            type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-amd64
           # CARGO_BUILD_JOBS=4: the hosted runner's core count, which is what
           # cargo would use anyway; passed explicitly because the Dockerfile
           # defaults to 8 for the self-hosted pools (see
@@ -3289,11 +3294,10 @@ jobs:
           # -j8 the compile is 317 s vs 601 s, at the same peak memory. This
           # is the ONLY build of the Dockerfile that passes it:
           # docker-publish.yml (whose output release.yml certifies) and
-          # e2e.yml keep the default `release`. The registry cache above is
-          # warmed with `release`, so the cook layer never hits it for this
-          # profile and is always cold here; a whole `ci` build is still
-          # shorter than the `release` builder stage alone on a warm cook
-          # (317 s vs 318 s + 191 s for the release lib and LTO'd bin).
+          # e2e.yml keep the default `release`. `buildcache-amd64` is warmed
+          # with `release`, so this profile's cook only hits
+          # `buildcache-ci-amd64` (#6133); before that tag existed it was
+          # always cold here (cook ~13.5 min on 2026-11-16, run 43852119667).
           build-args: |
             CARGO_BUILD_JOBS=4
             CARGO_PROFILE=ci
@@ -3327,6 +3331,62 @@ jobs:
           name: backend-image
           path: /tmp/backend-image.tar.gz
           retention-days: 1
+
+  # Warms the registry cache for the `ci`-profile dependency cook (#6133).
+  # The Build Backend Image job above builds with CARGO_PROFILE=ci, and
+  # docker-publish.yml warms `buildcache-amd64` with `release`, so that
+  # job's cook (`deps` stage, ~13.5 min on a hosted runner) never hit the
+  # cache and always ran cold. This job builds only the `deps` stage, with
+  # the same build args, and exports it to a tag of its own,
+  # `buildcache-ci-amd64`, which Build Backend Image reads.
+  #
+  # It is a job of its own because writing the registry needs
+  # packages:write. Build Backend Image also runs on pull requests, and
+  # their code must not run with that token (see its build step). This one
+  # runs only on a push to `main`, where the tree is a merged commit.
+  # When the cook is already cached (the lockfile, the manifests, the base
+  # image and the Dockerfile up to the `deps` stage are unchanged), every
+  # layer is CACHED and the job takes a minute or two. Advisory, like the
+  # rest of the container chain: CI Complete does not wait for it.
+  warm-ci-image-cache:
+    name: 🐳 Warm CI Image Cache
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    needs: [detect-changes]
+    if: ${{ !cancelled() && github.repository == 'artifact-keeper/artifact-keeper' && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.detect-changes.result == 'success' && needs.detect-changes.outputs.backend == 'true' }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build args must equal Build Backend Image's: they are part of the
+      # cook layer's cache key.
+      - name: Cook the ci-profile dependencies into the registry cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: ./docker/Dockerfile.backend
+          target: deps
+          platforms: linux/amd64
+          push: false
+          cache-from: |
+            type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-ci-amd64
+            type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-amd64
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-ci-amd64,mode=max,image-manifest=true,oci-mediatypes=true
+          build-args: |
+            CARGO_BUILD_JOBS=4
+            CARGO_PROFILE=ci
 
   build-openscap-image:
     name: 🐳 Build OpenSCAP Image
