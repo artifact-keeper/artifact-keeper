@@ -56,6 +56,9 @@ jobs:
   release-preflight:
     name: Release identity preflight
     runs-on: ubuntu-latest
+    # p100 ~0.2m over 29 runs (2026-08..2026-11). A sparse checkout and a few
+    # git/grep assertions: 10 is a floor, not a multiple.
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -235,6 +238,7 @@ jobs:
   preflight-evidence:
     name: Require a green Release Preflight for this commit
     runs-on: ubuntu-latest
+    # p100 ~0.2m over 26 runs (2026-08..2026-11).
     timeout-minutes: 5
     permissions:
       contents: read
@@ -283,6 +287,7 @@ jobs:
     name: Require a release-candidate certification for this commit
     needs: [release-preflight]
     runs-on: ubuntu-latest
+    # p100 ~0.5m over 21 runs (2026-08..2026-11).
     timeout-minutes: 10
     permissions:
       contents: read
@@ -391,6 +396,8 @@ jobs:
     # commit to completion -- so this job timeout is only a hard ceiling
     # against a genuinely hung publish: cold-cache amd64 worst case (~90 min)
     # + runner queue + cosign/provenance + margin.
+    # p100 ~33m over 28 runs (2026-08..2026-11); kept at 130 for the cold-cache
+    # case above, which the sample does not contain.
     timeout-minutes: 130
     permissions:
       packages: read
@@ -737,6 +744,9 @@ jobs:
           && needs.candidate-certified.outputs.certified != 'true'
           && needs.release-gate.result != 'success' }}
     runs-on: ubuntu-latest
+    # No samples: this runs only on a re-run attempt, and is one echo.
+    # 5 is a floor.
+    timeout-minutes: 5
     permissions: {}
     steps:
       - name: Explain
@@ -751,6 +761,15 @@ jobs:
   build-binaries:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    # Per leg, p100 over 25-27 successful legs (2026-08..2026-11):
+    #   linux-amd64 ~34m, linux-arm64 ~35m, windows-amd64 ~56m (cross-builds
+    #   on ubuntu-latest) -> 180, about 3x: 1.12 is memory-bound (legs died of
+    #   OOM before the swap step) and a leg that swaps hard runs long.
+    #   darwin-amd64 ~157m, darwin-arm64 ~167m (both v1.12.1; ~80-90m through
+    #   v1.11.14, ~108-156m on v1.12.0) -> 360, the hosted maximum: anything
+    #   lower only kills a build that would have finished. Fix the build time,
+    #   not this number (#6218). Almost all of it is the `Build` step.
+    timeout-minutes: ${{ startsWith(matrix.os, 'macos') && 360 || 180 }}
     # The gate must be green -- or, for a certified stable tag, skipped
     # because it already passed on these digests in the candidate (#3772).
     # Stated explicitly with `!cancelled()` rather than left to the default
@@ -1031,6 +1050,8 @@ jobs:
       ${{ !cancelled()
           && needs.build-binaries.result == 'success'
           && needs.resolve-candidate-digest.result == 'success' }}
+    # p100 ~1.7m over 24 runs (2026-08..2026-11); 35 covers the probe step's own
+    # 30-minute registry deadline.
     timeout-minutes: 35
     steps:
       - name: Checkout tag (for CHANGELOG verification)
@@ -1227,6 +1248,10 @@ jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
+    # p100 ~1.5m over 24 runs (2026-08..2026-11). Network-bound (asset download,
+    # cosign keyless signing, attestations, ~20 asset uploads), so 15 is a
+    # floor for a slow Sigstore or uploads API rather than 2-3x.
+    timeout-minutes: 15
     needs: [preflight-evidence, candidate-certified, build-binaries, release-gate, verify-images-published]
     # DECLARED, not inherited (#3558). This job used to take the workflow-level
     # set, which gave it `packages: write` it has never used and -- more to the
@@ -1582,6 +1607,7 @@ jobs:
       actions: write   # dispatch docker-publish and follow its run
       contents: read
       packages: read
+    # p100 ~21m over 20 runs (2026-08..2026-11).
     timeout-minutes: 45
     steps:
       # The assert at the end derives which adapter floating tags must have
@@ -1838,6 +1864,7 @@ jobs:
       contents: read
     # The sync builds the backend to export the spec (~15 min cold) and then
     # pushes; the follower polls until it concludes.
+    # p100 ~17m over 15 runs (2026-08..2026-11).
     timeout-minutes: 45
     steps:
       - name: Checkout (scripts)
@@ -1924,6 +1951,7 @@ jobs:
     permissions:
       actions: write   # dispatch release-announce.yml and follow its run
       contents: read
+    # p100 ~0.7m over 2 runs (2026-08..2026-11).
     timeout-minutes: 20
     steps:
       - name: Checkout (scripts)
@@ -1984,6 +2012,8 @@ jobs:
       actions: write   # dispatch ami-build.yml and follow its run
       contents: read
     # A Packer build plus the AMI copy; the follower polls until it concludes.
+    # p100 ~0.1m over 2 runs (2026-08..2026-11) is not a sample of that: ami-build.yml
+    # is disabled, so the dispatch returns at once. 120 is sized for Packer.
     timeout-minutes: 120
     steps:
       - name: Checkout (scripts)
