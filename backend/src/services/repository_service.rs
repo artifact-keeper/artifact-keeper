@@ -428,6 +428,22 @@ pub enum MemberVisibility {
 // Pure helper functions (no DB, testable in isolation)
 // ---------------------------------------------------------------------------
 
+/// Reject `mutable: true` (#5188) on a repository that could not honour it:
+/// see [`crate::services::artifact_service::overwrite_supported`].
+pub(crate) fn validate_mutable(
+    allow_overwrite: bool,
+    format: &RepositoryFormat,
+    repo_type: &RepositoryType,
+) -> Result<()> {
+    if allow_overwrite && !crate::services::artifact_service::overwrite_supported(format, repo_type)
+    {
+        return Err(AppError::UnprocessableEntity(
+            crate::services::artifact_service::OVERWRITE_UNSUPPORTED.into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate that a remote repository has an upstream URL and that the URL is
 /// safe to contact (anti-SSRF). Returns an error if validation fails.
 pub(crate) fn validate_remote_upstream(
@@ -1339,6 +1355,7 @@ impl RepositoryService {
                 crate::services::rpm_layout::UNSUPPORTED.into(),
             ));
         }
+        validate_mutable(req.allow_overwrite, &req.format, &req.repo_type)?;
         // Validate remote repository has upstream URL and it is safe to contact
         validate_remote_upstream(&req.repo_type, &req.upstream_url, &req.format)?;
 
@@ -1901,6 +1918,10 @@ impl RepositoryService {
         if req.upstream_url.is_some() {
             let existing = self.get_by_id(id).await?;
             validate_remote_upstream(&existing.repo_type, &req.upstream_url, &existing.format)?;
+        }
+        if req.allow_overwrite == Some(true) {
+            let existing = self.get_by_id(id).await?;
+            validate_mutable(true, &existing.format, &existing.repo_type)?;
         }
 
         let mut tx = self.db.begin().await?;
@@ -4253,6 +4274,28 @@ mod tests {
     // -----------------------------------------------------------------------
     // validate_remote_upstream (extracted pure function)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_mutable_rejects_unsupported_format_and_type() {
+        use RepositoryFormat::*;
+        let local = RepositoryType::Local;
+        for format in [Pypi, Debian, Rpm, Alpine, Pacman, Generic] {
+            assert!(
+                validate_mutable(true, &format, &local).is_ok(),
+                "{format:?}"
+            );
+        }
+        for format in [Npm, Cargo, Go, Maven] {
+            assert!(matches!(
+                validate_mutable(true, &format, &local),
+                Err(AppError::UnprocessableEntity(_))
+            ));
+            assert!(validate_mutable(false, &format, &local).is_ok());
+        }
+        for repo_type in [RepositoryType::Remote, RepositoryType::Virtual] {
+            assert!(validate_mutable(true, &Pypi, &repo_type).is_err());
+        }
+    }
 
     #[test]
     fn test_validate_remote_upstream_remote_without_url_fails() {

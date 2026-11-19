@@ -1102,7 +1102,8 @@ pub struct CreateRepositoryRequest {
     pub versioning_enabled: Option<bool>,
     /// Make this repository mutable (#5188): re-uploading an existing
     /// filename replaces it instead of answering 409. Defaults to false
-    /// (immutable, write-once).
+    /// (immutable, write-once). `true` is rejected (422) unless the repository
+    /// is a local or staging PyPI, Debian, RPM, Alpine, Pacman or Generic one.
     #[serde(rename = "mutable", alias = "allow_overwrite")]
     #[schema(rename = "mutable")]
     pub allow_overwrite: Option<bool>,
@@ -1484,7 +1485,9 @@ pub struct UpdateRepositoryRequest {
     /// this Generic/Mlmodel repository (#2367). When omitted, unchanged.
     pub versioning_enabled: Option<bool>,
     /// When provided, makes the repository mutable (`true`) or immutable
-    /// (`false`) (#5188). When omitted, unchanged.
+    /// (`false`) (#5188). When omitted, unchanged. `true` is rejected (422)
+    /// unless the repository is a local or staging PyPI, Debian, RPM, Alpine,
+    /// Pacman or Generic one.
     #[serde(rename = "mutable", alias = "allow_overwrite")]
     #[schema(rename = "mutable")]
     pub allow_overwrite: Option<bool>,
@@ -4777,7 +4780,7 @@ pub async fn list_repositories(
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Insufficient permissions: needs global admin, system repository admin, or project admin of the requested project_id"),
         (status = 409, description = "Repository key already exists or concurrent layout change; retry"),
-        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository; a bare namespace in mcp_server_deny or mcp_auto_approve_namespaces (write `com.acme/*`)"),
+        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository; a bare namespace in mcp_server_deny or mcp_auto_approve_namespaces (write `com.acme/*`); mutable on a repository other than a local or staging PyPI, Debian, RPM, Alpine, Pacman or Generic one"),
     )
 )]
 pub async fn create_repository(
@@ -6414,7 +6417,7 @@ fn validate_update_config_fields(
         (status = 403, description = "Insufficient permissions: needs repository admin, plus project admin of the destination project when changing project_id, or of the current project when clearing it with null"),
         (status = 404, description = "Repository not found"),
         (status = 409, description = "Repository key conflict, nonempty repository depth change, concurrent layout change, or an upstream_url origin change while upstream-auth credentials are configured"),
-        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository; a bare namespace in mcp_server_deny or mcp_auto_approve_namespaces (write `com.acme/*`)"),
+        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository; a bare namespace in mcp_server_deny or mcp_auto_approve_namespaces (write `com.acme/*`); mutable on a repository other than a local or staging PyPI, Debian, RPM, Alpine, Pacman or Generic one"),
     )
 )]
 pub async fn update_repository(
@@ -38797,6 +38800,38 @@ mod tests {
             Some(Some("203.0.113.61".to_string())),
             "the REPOSITORY_CREATED row must carry the request peer IP (#4762)"
         );
+    }
+
+    /// #5188: `allow_overwrite` set on a hash-pinned format (as a row written
+    /// before the create/update check existed could be) does not make the
+    /// generic PUT replace a released file: different bytes still get 409.
+    #[tokio::test]
+    async fn generic_put_on_mutable_npm_repo_still_conflicts_5188() {
+        let Some(f) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET allow_overwrite = true WHERE id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let app = f.router_with_auth(super::router());
+        let uri = format!("/{}/artifacts/notes/build-1.0.0.txt", f.repo_key);
+        let (first, b1) = tdh::send(
+            app.clone(),
+            tdh::put(uri.clone(), Bytes::from_static(b"one")),
+        )
+        .await;
+        let (second, _) = tdh::send(app, tdh::put(uri, Bytes::from_static(b"two"))).await;
+        f.teardown().await;
+
+        assert_eq!(
+            first,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&b1)
+        );
+        assert_eq!(second, StatusCode::CONFLICT);
     }
 
     /// #5458: a generic upload (`PUT /{key}/artifacts/{path}`) by an owner

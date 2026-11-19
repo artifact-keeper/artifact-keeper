@@ -7416,6 +7416,58 @@ mod upload_db_tests {
         }
     }
 
+    /// #5188: a hosted Debian repo answers a re-upload with new bytes at an
+    /// occupied pool path with 409 by default; once mutable, the re-upload
+    /// replaces it: one live row, and the pool serves the replacement.
+    #[tokio::test]
+    async fn mutable_repo_overwrites_deb_5188() {
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let first = minimal_deb("ak-ovr", "1.0-1", "amd64", "first build");
+        let second = minimal_deb("ak-ovr", "1.0-1", "amd64", "second build");
+        assert_ne!(first, second);
+        let path = "pool/main/a/ak-ovr/ak-ovr_1.0-1_amd64.deb";
+        let app = f.router_with_auth(super::router());
+        let put = |deb: &Vec<u8>| {
+            tdh::send(
+                app.clone(),
+                tdh::put(format!("/{}/{path}", f.repo_key), Bytes::from(deb.clone())),
+            )
+        };
+
+        let (created, _) = put(&first).await;
+        let (conflict, _) = put(&second).await;
+        sqlx::query("UPDATE repositories SET allow_overwrite = true WHERE id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let (replaced, body) = put(&second).await;
+        let live: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(f.repo_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        let (served_status, served) =
+            tdh::send(app, tdh::get(format!("/{}/{path}", f.repo_key))).await;
+        f.teardown().await;
+
+        assert_eq!(created, StatusCode::CREATED);
+        assert_eq!(conflict, StatusCode::CONFLICT, "default is write-once");
+        assert_eq!(
+            replaced,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(live, 1);
+        assert_eq!(served_status, StatusCode::OK);
+        assert_eq!(&served[..], &second[..], "the pool serves the replacement");
+    }
+
     #[tokio::test]
     async fn pool_upload_populates_debian_metadata_packages_and_indexes() {
         let Some(f) = tdh::Fixture::setup("local", "debian").await else {

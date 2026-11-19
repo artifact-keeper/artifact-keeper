@@ -15,7 +15,7 @@ use crate::api::handlers::escape_like_literal;
 use crate::api::middleware::download_telemetry::DownloadContext;
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata, ArtifactVersion};
-use crate::models::repository::{Repository, RepositoryFormat};
+use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
 use crate::services::opensearch_service::{ArtifactDocument, OpenSearchService};
 use crate::services::quality_check_service::QualityCheckService;
 use crate::services::repository_service::RepositoryService;
@@ -262,12 +262,40 @@ pub(crate) fn versioning_applies(format: &RepositoryFormat, versioning_enabled: 
         )
 }
 
+/// Whether a repository of this format and type may be made mutable (#5188).
+///
+/// Only hosted repositories of formats whose consumers re-read the index
+/// rather than pin a published file's hash. npm, Cargo, Go, Maven and the
+/// other lockfile ecosystems stay write-once even on the generic PUT, and a
+/// remote or virtual repository has no uploads of its own to replace.
+pub(crate) fn overwrite_supported(format: &RepositoryFormat, repo_type: &RepositoryType) -> bool {
+    matches!(repo_type, RepositoryType::Local | RepositoryType::Staging)
+        && matches!(
+            format,
+            RepositoryFormat::Pypi
+                | RepositoryFormat::Debian
+                | RepositoryFormat::Rpm
+                | RepositoryFormat::Alpine
+                | RepositoryFormat::Pacman
+                | RepositoryFormat::Generic
+        )
+}
+
+/// Error for a `mutable: true` request on a repository [`overwrite_supported`]
+/// rejects.
+pub(crate) const OVERWRITE_UNSUPPORTED: &str = "mutable is only supported on local or staging \
+     PyPI, Debian, RPM, Alpine, Pacman and Generic repositories";
+
 /// Whether an upload may replace the content already at its path (#5188):
-/// the repository opted in via `allow_overwrite` (DEFAULT false). Versioning
-/// wins when both are set, so a versioned repository still appends a revision
-/// rather than discarding history.
+/// the repository opted in via `allow_overwrite` (DEFAULT false) and its
+/// format and type are [`overwrite_supported`], so a flag set on any other
+/// repository before that check existed is ignored. Versioning wins when both
+/// are set, so a versioned repository still appends a revision rather than
+/// discarding history.
 pub(crate) fn overwrite_applies(repo: &Repository) -> bool {
-    repo.allow_overwrite && !versioning_applies(&repo.format, repo.versioning_enabled)
+    repo.allow_overwrite
+        && overwrite_supported(&repo.format, &repo.repo_type)
+        && !versioning_applies(&repo.format, repo.versioning_enabled)
 }
 
 /// The row a mutable-repository overwrite (#5188) retired, returned by
@@ -6638,8 +6666,26 @@ mod tests {
         assert!(overwrite_applies(&repo));
         // Versioning keeps history instead of replacing it.
         repo.format = RepositoryFormat::Generic;
+        assert!(overwrite_applies(&repo));
         repo.versioning_enabled = true;
         assert!(!overwrite_applies(&repo));
+        repo.versioning_enabled = false;
+        // Hash-pinned formats and non-hosted repos never overwrite, even with the flag set.
+        for format in [
+            RepositoryFormat::Npm,
+            RepositoryFormat::Cargo,
+            RepositoryFormat::Go,
+            RepositoryFormat::Maven,
+        ] {
+            repo.format = format;
+            assert!(!overwrite_applies(&repo), "{:?}", repo.format);
+        }
+        repo.format = RepositoryFormat::Debian;
+        assert!(overwrite_applies(&repo));
+        for repo_type in [RepositoryType::Remote, RepositoryType::Virtual] {
+            repo.repo_type = repo_type;
+            assert!(!overwrite_applies(&repo));
+        }
     }
 
     /// #5188: on a repository with `allow_overwrite`, a different-bytes
