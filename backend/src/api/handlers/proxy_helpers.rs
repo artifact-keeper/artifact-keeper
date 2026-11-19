@@ -952,6 +952,38 @@ pub(crate) fn upstream_refusal_status(response: &Response) -> Option<StatusCode>
     response.extensions().get::<UpstreamRefusal>().map(|r| r.0)
 }
 
+/// Whether a proxy error `Response` is the upstream refusing the credentials
+/// the Remote `repo_id` has configured (#6214): an upstream `401`/`403`
+/// ([`UpstreamRefusal`]) or an upstream authentication failure
+/// ([`UpstreamAuthFailure`]), on a Remote with upstream auth configured. The
+/// credentials no longer work, so the member could not answer; it says
+/// nothing about whether the upstream holds the object. A refusal of an
+/// anonymous request is not one (an S3-style upstream answers `403` for a key
+/// it does not hold). If the auth configuration cannot be read, the refusal
+/// counts as credentialed, so a database fault never turns it into a miss.
+///
+/// Takes the response's refusal classification
+/// ([`is_upstream_auth_refusal`]) rather than the response itself, so no
+/// borrow of a (non-`Sync`) `Response` is held across the await.
+pub(crate) async fn is_credentialed_upstream_refusal(
+    db: &PgPool,
+    repo_id: Uuid,
+    refused: bool,
+) -> bool {
+    refused
+        && !matches!(
+            crate::services::upstream_auth::load_upstream_auth(db, repo_id).await,
+            Ok(None)
+        )
+}
+
+/// Whether a proxy error `Response` is an upstream `401`/`403`
+/// ([`UpstreamRefusal`]) or an upstream authentication failure
+/// ([`UpstreamAuthFailure`]); see [`is_credentialed_upstream_refusal`].
+pub(crate) fn is_upstream_auth_refusal(response: &Response) -> bool {
+    upstream_refusal_status(response).is_some() || is_upstream_auth_failure(response)
+}
+
 /// The Hub's `X-Error-Code` (one of
 /// [`crate::services::proxy_service::HUB_ERROR_CODES`]) behind an upstream
 /// `401`/`403` proxy error `Response`, if it sent one (#5323).
@@ -5051,13 +5083,29 @@ where
                         MemberResolveOutcome::Miss
                     }
                 },
-                Err(resp) if report_unavailable && is_member_unavailable_response(&resp) => {
-                    tracing::debug!(
-                        member = %member.key,
-                        path = %path,
-                        "virtual metadata upstream fetch failed; member unavailable"
-                    );
-                    MemberResolveOutcome::Unavailable
+                // #6214: a member whose upstream could not answer, or refused
+                // the credentials it has configured, is unavailable, not a
+                // miss.
+                Err(resp) if report_unavailable => {
+                    let unavailable = is_member_unavailable_response(&resp);
+                    let refused = is_upstream_auth_refusal(&resp);
+                    drop(resp);
+                    if unavailable || is_credentialed_upstream_refusal(db, member.id, refused).await
+                    {
+                        tracing::debug!(
+                            member = %member.key,
+                            path = %path,
+                            "virtual metadata upstream fetch failed; member unavailable"
+                        );
+                        MemberResolveOutcome::Unavailable
+                    } else {
+                        tracing::debug!(
+                            member = %member.key,
+                            path = %path,
+                            "virtual metadata upstream fetch miss"
+                        );
+                        MemberResolveOutcome::Miss
+                    }
                 }
                 Err(_) => {
                     tracing::debug!(

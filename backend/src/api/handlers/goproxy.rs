@@ -685,12 +685,7 @@ async fn try_proxy_go_metadata(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            let proxy_helpers::CachedBody {
-                content,
-                content_type,
-                content_encoding,
-                stale_since,
-            } = proxy_helpers::proxy_fetch_capped_encoded_with_format(
+            let fetched = proxy_helpers::proxy_fetch_capped_encoded_with_format(
                 proxy,
                 repo.id,
                 &repo.key,
@@ -699,8 +694,16 @@ async fn try_proxy_go_metadata(
                 proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                 RepositoryFormat::Go,
             )
-            .await
-            .map_err(upstream_failure)?;
+            .await;
+            let proxy_helpers::CachedBody {
+                content,
+                content_type,
+                content_encoding,
+                stale_since,
+            } = match fetched {
+                Ok(body) => body,
+                Err(resp) => return Err(go_fetch_failure(state, repo.id, resp).await),
+            };
             return Ok(proxy_helpers::forward_verbatim_metadata(
                 content,
                 content_type,
@@ -761,6 +764,9 @@ async fn try_proxy_go_metadata(
 /// renders an unavailable failure as 502 or 503 today, and anything else
 /// marked unavailable is answered with
 /// [`proxy_helpers::member_unavailable_response`] rather than passed through.
+///
+/// A credentialed refusal is not decided here (it needs the repository's
+/// upstream-auth configuration); see [`go_fetch_failure`].
 fn upstream_failure(resp: Response) -> Option<Response> {
     if !proxy_helpers::is_member_unavailable_response(&resp) {
         return None;
@@ -770,6 +776,29 @@ fn upstream_failure(resp: Response) -> Option<Response> {
     } else {
         proxy_helpers::member_unavailable_response()
     })
+}
+
+/// [`upstream_failure`] for a fetch from the Remote `repo_id`, plus the
+/// credentialed refusal (#6214): an upstream 401/403 (or an upstream
+/// authentication failure) to a Remote that has upstream credentials
+/// configured means those credentials no longer work, not that the module is
+/// missing, so it is answered with the 502 `.mod` gives rather than the 404
+/// that sends `GOPROXY=<ak>,direct` to the next entry. An anonymous 401/403
+/// stays a miss: an S3-style upstream answers 403 for a key it does not hold.
+async fn go_fetch_failure(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    resp: Response,
+) -> Option<Response> {
+    let refused = proxy_helpers::is_upstream_auth_refusal(&resp);
+    if proxy_helpers::is_credentialed_upstream_refusal(&state.db, repo_id, refused).await {
+        return Some(if resp.status().is_server_error() {
+            resp
+        } else {
+            (StatusCode::BAD_GATEWAY, "Failed to fetch from upstream").into_response()
+        });
+    }
+    upstream_failure(resp)
 }
 
 /// Parse a goproxy `@v/list` document into its version lines.
@@ -847,7 +876,11 @@ async fn fetch_go_metadata_with_source(
             stale_since,
         } = match fetched {
             Ok(body) => body,
-            Err(resp) => return upstream_failure(resp).map_or(Ok(None), Err),
+            Err(resp) => {
+                return go_fetch_failure(state, repo.id, resp)
+                    .await
+                    .map_or(Ok(None), Err)
+            }
         };
         return Ok(Some((repo.id, content, content_encoding, stale_since)));
     }
@@ -885,7 +918,9 @@ async fn fetch_go_metadata_with_source(
                 }) => return Ok(Some((member.id, content, content_encoding, stale_since))),
                 // A lower-priority member may still serve; only when none
                 // does is the outage the answer.
-                Err(resp) => any_unavailable |= upstream_failure(resp).is_some(),
+                Err(resp) => {
+                    any_unavailable |= go_fetch_failure(state, member.id, resp).await.is_some()
+                }
             }
         }
         if any_unavailable {
@@ -1338,12 +1373,7 @@ async fn fetch_member_version_list(
 ) -> Option<String> {
     let proxy = state.proxy_service.as_ref()?;
     let upstream_url = member.upstream_url.as_deref()?;
-    let proxy_helpers::CachedBody {
-        content,
-        content_type: _content_type,
-        content_encoding,
-        ..
-    } = proxy_helpers::proxy_fetch_capped_encoded_with_format(
+    let fetched = proxy_helpers::proxy_fetch_capped_encoded_with_format(
         proxy,
         member.id,
         &member.key,
@@ -1352,18 +1382,26 @@ async fn fetch_member_version_list(
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
         RepositoryFormat::Go,
     )
-    .await
-    .map_err(|resp| {
-        if upstream_failure(resp).is_some() {
-            any_unavailable.store(true, Ordering::Relaxed);
+    .await;
+    let proxy_helpers::CachedBody {
+        content,
+        content_type: _content_type,
+        content_encoding,
+        ..
+    } = match fetched {
+        Ok(body) => body,
+        Err(resp) => {
+            if go_fetch_failure(state, member.id, resp).await.is_some() {
+                any_unavailable.store(true, Ordering::Relaxed);
+            }
+            tracing::debug!(
+                member_key = %member.key,
+                module = %module,
+                "@v/list upstream fetch miss for virtual member; skipping it"
+            );
+            return None;
         }
-        tracing::debug!(
-            member_key = %member.key,
-            module = %module,
-            "@v/list upstream fetch miss for virtual member; skipping it"
-        );
-    })
-    .ok()?;
+    };
     let decoded = decode_go_metadata_body(&content, content_encoding.as_deref())
         .map_err(|_| {
             tracing::warn!(
@@ -5883,6 +5921,10 @@ mod upstream_failure_6214_tests {
     const GONE: &str = "example.com/upstream-410";
     /// Not mounted: wiremock answers 404.
     const ABSENT: &str = "example.com/upstream-404";
+    /// The upstream answers 401 for every document of this module.
+    const UNAUTHORIZED: &str = "example.com/upstream-401";
+    /// The upstream answers 403 for every document of this module.
+    const FORBIDDEN: &str = "example.com/upstream-403";
     const VERSION: &str = "v1.0.0";
 
     /// The three metadata routes this issue is about, then `.mod`, whose
@@ -5943,7 +5985,13 @@ mod upstream_failure_6214_tests {
     async fn setup() -> Option<Rig> {
         let fx = tdh::Fixture::setup("remote", "go").await?;
         let mock = MockServer::start().await;
-        for (module, status) in [(ERRORING, 500), (RATE_LIMITED, 429), (GONE, 410)] {
+        for (module, status) in [
+            (ERRORING, 500),
+            (RATE_LIMITED, 429),
+            (GONE, 410),
+            (UNAUTHORIZED, 401),
+            (FORBIDDEN, 403),
+        ] {
             Mock::given(method("GET"))
                 .and(path_regex(format!("^/{module}/@")))
                 .respond_with(ResponseTemplate::new(status))
@@ -6082,6 +6130,88 @@ mod upstream_failure_6214_tests {
                 status,
                 StatusCode::NOT_FOUND,
                 "{module}: {route} through a Virtual keeps 404 for a module no member has"
+            );
+        }
+    }
+
+    /// An upstream 401/403 to a Remote that has upstream credentials
+    /// configured means the credentials no longer work: `@v/list`, `@latest`
+    /// and `.info` answer the 502 `.mod` answers (a Virtual over it, 503 +
+    /// `Retry-After`), not the 404 that sends `GOPROXY=<ak>,direct` past the
+    /// scan gate. The same refusal of an anonymous Remote stays a 404 (an
+    /// S3-style upstream answers 403 for a key it does not hold).
+    #[tokio::test]
+    async fn test_credentialed_upstream_refusal_is_not_a_miss_6214_db() {
+        if std::env::var("JWT_SECRET").is_err() && std::env::var("SSO_ENCRYPTION_KEY").is_err() {
+            // No key to encrypt the Remote's credentials with.
+            return;
+        }
+        let Some(mut rig) = setup().await else {
+            return;
+        };
+        let upstream = rig._mock.uri();
+        let (cred_id, cred_key) = rig.repo("remote", Some(&upstream)).await;
+        let creds = crate::services::upstream_auth::build_credentials_json(
+            &crate::services::upstream_auth::UpstreamAuthType::Bearer {
+                token: "expired-token".to_string(),
+            },
+        );
+        crate::services::upstream_auth::save_upstream_auth(&rig.fx.pool, cred_id, "bearer", &creds)
+            .await
+            .expect("save upstream auth");
+        crate::services::upstream_auth::invalidate_upstream_auth_cache(cred_id);
+        let (cred_virtual, cred_virtual_key) = rig.repo("virtual", None).await;
+        tdh::link_virtual_member(&rig.fx.pool, cred_virtual, cred_id, 0).await;
+        let anon_key = rig.fx.repo_key.clone();
+
+        let mut anonymous = Vec::new();
+        let mut credentialed = Vec::new();
+        let mut through_virtual = Vec::new();
+        for module in [UNAUTHORIZED, FORBIDDEN] {
+            // `.mod` answers 502 for any upstream 401/403; the metadata
+            // routes keep the anonymous refusal a miss.
+            for (route, uri) in routes(&anon_key, module).into_iter().take(3) {
+                anonymous.push((module, route, rig.get(uri).await.0));
+            }
+            let mut statuses = Vec::new();
+            for (route, uri) in routes(&cred_key, module) {
+                statuses.push((route, rig.get(uri).await.0));
+            }
+            credentialed.push((module, statuses));
+            for (route, uri) in routes(&cred_virtual_key, module).into_iter().take(3) {
+                let (status, headers) = rig.get(uri).await;
+                through_virtual.push((module, route, status, headers.contains_key("retry-after")));
+            }
+        }
+        rig.teardown().await;
+
+        for (module, statuses) in credentialed {
+            let mod_status = statuses[3].1;
+            assert_eq!(
+                mod_status,
+                StatusCode::BAD_GATEWAY,
+                "{module}: .mod answers a credentialed refusal with 502"
+            );
+            for (route, status) in &statuses[..3] {
+                assert_eq!(
+                    *status, mod_status,
+                    "{module}: {route} must answer a credentialed refusal as .mod does, not 404"
+                );
+            }
+        }
+        for (module, route, status, retry_after) in through_virtual {
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{module}: {route} through a Virtual over a credentialed member that is refused"
+            );
+            assert!(retry_after, "{module}: {route} 503 carries Retry-After");
+        }
+        for (module, route, status) in anonymous {
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{module}: {route} keeps 404 for a refusal of an anonymous Remote"
             );
         }
     }

@@ -971,6 +971,18 @@ have no core proxy path to gate.
   there, not through the `pods/` route; the same holds for a Composer
   package installed from `source` (a VCS checkout) instead of its `dist`,
   and for a Go client whose `GOPROXY` falls back to `direct`.
+- **Go: only `GOPROXY` without a fallback fully enforces the gate.** With
+  `GOPROXY=https://<ak>/go/<repo>,direct`, `go` moves on to `direct` when
+  the repository answers 404 or 410. With `GOPROXY=https://<ak>/go/<repo>|direct`
+  it moves on after *any* error, including the `403` `scan_blocked`, the
+  `423` and the 5xx a failing upstream gets. In both cases the client then
+  fetches from the VCS without going through the gate. The Go routes answer
+  with a 5xx, never a 404, when the upstream cannot answer or refuses the
+  Remote's configured credentials (#6214). So `,direct` falls through only
+  for a module the upstream really does not have. To
+  enforce the gate for every module, set `GOPROXY=https://<ak>/go/<repo>`
+  with no fallback. Modules that match `GOPRIVATE` or `GONOPROXY` also skip
+  the proxy, so keep those patterns limited to modules you trust.
 - **One stored verdict per digest.** A digest holds one verdict row, so
   byte-identical files pulled alternately as two coordinates (see
   [Verdicts and freshness](#verdicts-and-freshness)) are scanned again on
