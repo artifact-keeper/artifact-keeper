@@ -126,14 +126,6 @@ pub(crate) struct ScanStateRow {
 }
 
 impl ScanStateRow {
-    /// A row is "not applicable" (the scanner does not apply to this format,
-    /// rather than a genuine crash) when:
-    ///
-    /// * its status is the dedicated `not_applicable` terminal status (#1470,
-    ///   the canonical path for rows persisted from migration 124 onward), or
-    /// * (legacy) its status is `failed` and its error message carries the
-    ///   [`NOT_APPLICABLE_MARKER`] sentinel — historical rows written before the
-    ///   dedicated status existed.
     /// A row reopened for a retry after a recorded failure (#5942): `running`
     /// with [`RETRYING_AFTER_FAILURE_PREFIX`] on its error. It keeps counting
     /// as that failure, so `block_on_fail` does not let the artifact through,
@@ -146,6 +138,14 @@ impl ScanStateRow {
                 .is_some_and(|m| m.starts_with(RETRYING_AFTER_FAILURE_PREFIX))
     }
 
+    /// A row is "not applicable" (the scanner does not apply to this format,
+    /// rather than a genuine crash) when:
+    ///
+    /// * its status is the dedicated `not_applicable` terminal status (#1470,
+    ///   the canonical path for rows persisted from migration 124 onward), or
+    /// * (legacy) its status is `failed` and its error message carries the
+    ///   [`NOT_APPLICABLE_MARKER`] sentinel — historical rows written before the
+    ///   dedicated status existed.
     pub(crate) fn is_not_applicable(&self) -> bool {
         if self.status == NOT_APPLICABLE_STATUS {
             return true;
