@@ -16,7 +16,8 @@ use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::services::image_scanner::TrivyReport;
 use crate::services::scanner_adapter_client::{fs_upload_cap_bytes, TrivyEngine, TrivyFsBackend};
 use crate::services::scanner_service::{
-    fail_scan, ExpectedComponent, ScanOutput, ScanTarget, ScanWorkspace, Scanner, VersionCache,
+    fail_scan, sanitize_artifact_filename, ExpectedComponent, ScanOutput, ScanTarget,
+    ScanWorkspace, Scanner, VersionCache, SCAN_ARCHIVE_SUBDIR,
 };
 // `ScanCompleteness` is used via `output.scan_completeness.as_str()` in the
 // info!() log line below.
@@ -31,6 +32,11 @@ pub struct TrivyFsScanner {
     /// the field starts populating once the binary becomes available. Only
     /// meaningful in CLI mode.
     cached_version: VersionCache,
+    /// `TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS` (#6233), default `true`:
+    /// drop the embedded build POMs [`prune_embedded_build_poms`] may drop
+    /// before trivy runs. `false` keeps every one, so trivy grades the
+    /// dependencies they declare, as before #6233.
+    ignore_embedded_pom_declarations: bool,
 }
 
 impl TrivyFsScanner {
@@ -41,6 +47,7 @@ impl TrivyFsScanner {
             engine: TrivyEngine::cli(trivy_url),
             scan_workspace,
             cached_version: VersionCache::new(),
+            ignore_embedded_pom_declarations: true,
         }
     }
 
@@ -51,7 +58,14 @@ impl TrivyFsScanner {
             engine: TrivyEngine::adapter(adapter_url),
             scan_workspace,
             cached_version: VersionCache::new(),
+            ignore_embedded_pom_declarations: true,
         }
+    }
+
+    /// Set `TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS` (#6233); see the field.
+    pub fn with_ignore_embedded_pom_declarations(mut self, ignore: bool) -> Self {
+        self.ignore_embedded_pom_declarations = ignore;
+        self
     }
 
     /// Returns true if this scanner is applicable to the given artifact.
@@ -586,44 +600,71 @@ fn is_embedded_build_pom(rel: &Path) -> bool {
             .any(|w| w[0] == "META-INF" && w[1] == "maven")
 }
 
+/// Archive extensions that mark a nested JVM library for
+/// [`skip_embedded_build_pom_prune`]: Java, web and enterprise archives,
+/// Android libraries and Jenkins plugins.
+const NESTED_JVM_ARCHIVE_EXTENSIONS: &[&str] = &[".jar", ".war", ".ear", ".aar", ".hpi", ".jpi"];
+
 /// Whether the prune of [`prune_embedded_build_poms`] must be skipped for
 /// this workspace (#6233): the artifact's original `file_name` is a
-/// `.war`/`.ear`, or the tree bundles libraries as nested archives (a
-/// `WEB-INF/lib` or `BOOT-INF/lib` directory, or a JVM archive in any `lib/`
-/// directory).
+/// `.war`/`.ear`, the tree has a `WEB-INF/lib` or `BOOT-INF/lib` directory,
+/// or it holds a JVM archive anywhere other than the artifact's own copy
+/// (written at the extract root, the workspace root or its
+/// [`SCAN_ARCHIVE_SUBDIR`] for a pinned scan) and the inventory directory.
+/// Nested libraries do not only live under `lib/`: OSGi `Embed-Dependency`
+/// puts them at the bundle root, Mule 4 under `repository/<g>/<a>/<v>/`,
+/// other builds under `libs/` or `jars/`.
 ///
 /// Trivy's filesystem scan never opens a nested JAR, so a bundled library
 /// with no `pom.properties` is missing from the inventory POM, and the only
 /// thing that still names it is the outer archive's build POM declaring it.
 /// Unlike grype (#5340), whose syft cataloger still identifies nested JARs,
 /// pruning that POM would hide the library's vulnerabilities, so such an
-/// archive keeps its build POMs and is graded as before.
+/// archive keeps its build POMs and is graded as before. A walk error means
+/// the tree cannot be shown to be free of nested archives, so it skips the
+/// prune too.
 fn skip_embedded_build_pom_prune(root: &Path, file_name: &str) -> bool {
     let lower = file_name.to_ascii_lowercase();
     if lower.ends_with(".war") || lower.ends_with(".ear") {
         return true;
     }
-    walkdir::WalkDir::new(root)
+    let own = sanitize_artifact_filename(file_name);
+    let own_copies = [root.join(&own), root.join(SCAN_ARCHIVE_SUBDIR).join(&own)];
+    let walker = walkdir::WalkDir::new(root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| e.depth() != 1 || e.file_name() != JAR_INVENTORY_SUBDIR)
-        .filter_map(|e| e.ok())
-        .any(|entry| {
+        .filter_entry(|e| e.depth() != 1 || e.file_name() != JAR_INVENTORY_SUBDIR);
+    for entry in walker {
+        let Ok(entry) = entry else {
+            return true;
+        };
+        if entry.depth() == 0 {
+            continue;
+        }
+        if entry.file_type().is_dir() {
             let parent = entry
                 .path()
                 .parent()
                 .and_then(|p| p.file_name())
                 .unwrap_or_default();
-            if entry.file_type().is_dir() {
-                entry.depth() > 1
-                    && entry.file_name() == "lib"
-                    && (parent == "WEB-INF" || parent == "BOOT-INF")
-            } else {
-                entry.depth() > 1
-                    && parent == "lib"
-                    && is_jvm_archive_name(&entry.file_name().to_string_lossy())
+            if entry.depth() > 1
+                && entry.file_name() == "lib"
+                && (parent == "WEB-INF" || parent == "BOOT-INF")
+            {
+                return true;
             }
-        })
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if NESTED_JVM_ARCHIVE_EXTENSIONS
+            .iter()
+            .any(|ext| name.ends_with(ext))
+            && !own_copies.iter().any(|own| own.as_path() == entry.path())
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Delete the embedded build POMs from the extracted workspace before trivy
@@ -791,8 +832,10 @@ impl TrivyFsScanner {
         // against, not what it ships; keep them out of the trivy target, as
         // grype's directory scan does (#5262). After the inventory, which
         // reads only `pom.properties`. Skipped for an archive bundling nested
-        // libraries, whose build POM may be all that names them.
+        // libraries, whose build POM may be all that names them, and when
+        // TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS=false.
         let workspace_root = workspace.to_path_buf();
+        let ignore_declarations = self.ignore_embedded_pom_declarations;
         let file_name = artifact
             .path
             .rsplit('/')
@@ -800,7 +843,7 @@ impl TrivyFsScanner {
             .unwrap_or(&artifact.name)
             .to_string();
         match tokio::task::spawn_blocking(move || {
-            if skip_embedded_build_pom_prune(&workspace_root, &file_name) {
+            if !ignore_declarations || skip_embedded_build_pom_prune(&workspace_root, &file_name) {
                 0
             } else {
                 prune_embedded_build_poms(&workspace_root)
@@ -1761,7 +1804,9 @@ mod tests {
     }
 
     /// #6233 review: the prune is skipped for a `.war`/`.ear` by name and
-    /// for any tree that bundles nested libraries, and runs otherwise.
+    /// for any tree that holds a nested JVM archive anywhere, and runs
+    /// otherwise. The artifact's own copy (at the workspace root, or under
+    /// `pkg/` for a pinned scan) and the inventory directory do not count.
     #[test]
     fn test_prune_skipped_when_tree_bundles_nested_libraries_6233() {
         let tree = |files: &[&str]| {
@@ -1782,6 +1827,15 @@ mod tests {
             (vec![pom, "BOOT-INF/lib/inner.jar"], "app.jar"),
             (vec![pom, "lib/inner.jar"], "app.jar"),
             (vec![pom, "app/lib/inner.JAR"], "app.zip"),
+            // OSGi Embed-Dependency: embedded jars at the bundle root.
+            (vec![pom, "inner.jar"], "app.jar"),
+            (vec![pom, "app.jar", "commons-text-1.9.jar"], "app.jar"),
+            // Mule 4, and builds using libs/ or jars/.
+            (vec![pom, "repository/g/a/1.0/a-1.0.jar"], "app.jar"),
+            (vec![pom, "libs/x.aar"], "app.jar"),
+            (vec![pom, "jars/x.hpi"], "app.jar"),
+            (vec![pom, "plugins/x.jpi"], "app.jar"),
+            (vec![pom, "pkg/app.jar", "pkg/inner.ear"], "app.jar"),
         ] {
             let dir = tree(&files);
             assert!(
@@ -1792,8 +1846,11 @@ mod tests {
         for (files, name) in [
             (vec![pom], "app.jar"),
             (vec![pom, "lib/notes.txt"], "app.jar"),
-            (vec![pom, "inner.jar"], "app.jar"),
             (vec![pom, "WEB-INF/classes/A.class"], "app.jar"),
+            // The artifact's own copy, unpinned and pinned.
+            (vec![pom, "app.jar"], "app.jar"),
+            (vec![pom, "pkg/app.jar"], "app.jar"),
+            (vec![pom, "app-1.0.jar"], "maven/g/app/1.0/app-1.0.jar"),
         ] {
             let dir = tree(&files);
             assert!(
@@ -1804,6 +1861,136 @@ mod tests {
         // The inventory directory is never a reason to skip.
         let dir = tree(&[pom, ".ak-scan-jar-inventory/lib/x.jar"]);
         assert!(!skip_embedded_build_pom_prune(dir.path(), "app.jar"));
+    }
+
+    /// #6233 review: a walk error cannot show the tree is free of nested
+    /// archives, so it skips the prune (fails closed).
+    #[cfg(unix)]
+    #[test]
+    fn test_prune_skipped_when_tree_walk_fails_6233() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let pom = dir.path().join("META-INF/maven/g/a/pom.xml");
+        std::fs::create_dir_all(pom.parent().unwrap()).unwrap();
+        std::fs::write(&pom, b"x").unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("inner.txt"), b"x").unwrap();
+        assert!(!skip_embedded_build_pom_prune(dir.path(), "app.jar"));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read_dir(&locked).is_err();
+        let skipped = skip_embedded_build_pom_prune(dir.path(), "app.jar");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Running as root reads the directory anyway; there is no error then.
+        if unreadable {
+            assert!(skipped, "an unreadable directory must skip the prune");
+        }
+    }
+
+    /// #6233 review: an OSGi bundle (`Embed-Dependency`) embeds its
+    /// libraries at the bundle root. One with no `pom.properties` is named
+    /// only by the bundle's build POM, so the prune is skipped, both in the
+    /// flat workspace and in a pinned one (`pkg/`); a plain JAR in either
+    /// layout is pruned, its own copy notwithstanding.
+    #[tokio::test]
+    async fn test_osgi_root_embedded_jar_skips_prune_6233() {
+        let props = (
+            "META-INF/maven/com.acme/bundle/pom.properties",
+            b"groupId=com.acme\nartifactId=bundle\nversion=1.0.0\n".to_vec(),
+        );
+        let build_pom = (
+            "META-INF/maven/com.acme/bundle/pom.xml",
+            b"<project><artifactId>bundle</artifactId><dependencies><dependency><groupId>org.apache.commons</groupId><artifactId>commons-text</artifactId><version>1.9</version></dependency></dependencies></project>".to_vec(),
+        );
+        let osgi = Bytes::from(zip_of(&[
+            (
+                "META-INF/MANIFEST.MF",
+                b"Manifest-Version: 1.0\nBundle-ClassPath: .,commons-text-1.9.jar\n".to_vec(),
+            ),
+            props.clone(),
+            build_pom.clone(),
+            (
+                "commons-text-1.9.jar",
+                zip_of(&[(
+                    "org/apache/commons/text/StringSubstitutor.class",
+                    b"\xca\xfe".to_vec(),
+                )]),
+            ),
+        ]));
+        let plain = Bytes::from(zip_of(&[props, build_pom]));
+        let artifact = make_test_artifact(
+            "bundle-1.0.0.jar",
+            "application/java-archive",
+            "maven/com/acme/bundle/1.0.0/bundle-1.0.0.jar",
+        );
+        let pin = ExpectedComponent::new(ComponentEcosystem::Maven, "com.acme:bundle", "1.0.0");
+        for pinned in [None, Some(&pin)] {
+            for (content, expect_skip) in [(&osgi, true), (&plain, false)] {
+                let tmp = tempfile::tempdir().unwrap();
+                let ws = ScanWorkspace::prepare_pinned(
+                    tmp.path().to_str().unwrap(),
+                    None,
+                    &artifact,
+                    content,
+                    pinned,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    skip_embedded_build_pom_prune(&ws, "bundle-1.0.0.jar"),
+                    expect_skip,
+                    "pinned={} osgi={expect_skip}",
+                    pinned.is_some()
+                );
+            }
+        }
+    }
+
+    /// #6233: `TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS=false` skips the prune,
+    /// so the embedded build POM reaches trivy as before the fix.
+    #[tokio::test]
+    async fn test_opt_out_keeps_embedded_build_pom_6233() {
+        let server = wiremock::MockServer::start().await;
+        crate::services::scanner_adapter_client::test_support::mount_fs_scan_success(
+            &server,
+            "fs-optout",
+            serde_json::json!({"report": {"Results": []}, "stderr": ""}),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = TrivyFsScanner::new_with_adapter(
+            server.uri(),
+            dir.path().to_string_lossy().to_string(),
+        )
+        .with_ignore_embedded_pom_declarations(false);
+        let artifact = make_test_artifact(
+            "acme-maven-plugin-1.0.0.jar",
+            "application/java-archive",
+            "maven/com/acme/acme-maven-plugin/1.0.0/acme-maven-plugin-1.0.0.jar",
+        );
+        scanner
+            .scan(&artifact, None, &maven_plugin_jar_with_embedded_pom())
+            .await
+            .expect("adapter-backed scan should complete");
+        let upload = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.method == wiremock::http::Method::POST)
+            .expect("workspace upload");
+        let mut archive = tar::Archive::new(std::io::Cursor::new(upload.body));
+        let paths: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.ends_with("META-INF/maven/com.acme/acme-maven-plugin/pom.xml")),
+            "with the opt-out the build POM must reach trivy: {paths:?}"
+        );
     }
 
     /// #6233 review: a plain JAR whose build POM has no `pom.properties`

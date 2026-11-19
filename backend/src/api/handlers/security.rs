@@ -10352,6 +10352,7 @@ mod tests {
             None, // trivy_url
             None, // trivy_adapter_url
             true, // incus_scanner_enabled (irrelevant without a Trivy URL)
+            true, // trivy_ignore_embedded_pom_declarations (likewise)
             fx.state.storage.clone(),
             fx.state.storage_registry.clone(),
             fx.storage_dir.to_string_lossy().into_owned(),

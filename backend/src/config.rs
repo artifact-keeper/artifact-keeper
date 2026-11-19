@@ -945,6 +945,20 @@ pub struct Config {
     /// the scanner is then never constructed or consulted.
     pub incus_scanner_enabled: bool,
 
+    /// Whether the Trivy filesystem scan ignores the dependencies a JAR's
+    /// embedded build POM (`META-INF/maven/<g>/<a>/pom.xml`) only declares
+    /// (#6233), as grype has since #5340.
+    ///
+    /// Env var: `TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS` (opt-out). Default:
+    /// `true`: a build POM with a `pom.properties` beside it is dropped from
+    /// the Trivy workspace, unless the archive bundles nested libraries.
+    /// `false` or `0` keeps every build POM, so Trivy grades the declared
+    /// dependencies again, false positives included. Known gap of the
+    /// default: a Maven-shaded jar whose relocated classes come from
+    /// Gradle-built libraries (no `pom.properties`) is no longer flagged from
+    /// its embedded POM, by either engine.
+    pub trivy_ignore_embedded_pom_declarations: bool,
+
     /// Lifetime, in seconds, of the short-lived per-repository pull token the
     /// scanner mints for private-image scans (#2093). Env
     /// `SCAN_TOKEN_TTL_SECONDS`, default 300. Kept intentionally short: the
@@ -1932,6 +1946,7 @@ redacted_debug!(Config {
     show scan_worker_trivy_adapter_url,
     show scan_rescan_max_per_day,
     show incus_scanner_enabled,
+    show trivy_ignore_embedded_pom_declarations,
     show scan_token_ttl_seconds,
     show openscap_url,
     show openscap_profile,
@@ -2098,6 +2113,7 @@ impl Default for Config {
             trivy_url: None,
             trivy_adapter_url: None,
             incus_scanner_enabled: true,
+            trivy_ignore_embedded_pom_declarations: true,
             scan_token_ttl_seconds: 300,
             openscap_url: None,
             openscap_profile: crate::services::openscap_scanner::DEFAULT_OPENSCAP_PROFILE.into(),
@@ -2329,6 +2345,11 @@ impl Config {
             trivy_adapter_url: env::var("TRIVY_ADAPTER_URL").ok().filter(|s| !s.is_empty()),
             incus_scanner_enabled: parse_opt_out_flag(
                 env::var("INCUS_SCANNER_ENABLED").ok().as_deref(),
+            ),
+            trivy_ignore_embedded_pom_declarations: parse_opt_out_flag(
+                env::var("TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS")
+                    .ok()
+                    .as_deref(),
             ),
             scan_token_ttl_seconds: env_parse("SCAN_TOKEN_TTL_SECONDS", 300),
             openscap_url: env::var("OPENSCAP_URL").ok(),
@@ -3328,6 +3349,31 @@ mod tests {
             !disabled_config.incus_scanner_enabled,
             "INCUS_SCANNER_ENABLED=false must disable Incus scanner construction"
         );
+    }
+
+    /// #6233: `TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS` defaults on and only
+    /// an explicit `false`/`0` turns it off.
+    #[test]
+    fn test_config_trivy_ignore_embedded_pom_declarations_defaults_on_6233() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS").ok();
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        env::remove_var("TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS");
+        let default_config = Config::from_env().expect("config should load");
+        env::set_var("TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS", "false");
+        let disabled_config = Config::from_env().expect("config should load");
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS", saved_flag);
+
+        assert!(default_config.trivy_ignore_embedded_pom_declarations);
+        assert!(Config::default().trivy_ignore_embedded_pom_declarations);
+        assert!(!disabled_config.trivy_ignore_embedded_pom_declarations);
     }
 
     /// #5288: `UPSTREAM_JOBS_PAUSED` is opt-in; only `true`/`1` pauses the

@@ -100,6 +100,24 @@ the checks above run. The metadata check reads one copy of a manifest and the
 scan workspace unpacks the other, so neither can be vouched for. Published
 packages do not carry repeated paths.
 
+**Embedded build POMs (Maven).** A Maven-built JAR embeds the POM it was
+built from at `META-INF/maven/<groupId>/<artifactId>/pom.xml`. That POM
+declares what the JAR was built against (`provided` and `test` scope
+included), not what it ships, so neither engine grades those declarations as
+components: Grype has excluded embedded build POMs since #5340, and the Trivy
+filesystem scan does too since #6233. What the archive ships is graded from
+the `pom.properties` of the archive and of each component bundled in it. The
+Trivy scan keeps a build POM in two cases, because Trivy does not open nested
+JARs and the POM may be the only thing that names a bundled library: a POM
+with no `pom.properties` beside it, and any archive that bundles JVM archives
+(a `.war` or `.ear`, a `WEB-INF/lib` or `BOOT-INF/lib` directory, or a nested
+`.jar`, `.war`, `.ear`, `.aar`, `.hpi` or `.jpi` anywhere in it). This applies
+to every Trivy filesystem scan, on uploads as well as proxy pulls.
+`TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS=false` (default `true`) keeps every
+embedded build POM, so Trivy grades the declared dependencies again, false
+positives included. See [Known gaps](#known-gaps) for what the default
+misses.
+
 **Archive formats graded on their contents (Go, Composer, Conan, CocoaPods, Swift).** The gate
 takes the coordinate from the request and checks it against the archive
 first, as for every format: a Go module zip must hold only
@@ -872,6 +890,12 @@ have no core proxy path to gate.
   [The proxy cache and the gate](#the-proxy-cache-and-the-gate)). To enforce
   the Virtual's policy for every client, enable scan-on-proxy on the member
   too, or do not grant clients read access to the member.
+- **A Maven-shaded jar whose relocated classes come from Gradle-built
+  libraries** (no `pom.properties`) is no longer flagged from its embedded
+  POM. Grype has ignored embedded POM declarations since #5340, so neither
+  engine flags that case now. Set `TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS=false`
+  to grade those declarations again (and accept the false positives from
+  #6233). See [Embedded build POMs](#what-the-gate-does).
 - **Maven-layout archives other than `.jar`/`.war`/`.ear`** (`.aar`,
   `.hpi`/`.jpi`, `.nbm`, `.jmod`, `.rar`, `.zip`) are scanned as raw files,
   not unpacked, and carry no identity pin.

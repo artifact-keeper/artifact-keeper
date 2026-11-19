@@ -889,6 +889,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             config.trivy_url.clone(),
             trivy_adapter_url,
             config.incus_scanner_enabled,
+            config.trivy_ignore_embedded_pom_declarations,
             primary_storage.clone(),
             storage_registry.clone(),
             config.storage_path.clone(),
