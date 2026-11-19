@@ -202,6 +202,10 @@ pub struct MigrationWorker {
     storage_registry: Arc<StorageRegistry>,
     config: WorkerConfig,
     cancel_token: CancellationToken,
+    /// The process shutdown token `cancel_token` was derived from. When it
+    /// fired, the run stops as `paused`, not `cancelled`, so `/resume` can
+    /// finish it on another replica (#6253).
+    shutdown_token: CancellationToken,
     /// Optional search backend. When present, every imported artifact is
     /// indexed into OpenSearch as it commits so migrated content is
     /// searchable/visible without waiting for a manual or startup reindex
@@ -225,8 +229,16 @@ impl MigrationWorker {
             storage_registry,
             config,
             cancel_token,
+            shutdown_token: CancellationToken::new(),
             search_service: None,
         }
+    }
+
+    /// Record the process shutdown token the worker's `cancel_token` is a
+    /// child of (#6253).
+    pub fn with_shutdown_token(mut self, shutdown_token: CancellationToken) -> Self {
+        self.shutdown_token = shutdown_token;
+        self
     }
 
     /// Attach an OpenSearch service so imported artifacts are indexed for
@@ -964,6 +976,12 @@ impl MigrationWorker {
             SourceView::Partial,
         )
         .await?;
+
+        if self.shutdown_token.is_cancelled() {
+            tracing::info!(job_id = %job_id, "Migration paused, the backend is shutting down");
+            self.migration_service.pause_running_job(job_id).await?;
+            return Ok(());
+        }
 
         if self.cancel_token.is_cancelled() {
             // An in-process token cancel leaves no trace in the database (the
@@ -7111,6 +7129,9 @@ mod tests {
         /// guard matches and only the `RepoProcessOutcome::Interrupted`
         /// propagation can stop the terminal write.
         CancelToken,
+        /// The process shutdown token the worker's token is a child of fires
+        /// mid-listing, with the job row still `running` (#6253).
+        Shutdown,
         /// The operator pauses/cancels AFTER the last per-artifact check: the
         /// mock flips the job row to this status while returning an EMPTY
         /// listing, so the repository completes cleanly and the run walks all
@@ -7131,6 +7152,8 @@ mod tests {
         /// The same token the worker under test holds, so
         /// [`MockInterrupt::CancelToken`] can fire it mid-listing.
         cancel_token: CancellationToken,
+        /// The parent of `cancel_token`, fired by [`MockInterrupt::Shutdown`].
+        shutdown_token: CancellationToken,
     }
 
     #[async_trait::async_trait]
@@ -7186,6 +7209,7 @@ mod tests {
                         .expect("flip job status mid-listing");
                 }
                 MockInterrupt::CancelToken => self.cancel_token.cancel(),
+                MockInterrupt::Shutdown => self.shutdown_token.cancel(),
                 MockInterrupt::JobStatusOnDrain(status) => {
                     sqlx::query("UPDATE migration_jobs SET status = $1 WHERE id = $2")
                         .bind(status)
@@ -7292,7 +7316,8 @@ mod tests {
             std::collections::HashMap::new(),
             "filesystem".to_string(),
         ));
-        let cancel_token = CancellationToken::new();
+        let shutdown_token = CancellationToken::new();
+        let cancel_token = shutdown_token.child_token();
         let worker = MigrationWorker::new(
             pool.clone(),
             registry,
@@ -7301,7 +7326,8 @@ mod tests {
                 ..WorkerConfig::default()
             },
             cancel_token.clone(),
-        );
+        )
+        .with_shutdown_token(shutdown_token.clone());
 
         worker
             .process_job(
@@ -7312,6 +7338,7 @@ mod tests {
                     repo_key: repo_key.clone(),
                     interrupt,
                     cancel_token,
+                    shutdown_token,
                 }),
                 ConflictResolution::Skip,
                 None,
@@ -7456,6 +7483,24 @@ mod tests {
             !finished,
             "an interrupted job must not be stamped finished_at"
         );
+
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// A backend shutting down mid-job leaves the job `paused`, not
+    /// `cancelled` or `running`, so `/resume` can finish it (#6253).
+    #[tokio::test]
+    async fn test_process_job_shutdown_during_repo_pauses_the_job_6253() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (job_id, conn_id, status, finished) =
+            run_single_repo_job(&pool, "shutdown-src", MockInterrupt::Shutdown).await;
+
+        assert_eq!(status, "paused", "a shutdown must leave the job resumable");
+        assert!(!finished, "a paused job must not be stamped finished");
 
         cleanup_single_repo_job(&pool, job_id, conn_id).await;
     }
