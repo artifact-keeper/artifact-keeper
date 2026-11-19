@@ -1,0 +1,84 @@
+# TEMPORARY (#6218): measures the macOS release build on the hosted runner.
+# Runs only on the PR from ci/6218-macos-release-build-time, publishes
+# nothing, saves no cache. Delete before merge.
+name: TMP 6218 macOS build probe
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/tmp-6218-macos-build-probe.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tmp-6218-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: Probe ${{ matrix.variant }} ${{ matrix.target }} on ${{ matrix.os }}
+    if: github.head_ref == 'ci/6218-macos-release-build-time'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: release-as-shipped
+            target: aarch64-apple-darwin
+            os: macos-latest
+            cgu: ""
+          - variant: cgu16
+            target: aarch64-apple-darwin
+            os: macos-latest
+            cgu: "16"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: ${{ matrix.target }}
+      - run: brew install protobuf
+      - name: Runner facts
+        run: |
+          sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+          sysctl vm.swapusage
+      - name: Start memory sampler
+        run: |
+          (
+            while :; do
+              ts=$(date +%s)
+              rss=$(ps -axo rss=,comm= | awk '/rustc/ { if ($1 > m) m = $1 } END { print m + 0 }')
+              swap=$(sysctl -n vm.swapusage | awk '{ print $6 }')
+              free=$(memory_pressure -Q 2>/dev/null | awk -F': ' '/free percentage/ { print $2 }')
+              swapouts=$(vm_stat | awk '/Swapouts/ { gsub("\\.", "", $2); print $2 }')
+              comp=$(vm_stat | awk '/occupied by compressor/ { gsub("\\.", "", $5); print $5 }')
+              echo "$ts $rss $swap $free $swapouts $comp"
+              sleep 20
+            done
+          ) > "$RUNNER_TEMP/mem.tsv" 2>&1 &
+          echo "started"
+      - name: Build
+        env:
+          SQLX_OFFLINE: "true"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ matrix.cgu }}
+        run: |
+          if [ -z "${CARGO_PROFILE_RELEASE_CODEGEN_UNITS}" ]; then unset CARGO_PROFILE_RELEASE_CODEGEN_UNITS; fi
+          start=$(date +%s)
+          cargo build --release --target ${{ matrix.target }} --features vendored-openssl
+          echo "BUILD_SECONDS=$(( $(date +%s) - start ))" | tee -a "$GITHUB_ENV"
+          ls -l target/${{ matrix.target }}/release/artifact-keeper
+      - name: Memory report
+        if: always()
+        run: |
+          f="$RUNNER_TEMP/mem.tsv"
+          awk '
+            { if ($2 > r) r = $2; s = $3; sub("M", "", s); if (s + 0 > sw) sw = s + 0
+              fr = $4; sub("%", "", fr); if (min == "" || fr + 0 < min) min = fr + 0
+              if (first == "") first = $5; last = $5; if ($6 > c) c = $6 }
+            END { printf "peak rustc RSS: %.2f GiB\npeak swap used: %.0f MiB\nmin free: %s%%\nswapouts during job: %d pages\npeak compressor: %.2f GiB\n",
+                  r / 1048576, sw, min, last - first, c * 16384 / 1073741824 }' "$f" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "build seconds: ${BUILD_SECONDS:-n/a}" | tee -a "$GITHUB_STEP_SUMMARY"
+          tail -n 400 "$f"
