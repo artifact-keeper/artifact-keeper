@@ -87,6 +87,72 @@ fn parse_backfill_aging(raw: Option<&str>) -> std::time::Duration {
 tokio::task_local! {
     static BACKGROUND_BAND: ();
     static ENGINE_UNAVAILABLE: std::cell::Cell<bool>;
+    static JOB_BUDGET: JobBudget;
+}
+
+/// The queued job a scan runs in (#5942): when its budget ends, and whether a
+/// scanner was stopped by a time limit while it ran.
+struct JobBudget {
+    deadline: tokio::time::Instant,
+    budget: std::time::Duration,
+    timed_out: std::cell::Cell<bool>,
+}
+
+/// Run `fut` as a queued job that must finish by `deadline` (`budget` after it
+/// started), reporting whether a scanner was stopped by a time limit while it
+/// ran (#5942). Inside, [`within_job_deadline`] stops a scanner at the
+/// deadline, so the scanners of one job share its budget: however many hang,
+/// together they never run past it, and a stopped scanner's row is recorded
+/// `failed` instead of being dropped with the job.
+pub async fn with_job_deadline<F: std::future::Future>(
+    deadline: tokio::time::Instant,
+    budget: std::time::Duration,
+    fut: F,
+) -> (F::Output, bool) {
+    JOB_BUDGET
+        .scope(
+            JobBudget {
+                deadline,
+                budget,
+                timed_out: std::cell::Cell::new(false),
+            },
+            async {
+                let out = fut.await;
+                (out, JOB_BUDGET.with(|b| b.timed_out.get()))
+            },
+        )
+        .await
+}
+
+/// Note that a scanner of the current scan was stopped by a time limit (the
+/// job deadline or `SCANNER_PROCESS_TIMEOUT_SECS`). A no-op outside
+/// [`with_job_deadline`]: an in-process scan has no job to retry.
+pub fn note_scanner_timed_out() {
+    let _ = JOB_BUDGET.try_with(|b| b.timed_out.set(true));
+}
+
+/// Run one scanner, stopped at the queued job's deadline when there is one
+/// (#5942). Outside a job (an in-process scan) it runs unbounded, as before.
+/// Stopping drops the scanner's future, which kills a local child process
+/// (`kill_on_drop`).
+pub async fn within_job_deadline<T>(
+    scanner: &str,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let Ok((deadline, budget)) = JOB_BUDGET.try_with(|b| (b.deadline, b.budget)) else {
+        return fut.await;
+    };
+    match tokio::time::timeout_at(deadline, fut).await {
+        Ok(out) => out,
+        Err(_) => {
+            note_scanner_timed_out();
+            Err(AppError::Internal(format!(
+                "scanner {scanner} was stopped at the end of the queued scan job's {}s budget; \
+                 the job will be retried",
+                budget.as_secs()
+            )))
+        }
+    }
 }
 
 /// Run `fut`, reporting whether a scanner engine said it was unavailable while
@@ -1121,6 +1187,56 @@ mod tests {
         assert!(seen);
         let ((), seen) = tracking_engine_unavailable(async {}).await;
         assert!(!seen, "each scope starts clear");
+    }
+
+    /// #5942: outside a job a scanner runs unbounded and a timeout note is a
+    /// no-op; inside one, a scanner still running at the deadline is stopped
+    /// with a retry message and the scope reports it, a scanner that answers
+    /// is untouched, and scanners after the deadline share the spent budget
+    /// rather than getting a fresh one each.
+    #[tokio::test(start_paused = true)]
+    async fn scanners_in_a_job_share_its_deadline() {
+        use std::time::Duration;
+        use tokio::time::Instant;
+
+        note_scanner_timed_out();
+        let slow = within_job_deadline("grype", async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Ok(7)
+        })
+        .await;
+        assert_eq!(slow.unwrap(), 7, "no job: no limit");
+
+        let budget = Duration::from_secs(10);
+        let started = Instant::now();
+        let ((first, second, quick), timed_out) =
+            with_job_deadline(started + budget, budget, async {
+                let first: Result<()> = within_job_deadline("grype", std::future::pending()).await;
+                let second: Result<()> = within_job_deadline("trivy", std::future::pending()).await;
+                let quick = within_job_deadline("dependency", async { Ok(1) }).await;
+                (first, second, quick)
+            })
+            .await;
+        assert!(timed_out);
+        assert_eq!(started.elapsed(), budget, "two hung scanners, one budget");
+        let first = first.unwrap_err().to_string();
+        assert!(
+            first.contains("scanner grype was stopped") && first.contains("10s budget"),
+            "{first}"
+        );
+        assert!(second.unwrap_err().to_string().contains("scanner trivy"));
+        assert_eq!(
+            quick.unwrap(),
+            1,
+            "a scanner that answers at once still runs"
+        );
+
+        let (ok, timed_out) = with_job_deadline(Instant::now() + budget, budget, async {
+            within_job_deadline("grype", async { Ok(2) }).await
+        })
+        .await;
+        assert_eq!(ok.unwrap(), 2);
+        assert!(!timed_out, "each scope starts clear");
     }
 
     // ── DB-backed queue semantics ───────────────────────────────────────────
