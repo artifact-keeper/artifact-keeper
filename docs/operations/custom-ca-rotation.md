@@ -42,8 +42,11 @@ removals with an isolated private CA absent from the default trust sources.
 ## Failed updates and startup
 
 The whole candidate bundle must parse and every certificate must load as an
-X.509 trust anchor. Empty, malformed, incomplete, oversized (>4 MiB), or
-non-certificate PEM bundles are rejected. The limit is 2,048 certificates.
+X.509 trust anchor. Comments and non-certificate PEM sections are ignored.
+A certificate-free bundle at startup leaves default trust in place. Once
+custom roots are active, a certificate-free update retains them. Malformed
+or incomplete certificate sections and oversized bundles (>4 MiB or 2,048
+certificates) are rejected.
 All replacement clients must build successfully before activation; a failure
 in any client rejects the entire revision.
 

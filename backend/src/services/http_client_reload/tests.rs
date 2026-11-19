@@ -326,6 +326,53 @@ async fn an_in_flight_response_finishes_after_its_root_is_removed() {
     assert!(!succeeds(&client, &server_a).await);
 }
 
+#[tokio::test]
+async fn mixed_pem_bundle_keeps_its_certificate_roots_on_startup_and_reload() {
+    let a = TestCa::new();
+    let b = TestCa::new();
+    let server_a = TlsServer::start(&a).await;
+    let server_b = TlsServer::start(&b).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bundle.pem");
+    let csr = CertificateParams::new(vec!["localhost".to_string()])
+        .unwrap()
+        .serialize_request(&KeyPair::generate().unwrap())
+        .unwrap()
+        .pem()
+        .unwrap();
+    let mixed = |ca: &TestCa| format!("# CA bundle\n{csr}\n{}", ca.pem);
+
+    publish(&path, &mixed(&a));
+    let manager = manager(path.clone());
+    let client = register(&manager);
+    assert_eq!(manager.state.read().unwrap().bundle.certs.len(), 1);
+    assert!(succeeds(&client, &server_a).await);
+    assert!(!succeeds(&client, &server_b).await);
+
+    publish(&path, &mixed(&b));
+    assert!(manager.refresh());
+    assert_eq!(manager.state.read().unwrap().bundle.certs.len(), 1);
+    assert!(!succeeds(&client, &server_a).await);
+    assert!(succeeds(&client, &server_b).await);
+}
+
+#[test]
+fn empty_bundle_at_startup_uses_default_trust() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bundle.pem");
+    publish(&path, "");
+    let manager = manager(path.clone());
+    {
+        let state = manager.state.read().unwrap();
+        assert!(state.bundle.certs.is_empty());
+        assert!(state.bundle.digest.is_some());
+        assert!(state.last_error.is_none());
+    }
+    publish(&path, &TestCa::new().pem);
+    assert!(manager.refresh());
+    assert_eq!(manager.state.read().unwrap().bundle.certs.len(), 1);
+}
+
 #[test]
 fn rejects_invalid_empty_truncated_and_oversized_updates_without_changing_trust() {
     let a = TestCa::new();
@@ -339,12 +386,6 @@ fn rejects_invalid_empty_truncated_and_oversized_updates_without_changing_trust(
         "not a certificate".into(),
         format!("{}\n-----BEGIN CERTIFICATE-----\nAAAA", a.pem),
         "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----".into(),
-        // Assemble the non-certificate marker so secret-scanning hooks do not
-        // mistake this negative parser test for an actual credential.
-        format!(
-            "{}\n-----BEGIN {}-----\nAAAA\n-----END {}-----",
-            a.pem, "PRIVATE KEY", "PRIVATE KEY"
-        ),
         "x".repeat(MAX_BUNDLE_BYTES + 1),
     ];
     for pem in invalid {

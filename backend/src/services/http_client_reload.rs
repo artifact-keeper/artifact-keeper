@@ -46,25 +46,25 @@ impl Bundle {
     }
 
     fn parse(bytes: &[u8]) -> Result<Self, &'static str> {
-        let text = std::str::from_utf8(bytes).map_err(|_| "bundle is not UTF-8 PEM")?;
+        // Match reqwest's tolerance for comments and non-certificate PEM
+        // sections while ensuring that all certificate sections are complete.
         let mut inside = false;
         let mut blocks = 0;
-        for line in text.lines().map(str::trim) {
-            if line.starts_with("-----BEGIN ") {
-                if inside || line != "-----BEGIN CERTIFICATE-----" {
-                    return Err("bundle must contain only certificate PEM blocks");
+        for line in bytes.split(|&byte| byte == b'\n').map(<[u8]>::trim_ascii) {
+            match line {
+                b"-----BEGIN CERTIFICATE-----" if !inside => {
+                    inside = true;
+                    blocks += 1;
                 }
-                inside = true;
-                blocks += 1;
-            } else if line.starts_with("-----END ") {
-                if !inside || line != "-----END CERTIFICATE-----" {
+                b"-----END CERTIFICATE-----" if inside => inside = false,
+                b"-----BEGIN CERTIFICATE-----" | b"-----END CERTIFICATE-----" => {
                     return Err("unmatched certificate PEM boundary");
                 }
-                inside = false;
+                _ => {}
             }
         }
-        if inside || blocks == 0 || blocks > MAX_CERTIFICATES {
-            return Err("bundle is empty, incomplete, or has too many certificates");
+        if inside || blocks > MAX_CERTIFICATES {
+            return Err("bundle is incomplete or has too many certificates");
         }
         let mut roots = rustls::RootCertStore::empty();
         let mut certs = Vec::new();
@@ -171,6 +171,20 @@ impl TrustManager {
                 return false;
             }
         };
+        // Match startup with an empty bundle (default trust). Once custom
+        // roots are active, an empty write must not silently remove them.
+        if bundle.certs.is_empty()
+            && !self
+                .state
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .bundle
+                .certs
+                .is_empty()
+        {
+            self.warn("bundle contains no certificates");
+            return false;
+        }
         let mut prepared = Vec::with_capacity(clients.len());
         for inner in clients {
             match bundle.apply((inner.factory)()).build() {
