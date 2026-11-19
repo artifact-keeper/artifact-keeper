@@ -1110,15 +1110,6 @@ impl MigrationWorker {
                     continue;
                 }
 
-                // Dry run: report what would move and stop here. First branch
-                // in the body on purpose, ahead of every DB read/write, the
-                // download, and the storage put.
-                if self.config.dry_run {
-                    *completed += 1;
-                    *transferred += size;
-                    continue;
-                }
-
                 // Keep sha256 and sha1 separate so verification can compare
                 // each digest against the corresponding locally computed
                 // value. Picking a single "checksum" field and computing
@@ -1169,14 +1160,29 @@ impl MigrationWorker {
                         "Skipping duplicate artifact (already exists with matching checksum)"
                     );
                     // #3927: repair a pre-fix import's missing Maven
-                    // coordinates instead of skipping past them.
-                    self.repair_migrated_maven_metadata(
-                        keys.target.as_str(),
-                        package_type,
-                        &artifact_path,
-                    )
-                    .await;
+                    // coordinates instead of skipping past them. A write, so
+                    // not on a dry run.
+                    if !self.config.dry_run {
+                        self.repair_migrated_maven_metadata(
+                            keys.target.as_str(),
+                            package_type,
+                            &artifact_path,
+                        )
+                        .await;
+                    }
                     *skipped += 1;
+                    continue;
+                }
+
+                // Dry run: report what would move and stop here, ahead of
+                // every DB write, the download, and the storage put. It sits
+                // after the read-only skip checks above so a dry run counts an
+                // artifact the destination already holds as skipped, the way
+                // the real run would, instead of as one it would transfer
+                // (#6196).
+                if self.config.dry_run {
+                    *completed += 1;
+                    *transferred += size;
                     continue;
                 }
 
@@ -7931,6 +7937,91 @@ mod tests {
                 .expect("item count");
         assert_eq!(items, 0, "a dry run must still write no migration_items");
 
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await;
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// A dry run under `conflict_resolution: skip` previews the delta a real
+    /// run would move: an artifact the destination already holds is skipped,
+    /// not counted as one it would transfer (#6196).
+    ///
+    /// Fails-before: the dry-run branch ran ahead of the duplicate check, so
+    /// all three artifacts came back as completed (27 bytes) and none skipped.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_process_job_dry_run_skips_existing_artifacts_6196() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "drydup-6196").await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_id = seed_destination_repo(&pool, &repo_key, tmp.path()).await;
+
+        // `two.tar.gz` is already in the destination.
+        sqlx::query(
+            "INSERT INTO artifacts \
+               (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, 'pkg/1.0/two.tar.gz', 'two.tar.gz', 8, $2, 'application/octet-stream', $3)",
+        )
+        .bind(repo_id)
+        .bind(format!("{:064x}", 2))
+        .bind(format!("{repo_key}/pkg/1.0/two.tar.gz"))
+        .execute(&pool)
+        .await
+        .expect("seed pre-existing artifact");
+
+        run_enumerating_job(
+            &pool,
+            job_id,
+            &repo_key,
+            &[("one.tar.gz", 4), ("two.tar.gz", 8), ("three.tar.gz", 15)],
+            WorkerConfig {
+                dry_run: true,
+                throttle_delay_ms: 0,
+                ..WorkerConfig::default()
+            },
+        )
+        .await;
+
+        let finished = read_job_counters(&pool, job_id).await;
+        assert_eq!(
+            (
+                finished.completed_items,
+                finished.skipped_items,
+                finished.transferred_bytes
+            ),
+            (2, 1, 19),
+            "a dry run must count the artifact already in the destination as \
+             skipped and leave its bytes out of the estimate: {finished:?}"
+        );
+        assert_eq!(finished.total_items, 3);
+
+        let items: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM migration_items WHERE job_id = $1")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .expect("item count");
+        assert_eq!(items, 0, "a dry run must still write no migration_items");
+        let artifacts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("artifact count");
+        assert_eq!(artifacts, 1, "a dry run must not write artifacts");
+
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
         let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
             .bind(&repo_key)
             .execute(&pool)
