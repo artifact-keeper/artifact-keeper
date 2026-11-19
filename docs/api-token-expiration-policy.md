@@ -33,6 +33,8 @@ hex elsewhere) is checked only as a token. It costs no password hash and never
 counts as a failed login against the account. The management API (`/api/v1`)
 refuses it as a Basic password (#5640).
 
+Basic auth with the account password runs one cost-12 bcrypt (a few hundred milliseconds) on every request and takes a slot of `AUTH_MAX_CONCURRENCY`, so a busy client on a password is slow and can get `503 Authentication service is at capacity`. An API token as the Basic password is verified once and then cached
+
 ## What the policy governs — and what it never touches
 
 The policy is enforced at **mint time only**, inside the single choke-point
