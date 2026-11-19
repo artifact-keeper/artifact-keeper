@@ -91,6 +91,62 @@ pub async fn bind_listener(addr: SocketAddr, backlog: Option<u32>) -> io::Result
     socket.listen(backlog)
 }
 
+/// A listener the process binds at startup, named for startup errors (#6213).
+#[derive(Debug, Clone)]
+pub struct ListenerAddr {
+    /// What it serves, e.g. "gRPC".
+    pub name: &'static str,
+    /// The setting an operator changes to move it, e.g. "METRICS_PORT".
+    pub setting: &'static str,
+    pub addr: SocketAddr,
+}
+
+/// Whether binding both addresses would fail with "address in use": the same
+/// port in the same address family, on the same IP or with either one on the
+/// unspecified address (`0.0.0.0` / `::`). Port 0 asks the OS for a free port
+/// and never collides.
+pub fn listen_addrs_collide(a: SocketAddr, b: SocketAddr) -> bool {
+    a.port() != 0
+        && a.port() == b.port()
+        && a.is_ipv4() == b.is_ipv4()
+        && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
+}
+
+/// Refuse a startup where two listeners are given colliding addresses
+/// (#6213), e.g. `METRICS_PORT=9090` next to the default `GRPC_PORT` 9090.
+/// Without this, whichever listener binds second fails and the process
+/// carries on without it.
+pub fn check_listener_addrs(listeners: &[ListenerAddr]) -> Result<(), String> {
+    for (i, a) in listeners.iter().enumerate() {
+        for b in &listeners[i + 1..] {
+            if listen_addrs_collide(a.addr, b.addr) {
+                return Err(format!(
+                    "the {} listener ({} = {}) and the {} listener ({} = {}) use the same \
+                     address; give each listener its own port",
+                    a.name, a.setting, a.addr, b.name, b.setting, b.addr
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bind a dedicated listener (gRPC, metrics) before startup continues
+/// (#6213), so a port that cannot be bound stops the process with an error
+/// naming the listener and its setting instead of being logged from a
+/// background task while the server keeps running without it.
+pub async fn bind_dedicated_listener(listener: &ListenerAddr) -> io::Result<TcpListener> {
+    TcpListener::bind(listener.addr).await.map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "cannot bind the {} listener on {} ({}): {e}",
+                listener.name, listener.addr, listener.setting
+            ),
+        )
+    })
+}
+
 /// The accept-queue length the kernel grants: Linux caps any request,
 /// including the "OS maximum" default, at `net.core.somaxconn`.
 pub fn effective_listen_backlog(requested: Option<u32>, somaxconn: Option<u32>) -> Option<u32> {
@@ -669,5 +725,78 @@ mod tests {
         assert_eq!(effective_listen_backlog(Some(8192), Some(4096)), Some(4096));
         assert_eq!(effective_listen_backlog(Some(512), None), Some(512));
         assert_eq!(effective_listen_backlog(None, None), None);
+    }
+
+    fn listener(name: &'static str, setting: &'static str, addr: &str) -> ListenerAddr {
+        ListenerAddr {
+            name,
+            setting,
+            addr: addr.parse().unwrap(),
+        }
+    }
+
+    /// #6213: `METRICS_PORT=9090` next to the default gRPC port 9090 is
+    /// refused up front, with both settings named.
+    #[test]
+    fn check_listener_addrs_rejects_metrics_on_grpc_port() {
+        let err = check_listener_addrs(&[
+            listener("HTTP", "BIND_ADDRESS", "0.0.0.0:8080"),
+            listener("gRPC", "GRPC_PORT", "0.0.0.0:9090"),
+            listener("metrics", "METRICS_PORT", "0.0.0.0:9090"),
+        ])
+        .unwrap_err();
+        assert!(err.contains("gRPC") && err.contains("GRPC_PORT"), "{err}");
+        assert!(
+            err.contains("metrics") && err.contains("METRICS_PORT"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn check_listener_addrs_accepts_distinct_ports() {
+        assert!(check_listener_addrs(&[
+            listener("HTTP", "BIND_ADDRESS", "0.0.0.0:8080"),
+            listener("gRPC", "GRPC_PORT", "0.0.0.0:9090"),
+            listener("metrics", "METRICS_PORT", "0.0.0.0:9091"),
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn listen_addrs_collide_cases() {
+        let c = |a: &str, b: &str| listen_addrs_collide(a.parse().unwrap(), b.parse().unwrap());
+        assert!(c("0.0.0.0:9090", "0.0.0.0:9090"));
+        assert!(c("0.0.0.0:9090", "127.0.0.1:9090"));
+        assert!(c("127.0.0.1:9090", "0.0.0.0:9090"));
+        assert!(c("[::]:9090", "[::1]:9090"));
+        assert!(!c("127.0.0.1:9090", "10.0.0.1:9090"));
+        assert!(!c("0.0.0.0:9090", "0.0.0.0:9091"));
+        assert!(!c("127.0.0.1:9090", "[::1]:9090"));
+        assert!(!c("0.0.0.0:0", "0.0.0.0:0"));
+    }
+
+    /// #6213: a dedicated listener whose port is taken returns an error that
+    /// names the listener and its setting, for startup to fail on.
+    #[tokio::test]
+    async fn bind_dedicated_listener_fails_on_taken_port() {
+        let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = taken.local_addr().unwrap().to_string();
+        let err = bind_dedicated_listener(&listener("metrics", "METRICS_PORT", &addr))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("metrics") && msg.contains("METRICS_PORT"),
+            "{msg}"
+        );
+        assert!(msg.contains(&addr), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn bind_dedicated_listener_binds_free_port() {
+        let l = bind_dedicated_listener(&listener("gRPC", "GRPC_PORT", "127.0.0.1:0"))
+            .await
+            .unwrap();
+        assert_ne!(l.local_addr().unwrap().port(), 0);
     }
 }

@@ -1521,16 +1521,75 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     // Start HTTP server
     let addr: SocketAddr = config.bind_address.parse()?;
-    tracing::info!("HTTP server listening on {}", addr);
 
-    // Start gRPC server on a separate port
-    let grpc_port = std::env::var("GRPC_PORT")
-        .unwrap_or_else(|_| "9090".to_string())
-        .parse::<u16>()
-        .unwrap_or(9090);
+    // Start gRPC server on a separate port. A missing or unparseable
+    // GRPC_PORT falls back to 9090; only a valid explicit one counts as
+    // configured for the bind-failure rule below (#6213).
+    let grpc_port_configured = std::env::var("GRPC_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok());
+    let grpc_port = grpc_port_configured.unwrap_or(9090);
     // `SocketAddr::new` rather than a `format!`ed string so an IPv6 bind IP
     // (`::1`) needs no brackets (#2161).
     let grpc_addr = SocketAddr::new(config.grpc_bind_ip, grpc_port);
+
+    // #6213: every listener is bound before anything is served, and two
+    // listeners given the same address are refused up front, so a dedicated
+    // listener that cannot come up stops startup with a clear error instead of
+    // being logged from a background task while the process stays healthy.
+    let http_listener_addr = api::serve::ListenerAddr {
+        name: "HTTP",
+        setting: "BIND_ADDRESS",
+        addr,
+    };
+    let grpc_listener_addr = api::serve::ListenerAddr {
+        name: "gRPC",
+        setting: if grpc_port_configured.is_some() {
+            "GRPC_PORT"
+        } else {
+            "GRPC_PORT, default 9090"
+        },
+        addr: grpc_addr,
+    };
+    let metrics_listener_addr = config.metrics_port.map(|port| api::serve::ListenerAddr {
+        name: "metrics",
+        setting: "METRICS_PORT",
+        addr: SocketAddr::new(config.metrics_bind_ip, port),
+    });
+    let mut listener_addrs = vec![http_listener_addr, grpc_listener_addr.clone()];
+    listener_addrs.extend(metrics_listener_addr.clone());
+    api::serve::check_listener_addrs(&listener_addrs).map_err(|e| {
+        artifact_keeper_backend::error::AppError::Config(format!("Listener configuration: {e}"))
+    })?;
+
+    // A gRPC port that cannot be bound fails startup when GRPC_PORT is set.
+    // With the implicit default it is logged and gRPC stays off, as before, so
+    // an install that never asked for gRPC does not start failing (#6213).
+    let grpc_listener = match api::serve::bind_dedicated_listener(&grpc_listener_addr).await {
+        Ok(listener) => Some(listener),
+        Err(e) if grpc_port_configured.is_some() => {
+            return Err(artifact_keeper_backend::error::AppError::Config(
+                e.to_string(),
+            ));
+        }
+        Err(e) => {
+            tracing::error!(
+                "{e}; gRPC is disabled for this process (set GRPC_PORT to a free port)"
+            );
+            None
+        }
+    };
+
+    // METRICS_PORT is only Some when it is set to a valid port, so a metrics
+    // listener that cannot be bound always fails startup (#6213).
+    let metrics_listener = match &metrics_listener_addr {
+        Some(listener_addr) => Some(
+            api::serve::bind_dedicated_listener(listener_addr)
+                .await
+                .map_err(|e| artifact_keeper_backend::error::AppError::Config(e.to_string()))?,
+        ),
+        None => None,
+    };
 
     // Reuse the existing pool instead of creating a second one (PgPool is Arc-backed)
     let sbom_server = SbomGrpcServer::new(grpc_db_pool.clone());
@@ -1559,57 +1618,66 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let grpc_auth_cve = grpc_auth.clone();
     let grpc_auth_policy = grpc_auth;
     let grpc_shutdown_token = shutdown_token.clone();
-    tokio::spawn(async move {
-        tracing::info!("gRPC server listening on {}", grpc_addr);
-        #[allow(clippy::result_large_err)]
-        let sbom_interceptor = move |req| grpc_auth_sbom.intercept(req);
-        #[allow(clippy::result_large_err)]
-        let cve_interceptor = move |req| grpc_auth_cve.intercept(req);
-        #[allow(clippy::result_large_err)]
-        let policy_interceptor = move |req| grpc_auth_policy.intercept(req);
-        let mut server = TonicServer::builder()
-            .add_service(SbomServiceServer::with_interceptor(
-                sbom_server,
-                sbom_interceptor,
-            ))
-            .add_service(CveHistoryServiceServer::with_interceptor(
-                cve_history_server,
-                cve_interceptor,
-            ))
-            .add_service(SecurityPolicyServiceServer::with_interceptor(
-                security_policy_server,
-                policy_interceptor,
-            ));
-        if grpc_reflection_enabled {
-            // Include file descriptor for gRPC reflection
-            let reflection_service = tonic_reflection::server::Builder::configure()
-                .register_encoded_file_descriptor_set(include_bytes!(concat!(
-                    env!("OUT_DIR"),
-                    "/sbom_descriptor.bin"
-                )))
-                .build_v1()
-                .expect("Failed to build reflection service");
-            server = server.add_service(reflection_service);
-            tracing::info!("gRPC server reflection enabled");
-        }
-        if let Err(e) = server
-            .serve_with_shutdown(grpc_addr, grpc_shutdown_token.cancelled())
-            .await
-        {
-            tracing::error!("gRPC server error: {}", e);
-        }
-        tracing::info!("gRPC server shut down");
-    });
+    if let Some(grpc_listener) = grpc_listener {
+        tokio::spawn(async move {
+            // Logged once the port is bound (#6213).
+            tracing::info!("gRPC server listening on {}", grpc_addr);
+            #[allow(clippy::result_large_err)]
+            let sbom_interceptor = move |req| grpc_auth_sbom.intercept(req);
+            #[allow(clippy::result_large_err)]
+            let cve_interceptor = move |req| grpc_auth_cve.intercept(req);
+            #[allow(clippy::result_large_err)]
+            let policy_interceptor = move |req| grpc_auth_policy.intercept(req);
+            let mut server = TonicServer::builder()
+                .add_service(SbomServiceServer::with_interceptor(
+                    sbom_server,
+                    sbom_interceptor,
+                ))
+                .add_service(CveHistoryServiceServer::with_interceptor(
+                    cve_history_server,
+                    cve_interceptor,
+                ))
+                .add_service(SecurityPolicyServiceServer::with_interceptor(
+                    security_policy_server,
+                    policy_interceptor,
+                ));
+            if grpc_reflection_enabled {
+                // Include file descriptor for gRPC reflection
+                let reflection_service = tonic_reflection::server::Builder::configure()
+                    .register_encoded_file_descriptor_set(include_bytes!(concat!(
+                        env!("OUT_DIR"),
+                        "/sbom_descriptor.bin"
+                    )))
+                    .build_v1()
+                    .expect("Failed to build reflection service");
+                server = server.add_service(reflection_service);
+                tracing::info!("gRPC server reflection enabled");
+            }
+            // TCP_NODELAY on, as `serve_with_shutdown` sets by default.
+            let incoming =
+                tonic::transport::server::TcpIncoming::from(grpc_listener).with_nodelay(Some(true));
+            if let Err(e) = server
+                .serve_with_incoming_shutdown(incoming, grpc_shutdown_token.cancelled())
+                .await
+            {
+                tracing::error!("gRPC server error: {}", e);
+            }
+            tracing::info!("gRPC server shut down");
+        });
+    }
 
     // Optionally start an unauthenticated metrics-only listener on METRICS_PORT.
-    if let (Some(metrics_port), Some(metrics_state)) = (config.metrics_port, metrics_state) {
+    if let (Some(metrics_listener), Some(metrics_addr), Some(metrics_state)) = (
+        metrics_listener,
+        metrics_listener_addr.map(|l| l.addr),
+        metrics_state,
+    ) {
         tracing::warn!(
-            port = metrics_port,
-            bind_ip = %config.metrics_bind_ip,
+            port = metrics_addr.port(),
+            bind_ip = %metrics_addr.ip(),
             "Starting unauthenticated metrics listener - \
              ensure this port is not reachable from untrusted networks"
         );
-        let metrics_addr = SocketAddr::new(config.metrics_bind_ip, metrics_port);
         let metrics_shutdown = shutdown_token.clone();
         let header_read_timeout = config.http_header_read_timeout();
         tokio::spawn(async move {
@@ -1619,25 +1687,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                     axum::routing::get(api::handlers::health::metrics),
                 )
                 .with_state(metrics_state);
-            match tokio::net::TcpListener::bind(metrics_addr).await {
-                Ok(listener) => {
-                    tracing::info!("Metrics listener on {}", metrics_addr);
-                    if let Err(e) = artifact_keeper_backend::api::serve::serve(
-                        listener,
-                        metrics_app.into_make_service(),
-                        header_read_timeout,
-                        async move { metrics_shutdown.cancelled().await },
-                    )
-                    .await
-                    {
-                        tracing::error!("Metrics listener error: {}", e);
-                    }
-                    tracing::info!("Metrics listener shut down");
-                }
-                Err(e) => {
-                    tracing::error!("Failed to bind metrics listener on {}: {}", metrics_addr, e);
-                }
+            tracing::info!("Metrics listener on {}", metrics_addr);
+            if let Err(e) = artifact_keeper_backend::api::serve::serve(
+                metrics_listener,
+                metrics_app.into_make_service(),
+                header_read_timeout,
+                async move { metrics_shutdown.cancelled().await },
+            )
+            .await
+            {
+                tracing::error!("Metrics listener error: {}", e);
             }
+            tracing::info!("Metrics listener shut down");
         });
     }
 
@@ -1647,6 +1708,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let listen_backlog = config.http_listen_backlog();
     let somaxconn = artifact_keeper_backend::api::serve::read_somaxconn();
     let listener = artifact_keeper_backend::api::serve::bind_listener(addr, listen_backlog).await?;
+    tracing::info!("HTTP server listening on {}", addr);
     tracing::info!(
         requested = ?listen_backlog,
         somaxconn = ?somaxconn,
