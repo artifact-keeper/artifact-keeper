@@ -141,6 +141,9 @@ impl ProxySeverityGate {
 /// yesterday's DB is naturally ignored and the bytes are re-scanned against
 /// today's CVEs. When either version string is unknown (probe failed / legacy
 /// row) we fall back to the TTL alone rather than forcing an unbounded re-scan.
+///
+/// `PROXY_SCAN_VERDICT_MAX_AGE_HOURS` changes both rules, see
+/// [`VerdictReusePolicy`].
 pub fn verdict_is_fresh(
     scanned_at: DateTime<Utc>,
     stored_version: Option<&str>,
@@ -148,8 +151,84 @@ pub fn verdict_is_fresh(
     ttl_days: i64,
     now: DateTime<Utc>,
 ) -> bool {
-    let within_ttl = now < scanned_at + Duration::days(ttl_days);
+    verdict_is_fresh_with(
+        verdict_reuse_policy(),
+        scanned_at,
+        stored_version,
+        current_version,
+        ttl_days,
+        now,
+    )
+}
+
+/// Operator policy for reusing a stored proxy-scan verdict,
+/// `PROXY_SCAN_VERDICT_MAX_AGE_HOURS`.
+///
+/// Unset keeps the built-in TTL and treats every CVE-DB build as a new scanner
+/// version, so all stored verdicts go stale at once with each DB update and
+/// the next pulls of every cached package are scanned again together. Set, a
+/// verdict is reused for that many hours whatever the DB build, each one
+/// expiring on its own schedule. A scanner binary upgrade still invalidates
+/// it. `0` scans again on every pull.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VerdictReusePolicy {
+    pub max_age: Option<Duration>,
+}
+
+impl VerdictReusePolicy {
+    pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Self {
+        let raw = match get("PROXY_SCAN_VERDICT_MAX_AGE_HOURS") {
+            Some(v) if !v.trim().is_empty() => v,
+            _ => return Self::default(),
+        };
+        match raw
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .filter(|h| *h >= 0)
+            .and_then(Duration::try_hours)
+        {
+            Some(max_age) => Self {
+                max_age: Some(max_age),
+            },
+            None => {
+                tracing::warn!(
+                    value = %raw,
+                    "PROXY_SCAN_VERDICT_MAX_AGE_HOURS is not a whole number of hours, \
+                     keeping the default verdict reuse"
+                );
+                Self::default()
+            }
+        }
+    }
+}
+
+fn verdict_reuse_policy() -> &'static VerdictReusePolicy {
+    static POLICY: std::sync::OnceLock<VerdictReusePolicy> = std::sync::OnceLock::new();
+    POLICY.get_or_init(|| VerdictReusePolicy::from_env(|k| std::env::var(k).ok()))
+}
+
+/// `grype-0.83.0+db-2026-08-10` -> `grype-0.83.0`: the scanner binary without
+/// the CVE-DB build date that `compose_scanner_version` folds in.
+fn scanner_binary(version: &str) -> &str {
+    version.split("+db-").next().unwrap_or(version)
+}
+
+/// [`verdict_is_fresh`] under an explicit policy.
+pub fn verdict_is_fresh_with(
+    policy: &VerdictReusePolicy,
+    scanned_at: DateTime<Utc>,
+    stored_version: Option<&str>,
+    current_version: Option<&str>,
+    ttl_days: i64,
+    now: DateTime<Utc>,
+) -> bool {
+    let window = policy.max_age.unwrap_or_else(|| Duration::days(ttl_days));
+    let within_ttl = scanned_at
+        .checked_add_signed(window)
+        .is_none_or(|expires| now < expires);
     let version_ok = match (stored_version, current_version) {
+        (Some(a), Some(b)) if policy.max_age.is_some() => scanner_binary(a) == scanner_binary(b),
         (Some(a), Some(b)) => a == b,
         // Unknown on either side: cannot prove a mismatch, rely on TTL.
         _ => true,
@@ -1512,6 +1591,122 @@ mod tests {
             30,
             now
         ));
+    }
+
+    #[test]
+    fn verdict_reuse_policy_unset_keeps_the_default() {
+        assert_eq!(
+            VerdictReusePolicy::from_env(|_| None),
+            VerdictReusePolicy::default()
+        );
+        assert_eq!(
+            VerdictReusePolicy::from_env(|_| Some(" ".into())),
+            VerdictReusePolicy::default()
+        );
+    }
+
+    #[test]
+    fn verdict_reuse_policy_parses_hours_and_ignores_bad_values() {
+        let p = VerdictReusePolicy::from_env(|k| {
+            (k == "PROXY_SCAN_VERDICT_MAX_AGE_HOURS").then(|| " 24 ".into())
+        });
+        assert_eq!(p.max_age, Some(Duration::hours(24)));
+        let zero = VerdictReusePolicy::from_env(|_| Some("0".into()));
+        assert_eq!(zero.max_age, Some(Duration::zero()));
+        for bad in ["-3", "1.5", "a day", "9223372036854775807"] {
+            assert_eq!(
+                VerdictReusePolicy::from_env(|_| Some(bad.into())),
+                VerdictReusePolicy::default(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn db_update_invalidates_only_without_a_max_age() {
+        let now = Utc::now();
+        let scanned = now - Duration::hours(2);
+        let old = Some("grype-0.83.0+db-2026-11-02");
+        let new = Some("grype-0.83.0+db-2026-11-03");
+        let day = VerdictReusePolicy {
+            max_age: Some(Duration::hours(24)),
+        };
+        assert!(!verdict_is_fresh_with(
+            &VerdictReusePolicy::default(),
+            scanned,
+            old,
+            new,
+            30,
+            now
+        ));
+        assert!(verdict_is_fresh_with(&day, scanned, old, new, 30, now));
+        let upgraded = Some("grype-0.84.0+db-2026-11-03");
+        assert!(!verdict_is_fresh_with(
+            &day, scanned, old, upgraded, 30, now
+        ));
+    }
+
+    #[test]
+    fn max_age_replaces_the_ttl_and_zero_scans_every_pull() {
+        let now = Utc::now();
+        let v = Some("grype-0.83.0+db-2026-11-03");
+        let day = VerdictReusePolicy {
+            max_age: Some(Duration::hours(24)),
+        };
+        assert!(verdict_is_fresh_with(
+            &day,
+            now - Duration::hours(23),
+            v,
+            v,
+            30,
+            now
+        ));
+        assert!(!verdict_is_fresh_with(
+            &day,
+            now - Duration::hours(25),
+            v,
+            v,
+            30,
+            now
+        ));
+        let always = VerdictReusePolicy {
+            max_age: Some(Duration::zero()),
+        };
+        assert!(!verdict_is_fresh_with(
+            &always,
+            now - Duration::seconds(1),
+            v,
+            v,
+            30,
+            now
+        ));
+        let huge = VerdictReusePolicy {
+            max_age: Duration::try_hours(i64::MAX / 3_600_000),
+        };
+        assert!(verdict_is_fresh_with(&huge, now, v, v, 30, now));
+    }
+
+    /// Read through the environment like the serve path does. nextest runs
+    /// each test in its own process, so the cached policy is this test's.
+    #[test]
+    fn verdict_max_age_from_the_environment_survives_a_db_update() {
+        std::env::set_var("PROXY_SCAN_VERDICT_MAX_AGE_HOURS", "24");
+        let now = Utc::now();
+        assert!(verdict_is_fresh(
+            now - Duration::hours(2),
+            Some("grype-0.83.0+db-2026-11-02"),
+            Some("grype-0.83.0+db-2026-11-03"),
+            30,
+            now
+        ));
+        assert!(!verdict_is_fresh(
+            now - Duration::hours(25),
+            Some("grype-0.83.0+db-2026-11-03"),
+            Some("grype-0.83.0+db-2026-11-03"),
+            30,
+            now
+        ));
+        std::env::remove_var("PROXY_SCAN_VERDICT_MAX_AGE_HOURS");
     }
 
     /// #2976 follow-up: `verdict_is_fresh` fails OPEN on an unknown version
