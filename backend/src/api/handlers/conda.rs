@@ -1602,17 +1602,18 @@ async fn render_hosted_channeldata(
     let artifacts = list_conda_artifacts_at(db, repo_id, now).await?;
 
     // Query for the latest version of each package (ordered by created_at DESC,
-    // so the first row per name is the latest).
+    // so the first row per name is the latest). Package rows only: a
+    // non-package row marks no revision, so it must not move the document
+    // kept under one (#6090).
     let latest_versions: BTreeMap<String, String> = {
-        let rows = sqlx::query!(
-            r#"
-            SELECT DISTINCT ON (a.name) a.name, a.version
-            FROM artifacts a
-            WHERE a.repository_id = $1 AND a.is_deleted = false
-            ORDER BY a.name, a.created_at DESC
-            "#,
-            repo_id
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT DISTINCT ON (a.name) a.name, a.version \
+               FROM artifacts a \
+              WHERE a.repository_id = $1 AND a.is_deleted = false \
+                AND (a.path LIKE '%.conda' OR a.path LIKE '%.tar.bz2') \
+              ORDER BY a.name, a.created_at DESC",
         )
+        .bind(repo_id)
         .fetch_all(db)
         .await
         .map_err(|e| {
@@ -1621,7 +1622,7 @@ async fn render_hosted_channeldata(
         })?;
 
         rows.into_iter()
-            .filter_map(|r| r.version.map(|v| (r.name, v)))
+            .filter_map(|(name, version)| version.map(|v| (name, v)))
             .collect()
     };
 
@@ -5457,7 +5458,11 @@ fn repodata_document(
     // If latest_only, keep only the latest version per package name
     let filtered: Vec<&CondaArtifact> = if latest_only {
         let mut latest: BTreeMap<String, &CondaArtifact> = BTreeMap::new();
-        for a in subdir_artifacts {
+        // Only a package can be the newest record of its name (#6090).
+        for a in subdir_artifacts
+            .iter()
+            .filter(|a| is_conda_package(a.path.rsplit('/').next().unwrap_or(&a.path)))
+        {
             let pkg_name = a
                 .metadata
                 .as_ref()
@@ -5526,8 +5531,10 @@ fn conda_name_from_filename(filename: &str) -> Option<&str> {
 /// Like the other shadowing guards this is an ENFORCEMENT walk, so it reads
 /// the unfiltered member list rather than the caller-authorized one: a caller
 /// who cannot read the hosted member must still not be offered the upstream
-/// impostor. Every non-deleted row counts, including withdrawn ones, because a
-/// withdrawn internal package must not hand its name to the upstream either.
+/// impostor. Every non-deleted package row counts, including withdrawn ones,
+/// because a withdrawn internal package must not hand its name to the
+/// upstream either. Only package rows reach a conda client, and only they
+/// mark the revisions the set is kept under (#6090).
 /// Fails closed: a database error is a 500, never an unguarded merge.
 ///
 /// The set is kept per virtual under its hosted members' revisions (#4978
@@ -5609,6 +5616,11 @@ fn owned_names_cache() -> &'static moka::future::Cache<uuid::Uuid, std::sync::Ar
 }
 
 /// [`virtual_hosted_owned_names`]' read of the hosted members' rows.
+///
+/// Only package rows (`.conda`, `.tar.bz2`) count, the rows every conda output
+/// reads: the catalog triggers mark only those (#6090), so a non-package
+/// row's write moves no revision, and counting it would leave the kept set
+/// stale.
 async fn query_hosted_owned_names(
     db: &sqlx::PgPool,
     virtual_repo_id: uuid::Uuid,
@@ -5618,7 +5630,8 @@ async fn query_hosted_owned_names(
         "SELECT DISTINCT LOWER(COALESCE(am.metadata->>'name', a.name)) \
          FROM artifacts a \
          LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
-         WHERE a.repository_id = ANY($1) AND a.is_deleted = false",
+         WHERE a.repository_id = ANY($1) AND a.is_deleted = false \
+           AND (a.path LIKE '%.conda' OR a.path LIKE '%.tar.bz2')",
     )
     .bind(hosted_ids)
     .fetch_all(db)
