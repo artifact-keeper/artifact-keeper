@@ -10167,12 +10167,20 @@ async fn store_conda_package(
     content: Bytes,
     user_id: uuid::Uuid,
 ) -> Result<Response, Response> {
-    // The subdir the package itself declares (#2561: permit-scoped decode).
-    let declared_subdir = crate::util::bounded_archive::with_ingest_extraction(|| {
-        extract_conda_metadata(&content, filename)
-            .and_then(|m| m.get("subdir").and_then(|v| v.as_str()).map(str::to_string))
-    })
-    .map_err(|e| e.into_response())?;
+    // #2561: the archive reads below (the declared subdir, the structure
+    // check and the metadata/install-script enrichment) run under ONE ingest
+    // permit, taken before the first and dropped after the last, before any
+    // storage or DB work. On saturation it waits briefly for a slot, then
+    // sheds 503 (#6230): a fast-fail acquire always lost to queued uploads.
+    let ingest_permit = crate::util::bounded_archive::acquire_ingest_extraction_waiting()
+        .await
+        .map_err(|e| e.into_response())?;
+    // The package's own metadata: the subdir it declares, and the
+    // best-effort enrichment recorded after the artifact row commits.
+    let extracted = extract_conda_metadata(&content, filename);
+    let declared_subdir = extracted
+        .as_ref()
+        .and_then(|m| m.get("subdir").and_then(|v| v.as_str()).map(str::to_string));
     let subdir = resolve_upload_subdir(requested_subdir, declared_subdir.as_deref())?;
     let subdir = subdir.as_str();
     // Parse the filename using the existing conda_native handler
@@ -10204,13 +10212,16 @@ async fn store_conda_package(
         },
     )?;
 
-    // Validate package structure before storing.
-    // #2561: permit-scoped decode, fast-fail 503 on saturation.
-    crate::util::bounded_archive::with_ingest_extraction(|| {
-        validate_conda_package(&content, filename)
-    })
-    .map_err(|e| e.into_response())?
-    .map_err(|e| (StatusCode::BAD_REQUEST, e).into_response())?;
+    // Validate package structure before storing (under `ingest_permit`).
+    validate_conda_package(&content, filename)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e).into_response())?;
+
+    // The install scripts, still under `ingest_permit`, so this best-effort
+    // analysis neither queues for a second slot nor is skipped during a
+    // burst. They come out of the payload, which the metadata walk never
+    // opens, so they need a second pass over the same bytes.
+    let install_scripts = collect_conda_install_scripts(&content, filename);
+    drop(ingest_permit);
 
     // Compute SHA256 and MD5
     let mut sha256_hasher = Sha256::new();
@@ -10324,20 +10335,6 @@ async fn store_conda_package(
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
-
-    // Extract metadata from package contents. #2561: permit-scoped decode; the
-    // artifact row is already committed, so a saturated server skips this
-    // best-effort enrichment rather than failing the stored upload.
-    // The install scripts come out of the payload, which the metadata walk
-    // never opens, so they need a second pass over the same bytes — inside the
-    // same permit, since it is the same class of bounded decode work.
-    let (extracted, install_scripts) = crate::util::bounded_archive::with_ingest_extraction(|| {
-        (
-            extract_conda_metadata(&content, filename),
-            collect_conda_install_scripts(&content, filename),
-        )
-    })
-    .unwrap_or_default();
 
     // #4041/#4042: the identity the advisory path queries with. `pkg:conda/<name>`
     // on its own matches nothing — OSV and the GitHub Advisory Database have no
@@ -19069,6 +19066,46 @@ mod catalog_registration_tests {
         assert_eq!(
             row.description.as_deref(),
             Some("a catalogued conda package")
+        );
+    }
+
+    /// #6230: a conda upload whose repository's ingest bucket is full waits
+    /// for a permit instead of shedding 503 at once, succeeds once one frees,
+    /// and its post-commit enrichment (read under the same permit) is not
+    /// skipped: the catalog row carries the package's description.
+    #[tokio::test]
+    async fn conda_upload_waits_for_ingest_permit_6230() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let body = conda_v1_package("queuedpkg", "1.0.0", "py39_0");
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/upload", fx.repo_key))
+            .header("X-Conda-Subdir", "noarch")
+            .header("X-Package-Filename", "queuedpkg-1.0.0-py39_0.tar.bz2")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let ((status, resp), queued) =
+            crate::util::bounded_archive::test_support::run_queued_behind_full_tenant(
+                crate::util::bounded_archive::TenantKey::Repo(fx.repo_id),
+                tdh::send(fx.router_with_auth(super::router()), req),
+            )
+            .await;
+        let row = tdh::catalog_row(&fx.pool, fx.repo_id, "queuedpkg").await;
+        fx.teardown().await;
+
+        assert!(queued, "the upload must have waited for a permit");
+        assert!(
+            status.is_success(),
+            "a queued conda upload must succeed once a permit frees: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+        let row = row.expect("a conda upload must write a packages row");
+        assert_eq!(
+            row.description.as_deref(),
+            Some("a catalogued conda package"),
+            "the enrichment must run under the upload's permit, not be skipped"
         );
     }
 }

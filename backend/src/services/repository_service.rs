@@ -111,6 +111,10 @@ pub struct QuotaDenial {
     pub repository: Option<String>,
     /// Key of the project whose quota refused it (project scope only).
     pub project: Option<String>,
+    /// The bytes the refused write would have added, when known. Lets the
+    /// refusal tell "this upload does not fit in the space left" apart from
+    /// "the quota is full" (usage below the limit versus at it).
+    pub additional_bytes: Option<u64>,
 }
 
 impl QuotaDenial {
@@ -121,7 +125,15 @@ impl QuotaDenial {
             used_bytes,
             repository: None,
             project: None,
+            additional_bytes: None,
         }
+    }
+
+    /// This denial, recording that the refused write would have added
+    /// `additional_bytes` (ignored unless positive).
+    pub(crate) fn with_additional(mut self, additional_bytes: i64) -> Self {
+        self.additional_bytes = u64::try_from(additional_bytes).ok().filter(|n| *n > 0);
+        self
     }
 
     /// Client-facing reason for this refusal (the message of its body).
@@ -3030,6 +3042,7 @@ impl RepositoryService {
     ) -> Option<QuotaDenial> {
         let refuse = |scope: QuotaScope, usage: QuotaUsage| {
             QuotaDenial::new(scope, usage.quota_bytes.unwrap_or(0), usage.used_bytes)
+                .with_additional(additional_bytes)
         };
         // An upload that adds no bytes (a re-push of identical content, a
         // shrinking overwrite) is always admitted, even when usage is already
@@ -4782,6 +4795,12 @@ mod tests {
                 assert_eq!(
                     (Some(d.limit_bytes), d.used_bytes),
                     (usage.quota_bytes, usage.used_bytes),
+                    "case {label}"
+                );
+                // ...and the size of the write it refused.
+                assert_eq!(
+                    d.additional_bytes,
+                    u64::try_from(*additional).ok(),
                     "case {label}"
                 );
             }

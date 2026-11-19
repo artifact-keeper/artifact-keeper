@@ -2288,7 +2288,7 @@ async fn serve_remote_metadata(
             // CPU work on upstream-controlled bytes, so they are admission-
             // controlled together, and the decode is bounded by the same
             // decompression-bomb budget the zip walk uses.
-            let metadata = crate::util::bounded_archive::with_ingest_extraction(|| {
+            let metadata = crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
                 match crate::util::content_coding::strip_content_coding(
                     &wheel,
                     wheel_encoding.as_deref(),
@@ -2316,6 +2316,7 @@ async fn serve_remote_metadata(
                     Err(e) => Err(e),
                 }
             })
+            .await
             .map_err(|e| e.into_response())?
             .map_err(|e| e.into_response())?
             .ok_or_else(|| {
@@ -4080,9 +4081,11 @@ async fn pypi_proxy_cache_redirect(
     if !storage.supports_redirect() {
         return None;
     }
-    if !proxy.is_cache_fresh(repo_key, cache_path).await {
-        return None;
-    }
+    // #6035: the freshness probe also yields the size its sidecar records,
+    // which the transfer meter counts when the URL is issued.
+    let size_bytes = proxy
+        .fresh_cache_redirect_size(repo_key, cache_path)
+        .await?;
     // #4506: a Remote whose origin policy refuses its content gets no
     // redirect; the gated fetch below answers the 403.
     if proxy.cache_origin_policy_gate(repo_key).await.is_err() {
@@ -4106,6 +4109,7 @@ async fn pypi_proxy_cache_redirect(
         /* presigned_enabled = */ true,
         expiry,
         /* cache_is_fresh = */ true,
+        size_bytes,
     )
     .await
 }
@@ -4625,17 +4629,20 @@ async fn serve_metadata(
         Err(other) => return Err(map_storage_err(other)),
     };
 
-    // #2561: permit-scoped decode on the serve path, fast-fail 503 on
-    // saturation. Only taken for the branches that actually decode an archive.
+    // #2561: permit-scoped decode on the serve path; on saturation it waits
+    // briefly for a slot, then sheds 503 (#6230). Only taken for the
+    // branches that actually decode an archive.
     let metadata_text = if filename.ends_with(".whl") {
-        crate::util::bounded_archive::with_ingest_extraction(|| {
+        crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
             extract_metadata_from_wheel(&content)
         })
+        .await
         .map_err(|e| e.into_response())?
     } else if filename.ends_with(".tar.gz") {
-        crate::util::bounded_archive::with_ingest_extraction(|| {
+        crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
             extract_metadata_from_sdist(&content)
         })
+        .await
         .map_err(|e| e.into_response())?
     } else {
         None
@@ -17602,9 +17609,12 @@ mod tests {
             "pypi_proxy_cache_redirect MUST sign via cache_storage_backend() \
              (no-prefix handle), not a prefixed repo handle (#1555).",
         );
+        // #6035: `fresh_cache_redirect_size(` is the same metadata-only probe,
+        // returning the sidecar's size alongside the verdict.
         assert!(
-            window.contains("is_cache_fresh("),
-            "pypi_proxy_cache_redirect MUST gate on is_cache_fresh (#1555).",
+            window.contains("fresh_cache_redirect_size("),
+            "pypi_proxy_cache_redirect MUST gate on the metadata-only freshness \
+             probe `fresh_cache_redirect_size` (#1555).",
         );
     }
 
@@ -17686,6 +17696,12 @@ mod tests {
         assert!(
             loc.contains("proxy-cache/prod-eu/pypi-remote/"),
             "pypi redirect signed a non-scoped key (a revert to unscoped drops the scope): {loc}"
+        );
+        // #6035: tagged with the sidecar's size for the transfer meter.
+        assert_eq!(
+            resp.extensions()
+                .get::<crate::services::quota::http::PresignedDownload>(),
+            Some(&crate::services::quota::http::PresignedDownload(11))
         );
     }
 

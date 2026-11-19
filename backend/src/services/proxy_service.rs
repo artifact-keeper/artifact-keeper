@@ -3437,13 +3437,28 @@ impl CacheStore {
         keys: &CacheKeys,
         mutability: Option<cache_classifier::Mutability>,
     ) -> bool {
+        self.fresh_size(keys, mutability).await.is_some()
+    }
+
+    /// [`Self::is_fresh`], returning the size the sidecar records for a fresh
+    /// entry (`None` when not fresh). A presigned-redirect fast path tags its
+    /// 302 with this size for the transfer meter (#6035), so the sidecar is
+    /// read once per redirect rather than once for freshness and again for
+    /// the size.
+    async fn fresh_size(
+        &self,
+        keys: &CacheKeys,
+        mutability: Option<cache_classifier::Mutability>,
+    ) -> Option<i64> {
         let cache_key = &keys.content;
 
         let Ok(Some(metadata)) = self.load_metadata(&keys.metadata).await else {
-            return false;
+            return None;
         };
+        let size_bytes = metadata.size_bytes;
+        let fresh = |ok: bool| ok.then_some(size_bytes);
         if Utc::now() > metadata.expires_under(mutability) {
-            return false;
+            return None;
         }
 
         // #4630: refuse to presign a redirect to an object the sidecar itself
@@ -3459,7 +3474,7 @@ impl CacheStore {
                 "proxy cache sidecar pins the ETag of an empty object while claiming a \
                  non-zero size; not fresh (#4630)"
             );
-            return false;
+            return None;
         }
 
         // ETag-based integrity revalidation (#1051). Only meaningful when
@@ -3508,7 +3523,7 @@ impl CacheStore {
                             // describes, which is also what the caller's own
                             // `Content-Length` already claims it is.
                             return match self.storage.size(cache_key).await {
-                                Ok(len) => len == metadata.size_bytes as u64,
+                                Ok(len) => fresh(len == metadata.size_bytes as u64),
                                 Err(e) => {
                                     // Includes NotFound (object gone). Not
                                     // fresh: the slow path re-fetches and
@@ -3520,7 +3535,7 @@ impl CacheStore {
                                         error = %e,
                                         "proxy cache size probe failed during multipart fallback; treating as not fresh"
                                     );
-                                    false
+                                    None
                                 }
                             };
                         }
@@ -3530,28 +3545,28 @@ impl CacheStore {
                             current_etag = %current,
                             "proxy cache ETag mismatch on fast-path revalidation; falling back to slow path"
                         );
-                        return false;
+                        return None;
                     }
                     // ETag matched → object is present and unchanged
                     // since cache write. Skip the redundant exists() call.
-                    true
+                    fresh(true)
                 }
                 // Backend lost the object (None) or errored: treat as
                 // not-fresh. The slow path will re-fetch and re-cache.
-                Ok(None) => false,
+                Ok(None) => None,
                 Err(e) => {
                     tracing::warn!(
                         cache_key = %cache_key,
                         error = %e,
                         "proxy cache head_etag failed during revalidation; treating as not fresh"
                     );
-                    false
+                    None
                 }
             },
             None => {
                 // No pinned ETag (filesystem / legacy entry). Preserve
                 // pre-#1051 semantics: existence check only.
-                matches!(self.storage.exists(cache_key).await, Ok(true))
+                fresh(matches!(self.storage.exists(cache_key).await, Ok(true)))
             }
         }
     }
@@ -6845,6 +6860,17 @@ impl ProxyService {
         self.cache_store.is_fresh(&keys, mutability).await
     }
 
+    /// [`Self::is_cache_fresh`] for a presigned-redirect fast path: the size
+    /// the cache sidecar records when the entry is fresh, `None` otherwise.
+    /// The fast path tags its 302 with that size so the transfer meter counts
+    /// the object when the URL is issued (#6035), without a second sidecar
+    /// read after the freshness probe.
+    pub async fn fresh_cache_redirect_size(&self, repo_key: &str, path: &str) -> Option<i64> {
+        let keys = CacheKeys::derive(&self.cache_scope, repo_key, path).ok()?;
+        let mutability = self.effective_mutability_by_key(repo_key, path).await;
+        self.cache_store.fresh_size(&keys, mutability).await
+    }
+
     /// Gate a presigned-redirect fast path on the Remote's origin policy
     /// (#4506), the sibling of [`Self::cache_quarantine_gate`]. A redirect
     /// hands out the cached object without the body passing through the
@@ -7682,7 +7708,7 @@ impl ProxyService {
                 // is based on the upstream release date when known
                 // (#1771).
                 let quarantine_until = self
-                    .quarantine_until_for_new_entry(repo.id, resp.last_modified.as_deref())
+                    .quarantine_until_for_new_entry(repo, cache_path, resp.last_modified.as_deref())
                     .await;
 
                 // S3: content-addressed integrity. When `cache_path`
@@ -8093,7 +8119,7 @@ impl ProxyService {
             // Package Age Policy (#3912): the GET leader refuses a release
             // still inside the hold window with 409; so does its HEAD.
             let quarantine_until = self
-                .quarantine_until_for_new_entry(repo.id, headers.last_modified.as_deref())
+                .quarantine_until_for_new_entry(repo, cache_path, headers.last_modified.as_deref())
                 .await;
             if quarantine_until.is_some_and(|until| until > Utc::now()) {
                 return Err(AppError::Conflict(
@@ -8886,7 +8912,7 @@ impl ProxyService {
         // so the entry is cached under its hold and later requests are gated
         // by the sidecar until the window elapses or an admin releases it).
         let quarantine_until = self
-            .quarantine_until_for_new_entry(repo.id, upstream.last_modified.as_deref())
+            .quarantine_until_for_new_entry(repo, cache_path, upstream.last_modified.as_deref())
             .await;
         let hold_active = quarantine_until.is_some_and(|until| until > Utc::now());
 
@@ -11993,13 +12019,29 @@ impl ProxyService {
     /// ingestion time (#1771): an upstream release older than the configured
     /// window yields an already-elapsed hold, so old packages are not re-held
     /// from their first proxy fetch.
+    ///
+    /// A version listing (npm packument, PyPI simple page, `maven-metadata.xml`,
+    /// Cargo sparse index) is never held (#5933): upstream bumps its
+    /// `Last-Modified` on every publish, so one young release used to hold the
+    /// whole listing and every older version with it. The young version's
+    /// file is still held when it is fetched.
     async fn quarantine_until_for_new_entry(
         &self,
-        repository_id: Uuid,
+        repo: &Repository,
+        path: &str,
         last_modified: Option<&str>,
     ) -> Option<DateTime<Utc>> {
-        let config = quarantine_service::resolve_config(&self.db, repository_id).await;
+        let config = quarantine_service::resolve_config(&self.db, repo.id).await;
         if !quarantine_service::should_quarantine(&config) {
+            return None;
+        }
+        // The handlers' buffered fetches pass a Generic stand-in, so classify
+        // by the stored format.
+        let format = match self.repo_identity_by_key(&repo.key).await {
+            Some((_, format)) => format,
+            None => repo.format.clone(),
+        };
+        if cache_classifier::is_version_listing(&format, path) {
             return None;
         }
         let release = last_modified.and_then(parse_http_date);

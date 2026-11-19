@@ -481,10 +481,12 @@ async fn push_gem(
     }
 
     // Extract gemspec from the .gem file
-    // #2561: permit-scoped decode, fast-fail 503 on saturation.
-    let gemspec = crate::util::bounded_archive::with_ingest_extraction(|| {
+    // #2561: permit-scoped decode; on saturation it waits briefly
+    // for a slot, then sheds 503 (#6230).
+    let gemspec = crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
         RubygemsHandler::extract_gemspec(&body)
     })
+    .await
     .map_err(|e| e.into_response())?
     .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid gem file: {}", e)).into_response())?;
 
@@ -2797,6 +2799,36 @@ mod tests {
         let row = tdh::catalog_row(&f.pool, f.repo_id, "pushgem").await;
         f.teardown().await;
         assert!(row.is_some(), "a gem push must write a packages row");
+    }
+
+    /// #6230: a gem push whose repository's ingest bucket is full waits for a
+    /// permit instead of shedding 503 at once, and succeeds once one frees.
+    #[tokio::test]
+    async fn test_rubygems_push_waits_for_ingest_permit_6230() {
+        let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        let gem = build_test_gem("queuedgem", "1.0.0");
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/v1/gems", f.repo_key))
+            .body(axum::body::Body::from(gem))
+            .unwrap();
+        let ((status, body), queued) =
+            crate::util::bounded_archive::test_support::run_queued_behind_full_tenant(
+                crate::util::bounded_archive::TenantKey::Repo(f.repo_id),
+                tdh::send(app, req),
+            )
+            .await;
+        f.teardown().await;
+        assert!(queued, "the push must have waited for a permit");
+        assert!(
+            status.is_success(),
+            "a queued gem push must succeed once a permit frees: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
     }
 }
 
