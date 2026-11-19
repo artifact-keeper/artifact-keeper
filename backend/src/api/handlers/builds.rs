@@ -75,40 +75,55 @@ const MAX_ARTIFACTS_PER_BUILD: i64 = 1000;
 /// one list call returns at most 5000 artifact rows (#6240).
 const MAX_ARTIFACTS_PER_LISTED_BUILD: i64 = 50;
 
+/// Which rule set [`strip_vcs_userinfo`] applies.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UserinfoRules {
+    /// On write: cut only where the text cannot be a host (rules 1-4). The
+    /// stored value cannot be recovered, so an ambiguous URL is kept whole.
+    Write,
+    /// On read: rules 1-5. A value stored before this change, or one rule 5
+    /// would cut, is never echoed with what may be a credential. Reads of
+    /// `vcs_url` reach only the build's creator or an administrator.
+    Read,
+}
+
 /// `raw` without the userinfo (`user:password@`) of a `scheme://` URL
 /// (#6240). CI systems commonly set the clone URL to
 /// `https://x-access-token:<token>@host/org/repo`, and that token must not be
 /// stored or returned. This works on the text, not on a parsed URL: a
 /// password pasted without percent-encoding can contain `/`, `?` or `#`,
 /// which would end a parsed authority early and leave the rest of the secret
-/// in the "path". It runs before the row is written, so a rule that cuts too
-/// much loses the stored URL: each rule below cuts only where the text cannot
-/// be a host.
+/// in the "path".
 ///
-/// `head` is the text between `://` and the first `/` (all of it without one):
+/// `head` is the text between `://` and the first `/`, `?` or `#` (all of it
+/// without one):
 /// 1. `head` has a `:` before its first `@`: `user:password@`, the password
-///    possibly holding `@` or `/`, so cut at the LAST `@` in the value.
+///    possibly holding `@`, `/`, `?` or `#`, so cut at the LAST `@`.
 /// 2. Else `head` has an `@`: a password-less userinfo (`token@host`, or
 ///    `git@host:22`), cut at the last `@` in `head`. An `@` after it is in
 ///    the path (`https://token@host/repo@v1`).
 /// 3. Else no `@` after `head`, or `head` is an IPv6 literal (`[`...) or
-///    ends in `:<digits>` (a port): no userinfo, unchanged
-///    (`https://h:8443/r?ref=a@b`, `https://[::1]/r@v1`).
+///    ends in `:<digits>` (a port): unchanged (`https://h:8443/r?ref=a@b`,
+///    `https://[::1]/r@v1`).
 /// 4. Else `head` has a `:`: a password with a `/` in it
 ///    (`https://ci:pa/ss@host/r`), cut at the last `@`.
-/// 5. Else `head` cannot be a host name (a character outside
-///    `[A-Za-z0-9.-]`, or no `.` and not `localhost`): a password-less token
-///    with a `/` in it (`https://ab/cd==@host/r`), cut at the last `@`.
+/// 5. [`UserinfoRules::Read`] only. Else `head` is not a dotted host name
+///    (a character outside `[A-Za-z0-9.-]`, or no `.` and not `localhost`):
+///    possibly a password-less token with a `/` in it
+///    (`https://ab/cd==@host/r`), cut at the last `@`. This also cuts a
+///    single-label host with an `@` later (`https://gitlab/org/repo@v1`),
+///    which is why it never runs on write.
 /// 6. Else (`https://github.com/org/repo@v1`): unchanged.
 ///
 /// A value without `://` (scp-style `git@host:org/repo`, a login name and
-/// never a password) is returned unchanged.
-fn strip_vcs_userinfo(raw: &str) -> String {
+/// never a password) is returned unchanged. Known gap: a password that looks
+/// like a port (`https://ci:1234/ss@host/r`) is kept by rule 3.
+fn strip_vcs_userinfo(raw: &str, rules: UserinfoRules) -> String {
     let Some(scheme_end) = raw.find("://").map(|i| i + 3) else {
         return raw.to_string();
     };
     let rest = &raw[scheme_end..];
-    let head = rest.split('/').next().unwrap_or_default();
+    let head = rest.split(['/', '?', '#']).next().unwrap_or_default();
     let cut_at = |at: usize| format!("{}{}", &raw[..scheme_end], &rest[at + 1..]);
     let Some(last_at) = rest.rfind('@') else {
         return raw.to_string();
@@ -129,12 +144,14 @@ fn strip_vcs_userinfo(raw: &str) -> String {
     if head.contains(':') {
         return cut_at(last_at);
     }
+    if rules == UserinfoRules::Write {
+        return raw.to_string();
+    }
     let host_chars = head
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
-    let plausible_host =
-        host_chars && (head.contains('.') || head.eq_ignore_ascii_case("localhost"));
-    if plausible_host {
+    let dotted_host = host_chars && (head.contains('.') || head.eq_ignore_ascii_case("localhost"));
+    if dotted_host {
         raw.to_string()
     } else {
         cut_at(last_at)
@@ -414,7 +431,10 @@ impl From<Build> for BuildResponse {
             updated_at: build.updated_at,
             artifact_count: build.artifact_count,
             modules: None,
-            vcs_url: build.vcs_url.as_deref().map(strip_vcs_userinfo),
+            vcs_url: build
+                .vcs_url
+                .as_deref()
+                .map(|u| strip_vcs_userinfo(u, UserinfoRules::Read)),
             vcs_revision: build.vcs_revision,
             vcs_branch: build.vcs_branch,
             vcs_message: build.vcs_message,
@@ -724,7 +744,10 @@ pub async fn create_build(
             agent: payload.agent,
             started_at: payload.started_at,
             // #6240: a clone URL's credentials are never stored.
-            vcs_url: payload.vcs_url.as_deref().map(strip_vcs_userinfo),
+            vcs_url: payload
+                .vcs_url
+                .as_deref()
+                .map(|u| strip_vcs_userinfo(u, UserinfoRules::Write)),
             vcs_revision: payload.vcs_revision,
             vcs_branch: payload.vcs_branch,
             vcs_message: payload.vcs_message,
@@ -1461,55 +1484,114 @@ mod tests {
 
     #[test]
     fn test_strip_vcs_userinfo() {
-        for (raw, expected) in [
+        use UserinfoRules::{Read, Write};
+        // (raw, on write, on read)
+        for (raw, write, read) in [
             // Plain credentials, and a CI token as the password.
-            ("https://user:pass@host", "https://host"),
+            ("https://user:pass@host", "https://host", "https://host"),
             (
                 "https://x-access-token:ghs_SECRET@github.com/org/private",
+                "https://github.com/org/private",
                 "https://github.com/org/private",
             ),
             // Percent-encoded userinfo.
             (
                 "https://user:p%40ss%2Fword@git.example.test/r",
                 "https://git.example.test/r",
+                "https://git.example.test/r",
             ),
             // A password with an unencoded `/` and `@` still goes entirely.
             (
                 "https://ci:pa/ss@word@git.example.test/r",
+                "https://git.example.test/r",
                 "https://git.example.test/r",
             ),
             // A password-less token, and one with an `@` in the path too.
             (
                 "https://token@github.com/org/repo.git",
                 "https://github.com/org/repo.git",
+                "https://github.com/org/repo.git",
             ),
             (
                 "https://ghp_TOKEN@github.com/org/repo@v1",
                 "https://github.com/org/repo@v1",
+                "https://github.com/org/repo@v1",
             ),
-            // A password-less base64 token holding a `/`.
-            ("https://ab/cd==@host/r", "https://host/r"),
             // ssh with a login name and a port, `@` in the path kept.
-            ("ssh://git@h:22/r@tag", "ssh://h:22/r@tag"),
+            (
+                "ssh://git@h:22/r@tag",
+                "ssh://h:22/r@tag",
+                "ssh://h:22/r@tag",
+            ),
             (
                 "ssh://git:pw@host:2222/org/repo",
                 "ssh://host:2222/org/repo",
+                "ssh://host:2222/org/repo",
             ),
             // No userinfo: port plus `@` in the path or query, IPv6, plain.
-            ("https://h:8443/r?ref=a@b", "https://h:8443/r?ref=a@b"),
-            ("https://[::1]/r@v1", "https://[::1]/r@v1"),
-            ("https://u:p@[::1]/r", "https://[::1]/r"),
+            (
+                "https://h:8443/r?ref=a@b",
+                "https://h:8443/r?ref=a@b",
+                "https://h:8443/r?ref=a@b",
+            ),
+            (
+                "https://[::1]/r@v1",
+                "https://[::1]/r@v1",
+                "https://[::1]/r@v1",
+            ),
+            ("https://u:p@[::1]/r", "https://[::1]/r", "https://[::1]/r"),
             (
                 "https://github.com/org/repo@v1",
                 "https://github.com/org/repo@v1",
+                "https://github.com/org/repo@v1",
             ),
-            ("https://github.com/org/repo", "https://github.com/org/repo"),
-            ("https://localhost/r@v1", "https://localhost/r@v1"),
+            (
+                "https://github.com/org/repo",
+                "https://github.com/org/repo",
+                "https://github.com/org/repo",
+            ),
+            (
+                "https://localhost/r@v1",
+                "https://localhost/r@v1",
+                "https://localhost/r@v1",
+            ),
+            // `head` ends at `?` and `#` too.
+            (
+                "https://git.example.test?x=a@b",
+                "https://git.example.test?x=a@b",
+                "https://git.example.test?x=a@b",
+            ),
+            (
+                "https://git.example.test#a@b",
+                "https://git.example.test#a@b",
+                "https://git.example.test#a@b",
+            ),
+            ("https://u:p?w@host/r", "https://host/r", "https://host/r"),
+            // Rule 5 is read-only: a single-label host or a password-less
+            // base64 token with `/` is stored whole and read back cut.
+            ("https://host?x=a@b", "https://host?x=a@b", "https://b"),
+            (
+                "https://gitlab/org/repo@v1",
+                "https://gitlab/org/repo@v1",
+                "https://v1",
+            ),
+            (
+                "https://ab/cd==@host/r",
+                "https://ab/cd==@host/r",
+                "https://host/r",
+            ),
             // scp-style: a login name, never a password.
-            ("git@github.com:org/repo.git", "git@github.com:org/repo.git"),
-            ("", ""),
+            (
+                "git@github.com:org/repo.git",
+                "git@github.com:org/repo.git",
+                "git@github.com:org/repo.git",
+            ),
+            ("", "", ""),
         ] {
-            assert_eq!(strip_vcs_userinfo(raw), expected, "{raw}");
+            assert_eq!(strip_vcs_userinfo(raw, Write), write, "write {raw}");
+            assert_eq!(strip_vcs_userinfo(raw, Read), read, "read {raw}");
+            // Reading what was written gives what reading the raw value gives.
+            assert_eq!(strip_vcs_userinfo(write, Read), read, "read(write) {raw}");
         }
     }
 
@@ -2188,6 +2270,48 @@ mod tests {
         tdh::cleanup(&pool, open_repo, other_id).await;
         tdh::cleanup(&pool, hidden_repo, owner_id).await;
         tdh::cleanup_user(&pool, admin_id).await;
+    }
+
+    /// #6240 review: the write keeps a URL whose userinfo is ambiguous (a
+    /// single-label host with an `@` in the path) whole, since a cut there is
+    /// unrecoverable, and the read applies the strict rules to it.
+    #[tokio::test]
+    async fn ambiguous_vcs_url_is_stored_whole_and_read_strict_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool.clone(), "/tmp/ph-6240-ambiguous");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let app = tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+        let name = format!("ph-6240-amb-{}", Uuid::new_v4());
+        let raw = "https://gitlab/org/repo@v1";
+        let created = send_json(
+            app.clone(),
+            post_json(
+                "/",
+                json!({ "name": name, "build_number": 1, "vcs_url": raw }),
+            ),
+        )
+        .await;
+        let id = created["id"].as_str().expect("build id").to_string();
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT vcs_url FROM builds WHERE id = $1::uuid")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .expect("stored vcs_url");
+        assert_eq!(stored.as_deref(), Some(raw), "nothing is lost in storage");
+        let read = strip_vcs_userinfo(raw, UserinfoRules::Read);
+        assert_eq!(created["vcs_url"], read.as_str());
+        let got = send_json(app, tdh::get(format!("/{id}"))).await;
+        assert_eq!(got["vcs_url"], read.as_str(), "{got}");
+
+        let _ = sqlx::query("DELETE FROM builds WHERE name = $1")
+            .bind(&name)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, user_id).await;
     }
 
     /// #6240: the artifacts a read returns per build are capped.
