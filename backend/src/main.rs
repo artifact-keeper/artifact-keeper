@@ -1554,40 +1554,17 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         tracing::error!("{msg}");
     }
 
-    // A gRPC port that cannot be bound fails startup when GRPC_PORT is set.
-    // With the implicit default it is logged and gRPC stays off, as before, so
-    // an install that never asked for gRPC does not start failing (#6213).
-    let grpc_listener = match &listener_plan.grpc {
-        None => None,
-        Some(grpc_listener_addr) => {
-            match api::serve::bind_dedicated_listener(grpc_listener_addr).await {
-                Ok(listener) => Some(listener),
-                Err(e) if grpc_port_configured.is_some() => {
-                    return Err(artifact_keeper_backend::error::AppError::Config(
-                        e.to_string(),
-                    ));
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "{e}; gRPC is disabled for this process (set GRPC_PORT to a free port)"
-                    );
-                    None
-                }
-            }
-        }
-    };
-
-    // METRICS_PORT is only Some when it is set to a valid port, so a metrics
-    // listener that cannot be bound always fails startup (#6213).
+    // METRICS_PORT binds before gRPC, so the implicit gRPC default loses any
+    // clash the planner missed. A metrics bind failure, or a gRPC one with
+    // GRPC_PORT set, fails startup; with GRPC_PORT unset gRPC is logged off,
+    // as before (#6213).
     let metrics_listener_addr = listener_plan.metrics.clone();
-    let metrics_listener = match &metrics_listener_addr {
-        Some(listener_addr) => Some(
-            api::serve::bind_dedicated_listener(listener_addr)
-                .await
-                .map_err(|e| artifact_keeper_backend::error::AppError::Config(e.to_string()))?,
-        ),
-        None => None,
-    };
+    let api::serve::BoundListeners {
+        grpc: grpc_listener,
+        metrics: metrics_listener,
+    } = api::serve::bind_planned_listeners(&listener_plan, grpc_port_configured.is_some())
+        .await
+        .map_err(|e| artifact_keeper_backend::error::AppError::Config(e.to_string()))?;
 
     // Reuse the existing pool instead of creating a second one (PgPool is Arc-backed)
     let sbom_server = SbomGrpcServer::new(grpc_db_pool.clone());

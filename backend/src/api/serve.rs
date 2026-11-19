@@ -105,11 +105,19 @@ pub struct ListenerAddr {
 /// port in the same address family, on the same IP or with either one on the
 /// unspecified address (`0.0.0.0` / `::`). Port 0 asks the OS for a free port
 /// and never collides.
+///
+/// An IPv6 wildcard (`[::]`) also collides with any IPv4 address on the same
+/// port: with Linux's default dual-stack (`net.ipv6.bindv6only = 0`) a `[::]`
+/// socket takes the IPv4 port too. An IPv4 wildcard does not take IPv6.
 pub fn listen_addrs_collide(a: SocketAddr, b: SocketAddr) -> bool {
-    a.port() != 0
-        && a.port() == b.port()
-        && a.is_ipv4() == b.is_ipv4()
-        && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
+    if a.port() == 0 || a.port() != b.port() {
+        return false;
+    }
+    if a.is_ipv4() != b.is_ipv4() {
+        let v6 = if a.is_ipv6() { a } else { b };
+        return v6.ip().is_unspecified();
+    }
+    a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified()
 }
 
 /// Which dedicated listeners startup binds, after resolving address clashes
@@ -219,6 +227,43 @@ pub async fn bind_dedicated_listener(listener: &ListenerAddr) -> io::Result<TcpL
             ),
         )
     })
+}
+
+/// The dedicated listeners bound for a [`ListenerPlan`] (#6213).
+#[derive(Debug)]
+pub struct BoundListeners {
+    pub grpc: Option<TcpListener>,
+    pub metrics: Option<TcpListener>,
+}
+
+/// Bind the dedicated listeners of `plan` (#6213). The metrics listener binds
+/// first, so if the default gRPC port clashes in a way [`plan_listeners`] did
+/// not predict, gRPC loses rather than the listener the operator asked for.
+/// A metrics bind failure, and a gRPC one when `grpc_explicit`, is returned
+/// for startup to fail on. With the implicit gRPC default it is logged and
+/// gRPC stays off.
+pub async fn bind_planned_listeners(
+    plan: &ListenerPlan,
+    grpc_explicit: bool,
+) -> io::Result<BoundListeners> {
+    let metrics = match &plan.metrics {
+        Some(addr) => Some(bind_dedicated_listener(addr).await?),
+        None => None,
+    };
+    let grpc = match &plan.grpc {
+        None => None,
+        Some(addr) => match bind_dedicated_listener(addr).await {
+            Ok(listener) => Some(listener),
+            Err(e) if grpc_explicit => return Err(e),
+            Err(e) => {
+                tracing::error!(
+                    "{e}; gRPC is disabled for this process (set GRPC_PORT to a free port)"
+                );
+                None
+            }
+        },
+    };
+    Ok(BoundListeners { grpc, metrics })
 }
 
 /// The accept-queue length the kernel grants: Linux caps any request,
@@ -908,6 +953,10 @@ mod tests {
         assert!(!c("127.0.0.1:9090", "10.0.0.1:9090"));
         assert!(!c("0.0.0.0:9090", "0.0.0.0:9091"));
         assert!(!c("127.0.0.1:9090", "[::1]:9090"));
+        // Linux dual-stack: `[::]` takes the IPv4 port too, `0.0.0.0` not IPv6.
+        assert!(c("[::]:9090", "0.0.0.0:9090"));
+        assert!(c("127.0.0.1:9090", "[::]:9090"));
+        assert!(!c("0.0.0.0:9090", "[::1]:9090"));
         assert!(!c("0.0.0.0:0", "0.0.0.0:0"));
     }
 
@@ -934,5 +983,55 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(l.local_addr().unwrap().port(), 0);
+    }
+
+    /// A free port on 127.0.0.1 (bound once and released).
+    async fn free_port() -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    fn plan_on(port: u16) -> ListenerPlan {
+        let addr = sa(&format!("127.0.0.1:{port}"));
+        ListenerPlan {
+            grpc: Some(listener(
+                "gRPC",
+                "GRPC_PORT unset, default 9090",
+                &addr.to_string(),
+            )),
+            metrics: Some(listener("metrics", "METRICS_PORT", &addr.to_string())),
+            grpc_disabled: None,
+        }
+    }
+
+    /// #6213 re-review: a clash the planner misses (e.g. `METRICS_BIND_IP=::`
+    /// on a platform where that is dual-stack) must cost the implicit gRPC
+    /// default, not the configured metrics listener. Metrics binds first.
+    #[tokio::test]
+    async fn bind_planned_listeners_binds_metrics_before_implicit_grpc() {
+        let bound = bind_planned_listeners(&plan_on(free_port().await), false)
+            .await
+            .unwrap();
+        assert!(bound.metrics.is_some());
+        assert!(bound.grpc.is_none());
+    }
+
+    #[tokio::test]
+    async fn bind_planned_listeners_fails_for_explicit_grpc_clash() {
+        let err = bind_planned_listeners(&plan_on(free_port().await), true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("gRPC"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn bind_planned_listeners_implicit_grpc_on_taken_port_continues() {
+        let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut plan = plan_on(taken.local_addr().unwrap().port());
+        plan.metrics = None;
+        let bound = bind_planned_listeners(&plan, false).await.unwrap();
+        assert!(bound.grpc.is_none() && bound.metrics.is_none());
+        let err = bind_planned_listeners(&plan, true).await.unwrap_err();
+        assert!(err.to_string().contains("GRPC_PORT"), "{err}");
     }
 }
