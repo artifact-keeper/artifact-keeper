@@ -240,49 +240,19 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             .await;
     }
 
-    // Reconcile stale/diverged `_sqlx_migrations` ledgers BEFORE the
-    // SKIP_MIGRATIONS gate. These repairs each no-op on fresh and healthy
-    // databases, so running them unconditionally is safe -- and it is
-    // necessary: an operator who applies migrations out-of-band with
-    // SKIP_MIGRATIONS=true still needs the ledger renumbered, otherwise the
-    // v1.5.7/v1.5.8 -> 1.6.0 upgrade aborts (issue #2686) and any later
-    // out-of-band `sqlx migrate` hits the same VersionMismatch the repair
-    // exists to clear.
-    artifact_keeper_backend::migration_repair::repair_legacy_073_checksum(&db_pool).await?;
-    artifact_keeper_backend::migration_repair::repair_release_1_1_9_divergence(&db_pool).await?;
-    artifact_keeper_backend::migration_repair::repair_release_1_5_x_divergence(&db_pool).await?;
-
-    // Run migrations (skip with SKIP_MIGRATIONS=true for pre-applied migrations)
+    // Run migrations (skip with SKIP_MIGRATIONS=true when they run out of
+    // band, e.g. `artifact-keeper db-migrate` in a pre-upgrade Job). The
+    // ledger repairs run either way (#2686).
     let skip_migrations = std::env::var("SKIP_MIGRATIONS")
         .unwrap_or_default()
         .eq_ignore_ascii_case("true");
 
     if skip_migrations {
+        artifact_keeper_backend::migration_repair::repair_migration_ledger(&db_pool).await?;
         tracing::info!("SKIP_MIGRATIONS=true, skipping automatic database migrations");
     } else {
         tracing::info!("Running database migrations...");
-        // Some migrations (e.g. CREATE INDEX on a populated `artifacts` table
-        // or backfill UPDATEs) take longer than the per-query
-        // `statement_timeout` that operators commonly set on their Postgres
-        // parameter group as an app-query safeguard (10 s on AWS RDS for many
-        // tunings). `with_migration_session` marks the startup connection
-        // close-on-drop before raising the timeouts and closes it afterwards
-        // (keeping its pool slot until then), so these session-local settings
-        // cannot leak into normal app queries (#6319).
-        // Takes the migration lock without blocking in pg_advisory_lock (a
-        // blocked waiter deadlocks a CREATE INDEX CONCURRENTLY in the holder,
-        // #5993), repairs INVALID concurrent index leftovers under that lock
-        // (#4426, #5993), then applies pending migrations.
-        db::with_migration_session(&db_pool, |conn| {
-            Box::pin(async move {
-                artifact_keeper_backend::migration_repair::run_startup_migrations(
-                    conn,
-                    &artifact_keeper_backend::MIGRATOR,
-                )
-                .await
-            })
-        })
-        .await?;
+        artifact_keeper_backend::migration_repair::apply_schema_migrations(&db_pool).await?;
         tracing::info!("Database migrations complete");
     }
 
@@ -1933,9 +1903,20 @@ fn run_healthcheck_subcommand_if_requested() {
     }
 }
 
+/// `artifact-keeper db-migrate`: apply the schema migrations and exit (see
+/// `cli::db_migrate`). Exits the process when the subcommand is given.
+fn run_db_migrate_subcommand_if_requested() {
+    use artifact_keeper_backend::cli::db_migrate;
+    let args: Vec<String> = std::env::args().collect();
+    if db_migrate::requested(&args) {
+        std::process::exit(db_migrate::main());
+    }
+}
+
 #[cfg(not(windows))]
 fn main() -> std::process::ExitCode {
     run_healthcheck_subcommand_if_requested();
+    run_db_migrate_subcommand_if_requested();
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1949,6 +1930,7 @@ fn main() -> Result<()> {
     use artifact_keeper_backend::error::AppError;
 
     run_healthcheck_subcommand_if_requested();
+    run_db_migrate_subcommand_if_requested();
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--service") {
