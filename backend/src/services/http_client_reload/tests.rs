@@ -349,7 +349,8 @@ async fn mixed_pem_bundle_keeps_its_certificate_roots_on_startup_and_reload() {
     assert!(succeeds(&client, &server_a).await);
     assert!(!succeeds(&client, &server_b).await);
 
-    publish(&path, &mixed(&b));
+    // reqwest also accepts carriage-return delimited PEM.
+    publish(&path, &mixed(&b).replace('\n', "\r"));
     assert!(manager.refresh());
     assert_eq!(manager.state.read().unwrap().bundle.certs.len(), 1);
     assert!(!succeeds(&client, &server_a).await);

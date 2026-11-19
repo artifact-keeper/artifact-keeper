@@ -50,17 +50,18 @@ impl Bundle {
         // sections while ensuring that all certificate sections are complete.
         let mut inside = false;
         let mut blocks = 0;
-        for line in bytes.split(|&byte| byte == b'\n').map(<[u8]>::trim_ascii) {
-            match line {
-                b"-----BEGIN CERTIFICATE-----" if !inside => {
-                    inside = true;
-                    blocks += 1;
-                }
-                b"-----END CERTIFICATE-----" if inside => inside = false,
-                b"-----BEGIN CERTIFICATE-----" | b"-----END CERTIFICATE-----" => {
+        for line in bytes.split(|&byte| matches!(byte, b'\n' | b'\r')) {
+            if line.trim_ascii_end() == b"-----BEGIN CERTIFICATE-----" {
+                if inside {
                     return Err("unmatched certificate PEM boundary");
                 }
-                _ => {}
+                inside = true;
+                blocks += 1;
+            } else if line.starts_with(b"-----END CERTIFICATE-----") {
+                if !inside {
+                    return Err("unmatched certificate PEM boundary");
+                }
+                inside = false;
             }
         }
         if inside || blocks > MAX_CERTIFICATES {
