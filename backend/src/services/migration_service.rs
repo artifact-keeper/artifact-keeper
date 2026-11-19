@@ -202,6 +202,25 @@ pub enum ConflictType {
     FormatMismatch,
 }
 
+/// Error summary of a job the janitor paused because its worker's claim
+/// lapsed (#6253). `/resume` clears it.
+pub const WORKER_LOST: &str = "worker lost";
+
+/// How long a migration worker's claim on its job row lasts unless renewed.
+/// The renewal runs every third of it, so a replica that died is noticed
+/// within about this long (#6253).
+pub const JOB_CLAIM_TTL_SECS: f64 = 300.0;
+
+/// Pause the jobs the workers of replica `owner` were running as it shuts
+/// down, so `/resume` continues them (#6253).
+pub async fn pause_jobs_on_shutdown(db: PgPool, owner: &str) {
+    match MigrationService::new(db).pause_jobs_claimed_by(owner).await {
+        Ok(0) => {}
+        Ok(paused) => info!(paused, "Paused the migration jobs this replica was running"),
+        Err(e) => warn!(error = %e, "Failed to pause this replica's migration jobs"),
+    }
+}
+
 /// Migration service for orchestrating the migration process
 pub struct MigrationService {
     db: PgPool,
@@ -902,6 +921,52 @@ impl MigrationService {
         .await?;
 
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Pause a job that is still `running` because its worker stops with the
+    /// process (#6253). `migration_items` keeps what was done, so `/resume`
+    /// skips it. Returns whether the row was paused.
+    pub async fn pause_running_job(&self, job_id: Uuid) -> Result<bool, MigrationError> {
+        let result = sqlx::query(
+            "UPDATE migration_jobs SET status = 'paused' WHERE id = $1 AND status = 'running'",
+        )
+        .bind(job_id)
+        .execute(&self.db)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Pause every `running` job whose worker claim is held by `owner`, for a
+    /// replica that shuts down with workers still running (#6253).
+    pub async fn pause_jobs_claimed_by(&self, owner: &str) -> Result<u64, MigrationError> {
+        let result = sqlx::query(
+            "UPDATE migration_jobs SET status = 'paused' \
+             WHERE status = 'running' AND claimed_by = $1",
+        )
+        .bind(owner)
+        .execute(&self.db)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Pause every `running` job whose worker claim lapsed: the replica that
+    /// ran it died without a clean shutdown (#6253). The job is left for an
+    /// operator to resume, with [`WORKER_LOST`] as its error summary.
+    pub async fn pause_stale_running_jobs(&self) -> Result<u64, MigrationError> {
+        let result = sqlx::query(
+            "UPDATE migration_jobs SET status = 'paused', error_summary = $1 \
+             WHERE status = 'running' AND claim_expires_at < NOW()",
+        )
+        .bind(WORKER_LOST)
+        .execute(&self.db)
+        .await?;
+        if result.rows_affected() > 0 {
+            warn!(
+                jobs = result.rows_affected(),
+                "Paused migration jobs whose worker was lost; resume them to continue"
+            );
+        }
+        Ok(result.rows_affected())
     }
 
     /// Finalize a job with a terminal status and stamp `finished_at`, unless

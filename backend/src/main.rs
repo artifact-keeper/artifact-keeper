@@ -956,6 +956,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         ),
     };
     app_state.set_scanner_service(scanner_service);
+    app_state.shutdown_token = runtime_shutdown_token.clone();
 
     // Initialize quality check service for health scoring and quality gates
     let quality_check_service = Arc::new(
@@ -1345,6 +1346,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     // Keep a handle for the gRPC server before the sync worker consumes db_pool
     let grpc_db_pool = db_pool.clone();
+    let migration_db_pool = db_pool.clone();
 
     // Spawn background sync worker for peer replication
     artifact_keeper_backend::services::sync_worker::spawn_sync_worker(
@@ -1735,6 +1737,14 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     .await?;
 
     tracing::info!("HTTP server shut down");
+
+    // #6253: a migration worker may be mid-transfer and never reach its next
+    // status check before the process exits
+    artifact_keeper_backend::services::migration_service::pause_jobs_on_shutdown(
+        migration_db_pool,
+        artifact_keeper_backend::services::cluster_work::WorkerIdentity::for_process().as_str(),
+    )
+    .await;
 
     Ok(())
 }
