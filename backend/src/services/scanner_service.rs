@@ -6574,6 +6574,61 @@ pub trait Scanner: Send + Sync {
     }
 }
 
+/// Env var for the wall-clock limit on one local scanner process (#5942):
+/// the `grype` and `trivy` children the backend spawns itself. Unset, blank,
+/// `0` or unparsable means no limit of its own, the behaviour before it
+/// existed. Scans through the scanner adapter are not affected: the adapter
+/// client has its own budgets (submission, queue and report polling).
+pub const SCANNER_PROCESS_TIMEOUT_ENV: &str = "SCANNER_PROCESS_TIMEOUT_SECS";
+
+/// The local scanner process limit this process runs with, from
+/// [`SCANNER_PROCESS_TIMEOUT_ENV`]. Read at call time, like the other scan
+/// env knobs, so a test can set it per process.
+pub(crate) fn scanner_process_timeout() -> Option<Duration> {
+    parse_scanner_process_timeout(std::env::var(SCANNER_PROCESS_TIMEOUT_ENV).ok().as_deref())
+}
+
+fn parse_scanner_process_timeout(raw: Option<&str>) -> Option<Duration> {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+}
+
+/// Wait for a local scanner child (`output`, from a `kill_on_drop` command)
+/// under [`SCANNER_PROCESS_TIMEOUT_ENV`] (#5942). Past the limit the future
+/// is dropped, which kills the child, and the scan gets an error naming the
+/// limit; inside a queued job the timeout is also noted so the job is retried
+/// rather than finishing with a `failed` row. The outer `Result` is the
+/// timeout, the inner one the spawn, so each caller keeps its own spawn-error
+/// classification.
+pub(crate) async fn wait_scanner_process(
+    program: &str,
+    output: impl std::future::Future<Output = std::io::Result<std::process::Output>>,
+) -> Result<std::io::Result<std::process::Output>> {
+    wait_scanner_process_with_limit(program, scanner_process_timeout(), output).await
+}
+
+async fn wait_scanner_process_with_limit(
+    program: &str,
+    limit: Option<Duration>,
+    output: impl std::future::Future<Output = std::io::Result<std::process::Output>>,
+) -> Result<std::io::Result<std::process::Output>> {
+    let Some(limit) = limit else {
+        return Ok(output.await);
+    };
+    match tokio::time::timeout(limit, output).await {
+        Ok(out) => Ok(out),
+        Err(_) => {
+            crate::services::scan_queue::note_scanner_timed_out();
+            Err(AppError::Internal(format!(
+                "{program} did not finish within {SCANNER_PROCESS_TIMEOUT_ENV}={}s; \
+                 the process was stopped",
+                limit.as_secs()
+            )))
+        }
+    }
+}
+
 /// Maximum wall-clock time we will wait for a scanner CLI's `--version`
 /// subcommand to return. A hung version probe is serialized through
 /// `OnceCell::get_or_init`, so any single hang would head-of-line block
@@ -10438,9 +10493,16 @@ impl ScannerService {
             // for dedup-checking and may sit briefly before scan invocation).
             // See issue #902.
             let started_at = chrono::Utc::now();
-            match scanner
-                .scan_target(&target, metadata.as_ref(), &content)
-                .await
+            // #5942: in a queued job the scanner stops at the job's deadline
+            // and its row is recorded `failed` (the job is then retried),
+            // instead of the job budget dropping the whole scan with this row
+            // and every later one left `running`. In-process scans run as
+            // before.
+            match crate::services::scan_queue::within_job_deadline(
+                scanner.name(),
+                scanner.scan_target(&target, metadata.as_ref(), &content),
+            )
+            .await
             {
                 Ok(ScanOutput {
                     findings,
@@ -15269,6 +15331,98 @@ mod tests {
             "timeout did not fire promptly; elapsed was {:?}",
             elapsed
         );
+    }
+
+    /// #5942: unset, blank, garbage or `0` is no limit (the behaviour before
+    /// the knob), so a scan that finishes today cannot start failing.
+    #[test]
+    fn scanner_process_timeout_is_off_unless_set() {
+        assert_eq!(parse_scanner_process_timeout(None), None);
+        assert_eq!(parse_scanner_process_timeout(Some("")), None);
+        assert_eq!(parse_scanner_process_timeout(Some("soon")), None);
+        assert_eq!(parse_scanner_process_timeout(Some("-1")), None);
+        assert_eq!(parse_scanner_process_timeout(Some("0")), None);
+        assert_eq!(
+            parse_scanner_process_timeout(Some(" 900 ")),
+            Some(Duration::from_secs(900))
+        );
+    }
+
+    /// `sh -c` that records its pid, then sleeps `secs` and prints `done`.
+    #[cfg(unix)]
+    fn sleeping_child(pidfile: &std::path::Path, secs: u32) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "echo $$ > '{}'; exec sleep {secs}",
+                pidfile.display()
+            ))
+            .kill_on_drop(true);
+        command
+    }
+
+    /// #5942: a local scanner process past `SCANNER_PROCESS_TIMEOUT_SECS` is
+    /// stopped (killed through `kill_on_drop`, not orphaned) and the scan gets
+    /// an error naming the limit. One that finishes inside the limit returns
+    /// its output untouched, and with no limit nothing changes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_local_scanner_process_past_its_limit_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+
+        let started = std::time::Instant::now();
+        let err = wait_scanner_process_with_limit(
+            "grype",
+            Some(Duration::from_secs(1)),
+            sleeping_child(&pidfile, 600).output(),
+        )
+        .await
+        .expect_err("a hung process must time out");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(
+            err.to_string()
+                .contains("grype did not finish within SCANNER_PROCESS_TIMEOUT_SECS=1s"),
+            "{err}"
+        );
+        let pid = std::fs::read_to_string(&pidfile).unwrap();
+        let stat = std::path::PathBuf::from(format!("/proc/{}/stat", pid.trim()));
+        if std::path::Path::new("/proc/self/stat").exists() {
+            // Killed: gone, or a zombie until tokio reaps it.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let alive = std::fs::read_to_string(&stat)
+                    .map(|s| !s.contains(") Z "))
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the timed-out child {} is still running",
+                    pid.trim()
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        let mut slow = tokio::process::Command::new("/bin/sh");
+        slow.args(["-c", "sleep 1; echo done"]).kill_on_drop(true);
+        let out =
+            wait_scanner_process_with_limit("grype", Some(Duration::from_secs(20)), slow.output())
+                .await
+                .expect("inside the limit")
+                .expect("spawned");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
+
+        let mut quick = tokio::process::Command::new("/bin/sh");
+        quick.args(["-c", "echo done"]);
+        let out = wait_scanner_process_with_limit("grype", None, quick.output())
+            .await
+            .expect("no limit")
+            .expect("spawned");
+        assert!(out.status.success());
     }
 
     /// Default `Scanner::version()` returns None so existing scanners
@@ -29911,6 +30065,119 @@ tonic-build = "0.12"
 
         cleanup_scan_state(&fx.pool, fx.repo_id).await;
         fx.teardown().await;
+    }
+
+    /// #5942: in a queued job, two scanners that never return share the job's
+    /// budget. Each is stopped at the deadline and its row recorded `failed`
+    /// with the retry message (not left `running` for the janitor), the scope
+    /// reports the timeout so the worker retries the job, and a scanner after
+    /// them that answers at once still completes. Real time, not a paused
+    /// clock: the scan does Postgres I/O between the scanners.
+    #[tokio::test]
+    async fn test_hung_scanners_in_a_queued_job_stop_at_its_shared_deadline() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        struct HungScanner(&'static str);
+        #[async_trait::async_trait]
+        impl Scanner for HungScanner {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn scan_type(&self) -> &str {
+                self.0
+            }
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<ScanOutput> {
+                std::future::pending().await
+            }
+        }
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = Uuid::new_v4();
+        let checksum = fresh_checksum();
+        let storage_key = format!("scanner-deadline/{artifact_id}.bin");
+        fx.state
+            .storage
+            .put(&storage_key, Bytes::from_static(b"data"))
+            .await
+            .expect("store artifact bytes");
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, checksum_sha256, \
+                                    content_type, storage_key, is_deleted) \
+             VALUES ($1, $2, 'pkg.bin', 'pkg.bin', 4, $3, 'application/octet-stream', $4, false)",
+        )
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(&checksum)
+        .bind(&storage_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert artifact");
+        let mut scanner = scanner_for_fixture(&fx);
+        scanner.scanners = vec![
+            Arc::new(HungScanner("grype")),
+            Arc::new(HungScanner("filesystem")),
+            Arc::new(inline_proxy_scan_fixtures::TrivialDependencyScanner),
+        ];
+
+        let budget = std::time::Duration::from_secs(2);
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::services::scan_queue::with_job_deadline(
+                started + budget,
+                budget,
+                scanner.scan_artifact_with_options(artifact_id, true, true),
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT scan_type, status, error_message FROM scan_results \
+             WHERE artifact_id = $1 ORDER BY scan_type",
+        )
+        .bind(artifact_id)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("read scan rows");
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        let (result, timed_out) = outcome.expect("the scan must return at the job deadline");
+        result.expect("scan orchestration succeeds");
+        assert!(
+            timed_out,
+            "the worker must see the timeout to retry the job"
+        );
+        assert!(
+            elapsed < budget * 2,
+            "two hung scanners must share one budget, took {elapsed:?}"
+        );
+        let summary: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|(t, s, _)| (t.as_str(), s.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("dependency", "completed"),
+                ("filesystem", "failed"),
+                ("grype", "failed")
+            ],
+            "{rows:?}"
+        );
+        for (scan_type, _, error) in &rows[1..] {
+            let error = error.as_deref().unwrap_or_default();
+            assert!(
+                error.contains(&format!("scanner {scan_type} was stopped"))
+                    && error.contains("2s budget"),
+                "{rows:?}"
+            );
+        }
     }
 
     /// Records the [`ScanTarget::expected_component`] the orchestration hands
