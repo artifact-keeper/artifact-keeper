@@ -369,7 +369,7 @@ pub async fn quarantine_artifact(
     params(
         ("artifact_id" = Uuid, Path, description = "Artifact ID"),
     ),
-    request_body(content = ReleaseRequest, description = "Optional; an empty body releases the row as it reads now"),
+    request_body(content = Option<ReleaseRequest>, description = "Optional; an empty body releases the row as it reads now"),
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Artifact released", body = QuarantineActionResponse),
@@ -1415,6 +1415,30 @@ mod tests {
             .unwrap());
         tdh::cleanup_user(&fx.pool, other).await;
         fx.teardown().await;
+    }
+
+    /// #5766: the release body is optional (the route took none before), so
+    /// the OpenAPI document must not mark it required; generated clients
+    /// would otherwise force one.
+    #[test]
+    fn release_request_body_is_optional_in_openapi() {
+        let doc = serde_json::to_value(QuarantineApiDoc::openapi()).unwrap();
+        let body = doc["paths"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(p, _)| p.ends_with("/{artifact_id}/release"))
+            .map(|(_, v)| v["post"]["requestBody"].clone())
+            .expect("the release path is documented");
+        assert!(
+            body.get("content").is_some(),
+            "the body is documented: {body}"
+        );
+        assert_ne!(
+            body.get("required"),
+            Some(&serde_json::Value::Bool(true)),
+            "the release body must not be required: {body}"
+        );
     }
 }
 

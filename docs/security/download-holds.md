@@ -104,7 +104,10 @@ the image the release was decided for. When the tag has moved since, the old
 digest's held row is released instead, the answer names both digests, and a
 newer hold on the new image stays in place. When the old digest has no held
 row, the release answers `409` and changes nothing (no row is created). A body
-is still optional. The `flagged` mark a failed scan writes also binds to the
+is still optional, but without `expected_digest` the release binds to the digest
+the row names when the request is handled, so a push that moves the tag between
+the administrator's decision and the request still lets the release land on
+the new image. Send `expected_digest` to close that window. The `flagged` mark a failed scan writes also binds to the
 digest the scan read, so it no longer lands on an image the tag moved to.
 
 What this means for operators:
