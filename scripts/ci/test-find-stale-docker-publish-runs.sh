@@ -278,6 +278,20 @@ stuck_fixture
 run 9001 "$SHA_C" main workflow_dispatch completed 1 2026-11-16T05:00:00Z "" release-candidate.yml
 expect "only a finished candidate -> cancelled" 1 "action=cancelled" STALE_ACTION=cancel
 
+# A candidate that is only QUEUED (not yet running) holds every cancel too:
+# it will wait for some commit's images once it starts.
+reset_fx
+run 660 "$SHA_A" main push in_progress 1 2026-11-16T07:00:00Z
+done_but_amd64 660 queued - 2026-11-16T07:00:10Z
+run 661 "$SHA_B" main push in_progress 1 2026-11-16T07:05:00Z
+done_but_amd64 661 queued - 2026-11-16T07:05:10Z
+run 662 "$SHA_C" main push pending 1 2026-11-16T09:00:00Z
+run 9002 "$SHA_C" main workflow_dispatch queued 1 2026-11-16T11:58:00Z "" release-candidate.yml
+expect "queued release candidate -> every stuck run held" 1 "stuck run_id=661" STALE_ACTION=cancel
+[ "$(grep -c 'action=reported hold=candidate-active' "$WORK/out.txt")" = 2 ] \
+  && pass "both stuck runs report hold=candidate-active" || fail "out: $(cat "$WORK/out.txt")"
+no_posts "queued candidate"
+
 # Anything it cannot prove holds the cancel.
 stuck_fixture
 expect "superseded check fails -> reported (superseded-unknown)" 1 "hold=superseded-unknown" STALE_ACTION=cancel FAKE_SUPERSEDED_FAIL=1
@@ -316,6 +330,10 @@ if [ -n "$WF_DIR" ] && [ -f "$WF_DIR/docker-publish-watchdog.yml" ]; then
     && pass "runs on workflow_run of '${publish_name}'" || fail "docker-publish-watchdog.yml has no workflow_run on '${publish_name}'"
   awk '/^  workflow_run:/{f=1;next} f&&/^  [a-z_]+:/{f=0} f' "$wd" | grep -q "types: \[requested, completed\]" \
     && pass "on requested and completed" || fail "workflow_run types are not [requested, completed]"
+  # Its own cancel ends a Docker Publish run, which starts another watchdog:
+  # cancelling the sweep in progress would hide that cancel's report.
+  awk '/^concurrency:/{f=1;next} f&&/^[^ #]/{f=0} f' "$wd" | grep -qx "  cancel-in-progress: false" \
+    && pass "concurrency does not cancel a sweep in progress" || fail "docker-publish-watchdog.yml concurrency must be cancel-in-progress: false"
   for v in STUCK_JOB_MINUTES STUCK_RUN_MINUTES STALE_ACTION; do
     grep -q "^ *${v}: " "$wd" && pass "passes ${v} to the finder" || fail "docker-publish-watchdog.yml does not set ${v}"
   done

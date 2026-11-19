@@ -72,9 +72,16 @@ on:
 
 permissions: {}
 
+# NOT cancel-in-progress (#6289). The watchdog starts on Docker Publish
+# workflow_run events, and its own cancel ends a Docker Publish run, which
+# starts another watchdog. Cancelling the sweep in progress would kill it
+# while it writes its summary and ::error lines: the run would read
+# "cancelled", not red, and the next sweep finds nothing, so a cancel would go
+# unreported. A newer sweep waits instead; the group still replaces older
+# waiting ones, so at most one waits.
 concurrency:
   group: docker-publish-watchdog
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   sweep:
