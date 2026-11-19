@@ -5245,8 +5245,10 @@ mod tests {
             leader_result.is_ok(),
             "the leader read the row before the revocation: {leader_result:?}"
         );
+        // The DB lookup's revoked-row refusal, exactly what this request got
+        // on main.
         assert!(
-            matches!(late_result, Err(AppError::Authentication(_))),
+            matches!(&late_result, Err(AppError::Unauthorized(msg)) if msg.contains("revoked")),
             "a request that joined after the revocation is refused: {late_result:?}"
         );
         assert_eq!(
