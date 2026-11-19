@@ -15036,6 +15036,77 @@ const REFERRERS_SQL: &str = r#"
     ORDER BY s.created_at, s.manifest_digest
 "#;
 
+/// The referrers of `digest` in one non-virtual repository, as a direct
+/// `referrers` request on it lists them.
+async fn repo_referrer_rows(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    digest: &str,
+) -> Result<Vec<ReferrerRow>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, ReferrerRow>(REFERRERS_SQL)
+        .bind(repo.id)
+        .bind(digest)
+        .fetch_all(&state.db)
+        .await?;
+    // #5793: on a hosted repository a referrer is listed under `<name>` only
+    // when it resolves under that image, as a pull of it by digest would.
+    if !stores_own_manifests(&repo.repo_type) {
+        return Ok(rows);
+    }
+    let mut scoped = Vec::with_capacity(rows.len());
+    for row in rows {
+        if resolve_hosted_digest(state, repo, &row.manifest_digest)
+            .await?
+            .is_some()
+        {
+            scoped.push(row);
+        }
+    }
+    Ok(scoped)
+}
+
+/// The referrers of `digest` through a Virtual repository (#5792): the
+/// referrers of every member the CALLER may read, in member priority order,
+/// each descriptor listed once (the first member that lists a digest wins).
+///
+/// `auth` is the CALLER. Members are narrowed through the same
+/// [`proxy_helpers::try_authorize_virtual_members`] filter the manifest, blob
+/// and tags walks apply (#3268 review F2), so a member the caller may not read
+/// contributes nothing and its existence is not leaked. The fallible form is
+/// used because the result is aggregated: a failed member query is answered
+/// as a server error, not as an empty index. Each member is read exactly as a
+/// direct `referrers` request on it would be ([`repo_referrer_rows`]); the
+/// expansion already flattens nested Virtual members into their leaves.
+async fn virtual_referrer_rows(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
+    digest: &str,
+) -> Result<Vec<ReferrerRow>, Response> {
+    let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id)
+        .await
+        .map_err(|resp| oci_db_error_from(&resp))?;
+    let members = proxy_helpers::try_authorize_virtual_members(&state.db, auth, repo.id, members)
+        .await
+        .map_err(|resp| oci_db_error_from(&resp))?;
+    let mut seen = std::collections::HashSet::new();
+    let mut merged = Vec::new();
+    for member in &members {
+        if member.repo_type == RepositoryType::Virtual {
+            continue;
+        }
+        let member_repo = oci_repo_info_from_member(member, &repo.image);
+        let rows = repo_referrer_rows(state, &member_repo, digest)
+            .await
+            .map_err(|e| oci_db_error(&e))?;
+        merged.extend(
+            rows.into_iter()
+                .filter(|row| seen.insert(row.manifest_digest.clone())),
+        );
+    }
+    Ok(merged)
+}
+
 /// `GET /v2/<name>/referrers/<digest>` (distribution-spec 1.1, #3108).
 ///
 /// Returns an image index whose `manifests` are descriptors of every manifest
@@ -15046,8 +15117,10 @@ const REFERRERS_SQL: &str = r#"
 /// principals.
 ///
 /// Subject edges are recorded at manifest-PUT time (hosted repos, the only
-/// ones that accept pushes), so Remote/Virtual repositories answer from the
-/// same local table — typically the empty index.
+/// ones that accept pushes), so a Remote repository answers from the same
+/// local table — typically the empty index. A Virtual repository owns no
+/// rows: it answers the merged referrers of its members (#5792), see
+/// [`virtual_referrer_rows`].
 async fn handle_referrers(
     state: &SharedState,
     headers: &HeaderMap,
@@ -15056,8 +15129,7 @@ async fn handle_referrers(
     digest: &str,
     query: &std::collections::HashMap<String, String>,
 ) -> Response {
-    let (repo, _claims) = match authorize_oci_repo_read(state, headers, base_url, image_name).await
-    {
+    let (repo, claims) = match authorize_oci_repo_read(state, headers, base_url, image_name).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -15070,29 +15142,19 @@ async fn handle_referrers(
         );
     }
 
-    let rows = match sqlx::query_as::<_, ReferrerRow>(REFERRERS_SQL)
-        .bind(repo.id)
-        .bind(digest)
-        .fetch_all(&state.db)
-        .await
-    {
-        Ok(rows) => rows,
-        Err(e) => return oci_db_error(&e),
-    };
-    // #5793: on a hosted repository a referrer is listed under `<name>` only
-    // when it resolves under that image, as a pull of it by digest would.
-    let rows = if stores_own_manifests(&repo.repo_type) {
-        let mut scoped = Vec::with_capacity(rows.len());
-        for row in rows {
-            match resolve_hosted_digest(state, &repo, &row.manifest_digest).await {
-                Ok(Some(_)) => scoped.push(row),
-                Ok(None) => {}
-                Err(e) => return oci_db_error(&e),
-            }
+    let rows = if repo.repo_type == RepositoryType::Virtual {
+        // The read gate above authorizes the Virtual PARENT only; the member
+        // set is narrowed to what this caller may read (#3268 review F2).
+        let auth = virtual_caller_auth(claims.as_ref());
+        match virtual_referrer_rows(state, &repo, auth.as_ref(), digest).await {
+            Ok(rows) => rows,
+            Err(resp) => return resp,
         }
-        scoped
     } else {
-        rows
+        match repo_referrer_rows(state, &repo, digest).await {
+            Ok(rows) => rows,
+            Err(e) => return oci_db_error(&e),
+        }
     };
 
     let filter = query.get("artifactType").map(|s| s.as_str());
@@ -49785,6 +49847,214 @@ mod oci_read_authz_tests {
              members' tags through the virtual — the filter narrows to the \
              caller's visible members, it does not deny everyone; got {granted_tags:?}"
         );
+    }
+
+    /// #5792: `GET /v2/<virtual>/<image>/referrers/<digest>` answered an empty
+    /// index, because the Virtual itself owns no `oci_manifest_subjects`
+    /// rows and its members were never consulted, so `oras discover` listed
+    /// nothing and cosign v3 (new bundle format) found no signature through
+    /// the Virtual. It now merges the referrers of the members the caller may
+    /// read, in member order, each digest once, with the `artifactType` filter
+    /// and `OCI-Filters-Applied` applied to the merged list.
+    ///
+    /// Fixture: a PUBLIC Virtual over the PRIVATE fixture repo (priority 1)
+    /// and a PUBLIC hosted repo (priority 2). The same signature referrer is
+    /// pushed into both (dedupe), an SBOM only into the private member, and a
+    /// second SBOM only into the public member.
+    #[tokio::test]
+    async fn virtual_referrers_merge_readable_members_5792() {
+        const SIG_TYPE: &str = "application/vnd.example.sig";
+        const SBOM_TYPE: &str = "application/vnd.example.sbom";
+
+        fn referrer(artifact_type: &str, subject: &str, marker: &str) -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "artifactType": artifact_type,
+                "config": {"mediaType": "application/vnd.oci.empty.v1+json",
+                           "digest": format!("sha256:{}", "6".repeat(64)), "size": 2},
+                "layers": [{"mediaType": "application/vnd.example.layer",
+                            "digest": format!("sha256:{}", "7".repeat(64)), "size": 2}],
+                "subject": {"mediaType": "application/vnd.oci.image.manifest.v1+json",
+                            "digest": subject, "size": 100},
+                "annotations": {"org.example.marker": marker},
+            }))
+            .unwrap()
+        }
+
+        fn digests(body: &Bytes) -> Vec<String> {
+            let index: serde_json::Value = serde_json::from_slice(body).expect("index json");
+            index["manifests"]
+                .as_array()
+                .expect("manifests array")
+                .iter()
+                .map(|d| d["digest"].as_str().unwrap().to_string())
+                .collect()
+        }
+
+        let Some(mut f) = ReadFixture::setup().await else {
+            return;
+        };
+        let (public_id, public_key, public_dir) =
+            tdh::create_repo(&f.pool, "local", "docker").await;
+        let (virt_id, virt_key, virt_dir) = tdh::create_repo(&f.pool, "virtual", "docker").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
+            .bind(vec![public_id, virt_id])
+            .execute(&f.pool)
+            .await
+            .expect("publish member + virtual");
+        for (member, priority) in [(f.repo_id, 1i32), (public_id, 2i32)] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(virt_id)
+            .bind(member)
+            .bind(priority)
+            .execute(&f.pool)
+            .await
+            .expect("link virtual member");
+        }
+
+        let subject = format!("sha256:{}", "5".repeat(64));
+        let sig = referrer(SIG_TYPE, &subject, "shared-sig");
+        let private_sbom = referrer(SBOM_TYPE, &subject, "private-sbom");
+        let public_sbom = referrer(SBOM_TYPE, &subject, "public-sbom");
+        let (sig_d, private_sbom_d, public_sbom_d) = (
+            compute_sha256(&sig),
+            compute_sha256(&private_sbom),
+            compute_sha256(&public_sbom),
+        );
+
+        let admin = f.add_user(true).await;
+        let admin_bearer = f.bearer(admin).await;
+        for (key, body) in [
+            (&f.repo_key, &sig),
+            (&f.repo_key, &private_sbom),
+            (&public_key, &sig),
+            (&public_key, &public_sbom),
+        ] {
+            let req = Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/{}/{}/manifests/{}",
+                    key,
+                    IMAGE,
+                    compute_sha256(body)
+                ))
+                .header(AUTHORIZATION, &admin_bearer)
+                .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+                .body(Body::from(body.clone()))
+                .unwrap();
+            let (status, resp_body) =
+                tdh::send(router(None).with_state(f.state.clone()), req).await;
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "push referrer into {key}: {}",
+                String::from_utf8_lossy(&resp_body)
+            );
+        }
+
+        let path = format!("/{}/{}/referrers/{}", virt_key, IMAGE, subject);
+        let filtered_path = format!("{path}?artifactType=application%2Fvnd.example.sbom");
+        let anon = format!("Bearer {ANONYMOUS_TOKEN}");
+        let outsider = f.add_user(false).await;
+        let outsider_bearer = f.bearer(outsider).await;
+        let member_bearer = f.bearer(f.member_id).await;
+
+        let (granted, granted_body, granted_headers) = f
+            .call_with_headers("GET", path.clone(), &member_bearer)
+            .await;
+        let (filtered, filtered_body, filtered_headers) = f
+            .call_with_headers("GET", filtered_path, &member_bearer)
+            .await;
+        let (anon_status, anon_body, _) = f.call_with_headers("GET", path.clone(), &anon).await;
+        let (outsider_status, outsider_body, _) = f
+            .call_with_headers("GET", path.clone(), &outsider_bearer)
+            .await;
+        let (direct, direct_body, _) = f
+            .call_with_headers(
+                "GET",
+                format!("/{}/{}/referrers/{}", public_key, IMAGE, subject),
+                &anon,
+            )
+            .await;
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virt_id)
+            .execute(&f.pool)
+            .await;
+        for repo in [f.repo_id, public_id] {
+            for table in ["oci_manifest_subjects", "manifest_blob_refs", "artifacts"] {
+                let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                    "DELETE FROM {table} WHERE repository_id = $1"
+                )))
+                .bind(repo)
+                .execute(&f.pool)
+                .await;
+            }
+        }
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(public_id)
+            .execute(&f.pool)
+            .await;
+        for repo in [public_id, virt_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo)
+                .execute(&f.pool)
+                .await;
+        }
+        let _ = std::fs::remove_dir_all(&public_dir);
+        let _ = std::fs::remove_dir_all(&virt_dir);
+        f.teardown().await;
+
+        assert_eq!(direct, StatusCode::OK);
+        assert_eq!(
+            digests(&direct_body),
+            vec![sig_d.clone(), public_sbom_d.clone()],
+            "control: the hosted member lists its referrers directly"
+        );
+
+        assert_eq!(granted, StatusCode::OK);
+        assert_eq!(
+            granted_headers.get(CONTENT_TYPE).unwrap(),
+            OCI_INDEX_MEDIA_TYPE
+        );
+        assert!(
+            granted_headers.get("OCI-Filters-Applied").is_none(),
+            "no artifactType param, no OCI-Filters-Applied header"
+        );
+        assert_eq!(
+            digests(&granted_body),
+            vec![sig_d.clone(), private_sbom_d.clone(), public_sbom_d.clone()],
+            "the Virtual must list its members' referrers in member order, the \
+             signature both members hold once (#5792)"
+        );
+
+        assert_eq!(filtered, StatusCode::OK);
+        assert_eq!(
+            filtered_headers.get("OCI-Filters-Applied").unwrap(),
+            "artifactType"
+        );
+        assert_eq!(
+            digests(&filtered_body),
+            vec![private_sbom_d.clone(), public_sbom_d.clone()],
+            "the artifactType filter applies to the merged list"
+        );
+
+        for (who, status, body) in [
+            ("anonymous", anon_status, &anon_body),
+            ("ungranted", outsider_status, &outsider_body),
+        ] {
+            assert_eq!(status, StatusCode::OK, "{who} lists the public Virtual");
+            assert_eq!(
+                digests(body),
+                vec![sig_d.clone(), public_sbom_d.clone()],
+                "a {who} caller sees only the public member's referrers, never \
+                 the private member's"
+            );
+        }
     }
 
     /// #3325, driven end-to-end through the real `tags/list` route: a grant
