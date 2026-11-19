@@ -3774,7 +3774,10 @@ where
     // when nothing serves.
     let mut any_unavailable = false;
     for member in members {
-        let (mut class, hit) = probe(member).await;
+        // Boxed (#6270): a member probe future held inline makes this
+        // function's poll frame large enough to overflow a debug-build test
+        // thread's stack together with the handler frames above it.
+        let (mut class, hit) = Box::pin(probe(member)).await;
         // A probe that could not answer is a definite non-winner here; it is
         // remembered, not offered as the Pass-1 fallback winner. In strict
         // mode (#5810) it is terminal like a policy block: Pass 1 stops
@@ -3838,7 +3841,10 @@ where
             },
             None => None,
         };
-        let fetch = upstream(member);
+        // Boxed for the same reason as the Pass-1 probe above (#6270): this
+        // future is held inline by `bounded`, the Pass-2 `FuturesUnordered`
+        // task and this walk's own state.
+        let fetch = Box::pin(upstream(member));
         futures::future::Either::Right(async move {
             let _admission = admission;
             let Some(deadline) = walk.deadline else {
@@ -4858,7 +4864,9 @@ where
     // PyPI simple index, ...) classifies as mutable regardless of format, so the
     // synthesized `build_remote_repo` format in `proxy_fetch` changes nothing.
     let transform = &transform;
-    let outcome = resolve_members_two_phase::<Response, Response, _, _, _, _>(
+    // Boxed (#6270): the walk's future is large, and holding it inline in
+    // each caller's future overflows the stack of a debug-build test thread.
+    let outcome = Box::pin(resolve_members_two_phase::<Response, Response, _, _, _, _>(
         &members,
         |member| async move {
             if member.repo_type != RepositoryType::Remote {
@@ -4996,7 +5004,7 @@ where
             path,
             ..MemberWalk::default()
         },
-    )
+    ))
     .await;
 
     match outcome {
