@@ -47,6 +47,14 @@ ignore = [
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
     "RUSTSEC-2026-0429",
+    # Same zip 2.4.2 build dependency: RUSTSEC-2026-0545 needs an AES-encrypted
+    # entry read with a password, and 2.4.2 is built without its `aes-crypto`
+    # feature. RUSTSEC-2026-0548 is in the streaming reader (ZipStreamReader,
+    # read_zipfile_from_stream), and the swagger-ui build.rs only uses
+    # ZipArchive::by_index. The backend's own zip 9.x has both fixes. Remove
+    # together with the four above (#6156).
+    "RUSTSEC-2026-0545",
+    "RUSTSEC-2026-0548",
 
     # crypto-bigint timing variability (RUSTSEC-2026-0387, patched only in
     # >= 0.7.6). The 0.7.x copy (via kryptering under bergshamra) is on 0.7.6.

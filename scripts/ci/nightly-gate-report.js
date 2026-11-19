@@ -22,7 +22,7 @@
 //
 // ISSUES (REPORT_TRACK=true). One open issue per red (line, tier), found by
 // the marker `<!-- nightly-gate-tier: <line>|<tier> -->` among open issues
-// labelled `release-gate`:
+// labelled `release-gate` (a lane's: `nightly-lane`, see LANES):
 //   red, no issue    open one, naming the first red commit and the last
 //                    green one before it: the range the cause is in. Both
 //                    come from earlier runs' verdict records (the
@@ -81,6 +81,9 @@
 //   * its record goes to the artifact `nightly-lane-verdict-<lane>` (kind
 //     nightly-lane), and its history walk reads only that artifact, so
 //     #6075 and preflight, which read `nightly-gate-verdict`, never see it;
+//   * its issues are labelled `nightly-lane`, not `release-gate`, so a red
+//     lane does not read as a gate failure, and its lookup of open issues
+//     searches only that label;
 //   * it never writes the `release-gate/nightly` commit status.
 'use strict';
 
@@ -94,7 +97,14 @@ const ARTIFACT = 'nightly-gate-verdict';
 const LANE_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const STATUS_CONTEXT = 'release-gate/nightly';
 const AGGREGATE = 'collect-results';
-const LABELS = ['automated', 'release-gate'];
+const GATE_LABEL = 'release-gate';
+const LANE_LABEL = 'nightly-lane';
+
+// The tracking label: the gate's issues are `release-gate`, a lane's are
+// `nightly-lane` (a red lane is not a gate failure).
+function trackingLabel(lane) {
+  return lane ? LANE_LABEL : GATE_LABEL;
+}
 const RED = new Set(['failure', 'timed_out', 'cancelled', 'startup_failure']);
 const MARKER_RE = /<!-- nightly-gate-tier: (.+?) -->/;
 
@@ -296,9 +306,9 @@ function listJobs(repo, runId) {
     '--jq', '.jobs[] | {name, conclusion, html_url}']));
 }
 
-function listOpenIssues(repo) {
+function listOpenIssues(repo, label) {
   return jsonLines(gh(['api', '--paginate',
-    `repos/${repo}/issues?state=open&labels=release-gate&per_page=100`,
+    `repos/${repo}/issues?state=open&labels=${label}&per_page=100`,
     '--jq', '.[] | select(.pull_request | not) | {number, title, body}']));
 }
 
@@ -342,7 +352,7 @@ function historyReader(repo, workflow, currentRunId, limit, artifact = ARTIFACT)
   };
 }
 
-function applyAction(repo, a, dry) {
+function applyAction(repo, a, dry, label) {
   const say = { open: `OPEN   "${a.title}"`, comment: `COMMENT #${a.number}`, close: `CLOSE  #${a.number}` }[a.type];
   console.log(`${dry ? '[dry run] ' : ''}${say}`);
   if (dry) {
@@ -351,7 +361,7 @@ function applyAction(repo, a, dry) {
   }
   if (a.type === 'open') {
     const args = ['api', `repos/${repo}/issues`, '-f', `title=${a.title}`, '-f', `body=${a.body}`];
-    for (const l of LABELS) args.push('-f', `labels[]=${l}`);
+    for (const l of ['automated', label]) args.push('-f', `labels[]=${l}`);
     return Number(gh([...args, '--jq', '.number']).trim());
   }
   gh(['api', `repos/${repo}/issues/${a.number}/comments`, '-f', `body=${a.body}`, '--jq', '.id']);
@@ -436,7 +446,7 @@ function main() {
   if (attempt > 1) {
     console.log('re-run attempt: the gate did not run again (see the workflow), so nothing is tracked');
   } else if (truthy(env.REPORT_TRACK) || selfTest) {
-    const open = listOpenIssues(repo);
+    const open = listOpenIssues(repo, trackingLabel(lane));
     const history = historyReader(repo, env.REPORT_WORKFLOW || 'nightly-release-gate.yml', runId,
       Number(env.REPORT_HISTORY_RUNS || '20'), artifactName(lane));
     summary.push('', '### Tracking issues', '');
@@ -445,7 +455,7 @@ function main() {
       const current = { sha: l.sha, tests_sha: l.tests_sha, run_id: Number(runId) };
       const actions = planIssues(ctx, l, open, (tier) => redRange(l.line, tier, current, history));
       for (const a of actions) {
-        const n = applyAction(repo, a, dry);
+        const n = applyAction(repo, a, dry, trackingLabel(lane));
         summary.push(`- ${a.type} ${n ? `#${n}` : `"${a.title}"`}${dry ? ' (dry run)' : ''}`);
       }
     }
@@ -472,6 +482,6 @@ function main() {
   console.log(summary.join('\n'));
 }
 
-module.exports = { tierKey, classifyLine, redRange, planIssues, markerOf, issueKey, openBody, laneLine, artifactName };
+module.exports = { trackingLabel, tierKey, classifyLine, redRange, planIssues, markerOf, issueKey, openBody, laneLine, artifactName };
 
 if (require.main === module) main();

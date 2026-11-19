@@ -1233,13 +1233,6 @@ async fn upload_chart(
     // through the pool, so it can only run once the rows are visible; metadata
     // recording is best-effort by contract.
     quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id).await;
-    crate::services::scanner_service::trigger_scan_on_upload(
-        &state.db,
-        state.scanner_service.clone(),
-        repo.id,
-        artifact_id,
-    )
-    .await;
 
     // Build metadata JSON including the full Chart.yaml data
     let helm_metadata = serde_json::json!({
@@ -1254,6 +1247,16 @@ async fn upload_chart(
         repo.id,
         "helm",
         &helm_metadata,
+    )
+    .await;
+
+    // #5692: the scan reads the chart metadata above for declared dependencies,
+    // so enqueue it only once that write has landed.
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
     )
     .await;
 

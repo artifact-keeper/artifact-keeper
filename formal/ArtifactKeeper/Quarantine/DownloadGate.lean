@@ -7,6 +7,12 @@ A model of `check_download_allowed`, `admin_quarantine_allowed` and
 The gate reads `artifacts.quarantine_status` and `quarantine_until`. This file
 proves what the gate guarantees about each kind of hold as time passes, and
 records one thing it does not guarantee.
+
+Paired Rust tests: `download_gate_props` in
+`backend/src/services/quarantine_service.rs` checks the theorems as
+properties, and `matches_the_vectors_generated_from_the_lean_model` replays
+every answer in `formal/vectors/quarantine_download_gate.txt`, which
+`lake exe ak-oracle emit quarantine_download_gate` generates from this model.
 -/
 
 namespace ArtifactKeeper.Quarantine.DownloadGate

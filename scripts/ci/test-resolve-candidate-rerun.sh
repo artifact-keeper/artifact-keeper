@@ -159,6 +159,19 @@ expect "release-gate.yml changed, tests=same -> BLOCKED" 1 "dispatch again with 
 CASE_TESTS=moved
 expect "release-gate.yml changed, tests=moved -> allowed and flagged" 0 "gate_changed=true"
 expect "tests=moved pins nothing" 0 "pin_tests_sha="$'\n'
+# The callers pin release-gate.yml by sha (#6170): referenced_workflows then
+# records `...release-gate.yml@<sha>`, and an original from before the pin
+# recorded `@main`. The resolver matches the path by prefix and compares the
+# file's blob, so a pin bump between original and rerun is judged exactly
+# like main moving was: same blob -> same; different blob -> tests=moved.
+pin_self() { edit self_run.json ".referenced_workflows[0] = {path: \"artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@$1\", sha: \"$1\"}"; }
+reset_case; pin_self "$GATE_A"
+expect "original @main, rerun pinned to the same commit: same" 0 "gate_changed=false"
+reset_case; edit orig_run.json ".referenced_workflows[0] = {path: \"artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@$GATE_A\", sha: \"$GATE_A\"}"
+pin_self "$GATE_B"; echo '{"sha":"blobB"}' > "$F/blob_${GATE_B}.json"
+expect "a pin bump that changed release-gate.yml, tests=same -> BLOCKED" 1 "dispatch again with tests=moved"
+CASE_TESTS=moved
+expect "a pin bump that changed release-gate.yml, tests=moved -> allowed and flagged" 0 "gate_changed=true"
 reset_case; CASE_TESTS=sideways
 expect "an unknown tests mode -> BLOCKED" 1 "tests must be 'same' or 'moved'"
 
@@ -252,6 +265,26 @@ reset_case; CASE_MODE=coverage
 expect "every gate job of the rerun ran in the original" 0 "also ran in the original"
 edit self_jobs.json ".jobs += [$(job "$G / dtf-gate (brand-new-group)" success), $(job "$G / brand-new-tests" success)]"
 expect "a gate job or leg the original never ran -> BLOCKED" 1 "brand-new-tests dtf-gate/brand-new-group"
+# #6163, the first real rerun (44106249514): only_jobs named a suite and no
+# dtf-gate leg, so GitHub listed the whole matrix as ONE skipped job with its
+# name unexpanded. It is not a leg and must not refuse certification.
+reset_case; CASE_MODE=coverage
+printf '%s' '{"jobs":[]}' > "$F/self_jobs.json"
+edit self_jobs.json ".jobs += [$(job "$G / version-set-integrity" success), $(job "$G / webhook-tests" success), $(job "$G / collect-results" success), $(job "$G / dtf-gate (\${{ matrix.group }})" skipped)]"
+expect "suite-only rerun: the skipped unexpanded dtf-gate matrix is not a new leg" 0 "also ran in the original"
+# ...but only the PLACEHOLDER is dropped. A real job the gate gained since the
+# original, skipped by this rerun, was tested by neither run: still refused.
+edit self_jobs.json ".jobs += [$(job "$G / brand-new-tests" skipped)]"
+expect "a skipped job the original never ran is still BLOCKED" 1 "brand-new-tests"
+# ...nor a skipped dtf-gate LEG the original never ran (the matrix expanded),
+reset_case; CASE_MODE=coverage
+edit self_jobs.json ".jobs += [$(job "$G / dtf-gate (brand-new-group)" skipped)]"
+expect "a skipped dtf-gate leg the original never ran is still BLOCKED" 1 "dtf-gate/brand-new-group"
+# ...nor ANOTHER matrix skipped as a whole: only the dtf-gate placeholder is
+# dropped, by its exact name.
+reset_case; CASE_MODE=coverage
+edit self_jobs.json ".jobs += [$(job "$G / brand-new-matrix (\${{ matrix.x }})" skipped)]"
+expect "another unexpanded matrix the original never ran is still BLOCKED" 1 "brand-new-matrix"
 
 if [ "$fails" -ne 0 ]; then
   echo "candidate rerun resolver: $fails case(s) FAILED"
