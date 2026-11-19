@@ -1838,13 +1838,14 @@ fn run_healthcheck_subcommand_if_requested() {
 }
 
 #[cfg(not(windows))]
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
     run_healthcheck_subcommand_if_requested();
-    tokio::runtime::Builder::new_multi_thread()
+    let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("Failed to create tokio runtime")
-        .block_on(run_server(None))
+        .block_on(run_server(None));
+    artifact_keeper_backend::telemetry::exit_code(result)
 }
 
 #[cfg(windows)]
