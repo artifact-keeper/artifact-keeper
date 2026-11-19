@@ -1870,8 +1870,9 @@ impl ScanResultService {
         //
         // Invariant relied upon: scan_findings rows are only ever deleted
         // via the `ON DELETE CASCADE` from scan_results(id) (migration 022),
-        // or by `reopen_failed_scan` (#5942), which first locks the parent
-        // row FOR UPDATE and so conflicts with the FOR SHARE taken here.
+        // or by `clear_retry_leftovers` (#5942, from `create_findings_for_row`
+        // and `convert_to_reused`), which first locks the parent row FOR
+        // UPDATE and so conflicts with the FOR SHARE taken here.
         // Any other direct `DELETE FROM scan_findings WHERE scan_result_id
         // = $X` would NOT be blocked by FOR SHARE on the parent row and would
         // re-open this race. Don't add one without locking the parent too.
@@ -2374,7 +2375,13 @@ impl ScanResultService {
     /// - `started_at` moves to now, so the stuck-scan janitor (which reaps by
     ///   `started_at`) times the retry from its own start, not from the first
     ///   attempt or the queue time;
-    /// - the completion time and the `failed` inventory are cleared;
+    /// - the `failed` inventory is cleared. The completion time is KEPT (the
+    ///   failed attempt's): the per-scanner "latest row" readers
+    ///   (`LATEST_PER_SCAN_TYPE_SQL`, the repository coverage windows) order
+    ///   by `completed_at DESC NULLS LAST`, and a NULL would let an older
+    ///   completed row of the same scanner outrank the reopened one, hiding
+    ///   the failure below. The retry's own completion or failure sets it to
+    ///   now;
     /// - the recorded failure is KEPT, under
     ///   [`RETRYING_AFTER_FAILURE_PREFIX`](crate::services::scan_state::RETRYING_AFTER_FAILURE_PREFIX):
     ///   the gates count the row as that failure until the retry completes it
@@ -2393,7 +2400,7 @@ impl ScanResultService {
             UPDATE scan_results
             SET status = 'running',
                 error_message = $2 || COALESCE(error_message, 'no error recorded'),
-                completed_at = NULL, inventory_status = 'complete', started_at = NOW()
+                inventory_status = 'complete', started_at = NOW()
             WHERE id = $1 AND status = 'failed'
             "#,
         )
