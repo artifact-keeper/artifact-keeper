@@ -1741,6 +1741,11 @@ impl LifecycleService {
                 deleted_at,
             )
             .await;
+            // #5244: the bulk soft delete publishes no `artifact.deleted`, so
+            // the score refresher never sees it and the repository kept the
+            // deleted artifacts' findings in its grade until its next scan
+            crate::services::scan_result_service::refresh_existing_score(&self.db, repository_id)
+                .await;
         }
 
         Ok(result)
@@ -2952,6 +2957,89 @@ mod tests {
         );
 
         tx.rollback().await.expect("failed to roll back test data");
+    }
+
+    /// #5244: a lifecycle run that deletes a scanned artifact refreshes the
+    /// repository's security score, which kept the artifact's findings until
+    /// the next scan
+    #[tokio::test]
+    async fn test_execute_policy_refreshes_security_score_5244() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::scan_result_service::ScanResultService;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mut conn = pool.acquire().await.expect("acquire");
+        let repository_id = insert_max_age_test_repository(&mut conn).await;
+        let artifact_id =
+            insert_max_age_test_artifact(&mut conn, repository_id, "app/old", "1", "old", 30).await;
+        drop(conn);
+        let scan_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, completed_at) \
+             VALUES ($1, $2, 'dependency', 'completed', NOW()) RETURNING id",
+        )
+        .bind(artifact_id)
+        .bind(repository_id)
+        .fetch_one(&pool)
+        .await
+        .expect("scan");
+        sqlx::query(
+            "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title, cve_id, \
+                                        affected_component, affected_version) \
+             VALUES ($1, $2, 'high', 't', 'CVE-2031-5244', 'lodash', '4')",
+        )
+        .bind(scan_id)
+        .bind(artifact_id)
+        .execute(&pool)
+        .await
+        .expect("finding");
+        let before = ScanResultService::new(pool.clone())
+            .recalculate_score(repository_id)
+            .await
+            .expect("recalculate_score");
+        assert_eq!((before.total_findings, before.high_count), (1, 1));
+
+        let service = LifecycleService::new(pool.clone());
+        let policy = service
+            .create_policy(CreateLifecyclePolicyRequest {
+                applies_to_all: false,
+                repository_ids: None,
+                repository_id: Some(repository_id),
+                name: format!("max-age-score-{repository_id}"),
+                description: None,
+                policy_type: "max_age_days".to_string(),
+                config: json!({"days": 7}),
+                priority: None,
+                cron_schedule: None,
+                enabled: None,
+            })
+            .await
+            .expect("create lifecycle policy");
+        let execution = service
+            .execute_policy(policy.id, false)
+            .await
+            .expect("execute lifecycle policy");
+        assert_eq!(execution.artifacts_removed, 1);
+
+        let after: (i32, i32, String) = sqlx::query_as(
+            "SELECT total_findings, high_count, grade FROM repo_security_scores \
+             WHERE repository_id = $1",
+        )
+        .bind(repository_id)
+        .fetch_one(&pool)
+        .await
+        .expect("score row");
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repository_id)
+            .execute(&pool)
+            .await;
+        assert_eq!(
+            after,
+            (0, 0, "A".to_string()),
+            "the deleted artifact's finding must leave the repository score"
+        );
     }
 
     #[tokio::test]
