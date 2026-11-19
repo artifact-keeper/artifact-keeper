@@ -788,8 +788,8 @@ jobs:
   windows-cross-check:
     name: 🪟 Windows Cross-Check
     runs-on: ubuntu-24.04
-    # Cold, a check of the whole graph is about as long as a cold clippy
-    # (see check-rust's 30-minute note); warm, only the workspace crate.
+    # Always cold (no rust-cache, see below): 6-11 minutes for the check,
+    # plus at most 2 x 6 minutes of package install on a slow mirror.
     timeout-minutes: 30
     needs: [changes, release-bump]
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
@@ -808,17 +808,42 @@ jobs:
       - name: Assert the pinned Rust toolchain is in force
         run: ./scripts/ci/check-toolchain-pin.sh --active
 
-      # release.yml's two install steps for this leg, in one.
-      - name: Install protoc and mingw-w64
+      # Only the x86_64 cross compilers, not release.yml's `mingw-w64`
+      # (#6242). That metapackage is 280 MB: i686 and x86_64, posix and
+      # win32 threads, gcc and g++. On runners whose apt mirror is
+      # us-east-2.ec2.archive.ubuntu.com it downloads at 50-100 kB/s, and
+      # this step, not the check, is what ran into the 30-minute ceiling on
+      # 2026-11-18/19: 20 of 66 runs hit the ceiling in it, none in the check
+      # (azure.archive runs fetch it in 20 s). x86_64 posix gcc and g++ are
+      # ~80 MB and all a check needs: build scripts compile C (openssl-src,
+      # aws-lc-sys, ring, libgit2-sys, zstd-sys, lzma-sys, libz-sys,
+      # libsqlite3-sys) with x86_64-w64-mingw32-gcc; g++ in case a
+      # cmake-driven one enables CXX.
+      #
+      # Each attempt gets 6 minutes. A slow mirror then fails the attempt,
+      # and the second one goes to azure.archive.ubuntu.com and
+      # archive.ubuntu.com instead of crawling into the job ceiling.
+      - name: Install protoc and the x86_64 mingw-w64 cross compilers
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev mingw-w64
+          pkgs=(protobuf-compiler pkg-config libssl-dev gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix)
+          echo "apt mirrors: $(tr '\n' ' ' < /etc/apt/apt-mirrors.txt 2>/dev/null)"
+          install() {
+            sudo timeout 6m apt-get update -o Acquire::Retries=3 \
+              && sudo timeout 6m apt-get install -y --no-install-recommends -o Acquire::Retries=3 "${pkgs[@]}"
+          }
+          if ! install; then
+            echo "::warning title=Slow apt mirror::installing the mingw cross compilers did not finish in 6 minutes; retrying on azure.archive.ubuntu.com / archive.ubuntu.com."
+            printf 'http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\nhttp://archive.ubuntu.com/ubuntu/\tpriority:2\n' \
+              | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+            install
+          fi
+          x86_64-w64-mingw32-gcc --version | head -1
 
-      # No rust-cache, on purpose. The repo cache is over its 10 GiB quota,
-      # so a windows-check entry would evict release.yml's cli-* entries
-      # (least recently used) and make release builds cold (#6218). Most main
-      # pushes skip the Rust jobs anyway, so the entry would rarely be fresh.
-      # A cold check is ~5-15 min, in parallel, off the critical path.
+      # No rust-cache: a cold check of the whole graph is 6-11 minutes
+      # (2026-11-18/19, every run that got past the install), and the repo
+      # cache is at its 10 GiB quota, where a windows-check entry would evict
+      # release.yml's cli-* entries (least recently used) and make release
+      # builds cold (#6218).
 
       # The workspace crate's rustc is the one heavy step here, as in
       # check-rust, whose cgroup peaks at ~15 GiB on the same VM. Same
@@ -3629,7 +3654,7 @@ jobs:
     # Not smoke-e2e, build-backend-image or build-openscap-image: they are
     # advisory (see the container-chain note in the step below), and a
     # `needs` edge would make this required context wait ~25 min for them.
-    needs: [changes, detect-changes, release-bump, check-rust, test-backend-unit-shard, test-backend-unit, workflow-contracts, shell-tests, version-pin-bump, scanner-adapter-go, go-floor-agreement, coverage-gates, security-audit]
+    needs: [changes, detect-changes, release-bump, check-rust, windows-cross-check, test-backend-unit-shard, test-backend-unit, workflow-contracts, shell-tests, version-pin-bump, scanner-adapter-go, go-floor-agreement, coverage-gates, security-audit]
     if: always()
     # The coverage decision reads the PR's live labels/draft state, the
     # override label's `labeled` events and `/coverage-override` comments,
@@ -3654,6 +3679,7 @@ jobs:
         # the shell control flow.
         env:
           RESULT_CHECK_RUST: ${{ needs.check-rust.result }}
+          RESULT_WINDOWS_CHECK: ${{ needs.windows-cross-check.result }}
           RESULT_UNIT: ${{ needs.test-backend-unit.result }}
           RESULT_UNIT_SHARDS: ${{ needs.test-backend-unit-shard.result }}
           RESULT_WORKFLOW_CONTRACTS: ${{ needs.workflow-contracts.result }}
@@ -3783,13 +3809,10 @@ jobs:
           }
 
           require_success "check-rust" "$RESULT_CHECK_RUST"
-          # The Windows cross-check (#6022) is advisory for now: it has no
-          # rust-cache (a cache for it would push the repo over its 10 GB
-          # quota and evict the release cli-* caches), so a cold check runs
-          # past its ceiling on a loaded day. It still runs on every Rust PR
-          # and main push, and a release is not tagged until it is green on
-          # the release-prep commit. Back to required once it has a cache or
-          # a faster form.
+          # The Windows cross-check (#6022) has check-rust's condition, so it
+          # may skip exactly where check-rust may. Advisory from #6243 until
+          # its mingw install stopped hanging (#6242).
+          require_success "windows-cross-check" "$RESULT_WINDOWS_CHECK"
           require_success "test-backend-unit" "$RESULT_UNIT"
           require_success "shell-tests" "$RESULT_SHELL"
 
