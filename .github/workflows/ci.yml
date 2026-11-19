@@ -363,7 +363,8 @@ jobs:
               scripts/ci/check-auth-event-audit.sh|\
               scripts/ci/check-migration-ledger.sh|\
               scripts/ci/check-duplicate-migrations.sh|\
-              scripts/ci/memory-watch.sh)
+              scripts/ci/memory-watch.sh|\
+              scripts/ci/apt-install-bounded.sh)
                 code=true
                 rust=true
                 ;;
@@ -632,8 +633,12 @@ jobs:
 
       # The self-hosted image shipped protoc; ubuntu-24.04 does not, and
       # build scripts in the dependency tree (which clippy runs) need it.
+      # Bounded (#6272): scripts/ci/apt-install-bounded.sh caps each download
+      # attempt at 3 minutes and retries on azure.archive.ubuntu.com, so a
+      # crawling mirror cannot hold the job to its ceiling.
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        timeout-minutes: 12
+        run: bash scripts/ci/apt-install-bounded.sh protobuf-compiler
 
       # Cache the dependency build so only the workspace crate recompiles.
       # ~635 deps are byte-identical run-to-run.
@@ -880,6 +885,8 @@ jobs:
       # half-configured, and everything after it fails on "dpkg was
       # interrupted". Worst case 2 x 6 minutes of download.
       - name: Install protoc and the x86_64 mingw-w64 cross compilers
+        # Outer bound over the 2 x 6-minute capped downloads and the install.
+        timeout-minutes: 20
         run: |
           # libprotobuf-dev: the well-known .proto files (timestamp.proto)
           # build.rs imports, a Recommends of protobuf-compiler that
@@ -1044,8 +1051,12 @@ jobs:
       # and build scripts in the dependency tree need it. services-1 also
       # gets squashfs-tools so the incus scanner's real mksquashfs/unsquashfs
       # tests run as the non-root runner user instead of skipping (#4470).
+      # Bounded (#6272): scripts/ci/apt-install-bounded.sh caps each download
+      # attempt at 3 minutes and retries on azure.archive.ubuntu.com, so a
+      # crawling mirror cannot hold the job to its ceiling.
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler ${{ matrix.shard == 'services-1' && 'squashfs-tools' || '' }}
+        timeout-minutes: 12
+        run: bash scripts/ci/apt-install-bounded.sh protobuf-compiler ${{ matrix.shard == 'services-1' && 'squashfs-tools' || '' }}
 
       # The instrumented dependency graph (~750 crates, 3.3 GB) is identical
       # in every leg, so all legs share one cache entry. Saved from `main`
@@ -1313,8 +1324,12 @@ jobs:
 
       # The self-hosted image shipped protoc; ubuntu-24.04 does not, and
       # build scripts in the dependency tree need it.
+      # Bounded (#6272): scripts/ci/apt-install-bounded.sh caps each download
+      # attempt at 3 minutes and retries on azure.archive.ubuntu.com, so a
+      # crawling mirror cannot hold the job to its ceiling.
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        timeout-minutes: 12
+        run: bash scripts/ci/apt-install-bounded.sh protobuf-compiler
 
       # The dependency graph and the library, saved from `main` only (see
       # the note on check-rust's rust-cache step). The pool job had no
@@ -1813,8 +1828,12 @@ jobs:
         with:
           tool: cargo-nextest
 
+      # Bounded (#6272): scripts/ci/apt-install-bounded.sh caps each download
+      # attempt at 3 minutes and retries on azure.archive.ubuntu.com, so a
+      # crawling mirror cannot hold the job to its ceiling.
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        timeout-minutes: 12
+        run: bash scripts/ci/apt-install-bounded.sh protobuf-compiler
 
       # The integration job's entry: the same uninstrumented dev-profile
       # dependency graph, dev-dependencies included. Restore only.
@@ -2135,6 +2154,13 @@ jobs:
       # the job it watches. Fixtures only, ~2s.
       - name: Check the memory sampler
         run: bash scripts/ci/test-memory-watch.sh
+
+      # The bounded apt install every "Install protoc" step runs (#6272): a
+      # hung mirror is killed and retried on azure, a dead one fails in
+      # bounded time, and the unpack itself is never time-boxed. Stub
+      # apt-get, ~10s.
+      - name: Check the bounded apt install
+        run: bash scripts/ci/test-apt-install-bounded.sh
 
       # What a Release Candidate rerun of the failed gate groups runs, and
       # whether it may run at all (#6076): the wrong commit, a non-candidate

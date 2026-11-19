@@ -240,10 +240,11 @@ jobs:
         with:
           targets: x86_64-pc-windows-gnu
 
+      # Bounded (#6272): each download attempt is capped and retried on
+      # azure.archive.ubuntu.com (scripts/ci/apt-install-bounded.sh).
       - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev mingw-w64
+        timeout-minutes: 15
+        run: APT_ATTEMPT_TIMEOUT=4m bash scripts/ci/apt-install-bounded.sh protobuf-compiler pkg-config libssl-dev mingw-w64
 
       # The 1.12 backend's release build fills the hosted VM's 15 GiB of RAM
       # and 2 GiB of swap. Over it, the runner stops answering instead of
