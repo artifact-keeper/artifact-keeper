@@ -178,6 +178,77 @@ pub const LISTING_MAX_POM_PROBES: usize = 64;
 /// How many POMs a listing fetches at once.
 pub const LISTING_POM_CONCURRENCY: usize = 8;
 
+/// How long a filtered listing that left versions undated is reused (#6284).
+///
+/// While a GA is still being dated, every filter pass dates the next
+/// [`LISTING_MAX_POM_PROBES`] versions and so returns a longer document than
+/// the one before. Without this memo the `maven-metadata.xml.sha1` request
+/// (a second pass) hashed a different document than the body the client had
+/// just downloaded, and two downloads in a row differed. Within this window
+/// the body and every checksum sidecar are served from the same bytes; the
+/// next pass after it continues dating where the memoized one stopped.
+pub const LISTING_MEMO_TTL: Duration = Duration::from_secs(15);
+
+/// What a memoized filtered listing is keyed by: the repository, its
+/// upstream, the metadata path, the policy that filtered it and a digest of
+/// the upstream document it was filtered from, so a changed upstream
+/// document, a repointed Remote or a changed policy never reuses it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ListingMemoKey {
+    repo_id: Uuid,
+    upstream_url: String,
+    path: String,
+    min_age_days: i32,
+    mode: &'static str,
+    upstream_sha256: [u8; 32],
+}
+
+impl ListingMemoKey {
+    pub fn new(
+        repo_id: Uuid,
+        upstream_url: &str,
+        path: &str,
+        min_age_days: i32,
+        mode: &'static str,
+        upstream_doc: &[u8],
+    ) -> Self {
+        use sha2::{Digest, Sha256};
+        Self {
+            repo_id,
+            upstream_url: upstream_url.to_string(),
+            path: path.trim_matches('/').to_string(),
+            min_age_days,
+            mode,
+            upstream_sha256: Sha256::digest(upstream_doc).into(),
+        }
+    }
+}
+
+static LISTINGS: Lazy<MokaCache<ListingMemoKey, bytes::Bytes>> = Lazy::new(|| {
+    MokaCache::builder()
+        .max_capacity(4_000)
+        .time_to_live(LISTING_MEMO_TTL)
+        .build()
+});
+
+/// The filtered listing a recent pass produced for `key`, if any.
+pub async fn memo_listing(key: &ListingMemoKey) -> Option<bytes::Bytes> {
+    LISTINGS.get(key).await
+}
+
+/// Keep a filtered listing whose pass left versions undated, so the next
+/// requests for the document and its checksums within [`LISTING_MEMO_TTL`]
+/// get the same bytes.
+pub async fn remember_listing(key: ListingMemoKey, filtered: bytes::Bytes) {
+    LISTINGS.insert(key, filtered).await;
+}
+
+/// Drop every memoized listing (tests that step through successive passes).
+#[cfg(test)]
+pub fn forget_listings() {
+    LISTINGS.invalidate_all();
+}
+
 /// The non-SNAPSHOT versions of a GA-level `maven-metadata.xml` that the gate
 /// evaluates, newest first (Maven version order), with the document's group
 /// and artifact ids and `lastUpdated`.
@@ -308,6 +379,49 @@ mod tests {
         );
         assert_eq!(gate_target("widget.jar"), None);
         assert_eq!(gate_target(".meta/prefixes.txt"), None);
+    }
+
+    #[tokio::test]
+    async fn listing_memo_is_keyed_by_document_policy_and_upstream_6284() {
+        let id = Uuid::new_v4();
+        let doc = b"<metadata>a</metadata>";
+        let key = |url: &str, path: &str, days: i32, doc: &[u8]| {
+            ListingMemoKey::new(id, url, path, days, "upstream_publish_time", doc)
+        };
+        let base = key("http://up/", "g/a/maven-metadata.xml", 7, doc);
+        remember_listing(base.clone(), bytes::Bytes::from_static(b"filtered")).await;
+        // The same document under a slash-spelled path reads the memo.
+        assert_eq!(
+            memo_listing(&key("http://up/", "/g/a/maven-metadata.xml/", 7, doc))
+                .await
+                .as_deref(),
+            Some(&b"filtered"[..])
+        );
+        // A changed upstream document, policy or upstream never does.
+        for other in [
+            key(
+                "http://up/",
+                "g/a/maven-metadata.xml",
+                7,
+                b"<metadata>b</metadata>",
+            ),
+            key("http://up/", "g/a/maven-metadata.xml", 8, doc),
+            key("http://other/", "g/a/maven-metadata.xml", 7, doc),
+            ListingMemoKey::new(
+                id,
+                "http://up/",
+                "g/a/maven-metadata.xml",
+                7,
+                "first_seen",
+                doc,
+            ),
+        ] {
+            assert_ne!(other, base);
+            assert!(memo_listing(&other).await.is_none());
+        }
+        forget_listings();
+        LISTINGS.run_pending_tasks().await;
+        assert!(memo_listing(&base).await.is_none());
     }
 
     #[test]

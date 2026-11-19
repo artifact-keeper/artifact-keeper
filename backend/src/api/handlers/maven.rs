@@ -1742,8 +1742,12 @@ fn maven_virtual_age_gate_answer(
 /// `maven-metadata.xml` (#4702), so `LATEST`, `RELEASE` and version ranges
 /// never resolve to a version whose download would be refused. Returns the
 /// bytes unchanged when nothing is withheld (the checksum then still matches
-/// the upstream's); the `.sha1` of the metadata is computed from what this
-/// returns, so it always matches the served body.
+/// the upstream's). The `.sha1` (and the other digests) of the metadata are
+/// computed from what this returns. A pass that leaves versions undated (see
+/// below) is memoized for [`crate::services::age_gate_maven::LISTING_MEMO_TTL`]
+/// and reused by the next calls for the same upstream document, so the body
+/// and its checksum sidecars come from the same filtered bytes (#6284)
+/// instead of a second pass dating more versions.
 ///
 /// Dating: `first_seen` uses this server's observations (the listing is the
 /// existence evidence, as for npm and PyPI). `upstream_publish_time` reads
@@ -1785,6 +1789,23 @@ async fn maven_filter_listing(
     }
     // The identity is the request path's, never the document's own ids.
     let package = format!("{group_id}:{artifact_id}");
+
+    // #6284: a recent pass that left versions undated answers for this
+    // document, so the metadata and its checksum requests hash one body.
+    let memo_key = gate::ListingMemoKey::new(
+        params.id,
+        upstream.upstream_url,
+        path,
+        params.age_gate_min_age_days,
+        params.age_gate_mode.as_str(),
+        &content,
+    );
+    if let Some(memoized) = gate::memo_listing(&memo_key).await {
+        return Ok(memoized);
+    }
+    // Whether this pass leaves versions undated (withheld until a later pass
+    // dates them), i.e. whether the next pass could list more.
+    let mut left_undated = false;
 
     let versions: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> = match params.age_gate_mode
     {
@@ -1857,6 +1878,7 @@ async fn maven_filter_listing(
                         known[i] = published;
                     }
                 }
+                left_undated = known.iter().any(Option::is_none);
                 let mut out = Vec::with_capacity(targets.len());
                 for (target, published) in targets.iter().zip(known) {
                     out.push((target.version.clone(), published));
@@ -1870,17 +1892,22 @@ async fn maven_filter_listing(
         .evaluate_versions_batch(&params, &package, &versions)
         .await
         .map_err(|e| e.into_response())?;
-    if blocked.is_empty() {
-        return Ok(content);
+    let served = if blocked.is_empty() {
+        content.clone()
+    } else {
+        crate::services::metrics_service::record_age_gate_filtered_metadata(
+            &params.key,
+            crate::services::age_gate_service::format_label(&params.format),
+        );
+        match gate::filter_metadata_versions(xml, &blocked) {
+            Some(filtered) => Bytes::from(filtered),
+            None => content.clone(),
+        }
+    };
+    if left_undated {
+        gate::remember_listing(memo_key, served.clone()).await;
     }
-    crate::services::metrics_service::record_age_gate_filtered_metadata(
-        &params.key,
-        crate::services::age_gate_service::format_label(&params.format),
-    );
-    Ok(match gate::filter_metadata_versions(xml, &blocked) {
-        Some(filtered) => Bytes::from(filtered),
-        None => content,
-    })
+    Ok(served)
 }
 
 /// Refuse a Maven/sbt proxy path that the upstream request could read
@@ -18669,8 +18696,10 @@ mod age_gate_4702_tests {
     }
 
     /// A GA with more undated versions than one listing probes: the first
-    /// listing withholds the oldest undated ones, and the next listing probes
-    /// those instead of the already dated newest ones, so it lists them all.
+    /// listing withholds the oldest undated ones, and its checksum sidecars
+    /// and the next download within the memo window hash and serve that same
+    /// document (#6284); the next pass after the window probes the withheld
+    /// ones instead of the already dated newest ones, so it lists them all.
     #[tokio::test]
     async fn listing_probe_budget_continues_on_the_next_listing_4702() {
         let Some(pool) = tdh::try_pool().await else {
@@ -18718,6 +18747,11 @@ mod age_gate_4702_tests {
             tdh::build_state_with_proxy_and_age_gate(pool.clone(), dir.to_str().unwrap(), proxy);
         let path = format!("{G}/many/maven-metadata.xml");
         let first = get(&state, &key, &path).await;
+        let sha1 = get(&state, &key, &format!("{path}.sha1")).await;
+        let md5 = get(&state, &key, &format!("{path}.md5")).await;
+        let again = get(&state, &key, &path).await;
+        // The memo window has passed: the next pass continues dating.
+        crate::services::age_gate_maven::forget_listings();
         let second = get(&state, &key, &path).await;
         let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
             .bind(id)
@@ -18736,6 +18770,23 @@ mod age_gate_4702_tests {
             count(&first.1),
             crate::services::age_gate_maven::LISTING_MAX_POM_PROBES,
             "the first listing dates only its probe budget"
+        );
+        // #6284: the sidecars describe the body just served, not a second
+        // pass that dated more versions.
+        assert_eq!(sha1.0, StatusCode::OK);
+        assert_eq!(
+            String::from_utf8_lossy(&sha1.1),
+            compute_checksum(&first.1, ChecksumType::Sha1),
+            "the .sha1 must hash the served body"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&md5.1),
+            compute_checksum(&first.1, ChecksumType::Md5),
+            "the .md5 must hash the served body"
+        );
+        assert_eq!(
+            again, first,
+            "two downloads in the memo window are identical"
         );
         assert_eq!(
             count(&second.1),

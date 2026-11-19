@@ -19,7 +19,7 @@ catalog use) and the version is the path's version directory.
 | Any file in a version directory: `.pom`, `.jar`, `.war`, `.module`, `-sources.jar`, classifier archives | Served when the version is old enough or its review is approved; otherwise `451` with the shared `age_gate_blocked` body (`review_id`, `package`, `version`, `min_age_days`, `requested_age_days`) and a pending review. The `451` carries `Cache-Control: no-store` (RFC 7725 makes a `451` cacheable by default; this hold is lifted by a review or by time). A refused file is neither fetched nor cached; the gate only reads the version's POM, uncached, to date it. |
 | That file's `.sha1`, `.md5`, `.sha256`, `.sha512`, `.asc` | Answers exactly as the file does (the same `451`). |
 | GA-level `g/a/maven-metadata.xml` | Withheld versions are removed from `<versions>`; `<latest>` and `<release>` are re-pointed to the newest remaining version (release: newest non-SNAPSHOT). When nothing is withheld the upstream bytes are served unchanged. |
-| `g/a/maven-metadata.xml.sha1` (and the other digests) | Computed from the served (filtered) metadata, so it always matches. |
+| `g/a/maven-metadata.xml.sha1` (and the other digests) | Computed from the served (filtered) metadata, so it matches the body. While the GA is still being dated (below), the body and its digests are served from the same filtered document for 15 seconds instead of a fresh pass each. |
 | `-SNAPSHOT` versions and their metadata | Not gated, see below. |
 
 There is no last-known-good substitution for Maven: a client asked for one
@@ -73,6 +73,15 @@ When `<lastUpdated>` is inside the gate window, the metadata filter reads up to
 64 POMs per request (eight at a time, newest versions first) and caches each
 date; undated versions beyond that are withheld from that listing and dated by
 the next one. Downloads always decide each version on its own POM.
+
+While versions are still undated, each filter pass lists more versions than
+the one before, so a document filtered that way is reused for 15 seconds
+(#6284): within that window the `maven-metadata.xml` downloads and their
+`.sha1`, `.md5`, `.sha256` and `.sha512` all describe the same bytes, and the
+first request after it runs the next pass. A GA with N undated versions is
+therefore fully listed after about N / 64 passes, at most one per 15 seconds.
+Once every version is dated the document is filtered on every request as
+before.
 
 `first_seen` mode dates a version by the first time this server saw it
 from that upstream, as for the other formats: the upstream metadata listing
