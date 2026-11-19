@@ -3351,6 +3351,9 @@ pub async fn repo_visibility_middleware(
     // the same decoded value the handler's `Path<String>` extraction will
     // resolve (GHSA-fv45-mwhh-q23r).
     let path = request.uri().path().to_string();
+    // Captured before the no-repo branch below: that branch also resolves
+    // credentials, and the LDAP passthrough needs the method for its audit row.
+    let method = request.method().as_str().to_string();
     let repo_key = extract_repo_key(&path);
 
     if repo_key.is_empty() {
@@ -3543,13 +3546,26 @@ pub async fn repo_visibility_middleware(
     // - no credential at all -> the same 401 + `WWW-Authenticate` challenge
     //   an existing *private* repo produces (#1808, the anonymous
     //   repo-existence oracle);
-    // - a VALID credential -> the existence-hiding 404 below
-    //   (GHSA-fv45-mwhh-q23r).
+    // - a VALID credential (including an LDAP/AD Basic credential resolved by
+    //   the passthrough below) -> the existence-hiding 404 below
+    //   (GHSA-fv45-mwhh-q23r, #6160).
     let Some(repo) = repo else {
         let extracted = extract_visibility_token(&request);
         // Format/registry endpoint: preserve pip-netrc / Artifactory-style
         // `username:<api_token>` Basic auth (`allow_basic_api_token=true`, #2786).
-        let outcome = try_resolve_auth_outcome(&vis_state.auth_service, extracted, true).await;
+        // The LDAP passthrough belongs here too (#6160): a directory user's
+        // `username:password` is a valid credential on this surface, so a
+        // nonexistent repo must answer the valid-credential 404 rather than
+        // the anonymous/explicitly-invalid 401. Skipping it here made Maven
+        // uploads with a directory password fail at the repository lookup.
+        let outcome = try_resolve_auth_outcome_with_passthrough(
+            &vis_state.auth_service,
+            extracted,
+            true,
+            &path,
+            &method,
+        )
+        .await;
         // Transient bcrypt-capacity shed -> retryable 503 (see
         // `AuthOutcome::Overloaded`), never a 401.
         if matches!(outcome, AuthOutcome::Overloaded) {
@@ -3619,7 +3635,6 @@ pub async fn repo_visibility_middleware(
     let extracted = extract_visibility_token(&request);
     // Format/registry endpoint: preserve pip-netrc / Artifactory-style
     // `username:<api_token>` Basic auth (`allow_basic_api_token=true`, #2786).
-    let method = request.method().as_str().to_string();
     let outcome = try_resolve_auth_outcome_with_passthrough(
         &vis_state.auth_service,
         extracted,
