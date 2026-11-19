@@ -4338,15 +4338,19 @@ async fn publish_extension(
     // #4673: entry names that would escape a client's extraction directory
     // are refused before anything else, as a 400 VALIDATION_ERROR, whether or
     // not the archive carries a usable manifest.
-    bounded_archive::with_ingest_extraction(|| vscode_extensions::reject_unsafe_entry_names(&body))
-        .and_then(|checked| checked)
-        .map_err(|e| e.into_response())?;
+    bounded_archive::with_ingest_extraction_waiting(|| {
+        vscode_extensions::reject_unsafe_entry_names(&body)
+    })
+    .await
+    .and_then(|checked| checked)
+    .map_err(|e| e.into_response())?;
 
     // The archive is the source of truth (#3961); the `x-*` headers only assert.
-    let manifest = match bounded_archive::with_ingest_extraction(|| {
+    let manifest = match bounded_archive::with_ingest_extraction_waiting(|| {
         vscode_extensions::extract_vsix_metadata(&body)
             .map_err(|e| (e, vscode_extensions::has_extension_manifest(&body)))
     })
+    .await
     .map_err(|e| e.into_response())?
     {
         Ok(manifest) => {
@@ -10229,6 +10233,37 @@ mod catalog_registration_tests {
         let row = row.expect("a vscode publish must write a packages row (#3659)");
         assert_eq!(row.version, "3.1.4");
         assert_eq!(row.versions, vec!["3.1.4".to_string()]);
+    }
+
+    /// #6230: an extension publish whose repository's ingest bucket is full
+    /// waits for a permit instead of shedding 503 at once, and succeeds once
+    /// one frees.
+    #[tokio::test]
+    async fn extension_publish_waits_for_ingest_permit_6230() {
+        let Some(fx) = tdh::Fixture::setup("local", "vscode").await else {
+            return;
+        };
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/extensions", fx.repo_key))
+            .header("x-publisher", "acme")
+            .header("x-extension-name", "queued-tools")
+            .header("x-extension-version", "1.0.0")
+            .body(axum::body::Body::from("vsix-bytes"))
+            .unwrap();
+        let ((status, body), queued) =
+            crate::util::bounded_archive::test_support::run_queued_behind_full_tenant(
+                crate::util::bounded_archive::TenantKey::Repo(fx.repo_id),
+                tdh::send(fx.router_with_auth(super::router()), req),
+            )
+            .await;
+        fx.teardown().await;
+        assert!(queued, "the publish must have waited for a permit");
+        assert!(
+            status.is_success(),
+            "a queued extension publish must succeed once a permit frees: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
     }
 
     /// #4725: an extension publish to a hosted repository must queue a push

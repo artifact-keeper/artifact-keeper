@@ -62,8 +62,18 @@ pub(crate) fn content_disposition_attachment(filename: &str) -> String {
 
 /// Download response that can be either a redirect or streamed content
 pub enum DownloadResponse {
-    /// 302 redirect to presigned URL
-    Redirect(PresignedUrl),
+    /// 302 redirect to a presigned URL for an object of `size_bytes` bytes.
+    ///
+    /// The size is part of the variant so no redirect can be built without
+    /// it: the response is tagged with
+    /// [`PresignedDownload`](crate::services::quota::http::PresignedDownload),
+    /// and the transfer meter counts the object when the URL is issued, since
+    /// its bytes then leave storage without passing through the backend
+    /// (#6035).
+    Redirect {
+        presigned: PresignedUrl,
+        size_bytes: i64,
+    },
     /// Stream content directly
     Content {
         data: Bytes,
@@ -73,9 +83,12 @@ pub enum DownloadResponse {
 }
 
 impl DownloadResponse {
-    /// Create a redirect response
-    pub fn redirect(url: PresignedUrl) -> Self {
-        Self::Redirect(url)
+    /// Create a redirect response for an object of `size_bytes` bytes.
+    pub fn redirect(presigned: PresignedUrl, size_bytes: i64) -> Self {
+        Self::Redirect {
+            presigned,
+            size_bytes,
+        }
     }
 
     /// Create a content response
@@ -104,7 +117,10 @@ impl DownloadResponse {
 impl IntoResponse for DownloadResponse {
     fn into_response(self) -> Response {
         match self {
-            DownloadResponse::Redirect(presigned) => {
+            DownloadResponse::Redirect {
+                presigned,
+                size_bytes,
+            } => {
                 let source = match presigned.source {
                     PresignedUrlSource::S3 => "redirect-s3",
                     PresignedUrlSource::CloudFront => "redirect-cloudfront",
@@ -112,7 +128,7 @@ impl IntoResponse for DownloadResponse {
                     PresignedUrlSource::Gcs => "redirect-gcs",
                 };
 
-                Response::builder()
+                let mut response = Response::builder()
                     .status(StatusCode::FOUND)
                     .header(LOCATION, presigned.url)
                     .header(X_ARTIFACT_STORAGE, source)
@@ -121,7 +137,9 @@ impl IntoResponse for DownloadResponse {
                         format!("private, max-age={}", presigned.expires_in.as_secs()),
                     )
                     .body(Body::empty())
-                    .unwrap()
+                    .unwrap();
+                crate::services::quota::http::tag_presigned_download(&mut response, size_bytes);
+                response
             }
             DownloadResponse::Content {
                 data,
@@ -145,85 +163,6 @@ impl IntoResponse for DownloadResponse {
     }
 }
 
-/// Serve content from storage, using redirect if available
-///
-/// This helper checks if the storage backend supports redirects and returns
-/// either a 302 redirect to a presigned URL or streams the content directly.
-///
-/// **Method-unaware (#3209).** It has no request context, so it cannot tell a
-/// `GET` from a `HEAD`, and a presigned URL is signed for ONE method (the
-/// method is the first line of the SigV4 canonical request). A caller on a
-/// route registered `get(..)` only — where axum answers `HEAD` by running the
-/// GET handler — must therefore gate the call on `DownloadContext::is_head`
-/// itself, or use a helper that takes the context
-/// ([`try_presigned_redirect`]'s callers in `proxy_helpers` do). This helper
-/// currently has no callers anywhere in the workspace.
-pub async fn serve_from_storage<S: StorageBackend + ?Sized>(
-    storage: &S,
-    key: &str,
-    content_type: &str,
-    filename: Option<&str>,
-) -> Result<DownloadResponse, crate::error::AppError> {
-    // Check if redirect is supported
-    if storage.supports_redirect() {
-        // Try to get presigned URL with default expiry (1 hour)
-        if let Some(presigned) = storage
-            .get_presigned_url(key, Duration::from_secs(3600))
-            .await?
-        {
-            tracing::debug!(
-                key = %key,
-                source = ?presigned.source,
-                "Serving artifact via redirect"
-            );
-            return Ok(DownloadResponse::redirect(presigned));
-        }
-    }
-
-    // Fall back to streaming content
-    let data = storage.get(key).await?;
-    tracing::debug!(
-        key = %key,
-        size = data.len(),
-        "Serving artifact via proxy"
-    );
-
-    Ok(match filename {
-        Some(name) => DownloadResponse::content_with_filename(data, content_type, name),
-        None => DownloadResponse::content(data, content_type),
-    })
-}
-
-/// Serve content with custom expiry for presigned URLs.
-///
-/// Method-unaware, with the same #3209 caveat as [`serve_from_storage`]; it too
-/// currently has no callers anywhere in the workspace.
-pub async fn serve_from_storage_with_expiry<S: StorageBackend + ?Sized>(
-    storage: &S,
-    key: &str,
-    content_type: &str,
-    filename: Option<&str>,
-    expiry: Duration,
-) -> Result<DownloadResponse, crate::error::AppError> {
-    if storage.supports_redirect() {
-        if let Some(presigned) = storage.get_presigned_url(key, expiry).await? {
-            tracing::debug!(
-                key = %key,
-                source = ?presigned.source,
-                expiry_secs = expiry.as_secs(),
-                "Serving artifact via redirect"
-            );
-            return Ok(DownloadResponse::redirect(presigned));
-        }
-    }
-
-    let data = storage.get(key).await?;
-    Ok(match filename {
-        Some(name) => DownloadResponse::content_with_filename(data, content_type, name),
-        None => DownloadResponse::content(data, content_type),
-    })
-}
-
 /// Try to generate a presigned redirect response for a storage key.
 ///
 /// Returns `Some(Response)` with a 302 redirect if `presigned_enabled` is true
@@ -232,11 +171,16 @@ pub async fn serve_from_storage_with_expiry<S: StorageBackend + ?Sized>(
 ///
 /// This is the primary entry point for format handlers that want to opt in to
 /// presigned download redirects without restructuring their response logic.
+///
+/// `size_bytes` is the size of the object at `key` (from its artifact or
+/// `oci_blobs` row); the transfer meter counts it when the URL is issued
+/// (#6035).
 pub async fn try_presigned_redirect<S: StorageBackend + ?Sized>(
     storage: &S,
     key: &str,
     presigned_enabled: bool,
     expiry: Duration,
+    size_bytes: i64,
 ) -> Option<axum::response::Response> {
     if !presigned_enabled || !storage.supports_redirect() {
         return None;
@@ -250,7 +194,7 @@ pub async fn try_presigned_redirect<S: StorageBackend + ?Sized>(
                 expiry_secs = expiry.as_secs(),
                 "Serving artifact via presigned redirect"
             );
-            Some(DownloadResponse::redirect(presigned).into_response())
+            Some(DownloadResponse::redirect(presigned, size_bytes).into_response())
         }
         Ok(None) => None,
         Err(e) => {
@@ -318,8 +262,11 @@ mod tests {
             expires_in: Duration::from_secs(3600),
             source: PresignedUrlSource::S3,
         };
-        let resp = DownloadResponse::redirect(presigned);
-        assert!(matches!(resp, DownloadResponse::Redirect(_)));
+        let resp = DownloadResponse::redirect(presigned, 42);
+        assert!(matches!(
+            resp,
+            DownloadResponse::Redirect { size_bytes: 42, .. }
+        ));
     }
 
     #[test]
@@ -368,7 +315,7 @@ mod tests {
             expires_in: Duration::from_secs(1800),
             source,
         };
-        DownloadResponse::Redirect(presigned).into_response()
+        DownloadResponse::redirect(presigned, 0).into_response()
     }
 
     #[test]
@@ -519,7 +466,7 @@ mod tests {
             expires_in: Duration::from_secs(7200),
             source: PresignedUrlSource::CloudFront,
         };
-        let resp = DownloadResponse::redirect(presigned).into_response();
+        let resp = DownloadResponse::redirect(presigned, 0).into_response();
         assert_eq!(
             resp.headers()
                 .get("cache-control")
@@ -616,6 +563,7 @@ mod tests {
             "cas/ab/cd/abcdef",
             true,
             Duration::from_secs(300),
+            1234,
         )
         .await;
 
@@ -625,6 +573,12 @@ mod tests {
         let location = resp.headers().get("location").unwrap().to_str().unwrap();
         assert!(location.contains("s3.example.com"));
         assert!(location.contains("cas/ab/cd/abcdef"));
+        // #6035: the redirect carries the object size for the transfer meter.
+        assert_eq!(
+            resp.extensions()
+                .get::<crate::services::quota::http::PresignedDownload>(),
+            Some(&crate::services::quota::http::PresignedDownload(1234))
+        );
     }
 
     #[tokio::test]
@@ -635,6 +589,7 @@ mod tests {
             "cas/ab/cd/abcdef",
             false,
             Duration::from_secs(300),
+            1234,
         )
         .await;
 
@@ -652,6 +607,7 @@ mod tests {
             "cas/ab/cd/abcdef",
             true,
             Duration::from_secs(300),
+            1234,
         )
         .await;
 
@@ -665,7 +621,7 @@ mod tests {
     async fn test_try_presigned_redirect_uses_configured_expiry() {
         let backend = MockBackend::redirecting();
         let result =
-            super::try_presigned_redirect(&backend, "test-key", true, Duration::from_secs(600))
+            super::try_presigned_redirect(&backend, "test-key", true, Duration::from_secs(600), 1)
                 .await;
 
         let resp = result.unwrap();

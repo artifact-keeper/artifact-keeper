@@ -33,6 +33,9 @@
 //! with the same extra fields.
 
 pub mod http;
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod redirect_meter_tests;
 pub mod refusal;
 #[cfg(ak_test_shard = "router")]
 #[cfg(test)]

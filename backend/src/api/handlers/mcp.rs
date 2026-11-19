@@ -7498,9 +7498,7 @@ mod tests {
         };
         let d1 = rig.push("paths").await;
         rig.publish("1.0.0").await;
-        // Control: neither read refuses before a hold. (The generic
-        // download of a docker repository's manifest answers 502 past the
-        // gate here, from its storage read; only the gate is under test.)
+        // Control: neither read refuses before a hold (#5594).
         let (download, tree) = rig.path_reads(&d1).await;
         assert!(
             ![StatusCode::CONFLICT, StatusCode::FORBIDDEN].contains(&download)

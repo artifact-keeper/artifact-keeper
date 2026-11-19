@@ -42,6 +42,24 @@ release/X.Y.x. Titles of type test/ci/docs/chore/build, or a diff only in
 docs/.github/scripts, are exempt ONLY when no linked issue is type:bug.
 -->
 
+## Release gate (behaviour changes)
+<!--
+A PR that changes observable behaviour (a status code, a default, a response
+shape, a default policy) moves the release gate in artifact-keeper-test with
+it. A reviewer applies the label behaviour-change (breaking-change counts too),
+which turns on the blocking check "Require gate test for behaviour changes".
+The PR then needs ONE line, outside this comment (see CONTRIBUTING.md, "Gate
+tests for behaviour changes"):
+
+  Gate: artifact-keeper-test#N     the test PR that updates or adds the gate
+                                   tier or suite; it names this PR or its
+                                   issue and targets the same-named branch
+                                   (an `E2E: artifact-keeper-test#N` line
+                                   counts too)
+  Gate-Exempt: <reason>            no gate tier or suite asserts the old
+                                   behaviour, and why
+-->
+
 ## Changelog
 <!--
 User-facing changes add ONE new file, changes/unreleased/<issue-number>-<slug>.md,

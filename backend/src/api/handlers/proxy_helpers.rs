@@ -2079,9 +2079,12 @@ async fn try_member_cache_redirect(
     }
     let storage = proxy.cache_storage_backend();
     let cache_key = ProxyService::cache_storage_key(proxy.cache_scope(), &member.key, path).ok()?;
-    if !(storage.supports_redirect() && proxy.is_cache_fresh(&member.key, path).await) {
+    if !storage.supports_redirect() {
         return None;
     }
+    // #6035: the freshness probe also yields the size its sidecar records,
+    // which the transfer meter counts when the URL is issued.
+    let size_bytes = proxy.fresh_cache_redirect_size(&member.key, path).await?;
     // #2075: gate the redirect on the hold window (mirrors the gate in
     // `proxy_fetch_or_redirect`). A held entry must not be handed out as a
     // 302; falling through routes it onto the quarantine-surfacing path.
@@ -2104,6 +2107,7 @@ async fn try_member_cache_redirect(
         /* presigned_enabled = */ true,
         expiry,
         /* cache_is_fresh = */ true,
+        size_bytes,
     )
     .await
 }
@@ -2266,9 +2270,17 @@ pub(crate) async fn proxy_cache_fresh_redirect(
     // #1555: the freshness probe reads the cache-meta sidecar, so skip it when
     // the proxy's own (no-prefix) backend cannot presign anyway.
     let storage = proxy_service.cache_storage_backend();
-    if !storage.supports_redirect() || !proxy_service.is_cache_fresh(repo_key, cache_path).await {
+    if !storage.supports_redirect() {
         return Ok(None);
     }
+    // #6035: the freshness probe also yields the size its sidecar records,
+    // which the transfer meter counts when the URL is issued.
+    let Some(size_bytes) = proxy_service
+        .fresh_cache_redirect_size(repo_key, cache_path)
+        .await
+    else {
+        return Ok(None);
+    };
     let refused = |e| map_proxy_error(repo_key, cache_path, e);
     proxy_service
         .cache_quarantine_gate(repo_key, cache_path)
@@ -2302,6 +2314,7 @@ pub(crate) async fn proxy_cache_fresh_redirect(
         /* presigned_enabled = */ true,
         expiry,
         /* cache_is_fresh = */ true,
+        size_bytes,
     )
     .await)
 }
@@ -2463,6 +2476,8 @@ pub async fn proxy_fetch_or_redirect(
         // #1555: sign the just-populated cache entry through the proxy's
         // no-prefix backend (same handle that wrote it), not the prefixed
         // repo handle. The entry was just written, so treat it as fresh.
+        // #6035: the entry holds exactly the bytes just fetched (served
+        // verbatim below), so their length is the size the meter counts.
         let storage = proxy_service.cache_storage_backend();
         if let Some(redirect) = try_proxy_cache_redirect(
             storage.as_ref(),
@@ -2470,6 +2485,7 @@ pub async fn proxy_fetch_or_redirect(
             presigned_enabled,
             expiry,
             /* cache_is_fresh = */ true,
+            i64::try_from(content.len()).unwrap_or(i64::MAX),
         )
         .await
         {
@@ -2500,6 +2516,10 @@ pub async fn proxy_fetch_or_redirect(
 /// Otherwise returns `None` so the caller falls through to the buffered
 /// fetch + cache + serve path.
 ///
+/// `size_bytes` is the size of the cached object (from its sidecar, or the
+/// body just written); the redirect is tagged with it so the transfer meter
+/// counts the object when the URL is issued (#6035).
+///
 /// Extracted from `proxy_fetch_or_redirect` so the redirect short-circuit can
 /// be exercised in unit tests with recording mock storage backends.
 ///
@@ -2517,6 +2537,7 @@ pub(crate) async fn try_proxy_cache_redirect<
     presigned_enabled: bool,
     expiry: Duration,
     cache_is_fresh: bool,
+    size_bytes: i64,
 ) -> Option<Response> {
     if !presigned_enabled || !cache_is_fresh || !storage.supports_redirect() {
         return None;
@@ -2530,7 +2551,7 @@ pub(crate) async fn try_proxy_cache_redirect<
                 "Serving proxy-cache artifact via presigned redirect"
             );
             Some(
-                crate::api::download_response::DownloadResponse::redirect(presigned)
+                crate::api::download_response::DownloadResponse::redirect(presigned, size_bytes)
                     .into_response(),
             )
         }
@@ -4043,17 +4064,75 @@ pub(crate) fn classify_streaming_cache_probe(
     }
 }
 
+/// Whether a Local/Staging member's failed fetch `Response` is transient
+/// (#5574): the `Response`-level counterpart of
+/// [`crate::services::proxy_service::classify_member_fetch_failure`].
+///
+/// A hosted member's `local_fetch` maps its own faults to responses:
+/// [`local_lookup_artifact`] answers `404` when no row matches, `403`/`409`
+/// (or the #4323 integrity `502`) when its download gate refuses an artifact
+/// it holds, and `open_local_stream` maps a storage fault with
+/// [`map_storage_err`] (`500`, or the `503` of an unreachable backend) while
+/// its coordinated hydration path answers `507` when the object is still
+/// absent. A `404` or another permanent client error means the member does not
+/// hold the artifact; anything else means it could not answer and may.
+fn is_transient_local_failure(resp: &Response) -> bool {
+    if is_member_unavailable_response(resp) {
+        return true;
+    }
+    let status = resp.status();
+    !status.is_client_error()
+        || matches!(
+            status,
+            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_EARLY | StatusCode::TOO_MANY_REQUESTS
+        )
+}
+
+/// Pass-1 classification of a Local/Staging member's failed fetch (#5574):
+/// the hosted counterpart of [`classify_cache_probe`], shared by the buffered
+/// and streaming resolvers so every format reading a hosted member sees the
+/// same answer.
+///
+/// #3220: a `403`/`409` (or the #4323 integrity `502`) from `local_fetch` is
+/// the member's own download gate (quarantine hold or scan policy) refusing an
+/// artifact it DOES hold — see [`local_lookup_artifact`]. That is terminal,
+/// not a miss: classifying it `DefiniteMiss` would let resolution continue to
+/// a lower-priority member or upstream and serve the very bytes the policy
+/// blocked, with no 403 anywhere in the response. It is returned as
+/// [`MemberResolveOutcome::Quarantine`] under `DefiniteHit` so Pass 1 stops
+/// here and the block surfaces.
+///
+/// A storage or database fault is [`MemberResolveOutcome::Unavailable`] under
+/// `DefiniteMiss` (#5574), so the walk remembers it and a request no other
+/// member serves answers the retryable `503` instead of the `404` a build tool
+/// caches. Only a permanent answer (a missing row, a rejected path) stays a
+/// plain miss.
+pub(crate) fn classify_local_fetch_failure<T>(
+    resp: Response,
+) -> (MemberCacheClass, Option<MemberResolveOutcome<T, Response>>) {
+    if is_member_policy_block_response(&resp) {
+        return (
+            MemberCacheClass::DefiniteHit,
+            Some(MemberResolveOutcome::Quarantine(resp)),
+        );
+    }
+    if is_transient_local_failure(&resp) {
+        tracing::warn!(
+            status = %resp.status(),
+            "hosted virtual member could not answer, trying the next member"
+        );
+        return (
+            MemberCacheClass::DefiniteMiss,
+            Some(MemberResolveOutcome::Unavailable),
+        );
+    }
+    (MemberCacheClass::DefiniteMiss, None)
+}
+
 /// Classify a Local/Staging member's buffered fetch for the streaming resolver
 /// (#2069): build the streaming response on a hit (or serve a 500 if header
-/// building fails — that member still "wins" with an error), else a miss.
-///
-/// #3220: a 403/409 from `local_fetch` is the member's own download gate
-/// (quarantine hold or scan policy) refusing an artifact it DOES hold — see
-/// [`local_lookup_artifact`]. That is terminal, not a miss: classifying it
-/// `DefiniteMiss` would let resolution continue to a lower-priority member or
-/// upstream and serve the very bytes the policy blocked, with no 403 anywhere
-/// in the response. It is returned as [`MemberResolveOutcome::Quarantine`]
-/// under `DefiniteHit` so Pass 1 stops here and the block surfaces.
+/// building fails — that member still "wins" with an error), else the shared
+/// pass-1 classification of [`classify_local_fetch_failure`] (#5574).
 pub(crate) fn classify_streaming_local(
     fetched: Result<StreamingFetchResult, Response>,
     default_content_type: &str,
@@ -4079,11 +4158,7 @@ pub(crate) fn classify_streaming_local(
                 )),
             ),
         },
-        Err(resp) if is_member_policy_block_response(&resp) => (
-            MemberCacheClass::DefiniteHit,
-            Some(MemberResolveOutcome::Quarantine(resp)),
-        ),
-        Err(_) => (MemberCacheClass::DefiniteMiss, None),
+        Err(resp) => classify_local_fetch_failure(resp),
     }
 }
 
@@ -4358,17 +4433,12 @@ where
                                 Some(MemberResolveOutcome::Hit((result, origin))),
                             )
                         }
-                        // #3220: the member's own download gate (quarantine /
-                        // scan policy) refused an artifact it HOLDS. Terminal,
-                        // not a miss — otherwise the block silently falls
-                        // through to the next member or upstream and the client
-                        // gets the bytes anyway. Fail closed on the member that
-                        // would have served.
-                        Err(resp) if is_member_policy_block_response(&resp) => (
-                            MemberCacheClass::DefiniteHit,
-                            Some(MemberResolveOutcome::Quarantine(resp)),
-                        ),
-                        Err(_) => (MemberCacheClass::DefiniteMiss, None),
+                        // #3220 / #5574: a policy block is the member's own
+                        // download gate refusing an artifact it HOLDS, and a
+                        // storage fault means it could not answer; both are
+                        // carried by the shared classifier instead of being
+                        // flattened into a miss.
+                        Err(resp) => classify_local_fetch_failure(resp),
                     }
                 }
                 VirtualMemberFetchStrategy::Proxy => match proxy_service {
@@ -6708,6 +6778,39 @@ pub async fn virtual_has_age_gated_member(db: &PgPool, virtual_repo_id: Uuid) ->
     .unwrap_or(true)
 }
 
+/// True when the Package Age Policy is on for any Remote a virtual repository
+/// reaches, its own `quarantine_enabled` or else the `QUARANTINE_ENABLED`
+/// default, as [`quarantine_service::resolve_config`] reads them (#5933).
+///
+/// Caller-independent and recursive for the same reasons as
+/// [`virtual_has_age_gated_member`], and `true` if the lookup fails.
+///
+/// [`quarantine_service::resolve_config`]: crate::services::quarantine_service::resolve_config
+pub async fn virtual_has_quarantine_member(db: &PgPool, virtual_repo_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "WITH RECURSIVE reach(repo_id) AS ( \
+            SELECT vrm.member_repo_id FROM virtual_repo_members vrm \
+             WHERE vrm.virtual_repo_id = $1 \
+            UNION \
+            SELECT vrm.member_repo_id FROM reach \
+              JOIN repositories parent \
+                ON parent.id = reach.repo_id AND parent.repo_type = 'virtual' \
+              JOIN virtual_repo_members vrm ON vrm.virtual_repo_id = reach.repo_id \
+         ) \
+         SELECT EXISTS( \
+            SELECT 1 FROM reach \
+            JOIN repositories r ON r.id = reach.repo_id AND r.repo_type = 'remote' \
+            LEFT JOIN repository_config c \
+              ON c.repository_id = r.id AND c.key = 'quarantine_enabled' \
+            WHERE COALESCE(c.value IN ('true', '1'), $2))",
+    )
+    .bind(virtual_repo_id)
+    .bind(crate::services::quarantine_service::globally_enabled())
+    .fetch_one(db)
+    .await
+    .unwrap_or(true)
+}
+
 /// Single-member form of [`authorize_virtual_members`]; see it for the access
 /// model, the #1804 / #3178 background and the #4559 parent term
 /// (`virtual_repo_id` is the virtual the request was routed through).
@@ -7363,19 +7466,24 @@ pub async fn local_fetch_or_redirect(
                     /* presigned_enabled = */ true,
                     expiry,
                     /* cache_is_fresh = */ object_present,
+                    artifact.size_bytes,
                 )
                 .await
             }
             None => {
-                try_presigned_redirect(storage.as_ref(), &artifact.storage_key, true, expiry).await
+                try_presigned_redirect(
+                    storage.as_ref(),
+                    &artifact.storage_key,
+                    true,
+                    expiry,
+                    artifact.size_bytes,
+                )
+                .await
             }
         };
-        if let Some(mut redirect) = redirect {
-            // The transfer quota counts the object when the URL is issued.
-            crate::services::quota::http::tag_presigned_download(
-                &mut redirect,
-                artifact.size_bytes,
-            );
+        // Tagged with `artifact.size_bytes` by the builder: the transfer quota
+        // counts the object when the URL is issued (#6035).
+        if let Some(redirect) = redirect {
             return Ok(redirect);
         }
     }
@@ -7424,6 +7532,7 @@ pub async fn try_hosted_blob_redirect(
     path: &str,
     storage_key: &str,
     artifact_id: Uuid,
+    size_bytes: i64,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Option<Response> {
     // #3181: a presigned URL is signed for ONE HTTP method — the method is part
@@ -7449,21 +7558,10 @@ pub async fn try_hosted_blob_redirect(
     }
     let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
     // `try_presigned_redirect` additionally verifies `supports_redirect()` and
-    // returns `None` for filesystem backends or on a signing error.
-    let mut redirect = try_presigned_redirect(storage, storage_key, true, expiry).await?;
-    // The transfer quota counts the object when the URL is issued.
-    if state.transfer_meter.enabled() {
-        let size: Option<i64> =
-            sqlx::query_scalar("SELECT size_bytes FROM artifacts WHERE id = $1")
-                .bind(artifact_id)
-                .fetch_optional(&state.db)
-                .await
-                .ok()
-                .flatten();
-        if let Some(size) = size {
-            crate::services::quota::http::tag_presigned_download(&mut redirect, size);
-        }
-    }
+    // returns `None` for filesystem backends or on a signing error. It tags the
+    // redirect with the row's `size_bytes`: the transfer quota counts the
+    // object when the URL is issued (#6035).
+    let redirect = try_presigned_redirect(storage, storage_key, true, expiry, size_bytes).await?;
     // Count-at-redirect (#2260): record BEFORE handing back the 302, matching the
     // generic download handler. A body-less redirect otherwise never counts.
     // Only GETs reach here (HEAD returned above), so the recorder's `ctx.is_head`
@@ -10361,11 +10459,31 @@ pub struct CurationBlock {
     /// Human-readable statement of which rule fired, from
     /// `CurationService::evaluate_pep503_package`.
     pub reason: String,
+    /// The policy could not be read, so the pull is refused as retryable
+    /// rather than denied by a rule
+    pub unavailable: bool,
 }
 
 impl CurationBlock {
+    /// Refusal for a curation config or rule read that errored
+    pub fn unavailable(package: &str) -> Self {
+        CurationBlock {
+            package: package.to_string(),
+            reason: "curation policy temporarily unavailable".to_string(),
+            unavailable: true,
+        }
+    }
+
     /// The shared REST-shaped 403 body every non-OCI proxy format serves.
+    /// An unreadable policy is a server fault, not a verdict, so it renders
+    /// as a 503 the client retries instead of a final 403
     pub fn into_rest_response(&self) -> Response {
+        if self.unavailable {
+            return AppError::ServiceUnavailable(
+                "Curation policy is temporarily unavailable, retry shortly".to_string(),
+            )
+            .into_response();
+        }
         curation_blocked_response(&self.package, &self.reason)
     }
 }
@@ -10431,8 +10549,8 @@ impl<'a> From<&'a RepoInfo> for CurationTarget<'a> {
 /// `virtual` proxy repo: curation rules describe what may be pulled from
 /// upstream, so applying them to a hosted (`local` / `staging`) repo would 403
 /// that repository's own published packages. On a rule-evaluation error it
-/// fails OPEN (logged with repo + package so the unenforced request is
-/// greppable) rather than taking the proxy down — identical to the pypi seam.
+/// fails CLOSED with a retryable 503 (logged with repo + package), so a
+/// database error never turns a `block` rule into an allow
 ///
 /// `pattern` rules are consulted here (via
 /// [`CurationService::evaluate_pep503_package`]), and so are the name-only
@@ -10488,14 +10606,11 @@ pub async fn evaluate_curation<'a>(
                 repo_key = %target.key,
                 package = %package,
                 error = %e,
-                "curation evaluation failed; failing open"
+                "curation evaluation failed; failing closed"
             );
-        })
-        .ok();
-    match eval {
-        Some(eval) => curation_verdict(&target, package, eval),
-        None => Ok(()),
-    }
+            CurationBlock::unavailable(package)
+        })?;
+    curation_verdict(&target, package, eval)
 }
 
 /// Map a proxy-path rule evaluation onto the download outcome: `block`
@@ -10515,9 +10630,10 @@ fn curation_verdict(
         ("block", _) => Err(CurationBlock {
             package: package.to_string(),
             reason: eval.reason,
+            unavailable: false,
         }),
         ("review", Some(rule_id)) => {
-            // `warn`, like the fail-open line above: a flagged download is
+            // `warn`, like the failed-evaluation line above: a flagged download is
             // served, so deployments that log at warn must still see it.
             tracing::warn!(
                 repo_id = %target.id,
@@ -10542,7 +10658,8 @@ fn curation_verdict(
 /// hand, so a `local` / `staging` pull costs no extra query. On the
 /// remote/virtual path it is one small primary-key SELECT, comparable to the
 /// per-request repo resolution these handlers already perform. A lookup error
-/// fails OPEN (logged), matching the evaluation-error stance of the seam.
+/// fails CLOSED with a retryable 503, matching the evaluation-error stance of
+/// the seam
 #[allow(clippy::result_large_err)]
 pub async fn enforce_curation_lookup(
     db: &PgPool,
@@ -10571,32 +10688,28 @@ pub async fn evaluate_curation_lookup(
     if !matches!(repo_type, "remote" | "virtual") {
         return Ok(());
     }
-    use sqlx::Row;
-    let row = sqlx::query(
+    let row = sqlx::query_as::<_, (bool, String)>(
         "SELECT curation_enabled, curation_default_action FROM repositories WHERE id = $1",
     )
     .bind(repo_id)
     .fetch_optional(db)
     .await;
     let (curation_enabled, default_action) = match row {
-        Ok(Some(r)) => (
-            r.try_get::<bool, _>("curation_enabled").unwrap_or(false),
-            r.try_get::<String, _>("curation_default_action")
-                .unwrap_or_else(|_| "allow".to_string()),
-        ),
-        // Row missing or query failed: fail open (the pull proceeds unenforced),
-        // logged so the gap is greppable — never take the proxy down on a
-        // curation-config read error.
+        Ok(Some(r)) => r,
+        // No row: the repository was deleted after the handler resolved it,
+        // so there is no policy left to enforce and the request fails later on
         Ok(None) => return Ok(()),
+        // A failed read or decode is not "curation off": refuse the pull
+        // rather than serve it unenforced
         Err(e) => {
             tracing::warn!(
                 repo_id = %repo_id,
                 repo_key = %repo_key,
                 package = %package,
                 error = %e,
-                "curation config lookup failed; failing open"
+                "curation config lookup failed; failing closed"
             );
-            return Ok(());
+            return Err(CurationBlock::unavailable(package));
         }
     };
     let target = CurationTarget {
@@ -10796,8 +10909,8 @@ pub async fn enqueue_curation_on_demand(
 /// 503 response when a repository's age gate is enabled but cannot be
 /// evaluated (service unwired, config unreadable, or no evidence resolution
 /// at the calling seam). The age gate fails CLOSED (#2264): an evaluation
-/// error must refuse the download rather than impersonate a disabled gate —
-/// the deliberate divergence from the curation seam above, which fails open.
+/// error must refuse the download rather than impersonate a disabled gate,
+/// the same stance as the curation seam above for an unreadable policy
 pub fn age_gate_unavailable_response(repo_key: &str, package: &str) -> Response {
     let body = serde_json::json!({
         "error": "age_gate_unavailable",
@@ -12543,6 +12656,34 @@ fn record_proxy_scan_outcome(outcome: &ProxyScanServeOutcome) {
     crate::services::metrics_service::record_proxy_scan_verdict(verdict, action);
 }
 
+/// A pull served pending that no scan will ever conclude: nothing is scanned
+/// or queued, so every later pull of the same bytes lands here again. Logged
+/// and counted apart from fail-open's async scans, so a format that stops
+/// establishing identity shows up on its own, not inside the fail-open share
+async fn record_unscannable_serve(
+    state: &crate::api::SharedState,
+    repo_id: Uuid,
+    filename: &str,
+    version: Option<&str>,
+    digest: &str,
+) {
+    const REASON: &str = "identity_not_established";
+    let (repo_key, format): (String, String) =
+        sqlx::query_as("SELECT key, format::text FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
+    tracing::warn!(
+        repo_id = %repo_id, repository = %repo_key, file = %filename, version,
+        digest = %digest, reason = REASON,
+        "served, will not be scanned: identity not established"
+    );
+    crate::services::metrics_service::record_proxy_scan_unscannable(&repo_key, &format, REASON);
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn decide_proxy_scan_serve(
     state: &crate::api::SharedState,
@@ -12714,10 +12855,6 @@ async fn decide_proxy_scan_serve(
             // header. Operators who cannot tolerate serving an unscanned byte
             // must use `proxy_scan_action=fail_closed`. Do NOT "fix" this by
             // turning fail-open into fail-closed here.
-            tracing::warn!(
-                repo_id = %repo_id, file = %filename, digest = %digest,
-                "fail-open proxy scan: serving unscanned bytes with X-AK-Scan: pending; scanning async"
-            );
             let state_bg = state.clone();
             let digest_bg = digest.to_string();
             let bytes_bg = bytes.clone();
@@ -12726,11 +12863,23 @@ async fn decide_proxy_scan_serve(
                 // posture) but do not run a scan whose only possible result
                 // would be an unfounded `clean` row for this digest.
                 ProxyScanIdentity::Unestablished => {
-                    return ProxyScanServeOutcome::Serve(ProxyScanServed::Pending)
+                    record_unscannable_serve(
+                        state,
+                        repo_id,
+                        filename,
+                        synthetic.version.as_deref(),
+                        digest,
+                    )
+                    .await;
+                    return ProxyScanServeOutcome::Serve(ProxyScanServed::Pending);
                 }
                 ProxyScanIdentity::Established(e) => Some(e),
                 ProxyScanIdentity::NotApplicable => None,
             };
+            tracing::warn!(
+                repo_id = %repo_id, file = %filename, digest = %digest,
+                "fail-open proxy scan: serving unscanned bytes with X-AK-Scan: pending; scanning async"
+            );
             // No cache probe here: nobody waits on the verdict, and this is the
             // hot path. A dangling reference shows up as a failed job. A digest
             // claimed in the last minute is already queued, and an enqueue that
@@ -16697,6 +16846,106 @@ mod tests {
         assert!(stored_verdict_blocks_under_gate(None, high));
     }
 
+    // ── Curation fails closed on an unreadable policy ────────────────
+    //
+    // A failed read of the curation config or rules must refuse the pull as a
+    // retryable 503, never serve it unenforced. No database needed: the point
+    // is the failure, so the pool can never connect
+
+    fn unreachable_curation_pool() -> PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+            .expect("lazy pool")
+    }
+
+    #[tokio::test]
+    async fn curation_lookup_fails_closed_when_the_config_is_unreadable() {
+        let block = evaluate_curation_lookup(
+            &unreachable_curation_pool(),
+            Uuid::nil(),
+            "r",
+            "remote",
+            "left-pad",
+            None,
+        )
+        .await
+        .expect_err("an unreadable curation config must not let the pull through");
+        assert_eq!(
+            block.into_rest_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let resp = enforce_curation_lookup(
+            &unreachable_curation_pool(),
+            Uuid::nil(),
+            "r",
+            "virtual",
+            "left-pad",
+            None,
+        )
+        .await
+        .expect_err("the rendered seam must refuse too");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn curation_evaluation_fails_closed_when_the_rules_are_unreadable() {
+        let target = || CurationTarget {
+            id: Uuid::nil(),
+            key: "r",
+            repo_type: "remote",
+            curation_enabled: true,
+            default_action: "allow",
+            format: Some("npm"),
+        };
+        let block = evaluate_curation(&unreachable_curation_pool(), target(), "left-pad", None)
+            .await
+            .expect_err("unreadable curation rules must not let the pull through");
+        assert_eq!(
+            block.into_rest_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let resp = enforce_curation(&unreachable_curation_pool(), target(), "left-pad", None)
+            .await
+            .expect_err("the rendered seam must refuse too");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().contains_key(axum::http::header::RETRY_AFTER));
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            !body.contains("curation_blocked"),
+            "an unreadable policy is not a rule verdict: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn curation_off_or_hosted_never_reads_the_policy() {
+        // The unreachable pool would fail any read, so Ok proves no read
+        let off = CurationTarget {
+            id: Uuid::nil(),
+            key: "r",
+            repo_type: "remote",
+            curation_enabled: false,
+            default_action: "allow",
+            format: Some("npm"),
+        };
+        assert!(
+            evaluate_curation(&unreachable_curation_pool(), off, "left-pad", None)
+                .await
+                .is_ok()
+        );
+        assert!(evaluate_curation_lookup(
+            &unreachable_curation_pool(),
+            Uuid::nil(),
+            "r",
+            "local",
+            "left-pad",
+            None,
+        )
+        .await
+        .is_ok());
+    }
+
     // ── Curation block rendering (#2930 body, #3110 structured verdict) ──
     //
     // Splitting the curation seam into `evaluate_*` (structured
@@ -16709,6 +16958,7 @@ mod tests {
         let block = CurationBlock {
             package: "left-pad".to_string(),
             reason: "#2930 tier block".to_string(),
+            unavailable: false,
         };
         let resp = block.into_rest_response();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -18587,9 +18837,11 @@ mod tests {
     /// Pass 1 (so no lower-priority member is even probed) and surfaces the
     /// status the gate produced.
     ///
-    /// The 404/500 arms are the control: they must STAY `DefiniteMiss`, or a
-    /// member that genuinely lacks the artifact would fail the whole virtual
-    /// request instead of deferring to a sibling that has it.
+    /// The 404 arm is the control: a member that genuinely lacks the artifact
+    /// must stay a plain miss so the walk defers to a sibling that has it. A
+    /// 500/507 is a fault the member may recover from, so it is a miss with an
+    /// `Unavailable` outcome (#5574): the walk still defers, but answers 503
+    /// if nothing serves.
     #[test]
     fn classify_streaming_local_policy_block_is_terminal_3220() {
         for status in [StatusCode::FORBIDDEN, StatusCode::CONFLICT] {
@@ -18610,24 +18862,35 @@ mod tests {
             }
         }
 
-        // Controls: a real miss and a real infrastructure failure must still
-        // defer to the next member.
+        // A genuine miss defers without earning a 503.
+        let (class, outcome) = classify_streaming_local(
+            Err((StatusCode::NOT_FOUND, "not a policy decision").into_response()),
+            "application/json",
+            None,
+        );
+        assert_eq!(
+            class,
+            MemberCacheClass::DefiniteMiss,
+            "a 404 is not a policy block and must remain a plain member miss"
+        );
+        assert!(outcome.is_none());
+
+        // A storage fault must still defer to the next member, but is
+        // remembered so nothing else serving answers 503 (#5574).
         for status in [
-            StatusCode::NOT_FOUND,
             StatusCode::INTERNAL_SERVER_ERROR,
             StatusCode::INSUFFICIENT_STORAGE,
         ] {
             let (class, outcome) = classify_streaming_local(
-                Err((status, "not a policy decision").into_response()),
+                Err((status, "storage is down").into_response()),
                 "application/json",
                 None,
             );
-            assert_eq!(
-                class,
-                MemberCacheClass::DefiniteMiss,
-                "a {status} is not a policy block and must remain a member miss"
+            assert_eq!(class, MemberCacheClass::DefiniteMiss);
+            assert!(
+                matches!(outcome, Some(MemberResolveOutcome::Unavailable)),
+                "a {status} storage fault must be an unavailable member, not a miss"
             );
-            assert!(outcome.is_none());
         }
     }
 
@@ -18745,6 +19008,12 @@ mod tests {
             "member redirect signed a non-scoped key (a revert to unscoped drops the \
              scope segment): {loc}"
         );
+        // #6035: tagged with the sidecar's size for the transfer meter.
+        assert_eq!(
+            resp.extensions()
+                .get::<crate::services::quota::http::PresignedDownload>(),
+            Some(&crate::services::quota::http::PresignedDownload(11))
+        );
     }
 
     /// `proxy_fetch_or_redirect` (proxy_helpers.rs generic presign fast path).
@@ -18791,6 +19060,12 @@ mod tests {
             "generic redirect signed a non-scoped key (a revert to unscoped drops the \
              scope segment): {loc}"
         );
+        // #6035: tagged with the sidecar's size for the transfer meter.
+        assert_eq!(
+            resp.extensions()
+                .get::<crate::services::quota::http::PresignedDownload>(),
+            Some(&crate::services::quota::http::PresignedDownload(11))
+        );
     }
 
     /// `proxy_cache_fresh_redirect` signs a fresh entry under the live scope,
@@ -18836,6 +19111,13 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(loc.contains(&content_key), "signed the wrong key: {loc}");
+        // #6035: tagged with the sidecar's size for the transfer meter.
+        assert_eq!(
+            signed
+                .extensions()
+                .get::<crate::services::quota::http::PresignedDownload>(),
+            Some(&crate::services::quota::http::PresignedDownload(11))
+        );
 
         assert!(redirect(&presigned, PATH, &head).await.is_none());
         assert!(
@@ -18844,6 +19126,65 @@ mod tests {
                 .is_none()
         );
         assert!(redirect(&unsigned, PATH, &get_ctx()).await.is_none());
+    }
+
+    /// #6035 review: the redirect fast paths take the size the transfer meter
+    /// counts from the freshness probe's own sidecar read, so a fresh entry
+    /// whose sidecar is gone by the time the 302 is built (evicted by another
+    /// replica after the probe) is still redirected, tagged with the probed
+    /// size, with the meter off. A second sidecar GET for the size made that
+    /// request stream instead, and cost one storage round trip per redirect.
+    #[tokio::test]
+    async fn fresh_redirects_read_the_sidecar_once_6035() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::lazy_pool();
+        let scope = scoped_test_scope();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let state = tdh::build_state_with_proxy_presigned(
+            pool,
+            dir.path().to_str().unwrap(),
+            proxy.clone(),
+        );
+        assert!(
+            !state.transfer_meter.enabled(),
+            "the meter must be off here"
+        );
+        let ctx = get_ctx();
+        let seed = |repo_key: &str, path: &str| {
+            let content_key = ProxyService::cache_storage_key(&scope, repo_key, path).unwrap();
+            let meta_key = ProxyService::cache_metadata_key(&scope, repo_key, path).unwrap();
+            backend.seed_fresh_entry(&content_key, &meta_key);
+            backend.evict_after_read.lock().unwrap().insert(meta_key);
+        };
+        let tagged = |resp: &Response| {
+            resp.extensions()
+                .get::<crate::services::quota::http::PresignedDownload>()
+                .copied()
+        };
+
+        const PATH: &str = "ns/ty/1.0.0/linux/amd64/p.zip";
+        seed("tf-proxy", PATH);
+        let resp =
+            proxy_cache_fresh_redirect(proxy.as_ref(), state.as_ref(), "tf-proxy", PATH, &ctx)
+                .await
+                .unwrap()
+                .expect("a fresh entry must be redirected without a second sidecar read");
+        assert_eq!(
+            tagged(&resp),
+            Some(crate::services::quota::http::PresignedDownload(11))
+        );
+
+        let member = test_local_member("maven-proxy");
+        let path = "org/example/lib/1.0/lib-1.0.jar";
+        seed(&member.key, path);
+        let resp = try_member_cache_redirect(state.as_ref(), proxy.as_ref(), &member, path, &ctx)
+            .await
+            .expect("a fresh member entry must be redirected without a second sidecar read");
+        assert_eq!(
+            tagged(&resp),
+            Some(crate::services::quota::http::PresignedDownload(11))
+        );
     }
 
     /// #4514: the package-file redirect fast paths of a Remote that scans on
@@ -20482,6 +20823,7 @@ mod tests {
             /* presigned_enabled = */ true,
             std::time::Duration::from_secs(300),
             /* cache_is_fresh = */ true,
+            /* size_bytes = */ 11,
         )
         .await;
 
@@ -20502,6 +20844,12 @@ mod tests {
 
         let resp = result.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::FOUND);
+        // #6035: the redirect carries the object size for the transfer meter.
+        assert_eq!(
+            resp.extensions()
+                .get::<crate::services::quota::http::PresignedDownload>(),
+            Some(&crate::services::quota::http::PresignedDownload(11))
+        );
         let location = resp
             .headers()
             .get("location")
@@ -20547,6 +20895,7 @@ mod tests {
             /* presigned_enabled = */ true,
             std::time::Duration::from_secs(300),
             /* cache_is_fresh = */ true,
+            /* size_bytes = */ 11,
         )
         .await
         .expect("fresh cache + redirect-capable backend must yield a redirect");
@@ -20697,6 +21046,7 @@ mod tests {
             /* presigned_enabled = */ false,
             std::time::Duration::from_secs(300),
             /* cache_is_fresh = */ true,
+            /* size_bytes = */ 11,
         )
         .await;
 
@@ -20716,6 +21066,7 @@ mod tests {
             /* presigned_enabled = */ true,
             std::time::Duration::from_secs(300),
             /* cache_is_fresh = */ false,
+            /* size_bytes = */ 11,
         )
         .await;
 
@@ -20738,6 +21089,7 @@ mod tests {
             /* presigned_enabled = */ true,
             std::time::Duration::from_secs(300),
             /* cache_is_fresh = */ true,
+            /* size_bytes = */ 11,
         )
         .await;
 
@@ -20819,6 +21171,7 @@ mod tests {
             /* presigned_enabled = */ true,
             std::time::Duration::from_secs(300),
             /* cache_is_fresh = */ true,
+            /* size_bytes = */ 11,
         )
         .await;
         assert!(
@@ -20838,6 +21191,7 @@ mod tests {
             /* presigned_enabled = */ true,
             std::time::Duration::from_secs(300),
             /* cache_is_fresh = */ true,
+            /* size_bytes = */ 11,
         )
         .await;
         assert!(
@@ -21645,7 +21999,7 @@ mod tests {
         use crate::api::{AppState, SharedState};
         use crate::config::Config;
 
-        pub async fn try_pool() -> Option<PgPool> {
+        pub(crate) async fn try_pool() -> Option<PgPool> {
             // Skip only when no DB is configured/reachable AND not required; a
             // connect failure under AK_TESTS_REQUIRE_DB panics (no fiction-green,
             // #2924).
@@ -21874,7 +22228,7 @@ mod tests {
             Arc::new(AppState::new(config, pool, redirect_backend, registry))
         }
 
-        pub async fn create_user(pool: &PgPool) -> Uuid {
+        pub(crate) async fn create_user(pool: &PgPool) -> Uuid {
             let id = Uuid::new_v4();
             let username = format!("ph-test-u-{}", id);
             let _ = sqlx::query(
@@ -21892,7 +22246,7 @@ mod tests {
             id
         }
 
-        pub async fn create_repo(
+        pub(crate) async fn create_repo(
             pool: &PgPool,
             repo_type: &str,
             format: &str,
@@ -21927,7 +22281,7 @@ mod tests {
 
         /// Insert a `virtual_repo_members` row so `fetch_virtual_members`
         /// returns `member_repo_id` when resolving `virtual_repo_id`.
-        pub async fn link_member(
+        pub(crate) async fn link_member(
             pool: &PgPool,
             virtual_repo_id: Uuid,
             member_repo_id: Uuid,
@@ -21945,7 +22299,7 @@ mod tests {
             .expect("link virtual member");
         }
 
-        pub async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
+        pub(crate) async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
             let _ = sqlx::query(
                 "DELETE FROM artifact_metadata WHERE artifact_id IN \
                  (SELECT id FROM artifacts WHERE repository_id = $1)",
@@ -24003,17 +24357,18 @@ mod tests {
         );
 
         // The redirect helper itself must call `try_proxy_cache_redirect(` and
-        // gate on a metadata-only `is_cache_fresh(` probe so it never pulls the
-        // body just to decide whether to redirect (#1555).
+        // gate on a metadata-only freshness probe so it never pulls the body
+        // just to decide whether to redirect (#1555). Since #6035 that probe is
+        // `fresh_cache_redirect_size(`, which also returns the sidecar's size.
         let helper_start = src
             .find("async fn try_member_cache_redirect(")
             .expect("try_member_cache_redirect must exist");
         let helper_window = item_body(src, helper_start);
         assert!(
             helper_window.contains("try_proxy_cache_redirect(")
-                && helper_window.contains("is_cache_fresh("),
+                && helper_window.contains("fresh_cache_redirect_size("),
             "`try_member_cache_redirect` MUST attempt `try_proxy_cache_redirect(` \
-             gated on a metadata-only `is_cache_fresh(` probe (#1555).",
+             gated on the metadata-only `fresh_cache_redirect_size(` probe (#1555).",
         );
     }
 
@@ -27700,6 +28055,9 @@ mod tests {
 
     /// Insert a hosted artifact row and return its id, so the redirect helper's
     /// count-at-redirect INSERT into `download_statistics` has a valid FK.
+    /// `size_bytes` of the row [`seed_blob_artifact`] writes.
+    const SEEDED_BLOB_SIZE: i64 = 9;
+
     async fn seed_blob_artifact(
         pool: &PgPool,
         repo_id: Uuid,
@@ -27717,7 +28075,7 @@ mod tests {
         .bind(path)
         .bind("lib")
         .bind("1.0")
-        .bind(9_i64)
+        .bind(SEEDED_BLOB_SIZE)
         .bind("test-blob")
         .bind("application/java-archive")
         .bind(storage_key)
@@ -27795,6 +28153,7 @@ mod tests {
             path,
             storage_key,
             artifact_id,
+            SEEDED_BLOB_SIZE,
             &get_ctx,
         )
         .await;
@@ -27813,6 +28172,7 @@ mod tests {
             path,
             storage_key,
             artifact_id,
+            SEEDED_BLOB_SIZE,
             &head_ctx,
         )
         .await;
@@ -27904,6 +28264,7 @@ mod tests {
                 path,
                 &storage_key,
                 artifact_id,
+                SEEDED_BLOB_SIZE,
                 &ctx_for(user_id, /* is_head = */ false),
             )
             .await;
@@ -27915,6 +28276,7 @@ mod tests {
                 path,
                 &storage_key,
                 artifact_id,
+                SEEDED_BLOB_SIZE,
                 &ctx_for(user_id, /* is_head = */ true),
             )
             .await;
@@ -27966,9 +28328,16 @@ mod tests {
         );
         let ctx = ctx_for(user_id, /* is_head = */ false);
 
-        let out =
-            super::try_hosted_blob_redirect(&state, &storage, path, storage_key, artifact_id, &ctx)
-                .await;
+        let out = super::try_hosted_blob_redirect(
+            &state,
+            &storage,
+            path,
+            storage_key,
+            artifact_id,
+            SEEDED_BLOB_SIZE,
+            &ctx,
+        )
+        .await;
 
         let stat_count = download_stat_count(&pool, artifact_id).await;
         let presign_calls = storage
@@ -28007,9 +28376,16 @@ mod tests {
         );
         let ctx = ctx_for(user_id, /* is_head = */ false);
 
-        let out =
-            super::try_hosted_blob_redirect(&state, &storage, path, storage_key, artifact_id, &ctx)
-                .await;
+        let out = super::try_hosted_blob_redirect(
+            &state,
+            &storage,
+            path,
+            storage_key,
+            artifact_id,
+            SEEDED_BLOB_SIZE,
+            &ctx,
+        )
+        .await;
 
         let stat_count = download_stat_count(&pool, artifact_id).await;
         db_helpers::cleanup(&pool, repo_id, user_id).await;
@@ -28040,9 +28416,16 @@ mod tests {
         let state = db_helpers::build_state(pool.clone(), dir.to_str().unwrap());
         let ctx = ctx_for(user_id, /* is_head = */ false);
 
-        let out =
-            super::try_hosted_blob_redirect(&state, &storage, path, storage_key, artifact_id, &ctx)
-                .await;
+        let out = super::try_hosted_blob_redirect(
+            &state,
+            &storage,
+            path,
+            storage_key,
+            artifact_id,
+            SEEDED_BLOB_SIZE,
+            &ctx,
+        )
+        .await;
 
         let presign_calls = storage
             .presigned_calls
@@ -28460,6 +28843,7 @@ mod tests {
             CurationBlock {
                 package: "pkg".to_string(),
                 reason: "test reason".to_string(),
+                unavailable: false,
             }
         );
         // A flagged rule and the review default stance both serve.
@@ -28539,8 +28923,8 @@ mod tests {
     #[tokio::test]
     async fn test_enforce_age_gate_applicable_without_service_fails_closed() {
         // An enabled, applicable gate with no wired service must refuse the
-        // download (503), never impersonate a disabled gate. Divergence from
-        // the curation seam, which fails open — deliberate (#2264).
+        // download (503), never impersonate a disabled gate, the same stance
+        // as the curation seam (#2264)
         let params = age_gate_params_for(uuid::Uuid::new_v4(), "ag-seam", "remote", "npm", true, 7);
         let out = enforce_age_gate(None, &params, "left-pad", "1.0.0", None).await;
         let resp = out.expect_err("must fail closed");
@@ -30222,9 +30606,17 @@ mod proxy_download_recording_tests {
                 "serve_scanned_pypi_file(",
                 1,
             ),
+            // #5875: the cache-first and the index-resolved paths both
+            // go through one scanned serve
             (
                 "pypi.rs",
                 "serve_scanned_pypi_file",
+                "serve_scanned_pypi_target(",
+                2,
+            ),
+            (
+                "pypi.rs",
+                "serve_scanned_pypi_target",
                 "serve_scanned_proxy_file(",
                 1,
             ),

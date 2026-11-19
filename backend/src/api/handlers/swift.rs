@@ -993,10 +993,12 @@ async fn fetch_manifest(
             let zip_bytes = storage.get(&storage_key).await.map_err(|e| {
                 crate::api::handlers::storage_err_response(&e, swift_error_response)
             })?;
-            // #2561: permit-scoped decode, fast-fail 503 on saturation.
-            crate::util::bounded_archive::with_ingest_extraction(|| {
+            // #2561: permit-scoped decode; on saturation it waits briefly
+            // for a slot, then sheds 503 (#6230).
+            crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
                 extract_manifest_from_zip(&zip_bytes)
             })
+            .await
             .map_err(|e| e.into_response())?
             .ok_or_else(|| {
                 swift_error_response(StatusCode::NOT_FOUND, "Manifest not found for this release")
@@ -1292,7 +1294,8 @@ async fn publish_release(
         .map(|s| s.to_string())
     {
         Some(m) => Some(m),
-        // #2561: permit-scoped decode, fast-fail 503 on saturation. Only taken
+        // #2561: permit-scoped decode; on saturation it waits briefly
+        // for a slot, then sheds 503 (#6221). Only taken
         // when the header fallback actually needs to decode the uploaded zip.
         None => {
             let local =

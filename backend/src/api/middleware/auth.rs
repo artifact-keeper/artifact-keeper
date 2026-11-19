@@ -2843,6 +2843,11 @@ fn is_write_method(method: &Method) -> bool {
 ///   advisory data (proxied upstream for a Remote) and never change AK state;
 ///   `npm install` and `npm audit` issue them with whatever credential the
 ///   client has for reads, which on a public registry is none.
+/// * **BSR reads** — `POST /proto/<repo_key>/<Service>/<Method>` for the
+///   read-only `buf.registry.*` RPCs (`Download`, `GetModules`, `GetCommits`,
+///   `GetGraph`, …). Connect makes every RPC a `POST`, so without this a
+///   read-only member got 403 on `buf dep update`. `CreateModules`, `Upload`
+///   and `CreateOrUpdateLabels` stay writes.
 ///
 /// These paths are classified as reads for the *permission* check only. The
 /// `#508` write-auth requirement (writes require authentication; anonymous
@@ -2886,8 +2891,24 @@ pub(crate) fn is_non_mutating_format_post(path: &str) -> bool {
         Some("npm") => is_npm_audit_tail(segments),
         // /mcp/<repo_key>/{v0,v0.1}/validate (#5253)
         Some("mcp") => is_mcp_validate_tail(segments),
+        // /proto/<repo_key>/<buf.registry Service>/<read Method>
+        Some("proto") => is_bsr_read_tail(segments),
         _ => false,
     }
+}
+
+/// `<repo_key>/<Service>/<Method>` naming a read-only BSR RPC — the remaining
+/// segments of a Connect path after the leading `proto`. Connect sends every
+/// RPC as a `POST`, reads included, so the method cannot tell `buf dep update`
+/// from `buf push`; the RPC name can. The classification is the handler's own
+/// ([`is_bsr_read_only_rpc`]), so this list cannot drift from the routes.
+///
+/// [`is_bsr_read_only_rpc`]: crate::api::handlers::protobuf_bsr::is_bsr_read_only_rpc
+fn is_bsr_read_tail<'a>(mut segments: impl Iterator<Item = &'a str>) -> bool {
+    matches!(segments.next(), Some(k) if !k.is_empty())
+        && crate::api::handlers::protobuf_bsr::is_bsr_read_only_rpc(
+            &segments.collect::<Vec<_>>().join("/"),
+        )
 }
 
 /// `<repo_key>/v0/validate` or `<repo_key>/v0.1/validate` — the remaining
@@ -2931,6 +2952,14 @@ fn is_mcp_validate_tail<'a>(mut segments: impl Iterator<Item = &'a str>) -> bool
 ///   read (version taken, package resolution) are skipped for an anonymous
 ///   caller. A private registry still answers an anonymous caller 401, as
 ///   every read does.
+///
+/// * **BSR reads** — the read-only Connect RPCs under `POST /proto/<repo_key>/`
+///   (`Download`, `GetModules`, `GetCommits`, `GetLabels`, `GetGraph`,
+///   `GetResources`, `GetOwners`, …). The `buf` CLI resolves and downloads
+///   dependencies with no credential when it has none, as it does against
+///   buf.build, so `buf dep update` against a public repository answered 401.
+///   The handlers only read; every BSR write keeps its 401 here and its
+///   `write:artifacts` check in the handler.
 ///
 /// git-lfs `objects/batch` and conan `users/authenticate` are deliberately NOT
 /// here. `batch` is an upload *and* download negotiation whose upload arm mints
@@ -2985,6 +3014,8 @@ fn is_anonymous_readable_format_post(path: &str) -> bool {
         Some("npm") => is_npm_audit_tail(segments),
         // /mcp/<repo_key>/{v0,v0.1}/validate (#5253)
         Some("mcp") => is_mcp_validate_tail(segments),
+        // /proto/<repo_key>/<buf.registry Service>/<read Method>
+        Some("proto") => is_bsr_read_tail(segments),
         _ => false,
     }
 }
@@ -3153,6 +3184,27 @@ fn permission_unavailable_response() -> Response {
             "permission service temporarily unavailable",
         ))
         .unwrap()
+}
+
+/// Whether any fine-grained rule targets the repository, for the read arm of
+/// [`repo_visibility_middleware`]. A failed lookup (the database is
+/// unreachable once the 30 s rules cache entry has expired) fails closed with
+/// the same retryable 503 + `Retry-After: 1` as the write arm, so a package
+/// client backs off and retries instead of treating the outage as final.
+async fn read_rules_exist(
+    permission_service: &crate::services::permission_service::PermissionService,
+    repo_id: uuid::Uuid,
+) -> std::result::Result<bool, Response> {
+    permission_service
+        .has_any_rules_for_target("repository", repo_id)
+        .await
+        .map_err(|_| {
+            tracing::error!(
+                repository_id = %repo_id,
+                "permission check failed: database unreachable"
+            );
+            permission_unavailable_response()
+        })
 }
 
 /// The answer to a write or delete the caller may not make (#5458).
@@ -3811,22 +3863,10 @@ pub async fn repo_visibility_middleware(
                 // sufficient for public repos; private repos still require a
                 // role assignment). If rules do exist, the user must hold the
                 // read action.
-                let has_rules = match vis_state
-                    .permission_service
-                    .has_any_rules_for_target("repository", repo.id)
-                    .await
+                let has_rules = match read_rules_exist(&vis_state.permission_service, repo.id).await
                 {
                     Ok(v) => v,
-                    Err(_) => {
-                        // DB error on permission check: fail closed.
-                        tracing::error!("permission check failed: database unreachable");
-                        return Response::builder()
-                            .status(StatusCode::SERVICE_UNAVAILABLE)
-                            .body(axum::body::Body::from(
-                                "permission service temporarily unavailable",
-                            ))
-                            .unwrap();
-                    }
+                    Err(resp) => return resp,
                 };
 
                 if has_rules {
@@ -7326,6 +7366,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_rules_lookup_db_outage_is_503_with_retry_after() {
+        // A read whose rules-existence entry has left the 30 s cache must
+        // query the database; during an outage that answer is a retryable 503
+        // carrying Retry-After: 1, like the write arm, never a bare 503.
+        let svc = crate::services::permission_service::PermissionService::new(lazy_pool());
+        let resp = read_rules_exist(&svc, uuid::Uuid::new_v4())
+            .await
+            .expect_err("an unreachable database must fail closed");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
     async fn test_try_resolve_ticket_auth_rejects_post() {
         // Write methods short-circuit before any DB query, so we do not need
         // a working pool to exercise this branch.
@@ -9977,6 +10035,69 @@ mod tests {
                 .unwrap();
             let resp = run_through_visibility(state.clone(), req).await;
             assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{key} publish");
+        }
+    }
+
+    const BSR_READS: [&str; 4] = [
+        "buf.registry.module.v1.ModuleService/GetModules",
+        "buf.registry.module.v1.CommitService/GetCommits",
+        "buf.registry.module.v1.DownloadService/Download",
+        "buf.registry.module.v1beta1.DownloadService/Download",
+    ];
+    const BSR_WRITES: [&str; 3] = [
+        "buf.registry.module.v1.ModuleService/CreateModules",
+        "buf.registry.module.v1beta1.UploadService/Upload",
+        "buf.registry.module.v1.LabelService/CreateOrUpdateLabels",
+    ];
+
+    #[test]
+    fn test_bsr_read_post_is_anonymous_readable_and_non_mutating() {
+        for rpc in BSR_READS {
+            let path = format!("/proto/bsr/{rpc}");
+            assert!(is_anonymous_readable_format_post(&path), "{path}");
+            assert!(is_non_mutating_format_post(&path), "{path}");
+        }
+        let writes = BSR_WRITES.map(|rpc| format!("/proto/bsr/{rpc}"));
+        for path in writes.iter().map(String::as_str).chain([
+            "/proto//buf.registry.module.v1.DownloadService/Download",
+            "/proto/bsr/buf.registry.module.v1.DownloadService/Download/",
+            "/proto/bsr/buf.registry.module.v1.DownloadService",
+            "/proto/bsr/evil.DownloadService/Download",
+            "/npm/bsr/buf.registry.module.v1.DownloadService/Download",
+        ]) {
+            assert!(!is_anonymous_readable_format_post(path), "{path}");
+            assert!(!is_non_mutating_format_post(path), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bsr_read_post_no_auth_passes_public_and_401s_private() {
+        let proto = |is_public| CachedRepo {
+            format: "protobuf".to_string(),
+            ..make_cached_repo(is_public)
+        };
+        let post = |key: &str, rpc: &str| {
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri(format!("/proto/{key}/{rpc}"))
+                .header("content-type", "application/proto")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        for (key, public, want) in [
+            ("pubproto", true, StatusCode::OK),
+            ("privproto", false, StatusCode::UNAUTHORIZED),
+        ] {
+            let state = make_vis_state(Some((key.to_string(), proto(public)))).await;
+            for rpc in BSR_READS {
+                let resp = run_through_visibility(state.clone(), post(key, rpc)).await;
+                assert_eq!(resp.status(), want, "{key} {rpc}");
+            }
+            // Every write stays an anonymous-write 401 on either.
+            for rpc in BSR_WRITES {
+                let resp = run_through_visibility(state.clone(), post(key, rpc)).await;
+                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{key} {rpc}");
+            }
         }
     }
 
@@ -14408,6 +14529,133 @@ mod tests {
                 Some(StatusCode::UNAUTHORIZED)
             );
             assert_eq!(allowed.ok(), Some(plain));
+        }
+    }
+}
+
+/// The laws proved in formal/ArtifactKeeper/Auth/MintRepoCeiling.lean, checked
+/// on the real mint path: `mint_repo_ceiling`, the selector a mint stores
+/// (`inherited_token_selector`, or the request's own after
+/// `validate_token_repo_selector`), and how that selector reads back as the
+/// new token's scope (`resolve_token_scope`'s branches, through the real
+/// `parse_token_selector_strict` and `RepoSelectorService::is_empty`).
+///
+/// The one step simulated is the database lookup of a `match_repos` selector
+/// (`WHERE id = ANY($1)`): the listed ids that exist.
+#[cfg(ak_test_shard = "services-2")]
+#[cfg(test)]
+mod mint_repo_ceiling_laws {
+    use super::AuthExtension;
+    use crate::models::access_scope::AccessScope;
+    use crate::services::repo_selector_service::{
+        inherited_token_selector, parse_token_selector_strict, validate_token_repo_selector,
+        RepoSelectorService,
+    };
+    use proptest::prelude::*;
+    use uuid::Uuid;
+
+    /// The repositories that exist.
+    fn universe() -> Vec<Uuid> {
+        (1..=4u128).map(Uuid::from_u128).collect()
+    }
+
+    fn credential(scope: AccessScope) -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::from_u128(99),
+            username: "minter".into(),
+            is_api_token: true,
+            allowed_repo_ids: scope,
+            ..Default::default()
+        }
+    }
+
+    /// A stored `repo_selector` read back as the token's scope, branch for
+    /// branch with `RepoSelectorService::resolve_token_scope`.
+    fn read_back(selector: Option<&serde_json::Value>) -> AccessScope {
+        let Some(value) = selector else {
+            return AccessScope::Admin;
+        };
+        match parse_token_selector_strict(value) {
+            Err(_) => AccessScope::Restricted(Vec::new()),
+            Ok(selector) if RepoSelectorService::is_empty(&selector) => AccessScope::Admin,
+            Ok(selector) => AccessScope::Restricted(
+                universe()
+                    .into_iter()
+                    .filter(|id| selector.match_repos.contains(id))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// One mint by `cred`, optionally naming its own restriction. `None` is a
+    /// refusal (the 403 from the ceiling, or the 400 for a selector that does
+    /// not restrict); otherwise the new token's scope.
+    fn mint(cred: &AccessScope, requested: Option<&[Uuid]>) -> Option<AccessScope> {
+        let ceiling = credential(cred.clone())
+            .mint_repo_ceiling(requested.is_some())
+            .ok()?;
+        let stored = match (ceiling, requested) {
+            (Some(ids), _) => Some(inherited_token_selector(&ids)),
+            (None, Some(ids)) => {
+                let selector = serde_json::json!({ "match_repos": ids });
+                validate_token_repo_selector(&selector).ok()?;
+                Some(selector)
+            }
+            (None, None) => None,
+        };
+        Some(read_back(stored.as_ref()))
+    }
+
+    fn any_ids() -> impl Strategy<Value = Vec<Uuid>> {
+        proptest::collection::vec(0u128..6, 0..4)
+            .prop_map(|v| v.into_iter().map(Uuid::from_u128).collect())
+    }
+
+    fn any_scope() -> impl Strategy<Value = AccessScope> {
+        prop_oneof![
+            Just(AccessScope::Admin),
+            any_ids().prop_map(AccessScope::Restricted)
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4000))]
+
+        /// Lean `mint_chain_never_widens`: through any chain of mints, the
+        /// last token reaches only repositories the original credential
+        /// reached.
+        #[test]
+        fn mint_chain_never_widens(
+            cred in any_scope(),
+            chain in proptest::collection::vec(proptest::option::of(any_ids()), 0..6),
+        ) {
+            let mut token = cred.clone();
+            for requested in &chain {
+                match mint(&token, requested.as_deref()) {
+                    Some(next) => token = next,
+                    None => break,
+                }
+            }
+            for repo in universe() {
+                prop_assert!(
+                    !token.grants(repo) || cred.grants(repo),
+                    "chain {:?} from {:?} widened to {:?}", chain, cred, token
+                );
+            }
+        }
+    }
+
+    /// Lean `restricted_to_nothing_cannot_mint`, and why it matters: the
+    /// selector such a mint would store reads back as no restriction at all
+    /// (`without_the_check_nothing_becomes_everything`).
+    #[test]
+    fn restricted_to_nothing_cannot_mint() {
+        assert_eq!(
+            read_back(Some(&inherited_token_selector(&[]))),
+            AccessScope::Admin
+        );
+        for requested in [None, Some(&universe()[..1])] {
+            assert!(mint(&AccessScope::Restricted(Vec::new()), requested).is_none());
         }
     }
 }

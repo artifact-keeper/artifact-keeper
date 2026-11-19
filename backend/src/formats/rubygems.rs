@@ -695,11 +695,14 @@ impl FormatHandler for RubygemsHandler {
 
         // Extract gemspec if this is a gem file
         if !content.is_empty() && matches!(info.operation, RubygemsOperation::Gem) {
-            // #2561: permit-scoped decode; on saturation skip this best-effort
-            // metadata enrichment rather than blocking/queueing.
-            if let Ok(Ok(gemspec)) = crate::util::bounded_archive::with_ingest_extraction(|| {
-                Self::extract_gemspec(content)
-            }) {
+            // #2561: permit-scoped decode; on saturation it waits briefly for a
+            // slot (#6230), and skips this best-effort enrichment if none frees.
+            if let Ok(Ok(gemspec)) =
+                crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
+                    Self::extract_gemspec(content)
+                })
+                .await
+            {
                 // #4645: the gemspec is authoritative for coordinates; the
                 // filename split is only a fallback when it cannot be read.
                 metadata["name"] = serde_json::Value::String(gemspec.name.clone());
@@ -716,10 +719,12 @@ impl FormatHandler for RubygemsHandler {
 
         // Validate gem packages
         if !content.is_empty() && matches!(info.operation, RubygemsOperation::Gem) {
-            // #2561: permit-scoped decode, fast-fail 503 on saturation.
-            let gemspec = crate::util::bounded_archive::with_ingest_extraction(|| {
+            // #2561: permit-scoped decode; on saturation it waits briefly
+            // for a slot, then sheds 503 (#6230).
+            let gemspec = crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
                 Self::extract_gemspec(content)
-            })??;
+            })
+            .await??;
 
             // Verify name matches
             if let Some(path_name) = &info.name {

@@ -456,6 +456,7 @@ async fn download_by_path(
         artifact_path,
         &artifact.storage_key,
         artifact.id,
+        artifact.size_bytes,
         &ctx,
     )
     .await

@@ -63,9 +63,17 @@ A sub-0.1s "pass" on a DB suite means it did not run. Always export
 `AK_TESTS_REQUIRE_DB=1` alongside `DATABASE_URL` when you need proof a test
 ran — it turns a missing/unreachable database into a hard failure (#2924).
 CI runs this suite in the `🧪 Backend Integration Tests` job on every push
-**and** on every pull request that touches `backend/**`, `Cargo.toml`,
-`Cargo.lock`, `.sqlx/**`, or `.github/workflows/ci.yml` (#3124). A failure
-there fails the required `🧪 Backend Unit Tests` check.
+**and** on every pull request that changes a Rust input and touches
+`backend/tests/**`, `backend/migrations/**` or `.github/workflows/ci.yml`, or
+carries the `ci:full` label (#3124). A failure there fails the required
+`🧪 Backend Unit Tests` check.
+
+A pull request that changes only workflows, CI/release scripts or docs skips
+the Rust jobs (#6115). If it touches `.github/workflows/`, the
+`🧾 Workflow Contract Tests` job runs the few Rust tests that read workflow
+files instead. Shell Tests runs `actionlint` over every workflow. To run every
+Rust job on such a PR anyway, for example for a `ci.yml` change to the Rust
+jobs' own steps, add the `ci:full` label and re-run.
 
 ### Full E2E Tests (Tier 3) - Release/Manual Only
 ```bash

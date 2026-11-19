@@ -8,3 +8,5 @@ self-hosted-runner:
     - ak-e2e-runners
     - ak-beefy-runners
     - ak-docker-runners
+    # Per-job KVM VMs from scripts/ci/vm-runner (#6072, docs/ci/vm-runners.md).
+    - ak-vm
