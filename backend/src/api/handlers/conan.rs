@@ -5470,6 +5470,7 @@ mod tests {
                 trivy_url: None,
                 trivy_adapter_url: None,
                 incus_scanner_enabled: true,
+                trivy_ignore_embedded_pom_declarations: false,
                 openscap_url: None,
                 openscap_profile: "standard".into(),
                 opensearch_url: None,

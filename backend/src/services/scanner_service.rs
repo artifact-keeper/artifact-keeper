@@ -9348,6 +9348,8 @@ mod construction {
             trivy_url: Option<String>,
             trivy_adapter_url: Option<String>,
             incus_scanner_enabled: bool,
+            // #6233: TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS.
+            trivy_ignore_embedded_pom_declarations: bool,
             storage: Arc<dyn StorageBackend>,
             storage_registry: Arc<crate::storage::StorageRegistry>,
             storage_base_path: String,
@@ -9412,10 +9414,15 @@ mod construction {
                         "Trivy filesystem scanner enabled (scanner-adapter at {})",
                         adapter_url
                     );
-                    scanners.push(Arc::new(TrivyFsScanner::new_with_adapter(
-                        adapter_url.clone(),
-                        scan_workspace_path.clone(),
-                    )));
+                    scanners.push(Arc::new(
+                        TrivyFsScanner::new_with_adapter(
+                            adapter_url.clone(),
+                            scan_workspace_path.clone(),
+                        )
+                        .with_ignore_embedded_pom_declarations(
+                            trivy_ignore_embedded_pom_declarations,
+                        ),
+                    ));
                     if let Some(capability) = incus_capability {
                         info!("Incus container image scanner enabled (scanner-adapter)");
                         scanners.push(Arc::new(
@@ -9429,10 +9436,12 @@ mod construction {
                 }
                 (None, Some(url)) => {
                     info!("Trivy filesystem scanner enabled (local CLI)");
-                    scanners.push(Arc::new(TrivyFsScanner::new(
-                        url.clone(),
-                        scan_workspace_path.clone(),
-                    )));
+                    scanners.push(Arc::new(
+                        TrivyFsScanner::new(url.clone(), scan_workspace_path.clone())
+                            .with_ignore_embedded_pom_declarations(
+                                trivy_ignore_embedded_pom_declarations,
+                            ),
+                    ));
                     if let Some(capability) = incus_capability {
                         info!("Incus container image scanner enabled (local CLI)");
                         scanners.push(Arc::new(crate::services::incus_scanner::IncusScanner::new(
@@ -12620,6 +12629,7 @@ mod tests {
             trivy_url,
             trivy_adapter_url,
             incus_scanner_enabled,
+            false,
             storage,
             storage_registry,
             "/tmp/ak-incus-construction-test".to_string(),
@@ -31302,9 +31312,10 @@ tonic-build = "0.12"
             advisory_client,
             scan_result_service,
             scan_config_service,
-            None, // trivy_url: skip fs / incus scanners
-            None, // trivy_adapter_url: skip image scanner
-            true, // incus_scanner_enabled (irrelevant without a Trivy URL)
+            None,  // trivy_url: skip fs / incus scanners
+            None,  // trivy_adapter_url: skip image scanner
+            true,  // incus_scanner_enabled (irrelevant without a Trivy URL)
+            false, // trivy_ignore_embedded_pom_declarations (likewise)
             storage,
             storage_registry,
             storage_base_path,
