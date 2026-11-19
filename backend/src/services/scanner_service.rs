@@ -31,6 +31,7 @@ use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{ProxyFinding, RawFinding, RawPackage, Severity, VulnDbProvenance};
 use crate::models::user::User;
+use crate::services::advisory_exclusions::AdvisoryExclusions;
 use crate::services::auth_service::AuthService;
 use crate::services::environment_reeval::{AdvisoryDelta, AdvisoryDeltaSink};
 use crate::services::grype_scanner::GrypeScanner;
@@ -7247,6 +7248,9 @@ pub struct AdvisoryClient {
     delta_sink: Option<Arc<dyn AdvisoryDeltaSink>>,
     /// Wall-clock budget for fetching full OSV records after a batch (#4150).
     osv_hydrate_budget: Duration,
+    /// Packages never sent to an external feed (#5691,
+    /// `ADVISORY_EXCLUDE_PATTERNS`). Empty by default: nothing is excluded.
+    exclusions: AdvisoryExclusions,
 }
 
 struct CachedAdvisory {
@@ -7394,6 +7398,14 @@ const GITHUB_ADVISORY_URL: &str = "https://api.github.com/advisories";
 
 impl AdvisoryClient {
     pub fn new(github_token: Option<String>) -> Self {
+        let exclusions = AdvisoryExclusions::from_env();
+        if !exclusions.is_empty() {
+            info!(
+                patterns = exclusions.len(),
+                "ADVISORY_EXCLUDE_PATTERNS is set: matching packages are never sent to \
+                 OSV.dev or the GitHub Advisory Database (#5691)"
+            );
+        }
         Self {
             http: crate::services::http_client::base_client_builder()
                 .timeout(Duration::from_secs(30))
@@ -7410,6 +7422,7 @@ impl AdvisoryClient {
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .map_or(OSV_HYDRATE_BUDGET, Duration::from_secs),
+            exclusions,
         }
     }
 
@@ -7442,11 +7455,18 @@ impl AdvisoryClient {
             cache_ttl,
             delta_sink: None,
             osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+            exclusions: AdvisoryExclusions::default(),
         }
     }
 
     fn osv_batch_url(&self) -> &str {
         &self.osv_batch_url
+    }
+
+    /// #5691: `dep` matches `ADVISORY_EXCLUDE_PATTERNS` and must never be
+    /// named in a request to an external feed.
+    fn excluded(&self, dep: &Dependency) -> bool {
+        self.exclusions.excludes(&dep.ecosystem, &dep.name)
     }
 
     fn github_advisory_url(&self) -> &str {
@@ -7491,6 +7511,12 @@ impl AdvisoryClient {
         {
             let cache = self.cache.read().await;
             for (i, dep) in deps.iter().enumerate() {
+                // #5691: an excluded package is never asked about. Recorded
+                // as unasked, not degraded: leaving it out is deliberate.
+                if self.excluded(dep) {
+                    out.not_queried.push(i);
+                    continue;
+                }
                 match cache.get(&Self::cache_key(dep)) {
                     Some(cached) if cached.fetched_at.elapsed() < cache_ttl => {
                         out.per_dep[i] = cached.findings.clone();
@@ -7711,6 +7737,11 @@ impl AdvisoryClient {
         };
 
         for (i, dep) in deps.iter().enumerate() {
+            // #5691: never name an excluded package to the feed.
+            if self.excluded(dep) {
+                out.not_queried.push(i);
+                continue;
+            }
             let ecosystem_param = match dep.ecosystem.as_str() {
                 "npm" => "npm",
                 "PyPI" | "pypi" => "pip",
@@ -20427,6 +20458,7 @@ tonic-build = "0.12"
             cache_ttl,
             delta_sink: None,
             osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+            exclusions: AdvisoryExclusions::default(),
         };
 
         let deps: Vec<_> = (0..1001)
@@ -20519,6 +20551,7 @@ tonic-build = "0.12"
             cache_ttl,
             delta_sink: None,
             osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+            exclusions: AdvisoryExclusions::default(),
         };
 
         let deps = vec![Dependency {
@@ -20625,6 +20658,7 @@ tonic-build = "0.12"
             cache_ttl,
             delta_sink: Some(sink.clone()),
             osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+            exclusions: AdvisoryExclusions::default(),
         };
         (server, client, sink)
     }
@@ -20693,6 +20727,7 @@ tonic-build = "0.12"
             cache_ttl: Duration::from_secs(3600),
             delta_sink: Some(sink.clone()),
             osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+            exclusions: AdvisoryExclusions::default(),
         };
         let deps = vec![Dependency {
             name: "never-seen-pkg".to_string(),
@@ -20750,6 +20785,7 @@ tonic-build = "0.12"
                 cache_ttl: Duration::from_secs(3600),
                 delta_sink: None,
                 osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+                exclusions: AdvisoryExclusions::default(),
             })
         }
 
@@ -21334,6 +21370,165 @@ tonic-build = "0.12"
                     .map(|m| &m.id)
                     .collect::<Vec<_>>()
             );
+        }
+
+        // -------------------------------------------------------------------
+        // #5691: internal packages are never named to an external feed
+        // -------------------------------------------------------------------
+
+        /// `advisory_client_for` with `ADVISORY_EXCLUDE_PATTERNS` set to `raw`.
+        fn excluding_client(osv_url: &str, github: Option<&str>, raw: &str) -> AdvisoryClient {
+            let mut client = Arc::try_unwrap(advisory_client_for(osv_url, github))
+                .unwrap_or_else(|_| unreachable!("a fresh Arc has one owner"));
+            client.exclusions = AdvisoryExclusions::parse(raw);
+            client
+        }
+
+        fn eco_dep(name: &str, version: &str, ecosystem: &str) -> Dependency {
+            Dependency {
+                name: name.to_string(),
+                version: Some(version.to_string()),
+                ecosystem: ecosystem.to_string(),
+            }
+        }
+
+        /// The names in every querybatch the mock received.
+        async fn osv_names_sent(server: &MockServer) -> Vec<String> {
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r.url.path() == "/v1/querybatch")
+                .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+                .flat_map(|b| {
+                    b["queries"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|q| q["package"]["name"].as_str().map(str::to_string))
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn test_excluded_package_is_never_sent_to_osv_and_public_one_still_is() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{ "vulns": [{ "id": "GHSA-j7hp-h8jx-5ppr" }] }]
+                })))
+                .mount(&server)
+                .await;
+            let client = excluding_client(
+                &format!("{}/v1/querybatch", server.uri()),
+                None,
+                "pkg:pypi/acme-*",
+            );
+
+            let lookup = client
+                .query_osv_detailed(&[pypi("acme-billing", "4.2.0"), pypi("pillow", "10.0.0")])
+                .await;
+
+            assert_eq!(
+                osv_names_sent(&server).await,
+                vec!["pillow".to_string()],
+                "the internal package must not appear in any OSV request"
+            );
+            assert!(
+                !lookup.degraded,
+                "a deliberate exclusion is not an unanswered question"
+            );
+            assert_eq!(lookup.not_queried, vec![0]);
+            assert!(lookup.per_dep[0].is_empty());
+            assert_eq!(
+                lookup.per_dep[1].len(),
+                1,
+                "the public package keeps its match"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_a_batch_of_only_excluded_packages_sends_no_request() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let client = excluding_client(
+                &format!("{}/v1/querybatch", server.uri()),
+                None,
+                "pkg:npm/@acme/*",
+            );
+            let lookup = client
+                .query_osv_detailed(&[eco_dep("@acme/billing", "4.2.0", "npm")])
+                .await;
+            assert!(!lookup.degraded);
+            assert_eq!(lookup.not_queried, vec![0]);
+        }
+
+        #[tokio::test]
+        async fn test_excluded_package_is_never_sent_to_github() {
+            let gh = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/advisories"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+                .mount(&gh)
+                .await;
+            let client = excluding_client(
+                "http://127.0.0.1:1/unused",
+                Some(&format!("{}/advisories", gh.uri())),
+                "pkg:maven/com.example.internal/*",
+            );
+            let lookup = client
+                .query_github_detailed(&[
+                    eco_dep("com.example.internal:billing-lib", "4.2.0", "Maven"),
+                    eco_dep("org.apache.commons:commons-text", "1.9", "Maven"),
+                ])
+                .await;
+
+            let asked: Vec<String> = gh
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .map(|r| r.url.query().unwrap_or_default().to_string())
+                .collect();
+            assert_eq!(
+                asked.len(),
+                1,
+                "only the public package is asked: {asked:?}"
+            );
+            assert!(asked[0].contains("commons-text"));
+            assert!(!asked.iter().any(|q| q.contains("internal")));
+            assert!(!lookup.degraded);
+            assert_eq!(lookup.not_queried, vec![0]);
+        }
+
+        /// Unset, nothing changes: every dependency is asked, as before #5691.
+        #[tokio::test]
+        async fn test_no_exclusions_sends_every_package() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "results": [{}, {}] })),
+                )
+                .mount(&server)
+                .await;
+            let client = excluding_client(&format!("{}/v1/querybatch", server.uri()), None, "");
+            let lookup = client
+                .query_osv_detailed(&[pypi("acme-billing", "4.2.0"), pypi("pillow", "10.0.0")])
+                .await;
+            assert_eq!(
+                osv_names_sent(&server).await,
+                vec!["acme-billing".to_string(), "pillow".to_string()]
+            );
+            assert!(lookup.not_queried.is_empty());
         }
 
         // -------------------------------------------------------------------
@@ -35246,6 +35441,7 @@ tonic-build = "0.12"
                 cache_ttl: Duration::from_secs(3600),
                 delta_sink: None,
                 osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+                exclusions: AdvisoryExclusions::default(),
             })
         }
 
@@ -36095,6 +36291,7 @@ tonic-build = "0.12"
                 cache_ttl: Duration::from_secs(3600),
                 delta_sink: None,
                 osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+                exclusions: AdvisoryExclusions::default(),
             })
         }
 
