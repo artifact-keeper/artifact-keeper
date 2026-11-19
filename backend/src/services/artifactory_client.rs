@@ -3,7 +3,8 @@
 //! This module provides a client for interacting with JFrog Artifactory's REST API
 //! to fetch repositories, artifacts, users, groups, and permissions for migration.
 
-use reqwest::{Client, RequestBuilder};
+use crate::services::http_client::Client;
+use reqwest::RequestBuilder;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
@@ -1299,7 +1300,7 @@ mod tests {
     /// wiremock's HTTP listener is reachable without env toggles.
     fn test_client(base_url: String) -> ArtifactoryClient {
         ArtifactoryClient {
-            client: reqwest::Client::new(),
+            client: crate::services::http_client::Client::new(),
             config: ArtifactoryClientConfig {
                 base_url,
                 ..Default::default()

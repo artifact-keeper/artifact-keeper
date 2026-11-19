@@ -428,7 +428,7 @@ async fn pypi_simple_index_withholds_young_version_via_real_anchors() {
 
     // Fetch publish times from the mock upstream exactly as the handler does,
     // then filter a realistic (rewritten, hash-fragmented) simple index.
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::new().into();
     let times = svc
         .metadata_cache()
         .fetch_pypi_publish_times(&client, repo_id, &server.uri(), pkg)

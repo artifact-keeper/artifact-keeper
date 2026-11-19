@@ -319,11 +319,11 @@ enum TokenSource {
 struct GcsTokenProvider {
     source: TokenSource,
     cache: RwLock<Option<CachedToken>>,
-    client: reqwest::Client,
+    client: crate::services::http_client::Client,
 }
 
 impl GcsTokenProvider {
-    fn new(source: TokenSource, client: reqwest::Client) -> Self {
+    fn new(source: TokenSource, client: crate::services::http_client::Client) -> Self {
         Self {
             source,
             cache: RwLock::new(None),
@@ -460,12 +460,13 @@ impl GcsTokenProvider {
 /// metadata host, and proxy env vars are ignored because the link-local
 /// metadata endpoint must always be dialed directly, never via an egress
 /// proxy.
-fn metadata_server_client() -> Result<reqwest::Client> {
+fn metadata_server_client() -> Result<crate::services::http_client::Client> {
     crate::services::http_client::plain_client_builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .build()
+        .map(Into::into)
         .map_err(|e| {
             AppError::Storage(format!(
                 "Failed to create GCP metadata server HTTP client: {}",
@@ -646,12 +647,12 @@ pub struct GcsBackend {
     /// stuck control op fails fast. ADC / Workload Identity token fetches use
     /// the dedicated [`metadata_server_client`] instead — this client's
     /// SSRF-guard resolver blocks the metadata server's link-local address.
-    client: reqwest::Client,
+    client: crate::services::http_client::Client,
     /// Long-timeout client used only for the streaming GET (`get_stream`) and
     /// the resumable PUT chunks in `put_stream`. A multi-GiB resumable upload's
     /// total can run for many minutes; bounding it at 30 min keeps a cliff in
     /// place without leaking that long timeout onto fast control-plane calls.
-    stream_client: reqwest::Client,
+    stream_client: crate::services::http_client::Client,
     auth: GcsAuthMode,
     path_format: StoragePathFormat,
     /// API base URL. Defaults to [`GCS_BASE_URL`]; set to a custom endpoint
@@ -3152,7 +3153,7 @@ mod tests {
             path_format,
             endpoint: None,
         };
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::Client::new();
         let provider = GcsTokenProvider::new(
             TokenSource::MetadataServer {
                 token_url: GCP_METADATA_TOKEN_URL.to_string(),

@@ -398,30 +398,20 @@ fn gate_detailed_health_fields(
 /// Cloud-metadata, loopback and link-local targets stay hard-blocked.
 ///
 /// [`internal_service_client_builder`]: crate::services::http_client::internal_service_client_builder
-fn build_service_probe_client() -> reqwest::Client {
+fn build_service_probe_client() -> crate::services::http_client::Client {
     crate::services::http_client::internal_service_client_builder()
         .timeout(Duration::from_secs(5))
         .build()
-        .unwrap_or_default()
+        .expect("build service probe HTTP client")
 }
 
-/// The one probe client, built on first use and reused for the process
-/// lifetime.
-///
-/// Building a `reqwest::Client` is not free: every build runs
-/// `apply_custom_ca_cert`, which does a **blocking** `std::fs::read` of
-/// `CUSTOM_CA_CERT_PATH` on the async runtime when that variable is set
-/// (`services/http_client.rs`), re-parses the PEM bundle, and hands back a
-/// client with an empty connection pool — so each probe also pays a fresh TCP
-/// (and TLS) handshake. Doing that per `/health` request on an
-/// unauthenticated endpoint turns anonymous polling into runtime-blocking
-/// filesystem work; one shared client makes it a one-off and lets the probe
-/// keep its connection alive between windows (#3127).
-static SERVICE_PROBE_CLIENT: Lazy<reqwest::Client> = Lazy::new(build_service_probe_client);
+/// Shared probe client. Clones reuse its pool until a validated custom-CA
+/// revision replaces it; polling and PEM parsing happen off the async workers.
+static SERVICE_PROBE_CLIENT: Lazy<crate::services::http_client::Client> =
+    Lazy::new(build_service_probe_client);
 
-/// Return the shared probe client. `reqwest::Client` is an `Arc` internally,
-/// so the clone shares one connection pool rather than creating a new one.
-fn service_probe_client() -> reqwest::Client {
+/// Return a clone sharing the current probe connection pool.
+fn service_probe_client() -> crate::services::http_client::Client {
     SERVICE_PROBE_CLIENT.clone()
 }
 

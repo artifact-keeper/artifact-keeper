@@ -81,7 +81,7 @@ const DEFAULT_PYPISTATS_BASE: &str = "https://pypistats.org";
 const DEFAULT_NPM_BASE: &str = "https://api.npmjs.org";
 
 pub struct HttpPopularitySource {
-    client: reqwest::Client,
+    client: crate::services::http_client::Client,
     /// `None`: lookups for this ecosystem are switched off and answer
     /// [`PopularityResult::Unknown`] without a request (#5288).
     pypistats_base: Option<String>,

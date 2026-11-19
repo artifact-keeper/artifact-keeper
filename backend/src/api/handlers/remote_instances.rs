@@ -345,7 +345,7 @@ const FORWARDED_RESPONSE_EXTRA_HEADERS: &[&str] = &["x-total-count"];
 /// historical `application/json` default so existing JSON callers are
 /// unaffected.
 fn build_upstream_request(
-    client: &reqwest::Client,
+    client: &crate::services::http_client::Client,
     method: reqwest::Method,
     target: &str,
     api_key: &str,
@@ -1162,7 +1162,7 @@ mod tests {
 
     #[test]
     fn test_build_upstream_request_passes_caller_content_type() {
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::Client::new();
         let ct = HeaderValue::from_static("multipart/form-data; boundary=xyz");
         let req = build_upstream_request(
             &client,
@@ -1183,7 +1183,7 @@ mod tests {
 
     #[test]
     fn test_build_upstream_request_defaults_body_content_type_to_json() {
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::Client::new();
         let req = build_upstream_request(
             &client,
             reqwest::Method::PUT,

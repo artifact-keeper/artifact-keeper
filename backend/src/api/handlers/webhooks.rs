@@ -2532,7 +2532,7 @@ fn group_deliveries_by_webhook(
 /// out another timeout now.
 async fn deliver_webhook_lane(
     db: &sqlx::PgPool,
-    client: &reqwest::Client,
+    client: &crate::services::http_client::Client,
     lane: Vec<&Claimed<RetryDeliveryRow>>,
 ) -> std::result::Result<(), String> {
     for (i, delivery) in lane.iter().enumerate() {
@@ -2586,7 +2586,7 @@ async fn release_unattempted_claims(db: &sqlx::PgPool, deliveries: &[&Claimed<Re
 /// Send one claimed delivery and record its outcome.
 async fn deliver_one_claimed_webhook(
     db: &sqlx::PgPool,
-    client: &reqwest::Client,
+    client: &crate::services::http_client::Client,
     delivery: &Claimed<RetryDeliveryRow>,
 ) -> std::result::Result<DeliveryStep, String> {
     use sqlx::Row;

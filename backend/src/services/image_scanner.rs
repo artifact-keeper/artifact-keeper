@@ -470,10 +470,10 @@ pub struct ImageScanner {
     /// How long to wait for `/probe/ready` before each scan submission
     /// (#5945, `SCANNER_ADAPTER_READY_TIMEOUT_SECS`).
     ready_wait: AdapterReadyWait,
-    http: reqwest::Client,
+    http: crate::services::http_client::Client,
     /// Dedicated client with redirects disabled so a `302 Found` "report not
     /// ready" response from the adapter is observed rather than followed.
-    poll_http: reqwest::Client,
+    poll_http: crate::services::http_client::Client,
     /// Optional token minter for private-repo pulls. When both an
     /// `AuthService` and a system scan identity are wired, each scan request
     /// carries a short-lived scoped JWT as `registry.authorization` so the
@@ -510,13 +510,13 @@ impl ImageScanner {
                 .apply(crate::services::http_client::internal_service_client_builder())
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
-                .unwrap_or_default(),
+                .expect("build scanner HTTP client with its configured policies"),
             poll_http: auth
                 .apply(crate::services::http_client::internal_service_client_builder())
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
-                .unwrap_or_default(),
+                .expect("build scanner HTTP client with its configured policies"),
             auth: None,
             scan_identity: None,
             scan_token_ttl_seconds: 300,

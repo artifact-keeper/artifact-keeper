@@ -56,7 +56,8 @@
 //!
 //! See: https://docs.dependencytrack.org/integrations/rest-api/
 
-use reqwest::{Client, StatusCode};
+use crate::services::http_client::Client;
+use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::error::Error as _;

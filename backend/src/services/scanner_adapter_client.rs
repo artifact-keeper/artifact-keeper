@@ -589,7 +589,7 @@ where
 
 /// One `GET {adapter_url}/probe/ready` attempt.
 pub(crate) async fn probe_adapter_ready(
-    http: &reqwest::Client,
+    http: &crate::services::http_client::Client,
     url: &str,
     timeout: std::time::Duration,
 ) -> ReadyProbe {
@@ -697,7 +697,7 @@ impl AdapterAuth {
     }
 
     /// Add the header to every request a client built from `builder` sends.
-    pub(crate) fn apply(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    pub(crate) fn apply(&self, builder: crate::services::http_client::ClientBuilder) -> crate::services::http_client::ClientBuilder {
         match self {
             Self::Bearer(value) => {
                 let mut headers = reqwest::header::HeaderMap::new();
@@ -872,10 +872,10 @@ pub(crate) struct ScannerAdapterFsClient {
     /// How long to wait for `/probe/ready` before a scan (#5945,
     /// `SCANNER_ADAPTER_READY_TIMEOUT_SECS`).
     ready_wait: AdapterReadyWait,
-    http: reqwest::Client,
+    http: crate::services::http_client::Client,
     /// Redirects disabled so a `302 Found` "report not ready" is observed
     /// rather than followed.
-    poll_http: reqwest::Client,
+    poll_http: crate::services::http_client::Client,
 }
 
 impl ScannerAdapterFsClient {
@@ -901,13 +901,13 @@ impl ScannerAdapterFsClient {
                 // for an incus rootfs.
                 .timeout(std::time::Duration::from_secs(900))
                 .build()
-                .unwrap_or_default(),
+                .expect("build scanner HTTP client with its configured policies"),
             poll_http: auth
                 .apply(crate::services::http_client::internal_service_client_builder())
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
-                .unwrap_or_default(),
+                .expect("build scanner HTTP client with its configured policies"),
             auth,
         }
     }

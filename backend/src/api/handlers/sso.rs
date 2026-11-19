@@ -2110,7 +2110,7 @@ pub(crate) fn userinfo_groups_enabled(attr: &serde_json::Value) -> bool {
 ///
 /// [`sso_client`]: crate::services::http_client::sso_client
 async fn fetch_userinfo_groups(
-    http_client: &reqwest::Client,
+    http_client: &crate::services::http_client::Client,
     userinfo_endpoint: &str,
     access_token: Option<&str>,
     candidates: &[&str],
@@ -2689,7 +2689,7 @@ fn verify_id_token_strict(
 /// accepted via the manual `rsa` + `sha2` PKCS#1 v1.5 fallback. Strict path
 /// otherwise (jsonwebtoken + aws_lc_rs, which enforces RFC 7518 + OWASP).
 async fn validate_id_token(
-    http_client: &reqwest::Client,
+    http_client: &crate::services::http_client::Client,
     id_token: &str,
     discovery: &serde_json::Value,
     client_id: &str,

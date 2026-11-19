@@ -18,9 +18,9 @@
 //! `not_applicable` with the reason, through
 //! [`AppError::ScannerEngineUnavailable`]. It is never recorded as a pass.
 
+use crate::services::http_client::Client;
 use async_trait::async_trait;
 use bytes::Bytes;
-use reqwest::Client;
 use serde::Deserialize;
 use std::path::Path;
 use std::time::Duration;

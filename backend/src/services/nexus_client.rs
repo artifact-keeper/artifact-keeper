@@ -3,7 +3,7 @@
 //! Supports Nexus 3.x Community/Pro editions. Handles the Nexus REST API
 //! for listing repositories, components, assets, and downloading artifacts.
 
-use reqwest::Client;
+use crate::services::http_client::Client;
 use serde::Deserialize;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
