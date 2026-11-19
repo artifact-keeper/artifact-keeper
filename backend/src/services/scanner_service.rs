@@ -10190,6 +10190,21 @@ impl ScannerService {
             // The id was already returned to the client in TriggerScanResponse,
             // so we must keep the same row alive (UPDATE rather than INSERT).
             let prepared_action = resolve_prepared_action(prepared.remove(scanner.scan_type()));
+            // #5942: a retried queued job reaches here with the row its
+            // timed-out attempt recorded `failed`. Reopen it before anything
+            // below touches it: the dedup conversions (`convert_to_reused`)
+            // only update a `running` row, so on a `failed` one they were
+            // no-ops that left attempt 1's row and its partial findings as
+            // the artifact's latest result. The reopened
+            // row keeps counting as that failure for the gates until this
+            // attempt completes or fails it. Reopening is one statement,
+            // committed before any of those take their locks, so the lock
+            // order stays as it was.
+            if let PreparedScanAction::Reuse(target_id) = &prepared_action {
+                self.scan_result_service
+                    .reopen_failed_scan(*target_id)
+                    .await?;
+            }
 
             // Gate on applicability BEFORE creating a scan_results row or
             // copying a reusable result. A non-applicable scanner must leave
@@ -10481,12 +10496,8 @@ impl ScannerService {
             // Either reuse path failed or no reusable scan: run a fresh scan.
             // If we still have a prepared id, reuse it; otherwise create a row.
             let scan_result = match prepared_action {
+                // Reopened above when an earlier attempt left it `failed`.
                 PreparedScanAction::Reuse(target_id) => {
-                    // #5942: a retried queued job scans into the row its
-                    // timed-out attempt recorded `failed`; reopen it first.
-                    self.scan_result_service
-                        .reopen_failed_scan(target_id)
-                        .await?;
                     self.scan_result_service.get_scan(target_id).await?
                 }
                 PreparedScanAction::InsertFresh => {
@@ -10727,10 +10738,12 @@ impl ScannerService {
                     // scanner. It is not completed without the findings it
                     // lost (that would be a cleaner verdict than the scanner
                     // gave), and `?` here used to abandon the row `running`
-                    // and skip every later scanner.
+                    // and skip every later scanner. #5942: on a row a retry
+                    // reopened, this replaces the failed attempt's findings
+                    // and packages in the same transaction.
                     if let Err(e) = self
                         .scan_result_service
-                        .create_findings(scan_result.id, artifact_id, &findings)
+                        .create_findings_for_row(scan_result.id, artifact_id, &findings)
                         .await
                     {
                         let reason = format!(
@@ -30328,7 +30341,28 @@ tonic-build = "0.12"
             .fetch_one(&fx.pool)
             .await
             .expect("db clock");
+        // The retry is in progress: its row is reopened (`running`). The
+        // recorded failure must keep blocking, and a quarantine update from
+        // another scanner in this window must not release the hold.
+        assert!(scanner
+            .scan_result_service
+            .reopen_failed_scan(row_id)
+            .await
+            .expect("reopen"));
+        let policy_during = crate::services::policy_service::PolicyService::new(fx.pool.clone())
+            .evaluate_artifact(artifact_id, fx.repo_id)
+            .await
+            .expect("evaluate during the retry");
+        let gate_during =
+            crate::services::quarantine_service::enforce_download_gate(&fx.pool, artifact_id).await;
+        scanner
+            .update_quarantine_status_of(artifact_id, None, 0)
+            .await
+            .expect("quarantine update during the retry");
+        let hold_during = source(fx.pool.clone()).await;
         let (second, retry_timed_out) = attempt(30).await;
+        let gate_after =
+            crate::services::quarantine_service::enforce_download_gate(&fx.pool, artifact_id).await;
         let after_second = row(fx.pool.clone()).await;
         let hold_second = source(fx.pool.clone()).await;
         // The #5153 release path audits QUARANTINE_RELEASED with
@@ -30400,6 +30434,24 @@ tonic-build = "0.12"
         // (`release_cleared_scan_policy_hold_bound`): its audit row, and the
         // scan_policy source it clears. The status then follows the retry's
         // own verdict (`flagged`: one low finding the policy allows).
+        assert!(
+            !policy_during.allowed,
+            "block_on_fail must still refuse while the retry runs: {:?}",
+            policy_during.violations
+        );
+        assert!(
+            gate_during.is_err(),
+            "a download must stay blocked while the retry runs"
+        );
+        assert_eq!(
+            (hold_during.0.as_deref(), hold_during.1.as_deref()),
+            (Some("quarantined"), Some("scan_policy")),
+            "a quarantine update during the retry must not release the hold"
+        );
+        assert!(
+            gate_after.is_ok(),
+            "the successful retry opens the download: {gate_after:?}"
+        );
         assert_eq!(releases, 1, "the retry must release the hold via #5153");
         assert_eq!(
             (hold_second.0.as_deref(), hold_second.1.as_deref()),
@@ -30408,12 +30460,348 @@ tonic-build = "0.12"
         );
     }
 
-    /// #5942 review: reopening a failed row resets it in one step, before the
-    /// retry runs: `running`, error, completion and counts cleared, the
-    /// attempt's findings and packages gone, and `started_at` moved to now so
-    /// the stuck-scan janitor times the retry from its own start (a row
-    /// queued 25 minutes ago would otherwise be reaped mid-retry). A row that
-    /// is not `failed` is left exactly as it was.
+    /// A queued on-demand scan whose grype attempt timed out, and whose retry
+    /// finds that a byte-identical artifact's scan completed during the
+    /// backoff. The retry takes the dedup path (`convert_to_reused`), which
+    /// only converts a `running` row: before the row was reopened ahead of it,
+    /// the conversion was a no-op, the job "succeeded", and the artifact's
+    /// latest grype row stayed `failed` with attempt 1's partial findings and
+    /// the `block_on_fail` hold in place. Now the row ends `completed` as a
+    /// reuse of that source, holding the source's findings and not attempt
+    /// 1's, and the retry releases the hold through the #5153 path.
+    #[tokio::test]
+    async fn a_retry_that_reuses_a_byte_identical_scan_completes_the_failed_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = Uuid::new_v4();
+        insert_test_artifact(&fx, artifact_id, "scanner-retry-reuse", None, None).await;
+        seed_enabled_policy(&fx.pool, fx.repo_id, &format!("retry-reuse-{artifact_id}")).await;
+        let mut scanner = scanner_for_fixture(&fx);
+        scanner.scanners = vec![Arc::new(HungScannerForReuse)];
+        let prepared = prepared_pairs_to_map(
+            scanner
+                .prepare_artifact_scan(artifact_id, true, false)
+                .await
+                .expect("prepare"),
+        );
+        let row_id = prepared["grype"];
+
+        // Attempt 1 hits the job deadline.
+        let budget = std::time::Duration::from_secs(1);
+        let (first, timed_out) = crate::services::scan_queue::with_job_deadline(
+            tokio::time::Instant::now() + budget,
+            budget,
+            scanner.scan_artifact_with_prepared(artifact_id, prepared.clone(), true, false),
+        )
+        .await;
+        first.expect("first attempt orchestration succeeds");
+        assert!(timed_out);
+        // Attempt 1 had stored a finding before failing (#5564).
+        sqlx::query(
+            "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title) \
+             VALUES ($1, $2, 'low', 'attempt-1 partial finding')",
+        )
+        .bind(row_id)
+        .bind(artifact_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed partial finding");
+        let (status, source): (String, Option<String>) = sqlx::query_as(
+            "SELECT s.status, a.quarantine_source FROM scan_results s \
+             JOIN artifacts a ON a.id = s.artifact_id WHERE s.id = $1",
+        )
+        .bind(row_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read attempt 1");
+
+        // During the backoff, a byte-identical artifact's grype scan completes.
+        let twin = Uuid::new_v4();
+        let source_scan = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, checksum_sha256, \
+                                    content_type, storage_key, is_deleted) \
+             SELECT $1, repository_id, 'twin.bin', 'twin.bin', size_bytes, checksum_sha256, \
+                    content_type, storage_key, false FROM artifacts WHERE id = $2",
+        )
+        .bind(twin)
+        .bind(artifact_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert twin");
+        sqlx::query(
+            "INSERT INTO scan_results (id, artifact_id, repository_id, scan_type, status, \
+                                       findings_count, low_count, checksum_sha256, \
+                                       scan_completeness, started_at, completed_at) \
+             SELECT $1, $2, repository_id, 'grype', 'completed', 1, 1, checksum_sha256, \
+                    'complete', NOW(), NOW() FROM artifacts WHERE id = $2",
+        )
+        .bind(source_scan)
+        .bind(twin)
+        .execute(&fx.pool)
+        .await
+        .expect("insert source scan");
+        sqlx::query(
+            "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title) \
+             VALUES ($1, $2, 'low', 'source finding')",
+        )
+        .bind(source_scan)
+        .bind(twin)
+        .execute(&fx.pool)
+        .await
+        .expect("seed source finding");
+
+        // The retry: no deadline pressure, and the dedup lookup finds the twin.
+        let budget = std::time::Duration::from_secs(30);
+        let (second, retry_timed_out) = crate::services::scan_queue::with_job_deadline(
+            tokio::time::Instant::now() + budget,
+            budget,
+            scanner.scan_artifact_with_prepared(artifact_id, prepared, true, false),
+        )
+        .await;
+        let (after, reused, from, error): (String, bool, Option<Uuid>, Option<String>) =
+            sqlx::query_as(
+                "SELECT status, is_reused, source_scan_id, error_message \
+                 FROM scan_results WHERE id = $1",
+            )
+            .bind(row_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read retried row");
+        let titles: Vec<String> = sqlx::query_scalar(
+            "SELECT title FROM scan_findings WHERE scan_result_id = $1 ORDER BY title",
+        )
+        .bind(row_id)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("read findings");
+        let mut releases = 0i64;
+        for _ in 0..50 {
+            releases = sqlx::query_scalar(
+                "SELECT count(*) FROM audit_log WHERE action = 'QUARANTINE_RELEASED' \
+                 AND resource_id = $1 AND details->>'released_by' = 'scan'",
+            )
+            .bind(artifact_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read audit");
+            if releases > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let hold: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT quarantine_status, quarantine_source FROM artifacts WHERE id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read hold");
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            (status.as_str(), source.as_deref()),
+            ("failed", Some("scan_policy")),
+            "attempt 1 leaves the row failed and the artifact held"
+        );
+        second.expect("retry orchestration succeeds");
+        assert!(!retry_timed_out, "the retry reused, it did not scan");
+        assert_eq!(
+            (after.as_str(), reused, from, error),
+            ("completed", true, Some(source_scan), None),
+            "the retried row must become a completed reuse of the twin's scan"
+        );
+        assert_eq!(
+            titles,
+            vec!["source finding".to_string()],
+            "the row carries the source's findings, not attempt 1's"
+        );
+        assert_eq!(releases, 1, "the retry must release the hold via #5153");
+        assert_ne!(hold.0.as_deref(), Some("quarantined"), "{hold:?}");
+        assert_eq!(hold.1, None, "{hold:?}");
+    }
+
+    /// #6282 review: the retry of a RESCAN. The artifact already has an
+    /// older completed grype row, so the reopened row has to keep outranking
+    /// it in the per-scanner "latest row" pick (`completed_at DESC NULLS
+    /// LAST`). Were its completion time cleared, the old clean row would win,
+    /// `block_on_fail` would let the artifact through while the retry runs,
+    /// and a quarantine update in that window would release the hold.
+    #[tokio::test]
+    async fn a_retried_rescan_keeps_its_failure_over_an_older_completed_scan() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct HangsOnce(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Scanner for HangsOnce {
+            fn name(&self) -> &str {
+                "grype"
+            }
+            fn scan_type(&self) -> &str {
+                "grype"
+            }
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<ScanOutput> {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    std::future::pending::<()>().await;
+                }
+                Ok(ScanOutput::default())
+            }
+        }
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = Uuid::new_v4();
+        insert_test_artifact(&fx, artifact_id, "scanner-rescan-retry", None, None).await;
+        // Yesterday's clean grype scan of these bytes.
+        sqlx::query(
+            "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
+                                       findings_count, checksum_sha256, scan_completeness, \
+                                       started_at, completed_at, created_at) \
+             SELECT id, repository_id, 'grype', 'completed', 0, checksum_sha256, 'complete', \
+                    NOW() - interval '1 day', NOW() - interval '1 day', NOW() - interval '1 day' \
+             FROM artifacts WHERE id = $1",
+        )
+        .bind(artifact_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed the older completed scan");
+        seed_enabled_policy(&fx.pool, fx.repo_id, &format!("rescan-retry-{artifact_id}")).await;
+        let mut scanner = scanner_for_fixture(&fx);
+        scanner.scanners = vec![Arc::new(HangsOnce(Arc::new(AtomicUsize::new(0))))];
+        // A rescan: bypass_dedup, so the old row is not simply reused.
+        let prepared = prepared_pairs_to_map(
+            scanner
+                .prepare_artifact_scan(artifact_id, true, true)
+                .await
+                .expect("prepare"),
+        );
+        let row_id = prepared["grype"];
+        let attempt = |secs: u64| {
+            let budget = std::time::Duration::from_secs(secs);
+            crate::services::scan_queue::with_job_deadline(
+                tokio::time::Instant::now() + budget,
+                budget,
+                scanner.scan_artifact_with_prepared(artifact_id, prepared.clone(), true, true),
+            )
+        };
+        let hold = |pool: PgPool| async move {
+            sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                "SELECT quarantine_status, quarantine_source FROM artifacts WHERE id = $1",
+            )
+            .bind(artifact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read hold")
+        };
+        let policy = |pool: PgPool, repo: Uuid| async move {
+            crate::services::policy_service::PolicyService::new(pool)
+                .evaluate_artifact(artifact_id, repo)
+                .await
+                .expect("evaluate")
+                .allowed
+        };
+
+        let (first, timed_out) = attempt(1).await;
+        let hold_first = hold(fx.pool.clone()).await;
+        let allowed_first = policy(fx.pool.clone(), fx.repo_id).await;
+        // The retry is in progress.
+        let reopened = scanner
+            .scan_result_service
+            .reopen_failed_scan(row_id)
+            .await
+            .expect("reopen");
+        let allowed_during = policy(fx.pool.clone(), fx.repo_id).await;
+        let gate_during =
+            crate::services::quarantine_service::enforce_download_gate(&fx.pool, artifact_id).await;
+        scanner
+            .update_quarantine_status_of(artifact_id, None, 0)
+            .await
+            .expect("quarantine update during the retry");
+        let hold_during = hold(fx.pool.clone()).await;
+        let (second, _) = attempt(30).await;
+        let allowed_after = policy(fx.pool.clone(), fx.repo_id).await;
+        let gate_after =
+            crate::services::quarantine_service::enforce_download_gate(&fx.pool, artifact_id).await;
+        let hold_after = hold(fx.pool.clone()).await;
+        let status: String = sqlx::query_scalar("SELECT status FROM scan_results WHERE id = $1")
+            .bind(row_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read row");
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        first.expect("first attempt orchestration succeeds");
+        assert!(timed_out);
+        assert_eq!(
+            (hold_first.0.as_deref(), hold_first.1.as_deref()),
+            (Some("quarantined"), Some("scan_policy")),
+            "the failed attempt holds the artifact"
+        );
+        assert!(!allowed_first, "the failed attempt refuses the artifact");
+        assert!(reopened);
+        assert!(
+            !allowed_during,
+            "the reopened row must outrank the older completed scan, so its \
+             failure keeps refusing while the retry runs"
+        );
+        assert!(
+            gate_during.is_err(),
+            "downloads stay blocked during the retry"
+        );
+        assert_eq!(
+            (hold_during.0.as_deref(), hold_during.1.as_deref()),
+            (Some("quarantined"), Some("scan_policy")),
+            "a quarantine update during the retry must not release the hold"
+        );
+        second.expect("retry orchestration succeeds");
+        assert_eq!(status, "completed");
+        assert!(allowed_after, "the successful retry clears the refusal");
+        assert!(gate_after.is_ok(), "{gate_after:?}");
+        assert_ne!(
+            hold_after.0.as_deref(),
+            Some("quarantined"),
+            "{hold_after:?}"
+        );
+    }
+
+    /// A grype stand-in that never returns, so only the dedup path can
+    /// complete its row.
+    struct HungScannerForReuse;
+    #[async_trait::async_trait]
+    impl Scanner for HungScannerForReuse {
+        fn name(&self) -> &str {
+            "grype"
+        }
+        fn scan_type(&self) -> &str {
+            "grype"
+        }
+        async fn scan(
+            &self,
+            _: &Artifact,
+            _: Option<&ArtifactMetadata>,
+            _: &Bytes,
+        ) -> Result<ScanOutput> {
+            std::future::pending().await
+        }
+    }
+
+    /// #5942 review: reopening a failed row for a retry moves it to `running`
+    /// with `started_at` now, so the stuck-scan janitor times the retry from
+    /// its own start (a row queued 25 minutes ago would otherwise be reaped
+    /// mid-retry), and clears its `failed` inventory. It keeps its completion
+    /// time so it still outranks an older completed row of the scanner. Its
+    /// recorded failure (under the retry marker) and its findings stay until
+    /// the retry writes its own result, so the gates keep seeing them. A row
+    /// that is not `failed` is left exactly as it was.
     #[tokio::test]
     async fn reopening_a_failed_row_resets_it_for_the_retry() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -30491,15 +30879,19 @@ tonic-build = "0.12"
             failed,
             (
                 "running".to_string(),
-                None,
-                false,
+                Some(format!(
+                    "{}attempt 1 timed out",
+                    crate::services::scan_state::RETRYING_AFTER_FAILURE_PREFIX
+                )),
+                true,
                 "complete".to_string(),
-                0,
-                0,
-                0,
+                1,
+                1,
+                1,
                 true
             ),
-            "the failed row is reset for the retry, started_at included"
+            "the row runs again from now, still carrying its recorded failure and \
+             its findings until the retry writes its own"
         );
         assert!(!untouched, "only a failed row is reopened");
         assert_eq!(
