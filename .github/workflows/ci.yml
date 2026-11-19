@@ -825,7 +825,10 @@ jobs:
       # archive.ubuntu.com instead of crawling into the job ceiling.
       - name: Install protoc and the x86_64 mingw-w64 cross compilers
         run: |
-          pkgs=(protobuf-compiler pkg-config libssl-dev gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix)
+          # libprotobuf-dev: the well-known .proto files (timestamp.proto)
+          # build.rs imports, a Recommends of protobuf-compiler that
+          # --no-install-recommends would otherwise drop.
+          pkgs=(protobuf-compiler libprotobuf-dev pkg-config libssl-dev gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix)
           echo "apt mirrors: $(tr '\n' ' ' < /etc/apt/apt-mirrors.txt 2>/dev/null)"
           install() {
             sudo timeout 6m apt-get update -o Acquire::Retries=3 \
