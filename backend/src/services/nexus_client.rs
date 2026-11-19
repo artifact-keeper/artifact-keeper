@@ -117,6 +117,9 @@ struct ListCursor {
     listed_paths: std::collections::HashSet<String>,
     /// Both listings answered without a continuation token: the walk is over.
     exhausted: bool,
+    /// Date bounds `(modified_after, modified_before)` this cursor was built
+    /// with so a walk with a different window never reuses stale state.
+    date_filter: (Option<String>, Option<String>),
 }
 
 /// A repository is walked through `/components` first, then through
@@ -249,6 +252,8 @@ pub struct NexusAsset {
     pub content_type: Option<String>,
     #[serde(rename = "fileSize")]
     pub file_size: Option<i64>,
+    #[serde(rename = "lastModified", default)]
+    pub last_modified: Option<String>,
     /// Nexus repository format of the asset (`raw`, `maven2`, `npm`, ...).
     pub format: Option<String>,
 }
@@ -584,14 +589,27 @@ impl NexusClient {
         }
     }
 
-    /// Take the cursor positioned exactly at `offset` for `repo_name`, if one
-    /// is there. Removing it means a concurrent call for the same repository
-    /// falls back to the cold walk rather than sharing a cursor, and it keeps
-    /// the lock off the upstream fetch.
-    fn take_list_cursor(&self, repo_name: &str, offset: i64) -> Option<ListCursor> {
+    /// Take the cursor positioned exactly at `offset` and matching
+    /// `(modified_after, modified_before)` for `repo_name`, if one is there.
+    /// Removing it means a concurrent call for the same repository falls back
+    /// to the cold walk rather than sharing a cursor, and it keeps the lock
+    /// off the upstream fetch.
+    fn take_list_cursor(
+        &self,
+        repo_name: &str,
+        offset: i64,
+        modified_after: Option<&str>,
+        modified_before: Option<&str>,
+    ) -> Option<ListCursor> {
         let mut cursors = self.list_cursors.lock().ok()?;
         match cursors.get(repo_name) {
-            Some(cursor) if cursor.next_offset == offset => cursors.remove(repo_name),
+            Some(cursor)
+                if cursor.next_offset == offset
+                    && cursor.date_filter.0.as_deref() == modified_after
+                    && cursor.date_filter.1.as_deref() == modified_before =>
+            {
+                cursors.remove(repo_name)
+            }
             _ => None,
         }
     }
@@ -636,10 +654,64 @@ impl NexusClient {
             name,
             size: asset.file_size,
             created: None,
-            modified: None,
+            modified: asset.last_modified.clone(),
             sha256: asset.checksum.as_ref().and_then(|c| c.sha256.clone()),
             actual_sha1: asset.checksum.as_ref().and_then(|c| c.sha1.clone()),
         }
+    }
+
+    fn parse_filter_timestamp(
+        value: &str,
+        end_of_day: bool,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        let trimmed = value.trim();
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+            return Some(dt.with_timezone(&chrono::Utc));
+        }
+        if let Ok(date) = chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+            let naive = if end_of_day {
+                date.and_hms_nano_opt(23, 59, 59, 999_999_999)?
+            } else {
+                date.and_hms_opt(0, 0, 0)?
+            };
+            return Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                naive,
+                chrono::Utc,
+            ));
+        }
+        None
+    }
+
+    /// Check whether an asset's `lastModified` timestamp falls within
+    /// `(modified_after, modified_before)`, matching Artifactory AQL's `$gt` /
+    /// `$lt` window semantics. When a date filter is active and an asset has no
+    /// parseable `lastModified`, fail open (`true`) rather than dropping it.
+    fn matches_date_window(
+        modified: Option<&str>,
+        modified_after: Option<&str>,
+        modified_before: Option<&str>,
+    ) -> bool {
+        if modified_after.is_none() && modified_before.is_none() {
+            return true;
+        }
+        let after_dt = modified_after.and_then(|v| Self::parse_filter_timestamp(v, false));
+        let before_dt = modified_before.and_then(|v| Self::parse_filter_timestamp(v, true));
+        if after_dt.is_none() && before_dt.is_none() {
+            return true;
+        }
+        let Some(asset_dt) = modified
+            .and_then(|v| chrono::DateTime::parse_from_rfc3339(v.trim()).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+        else {
+            return true;
+        };
+        if after_dt.is_some_and(|after| asset_dt <= after) {
+            return false;
+        }
+        if before_dt.is_some_and(|before| asset_dt >= before) {
+            return false;
+        }
+        true
     }
 
     /// Whether an asset outside every component is a file someone stored, not
@@ -702,18 +774,37 @@ impl NexusClient {
         offset: i64,
         limit: i64,
     ) -> Result<AqlResponse, ArtifactoryError> {
+        self.list_artifacts_filtered(repo_name, offset, limit, None, None)
+            .await
+    }
+
+    async fn list_artifacts_filtered(
+        &self,
+        repo_name: &str,
+        offset: i64,
+        limit: i64,
+        modified_after: Option<&str>,
+        modified_before: Option<&str>,
+    ) -> Result<AqlResponse, ArtifactoryError> {
         let offset = offset.max(0);
         let want = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
 
         // Resume where the previous call for this repository stopped; on a
         // miss, start cold and drop the `offset` assets that precede the page.
-        let (mut cursor, mut to_discard) = match self.take_list_cursor(repo_name, offset) {
-            Some(cursor) => (cursor, 0usize),
-            None => (
-                ListCursor::default(),
-                usize::try_from(offset).unwrap_or(usize::MAX),
-            ),
-        };
+        let (mut cursor, mut to_discard) =
+            match self.take_list_cursor(repo_name, offset, modified_after, modified_before) {
+                Some(cursor) => (cursor, 0usize),
+                None => (
+                    ListCursor {
+                        date_filter: (
+                            modified_after.map(str::to_string),
+                            modified_before.map(str::to_string),
+                        ),
+                        ..ListCursor::default()
+                    },
+                    usize::try_from(offset).unwrap_or(usize::MAX),
+                ),
+            };
 
         let target = to_discard.saturating_add(want);
         while cursor.pending.len() < target && !cursor.exhausted {
@@ -733,10 +824,16 @@ impl NexusClient {
                 ListPhase::Components => {
                     let page: NexusComponentsResponse = self.get(&path).await?;
                     let results = Self::page_to_results(repo_name, &page);
-                    cursor
-                        .listed_paths
-                        .extend(results.iter().map(Self::listed_path));
-                    cursor.pending.extend(results);
+                    for result in results {
+                        cursor.listed_paths.insert(Self::listed_path(&result));
+                        if Self::matches_date_window(
+                            result.modified.as_deref(),
+                            modified_after,
+                            modified_before,
+                        ) {
+                            cursor.pending.push_back(result);
+                        }
+                    }
                     page.continuation_token
                 }
                 ListPhase::Assets => match self.get::<NexusAssetsResponse>(&path).await {
@@ -749,7 +846,13 @@ impl NexusClient {
                                 continue;
                             }
                             let result = Self::asset_to_result(repo_name, asset_path, asset);
-                            if cursor.listed_paths.insert(Self::listed_path(&result)) {
+                            if cursor.listed_paths.insert(Self::listed_path(&result))
+                                && Self::matches_date_window(
+                                    result.modified.as_deref(),
+                                    modified_after,
+                                    modified_before,
+                                )
+                            {
                                 cursor.pending.push_back(result);
                             }
                         }
@@ -937,10 +1040,11 @@ impl crate::services::source_registry::SourceRegistry for NexusClient {
         repo_key: &str,
         offset: i64,
         limit: i64,
-        _modified_after: Option<&str>,
-        _modified_before: Option<&str>,
+        modified_after: Option<&str>,
+        modified_before: Option<&str>,
     ) -> Result<AqlResponse, ArtifactoryError> {
-        self.list_artifacts(repo_key, offset, limit).await
+        self.list_artifacts_filtered(repo_key, offset, limit, modified_after, modified_before)
+            .await
     }
 
     async fn download_artifact(
@@ -2712,5 +2816,132 @@ mod tests {
 
         assert_eq!(request_count(&server, "/service/rest/v1/assets").await, 2);
         assert_eq!(page.results.len(), 1, "the repeated asset is listed once");
+    }
+
+    #[tokio::test]
+    async fn test_list_artifacts_with_date_filter_filters_components_and_assets_6195() {
+        use crate::services::source_registry::SourceRegistry;
+        use wiremock::matchers::{query_param, query_param_is_missing};
+
+        let server = MockServer::start().await;
+
+        let asset_with_ts = |fmt: &str, path_str: &str, id: usize, ts: Option<&str>| {
+            let mut v = fixture_asset_of(fmt, path_str, id);
+            if let Some(t) = ts {
+                v["lastModified"] = serde_json::json!(t);
+            }
+            v
+        };
+
+        // Page 1: all items precede `modified_after`, proving pagination continues
+        // across an empty filtered page instead of terminating early.
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/components"))
+            .and(query_param("repository", "date-repo"))
+            .and(query_param_is_missing("continuationToken"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [{
+                    "id": "comp-old",
+                    "repository": "date-repo",
+                    "format": "maven2",
+                    "name": "old",
+                    "version": "1.0",
+                    "assets": [asset_with_ts(
+                        "maven2",
+                        "/com/example/old/1.0/old-1.0.jar",
+                        1,
+                        Some("2026-10-01T00:00:00Z")
+                    )]
+                }],
+                "continuationToken": "c1"
+            })))
+            .mount(&server)
+            .await;
+
+        // Page 2: one boundary item equal to `after` (excluded by `$gt`), one inside
+        // the window, and one past `before` (excluded by `$lt`).
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/components"))
+            .and(query_param("repository", "date-repo"))
+            .and(query_param("continuationToken", "c1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [{
+                    "id": "comp-mix",
+                    "repository": "date-repo",
+                    "format": "maven2",
+                    "name": "mix",
+                    "version": "2.0",
+                    "assets": [
+                        asset_with_ts(
+                            "maven2",
+                            "/com/example/mix/2.0/at-boundary.jar",
+                            2,
+                            Some("2026-11-01T00:00:00Z")
+                        ),
+                        asset_with_ts(
+                            "maven2",
+                            "/com/example/mix/2.0/in-window.jar",
+                            3,
+                            Some("2026-11-10T12:00:00+00:00")
+                        ),
+                        asset_with_ts(
+                            "maven2",
+                            "/com/example/mix/2.0/too-new.jar",
+                            4,
+                            Some("2026-11-20T00:00:00Z")
+                        )
+                    ]
+                }],
+                "continuationToken": null
+            })))
+            .mount(&server)
+            .await;
+
+        // Component-less `/assets` page: one old raw file (excluded), one in-window
+        // raw file (included), plus the old component file (must not re-appear).
+        mount_asset_pages(
+            &server,
+            "date-repo",
+            vec![vec![
+                asset_with_ts(
+                    "maven2",
+                    "/com/example/old/1.0/old-1.0.jar",
+                    1,
+                    Some("2026-10-01T00:00:00Z"),
+                ),
+                asset_with_ts(
+                    "raw",
+                    "/raw/stale.txt",
+                    5,
+                    Some("2026-10-15T00:00:00Z"),
+                ),
+                asset_with_ts(
+                    "raw",
+                    "/raw/fresh.txt",
+                    6,
+                    Some("2026-11-12T08:30:00Z"),
+                ),
+            ]],
+        )
+        .await;
+
+        let client = nexus_client_for(&server);
+        let page = SourceRegistry::list_artifacts_with_date_filter(
+            &client,
+            "date-repo",
+            0,
+            10,
+            Some("2026-11-01T00:00:00Z"),
+            Some("2026-11-15T00:00:00Z"),
+        )
+        .await
+        .expect("list_artifacts_with_date_filter must succeed");
+
+        let names: Vec<&str> = page.results.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["in-window.jar", "fresh.txt"]);
+        assert_eq!(
+            page.results[0].modified.as_deref(),
+            Some("2026-11-10T12:00:00+00:00")
+        );
     }
 }
