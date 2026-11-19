@@ -2162,18 +2162,28 @@ mod tests {
             .await
             .expect("public repo");
         tdh::grant_repo_role(&pool, open_repo, other_id, "reader").await;
-        // The one recorded artifact that is really stored.
-        sqlx::query(
-            "INSERT INTO artifacts (repository_id, path, name, size_bytes, \
-             checksum_sha256, content_type, storage_key) \
-             VALUES ($1, 'com/org/app.jar', 'app.jar', 10, $2, 'application/java-archive', $3)",
-        )
-        .bind(open_repo)
-        .bind("a".repeat(64))
-        .bind(format!("ph-6281/{}", Uuid::new_v4()))
-        .execute(&pool)
-        .await
-        .expect("stored artifact");
+        // Stored rows in the readable repository: `app.jar` as uploads store
+        // it, `slash.jar` with a leading `/` (shown), and `deleted.jar`
+        // soft-deleted (hidden from a non-owner).
+        for (path, deleted) in [
+            ("com/org/app.jar", false),
+            ("/com/org/slash.jar", false),
+            ("com/org/deleted.jar", true),
+        ] {
+            sqlx::query(
+                "INSERT INTO artifacts (repository_id, path, name, size_bytes, \
+                 checksum_sha256, content_type, storage_key, is_deleted) \
+                 VALUES ($1, $2, 'stored.jar', 10, $3, 'application/java-archive', $4, $5)",
+            )
+            .bind(open_repo)
+            .bind(path)
+            .bind("a".repeat(64))
+            .bind(format!("ph-6281/{}", Uuid::new_v4()))
+            .bind(deleted)
+            .execute(&pool)
+            .await
+            .expect("stored artifact");
+        }
 
         let owner = tdh::router_with_auth(
             super::router(),
@@ -2232,6 +2242,8 @@ mod tests {
         let hidden_path = format!("{hidden_key}/com/org/secret.jar");
         let unstored_path = format!("{open_key}/com/org/typed.jar");
         let public_path = format!("{public_key}/never-stored.jar");
+        let slash_path = format!("{open_key}/com/org/slash.jar");
+        let deleted_path = format!("{open_key}/com/org/deleted.jar");
         send_json(
             owner.clone(),
             post_json(
@@ -2249,6 +2261,10 @@ mod tests {
                       "checksum_sha256": "d".repeat(64), "size_bytes": 40 },
                     { "name": "public.jar", "path": public_path,
                       "checksum_sha256": "e".repeat(64), "size_bytes": 50 },
+                    { "name": "slash.jar", "path": slash_path,
+                      "checksum_sha256": "f".repeat(64), "size_bytes": 60 },
+                    { "name": "deleted.jar", "path": deleted_path,
+                      "checksum_sha256": "1".repeat(64), "size_bytes": 70 },
                 ] }),
             ),
         )
@@ -2269,6 +2285,8 @@ mod tests {
             "dist/local.bin".to_string(),
             unstored_path.clone(),
             public_path.clone(),
+            slash_path.clone(),
+            deleted_path.clone(),
         ];
         all.sort();
 
@@ -2283,7 +2301,7 @@ mod tests {
             assert_eq!(got["vcs_branch"], "main", "{who}");
             assert_eq!(got["vcs_message"], "ph-6240 commit", "{who}");
             assert_eq!(got["metadata"], metadata, "{who}");
-            assert_eq!(got["artifact_count"], 5, "{who}");
+            assert_eq!(got["artifact_count"], 7, "{who}");
             assert_eq!(artifact_paths(&got), all, "{who}");
 
             let list = send_json(app.clone(), tdh::get(format!("/?search={name}"))).await;
@@ -2295,7 +2313,7 @@ mod tests {
                 "{who}"
             );
             assert_eq!(artifact_paths(&items[0]), all, "{who}");
-            assert_eq!(items[0]["artifact_count"], 5, "{who}");
+            assert_eq!(items[0]["artifact_count"], 7, "{who}");
         }
 
         // Anyone else: the build, without metadata or any VCS field, and
@@ -2309,9 +2327,11 @@ mod tests {
             for field in ["vcs_url", "vcs_revision", "vcs_branch", "vcs_message"] {
                 assert!(b.get(field).is_none(), "{field}: {b}");
             }
-            assert_eq!(artifact_paths(b), std::slice::from_ref(&open_path), "{b}");
+            let mut shown = vec![open_path.clone(), slash_path.clone()];
+            shown.sort();
+            assert_eq!(artifact_paths(b), shown, "{b}");
             // #6281: the count is what it is shown, not how many exist.
-            assert_eq!(b["artifact_count"], 1, "{b}");
+            assert_eq!(b["artifact_count"], 2, "{b}");
             let text = b.to_string();
             for secret in [
                 "SECRET6240",
@@ -2319,6 +2339,7 @@ mod tests {
                 hidden_key.as_str(),
                 "dist/local.bin",
                 "typed.jar",
+                "deleted.jar",
                 public_key.as_str(),
             ] {
                 assert!(!text.contains(secret), "{secret} leaked: {text}");
