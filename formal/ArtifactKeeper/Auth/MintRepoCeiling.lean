@@ -11,6 +11,10 @@ credential that minted it could not reach, through any chain of mints.
 The stored restriction is the legacy `Option<Vec<Uuid>>`, where an empty list
 is stored as "no restriction". The model keeps that step, because it is what
 makes the empty-allowlist refusal in `mint_repo_ceiling` load-bearing.
+
+Paired Rust test: `mint_repo_ceiling_laws` in
+`backend/src/api/middleware/auth.rs` checks `mint_chain_never_widens` and
+`restricted_to_nothing_cannot_mint` on the real mint path.
 -/
 
 namespace ArtifactKeeper.Auth.MintRepoCeiling

@@ -330,6 +330,18 @@ pub fn record_proxy_scan_abandoned() {
     counter!("ak_proxy_scan_abandoned_total").increment(1);
 }
 
+/// Count one proxied pull served without a scan and without one queued, so it
+/// never gets a verdict. `reason` is a fixed string, never the file name
+pub fn record_proxy_scan_unscannable(repo_key: &str, format: &str, reason: &'static str) {
+    counter!(
+        "ak_proxy_scan_unscannable_total",
+        "repository" => repo_key.to_string(),
+        "format" => format.to_string(),
+        "reason" => reason,
+    )
+    .increment(1);
+}
+
 /// Record one committed artifact upload: `ak_artifact_uploads_total` and the
 /// `ak_artifact_upload_size_bytes` histogram. Called from
 /// `scanner_service::trigger_scan_on_upload`, the post-commit step every

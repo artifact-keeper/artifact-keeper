@@ -1,0 +1,90 @@
+name: Docker Publish Watchdog
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A DOCKER PUBLISH RUN THAT NEVER GETS A RUNNER MUST NOT SIT THERE  (#6080)
+#
+# A run that stays `queued` -- not one job started, so not even the
+# GitHub-hosted publish-preflight got a runner -- holds its concurrency
+# group's running slot, and every later run in that group sits `pending`
+# with zero jobs (main@ea9425b6 sat 75 minutes; the next commits' images, and
+# a Release Candidate waiting on them, went nowhere). Nothing reported it.
+#
+# Every 15 minutes this cancels each Docker Publish run that is still queued
+# with no runner after 30 minutes (scripts/ci/find-stale-docker-publish-runs.sh
+# says exactly what counts), and goes RED naming each one, so a stuck run is
+# a red run in the Actions list rather than something somebody has to notice.
+# A run waiting for the self-hosted amd64 pool is `in_progress` and is never
+# touched. Re-run a cancelled run by hand once the runner problem is fixed
+# (`gh run rerun <id>`: the same push run, so the same signing identity and
+# provenance); a Release Candidate that was waiting on it is re-dispatched.
+# ══════════════════════════════════════════════════════════════════════════════
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+    inputs:
+      stale_minutes:
+        description: 'Minutes a run may stay queued with no runner before it counts as stale.'
+        required: false
+        default: '30'
+      dry_run:
+        description: 'Report stale runs without cancelling them.'
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: docker-publish-watchdog
+  cancel-in-progress: true
+
+jobs:
+  sweep:
+    name: Cancel Docker Publish runs stuck with no runner
+    if: ${{ github.repository == 'artifact-keeper/artifact-keeper' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write   # cancel the stale runs
+    steps:
+      - name: Checkout the tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: scripts/ci
+
+      - name: Find and cancel stale queued runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STALE_MINUTES: ${{ inputs.stale_minutes || '30' }}
+          STALE_ACTION: ${{ format('{0}', inputs.dry_run) == 'true' && 'report' || 'cancel' }}
+        run: |
+          set -uo pipefail
+          rc=0
+          out="$(bash scripts/ci/find-stale-docker-publish-runs.sh)" || rc=$?
+          case "$rc" in
+            0)
+              echo "No Docker Publish run has been queued with no runner for ${STALE_MINUTES}m." ;;
+            1)
+              {
+                echo "### Stale Docker Publish runs"
+                echo
+                echo "Queued for ${STALE_MINUTES}m or more with no runner assigned (action: ${STALE_ACTION})."
+                echo
+                echo '```'
+                echo "$out"
+                echo '```'
+                echo
+                echo "Fix the runner problem, then re-run any run that is still needed: \`gh run rerun <id>\`."
+              } >> "$GITHUB_STEP_SUMMARY"
+              while read -r line; do
+                [[ -z "$line" ]] && continue
+                echo "::error title=Docker Publish run stuck with no runner::${line}"
+              done <<< "$out"
+              exit 1 ;;
+            *)
+              echo "::error title=Watchdog could not read the runs::find-stale-docker-publish-runs.sh exited ${rc}; indeterminate, not a verdict."
+              exit 1 ;;
+          esac

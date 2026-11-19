@@ -1926,11 +1926,13 @@ async fn pool_entry_in_indexes(
             continue;
         }
         // #2561: permit-scoped decode on this serve path (each cached index
-        // inflates up to the 128 MiB budget), fast-fail 503 on saturation; the
+        // inflates up to the 128 MiB budget); on saturation it waits briefly for
+        // a slot, then sheds 503 (#6230); the
         // permit is released before the next cache read.
-        let Some(text) = crate::util::bounded_archive::with_ingest_extraction(|| {
+        let Some(text) = crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
             decompress_packages_index(&name, &bytes)
-        })?
+        })
+        .await?
         else {
             continue;
         };
@@ -3730,9 +3732,10 @@ async fn resolve_flat_expected_checksum(
             continue;
         };
         // #2561: permit-scoped decode, same as the pool resolver.
-        let Some(text) = crate::util::bounded_archive::with_ingest_extraction(|| {
+        let Some(text) = crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
             decompress_packages_index(&cache_path, &bytes)
-        })?
+        })
+        .await?
         else {
             continue;
         };
@@ -4977,7 +4980,8 @@ pub(crate) async fn record_debian_package_extras(
 ) {
     // `preinst`/`postinst`/`prerm`/`postrm` run as root on `apt install`
     // (#4033). Best-effort: the artifact row is already committed.
-    let (scripts, unanalyzed, completeness) = extract_deb_maintainer_scripts(deb_head);
+    let (scripts, unanalyzed, completeness) =
+        extract_deb_maintainer_scripts_waiting(deb_head).await;
     debug_assert!(
         scripts
             .iter()
@@ -5544,22 +5548,40 @@ fn collect_deb_maintainer_scripts<R: Read>(decoded: R) -> ExtractedScripts {
 ///
 /// Never fails: a package that cannot be opened yields no scripts and a
 /// `NotRead` completeness naming the reason, so the analysis row says "could
-/// not look" rather than "nothing found". The decode runs under the shared
-/// ingest-extraction permit; a saturated server is likewise `NotRead`, not a
-/// clean result.
+/// not look" rather than "nothing found". The caller holds the shared
+/// ingest-extraction permit across this decode (see
+/// [`extract_deb_maintainer_scripts_waiting`]).
 fn extract_deb_maintainer_scripts(body: &[u8]) -> ExtractedScripts {
     let not_read = |reason: String| (Vec::new(), Vec::new(), Completeness::NotRead { reason });
     let (member_name, data) = match DebianHandler::control_tar_member(body) {
         Ok(found) => found,
         Err(e) => return not_read(format!("control.tar could not be located: {e}")),
     };
-    match crate::util::bounded_archive::with_ingest_extraction(|| {
-        control_tar_decoder(member_name, data).map(collect_deb_maintainer_scripts)
-    }) {
-        Ok(Ok(result)) => result,
-        Ok(Err(e)) => not_read(format!("{member_name} could not be decoded: {e}")),
-        Err(e) => not_read(format!("extraction slot unavailable: {e}")),
+    match control_tar_decoder(member_name, data).map(collect_deb_maintainer_scripts) {
+        Ok(result) => result,
+        Err(e) => not_read(format!("{member_name} could not be decoded: {e}")),
     }
+}
+
+/// [`extract_deb_maintainer_scripts`] under the shared ingest-extraction
+/// permit. On saturation it waits briefly for a slot (#6230): a fast-fail
+/// acquire always lost to queued uploads, so a burst recorded every package
+/// as unread. A server still saturated after the wait is `NotRead`, not a
+/// clean result.
+async fn extract_deb_maintainer_scripts_waiting(body: &[u8]) -> ExtractedScripts {
+    crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
+        extract_deb_maintainer_scripts(body)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        (
+            Vec::new(),
+            Vec::new(),
+            Completeness::NotRead {
+                reason: format!("extraction slot unavailable: {e}"),
+            },
+        )
+    })
 }
 
 #[cfg(ak_test_shard = "handlers-1")]
@@ -9709,6 +9731,25 @@ mod maintainer_script_tests {
             findings.iter().any(|f| f.severity >= ScriptSeverity::High),
             "curl | sh in a root-run postinst must be a high-severity finding: {findings:?}"
         );
+    }
+
+    /// #6230: with the repository's ingest bucket full, the maintainer-script
+    /// analysis waits for a permit and reads the package once one frees. The
+    /// fast-fail acquire it replaced always lost to queued uploads, so a burst
+    /// recorded every package as `NotRead`.
+    #[tokio::test]
+    async fn maintainer_script_analysis_waits_for_ingest_permit_6230() {
+        let tar = tar_with(&[("control", CONTROL), ("postinst", HOSTILE)]);
+        let body = deb("control.tar.gz", &gz(&tar));
+        let ((scripts, _unanalyzed, completeness), queued) =
+            crate::util::bounded_archive::test_support::run_queued_behind_full_tenant(
+                crate::util::bounded_archive::TenantKey::Repo(uuid::Uuid::new_v4()),
+                async move { extract_deb_maintainer_scripts_waiting(&body).await },
+            )
+            .await;
+        assert!(queued, "the analysis must wait for a permit");
+        assert_eq!(completeness, Completeness::Complete);
+        assert_eq!(scripts.len(), 1);
     }
 
     #[test]

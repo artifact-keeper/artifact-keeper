@@ -1,6 +1,10 @@
 name = "artifact-keeper-formal"
 version = "0.1.0"
-defaultTargets = ["ArtifactKeeper"]
+defaultTargets = ["ArtifactKeeper", "ak-oracle"]
 
 [[lean_lib]]
 name = "ArtifactKeeper"
+
+[[lean_exe]]
+name = "ak-oracle"
+root = "Oracle"
