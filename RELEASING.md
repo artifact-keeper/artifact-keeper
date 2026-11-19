@@ -305,6 +305,14 @@ names the same commit.
    PR merged failed on "Docker Publish for HEAD is still 'pending'" (run
    36862392025, v1.10.2).
 
+   Main pushes coalesce in Docker Publish (#6242): if another PR merges
+   while the prep commit's run is still waiting, GitHub replaces that run
+   (cancelled, no jobs) and only the newest commit builds. You need not
+   freeze main for this. The candidate sees the cancelled run, re-runs it
+   (`gh run rerun`: the same push run, so the same signing identity), and
+   waits for it; a re-run is never replaced. To get the images without a
+   candidate, `gh run rerun <id>` does the same by hand.
+
    ```bash
    gh workflow run release-candidate.yml --repo artifact-keeper/artifact-keeper \
      --ref main                       # -f sha=<40-hex> to pick a commit that is not the tip
