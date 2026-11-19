@@ -254,8 +254,8 @@ publish_job="$(awk '/^  publish:$/{p=1; print; next} p && /^  [a-z][a-z0-9_-]*:$
     has "$group" "github.ref != 'refs/heads/main'"
   wire "docker-publish: other branch pushes keep a group per commit (#6080)" \
     has "$group" "format('-{0}', github.sha)"
-  wire "docker-publish: a re-run attempt gets a group of its own (cannot be replaced)" \
-    has "$group" "format('-attempt-{0}', github.run_attempt)"
+  wire "docker-publish: a re-run gets a group of its own, keyed on run id and attempt (cannot be replaced)" \
+    has "$group" "format('-rerun-{0}-{1}', github.run_id, github.run_attempt)"
   wire "docker-publish: cancel-in-progress is the literal false (#2099)" \
     test "$cip" = false
   wire "release-candidate publish job: actions: write (to re-run)" \

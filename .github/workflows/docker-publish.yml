@@ -122,7 +122,10 @@ permissions: {}
 #   commit either way (scripts/ci/decide-branch-floating-tags.sh keeps them
 #   from moving backwards).
 # - A RE-RUN IS NEVER REPLACED. An attempt after the first gets a group of
-#   its own (`-attempt-<n>`), so a re-run of a superseded commit's run runs
+#   its own (`-rerun-<run id>-<attempt>`: keyed on the run, so two re-runs of
+#   different main runs, e.g. a person's "re-run failed jobs" on the tip and a
+#   candidate's re-run of an older commit, never share a group), so a re-run
+#   of a superseded commit's run runs
 #   beside the branch's queue instead of joining it and being replaced again
 #   (run 42710734527's attempt 2 was, on 2026-11-09). That is how a commit
 #   whose run was replaced gets its `sha-<sha>` images: the Release Candidate
@@ -161,7 +164,7 @@ permissions: {}
 # those minutes by gambling that the *next* run completes — and when merges
 # arrive faster than the amd64 build takes, that gamble loses every time.
 concurrency:
-  group: docker-publish-${{ github.event_name }}-${{ github.ref }}${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master') && format('-{0}', github.sha) || '' }}${{ github.run_attempt != '1' && format('-attempt-{0}', github.run_attempt) || '' }}
+  group: docker-publish-${{ github.event_name }}-${{ github.ref }}${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master') && format('-{0}', github.sha) || '' }}${{ github.run_attempt != '1' && format('-rerun-{0}-{1}', github.run_id, github.run_attempt) || '' }}
   cancel-in-progress: false
 
 env:
