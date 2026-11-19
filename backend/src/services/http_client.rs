@@ -1479,7 +1479,7 @@ mod tests {
         // GET an external http host so the built-in proxy applies; we only care
         // that the connect reaches the proxy listener, not about a full response.
         let request = tokio::spawn(async move {
-            let _ = client.get("http://93.184.216.34/").send().await;
+            let _ = client.get("http://example.com/").send().await;
         });
 
         let accepted = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await;
@@ -1526,7 +1526,7 @@ mod tests {
             .expect("build client");
 
         let request =
-            tokio::spawn(async move { client.get("http://93.184.216.34/").send().await.is_err() });
+            tokio::spawn(async move { client.get("http://example.com/").send().await.is_err() });
 
         let accepted = tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
         let send_errored = request.await.expect("request task");
