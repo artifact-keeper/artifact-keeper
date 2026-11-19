@@ -114,6 +114,8 @@ Thanks to the external contributors and issue reporters who shaped this release.
 
 - **On a build someone else created, the builds API lists only artifacts that are really stored in a repository you can read, and counts only those** (#6281). A non-owner used to see a recorded artifact whenever its path started with the key of a readable repository. That path is text the build's creator types, so `dist/x.jar` was shown to every signed-in user whenever a public repository named `dist` existed. Now `<key>/<path>` must be a stored artifact in repository `<key>`, and otherwise only the creator and administrators see it. `artifact_count` on such a build is now the number of artifacts the caller is shown, not the total attached, so it no longer reveals how many are hidden. The creator and administrators see every artifact and the full count, as before.
 
+- **The scanner adapter's bundled trivy is rebuilt on Go 1.27.4** (#6320). It fixes CVE-2026-97054 (net/http: `MaxBytesReader` on HTTP/1 servers) in the trivy binary shipped in the scanner-adapter image, which was built on Go 1.27.3. Only the Go toolchain changes; trivy is still 0.76.0 with the same overrides.
+
 ## [1.12.2] - 2026-11-18
 
 **1.12.2 is a patch release on 1.12: about 50 fixes and two light migrations (385, 398).** Upgrade from 1.12.1 directly; from 1.11.x, the [1.12.1] upgrade notes apply first.
