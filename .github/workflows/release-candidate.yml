@@ -1161,7 +1161,7 @@ jobs:
     # sha, and
     # scripts/ci/check-gate-workflow-pins.sh enforces both that and that the
     # sha is on artifact-keeper-test main.
-    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@ff6f1c4e461a7ece9e73bf20064b9a985ef9007d # artifact-keeper-test main as of 2026-11-19
+    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@1c4552bd7ef12cbc05541f18dbba5868c4444b5b # artifact-keeper-test main as of 2026-11-19
     with:
       backend_tag: sha-${{ needs.resolve.outputs.short }}
       # The chart ref the gate deploys. `bookkeeping` renders the chart at this
