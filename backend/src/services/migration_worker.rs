@@ -1110,15 +1110,6 @@ impl MigrationWorker {
                     continue;
                 }
 
-                // Dry run: report what would move and stop here. First branch
-                // in the body on purpose, ahead of every DB read/write, the
-                // download, and the storage put.
-                if self.config.dry_run {
-                    *completed += 1;
-                    *transferred += size;
-                    continue;
-                }
-
                 // Keep sha256 and sha1 separate so verification can compare
                 // each digest against the corresponding locally computed
                 // value. Picking a single "checksum" field and computing
@@ -1169,14 +1160,27 @@ impl MigrationWorker {
                         "Skipping duplicate artifact (already exists with matching checksum)"
                     );
                     // #3927: repair a pre-fix import's missing Maven
-                    // coordinates instead of skipping past them.
-                    self.repair_migrated_maven_metadata(
-                        keys.target.as_str(),
-                        package_type,
-                        &artifact_path,
-                    )
-                    .await;
+                    // coordinates instead of skipping past them; dry runs stay
+                    // read-only.
+                    if !self.config.dry_run {
+                        self.repair_migrated_maven_metadata(
+                            keys.target.as_str(),
+                            package_type,
+                            &artifact_path,
+                        )
+                        .await;
+                    }
                     *skipped += 1;
+                    continue;
+                }
+
+                // Dry run: after deduplicating against items already present in
+                // the destination, count only what would actually transfer and
+                // stop before writing migration_items, downloading, or putting
+                // storage (#6196).
+                if self.config.dry_run {
+                    *completed += 1;
+                    *transferred += size;
                     continue;
                 }
 
@@ -13397,6 +13401,107 @@ mod tests {
 
         let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
             .bind(&repo_key)
+            .execute(&pool)
+            .await;
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// #6196: with `dry_run: true` and `conflict_resolution: skip`, items
+    /// already present in the destination must count under `skipped_items`
+    /// rather than `completed_items` / `transferred_bytes`, and no DB writes
+    /// (`migration_items` or new `artifacts`) may occur.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_dry_run_with_skip_counts_existing_duplicates_as_skipped_6196() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "dryskip-6196").await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_id = seed_destination_repo(&pool, &repo_key, tmp.path()).await;
+
+        // First pass: migrate `one.tar.gz` into the destination repository.
+        run_enumerating_job(
+            &pool,
+            job_id,
+            &repo_key,
+            &[("one.tar.gz", 4)],
+            WorkerConfig {
+                throttle_delay_ms: 0,
+                ..WorkerConfig::default()
+            },
+        )
+        .await;
+
+        // Second pass: dry run against the same repository with one existing
+        // artifact (`one.tar.gz`) and one new artifact (`two.tar.gz`).
+        let dry_job_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO migration_jobs (source_connection_id, job_type, config) \
+             VALUES ($1, 'incremental', $2) RETURNING id",
+        )
+        .bind(conn_id)
+        .bind(serde_json::json!({
+            "include_repos": [repo_key.as_str()],
+            "conflict_resolution": "skip",
+            "dry_run": true,
+        }))
+        .fetch_one(&pool)
+        .await
+        .expect("seed dry-run migration job");
+
+        run_enumerating_job(
+            &pool,
+            dry_job_id,
+            &repo_key,
+            &[("one.tar.gz", 4), ("two.tar.gz", 8)],
+            WorkerConfig {
+                dry_run: true,
+                throttle_delay_ms: 0,
+                ..WorkerConfig::default()
+            },
+        )
+        .await;
+
+        let finished = read_job_counters(&pool, dry_job_id).await;
+        assert_eq!(
+            (
+                finished.total_items,
+                finished.completed_items,
+                finished.skipped_items,
+                finished.failed_items,
+                finished.transferred_bytes,
+            ),
+            (2, 1, 1, 0, 8),
+            "dry-run with skip must count the existing artifact as skipped and \
+             report only the new artifact (8 bytes) as would-transfer: {finished:?}"
+        );
+
+        let dry_items: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM migration_items WHERE job_id = $1")
+                .bind(dry_job_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count dry-run migration_items");
+        assert_eq!(dry_items, 0, "dry run must write no migration_items rows");
+
+        let dest_artifacts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count destination artifacts");
+        assert_eq!(dest_artifacts, 1, "dry run must create no artifact rows");
+
+        let _ = sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+            .bind(dry_job_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
             .execute(&pool)
             .await;
         cleanup_single_repo_job(&pool, job_id, conn_id).await;
