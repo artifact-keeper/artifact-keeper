@@ -2892,14 +2892,7 @@ impl BackupService {
         let strict_layout_restore = layouts.values().any(|depth| *depth > 0);
 
         // Phase 2: Async restore from extracted data
-        let mut result = RestoreResult {
-            tables_restored: Vec::new(),
-            artifacts_restored: 0,
-            errors: Vec::new(),
-            integrity_anchor,
-            status: RestoreStatus::Completed,
-            excluded: Vec::new(),
-        };
+        let mut result = RestoreResult::empty(integrity_anchor);
 
         // A restore that could not be checked against the server's own record
         // must not look identical to one that was. The `manifest` anchor only
@@ -3053,10 +3046,28 @@ impl BackupService {
                 // A depth-bearing archive restores atomically: the layout is
                 // installed before the artifacts it admits, and any failure
                 // rolls back every table (#4216).
-                let mut tx = self.db.begin().await?;
-                validate_restore_layouts(&mut tx, &layouts, true).await?;
-                Self::restore_tables(&mut tx, &entries, &layouts, true, &mut result).await?;
-                tx.commit().await?;
+                //
+                // That one transaction writes every archived repository's
+                // artifacts, so the usage-ledger triggers lock their
+                // `repository_usage_ledger` rows in archive order, and it can
+                // deadlock against another multi-repository write taking them
+                // in another order (#5084). Postgres aborts the whole
+                // transaction, so the whole unit is retried, each attempt
+                // reporting into a fresh result; the objects were already
+                // written above and are not touched again.
+                let (db, entries, layouts) = (&self.db, &entries, &layouts);
+                let anchor = result.integrity_anchor;
+                let tables = crate::db::retry_on_deadlock("strict backup restore", || async move {
+                    let mut attempt = RestoreResult::empty(anchor);
+                    let mut tx = db.begin().await?;
+                    validate_restore_layouts(&mut tx, layouts, true).await?;
+                    Self::restore_tables(&mut tx, entries, layouts, true, &mut attempt).await?;
+                    tx.commit().await?;
+                    Ok::<_, AppError>(attempt)
+                })
+                .await?;
+                result.tables_restored.extend(tables.tables_restored);
+                result.errors.extend(tables.errors);
             } else {
                 // A depth-zero (legacy) archive restores exactly as before
                 // #4216: row by row in autocommit, collecting failures. One
@@ -3585,6 +3596,22 @@ pub struct RestoreResult {
     /// The categories of data the archive does not carry and this restore
     /// therefore did not restore (#5654), e.g. `webhook_deliveries`.
     pub excluded: Vec<String>,
+}
+
+impl RestoreResult {
+    /// An empty result: the start of a restore, and of each attempt of the
+    /// strict table restore (#5084), which is merged into the restore's
+    /// result once it commits.
+    fn empty(integrity_anchor: IntegrityAnchor) -> Self {
+        Self {
+            tables_restored: Vec::new(),
+            artifacts_restored: 0,
+            errors: Vec::new(),
+            integrity_anchor,
+            status: RestoreStatus::Completed,
+            excluded: Vec::new(),
+        }
+    }
 }
 
 /// How a restore ended (#5654).
