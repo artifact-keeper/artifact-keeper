@@ -64,10 +64,8 @@ name: Nightly Release Gate
 #     deliberately NOT shared with release-candidate.yml, whose group is per
 #     commit (`release-candidate-<sha>`): a shared group would make a
 #     candidate wait for the nightly, which is the wrong way round, and
-#     GitHub groups have no priority. The candidate cannot cancel the nightly
-#     itself either: a maintenance line's candidate requires its
-#     release-candidate.yml to be byte-identical to main's, so touching that
-#     file costs a forward-port on every line. Hence the sentinel: the
+#     GitHub groups have no priority. Nor does the candidate cancel the
+#     nightly: the sentinel keeps that logic out of the candidate's file. The
 #     nightly yields, the candidate does nothing.
 #
 # TRACKING ISSUES (scripts/ci/nightly-gate-report.js)
@@ -314,9 +312,10 @@ jobs:
     permissions:
       contents: read
       packages: read
-    # Still @main, like release-candidate.yml: the nightly measures the gate a
-    # candidate would run today.
-    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main
+    # The same artifact-keeper-test sha as release-candidate.yml (#6170): the
+    # nightly measures the gate a candidate would run today, so a bump moves
+    # both together. scripts/ci/check-gate-workflow-pins.sh enforces it.
+    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@987bccd15df3fd4c9c24bf78436ce12fb5bd5783 # artifact-keeper-test main as of 2026-11-18
     with:
       backend_tag: sha-${{ matrix.short }}
       backend_digest: ${{ matrix.digest }}
@@ -451,7 +450,8 @@ jobs:
     permissions:
       contents: read
       packages: read
-    uses: artifact-keeper/artifact-keeper-test/.github/workflows/nightly-s3-formats.yml@main
+    # Same pinned sha as the gate above (#6170).
+    uses: artifact-keeper/artifact-keeper-test/.github/workflows/nightly-s3-formats.yml@987bccd15df3fd4c9c24bf78436ce12fb5bd5783 # artifact-keeper-test main as of 2026-11-18
     with:
       backend_tag: sha-${{ needs.resolve.outputs.main_short }}
       backend_digest: ${{ needs.resolve.outputs.main_digest }}

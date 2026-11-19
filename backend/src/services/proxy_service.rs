@@ -2129,6 +2129,139 @@ enum RemoteRef<'a> {
     Id(Uuid),
 }
 
+/// What one request learned from the origin gate (#4506) for a repository key:
+/// it passed for this Remote (`remote: Some((id, upstream_url))`), or the key
+/// names no Remote (`remote: None`). Only a pass is ever recorded.
+struct OriginGatePassed {
+    remote: Option<(Uuid, Option<String>)>,
+}
+
+/// Memo of the origin gate (#6069) for one scope, keyed by repository key.
+///
+/// A Maven jar GET reaches the gate twice for the same Remote: the jar's
+/// content fetch, and alongside it the cached `.sha1` read that fills
+/// `X-Checksum-SHA1` (#4573). Inside [`ProxyService::with_origin_gate_memo`],
+/// which wraps only that pair and only for a GET (`maven_remote_stream`; a
+/// HEAD's fall-back GET and cold `.sha1` fetch contact the upstream, so a
+/// HEAD evaluates every time), the first caller
+/// evaluates the gate and the other waits for and reuses its pass, so the
+/// Remote is looked up and its policies loaded once.
+///
+/// Every byte path still goes through the gate. A refusal or a lookup error
+/// is never recorded: each caller then evaluates for itself and fails closed
+/// exactly as without the memo. A task spawned inside the scope does not
+/// inherit it and evaluates fresh.
+///
+/// What a reused pass can change, and only within the scope: a deny written
+/// after the first evaluation, or the key re-pointed to another Remote (the
+/// content fetch gates the handler's cached `Repository`, the key-addressed
+/// sidecar read would look the row up again), is not seen by the second
+/// caller. In this scope the second caller is the sidecar read, so the
+/// difference is at most the checksum header on a body the content fetch's
+/// gate allowed. Widening the scope to callers that serve bytes would make
+/// it a difference in what is served (formal/ArtifactKeeper/Proxy/OriginGateMemo.lean).
+#[derive(Default)]
+struct OriginGateMemo {
+    cells: std::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<OriginGatePassed>>>>,
+}
+
+tokio::task_local! {
+    static ORIGIN_GATE_MEMO: OriginGateMemo;
+}
+
+/// Test-only count of origin-gate evaluations per repository (#6069), so a
+/// test can assert how many times one request evaluated the gate.
+#[cfg(test)]
+pub(crate) mod origin_gate_evaluations {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex, PoisonError};
+    use uuid::Uuid;
+
+    static EVALUATIONS: LazyLock<Mutex<HashMap<Uuid, usize>>> = LazyLock::new(Default::default);
+    static KEY_LOOKUPS: LazyLock<Mutex<HashMap<String, usize>>> = LazyLock::new(Default::default);
+
+    pub(crate) fn record(repo_id: Uuid) {
+        *EVALUATIONS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(repo_id)
+            .or_default() += 1;
+    }
+
+    pub(crate) fn count(repo_id: Uuid) -> usize {
+        let counts = EVALUATIONS.lock().unwrap_or_else(PoisonError::into_inner);
+        counts.get(&repo_id).copied().unwrap_or(0)
+    }
+
+    /// A key-addressed gate that looked its Remote up in the database.
+    pub(crate) fn record_key_lookup(key: &str) {
+        *KEY_LOOKUPS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(key.to_string())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn key_lookups(key: &str) -> usize {
+        let counts = KEY_LOOKUPS.lock().unwrap_or_else(PoisonError::into_inner);
+        counts.get(key).copied().unwrap_or(0)
+    }
+}
+
+/// One caller's answer from the origin gate through the scope's memo
+/// (#6069). The rule `formal/ArtifactKeeper/Proxy/OriginGateMemo.lean` models.
+///
+/// * No memo in scope: evaluate.
+/// * Otherwise the first caller evaluates and a pass is recorded; a caller
+///   that arrives while it runs waits for it. A refusal or an error is not
+///   recorded (`get_or_try_init`), so the next caller evaluates for itself.
+/// * `wanted` is the Remote the caller gates, `(id, upstream_url)`; a recorded
+///   pass for anything else is not its answer and it evaluates. The
+///   key-addressed form passes `None` and accepts any recorded pass for the
+///   key, including "the key names no Remote".
+///
+/// Liveness: `get_or_try_init` holds the cell while the first caller
+/// evaluates, so every other caller for the key waits on it. Never hold a
+/// gate future unpolled inside the scope (a `select!` on `&mut fut`, a lazily
+/// polled stream) while another caller gates the same key: the waiter would
+/// hang. `tokio::join!` polls both, and dropping the first caller releases
+/// the cell to the next.
+async fn gate_through_memo<F, Fut>(
+    cell: Option<&tokio::sync::OnceCell<OriginGatePassed>>,
+    wanted: Option<&(Uuid, Option<String>)>,
+    evaluate: F,
+) -> Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<OriginGatePassed>>,
+{
+    let Some(cell) = cell else {
+        return evaluate().await.map(|_| ());
+    };
+    let passed = cell.get_or_try_init(&evaluate).await?;
+    match wanted {
+        None => Ok(()),
+        Some(remote) if passed.remote.as_ref() == Some(remote) => Ok(()),
+        Some(_) => evaluate().await.map(|_| ()),
+    }
+}
+
+/// The memo cell for `key` in the current memo scope, if there is one.
+fn origin_gate_memo_cell(key: &str) -> Option<Arc<tokio::sync::OnceCell<OriginGatePassed>>> {
+    ORIGIN_GATE_MEMO
+        .try_with(|memo| {
+            let mut cells = memo
+                .cells
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cell) = cells.get(key) {
+                return Arc::clone(cell);
+            }
+            Arc::clone(cells.entry(key.to_string()).or_default())
+        })
+        .ok()
+}
+
 /// Gate a proxy read on a Package Age Policy hold window (#1770).
 ///
 /// Reuses the pure `quarantine_service::check_download_allowed` decision the
@@ -3291,13 +3424,28 @@ impl CacheStore {
         keys: &CacheKeys,
         mutability: Option<cache_classifier::Mutability>,
     ) -> bool {
+        self.fresh_size(keys, mutability).await.is_some()
+    }
+
+    /// [`Self::is_fresh`], returning the size the sidecar records for a fresh
+    /// entry (`None` when not fresh). A presigned-redirect fast path tags its
+    /// 302 with this size for the transfer meter (#6035), so the sidecar is
+    /// read once per redirect rather than once for freshness and again for
+    /// the size.
+    async fn fresh_size(
+        &self,
+        keys: &CacheKeys,
+        mutability: Option<cache_classifier::Mutability>,
+    ) -> Option<i64> {
         let cache_key = &keys.content;
 
         let Ok(Some(metadata)) = self.load_metadata(&keys.metadata).await else {
-            return false;
+            return None;
         };
+        let size_bytes = metadata.size_bytes;
+        let fresh = |ok: bool| ok.then_some(size_bytes);
         if Utc::now() > metadata.expires_under(mutability) {
-            return false;
+            return None;
         }
 
         // #4630: refuse to presign a redirect to an object the sidecar itself
@@ -3313,7 +3461,7 @@ impl CacheStore {
                 "proxy cache sidecar pins the ETag of an empty object while claiming a \
                  non-zero size; not fresh (#4630)"
             );
-            return false;
+            return None;
         }
 
         // ETag-based integrity revalidation (#1051). Only meaningful when
@@ -3362,7 +3510,7 @@ impl CacheStore {
                             // describes, which is also what the caller's own
                             // `Content-Length` already claims it is.
                             return match self.storage.size(cache_key).await {
-                                Ok(len) => len == metadata.size_bytes as u64,
+                                Ok(len) => fresh(len == metadata.size_bytes as u64),
                                 Err(e) => {
                                     // Includes NotFound (object gone). Not
                                     // fresh: the slow path re-fetches and
@@ -3374,7 +3522,7 @@ impl CacheStore {
                                         error = %e,
                                         "proxy cache size probe failed during multipart fallback; treating as not fresh"
                                     );
-                                    false
+                                    None
                                 }
                             };
                         }
@@ -3384,28 +3532,28 @@ impl CacheStore {
                             current_etag = %current,
                             "proxy cache ETag mismatch on fast-path revalidation; falling back to slow path"
                         );
-                        return false;
+                        return None;
                     }
                     // ETag matched → object is present and unchanged
                     // since cache write. Skip the redundant exists() call.
-                    true
+                    fresh(true)
                 }
                 // Backend lost the object (None) or errored: treat as
                 // not-fresh. The slow path will re-fetch and re-cache.
-                Ok(None) => false,
+                Ok(None) => None,
                 Err(e) => {
                     tracing::warn!(
                         cache_key = %cache_key,
                         error = %e,
                         "proxy cache head_etag failed during revalidation; treating as not fresh"
                     );
-                    false
+                    None
                 }
             },
             None => {
                 // No pinned ETag (filesystem / legacy entry). Preserve
                 // pre-#1051 semantics: existence check only.
-                matches!(self.storage.exists(cache_key).await, Ok(true))
+                fresh(matches!(self.storage.exists(cache_key).await, Ok(true)))
             }
         }
     }
@@ -6682,6 +6830,17 @@ impl ProxyService {
         self.cache_store.is_fresh(&keys, mutability).await
     }
 
+    /// [`Self::is_cache_fresh`] for a presigned-redirect fast path: the size
+    /// the cache sidecar records when the entry is fresh, `None` otherwise.
+    /// The fast path tags its 302 with that size so the transfer meter counts
+    /// the object when the URL is issued (#6035), without a second sidecar
+    /// read after the freshness probe.
+    pub async fn fresh_cache_redirect_size(&self, repo_key: &str, path: &str) -> Option<i64> {
+        let keys = CacheKeys::derive(&self.cache_scope, repo_key, path).ok()?;
+        let mutability = self.effective_mutability_by_key(repo_key, path).await;
+        self.cache_store.fresh_size(&keys, mutability).await
+    }
+
     /// Gate a presigned-redirect fast path on the Remote's origin policy
     /// (#4506), the sibling of [`Self::cache_quarantine_gate`]. A redirect
     /// hands out the cached object without the body passing through the
@@ -7512,7 +7671,7 @@ impl ProxyService {
                 // is based on the upstream release date when known
                 // (#1771).
                 let quarantine_until = self
-                    .quarantine_until_for_new_entry(repo.id, resp.last_modified.as_deref())
+                    .quarantine_until_for_new_entry(repo, cache_path, resp.last_modified.as_deref())
                     .await;
 
                 // S3: content-addressed integrity. When `cache_path`
@@ -7922,7 +8081,7 @@ impl ProxyService {
             // Package Age Policy (#3912): the GET leader refuses a release
             // still inside the hold window with 409; so does its HEAD.
             let quarantine_until = self
-                .quarantine_until_for_new_entry(repo.id, headers.last_modified.as_deref())
+                .quarantine_until_for_new_entry(repo, cache_path, headers.last_modified.as_deref())
                 .await;
             if quarantine_until.is_some_and(|until| until > Utc::now()) {
                 return Err(AppError::Conflict(
@@ -8715,7 +8874,7 @@ impl ProxyService {
         // so the entry is cached under its hold and later requests are gated
         // by the sidecar until the window elapses or an admin releases it).
         let quarantine_until = self
-            .quarantine_until_for_new_entry(repo.id, upstream.last_modified.as_deref())
+            .quarantine_until_for_new_entry(repo, cache_path, upstream.last_modified.as_deref())
             .await;
         let hold_active = quarantine_until.is_some_and(|until| until > Utc::now());
 
@@ -10693,8 +10852,27 @@ impl ProxyService {
         if !self.origin_policy_gate {
             return Ok(());
         }
-        self.origin_policy_gate(repo.id, &repo.key, repo.upstream_url.as_deref())
-            .await
+        let gate = || self.origin_policy_gate(repo.id, &repo.key, repo.upstream_url.as_deref());
+        // Outside a memo scope (every caller but the Maven jar GET): evaluate,
+        // with nothing to allocate or record.
+        let Some(cell) = origin_gate_memo_cell(&repo.key) else {
+            return gate().await;
+        };
+        let this = (repo.id, repo.upstream_url.clone());
+        gate_through_memo(Some(&cell), Some(&this), || async {
+            gate().await?;
+            Ok(OriginGatePassed {
+                remote: Some(this.clone()),
+            })
+        })
+        .await
+    }
+
+    /// Run `fut` with a fresh memo of the origin gate (#6069). Wrap only
+    /// callers whose later gate calls cannot change what is served; see
+    /// [`OriginGateMemo`].
+    pub(crate) async fn with_origin_gate_memo<F: std::future::Future>(fut: F) -> F::Output {
+        ORIGIN_GATE_MEMO.scope(OriginGateMemo::default(), fut).await
     }
 
     async fn origin_policy_gate(
@@ -10703,6 +10881,8 @@ impl ProxyService {
         repo_key: &str,
         upstream_url: Option<&str>,
     ) -> Result<()> {
+        #[cfg(test)]
+        origin_gate_evaluations::record(repo_id);
         let violations = crate::services::policy_service::PolicyService::new(self.db.clone())
             .evaluate_proxy_origin(repo_id, repo_key, upstream_url)
             .await?;
@@ -10727,32 +10907,53 @@ impl ProxyService {
         if !self.origin_policy_gate {
             return Ok(());
         }
-        let row: Option<(Uuid, String, Option<String>)> = match repo_ref {
+        let id = match repo_ref {
+            // #6069: the key-addressed form goes through the scope's memo.
             RemoteRef::Key(key) => {
-                sqlx::query_as(
-                    "SELECT id, key, upstream_url FROM repositories \
-                 WHERE key = $1 AND repo_type = 'remote'",
-                )
-                .bind(key)
-                .fetch_optional(&self.db)
-                .await
+                return gate_through_memo(origin_gate_memo_cell(key).as_deref(), None, || {
+                    self.origin_policy_gate_for_key(key)
+                })
+                .await;
             }
-            RemoteRef::Id(id) => {
-                sqlx::query_as(
-                    "SELECT id, key, upstream_url FROM repositories \
-                 WHERE id = $1 AND repo_type = 'remote'",
-                )
-                .bind(id)
-                .fetch_optional(&self.db)
-                .await
-            }
-        }
+            RemoteRef::Id(id) => id,
+        };
+        let row: Option<(Uuid, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, key, upstream_url FROM repositories \
+             WHERE id = $1 AND repo_type = 'remote'",
+        )
+        .bind(id)
+        .fetch_optional(&self.db)
+        .await
         .map_err(|e| AppError::Database(e.to_string()))?;
         let Some((id, key, upstream_url)) = row else {
             return Ok(());
         };
         self.origin_policy_gate(id, &key, upstream_url.as_deref())
             .await
+    }
+
+    /// The key-addressed gate as a memo entry (#6069): look the Remote up by
+    /// key and gate it, recording which Remote passed (or that the key names
+    /// none).
+    async fn origin_policy_gate_for_key(&self, key: &str) -> Result<OriginGatePassed> {
+        #[cfg(test)]
+        origin_gate_evaluations::record_key_lookup(key);
+        let row: Option<(Uuid, Option<String>)> = sqlx::query_as(
+            "SELECT id, upstream_url FROM repositories \
+             WHERE key = $1 AND repo_type = 'remote'",
+        )
+        .bind(key)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        let Some((id, upstream_url)) = row else {
+            return Ok(OriginGatePassed { remote: None });
+        };
+        self.origin_policy_gate(id, key, upstream_url.as_deref())
+            .await?;
+        Ok(OriginGatePassed {
+            remote: Some((id, upstream_url)),
+        })
     }
 
     /// Build full upstream URL for an artifact path.
@@ -11767,13 +11968,29 @@ impl ProxyService {
     /// ingestion time (#1771): an upstream release older than the configured
     /// window yields an already-elapsed hold, so old packages are not re-held
     /// from their first proxy fetch.
+    ///
+    /// A version listing (npm packument, PyPI simple page, `maven-metadata.xml`,
+    /// Cargo sparse index) is never held (#5933): upstream bumps its
+    /// `Last-Modified` on every publish, so one young release used to hold the
+    /// whole listing and every older version with it. The young version's
+    /// file is still held when it is fetched.
     async fn quarantine_until_for_new_entry(
         &self,
-        repository_id: Uuid,
+        repo: &Repository,
+        path: &str,
         last_modified: Option<&str>,
     ) -> Option<DateTime<Utc>> {
-        let config = quarantine_service::resolve_config(&self.db, repository_id).await;
+        let config = quarantine_service::resolve_config(&self.db, repo.id).await;
         if !quarantine_service::should_quarantine(&config) {
+            return None;
+        }
+        // The handlers' buffered fetches pass a Generic stand-in, so classify
+        // by the stored format.
+        let format = match self.repo_identity_by_key(&repo.key).await {
+            Some((_, format)) => format,
+            None => repo.format.clone(),
+        };
+        if cache_classifier::is_version_listing(&format, path) {
             return None;
         }
         let release = last_modified.and_then(parse_http_date);
@@ -31325,5 +31542,299 @@ mod finish_fill_on_drop_5509 {
     #[tokio::test]
     async fn a_drain_that_fails_midway_releases_the_follower_to_re_enter() {
         assert_eq!(follower_of_a_dropped_leader(true).await, None);
+    }
+}
+
+/// #6069: the laws proved in formal/ArtifactKeeper/Proxy/OriginGateMemo.lean,
+/// checked on the real [`gate_through_memo`] and its `OnceCell`: callers by id
+/// and by key (including a key that names no Remote), sequential runs against
+/// the model's `run` exactly, concurrent runs against `run` for some turn
+/// order, and a caller dropped mid-evaluation.
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod origin_gate_memo_laws {
+    use super::{gate_through_memo, OriginGatePassed};
+    use crate::error::{AppError, Result};
+    use proptest::prelude::*;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use uuid::Uuid;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Gate {
+        Allow,
+        Deny,
+        Unavailable,
+    }
+
+    /// Lean `Caller`: by the Remote held (index 0 or 1), or by key, where
+    /// `row` is the Remote the key names now.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Caller {
+        ById(usize),
+        ByKey(Option<usize>),
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Pass {
+        Remote(usize),
+        NoRemote,
+    }
+
+    fn any_gate() -> impl Strategy<Value = Gate> {
+        prop_oneof![Just(Gate::Allow), Just(Gate::Deny), Just(Gate::Unavailable)]
+    }
+
+    fn any_caller() -> impl Strategy<Value = Caller> {
+        prop_oneof![
+            (0usize..2).prop_map(Caller::ById),
+            proptest::option::of(0usize..2).prop_map(Caller::ByKey),
+        ]
+    }
+
+    /// `evals[k][r]`: the k-th fresh evaluation's answer for Remote r
+    /// (`Unavailable` past the end).
+    fn any_evals() -> impl Strategy<Value = Vec<[Gate; 2]>> {
+        proptest::collection::vec([any_gate(), any_gate()], 0..8)
+    }
+
+    /// The Lean `run`, transcribed: each caller's answer and whether it ran
+    /// a fresh evaluation.
+    fn lean_run(callers: &[Caller], evals: &[[Gate; 2]]) -> Vec<(Gate, bool)> {
+        let ev = |k: usize, r: usize| evals.get(k).map(|e| e[r]).unwrap_or(Gate::Unavailable);
+        let record = |r: usize, g: Gate| (g == Gate::Allow).then_some(Pass::Remote(r));
+        let (mut k, mut memo) = (0usize, None::<Pass>);
+        let mut out = Vec::new();
+        for &c in callers {
+            let fresh = |k: &mut usize, r: usize| {
+                let g = ev(*k, r);
+                *k += 1;
+                g
+            };
+            match (c, memo) {
+                (Caller::ById(r), Some(Pass::Remote(m))) if m == r => {
+                    out.push((Gate::Allow, false))
+                }
+                (Caller::ById(r), Some(_)) => out.push((fresh(&mut k, r), true)),
+                (Caller::ById(r), None) => {
+                    let g = fresh(&mut k, r);
+                    memo = record(r, g);
+                    out.push((g, true));
+                }
+                (Caller::ByKey(_), Some(_)) => out.push((Gate::Allow, false)),
+                (Caller::ByKey(None), None) => {
+                    memo = Some(Pass::NoRemote);
+                    out.push((Gate::Allow, false));
+                }
+                (Caller::ByKey(Some(r)), None) => {
+                    let g = fresh(&mut k, r);
+                    memo = record(r, g);
+                    out.push((g, true));
+                }
+            }
+        }
+        out
+    }
+
+    /// One scope's gate: successive fresh evaluations answer `evals` in
+    /// order. With `yield_first` each evaluation yields before answering, so
+    /// concurrent callers overlap the way `tokio::join!` overlaps them.
+    struct ScriptedGate {
+        remotes: [(Uuid, Option<String>); 2],
+        evals: Mutex<VecDeque<[Gate; 2]>>,
+        yield_first: bool,
+    }
+
+    impl ScriptedGate {
+        fn new(evals: &[[Gate; 2]], yield_first: bool) -> Arc<Self> {
+            Arc::new(Self {
+                remotes: [
+                    (Uuid::new_v4(), Some("https://a.example".into())),
+                    (Uuid::new_v4(), Some("https://b.example".into())),
+                ],
+                evals: Mutex::new(evals.iter().copied().collect()),
+                yield_first,
+            })
+        }
+
+        /// A fresh evaluation for Remote `r`.
+        async fn evaluate(&self, r: usize, evaluated: &AtomicBool) -> Result<OriginGatePassed> {
+            if self.yield_first {
+                tokio::task::yield_now().await;
+            }
+            evaluated.store(true, Ordering::SeqCst);
+            let answer = self.evals.lock().unwrap().pop_front().map(|e| e[r]);
+            match answer {
+                Some(Gate::Allow) => Ok(OriginGatePassed {
+                    remote: Some(self.remotes[r].clone()),
+                }),
+                Some(Gate::Deny) => Err(AppError::Authorization("denied".into())),
+                Some(Gate::Unavailable) | None => Err(AppError::Database("down".into())),
+            }
+        }
+
+        /// One caller, as `ensure_origin_policy_allows` (by id) or the
+        /// key-addressed `ensure_origin_policy_allows_for` calls the memo.
+        async fn call(
+            &self,
+            cell: &tokio::sync::OnceCell<OriginGatePassed>,
+            caller: Caller,
+        ) -> (Gate, bool) {
+            let evaluated = AtomicBool::new(false);
+            let answer = match caller {
+                Caller::ById(r) => {
+                    gate_through_memo(Some(cell), Some(&self.remotes[r]), || {
+                        self.evaluate(r, &evaluated)
+                    })
+                    .await
+                }
+                Caller::ByKey(row) => {
+                    gate_through_memo(Some(cell), None, || async {
+                        match row {
+                            None => Ok(OriginGatePassed { remote: None }),
+                            Some(r) => self.evaluate(r, &evaluated).await,
+                        }
+                    })
+                    .await
+                }
+            };
+            let answer = match answer {
+                Ok(()) => Gate::Allow,
+                Err(AppError::Authorization(_)) => Gate::Deny,
+                Err(_) => Gate::Unavailable,
+            };
+            (answer, evaluated.load(Ordering::SeqCst))
+        }
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+    }
+
+    fn run_callers(callers: &[Caller], evals: &[[Gate; 2]], concurrent: bool) -> Vec<(Gate, bool)> {
+        let gate = ScriptedGate::new(evals, concurrent);
+        let cell = tokio::sync::OnceCell::new();
+        rt().block_on(async {
+            if concurrent {
+                futures::future::join_all(callers.iter().map(|&c| gate.call(&cell, c))).await
+            } else {
+                let mut out = Vec::new();
+                for &c in callers {
+                    out.push(gate.call(&cell, c).await);
+                }
+                out
+            }
+        })
+    }
+
+    /// Every ordering of `0..n`.
+    fn permutations(n: usize) -> Vec<Vec<usize>> {
+        if n == 0 {
+            return vec![Vec::new()];
+        }
+        let mut out = Vec::new();
+        for p in permutations(n - 1) {
+            for i in 0..=p.len() {
+                let mut q = p.clone();
+                q.insert(i, n - 1);
+                out.push(q);
+            }
+        }
+        out
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4000))]
+
+        /// Callers in turn get exactly what the Lean model says.
+        #[test]
+        fn sequential_callers_match_the_lean_model(
+            callers in proptest::collection::vec(any_caller(), 0..8),
+            evals in any_evals(),
+        ) {
+            prop_assert_eq!(run_callers(&callers, &evals, false), lean_run(&callers, &evals));
+        }
+
+        /// Concurrent callers on the real `OnceCell` get what the Lean model
+        /// says for some turn order of the same callers.
+        #[test]
+        fn concurrent_callers_match_some_turn_order(
+            callers in proptest::collection::vec(any_caller(), 0..5),
+            evals in any_evals(),
+        ) {
+            let got = run_callers(&callers, &evals, true);
+            let matches = permutations(callers.len()).into_iter().any(|order| {
+                let turned: Vec<Caller> = order.iter().map(|&i| callers[i]).collect();
+                let steps = lean_run(&turned, &evals);
+                order.iter().zip(steps).all(|(&i, step)| got[i] == step)
+            });
+            prop_assert!(matches, "no turn order of {:?} gives {:?}", callers, got);
+        }
+    }
+
+    /// A first caller dropped while it evaluates releases the cell: the next
+    /// caller evaluates for itself and gets its own answer.
+    #[test]
+    fn a_caller_dropped_mid_evaluation_releases_the_cell() {
+        let gate = ScriptedGate::new(
+            &[[Gate::Deny, Gate::Deny], [Gate::Allow, Gate::Allow]],
+            true,
+        );
+        let cell = tokio::sync::OnceCell::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let second = rt.block_on(async {
+            let mut first = Box::pin(gate.call(&cell, Caller::ById(0)));
+            assert!(futures::poll!(&mut first).is_pending());
+            drop(first);
+            // A cell the dropped caller never released would hang here.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                gate.call(&cell, Caller::ById(0)),
+            )
+            .await
+            .expect("the dropped caller released the cell")
+        });
+        assert_eq!(
+            second,
+            (Gate::Deny, true),
+            "the second caller ran the first evaluation"
+        );
+        assert!(cell.get().is_none(), "a refusal is not recorded");
+    }
+
+    /// Lean `maven_pair_evaluates_once` (sequential and concurrent).
+    #[test]
+    fn maven_pair_evaluates_once() {
+        for concurrent in [false, true] {
+            let steps = run_callers(
+                &[Caller::ById(0), Caller::ByKey(Some(0))],
+                &[[Gate::Allow, Gate::Allow]],
+                concurrent,
+            );
+            assert_eq!(
+                steps,
+                vec![(Gate::Allow, true), (Gate::Allow, false)],
+                "concurrent={concurrent}"
+            );
+        }
+    }
+
+    /// Lean `maven_pair_repointed_key_differs`: the key-addressed sidecar read
+    /// rides on the content fetch's pass even when the key now names another
+    /// Remote. In production this changes only the checksum header.
+    #[test]
+    fn maven_pair_repointed_key_rides_on_the_content_pass() {
+        let steps = run_callers(
+            &[Caller::ById(0), Caller::ByKey(Some(1))],
+            &[[Gate::Allow, Gate::Deny], [Gate::Allow, Gate::Deny]],
+            false,
+        );
+        assert_eq!(steps, vec![(Gate::Allow, true), (Gate::Allow, false)]);
     }
 }

@@ -763,6 +763,7 @@ pub async fn delete_group(
         return Err(AppError::NotFound("Group not found".to_string()));
     };
 
+    state.permission_service.invalidate_cache();
     state.event_bus.emit("group.deleted", id, None);
     audit_group(
         &state,
@@ -912,6 +913,7 @@ pub async fn add_members(
         }
     }
 
+    state.permission_service.invalidate_cache();
     state.event_bus.emit("group.member_added", id, None);
     if !added.is_empty() {
         let name = group_name_for_audit(&state.db, id).await;
@@ -987,6 +989,7 @@ pub async fn remove_members(
         }
     }
 
+    state.permission_service.invalidate_cache();
     state.event_bus.emit("group.member_removed", id, None);
     if !removed.is_empty() {
         let name = group_name_for_audit(&state.db, id).await;
@@ -2471,6 +2474,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #5608: deleting a group removes the fine-grained permission rules that
+    /// name it. Pre-fix the rows survived the DELETE (no FK on the polymorphic
+    /// principal pair) and showed up as `principal_name: null`.
+    #[tokio::test]
+    async fn test_delete_group_removes_its_permission_rules_5608() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Path, State};
+        use axum::Extension;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-grp-delete-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (group_id, _group_name) = tdh::create_group(&pool).await;
+        let (repo_id, _repo_name, storage_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        tdh::grant_permission(&pool, "group", group_id, "repository", repo_id, &["read"]).await;
+
+        let deleted = delete_group(
+            State(state),
+            Extension(Some(tdh::admin_auth(admin_id, &admin_name))),
+            Path(group_id),
+        )
+        .await;
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM permissions \
+             WHERE principal_type = 'group' AND principal_id = $1",
+        )
+        .bind(group_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count the deleted group's rules");
+
+        tdh::cleanup(&pool, repo_id, admin_id).await;
+        let _ = std::fs::remove_dir_all(storage_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(deleted.is_ok(), "delete_group failed: {deleted:?}");
+        assert_eq!(
+            remaining, 0,
+            "deleting a group must remove its permission rules (#5608)"
+        );
+    }
+
     /// Router-level (#4027): `GET /{id}/members` dispatches to the list handler
     /// instead of answering 405, also for an LDAP-synced group whose membership
     /// is read-only locally, and pages walk the whole group in a stable order
@@ -2735,5 +2783,160 @@ mod tests {
         assert_eq!(detail("GROUP_UPDATED")["before"]["name"], name);
         assert_eq!(detail("GROUP_UPDATED")["after"]["name"], renamed);
         assert_eq!(detail("GROUP_DELETED")["member_count"], 1);
+    }
+
+    // #5607: a membership change or a group delete takes effect on the replica
+    // that served it right away, not after the 30 s permission cache. No
+    // invalidation listener runs in these tests, so only the handler's own
+    // flush can make the second check see the change
+
+    struct GroupGrantFixture {
+        pool: sqlx::PgPool,
+        state: SharedState,
+        dir: std::path::PathBuf,
+        user_id: Uuid,
+        group_id: Uuid,
+        target: Uuid,
+        admin: AuthExtension,
+    }
+
+    impl GroupGrantFixture {
+        async fn setup(member: bool) -> Option<Self> {
+            use crate::api::handlers::test_db_helpers as tdh;
+            let pool = tdh::try_pool().await?;
+            let dir = std::env::temp_dir().join(format!("ph-grp-5607-{}", Uuid::new_v4()));
+            let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+            let (user_id, username) = tdh::create_user(&pool).await;
+            let group_id = Uuid::new_v4();
+            let target = Uuid::new_v4();
+            sqlx::query("INSERT INTO groups (id, name) VALUES ($1, $2)")
+                .bind(group_id)
+                .bind(format!("ph-grp-5607-{group_id}"))
+                .execute(&pool)
+                .await
+                .expect("seed group");
+            sqlx::query(
+                r#"INSERT INTO permissions
+                     (id, principal_type, principal_id, target_type, target_id, actions)
+                   VALUES ($1, 'group', $2, 'repository', $3, ARRAY['read'])"#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(group_id)
+            .bind(target)
+            .execute(&pool)
+            .await
+            .expect("seed group grant");
+            if member {
+                sqlx::query("INSERT INTO user_group_members (user_id, group_id) VALUES ($1, $2)")
+                    .bind(user_id)
+                    .bind(group_id)
+                    .execute(&pool)
+                    .await
+                    .expect("seed membership");
+            }
+            let admin = AuthExtension {
+                is_admin: true,
+                ..tdh::make_auth(user_id, &username)
+            };
+            Some(Self {
+                pool,
+                state,
+                dir,
+                user_id,
+                group_id,
+                target,
+                admin,
+            })
+        }
+
+        async fn can_read(&self) -> bool {
+            self.state
+                .permission_service
+                .check_permission(self.user_id, "repository", self.target, "read", false)
+                .await
+                .expect("check_permission")
+        }
+
+        fn members(&self) -> Json<MembersRequest> {
+            Json(MembersRequest {
+                user_ids: vec![self.user_id],
+            })
+        }
+
+        async fn teardown(self) {
+            use crate::api::handlers::test_db_helpers as tdh;
+            let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = $1")
+                .bind(self.group_id)
+                .execute(&self.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM groups WHERE id = $1")
+                .bind(self.group_id)
+                .execute(&self.pool)
+                .await;
+            tdh::cleanup_user(&self.pool, self.user_id).await;
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remove_members_drops_group_grant_at_once_5607() {
+        let Some(fx) = GroupGrantFixture::setup(true).await else {
+            return;
+        };
+        let before = fx.can_read().await;
+        let removed = remove_members(
+            State(fx.state.clone()),
+            Extension(Some(fx.admin.clone())),
+            Path(fx.group_id),
+            fx.members(),
+        )
+        .await;
+        let after = fx.can_read().await;
+        fx.teardown().await;
+
+        assert!(before, "the member reads through the group grant");
+        assert!(removed.is_ok(), "remove_members: {removed:?}");
+        assert!(!after, "a removed member must lose the group grant at once");
+    }
+
+    #[tokio::test]
+    async fn test_add_members_grants_group_grant_at_once_5607() {
+        let Some(fx) = GroupGrantFixture::setup(false).await else {
+            return;
+        };
+        let before = fx.can_read().await;
+        let added = add_members(
+            State(fx.state.clone()),
+            Extension(Some(fx.admin.clone())),
+            Path(fx.group_id),
+            fx.members(),
+        )
+        .await;
+        let after = fx.can_read().await;
+        fx.teardown().await;
+
+        assert!(!before, "a non-member has no grant");
+        assert!(added.is_ok(), "add_members: {added:?}");
+        assert!(after, "an added member must get the group grant at once");
+    }
+
+    #[tokio::test]
+    async fn test_delete_group_drops_group_grant_at_once_5607() {
+        let Some(fx) = GroupGrantFixture::setup(true).await else {
+            return;
+        };
+        let before = fx.can_read().await;
+        let deleted = delete_group(
+            State(fx.state.clone()),
+            Extension(Some(fx.admin.clone())),
+            Path(fx.group_id),
+        )
+        .await;
+        let after = fx.can_read().await;
+        fx.teardown().await;
+
+        assert!(before, "the member reads through the group grant");
+        assert!(deleted.is_ok(), "delete_group: {deleted:?}");
+        assert!(!after, "a deleted group's grant must stop at once");
     }
 }

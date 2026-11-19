@@ -247,12 +247,13 @@ impl FormatHandler for IncusHandler {
 
         // Try extracting metadata.yaml from tarballs
         if !content.is_empty() && info.file_type.is_tarball() {
-            // #2561: permit-scoped decode; on saturation skip this best-effort
-            // metadata enrichment rather than blocking/queueing.
+            // #2561: permit-scoped decode; on saturation it waits briefly for a
+            // slot (#6230), and skips this best-effort enrichment if none frees.
             if let Ok(Some(image_meta)) =
-                crate::util::bounded_archive::with_ingest_extraction(|| {
+                crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
                     Self::extract_metadata(content)
                 })
+                .await
             {
                 metadata["image_metadata"] =
                     serde_json::to_value(&image_meta).unwrap_or(serde_json::Value::Null);
@@ -638,6 +639,49 @@ properties:
             .await
             .expect("tarball parse_metadata succeeds");
         assert_eq!(meta["image_metadata"]["os"], "Ubuntu");
+    }
+
+    /// #6230: with the repository's ingest bucket full, the image-metadata
+    /// read waits for a permit and still enriches once one frees, rather than
+    /// skipping at once (a fast-fail acquire always lost to queued uploads, so
+    /// a burst left every image `{"file_type": "unknown"}`). Covers the
+    /// format handler and the upload paths' `extract_image_metadata`.
+    #[tokio::test]
+    async fn test_image_metadata_waits_for_ingest_permit_6230() {
+        use crate::util::bounded_archive::{test_support, TenantKey};
+        use std::io::Write;
+
+        let yaml = b"architecture: x86_64\nproperties:\n  os: Ubuntu\n  release: noble\n";
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&image_tar(yaml, 0)).unwrap();
+        let gz = gz.finish().unwrap();
+        let path = "ubuntu-noble/20240215/incus.tar.gz";
+
+        let content = Bytes::from(gz.clone());
+        let (meta, queued) = test_support::run_queued_behind_full_tenant(
+            TenantKey::Repo(uuid::Uuid::new_v4()),
+            async move { IncusHandler::new().parse_metadata(path, &content).await },
+        )
+        .await;
+        assert!(queued, "parse_metadata must wait for a permit");
+        assert_eq!(
+            meta.expect("parse_metadata")["image_metadata"]["os"],
+            "Ubuntu"
+        );
+
+        let staged = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(staged.path(), &gz).unwrap();
+        let staged_path = staged.path().to_path_buf();
+        let (meta, queued) =
+            test_support::run_queued_behind_full_tenant(
+                TenantKey::Repo(uuid::Uuid::new_v4()),
+                async move {
+                    crate::api::handlers::incus::extract_image_metadata(path, &staged_path).await
+                },
+            )
+            .await;
+        assert!(queued, "extract_image_metadata must wait for a permit");
+        assert_eq!(meta["image_metadata"]["os"], "Ubuntu", "got {meta}");
     }
 
     #[tokio::test]

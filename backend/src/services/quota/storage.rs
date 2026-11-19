@@ -161,15 +161,14 @@ pub async fn instance_denial(db: &PgPool, additional_bytes: i64) -> Result<Optio
     let used = instance_used_bytes(db).await?;
     observe(used);
     let additional = u64::try_from(additional_bytes).unwrap_or(0);
-    Ok(
-        (used.saturating_add(additional) > quota).then(|| QuotaDenial {
-            scope: QuotaScope::Instance,
-            limit_bytes: i64::try_from(quota).unwrap_or(i64::MAX),
-            used_bytes: i64::try_from(used).unwrap_or(i64::MAX),
-            repository: None,
-            project: None,
-        }),
-    )
+    Ok((used.saturating_add(additional) > quota).then(|| {
+        QuotaDenial::new(
+            QuotaScope::Instance,
+            i64::try_from(quota).unwrap_or(i64::MAX),
+            i64::try_from(used).unwrap_or(i64::MAX),
+        )
+        .with_additional(additional_bytes)
+    }))
 }
 
 /// Pre-body admission of a write that declares `declared` bytes (`None` for
@@ -188,8 +187,12 @@ pub async fn admit_declared(db: &PgPool, declared: Option<u64>) -> Result<Option
     }
     let used = instance_used_bytes(db).await?;
     observe(used);
-    Ok(declared_write_refused(s.quota_bytes, used, declared)
-        .then(|| QuotaRefusal::instance_storage(s.quota_bytes, used, s.help_url.clone())))
+    Ok(
+        declared_write_refused(s.quota_bytes, used, declared).then(|| {
+            QuotaRefusal::instance_storage_write(s.quota_bytes, used, declared, s.help_url.clone())
+                .with_content_length(declared)
+        }),
+    )
 }
 
 /// Whether the instance is at its storage quota. A proxy (remote)

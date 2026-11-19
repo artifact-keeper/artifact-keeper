@@ -15,8 +15,7 @@ name: Release Promote
 #       COMMIT (scripts/ci/resolve-certified-ref.sh). This workflow is always
 #       dispatched on `main`, so the branch is never the ref it runs on and
 #       never a dispatch input; it decides which signing identity step 2 will
-#       demand, and the same call refuses a commit whose release-candidate.yml
-#       is not byte-identical to a copy that lives on main;
+#       demand;
 #
 #   0. verify the commit can be released this way at all: release.yml and
 #      docker-publish.yml AT THE COMMIT must carry the triggers steps 7-8
@@ -141,12 +140,11 @@ jobs:
           git cat-file -e "${SHA}^{commit}" 2>/dev/null || { echo "::error title=Unknown commit::${SHA} is not a commit in this repository."; exit 1; }
           # ── 0a. which branch, and therefore which signer ─────────────────
           # From repository state, by the one resolver every consumer uses;
-          # never from a dispatch input. It also refuses a commit whose
-          # release-candidate.yml is not a copy that lives on main.
+          # never from a dispatch input.
           rc=0
           resolved="$(GITHUB_OUTPUT='' scripts/ci/resolve-certified-ref.sh "$SHA")" || rc=$?
           if [[ "$rc" -ne 0 ]]; then
-            echo "::error title=Commit cannot be promoted::${SHA} is on neither main nor the maintenance branch its Cargo.toml names, or its release-candidate.yml is not a copy that lives on main (resolver exit ${rc}; its message is above). Nothing was created."
+            echo "::error title=Commit cannot be promoted::${SHA} is on neither main nor the maintenance branch its Cargo.toml names (resolver exit ${rc}; its message is above). Nothing was created."
             exit 1
           fi
           CERTIFIED_REF="$(sed -n 's/^certified_ref=//p' <<<"$resolved" | head -1)"

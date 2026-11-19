@@ -3155,6 +3155,7 @@ async fn search_packages(
         FROM artifacts a
         WHERE a.repository_id = ANY($1::uuid[])
           AND a.is_deleted = false
+          AND a.version IS NOT NULL
           AND LOWER(a.name) LIKE $2 ESCAPE '\'
         GROUP BY LOWER(a.name), a.name
         ORDER BY LOWER(a.name)
@@ -3176,6 +3177,7 @@ async fn search_packages(
         FROM artifacts
         WHERE repository_id = ANY($1::uuid[])
           AND is_deleted = false
+          AND version IS NOT NULL
           AND LOWER(name) LIKE $2 ESCAPE '\'
         "#,
     )
@@ -4030,6 +4032,10 @@ impl NugetMemberWalk<'_> {
 /// and a Remote member is asked through the NuGet-specific proxy leg, which
 /// that resolver's path-concatenating leg cannot do (#2775). `None` when no
 /// member serves, so a scan-aware walk moves on to its next member.
+///
+/// A member that could not answer (#5504, #5574) is passed over so a later
+/// member in the run can still serve; only when none does is the run reported
+/// as the walk's 503. Strict fallback (#5810) ends the run at once instead.
 async fn walk_unscanned_nuget_members<F, Fut>(
     walk: &NugetMemberWalk<'_>,
     members: Vec<crate::models::repository::Repository>,
@@ -4043,6 +4049,7 @@ where
     >,
 {
     let state = walk.state;
+    let mut unavailable = false;
     let mut idx = 0;
     while idx < members.len() {
         if members[idx].repo_type == RepositoryType::Remote {
@@ -4064,6 +4071,13 @@ where
                 {
                     return Some(Err(proxy_helpers::member_unavailable_response()));
                 }
+                // #5504: a non-strict run remembers an unavailable member
+                // and moves on, so a later member can still serve.
+                Err(resp) if proxy_helpers::is_member_unavailable_response(&resp) => {
+                    unavailable = true;
+                }
+                // Any other failure, an upstream 403/409 included, is a miss
+                // on this Remote, as before #5574.
                 Err(_) => {}
             }
             continue;
@@ -4097,10 +4111,18 @@ where
             Err(resp) if proxy_helpers::is_member_policy_block_response(&resp) => {
                 return Some(Err(resp))
             }
+            // A hosted member's storage fault (#5574): remembered, and a
+            // later member in the run may still serve. Strict mode ends here.
+            Err(resp) if proxy_helpers::is_member_unavailable_response(&resp) => {
+                if fallback.is_strict() {
+                    return Some(Err(resp));
+                }
+                unavailable = true;
+            }
             Err(_) => {}
         }
     }
-    None
+    unavailable.then(|| Err(proxy_helpers::member_unavailable_response()))
 }
 
 async fn flatcontainer_download(
@@ -7685,6 +7707,38 @@ mod read_db_tests {
             json["data"][0]["version"], "2.0.0-beta.1",
             "prerelease=true must surface the pre-release; body={json}"
         );
+
+        f.teardown().await;
+    }
+
+    // A file uploaded at the repository root has no version, it made the
+    // versions aggregate NULL and the whole search failed to decode (#6062)
+    #[tokio::test]
+    async fn search_skips_a_package_without_a_version() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        push_pkg(&f, &f.repo_key, "Qa.RootPkg", "1.0.0", "versioned").await;
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $2, NULL, 4, $3, 'application/octet-stream', $2, $4)",
+        )
+        .bind(f.repo_id)
+        .bind("qa.rootonly.1.0.0.nupkg")
+        .bind("seed-qa-rootonly")
+        .bind(f.user_id)
+        .execute(&f.pool)
+        .await
+        .expect("seed a root upload");
+
+        let (status, json) = get_json(&f, format!("/{}/v3/search?q=qa.r", f.repo_key)).await;
+        assert_eq!(status, StatusCode::OK, "body={json}");
+        assert_eq!(json["totalHits"], 1, "body={json}");
+        let data = json["data"].as_array().expect("data array");
+        assert_eq!(data.len(), 1, "body={json}");
+        assert_eq!(data[0]["version"], "1.0.0", "body={json}");
 
         f.teardown().await;
     }
@@ -11308,6 +11362,71 @@ mod virtual_federation_tests {
             HOSTED_BYTES,
             "the higher-priority hosted member must serve the coordinate it holds"
         );
+    }
+
+    /// #5574: a higher-priority Remote member that cannot answer (its upstream
+    /// is down) or refuses the coordinate (an upstream 403) must not end the
+    /// walk: a later hosted member that holds the coordinate still serves it.
+    #[tokio::test]
+    async fn virtual_download_skips_a_failing_remote_for_a_hosted_member_5574() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const HOSTED_BYTES: &[u8] = b"hosted member nupkg 5574";
+
+        for upstream_status in [503u16, 403] {
+            let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+                return;
+            };
+            let upstream = MockServer::start().await;
+            Mock::given(any())
+                .respond_with(ResponseTemplate::new(upstream_status))
+                .mount(&upstream)
+                .await;
+
+            let (remote_id, _remote_key, remote_dir) =
+                tdh::create_repo(&fx.pool, "remote", "nuget").await;
+            let (hosted_id, _hosted_key, hosted_dir) =
+                tdh::create_repo(&fx.pool, "local", "nuget").await;
+            sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+                .bind(format!("{}/v3/index.json", upstream.uri()))
+                .bind(remote_id)
+                .execute(&fx.pool)
+                .await
+                .expect("set member upstream");
+            tdh::link_virtual_member(&fx.pool, fx.repo_id, remote_id, 1).await;
+            tdh::link_virtual_member(&fx.pool, fx.repo_id, hosted_id, 2).await;
+            tdh::grant_repo_access(&fx.pool, remote_id, fx.user_id).await;
+            tdh::grant_repo_access(&fx.pool, hosted_id, fx.user_id).await;
+            seed_local_version(&fx.pool, hosted_id, "pkg5574", "1.0.0", fx.user_id).await;
+            let blob = hosted_dir.join("pkg5574/1.0.0/pkg5574.1.0.0.nupkg");
+            std::fs::create_dir_all(blob.parent().unwrap()).expect("member blob dir");
+            std::fs::write(&blob, HOSTED_BYTES).expect("member blob");
+
+            let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+            let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+            let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+            let auth = tdh::make_auth(fx.user_id, &fx.username);
+            let (status, body) = tdh::send(
+                tdh::router_with_auth(super::router(), state, auth),
+                tdh::get(format!(
+                    "/{}/v3/flatcontainer/pkg5574/1.0.0/pkg5574.1.0.0.nupkg",
+                    fx.repo_key
+                )),
+            )
+            .await;
+
+            tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+            tdh::cleanup_member_repo(&fx.pool, hosted_id, &hosted_dir).await;
+            fx.teardown().await;
+
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "upstream {upstream_status}: the hosted member must still serve"
+            );
+            assert_eq!(&body[..], HOSTED_BYTES, "upstream {upstream_status}");
+        }
     }
 
     /// A virtual must resolve imported mixed-case names in both URL spellings (#5147).

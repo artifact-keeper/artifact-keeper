@@ -588,8 +588,12 @@ jobs:
     # dependency graph, and the job has been cancelled at 20 with every step
     # green, once inside the cache-save step itself (#3944). A cancellation
     # at the ceiling throws the whole run away; ten more minutes of headroom
-    # cost nothing on a green run.
-    timeout-minutes: 30
+    # cost nothing on a green run. 45, not 30 (2026-11-18): with the crate's
+    # growth the hosted 16 GB VM now runs clippy past 30 under memory pressure
+    # (cancelled at the ceiling on main and five PRs that day, 6-12 min
+    # otherwise). A hang still dies well inside 45; root cause tracked
+    # separately.
+    timeout-minutes: 45
     needs: [changes, release-bump]
     # Skip (reported as success for required checks) on docs-only PRs and on
     # version-bump-only release PRs; `!cancelled()` + `!= 'false'` /
@@ -758,6 +762,86 @@ jobs:
           free -g
           df -h / | tail -1
           du -sh target 2>/dev/null || true
+
+  # WINDOWS CROSS-CHECK (#6022). Every other Rust job here compiles for
+  # Linux only, so code that needs a Unix-only API without a cfg guard
+  # (`std::os::unix::*`, `PermissionsExt`, `symlink`) passed every PR check.
+  # The first build that saw it was release.yml's x86_64-pc-windows-gnu leg
+  # at tag time: v1.12.0's unpacker (#6005, backend/src/services/oci_rootfs.rs)
+  # stopped that leg, and 1.12.0 shipped no GitHub Release (fixed in #6201).
+  # The nightly 🪟 Windows Cross-Build (scheduled-tests.yml) only catches it
+  # after the merge.
+  #
+  # `cargo check`, not a build: type and name resolution is where Unix-only
+  # code fails, and a check emits metadata only, so there is no codegen and
+  # no link. The release-profile link is what fills the hosted VM and gets
+  # the runner killed with exit 143 (release.yml's "Add swap" note). Same
+  # target and features as release.yml's windows leg, and the same mingw-w64
+  # install: build scripts still run for a check, and openssl-src
+  # (`vendored-openssl`) compiles OpenSSL with the mingw C compiler.
+  # Library and binary targets only: the inline test modules are the
+  # 15 GiB lib-test rustc the unit legs shard, and tests do not ship.
+  #
+  # Reported through ✅ CI Complete, like Version Pin Bump, rather than as a
+  # new required context, so it blocks a merge with no branch-protection
+  # change. It runs and may skip exactly when Check Rust does.
+  windows-cross-check:
+    name: 🪟 Windows Cross-Check
+    runs-on: ubuntu-24.04
+    # Cold, a check of the whole graph is about as long as a cold clippy
+    # (see check-rust's 30-minute note); warm, only the workspace crate.
+    timeout-minutes: 30
+    needs: [changes, release-bump]
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_NET_RETRY: "10"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # rust-toolchain.toml already lists the target; naming it here as
+      # well keeps the job self-describing, as release.yml's leg does.
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Assert the pinned Rust toolchain is in force
+        run: ./scripts/ci/check-toolchain-pin.sh --active
+
+      # release.yml's two install steps for this leg, in one.
+      - name: Install protoc and mingw-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev mingw-w64
+
+      # No rust-cache, on purpose. The repo cache is over its 10 GiB quota,
+      # so a windows-check entry would evict release.yml's cli-* entries
+      # (least recently used) and make release builds cold (#6218). Most main
+      # pushes skip the Rust jobs anyway, so the entry would rarely be fresh.
+      # A cold check is ~5-15 min, in parallel, off the critical path.
+
+      # The workspace crate's rustc is the one heavy step here, as in
+      # check-rust, whose cgroup peaks at ~15 GiB on the same VM. Same
+      # best-effort swapfile; it costs seconds.
+      - name: Add swap
+        run: |
+          if sudo fallocate -l 12G /ak-ci-swapfile \
+             && sudo chmod 600 /ak-ci-swapfile \
+             && sudo mkswap /ak-ci-swapfile >/dev/null \
+             && sudo swapon /ak-ci-swapfile; then
+            echo "added a 12 GiB swapfile"
+          else
+            echo "::warning title=No extra swap::could not add /ak-ci-swapfile; this job runs with the image's default swap only."
+          fi
+          swapon --show
+          free -m
+
+      - name: Check the backend compiles for Windows
+        env:
+          SQLX_OFFLINE: true
+          CARGO_BUILD_JOBS: "4"
+          CARGO_INCREMENTAL: "0"
+        run: cargo check --locked --workspace --target x86_64-pc-windows-gnu --features vendored-openssl
 
   # UNIT TESTS + COVERAGE, SHARDED ACROSS GITHUB-HOSTED RUNNERS.
   #
@@ -978,6 +1062,9 @@ jobs:
       # `test-shards.py filter` skips its tests in all but the one leg its
       # file maps to, so each still runs exactly once (`all()` when every
       # module is gated, the normal case).
+      #
+      # `--profile ci` (.config/nextest.toml): no retries, and a JUnit report
+      # at target/nextest/ci/junit.xml for the two steps below (#6172).
       - name: Run unit tests
         id: unit
         env:
@@ -994,10 +1081,29 @@ jobs:
           filter="$(python3 scripts/ci/test-shards.py filter "${{ matrix.shard }}")"
           echo "nextest filter for this leg: ${filter}"
           if [ "${{ matrix.shard }}" = "$BIN_SHARD" ]; then
-            cargo nextest run --workspace --lib --bins --features "test-shard-${{ matrix.shard }}" -E "$filter" --test-threads 8 --no-fail-fast
+            cargo nextest run --workspace --lib --bins --features "test-shard-${{ matrix.shard }}" -E "$filter" --test-threads 8 --no-fail-fast --profile ci
           else
-            cargo nextest run --workspace --lib --features "test-shard-${{ matrix.shard }}" -E "$filter" --test-threads 8 --no-fail-fast
+            cargo nextest run --workspace --lib --features "test-shard-${{ matrix.shard }}" -E "$filter" --test-threads 8 --no-fail-fast --profile ci
           fi
+
+      # Report only: lists the leg's failed and flaky tests in the job
+      # summary, with an annotation each, and never changes the verdict
+      # (#6172). The `ci` profile does not retry, so "flaky" stays empty
+      # here until a retrying profile runs; the JUnit is the per-test record.
+      - name: Summarise unit test results
+        if: ${{ !cancelled() && steps.unit.outcome != 'skipped' }}
+        run: python3 scripts/ci/nextest-junit-summary.py "Unit tests (${{ matrix.shard }})" target/nextest/ci/junit.xml >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload unit test JUnit report
+        if: always()
+        # Report-only: an artifact-storage outage must not fail a green job.
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: junit-unit-${{ matrix.shard }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 7
 
       # This leg's share of the report. Only a fully green run yields one (a
       # failed run's counters are partial); `coverage-gates` then reports
@@ -1264,7 +1370,9 @@ jobs:
           AK_TESTS_REQUIRE_DB: "1"
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: |
-          cargo nextest run --workspace --no-tests=fail --test-threads 8 \
+          rm -f target/nextest/ci/junit.xml
+          trap 'mkdir -p junit && cp target/nextest/ci/junit.xml junit/tier1.xml 2>/dev/null || true' EXIT
+          cargo nextest run --workspace --no-tests=fail --test-threads 8 --profile ci \
             --test workflow_scan_gate_tests \
             --test security_tests \
             --test security_regression_tests \
@@ -1434,7 +1542,9 @@ jobs:
           AK_TESTS_REQUIRE_DB: "1"
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: |
-          cargo nextest run --workspace --no-tests=fail --no-fail-fast --test-threads 8 \
+          rm -f target/nextest/ci/junit.xml
+          trap 'mkdir -p junit && cp target/nextest/ci/junit.xml junit/tier2.xml 2>/dev/null || true' EXIT
+          cargo nextest run --workspace --no-tests=fail --no-fail-fast --test-threads 8 --profile ci \
             --run-ignored ignored-only \
             --test lifecycle_policy_tests \
             --test api_token_cache_flush_tests \
@@ -1512,10 +1622,31 @@ jobs:
           AK_TESTS_REQUIRE_DB: "1"
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: |
-          cargo nextest run --workspace --no-tests=fail \
+          rm -f target/nextest/ci/junit.xml
+          trap 'mkdir -p junit && cp target/nextest/ci/junit.xml junit/incus.xml 2>/dev/null || true' EXIT
+          cargo nextest run --workspace --no-tests=fail --profile ci \
             --run-ignored ignored-only \
             --test incus_upload_tests \
             test_chunked_upload_cross_repo_session_rejected
+
+      # Report only, as in the unit shards (#6172). Each nextest step above
+      # overwrites target/nextest/ci/junit.xml, so each copies its report to
+      # junit/ on exit; a step that did not run leaves no file, and the
+      # summary names it.
+      - name: Summarise integration test results
+        if: ${{ !cancelled() && steps.build.outcome != 'skipped' }}
+        run: python3 scripts/ci/nextest-junit-summary.py "Integration tests" junit/tier1.xml junit/tier2.xml junit/incus.xml >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload integration test JUnit reports
+        if: always()
+        # Report-only: an artifact-storage outage must not fail a green job.
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: junit-integration
+          path: junit/
+          if-no-files-found: warn
+          retention-days: 7
 
       # The acceptance numbers for keeping this job on hosted PR runs: the
       # per-process peak RSS of each build pass is already in the job
@@ -1871,9 +2002,7 @@ jobs:
       #     once a patch release can be cut from release/X.Y.x. Its
       #     permissive direction hands an attacker-controlled branch the
       #     right to sign, so it must refuse an arbitrary branch, a case
-      #     variant of a real one, a commit on neither, and a
-      #     release-candidate.yml that is not byte-identical to a copy that
-      #     lives on main;
+      #     variant of a real one and a commit on neither;
       #   * registry-tag-digest.sh -- the digest probe the certification is
       #     compared against; must never invent a digest or read a 404 from
       #     an unreadable repository as absence;
@@ -1917,6 +2046,21 @@ jobs:
       # Stubs `gh`; offline, ~1s.
       - name: Check the candidate rerun resolver selects and blocks correctly
         run: bash scripts/ci/test-resolve-candidate-rerun.sh
+
+      # The release gate is pinned by sha (#6170): every caller of an
+      # artifact-keeper-test reusable workflow names one 40-hex commit, and a
+      # newly pinned commit must be on artifact-keeper-test main (a public
+      # repository, so the default token reads the compare API; a PR that
+      # changes no pin makes no call). The self-test stubs `gh`; offline, ~2s.
+      - name: Check the gate pin guard catches what it must
+        run: bash scripts/ci/test-check-gate-workflow-pins.sh
+      - name: Every gate caller pins one artifact-keeper-test commit
+        run: bash scripts/ci/check-gate-workflow-pins.sh check
+      - name: A newly pinned gate commit is on artifact-keeper-test main
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci/check-gate-workflow-pins.sh reachable "origin/${GITHUB_BASE_REF}"
 
       # The nightly release gate (#6073): which lines and images it tests,
       # how it gives way to a release candidate on the shared pool, and the
@@ -2009,6 +2153,14 @@ jobs:
 
       - name: Check the conflict-marker gate catches what it must
         run: bash scripts/ci/test-check-conflict-markers.sh
+
+      # A native test that writes ~/.npmrc, ~/.cargo or ~/.m2 leaves the test
+      # registry and its credentials on the developer's machine (#5940).
+      - name: Check native tests keep client config in their work dir
+        run: bash scripts/ci/check-native-tests-user-config.sh
+
+      - name: Check the native-test config gate catches what it must
+        run: bash scripts/ci/test-check-native-tests-user-config.sh
 
       # Stock compose version pins (#4481): openscap and web were hardcoded to
       # :latest, so setting ARTIFACT_KEEPER_VERSION still left two images
@@ -2322,6 +2474,12 @@ jobs:
       # percentage. Throwaway trees, no cargo, ~1s.
       - name: Check the test-shard gates and the coverage merge
         run: bash scripts/ci/test-test-shards.sh
+
+      # The unit and integration jobs' JUnit summary is the only place a
+      # flaky pass shows (#6172); a parser that missed `<flakyFailure>`
+      # would hide it. Real nextest reports, no cargo, ~1s.
+      - name: Check the nextest JUnit summary names flaky and failed tests
+        run: bash scripts/ci/test-nextest-junit-summary.sh
 
       # The coverage merge gate (coverage-gates -> CI Complete). Three ways it
       # can silently stop measuring what it claims: counting inline
@@ -3533,7 +3691,8 @@ jobs:
 
           # Docs-only PRs legitimately skip the Tier 1 jobs (see the
           # `changes` job). Version-bump-only release PRs legitimately skip
-          # the heavy Rust jobs — check-rust and test-backend-unit, but NOT
+          # the heavy Rust jobs — check-rust, windows-cross-check and
+          # test-backend-unit, but NOT
           # shell-tests, which still runs on that path (see the
           # `release-bump` job). Any other skip/failure of a Tier 1 job is
           # fatal.
@@ -3549,8 +3708,8 @@ jobs:
           fi
           # The `changes` job found nothing a Rust job reads (a CI-only PR),
           # or, on a push, a merged PR already proved this exact tree green.
-          # Same allowance as the bump path: check-rust and test-backend-unit
-          # may skip; shell-tests and security-audit still run and must
+          # Same allowance as the bump path: check-rust, windows-cross-check
+          # and test-backend-unit may skip; shell-tests and security-audit still run and must
           # succeed. Only an explicit "false" counts -- an empty output (the
           # gate died) makes a skip fatal, matching the jobs' own fail-open
           # `!= 'false'` condition.
@@ -3571,12 +3730,14 @@ jobs:
             elif [[ "$result" == "skipped" && "$docs_only" == "true" ]]; then
               echo "⏭️ $name (docs-only)" >> "$GITHUB_STEP_SUMMARY"
             elif [[ "$result" == "skipped" && "$bump_only" == "true" \
-                    && ( "$name" == "check-rust" || "$name" == "test-backend-unit" ) ]]; then
-              # Only the two heavy Rust jobs are skippable on the bump path.
+                    && ( "$name" == "check-rust" || "$name" == "windows-cross-check" \
+                         || "$name" == "test-backend-unit" ) ]]; then
+              # Only the heavy Rust jobs are skippable on the bump path.
               # shell-tests and security-audit still run and must succeed.
               echo "⏭️ $name (version-bump-only release PR)" >> "$GITHUB_STEP_SUMMARY"
             elif [[ "$result" == "skipped" && "$rust_skipped" == "true" \
-                    && ( "$name" == "check-rust" || "$name" == "test-backend-unit" ) ]]; then
+                    && ( "$name" == "check-rust" || "$name" == "windows-cross-check" \
+                         || "$name" == "test-backend-unit" ) ]]; then
               echo "⏭️ $name (no Rust-job inputs to re-verify)" >> "$GITHUB_STEP_SUMMARY"
             else
               echo "❌ $name: ${result:-missing}" >> "$GITHUB_STEP_SUMMARY"
@@ -3622,6 +3783,13 @@ jobs:
           }
 
           require_success "check-rust" "$RESULT_CHECK_RUST"
+          # The Windows cross-check (#6022) is advisory for now: it has no
+          # rust-cache (a cache for it would push the repo over its 10 GB
+          # quota and evict the release cli-* caches), so a cold check runs
+          # past its ceiling on a loaded day. It still runs on every Rust PR
+          # and main push, and a release is not tagged until it is green on
+          # the release-prep commit. Back to required once it has a cache or
+          # a faster form.
           require_success "test-backend-unit" "$RESULT_UNIT"
           require_success "shell-tests" "$RESULT_SHELL"
 
