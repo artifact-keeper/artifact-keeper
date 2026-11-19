@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="3" skipped="0" failures="1" errors="0" uuid="1284c034-ed85-4640-b758-1367cd0641c6" timestamp="2026-11-18T07:24:20.319-06:00" time="2.375">
+    <testsuite name="flakecrate" tests="3" skipped="0" errors="0" failures="1">
+        <testcase name="tests::steady" classname="flakecrate" timestamp="2026-11-18T07:24:20.319-06:00" time="0.006"/>
+        <testcase name="tests::flaky_once" classname="flakecrate" timestamp="2026-11-18T07:24:21.261-06:00" time="0.006">
+            <flakyFailure timestamp="2026-11-18T07:24:20.319-06:00" time="0.007" message="thread &apos;tests::flaky_once&apos; (54757297) panicked at src/lib.rs:10:60" type="test failure with exit code 101">thread &apos;tests::flaky_once&apos; (54757297) panicked at src/lib.rs:10:60:
+first attempt fails
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+                <system-out>
+running 1 test
+test tests::flaky_once ... FAILED
+
+failures:
+
+failures:
+    tests::flaky_once
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+</system-out>
+                <system-err>
+thread &apos;tests::flaky_once&apos; (54757297) panicked at src/lib.rs:10:60:
+first attempt fails
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+</system-err>
+            </flakyFailure>
+        </testcase>
+        <testcase name="tests::always_fails" classname="flakecrate" timestamp="2026-11-18T07:24:20.319-06:00" time="0.007">
+            <failure message="thread &apos;tests::always_fails&apos; (54757298) panicked at src/lib.rs:14:57" type="test failure with exit code 101">thread &apos;tests::always_fails&apos; (54757298) panicked at src/lib.rs:14:57:
+assertion `left == right` failed: deterministic &lt;failure&gt; &amp; &quot;quote&quot;
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace</failure>
+            <rerunFailure timestamp="2026-11-18T07:24:21.030-06:00" time="0.005" message="thread &apos;tests::always_fails&apos; (54758567) panicked at src/lib.rs:14:57" type="test failure with exit code 101">thread &apos;tests::always_fails&apos; (54758567) panicked at src/lib.rs:14:57:
+assertion `left == right` failed: deterministic &lt;failure&gt; &amp; &quot;quote&quot;
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+                <system-out>
+running 1 test
+test tests::always_fails ... FAILED
+
+failures:
+
+failures:
+    tests::always_fails
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+</system-out>
+                <system-err>
+thread &apos;tests::always_fails&apos; (54758567) panicked at src/lib.rs:14:57:
+assertion `left == right` failed: deterministic &lt;failure&gt; &amp; &quot;quote&quot;
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+</system-err>
+            </rerunFailure>
+            <rerunFailure timestamp="2026-11-18T07:24:22.688-06:00" time="0.006" message="thread &apos;tests::always_fails&apos; (54761445) panicked at src/lib.rs:14:57" type="test failure with exit code 101">thread &apos;tests::always_fails&apos; (54761445) panicked at src/lib.rs:14:57:
+assertion `left == right` failed: deterministic &lt;failure&gt; &amp; &quot;quote&quot;
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+                <system-out>
+running 1 test
+test tests::always_fails ... FAILED
+
+failures:
+
+failures:
+    tests::always_fails
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+</system-out>
+                <system-err>
+thread &apos;tests::always_fails&apos; (54761445) panicked at src/lib.rs:14:57:
+assertion `left == right` failed: deterministic &lt;failure&gt; &amp; &quot;quote&quot;
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+</system-err>
+            </rerunFailure>
+            <system-out>
+running 1 test
+test tests::always_fails ... FAILED
+
+failures:
+
+failures:
+    tests::always_fails
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+</system-out>
+            <system-err>
+thread &apos;tests::always_fails&apos; (54757298) panicked at src/lib.rs:14:57:
+assertion `left == right` failed: deterministic &lt;failure&gt; &amp; &quot;quote&quot;
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+</system-err>
+        </testcase>
+    </testsuite>
+</testsuites>

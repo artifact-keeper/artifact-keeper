@@ -672,17 +672,24 @@ pub(crate) fn build_streams_index_json(products: &[String]) -> serde_json::Value
 /// staged file at `file`. Best-effort: #2561 permit-scoped decode, so a
 /// saturated server, an unparseable path or a tarball without
 /// `metadata.yaml` all yield the `{"file_type": "unknown"}` placeholder
-/// rather than failing an upload whose bytes are already staged.
+/// rather than failing an upload whose bytes are already staged. On
+/// saturation it waits briefly for a slot first (#6230): a fast-fail acquire
+/// always lost to queued uploads, so a burst left every image unlabelled.
 ///
 /// Shared by the monolithic and native chunked uploads and by the generic
 /// chunked completion (`/api/v1/uploads`, #1846), so all three record the
-/// same document for the same bytes. Synchronous (bounded decode); async
-/// callers that can afford it run it on the blocking pool.
-pub(crate) fn extract_image_metadata(artifact_path: &str, file: &Path) -> serde_json::Value {
-    crate::util::bounded_archive::with_ingest_extraction(|| {
-        IncusHandler::parse_metadata_from_file(artifact_path, file).ok()
+/// same document for the same bytes. The decode runs on the blocking pool
+/// with the permit held across the join.
+pub(crate) async fn extract_image_metadata(artifact_path: &str, file: &Path) -> serde_json::Value {
+    let (path, file) = (artifact_path.to_string(), file.to_path_buf());
+    crate::util::bounded_archive::with_ingest_extraction_async(|| {
+        tokio::task::spawn_blocking(move || {
+            IncusHandler::parse_metadata_from_file(&path, &file).ok()
+        })
     })
+    .await
     .ok()
+    .and_then(|joined| joined.ok())
     .flatten()
     .unwrap_or_else(|| serde_json::json!({"file_type": "unknown"}))
 }
@@ -1166,9 +1173,10 @@ async fn upload_image(
     let (size_bytes, checksum) = stream_body_to_file(body, &temp_path).await?;
 
     // Extract metadata from the file on disk. #2561: permit-scoped decode; the
-    // artifact is already staged, so a saturated server skips this best-effort
-    // extraction rather than shedding the upload.
-    let metadata = extract_image_metadata(&artifact_path, &temp_path);
+    // artifact is already staged, so a server still saturated after the brief
+    // wait (#6230) skips this best-effort extraction rather than shedding the
+    // upload.
+    let metadata = extract_image_metadata(&artifact_path, &temp_path).await;
 
     // Record an upload session in `finalizing` state, then push to the
     // StorageBackend on a background task and return 202. Doing the
@@ -2261,8 +2269,9 @@ async fn complete_chunked_upload(
     }
 
     // Extract metadata from the file on disk. #2561: permit-scoped decode; the
-    // artifact is already staged, so a saturated server skips this best-effort
-    // extraction rather than shedding the upload.
+    // artifact is already staged, so a server still saturated after the brief
+    // wait (#6230) skips this best-effort extraction rather than shedding the
+    // upload.
     //
     // The artifact is split across two files, so read from whichever holds
     // its head: the sealed chunks when any were committed, else the
@@ -2273,7 +2282,7 @@ async fn complete_chunked_upload(
     } else {
         &final_path
     };
-    let metadata = extract_image_metadata(&session.artifact_path, metadata_source);
+    let metadata = extract_image_metadata(&session.artifact_path, metadata_source).await;
 
     // Finalize asynchronously: push to the StorageBackend on a background
     // task and return 202. The assembled multi-GiB push can outlive an L7

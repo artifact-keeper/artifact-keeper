@@ -168,7 +168,7 @@ pub(super) fn restore_order() -> impl Iterator<Item = &'static str> {
 /// The artifacts a backup exports: the predicate the core `artifacts` export
 /// uses, as a sub-select. `$1` is the repository filter, `$2` the `since`
 /// cutoff.
-const ARTIFACTS_IN_SCOPE: &str = "SELECT a.id FROM artifacts a \
+pub(super) const ARTIFACTS_IN_SCOPE: &str = "SELECT a.id FROM artifacts a \
      WHERE ($1::uuid[] IS NULL OR a.repository_id = ANY($1)) \
        AND ($2::timestamptz IS NULL OR a.updated_at >= $2)";
 

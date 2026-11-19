@@ -9,14 +9,20 @@
 //!   storage quota or one whose declared length would take it over (403),
 //!   and one whose declared length does not fit its repository's (or
 //!   project's) quota (403). A body without a length is admitted here and
-//!   checked once its size is known by the shared publish admission.
+//!   checked once its size is known by the shared publish admission. A
+//!   refusal of a write to a named repository is only answered to a caller
+//!   who passes that repository's write gate; anyone else gets the handler's
+//!   own answer (401, 403, or the unknown-key 404), never quota figures.
 //! * [`transfer_meter`] runs on the routers that serve artifact bytes. It
 //!   counts the body bytes of every successful `GET` (and the object size of
-//!   a presigned redirect when it is issued), and once the monthly transfer
+//!   a presigned redirect when it is issued: every redirect is built by
+//!   [`DownloadResponse::redirect`](crate::api::download_response::DownloadResponse::redirect),
+//!   which takes the size, #6035), and once the monthly transfer
 //!   quota's hard limit is reached it answers `429` instead of an artifact
 //!   download. Metadata responses (JSON, XML, HTML, text and YAML indexes)
 //!   are still served, so publishing clients that read metadata first keep
-//!   working.
+//!   working. A redirected `GET` with `Range` counts the whole object,
+//!   since the object store, not the backend, answers the range.
 //! * [`quota_envelope`] wraps the whole router. It re-renders a refusal in
 //!   the OCI error envelope on `/v2` and with npm's `error` field on `/npm`,
 //!   and turns the plain-text `413` of a body limit into the JSON refusal.
@@ -177,7 +183,7 @@ async fn repository_refusal(
     Ok(RepositoryService::new(db.clone())
         .quota_preflight(repo_id, additional)
         .await?
-        .map(|denial| denial.refusal()))
+        .map(|denial| denial.refusal().with_content_length(Some(declared))))
 }
 
 /// The refusal, if any, of a write that declares `declared` bytes.
@@ -214,22 +220,114 @@ async fn admission_refusal(
     }
 }
 
+/// The `/v2` name a blob or manifest write targets: the path between `/v2/`
+/// and its `/blobs/` or `/manifests/` segment.
+fn oci_image_name(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/v2/")?;
+    ["/blobs/", "/manifests/"]
+        .iter()
+        .filter_map(|marker| rest.find(marker))
+        .min()
+        .map(|end| &rest[..end])
+}
+
+/// Whether the caller of `req` passes the write gate of `repo_key`'s
+/// handler, so it may be told about a quota.
+///
+/// The REST artifact API and OCI `/v2` authorize writes in the handler, after
+/// this middleware, so a quota refusal answered here without asking would
+/// reach a caller the handler refuses: an anonymous caller or a reader of a
+/// public repository got `403 QUOTA_EXCEEDED` with the repository's quota and
+/// usage instead of its 401 or 403. The native format routes are already
+/// write-gated by `repo_visibility_middleware` before this point, and are
+/// asked the same question here all the same.
+///
+/// Mirrors the generic write gate ([`authorize_generic_upload`] with the
+/// `write:artifacts` scope); `/v2` asks the OCI push gate instead
+/// (`oci_v2::check_write_repository`). Any doubt answers `false`, which only
+/// hands the request to the handler: it answers its own refusal, or, for a
+/// caller it admits, the publish admission still refuses the upload once its
+/// size is known.
+///
+/// [`authorize_generic_upload`]: crate::api::handlers::repositories::authorize_generic_upload
+async fn caller_may_write(state: &SharedState, caller: WriteCaller, repo_key: &str) -> bool {
+    // A download ticket never authorizes a write.
+    if caller.ticket {
+        return false;
+    }
+    let Some(auth) = caller.auth else {
+        return false;
+    };
+    auth.require_scope("write:artifacts").is_ok()
+        && crate::api::handlers::repositories::authorize_generic_upload(state, &auth, repo_key)
+            .await
+            .is_ok()
+}
+
+/// What [`caller_may_write`] needs from the request, taken out of it so the
+/// middleware's future does not hold a reference to the request (whose body
+/// is not `Sync`) across an await.
+struct WriteCaller {
+    ticket: bool,
+    auth: Option<crate::api::middleware::auth::AuthExtension>,
+}
+
+impl WriteCaller {
+    fn of(req: &Request) -> Self {
+        let extensions = req.extensions();
+        Self {
+            ticket: extensions
+                .get::<crate::api::middleware::auth::DownloadTicketAuth>()
+                .is_some(),
+            auth: extensions
+                .get::<Option<crate::api::middleware::auth::AuthExtension>>()
+                .cloned()
+                .flatten(),
+        }
+    }
+}
+
 /// Middleware: refuse an upload over a quota or the size limit before its
 /// body is read. See the module docs.
+///
+/// A refusal is answered only to a caller who may write the repository
+/// ([`caller_may_write`], or the OCI push gate on `/v2`); any other caller is handed to the handler, which
+/// answers exactly as it did before the pre-check existed. The write gate is
+/// asked only once a refusal is due, so an upload under every quota pays
+/// nothing for it.
 pub async fn upload_admission(
     State(state): State<SharedState>,
     req: Request,
     next: Next,
 ) -> Response {
-    let Some(target) = write_target(req.method(), &full_path(&req)) else {
+    let path = full_path(&req);
+    let Some(target) = write_target(req.method(), &path) else {
         return next.run(req).await;
     };
     let declared = declared_length(req.headers());
-    match admission_refusal(&state, &target, declared).await {
-        // The body is dropped unread with the request.
-        Some(refusal) => refusal.into_response(),
-        None => next.run(req).await,
+    let Some(refusal) = admission_refusal(&state, &target, declared).await else {
+        return next.run(req).await;
+    };
+    // A write that names no repository (the chunked upload API) runs behind
+    // the required-auth layer and only meets the instance figures, which
+    // `GET /api/v1/system/quota` serves to any authenticated caller.
+    if let Some(key) = &target.repo_key {
+        if let Some(image_name) = oci_image_name(&path) {
+            // `/v2`: the handler reuses the credential verification made here.
+            let headers = req.headers().clone();
+            let check =
+                crate::api::handlers::oci_v2::check_write_repository(&state, &headers, image_name)
+                    .await;
+            if !check.may_write {
+                return crate::api::handlers::oci_v2::run_with_preverified(check, next.run(req))
+                    .await;
+            }
+        } else if !caller_may_write(&state, WriteCaller::of(&req), key).await {
+            return next.run(req).await;
+        }
     }
+    // The body is dropped unread with the request.
+    refusal.into_response()
 }
 
 /// Response extension: this redirect hands the client a presigned URL for
@@ -515,6 +613,13 @@ mod tests {
                 target(true, true, Some("gen")),
             ),
             (&put_, "/api/v1/repositories/gen/settings", None),
+            // Repository and artifact metadata writes store no bytes and are
+            // never refused at the quota: repository PATCH, repository labels
+            // (artifact labels live under `/api/v1/artifacts/{id}`, outside
+            // this layer). The only writes under `.../artifacts` are uploads.
+            (&patch, "/api/v1/repositories/gen", None),
+            (&put_, "/api/v1/repositories/gen/labels", None),
+            (&patch, "/api/v1/repositories/gen/proxy-cache-cap", None),
             (
                 &put_,
                 "/api/v1/repositories/d/oci/blobs/sha256:a",

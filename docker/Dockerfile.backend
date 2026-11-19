@@ -133,8 +133,8 @@ FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rootfs-builder
 # Install only essential runtime libraries into a clean rootfs.
 # --refresh forces fresh repo metadata and the follow-up `upgrade -y` pulls
 # the latest RHEL 9 z-stream security errata for every installed package
-# (curl-minimal/libcurl, glibc*, tar, openssl-libs, xz, xz-libs,
-# zlib, zstd) that the install step alone may miss when the metadata cache is
+# (glibc*, tar, openssl-libs, xz, xz-libs, zlib, zstd) that the install
+# step alone may miss when the metadata cache is
 # stale. This guarantees the rootfs is rebuilt against current errata on every
 # image build. The reposdir override is required on the upgrade step because
 # once the installroot has a populated /etc, dnf reads repos from inside it
@@ -147,6 +147,23 @@ FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rootfs-builder
 # CI with `ignore-unfixed: true`, so they do not produce code-scanning alerts.
 # When Red Hat publishes the errata, the next rebuild picks the fixes up
 # automatically with no Dockerfile change. See the linked hardening issue.
+#
+# NO curl RPM (#5991). Every curl in UBI 9 (curl and curl-minimal alike)
+# links libcurl, and both libcurl and libcurl-minimal require libgssapi_krb5,
+# so the curl RPM was the only reason krb5-libs was in this image -- and,
+# because dnf resolved curl-minimal's libcurl dependency to the full libcurl,
+# also libssh, openldap, cyrus-sasl-lib, libbrotli, libpsl, libidn2 and their
+# own dependencies (27 RPMs leave; libnghttp2 stays, see below).
+# krb5-libs-1.21.1-10.el9_8.1 carries 14 HIGH CVEs whose fix (el9_9.2) is in
+# the entitled RHEL 9 repositories only. Nothing else here uses any of them: the backend binary links glibc,
+# libgcc, openssl, zlib and xz-libs; grype and buildctl are static Go;
+# unsquashfs links zlib/xz/zstd. The `curl` command that compose files,
+# scripts and probes exec inside this container is now built from source in
+# the curl-bin stage below, without Kerberos, LDAP or SSH, and the image
+# HEALTHCHECK is the binary's own `artifact-keeper healthcheck`. libnghttp2
+# is installed for that curl's HTTP/2 support; it needs only glibc.
+# Do not add curl, libcurl or any libcurl consumer RPM back: it re-imports
+# krb5-libs.
 RUN mkdir -p /mnt/rootfs && \
     dnf install --installroot /mnt/rootfs --releasever 9 --refresh \
         --setopt=reposdir=/etc/yum.repos.d/ \
@@ -157,11 +174,11 @@ RUN mkdir -p /mnt/rootfs && \
         zlib \
         xz-libs \
         xz \
-        curl-minimal \
         tar \
         gzip \
         zstd \
         libzstd \
+        libnghttp2 \
     && dnf --installroot /mnt/rootfs --releasever 9 \
         --setopt=reposdir=/etc/yum.repos.d/ upgrade -y \
     && dnf --installroot /mnt/rootfs clean all \
@@ -243,8 +260,8 @@ RUN rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
 # Strip residual setuid/setgid bits (shadow-utils chage/gpasswd/newgrp etc. are
 # pulled transitively and are never used by a non-root, no-login container) and
 # drop interpreters/shells the runtime does not need. The CMD (`artifact-keeper`)
-# and the curl healthcheck do not invoke bash/gawk/sed; jq is referenced only in
-# code comments and never spawned. Removing them shrinks attack surface and
+# and the healthcheck (`artifact-keeper healthcheck`) do not invoke
+# bash/gawk/sed; jq is referenced only in code comments and never spawned. Removing them shrinks attack surface and
 # clears jq's MEDIUM-CVE load. /bin/sh (coreutils-supplied) is intentionally
 # left in place.
 RUN find /mnt/rootfs -xdev -perm /6000 -type f -exec chmod a-s {} + && \
@@ -804,6 +821,110 @@ RUN set -eu; \
       "/licenses/squashfs-tools/squashfs-tools-${SQUASHFS_TOOLS_VERSION}.tar.gz"; \
     /out/unsquashfs -help >/dev/null
 
+# ---------- Stage 5c: curl without Kerberos, LDAP or SSH (#5991) ----------
+# The image keeps a `curl` command because compose files, docs, deployment
+# tests and downstream deployments exec `curl -sf http://localhost:8080/health`
+# (and friends) inside this container as their healthcheck. The UBI 9 curl
+# RPMs cannot provide it without krb5-libs (see rootfs-builder), so curl is
+# built here from the signed upstream release instead:
+#   - libcurl is linked STATICALLY into the curl binary, so the image has no
+#     libcurl.so at all; the binary's only shared libraries are glibc,
+#     openssl-libs, zlib and libnghttp2, all installed by rootfs-builder
+#     (the stage below refuses any other NEEDED entry, and the runtime
+#     stage's ldd sweep fails the build on anything unresolved);
+#   - HTTP/1.1 and HTTP/2 (UBI's libnghttp2, which needs only glibc) over
+#     plain TCP and OpenSSL with the system CA bundle, as the RPM curl did,
+#     plus file:// and ftp(s)://;
+#   - NOT: GSSAPI/Kerberos (Negotiate) or NTLM auth, LDAP, SCP/SFTP (no
+#     libssh), SASL (libgsasl), brotli or zstd content decoding, and the
+#     telnet/tftp/gopher/dict/imap/pop3/smtp/mqtt/rtsp/ipfs protocols.
+#     IDN hostnames and PSL cookie checks are also off: UBI 9 ships libidn2
+#     and libpsl but not their -devel packages, so curl cannot be built
+#     against them from the UBI repositories.
+#   - hardened as unsquashfs is (stack protector, _FORTIFY_SOURCE, PIE, full
+#     RELRO), asserted with readelf.
+#
+# Built natively per target platform, like unsquashfs: CI builds the amd64
+# and arm64 images on runners of that architecture, so no cross toolchain.
+#
+# The tarball is verified TWICE: its detached signature against the curl
+# release key committed at docker/keys/curl-daniel-stenberg.gpg (Daniel
+# Stenberg, fingerprint 27ED EAF2 2F3A BCEB 50DB 9A12 5CC9 08FD B71E 12C2,
+# exported from https://daniel.haxx.se/mykey.asc), and its SHA-256 pinned
+# below. A bump is CURL_VERSION + CURL_SHA256; the build fails on a mismatch
+# of either.
+#
+# Trade-off: a self-built curl is INVISIBLE to Trivy and dependabot, so they
+# will not report a future curl CVE against this image. grype DOES detect it
+# (from the binary's version string, as pkg:generic/curl with CPE haxx:curl),
+# so grype is the one scanner that still matches curl CVEs here. Two
+# controls cover the blind spot (#6003): scheduled-curl-advisory-watch.yml
+# checks CURL_VERSION against https://curl.se/docs/vuln.json daily and opens a
+# type:security issue when it is affected, and the image carries a CycloneDX
+# entry for curl and libcurl at /usr/share/sbom/curl.cdx.json, generated
+# below from CURL_VERSION. Nothing bumps the pin: do that by hand. Retire this
+# stage (and go back to the curl-minimal RPM) once UBI 9 ships a fixed
+# krb5-libs.
+FROM registry.access.redhat.com/ubi9/ubi:9.8 AS curl-bin
+ARG CURL_VERSION=8.23.0
+ARG CURL_SHA256=8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5
+ARG CURL_KEY_FINGERPRINT=27EDEAF22F3ABCEB50DB9A125CC908FDB71E12C2
+RUN dnf install -y --nodocs gcc make binutils diffutils perl xz gnupg2 \
+      openssl-devel zlib-devel libnghttp2-devel \
+    && dnf clean all
+COPY docker/keys/curl-daniel-stenberg.gpg /tmp/curl-release.gpg
+COPY docker/curl-sbom.sh /usr/local/bin/curl-sbom.sh
+RUN set -eu; \
+    base="https://curl.se/download/curl-${CURL_VERSION}.tar.xz"; \
+    curl --proto '=https' --tlsv1.2 -sSfL "${base}" -o /tmp/curl.tar.xz; \
+    curl --proto '=https' --tlsv1.2 -sSfL "${base}.asc" -o /tmp/curl.tar.xz.asc; \
+    echo "${CURL_SHA256}  /tmp/curl.tar.xz" | sha256sum -c -; \
+    gpgv --status-fd 1 --keyring /tmp/curl-release.gpg /tmp/curl.tar.xz.asc /tmp/curl.tar.xz \
+      | grep -q "^\[GNUPG:\] VALIDSIG ${CURL_KEY_FINGERPRINT} "; \
+    mkdir -p /src; \
+    tar -xJf /tmp/curl.tar.xz -C /src --strip-components=1; \
+    cd /src; \
+    CFLAGS="-O2 -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE" \
+    LDFLAGS="-pie -Wl,-z,relro,-z,now" \
+    ./configure --prefix=/usr \
+        --disable-shared --enable-static \
+        --with-openssl --with-zlib \
+        --with-ca-bundle=/etc/pki/tls/certs/ca-bundle.crt \
+        --without-gssapi --without-libssh --without-libssh2 --without-libgsasl \
+        --disable-ldap --disable-ldaps \
+        --with-nghttp2 --without-libidn2 --without-libpsl \
+        --without-brotli --without-zstd --without-libuv \
+        --disable-ntlm \
+        --disable-telnet --disable-tftp --disable-gopher --disable-dict \
+        --disable-imap --disable-pop3 --disable-smtp --disable-mqtt \
+        --disable-rtsp --disable-ipfs \
+        --disable-manual --disable-docs \
+        --enable-symbol-hiding; \
+    make -j"$(nproc)"; \
+    install -Dm755 src/curl /out/curl; \
+    install -Dm644 COPYING /licenses/curl/COPYING; \
+    readelf -h /out/curl | grep -q 'DYN '; \
+    readelf -d /out/curl | grep -q 'BIND_NOW'; \
+    needed="$(readelf -d /out/curl | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | sort | tr '\n' ' ')"; \
+    echo "curl ${CURL_VERSION} NEEDED: ${needed}"; \
+    for lib in ${needed}; do \
+      case "${lib}" in \
+        libc.so.6|ld-linux-*.so.[12]|libssl.so.3|libcrypto.so.3|libz.so.1|libnghttp2.so.14) ;; \
+        *) echo "ERROR: curl links ${lib}, which the runtime rootfs is not meant to carry" >&2; exit 1 ;; \
+      esac; \
+    done; \
+    features="$(/out/curl -V)"; echo "${features}"; \
+    if printf '%s\n' "${features}" | grep -Eiq 'GSS-API|Kerberos|SPNEGO|NTLM|ldap|scp|sftp|libssh|gsasl'; then \
+      echo "ERROR: curl was built with Kerberos/NTLM/LDAP/SSH/SASL support" >&2; exit 1; \
+    fi; \
+    printf '%s\n' "${features}" | grep -q '^Features:.* HTTP2' \
+      || { echo "ERROR: curl was built without HTTP/2" >&2; exit 1; }; \
+    printf '%s\n' "${features}" | head -1 | grep -q "^curl ${CURL_VERSION} .* libcurl/${CURL_VERSION} " \
+      || { echo "ERROR: the built curl does not report ${CURL_VERSION}" >&2; exit 1; }; \
+    mkdir -p /out/sbom; \
+    sh /usr/local/bin/curl-sbom.sh curl "${CURL_VERSION}" "${CURL_SHA256}" \
+      "statically linked into /usr/bin/curl" > /out/sbom/curl.cdx.json
+
 # ---------- Stage 5b: Pre-seed the Grype vulnerability DB ----------
 # Populates the Grype DB at build time so the image works on egress-restricted
 # networks (e.g. ARC runner pods) without a first-scan network fetch from
@@ -823,7 +944,8 @@ RUN mkdir -p /grype-db && grype db update && grype db status
 # rootfs-builder `dnf upgrade` layer stale and ship months-old errata (#2391).
 FROM registry.access.redhat.com/ubi9/ubi-micro:9.8 AS runtime
 
-# Copy minimal rootfs (glibc, openssl, ca-certs, curl, user/group, dirs)
+# Copy minimal rootfs (glibc, openssl, ca-certs, tar/xz/zstd, user/group, dirs).
+# No curl RPM: /usr/bin/curl comes from the curl-bin stage below.
 COPY --from=rootfs-builder /mnt/rootfs /
 
 # Copy the grype scanner CLI (local SBOM/vuln scans). The trivy CLI is
@@ -843,6 +965,17 @@ COPY --from=buildkit-bin /licenses/buildkit /licenses/buildkit
 # GPL-2.0 licence text and the corresponding source tarball (GPL-2.0 s.3(a)).
 COPY --from=squashfs-bin /out/unsquashfs /usr/local/bin/unsquashfs
 COPY --from=squashfs-bin /licenses/squashfs-tools /licenses/squashfs-tools
+
+# curl without Kerberos/LDAP/SSH (#5991), at the path the curl RPM used, so
+# `docker exec <backend> curl ...` and curl-based compose healthchecks keep
+# working. Its licence travels with it.
+COPY --from=curl-bin /out/curl /usr/bin/curl
+COPY --from=curl-bin /licenses/curl /licenses/curl
+# CycloneDX entry for that curl and its static libcurl (#6003), generated in
+# the curl-bin stage from the same CURL_VERSION. RPM-database scanners cannot
+# see a source-built curl; this gives CPE-matching scanners (syft's
+# sbom-cataloger, grype) cpe:2.3:a:haxx:curl and cpe:2.3:a:haxx:libcurl.
+COPY --from=curl-bin /out/sbom/curl.cdx.json /usr/share/sbom/curl.cdx.json
 
 # Pre-seeded Grype vulnerability DB (avoids first-scan network fetch).
 #
@@ -873,14 +1006,36 @@ COPY --from=grype-db-seed --chown=1001:0 --chmod=0550 /grype-db /home/artifact/.
 ARG CARGO_PROFILE=release
 COPY --from=builder /app/target/${CARGO_PROFILE}/artifact-keeper /usr/local/bin/
 
+# Fail the build if any executable or shared library in the final filesystem
+# has an unresolved dependency: the guard for #5991, where removing the curl
+# RPM's dependency chain (krb5-libs and 27 more) must not strand anything that
+# still needs one of them. Shell-form on purpose: /bin/sh (bash) still exists
+# here and is removed just below. Uses the image's own ldd. Also refuses a
+# Kerberos/LDAP/SSH/SASL library or a libcurl reappearing in /usr/lib64.
+RUN set -eu; \
+    if ls /usr/lib64 | grep -E '^lib(krb5|gssapi_krb5|k5crypto|kdb5|ldap|lber|sasl2|ssh|curl)\.so'; then \
+      echo 'ERROR: Kerberos/LDAP/SSH/SASL/libcurl library in the runtime image (#5991)' >&2; exit 1; \
+    fi; \
+    unresolved=''; checked=0; \
+    for f in /usr/bin/* /usr/sbin/* /usr/libexec/*/* /usr/local/bin/* /usr/lib64/*.so* /usr/lib64/*/*.so*; do \
+      [ -f "$f" ] && [ ! -L "$f" ] || continue; \
+      [ "$(head -c4 "$f" | od -An -c | tr -d ' ')" = '177ELF' ] || continue; \
+      checked=$((checked+1)); \
+      missing="$(/usr/bin/ldd "$f" 2>&1 | grep 'not found' || true)"; \
+      if [ -n "$missing" ]; then unresolved="${unresolved}${f}: $(echo $missing) | "; fi; \
+    done; \
+    if [ -n "$unresolved" ]; then echo "ERROR: unresolved shared libraries: ${unresolved}" >&2; exit 1; fi; \
+    echo "ldd sweep: ${checked} ELF files, all dependencies resolved"; \
+    /usr/bin/curl -V | head -n1
+
 # Remove the bash shell that the ubi-micro BASE layer ships (the rootfs-builder
 # strip only affects the copied rootfs, not files already present in the base).
 # On ubi-micro `/bin/sh` and `/usr/bin/sh` are symlinks to bash, so dropping
 # bash removes the only interactive shell. Nothing at runtime needs it: the
 # binary spawns its subprocesses (tar/chmod/grype) directly via Command::new
 # (no `sh -c`), CMD is exec-form `["artifact-keeper"]`, and the HEALTHCHECK is
-# exec-form curl. Done with the real coreutils `rm` (exec-form RUN) so it does
-# not depend on the shell being deleted. See issue #1544.
+# exec-form `artifact-keeper healthcheck`. Done with the real coreutils `rm`
+# (exec-form RUN) so it does not depend on the shell being deleted. See issue #1544.
 RUN ["/usr/bin/rm", "-f", \
      "/usr/bin/bash", "/bin/bash", \
      "/usr/bin/sh", "/bin/sh", \
@@ -924,7 +1079,13 @@ ENV RUST_LOG=info \
 
 EXPOSE 8080 9090
 
+# The probe is the backend binary itself (backend/src/cli/healthcheck.rs): a
+# plain HTTP GET of /health (the endpoint the old curl HEALTHCHECK checked:
+# database and storage) on the BIND_ADDRESS port, exit 0 on 2xx,
+# without loading any config or opening a database connection itself (#5991).
+# The image still ships a curl (the curl-bin stage) for compose files and
+# scripts that exec it here; the HEALTHCHECK itself no longer depends on it.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD ["curl", "-sf", "http://localhost:8080/health"]
+    CMD ["artifact-keeper", "healthcheck"]
 
 CMD ["artifact-keeper"]

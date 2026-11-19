@@ -56,6 +56,9 @@ jobs:
   release-preflight:
     name: Release identity preflight
     runs-on: ubuntu-latest
+    # p100 ~0.2m over 29 runs (2026-08..2026-11). A sparse checkout and a few
+    # git/grep assertions: 10 is a floor, not a multiple.
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -235,6 +238,7 @@ jobs:
   preflight-evidence:
     name: Require a green Release Preflight for this commit
     runs-on: ubuntu-latest
+    # p100 ~0.2m over 26 runs (2026-08..2026-11).
     timeout-minutes: 5
     permissions:
       contents: read
@@ -283,6 +287,7 @@ jobs:
     name: Require a release-candidate certification for this commit
     needs: [release-preflight]
     runs-on: ubuntu-latest
+    # p100 ~0.5m over 21 runs (2026-08..2026-11).
     timeout-minutes: 10
     permissions:
       contents: read
@@ -391,6 +396,8 @@ jobs:
     # commit to completion -- so this job timeout is only a hard ceiling
     # against a genuinely hung publish: cold-cache amd64 worst case (~90 min)
     # + runner queue + cosign/provenance + margin.
+    # p100 ~33m over 28 runs (2026-08..2026-11); kept at 130 for the cold-cache
+    # case above, which the sample does not contain.
     timeout-minutes: 130
     permissions:
       packages: read
@@ -398,7 +405,15 @@ jobs:
     outputs:
       backend_digest: ${{ steps.resolve.outputs.backend_digest }}   # sha256:...
       version: ${{ steps.resolve.outputs.version }}
+      # The scanner-adapter tag the gate's adapter tiers run. The adapter has
+      # its own VERSION, so the backend version names no adapter image;
+      # docker-publish tags the adapter it builds from this commit sha-<7>.
+      adapter_tag: ${{ steps.adapter-tag.outputs.adapter_tag }}
     steps:
+      - name: Name this commit's scanner-adapter tag
+        id: adapter-tag
+        run: echo "adapter_tag=sha-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
       # scripts/ci for the resolver + adoption gate, .github/scripts for the
       # registry probes, and full history so the adoption gate can diff the
       # published image's source revision against the tag (the sparse worktree
@@ -702,13 +717,30 @@ jobs:
           && needs.candidate-certified.result == 'success'
           && needs.candidate-certified.outputs.certified != 'true'
           && fromJSON(github.run_attempt) == 1 }}
-    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main
+    # The gate's jobs request at most contents: read and packages: read (ghcr
+    # pulls); a called workflow can never hold more than its calling job grants.
+    permissions:
+      contents: read
+      packages: read
+    # Pinned to an artifact-keeper-test commit, not @main (#6170): a gate
+    # change reaches a candidate only through a bump PR in this repo, which
+    # Mergify does not auto-merge. CODEOWNERS lists this file to mark
+    # ownership; a code-owner review is enforced only once branch protection
+    # on main and release/* requires it (#6216). The pin does not wait on
+    # protection for artifact-keeper-test (#6178). All five callers carry ONE
+    # sha, and
+    # scripts/ci/check-gate-workflow-pins.sh enforces both that and that the
+    # sha is on artifact-keeper-test main.
+    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@987bccd15df3fd4c9c24bf78436ce12fb5bd5783 # artifact-keeper-test main as of 2026-11-18
     with:
       backend_tag: ${{ needs.resolve-candidate-digest.outputs.version }}
       backend_digest: ${{ needs.resolve-candidate-digest.outputs.backend_digest }}
+      scanner_adapter_tag: ${{ needs.resolve-candidate-digest.outputs.adapter_tag }}
       web_tag: latest
       test_suite: all
-    secrets: inherit
+    # Only the one secret the gate declares, not every secret this repo holds.
+    secrets:
+      GHCR_DOCKER_CONFIG: ${{ secrets.GHCR_DOCKER_CONFIG }}
 
   gate-rerun-refused:
     name: Refuse a re-run of the gate
@@ -719,6 +751,9 @@ jobs:
           && needs.candidate-certified.outputs.certified != 'true'
           && needs.release-gate.result != 'success' }}
     runs-on: ubuntu-latest
+    # No samples: this runs only on a re-run attempt, and is one echo.
+    # 5 is a floor.
+    timeout-minutes: 5
     permissions: {}
     steps:
       - name: Explain
@@ -733,6 +768,15 @@ jobs:
   build-binaries:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    # Per leg, p100 over 25-27 successful legs (2026-08..2026-11):
+    #   linux-amd64 ~34m, linux-arm64 ~35m, windows-amd64 ~56m (cross-builds
+    #   on ubuntu-latest) -> 180, about 3x: 1.12 is memory-bound (legs died of
+    #   OOM before the swap step) and a leg that swaps hard runs long.
+    #   darwin-amd64 ~157m, darwin-arm64 ~167m (both v1.12.1; ~80-90m through
+    #   v1.11.14, ~108-156m on v1.12.0) -> 360, the hosted maximum: anything
+    #   lower only kills a build that would have finished. Fix the build time,
+    #   not this number (#6218). Almost all of it is the `Build` step.
+    timeout-minutes: ${{ startsWith(matrix.os, 'macos') && 360 || 180 }}
     # The gate must be green -- or, for a certified stable tag, skipped
     # because it already passed on these digests in the candidate (#3772).
     # Stated explicitly with `!cancelled()` rather than left to the default
@@ -795,6 +839,27 @@ jobs:
       - name: Install Windows cross-compilation tools
         if: matrix.target == 'x86_64-pc-windows-gnu'
         run: sudo apt-get install -y mingw-w64
+
+      # The 1.12 backend's release build fills the hosted VM's 15 GiB of RAM
+      # and 2 GiB of swap. Over it, the runner stops answering instead of
+      # being OOM-killed: "The runner has received a shutdown signal", exit
+      # 143. That killed v1.12.0's aarch64 and Windows legs (run 44223297721)
+      # and the Windows cross-build twice (run 44236328312), while 1.11.14,
+      # a smaller tree, built every target. Same remedy as ci.yml's unit
+      # legs ("Add swap"): a 12 GiB swapfile on the ~80 GB disk. Best effort.
+      - name: Add swap
+        if: runner.os == 'Linux'
+        run: |
+          if sudo fallocate -l 12G /ak-ci-swapfile \
+             && sudo chmod 600 /ak-ci-swapfile \
+             && sudo mkswap /ak-ci-swapfile >/dev/null \
+             && sudo swapon /ak-ci-swapfile; then
+            echo "added a 12 GiB swapfile"
+          else
+            echo "::warning title=No extra swap::could not add /ak-ci-swapfile; this job runs with the image's default swap only."
+          fi
+          swapon --show
+          free -m
 
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
@@ -992,6 +1057,8 @@ jobs:
       ${{ !cancelled()
           && needs.build-binaries.result == 'success'
           && needs.resolve-candidate-digest.result == 'success' }}
+    # p100 ~1.7m over 24 runs (2026-08..2026-11); 35 covers the probe step's own
+    # 30-minute registry deadline.
     timeout-minutes: 35
     steps:
       - name: Checkout tag (for CHANGELOG verification)
@@ -1188,6 +1255,10 @@ jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
+    # p100 ~1.5m over 24 runs (2026-08..2026-11). Network-bound (asset download,
+    # cosign keyless signing, attestations, ~20 asset uploads), so 15 is a
+    # floor for a slow Sigstore or uploads API rather than 2-3x.
+    timeout-minutes: 15
     needs: [preflight-evidence, candidate-certified, build-binaries, release-gate, verify-images-published]
     # DECLARED, not inherited (#3558). This job used to take the workflow-level
     # set, which gave it `packages: write` it has never used and -- more to the
@@ -1543,6 +1614,7 @@ jobs:
       actions: write   # dispatch docker-publish and follow its run
       contents: read
       packages: read
+    # p100 ~21m over 20 runs (2026-08..2026-11).
     timeout-minutes: 45
     steps:
       # The assert at the end derives which adapter floating tags must have
@@ -1799,6 +1871,7 @@ jobs:
       contents: read
     # The sync builds the backend to export the spec (~15 min cold) and then
     # pushes; the follower polls until it concludes.
+    # p100 ~17m over 15 runs (2026-08..2026-11).
     timeout-minutes: 45
     steps:
       - name: Checkout (scripts)
@@ -1885,6 +1958,7 @@ jobs:
     permissions:
       actions: write   # dispatch release-announce.yml and follow its run
       contents: read
+    # p100 ~0.7m over 2 runs (2026-08..2026-11).
     timeout-minutes: 20
     steps:
       - name: Checkout (scripts)
@@ -1945,6 +2019,8 @@ jobs:
       actions: write   # dispatch ami-build.yml and follow its run
       contents: read
     # A Packer build plus the AMI copy; the follower polls until it concludes.
+    # p100 ~0.1m over 2 runs (2026-08..2026-11) is not a sample of that: ami-build.yml
+    # is disabled, so the dispatch returns at once. 120 is sized for Packer.
     timeout-minutes: 120
     steps:
       - name: Checkout (scripts)
@@ -1952,8 +2028,40 @@ jobs:
         with:
           sparse-checkout: scripts/ci
 
+      # ami-build.yml is disabled in this repository until the AMI pipeline
+      # works (#3896, #5709). Dispatching a disabled workflow is a 422, which
+      # turned this job red on every release. A disabled target is a decision,
+      # not a failure: skip with a notice and a summary line. Any state other
+      # than `active` or `disabled_*` (e.g. `deleted`), or a failed lookup,
+      # still fails the job.
+      - name: Check that ami-build.yml is enabled
+        id: enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          state="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ami-build.yml" --jq .state)"
+          echo "ami-build.yml state: ${state}"
+          case "${state}" in
+            active)
+              echo "enabled=true" >> "$GITHUB_OUTPUT" ;;
+            disabled_*)
+              echo "enabled=false" >> "$GITHUB_OUTPUT"
+              echo "::notice title=AMI build skipped::ami-build.yml is ${state}, so no AMI was built for ${GITHUB_REF_NAME}. The release IS published. Enable the workflow (gh workflow enable ami-build.yml) and dispatch it by hand to build one: gh workflow run ami-build.yml --ref ${GITHUB_REF_NAME} -f version=${GITHUB_REF_NAME#v}"
+              {
+                echo "### AMI build skipped"
+                echo
+                echo "- \`ami-build.yml\` is \`${state}\`; no AMI was built for \`${GITHUB_REF_NAME}\`."
+                echo "- To build one: \`gh workflow enable ami-build.yml\`, then \`gh workflow run ami-build.yml --ref ${GITHUB_REF_NAME} -f version=${GITHUB_REF_NAME#v}\`."
+              } >> "$GITHUB_STEP_SUMMARY" ;;
+            *)
+              echo "::error title=Unexpected ami-build.yml state::ami-build.yml is '${state}'; expected active or disabled_*."
+              exit 1 ;;
+          esac
+
       - name: Dispatch the AMI build
         id: dispatch
+        if: ${{ steps.enabled.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -1965,6 +2073,7 @@ jobs:
           echo "Dispatched ami-build.yml on ${GITHUB_REF_NAME}."
 
       - name: Follow the AMI build to completion
+        if: ${{ steps.enabled.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           FOLLOW_REPO: ${{ github.repository }}

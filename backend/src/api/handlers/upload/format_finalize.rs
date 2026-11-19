@@ -552,12 +552,8 @@ pub(crate) async fn stage(
             let FinalizeSource::File(file) = source else {
                 return Err("an Incus image finalize needs the assembled file".to_string());
             };
-            let (path, file) = (artifact_path.to_string(), file.to_path_buf());
-            let metadata = tokio::task::spawn_blocking(move || {
-                crate::api::handlers::incus::extract_image_metadata(&path, &file)
-            })
-            .await
-            .unwrap_or_else(|_| serde_json::json!({"file_type": "unknown"}));
+            let metadata =
+                crate::api::handlers::incus::extract_image_metadata(artifact_path, file).await;
             Ok(StagedNativeFinalize::Incus(metadata))
         }
         RepositoryFormat::Debian => {
@@ -803,6 +799,11 @@ async fn stage_pypi(
 ) -> Result<StagedPypi, String> {
     use crate::formats::pypi::PypiHandler;
     let filename = basename(artifact_path).to_string();
+    // #6221: one ingest permit for the identity gate AND the analysis below,
+    // so the analysis never queues for a second one.
+    let ingest_permit = crate::util::bounded_archive::acquire_ingest_extraction_waiting()
+        .await
+        .map_err(|e| e.to_string())?;
     let pkg_info = {
         let file = file.to_path_buf();
         let (name, version, filename) = (
@@ -810,16 +811,13 @@ async fn stage_pypi(
             target.version.clone(),
             filename.clone(),
         );
-        crate::util::bounded_archive::with_ingest_extraction_async(|| {
-            tokio::task::spawn_blocking(move || {
-                let file = std::fs::File::open(&file).map_err(|e| {
-                    crate::error::AppError::Internal(format!("re-open assembled upload: {e}"))
-                })?;
-                PypiHandler::validate_upload_file(&name, &version, &filename, file)
-            })
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&file).map_err(|e| {
+                crate::error::AppError::Internal(format!("re-open assembled upload: {e}"))
+            })?;
+            PypiHandler::validate_upload_file(&name, &version, &filename, file)
         })
         .await
-        .map_err(|e| e.to_string())?
         .map_err(|e| format!("upload validation task failed: {e}"))?
         .map_err(|e| e.to_string())?
     };
@@ -832,8 +830,13 @@ async fn stage_pypi(
     let requires_python = pkg_info
         .as_ref()
         .and_then(|info| info.requires_python.clone());
-    let analysis =
-        crate::api::handlers::pypi::analyze_pypi_upload(file.to_path_buf(), filename.clone()).await;
+    let analysis = crate::api::handlers::pypi::analyze_pypi_upload(
+        &ingest_permit,
+        file.to_path_buf(),
+        filename.clone(),
+    )
+    .await;
+    drop(ingest_permit);
     let mut metadata = serde_json::json!({
         "name": raw_name,
         "normalized_name": target.name,

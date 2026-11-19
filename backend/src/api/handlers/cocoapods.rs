@@ -589,10 +589,12 @@ async fn push_pod(
 
     // Try to extract podspec from the archive body.
     // The body should contain a tar.gz with a podspec.json inside.
-    // #2561: permit-scoped decode, fast-fail 503 on saturation.
-    let podspec = crate::util::bounded_archive::with_ingest_extraction(|| {
+    // #2561: permit-scoped decode; on saturation it waits briefly
+    // for a slot, then sheds 503 (#6230).
+    let podspec = crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
         extract_podspec_from_archive(&body)
     })
+    .await
     .map_err(|e| e.into_response())?
     .map_err(|e| {
         (
@@ -1638,6 +1640,35 @@ mod db_cov_tests {
             String::from_utf8_lossy(&body[..])
         );
         fx.teardown().await;
+    }
+
+    /// #6230: a pod push whose repository's ingest bucket is full waits for a
+    /// permit instead of shedding 503 at once, and succeeds once one frees.
+    #[tokio::test]
+    async fn test_cocoapods_push_waits_for_ingest_permit_6230() {
+        let Some(fx) = tdh::Fixture::setup("local", "cocoapods").await else {
+            return;
+        };
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/pods", fx.repo_key))
+            .body(axum::body::Body::from(pod_archive("QueuedPod", "1.0.0")))
+            .unwrap();
+        let ((status, body), queued) =
+            crate::util::bounded_archive::test_support::run_queued_behind_full_tenant(
+                crate::util::bounded_archive::TenantKey::Repo(fx.repo_id),
+                tdh::send(app, req),
+            )
+            .await;
+        fx.teardown().await;
+        assert!(queued, "the push must have waited for a permit");
+        assert!(
+            status.is_success(),
+            "a queued pod push must succeed once a permit frees: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
     }
 
     /// #5662: the same pod version pushes into two CocoaPods repositories on

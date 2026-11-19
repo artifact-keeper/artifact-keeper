@@ -864,18 +864,21 @@ async fn publish_package(
     //   - metadata.config (Erlang term format)
     //   - contents.tar.gz (the actual package files)
     //   - CHECKSUM (SHA-256 of the above)
-    // #2561: permit-scoped decode, fast-fail 503 on saturation.
-    let (pkg_name, pkg_version) = crate::util::bounded_archive::with_ingest_extraction(|| {
-        extract_name_version_from_tarball(&body)
-    })
-    .map_err(|e| e.into_response())?
-    .map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid hex tarball: {}", e),
-        )
-            .into_response()
-    })?;
+    // #2561: permit-scoped decode; on saturation it waits briefly
+    // for a slot, then sheds 503 (#6230).
+    let (pkg_name, pkg_version) =
+        crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
+            extract_name_version_from_tarball(&body)
+        })
+        .await
+        .map_err(|e| e.into_response())?
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid hex tarball: {}", e),
+            )
+                .into_response()
+        })?;
 
     if pkg_name.is_empty() || pkg_version.is_empty() {
         return Err((
@@ -913,9 +916,10 @@ async fn publish_package(
     // with a 500 on it). Accepting such a tarball only moved the failure to
     // every later read; rejecting it here with a 422 tells the publisher now
     // and leaves no artifact row or storage object behind.
-    let registry_facts = crate::util::bounded_archive::with_ingest_extraction(|| {
+    let registry_facts = crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
         extract_registry_facts_from_tarball(&body)
     })
+    .await
     .map_err(|e| e.into_response())?;
     let (inner_checksum, requirements) = publishable_registry_facts(registry_facts)
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e).into_response())?;
@@ -3478,6 +3482,41 @@ mod tests {
         let row = tdh::catalog_row(&f.pool, f.repo_id, "pushpkg").await;
         f.teardown().await;
         assert!(row.is_some(), "a hex publish must write a packages row");
+    }
+
+    /// #6230: a hex publish whose repository's ingest bucket is full waits for
+    /// a permit instead of shedding 503 at once, and succeeds once one frees.
+    #[tokio::test]
+    async fn test_hex_publish_waits_for_ingest_permit_6230() {
+        let Some(f) = tdh::Fixture::setup("local", "hex").await else {
+            return;
+        };
+        let metadata = r#"{<<"name">>, <<"queuedpkg">>}.
+{<<"version">>, <<"1.0.0">>}.
+"#;
+        let tar_data = build_tar(&[
+            ("CHECKSUM", REAL_CHECKSUM.as_bytes()),
+            ("metadata.config", metadata.as_bytes()),
+        ]);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/publish", f.repo_key))
+            .body(axum::body::Body::from(tar_data))
+            .unwrap();
+        let ((status, body), queued) =
+            crate::util::bounded_archive::test_support::run_queued_behind_full_tenant(
+                crate::util::bounded_archive::TenantKey::Repo(f.repo_id),
+                tdh::send(f.router_with_auth(super::router()), req),
+            )
+            .await;
+        f.teardown().await;
+        assert!(queued, "the publish must have waited for a permit");
+        assert!(
+            status.is_success(),
+            "a queued hex publish must succeed once a permit frees: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
     }
 
     /// #4725: a hosted hex publish must queue a push sync task for a

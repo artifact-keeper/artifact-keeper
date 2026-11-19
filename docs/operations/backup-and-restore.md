@@ -16,8 +16,9 @@ webhook, settings and scan state around them.
 | Content | `full` | `incremental` (`since`) | `metadata` |
 |---|---|---|---|
 | Users, roles and global role grants (`users`, `roles`, `user_roles`, `permission_grants`), API tokens (`api_tokens`) | yes | yes | yes |
-| `repositories` and `artifacts` rows (filtered by `repository_ids` / `exclude_repository_ids`; `since` for incremental) | yes | changed rows only | yes |
-| `download_statistics` | yes | yes | yes |
+| `repositories` rows (filtered by `repository_ids` / `exclude_repository_ids`) | yes | yes | yes |
+| `artifacts` rows (filtered by `repository_ids` / `exclude_repository_ids`; `since` for incremental) | yes | changed rows only | yes |
+| `download_statistics` | for the archived artifacts | for the archived artifacts | for the archived artifacts |
 | Docker/OCI images: `oci_blobs`, `oci_manifests`, `oci_tags`, `oci_manifest_refs`, `oci_manifest_subjects`, `manifest_blob_refs` | yes | yes | yes (rows only) |
 | Groups and access: `groups`, `user_group_members`, `role_assignments`, `permissions`, `api_token_repositories`, `virtual_repo_members` | yes | yes | yes |
 | Webhooks: `webhooks`, `webhook_signing_keys` | yes | yes | yes |
@@ -26,8 +27,11 @@ webhook, settings and scan state around them.
 | Artifact bytes for every archived `artifacts` row, and Docker/OCI blob bytes for every archived `oci_blobs` row | yes | changed rows only | **no** |
 
 Rows that belong to a repository follow the backup's repository filter.
-Scan results, findings, packages and SBOMs follow the archived artifacts, so
-a restore never inserts a scan of an artifact the archive does not carry.
+Download statistics, scan results, findings, packages and SBOMs follow the
+archived artifacts, so a restore never inserts a download or a scan of an
+artifact the archive does not carry. A scoped backup does not carry the
+`repositories` rows of repositories outside its scope, so its restore never
+brings one of them back.
 `virtual_repo_members` is archived only when both the virtual repository and
 the member are in scope. Server-wide rows (groups, permissions, settings,
 global webhooks, webhook signing keys) are always archived.

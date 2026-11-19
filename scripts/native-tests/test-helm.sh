@@ -15,6 +15,9 @@ echo "Version: $TEST_VERSION"
 echo "==> Generating test Helm chart..."
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
+export HELM_REPOSITORY_CONFIG="$WORK_DIR/helm/repositories.yaml"
+export HELM_REPOSITORY_CACHE="$WORK_DIR/helm/cache"
+export HELM_REGISTRY_CONFIG="$WORK_DIR/helm/registry.json"
 
 cd "$WORK_DIR"
 mkdir -p test-chart-native/templates

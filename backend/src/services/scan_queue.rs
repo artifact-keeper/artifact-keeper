@@ -17,18 +17,120 @@ use crate::services::cluster_work::Claimed;
 /// jobs sit idle, not how long a scan may take.
 pub const CLAIM_TTL_SECS: f64 = 120.0;
 
-/// Priority bands. A client is parked on a fail-closed job, so it outranks
-/// fail-open backfill, which outranks work nobody waits on.
+/// Priority bands, claimed in this order (see [`ScanQueue::claim_filtered`]):
+///
+/// - [`PRIORITY_CLIENT_WAITING`] and above: a client is parked on a
+///   fail-closed job, so it always goes first.
+/// - [`PRIORITY_HOSTED`] up to the waiting band: hosted uploads, pushed images
+///   and manual scans, which a user, a promotion rule or a CI job waits on.
+/// - [`PRIORITY_BACKFILL`] up to the hosted band: fail-open proxy scans
+///   nobody waits on. They age into the hosted band (#6032): a backfill job is
+///   claimed as though it were a hosted job queued the aging window
+///   ([`backfill_aging`]) after it, so hosted work goes ahead of a backfill
+///   burst, and a backfill job still goes ahead of hosted work queued more
+///   than the window after it. Neither band can starve the other.
+/// - A non-rescan job below [`PRIORITY_BACKFILL`] is claimed as hosted: 1.12.0
+///   queued hosted scans at [`PRIORITY_HOSTED_1_12_0`], and those rows (and
+///   the ones a 1.12.0 pod still queues during a rolling upgrade) must not
+///   fall behind the backfill.
+/// - `rescan` jobs (#5947), after everything else.
 pub const PRIORITY_CLIENT_WAITING: i16 = 100;
+pub const PRIORITY_HOSTED: i16 = 75;
 pub const PRIORITY_BACKFILL: i16 = 50;
-pub const PRIORITY_HOSTED: i16 = 10;
+/// Rescans after a vulnerability-database update (#5947): below everything a
+/// user or a pull is waiting on, so a backlog of them never delays those.
+pub const PRIORITY_RESCAN: i16 = 5;
+/// What 1.12.0 queued hosted scans at, below the backfill. The claim treats
+/// every non-rescan row between [`PRIORITY_RESCAN`] and [`PRIORITY_BACKFILL`]
+/// as hosted; nothing queues a non-rescan job at or below [`PRIORITY_RESCAN`].
+pub const PRIORITY_HOSTED_1_12_0: i16 = 10;
 
-/// The claim CTE sorts on these, and getting the order wrong is a silent
-/// latency regression rather than a failure, so assert it at compile time.
+/// The claim CTE splits the bands on these, and getting the order wrong is a
+/// silent latency regression rather than a failure, so assert it at compile
+/// time.
 const _: () = {
-    assert!(PRIORITY_CLIENT_WAITING > PRIORITY_BACKFILL);
-    assert!(PRIORITY_BACKFILL > PRIORITY_HOSTED);
+    assert!(PRIORITY_CLIENT_WAITING > PRIORITY_HOSTED);
+    assert!(PRIORITY_HOSTED > PRIORITY_BACKFILL);
+    assert!(PRIORITY_BACKFILL > PRIORITY_RESCAN);
+    assert!(PRIORITY_BACKFILL > PRIORITY_HOSTED_1_12_0);
+    assert!(PRIORITY_HOSTED_1_12_0 > PRIORITY_RESCAN);
 };
+
+/// Default backfill aging window (#6032): how long a fail-open proxy scan
+/// waits before it competes with hosted scans on age alone.
+pub const DEFAULT_BACKFILL_AGING: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Env var overriding [`DEFAULT_BACKFILL_AGING`], in seconds. `0` claims the
+/// two bands in plain age order. Blank or unparsable keeps the default; more
+/// than [`MAX_BACKFILL_AGING`] is clamped to it.
+pub const BACKFILL_AGING_ENV: &str = "SCAN_QUEUE_BACKFILL_AGING_SECS";
+
+/// Ceiling for the aging window: 30 days is "hosted always first" in practice,
+/// and `created_at + window` past PostgreSQL's timestamp range would fail
+/// every claim, `fail_closed` pulls included.
+pub const MAX_BACKFILL_AGING: std::time::Duration =
+    std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+/// The backfill aging window this process claims with, from
+/// [`BACKFILL_AGING_ENV`].
+pub fn backfill_aging() -> std::time::Duration {
+    parse_backfill_aging(std::env::var(BACKFILL_AGING_ENV).ok().as_deref())
+}
+
+fn parse_backfill_aging(raw: Option<&str>) -> std::time::Duration {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(DEFAULT_BACKFILL_AGING)
+        .min(MAX_BACKFILL_AGING)
+}
+
+tokio::task_local! {
+    static BACKGROUND_BAND: ();
+    static ENGINE_UNAVAILABLE: std::cell::Cell<bool>;
+}
+
+/// Run `fut`, reporting whether a scanner engine said it was unavailable while
+/// it ran (#5994): unreachable, or not ready within its readiness wait. The
+/// orchestrator records such a scan `failed`, which is right for a request
+/// that cannot wait, but a queued job can try again once the engine is back.
+pub async fn tracking_engine_unavailable<F: std::future::Future>(fut: F) -> (F::Output, bool) {
+    ENGINE_UNAVAILABLE
+        .scope(std::cell::Cell::new(false), async {
+            let out = fut.await;
+            (out, ENGINE_UNAVAILABLE.with(|c| c.get()))
+        })
+        .await
+}
+
+/// Note that the scanner engine was unavailable for the current scan. A no-op
+/// outside [`tracking_engine_unavailable`], so an in-process scan (queue off)
+/// is unaffected.
+pub fn note_engine_unavailable() {
+    let _ = ENGINE_UNAVAILABLE.try_with(|c| c.set(true));
+}
+
+/// Run `fut` in the background priority band (#5947): a scan nobody waits on.
+/// The scanner-adapter clients read [`in_background_band`] and ask the adapter
+/// to schedule the scan behind interactive ones: [`BACKGROUND_PRIORITY_FIELD`]
+/// in an image scan request, [`BACKGROUND_PRIORITY_HEADER`] on a filesystem
+/// upload. An adapter that does not know either ignores it and scans as usual.
+pub async fn in_background<F: std::future::Future>(fut: F) -> F::Output {
+    BACKGROUND_BAND.scope((), fut).await
+}
+
+/// Whether the current task runs a background-band scan (see [`in_background`]).
+/// Task-local: a task spawned from inside the scan does not inherit it.
+pub fn in_background_band() -> bool {
+    BACKGROUND_BAND.try_with(|_| ()).is_ok()
+}
+
+/// `(key, value)` added to the body of an adapter image scan request for a
+/// background-band scan. Absent means interactive.
+pub const BACKGROUND_PRIORITY_FIELD: (&str, &str) = ("priority", "background");
+
+/// `(name, value)` sent on an adapter filesystem upload for a background-band
+/// scan. Absent means interactive.
+pub const BACKGROUND_PRIORITY_HEADER: (&str, &str) = ("X-Scan-Priority", "background");
 
 /// Claim extension for one job. Binds `$1 = id`, `$2 = token`, `$3 = ttl`.
 pub const RENEW_CLAIM_SQL: &str = r#"
@@ -39,6 +141,37 @@ pub const RENEW_CLAIM_SQL: &str = r#"
       AND state = 'running'
       AND claim_token = $2
 "#;
+
+/// The OCI manifest-row test both sides of a `hosted_image` job use (#5946):
+/// the enqueue side classifies an upload with it and the worker selects the
+/// rows to scan with it, so a row one side counts is a row the other finds. As
+/// in `parse_oci_manifest_path`, a leading `/` is tolerated and both the image
+/// name and the reference must be non-empty (`v2//manifests/x` and
+/// `v2/a/manifests/` are not manifest rows).
+macro_rules! oci_manifest_path_predicate {
+    () => {
+        "ltrim(path, '/') ~ '^v2/.+/manifests/.+$'"
+    };
+}
+
+/// An upload's digest and whether it is an OCI manifest row. Binds `$1 =
+/// artifact id`, `$2 = repository id`.
+pub const UPLOAD_SCAN_TARGET_SQL: &str = concat!(
+    "SELECT checksum_sha256, ",
+    oci_manifest_path_predicate!(),
+    " AS is_manifest FROM artifacts WHERE id = $1 AND repository_id = $2 AND is_deleted = false"
+);
+
+/// Every live manifest row in a repository whose bytes are one digest: all the
+/// tags and digest references that point at that manifest, including tags
+/// pushed before or after the push that queued the job. Binds `$1 =
+/// repository id`, `$2 = digest`.
+pub const HOSTED_IMAGE_ROWS_SQL: &str = concat!(
+    "SELECT id FROM artifacts WHERE repository_id = $1 AND checksum_sha256 = $2 ",
+    "AND is_deleted = false AND ",
+    oci_manifest_path_predicate!(),
+    " ORDER BY created_at, id"
+);
 
 /// Wakes a same-process worker on enqueue so a fail-closed pull does not wait out
 /// a tick. `notify_one` parks a permit, so an enqueue between ticks is not lost.
@@ -58,13 +191,34 @@ pub enum ScanJobKind {
     ProxyFile,
     /// A hosted artifact whose `scan_results` placeholders already exist.
     HostedArtifact,
+    /// A `scan_on_upload` for one artifact row, run as the in-process trigger
+    /// runs it. Migration 383.
+    HostedUpload,
+    /// A pushed OCI manifest: repository plus manifest digest. The worker scans
+    /// every manifest row in that repository with the digest. Migration 383.
+    HostedImage,
+    /// A rescan of one content digest after a vulnerability-database update,
+    /// across every artifact row in this instance holding it. Migration 384.
+    Rescan,
 }
 
 impl ScanJobKind {
+    /// Every kind this build runs, for gauges that must publish each one.
+    pub const ALL: [Self; 5] = [
+        Self::ProxyFile,
+        Self::HostedArtifact,
+        Self::HostedUpload,
+        Self::HostedImage,
+        Self::Rescan,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ProxyFile => "proxy_file",
             Self::HostedArtifact => "hosted_artifact",
+            Self::HostedUpload => "hosted_upload",
+            Self::HostedImage => "hosted_image",
+            Self::Rescan => "rescan",
         }
     }
 
@@ -74,6 +228,9 @@ impl ScanJobKind {
         match value {
             "proxy_file" => Some(Self::ProxyFile),
             "hosted_artifact" => Some(Self::HostedArtifact),
+            "hosted_upload" => Some(Self::HostedUpload),
+            "hosted_image" => Some(Self::HostedImage),
+            "rescan" => Some(Self::Rescan),
             _ => None,
         }
     }
@@ -172,11 +329,22 @@ pub struct ScanQueueJobRow {
 #[derive(Clone)]
 pub struct ScanQueue {
     db: PgPool,
+    backfill_aging: std::time::Duration,
 }
 
 impl ScanQueue {
     pub fn new(db: PgPool) -> Self {
-        Self { db }
+        Self {
+            db,
+            backfill_aging: DEFAULT_BACKFILL_AGING,
+        }
+    }
+
+    /// Claim with this backfill aging window instead of
+    /// [`DEFAULT_BACKFILL_AGING`] (see [`PRIORITY_HOSTED`]).
+    pub fn with_backfill_aging(mut self, aging: std::time::Duration) -> Self {
+        self.backfill_aging = aging.min(MAX_BACKFILL_AGING);
+        self
     }
 
     /// Queue a scan of the proxy object cached at `cache_path`. Returns
@@ -204,6 +372,7 @@ impl ScanQueue {
             -- only ever raises, so backfill cannot demote it.
             ON CONFLICT (kind, digest)
                 WHERE state IN ('pending', 'running') AND digest IS NOT NULL
+                  AND kind <> 'hosted_image'
             DO UPDATE SET
                 priority = GREATEST(scan_queue.priority, EXCLUDED.priority),
                 updated_at = NOW()
@@ -275,6 +444,77 @@ impl ScanQueue {
         Ok(claimed)
     }
 
+    /// Queue the `scan_on_upload` of one committed artifact row (#5946). Returns
+    /// whether a row was inserted. A second upload of the artifact while its job
+    /// is pending dedups into it; while it is running, the job is marked to run
+    /// again once it completes, since the worker may have read the old bytes.
+    pub async fn enqueue_hosted_upload(&self, artifact_id: Uuid, priority: i16) -> Result<bool> {
+        let row = sqlx::query(
+            r#"
+                INSERT INTO scan_queue (kind, priority, artifact_id)
+                VALUES ('hosted_upload', $1, $2)
+                ON CONFLICT (kind, artifact_id)
+                    WHERE state IN ('pending', 'running') AND artifact_id IS NOT NULL
+                DO UPDATE SET
+                    priority = GREATEST(scan_queue.priority, EXCLUDED.priority),
+                    requeue = scan_queue.requeue OR scan_queue.state = 'running',
+                    updated_at = NOW()
+                RETURNING (xmax = 0) AS inserted
+                "#,
+        )
+        .bind(priority)
+        .bind(artifact_id)
+        .fetch_one(&self.db)
+        .await;
+        Self::hosted_enqueued(row)
+    }
+
+    /// Queue the scan of a pushed OCI manifest (#5946): one job per
+    /// `(repository, digest)`, `digest` being the manifest's sha256 hex as
+    /// `artifacts.checksum_sha256` stores it. A push of the same manifest while
+    /// the job is pending dedups into it; while it is running, the job is marked
+    /// to run again, so a tag pushed after the worker listed the rows is scanned.
+    pub async fn enqueue_hosted_image(
+        &self,
+        repository_id: Uuid,
+        digest: &str,
+        priority: i16,
+    ) -> Result<bool> {
+        let row = sqlx::query(
+            r#"
+                INSERT INTO scan_queue (kind, priority, repository_id, digest)
+                VALUES ('hosted_image', $1, $2, $3)
+                ON CONFLICT (repository_id, digest)
+                    WHERE kind = 'hosted_image' AND state IN ('pending', 'running')
+                DO UPDATE SET
+                    priority = GREATEST(scan_queue.priority, EXCLUDED.priority),
+                    requeue = scan_queue.requeue OR scan_queue.state = 'running',
+                    updated_at = NOW()
+                RETURNING (xmax = 0) AS inserted
+                "#,
+        )
+        .bind(priority)
+        .bind(repository_id)
+        .bind(digest)
+        .fetch_one(&self.db)
+        .await;
+        Self::hosted_enqueued(row)
+    }
+
+    /// Decode a hosted enqueue's `RETURNING (xmax = 0) AS inserted`.
+    fn hosted_enqueued(
+        row: std::result::Result<sqlx::postgres::PgRow, sqlx::Error>,
+    ) -> Result<bool> {
+        use sqlx::Row;
+        let row = row.map_err(|e| AppError::Database(e.to_string()))?;
+        let inserted: bool = row.try_get("inserted").unwrap_or(false);
+        if inserted {
+            // Wake an in-process worker now rather than at its next tick.
+            enqueue_signal().notify_one();
+        }
+        Ok(inserted)
+    }
+
     /// Claim up to `limit` due jobs. Select and flip in one statement, so replicas
     /// drain disjoint jobs.
     ///
@@ -286,28 +526,129 @@ impl ScanQueue {
         claimed_by: &str,
         claim_ttl_secs: f64,
     ) -> Result<Vec<Claimed<ScanJob>>> {
+        self.claim_filtered(limit, claimed_by, claim_ttl_secs, limit)
+            .await
+    }
+
+    /// [`Self::claim`], taking at most `max_rescans` of the `rescan` jobs: a
+    /// worker claims no more rescans than it has free rescan slots (#5947),
+    /// so it never claims one just to hand it back.
+    ///
+    /// Order (#6032, see [`PRIORITY_HOSTED`]): the waiting band first, then
+    /// the hosted band (and anything below the backfill) merged with the
+    /// backfill band on `created_at`, a backfill job's pushed back by the aging
+    /// window, then rescans. The key does not move
+    /// with `NOW()`, so each band is still a range of
+    /// `idx_scan_queue_pending_claim` read in index order: every band CTE
+    /// reads at most `limit` rows and the merge sorts at most five times that.
+    pub async fn claim_filtered(
+        &self,
+        limit: i64,
+        claimed_by: &str,
+        claim_ttl_secs: f64,
+        max_rescans: i64,
+    ) -> Result<Vec<Claimed<ScanJob>>> {
         use sqlx::{FromRow, Row};
 
         let rows = sqlx::query(
             r#"
-            WITH candidate AS (
-                SELECT q.id
+            WITH waiting AS (
+                SELECT q.id, q.priority, q.created_at,
+                       0 AS band, q.created_at AS claim_at
                 FROM scan_queue q
                 WHERE q.state = 'pending'
                   AND q.next_attempt_at <= NOW()
+                  AND q.kind <> 'rescan'
+                  AND q.priority >= $5
                 ORDER BY q.priority DESC, q.created_at ASC
                 LIMIT $1
                 FOR UPDATE OF q SKIP LOCKED
             ),
+            hosted AS (
+                SELECT q.id, q.priority, q.created_at,
+                       1 AS band, q.created_at AS claim_at
+                FROM scan_queue q
+                WHERE q.state = 'pending'
+                  AND q.next_attempt_at <= NOW()
+                  AND q.kind <> 'rescan'
+                  AND q.priority < $5
+                  AND q.priority >= $6
+                ORDER BY q.priority DESC, q.created_at ASC
+                LIMIT $1
+                FOR UPDATE OF q SKIP LOCKED
+            ),
+            -- #6032: backfill ages into the hosted band. Same band as
+            -- `hosted`, keyed `aging` later than it was queued.
+            backfill AS (
+                SELECT q.id, q.priority, q.created_at,
+                       1 AS band, q.created_at + make_interval(secs => $7) AS claim_at
+                FROM scan_queue q
+                WHERE q.state = 'pending'
+                  AND q.next_attempt_at <= NOW()
+                  AND q.kind <> 'rescan'
+                  AND q.priority < $6
+                  AND q.priority >= $8
+                ORDER BY q.priority DESC, q.created_at ASC
+                LIMIT $1
+                FOR UPDATE OF q SKIP LOCKED
+            ),
+            -- Below the backfill: hosted scans 1.12.0 queued at 10. Claimed
+            -- as hosted, so an upgrade does not leave them behind the backfill.
+            -- Bounded above the rescans (5), so an empty range does not read
+            -- through a rescan backlog on every claim.
+            below AS (
+                SELECT q.id, q.priority, q.created_at,
+                       1 AS band, q.created_at AS claim_at
+                FROM scan_queue q
+                WHERE q.state = 'pending'
+                  AND q.next_attempt_at <= NOW()
+                  AND q.kind <> 'rescan'
+                  AND q.priority < $8
+                  AND q.priority > $9
+                ORDER BY q.priority DESC, q.created_at ASC
+                LIMIT $1
+                FOR UPDATE OF q SKIP LOCKED
+            ),
+            rescans AS (
+                SELECT q.id, q.priority, q.created_at,
+                       2 AS band, q.created_at AS claim_at
+                FROM scan_queue q
+                WHERE q.state = 'pending'
+                  AND q.next_attempt_at <= NOW()
+                  AND q.kind = 'rescan'
+                ORDER BY q.priority DESC, q.created_at ASC
+                LIMIT GREATEST($4, 0)
+                FOR UPDATE OF q SKIP LOCKED
+            ),
+            -- The best `limit` of all four, in the one claim order. A row
+            -- locked above but not chosen stays pending.
+            candidate AS (
+                SELECT c.id,
+                       row_number() OVER (
+                           ORDER BY c.band, c.claim_at, c.priority DESC, c.created_at, c.id
+                       ) AS ord
+                FROM (
+                    SELECT * FROM waiting
+                    UNION ALL SELECT * FROM hosted
+                    UNION ALL SELECT * FROM backfill
+                    UNION ALL SELECT * FROM below
+                    UNION ALL SELECT * FROM rescans
+                ) c
+                ORDER BY ord
+                LIMIT $1
+            ),
             claimed AS (
                 UPDATE scan_queue q
                 SET state = 'running',
+                    -- A claim reads everything afresh, so an earlier mark is spent.
+                    requeue = false,
                     claimed_by = $2,
                     claim_token = gen_random_uuid(),
                     claim_expires_at = NOW() + make_interval(secs => $3),
                     updated_at = NOW()
-                FROM candidate
-                WHERE q.id = candidate.id
+                -- An id array, not a join: a generic plan cannot size
+                -- `LIMIT $1` and hash-joined the whole table.
+                WHERE q.id = ANY(ARRAY(SELECT id FROM candidate))
                 RETURNING q.*
             )
             SELECT
@@ -318,12 +659,19 @@ impl ScanQueue {
                 c.attempts, c.max_attempts, c.created_at,
                 c.claim_token, c.claimed_by, c.claim_expires_at
             FROM claimed c
-            ORDER BY c.priority DESC, c.created_at ASC
+            JOIN candidate ON candidate.id = c.id
+            ORDER BY candidate.ord
             "#,
         )
         .bind(limit)
         .bind(claimed_by)
         .bind(claim_ttl_secs)
+        .bind(max_rescans)
+        .bind(PRIORITY_CLIENT_WAITING)
+        .bind(PRIORITY_HOSTED)
+        .bind(self.backfill_aging.as_secs_f64())
+        .bind(PRIORITY_BACKFILL)
+        .bind(PRIORITY_RESCAN)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -354,20 +702,72 @@ impl ScanQueue {
 
     /// Retire a finished job, token-guarded. Deleted, since the verdict row is the
     /// durable record. `false` means the claim lapsed and someone else owns it.
+    ///
+    /// A job an enqueue marked `requeue` while it ran (migration 383) goes back
+    /// to `pending` instead, with its attempts reset: the new request was never
+    /// tried.
     pub async fn complete(&self, job_id: Uuid, claim_token: Uuid) -> Result<bool> {
-        let result = sqlx::query(
-            "DELETE FROM scan_queue WHERE id = $1 AND state = 'running' AND claim_token = $2",
-        )
-        .bind(job_id)
-        .bind(claim_token)
-        .execute(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-        Ok(result.rows_affected() == 1)
+        // Two statements, requeue first. A mark set between them makes the
+        // delete miss, so look once more rather than leave the row running
+        // until its lease lapses.
+        for _ in 0..3 {
+            let requeued = sqlx::query(
+                r#"
+                UPDATE scan_queue
+                SET state = 'pending',
+                    requeue = false,
+                    attempts = 0,
+                    last_error = NULL,
+                    next_attempt_at = NOW(),
+                    claimed_by = NULL,
+                    claim_token = NULL,
+                    claim_expires_at = NULL,
+                    updated_at = NOW()
+                WHERE id = $1 AND state = 'running' AND claim_token = $2 AND requeue
+                "#,
+            )
+            .bind(job_id)
+            .bind(claim_token)
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+            if requeued.rows_affected() == 1 {
+                enqueue_signal().notify_one();
+                return Ok(true);
+            }
+            let deleted = sqlx::query(
+                "DELETE FROM scan_queue \
+                 WHERE id = $1 AND state = 'running' AND claim_token = $2 AND NOT requeue",
+            )
+            .bind(job_id)
+            .bind(claim_token)
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+            if deleted.rows_affected() == 1 {
+                return Ok(true);
+            }
+            let still_ours: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM scan_queue \
+                 WHERE id = $1 AND state = 'running' AND claim_token = $2)",
+            )
+            .bind(job_id)
+            .bind(claim_token)
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+            if !still_ours {
+                return Ok(false);
+            }
+        }
+        Ok(false)
     }
 
     /// Back to `pending` behind a backoff, or terminal `failed` once attempts run
     /// out. The dedup indexes exclude terminal rows, so a re-pull queues afresh.
+    /// A job marked `requeue` goes back to `pending` with a fresh budget either
+    /// way, as in [`Self::complete`]; so do [`Self::mark_terminal`] and
+    /// [`Self::recover_expired_claims`].
     pub async fn fail(
         &self,
         job_id: Uuid,
@@ -378,12 +778,16 @@ impl ScanQueue {
         let result = sqlx::query(
             r#"
             UPDATE scan_queue
-            SET attempts = attempts + 1,
+            SET attempts = CASE WHEN requeue THEN 0 ELSE attempts + 1 END,
                 last_error = $3,
+                -- An enqueue marked it while it ran (migration 383): that
+                -- request was never tried, so it does not inherit this
+                -- attempt's exhaustion.
                 state = CASE
-                    WHEN attempts + 1 < max_attempts THEN 'pending'
+                    WHEN requeue OR attempts + 1 < max_attempts THEN 'pending'
                     ELSE 'failed'
                 END,
+                requeue = false,
                 next_attempt_at = NOW() + make_interval(secs => $4),
                 claimed_by = NULL,
                 claim_token = NULL,
@@ -454,8 +858,10 @@ impl ScanQueue {
         let result = sqlx::query(
             r#"
             UPDATE scan_queue
-            SET state = 'failed',
-                attempts = max_attempts,
+            SET state = CASE WHEN requeue THEN 'pending' ELSE 'failed' END,
+                attempts = CASE WHEN requeue THEN 0 ELSE max_attempts END,
+                next_attempt_at = NOW(),
+                requeue = false,
                 last_error = $3,
                 claimed_by = NULL,
                 claim_token = NULL,
@@ -481,11 +887,12 @@ impl ScanQueue {
         let result = sqlx::query(
             r#"
             UPDATE scan_queue
-            SET attempts = attempts + 1,
+            SET attempts = CASE WHEN requeue THEN 0 ELSE attempts + 1 END,
                 state = CASE
-                    WHEN attempts + 1 < max_attempts THEN 'pending'
+                    WHEN requeue OR attempts + 1 < max_attempts THEN 'pending'
                     ELSE 'failed'
                 END,
+                requeue = false,
                 last_error = COALESCE(last_error, 'claim expired; worker vanished mid-scan'),
                 next_attempt_at = NOW() + make_interval(secs => $1),
                 claimed_by = NULL,
@@ -646,7 +1053,7 @@ mod tests {
     /// A rename of the stored token would orphan every queued job of that kind.
     #[test]
     fn kind_round_trips_through_its_stored_token() {
-        for kind in [ScanJobKind::ProxyFile, ScanJobKind::HostedArtifact] {
+        for kind in ScanJobKind::ALL {
             assert_eq!(ScanJobKind::from_db(kind.as_str()), Some(kind));
         }
     }
@@ -683,6 +1090,37 @@ mod tests {
         assert!(!job_with_attempts(3, 3).will_retry_after_failure());
         // A job configured for a single attempt is terminal on its first failure.
         assert!(!job_with_attempts(0, 1).will_retry_after_failure());
+    }
+
+    /// #6032: the aging window env var. Unset, blank or garbage keeps the
+    /// default; `0` is honoured (plain age order across the two bands).
+    #[test]
+    fn backfill_aging_parses_seconds_and_falls_back_to_the_default() {
+        use std::time::Duration;
+        assert_eq!(parse_backfill_aging(None), DEFAULT_BACKFILL_AGING);
+        assert_eq!(parse_backfill_aging(Some("")), DEFAULT_BACKFILL_AGING);
+        assert_eq!(parse_backfill_aging(Some("soon")), DEFAULT_BACKFILL_AGING);
+        assert_eq!(parse_backfill_aging(Some("-5")), DEFAULT_BACKFILL_AGING);
+        assert_eq!(parse_backfill_aging(Some(" 90 ")), Duration::from_secs(90));
+        assert_eq!(parse_backfill_aging(Some("0")), Duration::ZERO);
+        // Past the timestamp range every claim would fail: clamped.
+        assert_eq!(
+            parse_backfill_aging(Some("99999999999999")),
+            MAX_BACKFILL_AGING
+        );
+    }
+
+    /// #5994: the unavailable signal is seen only inside a tracking scope,
+    /// and noting it outside one (an in-process scan) does nothing.
+    #[tokio::test]
+    async fn the_engine_unavailable_signal_is_scoped() {
+        note_engine_unavailable();
+        let ((), seen) = tracking_engine_unavailable(async {}).await;
+        assert!(!seen, "nothing noted inside the scope");
+        let ((), seen) = tracking_engine_unavailable(async { note_engine_unavailable() }).await;
+        assert!(seen);
+        let ((), seen) = tracking_engine_unavailable(async {}).await;
+        assert!(!seen, "each scope starts clear");
     }
 
     // ── DB-backed queue semantics ───────────────────────────────────────────
@@ -1032,7 +1470,7 @@ mod tests {
         }
         assert_eq!(
             picked,
-            vec!["waiting01", "backfill1", "hosted01"],
+            vec!["waiting01", "hosted01", "backfill1"],
             "each single-slot claim must take the highest-priority job left"
         );
 
@@ -1304,6 +1742,668 @@ mod tests {
             "a forced rescan stays forced on the worker"
         );
 
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #5946: an image job is one per (repository, digest). The same digest
+    /// in another repository is its own job (findings are per artifact row),
+    /// and a proxy_file job of that digest keeps its fleet-wide dedup.
+    #[tokio::test]
+    async fn hosted_image_dedups_per_repository_and_digest() {
+        let Some(pool) = try_pool().await else { return };
+        let repo_a = fresh_queue(&pool).await;
+        let repo_b = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $2, $3, 'local', 'docker')",
+        )
+        .bind(repo_b)
+        .bind(format!("scan-queue-test-{repo_b}"))
+        .bind(format!("/tmp/scan-queue-test/{repo_b}"))
+        .execute(&pool)
+        .await
+        .expect("seed second repository");
+        let q = ScanQueue::new(pool.clone());
+
+        assert!(q
+            .enqueue_hosted_image(repo_a, "img01", PRIORITY_HOSTED)
+            .await
+            .expect("first"));
+        assert!(
+            !q.enqueue_hosted_image(repo_a, "img01", PRIORITY_HOSTED)
+                .await
+                .expect("again"),
+            "the same manifest in the same repository dedups"
+        );
+        assert!(
+            q.enqueue_hosted_image(repo_b, "img01", PRIORITY_HOSTED)
+                .await
+                .expect("other repo"),
+            "another repository's push of the digest is its own job"
+        );
+        assert!(
+            q.enqueue_proxy_file(repo_a, "x", "img01", None, 1, None, PRIORITY_BACKFILL)
+                .await
+                .expect("proxy"),
+            "a proxy_file job of the digest is unaffected"
+        );
+        assert_eq!(pending_count(&pool, "img01").await, 3);
+
+        drop_repo(&pool, repo_a).await;
+        drop_repo(&pool, repo_b).await;
+    }
+
+    /// #5946: a push that lands while its job RUNS cannot be dropped, the
+    /// worker listed the rows before it. Completing the job sends it back to
+    /// `pending` with a fresh attempt budget; completing that one retires it.
+    #[tokio::test]
+    async fn an_enqueue_on_a_running_hosted_job_runs_it_again() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        q.enqueue_hosted_image(repo, "again01", PRIORITY_HOSTED)
+            .await
+            .expect("enqueue");
+        let job = q
+            .claim(1, "w", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("one job");
+        assert!(matches!(job.job_kind(), Some(ScanJobKind::HostedImage)));
+
+        assert!(
+            !q.enqueue_hosted_image(repo, "again01", PRIORITY_HOSTED)
+                .await
+                .expect("push while running"),
+            "still one row for the key"
+        );
+        assert!(q
+            .complete(job.id, job.claim_token())
+            .await
+            .expect("complete"));
+        let (state, attempts, requeue) = sqlx::query_as::<_, (String, i32, bool)>(
+            "SELECT state, attempts, requeue FROM scan_queue WHERE digest = 'again01'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("row kept");
+        assert_eq!(
+            (state.as_str(), attempts, requeue),
+            ("pending", 0, false),
+            "the job must run again for the push that arrived mid-scan"
+        );
+
+        let again = q
+            .claim(1, "w", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("due again");
+        assert_eq!(again.id, job.id);
+        assert!(q
+            .complete(again.id, again.claim_token())
+            .await
+            .expect("complete"));
+        assert_eq!(pending_count(&pool, "again01").await, 0, "now retired");
+
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #5946 review (A1): a push that lands during the LAST attempt must not be
+    /// lost when that attempt fails, is retired as unrunnable, or dies with
+    /// its worker. Each finalizer sends a `requeue`-marked job back to
+    /// `pending` with a fresh budget instead of leaving it `failed`.
+    #[tokio::test]
+    async fn a_push_during_the_last_attempt_survives_every_finalizer() {
+        let Some(pool) = try_pool().await else { return };
+        for finalizer in ["fail", "mark_terminal", "recover_expired_claims"] {
+            let repo = fresh_queue(&pool).await;
+            let q = ScanQueue::new(pool.clone());
+            q.enqueue_hosted_image(repo, "last01", PRIORITY_HOSTED)
+                .await
+                .expect("enqueue");
+            // Two attempts already spent: this claim is the last one.
+            sqlx::query("UPDATE scan_queue SET attempts = max_attempts - 1")
+                .execute(&pool)
+                .await
+                .expect("spend attempts");
+            let job = q
+                .claim(1, "w", CLAIM_TTL_SECS)
+                .await
+                .expect("claim")
+                .pop()
+                .expect("one job");
+            assert!(!job.will_retry_after_failure(), "this is the last attempt");
+            assert!(!q
+                .enqueue_hosted_image(repo, "last01", PRIORITY_HOSTED)
+                .await
+                .expect("push while running"));
+
+            match finalizer {
+                "fail" => {
+                    assert!(q
+                        .fail(job.id, job.claim_token(), "boom", 0.0)
+                        .await
+                        .expect("fail"));
+                }
+                "mark_terminal" => {
+                    assert!(q
+                        .mark_terminal(job.id, job.claim_token(), "unrunnable")
+                        .await
+                        .expect("terminal"));
+                }
+                _ => {
+                    sqlx::query(
+                        "UPDATE scan_queue SET claim_expires_at = NOW() - INTERVAL '1 second'",
+                    )
+                    .execute(&pool)
+                    .await
+                    .expect("lapse the claim");
+                    assert_eq!(q.recover_expired_claims(0.0).await.expect("recover"), 1);
+                }
+            }
+
+            let (state, attempts, requeue) = sqlx::query_as::<_, (String, i32, bool)>(
+                "SELECT state, attempts, requeue FROM scan_queue WHERE digest = 'last01'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("row kept");
+            assert_eq!(
+                (state.as_str(), attempts, requeue),
+                ("pending", 0, false),
+                "{finalizer}: the push that arrived mid-scan must still be scanned"
+            );
+            assert!(
+                !q.claim(1, "w", CLAIM_TTL_SECS)
+                    .await
+                    .expect("claim again")
+                    .is_empty(),
+                "{finalizer}: and it is due"
+            );
+            drop_repo(&pool, repo).await;
+        }
+    }
+
+    /// #5946 review (A2): the enqueue side and the worker agree on what an
+    /// OCI manifest row is. A row stored with a leading `/` is queued as a
+    /// `hosted_image` job AND found by the worker's row query; before, the
+    /// worker's `LIKE 'v2/...'` missed it and the job scanned nothing.
+    #[tokio::test]
+    async fn the_enqueue_and_the_worker_agree_on_manifest_rows() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        // `artifacts.checksum_sha256` is CHAR(64): real-length digests, so the
+        // value read back is the value written.
+        let (slash01, plain01, file01) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        let seed = |path: &'static str, digest: String| {
+            let pool = pool.clone();
+            async move {
+                let id = Uuid::new_v4();
+                sqlx::query(
+                    "INSERT INTO artifacts (id, repository_id, path, name, size_bytes, \
+                     checksum_sha256, content_type, storage_key) \
+                     VALUES ($1, $2, $3, 'n', 1, $4, 'application/octet-stream', $3)",
+                )
+                .bind(id)
+                .bind(repo)
+                .bind(path)
+                .bind(digest)
+                .execute(&pool)
+                .await
+                .expect("seed artifact");
+                id
+            }
+        };
+        let slashed = seed("/v2/img/manifests/1.0", slash01.clone()).await;
+        let plain = seed("v2/img/manifests/1.1", plain01.clone()).await;
+        let file = seed("pkg/file-1.0.tgz", file01.clone()).await;
+        // Malformed manifest paths `parse_oci_manifest_path` rejects are not
+        // manifest rows on either side: an empty name, an empty reference.
+        let (noname01, noref01) = ("d".repeat(64), "e".repeat(64));
+        let no_name = seed("v2//manifests/x", noname01.clone()).await;
+        let no_ref = seed("v2/a/manifests/", noref01.clone()).await;
+        assert!(
+            crate::services::scanner_service::parse_oci_manifest_path("v2//manifests/x").is_none()
+        );
+        assert!(
+            crate::services::scanner_service::parse_oci_manifest_path("v2/a/manifests/").is_none()
+        );
+        for id in [slashed, plain, file, no_name, no_ref] {
+            crate::services::scanner_service::enqueue_scan_on_upload(&pool, repo, id)
+                .await
+                .expect("enqueue");
+        }
+        let mut jobs: Vec<(String, Option<String>, Option<Uuid>)> = sqlx::query_as(
+            "SELECT kind, digest, artifact_id FROM scan_queue ORDER BY kind, digest",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("jobs");
+        jobs.sort();
+        let mut expected = vec![
+            ("hosted_image".to_string(), Some(slash01.clone()), None),
+            ("hosted_image".to_string(), Some(plain01.clone()), None),
+            ("hosted_upload".to_string(), None, Some(file)),
+            ("hosted_upload".to_string(), None, Some(no_name)),
+            ("hosted_upload".to_string(), None, Some(no_ref)),
+        ];
+        expected.sort();
+        assert_eq!(jobs, expected);
+        for digest in [&noname01, &noref01] {
+            let rows: Vec<Uuid> = sqlx::query_scalar(HOSTED_IMAGE_ROWS_SQL)
+                .bind(repo)
+                .bind(digest)
+                .fetch_all(&pool)
+                .await
+                .expect("worker rows");
+            assert!(rows.is_empty(), "not a manifest row: {digest}");
+        }
+        for (digest, id) in [(&slash01, slashed), (&plain01, plain)] {
+            let rows: Vec<Uuid> = sqlx::query_scalar(HOSTED_IMAGE_ROWS_SQL)
+                .bind(repo)
+                .bind(digest)
+                .fetch_all(&pool)
+                .await
+                .expect("worker rows");
+            assert_eq!(rows, vec![id], "the worker must find the {digest} row");
+        }
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #5946: one `hosted_upload` job per artifact, and its own kind, so a
+    /// `POST /security/scan` job for the artifact is not merged into it.
+    #[tokio::test]
+    async fn hosted_upload_dedups_per_artifact() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let artifact_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, path, name, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, 'p/u.jar', 'u.jar', 1, 'abc', 'application/java-archive', 'k')",
+        )
+        .bind(artifact_id)
+        .bind(repo)
+        .execute(&pool)
+        .await
+        .expect("seed artifact");
+        let q = ScanQueue::new(pool.clone());
+
+        assert!(q
+            .enqueue_hosted_upload(artifact_id, PRIORITY_HOSTED)
+            .await
+            .expect("first"));
+        assert!(!q
+            .enqueue_hosted_upload(artifact_id, PRIORITY_HOSTED)
+            .await
+            .expect("again"));
+        assert!(q
+            .enqueue_hosted_artifact(
+                artifact_id,
+                &serde_json::json!({ "grype": Uuid::new_v4() }),
+                false,
+                PRIORITY_HOSTED
+            )
+            .await
+            .expect("hosted_artifact"));
+        let kinds: Vec<String> =
+            sqlx::query_scalar("SELECT kind FROM scan_queue WHERE artifact_id = $1 ORDER BY kind")
+                .bind(artifact_id)
+                .fetch_all(&pool)
+                .await
+                .expect("kinds");
+        assert_eq!(kinds, vec!["hosted_artifact", "hosted_upload"]);
+
+        drop_repo(&pool, repo).await;
+    }
+
+    /// Seed one artifact row in `repo` for a `hosted_upload` job.
+    async fn seed_artifact(pool: &sqlx::PgPool, repo: Uuid, name: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, path, name, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, $4, 1, $5, 'application/java-archive', $3)",
+        )
+        .bind(id)
+        .bind(repo)
+        .bind(format!("p/{name}"))
+        .bind(name)
+        .bind(format!("sha-{id}"))
+        .execute(pool)
+        .await
+        .expect("seed artifact");
+        id
+    }
+
+    /// Queue `n` fail-open proxy scans, the oldest `oldest_secs` ago and one
+    /// second apart, as a cold-proxy burst leaves them.
+    async fn seed_backfill(
+        pool: &sqlx::PgPool,
+        repo: Uuid,
+        prefix: &str,
+        n: i32,
+        oldest_secs: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO scan_queue (kind, priority, repository_id, cache_path, digest, created_at) \
+             SELECT 'proxy_file', $1, $2, $3 || g, $3 || g, \
+                    NOW() - make_interval(secs => ($4 - g + 1)::float8) \
+             FROM generate_series(1, $5) g",
+        )
+        .bind(PRIORITY_BACKFILL)
+        .bind(repo)
+        .bind(prefix)
+        .bind(oldest_secs)
+        .bind(n)
+        .execute(pool)
+        .await
+        .expect("seed backfill");
+    }
+
+    async fn claim_one(q: &ScanQueue) -> ScanJob {
+        q.claim(1, "w", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("a job is due")
+            .into_row()
+    }
+
+    /// #6032: a hosted upload and a pushed image queued behind a fail-open
+    /// proxy backlog are claimed before it, as long as the backlog is younger
+    /// than the aging window. The backlog then drains oldest first.
+    #[tokio::test]
+    async fn a_fresh_upload_is_claimed_before_an_older_proxy_backlog() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        // 200 backfill jobs, 1 to 200 seconds old: all inside the window.
+        seed_backfill(&pool, repo, "burst", 200, 200).await;
+        let upload = seed_artifact(&pool, repo, "fresh.jar").await;
+        assert!(q
+            .enqueue_hosted_upload(upload, PRIORITY_HOSTED)
+            .await
+            .expect("upload"));
+        assert!(q
+            .enqueue_hosted_image(repo, "img6032", PRIORITY_HOSTED)
+            .await
+            .expect("image"));
+
+        let first = claim_one(&q).await;
+        assert_eq!(first.kind, "hosted_upload");
+        assert_eq!(first.artifact_id, Some(upload));
+        let second = claim_one(&q).await;
+        assert_eq!(second.kind, "hosted_image");
+        // Then the backlog, oldest first.
+        let third = claim_one(&q).await;
+        assert_eq!(third.digest.as_deref(), Some("burst1"));
+
+        // A multi-slot claim takes the same order in one statement.
+        sqlx::query("DELETE FROM scan_queue")
+            .execute(&pool)
+            .await
+            .expect("reset");
+        seed_backfill(&pool, repo, "burst", 200, 200).await;
+        q.enqueue_hosted_upload(upload, PRIORITY_HOSTED)
+            .await
+            .expect("upload");
+        q.enqueue_hosted_image(repo, "img6032", PRIORITY_HOSTED)
+            .await
+            .expect("image");
+        let batch: Vec<String> = q
+            .claim(3, "w", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .into_iter()
+            .map(|c| c.into_row().kind)
+            .collect();
+        assert_eq!(batch, vec!["hosted_upload", "hosted_image", "proxy_file"]);
+
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #6032: aging. A proxy job queued more than the window before a new
+    /// upload is claimed ahead of it, so a steady stream of uploads cannot
+    /// starve the backlog; a proxy job inside the window still waits.
+    #[tokio::test]
+    async fn a_proxy_job_older_than_the_aging_window_is_claimed_before_a_new_upload() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        let window = DEFAULT_BACKFILL_AGING.as_secs() as i64;
+        // One job a minute past the window, one well inside it.
+        seed_backfill(&pool, repo, "aged", 1, window + 60).await;
+        seed_backfill(&pool, repo, "young", 1, 30).await;
+        let upload = seed_artifact(&pool, repo, "new.jar").await;
+        q.enqueue_hosted_upload(upload, PRIORITY_HOSTED)
+            .await
+            .expect("upload");
+
+        let picked: Vec<String> = [
+            claim_one(&q).await,
+            claim_one(&q).await,
+            claim_one(&q).await,
+        ]
+        .into_iter()
+        .map(|j| j.digest.unwrap_or(j.kind))
+        .collect();
+        assert_eq!(picked, vec!["aged1", "hosted_upload", "young1"]);
+
+        // The window is the knob: with none, plain age order.
+        sqlx::query("DELETE FROM scan_queue")
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_backfill(&pool, repo, "older", 1, 30).await;
+        let upload = seed_artifact(&pool, repo, "newer.jar").await;
+        q.enqueue_hosted_upload(upload, PRIORITY_HOSTED)
+            .await
+            .expect("upload");
+        let fifo = q.clone().with_backfill_aging(std::time::Duration::ZERO);
+        assert_eq!(claim_one(&fifo).await.digest.as_deref(), Some("older1"));
+
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #6032 review: a hosted job 1.12.0 queued at priority 10 is claimed as
+    /// hosted, not behind the backfill, at every batch size.
+    #[tokio::test]
+    async fn a_hosted_job_queued_by_1_12_0_is_not_left_behind_the_backfill() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        seed_backfill(&pool, repo, "fresh", 5, 5).await;
+        q.enqueue_hosted_image(repo, "legacy01", PRIORITY_HOSTED_1_12_0)
+            .await
+            .expect("legacy hosted");
+        sqlx::query(
+            "UPDATE scan_queue SET created_at = NOW() - interval '1 minute' WHERE digest = 'legacy01'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(claim_one(&q).await.digest.as_deref(), Some("legacy01"));
+
+        sqlx::query("UPDATE scan_queue SET state = 'pending', claim_token = NULL, claimed_by = NULL, claim_expires_at = NULL WHERE digest = 'legacy01'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let batch = q.claim(6, "w", CLAIM_TTL_SECS).await.expect("claim");
+        assert_eq!(batch.len(), 6);
+        assert_eq!(batch[0].digest.as_deref(), Some("legacy01"));
+
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #6032: a fail-closed pull still goes ahead of everything, however old
+    /// the hosted and backfill jobs are.
+    #[tokio::test]
+    async fn a_waiting_client_still_goes_ahead_of_aged_jobs() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        seed_backfill(&pool, repo, "ancient", 1, 86_400).await;
+        let upload = seed_artifact(&pool, repo, "old.jar").await;
+        q.enqueue_hosted_upload(upload, PRIORITY_HOSTED)
+            .await
+            .expect("upload");
+        sqlx::query("UPDATE scan_queue SET created_at = NOW() - interval '1 day' WHERE kind = 'hosted_upload'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        q.enqueue_proxy_file(
+            repo,
+            "w",
+            "wait6032",
+            None,
+            1,
+            None,
+            PRIORITY_CLIENT_WAITING,
+        )
+        .await
+        .expect("waiting");
+        assert_eq!(claim_one(&q).await.digest.as_deref(), Some("wait6032"));
+
+        drop_repo(&pool, repo).await;
+    }
+
+    async fn enqueue_rescan(pool: &sqlx::PgPool, digest: &str) {
+        sqlx::query("INSERT INTO scan_queue (kind, priority, digest) VALUES ('rescan', $1, $2)")
+            .bind(PRIORITY_RESCAN)
+            .bind(digest)
+            .execute(pool)
+            .await
+            .expect("enqueue rescan");
+    }
+
+    /// #5947: a pending rescan is claimed only after every job of a higher
+    /// band, even when it has waited longest.
+    #[tokio::test]
+    async fn a_rescan_is_claimed_after_every_higher_band() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        // Oldest first, so age alone would pick it.
+        enqueue_rescan(&pool, "resc01").await;
+        q.enqueue_hosted_image(repo, "host01", PRIORITY_HOSTED)
+            .await
+            .expect("hosted");
+        q.enqueue_proxy_file(repo, "b", "back01", None, 1, None, PRIORITY_BACKFILL)
+            .await
+            .expect("backfill");
+        q.enqueue_proxy_file(repo, "w", "wait01", None, 1, None, PRIORITY_CLIENT_WAITING)
+            .await
+            .expect("waiting");
+
+        let mut picked = Vec::new();
+        for _ in 0..4 {
+            let job = q
+                .claim(1, "w", CLAIM_TTL_SECS)
+                .await
+                .expect("claim")
+                .pop()
+                .expect("due");
+            picked.push(job.digest.clone().unwrap_or_default());
+        }
+        assert_eq!(picked, vec!["wait01", "host01", "back01", "resc01"]);
+
+        sqlx::query("DELETE FROM scan_queue")
+            .execute(&pool)
+            .await
+            .unwrap();
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #5947: a backlog of rescans does not starve normal work. A job queued
+    /// after 200 pending rescans is the next one claimed.
+    #[tokio::test]
+    async fn a_rescan_backlog_does_not_delay_a_new_hosted_job() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        sqlx::query(
+            "INSERT INTO scan_queue (kind, priority, digest) \
+             SELECT 'rescan', $1, 'backlog' || g FROM generate_series(1, 200) g",
+        )
+        .bind(PRIORITY_RESCAN)
+        .execute(&pool)
+        .await
+        .expect("backlog");
+        // Drain a few rescans first, as a worker would.
+        let early = q.claim(3, "w", CLAIM_TTL_SECS).await.expect("claim");
+        assert!(early.iter().all(|j| j.kind == "rescan"));
+
+        q.enqueue_hosted_image(repo, "late01", PRIORITY_HOSTED)
+            .await
+            .expect("hosted");
+        let next = q
+            .claim(1, "w", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("due");
+        assert_eq!(next.digest.as_deref(), Some("late01"));
+        assert_eq!(next.kind, "hosted_image");
+
+        sqlx::query("DELETE FROM scan_queue")
+            .execute(&pool)
+            .await
+            .unwrap();
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #5947 review / #5994 run: a worker claims no more rescans than it has
+    /// free rescan slots, leaving the rest pending, instead of claiming them
+    /// to release them again (which churned ~50 updates a minute).
+    #[tokio::test]
+    async fn a_claim_takes_no_more_rescans_than_free_slots() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        for d in ["skip01", "skip02", "skip03"] {
+            enqueue_rescan(&pool, d).await;
+        }
+        q.enqueue_hosted_image(repo, "keep01", PRIORITY_HOSTED)
+            .await
+            .expect("hosted");
+
+        // No rescan slot free: only the hosted job is claimed.
+        let got = q
+            .claim_filtered(10, "w", CLAIM_TTL_SECS, 0)
+            .await
+            .expect("claim");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind, "hosted_image");
+
+        // One slot free: one rescan, the others left pending and untouched.
+        let got = q
+            .claim_filtered(10, "w", CLAIM_TTL_SECS, 1)
+            .await
+            .expect("claim");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind, "rescan");
+        let (pending, touched): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*) FILTER (WHERE state = 'pending'), \
+                    COUNT(*) FILTER (WHERE state = 'pending' AND (attempts > 0 OR claimed_by IS NOT NULL)) \
+             FROM scan_queue WHERE kind = 'rescan'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((pending, touched), (2, 0));
+
+        // `claim` is unrestricted.
+        assert_eq!(
+            q.claim(10, "w", CLAIM_TTL_SECS).await.expect("claim").len(),
+            2
+        );
+        sqlx::query("DELETE FROM scan_queue")
+            .execute(&pool)
+            .await
+            .unwrap();
         drop_repo(&pool, repo).await;
     }
 

@@ -70,6 +70,11 @@ names the same commit.
    instruction. The transcript says which checks did not run, so re-run the
    preflight for a full verdict once you have fixed them.
 
+   **Cut from a nightly-green commit (#6075).** Before you write the prep,
+   pick its base: the newest commit on the line the nightly full gate
+   measured green. Check 8 of the preflight names it. The full procedure is
+   [Cut from a nightly-green commit](#cut-from-a-nightly-green-commit).
+
    **This step is now enforced, not advisory (#3538).** `release.yml`'s
    `preflight-evidence` job refuses to proceed unless a green run of the
    **Release Preflight workflow** exists for the exact commit the tag points
@@ -183,12 +188,10 @@ names the same commit.
    `needs-e2e-test` label to get past it.
 
    **Cut checklist, beyond the preflight.** Before dispatching the candidate,
-   also confirm the secrets the post-release jobs need (step 8): the
-   `DISCORD_RELEASE_WEBHOOK` webhook is live (rotate it if the last
-   announcement failed with 404), and `AWS_AMI_BUILDER_ROLE_ARN` names a role
-   whose OIDC trust admits this repository. Neither is visible to the
-   preflight, and a missing one turns a published release's announcement or
-   AMI job red.
+   also confirm the secret the AMI job needs (step 8):
+   `AWS_AMI_BUILDER_ROLE_ARN` names a role whose OIDC trust admits this
+   repository. It is not visible to the preflight, and a missing one turns a
+   published release's AMI job red.
 
 2. **Bump the version set.** The version is displayed or pinned in several
    decoupled places; a partial bump ships a stale version string. Update
@@ -362,11 +365,13 @@ names the same commit.
    tag), the verifier anchors the adapter at that tag, and the promote's tag
    message and summary print the certified adapter digest and decision.
 
-   Until artifact-keeper-test#380 lands (tracked here as #4439), the
-   adapter's attestation is **provenance of what ships, not proof that the
-   gate exercised those bytes**: the Release Gate takes no adapter input and deploys the chart's
-   pinned adapter, for "new" and "stays" alike. The candidate exposes the
-   value to pass (`needs.images.outputs.adapter_image_ref`) for when it can.
+   The Release Gate runs **that** adapter, for "new" and "stays" alike
+   (#4439, artifact-keeper-test#380). The candidate passes the certified
+   tag and digest (`scanner_adapter_tag`, `scanner_adapter_digest`). The
+   gate's k8s stack deploys `<tag>@<digest>` in place of the chart's pinned
+   adapter and asserts that the adapter pod runs that digest. Its
+   candidate-adapter DTF tiers pull it by digest. The adapter's attestation
+   is therefore proof that the gate exercised those bytes.
 
    **Maintenance lines need the #4076 verifier before their next cut.**
    `release.yml` runs the *tagged* commit's copy of
@@ -377,20 +382,96 @@ names the same commit.
    predates #4076, with an error naming the line. To cut a patch on a
    `release/X.Y.x` whose adapter version is already published, first backport
    #4076 to that line (`scripts/ci/assert-candidate-certified.sh`, its
-   self-test, and main's current `release-candidate.yml`, which the line
-   needs byte-identical anyway), then certify the backport commit. A
+   self-test), then certify the backport commit. A
    `release-candidate-<sha>` artifact and a `release-candidate/certified`
    status on the commit are written for humans; the release path verifies
    the attestation (`scripts/ci/assert-candidate-certified.sh`, pinned to
    the candidate workflow's identity), nothing else.
 
-   **If it fails, fix the cause and dispatch a new candidate.** Do not
-   "Re-run failed jobs" on a failed gate: GitHub replays the gate's `deploy`
-   outputs instead of re-executing them, so every suite targets a namespace
-   the first attempt's teardown already deleted and dies on "backend not
-   ready" (#3774; how v1.9.0's re-runs failed). The workflow refuses a
-   re-run of the gate and says so. Nothing was named, so a failed candidate
-   costs a gate run and nothing else — the version number is intact.
+   **If it fails, fix the cause and dispatch a new candidate**, or, when
+   only gate groups went red and the cause was a flake or the test itself,
+   **rerun just the failed groups** (see "Rerunning the failed gate groups"
+   below). Never "Re-run failed jobs" on a candidate: GitHub replays the
+   gate's `deploy` outputs instead of re-executing them, so every suite
+   targets a namespace the first attempt's teardown already deleted and dies
+   on "backend not ready" (#3774; how v1.9.0's re-runs failed). The workflow
+   refuses a re-run of the gate and says so. Nothing was named, so a failed
+   candidate costs a gate run and nothing else — the version number is
+   intact.
+
+   ### Rerunning the failed gate groups
+
+   A rerun is a **new dispatch** of the candidate that names the failed run
+   (#6076). Its gate runs only the gate jobs, and the single `dtf-gate` legs,
+   that did not pass in that run, so a red DTF leg costs that leg, not a
+   fresh 1.5 to 3 hour candidate:
+
+   ```bash
+   gh workflow run release-candidate.yml --repo artifact-keeper/artifact-keeper \
+     --ref main -f sha=<the same 40-hex commit> \
+     -f rerun_of=<the failed candidate's run id> \
+     -f reason='dtf-gate/storage-1.11.0 hit the s3-copy timeout flake (artifact-keeper-test#NNN)'
+     # -f tests=moved   only when a test-only fix merged to artifact-keeper-test since
+   ```
+
+   **A rerun is allowed when** the commit is right and the red was not the
+   product's fault: a known flake, a runner or registry blip, or a test that
+   was wrong and has been fixed in artifact-keeper-test (`tests=moved`). Say
+   which in `reason`, with the issue; it goes into the certification.
+
+   **At most one rerun per candidate.** A second rerun of the same original
+   is refused, whatever became of the first (failed, cancelled or green):
+   dispatch a fresh candidate instead. A rerun of a rerun is refused too.
+
+   **A fresh candidate is needed when**
+   - the candidate has already been rerun once;
+   - a red group is, or might be, a real regression: the fix is a new
+     commit, and a new commit is always a new candidate;
+   - anything outside the gate failed (preflight, bookkeeping, images, Docker
+     Publish): there is nothing to rerun, and the rerun says so;
+   - Docker Publish has rebuilt the commit's images since (the digests
+     differ), the line's test branch moved with `tests=same`, or
+     `release-candidate.yml` changed on main since (the record carries the
+     blob of the candidate workflow that ran, compared on the rerun);
+   - the original started more than 72 hours ago (`RERUN_MAX_AGE_HOURS`):
+     the gate's chart (`iac@main`), web image (`:latest`) and runners are not
+     pinned between runs, so two runs' results only add up while they are
+     close together;
+   - the gate gained a job or a DTF leg since the original (only possible with
+     `tests=moved`): nobody ran it, so `certify` refuses.
+
+   What a rerun checks, all before its gate starts unless noted:
+   - the original is a failed attempt-1 dispatch of `release-candidate.yml`
+     on main, whose pre-gate jobs all passed, which did not certify, and which
+     was not itself a rerun;
+   - no earlier dispatch has rerun it: any candidate run since the original
+     whose `release-candidate-record` names it as `rerun.of` counts, whatever
+     its conclusion. A dispatch refused before its record was written never
+     reached its gate and does not count;
+   - the commit, the three digests the original tested, the adapter decision,
+     the version, the line and this workflow's blob are unchanged (the
+     original's `release-candidate-record` artifact, written before its gate
+     started, against this run's own resolution);
+   - `tests=same` (the default) runs the original's artifact-keeper-test
+     commit, pinned through the gate's `tests_sha`, and refuses if
+     `release-gate.yml` changed since. `tests=moved` runs the current tests
+     and records `tests_moved: true`;
+   - after the gate, every gate job and leg of the rerun also ran in the
+     original (`certify`).
+
+   It certifies when its gate passes: every selected required job succeeded
+   (the gate's subset verdict, artifact-keeper-test#830), and the original
+   passed every gate job and leg the rerun did not run. The certification
+   records `gate_scope: "rerun"`, a `rerun` object (original run, reason,
+   actor, the groups rerun, the tests mode and whether the tests moved), and
+   `contributing_runs` with both runs, their actors, their `release-gate.yml`
+   commits and their tests commits. A full candidate records
+   `gate_scope: "full"` and itself alone. The `release-candidate/certified`
+   status and the run summary name both runs.
+
+   The cap exists because retrying a group until it goes green turns a flaky
+   product bug into a release. A group that is red on the candidate and on its
+   rerun is a regression until shown otherwise.
 
    **Fallback: a prerelease tag.** `vX.Y.Z-rc.N` still works as it always
    did (the ruleset excludes `v*-rc*`, `v*-beta*`, `v*-alpha*` from
@@ -501,19 +582,22 @@ names the same commit.
    **second** AMI for the same version; there is no de-duplication, so check
    the AMI build run's summary for an AMI ID before re-running it.
 
-   **Release prerequisites for these jobs.** They fail until two secrets are
-   in place:
+   **Release prerequisites for these jobs.**
 
-   - `DISCORD_RELEASE_WEBHOOK` must be a live webhook. The last two announce
-     runs (v1.7.0, v1.7.3) got HTTP 404 from Discord, so it needs rotating
-     (channel → Integrations → Webhooks → new webhook → update the secret).
+   - `DISCORD_RELEASE_WEBHOOK` is optional. When it is unset or Discord
+     refuses the post, `release-announce.yml` skips the announcement and
+     stays green, so it never fails the release run (#6079).
    - `AWS_AMI_BUILDER_ROLE_ARN` (repo or org secret) must name an IAM role
      whose OIDC trust policy admits this repository's runs on `refs/tags/v*`
      (the dispatch runs on the tag) and on `refs/heads/main` (manual runs for
      older tags). No AMI build has ever succeeded. Until one does, the
      `ami-build` job in `release.yml` is `continue-on-error: true`: a red AMI
      build shows as a failed job without failing the release run. Remove that
-     line (TODO in the job) once a tagged build succeeds.
+     line (TODO in the job) once a tagged build succeeds. While
+     `ami-build.yml` itself is disabled in the repository's Actions settings,
+     the job skips the dispatch with an "AMI build skipped" notice and summary
+     line instead of failing on GitHub's 422 (#5709); enable it with
+     `gh workflow enable ami-build.yml` to resume automatic builds.
 
 9. **Post-release checks.** Confirm the GitHub Release is published (not
    draft), release notes are the curated per-version body (see "Release-notes
@@ -553,6 +637,66 @@ names the same commit.
    `SECURITY.md` carries the same commands written out for a user who does
    not have the repository checked out; keep the two in step.
 
+## Cut from a nightly-green commit
+
+A Release Candidate runs the full gate (1.5–3 hours). It used to be the first
+time a commit met that gate, so drift merged since the last cut (stale tests,
+timing races in tiers, runner tooling gaps) showed up one red candidate at a
+time: 8 of 10 candidates went red on 2026-11-15/16 (#6081). The **Nightly
+Release Gate** (`.github/workflows/nightly-release-gate.yml`, #6073) runs the
+same gate every night at 08:00 UTC on `main` and on every `release/X.Y.x`
+with a commit in the last 30 days, against the newest Docker Publish image
+of each, with the tests ref a candidate would use (`switch-tests-ref.sh`:
+the tests' `release/X.Y.x` when it exists, else the tests' `main`). Each red
+tier has one open issue (label `release-gate`, title `Nightly gate [<line>]:
+<tier> is red`) naming the first red commit range. The issue closes the first
+night the tier is green again.
+
+What it records, per tested commit:
+
+- the commit status **`release-gate/nightly`** (`success` or `failure`),
+  written only after a complete full-suite run;
+- the **`nightly-gate-verdict`** artifact on the nightly run (`verdict.json`:
+  each line's sha, digest, version, tests ref and sha, verdict, red tiers and
+  per-tier conclusions; kept 90 days).
+
+Neither is a release certification, and nothing on the release path accepts
+either as one. Only the candidate's signed attestation certifies.
+
+**The procedure.**
+
+1. Find the base. `scripts/ci/release-preflight.sh` check 8 reports the
+   nightly result for `HEAD`. When `HEAD` has none, or a red one, it names
+   the newest nightly-green commit in the last 30 first-parent commits. By
+   hand: the commit page shows the `release-gate/nightly` status, or run
+   `gh api repos/artifact-keeper/artifact-keeper/commits/<sha>/statuses --jq '.[] | select(.context == "release-gate/nightly") | .state' | head -1`.
+2. Write the prep on that base. On a maintenance line, branch the prep from
+   the green commit. On main, either merge the prep while that commit is
+   still main's tip, or hold unrelated merges to main from the nightly
+   run until the prep merges. Anything merged after the green commit is
+   untested by the nightly, and it is inside the release tree.
+3. The prep must change **only release bookkeeping**: `CHANGELOG.md`,
+   `.github/release-notes/`, `changes/unreleased/`, `docker/*/VERSION`, and
+   the version line in `Cargo.toml`, `Cargo.lock` and
+   `backend/src/api/openapi.rs`. Check 8 then reports the prep commit as
+   covered ("differs from it only in release bookkeeping"). Any other change,
+   even a one-line fix folded into the prep, breaks the link, and check 8 warns.
+4. Dispatch the candidate on the prep commit as usual (step 6). It still runs
+   the full gate. The nightly predicts that gate; it does not replace it.
+
+**When check 8 warns.** It is advisory and never changes the verdict.
+
+- *Red on the base.* Open the tracking issues for that line. A candidate on
+  this tree will most likely go red on the same tiers. Fix them, or wait for
+  a green night.
+- *No result.* Either the commit is newer than the last nightly run (cut
+  from the commit check 8 names, or wait a night), or the nightly was
+  pre-empted that night. The nightly gives way to any Release Candidate in
+  flight and records nothing for a night it did not finish.
+- To get a result sooner, dispatch the nightly by hand once no candidate is
+  in flight: `gh workflow run nightly-release-gate.yml -f lines=<main|X.Y.x>
+  -f track_issues=true`. It writes the status only for `test_suite=all`.
+
 ## Creating a release line
 
 Cutting `release/1.10.x` — the branch itself, not a release from it — is the
@@ -577,7 +721,8 @@ asked for the line. An **existing** line needs none of this — only creating
 one, and deleting one, do.
 
 **A line is created in both repositories (#4372).** The Release Gate is
-`artifact-keeper-test`'s `release-gate.yml@main`, and every job in it runs
+`artifact-keeper-test`'s `release-gate.yml`, pinned to one `main` commit
+(#6170), and every job in it runs
 that repository's `scripts/switch-tests-ref.sh` (artifact-keeper-test#420):
 when `artifact-keeper-test` has a `release/X.Y.x` for the candidate's
 version, the suite runs from that branch, otherwise from `main`. Without it,
@@ -773,7 +918,7 @@ for at all, rather than being bounded by argument.
 
 Nothing in the workflow depended on the dispatched ref for this to work: the
 reusable Release Gate is an absolute cross-repository reference
-(`artifact-keeper-test/.../release-gate.yml@main`) that takes the images by
+(`artifact-keeper-test/.../release-gate.yml@<sha>`) that takes the images by
 digest, and no job needs the certified commit on disk (see "What runs from the
 certified commit" below — the answer is nothing).
 
@@ -793,25 +938,25 @@ records the resolved line as `certified_ref`, and the verifier asks the
 repository the same question again at promote time — a disagreement is never
 promoted.
 
-For a commit on a maintenance line the candidate also **blesses the content**
-of `release-candidate.yml` once, at certification time: it must be
-byte-identical (same git blob id) to the copy `main` carries then. The blob is
-recorded in the signed predicate, and every later consumer compares against
-**that record**, never against main's tip — otherwise any merge to main that
-touched the workflow would strand an already-certified commit permanently, and
-recovery would mean a new commit and a full gate re-run. Not to the copy at the merge base — the merge
-base is a function of the commit's own ancestry, so whoever chooses the
-commit's parent would be choosing which historical copy gets blessed,
-including one from before a guard existed, permanently. Main's current copy is
-the only copy nobody but main can choose, and cherry-picking it forward was
-already the documented remedy. So: if the candidate refuses with "not main's
-current copy", do **not** edit the workflow on the branch — cherry-pick main's
-copy across and dispatch a new candidate. (Nothing is demanded, explicitly,
-for a commit on `main`, where comparing main to itself decides nothing.)
+The candidate also **records** the git blob id of `release-candidate.yml` at
+the certified commit in the signed predicate (`certified_workflow_blob`), and
+the verifier compares the commit against that record, never against main's
+tip. It is **not** required to match main's copy (#6122), and an edit to
+`release-candidate.yml` on main needs **no backport** to any `release/X.Y.x`.
+A line's copy lags main's after every such edit, and the candidate prints a
+notice saying so. That is expected: the copy is inert. The candidate is
+dispatched on main (its guard refuses any other ref), every checkout in it is
+`refs/heads/main` (next section), and only main's signing identity is
+accepted, so nothing ever runs a release branch's copy.
 
-The blessing is no longer load-bearing for the identity; it backstops the
-window in which an admin has the release ruleset toggled off to create a
-line.
+Until #6122 the candidate demanded that a maintenance commit carry main's
+**current** copy byte for byte (#3821). It was meant as a backstop for the
+window in which an admin has the release ruleset toggled off to create a line.
+It protected nothing that runs. An attacker with a commit on the line passed
+it for free by copying main's file, while the files the tag side really runs
+(`scripts/ci/*`, `release.yml`, `docker-publish.yml`) were never pinned by it.
+What it did do was refuse every maintenance candidate after each main edit to
+the file, until someone backported the edit by hand.
 
 ### What runs from the certified commit
 
@@ -1025,8 +1170,8 @@ scanned bytes; deleting it breaks every chart that pins it.
   Candidate is always
   dispatched on `main`, including for a maintenance release, so the signing
   identity is always `...release-candidate.yml@refs/heads/main` and never
-  widens; `release-candidate.yml` at the certified commit must additionally be
-  byte-identical to a copy that lives on `main`. See "Patch releases from a
+  widens. The copy of `release-candidate.yml` on a release branch never runs
+  and needs no backport (#6122). See "Patch releases from a
   `release/X.Y.x` branch".
 - Floating tags (`:latest`, `:X.Y`) are applied ONLY after the release gate
   and the GitHub Release, by a build-free promotion that re-points them at the
@@ -1100,10 +1245,13 @@ scanned bytes; deleting it breaks every chart that pins it.
   entry, the preflight evidence, the exact-tag digest guard and the
   scanner-adapter exact-version decision on both registries, and the image
   adoption gate.
-- A failed Release Gate is never re-run; the recovery is a new candidate
-  (#3774). "Re-run failed jobs" replays the gate's `deploy` outputs, so the
-  suites target a namespace that no longer exists. Both workflows refuse the
-  re-run and say why.
+- A failed Release Gate is never re-run with "Re-run failed jobs" (#3774):
+  it replays the gate's `deploy` outputs, so the suites target a namespace
+  that no longer exists. Both workflows refuse it and say why. The recovery
+  is a new candidate, or, for a flake or a test-only fix, a new candidate
+  dispatch with `rerun_of` and a `reason` that runs only the failed gate
+  groups on the same commit and digests and records both runs in the
+  certification (#6076; "Rerunning the failed gate groups").
 
 
 ## Release-notes style

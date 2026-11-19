@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="3" skipped="0" failures="2" errors="0" uuid="3a868a8a-10f0-4dda-9f83-909ff3412774" timestamp="2026-11-18T07:27:06.709-06:00" time="0.007">
+    <testsuite name="flakecrate" tests="3" skipped="0" errors="0" failures="2">
+        <testcase name="tests::steady" classname="flakecrate" timestamp="2026-11-18T07:27:06.709-06:00" time="0.007"/>
+        <testcase name="tests::always_fails" classname="flakecrate" timestamp="2026-11-18T07:27:06.709-06:00" time="0.007">
+            <failure message="thread &apos;tests::always_fails&apos; (54924582) panicked at src/lib.rs:14:57" type="test failure with exit code 101">thread &apos;tests::always_fails&apos; (54924582) panicked at src/lib.rs:14:57:
+assertion `left == right` failed: deterministic &lt;failure&gt; &amp; &quot;quote&quot;
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace</failure>
+            <system-out>
+running 1 test
+test tests::always_fails ... FAILED
+
+failures:
+
+failures:
+    tests::always_fails
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+</system-out>
+            <system-err>
+thread &apos;tests::always_fails&apos; (54924582) panicked at src/lib.rs:14:57:
+assertion `left == right` failed: deterministic &lt;failure&gt; &amp; &quot;quote&quot;
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+</system-err>
+        </testcase>
+        <testcase name="tests::flaky_once" classname="flakecrate" timestamp="2026-11-18T07:27:06.709-06:00" time="0.007">
+            <failure message="thread &apos;tests::flaky_once&apos; (54924584) panicked at src/lib.rs:10:60" type="test failure with exit code 101">thread &apos;tests::flaky_once&apos; (54924584) panicked at src/lib.rs:10:60:
+first attempt fails
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace</failure>
+            <system-out>
+running 1 test
+test tests::flaky_once ... FAILED
+
+failures:
+
+failures:
+    tests::flaky_once
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+</system-out>
+            <system-err>
+thread &apos;tests::flaky_once&apos; (54924584) panicked at src/lib.rs:10:60:
+first attempt fails
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+</system-err>
+        </testcase>
+    </testsuite>
+</testsuites>

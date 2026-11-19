@@ -4007,7 +4007,9 @@ async fn serve_scanned_legacy_virtual_vsix(
         return None;
     }
 
-    let mut failures = proxy_helpers::MemberWalkFailures::default();
+    // #5810: the virtual's member-fallback policy, for every member below.
+    let fallback = proxy_helpers::virtual_member_fallback(&state.db, virtual_id).await;
+    let mut failures = proxy_helpers::MemberWalkFailures::new(fallback);
     let mut unscanned = Vec::new();
     for (member, policy) in members.into_iter().zip(policies) {
         let Some(policy) = policy else {
@@ -4016,7 +4018,16 @@ async fn serve_scanned_legacy_virtual_vsix(
         };
         let run = std::mem::take(&mut unscanned);
         if let Some(served) = failures.run_answer(
-            resolve_legacy_vsix_unscanned(state, proxy, run, legacy, extension_id, version).await,
+            resolve_legacy_vsix_unscanned(
+                state,
+                proxy,
+                run,
+                fallback,
+                legacy,
+                extension_id,
+                version,
+            )
+            .await,
         ) {
             return Some(served);
         }
@@ -4042,7 +4053,9 @@ async fn serve_scanned_legacy_virtual_vsix(
                 return Some(Err(resp))
             }
             Err(resp) => {
-                failures.note(&resp);
+                if let Some(ended) = failures.note(&resp) {
+                    return Some(ended);
+                }
                 tracing::debug!(
                     member_key = %member.key, status = %resp.status(),
                     "scanned legacy VSIX member did not serve; trying next member"
@@ -4050,9 +4063,20 @@ async fn serve_scanned_legacy_virtual_vsix(
             }
         }
     }
-    Some(failures.finish(
-        resolve_legacy_vsix_unscanned(state, proxy, unscanned, legacy, extension_id, version).await,
-    ))
+    Some(
+        failures.finish(
+            resolve_legacy_vsix_unscanned(
+                state,
+                proxy,
+                unscanned,
+                fallback,
+                legacy,
+                extension_id,
+                version,
+            )
+            .await,
+        ),
+    )
 }
 
 /// One run of non-scanning members through the shared resolver. `None` is a
@@ -4061,6 +4085,7 @@ async fn resolve_legacy_vsix_unscanned(
     state: &SharedState,
     proxy: &crate::services::proxy_service::ProxyService,
     members: Vec<crate::models::repository::Repository>,
+    fallback: proxy_helpers::VirtualMemberFallback,
     legacy: &LegacyVsixRequest<'_>,
     extension_id: &str,
     version: &str,
@@ -4070,6 +4095,7 @@ async fn resolve_legacy_vsix_unscanned(
     }
     let result = proxy_helpers::resolve_virtual_download_from_members(
         members,
+        fallback,
         Some(proxy),
         legacy.upstream_path,
         Some(legacy.ctx),
@@ -4312,15 +4338,19 @@ async fn publish_extension(
     // #4673: entry names that would escape a client's extraction directory
     // are refused before anything else, as a 400 VALIDATION_ERROR, whether or
     // not the archive carries a usable manifest.
-    bounded_archive::with_ingest_extraction(|| vscode_extensions::reject_unsafe_entry_names(&body))
-        .and_then(|checked| checked)
-        .map_err(|e| e.into_response())?;
+    bounded_archive::with_ingest_extraction_waiting(|| {
+        vscode_extensions::reject_unsafe_entry_names(&body)
+    })
+    .await
+    .and_then(|checked| checked)
+    .map_err(|e| e.into_response())?;
 
     // The archive is the source of truth (#3961); the `x-*` headers only assert.
-    let manifest = match bounded_archive::with_ingest_extraction(|| {
+    let manifest = match bounded_archive::with_ingest_extraction_waiting(|| {
         vscode_extensions::extract_vsix_metadata(&body)
             .map_err(|e| (e, vscode_extensions::has_extension_manifest(&body)))
     })
+    .await
     .map_err(|e| e.into_response())?
     {
         Ok(manifest) => {
@@ -10203,6 +10233,37 @@ mod catalog_registration_tests {
         let row = row.expect("a vscode publish must write a packages row (#3659)");
         assert_eq!(row.version, "3.1.4");
         assert_eq!(row.versions, vec!["3.1.4".to_string()]);
+    }
+
+    /// #6230: an extension publish whose repository's ingest bucket is full
+    /// waits for a permit instead of shedding 503 at once, and succeeds once
+    /// one frees.
+    #[tokio::test]
+    async fn extension_publish_waits_for_ingest_permit_6230() {
+        let Some(fx) = tdh::Fixture::setup("local", "vscode").await else {
+            return;
+        };
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/extensions", fx.repo_key))
+            .header("x-publisher", "acme")
+            .header("x-extension-name", "queued-tools")
+            .header("x-extension-version", "1.0.0")
+            .body(axum::body::Body::from("vsix-bytes"))
+            .unwrap();
+        let ((status, body), queued) =
+            crate::util::bounded_archive::test_support::run_queued_behind_full_tenant(
+                crate::util::bounded_archive::TenantKey::Repo(fx.repo_id),
+                tdh::send(fx.router_with_auth(super::router()), req),
+            )
+            .await;
+        fx.teardown().await;
+        assert!(queued, "the publish must have waited for a permit");
+        assert!(
+            status.is_success(),
+            "a queued extension publish must succeed once a permit frees: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
     }
 
     /// #4725: an extension publish to a hosted repository must queue a push

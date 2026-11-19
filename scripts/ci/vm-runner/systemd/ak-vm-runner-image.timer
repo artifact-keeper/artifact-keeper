@@ -1,0 +1,12 @@
+# Weekly golden-image rebuild: picks up Ubuntu security updates and a newer
+# docker. The runner version is pinned in config.env.
+[Unit]
+Description=ak-vm-runner: weekly golden image rebuild
+
+[Timer]
+OnCalendar=Sun *-*-* 06:00:00 UTC
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

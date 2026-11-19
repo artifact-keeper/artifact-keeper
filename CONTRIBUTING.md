@@ -90,6 +90,7 @@ related workflows) enforces, in order of how fast you can reproduce each locally
 | Security audit | `cargo audit` on the dependency tree | `cargo audit` |
 | Linked issue | PR body must reference an issue (`Closes #N`) | n/a (PR body) |
 | E2E proof (advisory) | a bug-fix PR declares its end-to-end proof or exemption (see [End-to-end proof for bug fixes](#end-to-end-proof-for-bug-fixes)) | `python3 scripts/ci/check-e2e-proof.py pr --pr <N> --no-write` |
+| Gate test | a PR labelled `behaviour-change` or `breaking-change` cites the test-repo PR that updates the release gate, or `Gate-Exempt:` (see [Gate tests for behaviour changes](#gate-tests-for-behaviour-changes)) | `python3 scripts/ci/check-e2e-proof.py gate --pr <N>` |
 | CHANGELOG fragments | every `changes/unreleased/*.md` is well-formed | `python3 scripts/ci/changelog-fragments.py validate` |
 | CodeQL | static analysis | n/a (runs in CI) |
 
@@ -260,6 +261,41 @@ The PR check is `Require E2E proof for bug fixes`
 `scripts/ci/check-e2e-proof.py`). It is **advisory** until the 1.12.0 backfill
 lands: it reports a warning but does not block the merge. Run it locally with
 `python3 scripts/ci/check-e2e-proof.py pr --pr <number> --no-write`.
+
+## Gate tests for behaviour changes
+
+A PR that deliberately changes observable behaviour (a status code, a default,
+a response shape, a default policy) must move the release gate in
+[`artifact-keeper-test`](https://github.com/artifact-keeper/artifact-keeper-test)
+with it. Otherwise the gate keeps asserting the old contract and goes red only
+on the release candidate: in the 1.12.0 cycle that happened with hosted `npm
+audit` answering 501/503, quota refusals moving from 507 to 403, OCI
+`SIZE_INVALID`, the per-provider SSO account binding and the default
+`accepted_grade_status`.
+
+**Turning it on.** The author or a reviewer applies the label
+`behaviour-change` (`breaking-change` turns it on too). The PR then declares
+one of these lines in its body (outside HTML comments and code blocks, which
+are ignored):
+
+| Line | Meaning |
+| --- | --- |
+| `Gate: artifact-keeper-test#N` | The test PR that updates or adds the gate tier or suite for the new behaviour. An `E2E: artifact-keeper-test#N` line counts too. |
+| `Gate-Exempt: <reason>` | No gate tier or suite asserts the old behaviour, and why (10+ characters). |
+
+**What the check verifies on the test PR:** it lives in artifact-keeper-test,
+is open or merged, targets the same-named branch as this PR (`main`, or the
+test repo's `release/X.Y.x` for a backport), touches
+`deploy-test/harness/tiers/**` or `tests/**`, and names this PR or one of its
+linked issues (`artifact-keeper#N`). Every `Gate:` line must hold.
+
+The check is `Require gate test for behaviour changes`, the second job of
+[`require-e2e-proof.yml`](.github/workflows/require-e2e-proof.yml) (rules in
+`scripts/ci/check-e2e-proof.py gate`). It **blocks** a labelled PR and passes
+on every other one. It reads the body and labels from the event, so it re-runs
+when you edit the body or change the labels; re-running an old run sees the
+old body. Run it locally with
+`python3 scripts/ci/check-e2e-proof.py gate --pr <number>`.
 
 ## Reporting Security Issues
 
