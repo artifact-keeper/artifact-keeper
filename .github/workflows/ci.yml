@@ -731,6 +731,14 @@ jobs:
           swapon --show
           free -m
 
+      # Samples MemAvailable, swap in use and the compiler processes' RSS
+      # every 5s until the job ends (#6242); "Memory and disk report"
+      # summarises it. memory.peak alone sat at 15.0 GiB on fast and slow
+      # runs alike and a cancelled run keeps no log, so neither said why
+      # clippy was sometimes 2x slower or stalled.
+      - name: Start the memory sampler
+        run: ./scripts/ci/memory-watch.sh start "$RUNNER_TEMP/memory-watch.tsv" 5
+
       - name: Run Clippy
         # CARGO_BUILD_JOBS is the hosted runner's core count. It was capped
         # at 2 and then 4 on the self-hosted pool after lib-test compiles
@@ -738,10 +746,27 @@ jobs:
         # peaks well below the instrumented lib-test build the unit shards
         # run at 4 on the same 16 GB VM. CARGO_INCREMENTAL=0: incremental
         # state is useless in CI's clean checkout and only adds memory.
+        #
+        # A STALL LEAVES EVIDENCE (#6242). Clippy gets 30 of the job's 45
+        # minutes; past that it is stopped here, and the sampler's summary,
+        # the top processes and any kernel OOM lines are printed while the
+        # runner can still upload its log. A job cancelled at its own ceiling
+        # keeps no log at all.
         env:
           CARGO_BUILD_JOBS: "4"
           CARGO_INCREMENTAL: "0"
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          rc=0
+          timeout --signal=TERM --kill-after=60s 30m \
+            cargo clippy --workspace --all-targets -- -D warnings || rc=$?
+          if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+            echo "::error title=Clippy stopped after 30 minutes::cargo clippy ran past 30 minutes (5-8 normally) and was stopped so this job keeps its log. The memory numbers below say whether the VM was swapping (#6242)."
+            ./scripts/ci/memory-watch.sh report "$RUNNER_TEMP/memory-watch.tsv"
+            free -m
+            ps -eo pid,rss,etime,stat,comm --sort=-rss | head -15
+            sudo dmesg -T 2>/dev/null | grep -iE 'out of memory|oom|killed process|hung_task' | tail -20 || true
+          fi
+          exit "$rc"
 
       # Memory and disk headroom on the hosted VM, recorded on every run so
       # a drift toward the 16 GB / free-disk ceilings shows before it fails
@@ -762,6 +787,8 @@ jobs:
           free -g
           df -h / | tail -1
           du -sh target 2>/dev/null || true
+          ./scripts/ci/memory-watch.sh stop "$RUNNER_TEMP/memory-watch.tsv"
+          ./scripts/ci/memory-watch.sh report "$RUNNER_TEMP/memory-watch.tsv"
 
   # WINDOWS CROSS-CHECK (#6022). Every other Rust job here compiles for
   # Linux only, so code that needs a Unix-only API without a cfg guard
@@ -2039,6 +2066,12 @@ jobs:
       # ~1s.
       - name: Check the candidate publish-run resolver selects and blocks correctly
         run: bash scripts/ci/test-resolve-candidate-publish-run.sh
+
+      # The memory sampler Check Rust runs beside clippy (#6242): it reads
+      # /proc/meminfo and the compiler processes right, and it never fails
+      # the job it watches. Fixtures only, ~2s.
+      - name: Check the memory sampler
+        run: bash scripts/ci/test-memory-watch.sh
 
       # What a Release Candidate rerun of the failed gate groups runs, and
       # whether it may run at all (#6076): the wrong commit, a non-candidate
