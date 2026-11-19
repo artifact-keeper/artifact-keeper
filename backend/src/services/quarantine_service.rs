@@ -678,6 +678,48 @@ pub async fn reject_bound(
     .await
 }
 
+/// The admin release of [`transition`], bound to the bytes the administrator
+/// reviewed (#5766), as [`reject_bound`] is: `expected_digest`, or for an OCI
+/// manifest row the digest it names when read. When an OCI tag moved to
+/// another image before the write, the release lands on a row of the old
+/// digest (which must itself be quarantined), never on the tag row, so a
+/// release decided for D1 cannot clear a newer hold on D2.
+pub async fn release_bound(
+    db: &PgPool,
+    artifact_id: Uuid,
+    expected_digest: Option<&str>,
+) -> Result<HoldOutcome> {
+    let seen = hold_binding(db, artifact_id, expected_digest).await?;
+    let not_quarantined = || {
+        AppError::Conflict(
+            "Artifact is not in quarantined state; transition not allowed".to_string(),
+        )
+    };
+    bound_write(
+        db,
+        artifact_id,
+        seen,
+        "released",
+        false,
+        not_quarantined,
+        |id, seen| async move {
+            sqlx::query(
+                "UPDATE artifacts SET quarantine_status = 'released', quarantine_until = NULL, \
+                 quarantine_reason = NULL, quarantine_source = NULL \
+                 WHERE id = $1 AND quarantine_status = 'quarantined' \
+                   AND ($2::text IS NULL OR checksum_sha256 = $2::bpchar)",
+            )
+            .bind(id)
+            .bind(seen)
+            .execute(db)
+            .await
+            .map(|r| r.rows_affected())
+            .map_err(|e| AppError::Database(e.to_string()))
+        },
+    )
+    .await
+}
+
 /// Release a scan-policy hold whose policy no longer refuses the artifact (#5153).
 ///
 /// A hold with `quarantine_source = 'scan_policy'` exists only because of the
@@ -830,6 +872,26 @@ where
     F: Fn(Uuid, Option<String>) -> Fut,
     Fut: std::future::Future<Output = Result<u64>>,
 {
+    bound_write(db, artifact_id, seen, status, true, refused, write).await
+}
+
+/// [`bound_hold_write`], creating the old digest's row on a moved tag only
+/// when `create_old_row` (see [`hold_target_with`]).
+///
+/// [`hold_target_with`]: crate::services::oci_manifests::hold_target_with
+async fn bound_write<F, Fut>(
+    db: &PgPool,
+    artifact_id: Uuid,
+    seen: Option<String>,
+    status: &'static str,
+    create_old_row: bool,
+    refused: impl Fn() -> AppError,
+    write: F,
+) -> Result<HoldOutcome>
+where
+    F: Fn(Uuid, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<u64>>,
+{
     if write(artifact_id, seen.clone()).await? > 0 {
         return Ok(HoldOutcome {
             status,
@@ -839,8 +901,8 @@ where
     let Some(seen) = seen else {
         return Err(refused());
     };
-    use crate::services::oci_manifests::{hold_target, HoldTarget};
-    match hold_target(db, artifact_id, &seen)
+    use crate::services::oci_manifests::{hold_target_with, HoldTarget};
+    match hold_target_with(db, artifact_id, &seen, create_old_row)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
     {

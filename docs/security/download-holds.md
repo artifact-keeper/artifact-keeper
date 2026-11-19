@@ -98,6 +98,15 @@ the old digest has no row left (it was deleted by digest), they answer `409`
 and change nothing. A scan verdict on the old image that would hold it is
 recorded as `admin`, like a moved hold.
 
+The release action is bound the same way (#5766). `POST
+/api/v1/quarantine/{id}/release` accepts an optional `expected_digest` naming
+the image the release was decided for. When the tag has moved since, the old
+digest's held row is released instead, the answer names both digests, and a
+newer hold on the new image stays in place. When the old digest has no held
+row, the release answers `409` and changes nothing (no row is created). A body
+is still optional. The `flagged` mark a failed scan writes also binds to the
+digest the scan read, so it no longer lands on an image the tag moved to.
+
 What this means for operators:
 
 - Releasing or rejecting acts on one row. To serve a held image again, release
