@@ -931,8 +931,9 @@ pub fn spawn_score_refresher(
 }
 
 /// Recalculate `repository_id`'s score if it has one; log and move on if not
-/// or on error.
-async fn refresh_existing_score(db: &PgPool, repository_id: Uuid) {
+/// or on error. Also run after a lifecycle sweep, whose bulk soft deletes
+/// publish no `artifact.deleted` events (#5244)
+pub(crate) async fn refresh_existing_score(db: &PgPool, repository_id: Uuid) {
     let exists: std::result::Result<bool, sqlx::Error> = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM repo_security_scores WHERE repository_id = $1)",
     )
