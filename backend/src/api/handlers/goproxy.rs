@@ -1664,7 +1664,9 @@ async fn get_mod_file(
                 let upstream_path = build_go_upstream_path(module, version, "mod");
                 let module_clone = module.to_string();
                 let version_clone = version.to_string();
-                let result = proxy_helpers::resolve_virtual_download(
+                // #6214: a member refusing its own credentials is
+                // unavailable, so an all-miss walk answers 503, not 404.
+                let result = proxy_helpers::resolve_virtual_download_reporting_refusals(
                     &state.db,
                     auth,
                     state.proxy_service.as_deref(),
@@ -1902,26 +1904,31 @@ async fn download_zip(
                 let version_clone = version.to_string();
                 // #5810: no member scans; the virtual's member-fallback policy.
                 let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
-                let result = proxy_helpers::resolve_virtual_download_from_members(
-                    allowed,
-                    fallback,
-                    state.proxy_service.as_deref(),
-                    &upstream_path,
-                    Some(ctx),
-                    |member_id, location| {
-                        let db = db.clone();
-                        let state = state.clone();
-                        let name = module_clone.clone();
-                        let ver = version_clone.clone();
-                        async move {
-                            proxy_helpers::local_fetch_by_name_version_and_suffix(
-                                &db, &state, member_id, &location, &name, &ver, "%.zip",
-                            )
-                            .await
-                        }
-                    },
-                )
-                .await;
+                // #6214: see the `.mod` walk.
+                let no_fetch_urls = std::collections::HashMap::new();
+                let result =
+                    proxy_helpers::resolve_virtual_download_from_members_reporting_refusals(
+                        &state.db,
+                        allowed,
+                        fallback,
+                        state.proxy_service.as_deref(),
+                        &upstream_path,
+                        &no_fetch_urls,
+                        Some(ctx),
+                        |member_id, location| {
+                            let db = db.clone();
+                            let state = state.clone();
+                            let name = module_clone.clone();
+                            let ver = version_clone.clone();
+                            async move {
+                                proxy_helpers::local_fetch_by_name_version_and_suffix(
+                                    &db, &state, member_id, &location, &name, &ver, "%.zip",
+                                )
+                                .await
+                            }
+                        },
+                    )
+                    .await;
 
                 return match result {
                     Ok(fetched) => {
@@ -2150,10 +2157,11 @@ async fn serve_scanned_virtual_go_zip(
         default_content_type: "application/zip",
         disposition: None,
         ctx,
+        report_refusals: true,
     };
     let scanned = |member: crate::models::repository::Repository, policy| async move {
         let upstream_url = member.upstream_url.clone().unwrap_or_default();
-        serve_scanned_go_zip(
+        let served = serve_scanned_go_zip(
             state,
             proxy,
             (member.id, &member.key, &upstream_url),
@@ -2161,12 +2169,47 @@ async fn serve_scanned_virtual_go_zip(
             policy,
             ctx,
         )
-        .await
+        .await;
+        scanned_member_refusal(state, member.id, &upstream_url, served).await
     };
     crate::api::handlers::proxy_scan_archive::walk_scanned_archive_members(
         state, virtual_id, members, runs, scanned,
     )
     .await
+}
+
+/// A scanning Remote member's failure in the Virtual module-zip walk, with a
+/// refusal of the member's own credentials read as unavailable (#6214).
+///
+/// The scanned fetch renders its error without the refusal marker, so this
+/// keys on what it does carry: a 5xx the shared classifier did not mark
+/// unavailable is a permanent upstream answer (an upstream 401/403, an
+/// authentication failure, another permanent 4xx); a 404/410 renders as 404
+/// and a policy block as 403/409/423, so neither is touched. From a member
+/// that carries credentials, that answer is unavailable, so a walk nothing
+/// serves answers the retryable 503, not a 404 `go` falls through on.
+async fn scanned_member_refusal(
+    state: &SharedState,
+    member_id: uuid::Uuid,
+    upstream_url: &str,
+    served: Result<Response, Response>,
+) -> Result<Response, Response> {
+    let resp = match served {
+        Err(resp)
+            if resp.status().is_server_error()
+                && !proxy_helpers::is_member_unavailable_response(&resp) =>
+        {
+            resp
+        }
+        other => return other,
+    };
+    if proxy_helpers::is_credentialed_upstream_refusal(&state.db, member_id, upstream_url, true)
+        .await
+    {
+        Err(proxy_helpers::member_unavailable_response())
+    } else {
+        Err(resp)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6237,6 +6280,114 @@ mod upstream_failure_6214_tests {
                 status,
                 StatusCode::NOT_FOUND,
                 "{module}: {route} keeps 404 for a refusal of an anonymous Remote"
+            );
+        }
+    }
+    /// `.mod` and `.zip` on a credentialed refusal (#6214). On a Remote both
+    /// already answer a 5xx (the proxy error mapping renders an upstream
+    /// 401/403 as a 502, the scanned fetch as a 5xx). Through a Virtual the
+    /// download walk read the refusal as a miss, so a Virtual whose only
+    /// other member misses answered 404 and `go` fell through to `direct`;
+    /// it now answers 503 + `Retry-After`, for configured credentials,
+    /// credentials in the upstream URL, and a scanning member. A Virtual over
+    /// an anonymous Remote keeps the 404.
+    #[tokio::test]
+    async fn test_credentialed_refusal_on_mod_and_zip_6214_db() {
+        if std::env::var("JWT_SECRET").is_err() && std::env::var("SSO_ENCRYPTION_KEY").is_err() {
+            return;
+        }
+        let Some(mut rig) = setup().await else {
+            return;
+        };
+        let upstream = rig._mock.uri();
+        let creds = crate::services::upstream_auth::build_credentials_json(
+            &crate::services::upstream_auth::UpstreamAuthType::Bearer {
+                token: "expired-token".to_string(),
+            },
+        );
+        let (cred_id, cred_key) = rig.repo("remote", Some(&upstream)).await;
+        let (scan_id, scan_key) = rig.repo("remote", Some(&upstream)).await;
+        for id in [cred_id, scan_id] {
+            crate::services::upstream_auth::save_upstream_auth(&rig.fx.pool, id, "bearer", &creds)
+                .await
+                .expect("save upstream auth");
+            crate::services::upstream_auth::invalidate_upstream_auth_cache(id);
+        }
+        sqlx::query(
+            "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
+                 scan_on_proxy, proxy_scan_action, block_on_policy_violation, severity_threshold) \
+             VALUES ($1, true, false, true, 'fail_closed', false, 'high')",
+        )
+        .bind(scan_id)
+        .execute(&rig.fx.pool)
+        .await
+        .expect("seed scan_configs");
+        let userinfo_upstream = upstream.replacen("://", "://dtf-reader:expired@", 1);
+        let (userinfo_id, userinfo_key) = rig.repo("remote", Some(&userinfo_upstream)).await;
+        // A hosted member that does not have the module: the walk's other
+        // members miss.
+        let (hosted_id, _) = rig.repo("local", None).await;
+        let mut virtuals = Vec::new();
+        for (member, label) in [
+            (cred_id, "configured credentials"),
+            (userinfo_id, "credentials in the URL"),
+            (scan_id, "scanning member, configured credentials"),
+            (rig.fx.repo_id, "anonymous"),
+        ] {
+            let (virtual_id, virtual_key) = rig.repo("virtual", None).await;
+            tdh::link_virtual_member(&rig.fx.pool, virtual_id, member, 0).await;
+            tdh::link_virtual_member(&rig.fx.pool, virtual_id, hosted_id, 1).await;
+            virtuals.push((virtual_key, label));
+        }
+
+        let module = UNAUTHORIZED;
+        let mod_uri = |key: &str| format!("/{key}/{module}/@v/{VERSION}.mod");
+        let zip_uri = |key: &str| format!("/{key}/{module}/@v/{VERSION}.zip");
+        let mut remote = Vec::new();
+        for (key, label) in [
+            (&cred_key, "configured credentials"),
+            (&userinfo_key, "credentials in the URL"),
+            (&scan_key, "scanning, configured credentials"),
+        ] {
+            remote.push((label, ".mod", rig.get(mod_uri(key)).await.0));
+            remote.push((label, ".zip", rig.get(zip_uri(key)).await.0));
+        }
+        let mut through_virtual = Vec::new();
+        for (key, label) in &virtuals {
+            for (route, uri) in [(".mod", mod_uri(key)), (".zip", zip_uri(key))] {
+                let (status, headers) = rig.get(uri).await;
+                through_virtual.push((*label, route, status, headers.contains_key("retry-after")));
+            }
+        }
+        let _ = sqlx::query("DELETE FROM scan_configs WHERE repository_id = $1")
+            .bind(scan_id)
+            .execute(&rig.fx.pool)
+            .await;
+        rig.teardown().await;
+
+        for (label, route, status) in remote {
+            assert!(
+                status.is_server_error(),
+                "Remote ({label}): {route} answers a credentialed refusal with a 5xx, got {status}"
+            );
+        }
+        for (label, route, status, retry_after) in through_virtual {
+            if label == "anonymous" {
+                assert_eq!(
+                    status,
+                    StatusCode::NOT_FOUND,
+                    "Virtual over an anonymous Remote: {route} keeps 404"
+                );
+                continue;
+            }
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Virtual ({label}): {route} must answer a refused member with 503, not 404"
+            );
+            assert!(
+                retry_after,
+                "Virtual ({label}): {route} 503 carries Retry-After"
             );
         }
     }

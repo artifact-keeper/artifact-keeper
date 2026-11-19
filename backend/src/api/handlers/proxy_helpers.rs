@@ -996,6 +996,13 @@ pub(crate) fn is_upstream_auth_refusal(response: &Response) -> bool {
     upstream_refusal_status(response).is_some() || is_upstream_auth_failure(response)
 }
 
+/// [`is_upstream_auth_refusal`] for the proxy error before it is mapped to a
+/// `Response`: an upstream `401`/`403` or [`crate::error::AppError::UpstreamAuth`].
+pub(crate) fn is_upstream_auth_refusal_error(e: &crate::error::AppError) -> bool {
+    crate::services::proxy_service::upstream_refusal_status(e).is_some()
+        || matches!(e, crate::error::AppError::UpstreamAuth(_))
+}
+
 /// The Hub's `X-Error-Code` (one of
 /// [`crate::services::proxy_service::HUB_ERROR_CODES`]) behind an upstream
 /// `401`/`403` proxy error `Response`, if it sent one (#5323).
@@ -4287,6 +4294,37 @@ where
     F: Fn(Uuid, StorageLocation) -> Fut,
     Fut: std::future::Future<Output = Result<StreamingFetchResult, Response>>,
 {
+    resolve_virtual_download_walk(
+        db,
+        auth,
+        proxy_service,
+        virtual_repo_id,
+        path,
+        ctx,
+        local_fetch,
+        false,
+    )
+    .await
+}
+
+/// The walk behind [`resolve_virtual_download`] and
+/// [`resolve_virtual_download_reporting_refusals`]; `refusals` selects the
+/// second's credentialed-refusal classification (#6214).
+#[allow(clippy::too_many_arguments)]
+async fn resolve_virtual_download_walk<F, Fut>(
+    db: &PgPool,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
+    proxy_service: Option<&ProxyService>,
+    virtual_repo_id: Uuid,
+    path: &str,
+    ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
+    local_fetch: F,
+    refusals: bool,
+) -> Result<StreamingFetchResult, Response>
+where
+    F: Fn(Uuid, StorageLocation) -> Fut,
+    Fut: std::future::Future<Output = Result<StreamingFetchResult, Response>>,
+{
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
     let had_members = !members.is_empty();
     // Fallible (#4308): a DB failure while authorizing is a retryable 503, not
@@ -4304,8 +4342,47 @@ where
         return Err(no_accessible_members_response());
     }
     let fallback = virtual_member_fallback(db, virtual_repo_id).await;
-    resolve_virtual_download_from_members(members, fallback, proxy_service, path, ctx, local_fetch)
-        .await
+    resolve_virtual_download_winner(
+        members,
+        fallback,
+        proxy_service,
+        path,
+        &std::collections::HashMap::new(),
+        ctx,
+        local_fetch,
+        refusals.then_some(db),
+    )
+    .await
+    .map(|(result, _origin)| result)
+}
+
+/// [`resolve_virtual_download`] that reads a Remote member's credentialed
+/// upstream refusal as unavailable, not a miss (#6214); see
+/// [`resolve_virtual_download_from_members_reporting_refusals`].
+pub(crate) async fn resolve_virtual_download_reporting_refusals<F, Fut>(
+    db: &PgPool,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
+    proxy_service: Option<&ProxyService>,
+    virtual_repo_id: Uuid,
+    path: &str,
+    ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
+    local_fetch: F,
+) -> Result<StreamingFetchResult, Response>
+where
+    F: Fn(Uuid, StorageLocation) -> Fut,
+    Fut: std::future::Future<Output = Result<StreamingFetchResult, Response>>,
+{
+    resolve_virtual_download_walk(
+        db,
+        auth,
+        proxy_service,
+        virtual_repo_id,
+        path,
+        ctx,
+        local_fetch,
+        true,
+    )
+    .await
 }
 
 /// Body of [`resolve_virtual_download`] operating over an already-fetched (and,
@@ -4390,6 +4467,41 @@ where
         member_fetch_urls,
         ctx,
         local_fetch,
+        None,
+    )
+    .await
+    .map(|(result, _origin)| result)
+}
+
+/// [`resolve_virtual_download_from_members_with_fetch_urls`] for a caller
+/// that must not read a credentialed upstream refusal as a miss (#6214): a
+/// Remote member whose upstream answers 401/403 to the credentials it
+/// carries counts as unavailable, so when nothing serves the walk answers
+/// the retryable 503 instead of a 404 that `go` falls through on.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn resolve_virtual_download_from_members_reporting_refusals<F, Fut>(
+    db: &PgPool,
+    members: Vec<Repository>,
+    fallback: VirtualMemberFallback,
+    proxy_service: Option<&ProxyService>,
+    path: &str,
+    member_fetch_urls: &std::collections::HashMap<Uuid, String>,
+    ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
+    local_fetch: F,
+) -> Result<StreamingFetchResult, Response>
+where
+    F: Fn(Uuid, StorageLocation) -> Fut,
+    Fut: Future<Output = Result<StreamingFetchResult, Response>>,
+{
+    resolve_virtual_download_winner(
+        members,
+        fallback,
+        proxy_service,
+        path,
+        member_fetch_urls,
+        ctx,
+        local_fetch,
+        Some(db),
     )
     .await
     .map(|(result, _origin)| result)
@@ -4418,10 +4530,16 @@ where
         &std::collections::HashMap::new(),
         ctx,
         local_fetch,
+        None,
     )
     .await
 }
 
+/// `refusals_db`: `Some` makes a Remote member whose upstream refuses the
+/// credentials it carries ([`is_credentialed_upstream_refusal`]) count as
+/// unavailable rather than a miss (#6214, the Go `.mod`/`.zip` walks); `None`
+/// keeps the shared #5504 classification, where a permanent 4xx is a miss.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_virtual_download_winner<F, Fut>(
     members: Vec<Repository>,
     fallback: VirtualMemberFallback,
@@ -4430,6 +4548,7 @@ async fn resolve_virtual_download_winner<F, Fut>(
     member_fetch_urls: &std::collections::HashMap<Uuid, String>,
     ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
     local_fetch: F,
+    refusals_db: Option<&PgPool>,
 ) -> Result<(StreamingFetchResult, VirtualServeOrigin), Response>
 where
     F: Fn(Uuid, StorageLocation) -> Fut,
@@ -4536,8 +4655,23 @@ where
                         &member.key,
                         fetch.as_ref().is_err_and(fetch_error_trips_breaker),
                     );
-                    classify_stream_upstream(fetch, &member.key, path)
-                        .map_hit(|result| (result, VirtualServeOrigin::remote(member)))
+                    // #6214: read a refusal of the member's own credentials
+                    // as unavailable, for a caller that asked for it.
+                    let refused = refusals_db.is_some()
+                        && fetch
+                            .as_ref()
+                            .err()
+                            .is_some_and(is_upstream_auth_refusal_error);
+                    let mut outcome = classify_stream_upstream(fetch, &member.key, path);
+                    if refused && matches!(outcome, MemberResolveOutcome::Miss) {
+                        if let (Some(db), Some(url)) = (refusals_db, member.upstream_url.as_deref())
+                        {
+                            if is_credentialed_upstream_refusal(db, member.id, url, true).await {
+                                outcome = MemberResolveOutcome::Unavailable;
+                            }
+                        }
+                    }
+                    outcome.map_hit(|result| (result, VirtualServeOrigin::remote(member)))
                 }
                 None => MemberResolveOutcome::Miss,
             }
