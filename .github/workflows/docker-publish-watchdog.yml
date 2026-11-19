@@ -9,27 +9,63 @@ name: Docker Publish Watchdog
 # with zero jobs (main@ea9425b6 sat 75 minutes; the next commits' images, and
 # a Release Candidate waiting on them, went nowhere). Nothing reported it.
 #
-# Every 15 minutes this cancels each Docker Publish run that is still queued
-# with no runner after 30 minutes (scripts/ci/find-stale-docker-publish-runs.sh
-# says exactly what counts), and goes RED naming each one, so a stuck run is
-# a red run in the Actions list rather than something somebody has to notice.
-# A run waiting for the self-hosted amd64 pool is `in_progress` and is never
-# touched. Re-run a cancelled run by hand once the runner problem is fixed
+# It cancels each Docker Publish run that is still queued with no runner
+# after 30 minutes (scripts/ci/find-stale-docker-publish-runs.sh says exactly
+# what counts), and goes RED naming each one, so a stuck run is a red run in
+# the Actions list rather than something somebody has to notice.
+#
+# A RUN THAT HAS STARTED CAN HOLD THE GROUP TOO  (#6289)
+#
+# Run 44495887855 (main@361dcf82) was `in_progress` for ~6 h: every job done
+# but `Backend (linux/amd64)`, waiting in the one-slot ak-beefy-runners queue.
+# Main pushes coalesce (#6264), so it held main's group and three newer pushes
+# were replaced while `:main` stood still. The watchdog now also reads the
+# JOBS of every started run: a job queued with no runner for 45 minutes, or a
+# run older than 4 hours, makes it RED. It CANCELS such a run only when that
+# loses nothing: attempt 1 of a main push, nothing mid-build, a newer main
+# push waiting to replace it, and no Release Candidate in flight. Tags,
+# dispatches (a promote, a candidate's build), the schedule, release/** and
+# re-runs are reported, never cancelled. 45 minutes: an idle pool picks a job
+# up in under a minute, and one amd64 build is ~50-70 minutes, so a 45-minute
+# wait means most of a build has gone through ahead of it (the watchdog runs
+# every 15 minutes, so it acts at 45-60).
+#
+# WHEN IT RUNS. The schedule alone is not enough: GitHub fired the
+# 15-minute cron 8 times in 3 days (2026-11-17..19, gaps of 6-9 h), so the
+# 6-hour stall went unseen. It also runs whenever a Docker Publish run is
+# requested or completes -- exactly when a newer main push starts waiting
+# behind a stuck run -- which costs one short ubuntu-latest job per event.
+#
+# Re-run a cancelled run by hand once the runner problem is fixed
 # (`gh run rerun <id>`: the same push run, so the same signing identity and
-# provenance); a Release Candidate that was waiting on it is re-dispatched.
+# provenance); a Release Candidate that was waiting on it re-runs it itself.
 # ══════════════════════════════════════════════════════════════════════════════
 
 on:
   schedule:
     - cron: '7,22,37,52 * * * *'
+  # Event-driven as well (#6289): the schedule above fires hours apart in
+  # practice. workflow_run runs this file from the default branch and checks
+  # out the default branch's scripts, never the triggering run's code.
+  workflow_run:
+    workflows: [Docker Publish]
+    types: [requested, completed]
   workflow_dispatch:
     inputs:
       stale_minutes:
         description: 'Minutes a run may stay queued with no runner before it counts as stale.'
         required: false
         default: '30'
+      stuck_job_minutes:
+        description: 'Minutes one job of a started run may wait for a runner before the run counts as stuck (#6289).'
+        required: false
+        default: '45'
+      stuck_run_minutes:
+        description: 'Minutes a started run may run before it counts as stuck, whatever its jobs do (#6289).'
+        required: false
+        default: '240'
       dry_run:
-        description: 'Report stale runs without cancelling them.'
+        description: 'Report stale and stuck runs without cancelling any.'
         required: false
         type: boolean
         default: false
@@ -42,23 +78,25 @@ concurrency:
 
 jobs:
   sweep:
-    name: Cancel Docker Publish runs stuck with no runner
+    name: Cancel Docker Publish runs stuck waiting for a runner
     if: ${{ github.repository == 'artifact-keeper/artifact-keeper' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
-      actions: write   # cancel the stale runs
+      actions: write   # cancel the stale and stuck runs
     steps:
       - name: Checkout the tooling
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: scripts/ci
 
-      - name: Find and cancel stale queued runs
+      - name: Find and cancel stale and stuck runs
         env:
           GH_TOKEN: ${{ github.token }}
           STALE_MINUTES: ${{ inputs.stale_minutes || '30' }}
+          STUCK_JOB_MINUTES: ${{ inputs.stuck_job_minutes || '45' }}
+          STUCK_RUN_MINUTES: ${{ inputs.stuck_run_minutes || '240' }}
           STALE_ACTION: ${{ format('{0}', inputs.dry_run) == 'true' && 'report' || 'cancel' }}
         run: |
           set -uo pipefail
@@ -66,12 +104,12 @@ jobs:
           out="$(bash scripts/ci/find-stale-docker-publish-runs.sh)" || rc=$?
           case "$rc" in
             0)
-              echo "No Docker Publish run has been queued with no runner for ${STALE_MINUTES}m." ;;
+              echo "No Docker Publish run has been queued with no runner for ${STALE_MINUTES}m, has a job waiting for a runner for ${STUCK_JOB_MINUTES}m, or is older than ${STUCK_RUN_MINUTES}m." ;;
             1)
               {
-                echo "### Stale Docker Publish runs"
+                echo "### Stale or stuck Docker Publish runs"
                 echo
-                echo "Queued for ${STALE_MINUTES}m or more with no runner assigned (action: ${STALE_ACTION})."
+                echo "Action: ${STALE_ACTION}. \`stale\`: queued ${STALE_MINUTES}m+ with no job started. \`stuck\`: started, with a job waiting ${STUCK_JOB_MINUTES}m+ for a runner or ${STUCK_RUN_MINUTES}m+ old; \`hold=\` says why it was not cancelled (only a superseded main push with nothing mid-build is)."
                 echo
                 echo '```'
                 echo "$out"
@@ -81,7 +119,7 @@ jobs:
               } >> "$GITHUB_STEP_SUMMARY"
               while read -r line; do
                 [[ -z "$line" ]] && continue
-                echo "::error title=Docker Publish run stuck with no runner::${line}"
+                echo "::error title=Docker Publish run stuck waiting for a runner::${line}"
               done <<< "$out"
               exit 1 ;;
             *)
