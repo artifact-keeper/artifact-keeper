@@ -1499,10 +1499,12 @@ impl GrypeScanner {
         for pattern in excludes {
             command.args(["--exclude", pattern]);
         }
-        let output = command
-            .output()
-            .await
-            .map_err(|e| classify_grype_spawn_error(&e))?;
+        // #5942: bounded by SCANNER_PROCESS_TIMEOUT_SECS when set; past it
+        // the child is killed (kill_on_drop above).
+        let output =
+            crate::services::scanner_service::wait_scanner_process("grype", command.output())
+                .await?
+                .map_err(|e| classify_grype_spawn_error(&e))?;
 
         let report = parse_grype_output(
             output.status.success(),

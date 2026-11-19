@@ -43,6 +43,16 @@ fn resolve_concurrency(configured: Option<usize>, extraction_permits: usize) -> 
 /// nobody holds a socket, but bounded so a wedged grype releases its permit.
 const DEFAULT_JOB_BUDGET: Duration = Duration::from_secs(600);
 
+/// Time after [`DEFAULT_JOB_BUDGET`] for a job to record what its scanners
+/// did (#5942). Each scanner stops at the budget's deadline
+/// ([`crate::services::scan_queue::within_job_deadline`]) and its row is
+/// recorded `failed`; this is the backstop past which the whole job is dropped,
+/// as it was at the budget itself before.
+const JOB_FINALIZE_GRACE: Duration = Duration::from_secs(60);
+
+// A backstop for recording, not a second budget for scanners.
+const _: () = assert!(JOB_FINALIZE_GRACE.as_secs() * 5 < DEFAULT_JOB_BUDGET.as_secs());
+
 /// Backoff before a failed job becomes due again.
 const RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -343,11 +353,20 @@ async fn run_claimed_job(state: SharedState, queue: ScanQueue, job: Claimed<Scan
             );
             return;
         }
-        result = tokio::time::timeout(DEFAULT_JOB_BUDGET, execute(&state, &job)) => match result {
+        result = tokio::time::timeout(
+            DEFAULT_JOB_BUDGET + JOB_FINALIZE_GRACE,
+            // Boxed: the scan future is large, and these wrappers would
+            // otherwise each carry it on the polling thread's stack.
+            retry_when_scanner_timed_out(
+                started + DEFAULT_JOB_BUDGET,
+                Box::pin(execute(&state, &job)),
+            ),
+        ) => match result {
             Ok(r) => r,
             Err(_) => Err(JobFailure::Retryable(format!(
-                "scan exceeded the {}s queued-job budget",
-                DEFAULT_JOB_BUDGET.as_secs()
+                "scan exceeded the {}s queued-job budget and its {}s grace",
+                DEFAULT_JOB_BUDGET.as_secs(),
+                JOB_FINALIZE_GRACE.as_secs()
             ))),
         }
     };
@@ -404,6 +423,25 @@ async fn retry_when_engine_unavailable(
     match result {
         Ok(()) if unavailable => Err(JobFailure::EngineUnavailable(
             "the scanner engine was unreachable or not ready; retrying once it is back".to_string(),
+        )),
+        other => other,
+    }
+}
+
+/// Run a job whose scanners stop at `deadline` (#5942), and turn a scan that
+/// finished with a scanner stopped by a time limit (the deadline, or
+/// `SCANNER_PROCESS_TIMEOUT_SECS` on a local grype or trivy) into a retry. The
+/// stopped scanner's `failed` row stays as the record of that attempt, like an
+/// unavailable engine's (#5994); when attempts run out the job ends `failed`.
+async fn retry_when_scanner_timed_out(
+    deadline: tokio::time::Instant,
+    scan: impl std::future::Future<Output = Result<(), JobFailure>>,
+) -> Result<(), JobFailure> {
+    let (result, timed_out) =
+        crate::services::scan_queue::with_job_deadline(deadline, DEFAULT_JOB_BUDGET, scan).await;
+    match result {
+        Ok(()) if timed_out => Err(JobFailure::Retryable(
+            "a scanner was stopped by its time limit; retrying the scan".to_string(),
         )),
         other => other,
     }
@@ -782,6 +820,45 @@ mod tests {
         let (depths, oldest) = queue_gauges(&[]);
         assert!(depths.iter().all(|(_, _, jobs)| *jobs == 0.0), "{depths:?}");
         assert!(oldest.iter().all(|(_, age)| *age == 0.0), "{oldest:?}");
+    }
+
+    /// #5942: a scan that finished with a scanner stopped by a time limit is
+    /// a retry, not a completed job; a scan with no timeout keeps its own
+    /// outcome, and an unavailable engine keeps its own backoff.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_scanner_makes_the_job_retryable() {
+        let deadline = tokio::time::Instant::now() + DEFAULT_JOB_BUDGET;
+        let hung = retry_when_scanner_timed_out(deadline, async {
+            let _ = crate::services::scan_queue::within_job_deadline(
+                "grype",
+                std::future::pending::<crate::error::Result<()>>(),
+            )
+            .await;
+            Ok(())
+        })
+        .await;
+        assert!(
+            matches!(&hung, Err(JobFailure::Retryable(m)) if m.contains("time limit")),
+            "a scan whose scanner was stopped must be retried"
+        );
+
+        let process_limit = retry_when_scanner_timed_out(deadline, async {
+            crate::services::scan_queue::note_scanner_timed_out();
+            Ok(())
+        })
+        .await;
+        assert!(matches!(process_limit, Err(JobFailure::Retryable(_))));
+
+        let deadline = tokio::time::Instant::now() + DEFAULT_JOB_BUDGET;
+        assert!(retry_when_scanner_timed_out(deadline, async { Ok(()) })
+            .await
+            .is_ok());
+        let engine = retry_when_scanner_timed_out(deadline, async {
+            crate::services::scan_queue::note_scanner_timed_out();
+            Err(JobFailure::EngineUnavailable("down".to_string()))
+        })
+        .await;
+        assert!(matches!(engine, Err(JobFailure::EngineUnavailable(_))));
     }
 
     /// #5947 review: rescans never hold more than half the slots, so a hosted
