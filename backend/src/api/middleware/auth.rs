@@ -3553,11 +3553,9 @@ pub async fn repo_visibility_middleware(
         let extracted = extract_visibility_token(&request);
         // Format/registry endpoint: preserve pip-netrc / Artifactory-style
         // `username:<api_token>` Basic auth (`allow_basic_api_token=true`, #2786).
-        // The LDAP passthrough belongs here too (#6160): a directory user's
-        // `username:password` is a valid credential on this surface, so a
-        // nonexistent repo must answer the valid-credential 404 rather than
-        // the anonymous/explicitly-invalid 401. Skipping it here made Maven
-        // uploads with a directory password fail at the repository lookup.
+        // The LDAP passthrough belongs here too (#6160): a valid directory
+        // credential gets the valid-credential 404 for a nonexistent repo, the
+        // same as a local or token credential.
         let outcome = try_resolve_auth_outcome_with_passthrough(
             &vis_state.auth_service,
             extracted,
