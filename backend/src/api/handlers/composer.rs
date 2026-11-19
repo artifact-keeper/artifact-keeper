@@ -1883,12 +1883,44 @@ fn build_search_next_url(
     )
 }
 
+/// Repositories a `search.json` on `repo` covers: the repository itself, or
+/// for a Virtual the Local/Staging members the caller may read (#6285, #3323).
+/// A Remote caches dist files, not package names, and nothing forwards a
+/// search upstream, so it answers 501 instead of an empty result
+async fn search_repo_ids(
+    db: &PgPool,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+) -> Result<Vec<uuid::Uuid>, Response> {
+    if repo.repo_type == RepositoryType::Remote {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            format!(
+                "search.json is not available on remote repository '{}'",
+                repo.key
+            ),
+        )
+            .into_response());
+    }
+    if repo.repo_type != RepositoryType::Virtual {
+        return Ok(vec![repo.id]);
+    }
+    let members = proxy_helpers::authorized_virtual_members(db, auth, repo.id).await?;
+    Ok(members
+        .iter()
+        .filter(|m| m.repo_type.is_hosted())
+        .map(|m| m.id)
+        .collect())
+}
+
 async fn search(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     Query(params): Query<SearchQuery>,
 ) -> Result<Response, Response> {
     let repo = resolve_composer_repo(&state.db, &repo_key).await?;
+    let repo_ids = search_repo_ids(&state.db, auth.as_ref(), &repo).await?;
 
     let query_str = params.q.unwrap_or_default();
     let per_page = params.per_page.unwrap_or(15).min(100);
@@ -1915,14 +1947,14 @@ async fn search(
                am.metadata as "metadata?"
         FROM artifacts a
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1
+        WHERE a.repository_id = ANY($1)
           AND a.is_deleted = false
           AND a.name ILIKE $2 ESCAPE '\'
           AND ($3::text IS NULL OR am.metadata #>> '{composer,type}' = $3)
         ORDER BY a.name
         LIMIT $4 OFFSET $5
         "#,
-        repo.id,
+        &repo_ids,
         search_pattern,
         type_filter,
         per_page,
@@ -1960,12 +1992,12 @@ async fn search(
         SELECT COUNT(DISTINCT a.name)
         FROM artifacts a
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1
+        WHERE a.repository_id = ANY($1)
           AND a.is_deleted = false
           AND a.name ILIKE $2 ESCAPE '\'
           AND ($3::text IS NULL OR am.metadata #>> '{composer,type}' = $3)
         "#,
-        repo.id,
+        &repo_ids,
         search_pattern,
         type_filter
     )
@@ -4797,6 +4829,93 @@ mod metadata_db_tests {
             "next must preserve per_page, got {}",
             next
         );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn virtual_search_covers_readable_members_6285() {
+        let Some(vf) = tdh::Fixture::setup("virtual", "composer").await else {
+            return;
+        };
+        let (member_id, _member_key, member_dir) =
+            tdh::create_repo(&vf.pool, "local", "composer").await;
+        insert_artifact(&vf.pool, member_id, "aktest/lib", "1.0.0", "s1", None).await;
+        insert_artifact(&vf.pool, member_id, "aktest/util", "1.0.0", "s2", None).await;
+        add_member(&vf.pool, vf.repo_id, member_id, 0).await;
+        tdh::grant_repo_access(&vf.pool, member_id, vf.user_id).await;
+
+        let app = vf.router_with_auth(super::router());
+        let req = tdh::get(format!("/{}/search.json?q=", vf.repo_key));
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let json = body_json(&body).await;
+        assert_eq!(json["total"], 2);
+        let results = json["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["name"], "aktest/lib");
+        assert_eq!(
+            results[0]["url"],
+            format!("/composer/{}/p2/aktest/lib.json", vf.repo_key)
+        );
+
+        let app = vf.router_with_auth(super::router());
+        let req = tdh::get(format!("/{}/search.json?q=akt&per_page=1", vf.repo_key));
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let json = body_json(&body).await;
+        assert_eq!(json["total"], 2);
+        assert_eq!(json["results"].as_array().unwrap().len(), 1);
+        let next = json["next"].as_str().expect("next link present");
+        assert!(next.starts_with(&format!("/composer/{}/search.json", vf.repo_key)));
+
+        tdh::cleanup(&vf.pool, member_id, Uuid::new_v4()).await;
+        let _ = std::fs::remove_dir_all(member_dir);
+        vf.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn virtual_search_drops_unreadable_members_6285() {
+        let Some(vf) = tdh::Fixture::setup("virtual", "composer").await else {
+            return;
+        };
+        let (open_id, _open_key, open_dir) = tdh::create_repo(&vf.pool, "local", "composer").await;
+        let (private_id, _private_key, private_dir) =
+            tdh::create_repo(&vf.pool, "local", "composer").await;
+        tdh::publish_repo(&vf.pool, open_id).await;
+        insert_artifact(&vf.pool, open_id, "aktest/open", "1.0.0", "o1", None).await;
+        insert_artifact(&vf.pool, private_id, "aktest/secret", "1.0.0", "p1", None).await;
+        add_member(&vf.pool, vf.repo_id, open_id, 0).await;
+        add_member(&vf.pool, vf.repo_id, private_id, 1).await;
+
+        let app = vf.router_anon(super::router());
+        let req = tdh::get(format!("/{}/search.json?q=aktest", vf.repo_key));
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let json = body_json(&body).await;
+        assert_eq!(json["total"], 1);
+        let results = json["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["name"], "aktest/open");
+
+        tdh::cleanup(&vf.pool, open_id, Uuid::new_v4()).await;
+        tdh::cleanup(&vf.pool, private_id, Uuid::new_v4()).await;
+        let _ = std::fs::remove_dir_all(open_dir);
+        let _ = std::fs::remove_dir_all(private_dir);
+        vf.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn remote_search_is_not_implemented_6285() {
+        let Some(f) = tdh::Fixture::setup("remote", "composer").await else {
+            return;
+        };
+        insert_artifact(&f.pool, f.repo_id, "aktest/cached", "1.0.0", "r1", None).await;
+
+        let app = f.router_with_auth(super::router());
+        let req = tdh::get(format!("/{}/search.json?q=aktest", f.repo_key));
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_IMPLEMENTED);
 
         f.teardown().await;
     }
