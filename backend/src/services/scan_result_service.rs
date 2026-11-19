@@ -2572,8 +2572,8 @@ impl ScanResultService {
         .ok_or_else(|| AppError::NotFound("Scan result not found".to_string()))
     }
 
-    /// List scan results with optional filters.
     /// List scan rows, newest first, with the caller's optional filters.
+    /// Scans of a soft-deleted artifact are left out (#5244).
     ///
     /// `scan_type` (#3410) narrows the listing to one engine. It is validated
     /// against the CHECK-constraint vocabulary in the handler before it gets
@@ -2590,52 +2590,16 @@ impl ScanResultService {
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<ScanResult>, i64)> {
-        let results = sqlx::query_as!(
-            ScanResult,
-            r#"
-            SELECT id, artifact_id, repository_id, scan_type, status,
-                   findings_count, critical_count, high_count, medium_count, low_count, info_count,
-                   scanner_version, error_message, started_at, completed_at, created_at,
-                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
-                      vuln_db_version, vuln_db_published_at
-            FROM scan_results
-            WHERE ($1::uuid IS NULL OR repository_id = $1)
-              AND ($2::uuid IS NULL OR artifact_id = $2)
-              AND ($3::text IS NULL OR status = $3)
-              AND ($4::text IS NULL OR scan_type = $4)
-            ORDER BY created_at DESC
-            LIMIT $5 OFFSET $6
-            "#,
+        self.list_scans_served_only(
             repository_id,
             artifact_id,
             status,
             scan_type,
-            limit,
+            &crate::services::search_service::McpServedOnly::default(),
             offset,
+            limit,
         )
-        .fetch_all(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        let total = sqlx::query_scalar!(
-            r#"
-            SELECT COUNT(*) as "count!"
-            FROM scan_results
-            WHERE ($1::uuid IS NULL OR repository_id = $1)
-              AND ($2::uuid IS NULL OR artifact_id = $2)
-              AND ($3::text IS NULL OR status = $3)
-              AND ($4::text IS NULL OR scan_type = $4)
-            "#,
-            repository_id,
-            artifact_id,
-            status,
-            scan_type,
-        )
-        .fetch_one(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        Ok((results, total))
     }
 
     /// [`Self::list_scans`] showing a scan of one of `served_only.repos` (MCP
@@ -2658,7 +2622,9 @@ impl ScanResultService {
               AND ($2::uuid IS NULL OR artifact_id = $2) \
               AND ($3::text IS NULL OR status = $3) \
               AND ($4::text IS NULL OR scan_type = $4) \
-              AND (repository_id <> ALL($5) OR artifact_id = ANY($6))";
+              AND (repository_id <> ALL($5) OR artifact_id = ANY($6)) \
+              AND NOT EXISTS (SELECT 1 FROM artifacts a \
+                              WHERE a.id = scan_results.artifact_id AND a.is_deleted)";
         let page_sql = format!(
             "SELECT id, artifact_id, repository_id, scan_type, status, \
                     findings_count, critical_count, high_count, medium_count, low_count, \
@@ -6516,6 +6482,63 @@ mod tests {
             assert_eq!(own(None).await, None, "a not_cataloged own row does not");
 
             cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #5244: the scan listings leave out the scans of a soft-deleted
+        /// artifact (a lifecycle sweep, a delete), page and total alike
+        #[tokio::test]
+        async fn list_scans_leaves_out_deleted_artifacts_5244() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (live, _) = insert_test_artifact(&pool, repo_id, "live").await;
+            let (gone, _) = insert_test_artifact(&pool, repo_id, "gone").await;
+            for artifact_id in [live, gone] {
+                sqlx::query(
+                    "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
+                     completed_at) VALUES ($1, $2, 'dependency', 'completed', NOW())",
+                )
+                .bind(artifact_id)
+                .bind(repo_id)
+                .execute(&pool)
+                .await
+                .expect("scan");
+            }
+            sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+                .bind(gone)
+                .execute(&pool)
+                .await
+                .expect("soft delete");
+
+            let (scans, total) = svc
+                .list_scans(Some(repo_id), None, None, None, 0, 50)
+                .await
+                .expect("list_scans");
+            let listed: Vec<Uuid> = scans.iter().map(|s| s.artifact_id).collect();
+            let (_, gone_total) = svc
+                .list_scans(None, Some(gone), None, None, 0, 50)
+                .await
+                .expect("list_scans by artifact");
+            let (served, served_total) = svc
+                .list_scans_served_only(
+                    Some(repo_id),
+                    None,
+                    None,
+                    None,
+                    &crate::services::search_service::McpServedOnly::default(),
+                    0,
+                    50,
+                )
+                .await
+                .expect("list_scans_served_only");
+            cleanup_repo(&pool, repo_id).await;
+
+            assert_eq!((listed, total), (vec![live], 1));
+            assert_eq!(gone_total, 0);
+            assert_eq!(served.len() as i64, served_total);
+            assert_eq!(served_total, 1);
         }
 
         /// #1059 coverage: recalculate_score runs end-to-end inside the
