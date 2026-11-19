@@ -368,7 +368,8 @@ pub struct ListBuildsQuery {
     pub sort_order: Option<String>,
     /// Exact build name
     pub name: Option<String>,
-    /// Exact VCS branch
+    /// Exact VCS branch, matched on the caller's own builds unless the caller
+    /// is an administrator
     pub branch: Option<String>,
     /// Exact agent
     pub agent: Option<String>,
@@ -379,16 +380,25 @@ pub struct ListBuildsQuery {
 }
 
 /// The list's `WHERE`, shared by the page and the count: `$1` status, `$2`
-/// search pattern, `$3` to `$7` the exact filters
+/// search pattern, `$3` to `$7` the exact filters, `$8` the creator a branch
+/// filter is limited to (NULL for an administrator). `vcs_branch` is owner or
+/// admin only on read (#6240), so filtering another user's builds by it would
+/// let a caller guess a hidden branch
 const LIST_FILTER: &str = r#"
         WHERE ($1::text IS NULL OR status = $1)
           AND ($2::text IS NULL OR name ILIKE $2 ESCAPE '\')
           AND ($3::text IS NULL OR name = $3)
-          AND ($4::text IS NULL OR vcs_branch = $4)
+          AND ($4::text IS NULL OR (vcs_branch = $4 AND ($8::uuid IS NULL OR created_by = $8)))
           AND ($5::text IS NULL OR agent = $5)
           AND ($6::timestamptz IS NULL OR created_at >= $6)
           AND ($7::timestamptz IS NULL OR created_at < $7)
 "#;
+
+/// The creator whose builds a branch filter may match: the caller, or nobody
+/// in particular for an administrator, who reads every build's branch
+fn branch_filter_owner(auth: &AuthExtension) -> Option<Uuid> {
+    (!auth.is_admin).then_some(auth.user_id)
+}
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct BuildArtifact {
@@ -559,6 +569,7 @@ pub async fn list_builds(
     }
 
     let order_clause = list_order_clause(query.sort_by.as_deref(), sort_desc);
+    let branch_owner = branch_filter_owner(&auth);
 
     let sql = format!(
         r#"
@@ -569,8 +580,8 @@ pub async fn list_builds(
         FROM builds
         {LIST_FILTER}
         {order_clause}
-        OFFSET $8
-        LIMIT $9
+        OFFSET $9
+        LIMIT $10
         "#
     );
 
@@ -582,6 +593,7 @@ pub async fn list_builds(
         .bind(&query.agent)
         .bind(query.created_after)
         .bind(query.created_before)
+        .bind(branch_owner)
         .bind(offset)
         .bind(per_page as i64)
         .fetch_all(&state.db)
@@ -597,6 +609,7 @@ pub async fn list_builds(
         .bind(&query.agent)
         .bind(query.created_after)
         .bind(query.created_before)
+        .bind(branch_owner)
         .fetch_one(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -2978,6 +2991,82 @@ mod tests {
             .execute(&pool)
             .await;
         tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    /// #6240: `vcs_branch` reads back only to the build's creator or an
+    /// administrator, so the branch filter matches only the caller's own
+    /// builds. Otherwise a non-owner could guess another user's branch from
+    /// whether the filtered list (or its total) is empty
+    #[tokio::test]
+    async fn list_builds_branch_filter_is_owner_gated_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool.clone(), "/tmp/ph-6240-branch");
+        let (owner_id, owner_name) = tdh::create_user(&pool).await;
+        let (other_id, other_name) = tdh::create_user(&pool).await;
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let owner = tdh::router_with_auth(
+            super::router(),
+            state.clone(),
+            tdh::make_auth(owner_id, &owner_name),
+        );
+        let other = tdh::router_with_auth(
+            super::router(),
+            state.clone(),
+            tdh::make_auth(other_id, &other_name),
+        );
+        let admin = tdh::router_with_auth(
+            super::router(),
+            state,
+            tdh::admin_auth(admin_id, &admin_name),
+        );
+        let p = format!("ph-6240-branch-{}", Uuid::new_v4());
+        let branch = format!("{p}/secret");
+        for (app, number) in [(&owner, 1), (&other, 2)] {
+            send_json(
+                app.clone(),
+                post_json(
+                    "/",
+                    json!({ "name": p, "build_number": number, "vcs_branch": branch }),
+                ),
+            )
+            .await;
+        }
+
+        let numbers = |app: axum::Router, filter: String| {
+            let p = p.clone();
+            async move {
+                let list = send_json(
+                    app,
+                    tdh::get(format!("/?search={p}&sort_by=build_number&{filter}")),
+                )
+                .await;
+                let items: Vec<i64> = list["items"]
+                    .as_array()
+                    .expect("items")
+                    .iter()
+                    .map(|b| b["number"].as_i64().expect("number"))
+                    .collect();
+                assert_eq!(list["pagination"]["total"], items.len(), "{list}");
+                items
+            }
+        };
+        let by_branch = format!("branch={}", branch.replace('/', "%2F"));
+
+        assert_eq!(numbers(other.clone(), String::new()).await, [1, 2]);
+        assert_eq!(numbers(other, by_branch.clone()).await, [2]);
+        assert_eq!(numbers(owner, by_branch.clone()).await, [1]);
+        assert_eq!(numbers(admin, by_branch).await, [1, 2]);
+
+        let _ = sqlx::query("DELETE FROM builds WHERE name = $1")
+            .bind(&p)
+            .execute(&pool)
+            .await;
+        for user in [owner_id, other_id, admin_id] {
+            tdh::cleanup_user(&pool, user).await;
+        }
     }
 
     /// #6046: the list parsed `sort_by` and always ordered by build number.
