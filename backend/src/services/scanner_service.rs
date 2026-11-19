@@ -6574,6 +6574,61 @@ pub trait Scanner: Send + Sync {
     }
 }
 
+/// Env var for the wall-clock limit on one local scanner process (#5942):
+/// the `grype` and `trivy` children the backend spawns itself. Unset, blank,
+/// `0` or unparsable means no limit of its own, the behaviour before it
+/// existed. Scans through the scanner adapter are not affected: the adapter
+/// client has its own budgets (submission, queue and report polling).
+pub const SCANNER_PROCESS_TIMEOUT_ENV: &str = "SCANNER_PROCESS_TIMEOUT_SECS";
+
+/// The local scanner process limit this process runs with, from
+/// [`SCANNER_PROCESS_TIMEOUT_ENV`]. Read at call time, like the other scan
+/// env knobs, so a test can set it per process.
+pub(crate) fn scanner_process_timeout() -> Option<Duration> {
+    parse_scanner_process_timeout(std::env::var(SCANNER_PROCESS_TIMEOUT_ENV).ok().as_deref())
+}
+
+fn parse_scanner_process_timeout(raw: Option<&str>) -> Option<Duration> {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+}
+
+/// Wait for a local scanner child (`output`, from a `kill_on_drop` command)
+/// under [`SCANNER_PROCESS_TIMEOUT_ENV`] (#5942). Past the limit the future
+/// is dropped, which kills the child, and the scan gets an error naming the
+/// limit; inside a queued job the timeout is also noted so the job is retried
+/// rather than finishing with a `failed` row. The outer `Result` is the
+/// timeout, the inner one the spawn, so each caller keeps its own spawn-error
+/// classification.
+pub(crate) async fn wait_scanner_process(
+    program: &str,
+    output: impl std::future::Future<Output = std::io::Result<std::process::Output>>,
+) -> Result<std::io::Result<std::process::Output>> {
+    wait_scanner_process_with_limit(program, scanner_process_timeout(), output).await
+}
+
+async fn wait_scanner_process_with_limit(
+    program: &str,
+    limit: Option<Duration>,
+    output: impl std::future::Future<Output = std::io::Result<std::process::Output>>,
+) -> Result<std::io::Result<std::process::Output>> {
+    let Some(limit) = limit else {
+        return Ok(output.await);
+    };
+    match tokio::time::timeout(limit, output).await {
+        Ok(out) => Ok(out),
+        Err(_) => {
+            crate::services::scan_queue::note_scanner_timed_out();
+            Err(AppError::Internal(format!(
+                "{program} did not finish within {SCANNER_PROCESS_TIMEOUT_ENV}={}s; \
+                 the process was stopped",
+                limit.as_secs()
+            )))
+        }
+    }
+}
+
 /// Maximum wall-clock time we will wait for a scanner CLI's `--version`
 /// subcommand to return. A hung version probe is serialized through
 /// `OnceCell::get_or_init`, so any single hang would head-of-line block
@@ -9348,6 +9403,8 @@ mod construction {
             trivy_url: Option<String>,
             trivy_adapter_url: Option<String>,
             incus_scanner_enabled: bool,
+            // #6233: TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS.
+            trivy_ignore_embedded_pom_declarations: bool,
             storage: Arc<dyn StorageBackend>,
             storage_registry: Arc<crate::storage::StorageRegistry>,
             storage_base_path: String,
@@ -9412,10 +9469,15 @@ mod construction {
                         "Trivy filesystem scanner enabled (scanner-adapter at {})",
                         adapter_url
                     );
-                    scanners.push(Arc::new(TrivyFsScanner::new_with_adapter(
-                        adapter_url.clone(),
-                        scan_workspace_path.clone(),
-                    )));
+                    scanners.push(Arc::new(
+                        TrivyFsScanner::new_with_adapter(
+                            adapter_url.clone(),
+                            scan_workspace_path.clone(),
+                        )
+                        .with_ignore_embedded_pom_declarations(
+                            trivy_ignore_embedded_pom_declarations,
+                        ),
+                    ));
                     if let Some(capability) = incus_capability {
                         info!("Incus container image scanner enabled (scanner-adapter)");
                         scanners.push(Arc::new(
@@ -9429,10 +9491,12 @@ mod construction {
                 }
                 (None, Some(url)) => {
                     info!("Trivy filesystem scanner enabled (local CLI)");
-                    scanners.push(Arc::new(TrivyFsScanner::new(
-                        url.clone(),
-                        scan_workspace_path.clone(),
-                    )));
+                    scanners.push(Arc::new(
+                        TrivyFsScanner::new(url.clone(), scan_workspace_path.clone())
+                            .with_ignore_embedded_pom_declarations(
+                                trivy_ignore_embedded_pom_declarations,
+                            ),
+                    ));
                     if let Some(capability) = incus_capability {
                         info!("Incus container image scanner enabled (local CLI)");
                         scanners.push(Arc::new(crate::services::incus_scanner::IncusScanner::new(
@@ -10418,6 +10482,11 @@ impl ScannerService {
             // If we still have a prepared id, reuse it; otherwise create a row.
             let scan_result = match prepared_action {
                 PreparedScanAction::Reuse(target_id) => {
+                    // #5942: a retried queued job scans into the row its
+                    // timed-out attempt recorded `failed`; reopen it first.
+                    self.scan_result_service
+                        .reopen_failed_scan(target_id)
+                        .await?;
                     self.scan_result_service.get_scan(target_id).await?
                 }
                 PreparedScanAction::InsertFresh => {
@@ -10438,9 +10507,16 @@ impl ScannerService {
             // for dedup-checking and may sit briefly before scan invocation).
             // See issue #902.
             let started_at = chrono::Utc::now();
-            match scanner
-                .scan_target(&target, metadata.as_ref(), &content)
-                .await
+            // #5942: in a queued job the scanner stops at the job's deadline
+            // and its row is recorded `failed` (the job is then retried),
+            // instead of the job budget dropping the whole scan with this row
+            // and every later one left `running`. In-process scans run as
+            // before.
+            match crate::services::scan_queue::within_job_deadline(
+                scanner.name(),
+                scanner.scan_target(&target, metadata.as_ref(), &content),
+            )
+            .await
             {
                 Ok(ScanOutput {
                     findings,
@@ -12620,6 +12696,7 @@ mod tests {
             trivy_url,
             trivy_adapter_url,
             incus_scanner_enabled,
+            false,
             storage,
             storage_registry,
             "/tmp/ak-incus-construction-test".to_string(),
@@ -15269,6 +15346,98 @@ mod tests {
             "timeout did not fire promptly; elapsed was {:?}",
             elapsed
         );
+    }
+
+    /// #5942: unset, blank, garbage or `0` is no limit (the behaviour before
+    /// the knob), so a scan that finishes today cannot start failing.
+    #[test]
+    fn scanner_process_timeout_is_off_unless_set() {
+        assert_eq!(parse_scanner_process_timeout(None), None);
+        assert_eq!(parse_scanner_process_timeout(Some("")), None);
+        assert_eq!(parse_scanner_process_timeout(Some("soon")), None);
+        assert_eq!(parse_scanner_process_timeout(Some("-1")), None);
+        assert_eq!(parse_scanner_process_timeout(Some("0")), None);
+        assert_eq!(
+            parse_scanner_process_timeout(Some(" 900 ")),
+            Some(Duration::from_secs(900))
+        );
+    }
+
+    /// `sh -c` that records its pid, then sleeps `secs` and prints `done`.
+    #[cfg(unix)]
+    fn sleeping_child(pidfile: &std::path::Path, secs: u32) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "echo $$ > '{}'; exec sleep {secs}",
+                pidfile.display()
+            ))
+            .kill_on_drop(true);
+        command
+    }
+
+    /// #5942: a local scanner process past `SCANNER_PROCESS_TIMEOUT_SECS` is
+    /// stopped (killed through `kill_on_drop`, not orphaned) and the scan gets
+    /// an error naming the limit. One that finishes inside the limit returns
+    /// its output untouched, and with no limit nothing changes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_local_scanner_process_past_its_limit_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+
+        let started = std::time::Instant::now();
+        let err = wait_scanner_process_with_limit(
+            "grype",
+            Some(Duration::from_secs(1)),
+            sleeping_child(&pidfile, 600).output(),
+        )
+        .await
+        .expect_err("a hung process must time out");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(
+            err.to_string()
+                .contains("grype did not finish within SCANNER_PROCESS_TIMEOUT_SECS=1s"),
+            "{err}"
+        );
+        let pid = std::fs::read_to_string(&pidfile).unwrap();
+        let stat = std::path::PathBuf::from(format!("/proc/{}/stat", pid.trim()));
+        if std::path::Path::new("/proc/self/stat").exists() {
+            // Killed: gone, or a zombie until tokio reaps it.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let alive = std::fs::read_to_string(&stat)
+                    .map(|s| !s.contains(") Z "))
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the timed-out child {} is still running",
+                    pid.trim()
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        let mut slow = tokio::process::Command::new("/bin/sh");
+        slow.args(["-c", "sleep 1; echo done"]).kill_on_drop(true);
+        let out =
+            wait_scanner_process_with_limit("grype", Some(Duration::from_secs(20)), slow.output())
+                .await
+                .expect("inside the limit")
+                .expect("spawned");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
+
+        let mut quick = tokio::process::Command::new("/bin/sh");
+        quick.args(["-c", "echo done"]);
+        let out = wait_scanner_process_with_limit("grype", None, quick.output())
+            .await
+            .expect("no limit")
+            .expect("spawned");
+        assert!(out.status.success());
     }
 
     /// Default `Scanner::version()` returns None so existing scanners
@@ -29913,6 +30082,442 @@ tonic-build = "0.12"
         fx.teardown().await;
     }
 
+    /// #5942: in a queued job, two scanners that never return share the job's
+    /// budget. Each is stopped at the deadline and its row recorded `failed`
+    /// with the retry message (not left `running` for the janitor), the scope
+    /// reports the timeout so the worker retries the job, and a scanner after
+    /// them that answers at once still completes. Real time, not a paused
+    /// clock: the scan does Postgres I/O between the scanners.
+    #[tokio::test]
+    async fn test_hung_scanners_in_a_queued_job_stop_at_its_shared_deadline() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        struct HungScanner(&'static str);
+        #[async_trait::async_trait]
+        impl Scanner for HungScanner {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn scan_type(&self) -> &str {
+                self.0
+            }
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<ScanOutput> {
+                std::future::pending().await
+            }
+        }
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = Uuid::new_v4();
+        let checksum = fresh_checksum();
+        let storage_key = format!("scanner-deadline/{artifact_id}.bin");
+        fx.state
+            .storage
+            .put(&storage_key, Bytes::from_static(b"data"))
+            .await
+            .expect("store artifact bytes");
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, checksum_sha256, \
+                                    content_type, storage_key, is_deleted) \
+             VALUES ($1, $2, 'pkg.bin', 'pkg.bin', 4, $3, 'application/octet-stream', $4, false)",
+        )
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(&checksum)
+        .bind(&storage_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert artifact");
+        let mut scanner = scanner_for_fixture(&fx);
+        scanner.scanners = vec![
+            Arc::new(HungScanner("grype")),
+            Arc::new(HungScanner("filesystem")),
+            Arc::new(inline_proxy_scan_fixtures::TrivialDependencyScanner),
+        ];
+
+        let budget = std::time::Duration::from_secs(2);
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::services::scan_queue::with_job_deadline(
+                started + budget,
+                budget,
+                scanner.scan_artifact_with_options(artifact_id, true, true),
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT scan_type, status, error_message FROM scan_results \
+             WHERE artifact_id = $1 ORDER BY scan_type",
+        )
+        .bind(artifact_id)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("read scan rows");
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        let (result, timed_out) = outcome.expect("the scan must return at the job deadline");
+        result.expect("scan orchestration succeeds");
+        assert!(
+            timed_out,
+            "the worker must see the timeout to retry the job"
+        );
+        assert!(
+            elapsed < budget * 2,
+            "two hung scanners must share one budget, took {elapsed:?}"
+        );
+        let summary: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|(t, s, _)| (t.as_str(), s.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("dependency", "completed"),
+                ("filesystem", "failed"),
+                ("grype", "failed")
+            ],
+            "{rows:?}"
+        );
+        for (scan_type, _, error) in &rows[1..] {
+            let error = error.as_deref().unwrap_or_default();
+            assert!(
+                error.contains(&format!("scanner {scan_type} was stopped"))
+                    && error.contains("2s budget"),
+                "{rows:?}"
+            );
+        }
+    }
+
+    /// #5942 review: a queued on-demand scan whose grype attempt timed out and
+    /// whose retry succeeds. The retry scans into the same pre-allocated row,
+    /// so the row must end a clean `completed` (no stale error, inventory not
+    /// `failed`), not keep the first attempt's leftovers. And the
+    /// `block_on_fail` hold the failed attempt put on the artifact is released
+    /// by the successful retry (#5153), so the hold lasts only between
+    /// attempts. The failed row is seeded with a finding and a package, as an
+    /// attempt that stored them and then failed to complete (#5564) leaves
+    /// it: the retry must hold ONE attempt's findings, not both, and the
+    /// janitor must time the retry from its own start.
+    #[tokio::test]
+    async fn a_retry_after_a_timed_out_attempt_completes_the_row_and_releases_the_hold() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct HangsOnce(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Scanner for HangsOnce {
+            fn name(&self) -> &str {
+                "grype"
+            }
+            fn scan_type(&self) -> &str {
+                "grype"
+            }
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<ScanOutput> {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    std::future::pending::<()>().await;
+                }
+                Ok(ScanOutput {
+                    findings: vec![RawFinding {
+                        severity: Severity::Low,
+                        title: "CVE-2026-5942 in libretry".to_string(),
+                        description: None,
+                        cve_id: Some("CVE-2026-5942".to_string()),
+                        affected_component: Some("libretry".to_string()),
+                        affected_version: Some("1.0.0".to_string()),
+                        fixed_version: None,
+                        source: None,
+                        source_url: None,
+                        finding_class: Default::default(),
+                    }],
+                    packages: vec![RawPackage {
+                        name: "libretry".to_string(),
+                        version: Some("1.0.0".to_string()),
+                        purl: None,
+                        license: None,
+                        source_target: None,
+                    }],
+                    ..ScanOutput::default()
+                })
+            }
+        }
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = Uuid::new_v4();
+        insert_test_artifact(&fx, artifact_id, "scanner-retry", None, None).await;
+        seed_enabled_policy(&fx.pool, fx.repo_id, &format!("retry-{artifact_id}")).await;
+        let mut scanner = scanner_for_fixture(&fx);
+        scanner.scanners = vec![Arc::new(HangsOnce(Arc::new(AtomicUsize::new(0))))];
+        let prepared = prepared_pairs_to_map(
+            scanner
+                .prepare_artifact_scan(artifact_id, true, false)
+                .await
+                .expect("prepare"),
+        );
+        let row_id = prepared["grype"];
+        let row = |pool: PgPool| async move {
+            sqlx::query_as::<_, (String, Option<String>, String, bool)>(
+                "SELECT status, error_message, inventory_status, completed_at IS NOT NULL \
+                 FROM scan_results WHERE id = $1",
+            )
+            .bind(row_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read row")
+        };
+        let attempt = |deadline_secs: u64| {
+            let budget = std::time::Duration::from_secs(deadline_secs);
+            crate::services::scan_queue::with_job_deadline(
+                tokio::time::Instant::now() + budget,
+                budget,
+                scanner.scan_artifact_with_prepared(artifact_id, prepared.clone(), true, false),
+            )
+        };
+
+        let source = |pool: PgPool| async move {
+            sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                "SELECT quarantine_status, quarantine_source FROM artifacts WHERE id = $1",
+            )
+            .bind(artifact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read hold")
+        };
+
+        let (first, timed_out) = attempt(1).await;
+        let after_first = row(fx.pool.clone()).await;
+        let hold_first = source(fx.pool.clone()).await;
+        // What an attempt that stored its findings and then failed leaves.
+        sqlx::query(
+            "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title) \
+             VALUES ($1, $2, 'low', 'CVE-2026-5942 in libretry')",
+        )
+        .bind(row_id)
+        .bind(artifact_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed finding");
+        sqlx::query(
+            "INSERT INTO scan_packages (scan_result_id, artifact_id, name, version) \
+             VALUES ($1, $2, 'libretry', '1.0.0')",
+        )
+        .bind(row_id)
+        .bind(artifact_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed package");
+        let started_first: DateTime<Utc> =
+            sqlx::query_scalar("SELECT started_at FROM scan_results WHERE id = $1")
+                .bind(row_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("read started_at");
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let (db_before_retry,): (DateTime<Utc>,) = sqlx::query_as("SELECT now()")
+            .fetch_one(&fx.pool)
+            .await
+            .expect("db clock");
+        let (second, retry_timed_out) = attempt(30).await;
+        let after_second = row(fx.pool.clone()).await;
+        let hold_second = source(fx.pool.clone()).await;
+        // The #5153 release path audits QUARANTINE_RELEASED with
+        // released_by=scan, from a detached task: wait for it.
+        let mut releases = 0i64;
+        for _ in 0..50 {
+            releases = sqlx::query_scalar(
+                "SELECT count(*) FROM audit_log WHERE action = 'QUARANTINE_RELEASED' \
+                 AND resource_id = $1 AND details->>'released_by' = 'scan'",
+            )
+            .bind(artifact_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read audit");
+            if releases > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (findings, packages, findings_count, started_second): (i64, i64, i32, DateTime<Utc>) =
+            sqlx::query_as(
+                "SELECT (SELECT count(*) FROM scan_findings WHERE scan_result_id = $1), \
+                        (SELECT count(*) FROM scan_packages WHERE scan_result_id = $1), \
+                        findings_count, started_at FROM scan_results WHERE id = $1",
+            )
+            .bind(row_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read retried row");
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM scan_results WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count rows");
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        first.expect("first attempt orchestration succeeds");
+        assert!(timed_out, "the first attempt must report its timeout");
+        assert_eq!(after_first.0, "failed", "{after_first:?}");
+        assert!(after_first.1.is_some_and(|e| e.contains("was stopped")));
+        assert_eq!(after_first.2, "failed");
+        assert_eq!(
+            (hold_first.0.as_deref(), hold_first.1.as_deref()),
+            (Some("quarantined"), Some("scan_policy")),
+            "block_on_fail holds the artifact after the failed attempt"
+        );
+
+        second.expect("retry orchestration succeeds");
+        assert!(!retry_timed_out);
+        assert_eq!(rows, 1, "the retry reuses the trigger's row");
+        assert_eq!(
+            after_second,
+            ("completed".to_string(), None, "complete".to_string(), true),
+            "the retried row must not keep the timed-out attempt's leftovers"
+        );
+        assert_eq!(
+            (findings, packages, findings_count),
+            (1, 1, 1),
+            "the retry holds one attempt's findings and packages, not two"
+        );
+        assert!(
+            started_second >= db_before_retry && started_second > started_first,
+            "started_at must be the retry's own start: first {started_first}, \
+             retry began after {db_before_retry}, row says {started_second}"
+        );
+        // Released by the retry through the #5153 path
+        // (`release_cleared_scan_policy_hold_bound`): its audit row, and the
+        // scan_policy source it clears. The status then follows the retry's
+        // own verdict (`flagged`: one low finding the policy allows).
+        assert_eq!(releases, 1, "the retry must release the hold via #5153");
+        assert_eq!(
+            (hold_second.0.as_deref(), hold_second.1.as_deref()),
+            (Some("flagged"), None),
+            "no longer held; the source the release cleared stays cleared"
+        );
+    }
+
+    /// #5942 review: reopening a failed row resets it in one step, before the
+    /// retry runs: `running`, error, completion and counts cleared, the
+    /// attempt's findings and packages gone, and `started_at` moved to now so
+    /// the stuck-scan janitor times the retry from its own start (a row
+    /// queued 25 minutes ago would otherwise be reaped mid-retry). A row that
+    /// is not `failed` is left exactly as it was.
+    #[tokio::test]
+    async fn reopening_a_failed_row_resets_it_for_the_retry() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = Uuid::new_v4();
+        insert_test_artifact(&fx, artifact_id, "scanner-reopen", None, None).await;
+        let (failed_id, completed_id) = (Uuid::new_v4(), Uuid::new_v4());
+        for (id, status) in [(failed_id, "failed"), (completed_id, "completed")] {
+            sqlx::query(
+                "INSERT INTO scan_results (id, artifact_id, repository_id, scan_type, status, \
+                                           findings_count, low_count, error_message, \
+                                           inventory_status, started_at, completed_at) \
+                 VALUES ($1, $2, $3, 'grype', $4, 1, 1, 'attempt 1 timed out', 'failed', \
+                         NOW() - interval '25 minutes', NOW())",
+            )
+            .bind(id)
+            .bind(artifact_id)
+            .bind(fx.repo_id)
+            .bind(status)
+            .execute(&fx.pool)
+            .await
+            .expect("insert row");
+            sqlx::query(
+                "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title) \
+                 VALUES ($1, $2, 'low', 'CVE-2026-5942 in libretry')",
+            )
+            .bind(id)
+            .bind(artifact_id)
+            .execute(&fx.pool)
+            .await
+            .expect("insert finding");
+            sqlx::query(
+                "INSERT INTO scan_packages (scan_result_id, artifact_id, name) \
+                 VALUES ($1, $2, 'libretry')",
+            )
+            .bind(id)
+            .bind(artifact_id)
+            .execute(&fx.pool)
+            .await
+            .expect("insert package");
+        }
+        let svc = ScanResultService::new(fx.pool.clone());
+        let reopened = svc.reopen_failed_scan(failed_id).await.expect("reopen");
+        let untouched = svc
+            .reopen_failed_scan(completed_id)
+            .await
+            .expect("reopen completed");
+        type Row = (String, Option<String>, bool, String, i32, i64, i64, bool);
+        let read = |id: Uuid| {
+            let pool = fx.pool.clone();
+            async move {
+                sqlx::query_as::<_, Row>(
+                    "SELECT status, error_message, completed_at IS NOT NULL, inventory_status, \
+                            findings_count, \
+                            (SELECT count(*) FROM scan_findings WHERE scan_result_id = $1), \
+                            (SELECT count(*) FROM scan_packages WHERE scan_result_id = $1), \
+                            started_at > NOW() - interval '1 minute' \
+                     FROM scan_results WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("read row")
+            }
+        };
+        let failed = read(failed_id).await;
+        let completed = read(completed_id).await;
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        assert!(reopened);
+        assert_eq!(
+            failed,
+            (
+                "running".to_string(),
+                None,
+                false,
+                "complete".to_string(),
+                0,
+                0,
+                0,
+                true
+            ),
+            "the failed row is reset for the retry, started_at included"
+        );
+        assert!(!untouched, "only a failed row is reopened");
+        assert_eq!(
+            completed,
+            (
+                "completed".to_string(),
+                Some("attempt 1 timed out".to_string()),
+                true,
+                "failed".to_string(),
+                1,
+                1,
+                1,
+                false
+            ),
+            "a row that is not failed is left exactly as it was"
+        );
+    }
+
     /// Records the [`ScanTarget::expected_component`] the orchestration hands
     /// each scanner, and replays a caller-supplied finding list. Both halves
     /// are needed by the #3442 tests: one asserts WHICH component the hosted
@@ -31302,9 +31907,10 @@ tonic-build = "0.12"
             advisory_client,
             scan_result_service,
             scan_config_service,
-            None, // trivy_url: skip fs / incus scanners
-            None, // trivy_adapter_url: skip image scanner
-            true, // incus_scanner_enabled (irrelevant without a Trivy URL)
+            None,  // trivy_url: skip fs / incus scanners
+            None,  // trivy_adapter_url: skip image scanner
+            true,  // incus_scanner_enabled (irrelevant without a Trivy URL)
+            false, // trivy_ignore_embedded_pom_declarations (likewise)
             storage,
             storage_registry,
             storage_base_path,
