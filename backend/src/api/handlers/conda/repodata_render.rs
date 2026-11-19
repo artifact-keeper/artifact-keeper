@@ -134,18 +134,16 @@ async fn listing(
             }
             continue;
         }
-        let row_id = id;
-        latest
-            .entry(name)
-            .or_insert_with(|| (filename.clone(), row_id));
-        if is_conda_package(&filename) {
-            out.full.insert(filename, row_id);
+        // Only a package can be the newest record of its name: a non-package
+        // row marks no revision (#6090), so it must not hide one here.
+        if !is_conda_package(&filename) {
+            continue;
         }
+        latest.entry(name).or_insert_with(|| (filename.clone(), id));
+        out.full.insert(filename, id);
     }
     for (filename, id) in latest.into_values() {
-        if is_conda_package(&filename) {
-            out.current.insert(filename, id);
-        }
+        out.current.insert(filename, id);
     }
     out.refused.retain(|f| !out.full.contains_key(f));
     Ok(out)
