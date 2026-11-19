@@ -20,12 +20,15 @@ repeat activation logs. Detection normally takes up to one poll interval,
 plus filesystem propagation, file I/O, and replacement-client construction.
 There is no hard wall-clock guarantee for an unresponsive network filesystem.
 
-Every HTTP client built through `services::http_client` shares this mechanism,
-including health probes, repository egress, scanner integrations, SSO/OIDC,
-webhooks, import clients, and the HTTP clients used by Azure/GCS storage.
-All live client clones select replacement connection pools after activation.
-Existing SSRF trust classes, proxy settings, redirects, timeouts, and TLS
-verification settings are replayed when each client is rebuilt.
+Retained pools opt in to automatic replacement. These include health probes,
+repository egress, scanner integrations, retained OIDC services, import
+clients, and Azure/GCS HTTP data-plane clients. Ordinary clients, such as
+one-shot SSO, webhook and metadata requests, take the active trust snapshot
+when built and keep it for that operation. They do not register a pool.
+
+For each retained pool the backend rebuilds with the original SSRF, proxy,
+redirect, timeout, and TLS verification settings. Rustls clients use the
+crypto provider selected during startup on both the first build and reload.
 
 ## Removals and requests already in progress
 

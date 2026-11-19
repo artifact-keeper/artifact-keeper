@@ -370,7 +370,7 @@ pub async fn spawn_sync_worker(db: PgPool, storage_registry: Arc<StorageRegistry
         tokio::time::sleep(Duration::from_secs(5)).await;
         let mut tick = interval(Duration::from_secs(TICK_INTERVAL_SECS));
         let connect_timeout = peer_connect_timeout_secs();
-        let client = crate::services::http_client::base_client_builder()
+        let client = crate::services::http_client::reloadable_base_client_builder()
             .timeout(Duration::from_secs(300))
             // Bound the connect phase so an unreachable peer in a fan-out
             // fails fast instead of holding a transfer slot for the full
@@ -525,7 +525,7 @@ async fn run_stale_peer_detection(db: &PgPool, threshold_minutes: i32) {
 
 async fn run_peer_heartbeat_probes(
     db: &PgPool,
-    client: &crate::services::http_client::Client,
+    client: &crate::services::http_client::ReloadableClient,
     request_timeout: Duration,
 ) {
     let peers: Vec<PeerHeartbeatRow> = match sqlx::query_as(
@@ -569,7 +569,7 @@ async fn run_peer_heartbeat_probes(
 }
 
 async fn probe_peer(
-    client: &crate::services::http_client::Client,
+    client: &crate::services::http_client::ReloadableClient,
     peer: &PeerHeartbeatRow,
     request_timeout: Duration,
 ) -> Result<(), String> {
@@ -1145,7 +1145,7 @@ async fn extend_sync_task_claim(db: &PgPool, task: &Claimed<TaskRow>, claim_ttl_
 /// Process all eligible peers and their pending sync tasks.
 async fn process_pending_tasks(
     db: &PgPool,
-    client: &crate::services::http_client::Client,
+    client: &crate::services::http_client::ReloadableClient,
     storage_registry: Arc<StorageRegistry>,
     retry_policy: SyncRetryPolicy,
 ) -> Result<(), String> {
@@ -1362,7 +1362,7 @@ async fn process_pending_tasks(
 /// finalizer below re-asserts the claim token before writing.
 async fn execute_transfer(
     db: &PgPool,
-    client: &crate::services::http_client::Client,
+    client: &crate::services::http_client::ReloadableClient,
     storage_registry: Arc<StorageRegistry>,
     task: &Claimed<TaskRow>,
     peer_endpoint: &str,
@@ -1540,7 +1540,7 @@ async fn execute_transfer(
 /// fails, a different digest, a task with no checksum — is not applied, and
 /// the caller keeps the failure.
 async fn peer_already_holds_pushed_bytes(
-    client: &crate::services::http_client::Client,
+    client: &crate::services::http_client::ReloadableClient,
     peer_endpoint: &str,
     peer_api_key: &str,
     task: &TaskRow,
@@ -1752,7 +1752,7 @@ async fn child_manifest_content_type(db: &PgPool, repo_id: Uuid, digest: &str) -
 /// by the peer, so a partially transferred image never becomes pullable.
 async fn execute_oci_transfer(
     db: &PgPool,
-    client: &crate::services::http_client::Client,
+    client: &crate::services::http_client::ReloadableClient,
     storage_registry: &StorageRegistry,
     task: &Claimed<TaskRow>,
     peer_endpoint: &str,
@@ -1950,7 +1950,7 @@ fn oci_manifest_replication_headers(
 /// artifact row + storage object on completion.
 async fn execute_chunked_transfer(
     db: &PgPool,
-    client: &crate::services::http_client::Client,
+    client: &crate::services::http_client::ReloadableClient,
     storage_registry: &StorageRegistry,
     task: &Claimed<TaskRow>,
     peer_endpoint: &str,
@@ -2154,7 +2154,7 @@ async fn execute_chunked_transfer(
 /// Execute a delete task: tell the remote peer to remove an artifact.
 async fn execute_delete(
     db: &PgPool,
-    client: &crate::services::http_client::Client,
+    client: &crate::services::http_client::ReloadableClient,
     task: &Claimed<TaskRow>,
     peer_endpoint: &str,
     peer_api_key: &str,
@@ -3057,7 +3057,7 @@ pub(crate) fn build_content_range(byte_offset: i64, byte_length: i32, total_size
 }
 
 async fn cancel_chunked_upload_session(
-    client: &crate::services::http_client::Client,
+    client: &crate::services::http_client::ReloadableClient,
     peer_endpoint: &str,
     peer_api_key: &str,
     session_id: &Uuid,
@@ -6122,7 +6122,7 @@ mod tests {
         ));
         execute_transfer(
             &f.pool,
-            &crate::services::http_client::Client::new(),
+            &crate::services::http_client::ReloadableClient::new(),
             registry,
             &claimed[0],
             &server.uri(),
@@ -7518,7 +7518,7 @@ mod tests {
         let claimed = claim_pending_sync_tasks(pool, peer_id, 5, 5, 3, "worker-5699", 60.0)
             .await
             .expect("claim");
-        let client: crate::services::http_client::Client = reqwest::Client::new().into();
+        let client: crate::services::http_client::ReloadableClient = reqwest::Client::new().into();
         let runs = claimed.iter().map(|task| {
             execute_transfer(
                 pool,

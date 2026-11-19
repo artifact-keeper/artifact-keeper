@@ -327,6 +327,38 @@ async fn an_in_flight_response_finishes_after_its_root_is_removed() {
 }
 
 #[tokio::test]
+async fn short_lived_clients_use_current_trust_without_registering_a_pool() {
+    let a = TestCa::new();
+    let b = TestCa::new();
+    let server_a = TlsServer::start(&a).await;
+    let server_b = TlsServer::start(&b).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bundle.pem");
+    publish(&path, &a.pem);
+    let manager = manager(path.clone());
+    let snapshot = || {
+        manager
+            .snapshot(
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_secs(3)),
+            )
+            .build()
+            .unwrap()
+    };
+    let original = snapshot();
+    assert!(original.get(server_a.url()).send().await.is_ok());
+
+    publish(&path, &b.pem);
+    assert!(manager.refresh());
+    let current = snapshot();
+    assert!(current.get(server_b.url()).send().await.is_ok());
+    assert!(current.get(server_a.url()).send().await.is_err());
+    assert!(original.get(server_b.url()).send().await.is_err());
+    assert!(manager.state.read().unwrap().clients.is_empty());
+}
+
+#[tokio::test]
 async fn mixed_pem_bundle_keeps_its_certificate_roots_on_startup_and_reload() {
     let a = TestCa::new();
     let b = TestCa::new();

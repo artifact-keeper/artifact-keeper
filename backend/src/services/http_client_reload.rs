@@ -207,6 +207,11 @@ impl TrustManager {
         true
     }
 
+    fn snapshot(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        let state = self.state.read().unwrap_or_else(|e| e.into_inner());
+        state.bundle.apply(builder)
+    }
+
     fn register(self: &Arc<Self>, factory: Factory) -> Result<Client, reqwest::Error> {
         let _update = self.update.lock().unwrap_or_else(|e| e.into_inner());
         let bundle = self
@@ -230,6 +235,12 @@ impl TrustManager {
             },
         })
     }
+}
+
+fn custom_ca_path() -> Option<PathBuf> {
+    std::env::var_os("CUSTOM_CA_CERT_PATH")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
 }
 
 fn manager_for(path: PathBuf) -> Arc<TrustManager> {
@@ -393,9 +404,19 @@ impl ClientBuilder {
         Self::new(move || configure((self.factory)()))
     }
 
+    /// A short-lived client needs only the latest trust snapshot. It does not
+    /// register a pool or keep its builder factory alive.
+    pub(super) fn snapshot(self) -> reqwest::ClientBuilder {
+        let builder = (self.factory)();
+        let Some(path) = custom_ca_path() else {
+            return builder;
+        };
+        manager_for(path).snapshot(builder)
+    }
+
     pub fn build(self) -> Result<Client, reqwest::Error> {
-        match std::env::var_os("CUSTOM_CA_CERT_PATH").filter(|path| !path.is_empty()) {
-            Some(path) => manager_for(path.into()).register(self.factory),
+        match custom_ca_path() {
+            Some(path) => manager_for(path).register(self.factory),
             None => (self.factory)().build().map(Into::into),
         }
     }

@@ -319,11 +319,11 @@ enum TokenSource {
 struct GcsTokenProvider {
     source: TokenSource,
     cache: RwLock<Option<CachedToken>>,
-    client: crate::services::http_client::Client,
+    client: crate::services::http_client::ReloadableClient,
 }
 
 impl GcsTokenProvider {
-    fn new(source: TokenSource, client: crate::services::http_client::Client) -> Self {
+    fn new(source: TokenSource, client: crate::services::http_client::ReloadableClient) -> Self {
         Self {
             source,
             cache: RwLock::new(None),
@@ -447,7 +447,7 @@ impl GcsTokenProvider {
 /// Build the HTTP client used exclusively for the GCE metadata server token
 /// endpoint ([`GCP_METADATA_TOKEN_URL`]).
 ///
-/// This deliberately does NOT use `http_client::base_client_builder()`: that
+/// This deliberately does NOT use `http_client::reloadable_base_client_builder()`: that
 /// builder installs the SSRF-guard DNS resolver, which hard-blocks
 /// cloud-metadata / link-local addresses in every trust class — so
 /// `metadata.google.internal` (169.254.169.254) can never connect through it
@@ -460,7 +460,7 @@ impl GcsTokenProvider {
 /// metadata host, and proxy env vars are ignored because the link-local
 /// metadata endpoint must always be dialed directly, never via an egress
 /// proxy.
-fn metadata_server_client() -> Result<crate::services::http_client::Client> {
+fn metadata_server_client() -> Result<crate::services::http_client::ReloadableClient> {
     crate::services::http_client::plain_client_builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
@@ -647,12 +647,12 @@ pub struct GcsBackend {
     /// stuck control op fails fast. ADC / Workload Identity token fetches use
     /// the dedicated [`metadata_server_client`] instead — this client's
     /// SSRF-guard resolver blocks the metadata server's link-local address.
-    client: crate::services::http_client::Client,
+    client: crate::services::http_client::ReloadableClient,
     /// Long-timeout client used only for the streaming GET (`get_stream`) and
     /// the resumable PUT chunks in `put_stream`. A multi-GiB resumable upload's
     /// total can run for many minutes; bounding it at 30 min keeps a cliff in
     /// place without leaking that long timeout onto fast control-plane calls.
-    stream_client: crate::services::http_client::Client,
+    stream_client: crate::services::http_client::ReloadableClient,
     auth: GcsAuthMode,
     path_format: StoragePathFormat,
     /// API base URL. Defaults to [`GCS_BASE_URL`]; set to a custom endpoint
@@ -676,7 +676,7 @@ impl GcsBackend {
         // STORAGE_CONNECT_TIMEOUT_SECS on both clients, so a stopped endpoint
         // is reported unavailable instead of stalling for the whole timeout.
         let connect_timeout = crate::storage::StorageTimeouts::from_env().connect;
-        let client = crate::services::http_client::base_client_builder()
+        let client = crate::services::http_client::reloadable_base_client_builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(connect_timeout)
             .build()
@@ -686,7 +686,7 @@ impl GcsBackend {
         // many minutes; bound the cliff at 30 min. Per-chunk PUTs stay well
         // under this on intra-GCP networking, but the streaming GET of a large
         // object can legitimately run long.
-        let stream_client = crate::services::http_client::base_client_builder()
+        let stream_client = crate::services::http_client::reloadable_base_client_builder()
             .timeout(Duration::from_secs(1800))
             .connect_timeout(connect_timeout)
             .build()
@@ -3119,7 +3119,7 @@ mod tests {
     async fn test_ssrf_guarded_client_cannot_fetch_metadata_token_by_hostname() {
         let (_server, token_url) = mock_metadata_server().await;
 
-        let guarded = crate::services::http_client::base_client_builder()
+        let guarded = crate::services::http_client::reloadable_base_client_builder()
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap();
@@ -3153,7 +3153,7 @@ mod tests {
             path_format,
             endpoint: None,
         };
-        let client = crate::services::http_client::Client::new();
+        let client = crate::services::http_client::ReloadableClient::new();
         let provider = GcsTokenProvider::new(
             TokenSource::MetadataServer {
                 token_url: GCP_METADATA_TOKEN_URL.to_string(),

@@ -3,7 +3,7 @@
 //! Monitors service health, tracks state transitions, fires webhook alerts,
 //! and manages alert suppression to prevent spam during extended outages.
 
-use crate::services::http_client::Client;
+use crate::services::http_client::ReloadableClient as Client;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -157,9 +157,10 @@ pub(crate) async fn probe_http_endpoint(
 
 impl HealthMonitorService {
     pub fn new(db: PgPool, config: MonitorConfig) -> Self {
-        let http_client = crate::services::http_client::internal_service_client_builder()
-            .timeout(Duration::from_secs(config.check_timeout_secs))
-            .build();
+        let http_client =
+            crate::services::http_client::reloadable_internal_service_client_builder()
+                .timeout(Duration::from_secs(config.check_timeout_secs))
+                .build();
 
         Self {
             db,
@@ -1016,7 +1017,7 @@ mod tests {
         });
 
         // Plain client: no SSRF resolver. Only testing header attachment.
-        let client = crate::services::http_client::Client::builder()
+        let client = crate::services::http_client::ReloadableClient::builder()
             .no_proxy()
             .timeout(Duration::from_secs(2))
             .build()

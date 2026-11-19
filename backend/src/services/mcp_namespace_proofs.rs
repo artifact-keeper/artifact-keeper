@@ -108,7 +108,7 @@ pub fn http_body_matches(body: &[u8], expected: &str) -> bool {
         .any(|l| l.trim() == expected)
 }
 
-fn client() -> Result<crate::services::http_client::Client, String> {
+fn client() -> Result<reqwest::Client, String> {
     crate::services::http_client::base_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(TIMEOUT)

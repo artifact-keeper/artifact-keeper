@@ -387,7 +387,7 @@ fn gate_detailed_health_fields(
 /// services (Trivy, OpenSCAP).
 ///
 /// Uses the **trusted-internal** client class
-/// ([`internal_service_client_builder`]), not the fail-closed upstream
+/// ([`reloadable_internal_service_client_builder`]), not the fail-closed upstream
 /// class: the probe targets come exclusively from server configuration
 /// (`TRIVY_URL` / `OPENSCAP_URL`), never from request input, and in the
 /// normal in-cluster / Compose topology they resolve to private-network
@@ -397,17 +397,19 @@ fn gate_detailed_health_fields(
 /// `HealthMonitorService` and the scan clients for the same endpoints.
 /// Cloud-metadata, loopback and link-local targets stay hard-blocked.
 ///
-/// [`internal_service_client_builder`]: crate::services::http_client::internal_service_client_builder
-fn build_service_probe_client() -> Result<crate::services::http_client::Client, reqwest::Error> {
-    crate::services::http_client::internal_service_client_builder()
+/// [`reloadable_internal_service_client_builder`]: crate::services::http_client::reloadable_internal_service_client_builder
+fn build_service_probe_client(
+) -> Result<crate::services::http_client::ReloadableClient, reqwest::Error> {
+    crate::services::http_client::reloadable_internal_service_client_builder()
         .timeout(Duration::from_secs(5))
         .build()
 }
 
 /// Shared probe client. Clones reuse its pool until a validated custom-CA
 /// revision replaces it; polling and PEM parsing happen off the async workers.
-static SERVICE_PROBE_CLIENT: Lazy<Result<crate::services::http_client::Client, reqwest::Error>> =
-    Lazy::new(build_service_probe_client);
+static SERVICE_PROBE_CLIENT: Lazy<
+    Result<crate::services::http_client::ReloadableClient, reqwest::Error>,
+> = Lazy::new(build_service_probe_client);
 
 /// Probe an external service health endpoint and return a CheckStatus.
 async fn check_service_health(

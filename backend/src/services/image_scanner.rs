@@ -8,7 +8,7 @@ use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::user::User;
 use crate::services::auth_service::AuthService;
-use crate::services::http_client::Client;
+use crate::services::http_client::ReloadableClient as Client;
 use crate::services::scanner_adapter_client::{
     adapter_reports_too_large, adapter_status_is_unreachable, initial_adapter_ready_wait,
     log_adapter_ready_outcome, probe_adapter_ready, wait_until_adapter_ready,

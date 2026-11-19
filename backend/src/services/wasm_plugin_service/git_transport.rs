@@ -67,7 +67,7 @@ fn guarded_transport(remote: &Remote<'_>) -> Result<Transport, git2::Error> {
 
 struct GuardedHttp {
     handle: tokio::runtime::Handle,
-    client: crate::services::http_client::Client,
+    client: reqwest::Client,
     /// The repository URL, fixed by the first action and moved if the
     /// reference advertisement was redirected (so the pack request follows).
     base_url: Arc<Mutex<Option<String>>>,
@@ -139,7 +139,7 @@ impl RequestKind {
 /// reads; the request is sent on the first read.
 struct GuardedHttpStream {
     handle: tokio::runtime::Handle,
-    client: crate::services::http_client::Client,
+    client: reqwest::Client,
     base_url: Arc<Mutex<Option<String>>>,
     url: String,
     request: RequestKind,

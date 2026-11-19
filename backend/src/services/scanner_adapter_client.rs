@@ -38,7 +38,10 @@
 use std::path::Path;
 
 use crate::error::{AppError, Result};
-use crate::services::http_client::{internal_service_client_builder, Client, ClientBuilder};
+use crate::services::http_client::{
+    reloadable_internal_service_client_builder, ReloadableClient as Client,
+    ReloadableClientBuilder as ClientBuilder,
+};
 use crate::services::image_scanner::TrivyReport;
 
 /// Default cap on the tarred filesystem workspace uploaded to the adapter
@@ -731,12 +734,12 @@ impl AdapterHttpClients {
         request_timeout: std::time::Duration,
     ) -> std::result::Result<Self, reqwest::Error> {
         let request = auth
-            .apply(internal_service_client_builder())
+            .apply(reloadable_internal_service_client_builder())
             .timeout(request_timeout)
             .build()?;
         // A 302 marks a pending report; following it would hide that status.
         let poll = auth
-            .apply(internal_service_client_builder())
+            .apply(reloadable_internal_service_client_builder())
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(30))
             .build()?;

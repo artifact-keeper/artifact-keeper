@@ -18,7 +18,7 @@
 //! `not_applicable` with the reason, through
 //! [`AppError::ScannerEngineUnavailable`]. It is never recorded as a pass.
 
-use crate::services::http_client::Client;
+use crate::services::http_client::ReloadableClient as Client;
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::Deserialize;
@@ -150,7 +150,7 @@ fn workspace_create_error(base: &str, err: &std::io::Error) -> AppError {
 
 impl OpenScapScanner {
     pub fn new(openscap_url: String, profile: String, scan_workspace: String) -> Self {
-        let http = crate::services::http_client::internal_service_client_builder()
+        let http = crate::services::http_client::reloadable_internal_service_client_builder()
             .timeout(Duration::from_secs(600))
             .build()
             .expect("failed to build HTTP client");

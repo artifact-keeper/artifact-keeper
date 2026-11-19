@@ -1,12 +1,16 @@
 //! Shared HTTP client builder with custom CA certificate support.
 //!
-//! All code that creates a `Client` should call [`default_client`] for
+//! For short-lived clients, call [`default_client`] for
 //! a ready-to-use client, or [`base_client_builder`] when extra configuration
 //! (timeouts, user-agent, etc.) is needed before building. This ensures that
 //! custom CA certificates (configured via `CUSTOM_CA_CERT_PATH`) are loaded
-//! consistently across the application.
+//! consistently across the application. Use the explicit reloadable builders
+//! for pools that are retained beyond a single operation.
 
-pub use super::http_client_reload::{Client, ClientBuilder};
+use super::http_client_reload::ClientBuilder;
+pub use super::http_client_reload::{
+    Client as ReloadableClient, ClientBuilder as ReloadableClientBuilder,
+};
 use reqwest::redirect::Policy;
 use std::time::Duration;
 
@@ -122,8 +126,13 @@ fn warn_on_env_proxy_posture(
 /// removes the routing but keeps the destination-check connector layer, so
 /// the fail-closed checks continue for any destination the environment
 /// proxy would have carried; a caller with its own routing should start from
-/// [`base_client_builder_without_env_proxy`] instead.
-pub fn base_client_builder() -> ClientBuilder {
+/// [`reloadable_base_client_builder_without_env_proxy`] instead.
+pub fn base_client_builder() -> reqwest::ClientBuilder {
+    reloadable_base_client_builder().snapshot()
+}
+
+/// Builder for a retained upstream pool.
+pub fn reloadable_base_client_builder() -> ReloadableClientBuilder {
     use crate::services::env_proxy_guard::{upstream_env_proxy_mode, UpstreamEnvProxyMode};
     let guard = match upstream_env_proxy_mode() {
         UpstreamEnvProxyMode::Check => Some(EnvProxyGuard::from_env(
@@ -137,7 +146,7 @@ pub fn base_client_builder() -> ClientBuilder {
 /// [`base_client_builder`] that never uses the environment proxy, for a
 /// caller that sets its own routing (a per-repository `direct` or
 /// `explicit` egress proxy).
-pub fn base_client_builder_without_env_proxy() -> ClientBuilder {
+pub fn reloadable_base_client_builder_without_env_proxy() -> ReloadableClientBuilder {
     upstream_client_builder(None)
 }
 
@@ -230,7 +239,7 @@ pub(crate) fn upstream_client_builder(guard: Option<EnvProxyGuard>) -> ClientBui
 /// for attacker/user-influenceable targets (remote-repo upstreams, proxy
 /// URLs, webhooks, plugins) — those keep using [`base_client_builder`], which
 /// stays fail-closed.
-pub fn internal_service_client_builder() -> ClientBuilder {
+pub fn reloadable_internal_service_client_builder() -> ReloadableClientBuilder {
     log_proxy_env();
 
     let guard =
@@ -254,7 +263,11 @@ pub fn internal_service_client_builder() -> ClientBuilder {
 /// identical to [`base_client_builder`] (fail-closed), and cloud-metadata,
 /// loopback and link-local addresses stay hard-blocked at connect time and
 /// across redirects regardless of any toggle.
-pub fn webhook_client_builder() -> ClientBuilder {
+pub fn webhook_client_builder() -> reqwest::ClientBuilder {
+    webhook_client_policy().snapshot()
+}
+
+fn webhook_client_policy() -> ClientBuilder {
     log_proxy_env();
 
     let guard = EnvProxyGuard::from_env(crate::api::validation::OutboundUrlContext::Webhook);
@@ -274,7 +287,7 @@ pub fn webhook_client_builder() -> ClientBuilder {
 /// [`webhook_client_builder`]).
 ///
 /// Panics if the client cannot be built (should not happen in practice).
-pub fn webhook_client() -> Client {
+pub fn webhook_client() -> reqwest::Client {
     webhook_client_builder()
         .build()
         .expect("failed to build webhook HTTP client")
@@ -303,7 +316,11 @@ pub fn webhook_client() -> Client {
 /// and a burst of logins tied up that many connections and tasks. A
 /// per-request `RequestBuilder::timeout` still overrides the total for the
 /// callers that want a tighter bound.
-pub fn sso_client_builder() -> ClientBuilder {
+pub fn sso_client_builder() -> reqwest::ClientBuilder {
+    sso_client_policy().snapshot()
+}
+
+fn sso_client_policy() -> ClientBuilder {
     log_proxy_env();
 
     let guard = EnvProxyGuard::from_env(crate::api::validation::OutboundUrlContext::SsoDiscovery);
@@ -340,10 +357,17 @@ pub const SSO_USER_AGENT: &str = DEFAULT_USER_AGENT;
 /// [`sso_client_builder`]).
 ///
 /// Panics if the client cannot be built (should not happen in practice).
-pub fn sso_client() -> Client {
+pub fn sso_client() -> reqwest::Client {
     sso_client_builder()
         .build()
         .expect("failed to build SSO HTTP client")
+}
+
+/// Build the pool retained by the OIDC and CI OIDC services.
+pub fn reloadable_sso_client() -> ReloadableClient {
+    sso_client_policy()
+        .build()
+        .expect("failed to build retained SSO HTTP client")
 }
 
 /// Maximum bytes accepted from an OIDC/SSO identity-provider JSON response
@@ -503,8 +527,8 @@ pub async fn read_idp_token_response(
 /// bound time spent streaming a large request *body*, so a stalled upstream
 /// that stops reading an upload is governed only by `connect_timeout` and
 /// connection-level (TCP) behavior, not by this timeout.
-pub fn large_object_client_builder(allow_http: bool) -> ClientBuilder {
-    base_client_builder()
+pub fn reloadable_large_object_client_builder(allow_http: bool) -> ReloadableClientBuilder {
+    reloadable_base_client_builder()
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(Duration::from_secs(30))
         .https_only(!allow_http)
@@ -515,24 +539,31 @@ pub fn large_object_client_builder(allow_http: bool) -> ClientBuilder {
 ///
 /// The storage service performs the whole copy before it sends a single
 /// response byte, so read inactivity is the copy's duration. The 30-second
-/// `read_timeout` of [`large_object_client_builder`] therefore aborts any copy
+/// `read_timeout` of [`reloadable_large_object_client_builder`] therefore aborts any copy
 /// that takes longer, even though the service is still working. This builder
 /// sets no read timeout. The caller MUST bound each request with
 /// [`reqwest::RequestBuilder::timeout`], sized to the bytes being copied.
-pub fn server_side_copy_client_builder(allow_http: bool) -> ClientBuilder {
-    base_client_builder()
+pub fn reloadable_server_side_copy_client_builder(allow_http: bool) -> ReloadableClientBuilder {
+    reloadable_base_client_builder()
         .connect_timeout(Duration::from_secs(10))
         .https_only(!allow_http)
 }
 
-/// Build and return a ready-to-use [`Client`] with custom CA
+/// Build and return a ready-to-use [`reqwest::Client`] with custom CA
 /// certificates and proxy support.
 ///
 /// Panics if the client cannot be built (should not happen in practice).
-pub fn default_client() -> Client {
+pub fn default_client() -> reqwest::Client {
     base_client_builder()
         .build()
         .expect("failed to build default HTTP client")
+}
+
+/// Build the upstream pool retained by a service.
+pub fn reloadable_default_client() -> ReloadableClient {
+    reloadable_base_client_builder()
+        .build()
+        .expect("failed to build retained HTTP client")
 }
 
 /// Default connect timeout (seconds) for the remote-instance proxy client.
@@ -541,18 +572,18 @@ const DEFAULT_PROXY_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// client.
 const DEFAULT_PROXY_READ_TIMEOUT_SECS: u64 = 30;
 
-/// Build a [`Client`] for the **remote-instance management proxy**
+/// Build a [`reqwest::Client`] for the **remote-instance management proxy**
 /// (`/api/v1/instances/:id/proxy/*`).
 ///
 /// Same SSRF trust class, redirect policy and plaintext/HTTP semantics as
 /// [`default_client`] — the proxy target is user-influenceable, so it stays
-/// fail-closed and is deliberately NOT switched to [`large_object_client_builder`],
+/// fail-closed and is deliberately NOT switched to [`reloadable_large_object_client_builder`],
 /// which would force `https_only` and change the existing behavior. The only
 /// addition is a `connect_timeout` plus a `read_timeout` that bounds inactivity
 /// while reading the upstream response, so a slow-loris / endless upstream
 /// cannot pin a worker task indefinitely. Both are env-tunable via
 /// `REMOTE_PROXY_CONNECT_TIMEOUT_SECS` and `REMOTE_PROXY_READ_TIMEOUT_SECS`.
-pub fn proxy_client() -> Client {
+pub fn proxy_client() -> reqwest::Client {
     let connect_secs = std::env::var("REMOTE_PROXY_CONNECT_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -708,9 +739,11 @@ fn ssrf_redirect_policy_with(
 #[cfg(test)]
 mod tests {
     use super::{
-        base_client_builder, default_client, internal_service_client_builder,
-        large_object_client_builder, sso_client_builder, webhook_client_builder, Client,
-        ClientBuilder, SSO_CONNECT_TIMEOUT, SSO_REQUEST_TIMEOUT,
+        default_client, reloadable_base_client_builder as base_client_builder,
+        reloadable_internal_service_client_builder as internal_service_client_builder,
+        reloadable_large_object_client_builder, sso_client_policy as sso_client_builder,
+        webhook_client_policy as webhook_client_builder, ClientBuilder, ReloadableClient as Client,
+        SSO_CONNECT_TIMEOUT, SSO_REQUEST_TIMEOUT,
     };
     use std::io::Write;
     use std::time::Duration;
@@ -1347,7 +1380,7 @@ mod tests {
     /// mid-body delay and any total timeout the builder might (wrongly)
     /// apply — which is exactly what this test exists to detect.
     #[tokio::test]
-    async fn test_large_object_client_builder_does_not_apply_total_timeout() {
+    async fn test_reloadable_large_object_client_builder_does_not_apply_total_timeout() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test server");
@@ -1381,7 +1414,7 @@ mod tests {
         // sets a process-wide `HTTP_PROXY` while building its own client: a
         // lock only helps while every call site remembers to take it, and this
         // round-trip must reach the test's own listener (#3377).
-        let client = large_object_client_builder(true)
+        let client = reloadable_large_object_client_builder(true)
             .no_proxy()
             .build()
             .expect("build large-object client");
@@ -2636,7 +2669,7 @@ mod tests {
             format!("artifact-keeper/{}", env!("CARGO_PKG_VERSION"))
         );
         let server = waf_fronted_idp_5036().await;
-        let resp = with_env_proxy_5459(&[], || loopback_client_from(super::sso_client_builder()))
+        let resp = with_env_proxy_5459(&[], || loopback_client_from(sso_client_builder()))
             .get(server.uri())
             .send()
             .await
@@ -2679,10 +2712,13 @@ mod tests {
                 ("webhook", webhook_client_builder()),
                 ("sso", sso_client_builder()),
                 ("plain", ClientBuilder::new(super::plain_client_builder)),
-                ("large_object", super::large_object_client_builder(true)),
+                (
+                    "large_object",
+                    super::reloadable_large_object_client_builder(true),
+                ),
                 (
                     "server_side_copy",
-                    super::server_side_copy_client_builder(true),
+                    super::reloadable_server_side_copy_client_builder(true),
                 ),
             ]
         });
@@ -2786,7 +2822,7 @@ mod tests {
         assert_eq!(err, "OIDC discovery returned HTTP 403 Forbidden");
         assert!(!err.contains("rule-secret-42"), "{err}");
 
-        let resp = with_env_proxy_5459(&[], || loopback_client_from(super::sso_client_builder()))
+        let resp = with_env_proxy_5459(&[], || loopback_client_from(sso_client_builder()))
             .get(server.uri())
             .send()
             .await
