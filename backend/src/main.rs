@@ -1533,55 +1533,53 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // (`::1`) needs no brackets (#2161).
     let grpc_addr = SocketAddr::new(config.grpc_bind_ip, grpc_port);
 
-    // #6213: every listener is bound before anything is served, and two
-    // listeners given the same address are refused up front, so a dedicated
-    // listener that cannot come up stops startup with a clear error instead of
-    // being logged from a background task while the process stays healthy.
-    let http_listener_addr = api::serve::ListenerAddr {
-        name: "HTTP",
-        setting: "BIND_ADDRESS",
+    // #6213: every listener is bound before anything is served. Two
+    // explicitly configured listeners on the same address refuse startup; the
+    // implicit gRPC default yields to HTTP or METRICS_PORT with an ERROR (see
+    // `plan_listeners`).
+    let listener_plan = api::serve::plan_listeners(
         addr,
-    };
-    let grpc_listener_addr = api::serve::ListenerAddr {
-        name: "gRPC",
-        setting: if grpc_port_configured.is_some() {
-            "GRPC_PORT"
-        } else {
-            "GRPC_PORT, default 9090"
-        },
-        addr: grpc_addr,
-    };
-    let metrics_listener_addr = config.metrics_port.map(|port| api::serve::ListenerAddr {
-        name: "metrics",
-        setting: "METRICS_PORT",
-        addr: SocketAddr::new(config.metrics_bind_ip, port),
-    });
-    let mut listener_addrs = vec![http_listener_addr, grpc_listener_addr.clone()];
-    listener_addrs.extend(metrics_listener_addr.clone());
-    api::serve::check_listener_addrs(&listener_addrs).map_err(|e| {
-        artifact_keeper_backend::error::AppError::Config(format!("Listener configuration: {e}"))
+        grpc_addr,
+        grpc_port_configured.is_some(),
+        config
+            .metrics_port
+            .map(|port| SocketAddr::new(config.metrics_bind_ip, port)),
+    )
+    .map_err(|e| {
+        artifact_keeper_backend::error::AppError::Config(format!(
+            "Listener configuration: {e}; give each listener its own port"
+        ))
     })?;
+    if let Some(msg) = &listener_plan.grpc_disabled {
+        tracing::error!("{msg}");
+    }
 
     // A gRPC port that cannot be bound fails startup when GRPC_PORT is set.
     // With the implicit default it is logged and gRPC stays off, as before, so
     // an install that never asked for gRPC does not start failing (#6213).
-    let grpc_listener = match api::serve::bind_dedicated_listener(&grpc_listener_addr).await {
-        Ok(listener) => Some(listener),
-        Err(e) if grpc_port_configured.is_some() => {
-            return Err(artifact_keeper_backend::error::AppError::Config(
-                e.to_string(),
-            ));
-        }
-        Err(e) => {
-            tracing::error!(
-                "{e}; gRPC is disabled for this process (set GRPC_PORT to a free port)"
-            );
-            None
+    let grpc_listener = match &listener_plan.grpc {
+        None => None,
+        Some(grpc_listener_addr) => {
+            match api::serve::bind_dedicated_listener(grpc_listener_addr).await {
+                Ok(listener) => Some(listener),
+                Err(e) if grpc_port_configured.is_some() => {
+                    return Err(artifact_keeper_backend::error::AppError::Config(
+                        e.to_string(),
+                    ));
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "{e}; gRPC is disabled for this process (set GRPC_PORT to a free port)"
+                    );
+                    None
+                }
+            }
         }
     };
 
     // METRICS_PORT is only Some when it is set to a valid port, so a metrics
     // listener that cannot be bound always fails startup (#6213).
+    let metrics_listener_addr = listener_plan.metrics.clone();
     let metrics_listener = match &metrics_listener_addr {
         Some(listener_addr) => Some(
             api::serve::bind_dedicated_listener(listener_addr)

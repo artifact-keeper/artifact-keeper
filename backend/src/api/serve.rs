@@ -92,7 +92,7 @@ pub async fn bind_listener(addr: SocketAddr, backlog: Option<u32>) -> io::Result
 }
 
 /// A listener the process binds at startup, named for startup errors (#6213).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenerAddr {
     /// What it serves, e.g. "gRPC".
     pub name: &'static str,
@@ -112,23 +112,97 @@ pub fn listen_addrs_collide(a: SocketAddr, b: SocketAddr) -> bool {
         && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
 }
 
-/// Refuse a startup where two listeners are given colliding addresses
-/// (#6213), e.g. `METRICS_PORT=9090` next to the default `GRPC_PORT` 9090.
-/// Without this, whichever listener binds second fails and the process
-/// carries on without it.
-pub fn check_listener_addrs(listeners: &[ListenerAddr]) -> Result<(), String> {
-    for (i, a) in listeners.iter().enumerate() {
-        for b in &listeners[i + 1..] {
-            if listen_addrs_collide(a.addr, b.addr) {
-                return Err(format!(
-                    "the {} listener ({} = {}) and the {} listener ({} = {}) use the same \
-                     address; give each listener its own port",
-                    a.name, a.setting, a.addr, b.name, b.setting, b.addr
-                ));
-            }
+/// Which dedicated listeners startup binds, after resolving address clashes
+/// (#6213).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenerPlan {
+    /// `None` when gRPC is off: its implicit default address collided.
+    pub grpc: Option<ListenerAddr>,
+    /// `None` when `METRICS_PORT` is not configured.
+    pub metrics: Option<ListenerAddr>,
+    /// The ERROR to log when the implicit gRPC listener was turned off.
+    pub grpc_disabled: Option<String>,
+}
+
+/// Two explicitly configured listeners given the same address (#6213).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenerConflict(pub String);
+
+impl std::fmt::Display for ListenerConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ListenerConflict {}
+
+fn clash_message(a: &ListenerAddr, b: &ListenerAddr) -> String {
+    format!(
+        "the {} listener ({} = {}) and the {} listener ({} = {}) use the same address",
+        a.name, a.setting, a.addr, b.name, b.setting, b.addr
+    )
+}
+
+/// Resolve which dedicated listeners to bind (#6213).
+///
+/// - Two explicitly configured listeners on colliding addresses (an explicit
+///   `GRPC_PORT` or `METRICS_PORT` against each other or `BIND_ADDRESS`)
+///   refuse startup: one of them cannot work.
+/// - The implicit gRPC default (`GRPC_PORT` unset, port 9090) yields when it
+///   collides with HTTP or metrics: gRPC is turned off with an ERROR and the
+///   listener the operator asked for binds. `METRICS_PORT=9090` (Prometheus's
+///   usual port) therefore keeps starting, now with metrics served.
+pub fn plan_listeners(
+    http: SocketAddr,
+    grpc: SocketAddr,
+    grpc_explicit: bool,
+    metrics: Option<SocketAddr>,
+) -> Result<ListenerPlan, ListenerConflict> {
+    let http = ListenerAddr {
+        name: "HTTP",
+        setting: "BIND_ADDRESS",
+        addr: http,
+    };
+    let grpc = ListenerAddr {
+        name: "gRPC",
+        setting: if grpc_explicit {
+            "GRPC_PORT"
+        } else {
+            "GRPC_PORT unset, default 9090"
+        },
+        addr: grpc,
+    };
+    let metrics = metrics.map(|addr| ListenerAddr {
+        name: "metrics",
+        setting: "METRICS_PORT",
+        addr,
+    });
+
+    if let Some(m) = &metrics {
+        if listen_addrs_collide(m.addr, http.addr) {
+            return Err(ListenerConflict(clash_message(&http, m)));
         }
     }
-    Ok(())
+    let grpc_clash = std::iter::once(&http)
+        .chain(metrics.as_ref())
+        .find(|other| listen_addrs_collide(grpc.addr, other.addr));
+    match grpc_clash {
+        Some(other) if grpc_explicit => Err(ListenerConflict(clash_message(&grpc, other))),
+        Some(other) => Ok(ListenerPlan {
+            grpc_disabled: Some(format!(
+                "{}; gRPC is disabled for this process. Set GRPC_PORT to a free port to \
+                 serve gRPC",
+                clash_message(&grpc, other)
+            )),
+            grpc: None,
+            metrics,
+        }),
+        None => Ok(ListenerPlan {
+            grpc: Some(grpc),
+            metrics,
+            grpc_disabled: None,
+        }),
+    }
 }
 
 /// Bind a dedicated listener (gRPC, metrics) before startup continues
@@ -735,31 +809,93 @@ mod tests {
         }
     }
 
-    /// #6213: `METRICS_PORT=9090` next to the default gRPC port 9090 is
-    /// refused up front, with both settings named.
+    fn sa(addr: &str) -> SocketAddr {
+        addr.parse().unwrap()
+    }
+
+    /// #6213: `METRICS_PORT=9090` with `GRPC_PORT` unset keeps starting: the
+    /// implicit gRPC default yields (off, with an ERROR naming both) and
+    /// metrics binds.
     #[test]
-    fn check_listener_addrs_rejects_metrics_on_grpc_port() {
-        let err = check_listener_addrs(&[
-            listener("HTTP", "BIND_ADDRESS", "0.0.0.0:8080"),
-            listener("gRPC", "GRPC_PORT", "0.0.0.0:9090"),
-            listener("metrics", "METRICS_PORT", "0.0.0.0:9090"),
-        ])
-        .unwrap_err();
-        assert!(err.contains("gRPC") && err.contains("GRPC_PORT"), "{err}");
+    fn plan_listeners_implicit_grpc_yields_to_metrics() {
+        let plan = plan_listeners(
+            sa("0.0.0.0:8080"),
+            sa("0.0.0.0:9090"),
+            false,
+            Some(sa("0.0.0.0:9090")),
+        )
+        .unwrap();
+        assert_eq!(plan.grpc, None);
+        assert_eq!(plan.metrics.as_ref().unwrap().addr, sa("0.0.0.0:9090"));
+        let msg = plan.grpc_disabled.unwrap();
         assert!(
-            err.contains("metrics") && err.contains("METRICS_PORT"),
+            msg.contains("gRPC") && msg.contains("METRICS_PORT"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn plan_listeners_implicit_grpc_yields_to_http() {
+        let plan = plan_listeners(sa("0.0.0.0:9090"), sa("0.0.0.0:9090"), false, None).unwrap();
+        assert_eq!(plan.grpc, None);
+        assert!(plan.grpc_disabled.unwrap().contains("BIND_ADDRESS"));
+    }
+
+    #[test]
+    fn plan_listeners_refuses_explicit_grpc_vs_explicit_metrics() {
+        let err = plan_listeners(
+            sa("0.0.0.0:8080"),
+            sa("0.0.0.0:9090"),
+            true,
+            Some(sa("0.0.0.0:9090")),
+        )
+        .unwrap_err();
+        assert!(
+            err.0.contains("GRPC_PORT") && err.0.contains("METRICS_PORT"),
             "{err}"
         );
     }
 
     #[test]
-    fn check_listener_addrs_accepts_distinct_ports() {
-        assert!(check_listener_addrs(&[
-            listener("HTTP", "BIND_ADDRESS", "0.0.0.0:8080"),
-            listener("gRPC", "GRPC_PORT", "0.0.0.0:9090"),
-            listener("metrics", "METRICS_PORT", "0.0.0.0:9091"),
-        ])
-        .is_ok());
+    fn plan_listeners_refuses_explicit_grpc_vs_bind_address() {
+        let err = plan_listeners(sa("0.0.0.0:9090"), sa("0.0.0.0:9090"), true, None).unwrap_err();
+        assert!(
+            err.0.contains("BIND_ADDRESS") && err.0.contains("GRPC_PORT"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn plan_listeners_refuses_metrics_vs_bind_address() {
+        let err = plan_listeners(
+            sa("0.0.0.0:8080"),
+            sa("0.0.0.0:9090"),
+            false,
+            Some(sa("127.0.0.1:8080")),
+        )
+        .unwrap_err();
+        assert!(
+            err.0.contains("BIND_ADDRESS") && err.0.contains("METRICS_PORT"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn plan_listeners_without_a_clash_keeps_everything_on() {
+        for explicit in [false, true] {
+            let plan = plan_listeners(
+                sa("0.0.0.0:8080"),
+                sa("0.0.0.0:9090"),
+                explicit,
+                Some(sa("0.0.0.0:9091")),
+            )
+            .unwrap();
+            assert_eq!(plan.grpc.unwrap().addr, sa("0.0.0.0:9090"));
+            assert_eq!(plan.metrics.unwrap().addr, sa("0.0.0.0:9091"));
+            assert_eq!(plan.grpc_disabled, None);
+        }
+        let plan = plan_listeners(sa("0.0.0.0:8080"), sa("0.0.0.0:9090"), false, None).unwrap();
+        assert!(plan.grpc.is_some() && plan.metrics.is_none());
     }
 
     #[test]
