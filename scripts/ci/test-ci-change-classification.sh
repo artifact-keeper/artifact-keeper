@@ -518,8 +518,10 @@ if grep -qE '(apt-get install|pkgs=\().* mingw-w64( |$|\))' <<< "$win_job"; then
 else
   pass "the Windows cross-check does not install the mingw-w64 metapackage"
 fi
-if grep -qF 'gcc-mingw-w64-x86-64-posix' <<< "$win_job" && grep -qF 'timeout 6m apt-get install' <<< "$win_job"; then
-  pass "the Windows cross-check installs only x86_64 mingw, with a bounded apt attempt"
+if grep -qF 'gcc-mingw-w64-x86-64-posix' <<< "$win_job" && grep -qF 'sudo timeout 6m bash -c' <<< "$win_job" \
+   && grep -qF 'apt-get install --download-only' <<< "$win_job" \
+   && ! grep -qE 'timeout [0-9]+m apt-get install -y' <<< "$win_job"; then
+  pass "the Windows cross-check installs only x86_64 mingw; only the download is time-boxed, never the unpack"
 else
   fail "the Windows cross-check's install is not the bounded x86_64-only one (#6242)"
 fi

@@ -789,8 +789,10 @@ jobs:
     name: 🪟 Windows Cross-Check
     runs-on: ubuntu-24.04
     # Always cold (no rust-cache, see below): 6-11 minutes for the check,
-    # plus at most 2 x 6 minutes of package install on a slow mirror.
-    timeout-minutes: 30
+    # plus at most 2 x 6 minutes of package download on a slow mirror and
+    # about a minute to unpack. 40 leaves headroom over that ~24-minute
+    # worst case now that the job is required again.
+    timeout-minutes: 40
     needs: [changes, release-bump]
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
     env:
@@ -820,9 +822,14 @@ jobs:
       # libsqlite3-sys) with x86_64-w64-mingw32-gcc; g++ in case a
       # cmake-driven one enables CXX.
       #
-      # Each attempt gets 6 minutes. A slow mirror then fails the attempt,
-      # and the second one goes to azure.archive.ubuntu.com and
-      # archive.ubuntu.com instead of crawling into the job ceiling.
+      # Only the DOWNLOAD is capped: each attempt runs `apt-get update` and
+      # `apt-get install --download-only` under ONE 6-minute timeout, so a
+      # slow mirror fails the attempt, and the second attempt goes to
+      # azure.archive.ubuntu.com and archive.ubuntu.com instead of crawling
+      # into the job ceiling. The real install then runs from the local
+      # archive with no timeout: one killed during unpack would leave dpkg
+      # half-configured, and everything after it fails on "dpkg was
+      # interrupted". Worst case 2 x 6 minutes of download.
       - name: Install protoc and the x86_64 mingw-w64 cross compilers
         run: |
           # libprotobuf-dev: the well-known .proto files (timestamp.proto)
@@ -830,16 +837,22 @@ jobs:
           # --no-install-recommends would otherwise drop.
           pkgs=(protobuf-compiler libprotobuf-dev pkg-config libssl-dev gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix)
           echo "apt mirrors: $(tr '\n' ' ' < /etc/apt/apt-mirrors.txt 2>/dev/null)"
-          install() {
-            sudo timeout 6m apt-get update -o Acquire::Retries=3 \
-              && sudo timeout 6m apt-get install -y --no-install-recommends -o Acquire::Retries=3 "${pkgs[@]}"
+          fetch() {
+            sudo timeout 6m bash -c '
+              apt-get update -o Acquire::Retries=3 \
+                && apt-get install --download-only -y --no-install-recommends -o Acquire::Retries=3 "$@"
+            ' _ "${pkgs[@]}"
           }
-          if ! install; then
-            echo "::warning title=Slow apt mirror::installing the mingw cross compilers did not finish in 6 minutes; retrying on azure.archive.ubuntu.com / archive.ubuntu.com."
+          if ! fetch; then
+            echo "::warning title=Slow apt mirror::downloading the mingw cross compilers did not finish in 6 minutes; retrying on azure.archive.ubuntu.com / archive.ubuntu.com."
             printf 'http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\nhttp://archive.ubuntu.com/ubuntu/\tpriority:2\n' \
               | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
-            install
+            if ! fetch; then
+              echo "::error title=apt download failed::the mingw cross compilers did not download in 2 x 6 minutes, on the image's mirror or on azure/archive.ubuntu.com."
+              exit 1
+            fi
           fi
+          sudo apt-get install -y --no-install-recommends "${pkgs[@]}"
           x86_64-w64-mingw32-gcc --version | head -1
 
       # No rust-cache: a cold check of the whole graph is 6-11 minutes
