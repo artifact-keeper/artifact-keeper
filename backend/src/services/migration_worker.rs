@@ -206,6 +206,12 @@ pub struct MigrationWorker {
     /// fired, the run stops as `paused`, not `cancelled`, so `/resume` can
     /// finish it on another replica (#6253).
     shutdown_token: CancellationToken,
+    /// Fired when the worker's claim on the job row was lost: the janitor
+    /// paused the job, or another worker took it over (#6305). The spawner
+    /// also cancels `cancel_token` then, so the run stops right away; this
+    /// token tells the interruption exit not to write a status onto a row
+    /// that is no longer this worker's.
+    claim_lost: CancellationToken,
     /// Optional search backend. When present, every imported artifact is
     /// indexed into OpenSearch as it commits so migrated content is
     /// searchable/visible without waiting for a manual or startup reindex
@@ -230,8 +236,16 @@ impl MigrationWorker {
             config,
             cancel_token,
             shutdown_token: CancellationToken::new(),
+            claim_lost: CancellationToken::new(),
             search_service: None,
         }
+    }
+
+    /// Record the token that fires when this worker's claim on the job row
+    /// is lost (#6305).
+    pub fn with_claim_lost_token(mut self, claim_lost: CancellationToken) -> Self {
+        self.claim_lost = claim_lost;
+        self
     }
 
     /// Record the process shutdown token the worker's `cancel_token` is a
@@ -976,6 +990,17 @@ impl MigrationWorker {
             SourceView::Partial,
         )
         .await?;
+
+        // Checked first: once the claim is gone the row belongs to the janitor
+        // or to another worker, so neither the shutdown pause nor the cancel
+        // below may write its status (#6305).
+        if self.claim_lost.is_cancelled() {
+            tracing::warn!(
+                job_id = %job_id,
+                "Migration worker stopped: it lost its claim on the job, which another worker or the janitor now holds"
+            );
+            return Ok(());
+        }
 
         if self.shutdown_token.is_cancelled() {
             tracing::info!(job_id = %job_id, "Migration paused, the backend is shutting down");
@@ -7132,6 +7157,10 @@ mod tests {
         /// The process shutdown token the worker's token is a child of fires
         /// mid-listing, with the job row still `running` (#6253).
         Shutdown,
+        /// The worker's claim renewal reports the claim lost mid-listing (the
+        /// janitor or another worker took the job), and the spawner's
+        /// forwarder cancels the worker's token in response (#6305).
+        ClaimLost,
         /// The operator pauses/cancels AFTER the last per-artifact check: the
         /// mock flips the job row to this status while returning an EMPTY
         /// listing, so the repository completes cleanly and the run walks all
@@ -7154,6 +7183,8 @@ mod tests {
         cancel_token: CancellationToken,
         /// The parent of `cancel_token`, fired by [`MockInterrupt::Shutdown`].
         shutdown_token: CancellationToken,
+        /// The worker's claim-lost token, fired by [`MockInterrupt::ClaimLost`].
+        claim_lost: CancellationToken,
     }
 
     #[async_trait::async_trait]
@@ -7210,6 +7241,10 @@ mod tests {
                 }
                 MockInterrupt::CancelToken => self.cancel_token.cancel(),
                 MockInterrupt::Shutdown => self.shutdown_token.cancel(),
+                MockInterrupt::ClaimLost => {
+                    self.claim_lost.cancel();
+                    self.cancel_token.cancel();
+                }
                 MockInterrupt::JobStatusOnDrain(status) => {
                     sqlx::query("UPDATE migration_jobs SET status = $1 WHERE id = $2")
                         .bind(status)
@@ -7318,6 +7353,7 @@ mod tests {
         ));
         let shutdown_token = CancellationToken::new();
         let cancel_token = shutdown_token.child_token();
+        let claim_lost = CancellationToken::new();
         let worker = MigrationWorker::new(
             pool.clone(),
             registry,
@@ -7327,7 +7363,8 @@ mod tests {
             },
             cancel_token.clone(),
         )
-        .with_shutdown_token(shutdown_token.clone());
+        .with_shutdown_token(shutdown_token.clone())
+        .with_claim_lost_token(claim_lost.clone());
 
         worker
             .process_job(
@@ -7339,6 +7376,7 @@ mod tests {
                     interrupt,
                     cancel_token,
                     shutdown_token,
+                    claim_lost,
                 }),
                 ConflictResolution::Skip,
                 None,
@@ -7501,6 +7539,31 @@ mod tests {
 
         assert_eq!(status, "paused", "a shutdown must leave the job resumable");
         assert!(!finished, "a paused job must not be stamped finished");
+
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// A worker whose claim was lost stops on the cancelled token but writes
+    /// no status: the row now belongs to the janitor or to the worker that
+    /// resumed it, so stamping it `cancelled` would wreck that run (#6305).
+    #[tokio::test]
+    async fn test_process_job_claim_lost_stops_without_writing_status_6305() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (job_id, conn_id, status, finished) =
+            run_single_repo_job(&pool, "claimlost-src", MockInterrupt::ClaimLost).await;
+
+        assert_eq!(
+            status, "running",
+            "a worker that lost its claim must leave the row to its new owner"
+        );
+        assert!(
+            !finished,
+            "a worker that lost its claim must not finish the job"
+        );
 
         cleanup_single_repo_job(&pool, job_id, conn_id).await;
     }

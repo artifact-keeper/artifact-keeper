@@ -609,9 +609,9 @@ fn spawn_migration_worker(
     let shutdown_token = state.shutdown_token.clone();
     let job_id = job.id;
     tokio::spawn(async move {
-        // Renewal stops once the row leaves `running`, which the worker
-        // notices on its own status checks, so the loss token is not needed.
-        let (_renewal, _lost) = crate::services::cluster_work::spawn_row_claim_renewal(
+        // The loss token fires when a renewal finds the row no longer ours:
+        // it left `running`, or the janitor or another worker took the claim.
+        let (_renewal, claim_lost) = crate::services::cluster_work::spawn_row_claim_renewal(
             db.clone(),
             format!("migration job {job_id}"),
             RENEW_JOB_CLAIM_SQL,
@@ -619,9 +619,21 @@ fn spawn_migration_worker(
             claim_token,
             JOB_CLAIM_TTL_SECS,
         );
+        // Stop the worker as soon as its claim is lost, rather than at its
+        // next status check, so it cannot keep migrating alongside the worker
+        // that resumed the job (#6305).
+        let stop_on_loss = {
+            let claim_lost = claim_lost.clone();
+            let cancel_token = cancel_token.clone();
+            tokio::spawn(async move {
+                claim_lost.cancelled().await;
+                cancel_token.cancel();
+            })
+        };
         let worker = MigrationWorker::new(db, storage_registry, worker_config, cancel_token)
             .with_search_service(search_service)
-            .with_shutdown_token(shutdown_token.clone());
+            .with_shutdown_token(shutdown_token.clone())
+            .with_claim_lost_token(claim_lost.clone());
         let outcome = if resume {
             worker
                 .resume_job(job_id, client, conflict_resolution, None)
@@ -631,7 +643,11 @@ fn spawn_migration_worker(
                 .process_job(job_id, client, conflict_resolution, None)
                 .await
         };
-        if outcome.is_err() && shutdown_token.is_cancelled() {
+        stop_on_loss.abort();
+        if outcome.is_err() && claim_lost.is_cancelled() {
+            // The row is no longer this worker's: leave its status alone.
+            tracing::warn!(job_id = %job_id, "Migration worker stopped after losing its claim on the job");
+        } else if outcome.is_err() && shutdown_token.is_cancelled() {
             tracing::info!(job_id = %job_id, "Migration paused, the backend is shutting down");
             let _ = MigrationService::new(fail_db)
                 .pause_running_job(job_id)
@@ -640,10 +656,12 @@ fn spawn_migration_worker(
             let phase = if resume { "resume" } else { "worker" };
             tracing::error!(job_id = %job_id, error = %e, "Migration {phase} failed");
             let _ = sqlx::query(
-                "UPDATE migration_jobs SET status = 'failed', finished_at = NOW(), error_summary = $2 WHERE id = $1"
+                "UPDATE migration_jobs SET status = 'failed', finished_at = NOW(), error_summary = $2 \
+                 WHERE id = $1 AND claim_token = $3"
             )
             .bind(job_id)
             .bind(e.to_string())
+            .bind(claim_token)
             .execute(&fail_db)
             .await;
         }
