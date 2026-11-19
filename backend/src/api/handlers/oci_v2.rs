@@ -3640,44 +3640,52 @@ async fn scope_mirror_namespace(
 
 /// Whether a Remote whose upstream is `upstream_url` proxies the registry `ns`.
 /// Docker Hub's hosts (`docker.io`, `registry-1.docker.io`, ...) match each
-/// other; any other registry matches on its exact `host[:port]`.
+/// other; any other registry matches on its `host[:port]`, the scheme's
+/// default port matching with or without being spelled out.
 fn upstream_serves_namespace(upstream_url: &str, ns: &str) -> bool {
     if is_docker_hub(ns) {
         return is_docker_hub(upstream_url);
     }
-    url::Url::parse(upstream_url).is_ok_and(|url| match url.port() {
-        Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()) == ns,
-        None => url.host_str() == Some(ns),
+    url::Url::parse(upstream_url).is_ok_and(|url| {
+        let host = url.host_str().unwrap_or_default();
+        (url.port().is_none() && ns == host)
+            || url
+                .port_or_known_default()
+                .is_some_and(|port| ns == format!("{host}:{port}"))
     })
 }
 
 /// The repository a read carrying `?ns=<registry>` falls back to when its path
-/// names no repository: the one OCI Remote whose upstream is that registry or,
-/// for Docker Hub with no such Remote, `AK_DEFAULT_DOCKER_MIRROR_REPO`.
-/// `None` (no Remote, or several, for the registry) is answered as a key
-/// naming no repository, so another registry's image is never served.
+/// names no repository. Docker Hub under Docker-mirror mode keeps the
+/// configured `AK_DEFAULT_DOCKER_MIRROR_REPO` (a Virtual's members and access
+/// rules included); otherwise it is the one OCI Remote whose upstream is that
+/// registry. `None` (no Remote, or several, for the registry) is answered as
+/// a key naming no repository, so another registry's image is never served.
 async fn ns_mirror_repo_key(db: &PgPool, ns: &str) -> Result<Option<String>, sqlx::Error> {
-    let remotes: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT key, format::text, upstream_url FROM repositories \
+    if is_docker_hub(ns) {
+        if let Some(key) = default_docker_mirror_repo() {
+            return Ok(Some(key.to_owned()));
+        }
+    }
+    // The formats whose handler key is "oci" (`RepositoryFormat::handler_key`).
+    let remotes: Vec<(String, String)> = sqlx::query_as(
+        "SELECT key, upstream_url FROM repositories \
          WHERE repo_type = 'remote' AND upstream_url IS NOT NULL \
+         AND format IN ('docker', 'podman', 'buildx', 'oras', 'wasm_oci', 'helm_oci') \
          AND key NOT LIKE '~deleting~%'",
     )
     .fetch_all(db)
     .await?;
     let keys: Vec<String> = remotes
         .into_iter()
-        .filter(|(_, format, upstream_url)| {
-            parse_format_str(format).is_some_and(|format| format_handler_key(&format) == "oci")
-                && upstream_serves_namespace(upstream_url, ns)
-        })
-        .map(|(key, _, _)| key)
+        .filter(|(_, upstream_url)| upstream_serves_namespace(upstream_url, ns))
+        .map(|(key, _)| key)
         .collect();
     Ok(match keys.as_slice() {
         [key] => Some(key.clone()),
-        [] if is_docker_hub(ns) => default_docker_mirror_repo().map(str::to_owned),
         [] => None,
         _ => {
-            warn!(
+            tracing::debug!(
                 ns,
                 repositories = ?keys,
                 "several Remote repositories proxy this registry; refusing `?ns=` reads for it"
@@ -19924,6 +19932,18 @@ mod tests {
         assert!(upstream_serves_namespace(
             "https://registry.example:443",
             "registry.example"
+        ));
+        assert!(upstream_serves_namespace(
+            "https://registry.example",
+            "registry.example:443"
+        ));
+        assert!(upstream_serves_namespace(
+            "http://registry.example",
+            "registry.example:80"
+        ));
+        assert!(!upstream_serves_namespace(
+            "http://registry.example",
+            "registry.example:443"
         ));
         assert!(!upstream_serves_namespace(
             "https://registry.example:5000",
@@ -49094,6 +49114,145 @@ mod oci_read_authz_tests {
             StatusCode::NOT_FOUND,
             "writes are never routed by `ns`"
         );
+    }
+
+    /// Resolve a read of `image_name`, a path naming no repository, as the
+    /// `/v2` middleware scopes a request carrying `?ns=<ns>`.
+    async fn resolve_read_with_ns(pool: &PgPool, image_name: &str, ns: &str) -> Option<String> {
+        match MIRROR_NAMESPACE
+            .scope(Some(ns.to_owned()), resolve_repo_inner(pool, image_name))
+            .await
+        {
+            Ok(resolved) => resolved.map(|(repo, _)| repo.key),
+            Err(_) => panic!("resolving {image_name} with ns={ns} failed"),
+        }
+    }
+
+    async fn create_remote(pool: &PgPool, format: &str, upstream_url: &str) -> Uuid {
+        let (id, _, dir) = tdh::create_repo(pool, "remote", format).await;
+        let _ = std::fs::remove_dir_all(dir);
+        sqlx::query("UPDATE repositories SET upstream_url = $2 WHERE id = $1")
+            .bind(id)
+            .bind(upstream_url)
+            .execute(pool)
+            .await
+            .expect("set upstream_url");
+        id
+    }
+
+    async fn repo_key_of(pool: &PgPool, id: Uuid) -> String {
+        sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("repository key")
+    }
+
+    /// Docker-mirror mode off, two OCI Remotes of Docker Hub under different
+    /// hosts: a Docker Hub `ns`, whichever of its hosts it names, is
+    /// ambiguous and fails closed. (Docker Hub is one registry for the whole
+    /// shared test database, where other suites create Docker Hub Remotes
+    /// concurrently, so a single-Remote match is asserted on a registry of
+    /// this test's own in the router test, and the alias rules in
+    /// `test_upstream_serves_namespace`.)
+    #[tokio::test]
+    async fn test_ns_docker_hub_without_mirror_mode_fails_closed_on_two_remotes() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mirror_mode = default_docker_mirror_repo().map(str::to_owned);
+        let image = format!("ns-hub-{}/app", Uuid::new_v4());
+        let first = create_remote(&pool, "docker", "https://registry-1.docker.io").await;
+        let second = create_remote(&pool, "podman", "https://index.docker.io").await;
+        let mut resolved = Vec::new();
+        for ns in ["docker.io", "registry-1.docker.io", "index.docker.io"] {
+            resolved.push((ns, resolve_read_with_ns(&pool, &image, ns).await));
+        }
+
+        sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![first, second])
+            .execute(&pool)
+            .await
+            .expect("delete remotes");
+
+        assert_eq!(mirror_mode, None, "FIXTURE: Docker-mirror mode must be off");
+        for (ns, key) in resolved {
+            assert_eq!(key, None, "ns={ns}: several Docker Hub Remotes fail closed");
+        }
+    }
+
+    /// Docker-mirror mode on (`AK_DEFAULT_DOCKER_MIRROR_REPO` names a Virtual):
+    /// a Docker Hub `ns` keeps resolving to the configured repository with no
+    /// Docker Hub Remote, with one (the Virtual's member), and with two, under
+    /// any of Docker Hub's hosts. A
+    /// `ns` naming another registry is routed by `ns` and, with no Remote for
+    /// it, fails closed rather than reaching the Docker Hub mirror.
+    ///
+    /// `default_docker_mirror_repo` caches its first read, so the variable is
+    /// set before the first resolution (nextest runs each test in its own
+    /// process).
+    #[tokio::test]
+    async fn test_ns_mirror_mode_keeps_docker_hub_on_the_configured_repo() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (mirror, mirror_key, mirror_dir) = tdh::create_repo(&pool, "virtual", "docker").await;
+        std::env::set_var("AK_DEFAULT_DOCKER_MIRROR_REPO", &mirror_key);
+        let mirror_mode = default_docker_mirror_repo().map(str::to_owned);
+        let image = format!("ns-mirror-{}/app", Uuid::new_v4());
+
+        let without_remote = resolve_read_with_ns(&pool, &image, "docker.io").await;
+        let member = create_remote(&pool, "docker", "https://registry-1.docker.io").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(mirror)
+        .bind(member)
+        .execute(&pool)
+        .await
+        .expect("link the Docker Hub Remote as the Virtual's member");
+        let with_remote = resolve_read_with_ns(&pool, &image, "docker.io").await;
+        let second = create_remote(&pool, "docker", "https://index.docker.io").await;
+        let mut with_two = Vec::new();
+        for ns in ["docker.io", "registry-1.docker.io", "index.docker.io"] {
+            with_two.push((ns, resolve_read_with_ns(&pool, &image, ns).await));
+        }
+        let quay_without_remote = resolve_read_with_ns(&pool, &image, "quay.io").await;
+        let quay = create_remote(&pool, "docker", "https://quay.io").await;
+        let quay_key = repo_key_of(&pool, quay).await;
+        let quay_routed = resolve_read_with_ns(&pool, &image, "quay.io").await;
+
+        sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![mirror, member, second, quay])
+            .execute(&pool)
+            .await
+            .expect("delete repositories");
+        let _ = std::fs::remove_dir_all(mirror_dir);
+
+        assert_eq!(
+            mirror_mode.as_deref(),
+            Some(mirror_key.as_str()),
+            "FIXTURE: Docker-mirror mode must be on in this process"
+        );
+        assert_eq!(without_remote.as_deref(), Some(mirror_key.as_str()));
+        assert_eq!(
+            with_remote.as_deref(),
+            Some(mirror_key.as_str()),
+            "the configured repository wins over a Docker Hub Remote"
+        );
+        for (ns, key) in with_two {
+            assert_eq!(
+                key.as_deref(),
+                Some(mirror_key.as_str()),
+                "ns={ns}: the configured repository wins over several Docker Hub Remotes"
+            );
+        }
+        assert_eq!(
+            quay_without_remote, None,
+            "another registry never falls through to the Docker Hub mirror"
+        );
+        assert_eq!(quay_routed.as_deref(), Some(quay_key.as_str()));
     }
 
     /// Verified-bug regression for #3730 — the anonymous half of #3524 on
