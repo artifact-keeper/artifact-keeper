@@ -219,24 +219,50 @@ async fn handle_get(
     // before anything is fetched or cached.
     reject_ambiguous_go_request(&repo, &request)?;
 
+    // Each arm is boxed (#6270): held inline, every arm's future sits in this
+    // handler's state and poll frame at once, which with the virtual member
+    // walk below it overflows the stack of a debug-build test thread.
     match request {
         GoProxyRequest::List { module } => {
-            list_versions(&state, auth.as_ref(), &repo, &module).await
+            Box::pin(list_versions(&state, auth.as_ref(), &repo, &module)).await
         }
         GoProxyRequest::Info { module, version } => {
-            version_info(&state, auth.as_ref(), &repo, &module, &version).await
+            Box::pin(version_info(
+                &state,
+                auth.as_ref(),
+                &repo,
+                &module,
+                &version,
+            ))
+            .await
         }
         GoProxyRequest::Mod { module, version } => {
-            get_mod_file(&state, auth.as_ref(), &repo, &module, &version, &ctx).await
+            Box::pin(get_mod_file(
+                &state,
+                auth.as_ref(),
+                &repo,
+                &module,
+                &version,
+                &ctx,
+            ))
+            .await
         }
         GoProxyRequest::Zip { module, version } => {
-            download_zip(&state, auth.as_ref(), &repo, &module, &version, &ctx).await
+            Box::pin(download_zip(
+                &state,
+                auth.as_ref(),
+                &repo,
+                &module,
+                &version,
+                &ctx,
+            ))
+            .await
         }
         GoProxyRequest::Latest { module } => {
-            latest_version(&state, auth.as_ref(), &repo, &module).await
+            Box::pin(latest_version(&state, auth.as_ref(), &repo, &module)).await
         }
         GoProxyRequest::SumDb { host, path } => {
-            serve_sumdb(&state, auth.as_ref(), &repo, &host, &path).await
+            Box::pin(serve_sumdb(&state, auth.as_ref(), &repo, &host, &path)).await
         }
     }
 }
@@ -1406,8 +1432,15 @@ async fn version_info(
             }
 
             let upstream_path = build_go_upstream_path(module, version, "info");
-            if let Ok(resp) =
-                try_proxy_go_metadata(state, auth, repo, &upstream_path, "application/json").await
+            // Boxed for the same stack-size reason as the walk it wraps (#6270).
+            if let Ok(resp) = Box::pin(try_proxy_go_metadata(
+                state,
+                auth,
+                repo,
+                &upstream_path,
+                "application/json",
+            ))
+            .await
             {
                 return Ok(resp);
             }

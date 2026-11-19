@@ -192,8 +192,9 @@ impl BuildService {
     /// instead of sorting all of them: one writer attaching a huge number of
     /// artifacts to a build cannot make every read of it (or every list page
     /// it appears on) scan them all. For a build over the cap, which
-    /// `per_build` rows come back is unspecified; `artifact_count` on the
-    /// build still reports the full number.
+    /// `per_build` rows come back is unspecified. `artifact_count` still
+    /// reports the full number to the build's creator and administrators;
+    /// any other caller gets the number of artifacts it is shown (#6281).
     pub async fn list_artifacts(
         &self,
         build_ids: &[Uuid],
