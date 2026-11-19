@@ -111,24 +111,34 @@ permissions: {}
 # - The group is keyed by `event_name` + `ref` so push and workflow_dispatch
 #   for the same branch are in DIFFERENT groups. A manual run (`workflow_dispatch`)
 #   never gets cancelled by an auto run, and vice versa.
-# - A BRANCH PUSH is additionally keyed by its commit (#6080): every pushed
-#   commit is a group of its own. GitHub keeps only ONE pending run per group
-#   and a newer one REPLACES it, so in a per-ref group a merge landing while
-#   the previous commit's run was still waiting cancelled that run outright
-#   (zero jobs, no `sha-<sha>` images). When that commit was a Release
-#   Candidate the candidate died with it (57a8ac57, 2026-11-10), which is why
-#   every cut needed a merge freeze on main; and a run stuck queued with no
-#   runner held the group for every later commit (ea9425b6, 75 min). Per
-#   commit, neither can happen. The order the per-ref queue used to impose on
-#   the branch's floating tags (`:main`, `:dev`, `:X.Y-dev`) is kept by
-#   scripts/ci/decide-branch-floating-tags.sh in each merge job instead: a run
-#   whose commit is older than the one those tags already name publishes its
-#   `sha-<sha>` tag and leaves them alone. Tag pushes, dispatches (the
-#   promote) and the schedule keep their per-ref groups.
+# - MAIN PUSHES COALESCE (#6242). `main`/`master` pushes share one group per
+#   branch, so GitHub keeps at most one running and one PENDING run there,
+#   and a newer push replaces the pending one. A burst of merges therefore
+#   builds the commit in flight and the newest commit, not every commit in
+#   between: on the 1.12.2 cut day, 13 intermediate main runs sat in the
+#   self-hosted amd64 pool's queue for hours and had to be cancelled by hand.
+#   A run that has started is never cancelled (`cancel-in-progress: false`,
+#   #2099), and the floating tags `:main` / `:dev` are moved by the newest
+#   commit either way (scripts/ci/decide-branch-floating-tags.sh keeps them
+#   from moving backwards).
+# - A RE-RUN IS NEVER REPLACED. An attempt after the first gets a group of
+#   its own (`-attempt-<n>`), so a re-run of a superseded commit's run runs
+#   beside the branch's queue instead of joining it and being replaced again
+#   (run 42710734527's attempt 2 was, on 2026-11-09). That is how a commit
+#   whose run was replaced gets its `sha-<sha>` images: the Release Candidate
+#   re-runs it ("Wait for a successful Docker Publish run" in
+#   release-candidate.yml, state=cancelled from
+#   scripts/ci/resolve-candidate-publish-run.sh), the same push run with the
+#   same signing identity and provenance. Run 42757946445 is the precedent:
+#   attempt 1 was replaced with zero jobs and attempt 2 built it.
+# - Every other branch push (`release/**`) keeps a group per commit (#6080):
+#   those lines get a handful of pushes, and each one is a commit a patch
+#   release may be cut from. Tag pushes, dispatches (the promote) and the
+#   schedule keep their per-ref groups.
 #   .github/workflows/docker-publish-watchdog.yml cancels, loudly, any run
-#   that is still queued with no runner after 30 minutes.
-# - `cancel-in-progress` is ALWAYS false. Runs queue behind each other and
-#   every one of them finishes.
+#   that is still queued with no runner after 30 minutes, so a stuck run
+#   holds main's group for at most that long.
+# - `cancel-in-progress` is ALWAYS false. A run that has started finishes.
 #
 # This workflow *publishes* — it is not a check whose only product is a
 # pass/fail verdict, so a cancelled run is not merely wasted CI time, it is a
@@ -151,7 +161,7 @@ permissions: {}
 # those minutes by gambling that the *next* run completes — and when merges
 # arrive faster than the amd64 build takes, that gamble loses every time.
 concurrency:
-  group: docker-publish-${{ github.event_name }}-${{ github.ref }}${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')) && format('-{0}', github.sha) || '' }}
+  group: docker-publish-${{ github.event_name }}-${{ github.ref }}${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master') && format('-{0}', github.sha) || '' }}${{ github.run_attempt != '1' && format('-attempt-{0}', github.run_attempt) || '' }}
   cancel-in-progress: false
 
 env:

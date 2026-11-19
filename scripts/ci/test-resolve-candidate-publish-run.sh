@@ -77,6 +77,7 @@ expect() {
       RESOLVE_REPO=artifact-keeper/artifact-keeper \
       RESOLVE_SHA="${CASE_SHA:-$SHA_A}" \
       RESOLVE_REF="${CASE_REF:-v9.9.9}" \
+      RESOLVE_REPORT_CANCELLED="${CASE_REPORT_CANCELLED-}" \
       FAKE_PUSH_RUNS="${FAKE_PUSH_RUNS-}" \
       FAKE_DISPATCH_RUNS="${FAKE_DISPATCH_RUNS-}" \
       FAKE_RUNS_SHA="${FAKE_RUNS_SHA-$SHA_A}" \
@@ -96,7 +97,7 @@ expect() {
 reset_case() {
   FAKE_PUSH_RUNS=""; FAKE_DISPATCH_RUNS=""
   FAKE_RUNS_SHA="$SHA_A"; FAKE_RUNS_FAIL=0
-  CASE_SHA="$SHA_A"; CASE_REF=v9.9.9
+  CASE_SHA="$SHA_A"; CASE_REF=v9.9.9; CASE_REPORT_CANCELLED=""
 }
 
 echo "candidate publish-run resolver: the legs"
@@ -181,6 +182,93 @@ reset_case
 CASE_SHA=deadbeef
 expect "short sha -> infra" 30 \
   "state=infra reason=bad-sha"
+
+echo
+echo "main pushes coalesce; the Release Candidate re-runs a replaced run (#6242)"
+
+# 12. The candidate's commit was REPLACED while pending by a newer main push
+#     (cancelled, zero jobs). With RESOLVE_REPORT_CANCELLED=1 -- what
+#     release-candidate.yml sets -- that is state=cancelled naming the run to
+#     re-run, not a failed build.
+reset_case
+CASE_REF=main; CASE_REPORT_CANCELLED=1
+FAKE_PUSH_RUNS=$'1201\tpush\tmain\tcompleted\tcancelled\t2026-11-18T19:00:00Z'
+expect "replaced main push run, candidate mode -> cancelled, names the run" 22 \
+  "state=cancelled run_id=1201"
+
+# 13. Without the opt-in (release.yml's tag path) the same answer stays a
+#     block: a tag push is never coalesced, so its cancelled run is a stop.
+reset_case
+CASE_REF=main
+FAKE_PUSH_RUNS=$'1301\tpush\tmain\tcompleted\tcancelled\t2026-11-18T19:00:00Z'
+expect "cancelled push run, default mode -> still BLOCKED" 20 \
+  "state=blocked"
+
+# 14. A FAILED build is never re-run by the candidate: only cancelled is.
+reset_case
+CASE_REF=main; CASE_REPORT_CANCELLED=1
+FAKE_PUSH_RUNS=$'1401\tpush\tmain\tcompleted\tfailure\t2026-11-18T19:00:00Z'
+expect "failed main push run, candidate mode -> BLOCKED, not re-run" 20 \
+  "state=blocked"
+
+# 15. Once re-run, the same run id is in flight, then green: pending, then
+#     resolved -- the candidate path completes on the re-run attempt.
+reset_case
+CASE_REF=main; CASE_REPORT_CANCELLED=1
+FAKE_PUSH_RUNS=$'1501\tpush\tmain\tin_progress\t-\t2026-11-18T19:00:00Z'
+expect "re-run in flight -> pending on the same run" 10 \
+  "state=pending run_id=1501"
+FAKE_PUSH_RUNS=$'1501\tpush\tmain\tcompleted\tsuccess\t2026-11-18T19:00:00Z'
+expect "re-run green -> resolved to the same run" 0 \
+  "state=resolved run_id=1501"
+
+# 16. A success anywhere still wins over a cancelled run (a promote dispatch
+#     on main that shares the sha does not make the push run matter).
+reset_case
+CASE_REF=main; CASE_REPORT_CANCELLED=1
+FAKE_PUSH_RUNS=$'1601\tpush\tmain\tcompleted\tcancelled\t2026-11-18T19:00:00Z'
+FAKE_DISPATCH_RUNS=$'1602\tworkflow_dispatch\tmain\tcompleted\tsuccess\t2026-11-18T20:00:00Z'
+expect "cancelled push run but a green run for the sha -> resolved" 0 \
+  "state=resolved run_id=1602"
+
+# --- the workflow wiring this depends on ------------------------------------
+# The resolver's state=cancelled is only half of the contract: the candidate
+# must act on it, a re-run must not be replaceable, and release.yml must not
+# opt in. Read straight from the workflow files.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+DP="$ROOT/.github/workflows/docker-publish.yml"
+RC="$ROOT/.github/workflows/release-candidate.yml"
+RY="$ROOT/.github/workflows/release.yml"
+
+wire() { # <label> <command...>: PASS when the command succeeds
+  local label="$1"; shift
+  if "$@"; then pass "$label"; else fail "$label"; fi
+}
+has() { grep -qF -- "$2" <<< "$1"; }   # <text> <fixed string>
+group="$(awk '/^concurrency:/{c=1; next} c && /^  group:/{print; exit}' "$DP")"
+cip="$(awk '/^concurrency:/{c=1; next} c && /^  cancel-in-progress:/{print $2; exit}' "$DP")"
+publish_job="$(awk '/^  publish:$/{p=1; print; next} p && /^  [a-z][a-z0-9_-]*:$/{exit} p' "$RC")"
+# shellcheck disable=SC2016 # literal workflow text, not shell expansions
+{
+  wire "docker-publish: main pushes share one group (no per-commit suffix on main)" \
+    has "$group" "github.ref != 'refs/heads/main'"
+  wire "docker-publish: other branch pushes keep a group per commit (#6080)" \
+    has "$group" "format('-{0}', github.sha)"
+  wire "docker-publish: a re-run attempt gets a group of its own (cannot be replaced)" \
+    has "$group" "format('-attempt-{0}', github.run_attempt)"
+  wire "docker-publish: cancel-in-progress is the literal false (#2099)" \
+    test "$cip" = false
+  wire "release-candidate publish job: actions: write (to re-run)" \
+    has "$publish_job" "      actions: write"
+  wire "release-candidate publish job: opts in to state=cancelled" \
+    has "$publish_job" "RESOLVE_REPORT_CANCELLED=1"
+  wire "release-candidate publish job: handles exit 22" \
+    has "$publish_job" "              22)"
+  wire "release-candidate publish job: re-runs the cancelled run" \
+    has "$publish_job" 'gh run rerun "${CANCELLED_RUN}"'
+  wire "release.yml: does not opt in (a cancelled tag run stays a block)" \
+    bash -c '! grep -qF RESOLVE_REPORT_CANCELLED "$1"' _ "$RY"
+}
 
 echo
 if [ "$fails" -gt 0 ]; then
