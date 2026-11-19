@@ -633,7 +633,8 @@ fn spawn_migration_worker(
         let worker = MigrationWorker::new(db, storage_registry, worker_config, cancel_token)
             .with_search_service(search_service)
             .with_shutdown_token(shutdown_token.clone())
-            .with_claim_lost_token(claim_lost.clone());
+            .with_claim_lost_token(claim_lost.clone())
+            .with_claim_token(Some(claim_token));
         let outcome = if resume {
             worker
                 .resume_job(job_id, client, conflict_resolution, None)

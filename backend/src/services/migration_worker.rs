@@ -241,6 +241,16 @@ impl MigrationWorker {
         }
     }
 
+    /// Write the job row only while it still carries `claim_token`, the
+    /// worker's claim (#6305): the progress, totals, warning and final status
+    /// writes are all guarded by it, so a worker whose job was taken over
+    /// cannot write onto the new owner's row before its claim renewal
+    /// reports the loss.
+    pub fn with_claim_token(mut self, claim_token: Option<Uuid>) -> Self {
+        self.migration_service = self.migration_service.with_claim_token(claim_token);
+        self
+    }
+
     /// Record the token that fires when this worker's claim on the job row
     /// is lost (#6305).
     pub fn with_claim_lost_token(mut self, claim_lost: CancellationToken) -> Self {
@@ -811,6 +821,16 @@ impl MigrationWorker {
         )
         .await?;
 
+        // Every write below is guarded by the claim, but a worker that was
+        // taken over has nothing left to say about the job (#6305).
+        if !self.migration_service.holds_claim(job_id).await? {
+            tracing::warn!(
+                job_id = %job_id,
+                "Migration worker finished after another worker or the janitor took its claim; leaving the job row to them"
+            );
+            return Ok(());
+        }
+
         // A run that walked repositories it was asked to migrate and moved no
         // counter at all is not evidence of success. It is what a source
         // whose listing quietly returned nothing looks like from the API:
@@ -973,6 +993,17 @@ impl MigrationWorker {
         skipped: i32,
         transferred: i64,
     ) -> Result<(), MigrationError> {
+        // A job another worker took over is no longer this worker's to write
+        // to at all, counters included (#6305). The renewal's loss signal can
+        // lag the takeover by up to one renewal interval, so ask the row.
+        if !self.migration_service.holds_claim(job_id).await? {
+            tracing::warn!(
+                job_id = %job_id,
+                "Migration worker stopped: another worker or the janitor now holds its claim on the job"
+            );
+            return Ok(());
+        }
+
         // A Partial view: the run stopped part-way through enumerating, so its
         // counters describe less of the job than the row may already record.
         // They may advance the row, never replace it — publishing them
@@ -991,13 +1022,13 @@ impl MigrationWorker {
         )
         .await?;
 
-        // Checked first: once the claim is gone the row belongs to the janitor
-        // or to another worker, so neither the shutdown pause nor the cancel
-        // below may write its status (#6305).
+        // Checked before the shutdown pause and the cancel: a lost claim means
+        // the row left `running` (the operator's status is already on it) or
+        // another owner holds it, so neither may write a status (#6305).
         if self.claim_lost.is_cancelled() {
             tracing::warn!(
                 job_id = %job_id,
-                "Migration worker stopped: it lost its claim on the job, which another worker or the janitor now holds"
+                "Migration worker stopped: it lost its claim on the job"
             );
             return Ok(());
         }
@@ -7565,6 +7596,148 @@ mod tests {
             "a worker that lost its claim must not finish the job"
         );
 
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// Hand `job_id` to another worker: `running` under a fresh claim token,
+    /// as a resume elsewhere leaves it. Returns that token.
+    async fn take_over_job(pool: &sqlx::PgPool, job_id: Uuid) -> Uuid {
+        let theirs = Uuid::new_v4();
+        sqlx::query(
+            "UPDATE migration_jobs SET status = 'running', claimed_by = 'other-pod:1:x', \
+             claim_token = $2, claim_expires_at = NOW() + interval '5 minutes' WHERE id = $1",
+        )
+        .bind(job_id)
+        .bind(theirs)
+        .execute(pool)
+        .await
+        .expect("take the job over");
+        theirs
+    }
+
+    /// The window before the renewal notices a takeover (#6305): the old
+    /// worker's final writes, each guarded by its claim token, leave the new
+    /// owner's row alone, while a service holding the row's token still
+    /// writes.
+    #[tokio::test]
+    async fn test_writes_under_a_taken_over_claim_are_rejected_6305() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (_repo, conn_id, job_id) = seed_single_repo_job(&pool, "takeover-svc").await;
+        let theirs = take_over_job(&pool, job_id).await;
+        let stale = MigrationService::new(pool.clone()).with_claim_token(Some(Uuid::new_v4()));
+
+        assert!(!stale.holds_claim(job_id).await.expect("holds_claim"));
+        assert!(!stale
+            .update_job_totals(job_id, 9, 900, SourceView::Complete)
+            .await
+            .expect("totals"));
+        assert!(!stale
+            .update_job_progress(job_id, 9, 0, 0, 900, SourceView::Complete)
+            .await
+            .expect("progress"));
+        assert!(!stale
+            .record_job_warning(job_id, "stale warning")
+            .await
+            .expect("warning"));
+        assert!(!stale
+            .finalize_job_status(job_id, MigrationJobStatus::Completed)
+            .await
+            .expect("finalize"));
+
+        let row: (String, bool, i32, i32, Option<String>, Option<Uuid>) = sqlx::query_as(
+            "SELECT status, finished_at IS NOT NULL, total_items, completed_items, \
+             error_summary, claim_token FROM migration_jobs WHERE id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read job row");
+        assert_eq!(
+            row,
+            ("running".to_string(), false, 0, 0, None, Some(theirs)),
+            "a stale worker wrote onto the new owner's row"
+        );
+
+        // Control: the owner's own token still writes.
+        let owner = MigrationService::new(pool.clone()).with_claim_token(Some(theirs));
+        assert!(owner.holds_claim(job_id).await.expect("holds_claim"));
+        assert!(owner
+            .finalize_job_status(job_id, MigrationJobStatus::Completed)
+            .await
+            .expect("finalize"));
+
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// A worker whose job was taken over before it finished, with no loss
+    /// signal yet (the renewal has not run), still leaves the row to the new
+    /// owner instead of stamping it `completed` (#6305).
+    #[tokio::test]
+    async fn test_process_job_taken_over_before_renewal_does_not_finalize_6305() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "takeover-run").await;
+        let theirs = take_over_job(&pool, job_id).await;
+
+        let staging = tempfile::tempdir().expect("tempdir");
+        let registry = Arc::new(StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let shutdown_token = CancellationToken::new();
+        let cancel_token = shutdown_token.child_token();
+        let worker = MigrationWorker::new(
+            pool.clone(),
+            registry,
+            WorkerConfig {
+                staging_path: staging.path().to_str().unwrap().to_string(),
+                ..WorkerConfig::default()
+            },
+            cancel_token.clone(),
+        )
+        .with_shutdown_token(shutdown_token.clone())
+        .with_claim_token(Some(Uuid::new_v4()));
+        worker
+            .process_job(
+                job_id,
+                Arc::new(InterruptingSource {
+                    pool: pool.clone(),
+                    job_id,
+                    repo_key: repo_key.clone(),
+                    interrupt: MockInterrupt::None,
+                    cancel_token,
+                    shutdown_token,
+                    claim_lost: CancellationToken::new(),
+                }),
+                ConflictResolution::Skip,
+                None,
+            )
+            .await
+            .expect("process_job must not error");
+
+        let row: (String, bool, Option<String>, Option<Uuid>) = sqlx::query_as(
+            "SELECT status, finished_at IS NOT NULL, error_summary, claim_token \
+             FROM migration_jobs WHERE id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read job row");
+        assert_eq!(
+            row,
+            ("running".to_string(), false, None, Some(theirs)),
+            "the taken-over worker finalized the new owner's job"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await;
         cleanup_single_repo_job(&pool, job_id, conn_id).await;
     }
 
