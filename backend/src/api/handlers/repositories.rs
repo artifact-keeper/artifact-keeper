@@ -4816,7 +4816,7 @@ pub async fn create_repository(
     validate_format_supports_repo_type(&format, &repo_type, &payload.key)?;
     // #6063: refuse a versioning opt-in the upload path cannot honour, before
     // the row exists so a rejected request leaves no orphaned repository.
-    validate_versioning_enabled(&format, payload.versioning_enabled)?;
+    validate_versioning_enabled(&format, payload.versioning_enabled, false)?;
     let is_apt_hosted = repo_type.is_hosted() && matches!(format, RepositoryFormat::Debian);
     // Computed before `format` is moved into the create request below.
     let is_hex_hosted = repo_type.is_hosted() && matches!(format, RepositoryFormat::Hex);
@@ -6319,12 +6319,19 @@ async fn persist_curation_source(
 }
 
 /// #6063: only Generic and Mlmodel repositories append immutable revisions on
-/// upload. Refuse a `versioning_enabled` opt-in on every other format instead
-/// of storing a flag the upload path ignores. Omitting the flag or setting it
-/// to `false` stays valid, so an existing row that already holds `true` can be
-/// turned back off.
-fn validate_versioning_enabled(format: &RepositoryFormat, requested: Option<bool>) -> Result<()> {
-    if requested == Some(true) && !crate::services::artifact_service::versioning_supported(format) {
+/// upload. Refuse turning `versioning_enabled` on for every other format
+/// instead of storing a flag the upload path ignores. Omitting the flag,
+/// setting it to `false`, or re-sending the `true` an existing row already
+/// holds stays valid, so such a row can be edited and turned back off.
+fn validate_versioning_enabled(
+    format: &RepositoryFormat,
+    requested: Option<bool>,
+    current: bool,
+) -> Result<()> {
+    if requested == Some(true)
+        && !current
+        && !crate::services::artifact_service::versioning_supported(format)
+    {
         return Err(AppError::Validation(
             "versioning_enabled=true is only valid for Generic and Mlmodel repositories"
                 .to_string(),
@@ -6341,6 +6348,7 @@ fn validate_versioning_enabled(format: &RepositoryFormat, requested: Option<bool
 fn validate_update_config_fields(
     repo_type: &RepositoryType,
     format: &RepositoryFormat,
+    versioning_enabled: bool,
     payload: &UpdateRepositoryRequest,
 ) -> Result<()> {
     validate_npm_scope_policy_fields(
@@ -6352,7 +6360,7 @@ fn validate_update_config_fields(
     )?;
     // #6063: the format is immutable here, so `existing` decides as it does
     // for every other field in this validator.
-    validate_versioning_enabled(format, payload.versioning_enabled)?;
+    validate_versioning_enabled(format, payload.versioning_enabled, versioning_enabled)?;
     // Quarantine and `virtual_metadata_partial`: the same rules as on create
     // (#3647, #5324).
     SharedRepoConfigSettings::from(payload).validate(repo_type)?;
@@ -6634,7 +6642,12 @@ pub async fn update_repository(
     // keeping the repository-row and config changes that ran ahead of the
     // check. Repository type and format are immutable here, so `existing`
     // decides, as for the npm and OCI fields above.
-    validate_update_config_fields(&existing.repo_type, &existing.format, &payload)?;
+    validate_update_config_fields(
+        &existing.repo_type,
+        &existing.format,
+        existing.versioning_enabled,
+        &payload,
+    )?;
     // Captured before `payload` is partly moved into the service request.
     let shared_config = SharedRepoConfigSettings::from(&payload);
     let release_link = match payload.release_repository_key.as_deref() {
@@ -34383,6 +34396,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
+    /// #6063: a Debian row that already holds `versioning_enabled = true`
+    /// from before the check accepts a PATCH that re-sends it unchanged, while
+    /// turning it on for a Debian row that holds `false` is still refused.
+    #[tokio::test]
+    async fn update_keeps_existing_versioning_opt_in_on_unsupported_format_6063_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (legacy_id, legacy_key, legacy_dir) = tdh::create_repo(&pool, "local", "debian").await;
+        let (off_id, off_key, off_dir) = tdh::create_repo(&pool, "local", "debian").await;
+        sqlx::query("UPDATE repositories SET versioning_enabled = true WHERE id = $1")
+            .bind(legacy_id)
+            .execute(&pool)
+            .await
+            .expect("seed a legacy versioned Debian row");
+        let state = tdh::build_state(pool.clone(), legacy_dir.to_str().unwrap());
+        let patch = |key: &str, json: &str| {
+            update_repository(
+                State(state.clone()),
+                Extension(Some(admin_auth(user_id, &username))),
+                Path(key.to_string()),
+                Json(serde_json::from_str(json).expect("deserialize update payload")),
+            )
+        };
+
+        let Json(updated) = patch(&legacy_key, r#"{"name":"x","versioning_enabled":true}"#)
+            .await
+            .expect("re-sending an unchanged true must be accepted");
+        assert_eq!(updated.name, "x");
+        assert!(updated.versioning_enabled);
+
+        let err = patch(&off_key, r#"{"name":"x","versioning_enabled":true}"#)
+            .await
+            .expect_err("turning versioning on for Debian must be refused");
+        assert!(
+            matches!(err, AppError::Validation(ref m) if m.contains("versioning_enabled=true")),
+            "expected the versioning Validation error, got {err:?}",
+        );
+        let off: bool =
+            sqlx::query_scalar("SELECT versioning_enabled FROM repositories WHERE id = $1")
+                .bind(off_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read versioning_enabled");
+        assert!(!off, "a refused PATCH must not turn versioning on");
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![legacy_id, off_id])
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&legacy_dir);
+        let _ = std::fs::remove_dir_all(&off_dir);
+    }
+
     // -----------------------------------------------------------------------
     // #3855: public create/update while guest access is disabled is an
     // explicit 400, never a silent rewrite to private.
@@ -36450,7 +36522,7 @@ mod tests {
             serde_json::from_str(json).expect("deserialize update payload")
         };
         let check = |repo_type: RepositoryType, format: RepositoryFormat, json: &str| {
-            validate_update_config_fields(&repo_type, &format, &req(json))
+            validate_update_config_fields(&repo_type, &format, false, &req(json))
         };
         use RepositoryFormat::{Debian, Generic, Maven, Mlmodel};
         use RepositoryType::{Local, Remote, Staging, Virtual};
@@ -36518,7 +36590,7 @@ mod tests {
     #[test]
     fn versioning_enabled_opt_in_is_format_gated_6063() {
         let check = |format: &RepositoryFormat, value: Option<bool>| {
-            validate_versioning_enabled(format, value)
+            validate_versioning_enabled(format, value, false)
         };
         for format in [RepositoryFormat::Generic, RepositoryFormat::Mlmodel] {
             assert!(check(&format, Some(true)).is_ok(), "{format:?}");
@@ -36535,6 +36607,13 @@ mod tests {
             );
             assert!(check(format, Some(false)).is_ok(), "{format:?}");
             assert!(check(format, None).is_ok(), "{format:?}");
+            // A row that already holds `true` keeps it as a no-op.
+            for value in [Some(true), Some(false), None] {
+                assert!(
+                    validate_versioning_enabled(format, value, true).is_ok(),
+                    "{format:?} {value:?} on a row already holding true"
+                );
+            }
         }
     }
 
