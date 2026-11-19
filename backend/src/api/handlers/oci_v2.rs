@@ -14816,14 +14816,12 @@ async fn tags_list_remote(
 ///
 /// `auth` is the CALLER. Members are narrowed through the same member
 /// visibility filter `resolve_virtual_manifest` and `resolve_virtual_blob`
-/// apply (#3268 review F2): a member contributes its tags when it is public
-/// or the caller holds *any* grant on it (a role assignment or any
-/// fine-grained rule, regardless of the actions it carries), and it passes
-/// the token-scope ceiling. That is deliberately the shared predicate, not a
-/// new one — note it is coarser than the direct read gate, which requires the
-/// `read` action: a principal holding only a write-scoped rule on a private
-/// member is refused a direct tags/list of it but does see its tags here.
-/// Anonymous and ungranted callers see public members only. A denied member
+/// apply (#3268 review F2): a member contributes its tags when it is public,
+/// or when the caller may READ it (the same `check_repository_action` `read`
+/// decision the direct `/v2` read gate makes, #3325) and it passes the
+/// token-scope ceiling. A principal holding only a write-scoped rule on a
+/// private member sees none of its tags here, exactly as a direct tags/list
+/// of it is refused. Anonymous and ungranted callers see public members only. A denied member
 /// contributes nothing, which reads as "no tags there" and leaks neither tag
 /// names nor member existence. Tag pages are computed per request and never
 /// enter the shared negative cache, so there is no principal-independence
@@ -49962,6 +49960,10 @@ mod oci_read_authz_tests {
         let outsider = f.add_user(false).await;
         let outsider_bearer = f.bearer(outsider).await;
         let member_bearer = f.bearer(f.member_id).await;
+        // A grant without `read` on the private member (#3325).
+        let write_only = f.add_user(false).await;
+        tdh::grant_repo_actions(&f.pool, f.repo_id, write_only, &["write"]).await;
+        let write_only_bearer = f.bearer(write_only).await;
 
         let (granted, granted_body, granted_headers) = f
             .call_with_headers("GET", path.clone(), &member_bearer)
@@ -49972,6 +49974,9 @@ mod oci_read_authz_tests {
         let (anon_status, anon_body, _) = f.call_with_headers("GET", path.clone(), &anon).await;
         let (outsider_status, outsider_body, _) = f
             .call_with_headers("GET", path.clone(), &outsider_bearer)
+            .await;
+        let (write_only_status, write_only_body, _) = f
+            .call_with_headers("GET", path.clone(), &write_only_bearer)
             .await;
         let (direct, direct_body, _) = f
             .call_with_headers(
@@ -50046,6 +50051,7 @@ mod oci_read_authz_tests {
         for (who, status, body) in [
             ("anonymous", anon_status, &anon_body),
             ("ungranted", outsider_status, &outsider_body),
+            ("write-only", write_only_status, &write_only_body),
         ] {
             assert_eq!(status, StatusCode::OK, "{who} lists the public Virtual");
             assert_eq!(
