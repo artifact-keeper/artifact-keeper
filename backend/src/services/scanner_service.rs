@@ -7406,6 +7406,14 @@ impl AdvisoryClient {
                  OSV.dev or the GitHub Advisory Database (#5691)"
             );
         }
+        for (pattern, why) in exclusions.suspicious() {
+            warn!(
+                pattern = %pattern,
+                "ADVISORY_EXCLUDE_PATTERNS entry probably matches nothing: {why}. \
+                 Patterns are package-URL globs on `pkg:<type>/<name>`, e.g. \
+                 `pkg:npm/@acme/*` (#5691)"
+            );
+        }
         Self {
             http: crate::services::http_client::base_client_builder()
                 .timeout(Duration::from_secs(30))
@@ -7463,9 +7471,14 @@ impl AdvisoryClient {
         &self.osv_batch_url
     }
 
+    /// The `ADVISORY_EXCLUDE_PATTERNS` this client applies (#5691).
+    pub(crate) fn exclusions(&self) -> &AdvisoryExclusions {
+        &self.exclusions
+    }
+
     /// #5691: `dep` matches `ADVISORY_EXCLUDE_PATTERNS` and must never be
     /// named in a request to an external feed.
-    fn excluded(&self, dep: &Dependency) -> bool {
+    pub(crate) fn excluded(&self, dep: &Dependency) -> bool {
         self.exclusions.excludes(&dep.ecosystem, &dep.name)
     }
 
@@ -8340,6 +8353,15 @@ struct CondaCoverageGap {
     reason: String,
 }
 
+/// What [`DependencyScanner::plan_conda_queries`] made of a batch: the
+/// queries to send, the conda packages no alias could identify, and how many
+/// conda packages `ADVISORY_EXCLUDE_PATTERNS` left out (#5691).
+struct CondaPlan {
+    planned: Vec<(Dependency, DepOrigin)>,
+    gaps: Vec<CondaCoverageGap>,
+    excluded: usize,
+}
+
 impl DependencyScanner {
     /// The CVE an advisory is about: its first `CVE-` alias, or its own id
     /// when that is a CVE.
@@ -8495,15 +8517,26 @@ impl DependencyScanner {
     fn plan_conda_queries(
         batch: Vec<(Dependency, DepOrigin)>,
         map: &crate::services::conda_identity::AliasMap,
-    ) -> (Vec<(Dependency, DepOrigin)>, Vec<CondaCoverageGap>) {
+        exclusions: &AdvisoryExclusions,
+    ) -> CondaPlan {
         use crate::services::conda_identity::{pypi_aliases, AliasCoverage};
 
         let mut planned = Vec::with_capacity(batch.len());
         let mut gaps = Vec::new();
+        let mut excluded = 0;
 
         for (dep, origin) in batch {
             if origin != DepOrigin::Declared || dep.ecosystem != ECOSYSTEM_CONDA {
                 planned.push((dep, origin));
+                continue;
+            }
+
+            // #5691: matched on the conda name the artifact ships, BEFORE it is
+            // rewritten to a PyPI alias or an unscoped query, which a
+            // `pkg:conda/...` pattern could never match. Left out entirely:
+            // not queried, and not a coverage gap, since it is deliberate.
+            if exclusions.excludes(ECOSYSTEM_CONDA, &dep.name) {
+                excluded += 1;
                 continue;
             }
 
@@ -8547,7 +8580,11 @@ impl DependencyScanner {
             }
         }
 
-        (planned, gaps)
+        CondaPlan {
+            planned,
+            gaps,
+            excluded,
+        }
     }
 
     /// The conda package an artifact IS, as a dependency to resolve advisories
@@ -9132,8 +9169,15 @@ impl DependencyScanner {
         // naming the conda package the artifact ships rather than the PyPI
         // alias it was looked up under -- and keeps naming the ones no alias
         // could be found for, which leave the batch entirely.
-        let (batch, conda_gaps) =
-            Self::plan_conda_queries(batch, crate::services::conda_identity::process_alias_map());
+        let CondaPlan {
+            planned: batch,
+            gaps: conda_gaps,
+            excluded: conda_excluded,
+        } = Self::plan_conda_queries(
+            batch,
+            crate::services::conda_identity::process_alias_map(),
+            self.advisory.exclusions(),
+        );
 
         for gap in &conda_gaps {
             warn!(
@@ -9178,12 +9222,31 @@ impl DependencyScanner {
             );
         }
 
-        if !gh_results.not_queried.is_empty() {
+        // #5691: what ADVISORY_EXCLUDE_PATTERNS kept out of every external
+        // request for this scan (conda names before planning, the rest in the
+        // advisory client), recorded so a reader can tell it from coverage.
+        let excluded: Vec<bool> = deps.iter().map(|d| self.advisory.excluded(d)).collect();
+        let advisory_excluded = conda_excluded + excluded.iter().filter(|e| **e).count();
+        if advisory_excluded > 0 {
+            info!(
+                artifact_id = %artifact.id,
+                advisory_excluded,
+                "dependencies matching ADVISORY_EXCLUDE_PATTERNS were not sent to \
+                 any external advisory feed (#5691)"
+            );
+        }
+
+        let gh_unasked = gh_results
+            .not_queried
+            .iter()
+            .filter(|&&i| !excluded.get(i).copied().unwrap_or(false))
+            .count();
+        if gh_unasked > 0 {
             tracing::debug!(
                 artifact_id = %artifact.id,
-                count = gh_results.not_queried.len(),
-                "GitHub Advisory does not serve these dependencies' ecosystems; \
-                 they were never asked about, and OSV is their only coverage"
+                count = gh_unasked,
+                "GitHub Advisory was not asked about these dependencies (no token, \
+                 or an ecosystem it does not serve); OSV is their only coverage"
             );
         }
 
@@ -36408,6 +36471,45 @@ tonic-build = "0.12"
                 .as_object()
                 .expect("package object")
                 .clone()
+        }
+
+        /// #5691 review: a `pkg:conda/...` pattern is matched on the conda name
+        /// BEFORE planning rewrites it into a PyPI alias (`numpy`) or leaves it
+        /// unidentified (`acme-internal-tool`). Neither reaches the feed, the
+        /// exclusion is not a coverage gap (the scan stays `complete`), and the
+        /// inventory still names the package.
+        #[tokio::test]
+        async fn test_excluded_conda_package_is_never_sent_whatever_its_alias() {
+            for name in ["numpy", "acme-internal-tool"] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(answered_clean()))
+                    .expect(0)
+                    .mount(&server)
+                    .await;
+                let mut client = Arc::try_unwrap(advisory_client_at(&format!(
+                    "{}/v1/querybatch",
+                    server.uri()
+                )))
+                .unwrap_or_else(|_| unreachable!("a fresh Arc has one owner"));
+                client.exclusions =
+                    AdvisoryExclusions::parse("pkg:conda/numpy,pkg:conda/acme-internal-*");
+                let scanner = DependencyScanner::new(Arc::new(client));
+
+                let out = scan_conda(&scanner, name, "1.0.0", &Bytes::new()).await;
+
+                assert_eq!(
+                    out.scan_completeness,
+                    ScanCompleteness::Complete,
+                    "{name}: a deliberate exclusion is not a coverage gap"
+                );
+                assert!(
+                    out.packages.iter().any(|p| p.name == name),
+                    "{name}: the inventory still names the package: {:?}",
+                    out.packages
+                );
+                // `expect(0)` is verified when `server` drops.
+            }
         }
 
         // -------------------------------------------------------------------

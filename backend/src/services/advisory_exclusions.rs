@@ -19,7 +19,10 @@
 //! including `/`, and `?` one character. A Maven name is
 //! `pkg:maven/<groupId>/<artifactId>`, an npm scope may be written `@acme` or
 //! `%40acme`, and PyPI names compare in their PEP 503 normal form, so
-//! `pkg:pypi/acme-*` also covers `Acme_Billing`.
+//! `pkg:pypi/acme-*` also covers `Acme_Billing`. A conda package matches on
+//! its conda name (`pkg:conda/...`), checked before the scanner rewrites it
+//! into a PyPI alias or an unscoped query. A pattern without `pkg:`, with a
+//! version or with qualifiers matches nothing and is warned about at startup.
 //!
 //! Unset or empty (the default) excludes nothing: every lookup is sent exactly
 //! as before. An excluded dependency is left out of every external request,
@@ -37,19 +40,34 @@ pub const ADVISORY_EXCLUDE_PATTERNS_ENV: &str = "ADVISORY_EXCLUDE_PATTERNS";
 pub struct AdvisoryExclusions {
     /// Normalised patterns (see [`normalize`]).
     patterns: Vec<String>,
+    /// `(pattern as written, why it probably matches nothing)` for each
+    /// pattern that looks misconfigured; reported at startup.
+    suspicious: Vec<(String, &'static str)>,
 }
 
 impl AdvisoryExclusions {
     /// Parse a comma- or whitespace-separated pattern list. Empty entries are
     /// dropped, so a blank value excludes nothing.
     pub fn parse(raw: &str) -> Self {
-        let patterns = raw
+        let written: Vec<&str> = raw
             .split(|c: char| c == ',' || c.is_whitespace())
             .map(str::trim)
             .filter(|p| !p.is_empty())
-            .map(normalize)
             .collect();
-        Self { patterns }
+        Self {
+            patterns: written.iter().map(|p| normalize(p)).collect(),
+            suspicious: written
+                .iter()
+                .filter_map(|p| suspicion(p).map(|why| ((*p).to_string(), why)))
+                .collect(),
+        }
+    }
+
+    /// Patterns that look misconfigured and probably match nothing, with the
+    /// reason: a missing `pkg:` prefix, a version, or purl qualifiers or a
+    /// subpath (matching is on `pkg:<type>/<name>` only).
+    pub fn suspicious(&self) -> &[(String, &'static str)] {
+        &self.suspicious
     }
 
     /// Read [`ADVISORY_EXCLUDE_PATTERNS_ENV`]. Unset excludes nothing.
@@ -99,10 +117,37 @@ fn purl_type(ecosystem: &str) -> String {
     .to_string()
 }
 
+/// Why a pattern as written probably matches nothing, if it does.
+fn suspicion(pattern: &str) -> Option<&'static str> {
+    let lower = pattern.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("pkg:") else {
+        return Some("it does not start with `pkg:<type>/`");
+    };
+    if rest.contains('=') || rest.contains('#') {
+        return Some(
+            "it carries purl qualifiers or a subpath (`?k=v`, `#path`); only \
+             `pkg:<type>/<name>` is matched, and `?` is a one-character wildcard",
+        );
+    }
+    // A version is an `@` that does not open a path segment (`@acme/` is an
+    // npm scope; `name@1.*` is a version).
+    let name = rest.split_once('/').map_or("", |(_, n)| n);
+    let decoded = name.replace("%40", "@");
+    let bytes = decoded.as_bytes();
+    if bytes
+        .iter()
+        .enumerate()
+        .any(|(i, b)| *b == b'@' && i > 0 && bytes[i - 1] != b'/')
+    {
+        return Some("it names a version (`@...`); patterns match names only, never versions");
+    }
+    None
+}
+
 /// Fold a `pkg:<type>/<name>` string (a pattern or a subject) into the form
 /// both sides are compared in: lowercase, `%40` decoded to `@`, a Maven
 /// `groupId:artifactId` written with `/`, and a PyPI name in PEP 503 form
-/// (`_` and `.` read as `-`). Applying the same fold to the pattern and the
+/// (every run of `-`, `_` and `.` read as one `-`). Applying the same fold to the pattern and the
 /// subject keeps `*` and `?` intact while making the spellings agree.
 fn normalize(raw: &str) -> String {
     let lower = raw.trim().to_lowercase().replace("%40", "@");
@@ -110,7 +155,18 @@ fn normalize(raw: &str) -> String {
         return format!("pkg:maven/{}", rest.replace(':', "/"));
     }
     if let Some(rest) = lower.strip_prefix("pkg:pypi/") {
-        return format!("pkg:pypi/{}", rest.replace(['_', '.'], "-"));
+        // PEP 503: `re.sub(r"[-_.]+", "-", name)`.
+        let mut name = String::with_capacity(rest.len());
+        for c in rest.chars() {
+            if matches!(c, '-' | '_' | '.') {
+                if !name.ends_with('-') {
+                    name.push('-');
+                }
+            } else {
+                name.push(c);
+            }
+        }
+        return format!("pkg:pypi/{name}");
     }
     lower
 }
@@ -157,6 +213,8 @@ mod tests {
         assert!(ex("PKG:NPM/@ACME/*").excludes("npm", "@Acme/X"));
         assert!(ex("pkg:pypi/acme-*").excludes("PyPI", "Acme_Billing"));
         assert!(ex("pkg:pypi/acme_billing").excludes("PyPI", "acme.billing"));
+        assert!(ex("pkg:pypi/acme-billing").excludes("PyPI", "Acme__Billing"));
+        assert!(ex("pkg:pypi/acme_.billing").excludes("PyPI", "acme-billing"));
         assert!(ex("pkg:maven/com.acme:billing").excludes("Maven", "com.acme:billing"));
         assert!(ex("pkg:maven/com.acme/billing").excludes("Maven", "com.acme:billing"));
     }
@@ -175,6 +233,25 @@ mod tests {
         assert!(any.excludes("npm", "acme-x"));
         assert!(any.excludes("PyPI", "acme-x"));
         assert!(!any.excludes("npm", "lodash"));
+    }
+
+    #[test]
+    fn misconfigured_patterns_are_reported() {
+        let e = ex("@acme/*,pkg:npm/@acme/*,pkg:maven/com.acme/lib@1.*,\
+                    pkg:maven/com.acme/lib?type=jar,pkg:npm/%40acme/x@2,pkg:golang/x.io/y#sub");
+        let flagged: Vec<&str> = e.suspicious().iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            flagged,
+            vec![
+                "@acme/*",
+                "pkg:maven/com.acme/lib@1.*",
+                "pkg:maven/com.acme/lib?type=jar",
+                "pkg:npm/%40acme/x@2",
+                "pkg:golang/x.io/y#sub",
+            ],
+            "an npm scope is not a version; everything else here matches nothing"
+        );
+        assert!(ex("pkg:pypi/acme-*,pkg:*/acme-*").suspicious().is_empty());
     }
 
     #[test]

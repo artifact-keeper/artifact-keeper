@@ -476,15 +476,40 @@ synthesized `.ak-scan-jar-inventory/pom.xml` built from their own
 The built-in dependency scanner looks up advisories at scan time on
 `api.osv.dev`, and on the GitHub advisory API only when `GITHUB_TOKEN` is set.
 Offline these lookups fail and the result is recorded as degraded, not clean.
-Leave `GITHUB_TOKEN` unset on a sealed instance. There is no switch to turn
-this scanner off.
+Leave `GITHUB_TOKEN` unset on a sealed instance. The scanner itself cannot be
+turned off.
+
+On a connected instance that hosts internal packages, set
+`ADVISORY_EXCLUDE_PATTERNS` (1.12.4, #5691) to keep their names out of these
+lookups: comma-separated package-URL globs matched on `pkg:<type>/<name>`,
+for example `pkg:maven/com.example.internal/*,pkg:npm/@acme/*,pkg:pypi/acme-*`.
+A matching package is never named in a request to OSV or GitHub, the scan is
+not graded partial for it, and it stays in the inventory and SBOM. Conda
+packages match on their conda name (`pkg:conda/...`), before any PyPI alias is
+looked up. A pattern without `pkg:`, with a version (`@1.*`) or with purl
+qualifiers (`?type=jar`) matches nothing and is reported as a warning at
+startup. Unset, every dependency is looked up.
+
+The setting covers the advisory lookups only. Other paths can still send an
+internal name off the instance:
+
+- Curation popularity lookups (`pypistats.org`, `api.npmjs.org`), for
+  `popularity` rules, both in the scheduled sync and when a rule evaluates a
+  package at request time. See section 5.
+- Remote and Virtual repositories: a request for a name not found locally
+  falls through to the public upstream, which then sees the internal name.
+  Keep internal packages out of Virtuals that include a public Remote, or
+  point those Remotes at internal upstreams (section 3).
+- Dependency-Track, when enabled, receives full SBOMs, internal components
+  included, and its analyzers may query public services. Mark those
+  components internal in Dependency-Track itself.
 
 For a JAR, WAR or EAR (1.12.0, #5666) it reads the coordinates of the
 libraries bundled inside -- each `META-INF/maven/<groupId>/<artifactId>/pom.properties`
 in the archive and in the jars nested one level down (`BOOT-INF/lib/`,
 `WEB-INF/lib/`) -- and looks those up, at the versions the archive ships.
-Only those coordinates leave the instance, and only to the advisory feeds
-above; nothing is resolved against Maven Central. A library built without a
+Those coordinates go only to the advisory feeds above (minus any that match
+`ADVISORY_EXCLUDE_PATTERNS`); nothing is resolved against Maven Central. A library built without a
 `pom.properties` (some Gradle and sbt builds) is not named this way.
 
 ### Dependency-Track and OpenSCAP
