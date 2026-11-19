@@ -42,7 +42,11 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use uuid::Uuid;
 
+use crate::api::handlers::nuget::{
+    build_nuget_push_metadata, existing_catalog_name, parse_nuspec_from_reader, NuspecInfo,
+};
 use crate::api::SharedState;
+use crate::formats::nuget::{NugetHandler, NugetOperation};
 use crate::models::repository::RepositoryFormat;
 use crate::services::package_service::PackageService;
 use crate::services::upload_service::UploadSession;
@@ -122,6 +126,8 @@ pub(crate) enum StagedNativeFinalize {
     /// An npm tarball's `package.json`, which the packument serves as the
     /// version document.
     Npm(Box<StagedNpm>),
+    /// A `.nupkg`'s .nuspec identity and document, which the V3 indexes read.
+    Nuget(Box<StagedNuget>),
     /// A PyPI distribution's parsed core metadata and content analysis.
     Pypi(Box<StagedPypi>),
     /// An RPM's install scriptlets and its filename-derived identity (the
@@ -151,8 +157,36 @@ pub(crate) fn resolved_target(target: NativeTarget, staged: &StagedNativeFinaliz
             version: alpine.identity.1.clone(),
             input: target.input,
         },
+        StagedNativeFinalize::Nuget(nuget) => NativeTarget {
+            name: nuget.info.id.to_lowercase(),
+            version: nuget.info.version.clone(),
+            input: target.input,
+        },
         _ => target,
     }
+}
+
+/// The catalog identity a staged package writes, when it differs from the
+/// lowercased `artifacts.name` the shared upload service would derive. NuGet
+/// keeps the id's authored casing and reuses an existing row's spelling.
+pub(crate) async fn catalog_name(
+    db: &sqlx::PgPool,
+    repository_id: Uuid,
+    staged: &StagedNativeFinalize,
+) -> Option<String> {
+    match staged {
+        StagedNativeFinalize::Nuget(nuget) => {
+            Some(nuget_catalog_name(db, repository_id, &nuget.info).await)
+        }
+        _ => None,
+    }
+}
+
+async fn nuget_catalog_name(db: &sqlx::PgPool, repository_id: Uuid, info: &NuspecInfo) -> String {
+    let lowercased_id = info.id.to_lowercase();
+    existing_catalog_name(db, repository_id, &lowercased_id)
+        .await
+        .unwrap_or_else(|| info.id.clone())
 }
 
 pub(crate) struct StagedMaven {
@@ -167,6 +201,10 @@ pub(crate) struct StagedNpm {
     package_name: String,
     version: String,
     version_data: serde_json::Value,
+}
+
+pub(crate) struct StagedNuget {
+    info: NuspecInfo,
 }
 
 pub(crate) struct StagedPypi {
@@ -227,6 +265,11 @@ pub(crate) fn metadata_document(
             }),
             properties: serde_json::json!({}),
         },
+        StagedNativeFinalize::Nuget(nuget) => NativeMetadata {
+            format: "nuget",
+            metadata: build_nuget_push_metadata(&nuget.info),
+            properties: serde_json::json!({}),
+        },
         StagedNativeFinalize::Pypi(pypi) => NativeMetadata {
             format: "pypi",
             metadata: pypi.metadata.clone(),
@@ -276,6 +319,7 @@ pub(crate) fn has_native_finalize(format: &RepositoryFormat) -> bool {
             | RepositoryFormat::Maven
             | RepositoryFormat::Gradle
             | RepositoryFormat::Npm
+            | RepositoryFormat::Nuget
             | RepositoryFormat::Pypi
             | RepositoryFormat::Rpm
             | RepositoryFormat::Alpine
@@ -379,6 +423,23 @@ pub(crate) fn native_target(
                 FinalizeInput::Stream,
             ))
         }
+        RepositoryFormat::Nuget => {
+            // A `.nupkg` at the repository root (the web UI upload) or at a
+            // NuGet read route's package path is a package. The .nuspec is
+            // authoritative for the identity the row is stored under; these
+            // path coordinates are checked against it before anything is
+            // stored.
+            let path = artifact_path.trim_matches('/');
+            let info = NugetHandler::parse_path(path).ok()?;
+            if !matches!(info.operation, NugetOperation::PackageContent)
+                || !path.ends_with(".nupkg")
+            {
+                return None;
+            }
+            let id = NugetHandler::normalize_id(&info.id?);
+            let version = NugetHandler::normalized_version(&info.version?)?;
+            Some(target((id, version), FinalizeInput::LocalFile))
+        }
         RepositoryFormat::Pypi => {
             let filename = basename(artifact_path);
             let info = crate::formats::pypi::PypiHandler::parse_filename(filename).ok()?;
@@ -427,6 +488,7 @@ pub(crate) fn needs_local_file(format: &RepositoryFormat, artifact_path: Option<
             RepositoryFormat::Incus
                 | RepositoryFormat::Lxc
                 | RepositoryFormat::Debian
+                | RepositoryFormat::Nuget
                 | RepositoryFormat::Pypi
                 | RepositoryFormat::Rpm
         ),
@@ -463,6 +525,7 @@ pub(crate) fn native_content_type(
             crate::api::handlers::maven::content_type_for_path(artifact_path),
         ),
         RepositoryFormat::Npm => Some("application/gzip"),
+        RepositoryFormat::Nuget => Some("application/octet-stream"),
         RepositoryFormat::Pypi => Some(crate::api::handlers::pypi::pypi_content_type(basename(
             artifact_path,
         ))),
@@ -574,6 +637,14 @@ pub(crate) async fn stage(
         RepositoryFormat::Npm => stage_npm(target, source)
             .await
             .map(|staged| StagedNativeFinalize::Npm(Box::new(staged))),
+        RepositoryFormat::Nuget => {
+            let FinalizeSource::File(file) = source else {
+                return Err("a NuGet package finalize needs the assembled file".to_string());
+            };
+            stage_nuget(target, file)
+                .await
+                .map(|staged| StagedNativeFinalize::Nuget(Box::new(staged)))
+        }
         RepositoryFormat::Pypi => {
             let FinalizeSource::File(file) = source else {
                 return Err("a PyPI distribution finalize needs the assembled file".to_string());
@@ -618,6 +689,36 @@ pub(crate) async fn stage(
         }
         _ => Err("this repository format has no native finalize".to_string()),
     }
+}
+
+/// Parse a staged `.nupkg`'s `.nuspec` and check it against the coordinates
+/// its path declares, as the native push route checks its generated path.
+async fn stage_nuget(target: &NativeTarget, file: &std::path::Path) -> Result<StagedNuget, String> {
+    let staged_path = file.to_path_buf();
+    let info = crate::util::bounded_archive::with_ingest_extraction_async(|| {
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&staged_path)
+                .map_err(|e| format!("Cannot open staged package: {e}"))?;
+            parse_nuspec_from_reader(file)
+        })
+    })
+    .await
+    .map_err(|e| format!("NuGet ingest extraction unavailable: {e}"))?
+    .map_err(|e| format!("nuspec parse task failed: {e}"))?
+    .map_err(|e| format!("Failed to read .nuspec from package: {e}"))?;
+
+    if info.id.trim().is_empty() || info.version.trim().is_empty() {
+        return Err("Package ID and version are required in .nuspec".to_string());
+    }
+    let declared_version = NugetHandler::normalized_version(&info.version)
+        .unwrap_or_else(|| info.version.to_lowercase());
+    if !target.name.eq_ignore_ascii_case(&info.id) || target.version != declared_version {
+        return Err(format!(
+            "The .nupkg declares {} {}, which disagrees with the upload path",
+            info.id, info.version
+        ));
+    }
+    Ok(StagedNuget { info })
 }
 
 /// Up to `limit` leading bytes of `source`, for a parser that only reads a
@@ -985,6 +1086,28 @@ pub(crate) async fn record(
                 &package_name,
             )
             .await;
+            Ok(())
+        }
+        StagedNativeFinalize::Nuget(nuget) => {
+            let catalog_name =
+                nuget_catalog_name(&state.db, context.repository_id, &nuget.info).await;
+            let StagedNuget { info } = *nuget;
+            let description = if info.description.is_empty() {
+                None
+            } else {
+                Some(info.description.as_str())
+            };
+            catalog
+                .try_create_or_update_from_artifact(
+                    context.repository_id,
+                    &catalog_name,
+                    &info.version,
+                    context.size_bytes,
+                    context.checksum_sha256,
+                    description,
+                    Some(serde_json::json!({ "format": "nuget" })),
+                )
+                .await;
             Ok(())
         }
         StagedNativeFinalize::Pypi(pypi) => {
@@ -1969,6 +2092,61 @@ mod tests {
             .fetch_one(&f.pool)
             .await
             .unwrap()
+    }
+
+    /// A minimal `.nupkg` whose `.nuspec` declares `id` and `version`.
+    fn nupkg(id: &str, version: &str) -> Vec<u8> {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file(format!("{id}.nuspec"), options).unwrap();
+        write!(
+            zip,
+            "<package><metadata><id>{id}</id><version>{version}</version>\
+             <authors>Test Author</authors><description>A test package</description>\
+             </metadata></package>"
+        )
+        .unwrap();
+        zip.finish().unwrap().into_inner()
+    }
+
+    // #6062: the web UI uploads a package at the repository root. The generic
+    // PUT used to leave it as an unversioned file named after the path, so no
+    // NuGet index could find it.
+    #[tokio::test]
+    async fn generic_put_root_nupkg_creates_a_nuget_package_6062() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let path = "Qa.UiUpload.1.2.3.nupkg";
+        assert_created(generic_put(&f, path, &nupkg("Qa.UiUpload", "1.2.3")).await).await;
+
+        let (_, name, version, content_type) = row(&f, path).await;
+        assert_eq!(name, "qa.uiupload");
+        assert_eq!(version.as_deref(), Some("1.2.3"));
+        assert_eq!(content_type, "application/octet-stream");
+
+        let (format, document) = metadata_at(&f, path).await.expect("nuget metadata");
+        assert_eq!(format, "nuget");
+        assert_eq!(document["id"], "Qa.UiUpload");
+        assert_eq!(document["version"], "1.2.3");
+        assert_eq!(document["filename"], "qa.uiupload.1.2.3.nupkg");
+        assert_eq!(
+            catalog_version(&f, "Qa.UiUpload").await.as_deref(),
+            Some("1.2.3")
+        );
+
+        let (status, body) = tdh::send(
+            f.router_with_auth(crate::api::handlers::nuget::router()),
+            tdh::get(format!("/{}/v3/search?q=qa.uiupload", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let search: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(search["totalHits"], 1, "{search}");
+        assert_eq!(search["data"][0]["version"], "1.2.3", "{search}");
+
+        f.teardown().await;
     }
 
     /// The `APKINDEX` text of an unsigned `APKINDEX.tar.gz`.
