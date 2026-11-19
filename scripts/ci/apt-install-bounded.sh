@@ -53,9 +53,10 @@ echo "apt-install-bounded: $* (download capped at ${APT_ATTEMPT_TIMEOUT} per att
 echo "apt mirrors: $(tr '\n' ' ' < "$APT_MIRRORS_FILE" 2>/dev/null || echo '(none)')"
 
 fetch() {
-  # One deadline over update + download, as in ci.yml's Windows cross-check.
+  # One deadline over update + download, as in ci.yml's Windows cross-check;
+  # -k: SIGKILL 30s later if apt ignores the TERM.
   # shellcheck disable=SC2016,SC2086  # expanded by the inner bash; $SUDO is empty or one word
-  $SUDO timeout "$APT_ATTEMPT_TIMEOUT" bash -c '
+  $SUDO timeout -k 30s "$APT_ATTEMPT_TIMEOUT" bash -c '
     apt=$1; shift
     "$apt" update -o Acquire::Retries=3 \
       && "$apt" install --download-only -y -o Acquire::Retries=3 "$@"
