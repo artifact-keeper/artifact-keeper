@@ -398,22 +398,16 @@ fn gate_detailed_health_fields(
 /// Cloud-metadata, loopback and link-local targets stay hard-blocked.
 ///
 /// [`internal_service_client_builder`]: crate::services::http_client::internal_service_client_builder
-fn build_service_probe_client() -> crate::services::http_client::Client {
+fn build_service_probe_client() -> Result<crate::services::http_client::Client, reqwest::Error> {
     crate::services::http_client::internal_service_client_builder()
         .timeout(Duration::from_secs(5))
         .build()
-        .expect("build service probe HTTP client")
 }
 
 /// Shared probe client. Clones reuse its pool until a validated custom-CA
 /// revision replaces it; polling and PEM parsing happen off the async workers.
-static SERVICE_PROBE_CLIENT: Lazy<crate::services::http_client::Client> =
+static SERVICE_PROBE_CLIENT: Lazy<Result<crate::services::http_client::Client, reqwest::Error>> =
     Lazy::new(build_service_probe_client);
-
-/// Return a clone sharing the current probe connection pool.
-fn service_probe_client() -> crate::services::http_client::Client {
-    SERVICE_PROBE_CLIENT.clone()
-}
 
 /// Probe an external service health endpoint and return a CheckStatus.
 async fn check_service_health(
@@ -421,7 +415,18 @@ async fn check_service_health(
     health_path: &str,
     service_name: &str,
 ) -> CheckStatus {
-    let client = service_probe_client();
+    let client = match SERVICE_PROBE_CLIENT.as_ref() {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::debug!(error = %err, "Cannot initialize service probe HTTP client");
+            return CheckStatus {
+                status: "unavailable".to_string(),
+                message: Some(format!(
+                    "{service_name} probe HTTP client could not be initialized"
+                )),
+            };
+        }
+    };
     let url = format!("{}{}", base_url.trim_end_matches('/'), health_path);
     match client.get(&url).send().await {
         Ok(resp) if resp.status().is_success() => CheckStatus {
@@ -1436,7 +1441,7 @@ mod tests {
             }
         });
 
-        let client = service_probe_client();
+        let client = SERVICE_PROBE_CLIENT.as_ref().unwrap();
         let url = format!("http://127.0.0.1:{}/healthz", addr.port());
         let result = client.get(&url).send().await;
         let _ = server.await;
@@ -1473,7 +1478,7 @@ mod tests {
             .expect("bind test listener");
         let port = listener.local_addr().expect("local addr").port();
 
-        let client = service_probe_client();
+        let client = SERVICE_PROBE_CLIENT.as_ref().unwrap();
         let url = format!("http://localhost:{port}/healthz");
         let err = client
             .get(&url)
