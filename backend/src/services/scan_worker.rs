@@ -364,8 +364,9 @@ async fn run_claimed_job(state: SharedState, queue: ScanQueue, job: Claimed<Scan
         ) => match result {
             Ok(r) => r,
             Err(_) => Err(JobFailure::Retryable(format!(
-                "scan exceeded the {}s queued-job budget",
-                DEFAULT_JOB_BUDGET.as_secs()
+                "scan exceeded the {}s queued-job budget and its {}s grace",
+                DEFAULT_JOB_BUDGET.as_secs(),
+                JOB_FINALIZE_GRACE.as_secs()
             ))),
         }
     };

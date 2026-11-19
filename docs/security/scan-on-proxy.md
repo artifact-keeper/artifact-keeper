@@ -564,6 +564,14 @@ killed and its row recorded `failed`, and a queued job is retried. Set it
 above the longest scan you expect to finish. Scans through the scanner adapter
 are not affected by it; the adapter client keeps its own budgets.
 
+Without the queue, the stuck-scan janitor (`STUCK_SCAN_THRESHOLD_SECS`, default
+1800) marks a hung scan's rows `failed` but never stops the hung `grype`. On
+such pods `SCANNER_PROCESS_TIMEOUT_SECS=1800` kills the process when the janitor
+would fail its row; a lower value such as `900` frees it sooner if your slowest
+scans finish well inside that. A retried on-demand scan reuses its rows: between
+attempts they read `failed`, so a `block_on_fail` policy holds the artifact,
+and a retry that succeeds completes the rows and releases the hold.
+
 **Rescans after a vulnerability-database update.** `SCAN_RESCAN_MAX_PER_DAY`
 (default `0`, off) has the worker look every 15 minutes for stored artifacts
 whose latest completed scan used an older database build than the one the

@@ -10473,6 +10473,11 @@ impl ScannerService {
             // If we still have a prepared id, reuse it; otherwise create a row.
             let scan_result = match prepared_action {
                 PreparedScanAction::Reuse(target_id) => {
+                    // #5942: a retried queued job scans into the row its
+                    // timed-out attempt recorded `failed`; reopen it first.
+                    self.scan_result_service
+                        .reopen_failed_scan(target_id)
+                        .await?;
                     self.scan_result_service.get_scan(target_id).await?
                 }
                 PreparedScanAction::InsertFresh => {
@@ -30178,6 +30183,113 @@ tonic-build = "0.12"
                 "{rows:?}"
             );
         }
+    }
+
+    /// #5942 review: a queued on-demand scan whose grype attempt timed out and
+    /// whose retry succeeds. The retry scans into the same pre-allocated row,
+    /// so the row must end a clean `completed` (no stale error, inventory not
+    /// `failed`), not keep the first attempt's leftovers. And the
+    /// `block_on_fail` hold the failed attempt put on the artifact is released
+    /// by the successful retry (#5153), so the hold lasts only between
+    /// attempts.
+    #[tokio::test]
+    async fn a_retry_after_a_timed_out_attempt_completes_the_row_and_releases_the_hold() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct HangsOnce(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Scanner for HangsOnce {
+            fn name(&self) -> &str {
+                "grype"
+            }
+            fn scan_type(&self) -> &str {
+                "grype"
+            }
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<ScanOutput> {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    std::future::pending::<()>().await;
+                }
+                Ok(ScanOutput::default())
+            }
+        }
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = Uuid::new_v4();
+        insert_test_artifact(&fx, artifact_id, "scanner-retry", None, None).await;
+        seed_enabled_policy(&fx.pool, fx.repo_id, &format!("retry-{artifact_id}")).await;
+        let mut scanner = scanner_for_fixture(&fx);
+        scanner.scanners = vec![Arc::new(HangsOnce(Arc::new(AtomicUsize::new(0))))];
+        let prepared = prepared_pairs_to_map(
+            scanner
+                .prepare_artifact_scan(artifact_id, true, false)
+                .await
+                .expect("prepare"),
+        );
+        let row_id = prepared["grype"];
+        let row = |pool: PgPool| async move {
+            sqlx::query_as::<_, (String, Option<String>, String, bool)>(
+                "SELECT status, error_message, inventory_status, completed_at IS NOT NULL \
+                 FROM scan_results WHERE id = $1",
+            )
+            .bind(row_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read row")
+        };
+        let attempt = |deadline_secs: u64| {
+            let budget = std::time::Duration::from_secs(deadline_secs);
+            crate::services::scan_queue::with_job_deadline(
+                tokio::time::Instant::now() + budget,
+                budget,
+                scanner.scan_artifact_with_prepared(artifact_id, prepared.clone(), true, false),
+            )
+        };
+
+        let (first, timed_out) = attempt(1).await;
+        let after_first = row(fx.pool.clone()).await;
+        let hold_first = quarantine_row(&fx.pool, artifact_id).await;
+        let (second, retry_timed_out) = attempt(30).await;
+        let after_second = row(fx.pool.clone()).await;
+        let hold_second = quarantine_row(&fx.pool, artifact_id).await;
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM scan_results WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count rows");
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        first.expect("first attempt orchestration succeeds");
+        assert!(timed_out, "the first attempt must report its timeout");
+        assert_eq!(after_first.0, "failed", "{after_first:?}");
+        assert!(after_first.1.is_some_and(|e| e.contains("was stopped")));
+        assert_eq!(after_first.2, "failed");
+        assert_eq!(
+            hold_first.0.as_deref(),
+            Some("quarantined"),
+            "block_on_fail holds the artifact after the failed attempt: {hold_first:?}"
+        );
+
+        second.expect("retry orchestration succeeds");
+        assert!(!retry_timed_out);
+        assert_eq!(rows, 1, "the retry reuses the trigger's row");
+        assert_eq!(
+            after_second,
+            ("completed".to_string(), None, "complete".to_string(), true),
+            "the retried row must not keep the timed-out attempt's leftovers"
+        );
+        assert_ne!(
+            hold_second.0.as_deref(),
+            Some("quarantined"),
+            "the successful retry must release the hold: {hold_second:?}"
+        );
     }
 
     /// Records the [`ScanTarget::expected_component`] the orchestration hands

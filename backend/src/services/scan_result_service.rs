@@ -2351,6 +2351,35 @@ impl ScanResultService {
         Ok(row.map(|(checksum,)| checksum))
     }
 
+    /// Put a trigger's pre-allocated row that an earlier attempt of the same
+    /// queued job left `failed` back to `running` before the retry scans into
+    /// it (#5942): clears the attempt's error, completion time and `failed`
+    /// inventory, so a retry that succeeds ends as a clean `completed` row
+    /// and pollers see `running` while it runs. A row in any other state is
+    /// left alone. Returns whether the row was reopened.
+    pub async fn reopen_failed_scan(&self, scan_id: Uuid) -> Result<bool> {
+        // Runtime query, as in `fail_scan_if_running`.
+        let reopened = sqlx::query(
+            r#"
+            UPDATE scan_results
+            SET status = 'running', error_message = NULL, completed_at = NULL,
+                inventory_status = 'complete'
+            WHERE id = $1 AND status = 'failed'
+            "#,
+        )
+        .bind(scan_id)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .rows_affected();
+        if reopened > 0 {
+            // A `failed` row moved a block_on_fail decision; drop the cached
+            // listing decisions the same way a terminal transition does.
+            scan_completed();
+        }
+        Ok(reopened > 0)
+    }
+
     /// Mark a scan as `not_applicable` (#1470): the scanner does not apply to
     /// this artifact's format, so it never ran. This is a distinct terminal
     /// status from `failed` (which is reserved for a scanner that started and
