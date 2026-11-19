@@ -1130,41 +1130,63 @@ type TokenCacheMap = RwLock<HashMap<String, (CachedApiTokenEntry, Instant)>>;
 /// A validated API token and the id of its row: what one validation yields.
 type ApiTokenOutcome = Result<(ApiTokenValidation, Uuid)>;
 
-/// The verdict a finished in-flight validation hands to the requests that
-/// waited on it (#6215). Only definitive outcomes are shared: a success, or an
-/// authentication refusal. A database error, an internal error or a `503`
-/// from the auth cap is not, so a waiter retries the validation itself
-/// instead of inheriting someone else's transient failure.
+/// How a finished in-flight validation left its slot for the requests that
+/// waited on it (#6215). An empty slot (`None`) means the leader was cancelled
+/// before finishing; the next waiter then runs the validation in its place.
 #[derive(Clone)]
-enum SharedTokenVerdict {
-    Valid(ApiTokenValidation, Uuid),
+enum TokenFlightState {
+    /// The token validated. `started` is when the leader began, before its
+    /// DB read: a waiter re-validates if the token was revoked, its user
+    /// invalidated after `started`, or it expired since.
+    Valid {
+        validation: ApiTokenValidation,
+        token_id: Uuid,
+        started: Instant,
+    },
+    /// The token was refused. Shared, never cached.
     Refused(String),
+    /// The leader hit an error that is not a verdict on the token (a database
+    /// error, an internal error or a `503` from the auth cap). Waiters
+    /// validate on their own, in parallel, as they would without the flight,
+    /// rather than inheriting a transient failure or queueing one by one.
+    Bypass,
 }
 
-impl SharedTokenVerdict {
-    fn from_outcome(outcome: &ApiTokenOutcome) -> Option<Self> {
+impl TokenFlightState {
+    fn from_outcome(outcome: &ApiTokenOutcome, started: Instant) -> Self {
         match outcome {
-            Ok((validation, token_id)) => Some(Self::Valid(validation.clone(), *token_id)),
-            Err(AppError::Authentication(msg)) => Some(Self::Refused(msg.clone())),
-            Err(_) => None,
+            Ok((validation, token_id)) => Self::Valid {
+                validation: validation.clone(),
+                token_id: *token_id,
+                started,
+            },
+            Err(AppError::Authentication(msg)) => Self::Refused(msg.clone()),
+            Err(_) => Self::Bypass,
         }
     }
+}
 
-    fn into_outcome(self) -> ApiTokenOutcome {
-        match self {
-            Self::Valid(validation, token_id) => Ok((validation, token_id)),
-            Self::Refused(msg) => Err(AppError::Authentication(msg)),
-        }
-    }
+/// Whether a `Valid` verdict a leader reached, starting at `started`, may no
+/// longer be handed to a waiter as is (#6215). The same checks the cache path
+/// applies, so a revocation, deactivation or expiry that landed while the
+/// leader was still validating is not missed by requests that joined it.
+fn shared_validation_is_stale(
+    validation: &ApiTokenValidation,
+    token_id: Uuid,
+    started: Instant,
+) -> bool {
+    is_api_token_revoked_in_cache(token_id)
+        || is_user_api_tokens_invalidated_after(validation.user.id, started)
+        || validation.expires_at.is_some_and(|exp| exp < Utc::now())
 }
 
 /// One in-flight API-token validation (#6215). The first request to lock it
-/// runs the validation while holding the lock and leaves its verdict in the
-/// slot; requests for the same token that arrived meanwhile queue on the lock
-/// and take that verdict instead of running their own bcrypt. If the leader is
-/// cancelled, or ends with a verdict that is not shared, the slot stays empty
-/// and the next waiter runs the validation in its place.
-type TokenFlight = tokio::sync::Mutex<Option<SharedTokenVerdict>>;
+/// runs the validation while holding the lock and leaves a
+/// [`TokenFlightState`] in the slot; requests for the same token that arrived
+/// meanwhile queue on the lock and act on it instead of running their own
+/// bcrypt. If the leader is cancelled the slot stays empty and the next
+/// waiter runs the validation in its place.
+type TokenFlight = tokio::sync::Mutex<Option<TokenFlightState>>;
 
 /// Per-instance map of in-flight API-token validations, keyed like the cache.
 type TokenFlightMap = std::sync::Mutex<HashMap<String, Arc<TokenFlight>>>;
@@ -3568,24 +3590,56 @@ impl AuthService {
         // Each request still returns its own `Result`, so the callers'
         // failure and lockout accounting sees one outcome per request, as
         // before; the cap still bounds every bcrypt that does run.
+        //
+        // Refuse a malformed credential before joining a flight: it costs no
+        // bcrypt, so there is nothing to share.
+        if !is_api_token_shape(token) {
+            return Err(AppError::Authentication("Invalid API token".to_string()));
+        }
         let flight = self.join_token_flight(&cache_key);
         let mut slot = flight.lock().await;
-        if let Some(verdict) = slot.as_ref() {
-            return Self::record_validated_api_token(verdict.clone().into_outcome());
+        match slot.clone() {
+            Some(TokenFlightState::Valid {
+                validation,
+                token_id,
+                started,
+            }) => {
+                drop(slot);
+                if shared_validation_is_stale(&validation, token_id, started) {
+                    // Revoked, deactivated or expired while the leader was
+                    // validating: decide from the DB, as without the flight.
+                    let outcome = self.validate_api_token_uncached(token, &cache_key).await;
+                    return Self::record_validated_api_token(outcome);
+                }
+                return Self::record_validated_api_token(Ok((validation, token_id)));
+            }
+            Some(TokenFlightState::Refused(msg)) => {
+                return Err(AppError::Authentication(msg));
+            }
+            Some(TokenFlightState::Bypass) => {
+                drop(slot);
+                let outcome = match self.cached_api_token(&cache_key) {
+                    Some(hit) => hit,
+                    None => self.validate_api_token_uncached(token, &cache_key).await,
+                };
+                return Self::record_validated_api_token(outcome);
+            }
+            None => {}
         }
-        // The leader. Look again: a flight that finished between our cache
-        // miss and joining has already cached its success.
+        // The leader. `started` precedes the DB read, so any revocation or
+        // deactivation the read could have missed lands after it.
+        let started = Instant::now();
+        // Look again: a flight that finished between our cache miss and
+        // joining has already cached its success.
         let outcome = match self.cached_api_token(&cache_key) {
             Some(hit) => hit,
             None => self.validate_api_token_uncached(token, &cache_key).await,
         };
-        *slot = SharedTokenVerdict::from_outcome(&outcome);
-        if slot.is_some() {
-            // Requests arriving from now on start a new flight: a success is
-            // in the cache, and a refusal is shared only with the requests
-            // that were already waiting on this one.
-            self.leave_token_flight(&cache_key, &flight);
-        }
+        *slot = Some(TokenFlightState::from_outcome(&outcome, started));
+        // Requests arriving from now on start a new flight: a success is in
+        // the cache, a refusal is shared only with the requests that were
+        // already waiting, and after a bypass they validate on their own.
+        self.leave_token_flight(&cache_key, &flight);
         drop(slot);
         Self::record_validated_api_token(outcome)
     }
@@ -3644,7 +3698,7 @@ impl AuthService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Drop flights nobody holds any more (every request on them was
-        // cancelled, or the last one ended without a shared verdict). Clones
+        // cancelled before a leader finished). Clones
         // are only taken under this lock, so a count of 1 cannot grow back.
         flights.retain(|_, flight| Arc::strong_count(flight) > 1);
         flights.entry(cache_key.to_string()).or_default().clone()
@@ -5135,6 +5189,172 @@ mod tests {
         assert_eq!(
             svc.validate_api_token(&token).await.unwrap().user.id,
             user_id
+        );
+    }
+
+    /// #6215 review: a request that joined a flight must not take a `Valid`
+    /// verdict the leader reached before the token was revoked. The leader
+    /// reads the row, the token is revoked while it is still in bcrypt, and a
+    /// second request joins: it re-validates against the DB and is refused,
+    /// as its own lookup would have been without the flight.
+    #[tokio::test]
+    async fn waiter_refuses_a_token_revoked_mid_flight_6215() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::atomic::Ordering;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+        let (token, token_id) = svc
+            .generate_api_token(user_id, "revoke-6215", vec!["read:artifacts".into()], None)
+            .await
+            .expect("mint API token");
+        // A production-cost hash keeps the leader in bcrypt long enough to
+        // revoke and join behind it.
+        let slow_hash = bcrypt::hash(&token, bcrypt::DEFAULT_COST).expect("hash");
+        sqlx::query("UPDATE api_tokens SET token_hash = $1 WHERE id = $2")
+            .bind(&slow_hash)
+            .bind(token_id)
+            .execute(&pool)
+            .await
+            .expect("store the production-cost hash");
+
+        let verifies = || bcrypt_verify_counter().load(Ordering::Relaxed);
+        let before = verifies();
+        let leader = svc.validate_api_token(&token);
+        let late = async {
+            // The leader has read the row and is in bcrypt.
+            while verifies() == before {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            svc.revoke_api_token(token_id, user_id)
+                .await
+                .expect("revoke");
+            assert_eq!(
+                svc.token_flights.lock().unwrap().len(),
+                1,
+                "the leader is still in flight, so this request joins it"
+            );
+            svc.validate_api_token(&token).await
+        };
+        let (leader_result, late_result) = tokio::join!(leader, late);
+
+        assert!(
+            leader_result.is_ok(),
+            "the leader read the row before the revocation: {leader_result:?}"
+        );
+        assert!(
+            matches!(late_result, Err(AppError::Authentication(_))),
+            "a request that joined after the revocation is refused: {late_result:?}"
+        );
+        assert_eq!(
+            verifies() - before,
+            1,
+            "the re-validation refuses the revoked row before bcrypt"
+        );
+    }
+
+    /// #6215 review: the checks a waiter applies to a shared `Valid` verdict
+    /// are the cache path's: revocation, user invalidation after the leader
+    /// started, and expiry.
+    #[test]
+    fn shared_validation_staleness_mirrors_the_cache_checks_6215() {
+        let validation = |expires_at| ApiTokenValidation {
+            user: make_test_user(),
+            scopes: vec!["read:artifacts".to_string()],
+            allowed_repo_ids: AccessScope::from(None::<Vec<Uuid>>),
+            expires_at,
+        };
+
+        let fresh = validation(None);
+        let started = Instant::now();
+        assert!(!shared_validation_is_stale(&fresh, Uuid::new_v4(), started));
+
+        let revoked_id = Uuid::new_v4();
+        mark_api_token_revoked(revoked_id);
+        assert!(shared_validation_is_stale(&fresh, revoked_id, started));
+
+        let deactivated = validation(None);
+        let started = Instant::now();
+        invalidate_user_token_cache_entries(deactivated.user.id);
+        assert!(shared_validation_is_stale(
+            &deactivated,
+            Uuid::new_v4(),
+            started
+        ));
+
+        let expired = validation(Some(Utc::now() - Duration::seconds(1)));
+        assert!(shared_validation_is_stale(
+            &expired,
+            Uuid::new_v4(),
+            Instant::now()
+        ));
+        let unexpired = validation(Some(Utc::now() + Duration::hours(1)));
+        assert!(!shared_validation_is_stale(
+            &unexpired,
+            Uuid::new_v4(),
+            Instant::now()
+        ));
+    }
+
+    /// #6215 review: when the leader fails with an error that is not a
+    /// verdict on the token (here a `503` from a saturated auth cap), the
+    /// requests that waited on it validate in parallel, as without the flight,
+    /// instead of taking the lock one by one and each waiting out
+    /// `AUTH_PERMIT_WAIT` in turn.
+    ///
+    /// Installs a one-slot cap; nextest's process-per-test isolation keeps
+    /// the `OnceLock` private to this test.
+    #[tokio::test]
+    async fn waiters_bypass_a_leader_shed_by_the_cap_in_parallel_6215() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let sem = Arc::new(Semaphore::new(1));
+        install_global_auth_semaphore(Some(sem.clone()));
+        let installed = installed_global_auth_semaphore().expect("a cap is installed");
+        assert!(
+            Arc::ptr_eq(&installed, &sem),
+            "another cap was installed first in this process"
+        );
+
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let minter = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+        let (token, _id) = minter
+            .generate_api_token(user_id, "bypass-6215", vec!["read:artifacts".into()], None)
+            .await
+            .expect("mint API token");
+
+        // Saturate the cap for the whole burst.
+        let held = sem.clone().acquire_owned().await.expect("permit");
+        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+        const BURST: usize = 9;
+        let t0 = Instant::now();
+        let results =
+            futures::future::join_all((0..BURST).map(|_| svc.validate_api_token(&token))).await;
+        let elapsed = t0.elapsed();
+        drop(held);
+
+        for result in results {
+            assert!(
+                matches!(result, Err(AppError::ServiceUnavailable(_))),
+                "every request is shed by the saturated cap: {result:?}"
+            );
+        }
+        // The leader waits out one permit-wait, then the waiters wait out
+        // theirs side by side: two waits, where queueing one by one took
+        // BURST of them.
+        assert!(
+            elapsed < AUTH_PERMIT_WAIT * 3,
+            "waiters behind a failed leader must not serialize: {elapsed:?}"
+        );
+        assert!(
+            svc.token_flights.lock().unwrap().is_empty(),
+            "the bypassed flight is retired"
         );
     }
 
