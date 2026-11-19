@@ -58,8 +58,9 @@ fn build_mutation_allowed(is_admin: bool, caller: Uuid, owner: Option<Uuid>) -> 
     is_admin || owner == Some(caller)
 }
 
-/// Whether `auth` may see a build's `metadata`, `vcs_url` and every attached
-/// artifact path (#6240). The same owner-or-admin rule `require_build_owner`
+/// Whether `auth` may see a build's `metadata`, its VCS fields (`vcs_url`,
+/// `vcs_revision`, `vcs_branch`, `vcs_message`) and every attached artifact
+/// path (#6240). The same owner-or-admin rule `require_build_owner`
 /// applies to writes, minus the `write:artifacts` scope: a read-only token of
 /// the creator still sees its own build. Anyone else gets the build without
 /// those fields, and only the artifacts in repositories it can read.
@@ -77,35 +78,66 @@ const MAX_ARTIFACTS_PER_LISTED_BUILD: i64 = 50;
 /// `raw` without the userinfo (`user:password@`) of a `scheme://` URL
 /// (#6240). CI systems commonly set the clone URL to
 /// `https://x-access-token:<token>@host/org/repo`, and that token must not be
-/// stored or returned. Like `storage::public_endpoint::redact_userinfo` this
-/// works on the text, not on a parsed URL: a password pasted without
-/// percent-encoding can contain `/`, `?` or `#`, which would end a parsed
-/// authority early and leave the rest of the secret in the "path".
+/// stored or returned. This works on the text, not on a parsed URL: a
+/// password pasted without percent-encoding can contain `/`, `?` or `#`,
+/// which would end a parsed authority early and leave the rest of the secret
+/// in the "path". It runs before the row is written, so a rule that cuts too
+/// much loses the stored URL: each rule below cuts only where the text cannot
+/// be a host.
 ///
-/// Let `head` be the text between `://` and the first `/`. When the last `@`
-/// comes before any `/`, or `head` has a `:` (a password, possibly with a
-/// `/` in it), everything up to the LAST `@` goes: an `@` that was really in
-/// the path costs part of the path, never a credential. Otherwise an `@` in
-/// `head` ends a password-less userinfo (`https://token@host/repo@v1`) and an
-/// `@` only after it is in the path (`https://host/org/repo@v1`), kept. A
-/// value without `://` (scp-style `git@host:org/repo`, a login name and never
-/// a password) is returned unchanged.
+/// `head` is the text between `://` and the first `/` (all of it without one):
+/// 1. `head` has a `:` before its first `@`: `user:password@`, the password
+///    possibly holding `@` or `/`, so cut at the LAST `@` in the value.
+/// 2. Else `head` has an `@`: a password-less userinfo (`token@host`, or
+///    `git@host:22`), cut at the last `@` in `head`. An `@` after it is in
+///    the path (`https://token@host/repo@v1`).
+/// 3. Else no `@` after `head`, or `head` is an IPv6 literal (`[`...) or
+///    ends in `:<digits>` (a port): no userinfo, unchanged
+///    (`https://h:8443/r?ref=a@b`, `https://[::1]/r@v1`).
+/// 4. Else `head` has a `:`: a password with a `/` in it
+///    (`https://ci:pa/ss@host/r`), cut at the last `@`.
+/// 5. Else `head` cannot be a host name (a character outside
+///    `[A-Za-z0-9.-]`, or no `.` and not `localhost`): a password-less token
+///    with a `/` in it (`https://ab/cd==@host/r`), cut at the last `@`.
+/// 6. Else (`https://github.com/org/repo@v1`): unchanged.
+///
+/// A value without `://` (scp-style `git@host:org/repo`, a login name and
+/// never a password) is returned unchanged.
 fn strip_vcs_userinfo(raw: &str) -> String {
     let Some(scheme_end) = raw.find("://").map(|i| i + 3) else {
         return raw.to_string();
     };
     let rest = &raw[scheme_end..];
+    let head = rest.split('/').next().unwrap_or_default();
+    let cut_at = |at: usize| format!("{}{}", &raw[..scheme_end], &rest[at + 1..]);
     let Some(last_at) = rest.rfind('@') else {
         return raw.to_string();
     };
-    let cut = match rest[..last_at].find('/') {
-        None => Some(last_at),
-        Some(slash) if rest[..slash].contains(':') => Some(last_at),
-        Some(slash) => rest[..slash].rfind('@'),
-    };
-    match cut {
-        Some(at) => format!("{}{}", &raw[..scheme_end], &rest[at + 1..]),
-        None => raw.to_string(),
+    if let Some(first_at) = head.find('@') {
+        if head[..first_at].contains(':') {
+            return cut_at(last_at);
+        }
+        let in_head = head.rfind('@').unwrap_or(first_at);
+        return cut_at(in_head);
+    }
+    let is_port = head
+        .rsplit_once(':')
+        .is_some_and(|(_, port)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()));
+    if head.starts_with('[') || is_port {
+        return raw.to_string();
+    }
+    if head.contains(':') {
+        return cut_at(last_at);
+    }
+    let host_chars = head
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
+    let plausible_host =
+        host_chars && (head.contains('.') || head.eq_ignore_ascii_case("localhost"));
+    if plausible_host {
+        raw.to_string()
+    } else {
+        cut_at(last_at)
     }
 }
 
@@ -176,8 +208,8 @@ async fn readable_artifacts(
         .collect())
 }
 
-/// The responses for `rows` as `auth` may see them: `metadata` and `vcs_url`
-/// only on the builds it created (or to an administrator), and `modules`
+/// The responses for `rows` as `auth` may see them: `metadata` and the VCS
+/// fields only on the builds it created (or to an administrator), and `modules`
 /// built from at most `per_build` of each build's readable artifacts.
 async fn build_responses(
     state: &SharedState,
@@ -209,6 +241,9 @@ async fn build_responses(
             if !visible {
                 response.metadata = None;
                 response.vcs_url = None;
+                response.vcs_revision = None;
+                response.vcs_branch = None;
+                response.vcs_message = None;
             }
             response.modules = Some(group_into_modules(artifacts));
             response
@@ -1427,29 +1462,49 @@ mod tests {
     #[test]
     fn test_strip_vcs_userinfo() {
         for (raw, expected) in [
+            // Plain credentials, and a CI token as the password.
+            ("https://user:pass@host", "https://host"),
             (
                 "https://x-access-token:ghs_SECRET@github.com/org/private",
                 "https://github.com/org/private",
             ),
+            // Percent-encoded userinfo.
             (
-                "https://token@github.com/org/repo.git",
-                "https://github.com/org/repo.git",
+                "https://user:p%40ss%2Fword@git.example.test/r",
+                "https://git.example.test/r",
             ),
             // A password with an unencoded `/` and `@` still goes entirely.
             (
                 "https://ci:pa/ss@word@git.example.test/r",
                 "https://git.example.test/r",
             ),
+            // A password-less token, and one with an `@` in the path too.
+            (
+                "https://token@github.com/org/repo.git",
+                "https://github.com/org/repo.git",
+            ),
+            (
+                "https://ghp_TOKEN@github.com/org/repo@v1",
+                "https://github.com/org/repo@v1",
+            ),
+            // A password-less base64 token holding a `/`.
+            ("https://ab/cd==@host/r", "https://host/r"),
+            // ssh with a login name and a port, `@` in the path kept.
+            ("ssh://git@h:22/r@tag", "ssh://h:22/r@tag"),
             (
                 "ssh://git:pw@host:2222/org/repo",
                 "ssh://host:2222/org/repo",
             ),
-            ("https://github.com/org/repo", "https://github.com/org/repo"),
-            // An `@` in the path of a URL without userinfo stays.
+            // No userinfo: port plus `@` in the path or query, IPv6, plain.
+            ("https://h:8443/r?ref=a@b", "https://h:8443/r?ref=a@b"),
+            ("https://[::1]/r@v1", "https://[::1]/r@v1"),
+            ("https://u:p@[::1]/r", "https://[::1]/r"),
             (
                 "https://github.com/org/repo@v1",
                 "https://github.com/org/repo@v1",
             ),
+            ("https://github.com/org/repo", "https://github.com/org/repo"),
+            ("https://localhost/r@v1", "https://localhost/r@v1"),
             // scp-style: a login name, never a password.
             ("git@github.com:org/repo.git", "git@github.com:org/repo.git"),
             ("", ""),
@@ -1971,8 +2026,8 @@ mod tests {
     }
 
     /// #6046 + #6240: the reads return the VCS fields, metadata and attached
-    /// artifacts the writes store, but `metadata` and `vcs_url` only to the
-    /// build's creator or an administrator, `vcs_url` never with its
+    /// artifacts the writes store, but `metadata` and the VCS fields only to
+    /// the build's creator or an administrator, `vcs_url` never with its
     /// credentials (stripped on create, and on read for older rows), and the
     /// artifact paths of another user's build only where they name a
     /// repository the caller can read. #6048 returned all of it to any
@@ -2103,17 +2158,17 @@ mod tests {
             assert_eq!(artifact_paths(&items[0]), all, "{who}");
         }
 
-        // Anyone else: the build, without metadata or vcs_url, and only the
-        // artifact in the repository it can read.
+        // Anyone else: the build, without metadata or any VCS field, and
+        // only the artifact in the repository it can read.
         let got = send_json(other.clone(), tdh::get(format!("/{id}"))).await;
         let list = send_json(other.clone(), tdh::get(format!("/?search={name}"))).await;
         let items = list["items"].as_array().expect("items");
         assert_eq!(items.len(), 1, "{list}");
         for b in [&got, &items[0]] {
             assert!(b.get("metadata").is_none(), "{b}");
-            assert!(b.get("vcs_url").is_none(), "{b}");
-            assert_eq!(b["vcs_branch"], "main", "{b}");
-            assert_eq!(b["vcs_revision"], "0123456789abcdef", "{b}");
+            for field in ["vcs_url", "vcs_revision", "vcs_branch", "vcs_message"] {
+                assert!(b.get(field).is_none(), "{field}: {b}");
+            }
             assert_eq!(artifact_paths(b), std::slice::from_ref(&open_path), "{b}");
             let text = b.to_string();
             for secret in [
