@@ -12638,7 +12638,7 @@ mod tests {
             trivy_url,
             trivy_adapter_url,
             incus_scanner_enabled,
-            true,
+            false,
             storage,
             storage_registry,
             "/tmp/ak-incus-construction-test".to_string(),
@@ -31408,10 +31408,10 @@ tonic-build = "0.12"
             advisory_client,
             scan_result_service,
             scan_config_service,
-            None, // trivy_url: skip fs / incus scanners
-            None, // trivy_adapter_url: skip image scanner
-            true, // incus_scanner_enabled (irrelevant without a Trivy URL)
-            true, // trivy_ignore_embedded_pom_declarations (likewise)
+            None,  // trivy_url: skip fs / incus scanners
+            None,  // trivy_adapter_url: skip image scanner
+            true,  // incus_scanner_enabled (irrelevant without a Trivy URL)
+            false, // trivy_ignore_embedded_pom_declarations (likewise)
             storage,
             storage_registry,
             storage_base_path,

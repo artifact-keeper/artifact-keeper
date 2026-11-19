@@ -85,7 +85,7 @@ fn build_scan_state(
         None,
         None,
         false,
-        true,
+        false,
         storage.clone(),
         registry.clone(),
         storage_path.to_string(),
