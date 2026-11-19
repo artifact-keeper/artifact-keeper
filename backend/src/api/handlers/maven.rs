@@ -18731,14 +18731,15 @@ mod age_gate_4702_tests {
         let recent = (chrono::Utc::now() - chrono::Duration::days(1))
             .format("%Y%m%d%H%M%S")
             .to_string();
+        let upstream_doc = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<metadata><groupId>com.example.agegate</groupId>\
+             <artifactId>many</artifactId><versioning><latest>1.0.{total}</latest>\
+             <release>1.0.{total}</release><versions>{listed}</versions>\
+             <lastUpdated>{recent}</lastUpdated></versioning></metadata>\n"
+        );
         Mock::given(method("GET"))
             .and(wm_path(format!("/{G}/many/maven-metadata.xml")))
-            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<metadata><groupId>com.example.agegate</groupId>\
-                 <artifactId>many</artifactId><versioning><latest>1.0.{total}</latest>\
-                 <release>1.0.{total}</release><versions>{listed}</versions>\
-                 <lastUpdated>{recent}</lastUpdated></versioning></metadata>\n"
-            )))
+            .respond_with(ResponseTemplate::new(200).set_body_string(upstream_doc.clone()))
             .mount(&mock)
             .await;
         let (id, key, dir) = gated_remote(&pool, &mock, "upstream_publish_time").await;
@@ -18750,8 +18751,20 @@ mod age_gate_4702_tests {
         let sha1 = get(&state, &key, &format!("{path}.sha1")).await;
         let md5 = get(&state, &key, &format!("{path}.md5")).await;
         let again = get(&state, &key, &path).await;
-        // The memo window has passed: the next pass continues dating.
-        crate::services::age_gate_maven::forget_listings();
+        // The memo window has passed: the next pass continues dating. Only
+        // this test's entry is dropped (a wrong key leaves it in place, and
+        // the "lists them all" assertion below then fails).
+        crate::services::age_gate_maven::forget_listing(
+            &crate::services::age_gate_maven::ListingMemoKey::new(
+                id,
+                &mock.uri(),
+                &path,
+                7,
+                "upstream_publish_time",
+                upstream_doc.as_bytes(),
+            ),
+        )
+        .await;
         let second = get(&state, &key, &path).await;
         let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
             .bind(id)

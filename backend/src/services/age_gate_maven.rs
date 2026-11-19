@@ -224,9 +224,15 @@ impl ListingMemoKey {
     }
 }
 
+/// Total bytes of memoized listings kept at once. Weighed by document size,
+/// so a few very large `maven-metadata.xml` documents cannot pin far more
+/// memory than this.
+const LISTING_MEMO_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
 static LISTINGS: Lazy<MokaCache<ListingMemoKey, bytes::Bytes>> = Lazy::new(|| {
     MokaCache::builder()
-        .max_capacity(4_000)
+        .weigher(|_, v: &bytes::Bytes| v.len().min(u32::MAX as usize) as u32)
+        .max_capacity(LISTING_MEMO_MAX_BYTES)
         .time_to_live(LISTING_MEMO_TTL)
         .build()
 });
@@ -243,10 +249,12 @@ pub async fn remember_listing(key: ListingMemoKey, filtered: bytes::Bytes) {
     LISTINGS.insert(key, filtered).await;
 }
 
-/// Drop every memoized listing (tests that step through successive passes).
+/// Drop one memoized listing (tests that step through successive passes).
+/// Per key, so a test never wipes an entry another test in the same process
+/// relies on.
 #[cfg(test)]
-pub fn forget_listings() {
-    LISTINGS.invalidate_all();
+pub async fn forget_listing(key: &ListingMemoKey) {
+    LISTINGS.invalidate(key).await;
 }
 
 /// The non-SNAPSHOT versions of a GA-level `maven-metadata.xml` that the gate
@@ -419,8 +427,7 @@ mod tests {
             assert_ne!(other, base);
             assert!(memo_listing(&other).await.is_none());
         }
-        forget_listings();
-        LISTINGS.run_pending_tasks().await;
+        forget_listing(&base).await;
         assert!(memo_listing(&base).await.is_none());
     }
 
