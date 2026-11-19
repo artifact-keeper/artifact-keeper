@@ -586,8 +586,50 @@ fn is_embedded_build_pom(rel: &Path) -> bool {
             .any(|w| w[0] == "META-INF" && w[1] == "maven")
 }
 
-/// Delete every embedded build POM from the extracted workspace before trivy
+/// Whether the prune of [`prune_embedded_build_poms`] must be skipped for
+/// this workspace (#6233): the artifact's original `file_name` is a
+/// `.war`/`.ear`, or the tree bundles libraries as nested archives (a
+/// `WEB-INF/lib` or `BOOT-INF/lib` directory, or a JVM archive in any `lib/`
+/// directory).
+///
+/// Trivy's filesystem scan never opens a nested JAR, so a bundled library
+/// with no `pom.properties` is missing from the inventory POM, and the only
+/// thing that still names it is the outer archive's build POM declaring it.
+/// Unlike grype (#5340), whose syft cataloger still identifies nested JARs,
+/// pruning that POM would hide the library's vulnerabilities, so such an
+/// archive keeps its build POMs and is graded as before.
+fn skip_embedded_build_pom_prune(root: &Path, file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    if lower.ends_with(".war") || lower.ends_with(".ear") {
+        return true;
+    }
+    walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| e.depth() != 1 || e.file_name() != JAR_INVENTORY_SUBDIR)
+        .filter_map(|e| e.ok())
+        .any(|entry| {
+            let parent = entry
+                .path()
+                .parent()
+                .and_then(|p| p.file_name())
+                .unwrap_or_default();
+            if entry.file_type().is_dir() {
+                entry.depth() > 1
+                    && entry.file_name() == "lib"
+                    && (parent == "WEB-INF" || parent == "BOOT-INF")
+            } else {
+                entry.depth() > 1
+                    && parent == "lib"
+                    && is_jvm_archive_name(&entry.file_name().to_string_lossy())
+            }
+        })
+}
+
+/// Delete the embedded build POMs from the extracted workspace before trivy
 /// runs, and return how many were removed (#6233, the trivy half of #5262).
+/// The caller skips this for an archive that bundles nested libraries
+/// ([`skip_embedded_build_pom_prune`]).
 ///
 /// A Maven-built JAR embeds its own build POM at
 /// `META-INF/maven/<groupId>/<artifactId>/pom.xml`. Once the workspace
@@ -599,12 +641,13 @@ fn is_embedded_build_pom(rel: &Path) -> bool {
 /// out of both engines: the local CLI scans this directory and the adapter
 /// path uploads it, so a running adapter of any version gets the fix.
 ///
-/// Nothing that grades the archive's real contents is lost. Bundled and
-/// shaded components are named, at the version they ship, by the inventory
-/// POM built from their `pom.properties` ([`write_embedded_jar_inventory`],
-/// which must run first and never reads a `pom.xml`); `pom.properties` and
-/// the archives themselves stay. Symlinks are not followed, and a link at a
-/// matching path is removed as a link, never written through.
+/// A `pom.xml` is removed only when its sibling `pom.properties` is present:
+/// that file identifies the archive, at the version it ships, in the
+/// inventory POM ([`write_embedded_jar_inventory`], which must run first and
+/// never reads a `pom.xml`), and it stays. A `pom.xml` with no
+/// `pom.properties` beside it is the only record of its archive, so it is
+/// kept. Symlinks are not followed, and a link at a matching path is removed
+/// as a link, never written through.
 fn prune_embedded_build_poms(root: &Path) -> usize {
     let walker = walkdir::WalkDir::new(root)
         .follow_links(false)
@@ -619,7 +662,13 @@ fn prune_embedded_build_poms(root: &Path) -> usize {
         let Ok(rel) = entry.path().strip_prefix(root) else {
             continue;
         };
-        if is_embedded_build_pom(rel) && std::fs::remove_file(entry.path()).is_ok() {
+        if !is_embedded_build_pom(rel) {
+            continue;
+        }
+        let has_properties =
+            std::fs::symlink_metadata(entry.path().with_file_name("pom.properties"))
+                .is_ok_and(|m| m.is_file());
+        if has_properties && std::fs::remove_file(entry.path()).is_ok() {
             removed += 1;
         }
     }
@@ -741,9 +790,23 @@ impl TrivyFsScanner {
         // #6233: the build POMs the archive embeds declare what it was built
         // against, not what it ships; keep them out of the trivy target, as
         // grype's directory scan does (#5262). After the inventory, which
-        // reads only `pom.properties`.
+        // reads only `pom.properties`. Skipped for an archive bundling nested
+        // libraries, whose build POM may be all that names them.
         let workspace_root = workspace.to_path_buf();
-        match tokio::task::spawn_blocking(move || prune_embedded_build_poms(&workspace_root)).await
+        let file_name = artifact
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&artifact.name)
+            .to_string();
+        match tokio::task::spawn_blocking(move || {
+            if skip_embedded_build_pom_prune(&workspace_root, &file_name) {
+                0
+            } else {
+                prune_embedded_build_poms(&workspace_root)
+            }
+        })
+        .await
         {
             Ok(0) => {}
             Ok(n) => info!(
@@ -1534,9 +1597,10 @@ mod tests {
     }
 
     /// The #5262 fixture: a Maven-plugin-shaped JAR with its own
-    /// `pom.properties`, a build POM declaring `provided` and `test`
-    /// dependencies that are not bundled, one shaded component carrying its
-    /// own `pom.properties`, and one nested JAR.
+    /// `pom.properties`, a build POM declaring compile, `provided` and `test`
+    /// dependencies that are not bundled, and one shaded component carrying
+    /// its own `pom.properties`. No nested JAR: a `lib/*.jar` keeps the build
+    /// POMs (see `test_prune_skipped_when_tree_bundles_nested_libraries_6233`).
     fn maven_plugin_jar_with_embedded_pom() -> Bytes {
         Bytes::from(zip_of(&[
             ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n".to_vec()),
@@ -1565,10 +1629,6 @@ mod tests {
                 b"groupId=com.google.code.gson\nartifactId=gson\nversion=2.8.0\n".to_vec(),
             ),
             ("com/acme/plugin/Mojo.class", b"\xca\xfe\xba\xbe".to_vec()),
-            (
-                "lib/commons-text-1.9.jar",
-                library_jar("org.apache.commons", "commons-text", "1.9"),
-            ),
         ]))
     }
 
@@ -1589,9 +1649,9 @@ mod tests {
     /// #6233 end to end in adapter mode (the setup the issue reports): the
     /// workspace uploaded for the trivy filesystem scan carries no embedded
     /// build POM, so trivy cannot grade the dependencies it merely
-    /// DECLARES, while the inventory still names the archive itself, its
-    /// shaded component and its nested JAR. The CLI path scans the same
-    /// pruned workspace directory.
+    /// DECLARES, while the inventory still names the archive itself and its
+    /// shaded component. The CLI path scans the same pruned workspace
+    /// directory.
     #[tokio::test]
     async fn test_adapter_scan_excludes_embedded_build_pom_declarations_6233() {
         let server = wiremock::MockServer::start().await;
@@ -1648,7 +1708,7 @@ mod tests {
             "{paths:?}"
         );
         let inventory = inventory.expect("the upload must carry the jar inventory");
-        for shipped in ["acme-maven-plugin", "gson", "commons-text"] {
+        for shipped in ["acme-maven-plugin", "gson"] {
             assert!(
                 inventory.contains(&format!("<artifactId>{shipped}</artifactId>")),
                 "{shipped} is in the archive and must stay graded:\n{inventory}"
@@ -1662,11 +1722,13 @@ mod tests {
         }
     }
 
-    /// #6233: a fat jar keeps every bundled library in the trivy target. Its
-    /// build POMs (outer and per library) are pruned, but the inventory read
-    /// from their `pom.properties` is unchanged, so its findings are too.
+    /// #6233: a Spring Boot fat jar bundles its libraries under
+    /// `BOOT-INF/lib`, so the prune is skipped and the outer build POM (the
+    /// only `pom.xml` on disk; each library's POM stays inside its nested
+    /// jar) reaches trivy as before. The inventory read from the
+    /// `pom.properties` is unchanged.
     #[tokio::test]
-    async fn test_prune_keeps_fat_jar_bundled_inventory_6233() {
+    async fn test_fat_jar_keeps_build_pom_and_bundled_inventory_6233() {
         let tmp = tempfile::tempdir().unwrap();
         let artifact = make_test_artifact(
             "fatapp-1.0.0.jar",
@@ -1683,18 +1745,152 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(write_embedded_jar_inventory(&ws).await, BUNDLED.len() + 1);
-        assert!(!embedded_build_poms_in(&ws).is_empty(), "fixture sanity");
+        assert_eq!(
+            embedded_build_poms_in(&ws),
+            vec!["META-INF/maven/com.example/fatapp/pom.xml".to_string()],
+            "fixture sanity"
+        );
 
-        assert!(prune_embedded_build_poms(&ws) >= 1);
-        assert!(embedded_build_poms_in(&ws).is_empty());
+        assert!(skip_embedded_build_pom_prune(&ws, "fatapp-1.0.0.jar"));
         assert!(ws
-            .join("META-INF/maven/com.example/fatapp/pom.properties")
+            .join("META-INF/maven/com.example/fatapp/pom.xml")
             .is_file());
         assert!(ws.join("BOOT-INF/lib/log4j-core-2.14.1.jar").is_file());
         let pom = std::fs::read_to_string(ws.join(JAR_INVENTORY_SUBDIR).join("pom.xml")).unwrap();
         assert_inventory_names_bundled(&pom);
-        // Re-running the inventory after the prune names the same set.
-        assert_eq!(write_embedded_jar_inventory(&ws).await, BUNDLED.len() + 1);
+    }
+
+    /// #6233 review: the prune is skipped for a `.war`/`.ear` by name and
+    /// for any tree that bundles nested libraries, and runs otherwise.
+    #[test]
+    fn test_prune_skipped_when_tree_bundles_nested_libraries_6233() {
+        let tree = |files: &[&str]| {
+            let dir = tempfile::tempdir().unwrap();
+            for f in files {
+                let p = dir.path().join(f);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, b"x").unwrap();
+            }
+            dir
+        };
+        let pom = "META-INF/maven/g/a/pom.xml";
+        for (files, name) in [
+            (vec![pom], "app.war"),
+            (vec![pom], "APP.EAR"),
+            (vec![pom, "WEB-INF/lib/inner.jar"], "app.jar"),
+            (vec![pom, "WEB-INF/lib/.keep"], "app.jar"),
+            (vec![pom, "BOOT-INF/lib/inner.jar"], "app.jar"),
+            (vec![pom, "lib/inner.jar"], "app.jar"),
+            (vec![pom, "app/lib/inner.JAR"], "app.zip"),
+        ] {
+            let dir = tree(&files);
+            assert!(
+                skip_embedded_build_pom_prune(dir.path(), name),
+                "{name} {files:?}"
+            );
+        }
+        for (files, name) in [
+            (vec![pom], "app.jar"),
+            (vec![pom, "lib/notes.txt"], "app.jar"),
+            (vec![pom, "inner.jar"], "app.jar"),
+            (vec![pom, "WEB-INF/classes/A.class"], "app.jar"),
+        ] {
+            let dir = tree(&files);
+            assert!(
+                !skip_embedded_build_pom_prune(dir.path(), name),
+                "{name} {files:?}"
+            );
+        }
+        // The inventory directory is never a reason to skip.
+        let dir = tree(&[pom, ".ak-scan-jar-inventory/lib/x.jar"]);
+        assert!(!skip_embedded_build_pom_prune(dir.path(), "app.jar"));
+    }
+
+    /// #6233 review: a plain JAR whose build POM has no `pom.properties`
+    /// beside it keeps that POM, the only record of the archive; a POM with
+    /// its `pom.properties` is pruned and the properties stay.
+    #[test]
+    fn test_prune_keeps_build_pom_without_pom_properties_6233() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let orphan = root.join("META-INF/maven/com.acme/no-props/pom.xml");
+        let paired = root.join("META-INF/maven/com.acme/with-props/pom.xml");
+        let props = paired.with_file_name("pom.properties");
+        for f in [&orphan, &paired, &props] {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, b"x").unwrap();
+        }
+        assert_eq!(prune_embedded_build_poms(root), 1);
+        assert!(orphan.is_file(), "a POM with no pom.properties must stay");
+        assert!(!paired.exists());
+        assert!(props.is_file());
+    }
+
+    /// #6233 review: a WAR bundling a library with no `pom.properties` under
+    /// `WEB-INF/lib`. Trivy never opens the nested jar and the inventory
+    /// cannot name it, so the WAR's build POM, which declares it, must still
+    /// reach trivy through the adapter upload.
+    #[tokio::test]
+    async fn test_adapter_war_keeps_build_pom_for_unidentified_nested_library_6233() {
+        let server = wiremock::MockServer::start().await;
+        crate::services::scanner_adapter_client::test_support::mount_fs_scan_success(
+            &server,
+            "fs-war",
+            serde_json::json!({"report": {"Results": []}, "stderr": ""}),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = TrivyFsScanner::new_with_adapter(
+            server.uri(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        let war = Bytes::from(zip_of(&[
+            (
+                "META-INF/maven/com.acme/webapp/pom.properties",
+                b"groupId=com.acme\nartifactId=webapp\nversion=1.0.0\n".to_vec(),
+            ),
+            (
+                "META-INF/maven/com.acme/webapp/pom.xml",
+                br#"<project><groupId>com.acme</groupId><artifactId>webapp</artifactId><version>1.0.0</version><packaging>war</packaging><dependencies><dependency><groupId>org.apache.logging.log4j</groupId><artifactId>log4j-core</artifactId><version>2.14.1</version></dependency></dependencies></project>"#
+                    .to_vec(),
+            ),
+            (
+                "WEB-INF/lib/log4j-core-2.14.1.jar",
+                zip_of(&[(
+                    "org/apache/logging/log4j/core/Logger.class",
+                    b"\xca\xfe\xba\xbe".to_vec(),
+                )]),
+            ),
+        ]));
+        let artifact = make_test_artifact(
+            "webapp-1.0.0.war",
+            "application/java-archive",
+            "maven/com/acme/webapp/1.0.0/webapp-1.0.0.war",
+        );
+        scanner
+            .scan(&artifact, None, &war)
+            .await
+            .expect("adapter-backed scan should complete");
+
+        let upload = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.method == wiremock::http::Method::POST)
+            .expect("workspace upload");
+        let mut archive = tar::Archive::new(std::io::Cursor::new(upload.body));
+        let mut build_pom = None;
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap() == Path::new("META-INF/maven/com.acme/webapp/pom.xml") {
+                let mut s = String::new();
+                std::io::Read::read_to_string(&mut entry, &mut s).unwrap();
+                build_pom = Some(s);
+            }
+        }
+        let build_pom = build_pom.expect("the WAR's build POM must reach trivy");
+        assert!(build_pom.contains("<artifactId>log4j-core</artifactId>"));
     }
 
     /// `version()` exercises the TTL-backed cached probe path. We do not
