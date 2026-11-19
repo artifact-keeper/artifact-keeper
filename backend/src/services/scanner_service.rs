@@ -30191,7 +30191,10 @@ tonic-build = "0.12"
     /// `failed`), not keep the first attempt's leftovers. And the
     /// `block_on_fail` hold the failed attempt put on the artifact is released
     /// by the successful retry (#5153), so the hold lasts only between
-    /// attempts.
+    /// attempts. The failed row is seeded with a finding and a package, as an
+    /// attempt that stored them and then failed to complete (#5564) leaves
+    /// it: the retry must hold ONE attempt's findings, not both, and the
+    /// janitor must time the retry from its own start.
     #[tokio::test]
     async fn a_retry_after_a_timed_out_attempt_completes_the_row_and_releases_the_hold() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -30214,7 +30217,28 @@ tonic-build = "0.12"
                 if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
                     std::future::pending::<()>().await;
                 }
-                Ok(ScanOutput::default())
+                Ok(ScanOutput {
+                    findings: vec![RawFinding {
+                        severity: Severity::Low,
+                        title: "CVE-2026-5942 in libretry".to_string(),
+                        description: None,
+                        cve_id: Some("CVE-2026-5942".to_string()),
+                        affected_component: Some("libretry".to_string()),
+                        affected_version: Some("1.0.0".to_string()),
+                        fixed_version: None,
+                        source: None,
+                        source_url: None,
+                        finding_class: Default::default(),
+                    }],
+                    packages: vec![RawPackage {
+                        name: "libretry".to_string(),
+                        version: Some("1.0.0".to_string()),
+                        purl: None,
+                        license: None,
+                        source_target: None,
+                    }],
+                    ..ScanOutput::default()
+                })
             }
         }
         let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
@@ -30251,12 +30275,79 @@ tonic-build = "0.12"
             )
         };
 
+        let source = |pool: PgPool| async move {
+            sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                "SELECT quarantine_status, quarantine_source FROM artifacts WHERE id = $1",
+            )
+            .bind(artifact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read hold")
+        };
+
         let (first, timed_out) = attempt(1).await;
         let after_first = row(fx.pool.clone()).await;
-        let hold_first = quarantine_row(&fx.pool, artifact_id).await;
+        let hold_first = source(fx.pool.clone()).await;
+        // What an attempt that stored its findings and then failed leaves.
+        sqlx::query(
+            "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title) \
+             VALUES ($1, $2, 'low', 'CVE-2026-5942 in libretry')",
+        )
+        .bind(row_id)
+        .bind(artifact_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed finding");
+        sqlx::query(
+            "INSERT INTO scan_packages (scan_result_id, artifact_id, name, version) \
+             VALUES ($1, $2, 'libretry', '1.0.0')",
+        )
+        .bind(row_id)
+        .bind(artifact_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed package");
+        let started_first: DateTime<Utc> =
+            sqlx::query_scalar("SELECT started_at FROM scan_results WHERE id = $1")
+                .bind(row_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("read started_at");
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let (db_before_retry,): (DateTime<Utc>,) = sqlx::query_as("SELECT now()")
+            .fetch_one(&fx.pool)
+            .await
+            .expect("db clock");
         let (second, retry_timed_out) = attempt(30).await;
         let after_second = row(fx.pool.clone()).await;
-        let hold_second = quarantine_row(&fx.pool, artifact_id).await;
+        let hold_second = source(fx.pool.clone()).await;
+        // The #5153 release path audits QUARANTINE_RELEASED with
+        // released_by=scan, from a detached task: wait for it.
+        let mut releases = 0i64;
+        for _ in 0..50 {
+            releases = sqlx::query_scalar(
+                "SELECT count(*) FROM audit_log WHERE action = 'QUARANTINE_RELEASED' \
+                 AND resource_id = $1 AND details->>'released_by' = 'scan'",
+            )
+            .bind(artifact_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read audit");
+            if releases > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (findings, packages, findings_count, started_second): (i64, i64, i32, DateTime<Utc>) =
+            sqlx::query_as(
+                "SELECT (SELECT count(*) FROM scan_findings WHERE scan_result_id = $1), \
+                        (SELECT count(*) FROM scan_packages WHERE scan_result_id = $1), \
+                        findings_count, started_at FROM scan_results WHERE id = $1",
+            )
+            .bind(row_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read retried row");
         let rows: i64 =
             sqlx::query_scalar("SELECT count(*) FROM scan_results WHERE artifact_id = $1")
                 .bind(artifact_id)
@@ -30272,9 +30363,9 @@ tonic-build = "0.12"
         assert!(after_first.1.is_some_and(|e| e.contains("was stopped")));
         assert_eq!(after_first.2, "failed");
         assert_eq!(
-            hold_first.0.as_deref(),
-            Some("quarantined"),
-            "block_on_fail holds the artifact after the failed attempt: {hold_first:?}"
+            (hold_first.0.as_deref(), hold_first.1.as_deref()),
+            (Some("quarantined"), Some("scan_policy")),
+            "block_on_fail holds the artifact after the failed attempt"
         );
 
         second.expect("retry orchestration succeeds");
@@ -30285,10 +30376,135 @@ tonic-build = "0.12"
             ("completed".to_string(), None, "complete".to_string(), true),
             "the retried row must not keep the timed-out attempt's leftovers"
         );
-        assert_ne!(
-            hold_second.0.as_deref(),
-            Some("quarantined"),
-            "the successful retry must release the hold: {hold_second:?}"
+        assert_eq!(
+            (findings, packages, findings_count),
+            (1, 1, 1),
+            "the retry holds one attempt's findings and packages, not two"
+        );
+        assert!(
+            started_second >= db_before_retry && started_second > started_first,
+            "started_at must be the retry's own start: first {started_first}, \
+             retry began after {db_before_retry}, row says {started_second}"
+        );
+        // Released by the retry through the #5153 path
+        // (`release_cleared_scan_policy_hold_bound`): its audit row, and the
+        // scan_policy source it clears. The status then follows the retry's
+        // own verdict (`flagged`: one low finding the policy allows).
+        assert_eq!(releases, 1, "the retry must release the hold via #5153");
+        assert_eq!(
+            (hold_second.0.as_deref(), hold_second.1.as_deref()),
+            (Some("flagged"), None),
+            "no longer held; the source the release cleared stays cleared"
+        );
+    }
+
+    /// #5942 review: reopening a failed row resets it in one step, before the
+    /// retry runs: `running`, error, completion and counts cleared, the
+    /// attempt's findings and packages gone, and `started_at` moved to now so
+    /// the stuck-scan janitor times the retry from its own start (a row
+    /// queued 25 minutes ago would otherwise be reaped mid-retry). A row that
+    /// is not `failed` is left exactly as it was.
+    #[tokio::test]
+    async fn reopening_a_failed_row_resets_it_for_the_retry() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = Uuid::new_v4();
+        insert_test_artifact(&fx, artifact_id, "scanner-reopen", None, None).await;
+        let (failed_id, completed_id) = (Uuid::new_v4(), Uuid::new_v4());
+        for (id, status) in [(failed_id, "failed"), (completed_id, "completed")] {
+            sqlx::query(
+                "INSERT INTO scan_results (id, artifact_id, repository_id, scan_type, status, \
+                                           findings_count, low_count, error_message, \
+                                           inventory_status, started_at, completed_at) \
+                 VALUES ($1, $2, $3, 'grype', $4, 1, 1, 'attempt 1 timed out', 'failed', \
+                         NOW() - interval '25 minutes', NOW())",
+            )
+            .bind(id)
+            .bind(artifact_id)
+            .bind(fx.repo_id)
+            .bind(status)
+            .execute(&fx.pool)
+            .await
+            .expect("insert row");
+            sqlx::query(
+                "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title) \
+                 VALUES ($1, $2, 'low', 'CVE-2026-5942 in libretry')",
+            )
+            .bind(id)
+            .bind(artifact_id)
+            .execute(&fx.pool)
+            .await
+            .expect("insert finding");
+            sqlx::query(
+                "INSERT INTO scan_packages (scan_result_id, artifact_id, name) \
+                 VALUES ($1, $2, 'libretry')",
+            )
+            .bind(id)
+            .bind(artifact_id)
+            .execute(&fx.pool)
+            .await
+            .expect("insert package");
+        }
+        let svc = ScanResultService::new(fx.pool.clone());
+        let reopened = svc.reopen_failed_scan(failed_id).await.expect("reopen");
+        let untouched = svc
+            .reopen_failed_scan(completed_id)
+            .await
+            .expect("reopen completed");
+        type Row = (String, Option<String>, bool, String, i32, i64, i64, bool);
+        let read = |id: Uuid| {
+            let pool = fx.pool.clone();
+            async move {
+                sqlx::query_as::<_, Row>(
+                    "SELECT status, error_message, completed_at IS NOT NULL, inventory_status, \
+                            findings_count, \
+                            (SELECT count(*) FROM scan_findings WHERE scan_result_id = $1), \
+                            (SELECT count(*) FROM scan_packages WHERE scan_result_id = $1), \
+                            started_at > NOW() - interval '1 minute' \
+                     FROM scan_results WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("read row")
+            }
+        };
+        let failed = read(failed_id).await;
+        let completed = read(completed_id).await;
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        assert!(reopened);
+        assert_eq!(
+            failed,
+            (
+                "running".to_string(),
+                None,
+                false,
+                "complete".to_string(),
+                0,
+                0,
+                0,
+                true
+            ),
+            "the failed row is reset for the retry, started_at included"
+        );
+        assert!(!untouched, "only a failed row is reopened");
+        assert_eq!(
+            completed,
+            (
+                "completed".to_string(),
+                Some("attempt 1 timed out".to_string()),
+                true,
+                "failed".to_string(),
+                1,
+                1,
+                1,
+                false
+            ),
+            "a row that is not failed is left exactly as it was"
         );
     }
 

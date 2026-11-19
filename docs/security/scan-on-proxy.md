@@ -566,9 +566,9 @@ are not affected by it; the adapter client keeps its own budgets.
 
 Without the queue, the stuck-scan janitor (`STUCK_SCAN_THRESHOLD_SECS`, default
 1800) marks a hung scan's rows `failed` but never stops the hung `grype`. On
-such pods `SCANNER_PROCESS_TIMEOUT_SECS=1800` kills the process when the janitor
-would fail its row; a lower value such as `900` frees it sooner if your slowest
-scans finish well inside that. A retried on-demand scan reuses its rows: between
+such pods, set `SCANNER_PROCESS_TIMEOUT_SECS` to match `STUCK_SCAN_THRESHOLD_SECS`
+(1800 by default), or lower, such as `900`, if your slowest scans finish well
+inside that. A retried on-demand scan reuses its rows: between
 attempts they read `failed`, so a `block_on_fail` policy holds the artifact,
 and a retry that succeeds completes the rows and releases the hold.
 

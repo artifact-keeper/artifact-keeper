@@ -1869,11 +1869,12 @@ impl ScanResultService {
         //   SELECT copied 0 rows. See #1058.
         //
         // Invariant relied upon: scan_findings rows are only ever deleted
-        // via the `ON DELETE CASCADE` from scan_results(id) (migration 022).
-        // A direct `DELETE FROM scan_findings WHERE scan_result_id = $X`
-        // would NOT be blocked by FOR SHARE on the parent row and would
-        // re-open this race. Don't add such a path without taking
-        // FOR SHARE on the parent here too.
+        // via the `ON DELETE CASCADE` from scan_results(id) (migration 022),
+        // or by `reopen_failed_scan` (#5942), which first locks the parent
+        // row FOR UPDATE and so conflicts with the FOR SHARE taken here.
+        // Any other direct `DELETE FROM scan_findings WHERE scan_result_id
+        // = $X` would NOT be blocked by FOR SHARE on the parent row and would
+        // re-open this race. Don't add one without locking the parent too.
         let mut tx = self
             .db
             .begin()
@@ -2353,31 +2354,65 @@ impl ScanResultService {
 
     /// Put a trigger's pre-allocated row that an earlier attempt of the same
     /// queued job left `failed` back to `running` before the retry scans into
-    /// it (#5942): clears the attempt's error, completion time and `failed`
-    /// inventory, so a retry that succeeds ends as a clean `completed` row
-    /// and pollers see `running` while it runs. A row in any other state is
-    /// left alone. Returns whether the row was reopened.
+    /// it (#5942). One transaction, so the row is either fully reset or left
+    /// as it was:
+    ///
+    /// - the row is locked `FOR UPDATE` first, which conflicts with the
+    ///   `FOR SHARE` a concurrent [`Self::copy_scan_results`] takes on its
+    ///   source, so the direct child deletes below cannot reopen the #1058
+    ///   race that copy guards against;
+    /// - the attempt's `scan_findings` and `scan_packages` are deleted, since
+    ///   both are only appended to (an attempt that stored its findings and
+    ///   then failed to complete, #5564, would otherwise be counted twice);
+    /// - the row goes back to `running` with its error, completion time and
+    ///   `failed` inventory cleared and `started_at` set to now, so the
+    ///   stuck-scan janitor (which reaps by `started_at`) times the retry from
+    ///   its own start, not from the first attempt or the queue time.
+    ///
+    /// A row in any other state is left alone. Returns whether it was reopened.
     pub async fn reopen_failed_scan(&self, scan_id: Uuid) -> Result<bool> {
-        // Runtime query, as in `fail_scan_if_running`.
-        let reopened = sqlx::query(
+        let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
+        let mut tx = self.db.begin().await.map_err(db_err)?;
+        // Runtime queries, as in `fail_scan_if_running`.
+        let locked: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM scan_results WHERE id = $1 AND status = 'failed' FOR UPDATE",
+        )
+        .bind(scan_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if locked.is_none() {
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM scan_findings WHERE scan_result_id = $1")
+            .bind(scan_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        sqlx::query("DELETE FROM scan_packages WHERE scan_result_id = $1")
+            .bind(scan_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        sqlx::query(
             r#"
             UPDATE scan_results
             SET status = 'running', error_message = NULL, completed_at = NULL,
-                inventory_status = 'complete'
+                inventory_status = 'complete', started_at = NOW(),
+                findings_count = 0, critical_count = 0, high_count = 0,
+                medium_count = 0, low_count = 0, info_count = 0
             WHERE id = $1 AND status = 'failed'
             "#,
         )
         .bind(scan_id)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .rows_affected();
-        if reopened > 0 {
-            // A `failed` row moved a block_on_fail decision; drop the cached
-            // listing decisions the same way a terminal transition does.
-            scan_completed();
-        }
-        Ok(reopened > 0)
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        // A `failed` row moved a block_on_fail decision; drop the cached
+        // listing decisions the same way a terminal transition does.
+        scan_completed();
+        Ok(true)
     }
 
     /// Mark a scan as `not_applicable` (#1470): the scanner does not apply to
