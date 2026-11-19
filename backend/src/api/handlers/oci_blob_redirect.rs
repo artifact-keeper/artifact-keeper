@@ -70,12 +70,17 @@ pub(crate) fn into_oci_blob_redirect(mut resp: Response, digest: &str) -> Respon
 /// object store's 404 — a remote repo re-fetches from upstream in that case —
 /// and leave it off when the 404 would be the answer anyway, saving a round
 /// trip per layer. A failed existence probe counts as "absent".
+///
+/// `size_bytes` is the row's `oci_blobs.size_bytes`; the redirect is tagged
+/// with it so the transfer meter counts the blob when the URL is issued
+/// (#6035).
 pub(crate) async fn try_stored_blob_redirect(
     state: &AppState,
     storage: &dyn crate::storage::StorageBackend,
     storage_key: &str,
     digest: &str,
     require_present: bool,
+    size_bytes: i64,
 ) -> Option<Response> {
     let expiry = redirect_expiry(state)?;
     if !storage.supports_redirect() {
@@ -84,7 +89,7 @@ pub(crate) async fn try_stored_blob_redirect(
     if require_present && !storage.exists(storage_key).await.unwrap_or(false) {
         return None;
     }
-    let resp = try_presigned_redirect(storage, storage_key, true, expiry).await?;
+    let resp = try_presigned_redirect(storage, storage_key, true, expiry, size_bytes).await?;
     Some(into_oci_blob_redirect(resp, digest))
 }
 
@@ -136,7 +141,16 @@ pub(crate) async fn try_proxy_cached_blob_redirect(
     }
     let cache_key =
         ProxyService::cache_storage_key(proxy.cache_scope(), repo_key, cache_path).ok()?;
-    let resp = try_proxy_cache_redirect(storage.as_ref(), &cache_key, true, expiry, true).await?;
+    // #6035: the sidecar's size is what the transfer meter counts.
+    let resp = try_proxy_cache_redirect(
+        storage.as_ref(),
+        &cache_key,
+        true,
+        expiry,
+        true,
+        meta.size_bytes,
+    )
+    .await?;
     Some(into_oci_blob_redirect(resp, digest))
 }
 
@@ -247,12 +261,24 @@ mod tests {
     async fn stored_blob_redirects_when_enabled_and_signable() {
         let (state, mem) = seeded_cloud(true).await;
         for require_present in [false, true] {
-            let resp =
-                try_stored_blob_redirect(&state, mem.as_ref(), "blobs/k", DIGEST, require_present)
-                    .await
-                    .expect("presign-capable backend must redirect");
+            let resp = try_stored_blob_redirect(
+                &state,
+                mem.as_ref(),
+                "blobs/k",
+                DIGEST,
+                require_present,
+                7,
+            )
+            .await
+            .expect("presign-capable backend must redirect");
             assert_oci_redirect(&resp);
             assert!(location(&resp).contains("blobs/k"));
+            // #6035: tagged with the row's size for the transfer meter.
+            assert_eq!(
+                resp.extensions()
+                    .get::<crate::services::quota::http::PresignedDownload>(),
+                Some(&crate::services::quota::http::PresignedDownload(7))
+            );
         }
     }
 
@@ -265,7 +291,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            try_stored_blob_redirect(&state, &signer, "blobs/k", DIGEST, false)
+            try_stored_blob_redirect(&state, &signer, "blobs/k", DIGEST, false, 7)
                 .await
                 .is_none()
         );
@@ -276,7 +302,7 @@ mod tests {
         let (state, _mem) = tdh::build_state_with_presigning_cloud(tdh::lazy_pool(), "s3");
         let (_s, plain) = seeded_cloud(false).await;
         assert!(
-            try_stored_blob_redirect(&state, plain.as_ref(), "blobs/k", DIGEST, false)
+            try_stored_blob_redirect(&state, plain.as_ref(), "blobs/k", DIGEST, false, 7)
                 .await
                 .is_none()
         );
@@ -286,13 +312,13 @@ mod tests {
     async fn stored_blob_presence_check_declines_a_missing_object() {
         let (state, mem) = seeded_cloud(true).await;
         assert!(
-            try_stored_blob_redirect(&state, mem.as_ref(), "blobs/missing", DIGEST, true)
+            try_stored_blob_redirect(&state, mem.as_ref(), "blobs/missing", DIGEST, true, 7)
                 .await
                 .is_none(),
             "a missing object must fall back so the caller can re-fetch"
         );
         assert!(
-            try_stored_blob_redirect(&state, mem.as_ref(), "blobs/missing", DIGEST, false)
+            try_stored_blob_redirect(&state, mem.as_ref(), "blobs/missing", DIGEST, false, 7)
                 .await
                 .is_some(),
             "without the probe the redirect is issued unconditionally"
@@ -339,6 +365,12 @@ mod tests {
             location(&resp).contains(&content_key),
             "must sign the cache key itself: {}",
             location(&resp)
+        );
+        // #6035: tagged with the sidecar's size for the transfer meter.
+        assert_eq!(
+            resp.extensions()
+                .get::<crate::services::quota::http::PresignedDownload>(),
+            Some(&crate::services::quota::http::PresignedDownload(11))
         );
     }
 

@@ -552,12 +552,8 @@ pub(crate) async fn stage(
             let FinalizeSource::File(file) = source else {
                 return Err("an Incus image finalize needs the assembled file".to_string());
             };
-            let (path, file) = (artifact_path.to_string(), file.to_path_buf());
-            let metadata = tokio::task::spawn_blocking(move || {
-                crate::api::handlers::incus::extract_image_metadata(&path, &file)
-            })
-            .await
-            .unwrap_or_else(|_| serde_json::json!({"file_type": "unknown"}));
+            let metadata =
+                crate::api::handlers::incus::extract_image_metadata(artifact_path, file).await;
             Ok(StagedNativeFinalize::Incus(metadata))
         }
         RepositoryFormat::Debian => {

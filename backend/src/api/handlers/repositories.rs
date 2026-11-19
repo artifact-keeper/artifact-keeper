@@ -13840,10 +13840,11 @@ pub async fn download_artifact(
         struct ArtifactRow {
             id: Uuid,
             storage_key: String,
+            size_bytes: i64,
         }
         if let Some(artifact) = sqlx::query_as::<_, ArtifactRow>(
             r#"
-            SELECT id, storage_key
+            SELECT id, storage_key, size_bytes
             FROM artifacts
             WHERE repository_id = $1 AND path = $2 AND is_deleted = false
             "#,
@@ -13882,13 +13883,97 @@ pub async fn download_artifact(
                     source = ?presigned.source,
                     "Serving artifact via redirect"
                 );
-                return Ok(DownloadResponse::redirect(presigned).into_response());
+                // #6035: the transfer meter counts the row's size when the
+                // URL is issued.
+                return Ok(
+                    DownloadResponse::redirect(presigned, artifact.size_bytes).into_response()
+                );
             }
         }
     }
 
     // Fall back to proxied download (filesystem or S3 without redirect)
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
+
+    // #5594: a Docker/OCI manifest's artifact row records the IMAGE size
+    // (config + layers) in `size_bytes`, not the byte length of the manifest
+    // stored at `storage_key`, while `checksum_sha256` is the manifest digest.
+    // Serving with `artifact.size_bytes` as the content length makes integrity
+    // verification fail (and would advertise a wrong Content-Length). Serve the
+    // actual manifest bytes with their real size instead. The read still goes
+    // through `download_stream`, so the download gate, the statistics row, the
+    // ARTIFACT_DOWNLOADED audit event and the AfterDownload hooks all apply.
+    if repo.repo_type != RepositoryType::Virtual
+        && repo.format == RepositoryFormat::Docker
+        && crate::services::oci_manifests::is_manifest_path(&path)
+    {
+        match artifact_service
+            .download_stream(
+                repo.id,
+                &path,
+                auth.as_ref().map(|a| a.user_id),
+                client_ip_str.clone(),
+                user_agent.as_deref(),
+                // #2260 §5: a HEAD serves no body, so it must not count.
+                !is_head,
+            )
+            .await
+        {
+            Ok((artifact, stream)) => {
+                // A manifest is small (the OCI push path caps it), so buffering
+                // it to learn its real length is cheap.
+                use futures::TryStreamExt;
+                let bytes = Bytes::from(stream.map_ok(|b| b.to_vec()).try_concat().await?);
+                let total = bytes.len() as u64;
+                let body: futures::stream::BoxStream<'static, crate::error::Result<Bytes>> =
+                    Box::pin(futures::stream::once(async move { Ok(bytes) }));
+                let range_header = request
+                    .headers()
+                    .get(header::RANGE)
+                    .and_then(|v| v.to_str().ok());
+                let checksum = artifact.checksum_sha256.trim().to_string();
+                let base_headers = vec![
+                    (header::CONTENT_TYPE, artifact.content_type),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        format!("attachment; filename=\"{}\"", download_filename(&path)),
+                    ),
+                    (header::ETAG, artifact_etag(&checksum)),
+                    (
+                        header::HeaderName::from_static("x-checksum-sha256"),
+                        checksum,
+                    ),
+                    (
+                        header::HeaderName::from_static(X_ARTIFACT_STORAGE),
+                        "proxy".to_string(),
+                    ),
+                ];
+                let verify = serve_verification(
+                    state.config.download_verify_checksums
+                        && crate::storage::verify::checksum_is_content_digest(
+                            repo.format.as_key(),
+                            &path,
+                        ),
+                    &artifact.checksum_sha256,
+                    || format!("{key}/{path}"),
+                );
+                let response = ranged_stream_response_checked(
+                    range_header,
+                    total,
+                    body,
+                    base_headers,
+                    verify,
+                    is_head,
+                )
+                .await?;
+                return Ok(response);
+            }
+            // No row, or a cached remote manifest whose local bytes are gone:
+            // the normal path below answers it (404, or the remote fallback).
+            Err(AppError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
 
     let download_result = artifact_service
         .download_stream(
@@ -39474,6 +39559,66 @@ mod tests {
         for user in [admin, owner] {
             tdh::cleanup_user(&pool, user).await;
         }
+    }
+
+    /// #5594: the generic `/download` of a docker repository's manifest serves the stored manifest
+    /// bytes with their real length. The row's `size_bytes` is the image size, so serving by it
+    /// failed the integrity check with a 502.
+    #[tokio::test]
+    async fn generic_download_serves_docker_manifest_5594_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use tower::ServiceExt;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "docker").await;
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write"]).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let bearer = tdh::bearer_for(&state, user_id).await;
+        let media_type = "application/vnd.oci.image.manifest.v1+json";
+        let manifest = format!(
+            r#"{{"schemaVersion":2,"mediaType":"{media_type}","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:{c}","size":4096}},"layers":[],"annotations":{{"build":"{u}"}}}}"#,
+            c = "1".repeat(64),
+            u = Uuid::new_v4()
+        );
+        let pushed = crate::api::handlers::oci_v2::router(None)
+            .with_state(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(format!("/{key}/acme/app/manifests/1.0"))
+                    .header(header::AUTHORIZATION, &bearer)
+                    .header(header::CONTENT_TYPE, media_type)
+                    .body(Body::from(manifest.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let push_status = pushed.status();
+        let (status, body, headers) = tdh::send_with_headers(
+            tdh::router_with_auth(
+                download_router(),
+                state.clone(),
+                tdh::make_auth(user_id, &username),
+            ),
+            tdh::get(format!("/{key}/download/v2/acme/app/manifests/1.0")),
+        )
+        .await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(push_status, StatusCode::CREATED, "push the manifest");
+        assert_eq!(status, StatusCode::OK, "generic download: {body:?}");
+        assert_eq!(body, manifest.as_bytes(), "the manifest bytes");
+        assert_eq!(
+            headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some(manifest.len().to_string().as_str()),
+            "Content-Length is the manifest length, not the image size"
+        );
     }
 }
 
