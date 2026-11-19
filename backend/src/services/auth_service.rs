@@ -1139,7 +1139,7 @@ enum TokenFlightState {
     /// DB read: a waiter re-validates if the token was revoked, its user
     /// invalidated after `started`, or it expired since.
     Valid {
-        validation: ApiTokenValidation,
+        validation: Box<ApiTokenValidation>,
         token_id: Uuid,
         started: Instant,
     },
@@ -1156,7 +1156,7 @@ impl TokenFlightState {
     fn from_outcome(outcome: &ApiTokenOutcome, started: Instant) -> Self {
         match outcome {
             Ok((validation, token_id)) => Self::Valid {
-                validation: validation.clone(),
+                validation: Box::new(validation.clone()),
                 token_id: *token_id,
                 started,
             },
@@ -3611,7 +3611,7 @@ impl AuthService {
                     let outcome = self.validate_api_token_uncached(token, &cache_key).await;
                     return Self::record_validated_api_token(outcome);
                 }
-                return Self::record_validated_api_token(Ok((validation, token_id)));
+                return Self::record_validated_api_token(Ok((*validation, token_id)));
             }
             Some(TokenFlightState::Refused(msg)) => {
                 return Err(AppError::Authentication(msg));
