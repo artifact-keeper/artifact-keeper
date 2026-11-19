@@ -119,11 +119,13 @@ impl TrivyFsScanner {
             "standalone"
         };
 
-        let output = trivy_cli_command()
-            .args(&args)
-            .output()
-            .await
-            .map_err(|e| crate::services::scanner_service::classify_trivy_spawn_error(&e))?;
+        // #5942: bounded by SCANNER_PROCESS_TIMEOUT_SECS when set.
+        let output = crate::services::scanner_service::wait_scanner_process(
+            "trivy",
+            trivy_cli_command().args(&args).output(),
+        )
+        .await?
+        .map_err(|e| crate::services::scanner_service::classify_trivy_spawn_error(&e))?;
 
         let stderr_text = String::from_utf8_lossy(&output.stderr).to_string();
 

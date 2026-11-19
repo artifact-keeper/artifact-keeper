@@ -573,6 +573,26 @@ on. Only the URL changes: the worker's adapter client sends the same credentials
 as the API pods' (for example a `TRIVY_ADAPTER_TOKEN`, where set), so the
 adapter next to the worker must accept them.
 
+**Scanners that never return.** A queued job has a 600 s budget. Each scanner
+in it stops when the budget runs out: its `scan_results` row is recorded
+`failed` with "scanner <name> was stopped at the end of the queued scan job's
+600s budget", and the job goes back to the queue for another attempt, like a
+job whose scanner engine was unavailable. The scanners of one job share that
+budget, so two that hang cannot run longer than one. `SCANNER_PROCESS_TIMEOUT_SECS`
+(unset by default, no limit of its own) also limits each local `grype` or
+`trivy` process, in queued and in-process scans alike: past it the process is
+killed and its row recorded `failed`, and a queued job is retried. Set it
+above the longest scan you expect to finish. Scans through the scanner adapter
+are not affected by it; the adapter client keeps its own budgets.
+
+Without the queue, the stuck-scan janitor (`STUCK_SCAN_THRESHOLD_SECS`, default
+1800) marks a hung scan's rows `failed` but never stops the hung `grype`. On
+such pods, set `SCANNER_PROCESS_TIMEOUT_SECS` to match `STUCK_SCAN_THRESHOLD_SECS`
+(1800 by default), or lower, such as `900`, if your slowest scans finish well
+inside that. A retried on-demand scan reuses its rows: between
+attempts they read `failed`, so a `block_on_fail` policy holds the artifact,
+and a retry that succeeds completes the rows and releases the hold.
+
 **Rescans after a vulnerability-database update.** `SCAN_RESCAN_MAX_PER_DAY`
 (default `0`, off) has the worker look every 15 minutes for stored artifacts
 whose latest completed scan used an older database build than the one the
