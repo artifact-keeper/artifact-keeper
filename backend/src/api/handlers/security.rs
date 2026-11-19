@@ -10349,9 +10349,10 @@ mod tests {
             advisory_client,
             scan_result_service,
             scan_config_service,
-            None, // trivy_url
-            None, // trivy_adapter_url
-            true, // incus_scanner_enabled (irrelevant without a Trivy URL)
+            None,  // trivy_url
+            None,  // trivy_adapter_url
+            true,  // incus_scanner_enabled (irrelevant without a Trivy URL)
+            false, // trivy_ignore_embedded_pom_declarations (likewise)
             fx.state.storage.clone(),
             fx.state.storage_registry.clone(),
             fx.storage_dir.to_string_lossy().into_owned(),

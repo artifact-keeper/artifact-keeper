@@ -100,6 +100,27 @@ the checks above run. The metadata check reads one copy of a manifest and the
 scan workspace unpacks the other, so neither can be vouched for. Published
 packages do not carry repeated paths.
 
+**Embedded build POMs (Maven).** A Maven-built JAR embeds the POM it was
+built from at `META-INF/maven/<groupId>/<artifactId>/pom.xml`. That POM
+declares what the JAR was built against (`provided` and `test` scope
+included), not only what it ships. Grype has not graded those declarations
+since #5340. By default the Trivy filesystem scan still does, so the default
+is unchanged. Set `TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS=true` (opt-in,
+default `false`) to stop the Trivy filesystem scan grading dependencies that
+are only *declared* in a JAR's embedded build POM, which removes false
+positives such as #6233's. What the archive ships is then graded from the
+`pom.properties` of the archive and of each component bundled in it. Even
+when enabled, the Trivy scan keeps a build POM in two cases, because Trivy
+does not open nested JARs and the POM may be the only thing that names a
+bundled library:
+- a POM with no `pom.properties` beside it;
+- any archive that bundles JVM archives: a `.war` or `.ear`, a `WEB-INF/lib`
+  or `BOOT-INF/lib` directory, or a nested `.jar`, `.war`, `.ear`, `.aar`,
+  `.hpi` or `.jpi` anywhere in it.
+
+The setting applies to every Trivy filesystem scan, on uploads as well as
+proxy pulls. See [Known gaps](#known-gaps) for what it misses when enabled.
+
 **Archive formats graded on their contents (Go, Composer, Conan, CocoaPods, Swift).** The gate
 takes the coordinate from the request and checks it against the archive
 first, as for every format: a Go module zip must hold only
@@ -552,6 +573,26 @@ on. Only the URL changes: the worker's adapter client sends the same credentials
 as the API pods' (for example a `TRIVY_ADAPTER_TOKEN`, where set), so the
 adapter next to the worker must accept them.
 
+**Scanners that never return.** A queued job has a 600 s budget. Each scanner
+in it stops when the budget runs out: its `scan_results` row is recorded
+`failed` with "scanner <name> was stopped at the end of the queued scan job's
+600s budget", and the job goes back to the queue for another attempt, like a
+job whose scanner engine was unavailable. The scanners of one job share that
+budget, so two that hang cannot run longer than one. `SCANNER_PROCESS_TIMEOUT_SECS`
+(unset by default, no limit of its own) also limits each local `grype` or
+`trivy` process, in queued and in-process scans alike: past it the process is
+killed and its row recorded `failed`, and a queued job is retried. Set it
+above the longest scan you expect to finish. Scans through the scanner adapter
+are not affected by it; the adapter client keeps its own budgets.
+
+Without the queue, the stuck-scan janitor (`STUCK_SCAN_THRESHOLD_SECS`, default
+1800) marks a hung scan's rows `failed` but never stops the hung `grype`. On
+such pods, set `SCANNER_PROCESS_TIMEOUT_SECS` to match `STUCK_SCAN_THRESHOLD_SECS`
+(1800 by default), or lower, such as `900`, if your slowest scans finish well
+inside that. A retried on-demand scan reuses its rows: between
+attempts they read `failed`, so a `block_on_fail` policy holds the artifact,
+and a retry that succeeds completes the rows and releases the hold.
+
 **Rescans after a vulnerability-database update.** `SCAN_RESCAN_MAX_PER_DAY`
 (default `0`, off) has the worker look every 15 minutes for stored artifacts
 whose latest completed scan used an older database build than the one the
@@ -873,6 +914,14 @@ have no core proxy path to gate.
   [The proxy cache and the gate](#the-proxy-cache-and-the-gate)). To enforce
   the Virtual's policy for every client, enable scan-on-proxy on the member
   too, or do not grant clients read access to the member.
+- **With `TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS=true`, any shaded library
+  whose own `META-INF/maven/**` wasn't carried into the jar is flagged by
+  neither engine.** maven-shade embeds the original build POM, so the
+  shaded dependency is named only by that POM's declaration. For example,
+  jackson-core's shaded fastdoubleparser has no `pom.properties` in the
+  jar. Grype has ignored embedded POM declarations since #5340, and the
+  opt-in makes Trivy ignore them too. The default (`false`) keeps grading
+  them. #6261 tracks a shading heuristic for both engines.
 - **Maven-layout archives other than `.jar`/`.war`/`.ear`** (`.aar`,
   `.hpi`/`.jpi`, `.nbm`, `.jmod`, `.rar`, `.zip`) are scanned as raw files,
   not unpacked, and carry no identity pin.
