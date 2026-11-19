@@ -702,7 +702,7 @@ async fn try_proxy_go_metadata(
                 stale_since,
             } = match fetched {
                 Ok(body) => body,
-                Err(resp) => return Err(go_fetch_failure(state, repo.id, resp).await),
+                Err(resp) => return Err(go_fetch_failure(state, repo.id, upstream_url, resp).await),
             };
             return Ok(proxy_helpers::forward_verbatim_metadata(
                 content,
@@ -785,13 +785,17 @@ fn upstream_failure(resp: Response) -> Option<Response> {
 /// missing, so it is answered with the 502 `.mod` gives rather than the 404
 /// that sends `GOPROXY=<ak>,direct` to the next entry. An anonymous 401/403
 /// stays a miss: an S3-style upstream answers 403 for a key it does not hold.
+/// Credentials embedded in `upstream_url` (`user:pass@`) count as configured.
 async fn go_fetch_failure(
     state: &SharedState,
     repo_id: uuid::Uuid,
+    upstream_url: &str,
     resp: Response,
 ) -> Option<Response> {
     let refused = proxy_helpers::is_upstream_auth_refusal(&resp);
-    if proxy_helpers::is_credentialed_upstream_refusal(&state.db, repo_id, refused).await {
+    if proxy_helpers::is_credentialed_upstream_refusal(&state.db, repo_id, upstream_url, refused)
+        .await
+    {
         return Some(if resp.status().is_server_error() {
             resp
         } else {
@@ -877,7 +881,7 @@ async fn fetch_go_metadata_with_source(
         } = match fetched {
             Ok(body) => body,
             Err(resp) => {
-                return go_fetch_failure(state, repo.id, resp)
+                return go_fetch_failure(state, repo.id, upstream_url, resp)
                     .await
                     .map_or(Ok(None), Err)
             }
@@ -919,7 +923,9 @@ async fn fetch_go_metadata_with_source(
                 // A lower-priority member may still serve; only when none
                 // does is the outage the answer.
                 Err(resp) => {
-                    any_unavailable |= go_fetch_failure(state, member.id, resp).await.is_some()
+                    any_unavailable |= go_fetch_failure(state, member.id, upstream_url, resp)
+                        .await
+                        .is_some()
                 }
             }
         }
@@ -1391,7 +1397,10 @@ async fn fetch_member_version_list(
     } = match fetched {
         Ok(body) => body,
         Err(resp) => {
-            if go_fetch_failure(state, member.id, resp).await.is_some() {
+            if go_fetch_failure(state, member.id, upstream_url, resp)
+                .await
+                .is_some()
+            {
                 any_unavailable.store(true, Ordering::Relaxed);
             }
             tracing::debug!(
@@ -6138,8 +6147,9 @@ mod upstream_failure_6214_tests {
     /// configured means the credentials no longer work: `@v/list`, `@latest`
     /// and `.info` answer the 502 `.mod` answers (a Virtual over it, 503 +
     /// `Retry-After`), not the 404 that sends `GOPROXY=<ak>,direct` past the
-    /// scan gate. The same refusal of an anonymous Remote stays a 404 (an
-    /// S3-style upstream answers 403 for a key it does not hold).
+    /// scan gate. Credentials embedded in the upstream URL (`user:pass@`)
+    /// count as configured. The same refusal of an anonymous Remote stays a
+    /// 404 (an S3-style upstream answers 403 for a key it does not hold).
     #[tokio::test]
     async fn test_credentialed_upstream_refusal_is_not_a_miss_6214_db() {
         if std::env::var("JWT_SECRET").is_err() && std::env::var("SSO_ENCRYPTION_KEY").is_err() {
@@ -6162,6 +6172,12 @@ mod upstream_failure_6214_tests {
         crate::services::upstream_auth::invalidate_upstream_auth_cache(cred_id);
         let (cred_virtual, cred_virtual_key) = rig.repo("virtual", None).await;
         tdh::link_virtual_member(&rig.fx.pool, cred_virtual, cred_id, 0).await;
+        // Credentials embedded in the upstream URL are sent as Basic auth
+        // (#4452) but are not in the auth configuration.
+        let userinfo_upstream = upstream.replacen("://", "://dtf-reader:expired@", 1);
+        let (userinfo_id, userinfo_key) = rig.repo("remote", Some(&userinfo_upstream)).await;
+        let (userinfo_virtual, userinfo_virtual_key) = rig.repo("virtual", None).await;
+        tdh::link_virtual_member(&rig.fx.pool, userinfo_virtual, userinfo_id, 0).await;
         let anon_key = rig.fx.repo_key.clone();
 
         let mut anonymous = Vec::new();
@@ -6173,14 +6189,23 @@ mod upstream_failure_6214_tests {
             for (route, uri) in routes(&anon_key, module).into_iter().take(3) {
                 anonymous.push((module, route, rig.get(uri).await.0));
             }
-            let mut statuses = Vec::new();
-            for (route, uri) in routes(&cred_key, module) {
-                statuses.push((route, rig.get(uri).await.0));
+            for key in [&cred_key, &userinfo_key] {
+                let mut statuses = Vec::new();
+                for (route, uri) in routes(key, module) {
+                    statuses.push((route, rig.get(uri).await.0));
+                }
+                credentialed.push((module, statuses));
             }
-            credentialed.push((module, statuses));
-            for (route, uri) in routes(&cred_virtual_key, module).into_iter().take(3) {
-                let (status, headers) = rig.get(uri).await;
-                through_virtual.push((module, route, status, headers.contains_key("retry-after")));
+            for key in [&cred_virtual_key, &userinfo_virtual_key] {
+                for (route, uri) in routes(key, module).into_iter().take(3) {
+                    let (status, headers) = rig.get(uri).await;
+                    through_virtual.push((
+                        module,
+                        route,
+                        status,
+                        headers.contains_key("retry-after"),
+                    ));
+                }
             }
         }
         rig.teardown().await;

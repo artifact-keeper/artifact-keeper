@@ -976,10 +976,13 @@ have no core proxy path to gate.
   the repository answers 404 or 410. With `GOPROXY=https://<ak>/go/<repo>|direct`
   it moves on after *any* error, including the `403` `scan_blocked`, the
   `423` and the 5xx a failing upstream gets. In both cases the client then
-  fetches from the VCS without going through the gate. The Go routes answer
-  with a 5xx, never a 404, when the upstream cannot answer or refuses the
-  Remote's configured credentials (#6214). So `,direct` falls through only
-  for a module the upstream really does not have. To
+  fetches from the VCS without going through the gate. `@v/list`,
+  `@latest`, `.info`, `.mod` and `.zip` answer with a 5xx, never a 404, when
+  the upstream cannot answer or refuses the Remote's credentials, whether
+  they are configured as upstream auth or embedded in the upstream URL as
+  `user:pass@` (#6214). So `,direct` falls through only for a module the
+  upstream really does not have, or an `@latest` the age gate withholds on
+  purpose. To
   enforce the gate for every module, set `GOPROXY=https://<ak>/go/<repo>`
   with no fallback. Modules that match `GOPRIVATE` or `GONOPROXY` also skip
   the proxy, so keep those patterns limited to modules you trust.

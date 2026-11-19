@@ -962,19 +962,31 @@ pub(crate) fn upstream_refusal_status(response: &Response) -> Option<StatusCode>
 /// it does not hold). If the auth configuration cannot be read, the refusal
 /// counts as credentialed, so a database fault never turns it into a miss.
 ///
+/// Credentials embedded in `upstream_url` as `user:pass@` are sent as Basic
+/// auth too (#4452) but are not in the auth configuration, so a URL with
+/// userinfo also counts as credentialed.
+///
 /// Takes the response's refusal classification
 /// ([`is_upstream_auth_refusal`]) rather than the response itself, so no
 /// borrow of a (non-`Sync`) `Response` is held across the await.
 pub(crate) async fn is_credentialed_upstream_refusal(
     db: &PgPool,
     repo_id: Uuid,
+    upstream_url: &str,
     refused: bool,
 ) -> bool {
-    refused
-        && !matches!(
-            crate::services::upstream_auth::load_upstream_auth(db, repo_id).await,
-            Ok(None)
-        )
+    if !refused {
+        return false;
+    }
+    if url::Url::parse(upstream_url)
+        .is_ok_and(|u| !u.username().is_empty() || u.password().is_some())
+    {
+        return true;
+    }
+    !matches!(
+        crate::services::upstream_auth::load_upstream_auth(db, repo_id).await,
+        Ok(None)
+    )
 }
 
 /// Whether a proxy error `Response` is an upstream `401`/`403`
@@ -5090,7 +5102,9 @@ where
                     let unavailable = is_member_unavailable_response(&resp);
                     let refused = is_upstream_auth_refusal(&resp);
                     drop(resp);
-                    if unavailable || is_credentialed_upstream_refusal(db, member.id, refused).await
+                    if unavailable
+                        || is_credentialed_upstream_refusal(db, member.id, upstream_url, refused)
+                            .await
                     {
                         tracing::debug!(
                             member = %member.key,
