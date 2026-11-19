@@ -4123,6 +4123,54 @@ mod tests {
         }
     }
 
+    /// #6218: with `codegen-units = 1` the 1.12 backend does not fit the
+    /// 7 GiB macos-latest runner, which pages for most of the build and took
+    /// 145-167 min per macOS leg. Both release workflows must raise the unit
+    /// count on macOS only, with the same value, before `Cache Cargo`
+    /// (rust-cache keys on CARGO_* variables, so a mismatch makes the tag
+    /// build miss the warmed cache). Linux and Windows keep the profile's 1.
+    #[test]
+    fn release_macos_legs_raise_codegen_units_6218() {
+        let step = "      - name: Use 16 codegen units on the 7 GiB macOS runners\n        \
+                    if: runner.os == 'macOS'\n        \
+                    run: echo \"CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16\" >> \"$GITHUB_ENV\"\n";
+        for (name, workflow) in [
+            (
+                "release.yml",
+                include_str!("../../.github/workflows/release.yml"),
+            ),
+            (
+                "release-cli-caches.yml",
+                include_str!("../../.github/workflows/release-cli-caches.yml"),
+            ),
+        ] {
+            let at = workflow.find(step).unwrap_or_else(|| {
+                panic!(
+                    "{name} must set CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 on \
+                     macOS only, in the step named \"Use 16 codegen units on \
+                     the 7 GiB macOS runners\" (#6218)"
+                )
+            });
+            let cache = workflow
+                .find("      - name: Cache Cargo\n")
+                .unwrap_or_else(|| panic!("{name} has no `Cache Cargo` step"));
+            assert!(
+                at < cache,
+                "{name} must set the codegen-units override before `Cache \
+                 Cargo`, or the cache key differs between the warm-up and \
+                 the tag build (#6218)"
+            );
+            assert_eq!(
+                workflow
+                    .matches("CARGO_PROFILE_RELEASE_CODEGEN_UNITS")
+                    .count(),
+                1,
+                "{name} must set CARGO_PROFILE_RELEASE_CODEGEN_UNITS exactly \
+                 once, in the macOS-only step (#6218)"
+            );
+        }
+    }
+
     /// #6193: a release.yml job with no `timeout-minutes` inherits GitHub's
     /// 6-hour default, so a hung cross-build or poll holds the release for
     /// hours before anything turns red. Every job must state its own

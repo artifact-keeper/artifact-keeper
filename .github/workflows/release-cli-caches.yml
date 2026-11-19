@@ -97,7 +97,9 @@ jobs:
     name: Warm ${{ matrix.target }}
     needs: require-main
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    # macOS: ~70 min cold with 16 codegen units (#6218); 90 cancelled
+    # every macOS leg on 1.12, so the macOS caches were never saved.
+    timeout-minutes: ${{ startsWith(matrix.os, 'macos') && 120 || 90 }}
     permissions:
       contents: read
     strategy:
@@ -151,6 +153,24 @@ jobs:
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
+
+      # #6218: the macos-latest runner is a 3-core M1 VM with 7 GiB of RAM
+      # and no fixed swap. With the release profile's `codegen-units = 1`
+      # the whole 1.12 backend crate goes through LLVM as one module, the VM
+      # pages to compressed memory and swap for most of the build, and the
+      # legs took 145-167 min on v1.12.x (they were 65-90 min on 1.11.x,
+      # when the crate was ~24% smaller). 16 units let rustc work on smaller
+      # modules in parallel; thin LTO (unchanged) still optimises across
+      # them. Measured on the hosted runner (PR #6292, same commit, same
+      # runner): aarch64-apple-darwin took 178 min with 1 unit and 69 min
+      # with 16, with less than half the swap-outs. Only the macOS legs change: Linux
+      # and Windows keep `codegen-units = 1`. The same value must be set in
+      # release.yml and release-cli-caches.yml, before `Cache Cargo`
+      # (rust-cache keys on CARGO_* variables), or the tag build misses the
+      # warmed cache.
+      - name: Use 16 codegen units on the 7 GiB macOS runners
+        if: runner.os == 'macOS'
+        run: echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16" >> "$GITHUB_ENV"
 
       # Saves on main (the default `save-if`). release.yml restores this key
       # and does not save.
