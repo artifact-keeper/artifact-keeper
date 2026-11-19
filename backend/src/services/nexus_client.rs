@@ -117,6 +117,69 @@ struct ListCursor {
     listed_paths: std::collections::HashSet<String>,
     /// Both listings answered without a continuation token: the walk is over.
     exhausted: bool,
+    /// The `modified` window this walk is filtered to. Offsets count only the
+    /// assets inside it, so a cursor serves only calls with the same window.
+    window: DateWindow,
+}
+
+/// The `modified` window a listing is filtered to (#6195), with the bounds the
+/// Artifactory client puts in its AQL query: strictly after `after`, strictly
+/// before `before`.
+///
+/// Nexus has no server-side filter on the listing endpoints, so the window is
+/// applied to each asset's `lastModified` as the pages arrive, inside the
+/// fetch loop: filtering a page after it is cut could hand back an empty page
+/// mid-walk, which the worker reads as the end of the repository.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+struct DateWindow {
+    after: Option<chrono::DateTime<chrono::FixedOffset>>,
+    before: Option<chrono::DateTime<chrono::FixedOffset>>,
+}
+
+impl DateWindow {
+    /// Parse the RFC 3339 bounds `SourceRegistry::list_artifacts_with_date_filter`
+    /// is called with. A bound that does not parse is an error rather than
+    /// being dropped, since dropping it silently is the bug this fixes.
+    fn parse(after: Option<&str>, before: Option<&str>) -> Result<Self, ArtifactoryError> {
+        fn bound(
+            name: &str,
+            value: Option<&str>,
+        ) -> Result<Option<chrono::DateTime<chrono::FixedOffset>>, ArtifactoryError> {
+            value
+                .map(|v| {
+                    chrono::DateTime::parse_from_rfc3339(v).map_err(|e| {
+                        ArtifactoryError::ApiError {
+                            status: 400,
+                            message: format!("invalid {name} date filter {v:?}: {e}"),
+                        }
+                    })
+                })
+                .transpose()
+        }
+        Ok(Self {
+            after: bound("modified_after", after)?,
+            before: bound("modified_before", before)?,
+        })
+    }
+
+    /// Whether a listed row falls inside the window. A row without a usable
+    /// `lastModified` is kept: the window cannot rule it out, and leaving it
+    /// behind would silently drop content from the migration, while listing
+    /// it costs only the duplicate check.
+    fn admits(&self, result: &AqlResult) -> bool {
+        if self.after.is_none() && self.before.is_none() {
+            return true;
+        }
+        let Some(modified) = result
+            .modified
+            .as_deref()
+            .and_then(|m| chrono::DateTime::parse_from_rfc3339(m).ok())
+        else {
+            return true;
+        };
+        self.after.is_none_or(|after| modified > after)
+            && self.before.is_none_or(|before| modified < before)
+    }
 }
 
 /// A repository is walked through `/components` first, then through
@@ -251,6 +314,11 @@ pub struct NexusAsset {
     pub file_size: Option<i64>,
     /// Nexus repository format of the asset (`raw`, `maven2`, `npm`, ...).
     pub format: Option<String>,
+    /// When the asset was last modified (RFC 3339). Read for the migration's
+    /// date window (#6195); `blobCreated` is not, because Nexus 3.68 emits it
+    /// twice per asset.
+    #[serde(rename = "lastModified", default)]
+    pub last_modified: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -588,10 +656,17 @@ impl NexusClient {
     /// is there. Removing it means a concurrent call for the same repository
     /// falls back to the cold walk rather than sharing a cursor, and it keeps
     /// the lock off the upstream fetch.
-    fn take_list_cursor(&self, repo_name: &str, offset: i64) -> Option<ListCursor> {
+    fn take_list_cursor(
+        &self,
+        repo_name: &str,
+        offset: i64,
+        window: DateWindow,
+    ) -> Option<ListCursor> {
         let mut cursors = self.list_cursors.lock().ok()?;
         match cursors.get(repo_name) {
-            Some(cursor) if cursor.next_offset == offset => cursors.remove(repo_name),
+            Some(cursor) if cursor.next_offset == offset && cursor.window == window => {
+                cursors.remove(repo_name)
+            }
             _ => None,
         }
     }
@@ -636,7 +711,7 @@ impl NexusClient {
             name,
             size: asset.file_size,
             created: None,
-            modified: None,
+            modified: asset.last_modified.clone(),
             sha256: asset.checksum.as_ref().and_then(|c| c.sha256.clone()),
             actual_sha1: asset.checksum.as_ref().and_then(|c| c.sha1.clone()),
         }
@@ -702,15 +777,32 @@ impl NexusClient {
         offset: i64,
         limit: i64,
     ) -> Result<AqlResponse, ArtifactoryError> {
+        self.list_artifacts_in_window(repo_name, offset, limit, DateWindow::default())
+            .await
+    }
+
+    /// [`Self::list_artifacts`] restricted to the assets inside `window`.
+    /// `offset` and `limit` count only those assets, so the worker's paging
+    /// (and its short-page end of walk) works unchanged (#6195).
+    async fn list_artifacts_in_window(
+        &self,
+        repo_name: &str,
+        offset: i64,
+        limit: i64,
+        window: DateWindow,
+    ) -> Result<AqlResponse, ArtifactoryError> {
         let offset = offset.max(0);
         let want = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
 
         // Resume where the previous call for this repository stopped; on a
         // miss, start cold and drop the `offset` assets that precede the page.
-        let (mut cursor, mut to_discard) = match self.take_list_cursor(repo_name, offset) {
+        let (mut cursor, mut to_discard) = match self.take_list_cursor(repo_name, offset, window) {
             Some(cursor) => (cursor, 0usize),
             None => (
-                ListCursor::default(),
+                ListCursor {
+                    window,
+                    ..ListCursor::default()
+                },
                 usize::try_from(offset).unwrap_or(usize::MAX),
             ),
         };
@@ -733,10 +825,14 @@ impl NexusClient {
                 ListPhase::Components => {
                     let page: NexusComponentsResponse = self.get(&path).await?;
                     let results = Self::page_to_results(repo_name, &page);
+                    // Every component asset is recorded as listed, inside the
+                    // window or not, so the asset walk never re-lists it.
                     cursor
                         .listed_paths
                         .extend(results.iter().map(Self::listed_path));
-                    cursor.pending.extend(results);
+                    cursor
+                        .pending
+                        .extend(results.into_iter().filter(|r| window.admits(r)));
                     page.continuation_token
                 }
                 ListPhase::Assets => match self.get::<NexusAssetsResponse>(&path).await {
@@ -749,7 +845,9 @@ impl NexusClient {
                                 continue;
                             }
                             let result = Self::asset_to_result(repo_name, asset_path, asset);
-                            if cursor.listed_paths.insert(Self::listed_path(&result)) {
+                            if cursor.listed_paths.insert(Self::listed_path(&result))
+                                && window.admits(&result)
+                            {
                                 cursor.pending.push_back(result);
                             }
                         }
@@ -937,10 +1035,12 @@ impl crate::services::source_registry::SourceRegistry for NexusClient {
         repo_key: &str,
         offset: i64,
         limit: i64,
-        _modified_after: Option<&str>,
-        _modified_before: Option<&str>,
+        modified_after: Option<&str>,
+        modified_before: Option<&str>,
     ) -> Result<AqlResponse, ArtifactoryError> {
-        self.list_artifacts(repo_key, offset, limit).await
+        let window = DateWindow::parse(modified_after, modified_before)?;
+        self.list_artifacts_in_window(repo_key, offset, limit, window)
+            .await
     }
 
     async fn download_artifact(
@@ -2712,5 +2812,235 @@ mod tests {
 
         assert_eq!(request_count(&server, "/service/rest/v1/assets").await, 2);
         assert_eq!(page.results.len(), 1, "the repeated asset is listed once");
+    }
+
+    // -----------------------------------------------------------------------
+    // #6195: the migration's date window applies to a Nexus source
+    // -----------------------------------------------------------------------
+
+    /// One single-asset raw component, modified at `last_modified`.
+    fn dated_component(n: usize, last_modified: Option<&str>) -> serde_json::Value {
+        let mut asset = fixture_asset(&format!("dated/file-{n}.bin"), n);
+        if let Some(when) = last_modified {
+            asset["lastModified"] = serde_json::json!(when);
+        }
+        serde_json::json!({
+            "id": format!("comp-{n}"),
+            "repository": "dated",
+            "format": "raw",
+            "name": format!("file-{n}"),
+            "assets": [asset]
+        })
+    }
+
+    /// Serve `pages` from `/components` for `dated`, chained by token.
+    async fn mount_component_pages(server: &MockServer, pages: Vec<Vec<serde_json::Value>>) {
+        use wiremock::matchers::{query_param, query_param_is_missing};
+
+        let count = pages.len();
+        for (page_index, items) in pages.into_iter().enumerate() {
+            let next = (page_index + 1 < count).then(|| format!("c{}", page_index + 1));
+            let response = ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "items": items, "continuationToken": next }));
+            let route = Mock::given(method("GET"))
+                .and(path("/service/rest/v1/components"))
+                .and(query_param("repository", "dated"));
+            if page_index == 0 {
+                route
+                    .and(query_param_is_missing("continuationToken"))
+                    .respond_with(response)
+                    .mount(server)
+                    .await;
+            } else {
+                route
+                    .and(query_param("continuationToken", format!("c{page_index}")))
+                    .respond_with(response)
+                    .mount(server)
+                    .await;
+            }
+        }
+    }
+
+    /// Walk `dated` through the `SourceRegistry` entry point the worker calls,
+    /// with the worker's short-page termination rule.
+    async fn walk_dated(
+        client: &NexusClient,
+        limit: i64,
+        after: Option<&str>,
+        before: Option<&str>,
+    ) -> Vec<String> {
+        use crate::services::source_registry::SourceRegistry;
+
+        let mut names = Vec::new();
+        let mut offset = 0i64;
+        loop {
+            let page = client
+                .list_artifacts_with_date_filter("dated", offset, limit, after, before)
+                .await
+                .expect("list a filtered page");
+            let page_len = page.results.len();
+            names.extend(page.results.into_iter().map(|r| r.name));
+            if page_len < limit as usize {
+                break;
+            }
+            offset += page_len as i64;
+        }
+        names
+    }
+
+    /// The fixture for the #6195 tests: three component pages, the middle one
+    /// entirely older than the window, then the component-less assets.
+    async fn dated_server() -> MockServer {
+        let server = MockServer::start().await;
+        mount_component_pages(
+            &server,
+            vec![
+                vec![
+                    dated_component(1, Some("2023-06-01T00:00:00.000+00:00")),
+                    dated_component(2, Some("2024-03-01T12:00:00.000+00:00")),
+                ],
+                vec![
+                    dated_component(3, Some("2022-01-01T00:00:00.000+00:00")),
+                    dated_component(4, Some("2023-12-31T23:59:59.000+00:00")),
+                ],
+                vec![
+                    dated_component(5, Some("2024-05-05T08:00:00.000+02:00")),
+                    dated_component(6, None),
+                ],
+            ],
+        )
+        .await;
+        let mut old = fixture_asset("loose/old.bin", 7);
+        old["lastModified"] = serde_json::json!("2021-01-01T00:00:00.000+00:00");
+        let mut new = fixture_asset("loose/new.bin", 8);
+        new["lastModified"] = serde_json::json!("2024-07-01T00:00:00.000+00:00");
+        mount_asset_pages(&server, "dated", vec![vec![old, new]]).await;
+        server
+    }
+
+    /// `date_from` was bound to an unused parameter and the full repository
+    /// listed, while the worker logged that the job was filtered (#6195).
+    /// The window must hold across the component and asset walks, and a whole
+    /// upstream page outside it must not end the walk early: the page after
+    /// it still has matching assets.
+    ///
+    /// Fails-before: every one of the eight assets is listed.
+    #[tokio::test]
+    async fn test_list_artifacts_with_date_filter_applies_date_from_6195() {
+        let server = dated_server().await;
+        let client = nexus_client_for(&server);
+
+        let names = walk_dated(&client, 2, Some("2024-01-01T00:00:00+00:00"), None).await;
+
+        assert_eq!(
+            names,
+            vec!["file-2.bin", "file-5.bin", "file-6.bin", "new.bin"],
+            "only assets modified after date_from are listed (an asset without \
+             lastModified cannot be ruled out and is kept), and the page of old \
+             components does not end the walk"
+        );
+        assert_eq!(
+            upstream_request_count(&server).await,
+            3,
+            "each component page is fetched once"
+        );
+    }
+
+    /// `date_to` is the exclusive upper bound, and both bounds together
+    /// select the window between them; the listed row carries the asset's
+    /// `lastModified`.
+    #[tokio::test]
+    async fn test_list_artifacts_with_date_filter_applies_date_to_6195() {
+        let server = dated_server().await;
+        let client = nexus_client_for(&server);
+
+        let names = walk_dated(&client, 10, None, Some("2023-12-31T23:59:59+00:00")).await;
+        assert_eq!(
+            names,
+            vec!["file-1.bin", "file-3.bin", "file-6.bin", "old.bin"],
+            "date_to is exclusive, as in the Artifactory AQL filter"
+        );
+
+        let names = walk_dated(
+            &client,
+            1,
+            Some("2023-01-01T00:00:00Z"),
+            Some("2024-04-01T00:00:00Z"),
+        )
+        .await;
+        assert_eq!(
+            names,
+            vec!["file-1.bin", "file-2.bin", "file-4.bin", "file-6.bin"]
+        );
+
+        let page = client
+            .list_artifacts("dated", 0, 1)
+            .await
+            .expect("unfiltered page");
+        assert_eq!(
+            page.results[0].modified.as_deref(),
+            Some("2023-06-01T00:00:00.000+00:00"),
+            "the row carries the asset's lastModified"
+        );
+    }
+
+    /// A cursor left by a filtered walk counts offsets inside its window, so
+    /// an unfiltered call at the same offset must not resume from it.
+    #[tokio::test]
+    async fn test_list_artifacts_filtered_cursor_does_not_serve_unfiltered_calls_6195() {
+        use crate::services::source_registry::SourceRegistry;
+
+        let server = dated_server().await;
+        let client = nexus_client_for(&server);
+
+        let filtered = client
+            .list_artifacts_with_date_filter("dated", 0, 1, Some("2024-01-01T00:00:00Z"), None)
+            .await
+            .expect("filtered page");
+        assert_eq!(filtered.results[0].name, "file-2.bin");
+
+        let unfiltered = client
+            .list_artifacts("dated", 1, 1)
+            .await
+            .expect("unfiltered page");
+        assert_eq!(
+            unfiltered.results[0].name, "file-2.bin",
+            "offset 1 of the unfiltered listing is the second asset"
+        );
+    }
+
+    /// A bound that does not parse fails the listing instead of being dropped.
+    #[tokio::test]
+    async fn test_list_artifacts_with_date_filter_rejects_an_invalid_bound_6195() {
+        use crate::services::source_registry::SourceRegistry;
+
+        let server = dated_server().await;
+        let client = nexus_client_for(&server);
+
+        let err = client
+            .list_artifacts_with_date_filter("dated", 0, 10, Some("last tuesday"), None)
+            .await
+            .expect_err("an unparseable date_from must not list the whole repository");
+        assert!(
+            matches!(err, ArtifactoryError::ApiError { status: 400, .. }),
+            "got {err:?}"
+        );
+        assert_eq!(upstream_request_count(&server).await, 0);
+    }
+
+    #[test]
+    fn test_nexus_asset_reads_last_modified_despite_duplicate_blob_created_6195() {
+        // Nexus 3.68.1 emits `blobCreated` twice per asset; it is not read, so
+        // the duplicate key must not fail the page.
+        let json = r#"{
+            "id": "a1", "path": "x/y.bin", "format": "raw",
+            "blobCreated": null, "blobCreated": "2024-01-01T00:00:00.000+00:00",
+            "lastModified": "2024-02-02T00:00:00.000+00:00"
+        }"#;
+        let asset: NexusAsset = serde_json::from_str(json).expect("asset parses");
+        assert_eq!(
+            asset.last_modified.as_deref(),
+            Some("2024-02-02T00:00:00.000+00:00")
+        );
     }
 }
