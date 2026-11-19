@@ -651,6 +651,7 @@ fn spawn_migration_worker(
         } else if outcome.is_err() && shutdown_token.is_cancelled() {
             tracing::info!(job_id = %job_id, "Migration paused, the backend is shutting down");
             let _ = MigrationService::new(fail_db)
+                .with_claim_token(Some(claim_token))
                 .pause_running_job(job_id)
                 .await;
         } else if let Err(e) = outcome {

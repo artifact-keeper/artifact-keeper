@@ -915,11 +915,12 @@ impl MigrationService {
             r#"
             UPDATE migration_jobs
             SET status = $1
-            WHERE id = $2
+            WHERE id = $2 AND ($3::uuid IS NULL OR claim_token = $3)
             "#,
         )
         .bind(status.to_string())
         .bind(job_id)
+        .bind(self.claim_token)
         .execute(&self.db)
         .await?;
 
@@ -960,9 +961,11 @@ impl MigrationService {
     /// skips it. Returns whether the row was paused.
     pub async fn pause_running_job(&self, job_id: Uuid) -> Result<bool, MigrationError> {
         let result = sqlx::query(
-            "UPDATE migration_jobs SET status = 'paused' WHERE id = $1 AND status = 'running'",
+            "UPDATE migration_jobs SET status = 'paused' WHERE id = $1 AND status = 'running' \
+             AND ($2::uuid IS NULL OR claim_token = $2)",
         )
         .bind(job_id)
+        .bind(self.claim_token)
         .execute(&self.db)
         .await?;
         Ok(result.rows_affected() > 0)

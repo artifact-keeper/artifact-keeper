@@ -7646,6 +7646,14 @@ mod tests {
             .finalize_job_status(job_id, MigrationJobStatus::Completed)
             .await
             .expect("finalize"));
+        assert!(!stale
+            .pause_running_job(job_id)
+            .await
+            .expect("shutdown pause"));
+        stale
+            .update_job_status(job_id, MigrationJobStatus::Cancelled)
+            .await
+            .expect("status");
 
         let row: (String, bool, i32, i32, Option<String>, Option<Uuid>) = sqlx::query_as(
             "SELECT status, finished_at IS NOT NULL, total_items, completed_items, \
