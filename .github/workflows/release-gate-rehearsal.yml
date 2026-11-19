@@ -270,7 +270,7 @@ jobs:
     # sha, and
     # scripts/ci/check-gate-workflow-pins.sh enforces both that and that the
     # sha is on artifact-keeper-test main.
-    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@987bccd15df3fd4c9c24bf78436ce12fb5bd5783 # artifact-keeper-test main as of 2026-11-18
+    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@d14a7ce44ccac9e566790b6ecc5439358d41cb6a # artifact-keeper-test main as of 2026-11-19
     with:
       backend_tag: ${{ inputs.backend_tag }}
       backend_digest: ${{ needs.resolve-rehearsal-digest.outputs.backend_digest }}

@@ -315,7 +315,7 @@ jobs:
     # The same artifact-keeper-test sha as release-candidate.yml (#6170): the
     # nightly measures the gate a candidate would run today, so a bump moves
     # both together. scripts/ci/check-gate-workflow-pins.sh enforces it.
-    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@987bccd15df3fd4c9c24bf78436ce12fb5bd5783 # artifact-keeper-test main as of 2026-11-18
+    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@d14a7ce44ccac9e566790b6ecc5439358d41cb6a # artifact-keeper-test main as of 2026-11-19
     with:
       backend_tag: sha-${{ matrix.short }}
       backend_digest: ${{ matrix.digest }}
@@ -451,7 +451,7 @@ jobs:
       contents: read
       packages: read
     # Same pinned sha as the gate above (#6170).
-    uses: artifact-keeper/artifact-keeper-test/.github/workflows/nightly-s3-formats.yml@987bccd15df3fd4c9c24bf78436ce12fb5bd5783 # artifact-keeper-test main as of 2026-11-18
+    uses: artifact-keeper/artifact-keeper-test/.github/workflows/nightly-s3-formats.yml@d14a7ce44ccac9e566790b6ecc5439358d41cb6a # artifact-keeper-test main as of 2026-11-19
     with:
       backend_tag: sha-${{ needs.resolve.outputs.main_short }}
       backend_digest: ${{ needs.resolve.outputs.main_digest }}
