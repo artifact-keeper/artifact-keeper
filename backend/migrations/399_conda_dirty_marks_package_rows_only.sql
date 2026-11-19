@@ -38,8 +38,8 @@
 -- behind it while it waits (#4153): each attempt waits at most 5 s and a lock
 -- timeout is retried (5 attempts, backing off), as in 298 and 360. The
 -- function is CREATE OR REPLACE FUNCTION, which takes no table lock.
--- `conda_shard_dirty_package_rows_ddl_takes_no_access_exclusive_6090` pins
--- the lock level.
+-- `conda_dirty_mark_migration_takes_no_access_exclusive_6090` (in
+-- handlers/conda/shard_store_tests.rs) pins the lock level.
 --
 -- The one observable difference: a subdir's revision no longer moves when only
 -- a non-package row in a conda repository changes, because nothing it serves
@@ -48,6 +48,14 @@
 -- Rollback: re-run the trigger block of migration 298 with CREATE OR REPLACE
 -- TRIGGER (no WHEN), then DROP TRIGGER conda_artifacts_mark_dirty_upd_t in a
 -- quiet window, and re-run the function body of migration 360.
+--
+-- Restore 298's triggers BEFORE rolling the binary back to 1.12.2 or older.
+-- An older binary counts every row in the virtual guard's owned-name set, so
+-- with this migration's triggers still in place a non-package row's write
+-- moves no revision and its kept set goes stale (#6234, defect b). An older
+-- binary also refuses to start while migration 399 is recorded in
+-- _sqlx_migrations but missing from its own set: delete that row once the
+-- triggers are restored.
 
 SET LOCAL lock_timeout = '5s';
 
