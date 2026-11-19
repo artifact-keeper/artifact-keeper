@@ -1277,3 +1277,372 @@ async fn scan_policy_blocked_packages_leave_the_listings_4978() {
         Some(vec![pkg.clone()])
     );
 }
+
+/// The `(subdir, package name)` marks of `fx`'s repository, sorted.
+async fn marks_6090(fx: &tdh::Fixture) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT subdir, package_name FROM conda_shard_dirty \
+          WHERE repository_id = $1 ORDER BY subdir, package_name",
+    )
+    .bind(fx.repo_id)
+    .fetch_all(&fx.pool)
+    .await
+    .unwrap()
+}
+
+async fn clear_marks_6090(fx: &tdh::Fixture) {
+    sqlx::query("DELETE FROM conda_shard_dirty WHERE repository_id = $1")
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+}
+
+/// Run `sql` (one `$1` id parameter) against `fx`'s pool.
+async fn exec_6090(fx: &tdh::Fixture, sql: &'static str, id: uuid::Uuid) {
+    sqlx::query(sql).bind(id).execute(&fx.pool).await.unwrap();
+}
+
+/// #6090: the dirty-mark triggers fire only for rows a conda output can
+/// contain. Shards, repodata records and `removed` all keep a row only when its
+/// file name ends in `.conda` or `.tar.bz2` (`is_conda_package`), so a mark for
+/// any other row changed nothing a client receives. A non-package row, its
+/// metadata, an edit and its delete leave no mark; a package row still marks on
+/// insert, on a metadata change, and when it is renamed to a non-package path
+/// (the old key), and its delete still marks.
+#[tokio::test]
+async fn only_package_rows_mark_their_shard_dirty_6090() {
+    let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+        return;
+    };
+    let key = |s: &str, n: &str| (s.to_string(), n.to_string());
+
+    // A non-package row and its metadata: no mark.
+    let note = insert_row(
+        &fx,
+        "noarch/release-notes.txt",
+        "release-notes",
+        Some("notes"),
+    )
+    .await;
+    assert_eq!(
+        marks_6090(&fx).await,
+        vec![],
+        "a non-package row marks nothing"
+    );
+    exec_6090(
+        &fx,
+        "UPDATE artifacts SET size_bytes = 11 WHERE id = $1",
+        note,
+    )
+    .await;
+    exec_6090(
+        &fx,
+        "UPDATE artifact_metadata SET metadata = metadata || '{\"name\": \"notes-2\"}' \
+          WHERE artifact_id = $1",
+        note,
+    )
+    .await;
+    assert_eq!(
+        marks_6090(&fx).await,
+        vec![],
+        "editing a non-package row marks nothing"
+    );
+
+    // A package row marks on insert.
+    let pkg = insert_row(&fx, "noarch/pk-a-1.0-h0_0.tar.bz2", "pk-a", Some("pk-a")).await;
+    assert!(
+        marks_6090(&fx).await.contains(&key("noarch", "pk-a")),
+        "{:?}",
+        marks_6090(&fx).await
+    );
+    clear_marks_6090(&fx).await;
+
+    // A metadata change on a package row still marks.
+    exec_6090(
+        &fx,
+        "UPDATE artifact_metadata SET metadata = metadata || '{\"build_number\": 1}' \
+          WHERE artifact_id = $1",
+        pkg,
+    )
+    .await;
+    assert!(
+        marks_6090(&fx).await.contains(&key("noarch", "pk-a")),
+        "{:?}",
+        marks_6090(&fx).await
+    );
+    clear_marks_6090(&fx).await;
+
+    // Renaming a package to a non-package path marks the key it leaves.
+    exec_6090(
+        &fx,
+        "UPDATE artifacts SET path = 'noarch/pk-a.txt' WHERE id = $1",
+        pkg,
+    )
+    .await;
+    assert!(
+        marks_6090(&fx).await.contains(&key("noarch", "pk-a")),
+        "{:?}",
+        marks_6090(&fx).await
+    );
+    clear_marks_6090(&fx).await;
+
+    // Deleting a non-package row marks nothing; deleting a package row marks.
+    exec_6090(&fx, "DELETE FROM artifacts WHERE id = $1", note).await;
+    assert_eq!(
+        marks_6090(&fx).await,
+        vec![],
+        "deleting a non-package row marks nothing"
+    );
+    let gone = insert_row(&fx, "noarch/pk-b-1.0-h0_0.conda", "pk-b", None).await;
+    clear_marks_6090(&fx).await;
+    exec_6090(&fx, "DELETE FROM artifacts WHERE id = $1", gone).await;
+    assert!(
+        marks_6090(&fx).await.contains(&key("noarch", "pk-b")),
+        "{:?}",
+        marks_6090(&fx).await
+    );
+}
+
+/// #6090: a write in another format no longer calls the conda trigger
+/// functions at all. Counted with `pg_stat_get_xact_function_calls` in one
+/// transaction (`track_functions` is superuser-only; a database that refuses
+/// it skips the count). A `.conda` path in the same transaction is the
+/// control: the trigger still runs there, and returns at the format check.
+#[tokio::test]
+async fn other_format_writes_call_no_conda_trigger_6090() {
+    let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+        return;
+    };
+    let mut tx = fx.pool.begin().await.unwrap();
+    if sqlx::query("SET LOCAL track_functions = 'pl'")
+        .execute(&mut *tx)
+        .await
+        .is_err()
+    {
+        eprintln!("track_functions needs a superuser; skipping the call count");
+        return;
+    }
+    async fn calls(tx: &mut sqlx::PgConnection) -> (i64, i64, i64) {
+        sqlx::query_as(
+            "SELECT COALESCE(pg_stat_get_xact_function_calls('conda_artifacts_mark_dirty'::regproc), 0), \
+                    COALESCE(pg_stat_get_xact_function_calls('conda_mark_artifact_dirty'::regproc), 0), \
+                    COALESCE(pg_stat_get_xact_function_calls('conda_artifact_metadata_mark_dirty'::regproc), 0)",
+        )
+        .fetch_one(tx)
+        .await
+        .unwrap()
+    }
+    let insert = |path: &'static str| {
+        sqlx::query_scalar::<_, uuid::Uuid>(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, 'tool', '1.0', 10, repeat('d', 64), 'application/octet-stream', $3) \
+             RETURNING id",
+        )
+        .bind(fx.repo_id)
+        .bind(path)
+        .bind(format!("seed/{}/{path}", fx.repo_id))
+    };
+    let id = insert("tool/1.0/tool.bin")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+         VALUES ($1, 'generic', '{\"name\": \"tool\"}')",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE artifacts SET size_bytes = 11, is_deleted = true WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM artifacts WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let (artifact_fn, mark_fn, _) = calls(&mut tx).await;
+    assert_eq!(
+        (artifact_fn, mark_fn),
+        (0, 0),
+        "a generic row's insert, metadata, update and delete call no conda trigger"
+    );
+
+    insert("tool/1.0/tool-1.0-h0_0.conda")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    let (artifact_fn, mark_fn, _) = calls(&mut tx).await;
+    assert_eq!(
+        (artifact_fn, mark_fn),
+        (1, 1),
+        "control: a package path still runs the trigger"
+    );
+    tx.rollback().await.unwrap();
+}
+
+/// #6090: the virtual dependency-confusion guard counts package rows only,
+/// the rows that mark the revisions its set is kept under. A non-package row
+/// moves no revision, so if it counted, the kept set would differ from a fresh
+/// read whenever one changed (#6234). After every step the kept set equals the
+/// uncached read, and a non-package row carrying a package's name neither
+/// adds that name nor keeps it owned once the package is gone.
+#[tokio::test]
+async fn virtual_owned_names_follow_package_rows_only_6090() {
+    let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+        return;
+    };
+    upload(&fx, "noarch", "og-a", "1.0").await;
+    let virtual_id = virtual_over(&fx, &[fx.repo_id]).await;
+    let check = |label: &'static str| {
+        let fx = &fx;
+        async move {
+            let kept = super::virtual_hosted_owned_names(&fx.pool, virtual_id)
+                .await
+                .unwrap();
+            let fresh = super::query_hosted_owned_names(&fx.pool, virtual_id, &[fx.repo_id])
+                .await
+                .unwrap();
+            assert_eq!(*kept, fresh, "{label}: kept set is stale");
+            fresh
+        }
+    };
+    let warm = check("warm").await;
+    assert!(warm.contains("og-a"), "{warm:?}");
+
+    // A non-package row named like an upstream package: not owned, warm or cold.
+    let notes = insert_row(&fx, "noarch/og-up.txt", "og-up", None).await;
+    let after = check("non-package row inserted").await;
+    assert!(!after.contains("og-up"), "{after:?}");
+
+    // A non-package row with the hosted package's name, then the package goes.
+    insert_row(&fx, "noarch/og-a-notes.txt", "og-a", None).await;
+    exec_6090(
+        &fx,
+        "UPDATE artifacts SET name = 'og-renamed' WHERE id = $1",
+        notes,
+    )
+    .await;
+    assert!(check("non-package row edited").await.contains("og-a"));
+    sqlx::query(
+        "UPDATE artifacts SET is_deleted = true \
+          WHERE repository_id = $1 AND path LIKE '%.tar.bz2'",
+    )
+    .bind(fx.repo_id)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    let gone = check("package deleted").await;
+    assert!(!gone.contains("og-a"), "{gone:?}");
+}
+
+/// #6090: `current_repodata.json` picks the newest PACKAGE of each name, and
+/// `channeldata.json` the newest package's version. A newer non-package row
+/// under the same name used to win the pick and hide the package; it marks no
+/// revision now, so a render after an unrelated write must not depend on it.
+#[tokio::test]
+async fn non_package_rows_do_not_move_current_repodata_or_channeldata_6090() {
+    let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+        return;
+    };
+    let pkg = upload(&fx, "noarch", "cr-a", "1.0").await;
+    let notes = insert_row(&fx, "noarch/cr-a-notes.txt", "cr-a", None).await;
+    exec_6090(
+        &fx,
+        "UPDATE artifacts SET version = '9.9', created_at = NOW() + INTERVAL '1 minute' \
+          WHERE id = $1",
+        notes,
+    )
+    .await;
+    // An unrelated package moves the subdir revision: the next GETs render.
+    upload(&fx, "noarch", "cr-other", "1.0").await;
+
+    let (status, body, _) = get(&fx, "noarch/current_repodata.json").await;
+    assert_eq!(status, StatusCode::OK);
+    let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let listed: Vec<String> = ["packages", "packages.conda"]
+        .iter()
+        .flat_map(|k| {
+            doc[*k]
+                .as_object()
+                .map(|m| m.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        })
+        .collect();
+    assert!(listed.contains(&pkg), "{listed:?}");
+
+    let (status, body, _) = get(&fx, "channeldata.json").await;
+    assert_eq!(status, StatusCode::OK);
+    let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(doc["packages"]["cr-a"]["version"], "1.0", "{doc}");
+}
+
+/// #6090 / #6234: migration 399 replaces the `artifacts` triggers without
+/// ACCESS EXCLUSIVE. The backed-out migration 390 dropped them, which locked
+/// every read of `artifacts` until commit. Re-run here (it is idempotent) in a
+/// transaction left open: it holds SHARE ROW EXCLUSIVE at most, and a reader
+/// on another connection is not blocked meanwhile.
+#[tokio::test]
+async fn conda_dirty_mark_migration_takes_no_access_exclusive_6090() {
+    let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+        return;
+    };
+    let mut tx = fx.pool.begin().await.unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(include_str!(
+        "../../../../migrations/399_conda_dirty_marks_package_rows_only.sql"
+    )))
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let modes: Vec<String> = sqlx::query_scalar(
+        "SELECT mode FROM pg_locks \
+          WHERE relation = 'artifacts'::regclass AND pid = pg_backend_pid() \
+          ORDER BY mode",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    assert!(
+        !modes.iter().any(|m| m == "AccessExclusiveLock"),
+        "{modes:?}"
+    );
+    assert!(
+        modes.iter().any(|m| m == "ShareRowExclusiveLock"),
+        "{modes:?}"
+    );
+
+    let mut reader = fx.pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL lock_timeout = '2s'")
+        .execute(&mut *reader)
+        .await
+        .unwrap();
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+        .bind(fx.repo_id)
+        .fetch_one(&mut *reader)
+        .await
+        .expect("a read of artifacts waits on nothing while the migration runs");
+    reader.rollback().await.unwrap();
+
+    let triggers: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT tgname, tgqual IS NOT NULL FROM pg_trigger \
+          WHERE tgrelid = 'artifacts'::regclass AND tgname LIKE 'conda_artifacts_mark_dirty%' \
+          ORDER BY tgname",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(
+        triggers,
+        vec![
+            ("conda_artifacts_mark_dirty_del_t".to_string(), true),
+            ("conda_artifacts_mark_dirty_t".to_string(), true),
+            ("conda_artifacts_mark_dirty_upd_t".to_string(), true),
+        ]
+    );
+    tx.rollback().await.unwrap();
+}
