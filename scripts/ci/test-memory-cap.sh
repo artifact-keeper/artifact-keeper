@@ -70,7 +70,7 @@ if [ "$rc" = 7 ]; then pass "exit status passes through (7)"; else fail "exit st
 # 4. The summary line reports peak and throttling from the cgroup files.
 mkroot
 run -- bash -c 'echo 15032385536 > "'"$WORK"'/cg/t/memory.peak"; printf "low 0\nhigh 42\nmax 0\n" > "'"$WORK"'/cg/t/memory.events"'
-if grep -qF "memory.peak 14.00 GiB" <<< "$out" && grep -qF "throttled 42 times" <<< "$out"; then
+if grep -qF "memory.peak 14.00 GiB, swap peak n/a, throttled 42 times" <<< "$out"; then
   pass "summary: memory.peak and memory.events high"
 else
   fail "summary"; printf '%s\n' "$out" | sed 's/^/      /'

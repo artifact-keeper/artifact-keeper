@@ -110,6 +110,7 @@ if [[ "$capped" == true ]]; then
   peak="$(cat "${cg}/memory.peak" 2>/dev/null || echo "")"
   throttled="$(awk '$1 == "high" { print $2 }' "${cg}/memory.events" 2>/dev/null)"
   swap_peak="$(cat "${cg}/memory.swap.peak" 2>/dev/null || echo "")"
-  echo "memory-cap: ${cg}: memory.peak ${peak:+$(gib "$peak") GiB}${peak:-n/a}, swap peak ${swap_peak:+$(gib "$swap_peak") GiB}${swap_peak:-n/a}, throttled ${throttled:-0} times at memory.high"
+  fmt() { if [[ "$1" =~ ^[0-9]+$ ]]; then echo "$(gib "$1") GiB"; else echo "n/a"; fi; }
+  echo "memory-cap: ${cg}: memory.peak $(fmt "$peak"), swap peak $(fmt "$swap_peak"), throttled ${throttled:-0} times at memory.high"
 fi
 exit "$status"
