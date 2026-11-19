@@ -372,12 +372,16 @@ async fn run_trivy_scan(
         false,
     );
 
-    // `kill_on_drop` (#3455) and the no-phone-home environment (#5666).
-    let output = crate::services::trivy_fs_scanner::trivy_cli_command()
-        .args(&args)
-        .output()
-        .await
-        .map_err(|e| crate::services::scanner_service::classify_trivy_spawn_error(&e))?;
+    // `kill_on_drop` (#3455) and the no-phone-home environment (#5666),
+    // bounded by SCANNER_PROCESS_TIMEOUT_SECS when set (#5942).
+    let output = crate::services::scanner_service::wait_scanner_process(
+        "trivy",
+        crate::services::trivy_fs_scanner::trivy_cli_command()
+            .args(&args)
+            .output(),
+    )
+    .await?
+    .map_err(|e| crate::services::scanner_service::classify_trivy_spawn_error(&e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
