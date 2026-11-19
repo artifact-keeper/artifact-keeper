@@ -105,7 +105,12 @@ case "$cmd" in
         printf "  swap in use, highest:              %.2f GiB\n", maxswap / 1024
         printf "  samples with >= 1 GiB swapped:     %d of %d\n", swapping, n
         printf "  samples with < 1 GiB available:    %d of %d\n", starved, n
-      }' "$file" ;;
+      }' "$file"
+    # A coarse timeline (one sample per 30 s) shows WHEN the peak and the
+    # swapping happened, which a single number cannot.
+    echo "  timeline (s, MemAvailable GiB, swap GiB, compiler RSS GiB, processes):"
+    awk -F'\t' 'NF >= 6 { if (!t0) t0 = $1; if ($1 - last >= 30 || !seen) {
+        printf "    %5d  %6.2f  %6.2f  %6.2f  %d\n", $1 - t0, $2/1024, $3/1024, $4/1024, $6; last = $1; seen = 1 } }' "$file" ;;
   *)
     echo "unknown subcommand '${cmd}'" >&2; exit 2 ;;
 esac

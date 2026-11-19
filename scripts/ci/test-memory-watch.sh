@@ -52,6 +52,14 @@ for needle in "3 samples over 10s" "all processes, peak: 13.67 GiB (3 processes,
   if grep -qF -- "$needle" <<< "$out"; then pass "report: $needle"; else fail "report lacks '$needle'"; printf '%s\n' "$out" | sed 's/^/      /'; fi
 done
 
+# 2b. ...and a timeline, one sample per 30 s: the first sample and the
+#     next one at least 30 s later (here only the first; 1010 is 10 s in).
+if grep -qE '^ +0 +8\.79 +0\.00 +3\.91 +2$' <<< "$out" && ! grep -qE '^ +10 ' <<< "$out"; then
+  pass "report: 30-second timeline"
+else
+  fail "report: timeline"; printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
 # 3. Report-only: a missing or empty file is a line of output, exit 0.
 rc=0; out="$(bash "$W" report "$WORK/absent.tsv")" || rc=$?
 if [ "$rc" = 0 ] && grep -qF "no samples" <<< "$out"; then pass "missing file -> 'no samples', exit 0"; else fail "missing file: rc=$rc out=$out"; fi

@@ -362,7 +362,8 @@ jobs:
               scripts/ci/check-token-mint-surface.sh|\
               scripts/ci/check-auth-event-audit.sh|\
               scripts/ci/check-migration-ledger.sh|\
-              scripts/ci/check-duplicate-migrations.sh)
+              scripts/ci/check-duplicate-migrations.sh|\
+              scripts/ci/memory-watch.sh)
                 code=true
                 rust=true
                 ;;
@@ -747,18 +748,39 @@ jobs:
         # run at 4 on the same 16 GB VM. CARGO_INCREMENTAL=0: incremental
         # state is useless in CI's clean checkout and only adds memory.
         #
-        # A STALL LEAVES EVIDENCE (#6242). Clippy gets 30 of the job's 45
-        # minutes; past that it is stopped here, and the sampler's summary,
-        # the top processes and any kernel OOM lines are printed while the
-        # runner can still upload its log. A job cancelled at its own ceiling
-        # keeps no log at all.
+        # TWO PASSES, SO THE TWO BIG RUSTCS NEVER OVERLAP (#6242). The lib
+        # and the lib-test target (the production crate plus ~17.5k inline
+        # tests) are separate rustc processes with no dependency between
+        # them, so a single `--all-targets` starts both at once. Measured
+        # with the sampler on this VM (PR #6263): one process at 14.35 GiB
+        # resident, MemAvailable down to 0.41 GiB, 5.73 GiB in swap and 84
+        # of 110 samples swapping; locally (aarch64, same flags) the lib is
+        # 6.3 GiB and lib-test 12.6 GiB, started in the same second. That
+        # swap is the 5-to-10-minute bimodality, and the stalls.
+        #
+        # Pass 1 checks everything EXCEPT the unit-test targets (lib, bins,
+        # example, every integration test), so pass 2 -- the original
+        # command, so the lint coverage is exactly what it was -- finds all
+        # of that fresh and runs only the lib-test and bin-test rustcs.
+        #
+        # A STALL LEAVES EVIDENCE. Clippy gets 30 of the job's 45 minutes;
+        # past that it is stopped here, and the sampler's summary, the top
+        # processes and any kernel OOM lines are printed while the runner
+        # can still upload its log. A job cancelled at its own ceiling keeps
+        # no log at all.
         env:
           CARGO_BUILD_JOBS: "4"
           CARGO_INCREMENTAL: "0"
         run: |
           rc=0
-          timeout --signal=TERM --kill-after=60s 30m \
-            cargo clippy --workspace --all-targets -- -D warnings || rc=$?
+          timeout --signal=TERM --kill-after=60s 30m bash -c '
+            set -e
+            echo "::group::clippy pass 1: lib, bins, example, integration tests"
+            cargo clippy --workspace --lib --bins --examples --test "*" -- -D warnings
+            echo "::endgroup::"
+            echo "clippy pass 2: the unit-test targets (all targets; the rest is fresh)"
+            cargo clippy --workspace --all-targets -- -D warnings
+          ' || rc=$?
           if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
             echo "::error title=Clippy stopped after 30 minutes::cargo clippy ran past 30 minutes (5-8 normally) and was stopped so this job keeps its log. The memory numbers below say whether the VM was swapping (#6242)."
             ./scripts/ci/memory-watch.sh report "$RUNNER_TEMP/memory-watch.tsv"
