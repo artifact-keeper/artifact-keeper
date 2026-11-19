@@ -184,6 +184,47 @@ impl BuildService {
         Ok(build)
     }
 
+    /// The artifacts attached to each of `build_ids`, at most `per_build`
+    /// per build, oldest first (#6046, #6240).
+    ///
+    /// The per-build `LIMIT` sits inside the lateral subquery without an
+    /// `ORDER BY`, so Postgres stops reading a build's rows at the cap
+    /// instead of sorting all of them: one writer attaching a huge number of
+    /// artifacts to a build cannot make every read of it (or every list page
+    /// it appears on) scan them all. For a build over the cap, which
+    /// `per_build` rows come back is unspecified; `artifact_count` on the
+    /// build still reports the full number.
+    pub async fn list_artifacts(
+        &self,
+        build_ids: &[Uuid],
+        per_build: i64,
+    ) -> Result<Vec<BuildArtifact>> {
+        if build_ids.is_empty() || per_build <= 0 {
+            return Ok(Vec::new());
+        }
+        let mut rows: Vec<BuildArtifact> = sqlx::query_as(
+            r#"
+            SELECT a.id, a.build_id, a.module_name, a.name, a.path,
+                   a.checksum_sha256, a.size_bytes, a.created_at
+            FROM unnest($1::uuid[]) AS b(id)
+            CROSS JOIN LATERAL (
+                SELECT ba.id, ba.build_id, ba.module_name, ba.name, ba.path,
+                       ba.checksum_sha256, ba.size_bytes, ba.created_at
+                FROM build_artifacts ba
+                WHERE ba.build_id = b.id
+                LIMIT $2
+            ) a
+            "#,
+        )
+        .bind(build_ids)
+        .bind(per_build)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        rows.sort_by_key(|x| (x.created_at, x.id));
+        Ok(rows)
+    }
+
     /// Bulk insert artifacts for a build and update the artifact_count.
     pub async fn add_artifacts(
         &self,

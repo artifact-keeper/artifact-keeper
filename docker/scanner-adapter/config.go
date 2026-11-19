@@ -29,8 +29,9 @@ type Config struct {
 	// is used verbatim instead of contacting the trivy DB registry.
 	SkipDBUpdate bool
 	// Offline (SCANNER_OFFLINE) is the single air-gap switch (#5287). It
-	// implies SkipDBUpdate, adds --skip-java-db-update to every scan, and
-	// suppresses the startup DB download. (--offline-scan, no API lookups
+	// implies SkipDBUpdate and suppresses the startup DB download and every
+	// Java DB download (every scan runs with --skip-java-db-update since
+	// #5913; the adapter fetches the Java DB itself, see javadb.go). (--offline-scan, no API lookups
 	// during analysis, is on for every scan since #5666; see noLookupArgs.) The vulnerability DB then comes only
 	// from what is already in CacheDir or from PUT /api/v1/vulndb. Default
 	// false: connected installs behave exactly as before.
