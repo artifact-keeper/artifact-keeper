@@ -6332,10 +6332,15 @@ fn validate_versioning_enabled(
         && !current
         && !crate::services::artifact_service::versioning_supported(format)
     {
-        return Err(AppError::Validation(
-            "versioning_enabled=true is only valid for Generic and Mlmodel repositories"
-                .to_string(),
-        ));
+        let supported: Vec<String> = RepositoryFormat::ALL
+            .iter()
+            .filter(|f| crate::services::artifact_service::versioning_supported(f))
+            .map(|f| format!("{f:?}"))
+            .collect();
+        return Err(AppError::Validation(format!(
+            "versioning_enabled=true is only valid for {} repositories",
+            supported.join(" and ")
+        )));
     }
     Ok(())
 }
@@ -36602,7 +36607,8 @@ mod tests {
             let err = check(format, Some(true))
                 .expect_err("an unsupported format must refuse the opt-in");
             assert!(
-                matches!(err, AppError::Validation(ref m) if m.contains("versioning_enabled=true")),
+                matches!(err, AppError::Validation(ref m)
+                    if m == "versioning_enabled=true is only valid for Generic and Mlmodel repositories"),
                 "{format:?}: {err:?}"
             );
             assert!(check(format, Some(false)).is_ok(), "{format:?}");
