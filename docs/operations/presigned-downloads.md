@@ -45,11 +45,29 @@ PRESIGNED_DOWNLOADS_ENABLED=true
   accepted. Anything else stops the backend at startup with an error naming
   the variable, rather than producing broken redirects later.
 - URLs keep path-style addressing (`https://s3.example.com/<bucket>/<key>`),
-  the same as the backend's own requests.
+  the same as the backend's own requests, unless `S3_VIRTUAL_HOSTED_STYLE` is
+  set (below), in which case the endpoint must already include the bucket.
 - Works with dedicated signing credentials (`S3_PRESIGN_ACCESS_KEY_ID` /
   `S3_PRESIGN_SECRET_ACCESS_KEY`); without them the normal credential chain
   signs.
 - CloudFront, when configured, takes precedence and is unaffected.
+
+## S3: `S3_VIRTUAL_HOSTED_STYLE`
+
+```bash
+S3_VIRTUAL_HOSTED_STYLE=true
+```
+
+Puts the bucket in the hostname instead of the path, for the backend's own
+requests and for presigned URLs alike. On AWS with no `S3_ENDPOINT`, a
+redirect then goes to `https://<bucket>.s3.<region>.amazonaws.com/<key>`
+instead of `https://s3.<region>.amazonaws.com/<bucket>/<key>`.
+
+Use it when something between clients and S3 can only match on hostname, for
+example a TLS-inspecting corporate proxy whose bypass list cannot single out
+one bucket on the shared regional host. Bucket names containing dots do not
+fit AWS's wildcard certificate under virtual-hosted style, so leave it off for
+those. Default: `false`.
 
 ## Azure: `AZURE_STORAGE_PUBLIC_ENDPOINT`
 
