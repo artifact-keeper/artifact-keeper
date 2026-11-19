@@ -19,7 +19,7 @@ catalog use) and the version is the path's version directory.
 | Any file in a version directory: `.pom`, `.jar`, `.war`, `.module`, `-sources.jar`, classifier archives | Served when the version is old enough or its review is approved; otherwise `451` with the shared `age_gate_blocked` body (`review_id`, `package`, `version`, `min_age_days`, `requested_age_days`) and a pending review. The `451` carries `Cache-Control: no-store` (RFC 7725 makes a `451` cacheable by default; this hold is lifted by a review or by time). A refused file is neither fetched nor cached; the gate only reads the version's POM, uncached, to date it. |
 | That file's `.sha1`, `.md5`, `.sha256`, `.sha512`, `.asc` | Answers exactly as the file does (the same `451`). |
 | GA-level `g/a/maven-metadata.xml` | Withheld versions are removed from `<versions>`; `<latest>` and `<release>` are re-pointed to the newest remaining version (release: newest non-SNAPSHOT). When nothing is withheld the upstream bytes are served unchanged. |
-| `g/a/maven-metadata.xml.sha1` (and the other digests) | Computed from the served (filtered) metadata, so it always matches. |
+| `g/a/maven-metadata.xml.sha1` (and the other digests) | Computed from the filtered metadata using only the versions already dated, so it matches the `maven-metadata.xml` just served (see the dating limit below). |
 | `-SNAPSHOT` versions and their metadata | Not gated, see below. |
 
 There is no last-known-good substitution for Maven: a client asked for one
@@ -73,6 +73,13 @@ When `<lastUpdated>` is inside the gate window, the metadata filter reads up to
 64 POMs per request (eight at a time, newest versions first) and caches each
 date; undated versions beyond that are withheld from that listing and dated by
 the next one. Downloads always decide each version on its own POM.
+
+The checksum sidecars of `maven-metadata.xml` read no POMs: they filter with
+the dates already known, so they hash the same list the metadata request
+served. The dates are kept in memory per backend process, so with several
+replicas a sidecar matches the document only when it reaches the replica that
+served it (or one that has dated the same versions). Until a GA is fully
+dated, two downloads of its `maven-metadata.xml` can list different versions.
 
 `first_seen` mode dates a version by the first time this server saw it
 from that upstream, as for the other formats: the upstream metadata listing

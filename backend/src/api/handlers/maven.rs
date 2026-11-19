@@ -1742,8 +1742,15 @@ fn maven_virtual_age_gate_answer(
 /// `maven-metadata.xml` (#4702), so `LATEST`, `RELEASE` and version ranges
 /// never resolve to a version whose download would be refused. Returns the
 /// bytes unchanged when nothing is withheld (the checksum then still matches
-/// the upstream's); the `.sha1` of the metadata is computed from what this
-/// returns, so it always matches the served body.
+/// the upstream's).
+///
+/// `probe` lets this call read POMs to date undated versions, which the
+/// metadata request does. Its checksum sidecars (`.sha1` and the others) call
+/// with `probe` off and use only the dates already known, so they hash the
+/// same list the metadata request just served instead of one that dated the
+/// next batch (#6284). Known dates are kept per process: with several
+/// replicas a sidecar matches only when it reaches the replica that served
+/// the document, or one that has dated the same versions.
 ///
 /// Dating: `first_seen` uses this server's observations (the listing is the
 /// existence evidence, as for npm and PyPI). `upstream_publish_time` reads
@@ -1758,6 +1765,7 @@ async fn maven_filter_listing(
     upstream: &MavenGateUpstream<'_>,
     path: &str,
     content: Bytes,
+    probe: bool,
 ) -> Result<Bytes, Response> {
     use crate::services::age_gate_maven as gate;
     use crate::services::age_gate_service::{AgeGateMode, AgeGateService};
@@ -1829,7 +1837,13 @@ async fn maven_filter_listing(
                     .collect();
                 // Already dated versions cost nothing; the probe budget goes
                 // to the newest undated ones, so successive listings date the
-                // rest instead of re-probing the same newest versions.
+                // rest instead of re-probing the same newest versions. A
+                // checksum request has no budget (#6284).
+                let budget = if probe {
+                    gate::LISTING_MAX_POM_PROBES
+                } else {
+                    0
+                };
                 let mut known: Vec<Option<chrono::DateTime<chrono::Utc>>> =
                     Vec::with_capacity(targets.len());
                 for target in &targets {
@@ -1839,7 +1853,7 @@ async fn maven_filter_listing(
                 }
                 let undated: Vec<usize> = (0..targets.len())
                     .filter(|&i| known[i].is_none())
-                    .take(gate::LISTING_MAX_POM_PROBES)
+                    .take(budget)
                     .collect();
                 // Plain loops (no iterator-adapter closures): a closure
                 // returning a future that borrows the proxy is not
@@ -2591,12 +2605,20 @@ async fn download(
     //    Always compute the checksum from the actual metadata XML bytes
     //    so the result is guaranteed to match what this same URL returns
     //    for the base maven-metadata.xml request — regardless of whether
-    //    the repo is local, remote, or virtual (with merge).
+    //    the repo is local, remote, or virtual (with merge). An age-gated
+    //    listing dates no new versions here (#6284), so it lists what the
+    //    metadata request just served.
     if let Some((base_path, checksum_type)) = parse_checksum_path(&path) {
         if MavenHandler::is_metadata(base_path) {
-            let (content, marks) =
-                fetch_maven_metadata_bytes(&state, &repo, &repo_key, base_path, auth.as_ref())
-                    .await?;
+            let (content, marks) = fetch_maven_metadata_bytes(
+                &state,
+                &repo,
+                &repo_key,
+                base_path,
+                auth.as_ref(),
+                false,
+            )
+            .await?;
             let checksum = compute_checksum(&content, checksum_type);
             let mut response = Response::builder()
                 .status(StatusCode::OK)
@@ -2628,7 +2650,8 @@ async fn download(
     // 2a. Check if this is a maven-metadata.xml request
     if MavenHandler::is_metadata(&path) {
         let (content, marks) =
-            fetch_maven_metadata_bytes(&state, &repo, &repo_key, &path, auth.as_ref()).await?;
+            fetch_maven_metadata_bytes(&state, &repo, &repo_key, &path, auth.as_ref(), true)
+                .await?;
         // A partial merge is never a 304 against the complete document's
         // validator, and carries none of its own (#5621).
         let conditional = if marks.is_partial() {
@@ -3176,11 +3199,13 @@ async fn fetch_remote_member_metadata(
 
 /// [`fetch_remote_member_metadata`] for a GA-level document, with the
 /// member's own age gate applied (#4702): a Virtual lists a young version
-/// only from members that would serve it.
+/// only from members that would serve it. `probe` as in
+/// [`maven_filter_listing`].
 async fn fetch_remote_member_metadata_gated(
     state: &SharedState,
     member: &crate::models::repository::Repository,
     path: &str,
+    probe: bool,
 ) -> Result<MemberMetadata, Response> {
     let (xml, stale_since) = match fetch_remote_member_metadata(state, member, path).await {
         MemberMetadata::Doc { xml, stale_since } => (xml, stale_since),
@@ -3204,6 +3229,7 @@ async fn fetch_remote_member_metadata_gated(
         &upstream,
         path,
         Bytes::from(xml),
+        probe,
     )
     .await?;
     Ok(match std::str::from_utf8(&filtered) {
@@ -3260,13 +3286,15 @@ async fn read_member_stored_metadata(
 /// The Maven metadata document at `path` for `repo`, with the marks its
 /// response must carry ([`MetadataMarks`]): a Remote body served under the
 /// `stale-if-error` grace (#5616), a Virtual merge built without a member
-/// that could not answer (#5621) or from a stale member body.
+/// that could not answer (#5621) or from a stale member body. `probe` is off
+/// for a checksum sidecar, see [`maven_filter_listing`].
 async fn fetch_maven_metadata_bytes(
     state: &SharedState,
     repo: &RepoInfo,
     repo_key: &str,
     path: &str,
     auth: Option<&AuthExtension>,
+    probe: bool,
 ) -> Result<(Bytes, MetadataMarks), Response> {
     let mut marks = MetadataMarks::default();
     // Remote repos: proxy from upstream. No local storage probe, no dynamic
@@ -3299,6 +3327,7 @@ async fn fetch_maven_metadata_bytes(
                 &upstream,
                 path,
                 content,
+                probe,
             )
             .await?;
             return Ok((filtered, marks));
@@ -3359,7 +3388,8 @@ async fn fetch_maven_metadata_bytes(
                             futures::future::join_all(chunk.iter().map(|member| async {
                                 if member.repo_type == RepositoryType::Remote {
                                     // #4702: each Remote member's own age gate.
-                                    fetch_remote_member_metadata_gated(state, member, path).await
+                                    fetch_remote_member_metadata_gated(state, member, path, probe)
+                                        .await
                                 } else {
                                     Ok(MemberMetadata::from_doc(
                                         generate_metadata_for_artifact(
@@ -3433,8 +3463,9 @@ async fn fetch_maven_metadata_bytes(
                     // not the complete answer (#5621): caching it would keep
                     // answering without that member's versions (or with "no
                     // versions") for 60 s after the member is back. A merge
-                    // from a stale member body is not kept either (#5616).
-                    if merge_cacheable && marks.cacheable() {
+                    // from a stale member body is not kept either (#5616), nor
+                    // a checksum request's merge, which dated nothing (#6284).
+                    if probe && merge_cacheable && marks.cacheable() {
                         VIRTUAL_MAVEN_METADATA_CACHE
                             .insert(cache_key, merged.clone())
                             .await;
@@ -18668,14 +18699,10 @@ mod age_gate_4702_tests {
         assert_eq!(versions, vec![OLD.to_string()], "{xml}");
     }
 
-    /// A GA with more undated versions than one listing probes: the first
-    /// listing withholds the oldest undated ones, and the next listing probes
-    /// those instead of the already dated newest ones, so it lists them all.
-    #[tokio::test]
-    async fn listing_probe_budget_continues_on_the_next_listing_4702() {
-        let Some(pool) = tdh::try_pool().await else {
-            return;
-        };
+    /// An upstream GA `many` with six more versions than one listing probes,
+    /// all from 2024, whose `lastUpdated` is a day old so the listing has to
+    /// date them by their POMs. Returns the mock and the number of versions.
+    async fn many_versions_upstream() -> (MockServer, usize) {
         let mock = MockServer::start().await;
         let old = http_date(
             chrono::DateTime::parse_from_rfc3339("2024-01-02T03:04:05Z")
@@ -18712,6 +18739,26 @@ mod age_gate_4702_tests {
             )))
             .mount(&mock)
             .await;
+        (mock, total)
+    }
+
+    fn listed_versions(body: &Bytes) -> usize {
+        let xml = String::from_utf8_lossy(body).to_string();
+        crate::formats::maven::parse_metadata_versions(&xml)
+            .unwrap()
+            .2
+            .len()
+    }
+
+    /// A GA with more undated versions than one listing probes: the first
+    /// listing withholds the oldest undated ones, and the next listing probes
+    /// those instead of the already dated newest ones, so it lists them all.
+    #[tokio::test]
+    async fn listing_probe_budget_continues_on_the_next_listing_4702() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (mock, total) = many_versions_upstream().await;
         let (id, key, dir) = gated_remote(&pool, &mock, "upstream_publish_time").await;
         let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
         let state =
@@ -18724,24 +18771,126 @@ mod age_gate_4702_tests {
             .execute(&pool)
             .await;
         drop_repo(&pool, id).await;
-        let count = |body: &Bytes| {
-            let xml = String::from_utf8_lossy(body).to_string();
-            crate::formats::maven::parse_metadata_versions(&xml)
-                .unwrap()
-                .2
-                .len()
-        };
         assert_eq!(first.0, StatusCode::OK);
         assert_eq!(
-            count(&first.1),
+            listed_versions(&first.1),
             crate::services::age_gate_maven::LISTING_MAX_POM_PROBES,
             "the first listing dates only its probe budget"
         );
         assert_eq!(
-            count(&second.1),
+            listed_versions(&second.1),
             total,
             "the next listing dates the rest: {}",
             String::from_utf8_lossy(&second.1)
+        );
+    }
+
+    /// The metadata checksums of a listing that is still being dated hash the
+    /// document just served (#6284): the sidecar request probes no further
+    /// POMs, so it lists the same versions.
+    #[tokio::test]
+    async fn metadata_checksum_matches_a_listing_still_being_dated_6284() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (mock, _total) = many_versions_upstream().await;
+        let (id, key, dir) = gated_remote(&pool, &mock, "upstream_publish_time").await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(pool.clone(), dir.to_str().unwrap(), proxy);
+        let path = format!("{G}/many/maven-metadata.xml");
+        let meta = get(&state, &key, &path).await;
+        let sha1 = get(&state, &key, &format!("{path}.sha1")).await;
+        let md5 = get(&state, &key, &format!("{path}.md5")).await;
+        let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await;
+        drop_repo(&pool, id).await;
+
+        assert_eq!(meta.0, StatusCode::OK);
+        assert_eq!(
+            listed_versions(&meta.1),
+            crate::services::age_gate_maven::LISTING_MAX_POM_PROBES,
+            "the listing is still being dated"
+        );
+        assert_eq!(sha1.0, StatusCode::OK);
+        assert_eq!(
+            String::from_utf8_lossy(&sha1.1),
+            hex::encode(sha1::Sha1::digest(&meta.1)),
+            "the .sha1 hashes the served body"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&md5.1),
+            compute_checksum(&meta.1, ChecksumType::Md5)
+        );
+    }
+
+    /// The same through a Virtual whose only member is that Remote, with the
+    /// merge cache entry gone before the sidecar request (its 60 s TTL ran
+    /// out): the sidecar's merge dates nothing new, and is not cached, so the
+    /// next listing still probes and lists every version (#6284).
+    #[tokio::test]
+    async fn virtual_metadata_checksum_matches_a_listing_still_being_dated_6284() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (mock, total) = many_versions_upstream().await;
+        let (remote_id, _remote_key, dir) =
+            gated_remote(&pool, &mock, "upstream_publish_time").await;
+        let (virtual_id, virtual_key, _vdir) = tdh::create_repo(&pool, "virtual", "maven").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(remote_id)
+        .execute(&pool)
+        .await
+        .expect("member");
+        tdh::publish_repo(&pool, virtual_id).await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(pool.clone(), dir.to_str().unwrap(), proxy);
+        let path = format!("{G}/many/maven-metadata.xml");
+        let cache_key = (
+            virtual_id,
+            "com.example.agegate".to_string(),
+            "many".to_string(),
+        );
+
+        let meta = get(&state, &virtual_key, &path).await;
+        VIRTUAL_MAVEN_METADATA_CACHE.invalidate(&cache_key).await;
+        let sha1 = get(&state, &virtual_key, &format!("{path}.sha1")).await;
+        let cached_after_sidecar = VIRTUAL_MAVEN_METADATA_CACHE.get(&cache_key).await;
+        let next = get(&state, &virtual_key, &path).await;
+        VIRTUAL_MAVEN_METADATA_CACHE.invalidate(&cache_key).await;
+        let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
+            .bind(remote_id)
+            .execute(&pool)
+            .await;
+        drop_repo(&pool, virtual_id).await;
+        drop_repo(&pool, remote_id).await;
+
+        assert_eq!(meta.0, StatusCode::OK);
+        assert_eq!(
+            listed_versions(&meta.1),
+            crate::services::age_gate_maven::LISTING_MAX_POM_PROBES
+        );
+        assert_eq!(sha1.0, StatusCode::OK);
+        assert_eq!(
+            String::from_utf8_lossy(&sha1.1),
+            hex::encode(sha1::Sha1::digest(&meta.1)),
+            "the .sha1 hashes the served merge"
+        );
+        assert!(
+            cached_after_sidecar.is_none(),
+            "a sidecar's merge is not cached"
+        );
+        assert_eq!(
+            listed_versions(&next.1),
+            total,
+            "the next listing dates the rest"
         );
     }
 
