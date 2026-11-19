@@ -2170,7 +2170,9 @@ jobs:
 
       # #6080: no merge freeze during a candidate. The stale-run finder
       # cancels only runs that are queued with no runner past its threshold,
-      # never a moving one; the floating-tag guard withholds :dev / :X.Y-dev
+      # or (#6289) a superseded main push whose remaining jobs have waited
+      # 45m for a runner, never a moving one, a tag, a dispatch or a re-run;
+      # the floating-tag guard withholds :dev / :X.Y-dev
       # only from a run whose commit is provably older than the one they
       # name. Stubs `gh`; offline.
       - name: Check the stale Docker Publish run finder
