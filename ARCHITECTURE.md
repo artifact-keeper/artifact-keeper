@@ -212,7 +212,9 @@ A build that fails with a missing-query error is almost always a stale cache.
 Migrations live in `backend/migrations/` as numbered SQL files
 (`001_users.sql`, `002_roles.sql`, and so on) and are embedded with
 `sqlx::migrate!`. They run automatically at startup on a dedicated connection
-with raised statement and lock timeouts, unless `SKIP_MIGRATIONS=true`. That
+with raised statement and lock timeouts, unless `SKIP_MIGRATIONS=true`.
+`artifact-keeper db-migrate` runs the same step on its own and exits, for a
+deployment that migrates in a separate Job before the rollout. That
 flag is also the supported **rollback** mechanism: an older binary refuses to
 start against a newer database because `sqlx` validates the applied ledger
 against the versions it embeds, and `SKIP_MIGRATIONS=true` takes a branch that
