@@ -1127,6 +1127,48 @@ fn api_token_user_invalidation_map() -> &'static RwLock<HashMap<Uuid, Instant>> 
 /// Type alias for an entry in the per-instance API-token cache map.
 type TokenCacheMap = RwLock<HashMap<String, (CachedApiTokenEntry, Instant)>>;
 
+/// A validated API token and the id of its row: what one validation yields.
+type ApiTokenOutcome = Result<(ApiTokenValidation, Uuid)>;
+
+/// The verdict a finished in-flight validation hands to the requests that
+/// waited on it (#6215). Only definitive outcomes are shared: a success, or an
+/// authentication refusal. A database error, an internal error or a `503`
+/// from the auth cap is not, so a waiter retries the validation itself
+/// instead of inheriting someone else's transient failure.
+#[derive(Clone)]
+enum SharedTokenVerdict {
+    Valid(ApiTokenValidation, Uuid),
+    Refused(String),
+}
+
+impl SharedTokenVerdict {
+    fn from_outcome(outcome: &ApiTokenOutcome) -> Option<Self> {
+        match outcome {
+            Ok((validation, token_id)) => Some(Self::Valid(validation.clone(), *token_id)),
+            Err(AppError::Authentication(msg)) => Some(Self::Refused(msg.clone())),
+            Err(_) => None,
+        }
+    }
+
+    fn into_outcome(self) -> ApiTokenOutcome {
+        match self {
+            Self::Valid(validation, token_id) => Ok((validation, token_id)),
+            Self::Refused(msg) => Err(AppError::Authentication(msg)),
+        }
+    }
+}
+
+/// One in-flight API-token validation (#6215). The first request to lock it
+/// runs the validation while holding the lock and leaves its verdict in the
+/// slot; requests for the same token that arrived meanwhile queue on the lock
+/// and take that verdict instead of running their own bcrypt. If the leader is
+/// cancelled, or ends with a verdict that is not shared, the slot stays empty
+/// and the next waiter runs the validation in its place.
+type TokenFlight = tokio::sync::Mutex<Option<SharedTokenVerdict>>;
+
+/// Per-instance map of in-flight API-token validations, keyed like the cache.
+type TokenFlightMap = std::sync::Mutex<HashMap<String, Arc<TokenFlight>>>;
+
 /// Registry of long-lived `AuthService` token caches that should be flushed
 /// when a user is invalidated. Each entry is a `Weak` reference so dropped
 /// services don't pin memory; dead weaks are pruned during invalidation.
@@ -1755,6 +1797,9 @@ pub struct AuthService {
     /// and have entries flushed by [`invalidate_user_token_cache_entries`]
     /// without holding a strong reference to the whole `AuthService`.
     token_cache: Arc<TokenCacheMap>,
+    /// Validations currently running, so a burst of requests carrying the
+    /// same uncached token runs one bcrypt rather than one each (#6215).
+    token_flights: Arc<TokenFlightMap>,
 }
 
 impl AuthService {
@@ -1823,6 +1868,7 @@ impl AuthService {
             encoding_key: EncodingKey::from_secret(secret.as_bytes()),
             decoding_key: DecodingKey::from_secret(secret.as_bytes()),
             token_cache: Arc::new(RwLock::new(HashMap::new())),
+            token_flights: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -3509,42 +3555,118 @@ impl AuthService {
         // are never stored in memory.
         let cache_key = format!("{:x}", Sha256::digest(token.as_bytes()));
 
+        if let Some(hit) = self.cached_api_token(&cache_key) {
+            return Self::record_validated_api_token(hit);
+        }
+
+        // #6215: single-flight the validation per token. Without it, every
+        // request that arrives while the first validation is still running
+        // misses the cache and runs its own bcrypt under
+        // `AUTH_MAX_CONCURRENCY`, so a burst larger than the cap carrying one
+        // valid token is partly answered `503 at capacity`. Requests for the
+        // same token now queue behind the first one and share its verdict.
+        // Each request still returns its own `Result`, so the callers'
+        // failure and lockout accounting sees one outcome per request, as
+        // before; the cap still bounds every bcrypt that does run.
+        let flight = self.join_token_flight(&cache_key);
+        let mut slot = flight.lock().await;
+        if let Some(verdict) = slot.as_ref() {
+            return Self::record_validated_api_token(verdict.clone().into_outcome());
+        }
+        // The leader. Look again: a flight that finished between our cache
+        // miss and joining has already cached its success.
+        let outcome = match self.cached_api_token(&cache_key) {
+            Some(hit) => hit,
+            None => self.validate_api_token_uncached(token, &cache_key).await,
+        };
+        *slot = SharedTokenVerdict::from_outcome(&outcome);
+        if slot.is_some() {
+            // Requests arriving from now on start a new flight: a success is
+            // in the cache, and a refusal is shared only with the requests
+            // that were already waiting on this one.
+            self.leave_token_flight(&cache_key, &flight);
+        }
+        drop(slot);
+        Self::record_validated_api_token(outcome)
+    }
+
+    /// The cached validation for `cache_key`, if one is fresh. `Some(Err)`
+    /// when the entry shows the token expired or its user deactivated.
+    fn cached_api_token(&self, cache_key: &str) -> Option<ApiTokenOutcome> {
         // Check in-memory cache before the expensive bcrypt verification.
         // Package managers like cargo send credentials on every request (index
         // lookups, downloads, etc.), so without caching every request pays the
         // full bcrypt cost (~100-500 ms), which compounds across the many
         // parallel requests in a single build.
-        if let Ok(cache) = self.token_cache.read() {
-            if let Some((entry, cached_at)) = cache.get(&cache_key) {
-                // A revoked entry (Bug #1) goes back to the DB: a re-minted
-                // token may carry the same caller-supplied value.
-                if cached_at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS
-                    && !is_api_token_revoked_in_cache(entry.token_id)
-                {
-                    // Reject if the token has since expired (Bug #2).
-                    if let Some(exp) = entry.expires_at {
-                        if exp < Utc::now() {
-                            return Err(AppError::Authentication("API token expired".to_string()));
-                        }
-                    }
-                    // Reject if the user has been deactivated (or hard-deleted)
-                    // since this entry was cached. Without this check, a cached
-                    // validation would keep accepting requests for up to
-                    // `API_TOKEN_CACHE_TTL_SECS` (5 min) after `is_active`
-                    // flipped to false, even though the SQL filter
-                    // `WHERE id = $1 AND is_active = true` would now reject.
-                    if is_user_api_tokens_invalidated_after(entry.validation.user.id, *cached_at) {
-                        return Err(AppError::Authentication(
-                            "User account is deactivated".to_string(),
-                        ));
-                    }
-                    // #4987: audit rows written for this request name the token.
-                    crate::api::middleware::request_span::record_api_token(entry.token_id);
-                    return Ok(entry.validation.clone());
-                }
+        let cache = self.token_cache.read().ok()?;
+        let (entry, cached_at) = cache.get(cache_key)?;
+        // A revoked entry (Bug #1) goes back to the DB: a re-minted
+        // token may carry the same caller-supplied value.
+        if cached_at.elapsed().as_secs() >= API_TOKEN_CACHE_TTL_SECS
+            || is_api_token_revoked_in_cache(entry.token_id)
+        {
+            return None;
+        }
+        // Reject if the token has since expired (Bug #2).
+        if let Some(exp) = entry.expires_at {
+            if exp < Utc::now() {
+                return Some(Err(AppError::Authentication(
+                    "API token expired".to_string(),
+                )));
             }
         }
+        // Reject if the user has been deactivated (or hard-deleted)
+        // since this entry was cached. Without this check, a cached
+        // validation would keep accepting requests for up to
+        // `API_TOKEN_CACHE_TTL_SECS` (5 min) after `is_active`
+        // flipped to false, even though the SQL filter
+        // `WHERE id = $1 AND is_active = true` would now reject.
+        if is_user_api_tokens_invalidated_after(entry.validation.user.id, *cached_at) {
+            return Some(Err(AppError::Authentication(
+                "User account is deactivated".to_string(),
+            )));
+        }
+        Some(Ok((entry.validation.clone(), entry.token_id)))
+    }
 
+    /// #4987: audit rows written for this request name the token.
+    fn record_validated_api_token(outcome: ApiTokenOutcome) -> Result<ApiTokenValidation> {
+        outcome.map(|(validation, token_id)| {
+            crate::api::middleware::request_span::record_api_token(token_id);
+            validation
+        })
+    }
+
+    /// The in-flight validation for `cache_key`, joined or started (#6215).
+    fn join_token_flight(&self, cache_key: &str) -> Arc<TokenFlight> {
+        let mut flights = self
+            .token_flights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Drop flights nobody holds any more (every request on them was
+        // cancelled, or the last one ended without a shared verdict). Clones
+        // are only taken under this lock, so a count of 1 cannot grow back.
+        flights.retain(|_, flight| Arc::strong_count(flight) > 1);
+        flights.entry(cache_key.to_string()).or_default().clone()
+    }
+
+    /// Retire `flight` so later requests for `cache_key` start afresh.
+    fn leave_token_flight(&self, cache_key: &str, flight: &Arc<TokenFlight>) {
+        let mut flights = self
+            .token_flights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if flights
+            .get(cache_key)
+            .is_some_and(|current| Arc::ptr_eq(current, flight))
+        {
+            flights.remove(cache_key);
+        }
+    }
+
+    /// The full validation of a token the cache did not answer: DB lookup,
+    /// bcrypt, user and repository scope. Caches a success.
+    async fn validate_api_token_uncached(&self, token: &str, cache_key: &str) -> ApiTokenOutcome {
         // API tokens have format: prefix_secret (or the separator-less
         // spelling conda can carry, restored above).
         // We store hash of full token and prefix for lookup.
@@ -3728,11 +3850,10 @@ impl AuthService {
                 token_id: stored_token.id,
                 expires_at: stored_token.expires_at,
             };
-            cache.insert(cache_key, (entry, Instant::now()));
+            cache.insert(cache_key.to_string(), (entry, Instant::now()));
         }
 
-        crate::api::middleware::request_span::record_api_token(stored_token.id);
-        Ok(validation)
+        Ok((validation, stored_token.id))
     }
 
     /// Generate a new API token
@@ -4900,6 +5021,121 @@ mod tests {
             .expect("the separator-less token validates");
         assert_eq!(canonical.user.id, user_id);
         assert_eq!(via_conda.user.id, user_id);
+    }
+
+    /// #6215: a burst of requests carrying one valid token, larger than the
+    /// auth cap, all succeed on a cold cache. Each request used to miss the
+    /// cache and run its own bcrypt under `AUTH_MAX_CONCURRENCY`, so with a
+    /// production-cost hash the tail of the queue waited out
+    /// `AUTH_PERMIT_WAIT` and was shed with `503 at capacity`. The burst now
+    /// runs one bcrypt and every request shares its result.
+    ///
+    /// Installs a one-slot cap; nextest's process-per-test isolation keeps
+    /// the `OnceLock` (and `bcrypt_verify_counter`) private to this test.
+    #[tokio::test]
+    async fn burst_with_one_valid_token_beyond_the_cap_all_succeed_6215() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::atomic::Ordering;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let sem = Arc::new(Semaphore::new(1));
+        install_global_auth_semaphore(Some(sem.clone()));
+        let installed = installed_global_auth_semaphore().expect("a cap is installed");
+        assert!(
+            Arc::ptr_eq(&installed, &sem),
+            "another cap was installed first in this process"
+        );
+
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let minter = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+        let (token, token_id) = minter
+            .generate_api_token(user_id, "burst-6215", vec!["read:artifacts".into()], None)
+            .await
+            .expect("mint API token");
+        // A production-cost hash, so a burst that verified once per request
+        // would queue for longer than `AUTH_PERMIT_WAIT` behind the cap.
+        let slow_hash = bcrypt::hash(&token, bcrypt::DEFAULT_COST).expect("hash");
+        sqlx::query("UPDATE api_tokens SET token_hash = $1 WHERE id = $2")
+            .bind(&slow_hash)
+            .bind(token_id)
+            .execute(&pool)
+            .await
+            .expect("store the production-cost hash");
+
+        // A fresh service: its token cache is cold.
+        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+        const BURST: usize = 32;
+        let before = bcrypt_verify_counter().load(Ordering::Relaxed);
+        let results =
+            futures::future::join_all((0..BURST).map(|_| svc.validate_api_token(&token))).await;
+        let verifies = bcrypt_verify_counter().load(Ordering::Relaxed) - before;
+
+        for (i, result) in results.into_iter().enumerate() {
+            let validation = result.unwrap_or_else(|e| panic!("request {i} failed: {e:?}"));
+            assert_eq!(validation.user.id, user_id);
+        }
+        assert_eq!(
+            verifies, 1,
+            "one valid token must cost one bcrypt per cache period, whatever the fan-out"
+        );
+        assert_eq!(sem.available_permits(), 1, "the cap is intact afterwards");
+    }
+
+    /// #6215: a refusal is shared only with the requests already waiting on
+    /// the validation that produced it, and is never cached: each request
+    /// still gets its own `Err` (so per-request failure accounting is
+    /// unchanged), and a later attempt verifies afresh.
+    #[tokio::test]
+    async fn burst_with_a_wrong_secret_shares_the_refusal_but_does_not_cache_it_6215() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::atomic::Ordering;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+        let (token, _id) = svc
+            .generate_api_token(user_id, "wrong-6215", vec!["read:artifacts".into()], None)
+            .await
+            .expect("mint API token");
+        // Same live prefix, different secret: only bcrypt can refuse it.
+        let last = if token.ends_with('0') { "1" } else { "0" };
+        let wrong = format!("{}{last}", &token[..token.len() - 1]);
+        assert!(is_api_token_shape(&wrong));
+
+        let verifies = || bcrypt_verify_counter().load(Ordering::Relaxed);
+        let before = verifies();
+        let results =
+            futures::future::join_all((0..8).map(|_| svc.validate_api_token(&wrong))).await;
+        assert_eq!(
+            verifies() - before,
+            1,
+            "the in-flight burst shares one verify"
+        );
+        for result in results {
+            assert!(
+                matches!(result, Err(AppError::Authentication(_))),
+                "every request is refused on its own: {result:?}"
+            );
+        }
+
+        let before = verifies();
+        let again = svc.validate_api_token(&wrong).await;
+        assert!(matches!(again, Err(AppError::Authentication(_))));
+        assert_eq!(verifies() - before, 1, "a refusal is not cached");
+        assert!(
+            svc.token_flights.lock().unwrap().is_empty(),
+            "finished flights are retired"
+        );
+
+        // The valid token is unaffected and validates.
+        assert_eq!(
+            svc.validate_api_token(&token).await.unwrap().user.id,
+            user_id
+        );
     }
 
     // -----------------------------------------------------------------------
