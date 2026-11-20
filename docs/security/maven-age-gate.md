@@ -109,7 +109,12 @@ What to expect while a GA is being dated:
   documents of that repository on the backend that handles it, so the next
   request there reflects it. Other replicas reflect it within the 15 s window.
   A public Virtual over the Remote can keep serving its 60 s merge of a fully
-  dated document for up to 60 s after a decision (#6345).
+  dated document for up to 60 s after a decision (#6345). On the same
+  process there is one narrow race: a filter pass that read the reviews just
+  before a rejection, and stores its document just after the rejection
+  cleared the reused documents, puts the rejected version back in the listing
+  for up to 15 s on that process. Downloads of that version still answer the
+  `451`, since each download decides on its own review and POM.
 
 `first_seen` mode dates a version by the first time this server saw it
 from that upstream, as for the other formats: the upstream metadata listing
