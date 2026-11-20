@@ -86,7 +86,7 @@ not be edited.
 
 `ACCESS EXCLUSIVE` also queues: a statement waiting for it blocks every
 subsequent reader behind it, so a five-minute rewrite on `artifacts` stops reads
-too. `backend/src/main.rs` sets `lock_timeout = '5min'` and
+too. `migration_repair::apply_schema_migrations` sets `lock_timeout = '5min'` and
 `statement_timeout = '30min'` for the migration session, which bounds the wait
 but not the hold.
 
@@ -135,7 +135,7 @@ The reset migration cannot help, because it was recorded on the first boot and
 does not run again.
 
 So the backend repairs it before migrating. On every start that runs
-migrations (not with `SKIP_MIGRATIONS=true`),
+migrations (not with `SKIP_MIGRATIONS=true`) and in `artifact-keeper db-migrate`,
 `migration_repair::run_startup_migrations` takes the migration lock, runs
 `migration_repair::repair_invalid_concurrent_indexes`, applies pending
 migrations and releases the lock, all in one lock hold. The repair walks
@@ -302,7 +302,7 @@ statement timer once per top-level statement, and the whole `DO` block is one
 statement: a `SET LOCAL statement_timeout` inside it, before or after a
 `COMMIT`, does not apply to the statements that follow in the block. A batched
 `DO` migration is bounded only by the migration session's
-`statement_timeout = '30min'` (main.rs) over the whole file, so keep batches
+`statement_timeout = '30min'` (`apply_schema_migrations`) over the whole file, so keep batches
 small and the total work well inside that.
 
 #### Rewriting `artifacts.origin`
