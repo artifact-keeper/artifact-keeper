@@ -266,7 +266,7 @@ pub fn forget_listings_for_repo(repo_id: Uuid) {
 /// Per key, so a test never wipes an entry another test in the same process
 /// relies on.
 #[cfg(test)]
-pub async fn forget_listing(key: &ListingMemoKey) {
+pub(crate) async fn forget_listing(key: &ListingMemoKey) {
     LISTINGS.invalidate(key).await;
 }
 
