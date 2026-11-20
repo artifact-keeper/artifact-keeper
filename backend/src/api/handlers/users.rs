@@ -1037,15 +1037,26 @@ pub async fn revoke_role(
     Ok(())
 }
 
-/// Unknown fields are refused (400) rather than dropped (#4226): this endpoint
-/// takes no repository restriction, and a client sending one must learn that
-/// instead of receiving a broader token than it asked for.
+/// Unknown fields are refused (400) rather than dropped (#4226), so a client
+/// that misspells a restriction learns that instead of receiving a broader
+/// token than it asked for.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateUserApiTokenRequest {
     pub name: String,
     pub scopes: Vec<String>,
     pub expires_in_days: Option<i64>,
+    /// Restrict the token to the repositories this selector matches, as on
+    /// `POST /api/v1/auth/tokens` (#5643, #4219): the same shape and storage
+    /// as a service-account token's `repo_selector`, resolved when the token
+    /// authenticates. It only narrows the owner's own repository permissions,
+    /// never widens them. Omit it for a token with the owner's full access; a
+    /// selector with no criteria is refused. A repository created later that
+    /// matches is picked up once the token's cached authentication expires
+    /// (up to 5 minutes).
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub repo_selector: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1191,19 +1202,28 @@ async fn create_api_token_inner(
     // are unaffected.
     auth.enforce_mint_ceiling(&payload.scopes)?;
 
+    if let Some(selector) = &payload.repo_selector {
+        crate::services::repo_selector_service::validate_token_repo_selector(selector)?;
+    }
+
     // Repository ceiling (#4225): a repository-restricted credential passes
-    // its restriction on to the token it mints.
-    let inherited = auth.mint_repo_ceiling(false)?;
+    // its restriction on to the token it mints, and may not name a different
+    // one. Otherwise the request's selector (if any) is kept as is (#5643),
+    // exactly as `POST /api/v1/auth/tokens` does.
+    let selector = match auth.mint_repo_ceiling(payload.repo_selector.is_some())? {
+        Some(ids) => Some(crate::services::repo_selector_service::inherited_token_selector(&ids)),
+        None => payload.repo_selector.clone(),
+    };
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let minted = auth_service
         .generate_api_token_with_policy(id, &payload.name, payload.scopes, payload.expires_in_days)
         .await?;
-    if let Some(ids) = inherited {
+    // If this write fails the plaintext is never returned, so the
+    // unrestricted row is unusable.
+    if let Some(selector) = &selector {
         crate::services::repo_selector_service::store_token_selector(
-            &state.db,
-            minted.id,
-            &crate::services::repo_selector_service::inherited_token_selector(&ids),
+            &state.db, minted.id, selector,
         )
         .await?;
     }
@@ -2613,6 +2633,22 @@ mod tests {
         assert_eq!(req.name, "CI token");
         assert_eq!(req.scopes, vec!["read", "deploy"]);
         assert_eq!(req.expires_in_days, Some(90));
+    }
+
+    #[test]
+    fn test_create_api_token_request_accepts_repo_selector_5643() {
+        let json = r#"{"name":"n","scopes":[],"repo_selector":{"match_formats":["npm"]}}"#;
+        let req: CreateUserApiTokenRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req.repo_selector,
+            Some(serde_json::json!({"match_formats": ["npm"]}))
+        );
+        // A misspelled field is still refused, never dropped (#4226).
+        let err = serde_json::from_str::<CreateUserApiTokenRequest>(
+            r#"{"name":"n","scopes":[],"repo_selektor":{}}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("repo_selektor"), "{err}");
     }
 
     #[test]
