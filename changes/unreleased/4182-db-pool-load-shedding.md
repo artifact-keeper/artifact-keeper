@@ -16,6 +16,6 @@ issues: [#6349, #4182]
 
   Measured trade-off, 24 installers on a pool of 8, clients retrying a 503 up to 5 times:
   - **+2 ms per database round trip:** all installs finish in 5 of 5 runs. Served requests take 5.3 s at p99 instead of 9.4 s. The fleet takes about 15% longer (42 to 44 s against 37 s).
-  - **+8 ms per round trip:** the fleet finishes in about 37 s instead of 93 s, with no client timeouts and readiness green.
+  - **+8 ms per round trip:** the fleet finishes in about 39 s instead of 93 s, with no client timeouts and readiness green.
 
   A shed upload may show up as a broken pipe on clients that send the body without waiting for `100 Continue`. Maven 3.8 does not retry a 503 by default. The client retry table, measurements and connection-budget formula are in `docs/operations/load-shedding.md`.

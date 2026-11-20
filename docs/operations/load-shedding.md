@@ -199,9 +199,9 @@ Before is 1.12.x (main `5d99629`). After is the gate with its defaults
 | Run | Installs done | Wall | 2xx p50 / p99 | Other answers | `/readyz` during the burst |
 |---|---|---|---|---|---|
 | +2 ms, 200 files each, before | 24 / 24 | 37.4 s | 9.25 s / 9.42 s | none | 13 / 13 ok, slowest 3.5 s |
-| +2 ms, 200 files each, after (5 runs) | 24 / 24 in 5 of 5 | 42.1 to 43.7 s | about 4.5 s / 5.25 to 5.29 s | 1,586 to 1,691 `503` + `Retry-After` | all ok, slowest 0.43 s |
+| +2 ms, 200 files each, after (5 runs) | 24 / 24 in 5 of 5 | 42.1 to 43.7 s | 4.69 to 4.79 s / 5.26 to 5.29 s | 1,618 to 1,708 `503` + `Retry-After` | all ok, slowest 0.44 s |
 | +8 ms, 50 files each, before | 24 / 24 | 92.6 s | 28.3 s / 29.7 s | 2,240 client timeouts at 30 s | 8 / 13 ok, 5 timed out at 10 s |
-| +8 ms, 50 files each, after (2 runs) | 24 / 24 in 2 of 2 | 36.5 / 38.5 s | 5.0 to 5.3 s / 6.0 s | about 1,600 `503` + `Retry-After` | all ok, slowest 0.45 s |
+| +8 ms, 50 files each, after (2 runs) | 24 / 24 in 2 of 2 | 38.8 / 39.4 s | 5.10 / 5.15 s, 6.01 / 6.04 s | 1,596 / 1,624 `503` + `Retry-After` | all ok, slowest 0.43 s |
 
 **Where queueing would have cleared within the clients' patience** (the
 +2 ms pair):
