@@ -37,10 +37,10 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
-permissions:
-  contents: write
-  packages: write
-  actions: write
+# Nothing is granted by default (#6178): every job declares exactly what it
+# uses. build-binaries compiles ~600 crates (every build.rs and proc macro
+# runs), so it holds a read-only token and no persisted credentials.
+permissions: {}
 
 # One release run per tag, and never cancel one. Two runs for the same tag would
 # both pass the preflight and then race to publish, and the winner decides which
@@ -777,6 +777,11 @@ jobs:
     #   lower only kills a build that would have finished. Fix the build time,
     #   not this number (#6218). Almost all of it is the `Build` step.
     timeout-minutes: ${{ startsWith(matrix.os, 'macos') && 360 || 180 }}
+    # Read-only (#6178): it used to inherit the workflow's contents, packages
+    # and actions WRITE while running third-party build code. It only checks
+    # out, compiles and uploads an artifact (the runtime token, not this one).
+    permissions:
+      contents: read
     # The gate must be green -- or, for a certified stable tag, skipped
     # because it already passed on these digests in the candidate (#3772).
     # Stated explicitly with `!cancelled()` rather than left to the default
@@ -820,10 +825,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
         with:
+          toolchain: 1.98.0
           targets: ${{ matrix.target }}
 
       # Bounded (#6272): each download attempt is capped and retried on
@@ -914,9 +922,11 @@ jobs:
       #   cargo-audit      reads the embedded graph back out, so the claim is
       #                    checked here rather than asserted in a doc
       - name: Install SBOM tooling
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: cargo-auditable,cargo-cyclonedx,cargo-audit
+          # Exact versions (#6178): the ones v1.12.3 resolved from @latest.
+          # Keep them equal to release-cli-caches.yml's.
+          tool: cargo-auditable@0.7.7,cargo-cyclonedx@0.5.10,cargo-audit@0.23.0
 
       - name: Set version from tag
         run: |
