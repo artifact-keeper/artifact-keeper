@@ -197,6 +197,18 @@ async fn delete_stored_metadata_document(
     }
 }
 
+/// The 400 for a deploy the repository's version policy refuses (#5872), with
+/// the reason as the HTTP status line too: `mvn deploy` prints the status
+/// line, not the body, like the quota refusals' reason phrase
+fn version_policy_refusal(reason: String) -> Response {
+    let phrase = hyper::ext::ReasonPhrase::try_from(reason.clone().into_bytes()).ok();
+    let mut response = AppError::Validation(reason).into_response();
+    if let Some(phrase) = phrase {
+        response.extensions_mut().insert(phrase);
+    }
+    response
+}
+
 /// The version-level `maven-metadata.xml` path of a file deleted from a
 /// `-SNAPSHOT` version directory
 /// (`g/a/1.0-SNAPSHOT/a-1.0-20260101.120000-2.jar` ->
@@ -5180,27 +5192,25 @@ async fn upload(
 
     // Reject direct uploads to promotion-only repositories (non-admins). Such
     // repos accept artifacts only via the promotion path, not direct push.
-    let promotion_only = sqlx::query_scalar!(
-        "SELECT promotion_only FROM repositories WHERE id = $1",
+    // The same row read also gives the #5872 version policy.
+    let (promotion_only, version_policy) = sqlx::query!(
+        "SELECT promotion_only, version_policy FROM repositories WHERE id = $1",
         repo.id
     )
     .fetch_optional(&state.db)
     .await
     .map_err(|e| proxy_helpers::internal_error("Database", e))?
-    .unwrap_or(false);
+    .map(|row| (row.promotion_only, row.version_policy))
+    .unwrap_or_default();
     proxy_helpers::reject_direct_upload_if_promotion_only(promotion_only, auth.is_admin)?;
 
     // #5872: a version the repository's policy refuses is answered before any
     // byte is staged
-    crate::services::maven_version_policy::check_write(
-        &state.db,
-        repo.id,
-        &repo_key,
-        &repo.format,
-        &path,
-    )
-    .await
-    .map_err(|e| e.into_response())?;
+    if let Some(reason) =
+        crate::services::maven_version_policy::refusal_stored(&version_policy, &repo_key, &path)
+    {
+        return Err(version_policy_refusal(reason));
+    }
 
     // #2624: on shared cloud namespaces new objects are written under a
     // repository-scoped key (`maven/{repository_id}/{path}`) so the physical
@@ -10456,6 +10466,26 @@ mod tests {
         };
 
         set_policy("release").await;
+        // `mvn deploy` prints the status line, so the reason is there too
+        let reason = {
+            use tower::ServiceExt;
+            let response = fx
+                .router_with_auth(super::router())
+                .oneshot(tdh::put(
+                    format!("/{}/{}", fx.repo_key, snapshot_refused[0]),
+                    Bytes::from_static(b"jar"),
+                ))
+                .await
+                .expect("oneshot");
+            (
+                response.status(),
+                response
+                    .extensions()
+                    .get::<hyper::ext::ReasonPhrase>()
+                    .map(|r| String::from_utf8_lossy(r.as_bytes()).into_owned()),
+            )
+        };
+        let expected_reason = format!("Repository '{}' accepts release versions only", fx.repo_key);
         let release_repo = put_all(
             snapshot_refused
                 .iter()
@@ -10492,6 +10522,7 @@ mod tests {
                 assert!(status.is_success(), "{path}: {status} {body}");
             }
         };
+        assert_eq!(reason, (StatusCode::BAD_REQUEST, Some(expected_reason)));
         refused("release", &release_repo, snapshot_refused.len());
         refused("snapshot", &snapshot_repo, release_refused.len());
     }
