@@ -69,6 +69,10 @@ one bucket on the shared regional host. Bucket names containing dots do not
 fit AWS's wildcard certificate under virtual-hosted style, so leave it off for
 those. Default: `false`.
 
+With a custom `S3_ENDPOINT` the backend uses that host as is, so
+`BACKUP_S3_BUCKET` is not honoured: backup requests keep the primary bucket's
+endpoint host and land in the primary bucket.
+
 ## Azure: `AZURE_STORAGE_PUBLIC_ENDPOINT`
 
 ```bash
