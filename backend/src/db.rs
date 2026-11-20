@@ -260,38 +260,43 @@ pub async fn create_pool(config: &Config) -> Result<PgPool> {
 
 /// Run `action` on a session dedicated to startup migrations (#6319).
 ///
-/// Dropping a `PoolConnection` only returns it to the pool, so session-level
-/// `SET`s made on it leak into later application queries. Detaching before the
-/// `SET`s removes the session from the pool; closing it afterwards discards
-/// the settings even when `action` fails or the future is cancelled.
+/// Dropping a `PoolConnection` normally returns it to the pool, so
+/// session-level `SET`s made on it would leak into later application queries.
+/// Marking the connection `close_on_drop` before the `SET`s means it is never
+/// returned: it is closed with [`PoolConnection::close`] when `action`
+/// finishes, and by the drop handler if `action` panics or the future is
+/// cancelled. Unlike `detach()`, the connection keeps its pool slot until the
+/// socket is closed, so the pool cannot open a replacement for it (when
+/// `min_connections` > 0) and never holds more than `max_connections`
+/// sessions on the server during the migration.
+///
+/// [`PoolConnection::close`]: sqlx::pool::PoolConnection::close
 pub async fn with_migration_session<T, F>(pool: &PgPool, action: F) -> Result<T>
 where
     F: for<'a> FnOnce(&'a mut sqlx::PgConnection) -> BoxFuture<'a, Result<T>>,
 {
-    let mut conn = pool.acquire().await?.detach();
+    let mut conn = pool.acquire().await?;
+    conn.close_on_drop();
 
     let result = async {
         sqlx::query("SET statement_timeout = '30min'")
-            .execute(&mut conn)
+            .execute(&mut *conn)
             .await?;
         sqlx::query("SET lock_timeout = '5min'")
-            .execute(&mut conn)
+            .execute(&mut *conn)
             .await?;
         action(&mut conn).await
     }
     .await;
 
-    // The migration error is the useful one when both fail. Either way the
-    // detached session cannot return to the pool, so only the server sees the
-    // settings now.
-    let close_result = sqlx::Connection::close(conn).await;
-    match result {
-        Ok(value) => {
-            close_result?;
-            Ok(value)
-        }
-        Err(err) => Err(err),
+    // The migration error is the useful one when both fail. A close failure
+    // after a successful migration is not worth aborting startup over: the
+    // connection never goes back to the pool either way, so its settings
+    // cannot reach application queries.
+    if let Err(err) = sqlx::pool::PoolConnection::close(conn).await {
+        tracing::warn!(error = %err, "failed to close the startup migration connection");
     }
+    result
 }
 
 /// How many times a transaction that can lose a lock-order race is attempted
@@ -864,6 +869,82 @@ mod tests {
         assert_eq!(
             after, baseline,
             "migration-only timeouts must not survive in the application pool"
+        );
+    }
+
+    /// #6319 follow-up: the migration session must keep its pool slot while
+    /// it runs. `detach()` released the slot, so with `min_connections` > 0
+    /// the pool opened a replacement and a replica held `max_connections + 1`
+    /// sessions on the server for the whole migration. With max = min = 1,
+    /// count this pool's sessions server-side (tagged by `application_name`)
+    /// while the migration connection is held.
+    #[tokio::test]
+    async fn migration_session_keeps_its_pool_slot_6319() {
+        let Some(url) = crate::testing::require_db_url() else {
+            return;
+        };
+        let app_name = format!("ak-6319-slot-{}", uuid::Uuid::new_v4().simple());
+        let options = PgConnectOptions::from_str(&url)
+            .expect("parse DATABASE_URL")
+            .application_name(&app_name);
+        let Some(pool) = crate::testing::on_connect_result(
+            PgPoolOptions::new()
+                .max_connections(1)
+                .min_connections(1)
+                .acquire_timeout(std::time::Duration::from_secs(30))
+                .connect_with(options)
+                .await,
+        ) else {
+            return;
+        };
+
+        let (probe_pool, probe_name) = (pool.clone(), app_name.clone());
+        let (server_max, size_max, idle_max) = with_migration_session(&pool, move |conn| {
+            Box::pin(async move {
+                let (mut server_max, mut size_max, mut idle_max) = (0i64, 0u32, 0usize);
+                // Give the pool's min_connections maintenance ample time to
+                // open a replacement if the slot had been released.
+                for _ in 0..20 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    let (n,): (i64,) = sqlx::query_as(
+                        "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1",
+                    )
+                    .bind(&probe_name)
+                    .fetch_one(&mut *conn)
+                    .await?;
+                    server_max = server_max.max(n);
+                    size_max = size_max.max(probe_pool.size());
+                    idle_max = idle_max.max(probe_pool.num_idle());
+                }
+                Ok((server_max, size_max, idle_max))
+            })
+        })
+        .await
+        .expect("run migration session");
+
+        // The slot comes back once the session is closed.
+        let mut conn = pool
+            .acquire()
+            .await
+            .expect("acquire a connection after the migration session");
+        sqlx::query("SELECT 1")
+            .execute(&mut *conn)
+            .await
+            .expect("query after the migration session");
+        drop(conn);
+        pool.close().await;
+
+        assert_eq!(
+            server_max, 1,
+            "the pool must not open a replacement session while the migration holds its slot"
+        );
+        assert!(
+            size_max <= 1,
+            "pool size {size_max} exceeded max_connections = 1"
+        );
+        assert_eq!(
+            idle_max, 0,
+            "no idle replacement may exist during the migration"
         );
     }
 

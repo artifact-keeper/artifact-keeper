@@ -227,9 +227,10 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         // or backfill UPDATEs) take longer than the per-query
         // `statement_timeout` that operators commonly set on their Postgres
         // parameter group as an app-query safeguard (10 s on AWS RDS for many
-        // tunings). `with_migration_session` detaches the startup connection
-        // before raising the timeouts and closes it afterwards, so these
-        // session-local settings cannot leak into normal app queries (#6319).
+        // tunings). `with_migration_session` marks the startup connection
+        // close-on-drop before raising the timeouts and closes it afterwards
+        // (keeping its pool slot until then), so these session-local settings
+        // cannot leak into normal app queries (#6319).
         // Takes the migration lock without blocking in pg_advisory_lock (a
         // blocked waiter deadlocks a CREATE INDEX CONCURRENTLY in the holder,
         // #5993), repairs INVALID concurrent index leftovers under that lock
