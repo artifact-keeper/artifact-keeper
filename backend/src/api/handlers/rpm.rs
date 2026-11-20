@@ -220,9 +220,13 @@ async fn depth_response(
     )
     .await?;
     crate::services::artifact_service::record_download(&state.db, id, ctx).await;
-    let mut response = proxy_helpers::StoredRowBody::stamp(
-        scan,
-        build_rpm_package_response(Body::from_stream(stream), "", size_bytes, &checksum),
+    let mut response = proxy_helpers::revalidate_if_mutable(
+        repo,
+        &checksum,
+        proxy_helpers::StoredRowBody::stamp(
+            scan,
+            build_rpm_package_response(Body::from_stream(stream), "", size_bytes, &checksum),
+        ),
     );
     // The stored basename, not its URL form; the shared helper keeps any
     // name a valid header (quoted-string escapes, RFC 5987 for non-ASCII).
@@ -2993,13 +2997,17 @@ async fn upstream_proxy(
         )
         .await?;
 
-        return Ok(proxy_helpers::StoredRowBody::stamp(
-            scan,
-            build_rpm_package_response(
-                Body::from_stream(stream),
-                filename,
-                artifact.size_bytes,
-                &artifact.checksum_sha256,
+        return Ok(proxy_helpers::revalidate_if_mutable(
+            &repo,
+            &artifact.checksum_sha256,
+            proxy_helpers::StoredRowBody::stamp(
+                scan,
+                build_rpm_package_response(
+                    Body::from_stream(stream),
+                    filename,
+                    artifact.size_bytes,
+                    &artifact.checksum_sha256,
+                ),
             ),
         ));
     }
@@ -3381,13 +3389,17 @@ async fn download_package(
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
-    Ok(proxy_helpers::StoredRowBody::stamp(
-        scan,
-        build_rpm_package_response(
-            Body::from_stream(stream),
-            filename,
-            artifact.size_bytes,
-            &artifact.checksum_sha256,
+    Ok(proxy_helpers::revalidate_if_mutable(
+        &repo,
+        &artifact.checksum_sha256,
+        proxy_helpers::StoredRowBody::stamp(
+            scan,
+            build_rpm_package_response(
+                Body::from_stream(stream),
+                filename,
+                artifact.size_bytes,
+                &artifact.checksum_sha256,
+            ),
         ),
     ))
 }

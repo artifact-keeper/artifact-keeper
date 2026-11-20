@@ -13928,7 +13928,7 @@ pub async fn download_artifact(
             // Shared range-aware streaming (#1847): one primitive serves the
             // 200 / 206 / 416 cases for both this generic path and the format
             // handlers (e.g. incus image download).
-            let base_headers = vec![
+            let mut base_headers = vec![
                 (header::CONTENT_TYPE, artifact.content_type),
                 (
                     header::CONTENT_DISPOSITION,
@@ -13945,6 +13945,11 @@ pub async fn download_artifact(
                     "proxy".to_string(),
                 ),
             ];
+            // #5188: content at a mutable repository's path can change, so
+            // caches revalidate the ETag above before reusing it.
+            if crate::services::artifact_service::overwrite_applies(&repo, &path) {
+                base_headers.push((header::CACHE_CONTROL, "no-cache".to_string()));
+            }
             let verify = serve_verification(
                 state.config.download_verify_checksums
                     && crate::storage::verify::checksum_is_content_digest(

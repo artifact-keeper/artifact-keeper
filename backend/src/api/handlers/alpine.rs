@@ -1610,6 +1610,9 @@ async fn download_package(
                 &artifact.checksum_sha256,
             )
             .map(|resp| proxy_helpers::StoredRowBody::stamp(scan, resp))
+            .map(|resp| {
+                proxy_helpers::revalidate_if_mutable(&repo, &artifact.checksum_sha256, resp)
+            })
         }
         Err(crate::error::AppError::NotFound(_)) if repo.repo_type != RepositoryType::Remote => {
             // Hosted artifact: file absent from storage. Serialise concurrent
@@ -1633,6 +1636,9 @@ async fn download_package(
                 &filename,
                 &artifact.checksum_sha256,
             )
+            .map(|resp| {
+                proxy_helpers::revalidate_if_mutable(&repo, &artifact.checksum_sha256, resp)
+            })
         }
         Err(e) => {
             // Storage retrieval failed. For remote repos, the DB record may

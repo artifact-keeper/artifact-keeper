@@ -3229,6 +3229,7 @@ pub fn fresh_cache_sidecar_bytes() -> Bytes {
         upstream_commit_sha: None,
         size_bytes: 11,
         checksum_sha256: String::new(),
+        revalidate: false,
     };
     Bytes::from(serde_json::to_vec(&meta).expect("serialize fresh sidecar"))
 }

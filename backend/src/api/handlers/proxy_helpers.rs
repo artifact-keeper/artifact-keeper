@@ -448,6 +448,32 @@ impl RepoInfo {
     }
 }
 
+/// Mark a file served from a mutable repository (#5188) as revalidate-before-
+/// reuse: `Cache-Control: no-cache` and its SHA-256 as a strong `ETag`. A
+/// Remote or HTTP cache in front of the repository then checks the ETag
+/// before reusing its copy, instead of keeping a replaced file forever. A
+/// write-once repository's response is returned unchanged.
+pub(crate) fn revalidate_if_mutable(
+    repo: &RepoInfo,
+    checksum_sha256: &str,
+    mut resp: Response,
+) -> Response {
+    if !repo.overwrite_allowed() {
+        return resp;
+    }
+    let headers = resp.headers_mut();
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    if let Ok(etag) = axum::http::HeaderValue::from_str(
+        &crate::api::handlers::repositories::artifact_etag(checksum_sha256),
+    ) {
+        headers.insert(axum::http::header::ETAG, etag);
+    }
+    resp
+}
+
 /// Look up a repository by key and verify that its format matches one of the
 /// `expected_formats` (compared case-insensitively).
 ///
@@ -24295,6 +24321,7 @@ mod tests {
                     content_type: Some("application/octet-stream".to_string()),
                     size_bytes: 9,
                     checksum_sha256: "deadbeef".to_string(),
+                    revalidate: false,
                 };
                 Ok(Bytes::from(serde_json::to_vec(&meta).unwrap()))
             } else {
@@ -24599,6 +24626,7 @@ mod tests {
                     content_type: Some("application/octet-stream".to_string()),
                     size_bytes: 9,
                     checksum_sha256: "deadbeef".to_string(),
+                    revalidate: false,
                 };
                 Ok(Bytes::from(serde_json::to_vec(&meta).unwrap()))
             } else {

@@ -548,7 +548,21 @@ async fn serve_package(
     .await?;
     // #3143: quarantine + scan policy apply to the streamed download too.
     proxy_helpers::gate_and_record_streamed_local(&state.db, result.artifact_id, ctx).await?;
-    proxy_helpers::stream_fetch_result(result, PACKAGE_CONTENT_TYPE, Some(filename))
+    let checksum = match (repo.overwrite_allowed(), result.artifact_id) {
+        (true, Some(id)) => {
+            sqlx::query_scalar::<_, String>("SELECT checksum_sha256 FROM artifacts WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&state.db)
+                .await
+                .map_err(super::db_err)?
+        }
+        _ => None,
+    };
+    let resp = proxy_helpers::stream_fetch_result(result, PACKAGE_CONTENT_TYPE, Some(filename))?;
+    Ok(match checksum {
+        Some(checksum) => proxy_helpers::revalidate_if_mutable(repo, &checksum, resp),
+        None => resp,
+    })
 }
 
 /// The binary signature stored for a package, if one was uploaded.

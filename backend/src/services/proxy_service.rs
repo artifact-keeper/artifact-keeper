@@ -444,6 +444,8 @@ pub(crate) struct UpstreamResponse {
     pub(crate) content: Bytes,
     pub(crate) content_type: Option<String>,
     pub(crate) etag: Option<String>,
+    /// See [`upstream_requires_revalidation`].
+    pub(crate) revalidate: bool,
     /// `Last-Modified` header from upstream, persisted into the cache sidecar
     /// so a later conditional revalidation can send `If-Modified-Since` (#1611).
     pub(crate) last_modified: Option<String>,
@@ -494,6 +496,8 @@ struct UpstreamStream {
     /// Policy window is measured from on the streaming path, and the value the
     /// cache sidecar records for later conditional revalidation (#1611).
     last_modified: Option<String>,
+    /// See [`upstream_requires_revalidation`].
+    revalidate: bool,
 }
 
 /// Output of [`ProxyService::fetch_artifact_streaming`]. Carries the
@@ -1827,6 +1831,24 @@ pub(crate) struct UpstreamHeaders {
     /// signal for the Package Age Policy window, recorded on the cache sidecar
     /// exactly as the buffered path's `last_modified` is.
     pub(crate) last_modified: Option<String>,
+    /// See [`upstream_requires_revalidation`].
+    pub(crate) revalidate: bool,
+}
+
+/// Whether upstream asked every cache to revalidate this response before
+/// reusing it (#5188): `Cache-Control: no-cache`, `no-store` or `max-age=0`.
+/// A mutable repository serves its files with `no-cache`, so a Remote in front
+/// of one caches them with a zero TTL and revalidates on each read, instead of
+/// keeping a path the classifier calls immutable forever. A field-qualified
+/// `no-cache="…"` only restricts those headers and does not count.
+pub(crate) fn upstream_requires_revalidation(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get_all(reqwest::header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|d| d.trim().to_ascii_lowercase())
+        .any(|d| matches!(d.as_str(), "no-cache" | "no-store" | "max-age=0"))
 }
 
 /// Extract the forwardable headers from an upstream response. Extracted from
@@ -1865,6 +1887,7 @@ fn extract_streaming_headers(headers: &reqwest::header::HeaderMap) -> UpstreamHe
         content_encoding,
         commit_sha,
         last_modified,
+        revalidate: upstream_requires_revalidation(headers),
     }
 }
 
@@ -2073,9 +2096,31 @@ pub struct CacheMetadata {
     pub size_bytes: i64,
     /// SHA-256 checksum of cached content
     pub checksum_sha256: String,
+    /// The entry was written with a zero TTL, because upstream asked for
+    /// revalidation (`Cache-Control: no-cache`, `no-store` or `max-age=0`, as
+    /// a mutable repository serves its files, #5188) or the repository's TTL
+    /// is zero. Every read revalidates it, even on a path the classifier
+    /// calls immutable. `#[serde(default)]` keeps older sidecars cacheable
+    /// as before.
+    #[serde(default)]
+    pub revalidate: bool,
 }
 
 impl CacheMetadata {
+    /// `mutability`, unless this entry must be revalidated on every read.
+    fn read_mutability(
+        &self,
+        mutability: crate::services::cache_classifier::Mutability,
+    ) -> crate::services::cache_classifier::Mutability {
+        if self.revalidate {
+            crate::services::cache_classifier::Mutability::Mutable {
+                default_ttl_secs: 0,
+            }
+        } else {
+            mutability
+        }
+    }
+
     /// Project this sidecar into the pure [`cache_classifier::CacheEntry`] the
     /// freshness evaluator consumes, given the path's classified mutability.
     /// Keeps the storage type and the pure evaluator decoupled (#1611).
@@ -2083,6 +2128,7 @@ impl CacheMetadata {
         &self,
         mutability: crate::services::cache_classifier::Mutability,
     ) -> crate::services::cache_classifier::CacheEntry {
+        let mutability = self.read_mutability(mutability);
         crate::services::cache_classifier::CacheEntry {
             mutability,
             expires_at: self.effective_expires_at(mutability),
@@ -2098,7 +2144,11 @@ impl CacheMetadata {
         &self,
         mutability: crate::services::cache_classifier::Mutability,
     ) -> DateTime<Utc> {
-        cache_classifier::effective_expires_at(mutability, self.cached_at, self.expires_at)
+        cache_classifier::effective_expires_at(
+            self.read_mutability(mutability),
+            self.cached_at,
+            self.expires_at,
+        )
     }
 
     /// Expiry for a gate that may not know the path's classification: the
@@ -3565,6 +3615,7 @@ impl CachePersister {
             content_type,
             size_bytes: content.len() as i64,
             checksum_sha256: checksum,
+            revalidate: ttl_secs <= 0,
         };
 
         // #1618 S9: sidecar written second, after the content object above.
@@ -4077,6 +4128,7 @@ impl CachePersister {
                             content_type: template.content_type,
                             size_bytes: result.bytes_written as i64,
                             checksum_sha256: result.checksum_sha256,
+                            revalidate: template.ttl_secs <= 0,
                         };
                         match serde_json::to_vec(&metadata) {
                             Ok(json) => {
@@ -5016,6 +5068,7 @@ impl UpstreamClient {
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
+        let revalidate = upstream_requires_revalidation(response.headers());
         let last_modified = response
             .headers()
             .get(reqwest::header::LAST_MODIFIED)
@@ -5085,6 +5138,7 @@ impl UpstreamClient {
             content,
             content_type,
             etag,
+            revalidate,
             last_modified,
             content_encoding,
             commit_sha,
@@ -5342,6 +5396,7 @@ impl UpstreamClient {
             commit_sha: headers.commit_sha,
             content_length: headers.content_length,
             last_modified: headers.last_modified,
+            revalidate: headers.revalidate,
         })
     }
 
@@ -7505,8 +7560,13 @@ impl ProxyService {
                 // coding can also be returned to the caller that serves
                 // these freshly-fetched bytes.
                 let upstream_encoding = resp.content_encoding.clone();
-                // #1611: mutability-aware TTL (immutable -> forever).
-                let cache_ttl = self.cache_ttl_for_path(repo, cache_path).await;
+                // #1611: mutability-aware TTL (immutable -> forever), unless
+                // upstream asked for revalidation (#5188).
+                let cache_ttl = if resp.revalidate {
+                    0
+                } else {
+                    self.cache_ttl_for_path(repo, cache_path).await
+                };
                 // Package Age Policy (#1770): resolve the hold window
                 // BEFORE caching so the sidecar records it; the window
                 // is based on the upstream release date when known
@@ -8723,8 +8783,13 @@ impl ProxyService {
         // blobs) cache effectively forever; mutable indexes get the short
         // conservative TTL (or the repo-configured override). Classification
         // keys off `cache_path` — the canonical artifact identity — not the
-        // upstream-specific download URL.
-        let cache_ttl = self.cache_ttl_for_path(repo, cache_path).await;
+        // upstream-specific download URL. Upstream asking for revalidation
+        // (#5188) overrides the classifier.
+        let cache_ttl = if upstream.revalidate {
+            0
+        } else {
+            self.cache_ttl_for_path(repo, cache_path).await
+        };
 
         // Cache miss + successful upstream fetch: a new artifact is being
         // cached. Surface the scan-on-proxy gap (#1274) before teeing to
@@ -11476,6 +11541,7 @@ impl ProxyService {
             content_type: None,
             size_bytes: 0,
             checksum_sha256: String::new(),
+            revalidate: false,
         };
         match serde_json::to_vec(&metadata) {
             Ok(json) => {
@@ -12435,6 +12501,7 @@ mod tests {
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: 10,
             checksum_sha256: "abc".to_string(),
+            revalidate: false,
         };
         let json = serde_json::to_vec(&meta).unwrap();
         let back: CacheMetadata = serde_json::from_slice(&json).unwrap();
@@ -13259,6 +13326,7 @@ mod tests {
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: 1024,
             checksum_sha256: "a".repeat(64),
+            revalidate: false,
         };
 
         let json = serde_json::to_string(&metadata).unwrap();
@@ -13285,6 +13353,7 @@ mod tests {
             content_type: None,
             size_bytes: 0,
             checksum_sha256: String::new(),
+            revalidate: false,
         };
 
         let json = serde_json::to_string(&metadata).unwrap();
@@ -13312,6 +13381,7 @@ mod tests {
             content_type: Some("application/json".to_string()),
             size_bytes: 4096,
             checksum_sha256: "b".repeat(64),
+            revalidate: false,
         };
 
         let json_bytes = serde_json::to_vec(&metadata).unwrap();
@@ -13336,6 +13406,7 @@ mod tests {
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: i64::MAX,
             checksum_sha256: "c".repeat(64),
+            revalidate: false,
         };
 
         let json = serde_json::to_string(&metadata).unwrap();
@@ -13370,6 +13441,7 @@ mod tests {
             content_type: None,
             size_bytes: 100,
             checksum_sha256: "abc".to_string(),
+            revalidate: false,
         };
         assert!(
             Utc::now() > expired_metadata.expires_at,
@@ -13390,6 +13462,7 @@ mod tests {
             content_type: None,
             size_bytes: 100,
             checksum_sha256: "abc".to_string(),
+            revalidate: false,
         };
         assert!(
             Utc::now() < valid_metadata.expires_at,
@@ -13620,6 +13693,7 @@ mod tests {
             content_type: Some("application/java-archive".to_string()),
             size_bytes: 2048,
             checksum_sha256: "d".repeat(64),
+            revalidate: false,
         };
 
         // The entry is expired (stale) because expires_at is in the past
@@ -13646,6 +13720,7 @@ mod tests {
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: 512,
             checksum_sha256: "e".repeat(64),
+            revalidate: false,
         };
 
         // Not expired, so it would be served normally (not as stale)
@@ -13668,6 +13743,7 @@ mod tests {
             content_type: Some("application/gzip".to_string()),
             size_bytes: 4096,
             checksum_sha256: "f".repeat(64),
+            revalidate: false,
         };
 
         assert!(is_cache_expired(&metadata.expires_at));
@@ -14485,6 +14561,7 @@ mod tests {
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: 42,
             checksum_sha256: "a".repeat(64),
+            revalidate: false,
         }
     }
 
@@ -14603,6 +14680,7 @@ mod tests {
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: 42,
             checksum_sha256: "a".repeat(64),
+            revalidate: false,
         };
         Bytes::from(serde_json::to_vec(&metadata).unwrap())
     }
@@ -14621,6 +14699,7 @@ mod tests {
             content_type: None,
             size_bytes: 0,
             checksum_sha256: String::new(),
+            revalidate: false,
         };
         Bytes::from(serde_json::to_vec(&metadata).unwrap())
     }
@@ -14642,6 +14721,7 @@ mod tests {
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: 42,
             checksum_sha256: "a".repeat(64),
+            revalidate: false,
         };
         Bytes::from(serde_json::to_vec(&metadata).unwrap())
     }
@@ -16329,6 +16409,7 @@ mod tests {
             content_type: Some("application/gzip".to_string()),
             size_bytes,
             checksum_sha256: "b".repeat(64),
+            revalidate: false,
         }
     }
 
@@ -20244,6 +20325,7 @@ mod tests {
             content_type: content_type.map(|s| s.to_string()),
             size_bytes: size,
             checksum_sha256: checksum.to_string(),
+            revalidate: false,
         };
         Bytes::from(serde_json::to_vec(&metadata).unwrap())
     }
@@ -20271,6 +20353,7 @@ mod tests {
             content_type: Some("application/gzip".to_string()),
             size_bytes: 789,
             checksum_sha256: "d".repeat(64),
+            revalidate: false,
         };
         let entry =
             ProxyService::build_cached_entry("scope/-/scope-1.2.3.tgz".to_string(), metadata);
@@ -20301,6 +20384,7 @@ mod tests {
             content_type: None,
             size_bytes: 1,
             checksum_sha256: "e".repeat(64),
+            revalidate: false,
         };
         // A path with no '/' must still produce a name equal to the whole path.
         let entry = ProxyService::build_cached_entry("flat-file.bin".to_string(), metadata);
@@ -20751,6 +20835,7 @@ mod tests {
             content_type: Some("application/json".to_string()),
             size_bytes: 3,
             checksum_sha256: "abc".to_string(),
+            revalidate: false,
         };
         let json = serde_json::to_string(&metadata).expect("serialize");
         let back: CacheMetadata = serde_json::from_str(&json).expect("deserialize");
@@ -23072,6 +23157,7 @@ mod tests {
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: body.len() as i64,
             checksum_sha256: StorageService::calculate_hash(body),
+            revalidate: false,
         };
         Bytes::from(serde_json::to_vec(&metadata).unwrap())
     }
@@ -26589,6 +26675,7 @@ mod tests {
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: body.len() as i64,
             checksum_sha256: StorageService::calculate_hash(&Bytes::copy_from_slice(body)),
+            revalidate: false,
         };
         write_primed_cache_files(storage_root, repo_key, cache_path, Some(body), &metadata);
     }
@@ -26858,6 +26945,7 @@ mod tests {
             content_type: Some("application/json".to_string()),
             size_bytes: body.len() as i64,
             checksum_sha256: StorageService::calculate_hash(&Bytes::copy_from_slice(body)),
+            revalidate: false,
         };
         write_primed_cache_files(root, &fx.repo_key, INDEX, Some(body), &metadata);
 
@@ -27623,6 +27711,7 @@ mod tests {
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: body.len() as i64,
             checksum_sha256: StorageService::calculate_hash(&Bytes::copy_from_slice(body)),
+            revalidate: false,
         };
         write_primed_cache_files(storage_root, repo_key, cache_path, Some(body), &metadata);
     }
@@ -27645,6 +27734,7 @@ mod tests {
             content_type: None,
             size_bytes: 0,
             checksum_sha256: String::new(),
+            revalidate: false,
         };
         write_primed_cache_files(storage_root, repo_key, cache_path, None, &metadata);
     }
@@ -27830,6 +27920,112 @@ mod tests {
             b"jar-bytes",
             "immutable streaming hit must serve cached bytes with no upstream contact"
         );
+    }
+
+    /// #5188: a path the classifier calls immutable is still revalidated when
+    /// upstream (a mutable repository) serves it with `Cache-Control:
+    /// no-cache`, on the buffered and the streaming path: once upstream
+    /// replaces the file, the Remote serves the replacement.
+    #[tokio::test]
+    async fn test_upstream_no_cache_revalidates_an_immutable_path_5188() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let jar = "com/example/app/1.0.0/app-1.0.0.jar";
+        for streaming in [false, true] {
+            let server = MockServer::start().await;
+            let build = |body: &'static [u8], etag: &str| {
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "no-cache")
+                    .insert_header("etag", etag)
+                    .set_body_bytes(body)
+            };
+            Mock::given(any())
+                .respond_with(build(b"build-1", "\"v1\""))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(any())
+                .respond_with(build(b"build-2", "\"v2\""))
+                .mount(&server)
+                .await;
+
+            let key = format!("s5188-{streaming}");
+            let tmp = std::env::temp_dir().join(format!("{key}-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&tmp).expect("tmp");
+            let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+            let repo = wiremock_remote_repo_fmt(
+                &key,
+                &server.uri(),
+                tmp.to_str().unwrap(),
+                RepositoryFormat::Maven,
+            );
+            let mut bodies = Vec::new();
+            for _ in 0..2 {
+                bodies.push(if streaming {
+                    let result = proxy
+                        .fetch_artifact_streaming(&repo, jar)
+                        .await
+                        .expect("fetch");
+                    let body = drain_stream(result.body).await;
+                    // Let the tee commit the sidecar before the next read.
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    body
+                } else {
+                    proxy
+                        .fetch_artifact_with_cache_path(&repo, jar, jar)
+                        .await
+                        .expect("fetch")
+                        .into_parts()
+                        .0
+                        .to_vec()
+                });
+            }
+            let _ = std::fs::remove_dir_all(&tmp);
+            assert_eq!(bodies[0], b"build-1", "streaming={streaming}");
+            assert_eq!(
+                bodies[1], b"build-2",
+                "streaming={streaming}: a no-cache entry must be revalidated"
+            );
+        }
+    }
+
+    #[test]
+    fn test_upstream_requires_revalidation_5188() {
+        let headers = |values: &[&str]| {
+            let mut h = reqwest::header::HeaderMap::new();
+            for v in values {
+                h.append(
+                    reqwest::header::CACHE_CONTROL,
+                    reqwest::header::HeaderValue::from_str(v).unwrap(),
+                );
+            }
+            h
+        };
+        for revalidate in [
+            &["no-cache"][..],
+            &["public, No-Cache"],
+            &["no-store"],
+            &["max-age=0"],
+            &["public", "max-age=0"],
+        ] {
+            assert!(
+                upstream_requires_revalidation(&headers(revalidate)),
+                "{revalidate:?}"
+            );
+        }
+        for keep in [
+            &[][..],
+            &["public, max-age=31536000, immutable"],
+            &["max-age=600, must-revalidate"],
+            &["no-cache=\"set-cookie\""],
+        ] {
+            assert!(!upstream_requires_revalidation(&headers(keep)), "{keep:?}");
+        }
     }
 
     // ---- repo_key_from_cache_key (observability label extraction) ------
@@ -28940,6 +29136,7 @@ mod tests {
             content_type: Some("text/xml".to_string()),
             size_bytes: 12,
             checksum_sha256: "deadbeef".to_string(),
+            revalidate: false,
         }
     }
 
@@ -29665,6 +29862,7 @@ mod tests {
             content_type: Some("application/vnd.pypi.simple.v1+json".to_string()),
             size_bytes: 2,
             checksum_sha256: String::new(),
+            revalidate: false,
         }
     }
 
@@ -30305,6 +30503,8 @@ mod upstream_filter_cache_tests {
             content_type: Some("text/xml".to_string()),
             size_bytes: body.len() as i64,
             checksum_sha256: StorageService::calculate_hash(&body),
+
+            revalidate: false,
         };
         let mut metadata = metadata;
         customize(&mut metadata);
@@ -30885,6 +31085,7 @@ mod cache_read_overlap_tests {
             content_type: Some("application/java-archive".to_string()),
             size_bytes: BODY.len() as i64,
             checksum_sha256: StorageService::calculate_hash(BODY),
+            revalidate: false,
         };
         backend
             .inner
@@ -31026,6 +31227,7 @@ mod cache_read_overlap_tests {
             content_type: None,
             size_bytes: 1,
             checksum_sha256: String::new(),
+            revalidate: false,
         };
         let old = meta(now - chrono::Duration::hours(1));
         let new = meta(now + chrono::Duration::seconds(1));

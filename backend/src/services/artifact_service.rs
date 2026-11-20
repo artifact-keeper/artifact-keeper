@@ -184,7 +184,7 @@ pub(crate) async fn enforce_path_immutability_with(
 ) -> Result<()> {
     // #5188: a mutable repository replaces whatever is at the path, live or
     // released, so neither check applies.
-    if repo.is_some_and(overwrite_applies) {
+    if repo.is_some_and(|r| overwrite_applies(r, path)) {
         return Ok(());
     }
     let versioning_active = repo
@@ -295,11 +295,18 @@ pub(crate) const OVERWRITE_UNSUPPORTED: &str =
 /// format and type are [`overwrite_supported`], so a flag set on any other
 /// repository before that check existed is ignored. Versioning wins when both
 /// are set, so a versioned repository still appends a revision rather than
-/// discarding history.
-pub(crate) fn overwrite_applies(repo: &Repository) -> bool {
+/// discarding history. On PyPI only a `.devN` / `+local` file at `path` may
+/// be replaced ([`PypiHandler::overwritable_filename`]).
+///
+/// [`PypiHandler::overwritable_filename`]: crate::formats::pypi::PypiHandler::overwritable_filename
+pub(crate) fn overwrite_applies(repo: &Repository, path: &str) -> bool {
     repo.immutability == RepositoryImmutability::Mutable
         && overwrite_supported(&repo.format, &repo.repo_type)
         && !versioning_applies(&repo.format, repo.versioning_enabled)
+        && (repo.format != RepositoryFormat::Pypi
+            || crate::formats::pypi::PypiHandler::overwritable_filename(
+                path.rsplit('/').next().unwrap_or(path),
+            ))
 }
 
 /// The content replacing a retired row (#5188): where it is stored, its
@@ -1640,7 +1647,9 @@ impl ArtifactService {
         let versioning_active = repo_for_upload
             .as_ref()
             .is_some_and(|r| versioning_applies(&r.format, r.versioning_enabled));
-        let overwrite_active = repo_for_upload.as_ref().is_some_and(overwrite_applies);
+        let overwrite_active = repo_for_upload
+            .as_ref()
+            .is_some_and(|r| overwrite_applies(r, path));
         // #2382: `.safetensors` uploads to Mlmodel repos get their header
         // summarised into `artifact_metadata` once the row exists.
         let safetensors_eligible = repo_for_upload.as_ref().is_some_and(|r| {
@@ -6709,14 +6718,30 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        assert!(!overwrite_applies(&repo), "default is immutable");
+        const DEV: &str = "demo/1.0.dev3/demo-1.0.dev3-py3-none-any.whl";
+        assert!(!overwrite_applies(&repo, DEV), "default is immutable");
         repo.immutability = RepositoryImmutability::Mutable;
-        assert!(overwrite_applies(&repo));
+        assert!(overwrite_applies(&repo, DEV));
+        // PyPI: only `.devN` / `+local` files are replaceable (until #4812).
+        for path in [
+            "demo/1.0+build.7/demo-1.0+build.7.tar.gz",
+            "demo/2.0rc1.dev2/demo-2.0rc1.dev2-py3-none-any.whl",
+        ] {
+            assert!(overwrite_applies(&repo, path), "{path}");
+        }
+        for path in [
+            "demo/1.0/demo-1.0-py3-none-any.whl",
+            "demo/1.0rc1/demo-1.0rc1.tar.gz",
+            "demo/1.0.post1/demo-1.0.post1.tar.gz",
+            "demo/not-a-dist.txt",
+        ] {
+            assert!(!overwrite_applies(&repo, path), "{path}");
+        }
         // Versioning keeps history instead of replacing it.
         repo.format = RepositoryFormat::Generic;
-        assert!(overwrite_applies(&repo));
+        assert!(overwrite_applies(&repo, DEV));
         repo.versioning_enabled = true;
-        assert!(!overwrite_applies(&repo));
+        assert!(!overwrite_applies(&repo, DEV));
         repo.versioning_enabled = false;
         // Hash-pinned formats and non-hosted repos never overwrite, even with the flag set.
         for format in [
@@ -6726,13 +6751,13 @@ mod tests {
             RepositoryFormat::Maven,
         ] {
             repo.format = format;
-            assert!(!overwrite_applies(&repo), "{:?}", repo.format);
+            assert!(!overwrite_applies(&repo, DEV), "{:?}", repo.format);
         }
         repo.format = RepositoryFormat::Debian;
-        assert!(overwrite_applies(&repo));
+        assert!(overwrite_applies(&repo, DEV));
         for repo_type in [RepositoryType::Remote, RepositoryType::Virtual] {
             repo.repo_type = repo_type;
-            assert!(!overwrite_applies(&repo));
+            assert!(!overwrite_applies(&repo, DEV));
         }
     }
 
@@ -6762,13 +6787,13 @@ mod tests {
             crate::storage::filesystem::FilesystemStorage::new(storage_dir.clone()),
         );
         let svc = ArtifactService::new(pool.clone(), storage);
-        let path = "demo/1.0.0/demo-1.0.0-py3-none-any.whl";
+        let path = "demo/1.0.0.dev1/demo-1.0.0.dev1-py3-none-any.whl";
         let upload = |bytes: &'static [u8]| {
             svc.upload_with_sync_options(
                 repo_id,
                 path,
                 "demo",
-                Some("1.0.0"),
+                Some("1.0.0.dev1"),
                 "application/zip",
                 Bytes::from_static(bytes),
                 Some(user_id),

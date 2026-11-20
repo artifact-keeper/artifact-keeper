@@ -1322,7 +1322,8 @@ async fn complete_session_commit(
         &repo.format,
         repo.versioning_enabled,
     );
-    let overwrite_active = crate::services::artifact_service::overwrite_applies(&repo);
+    let overwrite_active =
+        crate::services::artifact_service::overwrite_applies(&repo, &session.artifact_path);
     let mut retired = None;
     let mut attempt = 0;
     let (inserted_artifact_id, replaced) = loop {

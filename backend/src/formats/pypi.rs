@@ -253,6 +253,16 @@ impl PypiHandler {
             .and_then(|info| info.version)
     }
 
+    /// Whether a mutable repository (#5188) may replace this distribution
+    /// file: its version is a development (`.devN`) or local (`+local`)
+    /// release. Final and pre-releases stay write-once until per-path rules
+    /// (#4812) can say otherwise; an unparseable name is never replaced.
+    pub fn overwritable_filename(filename: &str) -> bool {
+        Self::version_from_filename(filename)
+            .and_then(|v| parse_pep440(&v))
+            .is_some_and(|p| p.dev.is_some() || p.local.is_some())
+    }
+
     /// Canonicalize a PEP 440 version into a comparable string.
     ///
     /// Two versions that PEP 440 considers equal produce the same output, so

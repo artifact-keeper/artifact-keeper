@@ -1160,6 +1160,7 @@ mod tests {
             upstream_commit_sha: None,
             size_bytes: body.len() as i64,
             checksum_sha256: checksum.clone(),
+            revalidate: false,
         };
         std::fs::write(
             cache_root.join(&metadata_key),

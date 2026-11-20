@@ -4274,19 +4274,23 @@ async fn pool_download(
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
-    Ok(proxy_helpers::StoredRowBody::stamp(
-        scan,
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, DEBIAN_BINARY_CONTENT_TYPE)
-            .header(
-                "Content-Disposition",
-                format!("attachment; filename=\"{}\"", filename),
-            )
-            .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
-            .header("X-Checksum-SHA256", &artifact.checksum_sha256)
-            .body(Body::from_stream(stream))
-            .unwrap(),
+    Ok(proxy_helpers::revalidate_if_mutable(
+        &repo,
+        &artifact.checksum_sha256,
+        proxy_helpers::StoredRowBody::stamp(
+            scan,
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, DEBIAN_BINARY_CONTENT_TYPE)
+                .header(
+                    "Content-Disposition",
+                    format!("attachment; filename=\"{}\"", filename),
+                )
+                .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
+                .header("X-Checksum-SHA256", &artifact.checksum_sha256)
+                .body(Body::from_stream(stream))
+                .unwrap(),
+        ),
     ))
 }
 
@@ -5609,6 +5613,7 @@ mod tests {
             upstream_commit_sha: None,
             size_bytes: 3,
             checksum_sha256: String::new(),
+            revalidate: false,
         };
         backend
             .put(&keys.content, bytes::Bytes::from_static(b"idx"))
@@ -7466,6 +7471,88 @@ mod upload_db_tests {
         assert_eq!(live, 1);
         assert_eq!(served_status, StatusCode::OK);
         assert_eq!(&served[..], &second[..], "the pool serves the replacement");
+    }
+
+    /// #5188, fail closed: on a mutable repository with the upload quarantine
+    /// on, a replacement is a new artifact under its own hold. Until its scan
+    /// releases it, the path answers 409 and serves neither the replacement
+    /// nor the released bytes it replaced.
+    #[tokio::test]
+    async fn mutable_overwrite_is_held_until_its_own_scan_5188() {
+        use crate::services::quarantine_service::{transition, QuarantineState};
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET immutability = 'mutable' WHERE id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        tdh::enable_proxy_quarantine(&f.pool, f.repo_id, 60).await;
+        let first = minimal_deb("ak-held", "1.0-1", "amd64", "first build");
+        let second = minimal_deb("ak-held", "1.0-1", "amd64", "second build");
+        let path = "pool/main/a/ak-held/ak-held_1.0-1_amd64.deb";
+        let app = f.router_with_auth(super::router());
+        let put = |deb: &Vec<u8>| {
+            tdh::send(
+                app.clone(),
+                tdh::put(format!("/{}/{path}", f.repo_key), Bytes::from(deb.clone())),
+            )
+        };
+        let get = || tdh::send(app.clone(), tdh::get(format!("/{}/{path}", f.repo_key)));
+        let live = || async {
+            sqlx::query_as::<_, (uuid::Uuid, Option<String>)>(
+                "SELECT id, quarantine_status FROM artifacts \
+                 WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+            )
+            .bind(f.repo_id)
+            .bind(path)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap()
+        };
+
+        let (created, _) = put(&first).await;
+        let (first_id, _) = live().await;
+        // The first build's scan came back clean.
+        transition(&f.pool, first_id, QuarantineState::Released, None)
+            .await
+            .unwrap();
+        let (released_status, released) = get().await;
+
+        let (replaced, body) = put(&second).await;
+        let (second_id, second_hold) = live().await;
+        let (held_status, _) = get().await;
+
+        transition(&f.pool, second_id, QuarantineState::Released, None)
+            .await
+            .unwrap();
+        let (after_scan_status, after_scan) = get().await;
+        crate::services::quarantine_service::invalidate_config_cache(f.repo_id);
+        f.teardown().await;
+
+        assert_eq!(created, StatusCode::CREATED);
+        assert_eq!(released_status, StatusCode::OK);
+        assert_eq!(&released[..], &first[..]);
+        assert_eq!(
+            replaced,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_ne!(second_id, first_id, "the replacement is a new artifact");
+        assert_eq!(
+            second_hold.as_deref(),
+            Some("quarantined"),
+            "the old release must not carry over"
+        );
+        assert_eq!(
+            held_status,
+            StatusCode::CONFLICT,
+            "an unscanned replacement must not be served"
+        );
+        assert_eq!(after_scan_status, StatusCode::OK);
+        assert_eq!(&after_scan[..], &second[..]);
     }
 
     #[tokio::test]
