@@ -136,23 +136,32 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Bounded (#6272): each download attempt is capped and retried on
+      # azure.archive.ubuntu.com (scripts/ci/apt-install-bounded.sh), so a
+      # crawling apt mirror cannot hold the build to the job ceiling.
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+        timeout-minutes: 12
+        run: bash scripts/ci/apt-install-bounded.sh protobuf-compiler pkg-config libssl-dev
 
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get install -y gcc-aarch64-linux-gnu
+        timeout-minutes: 12
+        run: bash scripts/ci/apt-install-bounded.sh gcc-aarch64-linux-gnu
 
       - name: Install Windows cross-compilation tools
         if: matrix.target == 'x86_64-pc-windows-gnu'
-        run: sudo apt-get install -y mingw-w64
+        # Above 3 x 4-minute capped downloads plus the full mingw-w64 unpack, so
+        # the step timeout can never kill dpkg mid-unpack.
+        timeout-minutes: 20
+        run: APT_ATTEMPT_TIMEOUT=4m bash scripts/ci/apt-install-bounded.sh mingw-w64
 
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install protobuf
+        timeout-minutes: 10
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: brew install protobuf || { sleep 10; brew install protobuf; }
 
       # #6218: the macos-latest runner is a 3-core M1 VM with 7 GiB of RAM
       # and no fixed swap. With the release profile's `codegen-units = 1`

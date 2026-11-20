@@ -403,6 +403,25 @@ pub fn spawn_all(
         });
     }
 
+    // Migration jobs whose replica died (every minute, from startup, #6253):
+    // pause `running` jobs whose worker claim lapsed so `/resume` takes them.
+    // DB-only and idempotent (`IdempotentDbOnly`).
+    {
+        let service = crate::services::migration_service::MigrationService::new(db.clone());
+        tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(60));
+            loop {
+                ticker.tick().await;
+                if let Err(e) = service.pause_stale_running_jobs().await {
+                    tracing::warn!(
+                        "Failed to pause migration jobs whose worker was lost: {}",
+                        e
+                    );
+                }
+            }
+        });
+    }
+
     // MCP introspection queue (every 15 minutes, #5253): return expired worker
     // claims and re-queue remote probes that are due. DB-only and idempotent
     // (`IdempotentDbOnly`): one open job per target is a unique index.

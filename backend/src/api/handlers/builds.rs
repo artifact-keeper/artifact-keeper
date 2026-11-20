@@ -158,13 +158,13 @@ fn strip_vcs_userinfo(raw: &str, rules: UserinfoRules) -> String {
     }
 }
 
-/// The repository key an artifact path names: its first segment, the
-/// `<repo-key>/<path>` form a build records for an artifact it published.
-fn artifact_repo_key(path: &str) -> Option<&str> {
-    path.trim_start_matches('/')
-        .split('/')
-        .next()
-        .filter(|k| !k.is_empty())
+/// The repository key and the path inside it that a build artifact's
+/// recorded `path` names: the `<repo-key>/<path>` form a build records for an
+/// artifact it published. `None` when either part is empty.
+fn split_artifact_path(path: &str) -> Option<(&str, &str)> {
+    let (key, rest) = path.trim_start_matches('/').split_once('/')?;
+    let rest = rest.trim_start_matches('/');
+    (!key.is_empty() && !rest.is_empty()).then_some((key, rest))
 }
 
 /// A build row with the creator, which decides who sees its details.
@@ -176,58 +176,77 @@ struct BuildReadRow {
 }
 
 /// Drop the artifacts of builds whose details `auth` may not see unless the
-/// artifact's path names a repository `auth` can read (#6240). A path that
-/// names no repository is dropped for such callers: it describes the
-/// creator's build, not anything the caller may read. Readability is the
-/// grant half plus the token-scope half (`readable_repo_ids`), the same
-/// predicate the virtual-member and promotion listings use.
+/// artifact resolves to a stored one that `auth` can read (#6240, #6281).
+///
+/// The recorded `path` is free text from the build's creator, so naming a
+/// readable repository is not enough: `dist/x.jar` would show to everyone
+/// whenever a public repository happens to be called `dist`. A non-owner sees
+/// a build artifact only when `<key>/<path>` is a non-deleted row of
+/// `artifacts` in repository `<key>`, and that repository passes the grant
+/// half plus the token-scope half (`readable_repo_ids`, the predicate the
+/// virtual-member and promotion listings use). Everything else is visible
+/// only to the creator or an administrator.
 async fn readable_artifacts(
     state: &SharedState,
     auth: &AuthExtension,
     artifacts: Vec<StoredBuildArtifact>,
     details_visible: &HashSet<Uuid>,
 ) -> Result<Vec<StoredBuildArtifact>> {
-    let keys: Vec<String> = artifacts
+    let candidates: HashSet<(String, String)> = artifacts
         .iter()
         .filter(|a| !details_visible.contains(&a.build_id))
-        .filter_map(|a| artifact_repo_key(&a.path))
-        .map(str::to_string)
-        .collect::<HashSet<_>>()
-        .into_iter()
+        .filter_map(|a| split_artifact_path(&a.path))
+        .map(|(k, p)| (k.to_string(), p.to_string()))
         .collect();
-    let readable_keys: HashSet<String> = if keys.is_empty() {
+    let resolved: HashSet<(String, String)> = if candidates.is_empty() {
         HashSet::new()
     } else {
-        let repos: Vec<(Uuid, String, RepositoryVisibility)> =
-            sqlx::query_as("SELECT id, key, visibility FROM repositories WHERE key = ANY($1)")
-                .bind(&keys)
-                .fetch_all(&state.db)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?;
+        let (keys, paths): (Vec<String>, Vec<String>) = candidates.into_iter().unzip();
+        // `artifacts.path` is stored without a leading `/`; the second form
+        // tolerates rows written with one. Both hit UNIQUE(repository_id, path).
+        let rows: Vec<(Uuid, RepositoryVisibility, String, String)> = sqlx::query_as(
+            r#"
+            SELECT r.id, r.visibility, c.key, c.path
+            FROM unnest($1::text[], $2::text[]) AS c(key, path)
+            JOIN repositories r ON r.key = c.key
+            WHERE EXISTS (
+                SELECT 1 FROM artifacts a
+                WHERE a.repository_id = r.id
+                  AND (a.path = c.path OR a.path = '/' || c.path)
+                  AND a.is_deleted = false
+            )
+            "#,
+        )
+        .bind(&keys)
+        .bind(&paths)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
         let readable = readable_repo_ids(
             &state.db,
-            repos.iter().map(|(id, _, visibility)| (*id, *visibility)),
+            rows.iter().map(|(id, visibility, _, _)| (*id, *visibility)),
             Some(auth),
         )
         .await;
-        repos
-            .into_iter()
-            .filter(|(id, _, _)| readable.contains(id))
-            .map(|(_, key, _)| key)
+        rows.into_iter()
+            .filter(|(id, _, _, _)| readable.contains(id))
+            .map(|(_, _, key, path)| (key, path))
             .collect()
     };
     Ok(artifacts
         .into_iter()
         .filter(|a| {
             details_visible.contains(&a.build_id)
-                || artifact_repo_key(&a.path).is_some_and(|k| readable_keys.contains(k))
+                || split_artifact_path(&a.path)
+                    .is_some_and(|(k, p)| resolved.contains(&(k.to_string(), p.to_string())))
         })
         .collect())
 }
 
 /// The responses for `rows` as `auth` may see them: `metadata` and the VCS
 /// fields only on the builds it created (or to an administrator), and `modules`
-/// built from at most `per_build` of each build's readable artifacts.
+/// built from at most `per_build` of each build's readable artifacts. On a
+/// build it did not create, `artifact_count` is the number of artifacts shown.
 async fn build_responses(
     state: &SharedState,
     auth: &AuthExtension,
@@ -261,6 +280,10 @@ async fn build_responses(
                 response.vcs_revision = None;
                 response.vcs_branch = None;
                 response.vcs_message = None;
+                // #6281: the full count would tell a non-owner how many
+                // attached artifacts it cannot see. It gets the number it
+                // is shown (out of the per-read cap).
+                response.artifact_count = Some(i32::try_from(artifacts.len()).unwrap_or(i32::MAX));
             }
             response.modules = Some(group_into_modules(artifacts));
             response
@@ -1596,18 +1619,19 @@ mod tests {
     }
 
     #[test]
-    fn test_artifact_repo_key() {
+    fn test_split_artifact_path() {
         assert_eq!(
-            artifact_repo_key("libs-release/com/x.jar"),
-            Some("libs-release")
+            split_artifact_path("libs-release/com/x.jar"),
+            Some(("libs-release", "com/x.jar"))
         );
         assert_eq!(
-            artifact_repo_key("/libs-release/x.jar"),
-            Some("libs-release")
+            split_artifact_path("/libs-release//x.jar"),
+            Some(("libs-release", "x.jar"))
         );
-        assert_eq!(artifact_repo_key("x.jar"), Some("x.jar"));
-        assert_eq!(artifact_repo_key(""), None);
-        assert_eq!(artifact_repo_key("/"), None);
+        assert_eq!(split_artifact_path("x.jar"), None);
+        assert_eq!(split_artifact_path("dist/"), None);
+        assert_eq!(split_artifact_path("/x.jar"), None);
+        assert_eq!(split_artifact_path(""), None);
     }
 
     // -----------------------------------------------------------------------
@@ -2113,7 +2137,10 @@ mod tests {
     /// credentials (stripped on create, and on read for older rows), and the
     /// artifact paths of another user's build only where they name a
     /// repository the caller can read. #6048 returned all of it to any
-    /// signed-in caller, a `read:artifacts` token included.
+    /// signed-in caller, a `read:artifacts` token included. #6281: the path
+    /// must also resolve to a stored artifact (a readable or public key with
+    /// nothing at that path stays hidden), and `artifact_count` is the number
+    /// shown.
     #[tokio::test]
     async fn build_reads_are_owner_gated_db() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -2126,7 +2153,37 @@ mod tests {
         let (admin_id, admin_name) = tdh::create_user(&pool).await;
         let (open_repo, open_key, _) = tdh::create_repo(&pool, "local", "generic").await;
         let (hidden_repo, hidden_key, _) = tdh::create_repo(&pool, "local", "generic").await;
+        // #6281: a public repository every signed-in user reads, holding
+        // nothing at the paths the build records under its key.
+        let (public_repo, public_key, _) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET visibility = 'public' WHERE id = $1")
+            .bind(public_repo)
+            .execute(&pool)
+            .await
+            .expect("public repo");
         tdh::grant_repo_role(&pool, open_repo, other_id, "reader").await;
+        // Stored rows in the readable repository: `app.jar` as uploads store
+        // it, `slash.jar` with a leading `/` (shown), and `deleted.jar`
+        // soft-deleted (hidden from a non-owner).
+        for (path, deleted) in [
+            ("com/org/app.jar", false),
+            ("/com/org/slash.jar", false),
+            ("com/org/deleted.jar", true),
+        ] {
+            sqlx::query(
+                "INSERT INTO artifacts (repository_id, path, name, size_bytes, \
+                 checksum_sha256, content_type, storage_key, is_deleted) \
+                 VALUES ($1, $2, 'stored.jar', 10, $3, 'application/java-archive', $4, $5)",
+            )
+            .bind(open_repo)
+            .bind(path)
+            .bind("a".repeat(64))
+            .bind(format!("ph-6281/{}", Uuid::new_v4()))
+            .bind(deleted)
+            .execute(&pool)
+            .await
+            .expect("stored artifact");
+        }
 
         let owner = tdh::router_with_auth(
             super::router(),
@@ -2183,6 +2240,10 @@ mod tests {
 
         let open_path = format!("{open_key}/com/org/app.jar");
         let hidden_path = format!("{hidden_key}/com/org/secret.jar");
+        let unstored_path = format!("{open_key}/com/org/typed.jar");
+        let public_path = format!("{public_key}/never-stored.jar");
+        let slash_path = format!("{open_key}/com/org/slash.jar");
+        let deleted_path = format!("{open_key}/com/org/deleted.jar");
         send_json(
             owner.clone(),
             post_json(
@@ -2194,6 +2255,16 @@ mod tests {
                       "checksum_sha256": "b".repeat(64), "size_bytes": 20 },
                     { "name": "local.bin", "path": "dist/local.bin",
                       "checksum_sha256": "c".repeat(64), "size_bytes": 30 },
+                    // #6281: names a readable repository, but nothing is
+                    // stored there at that path.
+                    { "name": "typed.jar", "path": unstored_path,
+                      "checksum_sha256": "d".repeat(64), "size_bytes": 40 },
+                    { "name": "public.jar", "path": public_path,
+                      "checksum_sha256": "e".repeat(64), "size_bytes": 50 },
+                    { "name": "slash.jar", "path": slash_path,
+                      "checksum_sha256": "f".repeat(64), "size_bytes": 60 },
+                    { "name": "deleted.jar", "path": deleted_path,
+                      "checksum_sha256": "1".repeat(64), "size_bytes": 70 },
                 ] }),
             ),
         )
@@ -2212,6 +2283,10 @@ mod tests {
             open_path.clone(),
             hidden_path.clone(),
             "dist/local.bin".to_string(),
+            unstored_path.clone(),
+            public_path.clone(),
+            slash_path.clone(),
+            deleted_path.clone(),
         ];
         all.sort();
 
@@ -2226,7 +2301,7 @@ mod tests {
             assert_eq!(got["vcs_branch"], "main", "{who}");
             assert_eq!(got["vcs_message"], "ph-6240 commit", "{who}");
             assert_eq!(got["metadata"], metadata, "{who}");
-            assert_eq!(got["artifact_count"], 3, "{who}");
+            assert_eq!(got["artifact_count"], 7, "{who}");
             assert_eq!(artifact_paths(&got), all, "{who}");
 
             let list = send_json(app.clone(), tdh::get(format!("/?search={name}"))).await;
@@ -2238,10 +2313,11 @@ mod tests {
                 "{who}"
             );
             assert_eq!(artifact_paths(&items[0]), all, "{who}");
+            assert_eq!(items[0]["artifact_count"], 7, "{who}");
         }
 
         // Anyone else: the build, without metadata or any VCS field, and
-        // only the artifact in the repository it can read.
+        // only the artifact stored in a repository it can read.
         let got = send_json(other.clone(), tdh::get(format!("/{id}"))).await;
         let list = send_json(other.clone(), tdh::get(format!("/?search={name}"))).await;
         let items = list["items"].as_array().expect("items");
@@ -2251,13 +2327,20 @@ mod tests {
             for field in ["vcs_url", "vcs_revision", "vcs_branch", "vcs_message"] {
                 assert!(b.get(field).is_none(), "{field}: {b}");
             }
-            assert_eq!(artifact_paths(b), std::slice::from_ref(&open_path), "{b}");
+            let mut shown = vec![open_path.clone(), slash_path.clone()];
+            shown.sort();
+            assert_eq!(artifact_paths(b), shown, "{b}");
+            // #6281: the count is what it is shown, not how many exist.
+            assert_eq!(b["artifact_count"], 2, "{b}");
             let text = b.to_string();
             for secret in [
                 "SECRET6240",
                 "legacy_SECRET",
                 hidden_key.as_str(),
                 "dist/local.bin",
+                "typed.jar",
+                "deleted.jar",
+                public_key.as_str(),
             ] {
                 assert!(!text.contains(secret), "{secret} leaked: {text}");
             }
@@ -2269,7 +2352,7 @@ mod tests {
             .await;
         tdh::cleanup(&pool, open_repo, other_id).await;
         tdh::cleanup(&pool, hidden_repo, owner_id).await;
-        tdh::cleanup_user(&pool, admin_id).await;
+        tdh::cleanup(&pool, public_repo, admin_id).await;
     }
 
     /// #6240 review: the write keeps a URL whose userinfo is ambiguous (a

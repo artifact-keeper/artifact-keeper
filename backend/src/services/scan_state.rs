@@ -27,6 +27,13 @@ const NOT_APPLICABLE_STATUS: &str = "not_applicable";
 /// "not applicable" rather than as genuine crashes.
 pub(crate) const NOT_APPLICABLE_MARKER: &str = "does not apply";
 
+/// Prefix `ScanResultService::reopen_failed_scan` puts on a `failed` row's
+/// error when a retried queued job reopens it (#5942): the row reads
+/// `running` while the retry runs, but the failure it recorded still stands
+/// for the gates until the retry completes it or fails it again. Every
+/// terminal write replaces or clears it.
+pub(crate) const RETRYING_AFTER_FAILURE_PREFIX: &str = "retrying after a failed attempt: ";
+
 /// All `scan_results` statuses for an artifact, used to classify scan state.
 pub(crate) const SCAN_STATE_SQL: &str = r#"
     SELECT status, error_message
@@ -105,7 +112,7 @@ pub(crate) async fn any_latest_uncataloged(
 pub(crate) fn any_scanner_failed(latest_per_scan_type: &[ScanStateRow]) -> bool {
     latest_per_scan_type
         .iter()
-        .any(|r| r.status == "failed" && !r.is_not_applicable())
+        .any(|r| (r.status == "failed" && !r.is_not_applicable()) || r.is_retrying_after_failure())
 }
 
 /// One `scan_results` row reduced to the only fields that matter for deciding
@@ -119,6 +126,18 @@ pub(crate) struct ScanStateRow {
 }
 
 impl ScanStateRow {
+    /// A row reopened for a retry after a recorded failure (#5942): `running`
+    /// with [`RETRYING_AFTER_FAILURE_PREFIX`] on its error. It keeps counting
+    /// as that failure, so `block_on_fail` does not let the artifact through,
+    /// or release its hold, while the retry runs.
+    pub(crate) fn is_retrying_after_failure(&self) -> bool {
+        self.status == "running"
+            && self
+                .error_message
+                .as_deref()
+                .is_some_and(|m| m.starts_with(RETRYING_AFTER_FAILURE_PREFIX))
+    }
+
     /// A row is "not applicable" (the scanner does not apply to this format,
     /// rather than a genuine crash) when:
     ///
@@ -294,6 +313,33 @@ mod tests {
                 "no genuine failure -> block_on_fail must stay quiet: {rows:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_any_scanner_failed_counts_a_row_reopened_for_a_retry() {
+        let retrying = ScanStateRow {
+            status: "running".to_string(),
+            error_message: Some(format!(
+                "{RETRYING_AFTER_FAILURE_PREFIX}grype did not finish within \
+                 SCANNER_PROCESS_TIMEOUT_SECS=30s"
+            )),
+        };
+        assert!(retrying.is_retrying_after_failure());
+        assert!(
+            any_scanner_failed(&[row("completed", None), retrying]),
+            "a recorded failure stands while its retry runs (#5942)"
+        );
+        assert!(
+            !any_scanner_failed(&[row("running", None)]),
+            "a first run is not a failure"
+        );
+        assert!(
+            !any_scanner_failed(&[row(
+                "completed",
+                Some(&format!("{RETRYING_AFTER_FAILURE_PREFIX}x"))
+            )]),
+            "only a running row carries the retry's failure"
+        );
     }
 
     #[test]
@@ -496,7 +542,7 @@ mod tests {
     }
 
     fn genuine_failure(r: &ScanStateRow) -> bool {
-        r.status == "failed" && !r.is_not_applicable()
+        (r.status == "failed" && !r.is_not_applicable()) || r.is_retrying_after_failure()
     }
 
     proptest! {
