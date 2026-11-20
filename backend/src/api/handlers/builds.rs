@@ -22,6 +22,7 @@ use crate::api::extractors::Json;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::models::access_scope::AccessScope;
 use crate::models::repository::RepositoryVisibility;
 use crate::services::audit_service::{
     audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
@@ -38,20 +39,21 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
 
 /// Build records belong to the principal that created them: changing one
 /// (status, attached artifacts) needs the `write:artifacts` token scope,
-/// deleting one `delete:artifacts`, and either administrator rights or being
-/// its creator. A build created before the creator was recorded is
-/// administrator-only (GHSA-mvmh-g8wm-r3cp)
+/// deleting one `delete:artifacts`, and either administrator rights
+/// (`is_admin`) or being its creator. A build created before the creator was
+/// recorded is administrator-only (GHSA-mvmh-g8wm-r3cp)
 async fn require_build_owner(
     state: &SharedState,
     auth: &AuthExtension,
     build_id: Uuid,
     scope: &str,
+    is_admin: bool,
 ) -> Result<()> {
     auth.require_scope(scope)?;
     let owner = BuildService::new(state.db.clone())
         .created_by(build_id)
         .await?;
-    if build_mutation_allowed(auth.is_admin, auth.user_id, owner) {
+    if build_mutation_allowed(is_admin, auth.user_id, owner) {
         Ok(())
     } else {
         Err(AppError::Authorization(
@@ -823,7 +825,7 @@ pub async fn update_build(
     Json(payload): Json<UpdateBuildRequest>,
 ) -> Result<Json<BuildResponse>> {
     let auth = require_auth(auth)?;
-    require_build_owner(&state, &auth, id, "write:artifacts").await?;
+    require_build_owner(&state, &auth, id, "write:artifacts", auth.is_admin).await?;
 
     let service = BuildService::new(state.db.clone());
     let build = service
@@ -905,7 +907,7 @@ pub async fn add_build_artifacts(
     Json(payload): Json<AddBuildArtifactsRequest>,
 ) -> Result<Json<AddBuildArtifactsResponse>> {
     let auth = require_auth(auth)?;
-    require_build_owner(&state, &auth, id, "write:artifacts").await?;
+    require_build_owner(&state, &auth, id, "write:artifacts", auth.is_admin).await?;
 
     let service = BuildService::new(state.db.clone());
     let inputs: Vec<BuildArtifactInput> = payload
@@ -944,6 +946,13 @@ pub async fn add_build_artifacts(
 /// Most builds one `POST /api/v1/builds/delete` takes
 pub const MAX_BULK_DELETE: usize = 100;
 
+/// Whether `auth` may delete builds it did not create. A build can name
+/// artifacts in any repository, so a repository-scoped token, even an
+/// administrator's, deletes only its own builds
+fn delete_as_admin(auth: &AuthExtension) -> bool {
+    auth.is_admin && !matches!(auth.allowed_repo_ids, AccessScope::Restricted(_))
+}
+
 /// Delete a build record (DELETE /api/v1/builds/:id)
 ///
 /// Only the record and its attached artifact list are deleted, the artifacts
@@ -959,7 +968,7 @@ pub const MAX_BULK_DELETE: usize = 100;
     security(("bearer_auth" = [])),
     responses(
         (status = 204, description = "Build deleted"),
-        (status = 403, description = "Caller is neither the build's creator nor an administrator, or the token lacks delete:artifacts"),
+        (status = 403, description = "Caller is neither the build's creator nor an administrator with an unrestricted credential, or the token lacks delete:artifacts"),
         (status = 401, description = "Authentication required"),
         (status = 404, description = "Build not found"),
     )
@@ -970,7 +979,14 @@ pub async fn delete_build(
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode> {
     let auth = require_auth(auth)?;
-    require_build_owner(&state, &auth, id, "delete:artifacts").await?;
+    require_build_owner(
+        &state,
+        &auth,
+        id,
+        "delete:artifacts",
+        delete_as_admin(&auth),
+    )
+    .await?;
 
     let deleted = BuildService::new(state.db.clone()).delete(&[id]).await?;
     if deleted.is_empty() {
@@ -1001,8 +1017,8 @@ pub struct DeleteBuildsResponse {
 
 /// Delete several build records (POST /api/v1/builds/delete)
 ///
-/// Each id is deleted when the caller created it or is an administrator,
-/// an unknown or foreign id is reported in `failed` and does not stop the
+/// Each id is deleted when the caller created it or is an administrator
+/// with an unrestricted credential, an unknown or foreign id is reported in `failed` and does not stop the
 /// others. Only the records go, the artifacts in repositories stay
 #[utoipa::path(
     post,
@@ -1027,7 +1043,7 @@ pub async fn delete_builds(
     auth.require_scope("delete:artifacts")?;
 
     let mut ids = payload.ids;
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     ids.retain(|id| seen.insert(*id));
     if ids.is_empty() || ids.len() > MAX_BULK_DELETE {
         return Err(AppError::Validation(format!(
@@ -1037,11 +1053,12 @@ pub async fn delete_builds(
 
     let service = BuildService::new(state.db.clone());
     let owners = service.owners(&ids).await?;
-    let (allowed, mut failed) = partition_bulk_delete(&ids, &owners, auth.is_admin, auth.user_id);
+    let (allowed, mut failed) =
+        partition_bulk_delete(&ids, &owners, delete_as_admin(&auth), auth.user_id);
     let deleted = service.delete(&allowed).await?;
 
     // A build deleted by someone else between the two queries is gone too
-    let gone: std::collections::HashSet<Uuid> = deleted.iter().map(|b| b.id).collect();
+    let gone: HashSet<Uuid> = deleted.iter().map(|b| b.id).collect();
     failed.extend(
         allowed
             .iter()
@@ -1063,7 +1080,7 @@ pub async fn delete_builds(
 /// ones, keeping the request order
 fn partition_bulk_delete(
     ids: &[Uuid],
-    owners: &std::collections::HashMap<Uuid, Option<Uuid>>,
+    owners: &HashMap<Uuid, Option<Uuid>>,
     is_admin: bool,
     caller: Uuid,
 ) -> (Vec<Uuid>, Vec<DeleteBuildFailure>) {
@@ -2723,6 +2740,8 @@ mod tests {
         let first = create(as_owner.clone(), 1).await;
         let second = create(as_owner.clone(), 2).await;
         let foreign = create(as_other.clone(), 3).await;
+        let third = create(as_owner.clone(), 4).await;
+        let own_scoped = create(as_other.clone(), 5).await;
         send_json(
             as_owner.clone(),
             post_json(
@@ -2805,6 +2824,26 @@ mod tests {
             tdh::send(as_owner, post_json("/delete", json!({ "ids": too_many }))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
 
+        // A repository-scoped admin token deletes only its own builds
+        let scoped_admin = app(AuthExtension {
+            is_api_token: true,
+            allowed_repo_ids: AccessScope::Restricted(vec![Uuid::new_v4()]),
+            ..tdh::admin_auth(other_id, &other_name)
+        });
+        let (status, _) = tdh::send(scoped_admin.clone(), delete_req(&format!("/{third}"))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let got = send_json(
+            scoped_admin.clone(),
+            post_json("/delete", json!({ "ids": [third, own_scoped] })),
+        )
+        .await;
+        assert_eq!(got["deleted"], json!([own_scoped]));
+        assert_eq!(
+            got["failed"],
+            json!([{ "id": third, "reason": "forbidden" }])
+        );
+        assert!(exists(third).await);
+
         // An administrator deletes any build, one without a creator included
         let legacy: Uuid = sqlx::query_scalar(
             "INSERT INTO builds (name, build_number, status) VALUES ($1, 9, 'running') RETURNING id",
@@ -2815,10 +2854,10 @@ mod tests {
         .expect("legacy build");
         let got = send_json(
             as_admin,
-            post_json("/delete", json!({ "ids": [foreign, legacy] })),
+            post_json("/delete", json!({ "ids": [foreign, legacy, third] })),
         )
         .await;
-        assert_eq!(got["deleted"], json!([foreign, legacy]));
+        assert_eq!(got["deleted"], json!([foreign, legacy, third]));
         assert_eq!(got["failed"], json!([]));
 
         let _ = sqlx::query("DELETE FROM builds WHERE name LIKE $1")
