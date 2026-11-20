@@ -288,6 +288,12 @@ services:
       # setting recovers the client IP, and an allowed_cidrs condition that
       # covers the proxy network is meaningless. See .env.example.
       XFF_TRUSTED_FOR_AUTHZ: ${XFF_TRUSTED_FOR_AUTHZ:-false}
+      # Opt-in LDAP/AD Basic-auth passthrough for package-manager clients
+      # (#3830, #6160). This service lists its environment explicitly, so the
+      # setting must be forwarded by name; without this line a value in .env
+      # never reaches the container and LDAP users still get 401 on Maven
+      # uploads. The backend keeps the switch off when the variable is unset.
+      LDAP_BASIC_AUTH_PASSTHROUGH: ${LDAP_BASIC_AUTH_PASSTHROUGH:-false}
       TRIVY_URL: http://trivy:8090
       # Trivy scanner-adapter URL (container-image scanning, #2471 / #2305).
       # TRIVY_URL above only wires the legacy trivy *server* used for
