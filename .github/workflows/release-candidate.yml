@@ -439,13 +439,18 @@ jobs:
   # main's tip serves any candidate with the same dependencies. This job only
   # DISPATCHES: nothing here waits for the build and nothing needs this job. A
   # missing cache costs build time at the tag, not correctness, so the script
-  # retries a 5xx or 429 and then only warns (#6089). Any other error fails the
-  # job: a missing workflow or a lost permission does not fix itself.
+  # retries a 5xx, a 429 or an error with no HTTP status and then only warns
+  # (#6089). A 404 or 403 fails the step, so a missing workflow or a lost
+  # permission shows red, but `continue-on-error` keeps the run's conclusion:
+  # create-release-line.sh refuses `--tests-from-run` on a failed run and
+  # resolve-candidate-rerun.sh only reruns one, so a certified candidate must
+  # never conclude `failure` because of this job.
   warm-cli-caches:
     name: Dispatch the CLI build cache warm-up
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    continue-on-error: true
     permissions:
       contents: read
       actions: write   # gh workflow run

@@ -7,11 +7,13 @@
 #   The warm-up is an optimisation: without it the tag run builds the CLI
 #   binaries cold, which costs time and nothing else. A single HTTP 502 on the
 #   dispatch (Release Candidate run 43912490439) still turned the job red. So:
-#     * HTTP 5xx and 429 are retried with backoff;
+#     * HTTP 5xx, 429 and errors with no HTTP status (connection reset, DNS)
+#       are retried with backoff;
 #     * if they persist, a ::warning:: says the tag run will build cold and the
 #       script exits 0;
-#     * any other failure (404 missing workflow, 403 permissions, an error with
-#       no HTTP status) exits 1, because retrying cannot fix it.
+#     * any other HTTP status (404 missing workflow, 403 permissions) exits 1,
+#       because retrying cannot fix it. The job keeps `continue-on-error`, so
+#       that shows as a red step without failing the candidate run.
 #   Only this dispatch is soft. Nothing in the gate or the certification may
 #   call this script.
 #
@@ -38,16 +40,16 @@ while :; do
   cat "$err" >&2
   status="$(grep -oE 'HTTP [0-9]{3}' "$err" | head -n1 | cut -c6- || true)"
   case "$status" in
-    5[0-9][0-9]|429) ;;
+    5[0-9][0-9]|429|"") ;;
     *)
       echo "::error::Dispatching release-cli-caches.yml failed (HTTP ${status:-status unknown}), retrying will not fix it."
       exit 1 ;;
   esac
   if [ "$attempt" -gt "${#backoff[@]}" ]; then
-    echo "::warning::Could not dispatch release-cli-caches.yml after ${attempt} attempts (last HTTP ${status}). The tag run will build the CLI binaries cold."
+    echo "::warning::Could not dispatch release-cli-caches.yml after ${attempt} attempts (last HTTP ${status:-status unknown}). The tag run will build the CLI binaries cold."
     exit 0
   fi
   delay="${backoff[$((attempt - 1))]}"
-  echo "Dispatch attempt ${attempt} got HTTP ${status}, retrying in ${delay}s." >&2
+  echo "Dispatch attempt ${attempt} got HTTP ${status:-status unknown}, retrying in ${delay}s." >&2
   sleep "$delay"
 done

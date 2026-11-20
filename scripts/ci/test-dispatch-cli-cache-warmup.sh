@@ -70,8 +70,19 @@ expect "403 -> no retry, error, exit 1" \
   "403" 1 1 "::error::"
 expect "502 then 404 -> stops at the 404, exit 1" \
   "502 404" 1 2 "::error::"
-expect "error with no HTTP status -> no retry, exit 1" \
-  "neterr" 1 1 "::error::"
+expect "error with no HTTP status then success -> retried, exit 0" \
+  "neterr ok" 0 2 "Dispatched Release CLI Caches"
+expect "error with no HTTP status on every attempt -> 4 calls, warning, exit 0" \
+  "neterr neterr neterr neterr" 0 4 "::warning::"
+
+# A hard exit above must not decide the candidate run's conclusion:
+# create-release-line.sh and resolve-candidate-rerun.sh both read it.
+WF="$(dirname "$SCRIPT")/../../.github/workflows/release-candidate.yml"
+if awk '/^  warm-cli-caches:/{j=1;next} j&&/^  [a-z]/{exit} j&&/^    continue-on-error: true$/{f=1} END{exit !f}' "$WF"; then
+  pass "warm-cli-caches keeps continue-on-error: true"
+else
+  fail "warm-cli-caches keeps continue-on-error: true"
+fi
 
 if [ "$fails" -eq 0 ]; then echo "all dispatch-cli-cache-warmup.sh cases passed"; exit 0; fi
 echo "${fails} dispatch-cli-cache-warmup.sh case(s) FAILED"; exit 1
