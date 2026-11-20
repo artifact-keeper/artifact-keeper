@@ -1830,7 +1830,7 @@ pub struct RepositoryResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_user_agent: Option<String>,
     /// The Maven version policy of a Maven or Gradle repository (#5872),
-    /// absent for other formats and on listings
+    /// absent for other formats
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version_policy: Option<crate::models::repository::MavenVersionPolicy>,
     /// Custom Origin field for Debian/APT Release files (default: "artifact-keeper").
@@ -4775,6 +4775,9 @@ pub async fn list_repositories(
 
     let depth_settings = rpm_layout::settings(&state.db, &repo_ids).await?;
     let mut repodata_modes = rpm_repodata_builder::modes(&state.db, &repo_ids).await?;
+    // #5872: the Maven and Gradle repositories' version policy, one query
+    let version_policies =
+        crate::services::maven_version_policy::load_many(&state.db, &repo_ids).await?;
     let items: Vec<RepositoryResponse> = repos
         .into_iter()
         .map(|r| {
@@ -4791,6 +4794,7 @@ pub async fn list_repositories(
                 resp.repodata_depth_editable = editable;
             }
             resp.repodata_mode = repodata_modes.remove(&resp.id);
+            resp.version_policy = version_policies.get(&resp.id).copied();
             if resp.repo_type == RepositoryType::Virtual.as_str() {
                 resp.virtual_metadata_partial =
                     Some(partial_opt_in.get(&resp.id).copied().unwrap_or(false));
@@ -11674,6 +11678,19 @@ pub async fn upload_artifact(
             );
         }
     }
+
+    // #5872: the path is known before the body is read, so a version the
+    // Maven policy refuses is answered without staging a byte.
+    // `persist_generic_staged_upload` checks again for the multipart routes.
+    crate::services::maven_version_policy::check_write(
+        &state.db,
+        repo.id,
+        &key,
+        repo.format.as_key(),
+        &path,
+    )
+    .await
+    .map_err(|e| e.into_response())?;
 
     // Stream the request body into staging, computing SHA-256/SHA-1/MD5 in a
     // single pass — the whole artifact is never buffered in memory (#2517).
@@ -24670,8 +24687,8 @@ mod tests {
     }
 
     /// #5872: the version policy is set on create, read back on GET, changed
-    /// by an update, and refused on a repository that cannot carry it, before
-    /// any row exists
+    /// by an update, returned on the listing, and refused on a repository
+    /// that cannot carry it, before any row exists
     #[tokio::test]
     async fn version_policy_round_trips_through_the_api_5872_db() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -24719,6 +24736,25 @@ mod tests {
         )
         .await
         .map(|Json(r)| r.version_policy);
+        let listed = list_repositories(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Query(ListRepositoriesQuery {
+                page: Some(1),
+                per_page: Some(100),
+                format: None,
+                repo_type: None,
+                q: Some(maven_key.clone()),
+                project: None,
+            }),
+        )
+        .await
+        .map(|Json(l)| {
+            l.items
+                .into_iter()
+                .find(|r| r.key == maven_key)
+                .and_then(|r| r.version_policy)
+        });
         let refused = create_repository(
             State(state.clone()),
             Extension(Some(admin.clone())),
@@ -24746,6 +24782,11 @@ mod tests {
         assert_eq!(created.ok(), Some(Some(MavenVersionPolicy::Release)));
         assert_eq!(fetched.ok(), Some(Some(MavenVersionPolicy::Release)));
         assert_eq!(updated.ok(), Some(Some(MavenVersionPolicy::Snapshot)));
+        assert_eq!(
+            listed.ok(),
+            Some(Some(MavenVersionPolicy::Snapshot)),
+            "the listing returns the policy too"
+        );
         assert!(
             matches!(refused, Err(AppError::Validation(_))),
             "a policy on an npm repository is a 400"
@@ -24789,6 +24830,31 @@ mod tests {
             }
         };
         let snapshot = put("com/acme/lib/1.0-SNAPSHOT/lib-1.0-20260101.120000-1.jar").await;
+        // A body that fails when read: the refusal must come before staging
+        let unread = upload_artifact(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path((
+                key.clone(),
+                "com/acme/lib/1.0-SNAPSHOT/lib-1.0-20260101.120000-2.jar".to_string(),
+            )),
+            HeaderMap::new(),
+            Body::from_stream(futures::stream::once(async {
+                Err::<Bytes, std::io::Error>(std::io::Error::other("body must not be read"))
+            })),
+        )
+        .await
+        .err()
+        .expect("a refused path is an error");
+        let unread = (
+            unread.status(),
+            String::from_utf8_lossy(
+                &axum::body::to_bytes(unread.into_body(), usize::MAX)
+                    .await
+                    .expect("read body"),
+            )
+            .to_string(),
+        );
         let release = put("com/acme/lib/1.0/lib-1.0.jar").await;
         let rows: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
@@ -24800,6 +24866,12 @@ mod tests {
         tdh::cleanup_user(&pool, user_id).await;
 
         assert_eq!(snapshot, Err(StatusCode::BAD_REQUEST));
+        assert_eq!(unread.0, StatusCode::BAD_REQUEST, "{}", unread.1);
+        assert!(
+            unread.1.contains("accepts release versions only"),
+            "refused before staging: {}",
+            unread.1
+        );
         assert!(
             release.as_ref().is_ok_and(|s| s.is_success()),
             "{release:?}"

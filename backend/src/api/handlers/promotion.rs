@@ -1451,15 +1451,32 @@ pub async fn promote_artifact(
     }
 
     // #5872: the target's Maven version policy holds for a promoted artifact,
-    // checked before an approval is spent on a copy that would be refused
-    crate::services::maven_version_policy::check_write(
+    // checked before an approval is spent on a copy that would be refused, and
+    // audited like the other refusals of this route
+    if let Err(e) = crate::services::maven_version_policy::check_write(
         &state.db,
         target_repo.id,
         &target_key,
         target_repo.format.as_key(),
         &artifact.path,
     )
-    .await?;
+    .await
+    {
+        if let AppError::Validation(reason) = &e {
+            let refusal = PromotionResponse {
+                promoted: false,
+                source: build_promotion_source_display(&repo_key, &artifact.path),
+                target: build_promotion_target_display(&target_key, &artifact.path),
+                promotion_id: None,
+                policy_violations: Vec::new(),
+                message: Some(reason.clone()),
+                gate_results: Vec::new(),
+                scan_state: None,
+            };
+            audit.record(artifact_id, &artifact.path, &refusal).await;
+        }
+        return Err(e);
+    }
 
     // Approval gate (promotion-approval-gate-bypass): when the source requires
     // approval, atomically consume an APPROVED + unconsumed approval row for this
@@ -1697,6 +1714,13 @@ pub async fn promote_artifacts_bulk(
     // first here: it is batch-wide and the gate is per item, so a mis-shaped
     // batch is refused with 400 before any item's gate is evaluated.
     validate_promotion_repos(&source_repo, &target_repo)?;
+    // #5872: the target's Maven version policy, read once for the whole batch
+    let target_version_policy = crate::services::maven_version_policy::load_for_format(
+        &state.db,
+        target_repo.id,
+        target_repo.format.as_key(),
+    )
+    .await?;
 
     // Tenant-ownership gate (campaign-#4 systemic authz). Enforced once for the
     // whole batch since source/target are fixed across all items; rejects a
@@ -1913,17 +1937,17 @@ pub async fn promote_artifacts_bulk(
         }
 
         // #5872: the target's Maven version policy fails just this item
-        if let Err(e) = crate::services::maven_version_policy::check_write(
-            &state.db,
-            target_repo.id,
+        if let Some(reason) = crate::services::maven_version_policy::refusal(
+            target_version_policy,
             &target_key,
-            target_repo.format.as_key(),
             &artifact.path,
-        )
-        .await
-        {
+        ) {
             failed += 1;
-            let resp = failed_response(source_display, target_display, e.to_string());
+            let resp = failed_response(
+                source_display,
+                target_display,
+                AppError::Validation(reason).to_string(),
+            );
             audit.record(*artifact_id, &artifact.path, &resp).await;
             results.push(resp);
             continue;
@@ -6372,8 +6396,8 @@ mod tests {
         }
 
         /// #5872: single and bulk promotion hold the target's Maven version
-        /// policy, a refused SNAPSHOT is not copied and the bulk call fails
-        /// only that item
+        /// policy, a refused SNAPSHOT is not copied, the single refusal is
+        /// audited and the bulk call fails only that item
         #[tokio::test]
         async fn test_promote_honours_target_version_policy_5872() {
             let Some(pool) = tdh::try_pool().await else {
@@ -6411,6 +6435,8 @@ mod tests {
                 }),
             )
             .await;
+            // The single route audits its refusal like the other refusals
+            let refused_row = tdh::audit_row_eventually(&pool, snap, "PROMOTION_REFUSED").await;
             let bulk = promote_artifacts_bulk(
                 State(state.clone()),
                 Extension(admin_ext(user)),
@@ -6439,6 +6465,11 @@ mod tests {
                 matches!(&single, Err(AppError::Validation(m)) if m.contains("accepts release versions only")),
                 "{single:?}"
             );
+            assert_eq!(refused_row.details["bulk"], false);
+            assert!(refused_row.details["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("accepts release versions only"));
             assert_eq!(bulk.ok(), Some((1, 1)));
             assert_eq!(
                 copied,

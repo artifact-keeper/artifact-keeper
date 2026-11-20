@@ -83,6 +83,53 @@ pub async fn load(db: &PgPool, repo_id: Uuid) -> Result<MavenVersionPolicy> {
         .unwrap_or_default())
 }
 
+/// [`refusal`] for a policy as stored in `repositories.version_policy`, for
+/// callers that already read the column with their own query
+pub fn refusal_stored(stored: &str, repo_key: &str, path: &str) -> Option<String> {
+    refusal(
+        MavenVersionPolicy::parse(stored).unwrap_or_default(),
+        repo_key,
+        path,
+    )
+}
+
+/// The policy of a repository of `format`, `Mixed` without a lookup for a
+/// format that carries none. Loaded once for a batch of writes
+pub async fn load_for_format(
+    db: &PgPool,
+    repo_id: Uuid,
+    format: &str,
+) -> Result<MavenVersionPolicy> {
+    if applies_to_format(format) {
+        load(db, repo_id).await
+    } else {
+        Ok(MavenVersionPolicy::Mixed)
+    }
+}
+
+/// The policy of every Maven or Gradle repository among `repo_ids`, one
+/// query for a listing. Other formats are absent from the map
+pub async fn load_many(
+    db: &PgPool,
+    repo_ids: &[Uuid],
+) -> Result<std::collections::HashMap<Uuid, MavenVersionPolicy>> {
+    if repo_ids.is_empty() {
+        return Ok(Default::default());
+    }
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, version_policy FROM repositories \
+         WHERE id = ANY($1) AND format::text = ANY($2)",
+    )
+    .bind(repo_ids)
+    .bind(POLICY_FORMATS.map(str::to_string).to_vec())
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, stored)| (id, MavenVersionPolicy::parse(&stored).unwrap_or_default()))
+        .collect())
+}
+
 /// Refuse with 400 a write of `path` into a Maven or Gradle repository whose
 /// version policy does not accept it. Any other format passes without a
 /// lookup
@@ -281,6 +328,9 @@ mod tests {
         let on_npm = store(&pool, npm, MavenVersionPolicy::Snapshot).await;
         let mixed_on_npm = store(&pool, npm, MavenVersionPolicy::Mixed).await;
         let missing = store(&pool, Uuid::new_v4(), MavenVersionPolicy::Release).await;
+        let many = load_many(&pool, &[hosted, remote, npm]).await;
+        let for_npm = load_for_format(&pool, npm, "npm").await;
+        let for_hosted = load_for_format(&pool, hosted, "maven").await;
 
         for (id, dir) in [(hosted, hosted_dir), (remote, remote_dir), (npm, npm_dir)] {
             tdh::cleanup_member_repo(&pool, id, &dir).await;
@@ -308,5 +358,22 @@ mod tests {
         assert!(matches!(on_npm, Err(AppError::Validation(_))), "{on_npm:?}");
         assert!(mixed_on_npm.is_ok(), "{mixed_on_npm:?}");
         assert!(matches!(missing, Err(AppError::NotFound(_))), "{missing:?}");
+        let many = many.expect("load_many");
+        assert_eq!(many.get(&hosted), Some(&MavenVersionPolicy::Release));
+        assert_eq!(many.get(&remote), Some(&MavenVersionPolicy::Mixed));
+        assert!(
+            !many.contains_key(&npm),
+            "an npm repository carries no policy"
+        );
+        assert_eq!(for_npm.ok(), Some(MavenVersionPolicy::Mixed));
+        assert_eq!(for_hosted.ok(), Some(MavenVersionPolicy::Release));
+        assert_eq!(
+            refusal_stored("release", "r", "com/a/b/1.0-SNAPSHOT/b.jar").as_deref(),
+            Some("Repository 'r' accepts release versions only")
+        );
+        assert_eq!(
+            refusal_stored("bogus", "r", "com/a/b/1.0-SNAPSHOT/b.jar"),
+            None
+        );
     }
 }

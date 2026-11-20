@@ -38,7 +38,7 @@ pub const SECRET_EGRESS_PROXY: &str = "egress_proxy";
 const IMMUTABLE_FIELDS: [&str; 3] = ["format", "format_key", "repo_type"];
 
 /// Fields `apply` writes through `PATCH /api/v1/repositories/{key}`.
-const PATCH_FIELDS: [&str; 13] = [
+const PATCH_FIELDS: [&str; 14] = [
     "name",
     "description",
     "visibility",
@@ -52,6 +52,7 @@ const PATCH_FIELDS: [&str; 13] = [
     "curation_enabled",
     "curation_default_action",
     "curation_source_repository_key",
+    "version_policy",
 ];
 
 /// Placeholder for a credential the export never carries. The import takes
@@ -121,6 +122,11 @@ pub struct ConfigRepository {
     pub versioning_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_user_agent: Option<String>,
+    /// Local and staging Maven or Gradle repositories: which versions they
+    /// accept (#5872). Absent means `mixed`, only `release` and `snapshot`
+    /// are exported
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_policy: Option<crate::models::repository::MavenVersionPolicy>,
     #[serde(default)]
     pub curation_enabled: bool,
     #[serde(default = "default_curation_action")]
@@ -625,6 +631,9 @@ pub fn create_body(
     if let Some(ua) = &desired.custom_user_agent {
         set("custom_user_agent", ua.clone().into());
     }
+    if let Some(policy) = desired.version_policy {
+        set("version_policy", policy.as_str().into());
+    }
     for (field, value) in [
         ("promotion_only", desired.promotion_only),
         ("versioning_enabled", desired.versioning_enabled),
@@ -672,6 +681,11 @@ pub fn patch_body(
     if changed("custom_user_agent") {
         let ua = desired.custom_user_agent.clone().unwrap_or_default();
         map.insert("custom_user_agent".into(), ua.into());
+    }
+    if changed("version_policy") {
+        // Absent is `mixed`, so removing it from the document resets it
+        let policy = desired.version_policy.unwrap_or_default();
+        map.insert("version_policy".into(), policy.as_str().into());
     }
     if changed("curation_default_action") {
         map.insert(
@@ -1086,6 +1100,39 @@ mod tests {
             p.errors
         );
         assert!(!p.applicable);
+    }
+
+    /// #5872: a Maven version policy is created, patched and reset to
+    /// `mixed` when the document drops it
+    #[test]
+    fn version_policy_is_created_patched_and_reset_5872() {
+        use crate::models::repository::MavenVersionPolicy;
+        let desired: ConfigRepository = serde_json::from_value(serde_json::json!({
+            "key": "libs-release", "name": "libs-release", "format": "maven",
+            "repo_type": "local", "visibility": "private",
+            "version_policy": "release",
+        }))
+        .expect("maven fixture");
+        assert_eq!(desired.version_policy, Some(MavenVersionPolicy::Release));
+        let created = create_body(&desired, &BTreeMap::new()).unwrap();
+        assert_eq!(created["version_policy"], "release");
+
+        let mut current = desired.clone();
+        current.version_policy = None;
+        let changes: BTreeSet<String> = changed_fields(&desired, &current).into_iter().collect();
+        assert_eq!(changes, keys(&["version_policy"]));
+        let patch = patch_body(&desired, &changes, &BTreeMap::new())
+            .unwrap()
+            .expect("a PATCH");
+        assert_eq!(patch["version_policy"], "release");
+        let reset = patch_body(&current, &changes, &BTreeMap::new())
+            .unwrap()
+            .expect("a PATCH");
+        assert_eq!(reset["version_policy"], "mixed");
+        assert!(create_body(&current, &BTreeMap::new())
+            .unwrap()
+            .get("version_policy")
+            .is_none());
     }
 
     #[test]

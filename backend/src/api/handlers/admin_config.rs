@@ -157,6 +157,9 @@ async fn export_repository(
         promotion_only: repo.promotion_only,
         versioning_enabled: repo.versioning_enabled,
         custom_user_agent: repo.custom_user_agent,
+        version_policy: repo
+            .version_policy
+            .filter(|p| *p != crate::models::repository::MavenVersionPolicy::Mixed),
         curation_enabled: repo.curation_enabled,
         curation_default_action: repo.curation_default_action,
         curation_source_repository_key: None,
@@ -997,5 +1000,74 @@ mod tests {
         tdh::cleanup_user(&pool, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
         assert_eq!(content(&first), content(&second));
+    }
+
+    /// #5872: a Maven repository's version policy survives export, delete and
+    /// apply, and dropping it from the document resets it to `mixed`
+    #[tokio::test]
+    async fn version_policy_round_trips_and_resets_5872() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("ak-5872-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = tdh::admin_auth(user_id, &username);
+        let key = format!("cfg-5872-{}", uuid::Uuid::new_v4().simple());
+        repos::create_repository(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            bytes::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "key": key, "name": key, "format": "maven",
+                    "repo_type": "local", "version_policy": "release",
+                }))
+                .unwrap(),
+            ),
+        )
+        .await
+        .expect("create");
+
+        let first = export_keys(&state, &auth, &key).await;
+        delete_repo_by_key(&pool, &key).await;
+        let applied = import(
+            &state,
+            &auth,
+            ConfigImportMode::Apply,
+            false,
+            serde_json::to_value(&first).unwrap(),
+        )
+        .await
+        .expect("apply");
+        let second = export_keys(&state, &auth, &key).await;
+        let mut dropped = second.clone();
+        dropped.repositories[0].version_policy = None;
+        let reset = import(
+            &state,
+            &auth,
+            ConfigImportMode::Apply,
+            false,
+            serde_json::to_value(&dropped).unwrap(),
+        )
+        .await
+        .expect("apply without the policy");
+        let stored: String =
+            sqlx::query_scalar("SELECT version_policy FROM repositories WHERE key = $1")
+                .bind(&key)
+                .fetch_one(&pool)
+                .await
+                .expect("stored policy");
+        delete_repo_by_key(&pool, &key).await;
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            first.repositories[0].version_policy,
+            Some(crate::models::repository::MavenVersionPolicy::Release)
+        );
+        assert!(applied.applied && reset.applied);
+        assert_eq!(content(&first), content(&second));
+        assert_eq!(stored, "mixed");
     }
 }
