@@ -9688,7 +9688,11 @@ pub async fn insert_artifact_replacing(
             location,
             art.path,
             None,
-            art.storage_key,
+            crate::services::artifact_service::OverwriteReplacement {
+                storage_key: art.storage_key,
+                checksum_sha256: art.checksum_sha256,
+                uploaded_by: Some(art.uploaded_by),
+            },
         )
         .await
         .map_err(IntoResponse::into_response)?,

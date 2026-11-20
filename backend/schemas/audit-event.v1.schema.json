@@ -104,6 +104,13 @@
     {
       "if": {
         "required": ["action"],
+        "properties": { "action": { "const": "ARTIFACT_OVERWRITTEN" } }
+      },
+      "then": { "properties": { "details": { "anyOf": [{ "$ref": "#/$defs/ArtifactOverwriteDetails" }, { "$ref": "#/$defs/TruncatedDetails" }, { "type": "null" }] } } }
+    },
+    {
+      "if": {
+        "required": ["action"],
         "properties": { "action": { "const": "SETTING_CHANGED" } }
       },
       "then": { "properties": { "details": { "anyOf": [{ "$ref": "#/$defs/SettingDetails" }, { "$ref": "#/$defs/TruncatedDetails" }, { "type": "null" }] } } }
@@ -302,6 +309,20 @@
         "size_bytes": { "type": "integer", "minimum": 0 },
         "digest": { "type": "string" },
         "uploaded_by": { "type": "string", "format": "uuid" }
+      }
+    },
+    "ArtifactOverwriteDetails": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["repository_id", "path", "retired_artifact_id", "previous_digest", "digest"],
+      "description": "details for ARTIFACT_OVERWRITTEN: a mutable repository replaced the content at a path (#5188).",
+      "properties": {
+        "repository_id": { "type": "string", "format": "uuid" },
+        "path": { "type": "string" },
+        "retired_artifact_id": { "type": "string", "format": "uuid" },
+        "previous_digest": { "type": "string" },
+        "digest": { "type": "string" },
+        "previous_scan_verdict": { "type": "string" }
       }
     },
     "SettingDetails": {

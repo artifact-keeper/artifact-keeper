@@ -123,6 +123,7 @@ the remaining actions is an incremental follow-up.
 | `API_TOKEN_CREATED` / `_REVOKED` | `TokenDetails` (`token_id`, `token_name?`, `surface`, `expires_at?`, `policy_applied?`) |
 | `LOGIN_FAILED`, `PERMISSION_DENIED`, `LOGIN_RATE_LIMITED` | `AuthDetails` (`username?`, `path?`, `method?`, `reason?`, federated labels?) |
 | `ARTIFACT_UPLOADED` / `_DOWNLOADED` / `_DELETED` | `ArtifactDetails` (`repository_id`, `path`, `name`, `version?`, `size_bytes?`, `digest?`, `uploaded_by?`) |
+| `ARTIFACT_OVERWRITTEN` | `ArtifactOverwriteDetails` (`repository_id`, `path`, `retired_artifact_id`, `previous_digest`, `digest`, `previous_scan_verdict?`). Written in the publish transaction when a repository with `immutability: mutable` replaces the content at a path (#5188); `resource_id` is the retired artifact, `user_id` the uploader of the replacement, and `previous_scan_verdict` the retired row's `quarantine_status` |
 | `SETTING_CHANGED` | `SettingDetails` (`key`, `old_value?`, `new_value?`) |
 
 ## Privileged administrative actions

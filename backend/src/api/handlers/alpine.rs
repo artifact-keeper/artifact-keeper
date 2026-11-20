@@ -2151,7 +2151,11 @@ async fn store_apk(
             &repo.storage_location(),
             &artifact_path,
             None,
-            &storage_key,
+            crate::services::artifact_service::OverwriteReplacement {
+                storage_key: &storage_key,
+                checksum_sha256: &computed_sha256,
+                uploaded_by: Some(user_id),
+            },
         )
         .await
         .map_err(|e| e.into_response())?

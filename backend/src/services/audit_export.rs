@@ -130,6 +130,7 @@ impl AuditAction {
             | AuditAction::ArtifactMetadataUpdated
             | AuditAction::ArtifactRestored
             | AuditAction::ArtifactPurged
+            | AuditAction::ArtifactOverwritten
             | AuditAction::BackupStarted
             | AuditAction::BackupCompleted
             | AuditAction::RestoreStarted
@@ -691,6 +692,23 @@ pub mod details {
         /// Original uploader, when known (not necessarily the delete actor).
         #[serde(skip_serializing_if = "Option::is_none")]
         pub uploaded_by: Option<Uuid>,
+    }
+
+    /// `ARTIFACT_OVERWRITTEN` (#5188): a mutable repository replaced the
+    /// content at `path`. The retired row is gone (its scan state cascaded
+    /// away), so this event is what keeps its id, digest and verdict.
+    #[derive(Debug, Clone, Serialize)]
+    pub struct ArtifactOverwriteDetails {
+        pub repository_id: Uuid,
+        pub path: String,
+        pub retired_artifact_id: Uuid,
+        /// `sha256:<hex>` of the content that was replaced.
+        pub previous_digest: String,
+        /// `sha256:<hex>` of the replacement.
+        pub digest: String,
+        /// The retired row's `quarantine_status`, if it had one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub previous_scan_verdict: Option<String>,
     }
 
     /// `SETTING_CHANGED` — a security/system configuration change. Secret-bearing

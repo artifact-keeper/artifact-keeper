@@ -1930,7 +1930,11 @@ async fn retire_for_overwrite(
         &repo.storage_location(),
         &session.artifact_path,
         Some(&session.checksum_sha256),
-        storage_key,
+        crate::services::artifact_service::OverwriteReplacement {
+            storage_key,
+            checksum_sha256: &session.checksum_sha256,
+            uploaded_by: Some(session.user_id),
+        },
     )
     .await?;
     let identical_live = sqlx::query_scalar::<_, bool>(

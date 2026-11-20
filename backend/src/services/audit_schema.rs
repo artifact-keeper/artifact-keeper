@@ -234,6 +234,7 @@ mod tests {
             "TokenDetails",
             "AuthDetails",
             "ArtifactDetails",
+            "ArtifactOverwriteDetails",
             "SettingDetails",
         ] {
             assert!(s["$defs"][def].is_object(), "missing $def {def}");
@@ -444,6 +445,18 @@ mod tests {
                 size_bytes: Some(4096),
                 digest: Some("sha256:abcd".into()),
                 uploaded_by: Some(Uuid::new_v4()),
+            })
+            .unwrap(),
+        );
+        assert_valid_against(
+            "ArtifactOverwriteDetails",
+            &serde_json::to_value(details::ArtifactOverwriteDetails {
+                repository_id: Uuid::new_v4(),
+                path: "pool/main/a/a_1.0_amd64.deb".into(),
+                retired_artifact_id: Uuid::new_v4(),
+                previous_digest: "sha256:aa".into(),
+                digest: "sha256:bb".into(),
+                previous_scan_verdict: Some("clean".into()),
             })
             .unwrap(),
         );

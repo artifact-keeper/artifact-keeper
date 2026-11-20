@@ -704,7 +704,11 @@ async fn insert_package_rows(
             location,
             artifact.path,
             None,
-            artifact.storage_key,
+            crate::services::artifact_service::OverwriteReplacement {
+                storage_key: artifact.storage_key,
+                checksum_sha256: artifact.checksum_sha256,
+                uploaded_by: Some(artifact.uploaded_by),
+            },
         )
         .await
         .map_err(IntoResponse::into_response)?,

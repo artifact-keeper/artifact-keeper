@@ -302,6 +302,15 @@ pub(crate) fn overwrite_applies(repo: &Repository) -> bool {
         && !versioning_applies(&repo.format, repo.versioning_enabled)
 }
 
+/// The content replacing a retired row (#5188): where it is stored, its
+/// SHA-256 and who uploaded it, for the GC journal and the audit event.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OverwriteReplacement<'a> {
+    pub storage_key: &'a str,
+    pub checksum_sha256: &'a str,
+    pub uploaded_by: Option<Uuid>,
+}
+
 /// The row a mutable-repository overwrite (#5188) retired, returned by
 /// [`retire_overwritten_artifact`].
 #[derive(Debug, Clone)]
@@ -326,22 +335,27 @@ pub struct RetiredArtifact {
 /// bytes are not a replacement; the caller's upsert keeps its id and its
 /// approvals). `None` retires any row at the path.
 ///
-/// When the retired row named a different object than `new_storage_key`, that
-/// object is journalled for storage GC in the same transaction; the candidate
-/// sweep deletes it only if nothing references the key by then.
+/// When the retired row named a different object than `replacement`'s key,
+/// that object is journalled for storage GC in the same transaction; the
+/// candidate sweep deletes it only if nothing references the key by then.
+///
+/// Every retire records `ARTIFACT_OVERWRITTEN` in `tx` too, so the audit row
+/// commits or rolls back with the overwrite, and an audit write that fails
+/// fails the publish rather than leaving an unaudited replacement.
 pub(crate) async fn retire_overwritten_artifact(
     tx: &mut sqlx::PgConnection,
     repository_id: Uuid,
     location: &crate::storage::StorageLocation,
     path: &str,
     keep_checksum: Option<&str>,
-    new_storage_key: &str,
+    replacement: OverwriteReplacement<'_>,
 ) -> Result<Option<RetiredArtifact>> {
-    let retired = sqlx::query_as::<_, (Uuid, String)>(
+    let new_storage_key = replacement.storage_key;
+    let retired = sqlx::query_as::<_, (Uuid, String, String, Option<String>)>(
         "DELETE FROM artifacts \
           WHERE repository_id = $1 AND path = $2 \
             AND ($3::text IS NULL OR LOWER(TRIM(checksum_sha256)) <> LOWER(TRIM($3))) \
-         RETURNING id, storage_key",
+         RETURNING id, storage_key, checksum_sha256, quarantine_status",
     )
     .bind(repository_id)
     .bind(path)
@@ -349,9 +363,35 @@ pub(crate) async fn retire_overwritten_artifact(
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
-    let Some((id, storage_key)) = retired else {
+    let Some((id, storage_key, previous_sha256, previous_scan_verdict)) = retired else {
         return Ok(None);
     };
+    let mut entry = crate::services::audit_service::AuditEntry::new(
+        crate::services::audit_service::AuditAction::ArtifactOverwritten,
+        crate::services::audit_service::ResourceType::Artifact,
+    )
+    .resource(id)
+    .resource_name(path)
+    .details_typed(
+        crate::services::audit_export::details::ArtifactOverwriteDetails {
+            repository_id,
+            path: path.to_string(),
+            retired_artifact_id: id,
+            previous_digest: format!("sha256:{}", previous_sha256.trim().to_ascii_lowercase()),
+            digest: format!(
+                "sha256:{}",
+                replacement.checksum_sha256.to_ascii_lowercase()
+            ),
+            previous_scan_verdict,
+        },
+    );
+    if let Some(actor) = replacement.uploaded_by {
+        entry = entry.user(actor);
+    }
+    crate::services::audit_export::emit_entry(&entry);
+    crate::services::audit_service::insert_audit_row(&mut *tx, &entry)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
     if storage_key != new_storage_key {
         let scope = crate::services::storage_gc_service::oci_gc_candidate_scope(location);
         sqlx::query(
@@ -1703,7 +1743,11 @@ impl ArtifactService {
                     &repo.storage_location(),
                     path,
                     Some(checksum_sha256),
-                    storage_key,
+                    OverwriteReplacement {
+                        storage_key,
+                        checksum_sha256,
+                        uploaded_by,
+                    },
                 )
                 .await?
                 {
@@ -6775,11 +6819,43 @@ mod tests {
         let replay = upload(b"build-1").await.expect("identical re-upload");
         assert_eq!(replay.id, first.id, "identical bytes keep the artifact id");
         assert_eq!(count(APPROVALS, first.id).await, 1);
+        const OVERWRITES: &str =
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'ARTIFACT_OVERWRITTEN' AND resource_id = $1";
+        assert_eq!(
+            count(OVERWRITES, first.id).await,
+            0,
+            "identical bytes are not an overwrite"
+        );
+        sqlx::query("UPDATE artifacts SET quarantine_status = 'clean' WHERE id = $1")
+            .bind(first.id)
+            .execute(&pool)
+            .await
+            .expect("seed verdict");
 
         let second = upload(b"build-2")
             .await
             .expect("different-bytes re-upload must replace, not 409");
         assert_ne!(second.id, first.id, "new bytes must get a new artifact id");
+        let (actor, details): (Option<Uuid>, serde_json::Value) = sqlx::query_as(
+            "SELECT user_id, details FROM audit_log \
+             WHERE action = 'ARTIFACT_OVERWRITTEN' AND resource_id = $1",
+        )
+        .bind(first.id)
+        .fetch_one(&pool)
+        .await
+        .expect("one ARTIFACT_OVERWRITTEN row for the retired id");
+        assert_eq!(actor, Some(user_id));
+        assert_eq!(details["retired_artifact_id"], first.id.to_string());
+        assert_eq!(details["path"], path);
+        assert_eq!(
+            details["previous_digest"],
+            format!("sha256:{}", first.checksum_sha256)
+        );
+        assert_eq!(
+            details["digest"],
+            format!("sha256:{}", second.checksum_sha256)
+        );
+        assert_eq!(details["previous_scan_verdict"], "clean");
         assert_eq!(
             second.checksum_sha256,
             ArtifactService::calculate_sha256(b"build-2")
