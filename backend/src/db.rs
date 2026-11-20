@@ -2,6 +2,7 @@
 
 use crate::config::Config;
 use crate::error::{DeadlockError, Result};
+use futures::future::BoxFuture;
 use rand::RngExt;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use std::str::FromStr;
@@ -255,6 +256,42 @@ pub async fn create_pool(config: &Config) -> Result<PgPool> {
     )
     .await?;
     Ok(pool)
+}
+
+/// Run `action` on a session dedicated to startup migrations (#6319).
+///
+/// Dropping a `PoolConnection` only returns it to the pool, so session-level
+/// `SET`s made on it leak into later application queries. Detaching before the
+/// `SET`s removes the session from the pool; closing it afterwards discards
+/// the settings even when `action` fails or the future is cancelled.
+pub async fn with_migration_session<T, F>(pool: &PgPool, action: F) -> Result<T>
+where
+    F: for<'a> FnOnce(&'a mut sqlx::PgConnection) -> BoxFuture<'a, Result<T>>,
+{
+    let mut conn = pool.acquire().await?.detach();
+
+    let result = async {
+        sqlx::query("SET statement_timeout = '30min'")
+            .execute(&mut conn)
+            .await?;
+        sqlx::query("SET lock_timeout = '5min'")
+            .execute(&mut conn)
+            .await?;
+        action(&mut conn).await
+    }
+    .await;
+
+    // The migration error is the useful one when both fail. Either way the
+    // detached session cannot return to the pool, so only the server sees the
+    // settings now.
+    let close_result = sqlx::Connection::close(conn).await;
+    match result {
+        Ok(value) => {
+            close_result?;
+            Ok(value)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// How many times a transaction that can lose a lock-order race is attempted
@@ -782,6 +819,51 @@ mod tests {
         assert_ne!(
             source, "session",
             "with the hook disabled nothing sets tcp_keepalives_idle (now {idle})"
+        );
+    }
+
+    /// #6319: startup migrations raise session timeouts on their connection.
+    /// Returning that connection to a single-connection pool made the next
+    /// application query inherit 30min/5min instead of the operator's default.
+    #[tokio::test]
+    async fn migration_session_timeouts_do_not_leak_into_pool_6319() {
+        async fn timeouts(conn: &mut sqlx::PgConnection) -> (String, String) {
+            sqlx::query_as(
+                "SELECT current_setting('statement_timeout'), current_setting('lock_timeout')",
+            )
+            .fetch_one(conn)
+            .await
+            .expect("read session timeouts")
+        }
+
+        let Some(pool) = crate::testing::try_pool_with(1).await else {
+            return;
+        };
+
+        let baseline = {
+            let mut conn = pool.acquire().await.expect("acquire baseline connection");
+            timeouts(&mut conn).await
+        };
+
+        let during = with_migration_session(&pool, |conn| {
+            Box::pin(async move { Ok(timeouts(conn).await) })
+        })
+        .await
+        .expect("run migration session");
+        assert_eq!(during, ("30min".to_string(), "5min".to_string()));
+
+        let after = {
+            let mut conn = pool
+                .acquire()
+                .await
+                .expect("acquire a connection after the migration session");
+            timeouts(&mut conn).await
+        };
+        pool.close().await;
+
+        assert_eq!(
+            after, baseline,
+            "migration-only timeouts must not survive in the application pool"
         );
     }
 
