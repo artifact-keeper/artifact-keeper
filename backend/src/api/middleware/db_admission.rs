@@ -89,7 +89,7 @@ pub struct DbAdmission {
     /// that will be back, and that a newcomer's prediction has to count, or
     /// the gate tells everyone to return at the same short interval and they
     /// collide again.
-    deferred: Arc<AtomicUsize>,
+    deferred: DeferredRing,
     /// Moving average of how long a request holds its slot, in microseconds
     /// (0 until the first slot is returned).
     avg_hold_us: AtomicU64,
@@ -128,7 +128,7 @@ impl DbAdmission {
                 capacity: concurrency,
                 wait: Duration::from_millis(wait_ms),
                 waiters: AtomicUsize::new(0),
-                deferred: Arc::new(AtomicUsize::new(0)),
+                deferred: DeferredRing::default(),
                 avg_hold_us: AtomicU64::new(0),
             })
         })
@@ -176,9 +176,14 @@ impl DbAdmission {
         if queued > 0 && predicted_wait(queued + 1, self.avg_hold(), self.capacity) > self.wait {
             return self.shed();
         }
-        self.waiters.fetch_add(1, Ordering::Relaxed);
-        let acquired = tokio::time::timeout(self.wait, self.permits.clone().acquire_owned()).await;
-        self.waiters.fetch_sub(1, Ordering::Relaxed);
+        // Counted while queued, by a guard: this future is dropped mid-wait
+        // whenever the request goes away (a reset stream or connection, the
+        // request timeout, the upload progress deadline), and a hand-written
+        // decrement after the `.await` would then never run.
+        let acquired = {
+            let _queued = WaiterGuard::enter(&self.waiters);
+            tokio::time::timeout(self.wait, self.permits.clone().acquire_owned()).await
+        };
         match acquired {
             Ok(Ok(permit)) => Admission::Run(Some(self.slot(permit))),
             // Out of time: run it anyway if the pool has room by now.
@@ -195,17 +200,76 @@ impl DbAdmission {
     /// already told to come back should have been served (at least the wait
     /// budget), counting the client as deferred until that runs out.
     fn shed(&self) -> Admission {
-        let backlog =
-            self.waiters.load(Ordering::Relaxed) + self.deferred.load(Ordering::Relaxed) + 1;
+        let now = now_secs();
+        let backlog = self.waiters.load(Ordering::Relaxed) + self.deferred.live(now) + 1;
         let predicted = predicted_wait(backlog, self.avg_hold(), self.capacity).max(self.wait);
         let retry_after_secs = retry_after_secs(predicted);
-        self.deferred.fetch_add(1, Ordering::Relaxed);
-        let deferred = self.deferred.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(retry_after_secs)).await;
-            deferred.fetch_sub(1, Ordering::Relaxed);
-        });
+        // The gate cannot tell clients apart before authentication, so a
+        // client that ignores `Retry-After` and comes straight back is
+        // counted again on each shed. That inflates the prediction for
+        // everyone (towards the 30 s cap) only while such a client keeps
+        // hammering, and each count expires with its own Retry-After.
+        // Per-client accounting is #6344.
+        self.deferred.add(now + retry_after_secs);
         Admission::Shed { retry_after_secs }
+    }
+}
+
+/// Seconds on a monotonic clock that starts with the process.
+pub(crate) fn now_secs() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs()
+}
+
+/// Ring size for [`DeferredRing`]: longer than the longest Retry-After, so
+/// two live expiry seconds never share a bucket.
+const DEFERRED_BUCKETS: usize = MAX_RETRY_AFTER_SECS as usize + 2;
+
+/// Clients shed with a Retry-After that has not run out, as counts per
+/// expiry second in a ring (no timer task per shed).
+#[derive(Default)]
+pub(crate) struct DeferredRing {
+    /// `(expiry second, count)` per bucket, indexed by expiry % len.
+    buckets: std::sync::Mutex<[(u64, usize); DEFERRED_BUCKETS]>,
+}
+
+impl DeferredRing {
+    /// Count one client deferred until `expires` (in [`now_secs`] seconds).
+    pub(crate) fn add(&self, expires: u64) {
+        let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let bucket = &mut buckets[(expires % DEFERRED_BUCKETS as u64) as usize];
+        if bucket.0 == expires {
+            bucket.1 += 1;
+        } else {
+            // A stale bucket from an earlier lap of the ring: reuse it.
+            *bucket = (expires, 1);
+        }
+    }
+
+    /// Clients whose Retry-After has not run out at `now`.
+    pub(crate) fn live(&self, now: u64) -> usize {
+        let buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        buckets
+            .iter()
+            .filter(|(expires, _)| *expires > now)
+            .map(|(_, count)| count)
+            .sum()
+    }
+}
+
+/// Counts one request as queued for a slot for as long as it lives.
+struct WaiterGuard<'a>(&'a AtomicUsize);
+
+impl<'a> WaiterGuard<'a> {
+    fn enter(waiters: &'a AtomicUsize) -> Self {
+        waiters.fetch_add(1, Ordering::Relaxed);
+        Self(waiters)
+    }
+}
+
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -214,7 +278,9 @@ impl DbAdmission {
 /// served `capacity` at a time. Zero before any hold time is known (the gate
 /// then just waits, bounded by its budget). Pure.
 pub(crate) fn predicted_wait(position: usize, avg_hold: Duration, capacity: usize) -> Duration {
-    avg_hold.saturating_mul(position.min(u32::MAX as usize) as u32) / capacity.max(1) as u32
+    let position = position.min(u32::MAX as usize) as u32;
+    let capacity = capacity.clamp(1, u32::MAX as usize) as u32;
+    avg_hold.saturating_mul(position) / capacity
 }
 
 /// `Retry-After` for a predicted wait: whole seconds, rounded up, at least
@@ -363,7 +429,7 @@ mod tests {
         // permit held, a request still runs at once (without a permit), and
         // the gate never touches the (unreachable) database.
         let pool = PgPool::connect_lazy("postgres://u:p@127.0.0.1:1/db").unwrap();
-        let gate = DbAdmission::new(pool, 5_000, 1).unwrap();
+        let gate = DbAdmission::new(pool, 30_000, 1).unwrap();
         let started = std::time::Instant::now();
         let first = gate.admit().await;
         assert!(
@@ -371,7 +437,8 @@ mod tests {
             "took the only slot"
         );
         assert!(matches!(gate.admit().await, Admission::Run(None)));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // Waiting would take the 30 s budget.
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]
@@ -466,7 +533,7 @@ mod tests {
     /// wait.
     #[tokio::test]
     async fn a_backlog_longer_than_the_wait_sheds_at_once_with_its_length() {
-        let Some(pool) = crate::testing::try_pool_with(1).await else {
+        let Some(pool) = db_or_skip(module_path!()).await else {
             return;
         };
         let gate = DbAdmission::new(pool.clone(), 2_000, 1).unwrap();
@@ -479,21 +546,91 @@ mod tests {
         gate.waiters.store(1, Ordering::Relaxed);
         let started = std::time::Instant::now();
         let decision = gate.admit().await;
-        assert!(
-            started.elapsed() < Duration::from_millis(500),
-            "no queueing"
-        );
+        // Queueing would take the whole 2 s wait; a shed at once does not.
+        assert!(started.elapsed() < gate.wait, "no queueing");
         match decision {
             Admission::Shed { retry_after_secs } => assert_eq!(retry_after_secs, 10),
             Admission::Run(_) => panic!("a 10 s backlog over a 2 s wait must shed"),
         }
         // The client just told to come back counts toward the next one's
         // Retry-After, so returning clients are spread out, not bunched.
-        assert_eq!(gate.deferred.load(Ordering::Relaxed), 1);
+        assert_eq!(gate.deferred.live(now_secs()), 1);
         match gate.admit().await {
             Admission::Shed { retry_after_secs } => assert_eq!(retry_after_secs, 15),
             Admission::Run(_) => panic!("still over the wait"),
         }
+    }
+
+    /// A one-connection pool for the DB-backed tests. CI sets
+    /// `AK_TESTS_REQUIRE_DB=1`, under which an unreachable database panics
+    /// inside `try_pool_with`; without it the test says loudly that it did
+    /// not run instead of passing silently.
+    async fn db_or_skip(test: &str) -> Option<PgPool> {
+        let pool = crate::testing::try_pool_with(1).await;
+        if pool.is_none() {
+            eprintln!(
+                "SKIPPED {test}: no DATABASE_URL (set AK_TESTS_REQUIRE_DB=1 to fail instead)"
+            );
+        }
+        pool
+    }
+
+    #[test]
+    fn deferred_ring_counts_until_each_expiry_and_reuses_old_buckets() {
+        let ring = DeferredRing::default();
+        ring.add(10);
+        ring.add(10);
+        ring.add(12);
+        assert_eq!(ring.live(9), 3);
+        assert_eq!(ring.live(10), 1, "the two expiring at 10 are gone at 10");
+        assert_eq!(ring.live(12), 0);
+        // A lap later the bucket for 10 is reused, not added to.
+        ring.add(10 + DEFERRED_BUCKETS as u64);
+        assert_eq!(ring.live(20), 1);
+    }
+
+    #[test]
+    fn predicted_wait_survives_extreme_inputs() {
+        // Capacity past u32::MAX must not truncate to 0 and divide by zero.
+        let huge = usize::MAX;
+        assert_eq!(
+            predicted_wait(1, Duration::from_secs(1), huge),
+            Duration::ZERO
+        );
+        assert!(predicted_wait(huge, Duration::from_secs(1), 1) > Duration::from_secs(1 << 31));
+    }
+
+    /// The request goes away (reset stream, request timeout) while it is
+    /// queued for a slot: the admit future is dropped mid-wait, and the
+    /// queued count must still come back down, or the first-waiter rule,
+    /// the predicted wait and Retry-After stay inflated until restart.
+    #[tokio::test]
+    async fn a_request_dropped_while_queued_leaves_the_queue_count_at_zero() {
+        let Some(pool) = db_or_skip(module_path!()).await else {
+            return;
+        };
+        let gate = DbAdmission::new(pool.clone(), 30_000, 1).unwrap();
+        let Admission::Run(Some(_held_slot)) = gate.admit().await else {
+            panic!("an idle gate hands out its slot");
+        };
+        let _held_conn = pool.acquire().await.expect("hold the only connection");
+
+        let queued = {
+            let gate = gate.clone();
+            tokio::spawn(async move { gate.admit().await })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while gate.waiters.load(Ordering::Relaxed) == 0 {
+            assert!(std::time::Instant::now() < deadline, "never queued");
+            tokio::task::yield_now().await;
+        }
+        queued.abort();
+        let _ = queued.await;
+        assert_eq!(gate.waiters.load(Ordering::Relaxed), 0);
+
+        // And via a timeout wrapper, the shape the request timeout has.
+        let _ = tokio::time::timeout(Duration::from_millis(50), gate.admit()).await;
+        assert_eq!(gate.waiters.load(Ordering::Relaxed), 0);
     }
 
     fn gated_router(gate: Arc<DbAdmission>) -> Router {
@@ -522,13 +659,14 @@ mod tests {
     /// The next request is answered 503 within the admission wait instead of
     /// queueing to the pool's acquire timeout (30 s here); a probe still
     /// passes; a permit released within the wait admits the request; and
-    /// once both are released, requests are admitted again.
+    /// once both are released, requests are admitted again. Timings are
+    /// asserted against the 30 s alternative, with room for a loaded runner.
     #[tokio::test]
     async fn saturated_pool_sheds_fast_and_recovers() {
-        let Some(pool) = crate::testing::try_pool_with(1).await else {
+        let Some(pool) = db_or_skip(module_path!()).await else {
             return;
         };
-        let gate = DbAdmission::new(pool.clone(), 200, 1).unwrap();
+        let gate = DbAdmission::new(pool.clone(), 1_000, 1).unwrap();
         let router = gated_router(gate.clone());
 
         let (status, _) = status_of(&router, "/work").await;
@@ -541,8 +679,8 @@ mod tests {
         let (status, elapsed) = status_of(&router, "/work").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(
-            elapsed < Duration::from_secs(2),
-            "shed after the 200 ms wait, not the pool's acquire timeout: {elapsed:?}"
+            elapsed < Duration::from_secs(10),
+            "shed after the 1 s wait, not the pool's 30 s acquire timeout: {elapsed:?}"
         );
         let (status, _) = status_of(&router, "/readyz").await;
         assert_eq!(status, StatusCode::OK, "probes are never gated");
