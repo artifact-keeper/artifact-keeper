@@ -105,7 +105,9 @@ without holding a slot. When every slot is held and the pool is busy, a
 request may queue for one for up to `DATABASE_REQUEST_ACQUIRE_WAIT_MS`
 (default 2000, below the pool's 5 s acquire timeout). Before it queues, the
 gate predicts its wait from what it measures: the requests queued ahead,
-times the moving average of how long a slot is held, divided by the slots.
+times the moving average of how long a slot is held (a hold longer than the
+budget counts as the budget, so one stuck request does not skew it),
+divided by the slots. The first request to queue always gets to wait.
 A backlog predicted to outlast the budget is answered at once with the same
 `503 POOL_EXHAUSTED` body and a `Retry-After` (1 to 30 s) predicted
 from the queue plus every client already told to come back, so clients that
@@ -151,32 +153,30 @@ To keep the behaviour before 1.13: `DATABASE_REQUEST_ACQUIRE_WAIT_MS=0` or
 (probes share the request pool).
 
 Measured with `scripts/perf/db-pool-burst.sh` (24 installers x 50 fetches in
-flight, anonymous downloads from a public generic repository, clients retry a
-503 after its `Retry-After` up to 30 times, 30 s client timeout per attempt).
-One backend container (4 CPUs, `GLOBAL_MAX_CONCURRENCY=4096` so the global
-limit does not shed first, `DATABASE_MAX_CONNECTIONS=8`), Postgres with every
-round trip delayed by netem to make the burst exhaust the pool. Before is
-1.12.x (main `5d99629`), after is this change with its defaults.
+flight, anonymous downloads from a public generic repository, each client
+retries a 503 after its `Retry-After` at most 5 times, 30 s client timeout per
+attempt). One backend container (4 CPUs, `GLOBAL_MAX_CONCURRENCY=4096` so the
+global limit does not shed first, `DATABASE_MAX_CONNECTIONS=8`), Postgres
+with every round trip delayed by netem to make the burst exhaust the pool.
+Before is 1.12.x (main `5d99629`), after is the gate with its defaults.
 
 | Run | Installs done | Wall | 2xx p50 / p99 | Other answers | `/readyz` during the burst |
 |---|---|---|---|---|---|
-| +2 ms, 200 files each, before | 24 / 24 | 37.1 s | 9.19 s / 9.31 s | none | 13 / 13 ok, slowest 3.5 s |
-| +2 ms, 200 files each, after | 24 / 24 | 39.0 s | 0.75 s / 1.00 s | 23,759 `503` + `Retry-After`, p50 0.50 s | 76 / 76 ok, slowest 0.39 s |
-| +8 ms, 50 files each, before | 24 / 24 | 92.6 s | 28.3 s / 29.9 s | 2,218 client timeouts at 30 s | 8 / 13 ok, 5 timed out at 10 s |
-| +8 ms, 50 files each, after | 24 / 24 | 35.9 s | 1.44 s / 2.05 s | 13,289 `503` + `Retry-After`, p50 0.50 s | 65 / 65 ok, slowest 0.41 s |
+| +2 ms, 200 files each, before | 24 / 24 | 37.4 s | 9.25 s / 9.42 s | none | 13 / 13 ok, slowest 3.5 s |
+| +2 ms, 200 files each, after | 24 / 24 | 43.2 s | 1.94 s / 2.25 s | 3,236 `503` + `Retry-After` | 83 / 83 ok, slowest 0.41 s |
+| +8 ms, 50 files each, before | 24 / 24 | 92.6 s | 28.3 s / 29.7 s | 2,240 client timeouts at 30 s | 8 / 13 ok, 5 timed out at 10 s |
+| +8 ms, 50 files each, after | 24 / 24 | 44.6 s | 0.36 s / 3.17 s | 2,129 `503` + `Retry-After` | 81 / 81 ok, slowest 0.46 s |
 
-Throughput is set by the database either way (about 125 to 130 files a second
-in the first pair), so where the burst stays inside the clients' patience the
-gate moves the waiting from the server to the clients' back-off: served
-requests drop from 9 s to under 1 s, the fleet finishes in about the same
-time, and readiness stays fast. Where it does not (the second pair), every
-request on 1.12.x slowed to the client timeout, timed-out work was thrown
-away, and readiness failed; with the gate the same fleet finished 2.6x
-sooner with no timeouts. The trade-off: a client with a small retry budget
-gives up sooner on 503s than on a slow answer (with 5 retries instead of 30,
-the first pair's installs did not finish), so give a fleet a pool and server
-sized for its burst (below) and treat the gate as the overload backstop, not
-the steady state.
+Throughput is set by the database either way. Where the burst stays inside
+the clients' patience (the first pair), the gate turns a 9 s wait for every
+request into a bounded 2 s one plus a back-off for the rest, at the cost of a
+somewhat longer fleet wall time (+15 % here); readiness stays fast. Where it
+does not (the second pair), every request on 1.12.x slowed to the client
+timeout and timed-out work was thrown away; with the gate the same fleet
+finished in half the time with no timeouts. A gate that told every shed
+client to retry after 1 s did worse: they collided again, and clients with 5
+retries gave up. Give a fleet a pool and server sized for its burst (below)
+and treat the gate as the overload backstop, not the steady state.
 
 ## Conda package downloads under an installer fleet
 
