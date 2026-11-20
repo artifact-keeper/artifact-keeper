@@ -1674,6 +1674,96 @@ mod tests {
         cleanup(&pool, provider_id, &username).await;
     }
 
+    /// #6160: a directory username/password must be resolved on the
+    /// no-repository path of `repo_visibility_middleware` too. Without the
+    /// passthrough there, a valid LDAP credential fell into the
+    /// `InvalidCredential` arm and got the anonymous 401 instead of the
+    /// existence-hiding 404 a valid caller receives for a nonexistent repo.
+    #[tokio::test]
+    async fn test_nonexistent_repo_resolves_ldap_credential_6160() {
+        use crate::api::middleware::auth::{repo_visibility_middleware, RepoVisibilityState};
+        use axum::body::Body;
+        use axum::http::header::AUTHORIZATION;
+        use axum::http::{Request as HttpRequest, StatusCode};
+        use axum::routing::get;
+        use axum::Router;
+        use base64::Engine as _;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        if !encryption_key_available() {
+            return;
+        }
+        let Some(pool) = test_db_helpers::try_pool().await else {
+            return;
+        };
+
+        let suffix = Uuid::new_v4().simple().to_string();
+        let username = format!("ldapmissing{suffix}");
+        let dn = format!("uid={username},ou=people,{BASE}");
+        let ops: crate::services::ldap_service::tests::OpsLog = Default::default();
+        let port = spawn_mock_directory(MockDirectory {
+            service_dn: MOCK_SERVICE_DN.to_string(),
+            entry: Some((
+                dn.clone(),
+                username.clone(),
+                format!("{username}@example.com"),
+            )),
+            user_bind_rc: 0x00,
+            ops: ops.clone(),
+        })
+        .await;
+        let provider_id = create_provider(&pool, &format!("missing-{suffix}"), port).await;
+        insert_known_user(&pool, &username, &dn, provider_id).await;
+
+        let vis = RepoVisibilityState {
+            auth_service: Arc::new(test_auth_service(&pool)),
+            db: pool.clone(),
+            repo_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            permission_service: Arc::new(
+                crate::services::permission_service::PermissionService::new(pool.clone()),
+            ),
+        };
+        let uri = "/maven/missing-repo/com/example/app/1.0/app-1.0.pom";
+        let app = Router::new().route(uri, get(|| async { "pom" })).layer(
+            axum::middleware::from_fn_with_state(vis, repo_visibility_middleware),
+        );
+        let basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD
+                .encode(format!("{username}:directory-password"))
+        );
+        let _pin = test_seam::SettingsOverride::set(settings());
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .header(AUTHORIZATION, basic)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let binds = count(&ops, "bind");
+        cleanup(&pool, provider_id, &username).await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a valid LDAP credential on a nonexistent repo must get the \
+             existence-hiding 404, not the 401 an invalid credential gets"
+        );
+        assert_eq!(
+            binds, 1,
+            "the no-repo branch must try the LDAP passthrough exactly once"
+        );
+    }
+
     #[tokio::test]
     async fn test_distinct_failure_cap_stops_binding() {
         if !encryption_key_available() {

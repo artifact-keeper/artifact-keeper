@@ -290,6 +290,9 @@ pub(crate) struct UnscannedArchiveRuns<'a, L> {
     pub default_content_type: &'a str,
     pub disposition: Option<&'a str>,
     pub ctx: &'a DownloadContext,
+    /// Read a Remote member's credentialed upstream refusal as unavailable
+    /// rather than a miss (#6214, the Go module-zip walk).
+    pub report_refusals: bool,
 }
 
 /// A Virtual download walk with scan-on-proxy for an archive format (#4097).
@@ -317,18 +320,33 @@ where
     SFut: std::future::Future<Output = Result<Response, Response>>,
 {
     let runs = &runs;
+    let db = &state.db;
     let unscanned_run = |run: Vec<Repository>, fallback| async move {
-        match proxy_helpers::resolve_virtual_download_from_members_with_fetch_urls(
-            run,
-            fallback,
-            Some(runs.proxy),
-            runs.path,
-            runs.member_fetch_urls,
-            Some(runs.ctx),
-            &runs.local_fetch,
-        )
-        .await
-        {
+        let resolved = if runs.report_refusals {
+            proxy_helpers::resolve_virtual_download_from_members_reporting_refusals(
+                db,
+                run,
+                fallback,
+                Some(runs.proxy),
+                runs.path,
+                runs.member_fetch_urls,
+                Some(runs.ctx),
+                &runs.local_fetch,
+            )
+            .await
+        } else {
+            proxy_helpers::resolve_virtual_download_from_members_with_fetch_urls(
+                run,
+                fallback,
+                Some(runs.proxy),
+                runs.path,
+                runs.member_fetch_urls,
+                Some(runs.ctx),
+                &runs.local_fetch,
+            )
+            .await
+        };
+        match resolved {
             Ok(result) => Some(proxy_helpers::stream_fetch_result(
                 result,
                 runs.default_content_type,
@@ -487,6 +505,7 @@ where
         default_content_type: route.default_content_type,
         disposition: route.virtual_disposition,
         ctx,
+        report_refusals: false,
     };
     let scanned = &scanned;
     let disposition = route.virtual_disposition;
