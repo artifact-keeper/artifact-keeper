@@ -178,6 +178,98 @@ pub const LISTING_MAX_POM_PROBES: usize = 64;
 /// How many POMs a listing fetches at once.
 pub const LISTING_POM_CONCURRENCY: usize = 8;
 
+/// How long a filtered listing that left versions undated is reused (#6284).
+///
+/// While a GA is still being dated, every filter pass dates the next
+/// [`LISTING_MAX_POM_PROBES`] versions and so returns a longer document than
+/// the one before. Without this memo the `maven-metadata.xml.sha1` request
+/// (a second pass) hashed a different document than the body the client had
+/// just downloaded, and two downloads in a row differed. Within this window
+/// the body and every checksum sidecar are served from the same bytes; the
+/// next pass after it continues dating where the memoized one stopped.
+pub const LISTING_MEMO_TTL: Duration = Duration::from_secs(15);
+
+/// What a memoized filtered listing is keyed by: the repository, its
+/// upstream, the metadata path, the policy that filtered it and a digest of
+/// the upstream document it was filtered from, so a changed upstream
+/// document, a repointed Remote or a changed policy never reuses it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ListingMemoKey {
+    repo_id: Uuid,
+    upstream_url: String,
+    path: String,
+    min_age_days: i32,
+    mode: &'static str,
+    upstream_sha256: [u8; 32],
+}
+
+impl ListingMemoKey {
+    pub fn new(
+        repo_id: Uuid,
+        upstream_url: &str,
+        path: &str,
+        min_age_days: i32,
+        mode: &'static str,
+        upstream_doc: &[u8],
+    ) -> Self {
+        use sha2::{Digest, Sha256};
+        Self {
+            repo_id,
+            upstream_url: upstream_url.to_string(),
+            path: path.trim_matches('/').to_string(),
+            min_age_days,
+            mode,
+            upstream_sha256: Sha256::digest(upstream_doc).into(),
+        }
+    }
+}
+
+/// Total bytes of memoized listings kept at once. Weighed by document size,
+/// so a few very large `maven-metadata.xml` documents cannot pin far more
+/// memory than this.
+const LISTING_MEMO_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+static LISTINGS: Lazy<MokaCache<ListingMemoKey, bytes::Bytes>> = Lazy::new(|| {
+    MokaCache::builder()
+        .weigher(|_, v: &bytes::Bytes| v.len().min(u32::MAX as usize) as u32)
+        .max_capacity(LISTING_MEMO_MAX_BYTES)
+        .time_to_live(LISTING_MEMO_TTL)
+        .support_invalidation_closures()
+        .build()
+});
+
+/// The filtered listing a recent pass produced for `key`, if any.
+pub async fn memo_listing(key: &ListingMemoKey) -> Option<bytes::Bytes> {
+    LISTINGS.get(key).await
+}
+
+/// Keep a filtered listing whose pass left versions undated, so the next
+/// requests for the document and its checksums within [`LISTING_MEMO_TTL`]
+/// get the same bytes, and return the listing to serve. The first writer
+/// wins: when concurrent passes over one document finish, each serves the
+/// listing stored first, so no client in the window gets a body whose
+/// checksum a later request contradicts.
+pub async fn remember_listing(key: ListingMemoKey, filtered: bytes::Bytes) -> bytes::Bytes {
+    LISTINGS.entry(key).or_insert(filtered).await.into_value()
+}
+
+/// Drop every memoized listing of `repo_id`. Called on each age-gate policy
+/// write and review decision (`invalidate_decision_memos`), so an approval,
+/// rejection or reopen shows on the next request instead of after the
+/// window. Process-local, like the memo.
+pub fn forget_listings_for_repo(repo_id: Uuid) {
+    // Only fails when the cache was built without closure support.
+    let _ = LISTINGS.invalidate_entries_if(move |key, _| key.repo_id == repo_id);
+}
+
+/// Drop one memoized listing (tests that step through successive passes).
+/// Per key, so a test never wipes an entry another test in the same process
+/// relies on.
+#[cfg(test)]
+pub(crate) async fn forget_listing(key: &ListingMemoKey) {
+    LISTINGS.invalidate(key).await;
+}
+
 /// The non-SNAPSHOT versions of a GA-level `maven-metadata.xml` that the gate
 /// evaluates, newest first (Maven version order), with the document's group
 /// and artifact ids and `lastUpdated`.
@@ -308,6 +400,101 @@ mod tests {
         );
         assert_eq!(gate_target("widget.jar"), None);
         assert_eq!(gate_target(".meta/prefixes.txt"), None);
+    }
+
+    #[tokio::test]
+    async fn listing_memo_is_keyed_by_document_policy_and_upstream_6284() {
+        let id = Uuid::new_v4();
+        let doc = b"<metadata>a</metadata>";
+        let key = |url: &str, path: &str, days: i32, doc: &[u8]| {
+            ListingMemoKey::new(id, url, path, days, "upstream_publish_time", doc)
+        };
+        let base = key("http://up/", "g/a/maven-metadata.xml", 7, doc);
+        remember_listing(base.clone(), bytes::Bytes::from_static(b"filtered")).await;
+        // The same document under a slash-spelled path reads the memo.
+        assert_eq!(
+            memo_listing(&key("http://up/", "/g/a/maven-metadata.xml/", 7, doc))
+                .await
+                .as_deref(),
+            Some(&b"filtered"[..])
+        );
+        // A changed upstream document, policy or upstream never does.
+        for other in [
+            key(
+                "http://up/",
+                "g/a/maven-metadata.xml",
+                7,
+                b"<metadata>b</metadata>",
+            ),
+            key("http://up/", "g/a/maven-metadata.xml", 8, doc),
+            key("http://other/", "g/a/maven-metadata.xml", 7, doc),
+            ListingMemoKey::new(
+                id,
+                "http://up/",
+                "g/a/maven-metadata.xml",
+                7,
+                "first_seen",
+                doc,
+            ),
+        ] {
+            assert_ne!(other, base);
+            assert!(memo_listing(&other).await.is_none());
+        }
+        forget_listing(&base).await;
+        assert!(memo_listing(&base).await.is_none());
+    }
+
+    /// Two passes over one document that end with different listings: both
+    /// serve, and the memo keeps, the one stored first (#6284).
+    #[tokio::test]
+    async fn concurrent_passes_serve_the_first_stored_listing_6284() {
+        let key = ListingMemoKey::new(
+            Uuid::new_v4(),
+            "http://up/",
+            "g/a/maven-metadata.xml",
+            7,
+            "upstream_publish_time",
+            b"<metadata/>",
+        );
+        let first = bytes::Bytes::from_static(b"63 versions");
+        let later = bytes::Bytes::from_static(b"127 versions");
+        let (a, b) = tokio::join!(
+            remember_listing(key.clone(), first.clone()),
+            remember_listing(key.clone(), later.clone())
+        );
+        // Whichever finished first is the one both serve.
+        assert_eq!(a, b, "both passes serve one document");
+        assert_eq!(memo_listing(&key).await, Some(a.clone()));
+        // A pass after that, with a longer listing, still serves the stored one.
+        assert_eq!(
+            remember_listing(key.clone(), bytes::Bytes::from_static(b"150")).await,
+            a
+        );
+        forget_listing(&key).await;
+    }
+
+    /// A review decision or policy write drops the memo of that repository
+    /// only (#6284).
+    #[tokio::test]
+    async fn forget_listings_for_repo_drops_only_that_repository_6284() {
+        let (mine, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let key = |repo| {
+            ListingMemoKey::new(
+                repo,
+                "http://up/",
+                "g/a/maven-metadata.xml",
+                7,
+                "upstream_publish_time",
+                b"<metadata/>",
+            )
+        };
+        let doc = bytes::Bytes::from_static(b"listing");
+        remember_listing(key(mine), doc.clone()).await;
+        remember_listing(key(other), doc.clone()).await;
+        forget_listings_for_repo(mine);
+        assert!(memo_listing(&key(mine)).await.is_none());
+        assert_eq!(memo_listing(&key(other)).await, Some(doc));
+        forget_listing(&key(other)).await;
     }
 
     #[test]
