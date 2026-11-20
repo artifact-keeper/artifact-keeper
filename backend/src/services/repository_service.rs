@@ -8300,6 +8300,58 @@ mod tests {
             cleanup_repo(&pool, repo.id).await;
         }
 
+        /// #5084 review: netting the three components per repository must not
+        /// turn 182's positive seed into an UPDATE-only no-op on an unseeded
+        /// row. A transaction that adds 100 hosted bytes and removes 100
+        /// proxy bytes nets to (+100, -100); 182 would seed `hosted_bytes`
+        /// and clamp `proxy_bytes` to zero, so the netted apply must too.
+        #[tokio::test]
+        async fn test_usage_ledger_mixed_delta_seeds_unseeded_row_5084() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Generic))
+                .await
+                .expect("create repo");
+
+            insert_proxy_cache(&pool, repo.id, "mixed/old", 100).await;
+            // Simulate a repository that predates the ledger: source rows
+            // exist, but no ledger row does.
+            sqlx::query("DELETE FROM repository_usage_ledger WHERE repository_id = $1")
+                .bind(repo.id)
+                .execute(&pool)
+                .await
+                .expect("clear ledger row");
+            assert_eq!(ledger_row(&pool, repo.id).await, (0, 0, 0));
+
+            let mut tx = pool.begin().await.expect("begin mixed delta");
+            insert_artifact_in_tx(&mut tx, repo.id, "mixed/new", 100)
+                .await
+                .expect("insert hosted row");
+            sqlx::query(
+                "DELETE FROM proxy_cache_artifacts \
+                  WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(repo.id)
+            .bind("mixed/old")
+            .execute(&mut *tx)
+            .await
+            .expect("delete proxy row");
+            tx.commit().await.expect("commit mixed delta");
+
+            assert_eq!(
+                ledger_row(&pool, repo.id).await,
+                (100, 0, 0),
+                "mixed-sign net delta must seed the positive component"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
         /// #2992: migration 183's one-time true-up sets every ledger row to
         /// the authoritative live sums (DO UPDATE, unlike 171's DO NOTHING),
         /// erasing pre-trigger drift. Exercises the same statement scoped to

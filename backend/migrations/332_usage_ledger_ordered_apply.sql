@@ -104,10 +104,60 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- ---------------------------------------------------------------------------
+-- Apply one netted delta. Migration 182 seeded a missing ledger row only when
+-- every component of the delta was non-negative; a mixed-sign batch took the
+-- UPDATE-only branch and left an unseeded repository uncharged. Netting the
+-- whole transaction can produce that mixed shape even when the individual
+-- writes were all positive or all negative, so seed each positive component
+-- here and preserve 182's rule that an all-negative batch creates no row.
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION ak_usage_ledger_apply(
+    p_repository_id UUID,
+    p_hosted_delta  BIGINT,
+    p_proxy_delta   BIGINT,
+    p_oci_delta     BIGINT
+) RETURNS void AS $$
+BEGIN
+    IF p_repository_id IS NULL
+       OR (p_hosted_delta = 0 AND p_proxy_delta = 0 AND p_oci_delta = 0) THEN
+        RETURN;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM repository_usage_ledger WHERE repository_id = p_repository_id
+    ) THEN
+        UPDATE repository_usage_ledger SET
+            hosted_bytes = GREATEST(hosted_bytes + p_hosted_delta, 0),
+            proxy_bytes  = GREATEST(proxy_bytes  + p_proxy_delta, 0),
+            oci_bytes    = GREATEST(oci_bytes    + p_oci_delta, 0),
+            updated_at   = now()
+        WHERE repository_id = p_repository_id;
+    ELSE
+        IF p_hosted_delta <= 0 AND p_proxy_delta <= 0 AND p_oci_delta <= 0 THEN
+            RETURN;
+        END IF;
+        INSERT INTO repository_usage_ledger
+            (repository_id, hosted_bytes, proxy_bytes, oci_bytes, updated_at)
+        VALUES (p_repository_id,
+                GREATEST(p_hosted_delta, 0),
+                GREATEST(p_proxy_delta, 0),
+                GREATEST(p_oci_delta, 0),
+                now())
+        ON CONFLICT (repository_id) DO UPDATE SET
+            hosted_bytes = GREATEST(repository_usage_ledger.hosted_bytes + p_hosted_delta, 0),
+            proxy_bytes  = GREATEST(repository_usage_ledger.proxy_bytes  + p_proxy_delta, 0),
+            oci_bytes    = GREATEST(repository_usage_ledger.oci_bytes    + p_oci_delta, 0),
+            updated_at   = now();
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ---------------------------------------------------------------------------
 -- Apply every queued delta of this transaction in repository-id order, then
--- clear both transaction-local tables. `ak_usage_ledger_apply` is deliberately
--- unchanged: it still self-seeds on growth, shrinks with a plain UPDATE (the
--- repository can already be gone) and floors at zero.
+-- clear both transaction-local tables. The ordered walk is the only place that
+-- takes ledger-row locks for trigger-queued writes; zero-net deltas return
+-- from `ak_usage_ledger_apply` before touching a row.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION ak_usage_ledger_flush() RETURNS trigger AS $$
