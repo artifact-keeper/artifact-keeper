@@ -264,6 +264,9 @@ pub struct AppState {
     /// This replica's view of the monthly download transfer counter
     /// (`TRANSFER_QUOTA_BYTES`, see [`crate::services::quota`]).
     pub transfer_meter: Arc<crate::services::quota::TransferMeter>,
+    /// Cancelled when the process shuts down. Work spawned from a request
+    /// that outlives it (migration jobs) runs under a child of this token.
+    pub shutdown_token: tokio_util::sync::CancellationToken,
 }
 
 /// The quota handles every `AppState` constructor installs: the process-wide
@@ -352,6 +355,7 @@ impl AppState {
             auth_semaphore,
             guest_access_policy,
             transfer_meter,
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -406,6 +410,7 @@ impl AppState {
             auth_semaphore,
             guest_access_policy,
             transfer_meter,
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
         }
     }
 

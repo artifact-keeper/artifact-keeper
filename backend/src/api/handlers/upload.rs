@@ -2359,6 +2359,12 @@ fn completed_package_catalog_entry(
     // chunked Maven uploads that carry their coordinates only in the path.
     let metadata = replicated_maven_artifact_metadata(session);
     let maven_layout = matches!(format, RepositoryFormat::Maven | RepositoryFormat::Gradle);
+    // #6271: without replicated POM metadata the path is the only coordinate,
+    // and a file outside the GAV layout is not a package
+    if maven_layout && metadata.is_none() {
+        return crate::services::package_service::maven_catalog_coordinates(&session.artifact_path)
+            .map(|(name, version, _)| (name, version));
+    }
     let version = if maven_layout {
         metadata
             .and_then(|m| m.get("version"))
@@ -3191,6 +3197,21 @@ mod tests {
             completed_package_catalog_entry(&session, &RepositoryFormat::Generic),
             None
         );
+    }
+
+    #[test]
+    fn test_completed_package_catalog_entry_skips_non_gav_maven_files_6271() {
+        for path in [
+            "com/myDomain/notes.txt",
+            "com/acme/widget/1.2.3/_remote.repositories",
+        ] {
+            let session = test_upload_session(path, Some("com"), Some("myDomain"));
+            assert_eq!(
+                completed_package_catalog_entry(&session, &RepositoryFormat::Maven),
+                None,
+                "{path}"
+            );
+        }
     }
 
     #[test]

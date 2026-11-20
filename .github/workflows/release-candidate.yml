@@ -480,7 +480,7 @@ jobs:
     timeout-minutes: 130
     permissions:
       contents: read
-      actions: read
+      actions: write   # re-run a commit's replaced Docker Publish run (#6242)
     outputs:
       run_id: ${{ steps.publish.outputs.run_id }}
     steps:
@@ -500,6 +500,16 @@ jobs:
       # Since #3629 that is a narrower set than "a docs-only tip": CHANGELOG.md,
       # the changes/** fragments and .github/release-notes/** build, because a
       # cut ends on one of them.
+      #
+      # A CANCELLED run is re-run, not a verdict (#6242). Main pushes
+      # coalesce in docker-publish.yml's concurrency group: when another
+      # merge lands while this commit's run is still pending, GitHub replaces
+      # it (cancelled, zero jobs), and the prep commit of a cut is exactly
+      # such a commit whenever main keeps moving. `gh run rerun` re-runs that
+      # same push run (same signing identity, same provenance), and a re-run
+      # attempt has a concurrency group of its own, so it cannot be replaced
+      # again. Twice at most: a run somebody keeps cancelling is a decision,
+      # and a failed build stays a failure.
       - name: Wait for a successful Docker Publish run for this commit
         id: publish
         env:
@@ -509,9 +519,11 @@ jobs:
         run: |
           set -euo pipefail
           APPEAR_DEADLINE=$(($(date +%s) + 15*60))
+          RERUNS=0
           while true; do
             rc=0; out=""
             out="$(RESOLVE_REPO="${GITHUB_REPOSITORY}" RESOLVE_SHA="${SHA}" RESOLVE_REF="${BRANCH}" \
+              RESOLVE_REPORT_CANCELLED=1 \
               bash scripts/ci/resolve-candidate-publish-run.sh)" || rc=$?
             case "$rc" in
               0)
@@ -523,6 +535,25 @@ jobs:
               20)
                 echo "::error title=Docker Publish failed for this commit::Every Docker Publish run for ${BRANCH}@${SHA} completed without success, so there are no scanned images to certify. Fix the cause on main; the next commit that publishes cleanly is the candidate."
                 exit 1 ;;
+              22)
+                CANCELLED_RUN="${out#*run_id=}"
+                if [[ "$RERUNS" -ge 2 ]]; then
+                  echo "::error title=Docker Publish cancelled for this commit::Docker Publish run ${CANCELLED_RUN} for ${BRANCH}@${SHA} was cancelled again after ${RERUNS} re-runs by this candidate. Find out who or what cancels it (docker-publish-watchdog.yml cancels runs queued with no runner for 30m), then dispatch the candidate again."
+                  exit 1
+                fi
+                RERUNS=$((RERUNS + 1))
+                echo "  Docker Publish run ${CANCELLED_RUN} for ${SHA} was cancelled before it published (a newer main push replaced it, or it was cancelled by hand); re-running it (${RERUNS}/2)."
+                if ! gh run rerun "${CANCELLED_RUN}" --repo "${GITHUB_REPOSITORY}"; then
+                  echo "::error title=Could not re-run Docker Publish::gh run rerun ${CANCELLED_RUN} failed. Re-run it by hand (gh run rerun ${CANCELLED_RUN}), then dispatch the candidate again."
+                  exit 1
+                fi
+                # Until the re-run attempt shows, the run still reads as
+                # cancelled; do not count that as a second cancellation.
+                for _ in $(seq 1 18); do
+                  st="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CANCELLED_RUN}" --jq .status 2>/dev/null || echo unknown)"
+                  [[ "$st" != completed ]] && break
+                  sleep 10
+                done ;;
               21|30)
                 if [[ "$(date +%s)" -ge "$APPEAR_DEADLINE" ]]; then
                   echo "::error title=No Docker Publish run for this commit::No docker-publish.yml run exists for ${BRANCH}@${SHA} after 15m. A commit touching only markdown other than CHANGELOG.md, changes/** and .github/release-notes/**, or only .beads/** or LICENSE, is skipped by docker-publish.yml's path filter and gets no build (#3629): certify the newest commit that has one, or land a change outside that set."
@@ -1130,7 +1161,7 @@ jobs:
     # sha, and
     # scripts/ci/check-gate-workflow-pins.sh enforces both that and that the
     # sha is on artifact-keeper-test main.
-    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@987bccd15df3fd4c9c24bf78436ce12fb5bd5783 # artifact-keeper-test main as of 2026-11-18
+    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@1c4552bd7ef12cbc05541f18dbba5868c4444b5b # artifact-keeper-test main as of 2026-11-19
     with:
       backend_tag: sha-${{ needs.resolve.outputs.short }}
       # The chart ref the gate deploys. `bookkeeping` renders the chart at this

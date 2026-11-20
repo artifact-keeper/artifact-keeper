@@ -1731,30 +1731,11 @@ impl ArtifactService {
                             RepositoryFormat::Maven | RepositoryFormat::Gradle
                         ) =>
                     {
-                        // #4197: `maven-metadata.xml` and checksum/signature
-                        // sidecars are repository metadata, not packages —
-                        // `parse_coordinates` would read the artifactId
-                        // directory as a version and register a bogus row.
-                        // Same skip predicate as the catalog backfill, so
-                        // publish time and backfill can never disagree.
-                        if crate::services::package_service::is_maven_sidecar(&artifact.path) {
-                            None
-                        } else {
-                            match crate::formats::maven::MavenHandler::parse_coordinates(
-                                &artifact.path,
-                            ) {
-                                Ok(coords) => Some((
-                                    format!("{}:{}", coords.group_id, coords.artifact_id),
-                                    coords.version,
-                                    // #4633: a Maven version is the sum of
-                                    // the files in its directory.
-                                    crate::api::handlers::maven::maven_version_directory(
-                                        &artifact.path,
-                                    ),
-                                )),
-                                Err(_) => Some((artifact.name.clone(), ver.clone(), None)),
-                            }
-                        }
+                        // #4197, #6271: sidecars, resolver files and paths
+                        // that are not `groupId/artifactId/version/file` are
+                        // not packages. Same helper as the catalog backfill,
+                        // so publish time and backfill can never disagree.
+                        crate::services::package_service::maven_catalog_coordinates(&artifact.path)
                     }
                     _ => Some((artifact.name.clone(), ver.clone(), None)),
                 },
@@ -3010,7 +2991,7 @@ impl ArtifactService {
 
     /// Stop advertising soft-deleted versions of repository `repository_id`
     /// (#5604, #5632, #5676): move each affected catalog row's Latest to the
-    /// newest version still live and, for an npm repository only, drop the
+    /// newest version still live and, for an npm-family repository only, drop the
     /// dist-tags that name a version with no live artifact left.
     ///
     /// The single post-commit step every soft delete shares: the per-artifact
@@ -3061,7 +3042,7 @@ impl ArtifactService {
                 );
             }
         }
-        if format != "npm" {
+        if !crate::api::handlers::npm::is_npm_family_format_key(&format) {
             return;
         }
         let mut by_package: std::collections::BTreeMap<&str, Vec<String>> =
@@ -5859,7 +5840,7 @@ mod tests {
     /// `packages`/`package_versions` rows on the GAV coordinates derived from
     /// the artifact path (`com.example.demo:app` / `1.2.3`), not on the naive
     /// path-segment name/version the generic handler computes. An unparseable
-    /// path keeps the bare-name fallback. Skips without `DATABASE_URL`.
+    /// path registers no package (#6271). Skips without `DATABASE_URL`.
     #[tokio::test]
     async fn test_generic_push_into_maven_repo_records_gav_catalog_entry() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -5907,7 +5888,7 @@ mod tests {
         .expect("package_versions row");
         assert_eq!(version, "1.2.3");
 
-        // Unparseable Maven path (< 4 segments): bare name/version fallback.
+        // Unparseable Maven path (< 4 segments): no package (#6271)
         svc.upload(
             repo_id,
             "misc/tools/tool.bin",
@@ -5920,16 +5901,13 @@ mod tests {
         .await
         .expect("fallback upload succeeds");
 
-        let (fallback_version,): (String,) = sqlx::query_as(
-            "SELECT pv.version FROM package_versions pv \
-             JOIN packages p ON p.id = pv.package_id \
-             WHERE p.repository_id = $1 AND p.name = 'misc'",
-        )
-        .bind(repo_id)
-        .fetch_one(&pool)
-        .await
-        .expect("fallback package_versions row");
-        assert_eq!(fallback_version, "tools");
+        let names: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM packages WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_all(&pool)
+                .await
+                .expect("list packages");
+        assert_eq!(names, vec!["com.example.demo:app".to_string()]);
 
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
@@ -7054,6 +7032,61 @@ mod tests {
                 .is_some(),
             "the real asset registers com.acme:widget"
         );
+    }
+
+    /// #6271: a file outside the `groupId/artifactId/version/file` layout
+    /// fell back to the naive path coordinate and registered the first group
+    /// directory as a package (`com` at version `myDomain`)
+    #[tokio::test]
+    async fn test_6271_non_gav_maven_files_register_no_catalog_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let service = ArtifactService::new(pool.clone(), storage);
+
+        for (path, name, version) in [
+            (
+                "com/acme/widget/1.2.3/widget-1.2.3.jar",
+                "widget-1.2.3.jar",
+                "1.2.3",
+            ),
+            // name and version as the generic upload derives them (#6271)
+            ("com/acme/widget/1.2.3/_remote.repositories", "com", "acme"),
+            ("com/myDomain/notes.txt", "com", "myDomain"),
+        ] {
+            service
+                .upload(
+                    repo_id,
+                    path,
+                    name,
+                    Some(version),
+                    "application/octet-stream",
+                    Bytes::from_static(b"bytes"),
+                    None,
+                )
+                .await
+                .expect("upload");
+        }
+
+        let names: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM packages WHERE repository_id = $1 ORDER BY name")
+                .bind(repo_id)
+                .fetch_all(&pool)
+                .await
+                .expect("list packages");
+        assert_eq!(names, vec!["com.acme:widget".to_string()]);
+        let artifacts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count artifacts");
+        assert_eq!(artifacts, 3, "every file keeps its artifact row");
     }
 }
 
