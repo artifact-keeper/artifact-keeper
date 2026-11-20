@@ -17198,6 +17198,52 @@ mod tests {
         assert_eq!(sidecar_codings, vec!["identity".to_string()]);
     }
 
+    /// #5983: a gzip-coded index that does not decode is the upstream's
+    /// fault, the client gets a 502, not the decoder's 400
+    #[tokio::test]
+    async fn test_resolver_index_bad_gzip_is_a_bad_gateway_5983() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+
+        let project = "badgz5983";
+        let wheel = "badgz5983-1.0-py3-none-any.whl";
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .insert_header("content-type", "text/html")
+                    .set_body_bytes(b"this is not a gzip stream".to_vec()),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let (status, body, _) = tdh::send_with_headers(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!(
+                "/{}/simple/{project}/{wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
     /// A repeated `.whl.metadata` request is served from the proxy cache
     /// (#3300), reaching upstream zero times.
     ///

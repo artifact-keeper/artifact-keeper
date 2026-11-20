@@ -1,5 +1,5 @@
 ---
-section: Changed
+section: Fixed
 issues: [#5983]
 ---
-- **The PyPI resolver reads the upstream simple index gzip-compressed** (#5983). Resolving a Remote file or `.whl.metadata` sidecar reads the project's whole simple index, and that read always went out as `Accept-Encoding: identity`, about 5x the bytes on the wire for a large project. That one read now asks for `gzip` and decodes it under the same 128 MiB `LARGE_METADATA_MAX_BYTES` cap the identity read had, a body that would inflate past it is refused instead of inflated. The index is only parsed, never served or cached, so downloads and every client-facing response keep the `identity` behaviour from #2915
+- **A cold PyPI `.whl.metadata` or file request downloaded the whole upstream simple index uncompressed** (#5983). Resolving a Remote file or sidecar reads the project's simple index, and since #2915 that read went out as `Accept-Encoding: identity`, about 5x the bytes on the wire for a large project (2.86 MB against 566 KB in the issue). That one read now asks for `gzip` and decodes it under the same 128 MiB `LARGE_METADATA_MAX_BYTES` cap the identity read had. A body that would inflate past the cap, a corrupt one or an unsupported coding is refused with a 502. The index is only parsed, never served or cached, so downloads and every client-facing response, the client-facing simple index included, keep the `identity` behaviour from #2915. Concurrent cold misses already share one read since #6047

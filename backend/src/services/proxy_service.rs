@@ -4697,10 +4697,14 @@ const USER_AGENT_CACHE_TTL_SECS: u64 = 60;
 /// TTL for cached per-repository egress-proxy clients.
 const EGRESS_CLIENT_CACHE_TTL_SECS: u64 = 60;
 
-/// Strip the content coding off an upstream body the caller only parses
+/// Strip the content coding off an upstream body the caller only parses. A
+/// corrupt body or one that inflates past `cap` is the upstream's fault, so it
+/// is a 502, not the 400 the decoder reports
 fn decode_parsed_upstream_body(body: Bytes, coding: Option<&str>, cap: u64) -> Result<Bytes> {
     use crate::util::content_coding::{strip_content_coding_to, Decoded};
-    let decoded = match strip_content_coding_to(&body, coding, cap)? {
+    let decoded = match strip_content_coding_to(&body, coding, cap).map_err(|e| {
+        AppError::BadGateway(format!("upstream body could not be decoded: {e}"))
+    })? {
         Decoded::Bytes(std::borrow::Cow::Owned(v)) => Some(v),
         Decoded::Bytes(std::borrow::Cow::Borrowed(_)) => None,
         Decoded::Unsupported => {
@@ -31260,13 +31264,28 @@ mod parsed_body_coding_tests {
     fn gzip_body_over_the_cap_is_refused_not_inflated() {
         let coded = gzip(&vec![b'a'; 64 * 1024]);
         assert!(coded.len() < 1024, "fixture must be small on the wire");
-        assert!(decode_parsed_upstream_body(coded, Some("gzip"), 1024).is_err());
+        assert!(matches!(
+            decode_parsed_upstream_body(coded, Some("gzip"), 1024),
+            Err(AppError::BadGateway(_))
+        ));
+    }
+
+    #[test]
+    fn corrupt_gzip_body_is_a_bad_gateway() {
+        let body = Bytes::from_static(b"not gzip at all");
+        assert!(matches!(
+            decode_parsed_upstream_body(body, Some("gzip"), 1024),
+            Err(AppError::BadGateway(_))
+        ));
     }
 
     #[test]
     fn unsupported_coding_is_refused() {
         let body = Bytes::from_static(b"not really brotli");
-        assert!(decode_parsed_upstream_body(body, Some("br"), 1024).is_err());
+        assert!(matches!(
+            decode_parsed_upstream_body(body, Some("br"), 1024),
+            Err(AppError::BadGateway(_))
+        ));
     }
 }
 
