@@ -50,6 +50,18 @@
 #       THIS commit's images. It would re-run a cancelled run (and can), but
 #       the re-run joins the back of the pool's queue, so the watchdog leaves
 #       the run alone and only reports it while a candidate is in flight.
+#     - no earlier started run on the branch was cancelled since the branch's
+#       last run that completed (#6297): at most ONE stuck-run cancel per
+#       advance. Under a pool that stays saturated, cancelling N lets N+1
+#       start at the BACK of the pool's queue (release/**, tags, the schedule
+#       and other repos' jobs share it), so a second cancel would only repeat
+#       that, and a steady merge stream could cancel every run in turn and
+#       starve `:main`. With the cap, N+1 is never cancelled for being stuck:
+#       it is reported and waits its turn, and the cap clears once it (or any
+#       later run) completes. "Cancelled after it started" means at least one
+#       job had a runner; a run coalesced away while pending has no jobs, and
+#       one cancelled while still queued (the #6080 rule) has none with a
+#       runner, so neither counts.
 #   Anything the watchdog cannot prove (an API read that failed) holds the
 #   cancel and reports instead.
 #
@@ -126,6 +138,25 @@ superseded() {
     2>/dev/null)" || return 2
   [[ "$n" =~ ^[0-9]+$ ]] || return 2
   (( n > 0 )) && return 0
+  return 1
+}
+
+# #6297: was an earlier started run on this branch cancelled since the
+# branch's newest earlier run that completed otherwise? 0 yes (hold), 1 no,
+# 2 could not tell (holds the cancel).
+cancelled_since_advance() {
+  local branch="$1" created="$2" rows rid rconc n
+  rows="$(gh api "repos/${REPO}/actions/workflows/${WORKFLOW}/runs?branch=${branch}&event=push&status=completed&per_page=30" \
+    --jq "[.workflow_runs[] | select(.created_at < \"${created}\")] | sort_by(.created_at) | reverse | .[] | [.id, (.conclusion // \"-\")] | @tsv" \
+    2>/dev/null)" || return 2
+  while IFS=$'\t' read -r rid rconc; do
+    [[ -z "$rid" ]] && continue
+    [[ "$rconc" != "cancelled" ]] && return 1   # it ran to an end: :main moved past here
+    n="$(gh api "repos/${REPO}/actions/runs/${rid}/jobs?per_page=100" \
+      --jq '[.jobs[] | select((.runner_name // "") != "")] | length' 2>/dev/null)" || return 2
+    [[ "$n" =~ ^[0-9]+$ ]] || return 2
+    (( n > 0 )) && return 0
+  done <<< "$rows"
   return 1
 }
 
@@ -215,6 +246,11 @@ while IFS=$'\t' read -r id sha branch event status attempt started created; do
       candidate_active; c=$?
       if (( c == 0 )); then hold="candidate-active"
       elif (( c == 2 )); then hold="candidate-unknown"
+      else
+        cancelled_since_advance "$branch" "$created"; k=$?
+        if (( k == 0 )); then hold="one-cancel-per-advance"
+        elif (( k == 2 )); then hold="cancel-history-unknown"
+        fi
       fi
     fi
   fi

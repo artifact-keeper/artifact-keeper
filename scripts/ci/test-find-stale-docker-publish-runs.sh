@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Self-test for scripts/ci/find-stale-docker-publish-runs.sh (#6080, #6289).
+# Self-test for scripts/ci/find-stale-docker-publish-runs.sh (#6080, #6289, #6297).
 #
 # The finder cancels runs, so its dangerous direction is cancelling a run
 # that is MOVING or NEEDED: one whose jobs have a runner, one that is merely
@@ -41,12 +41,14 @@ NOW=$(date -u -d '2026-11-16T12:00:00Z' +%s)
 FX="$WORK/fx"
 
 STUB="$WORK/bin"; mkdir -p "$STUB"
+STUB_PATH="$STUB:$PATH"
 # Fixtures (TSV, turned into API-shaped JSON by the stub):
-#   $FX/runs-<workflow file>.tsv  id sha branch event status attempt run_started_at created_at
+#   $FX/runs-<workflow file>.tsv  id sha branch event status attempt run_started_at created_at [conclusion]
 #   $FX/jobs-<run id>.tsv         status runner(- = none) created_at name
 # FAKE_RUNS_FAIL=1: every runs list fails; FAKE_SUPERSEDED_FAIL=1: the
 # branch-scoped runs list fails; FAKE_JOBS_FAIL_<id>=1: that run's jobs fail;
 # FAKE_CANCEL_FAIL=1: plain cancel answers 409; FAKE_FORCE_FAIL=1: force too.
+# FAKE_HISTORY_FAIL=1: the completed-runs list (#6297) fails.
 cat > "$STUB/gh" <<'STUBGH'
 #!/usr/bin/env bash
 [ "$1" = api ] || exit 0
@@ -67,7 +69,8 @@ param() { local q="${path#*\?}"; tr '&' '\n' <<<"$q" | sed -n "s/^$1=//p" | head
 case "$path" in
   *actions/workflows/*/runs*)
     [ "${FAKE_RUNS_FAIL-0}" = 1 ] && exit 1
-    [ -n "$(param branch)" ] && [ "${FAKE_SUPERSEDED_FAIL-0}" = 1 ] && exit 1
+    [ "$(param status)" = completed ] && [ "${FAKE_HISTORY_FAIL-0}" = 1 ] && exit 1
+    [ -n "$(param branch)" ] && [ "$(param status)" != completed ] && [ "${FAKE_SUPERSEDED_FAIL-0}" = 1 ] && exit 1
     wf="${path#*actions/workflows/}"; wf="${wf%%/*}"
     f="$FAKE_FX/runs-${wf}.tsv"; [ -f "$f" ] || : > "$f"
     jq -R -s --arg st "$(param status)" --arg br "$(param branch)" \
@@ -75,7 +78,7 @@ case "$path" in
       split("\n") | map(select(length > 0) | split("\t")
         | {id: (.[0]|tonumber), head_sha: .[1], head_branch: .[2], event: .[3],
            status: .[4], run_attempt: (.[5]|tonumber), run_started_at: .[6],
-           created_at: .[7]})
+           created_at: .[7], conclusion: (if (.[8] // "") == "" then null else .[8] end)})
       | map(select(($st == "" or .status == $st) and ($br == "" or .head_branch == $br)
                    and ($ev == "" or .event == $ev) and ($sha == "" or .head_sha == $sha)))
       | sort_by(.created_at) | reverse | {workflow_runs: .}' "$f" | jq -r "$filter"
@@ -96,10 +99,22 @@ STUBGH
 chmod +x "$STUB/gh"
 
 reset_fx() { rm -rf "$FX"; mkdir -p "$FX"; }
-# run <id> <sha> <branch> <event> <status> <attempt> <started> [created] [workflow]
+# run <id> <sha> <branch> <event> <status> <attempt> <started> [created] [workflow] [conclusion]
 run() {
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7" "${8:-$7}" \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7" "${8:-$7}" "${10:-}" \
     >> "$FX/runs-${9:-docker-publish.yml}.tsv"
+}
+# done_run <id> <created> <conclusion> [started|coalesced|stale]: an earlier
+# completed main push run. started = its jobs had runners (a run cancelled
+# after it started); coalesced = no jobs; stale = jobs never got a runner.
+done_run() {
+  run "$1" "$SHA_C" main push completed 1 "$2" "$2" docker-publish.yml "$3"
+  case "${4:-started}" in
+    started) job "$1" completed "GitHub Actions 9" "$2" "Publish identity preflight"
+             job "$1" completed - "$2" "Backend (linux/amd64)" ;;
+    stale)   job "$1" completed - "$2" "Publish identity preflight" ;;
+    coalesced) : ;;
+  esac
 }
 # job <run id> <status> <runner|-> <created> <name>
 job() { printf '%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "$5" >> "$FX/jobs-$1.tsv"; }
@@ -298,6 +313,65 @@ expect "superseded check fails -> reported (superseded-unknown)" 1 "hold=superse
 no_posts "superseded unknown"
 expect "jobs read fails -> skipped, exit 0" 0 "" STALE_ACTION=cancel FAKE_JOBS_FAIL_601=1
 no_posts "jobs unknown"
+
+# #6297: one stuck-run cancel per advance of the branch. A run cancelled after
+# it started, with no completed run since, holds the next cancel.
+stuck_fixture; done_run 600 2026-11-16T06:00:00Z cancelled
+expect "an earlier started run was cancelled, nothing completed since -> held" 1 \
+  "action=reported hold=one-cancel-per-advance" STALE_ACTION=cancel
+no_posts "one cancel per advance"
+stuck_fixture; done_run 599 2026-11-16T05:00:00Z cancelled; done_run 600 2026-11-16T06:00:00Z success
+expect "a run completed after the last cancel -> cancelled again" 1 "stuck run_id=601" STALE_ACTION=cancel
+posted "cap cleared by a completed run" 601
+stuck_fixture; done_run 600 2026-11-16T06:00:00Z failure
+expect "the newest earlier run failed (it ran) -> cancelled" 1 "stuck run_id=601" STALE_ACTION=cancel
+posted "a failed run clears the cap" 601
+stuck_fixture; done_run 599 2026-11-16T05:00:00Z success; done_run 600 2026-11-16T06:00:00Z cancelled coalesced
+expect "only a coalesced (no-job) cancel since -> cancelled" 1 "stuck run_id=601" STALE_ACTION=cancel
+posted "coalesced cancel does not count" 601
+stuck_fixture; done_run 600 2026-11-16T06:00:00Z cancelled stale
+expect "only a never-started (#6080) cancel since -> cancelled" 1 "stuck run_id=601" STALE_ACTION=cancel
+posted "stale cancel does not count" 601
+stuck_fixture; done_run 600 2026-11-16T08:00:00Z cancelled
+done_run 598 2026-11-16T05:00:00Z success
+expect "a cancelled run NEWER than the stuck one is not history -> cancelled" 1 "stuck run_id=601" STALE_ACTION=cancel
+posted "only earlier runs count" 601
+stuck_fixture
+expect "cancel history unreadable -> reported (cancel-history-unknown)" 1 "hold=cancel-history-unknown" STALE_ACTION=cancel FAKE_HISTORY_FAIL=1
+no_posts "history unknown"
+stuck_fixture; done_run 600 2026-11-16T06:00:00Z cancelled
+expect "history jobs unreadable -> reported (cancel-history-unknown)" 1 "hold=cancel-history-unknown" STALE_ACTION=cancel FAKE_JOBS_FAIL_600=1
+no_posts "history jobs unknown"
+
+# Replay (#6297): a pool that never frees up within the threshold and a merge
+# landing every cycle. Each cycle the oldest started run is stuck and a newer
+# push waits. Without the cap every run is cancelled and nothing completes;
+# with it, a cancelled run's successor is held, completes, and `:main` moves.
+replay() {  # prints the per-cycle actions: c (cancelled) or h (held, then completed)
+  local cur hist=() t r _
+  cur=700
+  for _ in 1 2 3 4 5 6 7 8; do
+    reset_fx
+    for r in "${hist[@]}"; do done_run "${r%%:*}" "2026-11-16T0$(( (${r%%:*} - 700) / 10 )):00:00Z" "${r#*:}"; done
+    t="2026-11-16T0$(( (cur - 700) / 10 )):30:00Z"
+    run "$cur" "$SHA_A" main push in_progress 1 "$t"
+    done_but_amd64 "$cur" queued - "$t"
+    run $((cur + 10)) "$SHA_B" main push pending 1 "2026-11-16T0$(( (cur - 700) / 10 )):45:00Z"
+    : > "$WORK/posts"
+    env PATH="$STUB_PATH" STALE_REPO=artifact-keeper/artifact-keeper STALE_NOW="$NOW" \
+      FAKE_POSTS="$WORK/posts" FAKE_QUERIES="$WORK/queries" FAKE_FX="$FX" STALE_ACTION=cancel \
+      bash "$FINDER" >/dev/null 2>&1
+    if grep -q "/runs/${cur}/cancel" "$WORK/posts"; then printf c; hist+=("${cur}:cancelled")
+    else printf h; hist+=("${cur}:success"); fi
+    cur=$((cur + 10))
+  done
+}
+seq_="$(replay)"
+case "$seq_" in
+  *cc*) fail "replay: two cancels in a row ($seq_): :main can starve" ;;
+  *h*)  pass "replay over 8 saturated cycles: $seq_ (never two cancels in a row, :main advances)" ;;
+  *)    fail "replay: nothing ever completed ($seq_)" ;;
+esac
 
 # The run summary may still say queued after a job ran (run 44544311118):
 # that is the started path, not #6080's.
