@@ -1213,7 +1213,7 @@ async fn insert_promotion_history_row(
         (status = 200, description = "Artifact promotion result", body = PromotionResponse),
         (status = 404, description = "Artifact or repository not found", body = crate::api::openapi::ErrorResponse),
         (status = 409, description = "Artifact already exists in target", body = crate::api::openapi::ErrorResponse),
-        (status = 400, description = "Validation error (repo type/format mismatch)", body = crate::api::openapi::ErrorResponse),
+        (status = 400, description = "Validation error (repo type/format mismatch, or the target's Maven version policy refuses the artifact)", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1450,13 +1450,6 @@ pub async fn promote_artifact(
         }
     }
 
-    // Approval gate (promotion-approval-gate-bypass): when the source requires
-    // approval, atomically consume an APPROVED + unconsumed approval row for this
-    // exact (artifact, source, target) pair before copying any bytes. A single-row
-    // UPDATE ... SET consumed_at claim is the concurrency boundary: a miss (no
-    // approval, only a pending request, or a concurrent double-spend) returns 409
-    // and the target is constrained to the approved pair. Done after the
-    // gate/policy/rule checks so a rejected promotion never spends the approval.
     // #5872: the target's Maven version policy holds for a promoted artifact,
     // checked before an approval is spent on a copy that would be refused
     crate::services::maven_version_policy::check_write(
@@ -1468,6 +1461,13 @@ pub async fn promote_artifact(
     )
     .await?;
 
+    // Approval gate (promotion-approval-gate-bypass): when the source requires
+    // approval, atomically consume an APPROVED + unconsumed approval row for this
+    // exact (artifact, source, target) pair before copying any bytes. A single-row
+    // UPDATE ... SET consumed_at claim is the concurrency boundary: a miss (no
+    // approval, only a pending request, or a concurrent double-spend) returns 409
+    // and the target is constrained to the approved pair. Done after the
+    // gate/policy/rule checks so a rejected promotion never spends the approval.
     if approval_required {
         super::approval::require_and_consume_approval(
             &state.db,
@@ -1912,10 +1912,6 @@ pub async fn promote_artifacts_bulk(
             }
         }
 
-        // Approval gate (promotion-approval-gate-bypass): consume this item's
-        // own APPROVED + unconsumed approval row before copying. Runs after the
-        // rule check so a rule-blocked item never spends an approval, and fails
-        // the item (not the batch) when no consumable approval exists.
         // #5872: the target's Maven version policy fails just this item
         if let Err(e) = crate::services::maven_version_policy::check_write(
             &state.db,
@@ -1933,6 +1929,10 @@ pub async fn promote_artifacts_bulk(
             continue;
         }
 
+        // Approval gate (promotion-approval-gate-bypass): consume this item's
+        // own APPROVED + unconsumed approval row before copying. Runs after the
+        // rule check so a rule-blocked item never spends an approval, and fails
+        // the item (not the batch) when no consumable approval exists.
         if approval_required {
             if let Err(e) = super::approval::require_and_consume_approval(
                 &state.db,
@@ -6368,6 +6368,81 @@ mod tests {
                  repository it was promoted into, or Resolver will refuse to \
                  ask for it: {}",
                 text
+            );
+        }
+
+        /// #5872: single and bulk promotion hold the target's Maven version
+        /// policy, a refused SNAPSHOT is not copied and the bulk call fails
+        /// only that item
+        #[tokio::test]
+        async fn test_promote_honours_target_version_policy_5872() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let (src, src_key, sdir) = tdh::create_repo(&pool, "local", "maven").await;
+            let (tgt, tgt_key, tdir) = tdh::create_repo(&pool, "local", "maven").await;
+            sqlx::query("UPDATE repositories SET version_policy = 'release' WHERE id = $1")
+                .bind(tgt)
+                .execute(&pool)
+                .await
+                .expect("set version_policy");
+            let user = make_admin(&pool, "vp5872").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let snap = make_maven_artifact(
+                &pool,
+                src,
+                &storage,
+                "com/acme/vp5872/lib/1.0-SNAPSHOT/lib-1.0-20260101.120000-1.jar",
+            )
+            .await;
+            let release =
+                make_maven_artifact(&pool, src, &storage, "com/acme/vp5872/lib/1.0/lib-1.0.jar")
+                    .await;
+
+            let single = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path((src_key.clone(), snap)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: true,
+                    notes: None,
+                }),
+            )
+            .await;
+            let bulk = promote_artifacts_bulk(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(src_key.clone()),
+                Json(BulkPromoteRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    artifact_ids: vec![snap, release],
+                    skip_policy_check: true,
+                    notes: None,
+                }),
+            )
+            .await
+            .map(|r| (r.0.promoted, r.0.failed));
+            let copied: Vec<String> =
+                sqlx::query_scalar("SELECT path FROM artifacts WHERE repository_id = $1")
+                    .bind(tgt)
+                    .fetch_all(&pool)
+                    .await
+                    .expect("target rows");
+
+            cleanup(&pool, &[src, tgt], user).await;
+            let _ = std::fs::remove_dir_all(&sdir);
+            let _ = std::fs::remove_dir_all(&tdir);
+
+            assert!(
+                matches!(&single, Err(AppError::Validation(m)) if m.contains("accepts release versions only")),
+                "{single:?}"
+            );
+            assert_eq!(bulk.ok(), Some((1, 1)));
+            assert_eq!(
+                copied,
+                vec!["com/acme/vp5872/lib/1.0/lib-1.0.jar".to_string()]
             );
         }
 

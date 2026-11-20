@@ -797,6 +797,7 @@ pub async fn get_approval(
     request_body = ReviewRequest,
     responses(
         (status = 200, description = "Promotion approved and executed", body = ApprovalResponse),
+        (status = 400, description = "The target's Maven version policy refuses the artifact, the approval stays pending", body = crate::api::openapi::ErrorResponse),
         (status = 403, description = "Admin access required", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Approval request not found", body = crate::api::openapi::ErrorResponse),
         (status = 409, description = "Approval already reviewed", body = crate::api::openapi::ErrorResponse),
@@ -3132,6 +3133,67 @@ mod tests {
 
             cleanup(&pool, &[src, tgt], user).await;
             cleanup_user(&pool, requester).await;
+        }
+
+        /// #5872: approving a promotion into a Maven repository whose version
+        /// policy refuses the artifact is a 400, copies nothing and leaves the
+        /// approval pending
+        #[tokio::test]
+        async fn test_approval_honours_target_version_policy_5872() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("vp5872-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("vp5872-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "vp5872-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "vp5872-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            sqlx::query(
+                "UPDATE repositories SET format = 'maven', \
+                 version_policy = CASE WHEN id = $2 THEN 'release' ELSE 'mixed' END \
+                 WHERE id = ANY($1)",
+            )
+            .bind(vec![src, tgt])
+            .bind(tgt)
+            .execute(&pool)
+            .await
+            .expect("make maven repositories");
+            let user = make_admin(&pool, "vp5872").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "vp5872").await;
+            sqlx::query("UPDATE artifacts SET path = $2 WHERE id = $1")
+                .bind(artifact)
+                .bind("com/acme/vp5872/lib/1.0-SNAPSHOT/lib-1.0-20260101.120000-1.jar")
+                .execute(&pool)
+                .await
+                .expect("snapshot path");
+            let requester = make_requester(&pool, "vp5872").await;
+            let approval = make_pending_approval(&pool, artifact, src, tgt, requester).await;
+
+            let res = approve_promotion(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(approval),
+                Json(ReviewRequest {
+                    notes: None,
+                    skip_policy_check: true,
+                }),
+            )
+            .await;
+            let copied = target_has_artifact(&pool, tgt, "vp5872").await;
+            let status = approval_status(&pool, approval).await;
+            cleanup(&pool, &[src, tgt], user).await;
+            cleanup_user(&pool, requester).await;
+
+            assert!(
+                matches!(&res, Err(AppError::Validation(m)) if m.contains("accepts release versions only")),
+                "expected the version policy 400, got ok={:?}",
+                res.is_ok()
+            );
+            assert!(!copied, "a refused approval must NOT copy the artifact");
+            assert_eq!(status, "pending", "a refused approval stays pending");
         }
 
         /// A rule-MET approval still executes: the artifact lands in the target
