@@ -54,6 +54,9 @@ func main() {
 	} else {
 		startStandalone(srv, cfg)
 	}
+	// Both modes analyze JAR files on this side, so both need the Java DB
+	// locally; fetched in the background, never gating readiness (#5913).
+	srv.scanner.javaDB.Startup()
 
 	go srv.jobs.RunSweeper(stop)
 

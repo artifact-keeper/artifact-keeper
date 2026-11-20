@@ -203,7 +203,4 @@ Loki, text format (needs `LOG_ANSI` at its default or `false`):
 
 ## Helm chart
 
-The chart does not yet expose these two settings as values; set them with the
-backend's extra environment variables until
-[artifact-keeper-iac#387](https://github.com/artifact-keeper/artifact-keeper-iac/issues/387)
-lands. With `LOG_ANSI` at its default, pods already log without colour.
+The chart sets both as values: `backend.logging.format` renders `LOG_FORMAT` and `backend.logging.ansi` renders `LOG_ANSI`. With `ansi` at its default `auto`, pods already log without colour

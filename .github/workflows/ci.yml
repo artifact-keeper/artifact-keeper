@@ -363,7 +363,9 @@ jobs:
               scripts/ci/check-auth-event-audit.sh|\
               scripts/ci/check-migration-ledger.sh|\
               scripts/ci/check-duplicate-migrations.sh|\
-              scripts/ci/memory-watch.sh)
+              scripts/ci/memory-watch.sh|\
+              scripts/ci/apt-install-bounded.sh|\
+              scripts/ci/memory-cap.sh)
                 code=true
                 rust=true
                 ;;
@@ -632,8 +634,12 @@ jobs:
 
       # The self-hosted image shipped protoc; ubuntu-24.04 does not, and
       # build scripts in the dependency tree (which clippy runs) need it.
+      # Bounded (#6272): scripts/ci/apt-install-bounded.sh caps each download
+      # attempt at 3 minutes and retries on azure.archive.ubuntu.com, so a
+      # crawling mirror cannot hold the job to its ceiling.
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        timeout-minutes: 12
+        run: bash scripts/ci/apt-install-bounded.sh protobuf-compiler
 
       # Cache the dependency build so only the workspace crate recompiles.
       # ~635 deps are byte-identical run-to-run.
@@ -771,9 +777,19 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "4"
           CARGO_INCREMENTAL: "0"
+        #
+        # UNDER A MEMORY CAP (#6242). The lib-test rustc alone needs more
+        # than this VM's RAM, so it swaps whatever the two passes do.
+        # memory-cap.sh runs the whole step in a cgroup whose memory.high is
+        # MemTotal minus 2.75 GiB: past it the kernel swaps the compiler's
+        # pages instead of the runner agent's, so a heavy swap slows clippy
+        # down instead of freezing the VM. A Check Rust on PR #6313 sat in
+        # this step for 50+ minutes, past both the 30-minute `timeout` below
+        # and the 45-minute job ceiling: nothing on the VM could run, the
+        # `timeout` included.
         run: |
           rc=0
-          timeout --signal=TERM --kill-after=60s 30m bash -c '
+          ./scripts/ci/memory-cap.sh -- timeout --signal=TERM --kill-after=60s 30m bash -c '
             set -e
             echo "::group::clippy pass 1: lib, bins, example, integration tests"
             cargo clippy --workspace --lib --bins --examples --test "*" -- -D warnings
@@ -880,6 +896,8 @@ jobs:
       # half-configured, and everything after it fails on "dpkg was
       # interrupted". Worst case 2 x 6 minutes of download.
       - name: Install protoc and the x86_64 mingw-w64 cross compilers
+        # Outer bound over the 2 x 6-minute capped downloads and the install.
+        timeout-minutes: 20
         run: |
           # libprotobuf-dev: the well-known .proto files (timestamp.proto)
           # build.rs imports, a Recommends of protobuf-compiler that
@@ -1044,8 +1062,12 @@ jobs:
       # and build scripts in the dependency tree need it. services-1 also
       # gets squashfs-tools so the incus scanner's real mksquashfs/unsquashfs
       # tests run as the non-root runner user instead of skipping (#4470).
+      # Bounded (#6272): scripts/ci/apt-install-bounded.sh caps each download
+      # attempt at 3 minutes and retries on azure.archive.ubuntu.com, so a
+      # crawling mirror cannot hold the job to its ceiling.
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler ${{ matrix.shard == 'services-1' && 'squashfs-tools' || '' }}
+        timeout-minutes: 12
+        run: bash scripts/ci/apt-install-bounded.sh protobuf-compiler ${{ matrix.shard == 'services-1' && 'squashfs-tools' || '' }}
 
       # The instrumented dependency graph (~750 crates, 3.3 GB) is identical
       # in every leg, so all legs share one cache entry. Saved from `main`
@@ -1116,22 +1138,49 @@ jobs:
           swapon --show
           free -m
 
+      # Same sampler as Check Rust (#6242): MemAvailable, swap in use and
+      # the compiler's RSS every 5 s, summarised in "Disk usage". The peak
+      # RSS that run-measured-build.sh records is capped by the VM's RAM
+      # (14.1-14.4 GiB on every leg), so on its own it cannot show how much
+      # of the compile was in swap.
+      - name: Start the memory sampler
+        run: ./scripts/ci/memory-watch.sh start "$RUNNER_TEMP/memory-watch.tsv" 5
+
       # Only the BIN_SHARD leg has bin-target tests, so only it pays for the
       # bins pass (the non-test library, instrumented, then main.rs's test
       # harness). run-measured-build.sh records each pass's peak RSS in the
       # job summary and retries only a SIGKILL, once (#3856); without sccache
       # on this runner every rustc is a child of cargo, so the number it
       # records is the compiler's own.
+      #
+      # UNDER A MEMORY CAP (#6242). Measured in a 16 GiB, 4-CPU, no-swap
+      # container with these flags, the handlers-1 lib-test rustc needs
+      # 18.2 GiB and is OOM-killed; the peak is in the front end and the
+      # monomorphization collector (`-Z time-passes`: 11.5 GB after borrow
+      # checking, 18.0 GB after collection), before LLVM, so
+      # CARGO_BUILD_JOBS, codegen-units, debuginfo and the linker do not
+      # move it. On this VM the overflow
+      # goes to the swapfile above, and when the kernel reclaims from every
+      # process to make room the runner agent stops answering: main run
+      # 44497657482's handlers-1 died "lost communication" 51 minutes into
+      # this step (8-9 minutes normally). memory-cap.sh runs the build in a
+      # cgroup with memory.high = MemTotal minus 2.75 GiB, so the kernel
+      # swaps the compiler's pages, not the agent's or Postgres's.
+      #
+      # 30 minutes (5-19 normally, the router leg's lib + bins the longest):
+      # a compile that the cap throttles into a crawl fails here with its
+      # log, instead of running into the 60-minute job ceiling.
       - name: Build instrumented test binaries
         id: build
+        timeout-minutes: 30
         run: |
           source <(cargo llvm-cov show-env --sh)
           cargo llvm-cov clean --workspace
           ok=true
-          ./scripts/ci/run-measured-build.sh "lib (${{ matrix.shard }})" \
+          ./scripts/ci/memory-cap.sh -- ./scripts/ci/run-measured-build.sh "lib (${{ matrix.shard }})" \
             cargo nextest run --workspace --lib --no-run --features "test-shard-${{ matrix.shard }}" || ok=false
           if [ "$ok" = true ] && [ "${{ matrix.shard }}" = "$BIN_SHARD" ]; then
-            ./scripts/ci/run-measured-build.sh bins \
+            ./scripts/ci/memory-cap.sh -- ./scripts/ci/run-measured-build.sh bins \
               cargo nextest run --workspace --bins --no-run --features "test-shard-${{ matrix.shard }}" || ok=false
           fi
           if [ "$ok" != true ]; then
@@ -1226,6 +1275,8 @@ jobs:
           du -sh target 2>/dev/null || true
           free -m
           swapon --show
+          ./scripts/ci/memory-watch.sh stop "$RUNNER_TEMP/memory-watch.tsv"
+          ./scripts/ci/memory-watch.sh report "$RUNNER_TEMP/memory-watch.tsv"
 
   # INTEGRATION SUITES (backend/tests/), GitHub-hosted.
   #
@@ -1313,8 +1364,12 @@ jobs:
 
       # The self-hosted image shipped protoc; ubuntu-24.04 does not, and
       # build scripts in the dependency tree need it.
+      # Bounded (#6272): scripts/ci/apt-install-bounded.sh caps each download
+      # attempt at 3 minutes and retries on azure.archive.ubuntu.com, so a
+      # crawling mirror cannot hold the job to its ceiling.
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        timeout-minutes: 12
+        run: bash scripts/ci/apt-install-bounded.sh protobuf-compiler
 
       # The dependency graph and the library, saved from `main` only (see
       # the note on check-rust's rust-cache step). The pool job had no
@@ -1813,8 +1868,12 @@ jobs:
         with:
           tool: cargo-nextest
 
+      # Bounded (#6272): scripts/ci/apt-install-bounded.sh caps each download
+      # attempt at 3 minutes and retries on azure.archive.ubuntu.com, so a
+      # crawling mirror cannot hold the job to its ceiling.
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        timeout-minutes: 12
+        run: bash scripts/ci/apt-install-bounded.sh protobuf-compiler
 
       # The integration job's entry: the same uninstrumented dev-profile
       # dependency graph, dev-dependencies included. Restore only.
@@ -2136,6 +2195,21 @@ jobs:
       - name: Check the memory sampler
         run: bash scripts/ci/test-memory-watch.sh
 
+      # The bounded apt install every "Install protoc" step runs (#6272): a
+      # hung mirror is killed and retried on azure, a dead one fails in
+      # bounded time, and the unpack itself is never time-boxed. Stub
+      # apt-get, ~10s.
+      - name: Check the bounded apt install
+        run: bash scripts/ci/test-apt-install-bounded.sh
+
+      # The memory cap the backend compiles run under (#6242): memory.high
+      # is MemTotal minus the reserve, the command runs inside the cgroup, a
+      # setup failure only warns, and every hosted step that compiles the
+      # backend crate (unit shards, clippy, the image build) is still
+      # capped. Fake cgroup tree, ~1s.
+      - name: Check the compile memory cap
+        run: bash scripts/ci/test-memory-cap.sh
+
       # What a Release Candidate rerun of the failed gate groups runs, and
       # whether it may run at all (#6076): the wrong commit, a non-candidate
       # original, a replaced record or a dropped failed group must BLOCK.
@@ -2170,7 +2244,9 @@ jobs:
 
       # #6080: no merge freeze during a candidate. The stale-run finder
       # cancels only runs that are queued with no runner past its threshold,
-      # never a moving one; the floating-tag guard withholds :dev / :X.Y-dev
+      # or (#6289) a superseded main push whose remaining jobs have waited
+      # 45m for a runner, never a moving one, a tag, a dispatch or a re-run;
+      # the floating-tag guard withholds :dev / :X.Y-dev
       # only from a run whose commit is provably older than the one they
       # name. Stubs `gh`; offline.
       - name: Check the stale Docker Publish run finder
@@ -3504,8 +3580,37 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The `ci`-profile lib rustc in the builder stage needs 17.2 GiB
+      # (measured in a 4-CPU container with this Dockerfile's command,
+      # #6242); this VM has 15.6 GiB of RAM and a 3 GiB zram device, so the
+      # build failed "ResourceExhausted: cannot allocate memory" on main
+      # (jobs 135788683205, 135831967115) and on PRs. Same swapfile as the
+      # Rust jobs. Best effort: a failure here is a ::warning::, never a
+      # red job.
+      - name: Add swap
+        run: |
+          if sudo fallocate -l 12G /ak-ci-swapfile \
+             && sudo chmod 600 /ak-ci-swapfile \
+             && sudo mkswap /ak-ci-swapfile >/dev/null \
+             && sudo swapon /ak-ci-swapfile; then
+            echo "added a 12 GiB swapfile"
+          else
+            echo "::warning title=No extra swap::could not add /ak-ci-swapfile; this job runs with the image's default swap only."
+          fi
+          swapon --show
+          free -m
+
+      # memory / memory-swap: buildkitd (and so the cargo build inside it)
+      # runs in a container with 12 GiB of RAM and up to 15 GiB of swap on
+      # top (Docker's memory-swap is RAM plus swap). Past 12 GiB the kernel
+      # swaps the compiler's pages rather than the runner agent's, the same
+      # job memory-cap.sh does for the Rust jobs (#6242).
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        with:
+          driver-opts: |
+            memory=12g
+            memory-swap=27g
 
       - name: Build backend image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7

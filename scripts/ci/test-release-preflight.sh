@@ -352,6 +352,17 @@ FAKE_NO_JOBS_907=1 \
 FAKE_SECURITY_SCAN_800=success FAKE_MANIFEST_800=success \
   expect "jobless cancelled dispatch over a green push run -> READY" 0 "run 907 (workflow_dispatch) built nothing"
 
+# 4q2. A PUSH run replaced while pending (main pushes coalesce, #6242) lists
+#      no jobs: NOT READY with the re-run instruction, not INFRA.
+FAKE_RUNS=$'801 completed push' \
+FAKE_NO_JOBS_801=1 \
+  expect "push run replaced before any job -> NOT READY, re-run it" 1 "gh run rerun 801"
+
+# 4q3. ...and once re-run green (same run id, new attempt), READY again.
+FAKE_RUNS=$'801 completed push' \
+FAKE_SECURITY_SCAN_801=success FAKE_MANIFEST_801=success \
+  expect "replaced push run, re-run green -> READY" 0 "this commit's images published cleanly"
+
 # 4r. A newer dispatch whose jobs cannot be read is INFRA, not a skip.
 FAKE_RUNS=$'908 completed workflow_dispatch\n800 completed push' \
 FAKE_VIEW_FAIL_908=1 \

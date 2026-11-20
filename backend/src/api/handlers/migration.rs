@@ -67,7 +67,8 @@ fn migration_encryption_key() -> Result<String> {
         Err(e) => Err(AppError::Config(e.to_string())),
     }
 }
-use crate::services::migration_service::MigrationService;
+use crate::services::cluster_work::WorkerIdentity;
+use crate::services::migration_service::{MigrationService, JOB_CLAIM_TTL_SECS, WORKER_LOST};
 use crate::services::migration_worker::{ConflictResolution, MigrationWorker, WorkerConfig};
 use crate::services::nexus_client::{NexusAuth, NexusClient, NexusClientConfig};
 use crate::services::proxy_service::redact_url_for_diagnostics;
@@ -556,16 +557,32 @@ async fn load_job_owned(
     Ok(job)
 }
 
+/// Claims a job row for this replica's worker, `$2` owner, `$3` token, `$4`
+/// TTL seconds.
+const CLAIM_JOB_SET: &str =
+    "claimed_by = $2, claim_token = $3, claim_expires_at = NOW() + make_interval(secs => $4)";
+
+/// Extends a worker's claim on its job row while the row is still its own.
+const RENEW_JOB_CLAIM_SQL: &str = "UPDATE migration_jobs \
+     SET claim_expires_at = NOW() + make_interval(secs => $3) \
+     WHERE id = $1 AND claim_token = $2 AND status = 'running'";
+
 /// Build the [`WorkerConfig`] for `job` from its `config` JSON and spawn a
 /// background [`MigrationWorker`] to run (or resume) it. Shared by
 /// `start_migration` and `resume_migration`, which previously duplicated this
 /// entire spawn block verbatim apart from the worker entrypoint. On worker
 /// error the job is marked `failed` with the error summary (best-effort).
+///
+/// The handler moved the row to `running` under `claim_token`. The worker
+/// renews that claim while it runs, so the janitor can tell a job whose
+/// replica died from one that is still running (#6253). `cancel_token` is a
+/// child of the process shutdown token: a shutdown pauses the job instead.
 fn spawn_migration_worker(
     state: &SharedState,
     job: &MigrationJobRow,
     client: Arc<dyn SourceRegistry>,
     cancel_token: CancellationToken,
+    claim_token: Uuid,
     resume: bool,
 ) {
     let config: MigrationConfig = serde_json::from_value(job.config.clone()).unwrap_or_default();
@@ -589,10 +606,22 @@ fn spawn_migration_worker(
     let storage_registry = state.storage_registry.clone();
     let search_service = state.search_service.clone();
     let fail_db = state.db.clone();
+    let shutdown_token = state.shutdown_token.clone();
     let job_id = job.id;
     tokio::spawn(async move {
+        // Renewal stops once the row leaves `running`, which the worker
+        // notices on its own status checks, so the loss token is not needed.
+        let (_renewal, _lost) = crate::services::cluster_work::spawn_row_claim_renewal(
+            db.clone(),
+            format!("migration job {job_id}"),
+            RENEW_JOB_CLAIM_SQL,
+            job_id,
+            claim_token,
+            JOB_CLAIM_TTL_SECS,
+        );
         let worker = MigrationWorker::new(db, storage_registry, worker_config, cancel_token)
-            .with_search_service(search_service);
+            .with_search_service(search_service)
+            .with_shutdown_token(shutdown_token.clone());
         let outcome = if resume {
             worker
                 .resume_job(job_id, client, conflict_resolution, None)
@@ -602,7 +631,12 @@ fn spawn_migration_worker(
                 .process_job(job_id, client, conflict_resolution, None)
                 .await
         };
-        if let Err(e) = outcome {
+        if outcome.is_err() && shutdown_token.is_cancelled() {
+            tracing::info!(job_id = %job_id, "Migration paused, the backend is shutting down");
+            let _ = MigrationService::new(fail_db)
+                .pause_running_job(job_id)
+                .await;
+        } else if let Err(e) = outcome {
             let phase = if resume { "resume" } else { "worker" };
             tracing::error!(job_id = %job_id, error = %e, "Migration {phase} failed");
             let _ = sqlx::query(
@@ -1331,11 +1365,15 @@ async fn start_migration(
     // 409 that would leak the job's existence/state) and never spawns a worker.
     load_job_owned(&state, &auth, id).await?;
 
+    let claim_token = Uuid::new_v4();
     let job: MigrationJobRow = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
-        "UPDATE migration_jobs SET status = 'running', started_at = NOW() \
+        "UPDATE migration_jobs SET status = 'running', started_at = NOW(), {CLAIM_JOB_SET} \
          WHERE id = $1 AND status IN ('pending', 'ready') RETURNING {MIGRATION_JOB_COLUMNS}"
     )))
     .bind(id)
+    .bind(WorkerIdentity::for_process().as_str())
+    .bind(claim_token)
+    .bind(JOB_CLAIM_TTL_SECS)
     .fetch_optional(&state.db)
     .await?
     .ok_or_else(|| {
@@ -1351,12 +1389,12 @@ async fn start_migration(
     .await?
     .ok_or_else(|| AppError::NotFound("Source connection not found".into()))?;
 
-    let cancel_token = CancellationToken::new();
+    let cancel_token = state.shutdown_token.child_token();
     let client = create_source_client(&connection, Some(&cancel_token))
         .map_err(|e| AppError::Internal(format!("Failed to create client: {}", e)))?;
 
     // Create and spawn the migration worker (shared with resume).
-    spawn_migration_worker(&state, &job, client, cancel_token, false);
+    spawn_migration_worker(&state, &job, client, cancel_token, claim_token, false);
 
     Ok(Json(job.into()))
 }
@@ -1421,11 +1459,17 @@ async fn resume_migration(
 ) -> Result<Json<MigrationJobResponse>> {
     load_job_owned(&state, &auth, id).await?;
 
+    let claim_token = Uuid::new_v4();
     let job: MigrationJobRow = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
-        "UPDATE migration_jobs SET status = 'running' \
+        "UPDATE migration_jobs SET status = 'running', {CLAIM_JOB_SET}, \
+         error_summary = NULLIF(error_summary, $5) \
          WHERE id = $1 AND status = 'paused' RETURNING {MIGRATION_JOB_COLUMNS}"
     )))
     .bind(id)
+    .bind(WorkerIdentity::for_process().as_str())
+    .bind(claim_token)
+    .bind(JOB_CLAIM_TTL_SECS)
+    .bind(WORKER_LOST)
     .fetch_optional(&state.db)
     .await?
     .ok_or_else(|| {
@@ -1441,12 +1485,12 @@ async fn resume_migration(
     .await?
     .ok_or_else(|| AppError::NotFound("Source connection not found".into()))?;
 
-    let cancel_token = CancellationToken::new();
+    let cancel_token = state.shutdown_token.child_token();
     let client = create_source_client(&connection, Some(&cancel_token))
         .map_err(|e| AppError::Internal(format!("Failed to create client: {}", e)))?;
 
     // Spawn the worker in resume mode (shared with start).
-    spawn_migration_worker(&state, &job, client, cancel_token, true);
+    spawn_migration_worker(&state, &job, client, cancel_token, claim_token, true);
 
     Ok(Json(job.into()))
 }
@@ -3798,6 +3842,155 @@ mod tests {
         assert!(v["message"].as_str().unwrap().contains("basic_auth"), "{v}");
 
         cleanup_user(&pool, marco).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #6253: a job whose replica died is paused by the janitor and resumable
+    // -----------------------------------------------------------------------
+
+    /// Seed a `running` job of `owner` whose worker claim, held by `claimed_by`,
+    /// expires `expires_in_secs` from now (negative: already lapsed). The
+    /// connection decrypts, so `/resume` can build a client for it.
+    async fn seed_claimed_running_job(
+        pool: &sqlx::PgPool,
+        owner: Uuid,
+        claimed_by: &str,
+        expires_in_secs: f64,
+    ) -> Uuid {
+        let key = migration_encryption_key().unwrap();
+        let creds = serde_json::json!({"username": "u", "password": "p"}).to_string();
+        let conn: Uuid = sqlx::query_scalar(
+            "INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type, created_by) \
+             VALUES ($1, 'http://127.0.0.1:9', 'basic_auth', $2, 'nexus', $3) RETURNING id",
+        )
+        .bind(format!("claim-conn-{}", Uuid::new_v4()))
+        .bind(encrypt_credentials(&creds, &key))
+        .bind(owner)
+        .fetch_one(pool)
+        .await
+        .expect("seed connection");
+        let job = seed_job(pool, conn, owner).await;
+        sqlx::query(
+            "UPDATE migration_jobs SET status = 'running', claimed_by = $2, \
+             claim_token = gen_random_uuid(), \
+             claim_expires_at = NOW() + make_interval(secs => $3) WHERE id = $1",
+        )
+        .bind(job)
+        .bind(claimed_by)
+        .bind(expires_in_secs)
+        .execute(pool)
+        .await
+        .expect("claim job");
+        job
+    }
+
+    async fn job_status_and_summary(pool: &sqlx::PgPool, job: Uuid) -> (String, Option<String>) {
+        sqlx::query_as("SELECT status, error_summary FROM migration_jobs WHERE id = $1")
+            .bind(job)
+            .fetch_one(pool)
+            .await
+            .expect("read job")
+    }
+
+    fn resume_request(job: Uuid) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{job}/resume"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_janitor_pauses_job_whose_worker_was_lost_and_resume_takes_it_6253() {
+        let Some(pool) = tdh::try_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (owner, owner_name) = tdh::create_user(&pool).await;
+        let job = seed_claimed_running_job(&pool, owner, "gone-pod:1:x", -600.0).await;
+
+        let paused = MigrationService::new(pool.clone())
+            .pause_stale_running_jobs()
+            .await
+            .expect("janitor");
+        assert!(paused >= 1, "the lapsed job must be paused");
+        assert_eq!(
+            job_status_and_summary(&pool, job).await,
+            ("paused".to_string(), Some(WORKER_LOST.to_string()))
+        );
+
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let app = app_as(state, tdh::make_auth(owner, &owner_name));
+        let (status, _) = tdh::send(app, resume_request(job)).await;
+        assert_eq!(status, StatusCode::OK, "a paused job must resume");
+
+        let (claimed_by, has_token, summary): (Option<String>, bool, Option<String>) =
+            sqlx::query_as(
+                "SELECT claimed_by, claim_token IS NOT NULL, error_summary \
+                 FROM migration_jobs WHERE id = $1",
+            )
+            .bind(job)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed_by.as_deref(),
+            Some(WorkerIdentity::for_process().as_str()),
+            "the resuming replica must own the job"
+        );
+        assert!(has_token);
+        assert_eq!(summary, None, "resume must clear the worker-lost summary");
+
+        cleanup_user(&pool, owner).await;
+    }
+
+    #[tokio::test]
+    async fn test_janitor_leaves_job_with_live_worker_running_6253() {
+        let Some(pool) = tdh::try_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (owner, owner_name) = tdh::create_user(&pool).await;
+        let job = seed_claimed_running_job(&pool, owner, "live-pod:1:x", 240.0).await;
+
+        MigrationService::new(pool.clone())
+            .pause_stale_running_jobs()
+            .await
+            .expect("janitor");
+        assert_eq!(
+            job_status_and_summary(&pool, job).await,
+            ("running".to_string(), None)
+        );
+
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let app = app_as(state, tdh::make_auth(owner, &owner_name));
+        let (status, _) = tdh::send(app, resume_request(job)).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a running job is not resumable"
+        );
+
+        cleanup_user(&pool, owner).await;
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_pauses_only_the_jobs_of_this_replica_6253() {
+        let Some(pool) = tdh::try_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (owner, _) = tdh::create_user(&pool).await;
+        let replica = format!("stopping-pod:1:{}", Uuid::new_v4());
+        let ours = seed_claimed_running_job(&pool, owner, &replica, 240.0).await;
+        let theirs = seed_claimed_running_job(&pool, owner, "other-pod:1:x", 240.0).await;
+
+        crate::services::migration_service::pause_jobs_on_shutdown(pool.clone(), &replica).await;
+
+        assert_eq!(job_status_and_summary(&pool, ours).await.0, "paused");
+        assert_eq!(job_status_and_summary(&pool, theirs).await.0, "running");
+
+        cleanup_user(&pool, owner).await;
     }
 }
 

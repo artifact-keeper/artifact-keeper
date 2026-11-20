@@ -41,11 +41,13 @@ type Scanner struct {
 	ipWarned sync.Map
 	// registryClient reads image manifests for the size check (#5909).
 	registryClient *http.Client
+	// javaDB owns the trivy Java DB download (#5913; javadb.go).
+	javaDB *javaDB
 }
 
 // NewScanner constructs a Scanner bound to cfg.
 func NewScanner(cfg *Config) *Scanner {
-	return &Scanner{cfg: cfg, registryClient: newRegistryHTTPClient(cfg)}
+	return &Scanner{cfg: cfg, registryClient: newRegistryHTTPClient(cfg), javaDB: newJavaDB(cfg)}
 }
 
 // trimRegistryHost strips any scheme and trailing slash from a registry URL so
@@ -124,22 +126,21 @@ func (s *Scanner) buildArgs(imageRef, partition string) []string {
 //     request to check.trivy.dev (either alone still sends it).
 //
 // The vulnerability and Java DB downloads are not affected; SCANNER_OFFLINE
-// governs those (dbUpdateArgs).
+// and SCANNER_TRIVY_SKIP_DB_UPDATE govern those (dbUpdateArgs, javadb.go).
 var noLookupArgs = []string{"--offline-scan", "--skip-version-check", "--disable-telemetry"}
 
 // dbUpdateArgs returns the DB-update flags shared by image and filesystem
 // scans: --skip-db-update when DB updates are off (always in offline mode),
-// and in offline mode (#5287) --skip-java-db-update, so no scan contacts a
-// DB registry or the Java DB registry. Every scan adds noLookupArgs as well.
+// and --skip-java-db-update always. No scan downloads the Java DB itself:
+// concurrent first scans used to unpack it over each other (#5913), so the
+// adapter downloads it, one at a time, and refreshes it (javadb.go); offline
+// it never does (#5287). Every scan adds noLookupArgs as well.
 func (c *Config) dbUpdateArgs() []string {
 	var args []string
 	if c.SkipDBUpdate || c.Offline {
 		args = append(args, "--skip-db-update")
 	}
-	if c.Offline {
-		args = append(args, "--skip-java-db-update")
-	}
-	return args
+	return append(args, "--skip-java-db-update")
 }
 
 // clientArgs returns the flags shared by every scan invocation for the
@@ -387,6 +388,13 @@ func downloadDBOnce(ctx context.Context, cfg *Config) error {
 // (cfg.DBUpdateRetries extra attempts, base cfg.DBUpdateRetryDelay), bounded by
 // ctx. For a durable fix, point cfg.DBRepository at an AK-controlled mirror.
 func DownloadDB(ctx context.Context, cfg *Config) error {
+	return retryDownload(ctx, cfg, "trivy DB", func(ctx context.Context) error { return downloadDBOnce(ctx, cfg) })
+}
+
+// retryDownload runs once, retrying a failure with exponential backoff
+// (cfg.DBUpdateRetries extra attempts, base cfg.DBUpdateRetryDelay), bounded
+// by ctx. what names the download in the log and the error.
+func retryDownload(ctx context.Context, cfg *Config, what string, once func(context.Context) error) error {
 	attempts := cfg.DBUpdateRetries + 1
 	if attempts < 1 {
 		attempts = 1
@@ -396,18 +404,18 @@ func DownloadDB(ctx context.Context, cfg *Config) error {
 		if i > 0 {
 			// Exponential backoff: base * 2^(i-1), interruptible by ctx.
 			delay := cfg.DBUpdateRetryDelay * time.Duration(1<<uint(i-1))
-			log.Printf("trivy DB download attempt %d/%d failed, retrying in %s: %v", i, attempts, delay, lastErr)
+			log.Printf("%s download attempt %d/%d failed, retrying in %s: %v", what, i, attempts, delay, lastErr)
 			select {
 			case <-ctx.Done():
-				return fmt.Errorf("trivy DB download canceled after %d attempt(s): %w (last error: %v)", i, ctx.Err(), lastErr)
+				return fmt.Errorf("%s download canceled after %d attempt(s): %w (last error: %v)", what, i, ctx.Err(), lastErr)
 			case <-time.After(delay):
 			}
 		}
-		if lastErr = downloadDBOnce(ctx, cfg); lastErr == nil {
+		if lastErr = once(ctx); lastErr == nil {
 			return nil
 		}
 	}
-	return fmt.Errorf("trivy DB download failed after %d attempt(s): %w", attempts, lastErr)
+	return fmt.Errorf("%s download failed after %d attempt(s): %w", what, attempts, lastErr)
 }
 
 // Scan runs trivy for the given request and returns the Harbor report. Any
@@ -446,12 +454,25 @@ func (s *Scanner) Scan(ctx context.Context, req *ScanRequest) (*HarborScanReport
 	}
 	s.warnIPPartition(host)
 	partition := s.cfg.imagePartition(host)
-	stdout, stderr, localDB, err := s.runImageScan(ctx, imageRef, partition, cred.env, memoryCache)
-	if err != nil && !memoryCache && trivyCacheLocked(stderr) {
-		// The lock is held outside this process (another adapter replica or
-		// a trivy run sharing the cache volume): retry without the cache.
-		log.Printf("trivy analysis cache in %s is locked by another process; rescanning %s with the memory cache backend", s.cfg.CacheDir, imageRef)
-		stdout, stderr, localDB, err = s.runImageScan(ctx, imageRef, partition, cred.env, true)
+	s.javaDB.MaybeRefresh()
+	scan := func() (string, string, *VulnDBInfo, error) {
+		stdout, stderr, localDB, err := s.runImageScan(ctx, imageRef, partition, cred.env, memoryCache)
+		if err != nil && !memoryCache && trivyCacheLocked(stderr) {
+			// The lock is held outside this process (another adapter replica or
+			// a trivy run sharing the cache volume): retry without the cache.
+			log.Printf("trivy analysis cache in %s is locked by another process; rescanning %s with the memory cache backend", s.cfg.CacheDir, imageRef)
+			memoryCache = true
+			stdout, stderr, localDB, err = s.runImageScan(ctx, imageRef, partition, cred.env, true)
+		}
+		return stdout, stderr, localDB, err
+	}
+	stdout, stderr, localDB, err := scan()
+	if err != nil && trivyJavaDBMissing(stderr) {
+		// The image has JAR files and the Java DB is not there yet (#5913).
+		if jerr := s.javaDB.EnsureForScan(ctx); jerr != nil {
+			return nil, fmt.Errorf("trivy scan failed for %s: the image contains JAR files and %v", imageRef, jerr)
+		}
+		stdout, stderr, localDB, err = scan()
 	}
 	if err != nil {
 		return nil, fmt.Errorf("trivy scan failed for %s: %v: %s", imageRef, err, strings.TrimSpace(stderr))
@@ -579,12 +600,25 @@ func (s *Scanner) ScanFilesystem(ctx context.Context, dir string) (json.RawMessa
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.FsScanTimeout+30*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, s.cfg.TrivyPath, s.buildFsArgs(dir)...)
+	s.javaDB.MaybeRefresh()
 	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	localDB, err := s.runLocked(cmd)
+	scan := func() (*VulnDBInfo, error) {
+		stdout.Reset()
+		stderr.Reset()
+		cmd := exec.CommandContext(ctx, s.cfg.TrivyPath, s.buildFsArgs(dir)...)
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		return s.runLocked(cmd)
+	}
+	localDB, err := scan()
+	if err != nil && trivyJavaDBMissing(stderr.String()) {
+		// trivy filesystem does not analyze JAR files today, but if it ever
+		// needs the Java DB, fetch it rather than fail (#5913).
+		if jerr := s.javaDB.EnsureForScan(ctx); jerr != nil {
+			return nil, nil, stderr.String(), fmt.Errorf("trivy filesystem scan failed: the workspace needs the trivy Java DB and %v", jerr)
+		}
+		localDB, err = scan()
+	}
 	if err != nil {
 		return nil, nil, stderr.String(), fmt.Errorf("trivy filesystem scan failed: %v: %s", err, strings.TrimSpace(stderr.String()))
 	}
