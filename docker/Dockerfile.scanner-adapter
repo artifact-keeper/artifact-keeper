@@ -251,7 +251,17 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # 0.76.0`. docker/scanner-adapter/VERSION stays 1.7.0: that version is not
 # published yet (scripts/ci/check-version-pin-bump.sh), so the cut creates
 # it.
-FROM ghcr.io/artifact-keeper/trivy@sha256:47199755ccf75b3c6776b0e6bca8a95ed8ca83fe330c7458bec30e661ded5835 AS trivy
+#
+# 0.76.0-r4 -> 0.76.0-r5 (#6320): Docker Publish's gate reported HIGH
+# CVE-2026-97054 (net/http: MaxBytesReader on HTTP/1 servers; stdlib v1.27.3,
+# fixed in 1.26.11 and 1.27.4) in the bundled trivy, blocking every main image
+# including the 1.12.3 release commit. Stdlib only: artifact-keeper/trivy#23
+# moved GO_VERSION to 1.27.4 (go.dev checksums), nothing else changed, tagged
+# v0.76.0-r5, and this FROM repoints to that published manifest-list digest
+# (read back from the registry for the tag; the build's own CVE gate ran on
+# those exact bytes). docker/scanner-adapter/VERSION stays 1.7.1, still
+# unpublished, so the 1.12.3 cut creates it.
+FROM ghcr.io/artifact-keeper/trivy@sha256:e605c01134a09946b5e3f45e9583a1c1471ad1b59187bfc01371e13ccb0a7248 AS trivy
 
 # ---------- Stage 3: minimal runtime ----------
 # alpine 3.20 reached EOL; 3.24 is the current stable with active security
