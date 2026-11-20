@@ -31,6 +31,7 @@ use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{ProxyFinding, RawFinding, RawPackage, Severity, VulnDbProvenance};
 use crate::models::user::User;
+use crate::services::advisory_exclusions::AdvisoryExclusions;
 use crate::services::auth_service::AuthService;
 use crate::services::environment_reeval::{AdvisoryDelta, AdvisoryDeltaSink};
 use crate::services::grype_scanner::GrypeScanner;
@@ -7247,6 +7248,9 @@ pub struct AdvisoryClient {
     delta_sink: Option<Arc<dyn AdvisoryDeltaSink>>,
     /// Wall-clock budget for fetching full OSV records after a batch (#4150).
     osv_hydrate_budget: Duration,
+    /// Packages never sent to an external feed (#5691,
+    /// `ADVISORY_EXCLUDE_PATTERNS`). Empty by default: nothing is excluded.
+    exclusions: AdvisoryExclusions,
 }
 
 struct CachedAdvisory {
@@ -7394,6 +7398,22 @@ const GITHUB_ADVISORY_URL: &str = "https://api.github.com/advisories";
 
 impl AdvisoryClient {
     pub fn new(github_token: Option<String>) -> Self {
+        let exclusions = AdvisoryExclusions::from_env();
+        if !exclusions.is_empty() {
+            info!(
+                patterns = exclusions.len(),
+                "ADVISORY_EXCLUDE_PATTERNS is set: matching packages are never sent to \
+                 OSV.dev or the GitHub Advisory Database (#5691)"
+            );
+        }
+        for (pattern, why) in exclusions.suspicious() {
+            warn!(
+                pattern = %pattern,
+                "ADVISORY_EXCLUDE_PATTERNS entry probably matches nothing: {why}. \
+                 Patterns are package-URL globs on `pkg:<type>/<name>`, e.g. \
+                 `pkg:npm/@acme/*` (#5691)"
+            );
+        }
         Self {
             http: crate::services::http_client::base_client_builder()
                 .timeout(Duration::from_secs(30))
@@ -7410,6 +7430,7 @@ impl AdvisoryClient {
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .map_or(OSV_HYDRATE_BUDGET, Duration::from_secs),
+            exclusions,
         }
     }
 
@@ -7442,11 +7463,23 @@ impl AdvisoryClient {
             cache_ttl,
             delta_sink: None,
             osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+            exclusions: AdvisoryExclusions::default(),
         }
     }
 
     fn osv_batch_url(&self) -> &str {
         &self.osv_batch_url
+    }
+
+    /// The `ADVISORY_EXCLUDE_PATTERNS` this client applies (#5691).
+    pub(crate) fn exclusions(&self) -> &AdvisoryExclusions {
+        &self.exclusions
+    }
+
+    /// #5691: `dep` matches `ADVISORY_EXCLUDE_PATTERNS` and must never be
+    /// named in a request to an external feed.
+    pub(crate) fn excluded(&self, dep: &Dependency) -> bool {
+        self.exclusions.excludes(&dep.ecosystem, &dep.name)
     }
 
     fn github_advisory_url(&self) -> &str {
@@ -7491,6 +7524,12 @@ impl AdvisoryClient {
         {
             let cache = self.cache.read().await;
             for (i, dep) in deps.iter().enumerate() {
+                // #5691: an excluded package is never asked about. Recorded
+                // as unasked, not degraded: leaving it out is deliberate.
+                if self.excluded(dep) {
+                    out.not_queried.push(i);
+                    continue;
+                }
                 match cache.get(&Self::cache_key(dep)) {
                     Some(cached) if cached.fetched_at.elapsed() < cache_ttl => {
                         out.per_dep[i] = cached.findings.clone();
@@ -7711,6 +7750,11 @@ impl AdvisoryClient {
         };
 
         for (i, dep) in deps.iter().enumerate() {
+            // #5691: never name an excluded package to the feed.
+            if self.excluded(dep) {
+                out.not_queried.push(i);
+                continue;
+            }
             let ecosystem_param = match dep.ecosystem.as_str() {
                 "npm" => "npm",
                 "PyPI" | "pypi" => "pip",
@@ -8309,6 +8353,15 @@ struct CondaCoverageGap {
     reason: String,
 }
 
+/// What [`DependencyScanner::plan_conda_queries`] made of a batch: the
+/// queries to send, the conda packages no alias could identify, and how many
+/// conda packages `ADVISORY_EXCLUDE_PATTERNS` left out (#5691).
+struct CondaPlan {
+    planned: Vec<(Dependency, DepOrigin)>,
+    gaps: Vec<CondaCoverageGap>,
+    excluded: usize,
+}
+
 impl DependencyScanner {
     /// The CVE an advisory is about: its first `CVE-` alias, or its own id
     /// when that is a CVE.
@@ -8464,15 +8517,26 @@ impl DependencyScanner {
     fn plan_conda_queries(
         batch: Vec<(Dependency, DepOrigin)>,
         map: &crate::services::conda_identity::AliasMap,
-    ) -> (Vec<(Dependency, DepOrigin)>, Vec<CondaCoverageGap>) {
+        exclusions: &AdvisoryExclusions,
+    ) -> CondaPlan {
         use crate::services::conda_identity::{pypi_aliases, AliasCoverage};
 
         let mut planned = Vec::with_capacity(batch.len());
         let mut gaps = Vec::new();
+        let mut excluded = 0;
 
         for (dep, origin) in batch {
             if origin != DepOrigin::Declared || dep.ecosystem != ECOSYSTEM_CONDA {
                 planned.push((dep, origin));
+                continue;
+            }
+
+            // #5691: matched on the conda name the artifact ships, BEFORE it is
+            // rewritten to a PyPI alias or an unscoped query, which a
+            // `pkg:conda/...` pattern could never match. Left out entirely:
+            // not queried, and not a coverage gap, since it is deliberate.
+            if exclusions.excludes(ECOSYSTEM_CONDA, &dep.name) {
+                excluded += 1;
                 continue;
             }
 
@@ -8516,7 +8580,11 @@ impl DependencyScanner {
             }
         }
 
-        (planned, gaps)
+        CondaPlan {
+            planned,
+            gaps,
+            excluded,
+        }
     }
 
     /// The conda package an artifact IS, as a dependency to resolve advisories
@@ -9101,8 +9169,15 @@ impl DependencyScanner {
         // naming the conda package the artifact ships rather than the PyPI
         // alias it was looked up under -- and keeps naming the ones no alias
         // could be found for, which leave the batch entirely.
-        let (batch, conda_gaps) =
-            Self::plan_conda_queries(batch, crate::services::conda_identity::process_alias_map());
+        let CondaPlan {
+            planned: batch,
+            gaps: conda_gaps,
+            excluded: conda_excluded,
+        } = Self::plan_conda_queries(
+            batch,
+            crate::services::conda_identity::process_alias_map(),
+            self.advisory.exclusions(),
+        );
 
         for gap in &conda_gaps {
             warn!(
@@ -9147,12 +9222,31 @@ impl DependencyScanner {
             );
         }
 
-        if !gh_results.not_queried.is_empty() {
+        // #5691: what ADVISORY_EXCLUDE_PATTERNS kept out of every external
+        // request for this scan (conda names before planning, the rest in the
+        // advisory client), recorded so a reader can tell it from coverage.
+        let excluded: Vec<bool> = deps.iter().map(|d| self.advisory.excluded(d)).collect();
+        let advisory_excluded = conda_excluded + excluded.iter().filter(|e| **e).count();
+        if advisory_excluded > 0 {
+            info!(
+                artifact_id = %artifact.id,
+                advisory_excluded,
+                "dependencies matching ADVISORY_EXCLUDE_PATTERNS were not sent to \
+                 any external advisory feed (#5691)"
+            );
+        }
+
+        let gh_unasked = gh_results
+            .not_queried
+            .iter()
+            .filter(|&&i| !excluded.get(i).copied().unwrap_or(false))
+            .count();
+        if gh_unasked > 0 {
             tracing::debug!(
                 artifact_id = %artifact.id,
-                count = gh_results.not_queried.len(),
-                "GitHub Advisory does not serve these dependencies' ecosystems; \
-                 they were never asked about, and OSV is their only coverage"
+                count = gh_unasked,
+                "GitHub Advisory was not asked about these dependencies (no token, \
+                 or an ecosystem it does not serve); OSV is their only coverage"
             );
         }
 
@@ -11717,7 +11811,8 @@ impl ScannerService {
     /// The artifact side of a failed scan: `flagged` unless it is already in
     /// a blocking state, then `block_on_fail` policies (#2912) bound to
     /// `scanned`, the bytes the scan was for (the hold is unbound when that
-    /// is unknown, as [`Self::scan_hold_row`] does for `None`).
+    /// is unknown, as [`Self::scan_hold_row`] does for `None`). The `flagged`
+    /// write is bound to `scanned` as well (#5766).
     async fn flag_after_failed_scan(&self, artifact_id: Uuid, scanned: Option<&str>) {
         // Mark as flagged on failure (conservative), but never
         // downgrade an artifact that is already in a blocking or
@@ -11726,13 +11821,24 @@ impl ScannerService {
         // artifact (policy violation, or admin action) must not
         // silently un-block it by stomping the status back to
         // 'flagged'. Only flag from a non-blocking state.
-        if let Err(e) = sqlx::query!(
-            "UPDATE artifacts SET quarantine_status = 'flagged' \
-             WHERE id = $1 \
-               AND (quarantine_status IS NULL \
-                    OR quarantine_status IN ('clean', 'flagged', 'unscanned'))",
-            artifact_id,
-        )
+        //
+        // #5766: bound to the bytes the scan was for. A tag row is rewritten
+        // in place when the tag moves, so after a failed scan of D1 an
+        // unbound write would mark D2, which this scan never read. On an OCI
+        // manifest row the write is a no-op once the row names other bytes;
+        // any other row is written as before.
+        let bind = scanned.map(|s| s.trim().to_ascii_lowercase());
+        if let Err(e) = sqlx::query(concat!(
+            "UPDATE artifacts a SET quarantine_status = 'flagged' \
+             WHERE a.id = $1 \
+               AND (a.quarantine_status IS NULL \
+                    OR a.quarantine_status IN ('clean', 'flagged', 'unscanned')) \
+               AND ($2::text IS NULL OR a.checksum_sha256 = $2::bpchar OR NOT ",
+            crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql!(),
+            ")"
+        ))
+        .bind(artifact_id)
+        .bind(bind.as_deref())
         .execute(&self.db)
         .await
         {
@@ -14094,6 +14200,79 @@ mod tests {
             tag_after_d2,
             Some((Some("quarantined".into()), Some("scan_policy".into()))),
             "control: D2's own verdict holds the tag row"
+        );
+    }
+
+    /// #5766: the `flagged` write after a FAILED scan binds to the bytes the
+    /// scan was for. The tag row already names D2 (the tag moved while the
+    /// scan of D1 ran), so the failure of D1's scan leaves it alone; the
+    /// control failure of a scan of D2 flags it. A non-manifest row is
+    /// flagged whatever `scanned` says, as before.
+    #[tokio::test]
+    async fn failed_scan_flag_after_a_tag_move_leaves_the_new_digest_5766() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let (d1, d2) = (fresh_checksum(), fresh_checksum());
+        let (tag_row, other_row) = (Uuid::new_v4(), Uuid::new_v4());
+        for (id, path, sum) in [
+            (tag_row, "v2/app/manifests/1.0", &d2),
+            (other_row, "app/readme.txt", &d2),
+        ] {
+            sqlx::query(
+                "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, \
+                                        checksum_sha256, content_type, storage_key, \
+                                        quarantine_status) \
+                 VALUES ($1, $2, $3, $3, 10, $4, 'application/octet-stream', $5, 'clean')",
+            )
+            .bind(id)
+            .bind(fx.repo_id)
+            .bind(path)
+            .bind(sum)
+            .bind(format!("k/{id}"))
+            .execute(&fx.pool)
+            .await
+            .expect("insert row");
+        }
+        let status = |id: Uuid| {
+            let pool = fx.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT quarantine_status FROM artifacts WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("read status")
+            }
+        };
+
+        let scanner = scanner_for_fixture(&fx);
+        scanner.flag_after_failed_scan(tag_row, Some(&d1)).await;
+        let tag_after_d1 = status(tag_row).await;
+        scanner.flag_after_failed_scan(other_row, Some(&d1)).await;
+        let other_after_d1 = status(other_row).await;
+        scanner
+            .flag_after_failed_scan(tag_row, Some(&d2.to_ascii_uppercase()))
+            .await;
+        let tag_after_d2 = status(tag_row).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            tag_after_d1.as_deref(),
+            Some("clean"),
+            "a failed scan of D1 must not flag the tag row, which names D2"
+        );
+        assert_eq!(
+            other_after_d1.as_deref(),
+            Some("flagged"),
+            "a non-manifest row is flagged as before"
+        );
+        assert_eq!(
+            tag_after_d2.as_deref(),
+            Some("flagged"),
+            "control: a failed scan of D2 flags the tag row"
         );
     }
 
@@ -20427,6 +20606,7 @@ tonic-build = "0.12"
             cache_ttl,
             delta_sink: None,
             osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+            exclusions: AdvisoryExclusions::default(),
         };
 
         let deps: Vec<_> = (0..1001)
@@ -20519,6 +20699,7 @@ tonic-build = "0.12"
             cache_ttl,
             delta_sink: None,
             osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+            exclusions: AdvisoryExclusions::default(),
         };
 
         let deps = vec![Dependency {
@@ -20625,6 +20806,7 @@ tonic-build = "0.12"
             cache_ttl,
             delta_sink: Some(sink.clone()),
             osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+            exclusions: AdvisoryExclusions::default(),
         };
         (server, client, sink)
     }
@@ -20693,6 +20875,7 @@ tonic-build = "0.12"
             cache_ttl: Duration::from_secs(3600),
             delta_sink: Some(sink.clone()),
             osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+            exclusions: AdvisoryExclusions::default(),
         };
         let deps = vec![Dependency {
             name: "never-seen-pkg".to_string(),
@@ -20750,6 +20933,7 @@ tonic-build = "0.12"
                 cache_ttl: Duration::from_secs(3600),
                 delta_sink: None,
                 osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+                exclusions: AdvisoryExclusions::default(),
             })
         }
 
@@ -21334,6 +21518,165 @@ tonic-build = "0.12"
                     .map(|m| &m.id)
                     .collect::<Vec<_>>()
             );
+        }
+
+        // -------------------------------------------------------------------
+        // #5691: internal packages are never named to an external feed
+        // -------------------------------------------------------------------
+
+        /// `advisory_client_for` with `ADVISORY_EXCLUDE_PATTERNS` set to `raw`.
+        fn excluding_client(osv_url: &str, github: Option<&str>, raw: &str) -> AdvisoryClient {
+            let mut client = Arc::try_unwrap(advisory_client_for(osv_url, github))
+                .unwrap_or_else(|_| unreachable!("a fresh Arc has one owner"));
+            client.exclusions = AdvisoryExclusions::parse(raw);
+            client
+        }
+
+        fn eco_dep(name: &str, version: &str, ecosystem: &str) -> Dependency {
+            Dependency {
+                name: name.to_string(),
+                version: Some(version.to_string()),
+                ecosystem: ecosystem.to_string(),
+            }
+        }
+
+        /// The names in every querybatch the mock received.
+        async fn osv_names_sent(server: &MockServer) -> Vec<String> {
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r.url.path() == "/v1/querybatch")
+                .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+                .flat_map(|b| {
+                    b["queries"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|q| q["package"]["name"].as_str().map(str::to_string))
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn test_excluded_package_is_never_sent_to_osv_and_public_one_still_is() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{ "vulns": [{ "id": "GHSA-j7hp-h8jx-5ppr" }] }]
+                })))
+                .mount(&server)
+                .await;
+            let client = excluding_client(
+                &format!("{}/v1/querybatch", server.uri()),
+                None,
+                "pkg:pypi/acme-*",
+            );
+
+            let lookup = client
+                .query_osv_detailed(&[pypi("acme-billing", "4.2.0"), pypi("pillow", "10.0.0")])
+                .await;
+
+            assert_eq!(
+                osv_names_sent(&server).await,
+                vec!["pillow".to_string()],
+                "the internal package must not appear in any OSV request"
+            );
+            assert!(
+                !lookup.degraded,
+                "a deliberate exclusion is not an unanswered question"
+            );
+            assert_eq!(lookup.not_queried, vec![0]);
+            assert!(lookup.per_dep[0].is_empty());
+            assert_eq!(
+                lookup.per_dep[1].len(),
+                1,
+                "the public package keeps its match"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_a_batch_of_only_excluded_packages_sends_no_request() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let client = excluding_client(
+                &format!("{}/v1/querybatch", server.uri()),
+                None,
+                "pkg:npm/@acme/*",
+            );
+            let lookup = client
+                .query_osv_detailed(&[eco_dep("@acme/billing", "4.2.0", "npm")])
+                .await;
+            assert!(!lookup.degraded);
+            assert_eq!(lookup.not_queried, vec![0]);
+        }
+
+        #[tokio::test]
+        async fn test_excluded_package_is_never_sent_to_github() {
+            let gh = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/advisories"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+                .mount(&gh)
+                .await;
+            let client = excluding_client(
+                "http://127.0.0.1:1/unused",
+                Some(&format!("{}/advisories", gh.uri())),
+                "pkg:maven/com.example.internal/*",
+            );
+            let lookup = client
+                .query_github_detailed(&[
+                    eco_dep("com.example.internal:billing-lib", "4.2.0", "Maven"),
+                    eco_dep("org.apache.commons:commons-text", "1.9", "Maven"),
+                ])
+                .await;
+
+            let asked: Vec<String> = gh
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .map(|r| r.url.query().unwrap_or_default().to_string())
+                .collect();
+            assert_eq!(
+                asked.len(),
+                1,
+                "only the public package is asked: {asked:?}"
+            );
+            assert!(asked[0].contains("commons-text"));
+            assert!(!asked.iter().any(|q| q.contains("internal")));
+            assert!(!lookup.degraded);
+            assert_eq!(lookup.not_queried, vec![0]);
+        }
+
+        /// Unset, nothing changes: every dependency is asked, as before #5691.
+        #[tokio::test]
+        async fn test_no_exclusions_sends_every_package() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "results": [{}, {}] })),
+                )
+                .mount(&server)
+                .await;
+            let client = excluding_client(&format!("{}/v1/querybatch", server.uri()), None, "");
+            let lookup = client
+                .query_osv_detailed(&[pypi("acme-billing", "4.2.0"), pypi("pillow", "10.0.0")])
+                .await;
+            assert_eq!(
+                osv_names_sent(&server).await,
+                vec!["acme-billing".to_string(), "pillow".to_string()]
+            );
+            assert!(lookup.not_queried.is_empty());
         }
 
         // -------------------------------------------------------------------
@@ -35246,6 +35589,7 @@ tonic-build = "0.12"
                 cache_ttl: Duration::from_secs(3600),
                 delta_sink: None,
                 osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+                exclusions: AdvisoryExclusions::default(),
             })
         }
 
@@ -36095,6 +36439,7 @@ tonic-build = "0.12"
                 cache_ttl: Duration::from_secs(3600),
                 delta_sink: None,
                 osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+                exclusions: AdvisoryExclusions::default(),
             })
         }
 
@@ -36211,6 +36556,45 @@ tonic-build = "0.12"
                 .as_object()
                 .expect("package object")
                 .clone()
+        }
+
+        /// #5691 review: a `pkg:conda/...` pattern is matched on the conda name
+        /// BEFORE planning rewrites it into a PyPI alias (`numpy`) or leaves it
+        /// unidentified (`acme-internal-tool`). Neither reaches the feed, the
+        /// exclusion is not a coverage gap (the scan stays `complete`), and the
+        /// inventory still names the package.
+        #[tokio::test]
+        async fn test_excluded_conda_package_is_never_sent_whatever_its_alias() {
+            for name in ["numpy", "acme-internal-tool"] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(answered_clean()))
+                    .expect(0)
+                    .mount(&server)
+                    .await;
+                let mut client = Arc::try_unwrap(advisory_client_at(&format!(
+                    "{}/v1/querybatch",
+                    server.uri()
+                )))
+                .unwrap_or_else(|_| unreachable!("a fresh Arc has one owner"));
+                client.exclusions =
+                    AdvisoryExclusions::parse("pkg:conda/numpy,pkg:conda/acme-internal-*");
+                let scanner = DependencyScanner::new(Arc::new(client));
+
+                let out = scan_conda(&scanner, name, "1.0.0", &Bytes::new()).await;
+
+                assert_eq!(
+                    out.scan_completeness,
+                    ScanCompleteness::Complete,
+                    "{name}: a deliberate exclusion is not a coverage gap"
+                );
+                assert!(
+                    out.packages.iter().any(|p| p.name == name),
+                    "{name}: the inventory still names the package: {:?}",
+                    out.packages
+                );
+                // `expect(0)` is verified when `server` drops.
+            }
         }
 
         // -------------------------------------------------------------------
