@@ -38,6 +38,10 @@
 use std::path::Path;
 
 use crate::error::{AppError, Result};
+use crate::services::http_client::{
+    reloadable_internal_service_client_builder, ReloadableClient as Client,
+    ReloadableClientBuilder as ClientBuilder,
+};
 use crate::services::image_scanner::TrivyReport;
 
 /// Default cap on the tarred filesystem workspace uploaded to the adapter
@@ -589,7 +593,7 @@ where
 
 /// One `GET {adapter_url}/probe/ready` attempt.
 pub(crate) async fn probe_adapter_ready(
-    http: &reqwest::Client,
+    http: &Client,
     url: &str,
     timeout: std::time::Duration,
 ) -> ReadyProbe {
@@ -697,7 +701,7 @@ impl AdapterAuth {
     }
 
     /// Add the header to every request a client built from `builder` sends.
-    pub(crate) fn apply(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    pub(crate) fn apply(&self, builder: ClientBuilder) -> ClientBuilder {
         match self {
             Self::Bearer(value) => {
                 let mut headers = reqwest::header::HeaderMap::new();
@@ -714,6 +718,32 @@ impl AdapterAuth {
             Self::Unusable(why) => Some(why),
             _ => None,
         }
+    }
+}
+
+/// Each adapter retains both pools. If either client cannot be built,
+/// callers report a configuration error before sending any adapter traffic.
+pub(crate) struct AdapterHttpClients {
+    pub(crate) request: Client,
+    pub(crate) poll: Client,
+}
+
+impl AdapterHttpClients {
+    pub(crate) fn build(
+        auth: &AdapterAuth,
+        request_timeout: std::time::Duration,
+    ) -> std::result::Result<Self, reqwest::Error> {
+        let request = auth
+            .apply(reloadable_internal_service_client_builder())
+            .timeout(request_timeout)
+            .build()?;
+        // A 302 marks a pending report; following it would hide that status.
+        let poll = auth
+            .apply(reloadable_internal_service_client_builder())
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+        Ok(Self { request, poll })
     }
 }
 
@@ -872,10 +902,7 @@ pub(crate) struct ScannerAdapterFsClient {
     /// How long to wait for `/probe/ready` before a scan (#5945,
     /// `SCANNER_ADAPTER_READY_TIMEOUT_SECS`).
     ready_wait: AdapterReadyWait,
-    http: reqwest::Client,
-    /// Redirects disabled so a `302 Found` "report not ready" is observed
-    /// rather than followed.
-    poll_http: reqwest::Client,
+    http: std::result::Result<AdapterHttpClients, reqwest::Error>,
 }
 
 impl ScannerAdapterFsClient {
@@ -895,19 +922,8 @@ impl ScannerAdapterFsClient {
         Self {
             adapter_url,
             ready_wait: initial_adapter_ready_wait(),
-            http: auth
-                .apply(crate::services::http_client::internal_service_client_builder())
-                // Generous: the body is the tarred workspace, potentially GBs
-                // for an incus rootfs.
-                .timeout(std::time::Duration::from_secs(900))
-                .build()
-                .unwrap_or_default(),
-            poll_http: auth
-                .apply(crate::services::http_client::internal_service_client_builder())
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .unwrap_or_default(),
+            // The body is the tarred workspace, potentially GBs for an incus rootfs.
+            http: AdapterHttpClients::build(&auth, std::time::Duration::from_secs(900)),
             auth,
         }
     }
@@ -917,12 +933,17 @@ impl ScannerAdapterFsClient {
     /// with the same tar, when the adapter lost the job or trivy's cache
     /// lock failed it (#5657).
     pub async fn scan_workspace_tar(&self, tar: Vec<u8>) -> Result<FsScanReportBody> {
+        let http = self.http.as_ref().map_err(|err| {
+            AppError::Internal(format!(
+                "Cannot initialize scanner-adapter HTTP clients: {err}"
+            ))
+        })?;
         let tar = bytes::Bytes::from(tar);
         let (this, tar) = (self, &tar);
         with_adapter_resubmits("Scanner-adapter filesystem scan", move || async move {
-            this.ensure_ready().await?;
-            let scan_id = this.submit(tar.clone()).await?;
-            this.poll_report(&scan_id).await
+            this.ensure_ready(&http.request).await?;
+            let scan_id = this.submit(&http.request, tar.clone()).await?;
+            this.poll_report(&http.poll, &scan_id).await
         })
         .await
     }
@@ -955,7 +976,7 @@ impl ScannerAdapterFsClient {
     /// Gate on `/probe/ready`: three attempts, or within
     /// `SCANNER_ADAPTER_READY_TIMEOUT_SECS` when set (#5945). Any failure
     /// here is an availability state, not a scan failure.
-    async fn ensure_ready(&self) -> Result<()> {
+    async fn ensure_ready(&self, http: &Client) -> Result<()> {
         if let Some(why) = self.auth.unusable() {
             return Err(self.unavailable(why));
         }
@@ -965,7 +986,7 @@ impl ScannerAdapterFsClient {
         let started = tokio::time::Instant::now();
         let outcome = wait_until_adapter_ready(
             wait,
-            |t| probe_adapter_ready(&self.http, &url, t),
+            |t| probe_adapter_ready(http, &url, t),
             |attempt, kind, detail| {
                 if fixed {
                     tracing::warn!(
@@ -1002,10 +1023,9 @@ impl ScannerAdapterFsClient {
     /// POST the tar body; returns the adapter-assigned job id. Transport
     /// errors and 503s are availability; any other adapter response that is
     /// not a valid accepted job is fail-closed `Internal`.
-    async fn submit(&self, tar: bytes::Bytes) -> Result<String> {
+    async fn submit(&self, http: &Client, tar: bytes::Bytes) -> Result<String> {
         let url = format!("{}/api/v1/filesystem/scan", self.adapter_url);
-        let mut req = self
-            .http
+        let mut req = http
             .post(&url)
             .header(reqwest::header::CONTENT_TYPE, "application/x-tar");
         // #5947: a DB-update rescan asks the adapter for its background band.
@@ -1058,6 +1078,7 @@ impl ScannerAdapterFsClient {
     ///   it is an unknown id or a cache-lock failure ([`AdapterResubmit`]).
     async fn poll_report(
         &self,
+        poll_http: &Client,
         scan_id: &str,
     ) -> std::result::Result<FsScanReportBody, AdapterAttemptError> {
         let url = format!(
@@ -1067,7 +1088,7 @@ impl ScannerAdapterFsClient {
         let mut clock = AdapterPollClock::new("Scanner-adapter filesystem scan", Self::POLL_BUDGET);
 
         loop {
-            let resp = match self.poll_http.get(&url).send().await {
+            let resp = match poll_http.get(&url).send().await {
                 Ok(resp) if !adapter_status_is_unreachable(resp.status()) => resp,
                 outcome => {
                     let detail = match outcome {

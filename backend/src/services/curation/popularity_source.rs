@@ -81,7 +81,7 @@ const DEFAULT_PYPISTATS_BASE: &str = "https://pypistats.org";
 const DEFAULT_NPM_BASE: &str = "https://api.npmjs.org";
 
 pub struct HttpPopularitySource {
-    client: reqwest::Client,
+    client: crate::services::http_client::ReloadableClient,
     /// `None`: lookups for this ecosystem are switched off and answer
     /// [`PopularityResult::Unknown`] without a request (#5288).
     pypistats_base: Option<String>,
@@ -110,7 +110,7 @@ impl HttpPopularitySource {
     /// Build a source using the repo-standard SSRF-guarded HTTP client with a
     /// short total-request timeout.
     pub fn new() -> Self {
-        let client = crate::services::http_client::base_client_builder()
+        let client = crate::services::http_client::reloadable_base_client_builder()
             .timeout(DEFAULT_REQUEST_TIMEOUT)
             .connect_timeout(Duration::from_secs(3))
             .build()

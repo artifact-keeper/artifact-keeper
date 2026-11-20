@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use reqwest::Client;
+use crate::services::http_client::ReloadableClient as Client;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -243,7 +243,7 @@ impl LdapService {
         Ok(Self {
             db,
             config,
-            http_client: crate::services::http_client::default_client(),
+            http_client: crate::services::http_client::reloadable_default_client(),
         })
     }
 
@@ -310,7 +310,7 @@ impl LdapService {
         Self {
             db,
             config,
-            http_client: crate::services::http_client::default_client(),
+            http_client: crate::services::http_client::reloadable_default_client(),
         }
     }
 
@@ -322,7 +322,7 @@ impl LdapService {
         Self {
             db,
             config,
-            http_client: crate::services::http_client::default_client(),
+            http_client: crate::services::http_client::reloadable_default_client(),
         }
     }
 

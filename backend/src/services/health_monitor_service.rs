@@ -3,8 +3,8 @@
 //! Monitors service health, tracks state transitions, fires webhook alerts,
 //! and manages alert suppression to prevent spam during extended outages.
 
+use crate::services::http_client::ReloadableClient as Client;
 use chrono::{DateTime, Utc};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::time::Duration;
@@ -82,7 +82,7 @@ pub enum HealthEvent {
 pub struct HealthMonitorService {
     db: PgPool,
     config: MonitorConfig,
-    http_client: Client,
+    http_client: std::result::Result<Client, reqwest::Error>,
 }
 
 /// Determine whether the periodic health monitor should probe
@@ -157,10 +157,10 @@ pub(crate) async fn probe_http_endpoint(
 
 impl HealthMonitorService {
     pub fn new(db: PgPool, config: MonitorConfig) -> Self {
-        let http_client = crate::services::http_client::internal_service_client_builder()
-            .timeout(Duration::from_secs(config.check_timeout_secs))
-            .build()
-            .unwrap_or_default();
+        let http_client =
+            crate::services::http_client::reloadable_internal_service_client_builder()
+                .timeout(Duration::from_secs(config.check_timeout_secs))
+                .build();
 
         Self {
             db,
@@ -185,7 +185,15 @@ impl HealthMonitorService {
         let full_url = format!("{}{}", url.trim_end_matches('/'), health_path);
         let start = std::time::Instant::now();
 
-        let (status, message) = probe_http_endpoint(&self.http_client, &full_url, basic_auth).await;
+        let (status, message) = match &self.http_client {
+            Ok(client) => probe_http_endpoint(client, &full_url, basic_auth).await,
+            Err(err) => (
+                "unavailable".to_string(),
+                Some(format!(
+                    "Cannot initialize service health HTTP client: {err}"
+                )),
+            ),
+        };
 
         let response_time_ms = start.elapsed().as_millis() as i32;
 
@@ -1009,7 +1017,7 @@ mod tests {
         });
 
         // Plain client: no SSRF resolver. Only testing header attachment.
-        let client = reqwest::Client::builder()
+        let client = crate::services::http_client::ReloadableClient::builder()
             .no_proxy()
             .timeout(Duration::from_secs(2))
             .build()

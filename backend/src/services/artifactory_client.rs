@@ -3,7 +3,8 @@
 //! This module provides a client for interacting with JFrog Artifactory's REST API
 //! to fetch repositories, artifacts, users, groups, and permissions for migration.
 
-use reqwest::{Client, RequestBuilder};
+use crate::services::http_client::ReloadableClient as Client;
+use reqwest::RequestBuilder;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
@@ -420,11 +421,13 @@ impl ArtifactoryClient {
         config: &ArtifactoryClientConfig,
         allow_http: bool,
     ) -> Result<Client, ArtifactoryError> {
-        Ok(crate::services::http_client::base_client_builder()
-            .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
-            .read_timeout(Duration::from_secs(config.timeout_secs))
-            .https_only(!allow_http)
-            .build()?)
+        Ok(
+            crate::services::http_client::reloadable_base_client_builder()
+                .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+                .read_timeout(Duration::from_secs(config.timeout_secs))
+                .https_only(!allow_http)
+                .build()?,
+        )
     }
 
     /// Whole-request ceiling for the callers that buffer the response body,
@@ -1299,7 +1302,7 @@ mod tests {
     /// wiremock's HTTP listener is reachable without env toggles.
     fn test_client(base_url: String) -> ArtifactoryClient {
         ArtifactoryClient {
-            client: reqwest::Client::new(),
+            client: crate::services::http_client::ReloadableClient::new(),
             config: ArtifactoryClientConfig {
                 base_url,
                 ..Default::default()

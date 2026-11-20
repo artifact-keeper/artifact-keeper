@@ -3,7 +3,7 @@
 //! Supports Nexus 3.x Community/Pro editions. Handles the Nexus REST API
 //! for listing repositories, components, assets, and downloading artifacts.
 
-use reqwest::Client;
+use crate::services::http_client::ReloadableClient as Client;
 use serde::Deserialize;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -337,7 +337,7 @@ impl NexusClient {
         // took longer than it, reported as "error decoding response body". That
         // made the real size limit depend on throughput. Bound the connect and
         // per-read phases instead: a slow download survives, a dead one does not.
-        let client = crate::services::http_client::base_client_builder()
+        let client = crate::services::http_client::reloadable_base_client_builder()
             .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
             .read_timeout(Duration::from_secs(config.timeout_secs))
             .build()?;

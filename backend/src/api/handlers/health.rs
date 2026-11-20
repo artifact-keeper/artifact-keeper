@@ -387,7 +387,7 @@ fn gate_detailed_health_fields(
 /// services (Trivy, OpenSCAP).
 ///
 /// Uses the **trusted-internal** client class
-/// ([`internal_service_client_builder`]), not the fail-closed upstream
+/// ([`reloadable_internal_service_client_builder`]), not the fail-closed upstream
 /// class: the probe targets come exclusively from server configuration
 /// (`TRIVY_URL` / `OPENSCAP_URL`), never from request input, and in the
 /// normal in-cluster / Compose topology they resolve to private-network
@@ -397,33 +397,19 @@ fn gate_detailed_health_fields(
 /// `HealthMonitorService` and the scan clients for the same endpoints.
 /// Cloud-metadata, loopback and link-local targets stay hard-blocked.
 ///
-/// [`internal_service_client_builder`]: crate::services::http_client::internal_service_client_builder
-fn build_service_probe_client() -> reqwest::Client {
-    crate::services::http_client::internal_service_client_builder()
+/// [`reloadable_internal_service_client_builder`]: crate::services::http_client::reloadable_internal_service_client_builder
+fn build_service_probe_client(
+) -> Result<crate::services::http_client::ReloadableClient, reqwest::Error> {
+    crate::services::http_client::reloadable_internal_service_client_builder()
         .timeout(Duration::from_secs(5))
         .build()
-        .unwrap_or_default()
 }
 
-/// The one probe client, built on first use and reused for the process
-/// lifetime.
-///
-/// Building a `reqwest::Client` is not free: every build runs
-/// `apply_custom_ca_cert`, which does a **blocking** `std::fs::read` of
-/// `CUSTOM_CA_CERT_PATH` on the async runtime when that variable is set
-/// (`services/http_client.rs`), re-parses the PEM bundle, and hands back a
-/// client with an empty connection pool — so each probe also pays a fresh TCP
-/// (and TLS) handshake. Doing that per `/health` request on an
-/// unauthenticated endpoint turns anonymous polling into runtime-blocking
-/// filesystem work; one shared client makes it a one-off and lets the probe
-/// keep its connection alive between windows (#3127).
-static SERVICE_PROBE_CLIENT: Lazy<reqwest::Client> = Lazy::new(build_service_probe_client);
-
-/// Return the shared probe client. `reqwest::Client` is an `Arc` internally,
-/// so the clone shares one connection pool rather than creating a new one.
-fn service_probe_client() -> reqwest::Client {
-    SERVICE_PROBE_CLIENT.clone()
-}
+/// Shared probe client. Clones reuse its pool until a validated custom-CA
+/// revision replaces it; polling and PEM parsing happen off the async workers.
+static SERVICE_PROBE_CLIENT: Lazy<
+    Result<crate::services::http_client::ReloadableClient, reqwest::Error>,
+> = Lazy::new(build_service_probe_client);
 
 /// Probe an external service health endpoint and return a CheckStatus.
 async fn check_service_health(
@@ -431,7 +417,18 @@ async fn check_service_health(
     health_path: &str,
     service_name: &str,
 ) -> CheckStatus {
-    let client = service_probe_client();
+    let client = match SERVICE_PROBE_CLIENT.as_ref() {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::debug!(error = %err, "Cannot initialize service probe HTTP client");
+            return CheckStatus {
+                status: "unavailable".to_string(),
+                message: Some(format!(
+                    "{service_name} probe HTTP client could not be initialized"
+                )),
+            };
+        }
+    };
     let url = format!("{}{}", base_url.trim_end_matches('/'), health_path);
     match client.get(&url).send().await {
         Ok(resp) if resp.status().is_success() => CheckStatus {
@@ -1446,7 +1443,7 @@ mod tests {
             }
         });
 
-        let client = service_probe_client();
+        let client = SERVICE_PROBE_CLIENT.as_ref().unwrap();
         let url = format!("http://127.0.0.1:{}/healthz", addr.port());
         let result = client.get(&url).send().await;
         let _ = server.await;
@@ -1483,7 +1480,7 @@ mod tests {
             .expect("bind test listener");
         let port = listener.local_addr().expect("local addr").port();
 
-        let client = service_probe_client();
+        let client = SERVICE_PROBE_CLIENT.as_ref().unwrap();
         let url = format!("http://localhost:{port}/healthz");
         let err = client
             .get(&url)

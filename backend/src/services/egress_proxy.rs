@@ -417,27 +417,29 @@ pub fn validate_no_proxy(no_proxy: &str) -> Result<()> {
 /// Build a `reqwest::Client` that routes this repository's outbound requests
 /// per `config`.
 ///
-/// Starts from [`http_client::base_client_builder`] so the custom-CA handling,
+/// Starts from [`http_client::reloadable_base_client_builder`] so the custom-CA handling,
 /// redirect SSRF policy, timeouts and content-encoding posture are byte-for-byte
 /// what every other upstream fetch gets. Only the proxy routing and the DNS
 /// resolver's proxy-host exemption differ.
 ///
-/// [`http_client::base_client_builder`]: crate::services::http_client::base_client_builder
+/// [`http_client::reloadable_base_client_builder`]: crate::services::http_client::reloadable_base_client_builder
 pub fn build_repo_client(config: &EgressProxyConfig) -> Result<reqwest::Client> {
     repo_client_builder(config)?
+        .snapshot()
         .build()
         .map_err(|e| AppError::Internal(format!("Failed to build egress-proxy HTTP client: {e}")))
 }
 
-/// The [`reqwest::ClientBuilder`] behind [`build_repo_client`], for a caller
-/// that adds its own settings (a client-wide timeout) before building.
-pub fn repo_client_builder(config: &EgressProxyConfig) -> Result<reqwest::ClientBuilder> {
+/// Policy for both the one-shot egress probe and retained repository pools.
+pub fn repo_client_builder(
+    config: &EgressProxyConfig,
+) -> Result<crate::services::http_client::ReloadableClientBuilder> {
     // `direct` and `explicit` replace the environment proxy, so they start
     // from a builder that never installs it (or its destination check).
     let mut builder = match config.mode {
-        EgressProxyMode::Inherit => crate::services::http_client::base_client_builder(),
+        EgressProxyMode::Inherit => crate::services::http_client::reloadable_base_client_builder(),
         EgressProxyMode::Direct | EgressProxyMode::Explicit => {
-            crate::services::http_client::base_client_builder_without_env_proxy()
+            crate::services::http_client::reloadable_base_client_builder_without_env_proxy()
         }
     };
 
