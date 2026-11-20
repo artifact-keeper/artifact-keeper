@@ -1,5 +1,0 @@
----
-section: Changed
-issues: [#6242, #6289, #6270]
----
-- **Development and CI: CI and the release pipeline are steadier on hosted runners** (#6242). Check Rust runs clippy in two passes so the library and its tests no longer compile at the same time and swap the 16 GB runner, with a memory watchdog that leaves evidence if a run stalls (#6263); the Windows cross-check installs only the x86_64 mingw toolchain with a bounded, mirror-fallback download and is a required check again (#6265); and Docker Publish runs for `main` pushes coalesce to the newest pending commit, with the Release Candidate re-running its own commit's build if it was replaced (#6264); the Docker Publish watchdog now also catches a started run whose last job has waited too long for a runner, and cancels a superseded `main` push run so the newest commit can publish, never a tag, release-branch, dispatched or re-run build, and never while a Release Candidate is running (#6289); and the goproxy tests that overflowed the stack under coverage instrumentation now pass with room to spare, with no behaviour change (#6270).
