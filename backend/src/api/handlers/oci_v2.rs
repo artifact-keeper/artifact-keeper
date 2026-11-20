@@ -4432,20 +4432,26 @@ async fn try_resolve_virtual_blob(
                     let fetched = match proxy_helpers::virtual_member_download_deadline(
                         proxy.upstream_read_timeout(),
                     ) {
-                        Some(deadline) => match tokio::time::timeout(deadline, fetch).await {
-                            Ok(fetched) => fetched,
-                            Err(_) => {
-                                proxy_helpers::record_virtual_member_download_deadline_miss(
-                                    &member.key,
-                                    &upstream_path,
-                                    deadline,
-                                );
-                                breaker.record(member.id, &member.key, true);
-                                // Not evidence the blob is absent (#3836).
-                                indeterminate = true;
-                                break;
+                        Some(deadline) => {
+                            match crate::services::upstream_circuit::within_own_deadline(
+                                deadline, fetch,
+                            )
+                            .await
+                            {
+                                Ok(fetched) => fetched,
+                                Err(_) => {
+                                    proxy_helpers::record_virtual_member_download_deadline_miss(
+                                        &member.key,
+                                        &upstream_path,
+                                        deadline,
+                                    );
+                                    breaker.record(member.id, &member.key, true);
+                                    // Not evidence the blob is absent (#3836).
+                                    indeterminate = true;
+                                    break;
+                                }
                             }
-                        },
+                        }
                         None => fetch.await,
                     };
                     // Only a deadline miss trips the breaker here: the error

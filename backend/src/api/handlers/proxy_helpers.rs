@@ -3848,7 +3848,9 @@ where
             let Some(deadline) = walk.deadline else {
                 return fetch.await;
             };
-            match tokio::time::timeout(deadline, fetch).await {
+            // #5013: our own deadline, so a request still waiting inside
+            // counts against the member's upstream circuit.
+            match crate::services::upstream_circuit::within_own_deadline(deadline, fetch).await {
                 Ok(outcome) => outcome,
                 Err(_) => {
                     record_virtual_member_download_deadline_miss(&member.key, walk.path, deadline);
@@ -5072,7 +5074,8 @@ pub async fn within_virtual_member_deadline<F: std::future::Future>(
     fut: F,
 ) -> Result<F::Output, std::time::Duration> {
     let deadline = virtual_member_metadata_timeout();
-    tokio::time::timeout(deadline, fut)
+    // #5013: our own deadline (see `within_own_deadline`).
+    crate::services::upstream_circuit::within_own_deadline(deadline, fut)
         .await
         .map_err(|_| deadline)
 }

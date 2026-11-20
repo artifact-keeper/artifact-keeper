@@ -9,9 +9,14 @@
 //!
 //! Every upstream request [`crate::services::proxy_service`] makes for a
 //! Remote repository goes through [`UpstreamCircuits::admit`] first. The
-//! circuit is keyed by the repository and the upstream host (with its port),
-//! so a dead Remote never short-circuits another Remote on the same host, and
-//! a redirect or token host gets a circuit of its own.
+//! circuit is keyed by the repository and the host (with its port) of the URL
+//! the request was sent to, so a dead Remote never short-circuits another
+//! Remote on the same host. A separate request to another host (an OCI token
+//! realm, a tarball URL an index names) gets a circuit of its own. Redirects
+//! are followed inside one request, so they share the circuit of the URL that
+//! was asked: a dead CDN behind a registry's redirects opens the registry's
+//! circuit for that Remote. Likewise the circuit is per host, not per path:
+//! repeated `502`/`503`/`504` from one path open it for the whole host.
 //!
 //! * **Closed** (the normal state): requests go out. After
 //!   [`CIRCUIT_FAILURES_ENV`] failures in a row, each within
@@ -32,9 +37,12 @@
 //!
 //! What counts:
 //! * a **failure** is a connect error, a timeout, another transport error, an
-//!   upstream `502`, `503` or `504`, or a request abandoned (its future
-//!   dropped by a deadline above it) after it had waited
-//!   [`CIRCUIT_SLOW_CALL_SECS_ENV`] for response headers;
+//!   upstream `502`, `503` or `504`, or a request that this server's own
+//!   deadline gave up on ([`within_own_deadline`]: the virtual member
+//!   deadlines, the fetch and fill deadlines) after it had waited
+//!   [`CIRCUIT_SLOW_CALL_SECS_ENV`] for response headers. A request dropped
+//!   because its client went away is never a failure, however long it waited:
+//!   a client that gives up after 15 s says nothing about the upstream;
 //! * a **success** is any other HTTP answer: `2xx`, `3xx`, `404`, `410`,
 //!   `401`, `403` and the other `4xx`. The upstream answered, so a real miss
 //!   stays a miss and a credentials refusal stays a refusal;
@@ -51,6 +59,12 @@
 //! to every upstream request and make the breaker depend on a second system
 //! during exactly the partial outages it exists for. A replica whose own
 //! egress is broken also ought to open on its own.
+//!
+//! The table is bounded: hosts can come from upstream content, so only
+//! failing upstreams are kept, an entry with no failure for a window (and no
+//! open period still running) is pruned, and past
+//! [`DEFAULT_CIRCUIT_MAX_TRACKED`] entries a new upstream is simply not
+//! tracked (it behaves as closed) until pruning makes room.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -76,8 +90,9 @@ pub const CIRCUIT_OPEN_SECS_ENV: &str = "AK_UPSTREAM_CIRCUIT_OPEN_SECS";
 /// The longest open period the backoff grows to, in seconds. Default
 /// [`DEFAULT_CIRCUIT_MAX_OPEN_SECS`]; never below the first period.
 pub const CIRCUIT_MAX_OPEN_SECS_ENV: &str = "AK_UPSTREAM_CIRCUIT_MAX_OPEN_SECS";
-/// A request abandoned after waiting this many seconds for its response
-/// headers counts as a failure. Default [`DEFAULT_CIRCUIT_SLOW_CALL_SECS`];
+/// A request this server's own deadline abandoned after it waited this many
+/// seconds for its response headers counts as a failure (a client disconnect
+/// never does). Default [`DEFAULT_CIRCUIT_SLOW_CALL_SECS`];
 /// `0` never counts an abandoned request.
 pub const CIRCUIT_SLOW_CALL_SECS_ENV: &str = "AK_UPSTREAM_CIRCUIT_SLOW_CALL_SECS";
 
@@ -93,6 +108,10 @@ pub const DEFAULT_CIRCUIT_OPEN_SECS: u64 = 10;
 pub const DEFAULT_CIRCUIT_MAX_OPEN_SECS: u64 = 300;
 /// Default for [`CIRCUIT_SLOW_CALL_SECS_ENV`]: the default connect timeout.
 pub const DEFAULT_CIRCUIT_SLOW_CALL_SECS: u64 = 10;
+/// Most upstreams tracked at once per proxy service.
+pub const DEFAULT_CIRCUIT_MAX_TRACKED: usize = 10_000;
+/// Least time between two prunes of a full table.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Gauge per circuit: `0` closed, `1` open, `2` half-open (a probe is out).
 pub const CIRCUIT_STATE_GAUGE: &str = "ak_upstream_circuit_state";
@@ -119,6 +138,8 @@ pub struct CircuitSettings {
     pub open_max: Duration,
     /// `None`: an abandoned request never counts.
     pub slow_call: Option<Duration>,
+    /// Most upstreams tracked at once.
+    pub max_tracked: usize,
 }
 
 impl Default for CircuitSettings {
@@ -160,6 +181,7 @@ impl CircuitSettings {
             open_base: (open > 0).then(|| Duration::from_secs(open)),
             open_max: Duration::from_secs(max_open),
             slow_call: (slow > 0).then(|| Duration::from_secs(slow)),
+            max_tracked: DEFAULT_CIRCUIT_MAX_TRACKED,
         }
     }
 
@@ -249,6 +271,58 @@ struct CircuitState {
     probing: bool,
 }
 
+impl CircuitState {
+    /// Whether the entry no longer carries anything worth keeping: closed
+    /// with its last failure a window ago (the next failure would start a new
+    /// count anyway), or open with its period over for a window and no probe
+    /// out (nobody has asked since; its backoff is forgotten).
+    fn is_stale(&self, now: Instant, window: Duration) -> bool {
+        if self.probing {
+            return false;
+        }
+        match self.open_until {
+            None => self
+                .last_failure_at
+                .is_none_or(|last| now.saturating_duration_since(last) > window),
+            Some(until) => now.saturating_duration_since(until) > window,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CircuitTable {
+    states: HashMap<CircuitKey, CircuitState>,
+    last_prune: Option<Instant>,
+}
+
+std::thread_local! {
+    /// Set while [`within_own_deadline`] drops the future its deadline
+    /// abandoned, so a [`CircuitCall`] dropped with it knows it was this
+    /// server that gave up, not the client.
+    static OWN_DEADLINE_DROP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`tokio::time::timeout`] for a deadline of this server's own (a virtual
+/// member deadline, the fetch or fill deadline): when it fires, the abandoned
+/// future is dropped right here, marked, so an upstream request still waiting
+/// inside it counts against its circuit ([`CircuitSettings::slow_call`]). A
+/// future dropped any other way (the client disconnected) never counts.
+pub async fn within_own_deadline<F: std::future::Future>(
+    deadline: Duration,
+    fut: F,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    let mut fut = Box::pin(fut);
+    match tokio::time::timeout(deadline, fut.as_mut()).await {
+        Ok(output) => Ok(output),
+        Err(elapsed) => {
+            OWN_DEADLINE_DROP.with(|flag| flag.set(true));
+            drop(fut);
+            OWN_DEADLINE_DROP.with(|flag| flag.set(false));
+            Err(elapsed)
+        }
+    }
+}
+
 /// A request to the upstream refused because its circuit is open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CircuitOpen {
@@ -281,7 +355,7 @@ pub fn is_upstream_circuit_open(err: &AppError) -> bool {
 #[derive(Debug)]
 pub struct UpstreamCircuits {
     settings: CircuitSettings,
-    states: Mutex<HashMap<CircuitKey, CircuitState>>,
+    states: Mutex<CircuitTable>,
 }
 
 impl Default for UpstreamCircuits {
@@ -290,10 +364,10 @@ impl Default for UpstreamCircuits {
     }
 }
 
-/// An admitted request. Report how it went with [`Self::finish`]; dropping it
-/// unfinished (the request was abandoned) counts as a failure only once it
-/// had waited [`CircuitSettings::slow_call`], and otherwise just frees the
-/// probe slot.
+/// An admitted request. Report how it went with [`Self::finish`]. Dropping it
+/// unfinished counts as a failure only when [`within_own_deadline`] dropped
+/// it after it had waited [`CircuitSettings::slow_call`]; any other drop (a
+/// client disconnect, a quick cancel) only frees the probe slot.
 #[must_use]
 pub struct CircuitCall<'a> {
     circuits: &'a UpstreamCircuits,
@@ -322,13 +396,14 @@ impl Drop for CircuitCall<'_> {
         let Some(key) = self.key.take() else {
             return;
         };
+        let own_deadline = OWN_DEADLINE_DROP.with(std::cell::Cell::get);
         let slow = self
             .circuits
             .settings
             .slow_call
             .is_some_and(|slow| self.started.elapsed() >= slow);
-        let outcome = if slow {
-            CallOutcome::Failure("no response headers before the request was abandoned")
+        let outcome = if own_deadline && slow {
+            CallOutcome::Failure("no response headers before this server's deadline")
         } else {
             CallOutcome::Neutral
         };
@@ -340,7 +415,7 @@ impl UpstreamCircuits {
     pub fn new(settings: CircuitSettings) -> Self {
         Self {
             settings,
-            states: Mutex::new(HashMap::new()),
+            states: Mutex::new(CircuitTable::default()),
         }
     }
 
@@ -352,7 +427,7 @@ impl UpstreamCircuits {
         &self.settings
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<CircuitKey, CircuitState>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CircuitTable> {
         // A few counters per entry: a panic while holding the lock leaves
         // nothing worth refusing to read.
         self.states
@@ -374,10 +449,11 @@ impl UpstreamCircuits {
             });
         }
         let key = CircuitKey::of(repo, url);
-        let mut states = self.lock();
+        let mut table = self.lock();
+        let states = &mut table.states;
         let open_until = states.get(&key).and_then(|s| s.open_until);
         let Some(open_until) = open_until else {
-            drop(states);
+            drop(table);
             return Ok(CircuitCall {
                 circuits: self,
                 key: Some(key),
@@ -388,7 +464,7 @@ impl UpstreamCircuits {
         let state = states.get_mut(&key).expect("present: open_until was read");
         if started < open_until || state.probing {
             let retry_in = open_until.saturating_duration_since(started);
-            drop(states);
+            drop(table);
             metrics::counter!(CIRCUIT_SHORT_CIRCUITED_COUNTER, &key.labels()).increment(1);
             return Err(CircuitOpen {
                 host: key.host,
@@ -396,7 +472,7 @@ impl UpstreamCircuits {
             });
         }
         state.probing = true;
-        drop(states);
+        drop(table);
         metrics::gauge!(CIRCUIT_STATE_GAUGE, &key.labels()).set(2.0);
         tracing::info!(
             repository_id = %key.repo,
@@ -413,21 +489,21 @@ impl UpstreamCircuits {
 
     fn record(&self, key: &CircuitKey, outcome: CallOutcome, probe: bool) {
         let now = Instant::now();
-        let mut states = self.lock();
+        let mut table = self.lock();
         match outcome {
             CallOutcome::Neutral => {
                 if probe {
-                    if let Some(state) = states.get_mut(key) {
+                    if let Some(state) = table.states.get_mut(key) {
                         // The probe said nothing: the next request probes.
                         state.probing = false;
                     }
                 }
             }
             CallOutcome::Success => {
-                let Some(state) = states.remove(key) else {
+                let Some(state) = table.states.remove(key) else {
                     return;
                 };
-                drop(states);
+                drop(table);
                 if state.open_until.is_some() {
                     metrics::gauge!(CIRCUIT_STATE_GAUGE, &key.labels()).set(0.0);
                     tracing::info!(
@@ -438,7 +514,12 @@ impl UpstreamCircuits {
                 }
             }
             CallOutcome::Failure(reason) => {
-                let state = states.entry(key.clone()).or_default();
+                if !table.states.contains_key(key) && !self.make_room(&mut table, now) {
+                    // Full of upstreams that are still failing: this one is
+                    // not tracked (it behaves as closed) until room is made.
+                    return;
+                }
+                let state = table.states.entry(key.clone()).or_default();
                 if state.open_until.is_some() && !probe {
                     // A request admitted before the circuit opened, failing
                     // late: already counted by the opening.
@@ -465,7 +546,7 @@ impl UpstreamCircuits {
                 state.open_until = Some(now + period);
                 state.probing = false;
                 let (failures, opens) = (state.failures, state.opens);
-                drop(states);
+                drop(table);
                 metrics::gauge!(CIRCUIT_STATE_GAUGE, &key.labels()).set(1.0);
                 metrics::counter!(CIRCUIT_OPENS_COUNTER, &key.labels()).increment(1);
                 tracing::warn!(
@@ -482,6 +563,37 @@ impl UpstreamCircuits {
                 );
             }
         }
+    }
+}
+
+impl UpstreamCircuits {
+    /// Whether a new entry fits: below the cap, or after pruning the stale
+    /// entries of a full table (at most once per [`PRUNE_INTERVAL`]).
+    fn make_room(&self, table: &mut CircuitTable, now: Instant) -> bool {
+        if table.states.len() < self.settings.max_tracked {
+            return true;
+        }
+        let due = table
+            .last_prune
+            .is_none_or(|last| now.saturating_duration_since(last) >= PRUNE_INTERVAL);
+        if due {
+            table.last_prune = Some(now);
+            let window = self.settings.window;
+            table.states.retain(|key, state| {
+                let stale = state.is_stale(now, window);
+                if stale && state.open_until.is_some() {
+                    metrics::gauge!(CIRCUIT_STATE_GAUGE, &key.labels()).set(0.0);
+                }
+                !stale
+            });
+        }
+        table.states.len() < self.settings.max_tracked
+    }
+
+    /// How many upstreams are tracked.
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.lock().states.len()
     }
 }
 
@@ -505,7 +617,20 @@ mod tests {
             open_base: Some(OPEN),
             open_max: Duration::from_secs(300),
             slow_call: Some(Duration::from_secs(10)),
+            max_tracked: DEFAULT_CIRCUIT_MAX_TRACKED,
         }
+    }
+
+    /// Hold `call` in a request that never answers, under this server's own
+    /// deadline of `secs`.
+    async fn abandon_by_own_deadline(call: CircuitCall<'_>, secs: u64) {
+        let hung = async move {
+            let _call = call;
+            std::future::pending::<()>().await
+        };
+        assert!(within_own_deadline(Duration::from_secs(secs), hung)
+            .await
+            .is_err());
     }
 
     fn url(s: &str) -> reqwest::Url {
@@ -648,11 +773,10 @@ mod tests {
             .admit(repo, &u)
             .expect("a quick cancel frees the probe slot");
         assert!(probe.is_probe());
-        tokio::time::advance(Duration::from_secs(10)).await;
-        drop(probe);
+        abandon_by_own_deadline(probe, 10).await;
         assert!(
             c.admit(repo, &u).is_err(),
-            "a probe abandoned after the slow-call threshold reopens"
+            "a probe our own deadline abandoned after the slow-call threshold reopens"
         );
     }
 
@@ -661,11 +785,77 @@ mod tests {
         let c = UpstreamCircuits::new(settings(2));
         let (repo, u) = (Uuid::new_v4(), url("http://up.example/a"));
         for _ in 0..2 {
-            let call = c.admit(repo, &u).unwrap();
-            tokio::time::advance(Duration::from_secs(11)).await;
-            drop(call);
+            abandon_by_own_deadline(c.admit(repo, &u).unwrap(), 11).await;
         }
         assert!(c.admit(repo, &u).is_err());
+    }
+
+    /// Review of #6339: a client that gives up (pip after 15 s, five times)
+    /// drops the request future; that is not the upstream failing.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_disconnect_is_never_a_failure_5013() {
+        let c = UpstreamCircuits::new(settings(2));
+        let (repo, u) = (Uuid::new_v4(), url("http://up.example/a"));
+        for _ in 0..5 {
+            let call = c.admit(repo, &u).unwrap();
+            tokio::time::advance(Duration::from_secs(15)).await;
+            drop(call);
+        }
+        assert!(c.admit(repo, &u).is_ok(), "five client drops at 15 s");
+        assert_eq!(c.tracked(), 0, "no failure was counted");
+        // A quick own-deadline drop (under the slow-call threshold) does not
+        // count either.
+        abandon_by_own_deadline(c.admit(repo, &u).unwrap(), 5).await;
+        assert_eq!(c.tracked(), 0);
+    }
+
+    /// Review of #6339: hosts can come from upstream content, so the table
+    /// is capped and stale entries are pruned to make room.
+    #[tokio::test(start_paused = true)]
+    async fn the_table_is_bounded_and_pruned_5013() {
+        let mut s = settings(5);
+        s.max_tracked = 3;
+        let c = UpstreamCircuits::new(s);
+        let repo = Uuid::new_v4();
+        let host = |i: u32| url(&format!("http://h{i}.example/x"));
+        for i in 0..3 {
+            fail(&c, repo, &host(i), 1);
+        }
+        assert_eq!(c.tracked(), 3);
+        fail(&c, repo, &host(3), 1);
+        assert_eq!(
+            c.tracked(),
+            3,
+            "full of fresh failures: the new host is not tracked"
+        );
+        // h0 keeps failing until it opens; the others go quiet.
+        fail(&c, repo, &host(0), 4);
+        assert!(c.admit(repo, &host(0)).is_err());
+        tokio::time::advance(Duration::from_secs(61)).await;
+        fail(&c, repo, &host(3), 1);
+        assert_eq!(
+            c.tracked(),
+            2,
+            "h1 and h2 were pruned; h0's open period still counts"
+        );
+        assert!(c.admit(repo, &host(0)).is_ok_and(|p| p.is_probe()));
+        // Untracked hosts behave as closed.
+        for i in 10..20 {
+            assert!(c.admit(repo, &host(i)).is_ok());
+        }
+        // An open circuit nobody asked about for a window after its period
+        // ended is pruned as well.
+        let mut s = settings(1);
+        s.max_tracked = 1;
+        let c = UpstreamCircuits::new(s);
+        fail(&c, repo, &host(0), 1);
+        tokio::time::advance(Duration::from_secs(12 + 61)).await;
+        fail(&c, repo, &host(1), 1);
+        assert!(
+            c.admit(repo, &host(0)).is_ok_and(|p| !p.is_probe()),
+            "h0 forgotten"
+        );
+        assert!(c.admit(repo, &host(1)).is_err(), "h1 tracked and open");
     }
 
     #[tokio::test(start_paused = true)]
@@ -708,7 +898,7 @@ mod tests {
         let (repo, u) = (Uuid::new_v4(), url("http://up.example/a"));
         fail(&c, repo, &u, 10);
         assert!(c.admit(repo, &u).is_ok());
-        assert!(c.lock().is_empty(), "nothing is tracked while disabled");
+        assert_eq!(c.tracked(), 0, "nothing is tracked while disabled");
     }
 
     #[test]
@@ -745,6 +935,6 @@ mod tests {
         // Outside a runtime: `tokio::time::Instant` falls back to std.
         fail(&c, repo, &u, 2);
         c.admit(repo, &u).unwrap().finish(CallOutcome::Success);
-        assert!(c.lock().is_empty(), "only failing upstreams are kept");
+        assert_eq!(c.tracked(), 0, "only failing upstreams are kept");
     }
 }

@@ -7761,7 +7761,8 @@ impl ProxyService {
         // long as the socket stays open. A deadline is a transient failure,
         // so stale-if-error below still applies.
         let deadline = self.upstream_timeouts.fetch_deadline();
-        let upstream_result = match tokio::time::timeout(
+        // #5013: our own deadline (see `within_own_deadline`).
+        let upstream_result = match crate::services::upstream_circuit::within_own_deadline(
             deadline,
             self.fetch_from_upstream_with_accept(full_url, repo.id, accept, max),
         )

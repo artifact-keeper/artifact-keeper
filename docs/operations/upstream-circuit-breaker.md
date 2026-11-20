@@ -33,7 +33,8 @@ replicas and repositories do not all probe at the same moment.
 |---|---|
 | Connect error, DNS failure, connection reset, timeout | Failure |
 | `502`, `503`, `504` | Failure |
-| Abandoned (a deadline above it, such as the virtual member deadline, gave up on it) after waiting `AK_UPSTREAM_CIRCUIT_SLOW_CALL_SECS` for response headers | Failure |
+| Given up on by one of this server's own deadlines (the virtual member deadlines, the fetch or fill deadline) after waiting `AK_UPSTREAM_CIRCUIT_SLOW_CALL_SECS` for response headers | Failure |
+| Dropped because the client went away (it timed out or disconnected), however long it had waited | Neither |
 | Any other answer: `2xx`, `3xx`, `404`, `410`, `401`, `403`, other `4xx` | Success: closes the circuit and resets the count |
 | `429`, `500`, `501` and other `5xx`; a refusal by this server's own outbound policy (SSRF, egress proxy) | Neither |
 
@@ -92,9 +93,22 @@ handles it the same way:
   the breaker depend on a second system during the partial outages it is for;
   and a replica whose own egress is broken should open on its own. A restart
   closes every circuit.
-- Circuits are per repository and host (with port): one dead Remote never
-  refuses requests for another Remote on the same host, and a redirect or
-  token host has its own circuit.
+- Circuits are per repository and host (with port) of the URL a request is
+  sent to: one dead Remote never refuses requests for another Remote on the
+  same host. A separate request to another host (an OCI token realm, a
+  tarball or file URL that an index names) has its own circuit.
+- Redirects are followed inside one request, so they count against the
+  circuit of the URL that was asked. If a registry redirects downloads to a
+  CDN and the CDN is down, the registry's circuit opens for that Remote.
+- A circuit covers a whole host, not one path. An upstream that answers
+  `502`, `503` or `504` five times in a row for a single path (with no other
+  answer in between) opens the circuit for every path of that host for the
+  open period.
+- The state is bounded: only upstreams that are failing are kept, an entry
+  is dropped once it has had no failure for a window (and no open period is
+  still running), and at most 10,000 upstreams are tracked per replica; past
+  that, a new upstream is not tracked (it behaves as closed) until room is
+  made.
 
 ## Settings
 
@@ -104,7 +118,7 @@ handles it the same way:
 | `AK_UPSTREAM_CIRCUIT_WINDOW_SECS` | `120` | A failure more than this long after the previous one starts a new count. |
 | `AK_UPSTREAM_CIRCUIT_OPEN_SECS` | `10` | First open period. `0` disables the breaker. |
 | `AK_UPSTREAM_CIRCUIT_MAX_OPEN_SECS` | `300` | Longest open period the backoff reaches. |
-| `AK_UPSTREAM_CIRCUIT_SLOW_CALL_SECS` | `10` | An abandoned request that waited this long for response headers counts as a failure. `0`: never. |
+| `AK_UPSTREAM_CIRCUIT_SLOW_CALL_SECS` | `10` | A request one of this server's own deadlines gave up on after it waited this long for response headers counts as a failure. A client disconnect never counts. `0`: never. |
 
 To keep the behaviour of 1.12 (every request contacts the upstream), set
 `AK_UPSTREAM_CIRCUIT_OPEN_SECS=0`.
