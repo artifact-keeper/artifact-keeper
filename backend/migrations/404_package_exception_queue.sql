@@ -7,6 +7,8 @@ ALTER TABLE age_gate_reviews
     -- NULL means the row exists only because a pull was refused
     ADD COLUMN IF NOT EXISTS justification TEXT,
     ADD COLUMN IF NOT EXISTS requested_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    -- Everyone who has filed a request on the row, so a co-requester can't grant it either
+    ADD COLUMN IF NOT EXISTS requesters UUID[] NOT NULL DEFAULT '{}',
     ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,
     -- Scan gate only: the content digest the exception was granted for, so republished bytes re-block
     ADD COLUMN IF NOT EXISTS basis_digest TEXT;
