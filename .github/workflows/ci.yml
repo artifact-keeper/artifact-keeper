@@ -1166,8 +1166,13 @@ jobs:
       # this step (8-9 minutes normally). memory-cap.sh runs the build in a
       # cgroup with memory.high = MemTotal minus 2.75 GiB, so the kernel
       # swaps the compiler's pages, not the agent's or Postgres's.
+      #
+      # 30 minutes (5-19 normally, the router leg's lib + bins the longest):
+      # a compile that the cap throttles into a crawl fails here with its
+      # log, instead of running into the 60-minute job ceiling.
       - name: Build instrumented test binaries
         id: build
+        timeout-minutes: 30
         run: |
           source <(cargo llvm-cov show-env --sh)
           cargo llvm-cov clean --workspace

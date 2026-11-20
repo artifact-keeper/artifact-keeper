@@ -112,5 +112,9 @@ if [[ "$capped" == true ]]; then
   swap_peak="$(cat "${cg}/memory.swap.peak" 2>/dev/null || echo "")"
   fmt() { if [[ "$1" =~ ^[0-9]+$ ]]; then echo "$(gib "$1") GiB"; else echo "n/a"; fi; }
   echo "memory-cap: ${cg}: memory.peak $(fmt "$peak"), swap peak $(fmt "$swap_peak"), throttled ${throttled:-0} times at memory.high"
+  # Leave the cgroup and remove it, so a second capped step starts clean.
+  # Best effort: a cgroup that still holds a process is simply left behind.
+  write "$$" "${root}/cgroup.procs"
+  if [[ -n "$sudo_cmd" ]]; then $sudo_cmd rmdir "$cg" 2>/dev/null; else rmdir "$cg" 2>/dev/null; fi
 fi
 exit "$status"

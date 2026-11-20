@@ -145,6 +145,9 @@ def check(ok, msg):
 
 unit = job("test-backend-unit-shard")
 build = step(unit, "Build instrumented test binaries")
+check(re.search(r"^        timeout-minutes: (\d+)$", build, re.M) is not None
+      and int(re.search(r"^        timeout-minutes: (\d+)$", build, re.M).group(1)) <= 30,
+      "unit shards: the instrumented build step has its own timeout of at most 30 minutes")
 check(build.count("scripts/ci/memory-cap.sh") >= 2,
       "unit shards: the lib and bins instrumented builds run under memory-cap.sh")
 check("Add swap" in unit and "memory-watch.sh start" in unit and "memory-watch.sh report" in unit,
