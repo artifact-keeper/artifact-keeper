@@ -389,10 +389,16 @@ pub fn merge_dependencies(
 /// texts can therefore wrap alike (`GPL-2.0+ AND MIT` and `GPL-2.0 AND MIT`,
 /// or two long lists that share their first 64 characters), and swapping on
 /// such a match could replace the license Trivy saw with a different one.
-/// So the match only counts when nothing but spaces was rewritten (`raw` is
-/// letters, digits, `.`, `-` and single spaces) and the body was not cut
-/// (shorter than 64 characters). The residual ambiguity is between a space
-/// and a `-` (`MIT AND X` vs `MIT-AND-X`), which names the same terms.
+/// So the match does not count when the body may have been cut (64
+/// characters or more), or when `raw` itself has anything the wrapping
+/// rewrites other than single spaces.
+///
+/// Residual: Trivy's original text is not stored, only its wrapped form, so
+/// a lossy character on Trivy's side cannot be seen. If Trivy read
+/// `GPL-2.0+ AND MIT` and Grype `GPL-2.0 AND MIT`, Grype's text is kept. The
+/// two scanners read the same package file, so that disagreement means one
+/// of them misparsed it; the swap never introduces a license term neither
+/// scanner reported.
 fn is_wrapped_form_of(wrapped: &str, raw: &str) -> bool {
     const LICENSEREF_BODY_CAP: usize = 64;
     let Some(body) = wrapped.strip_prefix("LicenseRef-") else {
@@ -890,6 +896,18 @@ mod tests {
             Some(trivy.as_str()),
             "precondition: the two texts collide"
         );
+        // The other scanner's text has the lossy `+`: no swap.
+        let out = merge_dependencies(
+            vec![
+                licensed("pkg:npm/p@1.0.0", &trivy),
+                licensed("pkg:npm/p@1.0.0", "GPL-2.0+ AND MIT"),
+            ],
+            vec![],
+        );
+        assert_eq!(out[0].license.as_deref(), Some(trivy.as_str()));
+        // The documented residual (see `is_wrapped_form_of`): when the `+`
+        // was on Trivy's side, which only its wrapped form records, the other
+        // scanner's `GPL-2.0 AND MIT` is kept.
         let out = merge_dependencies(
             vec![
                 licensed("pkg:npm/p@1.0.0", &trivy),
@@ -897,7 +915,7 @@ mod tests {
             ],
             vec![],
         );
-        assert_eq!(out[0].license.as_deref(), Some(trivy.as_str()));
+        assert_eq!(out[0].license.as_deref(), Some("GPL-2.0 AND MIT"));
 
         // Two long lists sharing their first 64 characters wrap alike.
         let common = "MIT AND Apache-2.0 AND BSD-3-Clause AND ISC AND Zlib AND Unlicense";
