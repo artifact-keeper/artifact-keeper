@@ -13,11 +13,7 @@
 //! Reads only `DATABASE_URL` (or `DATABASE_URL_FILE`). Exits 0 when the schema
 //! is up to date, 1 otherwise.
 
-use std::str::FromStr;
-
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-
-use crate::config::secret_or_env;
+use crate::config::{database_tcp_keepalives_from_env, secret_or_env, Config};
 use crate::error::{AppError, Result};
 
 /// The argument that selects this subcommand: `artifact-keeper db-migrate`.
@@ -28,13 +24,25 @@ pub fn requested(args: &[String]) -> bool {
     args.get(1).map(String::as_str) == Some(SUBCOMMAND)
 }
 
+/// The pool settings for `db-migrate`: two connections, and the server's
+/// startup connect retry and TCP keepalives (#4549) through
+/// [`crate::db::create_pool`]. The migration session holds the migration lock,
+/// so a Job pod that is killed must not leave it behind for the kernel's
+/// two-hour keepalive.
+fn pool_config(database_url: &str, tcp_keepalives: bool) -> Config {
+    Config {
+        database_url: database_url.to_owned(),
+        database_max_connections: 2,
+        database_min_connections: 0,
+        database_tcp_keepalives: tcp_keepalives,
+        ..Config::default()
+    }
+}
+
 /// Connect to `database_url` and bring its schema up to date.
 pub async fn run(database_url: &str) -> Result<()> {
-    let options = PgConnectOptions::from_str(database_url)?;
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect_with(options)
-        .await?;
+    let config = pool_config(database_url, database_tcp_keepalives_from_env());
+    let pool = crate::db::create_pool(&config).await?;
     let outcome = crate::migration_repair::apply_schema_migrations(&pool).await;
     pool.close().await;
     outcome
@@ -104,6 +112,16 @@ mod tests {
         assert!(run_blocking(Ok(None)).is_err());
         assert!(run_blocking(Err("DATABASE_URL_FILE unreadable".into())).is_err());
         assert!(run_blocking(Ok(Some("not a url".into()))).is_err());
+    }
+
+    #[test]
+    fn pool_config_keeps_two_connections_and_the_keepalive_choice() {
+        let on = pool_config("postgres://u:p@db/ak", true);
+        assert_eq!(on.database_url, "postgres://u:p@db/ak");
+        assert_eq!(on.database_max_connections, 2);
+        assert_eq!(on.database_min_connections, 0);
+        assert!(on.database_tcp_keepalives);
+        assert!(!pool_config("postgres://u:p@db/ak", false).database_tcp_keepalives);
     }
 
     #[tokio::test]
