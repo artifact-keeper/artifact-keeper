@@ -705,7 +705,7 @@ async fn stage_nuget(target: &NativeTarget, file: &std::path::Path) -> Result<St
     .await
     .map_err(|e| format!("NuGet ingest extraction unavailable: {e}"))?
     .map_err(|e| format!("nuspec parse task failed: {e}"))?
-    .map_err(|e| format!("Failed to read .nuspec from package: {e}"))?;
+    .map_err(|_| "Failed to read .nuspec from package".to_string())?;
 
     if info.id.trim().is_empty() || info.version.trim().is_empty() {
         return Err("Package ID and version are required in .nuspec".to_string());
