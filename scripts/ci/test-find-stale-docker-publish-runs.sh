@@ -74,14 +74,15 @@ case "$path" in
     wf="${path#*actions/workflows/}"; wf="${wf%%/*}"
     f="$FAKE_FX/runs-${wf}.tsv"; [ -f "$f" ] || : > "$f"
     jq -R -s --arg st "$(param status)" --arg br "$(param branch)" \
-      --arg ev "$(param event)" --arg sha "$(param head_sha)" '
+      --arg ev "$(param event)" --arg sha "$(param head_sha)" --arg pp "$(param per_page)" '
       split("\n") | map(select(length > 0) | split("\t")
         | {id: (.[0]|tonumber), head_sha: .[1], head_branch: .[2], event: .[3],
            status: .[4], run_attempt: (.[5]|tonumber), run_started_at: .[6],
            created_at: .[7], conclusion: (if (.[8] // "") == "" then null else .[8] end)})
       | map(select(($st == "" or .status == $st) and ($br == "" or .head_branch == $br)
                    and ($ev == "" or .event == $ev) and ($sha == "" or .head_sha == $sha)))
-      | sort_by(.created_at) | reverse | {workflow_runs: .}' "$f" | jq -r "$filter"
+      | sort_by(.created_at) | reverse
+      | (if $pp == "" then . else .[:($pp|tonumber)] end) | {workflow_runs: .}' "$f" | jq -r "$filter"
     ;;
   *actions/runs/*/jobs*)
     id="${path#*actions/runs/}"; id="${id%%/*}"
@@ -336,6 +337,18 @@ stuck_fixture; done_run 600 2026-11-16T08:00:00Z cancelled
 done_run 598 2026-11-16T05:00:00Z success
 expect "a cancelled run NEWER than the stuck one is not history -> cancelled" 1 "stuck run_id=601" STALE_ACTION=cancel
 posted "only earlier runs count" 601
+# A full page of coalesced (no-job) cancels decides nothing: the deciding run
+# may be on the next page, so the cancel is held, not let through.
+stuck_fixture
+for k in $(seq 10 39); do done_run "5${k}" "2026-11-16T06:${k}:00Z" cancelled coalesced; done
+expect "a full page of coalesced cancels, no decision -> reported (cancel-history-unknown)" 1 \
+  "hold=cancel-history-unknown" STALE_ACTION=cancel
+no_posts "undecided full page"
+stuck_fixture
+for k in $(seq 10 38); do done_run "5${k}" "2026-11-16T06:${k}:00Z" cancelled coalesced; done
+expect "29 coalesced cancels and the history ends -> cancelled" 1 "stuck run_id=601" STALE_ACTION=cancel
+posted "a short page that ends is a decision" 601
+
 stuck_fixture
 expect "cancel history unreadable -> reported (cancel-history-unknown)" 1 "hold=cancel-history-unknown" STALE_ACTION=cancel FAKE_HISTORY_FAIL=1
 no_posts "history unknown"

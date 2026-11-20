@@ -145,10 +145,16 @@ superseded() {
 # branch's newest earlier run that completed otherwise? 0 yes (hold), 1 no,
 # 2 could not tell (holds the cancel).
 cancelled_since_advance() {
-  local branch="$1" created="$2" rows rid rconc n
-  rows="$(gh api "repos/${REPO}/actions/workflows/${WORKFLOW}/runs?branch=${branch}&event=push&status=completed&per_page=30" \
-    --jq "[.workflow_runs[] | select(.created_at < \"${created}\")] | sort_by(.created_at) | reverse | .[] | [.id, (.conclusion // \"-\")] | @tsv" \
+  local branch="$1" created="$2" rows rid rconc n page=30 listed
+  # First line: how many runs the page held (before the created_at filter),
+  # so a page that runs out without a decision can be told from a branch
+  # whose history really ends.
+  rows="$(gh api "repos/${REPO}/actions/workflows/${WORKFLOW}/runs?branch=${branch}&event=push&status=completed&per_page=${page}" \
+    --jq "(.workflow_runs | length), ([.workflow_runs[] | select(.created_at < \"${created}\")] | sort_by(.created_at) | reverse | .[] | [.id, (.conclusion // \"-\")] | @tsv)" \
     2>/dev/null)" || return 2
+  listed="${rows%%$'\n'*}"
+  [[ "$listed" =~ ^[0-9]+$ ]] || return 2
+  [[ "$rows" == *$'\n'* ]] && rows="${rows#*$'\n'}" || rows=""
   while IFS=$'\t' read -r rid rconc; do
     [[ -z "$rid" ]] && continue
     [[ "$rconc" != "cancelled" ]] && return 1   # it ran to an end: :main moved past here
@@ -157,6 +163,9 @@ cancelled_since_advance() {
     [[ "$n" =~ ^[0-9]+$ ]] || return 2
     (( n > 0 )) && return 0
   done <<< "$rows"
+  # No decision on this page. A full page may hide the deciding run on the
+  # next one (30 coalesced runs in a row): what cannot be proved holds.
+  (( listed >= page )) && return 2
   return 1
 }
 
