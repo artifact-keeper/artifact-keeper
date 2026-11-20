@@ -190,6 +190,27 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
                     Err(e) => tracing::warn!(error = %e, "failed to publish scan queue depth"),
                 }
 
+                // #6300: how far behind the re-grades after a DB update are,
+                // against the grace window they have to finish in.
+                match queue.oldest_pending_regrade_secs().await {
+                    Ok(secs) => {
+                        crate::services::metrics_service::record_proxy_scan_regrade_backlog_oldest(
+                            "queue", secs,
+                        );
+                        let windows = crate::services::proxy_scan_service::db_grace_windows();
+                        let window = windows.serving.max(windows.fail_closed).num_seconds() as f64;
+                        if window > 0.0 && secs > window / 2.0 {
+                            tracing::warn!(
+                                oldest_secs = secs,
+                                window_secs = window,
+                                "proxy re-grades after a vulnerability-DB update are not keeping \
+                                 up with the grace window; add scan workers (#6300)"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "failed to read the re-grade backlog"),
+                }
+
                 // Live consumers (cluster-wide) and this pod's own slot
                 // occupancy. Together they answer "is the queue backed up
                 // because nothing is consuming it, or because everything is

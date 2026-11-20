@@ -142,13 +142,12 @@ impl ProxySeverityGate {
 /// today's CVEs. When either version string is unknown (probe failed / legacy
 /// row) we fall back to the TTL alone rather than forcing an unbounded re-scan.
 ///
-/// One exception to the exact match, the vulnerability-DB update grace
-/// (#6300, [`DbUpdateGrace`]): while this instance's grace for the live
-/// version is open, a verdict the same scanner binary graded against the
-/// previous DB build still counts, and one graded against a NEWER build than
-/// the live one (another replica updated first) always does. Without a grace
-/// record for the live version (`PROXY_SCAN_DB_GRACE_HOURS=0`, or not
-/// recorded yet) this is the exact match above.
+/// A verdict the same scanner binary graded against a NEWER DB build than the
+/// live one (another replica updated first, a rolling upgrade) also counts
+/// (#6300): it was graded with more advisories than this replica has, and
+/// re-scanning it here would only rewrite it with the older build for the next
+/// replica to undo. Verdicts from an OLDER build are covered, per scan action,
+/// only by the DB-update grace in [`verdict_is_reusable`].
 pub fn verdict_is_fresh(
     scanned_at: DateTime<Utc>,
     stored_version: Option<&str>,
@@ -156,31 +155,9 @@ pub fn verdict_is_fresh(
     ttl_days: i64,
     now: DateTime<Utc>,
 ) -> bool {
-    with_live_db_grace(current_version, |grace| {
-        verdict_is_fresh_under(
-            scanned_at,
-            stored_version,
-            current_version,
-            ttl_days,
-            now,
-            grace,
-        )
-    })
-}
-
-/// [`verdict_is_fresh`] with the live version's DB-update grace passed in
-/// rather than read from this process's record, so it is pure.
-pub fn verdict_is_fresh_under(
-    scanned_at: DateTime<Utc>,
-    stored_version: Option<&str>,
-    current_version: Option<&str>,
-    ttl_days: i64,
-    now: DateTime<Utc>,
-    grace: Option<&DbUpdateGrace>,
-) -> bool {
     let within_ttl = now < scanned_at + Duration::days(ttl_days);
     let version_ok = match (stored_version, current_version) {
-        (Some(a), Some(b)) => a == b || grace.is_some_and(|g| g.vouches_for(a, b, now)),
+        (Some(a), Some(b)) => a == b || compare_provenance(a, b) == DbProvenance::NewerDb,
         // Unknown on either side: cannot prove a mismatch, rely on TTL.
         _ => true,
     };
@@ -201,27 +178,35 @@ pub fn verdict_is_fresh_under(
 // verdict the SAME scanner binary graded against the PREVIOUS build keeps
 // deciding the pull, and the pull queues a re-grade of the cached bytes in the
 // lowest scan band (`PRIORITY_REGRADE`), so the work follows what is pulled,
-// runs on spare capacity, and never holds a client. What still holds:
+// runs on spare capacity, and never holds a client. The window depends on the
+// repository's scan action: `PROXY_SCAN_DB_GRACE_HOURS` (default 6) for
+// `fail_open` and `record_only`, which serve the pull either way, and
+// `PROXY_SCAN_DB_GRACE_HOURS_FAIL_CLOSED` (default 0: off) for `fail_closed`,
+// where the grace means a pull can be served clean from a verdict made before
+// the new DB added an advisory, so the operator has to opt in. What holds:
 //
 // * a `vulnerable` verdict keeps blocking;
 // * nothing unscanned is served, and an unknown version on either side gets
 //   no grace (#2976's fail-closed rule is untouched);
-// * a scanner binary upgrade, a verdict two or more DB builds behind, or one
-//   from a build this fleet never recorded is re-scanned exactly as before;
+// * a scanner binary upgrade, or a verdict older than the newest build this
+//   fleet recorded below the live one, is re-scanned exactly as before;
 // * the window is anchored on the fleet-wide first sighting
 //   (`proxy_scan_db_versions`), so neither a restart nor a new replica
-//   reopens it; past it, the pull behaves exactly as before.
+//   reopens it. Past it, a digest whose re-grade is still queued keeps the
+//   grace for at most one more window (no cliff of inline re-scans for work
+//   already queued); anything else behaves exactly as before.
 //
-// A verdict graded against a NEWER build than the live one (another replica
-// updated first, a rolling upgrade) is reused while the grace is enabled: it
-// was graded with more advisories than this replica has, and re-scanning it
-// here only rewrote it with the older build for the next replica to undo.
+// Process-wide state: the record below, `LAST_GRACE_FAILURE` and the windows
+// are statics, read on the hot path without a database query. Tests that set
+// them (`set_db_grace_for_test`) rely on nextest running each test in its own
+// process (.config/nextest.toml; CLAUDE.md "Use cargo nextest"), and the pure
+// `*_under` functions take the grace as an argument for everything else.
 
 /// Env var: hours a verdict graded against the previous vulnerability-DB
-/// build keeps deciding pulls after the fleet first saw a new build (#6300).
-/// `0` turns the grace off (every DB update re-scans on the next pull, as
-/// before 1.13.0). Blank or unparsable keeps the default; more than
-/// [`MAX_DB_GRACE_HOURS`] is clamped to it.
+/// build keeps deciding pulls on a `fail_open` or `record_only` repository
+/// after the fleet first saw a new build (#6300). `0` turns that grace off.
+/// Blank or unparsable keeps the default; more than [`MAX_DB_GRACE_HOURS`] is
+/// clamped to it, with a warning.
 pub const DB_GRACE_ENV: &str = "PROXY_SCAN_DB_GRACE_HOURS";
 
 /// Default for [`DB_GRACE_ENV`].
@@ -231,29 +216,87 @@ pub const DEFAULT_DB_GRACE_HOURS: i64 = 6;
 /// an air-gapped install without letting a verdict outlive several builds.
 pub const MAX_DB_GRACE_HOURS: i64 = 72;
 
-/// Parse [`DB_GRACE_ENV`].
-pub fn parse_db_grace(raw: Option<&str>) -> Duration {
+/// Env var: the same grace for a `fail_closed` repository. Off (`0`) unless
+/// the operator opts in: within it a pull can be served clean from a verdict
+/// made before the new DB added an advisory.
+pub const DB_GRACE_FAIL_CLOSED_ENV: &str = "PROXY_SCAN_DB_GRACE_HOURS_FAIL_CLOSED";
+
+/// Default for [`DB_GRACE_FAIL_CLOSED_ENV`]: off.
+pub const DEFAULT_DB_GRACE_FAIL_CLOSED_HOURS: i64 = 0;
+
+/// Ceiling for [`DB_GRACE_FAIL_CLOSED_ENV`].
+pub const MAX_DB_GRACE_FAIL_CLOSED_HOURS: i64 = 24;
+
+/// Parse one grace setting: whole hours, `0` off, clamped to `max`.
+pub fn parse_db_grace_hours(name: &str, raw: Option<&str>, default: i64, max: i64) -> Duration {
     let hours = match raw.map(str::trim).filter(|v| !v.is_empty()) {
-        None => DEFAULT_DB_GRACE_HOURS,
+        None => default,
         Some(v) => match v.parse::<i64>() {
-            Ok(h) if h >= 0 => h.min(MAX_DB_GRACE_HOURS),
+            Ok(h) if h > max => {
+                tracing::warn!(
+                    value = %v,
+                    "{name} is above its ceiling of {max} hours; using {max}"
+                );
+                max
+            }
+            Ok(h) if h >= 0 => h,
             _ => {
                 tracing::warn!(
                     value = %v,
-                    "{DB_GRACE_ENV} is not a whole number of hours; using the default of \
-                     {DEFAULT_DB_GRACE_HOURS}"
+                    "{name} is not a whole number of hours; using the default of {default}"
                 );
-                DEFAULT_DB_GRACE_HOURS
+                default
             }
         },
     };
     Duration::hours(hours)
 }
 
-/// The grace this process applies, from [`DB_GRACE_ENV`], read once.
-pub fn db_grace() -> Duration {
-    static GRACE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *GRACE.get_or_init(|| parse_db_grace(std::env::var(DB_GRACE_ENV).ok().as_deref()))
+/// The two grace windows (#6300).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DbGraceWindows {
+    /// `fail_open` and `record_only` ([`DB_GRACE_ENV`]).
+    pub serving: Duration,
+    /// `fail_closed` ([`DB_GRACE_FAIL_CLOSED_ENV`]).
+    pub fail_closed: Duration,
+}
+
+impl DbGraceWindows {
+    pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Self {
+        Self {
+            serving: parse_db_grace_hours(
+                DB_GRACE_ENV,
+                get(DB_GRACE_ENV).as_deref(),
+                DEFAULT_DB_GRACE_HOURS,
+                MAX_DB_GRACE_HOURS,
+            ),
+            fail_closed: parse_db_grace_hours(
+                DB_GRACE_FAIL_CLOSED_ENV,
+                get(DB_GRACE_FAIL_CLOSED_ENV).as_deref(),
+                DEFAULT_DB_GRACE_FAIL_CLOSED_HOURS,
+                MAX_DB_GRACE_FAIL_CLOSED_HOURS,
+            ),
+        }
+    }
+
+    pub fn for_action(&self, action: ProxyScanAction) -> Duration {
+        if action.is_fail_closed() {
+            self.fail_closed
+        } else {
+            self.serving
+        }
+    }
+
+    /// Whether either window is open at all.
+    pub fn any(&self) -> bool {
+        self.serving > Duration::zero() || self.fail_closed > Duration::zero()
+    }
+}
+
+/// The windows this process applies, read once.
+pub fn db_grace_windows() -> DbGraceWindows {
+    static WINDOWS: std::sync::OnceLock<DbGraceWindows> = std::sync::OnceLock::new();
+    *WINDOWS.get_or_init(|| DbGraceWindows::from_env(|k| std::env::var(k).ok()))
 }
 
 /// A scanner version token split into the scanner binary and its DB build:
@@ -265,6 +308,17 @@ pub fn split_scanner_version(version: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Whether a DB build token is the `YYYY-MM-DD` shape `db_build_date_token`
+/// produces, so that two of them order as dates when compared as strings.
+fn is_build_date(token: &str) -> bool {
+    let b = token.as_bytes();
+    b.len() == 10
+        && b.iter().enumerate().all(|(i, c)| match i {
+            4 | 7 => *c == b'-',
+            _ => c.is_ascii_digit(),
+        })
+}
+
 /// How a stored verdict's provenance relates to another version token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbProvenance {
@@ -274,58 +328,140 @@ pub enum DbProvenance {
     OlderDb,
     /// The same scanner binary, a newer DB build.
     NewerDb,
-    /// Another binary, or a token without a DB build on either side.
+    /// Another binary, a token without a DB build on either side, or a build
+    /// that is not a `YYYY-MM-DD` date.
     Different,
 }
 
 /// Compare `stored` with `other`. DB builds are `YYYY-MM-DD` tokens
-/// (`db_build_date_token`), so they order as strings.
+/// (`db_build_date_token`), so they order as strings; any other shape cannot
+/// be ordered and is [`DbProvenance::Different`].
 pub fn compare_provenance(stored: &str, other: &str) -> DbProvenance {
     if stored == other {
         return DbProvenance::Same;
     }
     match (split_scanner_version(stored), split_scanner_version(other)) {
-        ((a, Some(da)), (b, Some(db))) if a == b => match da.cmp(db) {
-            std::cmp::Ordering::Less => DbProvenance::OlderDb,
-            std::cmp::Ordering::Greater => DbProvenance::NewerDb,
-            std::cmp::Ordering::Equal => DbProvenance::Same,
-        },
+        ((a, Some(da)), (b, Some(db))) if a == b && is_build_date(da) && is_build_date(db) => {
+            match da.cmp(db) {
+                std::cmp::Ordering::Less => DbProvenance::OlderDb,
+                std::cmp::Ordering::Greater => DbProvenance::NewerDb,
+                std::cmp::Ordering::Equal => DbProvenance::Same,
+            }
+        }
         _ => DbProvenance::Different,
     }
 }
 
+/// One action class's window, on this replica's clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraceWindow {
+    /// The grace ends here.
+    pub until: DateTime<Utc>,
+    /// A digest whose re-grade is still queued keeps the grace up to here:
+    /// one more window, so the backlog drains without a cliff of inline
+    /// re-scans and is still bounded if nothing drains it.
+    pub queued_until: DateTime<Utc>,
+}
+
+impl GraceWindow {
+    /// `age` is how long ago the fleet first saw the build, measured on the
+    /// database clock; `now` is this replica's.
+    pub fn new(now: DateTime<Utc>, age: Duration, window: Duration) -> Option<Self> {
+        if window <= Duration::zero() {
+            return None;
+        }
+        let until = now - age + window;
+        Some(Self {
+            until,
+            queued_until: until + window,
+        })
+    }
+}
+
 /// What the fleet recorded about the live CVE-scanner version's arrival
-/// (`proxy_scan_db_versions`): when it was first seen, so when its grace ends,
-/// and the same-binary version that was live before it.
+/// (`proxy_scan_db_versions`): the newest same-binary build recorded below it,
+/// and the window per action class.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DbUpdateGrace {
     pub live: String,
     pub previous: Option<String>,
-    pub until: DateTime<Utc>,
+    pub serving: Option<GraceWindow>,
+    pub fail_closed: Option<GraceWindow>,
 }
 
 impl DbUpdateGrace {
-    /// Whether a verdict graded at `stored` may decide a pull while `live` is
-    /// the live version: graded against a newer DB build, or, before
-    /// `until`, against the previous one (or a build between it and `live`).
-    pub fn vouches_for(&self, stored: &str, live: &str, now: DateTime<Utc>) -> bool {
-        if self.live != live {
-            return false;
-        }
-        match compare_provenance(stored, live) {
-            DbProvenance::NewerDb => true,
-            DbProvenance::OlderDb => {
-                now < self.until
-                    && self.previous.as_deref().is_some_and(|p| {
-                        matches!(
-                            compare_provenance(stored, p),
-                            DbProvenance::Same | DbProvenance::NewerDb
-                        )
-                    })
-            }
-            DbProvenance::Same | DbProvenance::Different => false,
+    fn window(&self, action: ProxyScanAction) -> Option<&GraceWindow> {
+        if action.is_fail_closed() {
+            self.fail_closed.as_ref()
+        } else {
+            self.serving.as_ref()
         }
     }
+
+    /// Whether `stored` is the build this grace covers: the same binary as
+    /// `live`, older than it, and no older than the newest build recorded
+    /// below it. The window is not consulted.
+    pub fn covers_build(&self, stored: &str, live: &str) -> bool {
+        self.live == live
+            && compare_provenance(stored, live) == DbProvenance::OlderDb
+            && self.previous.as_deref().is_some_and(|p| {
+                matches!(
+                    compare_provenance(stored, p),
+                    DbProvenance::Same | DbProvenance::NewerDb
+                )
+            })
+    }
+
+    /// Whether a verdict graded at `stored` may decide a pull under `action`
+    /// while `live` is the live version: [`Self::covers_build`], within the
+    /// action's window, or, with `regrade_queued`, within its extension.
+    pub fn vouches_for(
+        &self,
+        stored: &str,
+        live: &str,
+        action: ProxyScanAction,
+        now: DateTime<Utc>,
+        regrade_queued: bool,
+    ) -> bool {
+        self.covers_build(stored, live)
+            && self
+                .window(action)
+                .is_some_and(|w| now < w.until || (regrade_queued && now < w.queued_until))
+    }
+
+    /// Whether only a queued re-grade could still let `stored` decide a pull:
+    /// covered build, past the window, inside its extension. The caller then
+    /// asks whether a re-grade of the digest is queued.
+    pub fn only_a_queued_regrade_vouches(
+        &self,
+        stored: &str,
+        live: &str,
+        action: ProxyScanAction,
+        now: DateTime<Utc>,
+    ) -> bool {
+        self.covers_build(stored, live)
+            && self
+                .window(action)
+                .is_some_and(|w| now >= w.until && now < w.queued_until)
+    }
+}
+
+/// Whether only a queued re-grade could still let a verdict graded at
+/// `stored` decide a pull under `action` (#6300): the caller then asks whether
+/// one is queued and, if so, decides with
+/// [`decide_serve_with_queued_regrade`]. A map read, no query.
+pub fn grace_extension_possible(
+    stored: Option<&str>,
+    live: Option<&str>,
+    action: ProxyScanAction,
+    now: DateTime<Utc>,
+) -> bool {
+    let (Some(stored), Some(live)) = (stored, live) else {
+        return false;
+    };
+    with_live_db_grace(Some(live), |grace| {
+        grace.is_some_and(|g| g.only_a_queued_regrade_vouches(stored, live, action, now))
+    })
 }
 
 /// Whether a reused verdict graded at `stored` was reused only under the DB
@@ -339,13 +475,15 @@ pub fn verdict_needs_regrade(stored: Option<&str>, live: Option<&str>) -> bool {
 
 type GraceRecord = std::sync::RwLock<std::collections::HashMap<String, DbUpdateGrace>>;
 
+/// This process's grace per live version (see the section comment on
+/// process-wide state).
 fn grace_record() -> &'static GraceRecord {
     static RECORD: std::sync::OnceLock<GraceRecord> = std::sync::OnceLock::new();
     RECORD.get_or_init(Default::default)
 }
 
 /// Run `f` with this process's grace for `live`, `None` when there is none.
-fn with_live_db_grace<R>(live: Option<&str>, f: impl FnOnce(Option<&DbUpdateGrace>) -> R) -> R {
+pub fn with_live_db_grace<R>(live: Option<&str>, f: impl FnOnce(Option<&DbUpdateGrace>) -> R) -> R {
     let Some(live) = live else { return f(None) };
     match grace_record().read() {
         Ok(record) => f(record.get(live)),
@@ -354,7 +492,8 @@ fn with_live_db_grace<R>(live: Option<&str>, f: impl FnOnce(Option<&DbUpdateGrac
 }
 
 /// Put `grace` in this process's record, as [`observe_live_scanner_version`]
-/// would after reading it from the database.
+/// would after reading it from the database. Process-wide: only for tests
+/// that run in their own process, as nextest runs every test.
 #[cfg(test)]
 pub(crate) fn set_db_grace_for_test(grace: DbUpdateGrace) {
     grace_record()
@@ -364,7 +503,7 @@ pub(crate) fn set_db_grace_for_test(grace: DbUpdateGrace) {
 }
 
 /// Last failed attempt to record a live version, so a database outage costs
-/// one query a minute rather than one per pull.
+/// one query a minute rather than one per pull. Process-wide, like the record.
 static LAST_GRACE_FAILURE: std::sync::Mutex<Option<std::time::Instant>> =
     std::sync::Mutex::new(None);
 
@@ -372,12 +511,12 @@ const GRACE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60
 
 /// Record that this process sees `live` as the CVE-scanner version, and load
 /// its grace (#6300). Once per version per process; every call after that is
-/// a map read. Nothing is recorded with the grace off, for a token without a
-/// DB build, or when the database cannot be read (then there is no grace,
+/// a map read. Nothing is recorded with both windows off, for a token without
+/// a DB build, or when the database cannot be read (then there is no grace,
 /// which is the behaviour before it existed).
 pub async fn observe_live_scanner_version(db: &PgPool, live: &str) {
-    let grace = db_grace();
-    if grace <= Duration::zero() || split_scanner_version(live).1.is_none() {
+    let windows = db_grace_windows();
+    if !windows.any() || split_scanner_version(live).1.is_none() {
         return;
     }
     if grace_record()
@@ -392,11 +531,17 @@ pub async fn observe_live_scanner_version(db: &PgPool, live: &str) {
             return;
         }
     }
-    match load_db_update_grace(db, live, grace).await {
+    match load_db_update_grace(db, live, windows).await {
         Ok(record) => {
             tracing::info!(
-                live = %record.live, previous = ?record.previous, until = %record.until,
+                live = %record.live, previous = ?record.previous,
+                serving_until = ?record.serving.map(|w| w.until),
+                fail_closed_until = ?record.fail_closed.map(|w| w.until),
                 "vulnerability-DB update grace for proxy scan verdicts (#6300)"
+            );
+            crate::services::metrics_service::record_proxy_scan_db_grace_window(
+                windows.serving.num_seconds() as f64,
+                windows.fail_closed.num_seconds() as f64,
             );
             if let Ok(mut map) = grace_record().write() {
                 // A handful of versions over a process's life; never let it grow.
@@ -419,40 +564,52 @@ pub async fn observe_live_scanner_version(db: &PgPool, live: &str) {
     }
 }
 
-/// Insert `live` into `proxy_scan_db_versions` if new and read back when the
-/// fleet first saw it and the same-binary version seen before it. Runtime
-/// queries (no macro) so this adds no offline sqlx data.
+/// Insert `live` into `proxy_scan_db_versions` if new, and read back how long
+/// ago the fleet first saw it (on the database clock, so replica clock skew
+/// does not move the window) and the newest same-binary build below it. The
+/// previous build is chosen by build date, not by when it was recorded: a
+/// replica with an older DB recorded late (a pinned or rolled-back DB, an
+/// air-gapped import, a new pod on an old bundled DB) must not become the
+/// previous build and widen the grace to every build up to the live one.
+/// Runtime queries (no macro) so this adds no offline sqlx data.
 pub async fn load_db_update_grace(
     db: &PgPool,
     live: &str,
-    grace: Duration,
+    windows: DbGraceWindows,
 ) -> Result<DbUpdateGrace> {
     let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
     // The no-op update makes RETURNING hand back the existing row's time.
-    let first_seen: DateTime<Utc> = sqlx::query_scalar(
+    let age_secs: f64 = sqlx::query_scalar(
         "INSERT INTO proxy_scan_db_versions (scanner_version) VALUES ($1) \
          ON CONFLICT (scanner_version) DO UPDATE SET scanner_version = EXCLUDED.scanner_version \
-         RETURNING first_seen_at",
+         RETURNING EXTRACT(EPOCH FROM (now() - first_seen_at))::float8",
     )
     .bind(live)
     .fetch_one(db)
     .await
     .map_err(db_err)?;
     let cli = split_scanner_version(live).0;
-    let previous: Option<String> = sqlx::query_scalar(
+    let below: Vec<String> = sqlx::query_scalar(
         "SELECT scanner_version FROM proxy_scan_db_versions \
-         WHERE first_seen_at < $1 AND starts_with(scanner_version, $2 || '+db-') \
-         ORDER BY first_seen_at DESC LIMIT 1",
+         WHERE starts_with(scanner_version, $1 || '+db-') AND scanner_version < $2 \
+         ORDER BY scanner_version DESC LIMIT 32",
     )
-    .bind(first_seen)
     .bind(cli)
-    .fetch_optional(db)
+    .bind(live)
+    .fetch_all(db)
     .await
     .map_err(db_err)?;
+    // String order is date order only for well-formed builds.
+    let previous = below
+        .into_iter()
+        .find(|v| compare_provenance(v, live) == DbProvenance::OlderDb);
+    let now = Utc::now();
+    let age = Duration::milliseconds((age_secs.max(0.0) * 1000.0) as i64);
     Ok(DbUpdateGrace {
         live: live.to_string(),
         previous,
-        until: first_seen + grace,
+        serving: GraceWindow::new(now, age, windows.serving),
+        fail_closed: GraceWindow::new(now, age, windows.fail_closed),
     })
 }
 
@@ -548,7 +705,44 @@ pub fn verdict_is_reusable(
     ttl_days: i64,
     now: DateTime<Utc>,
 ) -> bool {
-    if !verdict_is_fresh(scanned_at, stored_version, current_version, ttl_days, now) {
+    with_live_db_grace(current_version, |grace| {
+        verdict_is_reusable_under(
+            verdict,
+            scanned_at,
+            stored_version,
+            current_version,
+            action,
+            ttl_days,
+            now,
+            grace,
+            false,
+        )
+    })
+}
+
+/// [`verdict_is_reusable`] with the live version's DB-update grace passed in,
+/// and whether a re-grade of the digest is known to be queued (#6300): a
+/// verdict from the build the grace covers is reusable within the action's
+/// window, or within its extension while the re-grade is queued.
+#[allow(clippy::too_many_arguments)]
+pub fn verdict_is_reusable_under(
+    verdict: &str,
+    scanned_at: DateTime<Utc>,
+    stored_version: Option<&str>,
+    current_version: Option<&str>,
+    action: ProxyScanAction,
+    ttl_days: i64,
+    now: DateTime<Utc>,
+    grace: Option<&DbUpdateGrace>,
+    regrade_queued: bool,
+) -> bool {
+    let fresh = verdict_is_fresh(scanned_at, stored_version, current_version, ttl_days, now)
+        || (now < scanned_at + Duration::days(ttl_days)
+            && match (stored_version, current_version, grace) {
+                (Some(s), Some(l), Some(g)) => g.vouches_for(s, l, action, now, regrade_queued),
+                _ => false,
+            });
+    if !fresh {
         return false;
     }
     if action.is_fail_closed() && verdict == VERDICT_CLEAN {
@@ -621,16 +815,34 @@ pub fn decide_serve(
     ttl_days: i64,
     now: DateTime<Utc>,
 ) -> ServeDecision {
+    decide_serve_with_queued_regrade(row, current_version, action, ttl_days, now, false)
+}
+
+/// [`decide_serve`] for a digest whose re-grade is known to be queued
+/// (`regrade_queued`), which keeps a verdict the DB-update grace covers
+/// reusable past the window, up to its extension (#6300).
+pub fn decide_serve_with_queued_regrade(
+    row: Option<&ProxyScanRow>,
+    current_version: Option<&str>,
+    action: ProxyScanAction,
+    ttl_days: i64,
+    now: DateTime<Utc>,
+    regrade_queued: bool,
+) -> ServeDecision {
     if let Some(row) = row {
-        let reusable = verdict_is_reusable(
-            &row.verdict,
-            row.scanned_at,
-            row.scanner_version.as_deref(),
-            current_version,
-            action,
-            ttl_days,
-            now,
-        );
+        let reusable = with_live_db_grace(current_version, |grace| {
+            verdict_is_reusable_under(
+                &row.verdict,
+                row.scanned_at,
+                row.scanner_version.as_deref(),
+                current_version,
+                action,
+                ttl_days,
+                now,
+                grace,
+                regrade_queued,
+            )
+        });
         if !reusable && current_version.is_none() && action.is_fail_closed() {
             tracing::warn!(
                 stored_version = ?row.scanner_version,
@@ -2627,35 +2839,60 @@ mod tests {
     const LIVE: &str = "grype-0.120.1+db-2026-11-19";
     const PREVIOUS: &str = "grype-0.120.1+db-2026-11-18";
     const TWO_BEHIND: &str = "grype-0.120.1+db-2026-11-17";
+    const OPEN: ProxyScanAction = ProxyScanAction::FailOpen;
+    const CLOSED: ProxyScanAction = ProxyScanAction::FailClosed;
 
-    fn grace_until(until: DateTime<Utc>) -> DbUpdateGrace {
+    /// A grace for `LIVE` whose windows (both of `window`) began `age` ago.
+    fn grace_aged(now: DateTime<Utc>, age: Duration, window: Duration) -> DbUpdateGrace {
         DbUpdateGrace {
             live: LIVE.to_string(),
             previous: Some(PREVIOUS.to_string()),
-            until,
+            serving: GraceWindow::new(now, age, window),
+            fail_closed: GraceWindow::new(now, age, window),
         }
     }
 
+    fn windows(pairs: &[(&str, &str)]) -> DbGraceWindows {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        DbGraceWindows::from_env(|k| map.get(k).cloned())
+    }
+
+    /// The default depends on the action: 6 h for fail_open / record_only,
+    /// off for fail_closed unless the operator opts in, each with its own
+    /// ceiling. Bad values keep the default (cases from #6307, credit
+    /// nicola-preda: `-3`, `1.5`, an overflowing number).
     #[test]
-    fn db_grace_parses_hours_clamps_and_keeps_the_default_on_junk() {
+    fn db_grace_windows_default_per_action_and_parse_whole_hours() {
+        let unset = windows(&[]);
+        assert_eq!(unset.serving, Duration::hours(6));
+        assert_eq!(unset.fail_closed, Duration::zero(), "fail_closed is opt-in");
+        assert_eq!(unset.for_action(OPEN), Duration::hours(6));
         assert_eq!(
-            parse_db_grace(None),
-            Duration::hours(DEFAULT_DB_GRACE_HOURS)
+            unset.for_action(ProxyScanAction::RecordOnly),
+            Duration::hours(6)
         );
+        assert_eq!(unset.for_action(CLOSED), Duration::zero());
+        assert!(unset.any());
+        assert!(!windows(&[(DB_GRACE_ENV, "0")]).any());
+
+        let set = windows(&[(DB_GRACE_ENV, "12"), (DB_GRACE_FAIL_CLOSED_ENV, "4")]);
         assert_eq!(
-            parse_db_grace(Some("  ")),
-            Duration::hours(DEFAULT_DB_GRACE_HOURS)
+            (set.serving, set.fail_closed),
+            (Duration::hours(12), Duration::hours(4))
         );
-        assert_eq!(parse_db_grace(Some("0")), Duration::zero());
-        assert_eq!(parse_db_grace(Some("12")), Duration::hours(12));
+        let clamped = windows(&[(DB_GRACE_ENV, "1000"), (DB_GRACE_FAIL_CLOSED_ENV, "1000")]);
         assert_eq!(
-            parse_db_grace(Some("1000")),
-            Duration::hours(MAX_DB_GRACE_HOURS)
+            (clamped.serving, clamped.fail_closed),
+            (Duration::hours(72), Duration::hours(24))
         );
-        for junk in ["-1", "6h", "1.5", "six"] {
+        for junk in ["-3", "1.5", "6h", "a day", "9223372036854775807999", "  "] {
+            let w = windows(&[(DB_GRACE_ENV, junk), (DB_GRACE_FAIL_CLOSED_ENV, junk)]);
             assert_eq!(
-                parse_db_grace(Some(junk)),
-                Duration::hours(DEFAULT_DB_GRACE_HOURS),
+                (w.serving, w.fail_closed),
+                (Duration::hours(6), Duration::zero()),
                 "{junk:?}"
             );
         }
@@ -2685,34 +2922,60 @@ mod tests {
             compare_provenance("grype-0.120.1", LIVE),
             DbProvenance::Different
         );
-        assert_eq!(
-            compare_provenance(PREVIOUS, "grype-0.120.1"),
-            DbProvenance::Different
-        );
+        // A build that is not a YYYY-MM-DD date cannot be ordered.
+        for odd in [
+            "2026-11-1",
+            "20261118",
+            "2026-11-18T00",
+            "abcd-ef-gh",
+            "9999",
+        ] {
+            assert_eq!(
+                compare_provenance(&format!("grype-0.120.1+db-{odd}"), LIVE),
+                DbProvenance::Different,
+                "{odd}"
+            );
+        }
     }
 
-    /// The grace vouches only for a verdict one DB build behind, only while
-    /// it is open, and only for the version it was recorded for. A verdict
-    /// from a newer build than the live one is always good.
+    /// The grace covers only the newest build below the live one, only within
+    /// the action's window, or within its extension while a re-grade is
+    /// queued, and only for the version it was recorded for.
     #[test]
     fn db_grace_vouches_only_for_the_previous_build_while_open() {
         let now = Utc::now();
-        let open = grace_until(now + Duration::hours(1));
-        let closed = grace_until(now - Duration::seconds(1));
+        let six = Duration::hours(6);
+        let open = grace_aged(now, Duration::hours(1), six);
+        let past = grace_aged(now, Duration::hours(7), six);
+        let beyond = grace_aged(now, Duration::hours(13), six);
 
-        assert!(open.vouches_for(PREVIOUS, LIVE, now));
-        assert!(!closed.vouches_for(PREVIOUS, LIVE, now), "past the window");
+        assert!(open.vouches_for(PREVIOUS, LIVE, OPEN, now, false));
         assert!(
-            !open.vouches_for(TWO_BEHIND, LIVE, now),
+            !past.vouches_for(PREVIOUS, LIVE, OPEN, now, false),
+            "past the window"
+        );
+        assert!(
+            past.vouches_for(PREVIOUS, LIVE, OPEN, now, true),
+            "a queued re-grade keeps it, for one more window"
+        );
+        assert!(past.only_a_queued_regrade_vouches(PREVIOUS, LIVE, OPEN, now));
+        assert!(!open.only_a_queued_regrade_vouches(PREVIOUS, LIVE, OPEN, now));
+        assert!(
+            !beyond.vouches_for(PREVIOUS, LIVE, OPEN, now, true),
+            "bounded"
+        );
+        assert!(!beyond.only_a_queued_regrade_vouches(PREVIOUS, LIVE, OPEN, now));
+        assert!(
+            !open.vouches_for(TWO_BEHIND, LIVE, OPEN, now, true),
             "two builds behind is re-scanned"
         );
         assert!(
-            !open.vouches_for("grype-0.119.0+db-2026-11-18", LIVE, now),
+            !open.vouches_for("grype-0.119.0+db-2026-11-18", LIVE, OPEN, now, false),
             "a binary upgrade is re-scanned"
         );
-        assert!(!open.vouches_for("grype-0.120.1", LIVE, now));
+        assert!(!open.vouches_for("grype-0.120.1", LIVE, OPEN, now, false));
         assert!(
-            !open.vouches_for(PREVIOUS, "grype-0.120.1+db-2026-11-20", now),
+            !open.vouches_for(PREVIOUS, "grype-0.120.1+db-2026-11-20", OPEN, now, false),
             "a grace recorded for another live version says nothing"
         );
         // Between the previous build and the live one (a build this fleet
@@ -2721,59 +2984,32 @@ mod tests {
             previous: Some("grype-0.120.1+db-2026-11-16".to_string()),
             ..open.clone()
         };
-        assert!(skipped.vouches_for(TWO_BEHIND, LIVE, now));
-        // Nothing recorded before the live version: no grace at all.
+        assert!(skipped.vouches_for(TWO_BEHIND, LIVE, OPEN, now, false));
+        // Nothing recorded below the live version: no grace at all.
         let first = DbUpdateGrace {
             previous: None,
             ..open.clone()
         };
-        assert!(!first.vouches_for(PREVIOUS, LIVE, now));
-        // Graded against a newer build than this replica has: reused, open or not.
-        let newer = "grype-0.120.1+db-2026-11-20";
-        assert!(open.vouches_for(newer, LIVE, now));
-        assert!(closed.vouches_for(newer, LIVE, now));
+        assert!(!first.vouches_for(PREVIOUS, LIVE, OPEN, now, false));
+        // A window of 0 for the action is no grace for it.
+        let fail_closed_off = DbUpdateGrace {
+            fail_closed: GraceWindow::new(now, Duration::hours(1), Duration::zero()),
+            ..open.clone()
+        };
+        assert!(fail_closed_off.vouches_for(PREVIOUS, LIVE, OPEN, now, false));
+        assert!(!fail_closed_off.vouches_for(PREVIOUS, LIVE, CLOSED, now, true));
     }
 
-    /// Without a grace record (`PROXY_SCAN_DB_GRACE_HOURS=0`, or none
-    /// recorded yet) a DB update makes the verdict stale, as before; with an
-    /// open one it stays fresh, the TTL still applies, and a fail_closed clean
-    /// verdict is reusable because both versions are known.
+    /// A NEWER build's verdict is fresh with no grace at all (the
+    /// rolling-upgrade ping-pong does not return at grace 0); an OLDER one
+    /// only through the grace, per action, within the TTL.
     #[test]
-    fn freshness_follows_the_db_grace_and_keeps_the_ttl() {
+    fn freshness_takes_a_newer_build_and_reuse_follows_the_grace() {
         let now = Utc::now();
         let scanned = now - Duration::days(1);
-        let open = grace_until(now + Duration::hours(1));
-        assert!(!verdict_is_fresh_under(
-            scanned,
-            Some(PREVIOUS),
-            Some(LIVE),
-            30,
-            now,
-            None
-        ));
-        assert!(verdict_is_fresh_under(
-            scanned,
-            Some(PREVIOUS),
-            Some(LIVE),
-            30,
-            now,
-            Some(&open)
-        ));
-        assert!(!verdict_is_fresh_under(
-            now - Duration::days(31),
-            Some(PREVIOUS),
-            Some(LIVE),
-            30,
-            now,
-            Some(&open)
-        ));
-        assert!(
-            !verdict_is_fresh(scanned, Some(PREVIOUS), Some(LIVE), 30, now),
-            "no grace recorded in this process"
-        );
-
-        set_db_grace_for_test(open);
-        assert!(verdict_is_fresh(
+        let newer = "grype-0.120.1+db-2026-11-20";
+        assert!(verdict_is_fresh(scanned, Some(newer), Some(LIVE), 30, now));
+        assert!(!verdict_is_fresh(
             scanned,
             Some(PREVIOUS),
             Some(LIVE),
@@ -2783,23 +3019,54 @@ mod tests {
         assert!(verdict_is_reusable(
             VERDICT_CLEAN,
             scanned,
-            Some(PREVIOUS),
+            Some(newer),
             Some(LIVE),
-            ProxyScanAction::FailClosed,
+            CLOSED,
             30,
             now
         ));
+
+        let open = grace_aged(now, Duration::hours(1), Duration::hours(6));
+        let reuse = |action, scanned_at, grace: Option<&DbUpdateGrace>, queued| {
+            verdict_is_reusable_under(
+                VERDICT_CLEAN,
+                scanned_at,
+                Some(PREVIOUS),
+                Some(LIVE),
+                action,
+                30,
+                now,
+                grace,
+                queued,
+            )
+        };
+        assert!(!reuse(OPEN, scanned, None, false), "no grace recorded");
+        assert!(reuse(OPEN, scanned, Some(&open), false));
+        assert!(reuse(CLOSED, scanned, Some(&open), false), "opted in");
+        assert!(
+            !reuse(OPEN, now - Duration::days(31), Some(&open), true),
+            "the TTL still applies"
+        );
         // Unknown live version: no grace, so fail_closed does not reuse it.
-        assert!(!verdict_is_reusable(
+        assert!(!verdict_is_reusable_under(
             VERDICT_CLEAN,
             scanned,
             Some(PREVIOUS),
             None,
-            ProxyScanAction::FailClosed,
+            CLOSED,
             30,
-            now
+            now,
+            Some(&open),
+            true
         ));
-        let row = |verdict: &str| ProxyScanRow {
+    }
+
+    /// Through the process record, as the serve paths see it.
+    #[test]
+    fn serve_decisions_follow_the_recorded_grace() {
+        let now = Utc::now();
+        let scanned = now - Duration::days(1);
+        let row = |verdict: &str, version: &str| ProxyScanRow {
             checksum_sha256: "d".repeat(64),
             scan_type: "grype".to_string(),
             verdict: verdict.to_string(),
@@ -2809,42 +3076,94 @@ mod tests {
             medium_count: 0,
             low_count: 0,
             max_severity: None,
-            scanner_version: Some(PREVIOUS.to_string()),
+            scanner_version: Some(version.to_string()),
             scanned_at: scanned,
         };
+        let clean = row(VERDICT_CLEAN, PREVIOUS);
         assert_eq!(
-            decide_serve(
-                Some(&row(VERDICT_CLEAN)),
-                Some(LIVE),
-                ProxyScanAction::FailClosed,
-                30,
-                now
-            ),
+            decide_serve(Some(&clean), Some(LIVE), OPEN, 30, now),
+            ServeDecision::ServePendingScanAsync,
+            "no grace recorded in this process"
+        );
+
+        // fail_open has a window, fail_closed none (the default).
+        set_db_grace_for_test(DbUpdateGrace {
+            fail_closed: None,
+            ..grace_aged(now, Duration::hours(1), Duration::hours(6))
+        });
+        assert_eq!(
+            decide_serve(Some(&clean), Some(LIVE), OPEN, 30, now),
             ServeDecision::ServeCached
         );
         assert_eq!(
+            decide_serve(Some(&clean), Some(LIVE), CLOSED, 30, now),
+            ServeDecision::ScanInline,
+            "fail_closed re-scans unless the operator opted in"
+        );
+        assert_eq!(
             decide_serve(
-                Some(&row(VERDICT_VULNERABLE)),
+                Some(&row(VERDICT_VULNERABLE, PREVIOUS)),
                 Some(LIVE),
-                ProxyScanAction::FailOpen,
+                OPEN,
                 30,
                 now
             ),
             ServeDecision::BlockCached,
             "a vulnerable verdict keeps blocking through the grace"
         );
-        // The fast paths leave such a clean verdict to the buffered gate,
-        // which queues its re-grade; a vulnerable one still blocks there.
+        assert_eq!(
+            decide_serve(
+                Some(&row(VERDICT_CLEAN, TWO_BEHIND)),
+                Some(LIVE),
+                OPEN,
+                30,
+                now
+            ),
+            ServeDecision::ServePendingScanAsync
+        );
+
+        // fail_closed opted in, past the window: only a queued re-grade
+        // keeps it, and only for one more window.
+        set_db_grace_for_test(grace_aged(now, Duration::hours(7), Duration::hours(6)));
+        assert!(grace_extension_possible(
+            Some(PREVIOUS),
+            Some(LIVE),
+            CLOSED,
+            now
+        ));
+        assert_eq!(
+            decide_serve(Some(&clean), Some(LIVE), CLOSED, 30, now),
+            ServeDecision::ScanInline
+        );
+        assert_eq!(
+            decide_serve_with_queued_regrade(Some(&clean), Some(LIVE), CLOSED, 30, now, true),
+            ServeDecision::ServeCached
+        );
+        assert!(!grace_extension_possible(
+            Some(TWO_BEHIND),
+            Some(LIVE),
+            CLOSED,
+            now
+        ));
+
+        // Opted in and open: the fast paths leave a grace-only clean verdict
+        // to the buffered gate, which queues its re-grade; a vulnerable one
+        // still blocks there.
+        set_db_grace_for_test(grace_aged(now, Duration::hours(1), Duration::hours(6)));
         let pinned = |verdict: &str| StoredProxyVerdict {
-            row: row(verdict),
+            row: row(verdict, PREVIOUS),
             pin_identity: Some("python|foo|1.0".to_string()),
             components_cataloged: Some(1),
         };
         assert_eq!(
+            decide_serve(Some(&clean), Some(LIVE), CLOSED, 30, now),
+            ServeDecision::ServeCached
+        );
+        assert_eq!(
             decide_cache_scan_gate(
                 Some(&pinned(VERDICT_CLEAN)),
                 Some(LIVE),
-                ProxyScanAction::FailClosed,
+                CLOSED,
                 ProxySeverityGate::BlockOnAny,
                 30,
                 now
@@ -2855,24 +3174,12 @@ mod tests {
             decide_cache_scan_gate(
                 Some(&pinned(VERDICT_VULNERABLE)),
                 Some(LIVE),
-                ProxyScanAction::FailClosed,
+                CLOSED,
                 ProxySeverityGate::BlockOnAny,
                 30,
                 now
             ),
             CacheScanGate::Block
-        );
-        let mut two_behind = row(VERDICT_CLEAN);
-        two_behind.scanner_version = Some(TWO_BEHIND.to_string());
-        assert_eq!(
-            decide_serve(
-                Some(&two_behind),
-                Some(LIVE),
-                ProxyScanAction::FailClosed,
-                30,
-                now
-            ),
-            ServeDecision::ScanInline
         );
     }
 
@@ -2889,11 +3196,13 @@ mod tests {
         ));
     }
 
-    /// The first sighting is kept in the database: a second load of the same
-    /// version (a restart, another replica) gets the same window, and the
-    /// previous version is the same binary's last one recorded before it.
+    /// The window is anchored on the fleet-wide first sighting (a reload, as
+    /// on a restart or another replica, does not reopen it), and the previous
+    /// build is the newest same-binary BUILD below the live one, whenever it
+    /// was recorded: a stale build recorded late (a pinned DB, a rollback, a
+    /// new pod on an old bundled DB) does not become the previous build.
     #[tokio::test]
-    async fn db_grace_is_anchored_on_the_fleet_wide_first_sighting() {
+    async fn db_grace_is_anchored_on_the_first_sighting_and_the_newest_lower_build() {
         use crate::api::handlers::test_db_helpers as tdh;
         let Some(pool) = tdh::try_pool().await else {
             return;
@@ -2904,29 +3213,57 @@ mod tests {
         sqlx::query(
             "INSERT INTO proxy_scan_db_versions (scanner_version, first_seen_at) VALUES \
              ($1, now() - interval '3 days'), ($2, now() - interval '2 days'), \
-             ($3, now() - interval '1 day')",
+             ($3, now() - interval '1 day'), ($4, now() - interval '1 hour')",
         )
-        .bind(token("2026-11-16"))
         .bind(token("2026-11-17"))
+        .bind(token("2026-11-18"))
         // Another binary's newer build is not this one's previous version.
         .bind(format!("{cli}-other+db-2026-11-18"))
+        // A stale build recorded LAST.
+        .bind(token("2026-11-10"))
         .execute(&pool)
         .await
         .expect("seed earlier versions");
 
         let live = token("2026-11-19");
-        let first = load_db_update_grace(&pool, &live, Duration::hours(6))
+        let six = DbGraceWindows {
+            serving: Duration::hours(6),
+            fail_closed: Duration::hours(2),
+        };
+        let first = load_db_update_grace(&pool, &live, six)
             .await
             .expect("first load");
         assert_eq!(
             first.previous.as_deref(),
-            Some(token("2026-11-17").as_str())
+            Some(token("2026-11-18").as_str()),
+            "the newest build below the live one, not the last one recorded"
         );
-        assert!(first.until > Utc::now() + Duration::hours(5));
-        let again = load_db_update_grace(&pool, &live, Duration::hours(6))
+        assert!(!first.covers_build(&token("2026-11-10"), &live));
+        assert!(!first.covers_build(&token("2026-11-17"), &live));
+        let serving = first.serving.expect("serving window");
+        let fail_closed = first.fail_closed.expect("fail_closed window");
+        assert!(serving.until > Utc::now() + Duration::hours(5));
+        assert!(fail_closed.until < Utc::now() + Duration::hours(2));
+        assert_eq!(serving.queued_until - serving.until, Duration::hours(6));
+
+        // Reloaded an hour "later" (the row aged): the same end, give or take
+        // the time between the two loads.
+        sqlx::query(
+            "UPDATE proxy_scan_db_versions SET first_seen_at = first_seen_at - interval '1 hour' \
+             WHERE scanner_version = $1",
+        )
+        .bind(&live)
+        .execute(&pool)
+        .await
+        .expect("age");
+        let again = load_db_update_grace(&pool, &live, six)
             .await
             .expect("second load");
-        assert_eq!(again, first, "a reload must not reopen the window");
+        let moved = (serving.until - again.serving.expect("window").until).num_seconds();
+        assert!(
+            (3590..=3610).contains(&moved),
+            "a reload must not reopen the window ({moved}s)"
+        );
 
         sqlx::query("DELETE FROM proxy_scan_db_versions WHERE starts_with(scanner_version, $1)")
             .bind(&cli)

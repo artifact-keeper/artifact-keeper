@@ -100,11 +100,15 @@ docker exec "${TAG}-mock" python3 -c \
   > "${WORK}/digests.json"
 jq -r 'keys[]' "${WORK}/digests.json" > "${WORK}/paths"
 
-# One pull: "<path> <status> <seconds> <epoch when the response was in>".
+# One pull: "<path> <status> <seconds> <epoch when the response was in> <X-AK-Scan>".
 cat > "${WORK}/pull.sh" <<EOF
 #!/usr/bin/env bash
-out=\$(curl -s -o /dev/null -w '%{http_code} %{time_total}' --max-time 300 "${BASE}/maven/perf-mvn/\$1") || out="000 0"
-echo "\$1 \$out \$(date +%s.%N)"
+hdr=\$(mktemp)
+out=\$(curl -s -o /dev/null -D "\$hdr" -w '%{http_code} %{time_total}' --max-time 300 "${BASE}/maven/perf-mvn/\$1") || out="000 0"
+at=\$(date +%s.%N)
+scan=\$(grep -i '^x-ak-scan:' "\$hdr" | tr -d '\\r' | sed 's/^[^:]*:[[:space:]]*//' | head -1)
+rm -f "\$hdr"
+echo "\$1 \$out \$at \${scan:-none}"
 EOF
 chmod +x "${WORK}/pull.sh"
 burst() { xargs -P "$CONC" -n 1 "${WORK}/pull.sh" < "${WORK}/paths"; }
@@ -140,7 +144,7 @@ docker cp "${WORK}/burst.txt" "${TAG}-db:/tmp/burst.txt"
 jq -r 'to_entries[] | "\(.key) \(.value)"' "${WORK}/digests.json" > "${WORK}/map.txt"
 docker cp "${WORK}/map.txt" "${TAG}-db:/tmp/map.txt"
 INLINE="$(docker exec "${TAG}-db" psql -q -U registry -d artifact_registry -tAc "
-  CREATE TEMP TABLE b (path text, status text, secs float8, at float8);
+  CREATE TEMP TABLE b (path text, status text, secs float8, at float8, scan text);
   CREATE TEMP TABLE m (path text, digest text);
   COPY b FROM '/tmp/burst.txt' WITH (FORMAT text, DELIMITER ' ');
   COPY m FROM '/tmp/map.txt' WITH (FORMAT text, DELIMITER ' ');
@@ -166,15 +170,17 @@ import json, sys
 (path, image, backend_env, n, conc, action, t0, t1, hits, inline, at_live, regraded_in, final) = sys.argv[1:]
 rows = [l.split() for l in open(path) if l.strip()]
 secs = sorted(float(r[2]) for r in rows)
-codes = {}
+codes, headers = {}, {}
 for r in rows:
     codes[r[1]] = codes.get(r[1], 0) + 1
+    headers[r[4]] = headers.get(r[4], 0) + 1
 q = lambda p: round(secs[min(len(secs) - 1, int(p * len(secs)))], 3)
 print(json.dumps({
     "image": image, "backend_env": backend_env, "artifacts": int(n),
     "concurrency": int(conc), "action": action,
     "burst_wall_secs": round(float(t1) - float(t0), 2),
     "status_counts": codes,
+    "x_ak_scan_counts": headers,
     "latency_secs": {"p50": q(0.50), "p95": q(0.95), "p99": q(0.99), "max": round(secs[-1], 3)},
     "upstream_gets_during_burst": int(hits),
     "pulls_that_waited_for_a_scan": int(inline),

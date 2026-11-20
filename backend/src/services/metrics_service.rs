@@ -333,6 +333,24 @@ pub fn record_proxy_scan_regrade(outcome: &'static str) {
     counter!("ak_proxy_scan_regrades_total", "outcome" => outcome).increment(1);
 }
 
+/// The DB-update grace windows this process applies (#6300), in seconds:
+/// `action_class` `serving` (`fail_open`, `record_only`) and `fail_closed`.
+/// Alert when the re-grade backlog's age nears them
+/// (`ak_proxy_scan_regrade_backlog_oldest_seconds`).
+pub fn record_proxy_scan_db_grace_window(serving_secs: f64, fail_closed_secs: f64) {
+    gauge!("ak_proxy_scan_db_grace_window_seconds", "action_class" => "serving").set(serving_secs);
+    gauge!("ak_proxy_scan_db_grace_window_seconds", "action_class" => "fail_closed")
+        .set(fail_closed_secs);
+}
+
+/// Age of the oldest proxy re-grade still waiting (#6300): `where` is
+/// `queue` (a pending `proxy_file` job at the re-grade priority, published by
+/// the scan worker) or `in_process` (this process's own backlog). `0` when
+/// none waits.
+pub fn record_proxy_scan_regrade_backlog_oldest(location: &'static str, secs: f64) {
+    gauge!("ak_proxy_scan_regrade_backlog_oldest_seconds", "where" => location).set(secs);
+}
+
 /// A queued `fail_closed` proxy scan dropped because no request wanted it any
 /// more (#5231).
 pub fn record_proxy_scan_abandoned() {

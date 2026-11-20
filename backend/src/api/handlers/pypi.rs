@@ -20847,10 +20847,10 @@ mod tests {
     /// #6300: a vulnerability-DB update no longer re-scans every cached
     /// package on its next pull. A verdict the same scanner graded against
     /// the previous DB build decides the pull within the grace (here a
-    /// fail_closed pull served from a `clean` row, with no scan on the
-    /// request path), the pull re-grades the bytes in the background, and
-    /// once the re-grade has found the CVE the live DB knows the next pull is
-    /// blocked from the new row.
+    /// fail_closed pull, with the operator's opt-in, served from a `clean`
+    /// row with no scan on the request path), the pull re-grades the bytes in
+    /// the background, and once the re-grade has found the CVE the live DB
+    /// knows the next pull is blocked from the new row.
     #[tokio::test]
     async fn test_db_update_regrades_in_the_background_and_then_blocks_6300() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -20858,6 +20858,12 @@ mod tests {
         const LIVE: &str = "grype-0.84.6300+db-2026-11-19";
         const PREVIOUS: &str = "grype-0.84.6300+db-2026-11-18";
 
+        // The fail_closed grace is opt-in. Read once per process, and nextest
+        // runs this test in its own.
+        std::env::set_var(
+            crate::services::proxy_scan_service::DB_GRACE_FAIL_CLOSED_ENV,
+            "6",
+        );
         let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
             return;
         };

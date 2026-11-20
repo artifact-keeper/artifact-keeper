@@ -432,6 +432,19 @@ impl ScanQueue {
         self
     }
 
+    /// Seconds the oldest pending proxy re-grade ([`PRIORITY_REGRADE`]) has
+    /// waited, `0` with none (#6300).
+    pub async fn oldest_pending_regrade_secs(&self) -> Result<f64> {
+        sqlx::query_scalar(
+            "SELECT COALESCE(EXTRACT(EPOCH FROM (NOW() - MIN(created_at)))::float8, 0) \
+             FROM scan_queue WHERE kind = 'proxy_file' AND state = 'pending' AND priority <= $1",
+        )
+        .bind(PRIORITY_REGRADE)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
+
     /// Queue a scan of the proxy object cached at `cache_path`. Returns
     /// whether a row was inserted: a burst pulling the same digest, or a second
     /// replica serving the same bytes, dedups to one.

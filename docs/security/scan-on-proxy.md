@@ -655,66 +655,123 @@ hold:
 If either version string is unknown, a `fail_open` or `record_only`
 repository falls back to the 30-day window alone. A `fail_closed` repository
 reuses a `clean` verdict only when both versions are known and equal (or
-covered by the grace); otherwise it scans again, and an inconclusive result is
+covered by its opted-in grace); otherwise it scans again, and an inconclusive result is
 `423`.
 
 ### After a vulnerability-database update
 
 The version string carries the database build (`grype-0.120.1+db-2026-11-10`),
-so a database update used to make every stored verdict stale at once: the next
-pull of every cached package scanned again, together, on the request path (a
-`fail_closed` client waited for it or got a `423`) or as a queued scan.
+so a database update used to make every stored verdict stale at once. The next
+pull of every cached package was scanned again, all together: on the request
+path under `fail_closed` (the client waited for it or got a `423`), or as a
+queued scan under `fail_open`.
 
-Since 1.13.0, for `PROXY_SCAN_DB_GRACE_HOURS` (default `6`, at most `72`)
-after the instance first sees a new database build, a verdict the same scanner
-binary graded against the previous build still decides the pull: a `clean`
-one serves (`X-AK-Scan: clean`) and a `vulnerable` one blocks, under every
-action. That pull also re-grades the bytes in the background, against the new
-build:
+Since 1.13.0 the instance applies a **database-update grace**. For a window
+after it first sees a new database build, a verdict that the same scanner
+binary graded against the previous build still decides the pull. A `clean`
+verdict serves (`X-AK-Scan: clean`) and a `vulnerable` one blocks. The window
+depends on the repository's action:
 
-- with the [durable scan queue](#the-durable-scan-queue) on, as a `proxy_file`
-  job at priority 5, claimed after every other job and within the worker's
-  rescan slots (half of `SCAN_WORKER_CONCURRENCY`), with the background band
-  asked of the scanner adapter. A pull that does wait for the same bytes (a
-  `fail_closed` pull past the grace) raises it as usual;
-- otherwise in the serving process, at most two at a time. A cached file
-  waits its turn (up to 10,000 waiting, each holding a reference to the cached
-  object rather than its bytes, which are read when it runs); an image or an
-  OS package, which is re-graded from the bytes the pull holds, runs only when
-  a slot is free, and otherwise a later pull asks again.
+| Action | Setting | Default | Ceiling |
+|---|---|---|---|
+| `fail_open`, `record_only` | `PROXY_SCAN_DB_GRACE_HOURS` | `6` | `72` |
+| `fail_closed` | `PROXY_SCAN_DB_GRACE_HOURS_FAIL_CLOSED` | `0` (off) | `24` |
 
-Each process asks once per digest every ten minutes. The re-grade reads the
-cached object (or the bytes already in hand), never the upstream, and records
-its verdict against the live build, so the next pull is decided by it. Only
-what is pulled is re-graded, most-pulled first in practice, and on spare scan
-capacity. `ak_proxy_scan_regrades_total{outcome}` counts them (`queued`: a
-queue job; `started`: in process, running or waiting its turn; `deferred`: no
-slot free for an image or OS package).
+`0` turns the grace off for those actions. A larger value is clamped to the
+ceiling, with a warning in the log. Under `fail_open` and `record_only` the pull
+is served either way, so the grace only changes how the pull is labelled and
+when the scan runs. Under `fail_closed` it is an **opt-in trade**: within the
+window, a pull can be served clean from a verdict made before the new database
+added an advisory. Opt in only if that exposure (at most the window, on top of
+the time a database build already takes to reach you) is acceptable.
+
+A `vulnerable` verdict also keeps blocking for the whole window, even when the
+new database would grade the bytes clean (a withdrawn advisory). This
+paragraph and the performance note below come from nicola-preda's #6307.
+
+Performance note: with the `fail_closed` default of `0`, each database update
+still re-scans every cached package of a `fail_closed` repository on its next
+pull, as before 1.13.0. That is the thundering herd this grace exists to
+avoid, so plan scan capacity for it, or opt in.
+
+A pull that the grace decides also re-grades the bytes in the background,
+against the new build:
+
+- With the [durable scan queue](#the-durable-scan-queue) on, the re-grade is a
+  `proxy_file` job at priority 5. It is claimed after every other job, within
+  the worker's rescan slots (half of `SCAN_WORKER_CONCURRENCY`), and it asks
+  the scanner adapter for its background band. A pull that does wait for the
+  same bytes raises the job as usual.
+- Otherwise the re-grade runs in the serving process, at most two at a time
+  (fixed). A cached file waits its turn in a backlog of up to 10,000 (fixed).
+  Each waiting entry holds a reference to the cached object, not its bytes,
+  which are read when it runs. An image or an OS package is re-graded from the
+  bytes the pull holds, so it runs only when a slot is free; if none is, the
+  re-grade is `deferred` and a later pull asks again.
+
+Each process asks for a digest's re-grade at most once every ten minutes
+(fixed). The re-grade reads the cached object, or the bytes already in hand,
+and never the upstream. It records its verdict against the live build, so the
+next pull is decided by that verdict. Only what is pulled is re-graded, so the
+most-pulled packages go first in practice, and the work uses spare scan
+capacity.
+
+**The re-grade is best effort; the window is the bound.** A re-grade can be
+deferred, dropped by a full backlog, lost on a restart, or fail (for example
+when the cached object is gone). Then the verdict keeps deciding pulls until
+the window ends, and a later pull asks again. Two rules decide what happens
+when the window ends:
+
+- A digest whose re-grade is still queued, in the scan queue or in the
+  process's backlog, keeps the grace for at most one more window. A backlog
+  then drains instead of falling back to scans on the request path all at
+  once.
+- Everything else behaves exactly as before the grace existed.
+
+Watch the backlog against the window with
+`ak_proxy_scan_regrade_backlog_oldest_seconds{where="queue"|"in_process"}` and
+`ak_proxy_scan_db_grace_window_seconds{action_class="serving"|"fail_closed"}`.
+For example, alert on
+
+```promql
+max(ak_proxy_scan_regrade_backlog_oldest_seconds)
+  > 0.5 * max(ak_proxy_scan_db_grace_window_seconds)
+```
+
+The worker, or the serving process, also logs a warning once the oldest
+re-grade has waited half the window. `ak_proxy_scan_regrades_total{outcome}`
+counts re-grades by outcome: `queued` (a queue job), `started` (in process,
+running or waiting its turn) and `deferred` (no slot free for an image or OS
+package).
 
 The grace never covers:
 
-- a scanner binary upgrade (`grype-0.119.0` to `grype-0.120.1`): scanned again
-  on the next pull, as before;
-- a verdict two or more database builds behind, or from a build this instance
-  never recorded before the live one;
-- an unknown version on either side;
-- anything once the window has passed: the pull then behaves as before the
-  grace existed.
+- a scanner binary upgrade (`grype-0.119.0` to `grype-0.120.1`), which is
+  scanned again on the next pull, as before;
+- a verdict older than the newest build of the same binary that this fleet
+  recorded below the live one. "Newest" is by build date, not by when the
+  build was recorded, so a replica pinned to an old database cannot widen the
+  grace;
+- a build string that is not a `YYYY-MM-DD` date, or an unknown version on
+  either side.
 
 The window starts when the fleet first saw the build, recorded in
-`proxy_scan_db_versions` (migration 401), so a restart or a new replica does
-not reopen it. A verdict graded against a NEWER build than the live one (one
-replica updated before another, a rolling upgrade) is reused rather than
-scanned again with the older build. To keep the behaviour from before 1.13.0
-(every database update re-scans on the next pull, and a replica with the older
-build re-scans a newer build's verdicts), set `PROXY_SCAN_DB_GRACE_HOURS=0`.
+`proxy_scan_db_versions` (migration 401) and measured on the database's clock,
+so a restart or a new replica does not reopen it. As a result, a replica that
+installs the new database more than the window after the first sighting gets
+no grace for it.
 
-What this trades: for up to the window, a pull can be decided by a verdict
-graded before an advisory the new build added. That is the exposure an
-instance already has between a database build and its install, and it never
-serves bytes that were not scanned, nor serves a `vulnerable` verdict. A
-`fail_closed` repository that must have every pull graded against the newest
-build should set the window to `0`.
+A verdict graded against a **newer** build than the live one is always reused,
+whatever the grace settings. This happens when one replica updates before
+another, or during a rolling upgrade. Before, the replica with the older build
+re-scanned it, and the next replica re-scanned it back.
+
+With the `fail_closed` grace on, the presigned-redirect fast paths
+([below](#proxy-cache-fast-paths)) do not redirect a `clean` verdict that only
+the grace vouches for. That pull reads the body through the buffered gate
+instead, which queues the re-grade. The cost is one buffered read per such
+pull, of a body at most the scan cap, until the digest is re-graded. After
+that, the redirect is used again. `fail_open` fast paths are unaffected.
 
 A verdict also records the coordinate it was graded as (`pin_identity`,
 migration 301). For most formats the bytes name that coordinate themselves (an
