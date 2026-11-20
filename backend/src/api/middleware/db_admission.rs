@@ -16,13 +16,19 @@
 //! `DATABASE_REQUEST_CONCURRENCY` requests (default four per pool connection)
 //! hold an admission permit for their handler phase, from the gate until the
 //! response head is ready (a download's body streams after that, without a
-//! permit). When every permit is held and the pool is busy, a request waits
-//! up to `DATABASE_REQUEST_ACQUIRE_WAIT_MS` (default 500 ms) for a permit and
-//! is otherwise answered at once with the same `503 POOL_EXHAUSTED` +
-//! `Retry-After: 1` body the pool timeout produces, counted in
-//! `ak_db_requests_shed_total`. An admitted request queues behind at most the
-//! other permit holders, so it finishes in a bounded time instead of slowing
-//! down with the whole burst.
+//! permit). When every slot is held and the pool is busy, a request may
+//! queue for one for up to `DATABASE_REQUEST_ACQUIRE_WAIT_MS` (default 2 s,
+//! below the pool's 5 s acquire timeout). Before queueing, the gate predicts
+//! the wait from what it measures (requests queued ahead x the moving
+//! average of how long a slot is held / slots): a backlog predicted to
+//! outlast the budget is answered at once with the same `503 POOL_EXHAUSTED`
+//! body the pool timeout produces and `Retry-After` set to the predicted
+//! wait (1 to 30 s), so clients come back about when the queue ahead of them
+//! has cleared instead of competing with it every second. A request that
+//! queues and still gets no slot in time is answered the same way. Sheds are
+//! counted in `ak_db_requests_shed_total`. An admitted request queues behind
+//! at most the other slot holders, so it finishes in a bounded time instead
+//! of slowing down with the whole burst.
 //!
 //! The permits only shed while the pool is busy: when every permit is held
 //! but the pool has room (connections it has not opened yet, or a quarter of
@@ -32,15 +38,17 @@
 //! A shed request has done no work at all; in particular it has not
 //! authenticated, so a shed can never let a request through (it is a `503`,
 //! never a `2xx`), and an admitted request goes through every check exactly
-//! as before. Health and readiness probes are never gated, and read the
-//! database through their own small pool ([`crate::db::create_probe_pool`]),
-//! so a saturated request pool does not make a busy replica look dead.
+//! as before. Health and readiness probes and the main-port metrics scrape
+//! are never gated, and the probes read the database through their own small
+//! pool ([`crate::db::create_probe_pool`]), so a saturated request pool
+//! neither makes a busy replica look dead nor blinds monitoring.
 //!
 //! `DATABASE_REQUEST_ACQUIRE_WAIT_MS=0` or `DATABASE_REQUEST_CONCURRENCY=0`
 //! turns the gate off.
 
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{Request, State},
@@ -55,13 +63,53 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// Counter of requests the gate answered `503` without running them.
 pub const SHED_METRIC: &str = "ak_db_requests_shed_total";
 
-/// The gate's state: the request pool, the handler-phase permits, and how
-/// long a request may wait for a permit while the pool is busy.
-#[derive(Clone)]
+/// Paths the gate never sheds besides the probes: the main-port Prometheus
+/// scrape, so monitoring is not blinded during the very incident it should
+/// show. (The separate `METRICS_PORT` listener has no gate at all.)
+const EXEMPT_PATHS: &[&str] = &["/api/v1/admin/metrics"];
+
+/// Longest `Retry-After` the gate sends, in seconds.
+const MAX_RETRY_AFTER_SECS: u64 = 30;
+
+/// Weight of the newest sample in the moving average of slot hold times
+/// (1/16: smooth over a few dozen requests, follow a shift within ~50).
+const HOLD_EWMA_SHIFT: u32 = 4;
+
+/// The gate's state: the request pool, the handler-phase slots, the longest
+/// predicted wait a request is allowed to queue for, and what it measures to
+/// predict that wait.
 pub struct DbAdmission {
     pool: PgPool,
     permits: Arc<Semaphore>,
+    capacity: usize,
     wait: Duration,
+    /// Requests queued for a slot right now.
+    waiters: AtomicUsize,
+    /// Moving average of how long a request holds its slot, in microseconds
+    /// (0 until the first slot is returned).
+    avg_hold_us: AtomicU64,
+}
+
+/// A held slot. Returning it feeds the hold-time average the wait
+/// prediction uses.
+pub(crate) struct Slot {
+    _permit: OwnedSemaphorePermit,
+    since: Instant,
+    gate: Arc<DbAdmission>,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.gate.record_hold(self.since.elapsed());
+    }
+}
+
+/// What [`DbAdmission::admit`] decided.
+pub(crate) enum Admission {
+    /// Run, holding the slot (if any) until the response head is ready.
+    Run(Option<Slot>),
+    /// Shed, telling the client to come back after this many seconds.
+    Shed { retry_after_secs: u64 },
 }
 
 impl DbAdmission {
@@ -72,30 +120,88 @@ impl DbAdmission {
             Arc::new(Self {
                 pool,
                 permits: Arc::new(Semaphore::new(concurrency)),
+                capacity: concurrency,
                 wait: Duration::from_millis(wait_ms),
+                waiters: AtomicUsize::new(0),
+                avg_hold_us: AtomicU64::new(0),
             })
         })
     }
 
-    /// Admit or shed one request. `Some(permit)` runs it, holding the
-    /// permit (if any) until its response head is ready; `None` sheds it.
-    pub(crate) async fn admit(&self) -> Option<Option<OwnedSemaphorePermit>> {
-        let permits = &self.permits;
-        if let Ok(permit) = permits.clone().try_acquire_owned() {
-            return Some(Some(permit));
-        }
-        // Every permit is held. That only means the pool is the bottleneck
-        // when the pool is busy too; permits held by slow uploads or upstream
-        // fetches next to an idle pool must not shed anything.
-        if pool_has_room(&self.pool) {
-            return Some(None);
-        }
-        match tokio::time::timeout(self.wait, permits.clone().acquire_owned()).await {
-            Ok(Ok(permit)) => Some(Some(permit)),
-            // Out of time: run it anyway if the pool has room by now.
-            _ => pool_has_room(&self.pool).then_some(None),
+    fn record_hold(&self, held: Duration) {
+        let sample = held.as_micros().min(u64::MAX as u128) as u64;
+        // A lost update under contention only skips one sample.
+        let old = self.avg_hold_us.load(Ordering::Relaxed);
+        let new = if old == 0 {
+            sample.max(1)
+        } else {
+            (old - (old >> HOLD_EWMA_SHIFT) + (sample >> HOLD_EWMA_SHIFT)).max(1)
+        };
+        self.avg_hold_us.store(new, Ordering::Relaxed);
+    }
+
+    fn slot(self: &Arc<Self>, permit: OwnedSemaphorePermit) -> Slot {
+        Slot {
+            _permit: permit,
+            since: Instant::now(),
+            gate: self.clone(),
         }
     }
+
+    /// Admit or shed one request.
+    pub(crate) async fn admit(self: &Arc<Self>) -> Admission {
+        if let Ok(permit) = self.permits.clone().try_acquire_owned() {
+            return Admission::Run(Some(self.slot(permit)));
+        }
+        // Every slot is held. That only means the pool is the bottleneck
+        // when the pool is busy too; slots held by slow uploads or upstream
+        // fetches next to an idle pool must not shed anything.
+        if pool_has_room(&self.pool) {
+            return Admission::Run(None);
+        }
+        // Queue only when the queue ahead is predicted to clear within the
+        // wait; otherwise say at once how long the backlog is.
+        let predicted = predicted_wait(
+            self.waiters.load(Ordering::Relaxed) + 1,
+            Duration::from_micros(self.avg_hold_us.load(Ordering::Relaxed)),
+            self.capacity,
+        );
+        if predicted > self.wait {
+            return Admission::Shed {
+                retry_after_secs: retry_after_secs(predicted),
+            };
+        }
+        self.waiters.fetch_add(1, Ordering::Relaxed);
+        let acquired = tokio::time::timeout(self.wait, self.permits.clone().acquire_owned()).await;
+        self.waiters.fetch_sub(1, Ordering::Relaxed);
+        match acquired {
+            Ok(Ok(permit)) => Admission::Run(Some(self.slot(permit))),
+            // Out of time: run it anyway if the pool has room by now.
+            _ if pool_has_room(&self.pool) => Admission::Run(None),
+            _ => Admission::Shed {
+                retry_after_secs: retry_after_secs(self.wait),
+            },
+        }
+    }
+}
+
+/// How long the `position`-th request in the slot queue should wait: the
+/// requests ahead of it, each holding a slot for `avg_hold` on average,
+/// served `capacity` at a time. Zero before any hold time is known (the gate
+/// then just waits, bounded by its budget). Pure.
+pub(crate) fn predicted_wait(position: usize, avg_hold: Duration, capacity: usize) -> Duration {
+    avg_hold.saturating_mul(position.min(u32::MAX as usize) as u32) / capacity.max(1) as u32
+}
+
+/// `Retry-After` for a predicted wait: whole seconds, rounded up, at least
+/// 1 and at most [`MAX_RETRY_AFTER_SECS`]. Clients that honour it come back
+/// about when the backlog ahead of them has cleared instead of competing
+/// with it every second. Pure.
+pub(crate) fn retry_after_secs(predicted: Duration) -> u64 {
+    predicted
+        .as_millis()
+        .div_ceil(1000)
+        .clamp(1, MAX_RETRY_AFTER_SECS as u128) as u64
 }
 
 /// Whether a pool with `size` open connections, `idle` of them idle, and a
@@ -118,49 +224,58 @@ fn pool_has_room(pool: &PgPool) -> bool {
 }
 
 /// The shed answer: byte-for-byte the body a pool acquire timeout produces
-/// (`AppError::Sqlx(PoolTimedOut)`), with `Retry-After: 1`, so clients and
-/// dashboards that key off `POOL_EXHAUSTED` see the same thing, only sooner.
+/// (`AppError::Sqlx(PoolTimedOut)`), so clients and dashboards that key off
+/// `POOL_EXHAUSTED` see the same thing, only sooner, with `Retry-After` set
+/// to the predicted backlog ([`retry_after_secs`]).
 ///
 /// Built here rather than through `AppError` so a burst of sheds costs a
 /// counter increment each, not a `warn` log line each; the response carries
 /// [`crate::error::ExpectedOutcome`] so the trace layer does not log it as a
 /// server fault either.
-pub(crate) fn shed_response() -> Response {
+pub(crate) fn shed_response(retry_after_secs: u64) -> Response {
     let body = Json(serde_json::json!({
         "code": "POOL_EXHAUSTED",
         "message": "Database connection pool is saturated, retry shortly",
     }));
     let mut response = (StatusCode::SERVICE_UNAVAILABLE, body).into_response();
-    response.headers_mut().insert(
-        header::RETRY_AFTER,
-        HeaderValue::from_static(crate::error::RETRY_AFTER_SECS_ON_503),
-    );
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(retry_after_secs));
     response
         .extensions_mut()
         .insert(crate::error::ExpectedOutcome);
     response
 }
 
-/// The gate. Probes ([`crate::api::routes::is_probe_path`]) always pass.
+/// Whether the gate leaves `path` alone: probes
+/// ([`crate::api::routes::is_probe_path`], `/livez` included) and
+/// [`EXEMPT_PATHS`].
+pub(crate) fn is_exempt(path: &str) -> bool {
+    crate::api::routes::is_probe_path(path) || EXEMPT_PATHS.contains(&path)
+}
+
+/// The gate.
 pub async fn db_admission_gate(
     State(gate): State<Arc<DbAdmission>>,
     req: Request,
     next: Next,
 ) -> Response {
-    if crate::api::routes::is_probe_path(req.uri().path()) {
+    if is_exempt(req.uri().path()) {
         return next.run(req).await;
     }
-    if let Some(_permit) = gate.admit().await {
-        return next.run(req).await;
+    match gate.admit().await {
+        Admission::Run(_slot) => next.run(req).await,
+        Admission::Shed { retry_after_secs } => {
+            metrics::counter!(SHED_METRIC).increment(1);
+            tracing::debug!(
+                retry_after_secs,
+                pool_size = gate.pool.size(),
+                path = %req.uri().path(),
+                "request shed: database admission backlog over the wait budget"
+            );
+            shed_response(retry_after_secs)
+        }
     }
-    metrics::counter!(SHED_METRIC).increment(1);
-    tracing::debug!(
-        wait_ms = gate.wait.as_millis() as u64,
-        pool_size = gate.pool.size(),
-        path = %req.uri().path(),
-        "request shed: no database connection within the admission wait"
-    );
-    shed_response()
 }
 
 #[cfg(ak_test_shard = "services-2")]
@@ -197,9 +312,9 @@ mod tests {
 
     #[tokio::test]
     async fn shed_response_is_the_pool_exhausted_503_with_retry_after() {
-        let response = shed_response();
+        let response = shed_response(7);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        assert_eq!(response.headers()[header::RETRY_AFTER], "7");
         assert!(response
             .extensions()
             .get::<crate::error::ExpectedOutcome>()
@@ -226,16 +341,127 @@ mod tests {
         let pool = PgPool::connect_lazy("postgres://u:p@127.0.0.1:1/db").unwrap();
         let gate = DbAdmission::new(pool, 5_000, 1).unwrap();
         let started = std::time::Instant::now();
-        let first = gate.admit().await.expect("admitted");
-        assert!(first.is_some(), "took the only permit");
-        assert!(matches!(gate.admit().await, Some(None)));
+        let first = gate.admit().await;
+        assert!(
+            matches!(first, Admission::Run(Some(_))),
+            "took the only slot"
+        );
+        assert!(matches!(gate.admit().await, Admission::Run(None)));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn predicted_wait_is_the_queue_ahead_over_the_slots() {
+        let hold = Duration::from_millis(250);
+        // 1,168 queued behind 32 slots held 250 ms each: about 9 s.
+        assert_eq!(predicted_wait(1168, hold, 32), Duration::from_millis(9125));
+        assert_eq!(
+            predicted_wait(8, hold, 32),
+            Duration::from_millis(62) + Duration::from_micros(500)
+        );
+        assert_eq!(
+            predicted_wait(5, Duration::ZERO, 32),
+            Duration::ZERO,
+            "no data yet"
+        );
+        assert_eq!(
+            predicted_wait(5, hold, 0),
+            hold * 5,
+            "capacity 0 cannot divide by zero"
+        );
+    }
+
+    #[test]
+    fn retry_after_rounds_up_and_is_bounded() {
+        assert_eq!(retry_after_secs(Duration::ZERO), 1);
+        assert_eq!(retry_after_secs(Duration::from_millis(2001)), 3);
+        assert_eq!(retry_after_secs(Duration::from_millis(9125)), 10);
+        assert_eq!(
+            retry_after_secs(Duration::from_secs(600)),
+            MAX_RETRY_AFTER_SECS
+        );
+    }
+
+    #[test]
+    fn probes_and_the_metrics_scrape_are_exempt() {
+        for path in [
+            "/health",
+            "/healthz",
+            "/ready",
+            "/readyz",
+            "/livez",
+            "/api/v1/admin/metrics",
+        ] {
+            assert!(is_exempt(path), "{path}");
+        }
+        for path in [
+            "/api/v1/repositories",
+            "/api/v1/admin/metrics/x",
+            "/metrics2",
+        ] {
+            assert!(!is_exempt(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn hold_average_follows_the_samples() {
+        let pool_url = "postgres://u:p@127.0.0.1:1/db";
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let gate = DbAdmission::new(PgPool::connect_lazy(pool_url).unwrap(), 2000, 4).unwrap();
+            gate.record_hold(Duration::from_millis(160));
+            assert_eq!(
+                gate.avg_hold_us.load(Ordering::Relaxed),
+                160_000,
+                "first sample"
+            );
+            for _ in 0..200 {
+                gate.record_hold(Duration::from_millis(16));
+            }
+            let avg = gate.avg_hold_us.load(Ordering::Relaxed);
+            assert!(
+                (15_000..=17_000).contains(&avg),
+                "converged to 16 ms: {avg}"
+            );
+        });
+    }
+
+    /// A backlog predicted to outlast the wait is shed at once, with the
+    /// predicted backlog as `Retry-After`, instead of queueing to be shed at
+    /// the end of the wait.
+    #[tokio::test]
+    async fn a_backlog_longer_than_the_wait_sheds_at_once_with_its_length() {
+        let Some(pool) = crate::testing::try_pool_with(1).await else {
+            return;
+        };
+        let gate = DbAdmission::new(pool.clone(), 2_000, 1).unwrap();
+        let Admission::Run(Some(_held_slot)) = gate.admit().await else {
+            panic!("an idle gate hands out its slot");
+        };
+        let _held_conn = pool.acquire().await.expect("hold the only connection");
+        // Slots have been held 5 s on average; one request is already queued.
+        gate.avg_hold_us.store(5_000_000, Ordering::Relaxed);
+        gate.waiters.store(1, Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        let decision = gate.admit().await;
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "no queueing"
+        );
+        match decision {
+            Admission::Shed { retry_after_secs } => assert_eq!(retry_after_secs, 10),
+            Admission::Run(_) => panic!("a 10 s backlog over a 2 s wait must shed"),
+        }
     }
 
     fn gated_router(gate: Arc<DbAdmission>) -> Router {
         Router::new()
             .route("/work", get(|| async { "ok" }))
             .route("/readyz", get(|| async { "ready" }))
+            .route("/api/v1/admin/metrics", get(|| async { "metrics" }))
             .layer(axum::middleware::from_fn_with_state(
                 gate,
                 db_admission_gate,
@@ -269,7 +495,9 @@ mod tests {
         let (status, _) = status_of(&router, "/work").await;
         assert_eq!(status, StatusCode::OK, "control: an idle gate admits");
 
-        let held_permit = gate.admit().await.expect("idle gate").expect("permit");
+        let Admission::Run(Some(held_permit)) = gate.admit().await else {
+            panic!("an idle gate hands out its slot");
+        };
         let held_conn = pool.acquire().await.expect("hold the only connection");
         let (status, elapsed) = status_of(&router, "/work").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -279,6 +507,8 @@ mod tests {
         );
         let (status, _) = status_of(&router, "/readyz").await;
         assert_eq!(status, StatusCode::OK, "probes are never gated");
+        let (status, _) = status_of(&router, "/api/v1/admin/metrics").await;
+        assert_eq!(status, StatusCode::OK, "the metrics scrape is never gated");
 
         let release = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;

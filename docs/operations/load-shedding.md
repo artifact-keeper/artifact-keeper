@@ -102,9 +102,16 @@ database or storage work. At most `DATABASE_REQUEST_CONCURRENCY` requests
 (default four per pool connection, 200 with the default pool) run their
 handler phase at once; a download's body streams after the handler phase,
 without holding a slot. When every slot is held and the pool is busy, a
-request waits up to `DATABASE_REQUEST_ACQUIRE_WAIT_MS` (default 500) for one
-and is otherwise answered at once with the same `503 POOL_EXHAUSTED` body
-and `Retry-After: 1`, counted in `ak_db_requests_shed_total`. An admitted
+request may queue for one for up to `DATABASE_REQUEST_ACQUIRE_WAIT_MS`
+(default 2000, below the pool's 5 s acquire timeout). Before it queues, the
+gate predicts its wait from what it measures: the requests queued ahead,
+times the moving average of how long a slot is held, divided by the slots.
+A backlog predicted to outlast the budget is answered at once with the same
+`503 POOL_EXHAUSTED` body and `Retry-After` set to the predicted wait
+(1 to 30 s), so clients that honour it come back about when the queue ahead
+of them has cleared instead of competing with it every second; a request
+that queues and still gets no slot in time is answered the same way. Sheds
+are counted in `ak_db_requests_shed_total`. An admitted
 request queues behind at most the other slot holders, so it finishes in a
 bounded time; the rest are told to back off instead of waiting. When every
 slot is held but the pool has room (connections not yet opened, or a quarter
@@ -117,10 +124,26 @@ authentication, authorization and scanning run unchanged for every admitted
 request, and a credential check that cannot reach the database still answers
 `503`, never `2xx`.
 
-`/health` and `/readyz` are never gated, and they read the database through a
+`/health`, `/healthz`, `/ready`, `/readyz`, `/livez` and the main-port
+metrics scrape (`/api/v1/admin/metrics`; the `METRICS_PORT` listener has no
+gate) are never gated, so monitoring keeps working during the incident. The
+probes read the database through a
 separate pool of `DATABASE_PROBE_CONNECTIONS` (default 1), so they report
 whether the database answers rather than whether the request pool is busy.
 A replica that is saturated but healthy stays in its Service.
+
+That also means a request pool that is wedged (every connection held by a
+stuck query or a lock, as in the E2E tier) no longer takes the replica out
+of rotation: readiness reports the database reachable while every request
+is shed. Alert on the shed rate, for example
+`sum(rate(ak_db_requests_shed_total[5m])) > 0` for 10 minutes, together with
+`ak_db_pool_connection_failures_total{stage="request"}`; a burst sheds for
+seconds to a minute, a wedged pool sheds until someone intervenes.
+
+A shed is answered before the request body is read. Clients sending a body
+(an upload or publish) that do not wait for `100 Continue` may see the
+connection close mid-send and report a broken pipe or connection reset
+rather than the `503`; most package clients treat that as retryable too.
 
 To keep the behaviour before 1.13: `DATABASE_REQUEST_ACQUIRE_WAIT_MS=0` or
 `DATABASE_REQUEST_CONCURRENCY=0` (no gate), `DATABASE_PROBE_CONNECTIONS=0`

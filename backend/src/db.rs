@@ -126,7 +126,7 @@ fn connection_budget(config: &Config) -> String {
     format!(
         "connection budget: DATABASE_MAX_CONNECTIONS={} pool connections per replica \
          (DATABASE_ACQUIRE_TIMEOUT_SECS={}), plus single-flight lock/wait connections \
-         held outside the pool (capped per replica by PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS), \
+         held outside the pool (capped per replica by PROXY_SINGLEFLIGHT_LOCK_MAX_CONNECTIONS), \
          plus DATABASE_PROBE_CONNECTIONS={} for health and readiness probes, \
          plus one rolling-update surge replica, must stay below Postgres max_connections \
          (see the Database section of .env.example)",
@@ -570,7 +570,7 @@ mod tests {
             "DATABASE_MAX_CONNECTIONS=20",
             "DATABASE_ACQUIRE_TIMEOUT_SECS=7",
             "DATABASE_PROBE_CONNECTIONS=1",
-            "PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS",
+            "PROXY_SINGLEFLIGHT_LOCK_MAX_CONNECTIONS",
             "max_connections",
             "surge",
             ".env.example",

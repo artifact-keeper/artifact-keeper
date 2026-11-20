@@ -1348,7 +1348,7 @@ pub struct Config {
     /// `(DATABASE_MAX_CONNECTIONS + DATABASE_PROBE_CONNECTIONS) × replicas`,
     /// plus the single-flight lock/wait connections held outside the pool
     /// (capped per replica by
-    /// `PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS`) + headroom for one
+    /// `PROXY_SINGLEFLIGHT_LOCK_MAX_CONNECTIONS`) + headroom for one
     /// rolling-update surge replica must stay below Postgres
     /// `max_connections`. The defaults give 3 × 50 = 150 against a stock
     /// server's 100; see the Database section of `.env.example`.
@@ -1364,13 +1364,16 @@ pub struct Config {
     /// workloads where waiting is preferable to retrying.
     pub database_acquire_timeout_secs: u64,
 
-    /// Longest a request waits at the database admission gate for a permit
-    /// (see `database_request_concurrency`), while every permit is held and
-    /// the pool is busy, before it is answered `503 POOL_EXHAUSTED` with
-    /// `Retry-After` (#4182). The wait happens before any authentication or
-    /// handler work. Env var: `DATABASE_REQUEST_ACQUIRE_WAIT_MS`. Default
-    /// 500. `0` turns the gate off (every request queues on the pool, as
-    /// before 1.13).
+    /// Longest a request queues at the database admission gate for a slot
+    /// (see `database_request_concurrency`) while every slot is held and the
+    /// pool is busy (#4182). A request whose predicted wait (requests queued
+    /// ahead x average slot hold time / slots) is longer is answered
+    /// `503 POOL_EXHAUSTED` at once with that prediction as `Retry-After`;
+    /// one that queues and still gets no slot in time is answered the same.
+    /// The wait happens before any authentication or handler work, and stays
+    /// below the pool's own 5 s acquire timeout. Env var:
+    /// `DATABASE_REQUEST_ACQUIRE_WAIT_MS`. Default 2000. `0` turns the gate
+    /// off (every request queues on the pool, as before 1.13).
     pub database_request_acquire_wait_ms: u64,
 
     /// Connections in the separate pool that `/health` and `/readyz` read
@@ -1389,8 +1392,9 @@ pub struct Config {
     /// connections, so an admitted request's queries wait behind a bounded
     /// crowd instead of the whole burst. Sheds nothing while the pool has
     /// room. Env var: `DATABASE_REQUEST_CONCURRENCY`. Default four per pool
-    /// connection (`4 × DATABASE_MAX_CONNECTIONS`). `0` turns the gate off.
-    pub database_request_concurrency: usize,
+    /// connection (`None`: `4 × database_max_connections`, see
+    /// [`Config::database_request_slots`]). `0` turns the gate off.
+    pub database_request_concurrency: Option<usize>,
 
     /// Maximum number of bcrypt-bound auth operations (login,
     /// password verification, API-token verification) allowed to run
@@ -2181,9 +2185,9 @@ impl Default for Config {
             database_max_connections: 50,
             database_min_connections: 5,
             database_acquire_timeout_secs: 5,
-            database_request_acquire_wait_ms: 500,
+            database_request_acquire_wait_ms: 2000,
             database_probe_connections: 1,
-            database_request_concurrency: 200,
+            database_request_concurrency: None,
             database_idle_timeout_secs: 600,
             database_max_lifetime_secs: 1800,
             database_tcp_keepalives: true,
@@ -2272,6 +2276,14 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Database admission slots (#4182): `DATABASE_REQUEST_CONCURRENCY` when
+    /// set, otherwise four per pool connection, so a smaller or larger pool
+    /// scales the gate with it.
+    pub fn database_request_slots(&self) -> usize {
+        self.database_request_concurrency
+            .unwrap_or(4 * self.database_max_connections as usize)
+    }
+
     /// The HTTP/1 header-read timeout to hand the server (#4665); `None`
     /// when `HTTP_HEADER_READ_TIMEOUT_SECS=0` turned it off.
     pub fn http_header_read_timeout(&self) -> Option<std::time::Duration> {
@@ -2593,12 +2605,11 @@ impl Config {
             database_max_connections: env_parse("DATABASE_MAX_CONNECTIONS", 50),
             database_min_connections: env_parse("DATABASE_MIN_CONNECTIONS", 5),
             database_acquire_timeout_secs: env_parse("DATABASE_ACQUIRE_TIMEOUT_SECS", 5),
-            database_request_acquire_wait_ms: env_parse("DATABASE_REQUEST_ACQUIRE_WAIT_MS", 500),
+            database_request_acquire_wait_ms: env_parse("DATABASE_REQUEST_ACQUIRE_WAIT_MS", 2000),
             database_probe_connections: env_parse("DATABASE_PROBE_CONNECTIONS", 1),
-            database_request_concurrency: env_parse(
-                "DATABASE_REQUEST_CONCURRENCY",
-                4 * env_parse::<u32>("DATABASE_MAX_CONNECTIONS", 50) as usize,
-            ),
+            database_request_concurrency: env::var("DATABASE_REQUEST_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.trim().parse().ok()),
             database_idle_timeout_secs: env_parse("DATABASE_IDLE_TIMEOUT_SECS", 600),
             database_max_lifetime_secs: env_parse("DATABASE_MAX_LIFETIME_SECS", 1800),
             database_tcp_keepalives: !matches!(
@@ -3232,6 +3243,29 @@ fn secret_alphabet_size(chars: &[char]) -> usize {
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
+
+    /// #4182: the admission slots follow the pool unless pinned.
+    #[test]
+    fn request_slots_default_to_four_per_pool_connection_4182() {
+        let derived = Config {
+            database_max_connections: 20,
+            database_request_concurrency: None,
+            ..Config::default()
+        };
+        assert_eq!(derived.database_request_slots(), 80);
+        assert_eq!(Config::default().database_request_slots(), 200);
+        let pinned = Config {
+            database_request_concurrency: Some(7),
+            ..derived.clone()
+        };
+        assert_eq!(pinned.database_request_slots(), 7);
+        let off = Config {
+            database_request_concurrency: Some(0),
+            ..derived
+        };
+        assert_eq!(off.database_request_slots(), 0);
+    }
+
     use super::*;
     use std::sync::Mutex;
 

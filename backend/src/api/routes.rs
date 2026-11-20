@@ -386,7 +386,7 @@ pub fn create_router(state: SharedState) -> Router {
     if let Some(gate) = crate::api::middleware::db_admission::DbAdmission::new(
         state.db.clone(),
         state.config.database_request_acquire_wait_ms,
-        state.config.database_request_concurrency,
+        state.config.database_request_slots(),
     ) {
         router = router.layer(middleware::from_fn_with_state(
             gate,
