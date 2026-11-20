@@ -20,22 +20,29 @@ pub fn applies_to_format(format: &str) -> bool {
     POLICY_FORMATS.contains(&format.to_ascii_lowercase().as_str())
 }
 
+/// Ivy `[type]s` directories under a revision (`org/mod/1.0/jars/mod.jar`)
+const IVY_TYPE_DIRS: [&str; 6] = ["jars", "ivys", "poms", "srcs", "docs", "bundles"];
+
 /// The kind of version a written path belongs to: `Some(true)` for a
 /// SNAPSHOT, `Some(false)` for a release, `None` for a path that belongs to
 /// no single version.
 ///
-/// A path is a SNAPSHOT when any directory in it ends in `-SNAPSHOT`, the
-/// same component test the cache classifier uses, so the Ivy layout
-/// (`org/mod/1.0-SNAPSHOT/jars/mod.jar`) counts too and `1.0-SNAPSHOT-rc1` is
-/// a release. Group and artifact level `maven-metadata.xml` documents list
-/// both kinds and belong to neither, and so does a path too short to carry a
+/// Only the version directory decides, the one holding the file or, in the
+/// Ivy layout, the one above its `[type]s` directory. It is a SNAPSHOT when it
+/// ends in `-SNAPSHOT`, case-sensitive like the Maven handler, so an artifact
+/// named `db-snapshot` or a version `1.0-SNAPSHOT-rc1` is a release. Group and
+/// artifact level `maven-metadata.xml` documents list both kinds and belong
+/// to neither, and so does a path too short to carry a
 /// `group/artifact/version/file` coordinate.
 pub fn path_version_kind(path: &str) -> Option<bool> {
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     let (leaf, dirs) = segments.split_last()?;
-    let snapshot = dirs
-        .iter()
-        .any(|dir| dir.to_ascii_lowercase().ends_with("-snapshot"));
+    let version_dir = match dirs {
+        [.., version, kind] if IVY_TYPE_DIRS.contains(kind) => *version,
+        [.., version] => *version,
+        [] => return None,
+    };
+    let snapshot = version_dir.ends_with("-SNAPSHOT");
     if leaf.starts_with("maven-metadata.xml") {
         return snapshot.then_some(true);
     }
@@ -96,22 +103,30 @@ pub async fn check_write(
     }
 }
 
-/// [`check_write`] for a repository known by key, for the migration import,
-/// which writes by destination key. An unknown key passes, the import
-/// reports it on its own
-pub async fn check_write_by_key(db: &PgPool, repo_key: &str, path: &str) -> Result<()> {
+/// Why the version policy of the repository with key `repo_key` refuses a
+/// write of `path`, for the migration import, which writes by destination
+/// key. One lookup, none for a path that belongs to no single version, and
+/// `None` for an unknown key, which the import reports on its own. The
+/// database error is returned as is
+pub async fn refusal_by_key(
+    db: &PgPool,
+    repo_key: &str,
+    path: &str,
+) -> std::result::Result<Option<String>, sqlx::Error> {
     if path_version_kind(path).is_none() {
-        return Ok(());
+        return Ok(None);
     }
-    let repo: Option<(Uuid, String)> =
-        sqlx::query_as("SELECT id, format::text FROM repositories WHERE key = $1")
+    let repo: Option<(String, String)> =
+        sqlx::query_as("SELECT format::text, version_policy FROM repositories WHERE key = $1")
             .bind(repo_key)
             .fetch_optional(db)
             .await?;
-    match repo {
-        Some((repo_id, format)) => check_write(db, repo_id, repo_key, &format, path).await,
-        None => Ok(()),
-    }
+    Ok(repo.and_then(|(format, policy)| {
+        let policy = MavenVersionPolicy::parse(&policy)?;
+        applies_to_format(&format)
+            .then(|| refusal(policy, repo_key, path))
+            .flatten()
+    }))
 }
 
 /// Whether a repository of this format, hosted (local or staging) or not,
@@ -183,6 +198,14 @@ mod tests {
                 Some(false),
             ),
             ("com/example/lib/maven-metadata.xml", None),
+            ("com/acme/db-snapshot/1.0/db-snapshot-1.0.jar", Some(false)),
+            ("com/acme/db-snapshot/maven-metadata.xml", None),
+            (
+                "com/example/lib/1.0-snapshot/lib-1.0-snapshot.jar",
+                Some(false),
+            ),
+            ("org.example/mod/1.0/ivys/ivy.xml", Some(false)),
+            ("com/example-SNAPSHOT/lib/1.0/lib-1.0.jar", Some(false)),
             ("com/example/maven-metadata.xml.sha1", None),
             ("archetype-catalog.xml", None),
             ("lib/1.0/lib.jar", None),
@@ -251,8 +274,9 @@ mod tests {
         let snap_write = check_write(&pool, hosted, &hosted_key, "maven", snap).await;
         let release_write = check_write(&pool, hosted, &hosted_key, "maven", release).await;
         let npm_write = check_write(&pool, npm, &npm_key, "npm", snap).await;
-        let by_key = check_write_by_key(&pool, &hosted_key, snap).await;
-        let unknown_key = check_write_by_key(&pool, "no-such-repo-5872", snap).await;
+        let by_key = refusal_by_key(&pool, &hosted_key, snap).await;
+        let by_key_release = refusal_by_key(&pool, &hosted_key, release).await;
+        let unknown_key = refusal_by_key(&pool, "no-such-repo-5872", snap).await;
         let on_remote = store(&pool, remote, MavenVersionPolicy::Release).await;
         let on_npm = store(&pool, npm, MavenVersionPolicy::Snapshot).await;
         let mixed_on_npm = store(&pool, npm, MavenVersionPolicy::Mixed).await;
@@ -271,8 +295,12 @@ mod tests {
         );
         assert!(release_write.is_ok(), "{release_write:?}");
         assert!(npm_write.is_ok(), "{npm_write:?}");
-        assert!(matches!(by_key, Err(AppError::Validation(_))), "{by_key:?}");
-        assert!(unknown_key.is_ok(), "{unknown_key:?}");
+        assert_eq!(
+            by_key.ok().flatten().as_deref(),
+            Some(format!("Repository '{hosted_key}' accepts release versions only").as_str())
+        );
+        assert_eq!(by_key_release.ok(), Some(None));
+        assert_eq!(unknown_key.ok(), Some(None));
         assert!(
             matches!(on_remote, Err(AppError::Validation(_))),
             "{on_remote:?}"

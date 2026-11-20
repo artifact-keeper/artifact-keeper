@@ -1104,7 +1104,6 @@ pub struct CreateRepositoryRequest {
     /// accepts (#5872): `mixed` (both, the default), `release` or `snapshot`.
     /// A deploy, upload, promotion, replication or migration import of the
     /// other kind is refused with 400
-    #[serde(default)]
     pub version_policy: Option<crate::models::repository::MavenVersionPolicy>,
     /// Override the default storage backend for this repository.
     /// When omitted, the server's configured default is used.
@@ -1494,7 +1493,6 @@ pub struct UpdateRepositoryRequest {
     /// A deploy, upload, promotion, replication or migration import of the
     /// other kind is refused with 400
     /// When omitted, unchanged
-    #[serde(default)]
     pub version_policy: Option<crate::models::repository::MavenVersionPolicy>,
     /// Update the Cargo index upstream URL (stored in `repository_config`).
     /// When provided, upserts the `index_upstream_url` key for this repository.
