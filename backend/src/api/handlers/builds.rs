@@ -369,7 +369,7 @@ pub struct ListBuildsQuery {
     /// Exact build name
     pub name: Option<String>,
     /// Exact VCS branch, matched on the caller's own builds unless the caller
-    /// is an administrator
+    /// is an administrator with an unrestricted credential
     pub branch: Option<String>,
     /// Exact agent
     pub agent: Option<String>,
@@ -395,9 +395,11 @@ const LIST_FILTER: &str = r#"
 "#;
 
 /// The creator whose builds a branch filter may match: the caller, or nobody
-/// in particular for an administrator, who reads every build's branch
+/// in particular for an administrator with an unrestricted credential. A
+/// repository-scoped token, even an administrator's, matches only its own
+/// builds, the same rule as [`delete_as_admin`]
 fn branch_filter_owner(auth: &AuthExtension) -> Option<Uuid> {
-    (!auth.is_admin).then_some(auth.user_id)
+    (!delete_as_admin(auth)).then_some(auth.user_id)
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -526,6 +528,7 @@ pub struct BuildListResponse {
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "List of builds", body = BuildListResponse),
+        (status = 400, description = "A query parameter is not valid, e.g. created_after or created_before is not RFC 3339"),
         (status = 401, description = "Authentication required"),
     )
 )]
@@ -3019,9 +3022,32 @@ mod tests {
         );
         let admin = tdh::router_with_auth(
             super::router(),
-            state,
+            state.clone(),
             tdh::admin_auth(admin_id, &admin_name),
         );
+        // The owner's own read-only API token, scoped to no repository: the
+        // branch filter keys on the creator, not on repository access
+        let owner_token = tdh::router_with_auth(
+            super::router(),
+            state.clone(),
+            AuthExtension {
+                is_api_token: true,
+                scopes: Some(vec!["read:artifacts".to_string()]),
+                allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![]),
+                ..tdh::make_auth(owner_id, &owner_name)
+            },
+        );
+        let admin_scoped = tdh::router_with_auth(
+            super::router(),
+            state.clone(),
+            AuthExtension {
+                is_api_token: true,
+                scopes: Some(vec!["read:artifacts".to_string()]),
+                allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![]),
+                ..tdh::admin_auth(admin_id, &admin_name)
+            },
+        );
+        let anon = tdh::router_anon(super::router(), state);
         let p = format!("ph-6240-branch-{}", Uuid::new_v4());
         let branch = format!("{p}/secret");
         for (app, number) in [(&owner, 1), (&other, 2)] {
@@ -3058,7 +3084,11 @@ mod tests {
         assert_eq!(numbers(other.clone(), String::new()).await, [1, 2]);
         assert_eq!(numbers(other, by_branch.clone()).await, [2]);
         assert_eq!(numbers(owner, by_branch.clone()).await, [1]);
-        assert_eq!(numbers(admin, by_branch).await, [1, 2]);
+        assert_eq!(numbers(owner_token, by_branch.clone()).await, [1]);
+        assert_eq!(numbers(admin, by_branch.clone()).await, [1, 2]);
+        assert!(numbers(admin_scoped, by_branch.clone()).await.is_empty());
+        let (status, _) = tdh::send(anon, tdh::get(format!("/?search={p}&{by_branch}"))).await;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
 
         let _ = sqlx::query("DELETE FROM builds WHERE name = $1")
             .bind(&p)
