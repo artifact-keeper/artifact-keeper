@@ -899,7 +899,7 @@ impl ImageScanner {
         repo_key: Option<&str>,
     ) -> Result<ScanOutput> {
         let http = self.http.as_ref().map_err(|err| {
-            AppError::BadGateway(format!(
+            AppError::Internal(format!(
                 "Cannot initialize scanner-adapter HTTP clients: {err}"
             ))
         })?;
