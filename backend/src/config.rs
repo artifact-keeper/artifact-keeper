@@ -4123,6 +4123,54 @@ mod tests {
         }
     }
 
+    /// #6218: with `codegen-units = 1` the 1.12 backend does not fit the
+    /// 7 GiB macos-latest runner, which pages for most of the build and took
+    /// 145-167 min per macOS leg. Both release workflows must raise the unit
+    /// count on macOS only, with the same value, before `Cache Cargo`
+    /// (rust-cache keys on CARGO_* variables, so a mismatch makes the tag
+    /// build miss the warmed cache). Linux and Windows keep the profile's 1.
+    #[test]
+    fn release_macos_legs_raise_codegen_units_6218() {
+        let step = "      - name: Use 16 codegen units on the 7 GiB macOS runners\n        \
+                    if: runner.os == 'macOS'\n        \
+                    run: echo \"CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16\" >> \"$GITHUB_ENV\"\n";
+        for (name, workflow) in [
+            (
+                "release.yml",
+                include_str!("../../.github/workflows/release.yml"),
+            ),
+            (
+                "release-cli-caches.yml",
+                include_str!("../../.github/workflows/release-cli-caches.yml"),
+            ),
+        ] {
+            let at = workflow.find(step).unwrap_or_else(|| {
+                panic!(
+                    "{name} must set CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 on \
+                     macOS only, in the step named \"Use 16 codegen units on \
+                     the 7 GiB macOS runners\" (#6218)"
+                )
+            });
+            let cache = workflow
+                .find("      - name: Cache Cargo\n")
+                .unwrap_or_else(|| panic!("{name} has no `Cache Cargo` step"));
+            assert!(
+                at < cache,
+                "{name} must set the codegen-units override before `Cache \
+                 Cargo`, or the cache key differs between the warm-up and \
+                 the tag build (#6218)"
+            );
+            assert_eq!(
+                workflow
+                    .matches("CARGO_PROFILE_RELEASE_CODEGEN_UNITS")
+                    .count(),
+                1,
+                "{name} must set CARGO_PROFILE_RELEASE_CODEGEN_UNITS exactly \
+                 once, in the macOS-only step (#6218)"
+            );
+        }
+    }
+
     /// #6193: a release.yml job with no `timeout-minutes` inherits GitHub's
     /// 6-hour default, so a hung cross-build or poll holds the release for
     /// hours before anything turns red. Every job must state its own
@@ -7174,6 +7222,32 @@ mod tests {
             "backend service must not use a shell entrypoint; the runtime image \
              has no shell (#2059/#2084). Offending block:\n{backend}"
         );
+    }
+
+    /// Regression guard for #6160: the shipped and local-dev compose files
+    /// list the backend environment explicitly, so an opt-in switch documented
+    /// in `.env.example` has to be forwarded by name. `LDAP_BASIC_AUTH_PASSTHROUGH`
+    /// was missing, which made setting it in `.env` a no-op for the container
+    /// and left Maven uploads with a directory password at 401.
+    #[test]
+    fn compose_backend_forwards_ldap_basic_auth_passthrough() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("backend crate has a parent directory (repo root)");
+
+        for file_name in ["docker-compose.yml", "docker-compose.local-dev.yml"] {
+            let compose = read_compose(repo_root, file_name);
+            let backend = compose_service_block(&compose, "backend");
+            assert!(
+                !backend.is_empty(),
+                "backend service not found in {file_name}"
+            );
+            assert!(
+                backend.contains("LDAP_BASIC_AUTH_PASSTHROUGH:"),
+                "{file_name}'s backend service must forward LDAP_BASIC_AUTH_PASSTHROUGH \
+                 from .env (#6160). Offending block:\n{backend}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -784,4 +784,117 @@ mod tests {
             "with the hook disabled nothing sets tcp_keepalives_idle (now {idle})"
         );
     }
+
+    /// #5084: the usage-ledger triggers (migration 182) lock a repository's
+    /// `repository_usage_ledger` row on its first counted write and hold it to
+    /// commit, so two transactions that write the same two repositories in
+    /// opposite order deadlock on those rows. Run as whole units through
+    /// [`retry_on_deadlock`] (as the strict backup restore now is), the
+    /// deadlock victim re-runs after the winner commits: both commit, and each
+    /// repository is charged both writes exactly once.
+    #[tokio::test]
+    async fn opposite_order_ledger_writes_both_commit_under_retry_5084() {
+        let Some(pool) = crate::testing::try_pool_with(4).await else {
+            return;
+        };
+        async fn seed(pool: &PgPool) -> Uuid {
+            let id = Uuid::new_v4();
+            let key = format!("ledger-5084-{}", &id.to_string()[..8]);
+            sqlx::query(
+                "INSERT INTO repositories (id, key, name, format, repo_type, storage_path) \
+                 VALUES ($1, $2, $2, 'generic'::repository_format, \
+                         'local'::repository_type, $3)",
+            )
+            .bind(id)
+            .bind(&key)
+            .bind(format!("/data/{key}"))
+            .execute(pool)
+            .await
+            .expect("seed fixture repository");
+            id
+        }
+        async fn charge(
+            conn: &mut sqlx::PgConnection,
+            repo: Uuid,
+            size: i64,
+        ) -> std::result::Result<(), sqlx::Error> {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO artifacts \
+                   (id, repository_id, path, name, size_bytes, checksum_sha256, \
+                    content_type, storage_key, is_deleted) \
+                 VALUES ($1, $2, $3, $3, $4, repeat('a', 64), \
+                         'application/octet-stream', $3, false)",
+            )
+            .bind(id)
+            .bind(repo)
+            .bind(format!("ledger-5084/{id}"))
+            .bind(size)
+            .execute(conn)
+            .await
+            .map(|_| ())
+        }
+        // One whole transaction: `first` then `second`. On its first attempt
+        // it waits at `barrier` holding `first`'s ledger row, so both
+        // transactions hold one row each before reaching for the other's.
+        async fn write_pair(
+            pool: &PgPool,
+            (first, second): (Uuid, Uuid),
+            size: i64,
+            barrier: &tokio::sync::Barrier,
+            attempts: &AtomicU32,
+        ) -> std::result::Result<(), sqlx::Error> {
+            retry_on_deadlock("ledger pair (#5084 test)", || async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut tx = pool.begin().await?;
+                charge(&mut tx, first, size).await?;
+                if attempt == 1 {
+                    barrier.wait().await;
+                }
+                charge(&mut tx, second, size).await?;
+                tx.commit().await
+            })
+            .await
+        }
+
+        let (a, b) = (seed(&pool).await, seed(&pool).await);
+        let barrier = tokio::sync::Barrier::new(2);
+        let (attempts_ab, attempts_ba) = (AtomicU32::new(0), AtomicU32::new(0));
+        let (ab, ba) = tokio::join!(
+            write_pair(&pool, (a, b), 100, &barrier, &attempts_ab),
+            write_pair(&pool, (b, a), 1000, &barrier, &attempts_ba),
+        );
+        let ledger = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT hosted_bytes FROM repository_usage_ledger WHERE repository_id = $1",
+                )
+                .bind(id)
+                .fetch_optional(&pool)
+                .await
+                .expect("read ledger")
+            }
+        };
+        let (ledger_a, ledger_b) = (ledger(a).await, ledger(b).await);
+        let retried = attempts_ab.load(Ordering::SeqCst) + attempts_ba.load(Ordering::SeqCst);
+        for id in [a, b] {
+            for sql in [
+                "DELETE FROM artifacts WHERE repository_id = $1",
+                "DELETE FROM repository_usage_ledger WHERE repository_id = $1",
+                "DELETE FROM repositories WHERE id = $1",
+            ] {
+                let _ = sqlx::query(sql).bind(id).execute(&pool).await;
+            }
+        }
+
+        assert!(ab.is_ok(), "A-then-B did not commit: {ab:?}");
+        assert!(ba.is_ok(), "B-then-A did not commit: {ba:?}");
+        assert!(
+            retried >= 3,
+            "the two transactions never deadlocked ({retried} attempts), so the retry was not exercised"
+        );
+        assert_eq!(ledger_a, Some(1100), "repository A charged once per write");
+        assert_eq!(ledger_b, Some(1100), "repository B charged once per write");
+    }
 }
