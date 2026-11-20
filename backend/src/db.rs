@@ -569,6 +569,7 @@ mod tests {
         for needle in [
             "DATABASE_MAX_CONNECTIONS=20",
             "DATABASE_ACQUIRE_TIMEOUT_SECS=7",
+            "DATABASE_PROBE_CONNECTIONS=1",
             "PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS",
             "max_connections",
             "surge",
@@ -579,6 +580,35 @@ mod tests {
                 "the budget must name {needle:?}: {budget}"
             );
         }
+    }
+
+    /// #4182: health and readiness get their own pool, sized by
+    /// `DATABASE_PROBE_CONNECTIONS`, built lazily (no connect at startup) and
+    /// bounded by its own short acquire timeout; `0` means none (the probes
+    /// share the request pool).
+    #[tokio::test]
+    async fn probe_pool_is_separate_lazy_and_optional_4182() {
+        let config = Config {
+            database_url: "postgres://u:p@127.0.0.1:1/db".to_string(),
+            database_probe_connections: 2,
+            ..Config::default()
+        };
+        let pool = create_probe_pool(&config)
+            .expect("valid url")
+            .expect("2 connections build a pool");
+        assert_eq!(pool.options().get_max_connections(), 2);
+        assert_eq!(pool.options().get_min_connections(), 2);
+        assert_eq!(
+            pool.options().get_acquire_timeout(),
+            PROBE_POOL_ACQUIRE_TIMEOUT
+        );
+        assert_eq!(pool.size(), 0, "lazy: nothing opened at startup");
+
+        let off = Config {
+            database_probe_connections: 0,
+            ..config
+        };
+        assert!(create_probe_pool(&off).expect("valid url").is_none());
     }
 
     /// #4549: the initial connect is retried a bounded number of times, every
