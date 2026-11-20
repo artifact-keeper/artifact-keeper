@@ -448,6 +448,19 @@ pub(crate) async fn hold_target(
     artifact_id: Uuid,
     seen: &str,
 ) -> Result<HoldTarget, sqlx::Error> {
+    hold_target_with(db, artifact_id, seen, true).await
+}
+
+/// [`hold_target`], creating the old digest's row only when `create`. A
+/// release (#5766) passes `false`: a digest with no live row carries no hold
+/// to release, and creating one would leave a new row behind a refused
+/// request.
+pub(crate) async fn hold_target_with(
+    db: &PgPool,
+    artifact_id: Uuid,
+    seen: &str,
+    create: bool,
+) -> Result<HoldTarget, sqlx::Error> {
     let current: Option<(Uuid, String, String)> = sqlx::query_as(concat!(
         "SELECT a.repository_id, a.path, TRIM(a.checksum_sha256) FROM artifacts a \
          WHERE a.id = $1 AND a.is_deleted = false AND ",
@@ -480,7 +493,7 @@ pub(crate) async fn hold_target(
     .await?;
     let created = match (alias, image, digest_path.as_deref()) {
         (Some(id), _, _) => Some(id),
-        (None, Some(name), Some(digest_path)) => {
+        (None, Some(name), Some(digest_path)) if create => {
             sqlx::query_scalar(
                 "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
                                         checksum_sha256, content_type, storage_key) \

@@ -914,11 +914,11 @@ pub fn router() -> Router<SharedState> {
 
     Router::new()
         .route("/_/capabilities", get(repository_capabilities))
-        .route("/", get(list_repositories).post(create_repository))
+        .route("/", get(list_repositories).post(create_repository_route))
         .route(
             "/:key",
             get(get_repository)
-                .patch(update_repository)
+                .patch(update_repository_route)
                 .delete(delete_repository),
         )
         // Deduplicated storage accounting (logical/physical/unique/shared) (#2056)
@@ -4744,6 +4744,85 @@ pub async fn list_repositories(
             total_pages,
         },
     }))
+}
+
+/// #6063 (1.12.4): `versioning_enabled` is stored for every format, but only
+/// the Generic and Mlmodel upload paths honour it
+/// ([`crate::services::artifact_service::versioning_applies`]). Refusing the
+/// flag elsewhere would break clients and IaC configs that send it today, so
+/// the patch release keeps the `200` and the stored value unchanged and only
+/// tells the caller: an RFC 7234 `Warning: 299` header on the create/update
+/// response, plus one server log line. Returns the header value when `true`
+/// was requested on a format whose uploads ignore it.
+fn versioning_noop_warning(format_key: &str, versioning_requested: bool) -> Option<String> {
+    if !versioning_requested {
+        return None;
+    }
+    let applies = RepositoryFormat::ALL
+        .iter()
+        .find(|f| f.as_key() == format_key)
+        .map(|f| crate::services::artifact_service::versioning_applies(f, true))
+        // A format key outside the built-in set (a WASM plugin format) is not
+        // versioned by any upload path either.
+        .unwrap_or(false);
+    if applies {
+        return None;
+    }
+    Some(format!(
+        "299 - \"versioning_enabled has no effect for format {format_key}\""
+    ))
+}
+
+/// Wraps a create/update result with the [`versioning_noop_warning`] header
+/// and log line. The body and status are unchanged.
+fn respond_with_versioning_warning(
+    repo: RepositoryResponse,
+    versioning_requested: bool,
+) -> Response {
+    let warning = versioning_noop_warning(&repo.format, versioning_requested);
+    if warning.is_some() {
+        tracing::warn!(
+            repository = %repo.key,
+            format = %repo.format,
+            "versioning_enabled=true was stored but has no effect for this format; \
+             only generic and mlmodel uploads are versioned (#6063)"
+        );
+    }
+    let mut response = Json(repo).into_response();
+    if let Some(value) = warning.and_then(|v| header::HeaderValue::from_str(&v).ok()) {
+        response.headers_mut().append(header::WARNING, value);
+    }
+    response
+}
+
+/// HTTP route for [`create_repository`]: the same handler, plus the #6063
+/// `Warning` header. Kept as a wrapper so in-process callers of
+/// `create_repository` (config-as-code, projects, tests) keep their
+/// `Json<RepositoryResponse>` return type.
+async fn create_repository_route(
+    state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
+    body: Bytes,
+) -> Result<Response> {
+    let Json(repo) = create_repository(state, auth, body).await?;
+    // Create stores exactly what was sent (default false), so the echoed
+    // value is the requested one.
+    let requested = repo.versioning_enabled;
+    Ok(respond_with_versioning_warning(repo, requested))
+}
+
+/// HTTP route for [`update_repository`]; see [`create_repository_route`]. Only
+/// a PATCH that sends `versioning_enabled: true` is warned about, not every
+/// PATCH of a repository that already holds it.
+async fn update_repository_route(
+    state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
+    key: Path<String>,
+    Json(payload): Json<UpdateRepositoryRequest>,
+) -> Result<Response> {
+    let requested = payload.versioning_enabled == Some(true);
+    let Json(repo) = update_repository(state, auth, key, Json(payload)).await?;
+    Ok(respond_with_versioning_warning(repo, requested))
 }
 
 /// Create a new repository
@@ -14518,8 +14597,9 @@ pub async fn delete_artifact(
     // Deleting an npm artifact changes the packument, so drop the computed
     // packument cache for its package — including in every virtual repo that
     // serves this one; otherwise a warm virtual-repo GET keeps listing the
-    // just-removed version for the whole fresh window (#2162).
-    if repo.format == RepositoryFormat::Npm {
+    // just-removed version for the whole fresh window (#2162). Every
+    // npm-family format serves its packument through that cache (#5779).
+    if is_npm_family_format(&repo.format) {
         if let Some(package) = crate::api::handlers::npm::npm_package_name_from_artifact_path(&path)
         {
             crate::api::handlers::npm::invalidate_packument_caches(
@@ -28965,6 +29045,44 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["allow_anonymous_access"], true);
         assert_eq!(json["is_public"], true);
+    }
+
+    // -----------------------------------------------------------------------
+    // #6063: versioning_enabled on a format that ignores it
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn versioning_noop_warning_only_for_requested_true_on_unversioned_format() {
+        assert_eq!(
+            versioning_noop_warning("npm", true).as_deref(),
+            Some("299 - \"versioning_enabled has no effect for format npm\"")
+        );
+        assert!(versioning_noop_warning("debian", true).is_some());
+        assert!(versioning_noop_warning("some-wasm-plugin", true).is_some());
+        assert_eq!(versioning_noop_warning("npm", false), None);
+        assert_eq!(versioning_noop_warning("generic", true), None);
+        assert_eq!(versioning_noop_warning("mlmodel", true), None);
+    }
+
+    #[test]
+    fn versioning_warning_response_keeps_status_and_body() {
+        let mut repo = make_repo(false);
+        repo.versioning_enabled = true;
+        let warned = respond_with_versioning_warning(repo_to_response(repo.clone(), 0), true);
+        assert_eq!(warned.status(), StatusCode::OK);
+        assert_eq!(
+            warned.headers().get(header::WARNING).unwrap(),
+            "299 - \"versioning_enabled has no effect for format pypi\""
+        );
+
+        repo.format = RepositoryFormat::Generic;
+        let control = respond_with_versioning_warning(repo_to_response(repo.clone(), 0), true);
+        assert_eq!(control.status(), StatusCode::OK);
+        assert!(control.headers().get(header::WARNING).is_none());
+
+        repo.format = RepositoryFormat::Pypi;
+        let not_requested = respond_with_versioning_warning(repo_to_response(repo, 0), false);
+        assert!(not_requested.headers().get(header::WARNING).is_none());
     }
 
     // -----------------------------------------------------------------------

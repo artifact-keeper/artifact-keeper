@@ -2983,7 +2983,7 @@ impl ArtifactService {
 
     /// Stop advertising soft-deleted versions of repository `repository_id`
     /// (#5604, #5632, #5676): move each affected catalog row's Latest to the
-    /// newest version still live and, for an npm repository only, drop the
+    /// newest version still live and, for an npm-family repository only, drop the
     /// dist-tags that name a version with no live artifact left.
     ///
     /// The single post-commit step every soft delete shares: the per-artifact
@@ -3034,7 +3034,7 @@ impl ArtifactService {
                 );
             }
         }
-        if format != "npm" {
+        if !crate::api::handlers::npm::is_npm_family_format_key(&format) {
             return;
         }
         let mut by_package: std::collections::BTreeMap<&str, Vec<String>> =
