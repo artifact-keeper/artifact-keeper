@@ -718,13 +718,18 @@ async fn list_reviews_scoped(
     // can fetch multiple states in one page while keeping pagination totals honest.
     let statuses: Option<Vec<String>> = query.status.as_deref().and_then(parse_status_filter);
 
+    let readable = match requester {
+        Some(auth) => Some(readable_request_repository_ids(state, auth).await?),
+        None => None,
+    };
+
     let filter = crate::services::age_gate_service::ReviewFilter {
         gates: gates.as_deref(),
         repository_key,
         statuses: statuses.as_deref(),
         justified_only: query.justified_only.unwrap_or(false),
         requested_by: requester.map(|a| a.user_id),
-        repository_ids: requester.and_then(|a| a.allowed_repo_ids.as_allowed_repo_ids()),
+        repository_ids: readable.as_deref(),
     };
     let (items, total) = svc
         .list_reviews(&filter, offset, i64::from(per_page))
@@ -734,6 +739,38 @@ async fn list_reviews_scoped(
         items: items.into_iter().map(review_to_response).collect(),
         pagination: Pagination::for_page(page, per_page, total),
     }))
+}
+
+/// The repositories among the caller's requests that the caller can read now.
+/// A request does not outlive the read access it was filed under, so a
+/// revoked grant, a narrower token or a repository made private hides it
+async fn readable_request_repository_ids(
+    state: &SharedState,
+    auth: &AuthExtension,
+) -> Result<Vec<Uuid>> {
+    let candidates: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT repository_id FROM age_gate_reviews WHERE requested_by = $1",
+    )
+    .bind(auth.user_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    let mut readable = Vec::with_capacity(candidates.len());
+    for repo_id in candidates {
+        match crate::api::handlers::repositories::require_repo_id_visible(
+            &state.db,
+            auth,
+            repo_id,
+            "Repository not found",
+        )
+        .await
+        {
+            Ok(()) => readable.push(repo_id),
+            Err(AppError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(readable)
 }
 
 /// Return `Err` when the repository type does not support age-gating.
@@ -1077,19 +1114,24 @@ pub async fn reopen_exception(
         (status = 200, body = AgeGateReviewResponse),
         (status = 400, description = "Unknown gate, or a missing or oversized field"),
         (status = 401, description = "Authentication required"),
+        (status = 403, description = "An API token without the write:repositories scope"),
         (status = 404, description = "Repository not found or not visible to the caller"),
         (status = 409, description = "The caller already has the maximum number of open requests"),
     )
 )]
 pub async fn request_exception(
     State(state): State<SharedState>,
-    Extension(auth): Extension<AuthExtension>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Json(body): Json<CreateExceptionRequest>,
 ) -> Result<Json<AgeGateReviewResponse>> {
     use crate::services::exception_queue;
 
-    // Any authenticated user may ask. The guards below are what keep that from
-    // being an unbounded row-insert primitive:
+    let auth = require_auth(auth)?;
+    // Filing writes a row against the repository, as a repository write does
+    auth.require_scope("write:repositories")?;
+
+    // Any authenticated user may ask, an API token only with a write scope.
+    // The guards below are what keep that from being an unbounded row-insert primitive:
     //   * the repository must be VISIBLE to the caller, so this cannot be used
     //     to enumerate private repositories or file against them;
     //   * the gate name must be real, or the row would sit in a queue no seam
@@ -1165,7 +1207,8 @@ pub async fn request_exception(
 
 /// The caller's own exception requests, for any authenticated user. A row
 /// shows here while the caller holds its request: a later requester takes it
-/// over, unless it was already granted
+/// over, unless it was already granted. Only rows in repositories the caller
+/// can read now are listed
 #[utoipa::path(
     get,
     path = "/requests",
@@ -1186,9 +1229,10 @@ pub async fn request_exception(
 )]
 pub async fn list_my_requests(
     State(state): State<SharedState>,
-    Extension(auth): Extension<AuthExtension>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Query(query): Query<ReviewListQuery>,
 ) -> Result<Json<AgeGateReviewListResponse>> {
+    let auth = require_auth(auth)?;
     let gates = resolve_gates(query.gate.as_deref(), DefaultGates::All);
     list_reviews_scoped(
         &state,
@@ -1211,23 +1255,31 @@ pub async fn list_my_requests(
     responses(
         (status = 200, body = AgeGateReviewResponse),
         (status = 401, description = "Authentication required"),
-        (status = 404, description = "No request with this id is held by the caller"),
+        (status = 404, description = "No request with this id is held by the caller, or its repository is no longer readable"),
     )
 )]
 pub async fn get_my_request(
     State(state): State<SharedState>,
-    Extension(auth): Extension<AuthExtension>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<AgeGateReviewResponse>> {
+    let auth = require_auth(auth)?;
+    let not_found = || AppError::NotFound("Exception request not found".to_string());
     let svc = age_gate_service(&state)?;
-    let review = svc.get_review_by_id(id).await?;
-    if review.requested_by != Some(auth.user_id)
-        || !auth.allowed_repo_ids.grants(review.repository_id)
-    {
-        return Err(AppError::NotFound(
-            "Exception request not found".to_string(),
-        ));
+    let review = match svc.get_review_by_id(id).await {
+        Err(AppError::NotFound(_)) => return Err(not_found()),
+        other => other?,
+    };
+    if review.requested_by != Some(auth.user_id) {
+        return Err(not_found());
     }
+    crate::api::handlers::repositories::require_repo_id_visible(
+        &state.db,
+        &auth,
+        review.repository_id,
+        "Exception request not found",
+    )
+    .await?;
     Ok(Json(review_to_response(review)))
 }
 
@@ -2728,6 +2780,7 @@ mod tests {
                 .expect("seed request")
             }
         };
+        tdh::grant_repo_role(&pool, repo_id, user_id, "reader").await;
         let mine = seed("left-pad", user_id).await;
         let theirs = seed("right-pad", other_id).await;
         let state = gated_state(pool.clone(), &dir);
@@ -2753,6 +2806,141 @@ mod tests {
         tdh::cleanup(&pool, repo_id, user_id).await;
         tdh::cleanup_user(&pool, user_id).await;
         tdh::cleanup_user(&pool, other_id).await;
+    }
+
+    /// A request is listed and read back only while its requester can still
+    /// read the repository, and an anonymous caller reaches none of it
+    #[tokio::test]
+    async fn requests_follow_the_requesters_current_read_access_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        tdh::grant_repo_role(&pool, repo_id, user_id, "reader").await;
+        let state = gated_state(pool.clone(), &dir);
+        let caller = tdh::make_auth(user_id, &username);
+        let app = || tdh::router_with_auth_ext(exceptions_router(), state.clone(), caller.clone());
+        let total = |body: &[u8]| -> serde_json::Value {
+            serde_json::from_slice::<serde_json::Value>(body).unwrap()["pagination"]["total"]
+                .clone()
+        };
+
+        let (status, filed) = tdh::send(
+            app(),
+            tdh::post(
+                "/requests".to_string(),
+                "application/json",
+                file_request_body(&key, "left-pad", "filed while I could read it"),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let id = serde_json::from_slice::<serde_json::Value>(&filed).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, list) = tdh::send(app(), tdh::get("/requests".to_string())).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(total(&list), 1, "positive control");
+        let (status, _) = tdh::send(app(), tdh::get(format!("/requests/{id}"))).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "positive control");
+
+        sqlx::query("DELETE FROM role_assignments WHERE user_id = $1 AND repository_id = $2")
+            .bind(user_id)
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("revoke read");
+
+        for uri in [
+            "/requests".to_string(),
+            format!("/requests?repository_key={key}"),
+        ] {
+            let (status, list) = tdh::send(app(), tdh::get(uri.clone())).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{uri}");
+            assert_eq!(total(&list), 0, "{uri} after losing read access");
+        }
+        let (status, body) = tdh::send(app(), tdh::get(format!("/requests/{id}"))).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        let body = String::from_utf8_lossy(&body).to_string();
+        assert!(!body.contains("left-pad"), "{body}");
+        let (status, _) = tdh::send(app(), tdh::get(format!("/requests/{}", Uuid::new_v4()))).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+
+        let anon = || tdh::router_anon(exceptions_router(), state.clone());
+        for req in [
+            tdh::get("/requests".to_string()),
+            tdh::get(format!("/requests/{id}")),
+            tdh::post(
+                "/requests".to_string(),
+                "application/json",
+                file_request_body(&key, "right-pad", "anonymous"),
+            ),
+        ] {
+            let (status, _) = tdh::send(anon(), req).await;
+            assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+        }
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    /// Filing a request writes a row, so a read-only token cannot, while a
+    /// write token and a session can
+    #[tokio::test]
+    async fn filing_a_request_needs_a_write_scope_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("make the repository public");
+        let state = gated_state(pool.clone(), &dir);
+        let file = |caller: AuthExtension, package: &'static str| {
+            let app = tdh::router_with_auth_ext(exceptions_router(), state.clone(), caller);
+            let body = file_request_body(&key, package, "needed for the build");
+            async move {
+                tdh::send(
+                    app,
+                    tdh::post("/requests".to_string(), "application/json", body),
+                )
+                .await
+                .0
+            }
+        };
+        let rows = || {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM age_gate_reviews WHERE repository_id = $1",
+                )
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count requests")
+            }
+        };
+
+        let read_only = token(user_id, &username, &["read:repositories", "read:artifacts"]);
+        assert_eq!(
+            file(read_only, "left-pad").await,
+            axum::http::StatusCode::FORBIDDEN
+        );
+        assert_eq!(rows().await, 0, "a refused request writes nothing");
+
+        let write = token(user_id, &username, &["write:repositories"]);
+        assert_eq!(file(write, "left-pad").await, axum::http::StatusCode::OK);
+        let session = tdh::make_auth(user_id, &username);
+        assert_eq!(file(session, "right-pad").await, axum::http::StatusCode::OK);
+        assert_eq!(rows().await, 2);
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        tdh::cleanup_user(&pool, user_id).await;
     }
 
     fn file_request_body(key: &str, package: &str, why: &str) -> bytes::Bytes {
