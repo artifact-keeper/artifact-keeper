@@ -344,25 +344,6 @@ macro_rules! impl_repo_type_eq {
 
 impl_repo_type_eq!(str, &str, String);
 
-/// Baseline read audience of a repository.
-///
-/// This is the visibility axis, and it is orthogonal to the grant axis
-/// (`role_assignments` and `permissions`). It answers only "who may read this
-/// before any grant is consulted", and it NEVER confers write, delete, or
-/// administrative capability.
-///
-/// `internal` differs from `private` in exactly one respect: on the READ path
-/// the set of principals satisfying the baseline becomes "any resolved
-/// principal" instead of "grant holders". For every other decision -- write,
-/// delete, admin, configuration, tenancy pre-gates, anonymous listing --
-/// `internal` behaves as `private`.
-///
-/// Note the two accessors below and the deliberate ABSENCE of a third. There is
-/// no `is_not_private()` / `is_at_least_internal()` helper, because the natural
-/// shorthand `visibility != Private` is correct on the read and listing paths
-/// and WRONG on the write pre-gate (`require_repo_write_access`), where
-/// `internal` must behave exactly as `private`. Every call site therefore has to
-/// name the question it is actually asking.
 /// Which Maven versions a hosted Maven or Gradle repository accepts (#5872),
 /// Nexus' version policy. `Mixed` is the behaviour before the policy existed
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -396,28 +377,27 @@ impl MavenVersionPolicy {
             _ => None,
         }
     }
-
-    /// Artifactory's `handleReleases` / `handleSnapshots` pair. Both on, or
-    /// both off, is mixed
-    pub fn from_artifactory(handle_releases: bool, handle_snapshots: bool) -> Self {
-        match (handle_releases, handle_snapshots) {
-            (true, false) => Self::Release,
-            (false, true) => Self::Snapshot,
-            _ => Self::Mixed,
-        }
-    }
-
-    /// Nexus' `maven.versionPolicy` (`RELEASE`, `SNAPSHOT`, `MIXED`), mixed for
-    /// anything else
-    pub fn from_nexus(value: &str) -> Self {
-        match value.to_ascii_uppercase().as_str() {
-            "RELEASE" => Self::Release,
-            "SNAPSHOT" => Self::Snapshot,
-            _ => Self::Mixed,
-        }
-    }
 }
 
+/// Baseline read audience of a repository.
+///
+/// This is the visibility axis, and it is orthogonal to the grant axis
+/// (`role_assignments` and `permissions`). It answers only "who may read this
+/// before any grant is consulted", and it NEVER confers write, delete, or
+/// administrative capability.
+///
+/// `internal` differs from `private` in exactly one respect: on the READ path
+/// the set of principals satisfying the baseline becomes "any resolved
+/// principal" instead of "grant holders". For every other decision -- write,
+/// delete, admin, configuration, tenancy pre-gates, anonymous listing --
+/// `internal` behaves as `private`.
+///
+/// Note the two accessors below and the deliberate ABSENCE of a third. There is
+/// no `is_not_private()` / `is_at_least_internal()` helper, because the natural
+/// shorthand `visibility != Private` is correct on the read and listing paths
+/// and WRONG on the write pre-gate (`require_repo_write_access`), where
+/// `internal` must behave exactly as `private`. Every call site therefore has to
+/// name the question it is actually asking.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema,
 )]

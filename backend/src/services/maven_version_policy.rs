@@ -219,16 +219,8 @@ mod tests {
     }
 
     #[test]
-    fn importer_mappings_5872() {
+    fn policy_values_5872() {
         use MavenVersionPolicy::*;
-        assert_eq!(MavenVersionPolicy::from_artifactory(true, false), Release);
-        assert_eq!(MavenVersionPolicy::from_artifactory(false, true), Snapshot);
-        assert_eq!(MavenVersionPolicy::from_artifactory(true, true), Mixed);
-        assert_eq!(MavenVersionPolicy::from_artifactory(false, false), Mixed);
-        assert_eq!(MavenVersionPolicy::from_nexus("RELEASE"), Release);
-        assert_eq!(MavenVersionPolicy::from_nexus("snapshot"), Snapshot);
-        assert_eq!(MavenVersionPolicy::from_nexus("MIXED"), Mixed);
-        assert_eq!(MavenVersionPolicy::from_nexus("STRICT"), Mixed);
         for policy in [Mixed, Release, Snapshot] {
             assert_eq!(MavenVersionPolicy::parse(policy.as_str()), Some(policy));
         }
