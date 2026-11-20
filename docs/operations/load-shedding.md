@@ -163,7 +163,7 @@ Before is 1.12.x (main `5d99629`), after is the gate with its defaults.
 | Run | Installs done | Wall | 2xx p50 / p99 | Other answers | `/readyz` during the burst |
 |---|---|---|---|---|---|
 | +2 ms, 200 files each, before | 24 / 24 | 37.4 s | 9.25 s / 9.42 s | none | 13 / 13 ok, slowest 3.5 s |
-| +2 ms, 200 files each, after | 24 / 24 | 43.2 s | 1.94 s / 2.25 s | 3,236 `503` + `Retry-After` | 83 / 83 ok, slowest 0.41 s |
+| +2 ms, 200 files each, after | 22 to 24 / 24 (5 runs) | 42 to 43 s | 1.96 s / 2.27 s | about 3,300 `503` + `Retry-After` | all ok, slowest 0.41 s |
 | +8 ms, 50 files each, before | 24 / 24 | 92.6 s | 28.3 s / 29.7 s | 2,240 client timeouts at 30 s | 8 / 13 ok, 5 timed out at 10 s |
 | +8 ms, 50 files each, after | 24 / 24 | 44.6 s | 0.36 s / 3.17 s | 2,129 `503` + `Retry-After` | 81 / 81 ok, slowest 0.46 s |
 
@@ -173,7 +173,12 @@ request into a bounded 2 s one plus a back-off for the rest, at the cost of a
 somewhat longer fleet wall time (+15 % here); readiness stays fast. Where it
 does not (the second pair), every request on 1.12.x slowed to the client
 timeout and timed-out work was thrown away; with the gate the same fleet
-finished in half the time with no timeouts. A gate that told every shed
+finished in half the time with no timeouts. In the first pair a client
+retrying only 5 times still runs out of retries now and then: across five
+runs 0 to 2 of the 4,800 files gave up, failing that installer (none do with
+30 retries, and none on 1.12.x, where nothing is shed). Raising
+`DATABASE_REQUEST_ACQUIRE_WAIT_MS` to 3000 trades longer served latency
+(3.3 s p99) for fewer of those (0 to 1 in two runs). A gate that told every shed
 client to retry after 1 s did worse: they collided again, and clients with 5
 retries gave up. Give a fleet a pool and server sized for its burst (below)
 and treat the gate as the overload backstop, not the steady state.
