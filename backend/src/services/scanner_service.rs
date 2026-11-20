@@ -11811,7 +11811,8 @@ impl ScannerService {
     /// The artifact side of a failed scan: `flagged` unless it is already in
     /// a blocking state, then `block_on_fail` policies (#2912) bound to
     /// `scanned`, the bytes the scan was for (the hold is unbound when that
-    /// is unknown, as [`Self::scan_hold_row`] does for `None`).
+    /// is unknown, as [`Self::scan_hold_row`] does for `None`). The `flagged`
+    /// write is bound to `scanned` as well (#5766).
     async fn flag_after_failed_scan(&self, artifact_id: Uuid, scanned: Option<&str>) {
         // Mark as flagged on failure (conservative), but never
         // downgrade an artifact that is already in a blocking or
@@ -11820,13 +11821,24 @@ impl ScannerService {
         // artifact (policy violation, or admin action) must not
         // silently un-block it by stomping the status back to
         // 'flagged'. Only flag from a non-blocking state.
-        if let Err(e) = sqlx::query!(
-            "UPDATE artifacts SET quarantine_status = 'flagged' \
-             WHERE id = $1 \
-               AND (quarantine_status IS NULL \
-                    OR quarantine_status IN ('clean', 'flagged', 'unscanned'))",
-            artifact_id,
-        )
+        //
+        // #5766: bound to the bytes the scan was for. A tag row is rewritten
+        // in place when the tag moves, so after a failed scan of D1 an
+        // unbound write would mark D2, which this scan never read. On an OCI
+        // manifest row the write is a no-op once the row names other bytes;
+        // any other row is written as before.
+        let bind = scanned.map(|s| s.trim().to_ascii_lowercase());
+        if let Err(e) = sqlx::query(concat!(
+            "UPDATE artifacts a SET quarantine_status = 'flagged' \
+             WHERE a.id = $1 \
+               AND (a.quarantine_status IS NULL \
+                    OR a.quarantine_status IN ('clean', 'flagged', 'unscanned')) \
+               AND ($2::text IS NULL OR a.checksum_sha256 = $2::bpchar OR NOT ",
+            crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql!(),
+            ")"
+        ))
+        .bind(artifact_id)
+        .bind(bind.as_deref())
         .execute(&self.db)
         .await
         {
@@ -14188,6 +14200,79 @@ mod tests {
             tag_after_d2,
             Some((Some("quarantined".into()), Some("scan_policy".into()))),
             "control: D2's own verdict holds the tag row"
+        );
+    }
+
+    /// #5766: the `flagged` write after a FAILED scan binds to the bytes the
+    /// scan was for. The tag row already names D2 (the tag moved while the
+    /// scan of D1 ran), so the failure of D1's scan leaves it alone; the
+    /// control failure of a scan of D2 flags it. A non-manifest row is
+    /// flagged whatever `scanned` says, as before.
+    #[tokio::test]
+    async fn failed_scan_flag_after_a_tag_move_leaves_the_new_digest_5766() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let (d1, d2) = (fresh_checksum(), fresh_checksum());
+        let (tag_row, other_row) = (Uuid::new_v4(), Uuid::new_v4());
+        for (id, path, sum) in [
+            (tag_row, "v2/app/manifests/1.0", &d2),
+            (other_row, "app/readme.txt", &d2),
+        ] {
+            sqlx::query(
+                "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, \
+                                        checksum_sha256, content_type, storage_key, \
+                                        quarantine_status) \
+                 VALUES ($1, $2, $3, $3, 10, $4, 'application/octet-stream', $5, 'clean')",
+            )
+            .bind(id)
+            .bind(fx.repo_id)
+            .bind(path)
+            .bind(sum)
+            .bind(format!("k/{id}"))
+            .execute(&fx.pool)
+            .await
+            .expect("insert row");
+        }
+        let status = |id: Uuid| {
+            let pool = fx.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT quarantine_status FROM artifacts WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("read status")
+            }
+        };
+
+        let scanner = scanner_for_fixture(&fx);
+        scanner.flag_after_failed_scan(tag_row, Some(&d1)).await;
+        let tag_after_d1 = status(tag_row).await;
+        scanner.flag_after_failed_scan(other_row, Some(&d1)).await;
+        let other_after_d1 = status(other_row).await;
+        scanner
+            .flag_after_failed_scan(tag_row, Some(&d2.to_ascii_uppercase()))
+            .await;
+        let tag_after_d2 = status(tag_row).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            tag_after_d1.as_deref(),
+            Some("clean"),
+            "a failed scan of D1 must not flag the tag row, which names D2"
+        );
+        assert_eq!(
+            other_after_d1.as_deref(),
+            Some("flagged"),
+            "a non-manifest row is flagged as before"
+        );
+        assert_eq!(
+            tag_after_d2.as_deref(),
+            Some("flagged"),
+            "control: a failed scan of D2 flags the tag row"
         );
     }
 
