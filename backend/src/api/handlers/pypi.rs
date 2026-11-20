@@ -7690,10 +7690,15 @@ const PEP691_JSON_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+json";
 /// The JSON media types are `application/vnd.pypi.simple.v1+json` and its
 /// alias `application/vnd.pypi.simple.latest+json`; the HTML ones are
 /// `text/html` and the `v1+html` / `latest+html` types. Each range's `q`
-/// (default 1) is read, and JSON is chosen when its best `q` is above zero
-/// and at least the best HTML `q`, so a tie goes to JSON as it always has.
-/// Wildcards (`*/*`, `text/*`) leave the choice to the HTML default. Media
-/// types and parameter names compare case-insensitively.
+/// (default 1; an unparseable value is ignored) is read, and JSON is chosen
+/// when its best `q` is above zero and at least the best HTML `q`, so a tie
+/// goes to JSON as it always has. Media types and parameter names compare
+/// case-insensitively.
+///
+/// Wildcard ranges (`*/*`, `text/*`, `application/*`) are deliberately not
+/// counted for either side, although RFC 9110 would let them match: counting
+/// them would change the answer for clients that send only a wildcard, which
+/// have always got the HTML default.
 fn accept_prefers_pep691_json(accept: &str) -> bool {
     let mut json_q = 0.0_f32;
     let mut html_q = 0.0_f32;
@@ -7703,7 +7708,10 @@ fn accept_prefers_pep691_json(accept: &str) -> bool {
         let q = parts
             .filter_map(|p| p.split_once('='))
             .find(|(k, _)| k.trim().eq_ignore_ascii_case("q"))
-            .map(|(_, v)| v.trim().parse::<f32>().unwrap_or(0.0))
+            // An unparseable q is ignored (read as 1), so a malformed
+            // parameter keeps the answer the substring check gave before.
+            .and_then(|(_, v)| v.trim().parse::<f32>().ok())
+            .filter(|q| q.is_finite())
             .unwrap_or(1.0)
             .clamp(0.0, 1.0);
         match media.as_str() {
@@ -14621,7 +14629,11 @@ mod tests {
             ("text/html, application/vnd.pypi.simple.v1+json", true),
             ("application/vnd.pypi.simple.v1+json;q=0.1, text/html", false),
             ("application/vnd.pypi.simple.v1+json;q=0", false),
-            ("application/vnd.pypi.simple.v1+json;q=bogus", false),
+            // An unparseable q is ignored, as the old substring check did.
+            ("application/vnd.pypi.simple.v1+json;q=bogus", true),
+            ("application/vnd.pypi.simple.v1+json;q=bogus, text/html;q=0.5", true),
+            ("application/vnd.pypi.simple.v1+json;q=0.2, text/html;q=nan", false),
+            ("application/*, */*", false),
             ("application/vnd.pypi.simple.v1+html", false),
             ("text/html", false),
             ("*/*", false),

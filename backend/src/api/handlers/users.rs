@@ -1162,7 +1162,9 @@ async fn list_user_tokens_inner(
     request_body = CreateUserApiTokenRequest,
     responses(
         (status = 200, description = "API token created successfully", body = ApiTokenCreatedResponse),
-        (status = 403, description = "Cannot create tokens for other users"),
+        (status = 400, description = "Unknown field, invalid scope, or a repo_selector that does not restrict", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Not authenticated", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Cannot create tokens for other users, or a scope or repo_selector exceeds what the presenting credential may delegate", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1878,7 +1880,9 @@ pub async fn list_current_user_tokens(
     request_body = CreateUserApiTokenRequest,
     responses(
         (status = 200, description = "API token created successfully", body = ApiTokenCreatedResponse),
-        (status = 403, description = "Requested scopes require administrator privileges"),
+        (status = 400, description = "Unknown field, invalid scope, or a repo_selector that does not restrict", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Not authenticated", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Requested scopes require administrator privileges, or a scope or repo_selector exceeds what the presenting credential may delegate", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
