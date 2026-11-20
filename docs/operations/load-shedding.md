@@ -83,6 +83,77 @@ health check briefly removed the endpoint.
   backend's `503` and `Retry-After` through rather than turning upstream
   overload into a connection error.
 
+## Database admission under a burst
+
+Every request needs pooled database connections (credential check,
+repository and artifact lookups), and a replica's pool has
+`DATABASE_MAX_CONNECTIONS` of them. Each query is a separate acquire from a
+FIFO queue, so once a burst puts far more requests in flight than there are
+connections, every acquire of every request waits behind the whole crowd
+(#4182). Latency becomes the queue wait times the query count, the same for
+every request, so the whole burst slows down together: past the clients'
+timeouts nothing completes, and a request whose acquire reaches
+`DATABASE_ACQUIRE_TIMEOUT_SECS` (5 s) gets `503 POOL_EXHAUSTED` only then.
+`/readyz`, which queried the same pool, waited out the same timeout and
+reported the replica not ready.
+
+Since 1.13 a router-wide admission gate runs before any authentication,
+database or storage work. At most `DATABASE_REQUEST_CONCURRENCY` requests
+(default four per pool connection, 200 with the default pool) run their
+handler phase at once; a download's body streams after the handler phase,
+without holding a slot. When every slot is held and the pool is busy, a
+request waits up to `DATABASE_REQUEST_ACQUIRE_WAIT_MS` (default 500) for one
+and is otherwise answered at once with the same `503 POOL_EXHAUSTED` body
+and `Retry-After: 1`, counted in `ak_db_requests_shed_total`. An admitted
+request queues behind at most the other slot holders, so it finishes in a
+bounded time; the rest are told to back off instead of waiting. When every
+slot is held but the pool has room (connections not yet opened, or a quarter
+of them idle), a request runs without a slot, so slow uploads or upstream
+fetches holding slots never shed anything on their own.
+
+Package clients (pip, npm, Maven, Docker, rattler, conda, mamba) retry a
+503. A shed request has done no work, so it is never let through:
+authentication, authorization and scanning run unchanged for every admitted
+request, and a credential check that cannot reach the database still answers
+`503`, never `2xx`.
+
+`/health` and `/readyz` are never gated, and they read the database through a
+separate pool of `DATABASE_PROBE_CONNECTIONS` (default 1), so they report
+whether the database answers rather than whether the request pool is busy.
+A replica that is saturated but healthy stays in its Service.
+
+To keep the behaviour before 1.13: `DATABASE_REQUEST_ACQUIRE_WAIT_MS=0` or
+`DATABASE_REQUEST_CONCURRENCY=0` (no gate), `DATABASE_PROBE_CONNECTIONS=0`
+(probes share the request pool).
+
+Measured with `scripts/perf/db-pool-burst.sh` (24 installers x 50 fetches in
+flight, anonymous downloads from a public generic repository, clients retry a
+503 after its `Retry-After` up to 30 times, 30 s client timeout per attempt).
+One backend container (4 CPUs, `GLOBAL_MAX_CONCURRENCY=4096` so the global
+limit does not shed first, `DATABASE_MAX_CONNECTIONS=8`), Postgres with every
+round trip delayed by netem to make the burst exhaust the pool. Before is
+1.12.x (main `5d99629`), after is this change with its defaults.
+
+| Run | Installs done | Wall | 2xx p50 / p99 | Other answers | `/readyz` during the burst |
+|---|---|---|---|---|---|
+| +2 ms, 200 files each, before | 24 / 24 | 37.1 s | 9.19 s / 9.31 s | none | 13 / 13 ok, slowest 3.5 s |
+| +2 ms, 200 files each, after | 24 / 24 | 39.0 s | 0.75 s / 1.00 s | 23,759 `503` + `Retry-After`, p50 0.50 s | 76 / 76 ok, slowest 0.39 s |
+| +8 ms, 50 files each, before | 24 / 24 | 92.6 s | 28.3 s / 29.9 s | 2,218 client timeouts at 30 s | 8 / 13 ok, 5 timed out at 10 s |
+| +8 ms, 50 files each, after | 24 / 24 | 35.9 s | 1.44 s / 2.05 s | 13,289 `503` + `Retry-After`, p50 0.50 s | 65 / 65 ok, slowest 0.41 s |
+
+Throughput is set by the database either way (about 125 to 130 files a second
+in the first pair), so where the burst stays inside the clients' patience the
+gate moves the waiting from the server to the clients' back-off: served
+requests drop from 9 s to under 1 s, the fleet finishes in about the same
+time, and readiness stays fast. Where it does not (the second pair), every
+request on 1.12.x slowed to the client timeout, timed-out work was thrown
+away, and readiness failed; with the gate the same fleet finished 2.6x
+sooner with no timeouts. The trade-off: a client with a small retry budget
+gives up sooner on 503s than on a slow answer (with 5 retries instead of 30,
+the first pair's installs did not finish), so give a fleet a pool and server
+sized for its burst (below) and treat the gate as the overload backstop, not
+the steady state.
+
 ## Conda package downloads under an installer fleet
 
 rattler-based installers (pixi, micromamba, conda with the libmamba solver)
@@ -191,12 +262,54 @@ handling, as `AK_PROXY_METADATA_BUDGET_BYTES`.
 
 ## Database connection budget
 
-Every replica opens its own pool, so size the fleet against the server
-(#4549): `DATABASE_MAX_CONNECTIONS` x replicas, plus the single-flight
-lock/wait connections held outside the pool (capped per replica by
-`PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS`), plus one rolling-update surge
-replica, must stay below Postgres `max_connections`. The defaults
-(3 x 50 = 150) do not fit a stock server's 100. Every pool connection arms
+Every replica opens its own pools, so size the fleet against the server
+(#4549, #4182). Per replica, in the worst case:
+
+```
+C_replica = DATABASE_MAX_CONNECTIONS            request pool (default 50)
+          + DATABASE_PROBE_CONNECTIONS          health/readiness pool (default 1)
+          + PROXY_SINGLEFLIGHT_LOCK_MAX_CONNECTIONS
+                                                proxy single-flight lock and wait
+                                                sessions held outside the pool
+                                                (default 33; only while Remote
+                                                repositories are fetching)
+```
+
+and for the server:
+
+```
+(replicas + surge) x C_replica
+  + superuser_reserved_connections (Postgres default 3)
+  + every other client (migration job, backups, monitoring, psql)
+  <= max_connections
+```
+
+`surge` is the extra pods a rollout starts before old ones stop: `0` with the
+chart's default `strategy.type: Recreate`, `maxSurge` (usually 1) with
+`RollingUpdate`, and the HPA's `maxReplicas` replaces `replicas` when
+autoscaling is on.
+
+| Deployment | Per replica | Server needs | Stock `max_connections = 100`? |
+|---|---|---|---|
+| 1 replica, Recreate, no Remote repositories | 50 + 1 = 51 | 54 | fits |
+| 1 replica, Recreate, Remote repositories | 50 + 1 + 33 = 84 | 87 | fits, barely |
+| 2 replicas, RollingUpdate (`maxSurge` 1) | 84 | 3 x 84 + 3 = 255 | no: lower `DATABASE_MAX_CONNECTIONS` to 20 (3 x 54 + 3 = 165) and raise `max_connections` to 200 |
+| 3 to 20 replicas (HPA), RollingUpdate | 84 | 21 x 84 + 3 = 1767 | no: an RDS `db.r6g.large` (about 1,800 by default) barely fits; lower `DATABASE_MAX_CONNECTIONS` or put a pooler such as PgBouncer in front |
+
+How big the request pool needs to be is Little's law: the connections busy at
+once are the request rate times the database time each request holds a
+connection for. A hosted package download (#4181) holds one for a single
+round trip, about 1 ms on a local network, so one replica at 2,000 requests a
+second keeps about two connections busy, and a pool of 20 has ten times the
+headroom. A request that makes several queries, or a database a few
+milliseconds away, multiplies that. When the pool you can afford is smaller
+than the burst needs, the admission gate above sheds the excess as
+`503` + `Retry-After` instead of letting it queue; a sustained
+`rate(ak_db_requests_shed_total[5m])` after the burst has passed is the signal
+to raise the pool (and the server limit with it), not something to tune the
+gate for.
+
+Every pool connection arms
 server-side TCP keepalives (15 s idle, 5 s interval, 3 probes) with a query
 right after connect, so sessions left behind by a force-killed pod are
 reaped in about 30 s. `DATABASE_TCP_KEEPALIVES=false` turns this off. Behind
@@ -215,7 +328,7 @@ failures:
 | `stage` | Counted when |
 |---|---|
 | `startup` | An initial connect attempt failed at boot. Startup retries up to five times with a jittered 1 to 8 s backoff, so a refusal storm shows several increments before the process exits or recovers. |
-| `request` | A pool acquire timed out while serving a request and the client was answered `503 POOL_EXHAUSTED`. |
+| `request` | A pool acquire timed out while serving a request and the client was answered `503 POOL_EXHAUSTED`. Since 1.13 most saturation is shed at the admission gate first and counted in `ak_db_requests_shed_total` instead; alert on both. |
 
 The `startup` series is exported once the replica has started serving, so it
 shows how many connect attempts a replica that did come up needed; a replica

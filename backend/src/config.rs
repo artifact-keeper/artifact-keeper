@@ -1345,8 +1345,9 @@ pub struct Config {
     /// databases with restricted connection budgets (e.g., shared RDS).
     ///
     /// Size the whole fleet, not one replica (#4549):
-    /// `DATABASE_MAX_CONNECTIONS × replicas` + the single-flight lock/wait
-    /// connections held outside the pool (capped per replica by
+    /// `(DATABASE_MAX_CONNECTIONS + DATABASE_PROBE_CONNECTIONS) × replicas`,
+    /// plus the single-flight lock/wait connections held outside the pool
+    /// (capped per replica by
     /// `PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS`) + headroom for one
     /// rolling-update surge replica must stay below Postgres
     /// `max_connections`. The defaults give 3 × 50 = 150 against a stock
@@ -1362,6 +1363,34 @@ pub struct Config {
     /// under sustained pool exhaustion instead of piling up; raise for batch
     /// workloads where waiting is preferable to retrying.
     pub database_acquire_timeout_secs: u64,
+
+    /// Longest a request waits at the database admission gate for a permit
+    /// (see `database_request_concurrency`), while every permit is held and
+    /// the pool is busy, before it is answered `503 POOL_EXHAUSTED` with
+    /// `Retry-After` (#4182). The wait happens before any authentication or
+    /// handler work. Env var: `DATABASE_REQUEST_ACQUIRE_WAIT_MS`. Default
+    /// 500. `0` turns the gate off (every request queues on the pool, as
+    /// before 1.13).
+    pub database_request_acquire_wait_ms: u64,
+
+    /// Connections in the separate pool that `/health` and `/readyz` read
+    /// the database through, so a request pool saturated by a burst does not
+    /// fail the readiness probe of a replica that is busy, not broken
+    /// (#4182). Counts toward the connection budget on top of
+    /// `database_max_connections`. Env var: `DATABASE_PROBE_CONNECTIONS`.
+    /// Default 1. `0` makes the probes share the request pool (the behaviour
+    /// before 1.13).
+    pub database_probe_connections: u32,
+
+    /// How many requests may be in their handler phase at once while the
+    /// request pool is busy (#4182): past it, a request waits for an
+    /// admission permit within `database_request_acquire_wait_ms` and is
+    /// otherwise shed. Bounds how many requests compete for the pool's
+    /// connections, so an admitted request's queries wait behind a bounded
+    /// crowd instead of the whole burst. Sheds nothing while the pool has
+    /// room. Env var: `DATABASE_REQUEST_CONCURRENCY`. Default four per pool
+    /// connection (`4 × DATABASE_MAX_CONNECTIONS`). `0` turns the gate off.
+    pub database_request_concurrency: usize,
 
     /// Maximum number of bcrypt-bound auth operations (login,
     /// password verification, API-token verification) allowed to run
@@ -1976,6 +2005,9 @@ redacted_debug!(Config {
     show database_max_connections,
     show database_min_connections,
     show database_acquire_timeout_secs,
+    show database_request_acquire_wait_ms,
+    show database_probe_connections,
+    show database_request_concurrency,
     show database_idle_timeout_secs,
     show database_max_lifetime_secs,
     show database_tcp_keepalives,
@@ -2149,6 +2181,9 @@ impl Default for Config {
             database_max_connections: 50,
             database_min_connections: 5,
             database_acquire_timeout_secs: 5,
+            database_request_acquire_wait_ms: 500,
+            database_probe_connections: 1,
+            database_request_concurrency: 200,
             database_idle_timeout_secs: 600,
             database_max_lifetime_secs: 1800,
             database_tcp_keepalives: true,
@@ -2558,6 +2593,12 @@ impl Config {
             database_max_connections: env_parse("DATABASE_MAX_CONNECTIONS", 50),
             database_min_connections: env_parse("DATABASE_MIN_CONNECTIONS", 5),
             database_acquire_timeout_secs: env_parse("DATABASE_ACQUIRE_TIMEOUT_SECS", 5),
+            database_request_acquire_wait_ms: env_parse("DATABASE_REQUEST_ACQUIRE_WAIT_MS", 500),
+            database_probe_connections: env_parse("DATABASE_PROBE_CONNECTIONS", 1),
+            database_request_concurrency: env_parse(
+                "DATABASE_REQUEST_CONCURRENCY",
+                4 * env_parse::<u32>("DATABASE_MAX_CONNECTIONS", 50) as usize,
+            ),
             database_idle_timeout_secs: env_parse("DATABASE_IDLE_TIMEOUT_SECS", 600),
             database_max_lifetime_secs: env_parse("DATABASE_MAX_LIFETIME_SECS", 1800),
             database_tcp_keepalives: !matches!(
