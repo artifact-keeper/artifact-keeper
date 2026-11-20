@@ -3532,8 +3532,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # The backend crate's CI-profile compile can exceed the hosted runner's RAM.
-      # Give BuildKit swap headroom and reserve RAM for the runner itself (#6334).
+      # The `ci`-profile lib rustc in the builder stage needs 17.2 GiB
+      # (measured in a 4-CPU container with this Dockerfile's command,
+      # #6242); this VM has 15.6 GiB of RAM and a 3 GiB zram device, so the
+      # build failed "ResourceExhausted: cannot allocate memory" on main
+      # (jobs 135788683205, 135831967115) and on PRs. Same swapfile as the
+      # Rust jobs. Best effort: a failure here is a ::warning::, never a
+      # red job.
       - name: Add swap
         run: |
           if sudo fallocate -l 12G /ak-ci-swapfile \
@@ -3547,6 +3552,11 @@ jobs:
           swapon --show
           free -m
 
+      # memory / memory-swap: buildkitd (and so the cargo build inside it)
+      # runs in a container with 12 GiB of RAM and up to 15 GiB of swap on
+      # top (Docker's memory-swap is RAM plus swap). Past 12 GiB the kernel
+      # swaps the compiler's pages rather than the runner agent's, the same
+      # job memory-cap.sh does for the Rust jobs (#6242).
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
         with:
