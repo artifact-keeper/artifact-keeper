@@ -340,6 +340,15 @@ impl EnvironmentReevalService {
             )
         })?;
         let lookup = advisory.query_osv_detailed(&deps).await;
+        if !lookup.not_queried.is_empty() {
+            // #5691: the package matches ADVISORY_EXCLUDE_PATTERNS and the
+            // feed was never asked; an empty slot here is not an answer to
+            // record transitions from.
+            return Ok(DeltaOutcome {
+                skipped: true,
+                ..Default::default()
+            });
+        }
         if lookup.degraded {
             // An unanswered feed is not a clean feed: recording from it
             // would publish a false all-clear as `no-longer-affected`

@@ -731,7 +731,7 @@ jobs:
     # sha, and
     # scripts/ci/check-gate-workflow-pins.sh enforces both that and that the
     # sha is on artifact-keeper-test main.
-    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@987bccd15df3fd4c9c24bf78436ce12fb5bd5783 # artifact-keeper-test main as of 2026-11-18
+    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@1c4552bd7ef12cbc05541f18dbba5868c4444b5b # artifact-keeper-test main as of 2026-11-19
     with:
       backend_tag: ${{ needs.resolve-candidate-digest.outputs.version }}
       backend_digest: ${{ needs.resolve-candidate-digest.outputs.backend_digest }}
@@ -826,19 +826,25 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Bounded (#6272): each download attempt is capped and retried on
+      # azure.archive.ubuntu.com (scripts/ci/apt-install-bounded.sh), so a
+      # crawling apt mirror cannot hold the build to the job ceiling.
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+        timeout-minutes: 12
+        run: bash scripts/ci/apt-install-bounded.sh protobuf-compiler pkg-config libssl-dev
 
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get install -y gcc-aarch64-linux-gnu
+        timeout-minutes: 12
+        run: bash scripts/ci/apt-install-bounded.sh gcc-aarch64-linux-gnu
 
       - name: Install Windows cross-compilation tools
         if: matrix.target == 'x86_64-pc-windows-gnu'
-        run: sudo apt-get install -y mingw-w64
+        # Above 3 x 4-minute capped downloads plus the full mingw-w64 unpack, so
+        # the step timeout can never kill dpkg mid-unpack.
+        timeout-minutes: 20
+        run: APT_ATTEMPT_TIMEOUT=4m bash scripts/ci/apt-install-bounded.sh mingw-w64
 
       # The 1.12 backend's release build fills the hosted VM's 15 GiB of RAM
       # and 2 GiB of swap. Over it, the runner stops answering instead of
@@ -863,7 +869,10 @@ jobs:
 
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install protobuf
+        timeout-minutes: 10
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: brew install protobuf || { sleep 10; brew install protobuf; }
 
       # Restore only (#4927). A cache saved here lands on the tag's own ref,
       # which no later tag can read, so it was about 950 MB per target of

@@ -421,7 +421,11 @@ else
   # when it lists no jobs (cancelled before starting) or when Security Scan
   # skipped and no job failed (PROMOTE). Security Scan is also skipped when an
   # earlier build job fails, and that failed build stays the verdict. A push
-  # run always built (a branch push builds each commit once, #6080).
+  # run is always the commit's build: a branch push gets one run per commit.
+  # On main that run can be REPLACED while it waits (cancelled, zero jobs:
+  # main pushes coalesce, #6242); it then decides red here until it is
+  # re-run, which the Release Candidate does before dispatching this
+  # preflight (`gh run rerun <id>` by hand otherwise).
   #
   # The branch: PREFLIGHT_BRANCH, else a branch-shaped PREFLIGHT_REF. The
   # Release Candidate passes the commit sha as PREFLIGHT_REF
@@ -554,6 +558,15 @@ else
       bad "Docker Publish for HEAD is still '$run_status' (run $run_id) -- its verdict does not exist yet."
       note "  -> run: $(printf '%s/actions/runs/%s' "https://github.com/$REPO" "$run_id")"
       note "  -> wait for it to complete, then re-run preflight. Do not tag ahead of the gate."
+    elif [[ "$(gh run view "$run_id" --repo "$REPO" --json jobs --jq '.jobs | length' 2>/dev/null)" == 0 ]]; then
+      # The commit's push run never started a job: replaced while pending by
+      # a newer main push (main pushes coalesce, #6242) or cancelled before
+      # a runner took it. Not a failed build and not unmeasurable: there are
+      # simply no images yet, and re-running that run builds them.
+      bad "Docker Publish for HEAD was cancelled before it built anything (run $run_id) -- this commit has no images."
+      note "  -> run: $(printf '%s/actions/runs/%s' "https://github.com/$REPO" "$run_id")"
+      note "  -> re-run it (gh run rerun $run_id; a re-run is never replaced again), wait for it, then re-run preflight."
+      note "     The Release Candidate does this itself before it dispatches this preflight."
     else
       sec="$(sec_of "$run_id")"
       man="$(man_of "$run_id")"
