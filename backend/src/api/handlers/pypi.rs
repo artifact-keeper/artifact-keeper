@@ -6790,8 +6790,12 @@ async fn upload(
     // service does the dedup `exists()` check first and only moves bytes on a
     // miss.
     let content = staged_content.upload_content().await?;
+    // #6317: the `pypi` metadata the simple index and JSON API render from
+    // commits in the same transaction as the artifact row. Written as a
+    // separate step after the commit, a pool timeout there answered 503 for a
+    // stored package (whose retry then got 409) and left it without metadata.
     let artifact = artifact_service
-        .upload_content_with_sync_options(
+        .upload_content_with_commit_metadata(
             repo.id,
             &artifact_path,
             &normalized,
@@ -6801,20 +6805,19 @@ async fn upload(
             digests,
             size_bytes,
             Some(user_id),
-            // #4889: queue after the metadata write below, not before it.
+            // #4889: queue below, once the upload has committed.
             false,
             None,
             None,
+            Some(crate::services::artifact_service::CommitMetadata {
+                format: "pypi",
+                metadata: pkg_metadata,
+            }),
         )
         .await
         .map_err(|e| e.into_response())?;
     // The staging copy is no longer needed once the service has consumed it.
     staged_content.discard().await;
-
-    artifact_service
-        .set_metadata(artifact.id, "pypi", pkg_metadata, serde_json::json!({}))
-        .await
-        .map_err(|e| e.into_response())?;
 
     if should_enqueue_pypi_sync_tasks(&headers) {
         super::queue_push_sync_tasks_now(

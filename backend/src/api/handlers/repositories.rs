@@ -12674,10 +12674,17 @@ async fn persist_generic_staged_upload(
         }
     }
 
+    // #6317: the upload has committed. The reads below only fill the response
+    // body, so a failure (a pool timeout under load) falls back to a default
+    // instead of answering 503 for a stored artifact, whose retry would then
+    // be refused with 409.
     let downloads = artifact_service
         .get_download_stats(artifact.id)
         .await
-        .map_err(|e| e.into_response())?;
+        .unwrap_or_else(|e| {
+            tracing::warn!(artifact_id = %artifact.id, error = %e, "upload committed; download count for the response could not be read");
+            0
+        });
     let metadata_json = wasm_metadata.map(|m| m.to_json());
 
     // #2367: echo the revision this upload landed at for versioned repos.
@@ -12685,7 +12692,10 @@ async fn persist_generic_staged_upload(
         artifact_service
             .latest_version_info(repo.id, &artifact.path)
             .await
-            .map_err(|e| e.into_response())?
+            .unwrap_or_else(|e| {
+                tracing::warn!(artifact_id = %artifact.id, error = %e, "upload committed; revision for the response could not be read");
+                None
+            })
             .map(|(rev, label)| (Some(rev), label))
             .unwrap_or((None, None))
     } else {

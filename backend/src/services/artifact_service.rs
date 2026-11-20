@@ -90,6 +90,15 @@ pub struct ContentDigests {
     pub md5: String,
 }
 
+/// Format metadata written in the same transaction as the artifact row
+/// (#6317), for a format that serves the package from `artifact_metadata`.
+/// Written with empty `properties`, exactly as [`ArtifactService::set_metadata`]
+/// with `{}` would.
+pub struct CommitMetadata<'a> {
+    pub format: &'a str,
+    pub metadata: serde_json::Value,
+}
+
 /// Where the body of a streaming upload comes from (#3916).
 pub enum UploadContent {
     /// Bytes still to be written, e.g. re-read from a local scratch file.
@@ -1043,6 +1052,36 @@ impl ArtifactService {
         uploaded_by: Option<Uuid>,
         enqueue_sync_tasks: bool,
     ) -> Result<Artifact> {
+        self.upload_with_commit_metadata(
+            repository_id,
+            path,
+            name,
+            version,
+            content_type,
+            data,
+            uploaded_by,
+            enqueue_sync_tasks,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::upload_with_sync_options`] that also writes `commit_metadata`
+    /// in the transaction that commits the artifact row (#6317), so the row
+    /// can never be committed without the format metadata it is served from.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_with_commit_metadata(
+        &self,
+        repository_id: Uuid,
+        path: &str,
+        name: &str,
+        version: Option<&str>,
+        content_type: &str,
+        data: Bytes,
+        uploaded_by: Option<Uuid>,
+        enqueue_sync_tasks: bool,
+        commit_metadata: Option<CommitMetadata<'_>>,
+    ) -> Result<Artifact> {
         let size_bytes = data.len() as i64;
 
         // Calculate checksums.
@@ -1091,6 +1130,7 @@ impl ArtifactService {
             None,
             None,
             CasRewrite::Bytes(data),
+            commit_metadata,
         )
         .await
     }
@@ -1167,6 +1207,47 @@ impl ArtifactService {
         catalog_name: Option<&str>,
         precondition: Option<&WritePrecondition>,
     ) -> Result<Artifact> {
+        self.upload_content_with_commit_metadata(
+            repository_id,
+            path,
+            name,
+            version,
+            content_type,
+            content,
+            digests,
+            size_bytes,
+            uploaded_by,
+            enqueue_sync_tasks,
+            catalog_name,
+            precondition,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::upload_content_with_sync_options`] that also writes
+    /// `commit_metadata` in the transaction that commits the artifact row
+    /// (#6317). A format whose index is rendered from `artifact_metadata`
+    /// (PyPI) used to write it as a separate step after the commit, so a pool
+    /// timeout there left a stored package without metadata and answered 503
+    /// for an upload that had in fact landed.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_content_with_commit_metadata(
+        &self,
+        repository_id: Uuid,
+        path: &str,
+        name: &str,
+        version: Option<&str>,
+        content_type: &str,
+        content: UploadContent,
+        digests: ContentDigests,
+        size_bytes: i64,
+        uploaded_by: Option<Uuid>,
+        enqueue_sync_tasks: bool,
+        catalog_name: Option<&str>,
+        precondition: Option<&WritePrecondition>,
+        commit_metadata: Option<CommitMetadata<'_>>,
+    ) -> Result<Artifact> {
         let storage_key = Self::storage_key_from_checksum(&digests.sha256);
 
         self.preflight_upload(
@@ -1236,6 +1317,7 @@ impl ArtifactService {
                 catalog_name,
                 precondition,
                 rewrite,
+                commit_metadata,
             )
             .await;
         if finalized.is_err() && wrote_object {
@@ -1445,6 +1527,7 @@ impl ArtifactService {
         catalog_name: Option<&str>,
         precondition: Option<&WritePrecondition>,
         rewrite: CasRewrite,
+        commit_metadata: Option<CommitMetadata<'_>>,
     ) -> Result<Artifact> {
         // #2367: for versioning-enabled Generic/Mlmodel repos, capture the
         // pre-upsert HEAD state so the history append below can (a) stay
@@ -1641,6 +1724,21 @@ impl ArtifactService {
                 }
             }
         };
+
+        // #6317: format metadata the package is served from commits with its
+        // row. A failure here rolls the whole upload back, so the client's
+        // error is truthful and its retry starts clean (no 409 for a package
+        // that was stored, no package stored without metadata).
+        if let Some(CommitMetadata { format, metadata }) = commit_metadata {
+            Self::upsert_metadata(
+                &mut *tx,
+                artifact.id,
+                format,
+                metadata,
+                serde_json::json!({}),
+            )
+            .await?;
+        }
 
         // Commit the admission + INSERT together, releasing the ledger-row
         // lock. Everything below is a post-commit side effect on the pool.
@@ -3768,6 +3866,117 @@ mod tests {
             .await
             .expect("read row");
         assert!(deleted, "delete must have actually soft-deleted the row");
+    }
+
+    /// #6317: format metadata handed to the upload commits with the artifact
+    /// row, so a stored package always has it.
+    #[tokio::test]
+    async fn test_6317_commit_metadata_is_written_with_the_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let service = ArtifactService::new(pool.clone(), storage);
+        let path = format!("pkg6317/1.0/pkg6317-{}.tar.gz", Uuid::new_v4().simple());
+
+        let artifact = service
+            .upload_with_commit_metadata(
+                repo_id,
+                &path,
+                "pkg6317",
+                Some("1.0"),
+                "application/gzip",
+                Bytes::from(format!("body {path}")),
+                None,
+                false,
+                Some(CommitMetadata {
+                    format: "pypi",
+                    metadata: serde_json::json!({"name": "pkg6317", "version": "1.0"}),
+                }),
+            )
+            .await
+            .expect("upload with commit metadata");
+
+        let meta = service
+            .get_metadata(artifact.id)
+            .await
+            .expect("read metadata")
+            .expect("the metadata row commits with the artifact row");
+        assert_eq!(meta.format, "pypi");
+        assert_eq!(meta.metadata["name"], "pkg6317");
+        assert_eq!(meta.properties, serde_json::json!({}));
+    }
+
+    /// #6317: when the metadata write fails, nothing commits. Before the fix
+    /// PyPI wrote it as a separate step after the commit, so the failure left a
+    /// live row without metadata and the client's retry was refused with 409.
+    /// Here the failure is a `format` longer than the column allows
+    /// (VARCHAR(50)); the retry with valid metadata then succeeds.
+    #[tokio::test]
+    async fn test_6317_failed_commit_metadata_rolls_back_the_upload() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let service = ArtifactService::new(pool.clone(), storage);
+        let path = format!("pkg6317/1.0/pkg6317-{}.tar.gz", Uuid::new_v4().simple());
+        let body = Bytes::from(format!("body {path}"));
+        let too_long = "x".repeat(51);
+        let upload = |format: String| {
+            let service = &service;
+            let path = path.clone();
+            let body = body.clone();
+            async move {
+                service
+                    .upload_with_commit_metadata(
+                        repo_id,
+                        &path,
+                        "pkg6317",
+                        Some("1.0"),
+                        "application/gzip",
+                        body,
+                        None,
+                        false,
+                        Some(CommitMetadata {
+                            format: &format,
+                            metadata: serde_json::json!({"name": "pkg6317"}),
+                        }),
+                    )
+                    .await
+            }
+        };
+
+        let failed = upload(too_long).await;
+        assert!(failed.is_err(), "the metadata write must fail: {failed:?}");
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .fetch_one(&pool)
+        .await
+        .expect("count rows");
+        assert_eq!(
+            rows, 0,
+            "a failed metadata write must not leave the row committed"
+        );
+
+        let artifact = upload("pypi".to_string())
+            .await
+            .expect("the retry is a fresh upload, not a 409");
+        let meta = service
+            .get_metadata(artifact.id)
+            .await
+            .expect("read metadata");
+        assert!(meta.is_some(), "the retried upload has its metadata");
     }
 
     /// #3517: `exists` no longer reports an Azure throttle, 5xx or auth
