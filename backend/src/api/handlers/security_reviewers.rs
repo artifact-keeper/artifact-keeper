@@ -215,7 +215,8 @@ async fn revoke(
     tag = "admin",
     responses(
         (status = 200, description = "Security reviewers", body = SecurityReviewersResponse),
-        (status = 403, description = "Admin access required"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required, or a repository-scoped token"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -254,7 +255,8 @@ pub async fn list_security_reviewers(
     responses(
         (status = 204, description = "The user is a security reviewer"),
         (status = 400, description = "Service accounts cannot be security reviewers"),
-        (status = 403, description = "Admin access required"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required, or a repository-scoped token"),
         (status = 404, description = "User not found"),
     ),
     security(("bearer_auth" = []))
@@ -276,7 +278,8 @@ pub async fn grant_user_security_reviewer(
     params(("id" = Uuid, Path, description = "User ID")),
     responses(
         (status = 204, description = "Grant removed"),
-        (status = 403, description = "Admin access required"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required, or a repository-scoped token"),
         (status = 404, description = "The user holds no direct grant"),
     ),
     security(("bearer_auth" = []))
@@ -300,7 +303,8 @@ pub async fn revoke_user_security_reviewer(
     params(("id" = Uuid, Path, description = "Group ID")),
     responses(
         (status = 204, description = "The group's members are security reviewers"),
-        (status = 403, description = "Admin access required"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required, or a repository-scoped token"),
         (status = 404, description = "Group not found"),
     ),
     security(("bearer_auth" = []))
@@ -322,7 +326,8 @@ pub async fn grant_group_security_reviewer(
     params(("id" = Uuid, Path, description = "Group ID")),
     responses(
         (status = 204, description = "Grant removed"),
-        (status = 403, description = "Admin access required"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required, or a repository-scoped token"),
         (status = 404, description = "The group holds no grant"),
     ),
     security(("bearer_auth" = []))

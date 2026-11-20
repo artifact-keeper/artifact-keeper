@@ -2971,8 +2971,8 @@ mod tests {
             .await
             .expect("make the repository public");
         sqlx::query(
-            "INSERT INTO role_assignments (user_id, role_id, repository_id) \
-             SELECT $1, id, NULL FROM roles WHERE name = 'security-reviewer'",
+            "INSERT INTO user_global_roles (user_id, role_id) \
+             SELECT $1, id FROM roles WHERE name = 'security-reviewer'",
         )
         .bind(reviewer_id)
         .execute(&pool)
@@ -3020,7 +3020,7 @@ mod tests {
         assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
         assert_eq!(review_status(&pool, id.parse().unwrap()).await, "pending");
 
-        let _ = sqlx::query("DELETE FROM role_assignments WHERE user_id = $1")
+        let _ = sqlx::query("DELETE FROM user_global_roles WHERE user_id = $1")
             .bind(reviewer_id)
             .execute(&pool)
             .await;

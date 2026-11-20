@@ -14,6 +14,10 @@ CREATE TABLE IF NOT EXISTS group_global_roles (
     PRIMARY KEY (group_id, role_id)
 );
 
+-- The role_id foreign keys, the primary keys only lead with the grantee
+CREATE INDEX IF NOT EXISTS idx_user_global_roles_role_id ON user_global_roles (role_id);
+CREATE INDEX IF NOT EXISTS idx_group_global_roles_role_id ON group_global_roles (role_id);
+
 -- A security-reviewer grant written into role_assignments before this migration moves over
 INSERT INTO user_global_roles (user_id, role_id)
 SELECT ra.user_id, ra.role_id

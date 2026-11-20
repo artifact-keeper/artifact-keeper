@@ -816,7 +816,7 @@ fn check_membership_editable(external_source: Option<Option<String>>) -> Result<
 
 /// Look up a group's `external_source` and enforce [`check_membership_editable`].
 /// Does this group carry an instance-wide role (`group_global_roles`, migration
-/// 387)? Such a group confers that role on every member, so only an admin may
+/// 405)? Such a group confers that role on every member, so only an admin may
 /// add members to it or rename it.
 async fn group_holds_global_role(db: &sqlx::PgPool, id: Uuid) -> Result<bool> {
     Ok(
