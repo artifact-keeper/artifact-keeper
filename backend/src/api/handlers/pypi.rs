@@ -694,7 +694,7 @@ fn build_simple_root_response(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if accept.contains("application/vnd.pypi.simple.v1+json") {
+    if accept_prefers_pep691_json(accept) {
         let json = serde_json::json!({
             "meta": { "api-version": "1.2" },
             "projects": packages.iter().map(|p| {
@@ -804,11 +804,12 @@ async fn simple_project(
     // PEP 691 content negotiation also governs the proxy path: a JSON client
     // must get the upstream's JSON representation (which carries PEP 700
     // `upload-time`), not its HTML index (which rarely does).
-    let wants_json = headers
-        .get("accept")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .contains(PEP691_JSON_CONTENT_TYPE);
+    let wants_json = accept_prefers_pep691_json(
+        headers
+            .get("accept")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+    );
 
     // Find all artifacts that belong to this package.
     // We normalize the name for matching: replace [_.-]+ with - then lowercase.
@@ -1507,7 +1508,7 @@ fn build_simple_project_response(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if accept.contains("application/vnd.pypi.simple.v1+json") {
+    if accept_prefers_pep691_json(accept) {
         // PEP 691 JSON response
         let files: Vec<serde_json::Value> = artifacts
             .iter()
@@ -7685,6 +7686,49 @@ fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
 
 /// PEP 691 JSON simple-index media type.
 const PEP691_JSON_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+json";
+
+/// Whether a Simple API request's `Accept` header asks for the PEP 691 JSON
+/// form rather than HTML (#5643).
+///
+/// The JSON media types are `application/vnd.pypi.simple.v1+json` and its
+/// alias `application/vnd.pypi.simple.latest+json`; the HTML ones are
+/// `text/html` and the `v1+html` / `latest+html` types. Each range's `q`
+/// (default 1; an unparseable value is ignored) is read, and JSON is chosen
+/// when its best `q` is above zero and at least the best HTML `q`, so a tie
+/// goes to JSON as it always has. Media types and parameter names compare
+/// case-insensitively.
+///
+/// Wildcard ranges (`*/*`, `text/*`, `application/*`) are deliberately not
+/// counted for either side, although RFC 9110 would let them match: counting
+/// them would change the answer for clients that send only a wildcard, which
+/// have always got the HTML default.
+fn accept_prefers_pep691_json(accept: &str) -> bool {
+    let mut json_q = 0.0_f32;
+    let mut html_q = 0.0_f32;
+    for range in accept.split(',') {
+        let mut parts = range.split(';');
+        let media = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        let q = parts
+            .filter_map(|p| p.split_once('='))
+            .find(|(k, _)| k.trim().eq_ignore_ascii_case("q"))
+            // An unparseable q is ignored (read as 1), so a malformed
+            // parameter keeps the answer the substring check gave before.
+            .and_then(|(_, v)| v.trim().parse::<f32>().ok())
+            .filter(|q| q.is_finite())
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+        match media.as_str() {
+            "application/vnd.pypi.simple.v1+json" | "application/vnd.pypi.simple.latest+json" => {
+                json_q = json_q.max(q)
+            }
+            "text/html"
+            | "application/vnd.pypi.simple.v1+html"
+            | "application/vnd.pypi.simple.latest+html" => html_q = html_q.max(q),
+            _ => {}
+        }
+    }
+    json_q > 0.0 && json_q >= html_q
+}
 
 /// Cache-path suffix under which the PEP 691 JSON representation of a Simple
 /// project index is stored, appended to the HTML representation's cache path
@@ -14571,6 +14615,37 @@ mod tests {
     /// header. The HTML root arm is the one that matters most here: it builds
     /// its response by hand (to keep the PEP 503 CSP headers) and so does not
     /// inherit the shared helper's contract automatically.
+    #[test]
+    fn test_accept_prefers_pep691_json_reads_q_values_and_latest_alias() {
+        // #5643: substring matching ignored q-values and the `latest` alias.
+        for (accept, json) in [
+            ("application/vnd.pypi.simple.v1+json", true),
+            ("application/vnd.pypi.simple.latest+json", true),
+            ("Application/Vnd.Pypi.Simple.V1+JSON", true),
+            // pip / uv
+            (
+                "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html; q=0.1, text/html; q=0.01",
+                true,
+            ),
+            ("application/vnd.pypi.simple.v1+json, text/html;q=0.9", true),
+            ("application/vnd.pypi.simple.v1+json;q=0.5, */*", true),
+            ("text/html, application/vnd.pypi.simple.v1+json", true),
+            ("application/vnd.pypi.simple.v1+json;q=0.1, text/html", false),
+            ("application/vnd.pypi.simple.v1+json;q=0", false),
+            // An unparseable q is ignored, as the old substring check did.
+            ("application/vnd.pypi.simple.v1+json;q=bogus", true),
+            ("application/vnd.pypi.simple.v1+json;q=bogus, text/html;q=0.5", true),
+            ("application/vnd.pypi.simple.v1+json;q=0.2, text/html;q=nan", false),
+            ("application/*, */*", false),
+            ("application/vnd.pypi.simple.v1+html", false),
+            ("text/html", false),
+            ("*/*", false),
+            ("", false),
+        ] {
+            assert_eq!(accept_prefers_pep691_json(accept), json, "{accept}");
+        }
+    }
+
     #[test]
     fn test_negotiated_simple_index_declares_vary_accept() {
         let packages = vec!["flask".to_string()];
