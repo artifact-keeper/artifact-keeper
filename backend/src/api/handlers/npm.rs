@@ -977,6 +977,19 @@ pub(crate) fn npm_package_name_from_artifact_path(path: &str) -> Option<&str> {
     segments.next().filter(|s| !s.is_empty())
 }
 
+/// The repository formats this handler serves: `yarn`, `pnpm` and `bower`
+/// repositories speak the npm wire format, publish through the same routes and
+/// serve their packuments through the same cache. A post-write step that must
+/// reach the packument (cache invalidation, dist-tag cleanup) has to match all
+/// four, not only `npm` (#5779).
+pub(crate) const NPM_FAMILY_FORMATS: &[&str] = &["npm", "yarn", "pnpm", "bower"];
+
+/// Whether a repository's `format` key is one this handler serves
+/// ([`NPM_FAMILY_FORMATS`]).
+pub(crate) fn is_npm_family_format_key(format: &str) -> bool {
+    NPM_FAMILY_FORMATS.contains(&format)
+}
+
 /// Invalidate the computed-packument cache for a package after a local write
 /// (publish, dist-tag change, artifact delete), in the hosting repo and in
 /// every virtual repo that includes it — the packument a virtual repo serves
@@ -1683,8 +1696,7 @@ async fn resolve_npm_tarball_upstream(
 // ---------------------------------------------------------------------------
 
 async fn resolve_npm_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
-    proxy_helpers::resolve_repo_by_key(db, repo_key, &["npm", "yarn", "pnpm", "bower"], "an npm")
-        .await
+    proxy_helpers::resolve_repo_by_key(db, repo_key, NPM_FAMILY_FORMATS, "an npm").await
 }
 
 /// Resolve the repository an npm WRITE (publish / dist-tag change) addressed
@@ -19438,7 +19450,15 @@ mod db_cov_tests {
     /// Attach a freshly created local npm repo as a member of the fixture's
     /// virtual repo. Returns the member's `(id, key, storage_dir)`.
     async fn attach_local_member(fx: &tdh::Fixture) -> (uuid::Uuid, String, std::path::PathBuf) {
-        let (member_id, member_key, member_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
+        attach_local_member_of(fx, "npm").await
+    }
+
+    /// [`attach_local_member`] for a Local of another npm-family `format`.
+    async fn attach_local_member_of(
+        fx: &tdh::Fixture,
+        format: &str,
+    ) -> (uuid::Uuid, String, std::path::PathBuf) {
+        let (member_id, member_key, member_dir) = tdh::create_repo(&fx.pool, "local", format).await;
         sqlx::query(
             "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
              VALUES ($1, $2, 1)",
@@ -19748,7 +19768,16 @@ mod db_cov_tests {
         fx: &tdh::Fixture,
         package: &str,
     ) -> (uuid::Uuid, String, std::path::PathBuf) {
-        let (member_id, member_key, member_dir) = attach_local_member(fx).await;
+        virtual_with_two_versions_of(fx, package, "npm").await
+    }
+
+    /// [`virtual_with_two_versions`] with a Local member of `format`.
+    async fn virtual_with_two_versions_of(
+        fx: &tdh::Fixture,
+        package: &str,
+        format: &str,
+    ) -> (uuid::Uuid, String, std::path::PathBuf) {
+        let (member_id, member_key, member_dir) = attach_local_member_of(fx, format).await;
         for version in ["1.0.0", "2.0.0"] {
             let published = super::publish_package(
                 &fx.state,
@@ -19811,36 +19840,35 @@ mod db_cov_tests {
 
     /// #5779. FAILS BEFORE THE FIX: a retention sweep left the swept version
     /// in the Virtual's cached packument until the entry expired
-    #[tokio::test]
-    async fn retention_sweep_invalidates_the_virtual_packument_5779() {
+    /// Age `version` of `package` in `repo_id` past a 7-day retention window
+    /// and run a `max_age_days` policy scoped to that repository through the
+    /// handler, as the lifecycle UI does. Returns the policy id.
+    async fn run_retention_on(
+        fx: &tdh::Fixture,
+        repo_id: uuid::Uuid,
+        package: &str,
+        version: &str,
+    ) -> uuid::Uuid {
         use axum::extract::{Path, State};
         use axum::Extension;
-
-        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
-            return;
-        };
-        let package = "retention-sweep-5779";
-        let (member_id, _, member_dir) = virtual_with_two_versions(&fx, package).await;
         sqlx::query(
             "UPDATE artifacts SET created_at = NOW() - INTERVAL '30 days', \
              updated_at = NOW() - INTERVAL '30 days' \
-             WHERE repository_id = $1 AND name = $2 AND version = '1.0.0'",
+             WHERE repository_id = $1 AND name = $2 AND version = $3",
         )
-        .bind(member_id)
+        .bind(repo_id)
         .bind(package)
+        .bind(version)
         .execute(&fx.pool)
         .await
-        .expect("age 1.0.0");
-        let (_, _, warm) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
-        assert!(warm["versions"]["1.0.0"].is_object(), "got {warm:?}");
-
+        .expect("age the version");
         let policy = crate::services::lifecycle_service::LifecycleService::new(fx.pool.clone())
             .create_policy(
                 crate::services::lifecycle_service::CreateLifecyclePolicyRequest {
                     applies_to_all: false,
                     repository_ids: None,
-                    repository_id: Some(member_id),
-                    name: format!("expire-7d-{}", member_id.simple()),
+                    repository_id: Some(repo_id),
+                    name: format!("expire-7d-{}", repo_id.simple()),
                     description: None,
                     policy_type: "max_age_days".to_string(),
                     config: serde_json::json!({"days": 7}),
@@ -19853,12 +19881,106 @@ mod db_cov_tests {
             .expect("create lifecycle policy");
         let run = crate::api::handlers::lifecycle::execute_policy(
             State(fx.state.clone()),
-            Extension(admin_auth(&fx)),
+            Extension(admin_auth(fx)),
             Path(policy.id),
         )
         .await
         .expect("execute policy");
         assert_eq!(run.0.artifacts_removed, 1, "{:?}", run.0);
+        policy.id
+    }
+
+    #[test]
+    fn npm_family_formats_are_every_format_the_handler_serves_5779() {
+        for format in ["npm", "yarn", "pnpm", "bower"] {
+            assert!(super::is_npm_family_format_key(format), "{format}");
+        }
+        for format in ["maven", "pypi", "generic", "NPM", ""] {
+            assert!(!super::is_npm_family_format_key(format), "{format}");
+        }
+    }
+
+    /// A retention sweep of a `pnpm` Local (served by this handler and its
+    /// packument cache) must invalidate the Virtual's packument too; the
+    /// sweep used to match `format = 'npm'` only (#5779).
+    #[tokio::test]
+    async fn retention_sweep_of_a_pnpm_member_invalidates_the_virtual_packument_5779() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pnpm").await else {
+            return;
+        };
+        let package = "pnpm-retention-5779";
+        let (member_id, _, member_dir) = virtual_with_two_versions_of(&fx, package, "pnpm").await;
+        let (_, _, warm) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
+        assert!(warm["versions"]["1.0.0"].is_object(), "got {warm:?}");
+
+        let policy = run_retention_on(&fx, member_id, package, "1.0.0").await;
+        let (_, _, after) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
+
+        let _ = sqlx::query("DELETE FROM lifecycle_policies WHERE id = $1")
+            .bind(policy)
+            .execute(&fx.pool)
+            .await;
+        cleanup_member(&fx, member_id, &member_dir).await;
+        fx.teardown().await;
+        assert!(
+            after["versions"]["1.0.0"].is_null(),
+            "a retention sweep of a pnpm member must invalidate the Virtual packument; \
+             got {after:?}"
+        );
+        assert!(after["versions"]["2.0.0"].is_object(), "got {after:?}");
+    }
+
+    /// The REST artifact delete in a `yarn` Local must invalidate the Virtual
+    /// packument, as it does for an `npm` Local (#2162, #5779).
+    #[tokio::test]
+    async fn rest_delete_in_a_yarn_member_invalidates_the_virtual_packument_5779() {
+        use axum::extract::{Path, State};
+        use axum::http::HeaderMap;
+        use axum::Extension;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "yarn").await else {
+            return;
+        };
+        let package = "yarn-rest-delete-5779";
+        let (member_id, member_key, member_dir) =
+            virtual_with_two_versions_of(&fx, package, "yarn").await;
+        let (_, _, warm) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
+        assert!(warm["versions"]["1.0.0"].is_object(), "got {warm:?}");
+
+        let deleted = crate::api::handlers::repositories::delete_artifact(
+            State(fx.state.clone()),
+            Extension(Some(admin_auth(&fx))),
+            Path((member_key, format!("{package}/1.0.0/{package}-1.0.0.tgz"))),
+            axum::extract::Query(
+                crate::api::handlers::repositories::DeleteArtifactQuery::default(),
+            ),
+            HeaderMap::new(),
+        )
+        .await;
+        let (_, _, after) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
+
+        cleanup_member(&fx, member_id, &member_dir).await;
+        fx.teardown().await;
+        assert!(deleted.is_ok(), "REST delete must succeed: {deleted:?}");
+        assert!(
+            after["versions"]["1.0.0"].is_null(),
+            "a REST delete in a yarn member must invalidate the Virtual packument; \
+             got {after:?}"
+        );
+        assert!(after["versions"]["2.0.0"].is_object(), "got {after:?}");
+    }
+
+    #[tokio::test]
+    async fn retention_sweep_invalidates_the_virtual_packument_5779() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "retention-sweep-5779";
+        let (member_id, _, member_dir) = virtual_with_two_versions(&fx, package).await;
+        let (_, _, warm) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
+        assert!(warm["versions"]["1.0.0"].is_object(), "got {warm:?}");
+
+        let policy = run_retention_on(&fx, member_id, package, "1.0.0").await;
         let (_, _, after) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
         assert!(
             after["versions"]["1.0.0"].is_null(),
@@ -19867,7 +19989,7 @@ mod db_cov_tests {
         assert!(after["versions"]["2.0.0"].is_object(), "got {after:?}");
 
         let _ = sqlx::query("DELETE FROM lifecycle_policies WHERE id = $1")
-            .bind(policy.id)
+            .bind(policy)
             .execute(&fx.pool)
             .await;
         cleanup_member(&fx, member_id, &member_dir).await;

@@ -2132,10 +2132,14 @@ pub async fn start_sync(state: &SharedState, repo: RepoInfo) -> Result<(), SyncE
             Ok(mut run) => run_locked(&mut run).await,
             Err(e) => Err(e),
         };
-        lease.release().await;
+        // Record the failure while the sync lock is still held, so a poller
+        // that sees `running: false` also sees this pass's outcome, and a
+        // pass that starts next cannot have its state overwritten by this
+        // record (#6249).
         if let Err(e) = &result {
             record_failure(&state.db, repo.id, e).await;
         }
+        lease.release().await;
         match result {
             Ok(s) => tracing::info!(
                 repository = %repo.key,

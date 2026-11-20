@@ -526,6 +526,56 @@ else
   fail "the Windows cross-check's install is not the bounded x86_64-only one (#6242)"
 fi
 
+# Every protoc install, in every workflow, is bounded (#6272). An unbounded
+# `apt-get update && apt-get install protobuf-compiler` sat in Workflow
+# Contract Tests until its 45-minute ceiling (run 44478388591). Each step
+# that installs protoc (by name or by package) needs its own
+# `timeout-minutes`, and an apt one must go through
+# scripts/ci/apt-install-bounded.sh or cap its download itself.
+echo "workflows: every protoc install step is bounded (#6272)"
+protoc_report="$(python3 - "$ROOT/.github/workflows" <<'PY'
+import glob, os, re, sys, yaml
+found = 0
+for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.yml"))):
+    doc = yaml.safe_load(open(path)) or {}
+    for job_id, job in (doc.get("jobs") or {}).items():
+        for step in (job or {}).get("steps") or []:
+            name = str(step.get("name", ""))
+            run = str(step.get("run", ""))
+            uses = str(step.get("uses", ""))
+            if not (re.search(r"protoc", name, re.I)
+                    or re.search(r"protobuf-compiler|brew install protobuf\b", run)
+                    or "setup-protoc" in uses):
+                continue
+            found += 1
+            where = f"{os.path.basename(path)} {job_id}: {name or uses or run.splitlines()[0]}"
+            if "timeout-minutes" not in step:
+                print(f"NOTIMEOUT {where}")
+            if "protobuf-compiler" in run and "apt-install-bounded.sh" not in run \
+                    and not ("--download-only" in run and re.search(r"\btimeout \d+m\b", run)):
+                print(f"UNBOUNDED {where}")
+print(f"FOUND {found}")
+PY
+)"
+protoc_found="$(sed -n 's/^FOUND //p' <<< "$protoc_report")"
+if [ "${protoc_found:-0}" -ge 8 ]; then
+  pass "found ${protoc_found} protoc install steps across the workflows"
+else
+  fail "found only ${protoc_found:-0} protoc install steps; the scan no longer matches them"
+fi
+if grep -q '^NOTIMEOUT' <<< "$protoc_report"; then
+  fail "protoc install steps without a step timeout-minutes (#6272):"
+  sed -n 's/^NOTIMEOUT /        /p' <<< "$protoc_report" >&2
+else
+  pass "every protoc install step has its own timeout-minutes"
+fi
+if grep -q '^UNBOUNDED' <<< "$protoc_report"; then
+  fail "apt protoc installs with an uncapped download; use scripts/ci/apt-install-bounded.sh (#6272):"
+  sed -n 's/^UNBOUNDED /        /p' <<< "$protoc_report" >&2
+else
+  pass "every apt protoc install caps its download and retries on another mirror"
+fi
+
 echo "ci.yml CI Complete: the Workflow Contract Tests (#6115)"
 complete "workflow-only PR: contract tests green -> passes"          0 pull_request true false false "${SKIP_RUST[@]}" WORKFLOW_CONTRACTS=true
 complete "workflow-only PR: contract tests red -> fails"             1 pull_request true false false "${SKIP_RUST[@]}" WORKFLOW_CONTRACTS=true RESULT_WORKFLOW_CONTRACTS=failure
