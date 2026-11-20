@@ -31,9 +31,9 @@ What the server shares and what it does not, per trivy's client/server design:
   The one exception is a workspace that is a clean git repository: trivy then
   keys its analysis by the HEAD commit and reuses a cached analysis from the
   server. In `registry` partition mode the adapter does not extract a root
-  `.git` from an uploaded workspace, so that never happens. The Java DB, needed to analyze JAR files, is downloaded on the
-  client when a JAR is analyzed, so `SCANNER_TRIVY_CACHE_DIR` still needs room
-  for it.
+  `.git` from an uploaded workspace, so that never happens. The Java DB, needed to analyze JAR files, lives on the
+  client too (see "The Java DB" below), so `SCANNER_TRIVY_CACHE_DIR` still
+  needs room for it.
 - Trust: an image layer's cache key is derived from the diff ID the image's
   config *claims*; trivy does not re-hash the layer content against it. A
   client that scans a crafted image first can therefore store a false
@@ -280,6 +280,42 @@ separate listener serving Prometheus text on `GET /metrics`:
 `scanner_adapter_client_jobs_running{client}` for the clients with a job
 queued or running. It is opt-in because the client set is unbounded, and it
 needs a limits file (without one every job is the same client, `""`).
+
+## The Java DB (adapter >= 1.7.1)
+
+trivy needs a second database, the Java DB (`trivy-java-db:1`, ~1 GiB
+compressed, ~1.5 GiB unpacked in `<SCANNER_TRIVY_CACHE_DIR>/java-db`), to
+identify the JAR files in an image. Until 1.7.1 every trivy process that met a
+JAR downloaded it on demand, so two concurrent first JAR scans unpacked over
+each other and one failed (`chmod .../java-db/trivy-java.db: no such file or
+directory`, #5913), each staging its own ~1.9 GiB copy in `TMPDIR`.
+
+The adapter now owns the download, in both standalone and client mode, and
+every scan runs with `--skip-java-db-update`:
+
+- One download at a time: scans in one adapter share the download in flight,
+  and replicas sharing a cache volume take an `flock` on
+  `<SCANNER_TRIVY_CACHE_DIR>/java-db.lock`. The download goes to a
+  `.java-db-staging-*` directory in the cache and is renamed into place, so a
+  refresh briefly needs room for two copies.
+- Connected installs fetch it in the background at startup. Readiness does not
+  wait for it, and a scan only waits for it if that scan needs it: an image
+  scan that finds a JAR before the Java DB is in place waits for the download
+  and is run again.
+- It is refreshed on the vulnerability DB's terms: once its `NextUpdate` has
+  passed (trivy publishes it with a 3-day window), the next scan starts a
+  background refresh; scans keep using the current copy meanwhile.
+- If the download fails, the adapter logs it and scans without it. An image
+  with no JAR never opens the Java DB and scans normally; an image with JARs
+  fails with the download error (trivy cannot analyze a JAR without it), and
+  the adapter does not try the registry again for 5 minutes. A failed refresh
+  keeps the current copy.
+- `SCANNER_TRIVY_SKIP_DB_UPDATE=true`: not fetched at startup and never
+  refreshed, like the vulnerability DB; the first JAR scan still fetches it if
+  the cache has none, as trivy did before. `SCANNER_OFFLINE=true`: never
+  fetched; JAR images scan only if a Java DB is already in the cache.
+- trivy's `TRIVY_JAVA_DB_REPOSITORY` (an AK-controlled mirror) is honoured by
+  the download.
 
 ## Offline use and vulnerability-DB import (adapter >= 1.7.0)
 

@@ -1768,6 +1768,7 @@ fn api_v1_routes(
                     auth_middleware,
                 )),
         )
+        .fallback(api_v1_not_found)
         // Web-UI CSRF contract (#3065): a state-changing request authenticated
         // by the session cookie must carry the `X-Requested-With` header the
         // web UI sends. Applied to the whole nest so it also covers the
@@ -1780,6 +1781,12 @@ fn api_v1_routes(
             api_rate_limit_state,
             rate_limit_middleware,
         ))
+}
+
+/// Unknown `/api/v1` paths. Without it they fell through to the format
+/// routes and answered `Repository not found` (#5656)
+async fn api_v1_not_found() -> AppError {
+    AppError::NotFound("Not found".to_string())
 }
 
 #[cfg(ak_test_shard = "router")]
@@ -2959,5 +2966,40 @@ mod tests {
         );
         let (list_status, _) = tdh::send(app, tdh::get("/api/v1/webhooks".to_string())).await;
         assert_eq!(list_status, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    /// #5656: an unknown `/api/v1` path answers a plain `Not found`, not the
+    /// format routes' `Repository not found`, for a signed-in caller and an
+    /// anonymous one
+    #[tokio::test]
+    async fn unknown_api_v1_path_is_not_found_without_repository_5656() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool.clone(), "/tmp/api-not-found-5656");
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let bearer = tdh::bearer_for(&state, user_id).await;
+        let app = super::create_router(state);
+
+        let mut signed_in = tdh::get("/api/v1/nonexistent".to_string());
+        signed_in.headers_mut().insert(
+            axum::http::header::AUTHORIZATION,
+            bearer.parse().expect("header value"),
+        );
+        let anonymous = tdh::get("/api/v1/nonexistent".to_string());
+        for (who, request) in [("signed in", signed_in), ("anonymous", anonymous)] {
+            let (status, body) = tdh::send(app.clone(), request).await;
+            let body = String::from_utf8_lossy(&body);
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{who}: {body}");
+            assert!(!body.contains("Repository"), "{who}: {body}");
+            assert!(body.contains("Not found"), "{who}: {body}");
+        }
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("delete user");
     }
 }

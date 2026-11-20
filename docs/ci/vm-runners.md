@@ -270,5 +270,6 @@ queue their legs one VM at a time: each next VM is ready about 30 to 40 s
 after the last job ends, so four legs take about 12 minutes. That is well
 inside the ~55-minute backend amd64 leg the merge jobs already wait for.
 Nothing can deadlock, because a job holds the VM only while it runs. The
-watchdog leaves such runs alone, because `publish-preflight` has already
-started.
+watchdog leaves such runs alone: `publish-preflight` has already started, and
+its started-run rule (#6289) acts only on a job that has waited 45 minutes
+for a runner.

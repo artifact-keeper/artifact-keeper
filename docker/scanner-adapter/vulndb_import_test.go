@@ -190,7 +190,9 @@ func TestLoadConfigOffline(t *testing.T) {
 	if cfg.VulnDBMaxUploadBytes != 2<<30 || cfg.VulnDBMaxExtractedBytes != 8<<30 {
 		t.Errorf("cap defaults: %d %d", cfg.VulnDBMaxUploadBytes, cfg.VulnDBMaxExtractedBytes)
 	}
-	if got := strings.Join(cfg.dbUpdateArgs(), " "); got != "" {
+	// A connected install refreshes the vulnerability DB in-scan; the Java DB
+	// is the adapter's to download (#5913), so every scan skips its update.
+	if got := strings.Join(cfg.dbUpdateArgs(), " "); got != "--skip-java-db-update" {
 		t.Errorf("connected install got DB flags %q", got)
 	}
 
@@ -229,11 +231,11 @@ func TestOfflineScanArgs(t *testing.T) {
 			}
 		}
 	}
-	// SkipDBUpdate alone now also reaches filesystem scans, without the
-	// offline-only Java DB flag.
+	// SkipDBUpdate alone also reaches filesystem scans. --skip-java-db-update
+	// is on every scan since #5913: the adapter, not trivy, fetches the Java DB.
 	cfg.Offline = false
 	joined := strings.Join(s.buildFsArgs("/work"), " ")
-	if !strings.Contains(joined, "--skip-db-update") || strings.Contains(joined, "--skip-java-db-update") {
+	if !strings.Contains(joined, "--skip-db-update") || !strings.Contains(joined, "--skip-java-db-update") {
 		t.Errorf("SkipDBUpdate fs args: %s", joined)
 	}
 }
