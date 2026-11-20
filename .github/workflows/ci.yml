@@ -2583,6 +2583,12 @@ jobs:
       - name: Check the post-release dispatch gate catches what it must
         run: bash scripts/ci/test-check-release-downstream-dispatch.sh
 
+      # Create Release gets a 403 from GITHUB_TOKEN when the commit is not a
+      # branch tip (#6338); the promote pins publish/vX.Y.Z and release.yml
+      # removes it. Stub gh, no network, ~1s.
+      - name: Check the release pin branch script and its wiring
+        run: bash scripts/ci/test-pin-release-branch.sh
+
       # The rule the promotion obeys: a floating tag may only name a version
       # with a published GitHub Release, and only if it is newest in that line.
       # Its interesting cases (a backport that moves :X.Y but not :latest, a
