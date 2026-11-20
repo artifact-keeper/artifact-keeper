@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE repositories\n            SET\n                key = COALESCE($2, key),\n                name = COALESCE($3, name),\n                description = COALESCE($4, description),\n                is_public = COALESCE($5, is_public),\n                quota_bytes = COALESCE($6, quota_bytes),\n                upstream_url = COALESCE($7, upstream_url),\n                promotion_only = COALESCE($8, promotion_only),\n                versioning_enabled = COALESCE($9, versioning_enabled),\n                project_id = COALESCE($10, project_id),\n                curation_enabled = COALESCE($11, curation_enabled),\n                curation_default_action = COALESCE($12, curation_default_action),\n                -- Written ONLY when the caller supplied `visibility`. A legacy\n                -- client's `is_public` above is left to the database trigger,\n                -- which derives from whichever column actually changed and so\n                -- leaves an `internal` repository alone.\n                visibility = COALESCE($13::repository_visibility, visibility),\n                allow_overwrite = COALESCE($14, allow_overwrite),\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                visibility as \"visibility: RepositoryVisibility\",\n                is_public, quota_bytes, promotion_only,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                age_gate_enabled, age_gate_min_age_days, versioning_enabled, allow_overwrite,\n                project_id, created_at, updated_at\n            ",
+  "query": "\n            INSERT INTO repositories (\n                key, name, description, format, repo_type,\n                storage_backend, storage_path, upstream_url,\n                visibility, quota_bytes, promotion_only, versioning_enabled,\n                project_id, immutability\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::repository_visibility, $10, $11, $12, $13, $14)\n            RETURNING\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                visibility as \"visibility: RepositoryVisibility\",\n                is_public, quota_bytes, promotion_only,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                age_gate_enabled, age_gate_min_age_days, versioning_enabled, immutability as \"immutability: RepositoryImmutability\",\n                project_id, created_at, updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -111,7 +111,9 @@
                 "github",
                 "mise",
                 "aqua",
-                "pacman"
+                "pacman",
+                "agentplugins",
+                "mcp"
               ]
             }
           }
@@ -358,12 +360,22 @@
       },
       {
         "ordinal": 23,
-        "name": "allow_overwrite",
-        "type_info": "Bool",
+        "name": "immutability: RepositoryImmutability",
+        "type_info": {
+          "Custom": {
+            "name": "repository_immutability",
+            "kind": {
+              "Enum": [
+                "write_once",
+                "mutable"
+              ]
+            }
+          }
+        },
         "origin": {
           "Table": {
             "table": "repositories",
-            "name": "allow_overwrite"
+            "name": "immutability"
           }
         }
       },
@@ -403,18 +415,93 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
         "Varchar",
         "Varchar",
         "Text",
-        "Bool",
-        "Int8",
+        {
+          "Custom": {
+            "name": "repository_format",
+            "kind": {
+              "Enum": [
+                "maven",
+                "gradle",
+                "npm",
+                "pypi",
+                "nuget",
+                "go",
+                "rubygems",
+                "docker",
+                "helm",
+                "rpm",
+                "debian",
+                "conan",
+                "cargo",
+                "generic",
+                "podman",
+                "buildx",
+                "oras",
+                "wasm_oci",
+                "helm_oci",
+                "poetry",
+                "conda",
+                "yarn",
+                "bower",
+                "pnpm",
+                "chocolatey",
+                "powershell",
+                "terraform",
+                "opentofu",
+                "alpine",
+                "conda_native",
+                "composer",
+                "hex",
+                "cocoapods",
+                "swift",
+                "pub",
+                "sbt",
+                "chef",
+                "puppet",
+                "ansible",
+                "gitlfs",
+                "vscode",
+                "jetbrains",
+                "huggingface",
+                "mlmodel",
+                "cran",
+                "vagrant",
+                "opkg",
+                "p2",
+                "bazel",
+                "protobuf",
+                "incus",
+                "lxc",
+                "jupyter",
+                "github",
+                "mise",
+                "aqua",
+                "pacman",
+                "agentplugins",
+                "mcp"
+              ]
+            }
+          }
+        },
+        {
+          "Custom": {
+            "name": "repository_type",
+            "kind": {
+              "Enum": [
+                "local",
+                "remote",
+                "virtual",
+                "staging"
+              ]
+            }
+          }
+        },
         "Varchar",
-        "Bool",
-        "Bool",
-        "Uuid",
-        "Bool",
-        "Text",
+        "Varchar",
+        "Varchar",
         {
           "Custom": {
             "name": "repository_visibility",
@@ -427,7 +514,21 @@
             }
           }
         },
-        "Bool"
+        "Int8",
+        "Bool",
+        "Bool",
+        "Uuid",
+        {
+          "Custom": {
+            "name": "repository_immutability",
+            "kind": {
+              "Enum": [
+                "write_once",
+                "mutable"
+              ]
+            }
+          }
+        }
       ]
     },
     "nullable": [
@@ -460,5 +561,5 @@
       false
     ]
   },
-  "hash": "7331d183a657cb46cd3e6a17a74bb455d2de2ae5e6fc6af2aff4a5dfda1784f4"
+  "hash": "813c9fbc17d7062b6f025b932a873d987256cd4cf4780ec10c16d0c14471b0a8"
 }

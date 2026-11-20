@@ -6240,7 +6240,7 @@ mod tests {
         use crate::models::repository::{ReplicationPriority, Repository, RepositoryFormat};
         Repository {
             versioning_enabled: false,
-            allow_overwrite: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             id: uuid::Uuid::new_v4(),
             key: "m".to_string(),
             name: "m".to_string(),
@@ -7438,7 +7438,7 @@ mod upload_db_tests {
 
         let (created, _) = put(&first).await;
         let (conflict, _) = put(&second).await;
-        sqlx::query("UPDATE repositories SET allow_overwrite = true WHERE id = $1")
+        sqlx::query("UPDATE repositories SET immutability = 'mutable' WHERE id = $1")
             .bind(f.repo_id)
             .execute(&f.pool)
             .await

@@ -7839,7 +7839,7 @@ mod tests {
         let Some(f) = tdh::Fixture::setup("local", "generic").await else {
             return;
         };
-        sqlx::query("UPDATE repositories SET allow_overwrite = true WHERE id = $1")
+        sqlx::query("UPDATE repositories SET immutability = 'mutable' WHERE id = $1")
             .bind(f.repo_id)
             .execute(&f.pool)
             .await

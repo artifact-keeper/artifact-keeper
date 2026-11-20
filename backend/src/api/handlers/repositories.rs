@@ -34,7 +34,7 @@ use crate::error::{AppError, Result};
 use crate::formats::debian::{DebianConfigPatch, DebianRepositoryConfig, DEBIAN_CONFIG_KEY};
 use crate::formats::maven::MavenHandler;
 use crate::models::access_scope::AccessScope;
-use crate::models::repository::{RepositoryFormat, RepositoryType};
+use crate::models::repository::{RepositoryFormat, RepositoryImmutability, RepositoryType};
 use crate::services::artifact_service::ArtifactService;
 use crate::services::audit_export::details as audit_details;
 use crate::services::audit_service::{
@@ -1100,13 +1100,11 @@ pub struct CreateRepositoryRequest {
     /// uploads to Generic/Mlmodel repos append immutable revisions instead
     /// of overwriting. Defaults to false (current behavior preserved).
     pub versioning_enabled: Option<bool>,
-    /// Make this repository mutable (#5188): re-uploading an existing
-    /// filename replaces it instead of answering 409. Defaults to false
-    /// (immutable, write-once). `true` is rejected (422) unless the repository
-    /// is a local or staging PyPI, Debian, RPM, Alpine, Pacman or Generic one.
-    #[serde(rename = "mutable", alias = "allow_overwrite")]
-    #[schema(rename = "mutable")]
-    pub allow_overwrite: Option<bool>,
+    /// Immutability mode (#5188). `write_once` (the default): re-uploading
+    /// an existing filename answers 409. `mutable`: the re-upload replaces
+    /// it. `mutable` is rejected (422) unless the repository is a local or
+    /// staging PyPI, Debian, RPM, Alpine, Pacman or Generic one.
+    pub immutability: Option<RepositoryImmutability>,
     /// Override the default storage backend for this repository.
     /// When omitted, the server's configured default is used.
     /// Non-admin users may only use the default backend.
@@ -1484,13 +1482,11 @@ pub struct UpdateRepositoryRequest {
     /// When provided, enables/disables first-class artifact versioning for
     /// this Generic/Mlmodel repository (#2367). When omitted, unchanged.
     pub versioning_enabled: Option<bool>,
-    /// When provided, makes the repository mutable (`true`) or immutable
-    /// (`false`) (#5188). When omitted, unchanged. `true` is rejected (422)
-    /// unless the repository is a local or staging PyPI, Debian, RPM, Alpine,
-    /// Pacman or Generic one.
-    #[serde(rename = "mutable", alias = "allow_overwrite")]
-    #[schema(rename = "mutable")]
-    pub allow_overwrite: Option<bool>,
+    /// When provided, sets the immutability mode, `write_once` or `mutable`
+    /// (#5188). When omitted, unchanged. `mutable` is rejected (422) unless
+    /// the repository is a local or staging PyPI, Debian, RPM, Alpine, Pacman
+    /// or Generic one.
+    pub immutability: Option<RepositoryImmutability>,
     /// Update the Cargo index upstream URL (stored in `repository_config`).
     /// When provided, upserts the `index_upstream_url` key for this repository.
     pub index_upstream_url: Option<String>,
@@ -1733,11 +1729,9 @@ pub struct RepositoryResponse {
     /// When true, uploads to this Generic/Mlmodel repository append immutable
     /// revisions instead of overwriting the prior content (#2367).
     pub versioning_enabled: bool,
-    /// When true, re-uploading an existing filename replaces it instead of
-    /// answering 409 (#5188).
-    #[serde(rename = "mutable")]
-    #[schema(rename = "mutable")]
-    pub allow_overwrite: bool,
+    /// `write_once`: re-uploading an existing filename answers 409.
+    /// `mutable`: the re-upload replaces it (#5188).
+    pub immutability: RepositoryImmutability,
     /// Which storage backend holds this repository's content: `filesystem`,
     /// `s3`, `azure`, `gcs`. Accepted on create and immutable afterwards, so
     /// before #3917 it was write-only — no read path echoed it back and
@@ -2323,7 +2317,7 @@ fn repo_to_response(
         is_public: repo.is_public,
         promotion_only: repo.promotion_only,
         versioning_enabled: repo.versioning_enabled,
-        allow_overwrite: repo.allow_overwrite,
+        immutability: repo.immutability,
         storage_backend: repo.storage_backend,
         storage_used_bytes,
         member_storage_used_bytes: None,
@@ -5111,7 +5105,7 @@ pub async fn create_repository(
                 quota_bytes: payload.quota_bytes,
                 promotion_only: payload.promotion_only.unwrap_or(false),
                 versioning_enabled: payload.versioning_enabled.unwrap_or(false),
-                allow_overwrite: payload.allow_overwrite.unwrap_or(false),
+                immutability: payload.immutability.unwrap_or_default(),
                 // Plugin format key takes precedence over any explicit format_key
                 // in the payload: when a WASM plugin format was resolved above,
                 // `plugin_format_key` carries the canonical handler name.
@@ -5370,7 +5364,7 @@ pub async fn create_repository(
                 upstream_auth_change: None,
                 age_gate_change: None,
                 upstream_mode_change: born_remote.upstream_mode_audit(),
-                mutable_change: None,
+                immutability_change: None,
             }),
     )
     .await;
@@ -6700,7 +6694,7 @@ pub async fn update_repository(
                 upstream_url: payload.upstream_url.clone(),
                 promotion_only: payload.promotion_only,
                 versioning_enabled: payload.versioning_enabled,
-                allow_overwrite: payload.allow_overwrite,
+                immutability: payload.immutability,
                 // Three-way (#2472, #4026): omit = unchanged, Some(None) =
                 // clear, Some(Some(id)) = assign (authorized above).
                 project_id: payload.project_id,
@@ -6893,10 +6887,10 @@ pub async fn update_repository(
                 upstream_auth_change: None,
                 age_gate_change: None,
                 upstream_mode_change: None,
-                mutable_change: (existing.allow_overwrite != repo.allow_overwrite).then_some(
-                    audit_details::MutableChangeAudit {
-                        previous_mutable: existing.allow_overwrite,
-                        mutable: repo.allow_overwrite,
+                immutability_change: (existing.immutability != repo.immutability).then_some(
+                    audit_details::ImmutabilityChangeAudit {
+                        previous_immutability: existing.immutability,
+                        immutability: repo.immutability,
                     },
                 ),
             }),
@@ -7663,7 +7657,7 @@ pub async fn delete_repository(
                     upstream_auth_change: None,
                     age_gate_change: None,
                     upstream_mode_change: None,
-                    mutable_change: None,
+                    immutability_change: None,
                 }),
         )
         .await;
@@ -15096,7 +15090,7 @@ async fn audit_remote_setting_change(
         upstream_auth_change: None,
         age_gate_change: None,
         upstream_mode_change: None,
-        mutable_change: None,
+        immutability_change: None,
     };
     fill(&mut details);
     audit_fire_and_forget(
@@ -19524,7 +19518,7 @@ mod tests {
         let now = chrono::Utc::now();
         Repository {
             versioning_enabled: false,
-            allow_overwrite: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             id: Uuid::new_v4(),
             key: "rpm-curation".to_string(),
             name: "RPM Curation".to_string(),
@@ -20001,7 +19995,7 @@ mod tests {
             repodata_depth_editable: false,
             repodata_mode: None,
             versioning_enabled: false,
-            allow_overwrite: true,
+            immutability: RepositoryImmutability::Mutable,
             has_trusted_gpg_key: false,
             id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
             key: "my-repo".to_string(),
@@ -20058,28 +20052,25 @@ mod tests {
         assert!(json.contains("\"quota_bytes\":1048576"));
         assert!(json.contains("\"allow_anonymous_access\":true"));
         assert!(json.contains("\"promotion_only\":false"));
-        // #5188: the field serializes under its API name, not the column name.
-        assert!(json.contains("\"mutable\":true"), "got {json}");
-        assert!(!json.contains("allow_overwrite"));
+        // #5188: the mode serializes as its snake_case name.
+        assert!(json.contains("\"immutability\":\"mutable\""), "got {json}");
     }
 
     #[test]
-    fn test_mutable_json_field_renames_allow_overwrite_5188() {
-        // Request accepts the API name `mutable`...
+    fn test_immutability_json_field_5188() {
         let req: CreateRepositoryRequest = serde_json::from_str(
-            r#"{"key":"k","name":"n","format":"pypi","repo_type":"local","mutable":true}"#,
+            r#"{"key":"k","name":"n","format":"pypi","repo_type":"local","immutability":"mutable"}"#,
         )
         .unwrap();
-        assert_eq!(req.allow_overwrite, Some(true));
-        // ...and the legacy `allow_overwrite` alias stays accepted.
-        let aliased: CreateRepositoryRequest = serde_json::from_str(
-            r#"{"key":"k","name":"n","format":"pypi","repo_type":"local","allow_overwrite":true}"#,
-        )
-        .unwrap();
-        assert_eq!(aliased.allow_overwrite, Some(true));
-        // Update request too.
-        let upd: UpdateRepositoryRequest = serde_json::from_str(r#"{"mutable":false}"#).unwrap();
-        assert_eq!(upd.allow_overwrite, Some(false));
+        assert_eq!(req.immutability, Some(RepositoryImmutability::Mutable));
+        let upd: UpdateRepositoryRequest =
+            serde_json::from_str(r#"{"immutability":"write_once"}"#).unwrap();
+        assert_eq!(upd.immutability, Some(RepositoryImmutability::WriteOnce));
+        // A mode #4812 has not added yet is a 4xx, not silently ignored.
+        assert!(
+            serde_json::from_str::<UpdateRepositoryRequest>(r#"{"immutability":"strict"}"#)
+                .is_err()
+        );
     }
 
     #[test]
@@ -20089,7 +20080,7 @@ mod tests {
             repodata_depth_editable: false,
             repodata_mode: None,
             versioning_enabled: false,
-            allow_overwrite: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             has_trusted_gpg_key: false,
             id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
             key: "my-repo".to_string(),
@@ -21487,7 +21478,7 @@ mod tests {
         let now = chrono::Utc::now();
         let repo = Repository {
             versioning_enabled: false,
-            allow_overwrite: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
             key: "maven-central".to_string(),
             name: "Maven Central".to_string(),
@@ -21543,7 +21534,7 @@ mod tests {
             repodata_depth_editable: false,
             repodata_mode: None,
             versioning_enabled: false,
-            allow_overwrite: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             has_trusted_gpg_key: false,
             id: Uuid::new_v4(),
             key: "npm-age".to_string(),
@@ -21606,7 +21597,7 @@ mod tests {
         let now = chrono::Utc::now();
         let repo = Repository {
             versioning_enabled: false,
-            allow_overwrite: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             id: Uuid::new_v4(),
             key: "npm-hosted".to_string(),
             name: "NPM Local".to_string(),
@@ -21654,7 +21645,7 @@ mod tests {
         let now = chrono::Utc::now();
         let repo = Repository {
             versioning_enabled: false,
-            allow_overwrite: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             id: Uuid::new_v4(),
             key: "docker-all".to_string(),
             name: "Docker Virtual".to_string(),
@@ -21695,7 +21686,7 @@ mod tests {
         let now = chrono::Utc::now();
         let repo = Repository {
             versioning_enabled: false,
-            allow_overwrite: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             id: Uuid::new_v4(),
             key: "cargo-staging".to_string(),
             name: "Cargo Staging".to_string(),
@@ -21814,7 +21805,7 @@ mod tests {
         let now = chrono::Utc::now();
         Repository {
             versioning_enabled: false,
-            allow_overwrite: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             id,
             key: key.to_string(),
             name: key.to_string(),
@@ -26865,7 +26856,7 @@ mod tests {
         let now = chrono::Utc::now();
         Repository {
             versioning_enabled: false,
-            allow_overwrite: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             id: Uuid::new_v4(),
             key: "test-repo".to_string(),
             name: "Test Repo".to_string(),
@@ -37664,7 +37655,7 @@ mod tests {
             allow_anonymous_access: false,
             promotion_only: false,
             versioning_enabled: false,
-            allow_overwrite: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             storage_backend: "filesystem".to_string(),
             storage_used_bytes: 0,
             member_storage_used_bytes: None,
@@ -38802,7 +38793,7 @@ mod tests {
         );
     }
 
-    /// #5188: `allow_overwrite` set on a hash-pinned format (as a row written
+    /// #5188: `immutability = mutable` set on a hash-pinned format (as a row written
     /// before the create/update check existed could be) does not make the
     /// generic PUT replace a released file: different bytes still get 409.
     #[tokio::test]
@@ -38810,7 +38801,7 @@ mod tests {
         let Some(f) = tdh::Fixture::setup("local", "npm").await else {
             return;
         };
-        sqlx::query("UPDATE repositories SET allow_overwrite = true WHERE id = $1")
+        sqlx::query("UPDATE repositories SET immutability = 'mutable' WHERE id = $1")
             .bind(f.repo_id)
             .execute(&f.pool)
             .await

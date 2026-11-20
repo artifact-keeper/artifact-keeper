@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                visibility as \"visibility: RepositoryVisibility\",\n                is_public, quota_bytes, promotion_only,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                age_gate_enabled, age_gate_min_age_days, versioning_enabled, allow_overwrite,\n                project_id, created_at, updated_at\n            FROM repositories\n            WHERE id = $1\n            ",
+  "query": "\n            UPDATE repositories\n            SET\n                key = COALESCE($2, key),\n                name = COALESCE($3, name),\n                description = COALESCE($4, description),\n                is_public = COALESCE($5, is_public),\n                quota_bytes = COALESCE($6, quota_bytes),\n                upstream_url = COALESCE($7, upstream_url),\n                promotion_only = COALESCE($8, promotion_only),\n                versioning_enabled = COALESCE($9, versioning_enabled),\n                project_id = COALESCE($10, project_id),\n                curation_enabled = COALESCE($11, curation_enabled),\n                curation_default_action = COALESCE($12, curation_default_action),\n                -- Written ONLY when the caller supplied `visibility`. A legacy\n                -- client's `is_public` above is left to the database trigger,\n                -- which derives from whichever column actually changed and so\n                -- leaves an `internal` repository alone.\n                visibility = COALESCE($13::repository_visibility, visibility),\n                immutability = COALESCE($14, immutability),\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                visibility as \"visibility: RepositoryVisibility\",\n                is_public, quota_bytes, promotion_only,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                age_gate_enabled, age_gate_min_age_days, versioning_enabled, immutability as \"immutability: RepositoryImmutability\",\n                project_id, created_at, updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -111,7 +111,9 @@
                 "github",
                 "mise",
                 "aqua",
-                "pacman"
+                "pacman",
+                "agentplugins",
+                "mcp"
               ]
             }
           }
@@ -358,12 +360,22 @@
       },
       {
         "ordinal": 23,
-        "name": "allow_overwrite",
-        "type_info": "Bool",
+        "name": "immutability: RepositoryImmutability",
+        "type_info": {
+          "Custom": {
+            "name": "repository_immutability",
+            "kind": {
+              "Enum": [
+                "write_once",
+                "mutable"
+              ]
+            }
+          }
+        },
         "origin": {
           "Table": {
             "table": "repositories",
-            "name": "allow_overwrite"
+            "name": "immutability"
           }
         }
       },
@@ -403,7 +415,41 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Text",
+        "Bool",
+        "Int8",
+        "Varchar",
+        "Bool",
+        "Bool",
+        "Uuid",
+        "Bool",
+        "Text",
+        {
+          "Custom": {
+            "name": "repository_visibility",
+            "kind": {
+              "Enum": [
+                "public",
+                "internal",
+                "private"
+              ]
+            }
+          }
+        },
+        {
+          "Custom": {
+            "name": "repository_immutability",
+            "kind": {
+              "Enum": [
+                "write_once",
+                "mutable"
+              ]
+            }
+          }
+        }
       ]
     },
     "nullable": [
@@ -436,5 +482,5 @@
       false
     ]
   },
-  "hash": "d8d4ad29e4546813599df14d25bfd5201ad6e84e7955e17b1af41c356ef4df97"
+  "hash": "6230b340bf923a4c84f085985f3eccbe4d9238953d6bab5f39c1f5e748e89962"
 }

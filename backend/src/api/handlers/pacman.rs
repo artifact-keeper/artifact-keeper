@@ -1466,11 +1466,11 @@ mod db_tests {
         );
 
         // Flip the repo to mutable.
-        sqlx::query("UPDATE repositories SET allow_overwrite = true WHERE id = $1")
+        sqlx::query("UPDATE repositories SET immutability = 'mutable' WHERE id = $1")
             .bind(fx.repo_id)
             .execute(&fx.pool)
             .await
-            .expect("set allow_overwrite");
+            .expect("set immutability");
         assert_eq!(
             put(&fx, &filename, second.clone()).await,
             StatusCode::CREATED,

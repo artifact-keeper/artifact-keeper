@@ -529,18 +529,17 @@ pub mod details {
         /// mode before and after (`online` / `cache_only`).
         #[serde(skip_serializing_if = "Option::is_none")]
         pub upstream_mode_change: Option<UpstreamModeChangeAudit>,
-        /// A mutability change on update (#5188): whether re-uploading an
-        /// existing path replaced it, before and after. Turning it on lets
-        /// published content change under the same coordinate.
+        /// An immutability-mode change on update (#5188), before and after.
+        /// `mutable` lets published content change under the same coordinate.
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub mutable_change: Option<MutableChangeAudit>,
+        pub immutability_change: Option<ImmutabilityChangeAudit>,
     }
 
-    /// Before/after of a repository's mutability (#5188).
+    /// Before/after of a repository's immutability mode (#5188).
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-    pub struct MutableChangeAudit {
-        pub previous_mutable: bool,
-        pub mutable: bool,
+    pub struct ImmutabilityChangeAudit {
+        pub previous_immutability: crate::models::repository::RepositoryImmutability,
+        pub immutability: crate::models::repository::RepositoryImmutability,
     }
 
     /// Before/after of a Remote's upstream mode (#5282).
@@ -1389,7 +1388,7 @@ mod tests {
             upstream_auth_change: None,
             age_gate_change: None,
             upstream_mode_change: None,
-            mutable_change: None,
+            immutability_change: None,
         };
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["key"], "maven-releases");

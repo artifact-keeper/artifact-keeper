@@ -473,7 +473,8 @@ pub async fn resolve_repo_by_key(
         "SELECT id, key, storage_backend, storage_path, format::text as format, \
          repo_type::text as repo_type, upstream_url, promotion_only, \
          age_gate_enabled, age_gate_min_age_days, age_gate_mode, \
-         curation_enabled, curation_default_action, allow_overwrite \
+         curation_enabled, curation_default_action, \
+         (immutability = 'mutable') AS allow_overwrite \
          FROM repositories WHERE key = $1",
     )
     .bind(repo_key)
@@ -5566,7 +5567,8 @@ pub fn repo_info_from_member(m: &crate::models::repository::Repository) -> RepoI
         age_gate_mode: "upstream_publish_time".to_string(),
         curation_enabled: m.curation_enabled,
         curation_default_action: m.curation_default_action.clone(),
-        allow_overwrite: m.allow_overwrite,
+        allow_overwrite: m.immutability
+            == crate::models::repository::RepositoryImmutability::Mutable,
     }
 }
 
@@ -5782,7 +5784,7 @@ const VIRTUAL_MEMBER_EDGES_SQL: &str = r#"
         r.replication_priority,
         r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
         r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,
-        r.age_gate_enabled, r.age_gate_min_age_days, r.versioning_enabled, r.allow_overwrite,
+        r.age_gate_enabled, r.age_gate_min_age_days, r.versioning_enabled, r.immutability,
         r.project_id, r.created_at, r.updated_at
       FROM reach
       JOIN repositories r ON r.id = reach.member_repo_id
@@ -11079,7 +11081,7 @@ pub(crate) fn build_remote_repo_with_format(
         age_gate_enabled: false,
         age_gate_min_age_days: 7,
         versioning_enabled: false,
-        allow_overwrite: false,
+        immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
         project_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -22494,7 +22496,7 @@ mod tests {
         db_helpers::cleanup(&pool, repo_id, user_id).await;
     }
 
-    // #5188: a mutable (allow_overwrite) file-drop repo must NOT 409 on a
+    // #5188: a mutable file-drop repo must NOT 409 on a
     // re-upload to an occupied path, and must NOT remove the live row either:
     // the caller retires it inside its publish transaction, so a publish that
     // fails afterwards leaves the old package in place.

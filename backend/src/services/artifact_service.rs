@@ -15,7 +15,9 @@ use crate::api::handlers::escape_like_literal;
 use crate::api::middleware::download_telemetry::DownloadContext;
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata, ArtifactVersion};
-use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
+use crate::models::repository::{
+    Repository, RepositoryFormat, RepositoryImmutability, RepositoryType,
+};
 use crate::services::opensearch_service::{ArtifactDocument, OpenSearchService};
 use crate::services::quality_check_service::QualityCheckService;
 use crate::services::repository_service::RepositoryService;
@@ -281,19 +283,21 @@ pub(crate) fn overwrite_supported(format: &RepositoryFormat, repo_type: &Reposit
         )
 }
 
-/// Error for a `mutable: true` request on a repository [`overwrite_supported`]
+/// Error for an `immutability: mutable` request on a repository [`overwrite_supported`]
 /// rejects.
-pub(crate) const OVERWRITE_UNSUPPORTED: &str = "mutable is only supported on local or staging \
+pub(crate) const OVERWRITE_UNSUPPORTED: &str =
+    "immutability `mutable` is only supported on local or staging \
      PyPI, Debian, RPM, Alpine, Pacman and Generic repositories";
 
 /// Whether an upload may replace the content already at its path (#5188):
-/// the repository opted in via `allow_overwrite` (DEFAULT false) and its
+/// the repository opted in with `immutability = mutable` (DEFAULT
+/// `write_once`) and its
 /// format and type are [`overwrite_supported`], so a flag set on any other
 /// repository before that check existed is ignored. Versioning wins when both
 /// are set, so a versioned repository still appends a revision rather than
 /// discarding history.
 pub(crate) fn overwrite_applies(repo: &Repository) -> bool {
-    repo.allow_overwrite
+    repo.immutability == RepositoryImmutability::Mutable
         && overwrite_supported(&repo.format, &repo.repo_type)
         && !versioning_applies(&repo.format, repo.versioning_enabled)
 }
@@ -6656,13 +6660,13 @@ mod tests {
             age_gate_enabled: false,
             age_gate_min_age_days: 0,
             versioning_enabled: false,
-            allow_overwrite: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             project_id: None,
             created_at: now,
             updated_at: now,
         };
         assert!(!overwrite_applies(&repo), "default is immutable");
-        repo.allow_overwrite = true;
+        repo.immutability = RepositoryImmutability::Mutable;
         assert!(overwrite_applies(&repo));
         // Versioning keeps history instead of replacing it.
         repo.format = RepositoryFormat::Generic;
@@ -6688,14 +6692,14 @@ mod tests {
         }
     }
 
-    /// #5188: on a repository with `allow_overwrite`, a different-bytes
+    /// #5188: on a mutable repository, a different-bytes
     /// re-upload to a released coordinate replaces it under a NEW artifact id:
     /// the scan results and promotion approvals recorded for the old bytes go
     /// with the old row instead of staying attached to the new bytes, and the
     /// object it pointed at is handed to storage GC. Identical bytes keep the
     /// id (and what was recorded for them) and journal nothing.
     #[tokio::test]
-    async fn allow_overwrite_replaces_released_coordinate_db() {
+    async fn mutable_repo_replaces_released_coordinate_db() {
         use crate::api::handlers::test_db_helpers as tdh;
 
         let Some(pool) = tdh::try_pool().await else {
@@ -6704,11 +6708,11 @@ mod tests {
         let (user_id, _username) = tdh::create_user(&pool).await;
         let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "pypi").await;
         let (target_id, _target_key, target_dir) = tdh::create_repo(&pool, "local", "pypi").await;
-        sqlx::query("UPDATE repositories SET allow_overwrite = true WHERE id = $1")
+        sqlx::query("UPDATE repositories SET immutability = 'mutable' WHERE id = $1")
             .bind(repo_id)
             .execute(&pool)
             .await
-            .expect("set allow_overwrite");
+            .expect("set immutability");
 
         let storage: Arc<dyn StorageBackend> = Arc::new(
             crate::storage::filesystem::FilesystemStorage::new(storage_dir.clone()),

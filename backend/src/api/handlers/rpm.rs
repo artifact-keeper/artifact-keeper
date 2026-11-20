@@ -5827,11 +5827,11 @@ mod tests {
             let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
                 return;
             };
-            sqlx::query("UPDATE repositories SET allow_overwrite = true WHERE id = $1")
+            sqlx::query("UPDATE repositories SET immutability = 'mutable' WHERE id = $1")
                 .bind(f.repo_id)
                 .execute(&f.pool)
                 .await
-                .expect("set allow_overwrite");
+                .expect("set immutability");
             let mut conn = f.pool.acquire().await.unwrap();
             crate::services::rpm_layout::set_depth(&mut conn, f.repo_id, depth)
                 .await

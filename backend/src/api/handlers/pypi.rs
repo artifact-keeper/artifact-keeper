@@ -6621,11 +6621,11 @@ async fn upload(
         }
     }
 
-    // Check for duplicate. `Some(allow_overwrite)` when the file exists; a
+    // Check for duplicate. `Some(mutable)` when the file exists; a
     // mutable PyPI repository (#5188) lets the upload below replace it, a
     // Poetry, Conda or Jupyter repository on this route never does.
     let existing = sqlx::query_scalar!(
-        "SELECT r.allow_overwrite FROM repositories r \
+        "SELECT r.immutability = 'mutable' AS \"mutable!\" FROM repositories r \
          WHERE r.id = $1 AND EXISTS (SELECT 1 FROM artifacts a \
              WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false)",
         repo.id,
@@ -6635,7 +6635,7 @@ async fn upload(
     .await
     .map_err(map_db_err)?;
 
-    if existing.is_some_and(|allow_overwrite| !(allow_overwrite && repo.overwrite_allowed())) {
+    if existing.is_some_and(|mutable| !(mutable && repo.overwrite_allowed())) {
         return Err(AppError::Conflict("File already exists".to_string()).into_response());
     }
 
@@ -13107,11 +13107,11 @@ mod tests {
 
         let (first, _) = upload(b"build-1").await;
         let (immutable, _) = upload(b"build-2").await;
-        sqlx::query("UPDATE repositories SET allow_overwrite = true WHERE id = $1")
+        sqlx::query("UPDATE repositories SET immutability = 'mutable' WHERE id = $1")
             .bind(fx.repo_id)
             .execute(&fx.pool)
             .await
-            .expect("set allow_overwrite");
+            .expect("set immutability");
         let (mutable, mutable_body) = upload(b"build-2").await;
         let stored: String = sqlx::query_scalar(
             "SELECT checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = $2",

@@ -5320,11 +5320,11 @@ mod db_cov_tests {
         );
 
         // Flip the repo to mutable and re-upload: now it replaces.
-        sqlx::query("UPDATE repositories SET allow_overwrite = true WHERE id = $1")
+        sqlx::query("UPDATE repositories SET immutability = 'mutable' WHERE id = $1")
             .bind(fx.repo_id)
             .execute(&fx.pool)
             .await
-            .expect("set allow_overwrite");
+            .expect("set immutability");
         let (mutable, body) = put(super::MARKER_APK).await;
         assert!(
             mutable.is_success(),
@@ -5385,11 +5385,11 @@ mod db_cov_tests {
         let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
             return;
         };
-        sqlx::query("UPDATE repositories SET allow_overwrite = true WHERE id = $1")
+        sqlx::query("UPDATE repositories SET immutability = 'mutable' WHERE id = $1")
             .bind(fx.repo_id)
             .execute(&fx.pool)
             .await
-            .expect("set allow_overwrite");
+            .expect("set immutability");
         let path = format!("/{}/v3.21/main/aarch64/dtf-marker-1.0-r0.apk", fx.repo_key);
         let put = |bytes: &'static [u8]| {
             tdh::send(

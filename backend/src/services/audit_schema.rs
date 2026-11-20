@@ -297,7 +297,7 @@ mod tests {
                     upstream_auth_change: None,
                     age_gate_change: None,
                     upstream_mode_change: None,
-                    mutable_change: None,
+                    immutability_change: None,
                 }),
         ];
         for entry in &entries {
@@ -394,9 +394,10 @@ mod tests {
                     previous_upstream_mode: "online".into(),
                     upstream_mode: "cache_only".into(),
                 }),
-                mutable_change: Some(details::MutableChangeAudit {
-                    previous_mutable: false,
-                    mutable: true,
+                immutability_change: Some(details::ImmutabilityChangeAudit {
+                    previous_immutability:
+                        crate::models::repository::RepositoryImmutability::WriteOnce,
+                    immutability: crate::models::repository::RepositoryImmutability::Mutable,
                 }),
             })
             .unwrap(),
