@@ -428,6 +428,24 @@ impl RepoInfo {
     pub fn reject_if_promotion_only(&self, is_admin: bool) -> Result<(), Response> {
         reject_direct_upload_if_promotion_only(self.promotion_only, is_admin)
     }
+
+    /// Whether an upload may replace the live file at its path (#5188): the
+    /// repository opted in and its format and type pass
+    /// [`overwrite_supported`](crate::services::artifact_service::overwrite_supported),
+    /// the gate `overwrite_applies` puts on the generic upload paths. A flag
+    /// left on a repository the allowlist rejects (a Poetry or Conda repo on
+    /// the PyPI route) is ignored.
+    pub fn overwrite_allowed(&self) -> bool {
+        self.allow_overwrite
+            && matches!(
+                (
+                    crate::services::repository_service::parse_format_str(&self.format),
+                    RepositoryType::from_db_str(&self.repo_type),
+                ),
+                (Some(format), Some(repo_type))
+                    if crate::services::artifact_service::overwrite_supported(&format, &repo_type)
+            )
+    }
 }
 
 /// Look up a repository by key and verify that its format matches one of the
@@ -19557,6 +19575,37 @@ mod tests {
         let repo = promo_repo_info(false);
         assert!(repo.reject_if_promotion_only(false).is_ok());
         assert!(repo.reject_if_promotion_only(true).is_ok());
+    }
+
+    #[test]
+    fn test_repoinfo_overwrite_allowed_follows_overwrite_supported() {
+        let repo = |format: &str, repo_type: &str, allow_overwrite: bool| RepoInfo {
+            format: format.to_string(),
+            repo_type: repo_type.to_string(),
+            allow_overwrite,
+            ..promo_repo_info(false)
+        };
+        for format in ["pypi", "debian", "rpm", "alpine", "pacman", "generic"] {
+            assert!(repo(format, "local", true).overwrite_allowed(), "{format}");
+            assert!(
+                repo(format, "staging", true).overwrite_allowed(),
+                "{format}"
+            );
+            assert!(
+                !repo(format, "local", false).overwrite_allowed(),
+                "{format}"
+            );
+            assert!(
+                !repo(format, "remote", true).overwrite_allowed(),
+                "{format}"
+            );
+        }
+        // The PyPI and Debian routes also serve these formats, the allowlist
+        // does not.
+        for format in ["poetry", "conda", "jupyter", "apt", "npm", ""] {
+            assert!(!repo(format, "local", true).overwrite_allowed(), "{format}");
+        }
+        assert!(!repo("pypi", "", true).overwrite_allowed());
     }
 
     // ── promotion_only direct-delete gate ───────────────────────────

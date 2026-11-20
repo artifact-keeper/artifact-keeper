@@ -780,7 +780,7 @@ async fn store_package(
         repo.id,
         &artifact_path,
         "Package already exists",
-        repo.allow_overwrite,
+        repo.overwrite_allowed(),
     )
     .await?;
 

@@ -6622,7 +6622,8 @@ async fn upload(
     }
 
     // Check for duplicate. `Some(allow_overwrite)` when the file exists; a
-    // mutable repository (#5188) lets the upload below replace it.
+    // mutable PyPI repository (#5188) lets the upload below replace it, a
+    // Poetry, Conda or Jupyter repository on this route never does.
     let existing = sqlx::query_scalar!(
         "SELECT r.allow_overwrite FROM repositories r \
          WHERE r.id = $1 AND EXISTS (SELECT 1 FROM artifacts a \
@@ -6634,7 +6635,7 @@ async fn upload(
     .await
     .map_err(map_db_err)?;
 
-    if existing == Some(false) {
+    if existing.is_some_and(|allow_overwrite| !(allow_overwrite && repo.overwrite_allowed())) {
         return Err(AppError::Conflict("File already exists".to_string()).into_response());
     }
 
