@@ -16,8 +16,9 @@
 #   1. A workflow re-floats. `rust-toolchain.toml` is only load-bearing for a
 #      job that lets rustup choose; a `@stable` / `@nightly` / `@master` ref, or
 #      a `toolchain:` input naming a different version, overrides or fights it.
-#      Every `dtolnay/rust-toolchain@<ref>` in .github/workflows must name the
-#      pinned version.
+#      Every `dtolnay/rust-toolchain` step in .github/workflows is pinned by
+#      commit sha and passes `toolchain: <the pinned version>` (#6178: a
+#      branch ref such as `@1.98.0` can move under the same name).
 #   2. The pin turns out to be inert. A runner image whose cargo is not a rustup
 #      shim ignores `rust-toolchain.toml` entirely; the file would sit in the
 #      repo looking like protection while the compiler kept floating. Run with
@@ -78,19 +79,47 @@ fi
 # ci.yml and rust-toolchain.toml that explain #3551 -- is not mistaken for the
 # thing itself. Also catches any `toolchain:` input handed to the action.
 if [ -d "$WORKFLOW_DIR" ]; then
-  while IFS= read -r hit; do
-    file="${hit%%:*}"
-    rest="${hit#*:}"
-    line="${rest%%:*}"
-    ref="$(sed 's#.*dtolnay/rust-toolchain@##; s#[[:space:]].*##; s#\r##' <<<"$hit")"
-    if [ "$ref" != "$PINNED" ]; then
+  # One row per `uses: dtolnay/rust-toolchain@<ref>` step: file, line, ref,
+  # and the step's `toolchain:` input (empty when it has none). The step
+  # ends at the next line indented no deeper than its `- `.
+  while IFS=$'\t' read -r file line ref tc; do
+    [ -z "$file" ] && continue
+    if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+      if [ "$tc" != "$PINNED" ]; then
+        fail "$(basename "$file"):$line pins dtolnay/rust-toolchain by sha but its
+      step passes 'toolchain: ${tc:-<none>}'. A sha-pinned step must pass
+      'toolchain: $PINNED' (rust-toolchain.toml): at a sha, the input is what
+      chooses the compiler (#6178)."
+      fi
+    else
       fail "$(basename "$file"):$line uses dtolnay/rust-toolchain@$ref.
-      Expected @$PINNED to match rust-toolchain.toml. A channel ref
-      ('stable'/'beta'/'nightly'/'master') resolves at run time, which is
-      exactly how #3551 reached main."
+      Pin the action by commit sha with 'toolchain: $PINNED' as its input
+      (#6178). A branch or channel ref ('stable'/'master'/'$PINNED') can move
+      under the same name, which is how #3551 reached main."
     fi
-  done < <(grep -rnE "^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]*dtolnay/rust-toolchain@" \
-    "$WORKFLOW_DIR" || true)
+  done < <(for f in "$WORKFLOW_DIR"/*.yml "$WORKFLOW_DIR"/*.yaml; do
+      [ -f "$f" ] || continue
+      awk -v F="$f" '
+        function flush() { if (ln) { printf "%s\t%s\t%s\t%s\n", F, ln, ref, tc }; ln = "" }
+        {
+          sub(/\r$/, "")
+          if (ln && $0 !~ /^[[:space:]]*(#.*)?$/) {
+            match($0, /^[[:space:]]*/); ind = RLENGTH
+            if (ind <= dash) flush()
+          }
+          if (ln && $0 ~ /^[[:space:]]*toolchain:[[:space:]]*[^[:space:]]/) {
+            v = $0; sub(/^[[:space:]]*toolchain:[[:space:]]*/, "", v); sub(/[[:space:]#].*/, "", v); gsub(/["\047]/, "", v); tc = v
+          }
+          if ($0 ~ /^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]*dtolnay\/rust-toolchain@/) {
+            flush()
+            r = $0; sub(/.*dtolnay\/rust-toolchain@/, "", r); sub(/[[:space:]].*/, "", r)
+            match($0, /^[[:space:]]*/); u = RLENGTH
+            dash = ($0 ~ /^[[:space:]]*-[[:space:]]/) ? u : u - 2
+            ln = NR; ref = r; tc = ""
+          }
+        }
+        END { flush() }' "$f"
+    done)
 
   while IFS= read -r hit; do
     file="${hit%%:*}"
@@ -147,7 +176,7 @@ $(sed 's/^/        /' "$rustc_err"; rm -f "$rustc_err")"
       rustc $active, so the pin is NOT in force here. Most likely this
       runner's cargo/rustc are not rustup shims and ignore the toolchain
       file; that job needs an explicit
-      'uses: dtolnay/rust-toolchain@$PINNED' step (#3551)."
+      dtolnay/rust-toolchain step (sha-pinned, 'toolchain: $PINNED') (#3551)."
     fi
   fi
 fi
