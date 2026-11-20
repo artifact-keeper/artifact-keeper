@@ -4074,9 +4074,9 @@ async fn pypi_proxy_cache_redirect(
         return None;
     }
     // #1555: resolve the no-prefix presign handle and confirm redirect support
-    // BEFORE the `is_cache_fresh` probe — the probe loads the cache-meta
-    // sidecar, so we avoid a wasted S3 GET when we can't redirect anyway (the
-    // streaming fallback re-reads the same sidecar).
+    // BEFORE the `fresh_cache_redirect_size` probe — the probe loads the
+    // cache-meta sidecar, so we avoid a wasted S3 GET when we can't redirect
+    // anyway (the streaming fallback re-reads the same sidecar).
     let storage = proxy.cache_storage_backend();
     if !storage.supports_redirect() {
         return None;
@@ -17716,7 +17716,8 @@ mod tests {
         let proxy = tdh::build_proxy_service_with_fs(pool.clone(), &storage_path);
         // Presigned ENABLED, but the filesystem proxy backend reports
         // supports_redirect() == false, so the helper must still return None
-        // without touching the DB (the is_cache_fresh probe is never reached).
+        // without touching the DB (the fresh_cache_redirect_size probe is
+        // never reached).
         let state =
             tdh::build_state_with_proxy_presigned(pool.clone(), &storage_path, proxy.clone());
 
