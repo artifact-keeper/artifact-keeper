@@ -135,7 +135,10 @@ impl DbAdmission {
     }
 
     fn record_hold(&self, held: Duration) {
-        let sample = held.as_micros().min(u64::MAX as u128) as u64;
+        // A slot held for longer than the wait budget (a request stuck on a
+        // lock, a slow upload) counts as the budget: one outlier must not
+        // make the gate predict long waits for the fast requests after it.
+        let sample = held.min(self.wait).as_micros().min(u64::MAX as u128) as u64;
         // A lost update under contention only skips one sample.
         let old = self.avg_hold_us.load(Ordering::Relaxed);
         let new = if old == 0 {
@@ -167,8 +170,10 @@ impl DbAdmission {
         }
         // Queue only when the queue ahead is predicted to clear within the
         // wait; otherwise say at once how long the backlog is.
+        // With nobody queued yet the request always gets to wait: a
+        // prediction needs a queue to be about.
         let queued = self.waiters.load(Ordering::Relaxed);
-        if predicted_wait(queued + 1, self.avg_hold(), self.capacity) > self.wait {
+        if queued > 0 && predicted_wait(queued + 1, self.avg_hold(), self.capacity) > self.wait {
             return self.shed();
         }
         self.waiters.fetch_add(1, Ordering::Relaxed);
@@ -444,6 +449,13 @@ mod tests {
             assert!(
                 (15_000..=17_000).contains(&avg),
                 "converged to 16 ms: {avg}"
+            );
+            let clamp = DbAdmission::new(PgPool::connect_lazy(pool_url).unwrap(), 2000, 4).unwrap();
+            clamp.record_hold(Duration::from_secs(60));
+            assert_eq!(
+                clamp.avg_hold_us.load(Ordering::Relaxed),
+                2_000_000,
+                "a hold longer than the wait counts as the wait"
             );
         });
     }
