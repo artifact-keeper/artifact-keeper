@@ -199,7 +199,19 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
                         );
                         let windows = crate::services::proxy_scan_service::db_grace_windows();
                         let window = windows.serving.max(windows.fail_closed).num_seconds() as f64;
-                        if window > 0.0 && secs > window / 2.0 {
+                        static LAST_WARN: std::sync::Mutex<Option<tokio::time::Instant>> =
+                            std::sync::Mutex::new(None);
+                        let behind = window > 0.0 && secs > window / 2.0;
+                        let due = behind
+                            && LAST_WARN.lock().is_ok_and(|mut last| {
+                                let due =
+                                    last.is_none_or(|at| at.elapsed() > Duration::from_secs(300));
+                                if due {
+                                    *last = Some(tokio::time::Instant::now());
+                                }
+                                due
+                            });
+                        if due {
                             tracing::warn!(
                                 oldest_secs = secs,
                                 window_secs = window,

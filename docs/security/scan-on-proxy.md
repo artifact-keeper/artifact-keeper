@@ -605,7 +605,10 @@ build a scan recorded. Each scan type's last-known build is kept in
 never moves backwards there; to forget one (for example after rolling a
 scanner's database back on purpose), delete its row,
 `DELETE FROM scan_vuln_db_builds WHERE scan_type = 'grype';`, and the next pass
-records the build the scanner reports now. A latest scan with no recorded build
+records the build the scanner reports now. Proxy scan verdicts keep their own
+record of builds (`proxy_scan_db_versions`, see
+[After a vulnerability-database update](#after-a-vulnerability-database-update));
+the rollback procedure for those is described there. A latest scan with no recorded build
 counts as older. Each such content digest, in a repository with scanning on,
 becomes one `rescan` job at the lowest priority, below hosted scans, so every
 other job is claimed first. The worker scans the digest once, with the scanners
@@ -678,9 +681,13 @@ depends on the repository's action:
 | `fail_closed` | `PROXY_SCAN_DB_GRACE_HOURS_FAIL_CLOSED` | `0` (off) | `24` |
 
 `0` turns the grace off for those actions. A larger value is clamped to the
-ceiling, with a warning in the log. Under `fail_open` and `record_only` the pull
-is served either way, so the grace only changes how the pull is labelled and
-when the scan runs. Under `fail_closed` it is an **opt-in trade**: within the
+ceiling, with a warning in the log. Under `fail_open` and `record_only` a pull
+decided by a `clean` verdict is served either way, so for it the grace only
+changes how the pull is labelled and when the scan runs. A pull decided by a
+`vulnerable` verdict from the previous build is **refused** (`403` under
+`fail_open`) for the window, where before the update made it `pending` and it
+was served while the new scan ran: an availability change in the safe
+direction. Under `fail_closed` it is an **opt-in trade**: within the
 window, a pull can be served clean from a verdict made before the new database
 added an advisory. Opt in only if that exposure (at most the window, on top of
 the time a database build already takes to reach you) is acceptable.
@@ -762,10 +769,30 @@ so a restart or a new replica does not reopen it. As a result, a replica that
 installs the new database more than the window after the first sighting gets
 no grace for it.
 
-A verdict graded against a **newer** build than the live one is always reused,
-whatever the grace settings. This happens when one replica updates before
-another, or during a rolling upgrade. Before, the replica with the older build
-re-scanned it, and the next replica re-scanned it back.
+A verdict graded against a **newer** build than the live one is reused, under
+every action, while the fleet first saw that build within the longer of the
+two windows (`0` for both turns this off too). This happens when one replica
+updates before another, or during a rolling upgrade. Before, the replica with
+the older build re-scanned it, and the next replica re-scanned it back. The
+trust is bounded so that a build that was rolled back stops counting.
+
+**Rolling back a database build.** If a build grades wrongly (for example it
+misses an advisory and grades a vulnerable package clean) and you roll back
+to the previous build, the replicas on the older build keep trusting the bad
+build's verdicts until its trust window ends, at most the longer of the two
+windows after the fleet first saw it. To stop that at once, and to re-scan
+everything the bad build graded on its next pull, purge its verdicts and its
+record:
+
+```sql
+DELETE FROM proxy_scan_results WHERE scanner_version = 'grype-0.120.1+db-2026-11-20';
+DELETE FROM proxy_scan_db_versions WHERE scanner_version = 'grype-0.120.1+db-2026-11-20';
+```
+
+Each process reloads its record within a minute, and the fast paths' verdict
+memo within 30 seconds. Deleting a verdict makes the next pull of those bytes
+scan them again (under `fail_closed` inline, as for a first pull). It is not a
+waiver: a vulnerable package graded vulnerable again is blocked again.
 
 With the `fail_closed` grace on, the presigned-redirect fast paths
 ([below](#proxy-cache-fast-paths)) do not redirect a `clean` verdict that only
