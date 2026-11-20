@@ -2190,6 +2190,7 @@ impl S3Backend {
                 dedicated_signing_creds = config.presign_access_key.is_some()
                     && config.presign_secret_key.is_some(),
                 public_endpoint = config.public_endpoint.as_deref().unwrap_or("-"),
+                virtual_hosted_style = config.virtual_hosted_style,
                 "S3 redirect downloads enabled"
             );
             if config.endpoint.is_some()
