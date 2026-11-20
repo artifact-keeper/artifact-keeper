@@ -30,6 +30,12 @@
 -- at commit, while that lock is still held, so the committed bytes are visible
 -- to the next admission.
 --
+-- Cost per counted write is one primary-key upsert on the pending table plus
+-- one primary-key insert on the flush marker; each committing transaction then
+-- removes at most one pending row and one marker per repository it touched.
+-- A 10,000-row restore therefore still performs one ordered apply per
+-- repository, not 10,000 row-lock acquisitions on the ledger.
+--
 -- `reconcile_usage_ledger_in_tx` continues to write an absolute recompute. It
 -- now also discards that transaction's pending delta for the repository (see
 -- the application change in this PR), so a reconcile inside a transaction that
@@ -44,8 +50,9 @@ SET LOCAL lock_timeout = '5s';
 -- when the negative deltas are enqueued, exactly why the original shrink path
 -- uses a plain UPDATE rather than an upsert. Rows are private to one backend;
 -- the PK also serves the `WHERE backend_pid = $1 ORDER BY repository_id`
--- flush walk.
-CREATE TABLE repository_usage_ledger_pending (
+-- flush walk. UNLOGGED is safe because a crash discards every in-flight
+-- transaction with these rows; neither table is read outside its own backend.
+CREATE UNLOGGED TABLE repository_usage_ledger_pending (
     backend_pid   INTEGER NOT NULL,
     repository_id UUID    NOT NULL,
     hosted_delta  BIGINT  NOT NULL DEFAULT 0,
@@ -57,8 +64,8 @@ CREATE TABLE repository_usage_ledger_pending (
 -- One row per transaction that has queued anything. The deferred trigger below
 -- fires once, at COMMIT, instead of once per source row: bulk writes (a
 -- restore, a GC sweep) enqueue thousands of deltas but still take the ledger
--- rows in one ordered pass.
-CREATE TABLE repository_usage_ledger_flush (
+-- rows in one ordered pass. Unlogged for the same reason as the pending table.
+CREATE UNLOGGED TABLE repository_usage_ledger_flush (
     backend_pid INTEGER PRIMARY KEY
 );
 
