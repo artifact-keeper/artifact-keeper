@@ -1191,6 +1191,31 @@ jobs:
             exit 1
           fi
 
+      # #6329: a test helper used only by another shard's tests (the
+      # `archive_scan_suite` macro in services-1, 2026-11-20) compiles to a
+      # rustc warning in this leg, and `cargo clippy --lib --tests --features
+      # test-shard-<name> -- -D warnings` fails on it locally while CI stayed
+      # green. Re-running the same build is a no-op (seconds: nothing
+      # recompiles) and cargo replays the cached diagnostics, so this reads
+      # the leg's warnings without a second compile and fails on any in the
+      # workspace's own crates.
+      - name: Refuse compiler warnings in this shard's test build
+        if: steps.build.outcome == 'success'
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          out="$(cargo nextest run --workspace --lib --no-run --features "test-shard-${{ matrix.shard }}" 2>&1)"
+          if [ "${{ matrix.shard }}" = "$BIN_SHARD" ]; then
+            out+=$'\n'"$(cargo nextest run --workspace --bins --no-run --features "test-shard-${{ matrix.shard }}" 2>&1)"
+          fi
+          if grep -qE '^warning: `artifact-keeper[^`]*` \(.*\) generated [0-9]+ warnings?' <<<"$out"; then
+            printf '%s\n' "$out" | grep -vE '^ *(Compiling|Finished|Executable|Blocking|Downloaded|Fresh) '
+            echo "::error title=Compiler warnings in shard ${{ matrix.shard }}::this leg's test build has rustc warnings (above). A test helper unused in this shard belongs under lib.rs's shard-subset cfg_attr allow list (#6329); anything else is a real warning to fix."
+            exit 1
+          fi
+          echo "no compiler warnings in the ${{ matrix.shard }} test build"
+
       # See the pool job's history (#3494, #3699, #3479) for the flags:
       # `--bins` on the leg that owns the bin-target tests, `--no-fail-fast`
       # so a red run reports every failure, and the LLVM %Nm merge pool so
