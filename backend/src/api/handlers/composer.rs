@@ -1857,7 +1857,7 @@ struct SearchQuery {
 ///
 /// `per_page` is the *raw* request value (`None` when the client did not send
 /// one); we only append it when explicitly provided so default-page links stay
-/// clean. `type_filter` is appended verbatim when set.
+/// clean. `query_str` and `type_filter` are percent-encoded (#6285).
 fn build_search_next_url(
     repo_key: &str,
     query_str: &str,
@@ -1870,124 +1870,180 @@ fn build_search_next_url(
         None => String::new(),
     };
     let type_param = match type_filter {
-        Some(t) => format!("&type={}", t),
+        Some(t) => format!("&type={}", urlencoding::encode(t)),
         None => String::new(),
     };
     format!(
         "/composer/{}/search.json?q={}&page={}{}{}",
         repo_key,
-        query_str,
+        urlencoding::encode(query_str),
         page + 1,
         per_page_param,
         type_param,
     )
 }
 
+/// The normalised parameters of one search request.
+struct SearchParams<'a> {
+    query: &'a str,
+    type_filter: Option<&'a str>,
+    per_page: i64,
+    page: i64,
+}
+
+/// One page of search hits over a set of hosted repositories (#6285).
+#[derive(Debug, Default)]
+struct SearchPage {
+    results: Vec<serde_json::Value>,
+    total: i64,
+    has_next: bool,
+}
+
+/// One search hit in the wire shape, its `url` pointing at the p2 metadata of
+/// the repository the client asked (the Virtual for a member's hit).
+fn search_hit(repo_key: &str, name: &str, description: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "description": description,
+        "url": format!("/composer/{}/p2/{}.json", repo_key, name),
+    })
+}
+
+/// Search the hosted rows of `repo_ids`, one hit per package name. When a name
+/// is in several repositories the hit (and its description) comes from the
+/// first of `repo_ids` holding it, so a Virtual passes its members in priority
+/// order (#6285).
+async fn search_hosted(
+    db: &PgPool,
+    repo_ids: &[uuid::Uuid],
+    url_repo_key: &str,
+    params: &SearchParams<'_>,
+) -> Result<SearchPage, Response> {
+    if repo_ids.is_empty() {
+        return Ok(SearchPage::default());
+    }
+    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    // must match themselves; escaped here and matched under `ESCAPE '\'`.
+    let search_pattern = format!("%{}%", super::escape_like_literal(params.query));
+    let offset = (params.page - 1) * params.per_page;
+
+    // The `type` filter is applied in SQL (against the composer metadata) so
+    // that pagination LIMIT/OFFSET and the total count both see the same
+    // filtered row set (#1781). `$3::text IS NULL` short-circuits the
+    // predicate when no type is requested.
+    let rows: Vec<(String, Option<serde_json::Value>)> = sqlx::query_as(
+        r#"
+        SELECT DISTINCT ON (a.name) a.name, am.metadata
+        FROM artifacts a
+        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = ANY($1)
+          AND a.is_deleted = false
+          AND a.name ILIKE $2 ESCAPE '\'
+          AND ($3::text IS NULL OR am.metadata #>> '{composer,type}' = $3)
+        ORDER BY a.name, array_position($1, a.repository_id), a.created_at DESC
+        LIMIT $4 OFFSET $5
+        "#,
+    )
+    .bind(repo_ids)
+    .bind(&search_pattern)
+    .bind(params.type_filter)
+    .bind(params.per_page)
+    .bind(offset)
+    .fetch_all(db)
+    .await
+    .map_err(crate::api::handlers::db_err)?;
+
+    // Count total results for pagination — must honor the same `type`
+    // predicate as the page query (#1781).
+    let total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(DISTINCT a.name)
+        FROM artifacts a
+        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = ANY($1)
+          AND a.is_deleted = false
+          AND a.name ILIKE $2 ESCAPE '\'
+          AND ($3::text IS NULL OR am.metadata #>> '{composer,type}' = $3)
+        "#,
+    )
+    .bind(repo_ids)
+    .bind(&search_pattern)
+    .bind(params.type_filter)
+    .fetch_one(db)
+    .await
+    .map_err(crate::api::handlers::db_err)?;
+
+    let results = rows
+        .iter()
+        .map(|(name, metadata)| {
+            let description = metadata
+                .as_ref()
+                .and_then(|m| m.pointer("/composer/description"))
+                .and_then(|d| d.as_str())
+                .unwrap_or("");
+            search_hit(url_repo_key, name, description)
+        })
+        .collect();
+    let total_pages = ((total as f64) / (params.per_page as f64)).ceil() as i64;
+    Ok(SearchPage {
+        results,
+        total,
+        has_next: params.page < total_pages,
+    })
+}
+
+/// The hosted repositories a search reads. A Virtual stores nothing itself, so
+/// it searches its Local and Staging members, walked as `packages.json` walks
+/// them: only members this caller may read (#3323), in priority order (#6285).
+/// Remote members contribute nothing, as before.
+async fn search_repo_ids(
+    db: &PgPool,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+) -> Result<Vec<uuid::Uuid>, Response> {
+    if repo.repo_type != RepositoryType::Virtual {
+        return Ok(vec![repo.id]);
+    }
+    let members = proxy_helpers::authorized_virtual_members(db, auth, repo.id).await?;
+    Ok(members
+        .iter()
+        .filter(|m| m.repo_type.is_hosted())
+        .map(|m| m.id)
+        .collect())
+}
+
 async fn search(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     Query(params): Query<SearchQuery>,
 ) -> Result<Response, Response> {
     let repo = resolve_composer_repo(&state.db, &repo_key).await?;
 
-    let query_str = params.q.unwrap_or_default();
-    let per_page = params.per_page.unwrap_or(15).min(100);
-    let page = params.page.unwrap_or(1).max(1);
-    let offset = (page - 1) * per_page;
-
-    // Search by name pattern
-    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
-    // must match themselves; escaped here and matched under `ESCAPE '\'`.
-    let search_pattern = format!("%{}%", super::escape_like_literal(&query_str));
-
-    // The `type` filter is applied in SQL (against the composer metadata) so
-    // that pagination LIMIT/OFFSET and the total count both see the same
-    // filtered row set. Filtering in Rust *after* LIMIT/OFFSET (the old
-    // behaviour) under-filled pages and, worse, made the total count ignore
-    // `type` entirely — `type=library` returned total=6 with only 4 results
-    // (#1781). `$3::text IS NULL` short-circuits the predicate when no type is
-    // requested.
+    let query_str = params.q.clone().unwrap_or_default();
     let type_filter = params.package_type.as_deref();
-
-    let results = sqlx::query!(
-        r#"
-        SELECT DISTINCT a.name,
-               am.metadata as "metadata?"
-        FROM artifacts a
-        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1
-          AND a.is_deleted = false
-          AND a.name ILIKE $2 ESCAPE '\'
-          AND ($3::text IS NULL OR am.metadata #>> '{composer,type}' = $3)
-        ORDER BY a.name
-        LIMIT $4 OFFSET $5
-        "#,
-        repo.id,
-        search_pattern,
+    let search_params = SearchParams {
+        query: &query_str,
         type_filter,
-        per_page,
-        offset
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(crate::api::handlers::db_err)?;
+        per_page: params.per_page.unwrap_or(15).clamp(1, 100),
+        page: params.page.unwrap_or(1).max(1),
+    };
 
-    let search_results: Vec<serde_json::Value> = results
-        .iter()
-        .map(|r| {
-            let description = r
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("composer"))
-                .and_then(|c| c.get("description"))
-                .and_then(|d| d.as_str())
-                .unwrap_or("");
-
-            let url = format!("/composer/{}/p2/{}.json", repo_key, r.name);
-
-            serde_json::json!({
-                "name": r.name,
-                "description": description,
-                "url": url,
-            })
-        })
-        .collect();
-
-    // Count total results for pagination — must honor the same `type`
-    // predicate as the page query (#1781).
-    let total_count = sqlx::query_scalar!(
-        r#"
-        SELECT COUNT(DISTINCT a.name)
-        FROM artifacts a
-        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1
-          AND a.is_deleted = false
-          AND a.name ILIKE $2 ESCAPE '\'
-          AND ($3::text IS NULL OR am.metadata #>> '{composer,type}' = $3)
-        "#,
-        repo.id,
-        search_pattern,
-        type_filter
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(crate::api::handlers::db_err)?
-    .unwrap_or(0);
-
-    let total_pages = ((total_count as f64) / (per_page as f64)).ceil() as i64;
-    let has_next = page < total_pages;
+    let repo_ids = search_repo_ids(&state.db, auth.as_ref(), &repo).await?;
+    let page = search_hosted(&state.db, &repo_ids, &repo_key, &search_params).await?;
 
     let mut response = serde_json::json!({
-        "results": search_results,
-        "total": total_count,
+        "results": page.results,
+        "total": page.total,
     });
 
-    if has_next {
+    if page.has_next {
         response["next"] = serde_json::Value::String(build_search_next_url(
             &repo_key,
             &query_str,
-            page,
-            params.per_page,
+            search_params.page,
+            // The clamped size, and only when the client sent one.
+            params.per_page.map(|_| search_params.per_page),
             type_filter,
         ));
     }
@@ -4799,6 +4855,116 @@ mod metadata_db_tests {
         );
 
         f.teardown().await;
+    }
+
+    // -- Search across a Virtual's members (#6285) -------------------------
+
+    #[test]
+    fn search_next_url_encodes_the_term_and_type_6285() {
+        assert_eq!(
+            build_search_next_url("r", "a b&c", 1, Some(100), Some("x y")),
+            "/composer/r/search.json?q=a%20b%26c&page=2&per_page=100&type=x%20y"
+        );
+    }
+
+    async fn search_names(
+        app: axum::Router,
+        uri: String,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        let (status, body) = tdh::send(app, tdh::get(uri)).await;
+        let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn virtual_search_finds_readable_hosted_members_in_priority_order_6285() {
+        let Some(vf) = tdh::Fixture::setup("virtual", "composer").await else {
+            return;
+        };
+        let (m1, _k1, d1) = tdh::create_repo(&vf.pool, "local", "composer").await;
+        let (m2, _k2, d2) = tdh::create_repo(&vf.pool, "local", "composer").await;
+        let (hidden, _k3, d3) = tdh::create_repo(&vf.pool, "local", "composer").await;
+        let meta = |d: &str| Some(serde_json::json!({"composer": {"description": d}}));
+        insert_artifact(&vf.pool, m1, "aktest/lib", "1.0.0", "s1", meta("from m1")).await;
+        insert_artifact(&vf.pool, m2, "aktest/lib", "2.0.0", "s2", meta("from m2")).await;
+        insert_artifact(&vf.pool, m2, "aktest/util", "1.0.0", "s3", None).await;
+        insert_artifact(&vf.pool, hidden, "aktest/secret", "1.0.0", "s4", None).await;
+        add_member(&vf.pool, vf.repo_id, m1, 10).await;
+        add_member(&vf.pool, vf.repo_id, m2, 0).await;
+        add_member(&vf.pool, vf.repo_id, hidden, 5).await;
+        // The caller may read m1 and m2 only (#3323).
+        tdh::grant_repo_access(&vf.pool, m1, vf.user_id).await;
+        tdh::grant_repo_access(&vf.pool, m2, vf.user_id).await;
+
+        let (status, json) = search_names(
+            vf.router_with_auth(super::router()),
+            format!("/{}/search.json?q=aktest", vf.repo_key),
+        )
+        .await;
+        let (paged_status, paged) = search_names(
+            vf.router_with_auth(super::router()),
+            format!("/{}/search.json?q=aktest&per_page=1", vf.repo_key),
+        )
+        .await;
+
+        for (id, dir) in [(m1, d1), (m2, d2), (hidden, d3)] {
+            tdh::cleanup(&vf.pool, id, Uuid::new_v4()).await;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        vf.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "results": [
+                    {"name": "aktest/lib", "description": "from m2", "url": format!("/composer/{}/p2/aktest/lib.json", vf.repo_key)},
+                    {"name": "aktest/util", "description": "", "url": format!("/composer/{}/p2/aktest/util.json", vf.repo_key)},
+                ],
+                "total": 2,
+            }),
+            "one hit per name, from the higher-priority member, none from an unreadable member"
+        );
+        assert_eq!(paged_status, axum::http::StatusCode::OK);
+        assert_eq!(paged["results"].as_array().map(Vec::len), Some(1));
+        assert_eq!(paged["total"], 2);
+        assert!(paged["next"].as_str().is_some_and(|n| n.contains("page=2")));
+    }
+
+    /// A Remote's search stays local in 1.12.4 (#6285): the free-text term is
+    /// not sent upstream, so a Remote still answers the empty 200.
+    #[tokio::test]
+    async fn remote_search_is_not_forwarded_upstream_6285() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "composer").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    serde_json::json!({"results": [{"name": "monolog/monolog"}], "total": 1})
+                        .to_string(),
+                ),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+
+        let (status, json) = search_names(
+            tdh::router_anon(super::router(), state),
+            format!("/{}/search.json?q=monolog", fx.repo_key),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json, serde_json::json!({"results": [], "total": 0}));
+        server.verify().await;
     }
 
     // -- Virtual repo: priority order — first member with the package wins -

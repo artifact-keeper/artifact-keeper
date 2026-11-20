@@ -10,7 +10,10 @@ use sqlx::FromRow;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
+use std::collections::{HashMap, HashSet};
+
 use crate::api::dto::Pagination;
+use crate::api::handlers::last_promotion::readable_repo_ids;
 // #3713: the crate's `Json` rather than `axum::Json`, so a body this module
 // refuses (a NUL in a bound field included) is the 400 VALIDATION_ERROR
 // envelope every other handler emits, not axum's 422 plain text (#1368).
@@ -18,8 +21,10 @@ use crate::api::extractors::Json;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::models::repository::RepositoryVisibility;
 use crate::services::build_service::{
-    BuildArtifactInput, BuildService, CreateBuildInput, UpdateBuildStatusInput,
+    Build, BuildArtifact as StoredBuildArtifact, BuildArtifactInput, BuildService,
+    CreateBuildInput, UpdateBuildStatusInput,
 };
 
 /// Require that the request is authenticated, returning an error if not.
@@ -51,6 +56,285 @@ async fn require_build_owner(
 
 fn build_mutation_allowed(is_admin: bool, caller: Uuid, owner: Option<Uuid>) -> bool {
     is_admin || owner == Some(caller)
+}
+
+/// Whether `auth` may see a build's `metadata`, its VCS fields (`vcs_url`,
+/// `vcs_revision`, `vcs_branch`, `vcs_message`) and every attached artifact
+/// path (#6240). The same owner-or-admin rule `require_build_owner`
+/// applies to writes, minus the `write:artifacts` scope: a read-only token of
+/// the creator still sees its own build. Anyone else gets the build without
+/// those fields, and only the artifacts in repositories it can read.
+fn build_details_visible(auth: &AuthExtension, owner: Option<Uuid>) -> bool {
+    build_mutation_allowed(auth.is_admin, auth.user_id, owner)
+}
+
+/// Most artifacts `GET /api/v1/builds/{id}` returns for one build (#6240).
+const MAX_ARTIFACTS_PER_BUILD: i64 = 1000;
+
+/// Most artifacts the list returns per build. With `per_page` capped at 100,
+/// one list call returns at most 5000 artifact rows (#6240).
+const MAX_ARTIFACTS_PER_LISTED_BUILD: i64 = 50;
+
+/// Which rule set [`strip_vcs_userinfo`] applies.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UserinfoRules {
+    /// On write: cut only where the text cannot be a host (rules 1-4). The
+    /// stored value cannot be recovered, so an ambiguous URL is kept whole.
+    Write,
+    /// On read: rules 1-5. A value stored before this change, or one rule 5
+    /// would cut, is never echoed with what may be a credential. Reads of
+    /// `vcs_url` reach only the build's creator or an administrator.
+    Read,
+}
+
+/// `raw` without the userinfo (`user:password@`) of a `scheme://` URL
+/// (#6240). CI systems commonly set the clone URL to
+/// `https://x-access-token:<token>@host/org/repo`, and that token must not be
+/// stored or returned. This works on the text, not on a parsed URL: a
+/// password pasted without percent-encoding can contain `/`, `?` or `#`,
+/// which would end a parsed authority early and leave the rest of the secret
+/// in the "path".
+///
+/// `head` is the text between `://` and the first `/`, `?` or `#` (all of it
+/// without one):
+/// 1. `head` has a `:` before its first `@`: `user:password@`, the password
+///    possibly holding `@`, `/`, `?` or `#`, so cut at the LAST `@`.
+/// 2. Else `head` has an `@`: a password-less userinfo (`token@host`, or
+///    `git@host:22`), cut at the last `@` in `head`. An `@` after it is in
+///    the path (`https://token@host/repo@v1`).
+/// 3. Else no `@` after `head`, or `head` is an IPv6 literal (`[`...) or
+///    ends in `:<digits>` (a port): unchanged (`https://h:8443/r?ref=a@b`,
+///    `https://[::1]/r@v1`).
+/// 4. Else `head` has a `:`: a password with a `/` in it
+///    (`https://ci:pa/ss@host/r`), cut at the last `@`.
+/// 5. [`UserinfoRules::Read`] only. Else `head` is not a dotted host name
+///    (a character outside `[A-Za-z0-9.-]`, or no `.` and not `localhost`):
+///    possibly a password-less token with a `/` in it
+///    (`https://ab/cd==@host/r`), cut at the last `@`. This also cuts a
+///    single-label host with an `@` later (`https://gitlab/org/repo@v1`),
+///    which is why it never runs on write.
+/// 6. Else (`https://github.com/org/repo@v1`): unchanged.
+///
+/// A value without `://` (scp-style `git@host:org/repo`, a login name and
+/// never a password) is returned unchanged. Known gap: a password that looks
+/// like a port (`https://ci:1234/ss@host/r`) is kept by rule 3.
+fn strip_vcs_userinfo(raw: &str, rules: UserinfoRules) -> String {
+    let Some(scheme_end) = raw.find("://").map(|i| i + 3) else {
+        return raw.to_string();
+    };
+    let rest = &raw[scheme_end..];
+    let head = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let cut_at = |at: usize| format!("{}{}", &raw[..scheme_end], &rest[at + 1..]);
+    let Some(last_at) = rest.rfind('@') else {
+        return raw.to_string();
+    };
+    if let Some(first_at) = head.find('@') {
+        if head[..first_at].contains(':') {
+            return cut_at(last_at);
+        }
+        let in_head = head.rfind('@').unwrap_or(first_at);
+        return cut_at(in_head);
+    }
+    let is_port = head
+        .rsplit_once(':')
+        .is_some_and(|(_, port)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()));
+    if head.starts_with('[') || is_port {
+        return raw.to_string();
+    }
+    if head.contains(':') {
+        return cut_at(last_at);
+    }
+    if rules == UserinfoRules::Write {
+        return raw.to_string();
+    }
+    let host_chars = head
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
+    let dotted_host = host_chars && (head.contains('.') || head.eq_ignore_ascii_case("localhost"));
+    if dotted_host {
+        raw.to_string()
+    } else {
+        cut_at(last_at)
+    }
+}
+
+/// The repository key and the path inside it that a build artifact's
+/// recorded `path` names: the `<repo-key>/<path>` form a build records for an
+/// artifact it published. `None` when either part is empty.
+fn split_artifact_path(path: &str) -> Option<(&str, &str)> {
+    let (key, rest) = path.trim_start_matches('/').split_once('/')?;
+    let rest = rest.trim_start_matches('/');
+    (!key.is_empty() && !rest.is_empty()).then_some((key, rest))
+}
+
+/// A build row with the creator, which decides who sees its details.
+#[derive(FromRow)]
+struct BuildReadRow {
+    #[sqlx(flatten)]
+    build: Build,
+    created_by: Option<Uuid>,
+}
+
+/// Drop the artifacts of builds whose details `auth` may not see unless the
+/// artifact resolves to a stored one that `auth` can read (#6240, #6281).
+///
+/// The recorded `path` is free text from the build's creator, so naming a
+/// readable repository is not enough: `dist/x.jar` would show to everyone
+/// whenever a public repository happens to be called `dist`. A non-owner sees
+/// a build artifact only when `<key>/<path>` is a non-deleted row of
+/// `artifacts` in repository `<key>`, and that repository passes the grant
+/// half plus the token-scope half (`readable_repo_ids`, the predicate the
+/// virtual-member and promotion listings use). Everything else is visible
+/// only to the creator or an administrator.
+async fn readable_artifacts(
+    state: &SharedState,
+    auth: &AuthExtension,
+    artifacts: Vec<StoredBuildArtifact>,
+    details_visible: &HashSet<Uuid>,
+) -> Result<Vec<StoredBuildArtifact>> {
+    let candidates: HashSet<(String, String)> = artifacts
+        .iter()
+        .filter(|a| !details_visible.contains(&a.build_id))
+        .filter_map(|a| split_artifact_path(&a.path))
+        .map(|(k, p)| (k.to_string(), p.to_string()))
+        .collect();
+    let resolved: HashSet<(String, String)> = if candidates.is_empty() {
+        HashSet::new()
+    } else {
+        let (keys, paths): (Vec<String>, Vec<String>) = candidates.into_iter().unzip();
+        // `artifacts.path` is stored without a leading `/`; the second form
+        // tolerates rows written with one. Both hit UNIQUE(repository_id, path).
+        let rows: Vec<(Uuid, RepositoryVisibility, String, String)> = sqlx::query_as(
+            r#"
+            SELECT r.id, r.visibility, c.key, c.path
+            FROM unnest($1::text[], $2::text[]) AS c(key, path)
+            JOIN repositories r ON r.key = c.key
+            WHERE EXISTS (
+                SELECT 1 FROM artifacts a
+                WHERE a.repository_id = r.id
+                  AND (a.path = c.path OR a.path = '/' || c.path)
+                  AND a.is_deleted = false
+            )
+            "#,
+        )
+        .bind(&keys)
+        .bind(&paths)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        let readable = readable_repo_ids(
+            &state.db,
+            rows.iter().map(|(id, visibility, _, _)| (*id, *visibility)),
+            Some(auth),
+        )
+        .await;
+        rows.into_iter()
+            .filter(|(id, _, _, _)| readable.contains(id))
+            .map(|(_, _, key, path)| (key, path))
+            .collect()
+    };
+    Ok(artifacts
+        .into_iter()
+        .filter(|a| {
+            details_visible.contains(&a.build_id)
+                || split_artifact_path(&a.path)
+                    .is_some_and(|(k, p)| resolved.contains(&(k.to_string(), p.to_string())))
+        })
+        .collect())
+}
+
+/// The responses for `rows` as `auth` may see them: `metadata` and the VCS
+/// fields only on the builds it created (or to an administrator), and `modules`
+/// built from at most `per_build` of each build's readable artifacts. On a
+/// build it did not create, `artifact_count` is the number of artifacts shown.
+async fn build_responses(
+    state: &SharedState,
+    auth: &AuthExtension,
+    rows: Vec<BuildReadRow>,
+    per_build: i64,
+) -> Result<Vec<BuildResponse>> {
+    let details_visible: HashSet<Uuid> = rows
+        .iter()
+        .filter(|r| build_details_visible(auth, r.created_by))
+        .map(|r| r.build.id)
+        .collect();
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.build.id).collect();
+    let artifacts = BuildService::new(state.db.clone())
+        .list_artifacts(&ids, per_build)
+        .await?;
+    let artifacts = readable_artifacts(state, auth, artifacts, &details_visible).await?;
+
+    let mut by_build: HashMap<Uuid, Vec<StoredBuildArtifact>> = HashMap::new();
+    for a in artifacts {
+        by_build.entry(a.build_id).or_default().push(a);
+    }
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let visible = details_visible.contains(&row.build.id);
+            let artifacts = by_build.remove(&row.build.id).unwrap_or_default();
+            let mut response = BuildResponse::from(row.build);
+            if !visible {
+                response.metadata = None;
+                response.vcs_url = None;
+                response.vcs_revision = None;
+                response.vcs_branch = None;
+                response.vcs_message = None;
+                // #6281: the full count would tell a non-owner how many
+                // attached artifacts it cannot see. It gets the number it
+                // is shown (out of the per-read cap).
+                response.artifact_count = Some(i32::try_from(artifacts.len()).unwrap_or(i32::MAX));
+            }
+            response.modules = Some(group_into_modules(artifacts));
+            response
+        })
+        .collect())
+}
+
+/// Group a build's artifact rows by `module_name`, in first-seen order.
+/// Artifacts attached without a module go to a module with an empty name.
+/// A module has no row of its own: its id is the id of its first artifact.
+fn group_into_modules(artifacts: Vec<StoredBuildArtifact>) -> Vec<BuildModule> {
+    let mut modules: Vec<BuildModule> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for a in artifacts {
+        let name = a.module_name.unwrap_or_default();
+        let artifact = BuildArtifact {
+            name: a.name,
+            path: a.path,
+            checksum_sha256: a.checksum_sha256,
+            size_bytes: a.size_bytes,
+        };
+        match index.get(&name) {
+            Some(&i) => modules[i].artifacts.push(artifact),
+            None => {
+                index.insert(name.clone(), modules.len());
+                modules.push(BuildModule {
+                    id: a.id,
+                    name,
+                    artifacts: vec![artifact],
+                });
+            }
+        }
+    }
+    modules
+}
+
+/// `ORDER BY` for the build list. `sort_by` picks from a fixed set of
+/// columns, anything else keeps the build number order, so the value never
+/// reaches the SQL text (#6046).
+fn list_order_clause(sort_by: Option<&str>, desc: bool) -> String {
+    let column = match sort_by {
+        Some("created_at") => "created_at",
+        Some("started_at") => "started_at",
+        Some("finished_at") => "finished_at",
+        Some("duration") | Some("duration_ms") => "duration_ms",
+        Some("name") => "name",
+        Some("status") => "status",
+        _ => "build_number",
+    };
+    let direction = if desc { "DESC" } else { "ASC" };
+    format!("ORDER BY {column} {direction} NULLS LAST, id {direction}")
 }
 
 /// Create build routes
@@ -153,8 +437,10 @@ impl From<BuildRow> for BuildResponse {
     }
 }
 
-impl From<crate::services::build_service::Build> for BuildResponse {
-    fn from(build: crate::services::build_service::Build) -> Self {
+/// Every response carries `vcs_url` without its userinfo (#6240), including
+/// the rows stored before create started stripping it.
+impl From<Build> for BuildResponse {
+    fn from(build: Build) -> Self {
         Self {
             id: build.id,
             name: build.name,
@@ -168,7 +454,10 @@ impl From<crate::services::build_service::Build> for BuildResponse {
             updated_at: build.updated_at,
             artifact_count: build.artifact_count,
             modules: None,
-            vcs_url: build.vcs_url,
+            vcs_url: build
+                .vcs_url
+                .as_deref()
+                .map(|u| strip_vcs_userinfo(u, UserinfoRules::Read)),
             vcs_revision: build.vcs_revision,
             vcs_branch: build.vcs_branch,
             vcs_message: build.vcs_message,
@@ -201,7 +490,7 @@ pub async fn list_builds(
     Extension(auth): Extension<Option<AuthExtension>>,
     Query(query): Query<ListBuildsQuery>,
 ) -> Result<Json<BuildListResponse>> {
-    let _auth = require_auth(auth)?;
+    let auth = require_auth(auth)?;
 
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
@@ -235,17 +524,14 @@ pub async fn list_builds(
         }));
     }
 
-    // Build the query dynamically
-    let order_clause = if sort_desc {
-        "ORDER BY build_number DESC"
-    } else {
-        "ORDER BY build_number ASC"
-    };
+    let order_clause = list_order_clause(query.sort_by.as_deref(), sort_desc);
 
     let sql = format!(
         r#"
         SELECT id, name, build_number, status, started_at, finished_at,
-               duration_ms, agent, created_at, updated_at, artifact_count
+               duration_ms, agent, artifact_count,
+               vcs_url, vcs_revision, vcs_branch, vcs_message, metadata,
+               created_at, updated_at, created_by
         FROM builds
         WHERE ($1::text IS NULL OR status = $1)
           AND ($2::text IS NULL OR name ILIKE $2 ESCAPE '\')
@@ -256,7 +542,7 @@ pub async fn list_builds(
         order_clause
     );
 
-    let builds: Vec<BuildRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
+    let builds: Vec<BuildReadRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
         .bind(&query.status)
         .bind(&search_pattern)
         .bind(offset)
@@ -281,8 +567,10 @@ pub async fn list_builds(
 
     let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
 
+    let items = build_responses(&state, &auth, builds, MAX_ARTIFACTS_PER_LISTED_BUILD).await?;
+
     Ok(Json(BuildListResponse {
-        items: builds.into_iter().map(BuildResponse::from).collect(),
+        items,
         pagination: Pagination {
             page,
             per_page,
@@ -313,7 +601,7 @@ pub async fn get_build(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<BuildResponse>> {
-    let _auth = require_auth(auth)?;
+    let auth = require_auth(auth)?;
 
     // Check if builds table exists first
     let table_exists: bool = sqlx::query_scalar(
@@ -327,10 +615,12 @@ pub async fn get_build(
         return Err(AppError::NotFound("Build not found".to_string()));
     }
 
-    let build: BuildRow = sqlx::query_as(
+    let build: BuildReadRow = sqlx::query_as(
         r#"
         SELECT id, name, build_number, status, started_at, finished_at,
-               duration_ms, agent, created_at, updated_at, artifact_count
+               duration_ms, agent, artifact_count,
+               vcs_url, vcs_revision, vcs_branch, vcs_message, metadata,
+               created_at, updated_at, created_by
         FROM builds
         WHERE id = $1
         "#,
@@ -341,7 +631,12 @@ pub async fn get_build(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Build not found".to_string()))?;
 
-    Ok(Json(BuildResponse::from(build)))
+    let mut responses =
+        build_responses(&state, &auth, vec![build], MAX_ARTIFACTS_PER_BUILD).await?;
+    let response = responses
+        .pop()
+        .ok_or_else(|| AppError::NotFound("Build not found".to_string()))?;
+    Ok(Json(response))
 }
 
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
@@ -471,7 +766,11 @@ pub async fn create_build(
             build_number: payload.build_number,
             agent: payload.agent,
             started_at: payload.started_at,
-            vcs_url: payload.vcs_url,
+            // #6240: a clone URL's credentials are never stored.
+            vcs_url: payload
+                .vcs_url
+                .as_deref()
+                .map(|u| strip_vcs_userinfo(u, UserinfoRules::Write)),
             vcs_revision: payload.vcs_revision,
             vcs_branch: payload.vcs_branch,
             vcs_message: payload.vcs_message,
@@ -1107,17 +1406,232 @@ mod tests {
 
     #[test]
     fn test_sort_order_clause() {
-        for (sort_desc, expected) in [
-            (true, "ORDER BY build_number DESC"),
-            (false, "ORDER BY build_number ASC"),
+        for (sort_by, desc, expected) in [
+            (None, true, "ORDER BY build_number DESC NULLS LAST, id DESC"),
+            (None, false, "ORDER BY build_number ASC NULLS LAST, id ASC"),
+            (
+                Some("created_at"),
+                true,
+                "ORDER BY created_at DESC NULLS LAST, id DESC",
+            ),
+            (
+                Some("started_at"),
+                false,
+                "ORDER BY started_at ASC NULLS LAST, id ASC",
+            ),
+            (
+                Some("finished_at"),
+                false,
+                "ORDER BY finished_at ASC NULLS LAST, id ASC",
+            ),
+            (
+                Some("duration"),
+                true,
+                "ORDER BY duration_ms DESC NULLS LAST, id DESC",
+            ),
+            (
+                Some("duration_ms"),
+                false,
+                "ORDER BY duration_ms ASC NULLS LAST, id ASC",
+            ),
+            (Some("name"), false, "ORDER BY name ASC NULLS LAST, id ASC"),
+            (
+                Some("status"),
+                true,
+                "ORDER BY status DESC NULLS LAST, id DESC",
+            ),
+            (
+                Some("name; DROP TABLE builds"),
+                true,
+                "ORDER BY build_number DESC NULLS LAST, id DESC",
+            ),
+            (
+                Some("metadata"),
+                false,
+                "ORDER BY build_number ASC NULLS LAST, id ASC",
+            ),
         ] {
-            let order_clause = if sort_desc {
-                "ORDER BY build_number DESC"
-            } else {
-                "ORDER BY build_number ASC"
-            };
-            assert_eq!(order_clause, expected);
+            assert_eq!(list_order_clause(sort_by, desc), expected, "{sort_by:?}");
         }
+    }
+
+    fn stored_artifact(build_id: Uuid, module: Option<&str>, path: &str) -> StoredBuildArtifact {
+        StoredBuildArtifact {
+            id: Uuid::new_v4(),
+            build_id,
+            module_name: module.map(str::to_string),
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            path: path.to_string(),
+            checksum_sha256: "0".repeat(64),
+            size_bytes: 1,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_group_into_modules_keeps_every_artifact_in_first_seen_order() {
+        let build_id = Uuid::new_v4();
+        let rows = vec![
+            stored_artifact(build_id, Some("app"), "dist/a.jar"),
+            stored_artifact(build_id, None, "dist/notes.txt"),
+            stored_artifact(build_id, Some("app"), "dist/b.jar"),
+            stored_artifact(build_id, Some("lib"), "dist/c.jar"),
+        ];
+        let first_app_id = rows[0].id;
+        let modules = group_into_modules(rows);
+        let names: Vec<&str> = modules.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["app", "", "lib"]);
+        assert_eq!(modules[0].id, first_app_id);
+        let app: Vec<&str> = modules[0]
+            .artifacts
+            .iter()
+            .map(|a| a.path.as_str())
+            .collect();
+        assert_eq!(app, ["dist/a.jar", "dist/b.jar"]);
+        assert_eq!(modules[1].artifacts[0].path, "dist/notes.txt");
+        assert!(group_into_modules(vec![]).is_empty());
+    }
+
+    /// #6240: one module per name however many artifacts share it, without
+    /// a scan of the module list per artifact.
+    #[test]
+    fn test_group_into_modules_many_artifacts() {
+        let build_id = Uuid::new_v4();
+        let rows: Vec<_> = (0..5000)
+            .map(|i| stored_artifact(build_id, Some(&format!("m{}", i % 500)), &format!("d/{i}")))
+            .collect();
+        let modules = group_into_modules(rows);
+        assert_eq!(modules.len(), 500);
+        assert!(modules.iter().all(|m| m.artifacts.len() == 10));
+    }
+
+    #[test]
+    fn test_strip_vcs_userinfo() {
+        use UserinfoRules::{Read, Write};
+        // (raw, on write, on read)
+        for (raw, write, read) in [
+            // Plain credentials, and a CI token as the password.
+            ("https://user:pass@host", "https://host", "https://host"),
+            (
+                "https://x-access-token:ghs_SECRET@github.com/org/private",
+                "https://github.com/org/private",
+                "https://github.com/org/private",
+            ),
+            // Percent-encoded userinfo.
+            (
+                "https://user:p%40ss%2Fword@git.example.test/r",
+                "https://git.example.test/r",
+                "https://git.example.test/r",
+            ),
+            // A password with an unencoded `/` and `@` still goes entirely.
+            (
+                "https://ci:pa/ss@word@git.example.test/r",
+                "https://git.example.test/r",
+                "https://git.example.test/r",
+            ),
+            // A password-less token, and one with an `@` in the path too.
+            (
+                "https://token@github.com/org/repo.git",
+                "https://github.com/org/repo.git",
+                "https://github.com/org/repo.git",
+            ),
+            (
+                "https://ghp_TOKEN@github.com/org/repo@v1",
+                "https://github.com/org/repo@v1",
+                "https://github.com/org/repo@v1",
+            ),
+            // ssh with a login name and a port, `@` in the path kept.
+            (
+                "ssh://git@h:22/r@tag",
+                "ssh://h:22/r@tag",
+                "ssh://h:22/r@tag",
+            ),
+            (
+                "ssh://git:pw@host:2222/org/repo",
+                "ssh://host:2222/org/repo",
+                "ssh://host:2222/org/repo",
+            ),
+            // No userinfo: port plus `@` in the path or query, IPv6, plain.
+            (
+                "https://h:8443/r?ref=a@b",
+                "https://h:8443/r?ref=a@b",
+                "https://h:8443/r?ref=a@b",
+            ),
+            (
+                "https://[::1]/r@v1",
+                "https://[::1]/r@v1",
+                "https://[::1]/r@v1",
+            ),
+            ("https://u:p@[::1]/r", "https://[::1]/r", "https://[::1]/r"),
+            (
+                "https://github.com/org/repo@v1",
+                "https://github.com/org/repo@v1",
+                "https://github.com/org/repo@v1",
+            ),
+            (
+                "https://github.com/org/repo",
+                "https://github.com/org/repo",
+                "https://github.com/org/repo",
+            ),
+            (
+                "https://localhost/r@v1",
+                "https://localhost/r@v1",
+                "https://localhost/r@v1",
+            ),
+            // `head` ends at `?` and `#` too.
+            (
+                "https://git.example.test?x=a@b",
+                "https://git.example.test?x=a@b",
+                "https://git.example.test?x=a@b",
+            ),
+            (
+                "https://git.example.test#a@b",
+                "https://git.example.test#a@b",
+                "https://git.example.test#a@b",
+            ),
+            ("https://u:p?w@host/r", "https://host/r", "https://host/r"),
+            // Rule 5 is read-only: a single-label host or a password-less
+            // base64 token with `/` is stored whole and read back cut.
+            ("https://host?x=a@b", "https://host?x=a@b", "https://b"),
+            (
+                "https://gitlab/org/repo@v1",
+                "https://gitlab/org/repo@v1",
+                "https://v1",
+            ),
+            (
+                "https://ab/cd==@host/r",
+                "https://ab/cd==@host/r",
+                "https://host/r",
+            ),
+            // scp-style: a login name, never a password.
+            (
+                "git@github.com:org/repo.git",
+                "git@github.com:org/repo.git",
+                "git@github.com:org/repo.git",
+            ),
+            ("", "", ""),
+        ] {
+            assert_eq!(strip_vcs_userinfo(raw, Write), write, "write {raw}");
+            assert_eq!(strip_vcs_userinfo(raw, Read), read, "read {raw}");
+            // Reading what was written gives what reading the raw value gives.
+            assert_eq!(strip_vcs_userinfo(write, Read), read, "read(write) {raw}");
+        }
+    }
+
+    #[test]
+    fn test_split_artifact_path() {
+        assert_eq!(
+            split_artifact_path("libs-release/com/x.jar"),
+            Some(("libs-release", "com/x.jar"))
+        );
+        assert_eq!(
+            split_artifact_path("/libs-release//x.jar"),
+            Some(("libs-release", "x.jar"))
+        );
+        assert_eq!(split_artifact_path("x.jar"), None);
+        assert_eq!(split_artifact_path("dist/"), None);
+        assert_eq!(split_artifact_path("/x.jar"), None);
+        assert_eq!(split_artifact_path(""), None);
     }
 
     // -----------------------------------------------------------------------
@@ -1201,7 +1715,8 @@ mod tests {
             duration_ms: Some(60000),
             agent: Some("ci-runner".to_string()),
             artifact_count: Some(3),
-            vcs_url: Some("https://github.com/org/repo".to_string()),
+            // #6240: a stored URL with credentials reads back without them.
+            vcs_url: Some("https://user:secret@github.com/org/repo".to_string()),
             vcs_revision: Some("abc123".to_string()),
             vcs_branch: Some("main".to_string()),
             vcs_message: Some("fix: bug".to_string()),
@@ -1578,5 +2093,421 @@ mod tests {
             .await;
         tdh::cleanup_user(&pool, owner_id).await;
         tdh::cleanup_user(&pool, other_id).await;
+    }
+
+    fn post_json(uri: &str, body: serde_json::Value) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn send_json(
+        app: axum::Router,
+        req: axum::http::Request<axum::body::Body>,
+    ) -> serde_json::Value {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let (status, bytes) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    fn artifact_paths(build: &serde_json::Value) -> Vec<String> {
+        let mut paths: Vec<String> = build["modules"]
+            .as_array()
+            .expect("modules")
+            .iter()
+            .flat_map(|m| m["artifacts"].as_array().expect("artifacts").iter())
+            .map(|a| a["path"].as_str().expect("path").to_string())
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// #6046 + #6240: the reads return the VCS fields, metadata and attached
+    /// artifacts the writes store, but `metadata` and the VCS fields only to
+    /// the build's creator or an administrator, `vcs_url` never with its
+    /// credentials (stripped on create, and on read for older rows), and the
+    /// artifact paths of another user's build only where they name a
+    /// repository the caller can read. #6048 returned all of it to any
+    /// signed-in caller, a `read:artifacts` token included. #6281: the path
+    /// must also resolve to a stored artifact (a readable or public key with
+    /// nothing at that path stays hidden), and `artifact_count` is the number
+    /// shown.
+    #[tokio::test]
+    async fn build_reads_are_owner_gated_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool.clone(), "/tmp/ph-6240-builds");
+        let (owner_id, owner_name) = tdh::create_user(&pool).await;
+        let (other_id, other_name) = tdh::create_user(&pool).await;
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (open_repo, open_key, _) = tdh::create_repo(&pool, "local", "generic").await;
+        let (hidden_repo, hidden_key, _) = tdh::create_repo(&pool, "local", "generic").await;
+        // #6281: a public repository every signed-in user reads, holding
+        // nothing at the paths the build records under its key.
+        let (public_repo, public_key, _) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET visibility = 'public' WHERE id = $1")
+            .bind(public_repo)
+            .execute(&pool)
+            .await
+            .expect("public repo");
+        tdh::grant_repo_role(&pool, open_repo, other_id, "reader").await;
+        // Stored rows in the readable repository: `app.jar` as uploads store
+        // it, `slash.jar` with a leading `/` (shown), and `deleted.jar`
+        // soft-deleted (hidden from a non-owner).
+        for (path, deleted) in [
+            ("com/org/app.jar", false),
+            ("/com/org/slash.jar", false),
+            ("com/org/deleted.jar", true),
+        ] {
+            sqlx::query(
+                "INSERT INTO artifacts (repository_id, path, name, size_bytes, \
+                 checksum_sha256, content_type, storage_key, is_deleted) \
+                 VALUES ($1, $2, 'stored.jar', 10, $3, 'application/java-archive', $4, $5)",
+            )
+            .bind(open_repo)
+            .bind(path)
+            .bind("a".repeat(64))
+            .bind(format!("ph-6281/{}", Uuid::new_v4()))
+            .bind(deleted)
+            .execute(&pool)
+            .await
+            .expect("stored artifact");
+        }
+
+        let owner = tdh::router_with_auth(
+            super::router(),
+            state.clone(),
+            tdh::make_auth(owner_id, &owner_name),
+        );
+        // A different, non-admin user holding only a `read:artifacts` token.
+        let other = tdh::router_with_auth(
+            super::router(),
+            state.clone(),
+            AuthExtension {
+                is_api_token: true,
+                scopes: Some(vec!["read:artifacts".to_string()]),
+                ..tdh::make_auth(other_id, &other_name)
+            },
+        );
+        let admin = tdh::router_with_auth(
+            super::router(),
+            state.clone(),
+            tdh::admin_auth(admin_id, &admin_name),
+        );
+
+        let name = format!("ph-6240-{}", Uuid::new_v4());
+        let metadata = json!({ "env": { "NPM_TOKEN": "npm_SECRET6240" }, "runner": "linux" });
+        let created = send_json(
+            owner.clone(),
+            post_json(
+                "/",
+                json!({
+                    "name": name,
+                    "build_number": 7,
+                    "vcs_url": "https://x-access-token:ghs_SECRET6240@github.com/org/private",
+                    "vcs_revision": "0123456789abcdef",
+                    "vcs_branch": "main",
+                    "vcs_message": "ph-6240 commit",
+                    "metadata": metadata,
+                }),
+            ),
+        )
+        .await;
+        let id = created["id"].as_str().expect("build id").to_string();
+        assert_eq!(created["vcs_url"], "https://github.com/org/private");
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT vcs_url FROM builds WHERE id = $1::uuid")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .expect("stored vcs_url");
+        assert_eq!(
+            stored.as_deref(),
+            Some("https://github.com/org/private"),
+            "credentials are stripped before the row is written"
+        );
+
+        let open_path = format!("{open_key}/com/org/app.jar");
+        let hidden_path = format!("{hidden_key}/com/org/secret.jar");
+        let unstored_path = format!("{open_key}/com/org/typed.jar");
+        let public_path = format!("{public_key}/never-stored.jar");
+        let slash_path = format!("{open_key}/com/org/slash.jar");
+        let deleted_path = format!("{open_key}/com/org/deleted.jar");
+        send_json(
+            owner.clone(),
+            post_json(
+                &format!("/{id}/artifacts"),
+                json!({ "artifacts": [
+                    { "module_name": "app", "name": "app.jar", "path": open_path,
+                      "checksum_sha256": "a".repeat(64), "size_bytes": 10 },
+                    { "module_name": "app", "name": "secret.jar", "path": hidden_path,
+                      "checksum_sha256": "b".repeat(64), "size_bytes": 20 },
+                    { "name": "local.bin", "path": "dist/local.bin",
+                      "checksum_sha256": "c".repeat(64), "size_bytes": 30 },
+                    // #6281: names a readable repository, but nothing is
+                    // stored there at that path.
+                    { "name": "typed.jar", "path": unstored_path,
+                      "checksum_sha256": "d".repeat(64), "size_bytes": 40 },
+                    { "name": "public.jar", "path": public_path,
+                      "checksum_sha256": "e".repeat(64), "size_bytes": 50 },
+                    { "name": "slash.jar", "path": slash_path,
+                      "checksum_sha256": "f".repeat(64), "size_bytes": 60 },
+                    { "name": "deleted.jar", "path": deleted_path,
+                      "checksum_sha256": "1".repeat(64), "size_bytes": 70 },
+                ] }),
+            ),
+        )
+        .await;
+        // A row stored before create stripped credentials reads back without them.
+        sqlx::query(
+            "UPDATE builds SET vcs_url = 'https://u:legacy_SECRET@github.com/org/private' \
+             WHERE id = $1::uuid",
+        )
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .expect("legacy vcs_url");
+
+        let mut all = vec![
+            open_path.clone(),
+            hidden_path.clone(),
+            "dist/local.bin".to_string(),
+            unstored_path.clone(),
+            public_path.clone(),
+            slash_path.clone(),
+            deleted_path.clone(),
+        ];
+        all.sort();
+
+        // The creator and an administrator see everything, minus credentials.
+        for (who, app) in [("owner", &owner), ("admin", &admin)] {
+            let got = send_json(app.clone(), tdh::get(format!("/{id}"))).await;
+            assert_eq!(
+                got["vcs_url"], "https://github.com/org/private",
+                "{who}: {got}"
+            );
+            assert_eq!(got["vcs_revision"], "0123456789abcdef", "{who}");
+            assert_eq!(got["vcs_branch"], "main", "{who}");
+            assert_eq!(got["vcs_message"], "ph-6240 commit", "{who}");
+            assert_eq!(got["metadata"], metadata, "{who}");
+            assert_eq!(got["artifact_count"], 7, "{who}");
+            assert_eq!(artifact_paths(&got), all, "{who}");
+
+            let list = send_json(app.clone(), tdh::get(format!("/?search={name}"))).await;
+            let items = list["items"].as_array().expect("items");
+            assert_eq!(items.len(), 1, "{who}: {list}");
+            assert_eq!(items[0]["metadata"], metadata, "{who}");
+            assert_eq!(
+                items[0]["vcs_url"], "https://github.com/org/private",
+                "{who}"
+            );
+            assert_eq!(artifact_paths(&items[0]), all, "{who}");
+            assert_eq!(items[0]["artifact_count"], 7, "{who}");
+        }
+
+        // Anyone else: the build, without metadata or any VCS field, and
+        // only the artifact stored in a repository it can read.
+        let got = send_json(other.clone(), tdh::get(format!("/{id}"))).await;
+        let list = send_json(other.clone(), tdh::get(format!("/?search={name}"))).await;
+        let items = list["items"].as_array().expect("items");
+        assert_eq!(items.len(), 1, "{list}");
+        for b in [&got, &items[0]] {
+            assert!(b.get("metadata").is_none(), "{b}");
+            for field in ["vcs_url", "vcs_revision", "vcs_branch", "vcs_message"] {
+                assert!(b.get(field).is_none(), "{field}: {b}");
+            }
+            let mut shown = vec![open_path.clone(), slash_path.clone()];
+            shown.sort();
+            assert_eq!(artifact_paths(b), shown, "{b}");
+            // #6281: the count is what it is shown, not how many exist.
+            assert_eq!(b["artifact_count"], 2, "{b}");
+            let text = b.to_string();
+            for secret in [
+                "SECRET6240",
+                "legacy_SECRET",
+                hidden_key.as_str(),
+                "dist/local.bin",
+                "typed.jar",
+                "deleted.jar",
+                public_key.as_str(),
+            ] {
+                assert!(!text.contains(secret), "{secret} leaked: {text}");
+            }
+        }
+
+        let _ = sqlx::query("DELETE FROM builds WHERE name = $1")
+            .bind(&name)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, open_repo, other_id).await;
+        tdh::cleanup(&pool, hidden_repo, owner_id).await;
+        tdh::cleanup(&pool, public_repo, admin_id).await;
+    }
+
+    /// #6240 review: the write keeps a URL whose userinfo is ambiguous (a
+    /// single-label host with an `@` in the path) whole, since a cut there is
+    /// unrecoverable, and the read applies the strict rules to it.
+    #[tokio::test]
+    async fn ambiguous_vcs_url_is_stored_whole_and_read_strict_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool.clone(), "/tmp/ph-6240-ambiguous");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let app = tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+        let name = format!("ph-6240-amb-{}", Uuid::new_v4());
+        let raw = "https://gitlab/org/repo@v1";
+        let created = send_json(
+            app.clone(),
+            post_json(
+                "/",
+                json!({ "name": name, "build_number": 1, "vcs_url": raw }),
+            ),
+        )
+        .await;
+        let id = created["id"].as_str().expect("build id").to_string();
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT vcs_url FROM builds WHERE id = $1::uuid")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .expect("stored vcs_url");
+        assert_eq!(stored.as_deref(), Some(raw), "nothing is lost in storage");
+        let read = strip_vcs_userinfo(raw, UserinfoRules::Read);
+        assert_eq!(created["vcs_url"], read.as_str());
+        let got = send_json(app, tdh::get(format!("/{id}"))).await;
+        assert_eq!(got["vcs_url"], read.as_str(), "{got}");
+
+        let _ = sqlx::query("DELETE FROM builds WHERE name = $1")
+            .bind(&name)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    /// #6240: the artifacts a read returns per build are capped.
+    #[tokio::test]
+    async fn build_reads_cap_artifacts_per_build_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let name = format!("ph-6240-cap-{}", Uuid::new_v4());
+        let build_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO builds (name, build_number, status, created_by) \
+             VALUES ($1, 1, 'running', $2) RETURNING id",
+        )
+        .bind(&name)
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("build");
+        sqlx::query(
+            "INSERT INTO build_artifacts (build_id, name, path, checksum_sha256) \
+             SELECT $1, 'a' || g, 'dist/a' || g, repeat('0', 64) FROM generate_series(1, 60) g",
+        )
+        .bind(build_id)
+        .execute(&pool)
+        .await
+        .expect("artifacts");
+        let service = BuildService::new(pool.clone());
+        let rows = service
+            .list_artifacts(&[build_id], MAX_ARTIFACTS_PER_LISTED_BUILD)
+            .await
+            .expect("list");
+        assert_eq!(rows.len() as i64, MAX_ARTIFACTS_PER_LISTED_BUILD);
+        let rows = service
+            .list_artifacts(&[build_id], MAX_ARTIFACTS_PER_BUILD)
+            .await
+            .expect("list");
+        assert_eq!(rows.len(), 60);
+        assert!(rows
+            .windows(2)
+            .all(|w| (w[0].created_at, w[0].id) <= (w[1].created_at, w[1].id)));
+
+        let _ = sqlx::query("DELETE FROM builds WHERE id = $1")
+            .bind(build_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    /// #6046: the list parsed `sort_by` and always ordered by build number.
+    #[tokio::test]
+    async fn list_builds_honours_sort_by_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool.clone(), "/tmp/ph-6046-sort");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let app = tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+        let prefix = format!("ph-6046-sort-{}", Uuid::new_v4());
+
+        // Build 1 is `-c` created 1h ago, build 2 `-b` 3h ago, build 3 `-a`
+        // 2h ago, so number, name and creation order all differ.
+        for (number, suffix, hours) in [(1, "c", 1), (2, "b", 3), (3, "a", 2)] {
+            let created = send_json(
+                app.clone(),
+                post_json(
+                    "/",
+                    json!({ "name": format!("{prefix}-{suffix}"), "build_number": number }),
+                ),
+            )
+            .await;
+            sqlx::query(
+                "UPDATE builds SET created_at = NOW() - make_interval(hours => $2) WHERE id = $1",
+            )
+            .bind(Uuid::parse_str(created["id"].as_str().expect("id")).expect("uuid"))
+            .bind(hours)
+            .execute(&pool)
+            .await
+            .expect("backdate");
+        }
+
+        let numbers = |sort: &'static str| {
+            let app = app.clone();
+            let prefix = prefix.clone();
+            async move {
+                let list = send_json(app, tdh::get(format!("/?search={prefix}&{sort}"))).await;
+                list["items"]
+                    .as_array()
+                    .expect("items")
+                    .iter()
+                    .map(|b| b["number"].as_i64().expect("number"))
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        assert_eq!(
+            numbers("sort_by=created_at&sort_order=asc").await,
+            [2, 3, 1]
+        );
+        assert_eq!(
+            numbers("sort_by=created_at&sort_order=desc").await,
+            [1, 3, 2]
+        );
+        assert_eq!(numbers("sort_by=name&sort_order=asc").await, [3, 2, 1]);
+        assert_eq!(numbers("sort_order=desc").await, [3, 2, 1]);
+        assert_eq!(numbers("sort_by=nope&sort_order=asc").await, [1, 2, 3]);
+
+        let _ = sqlx::query("DELETE FROM builds WHERE name LIKE $1")
+            .bind(format!("{prefix}-%"))
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, user_id).await;
     }
 }

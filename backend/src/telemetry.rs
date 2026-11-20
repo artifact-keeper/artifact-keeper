@@ -694,6 +694,19 @@ pub fn init_tracing(otel_endpoint: Option<&str>, service_name: &str) -> Option<O
     }
 }
 
+/// The process exit code for the server's result. The error goes through the
+/// subscriber, so under `LOG_FORMAT=json` it is one JSON line instead of the
+/// plain `Error: ...` an `Err` returned from `main` prints (#5656)
+pub fn exit_code<E: std::fmt::Display>(result: Result<(), E>) -> std::process::ExitCode {
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!(error = %e, "fatal error, exiting");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
 /// The OTLP endpoint to export to, if any. An empty or blank
 /// `OTEL_EXPORTER_OTLP_ENDPOINT` counts as unset (#4931): before 1.12.0 it
 /// turned the OTel path on with an endpoint nothing could be sent to.
@@ -1544,6 +1557,44 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON ({e}): {l}")))
             .collect()
+    }
+
+    /// #5656: the error that stops the server is a JSON line under
+    /// `LOG_FORMAT=json`, not plain text on stderr
+    #[test]
+    fn test_exit_code_logs_the_fatal_error_as_one_json_line() {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry().with(build_fmt_layer_with_writer(
+            LogFormat::Json,
+            false,
+            capture.clone(),
+        ));
+        let code = tracing::subscriber::with_default(subscriber, || {
+            exit_code(Err::<(), _>(crate::error::AppError::Database(
+                "pool timed out while waiting for an open connection".to_string(),
+            )))
+        });
+        assert_eq!(code, std::process::ExitCode::FAILURE);
+        let lines = json_lines(&capture);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["level"], "ERROR");
+        assert_eq!(lines[0]["fields"]["message"], "fatal error, exiting");
+        let error = lines[0]["fields"]["error"].as_str().expect("error field");
+        assert!(error.contains("pool timed out"), "{error}");
+    }
+
+    #[test]
+    fn test_exit_code_is_success_and_silent_for_ok() {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry().with(build_fmt_layer_with_writer(
+            LogFormat::Json,
+            false,
+            capture.clone(),
+        ));
+        let code =
+            tracing::subscriber::with_default(subscriber, || exit_code(Ok::<(), String>(())));
+        assert_eq!(code, std::process::ExitCode::SUCCESS);
+        assert!(capture.text().is_empty(), "{}", capture.text());
     }
 
     #[test]
