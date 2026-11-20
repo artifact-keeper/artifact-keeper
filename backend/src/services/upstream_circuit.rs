@@ -293,6 +293,7 @@ impl CircuitState {
 struct CircuitTable {
     states: HashMap<CircuitKey, CircuitState>,
     last_prune: Option<Instant>,
+    last_full_warn: Option<Instant>,
 }
 
 std::thread_local! {
@@ -301,6 +302,26 @@ std::thread_local! {
     /// server that gave up, not the client.
     static OWN_DEADLINE_DROP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+/// Sets [`OWN_DEADLINE_DROP`] for its lifetime, and clears it in its own
+/// `Drop`, so a panicking `Drop` inside the abandoned future cannot leave the
+/// flag set on the worker thread for whatever it runs next.
+struct OwnDeadlineDrop(bool);
+
+impl OwnDeadlineDrop {
+    fn mark() -> Self {
+        Self(OWN_DEADLINE_DROP.with(|flag| flag.replace(true)))
+    }
+}
+
+impl Drop for OwnDeadlineDrop {
+    fn drop(&mut self) {
+        OWN_DEADLINE_DROP.with(|flag| flag.set(self.0));
+    }
+}
+
+/// Least time between two warnings that the table is full.
+const FULL_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// [`tokio::time::timeout`] for a deadline of this server's own (a virtual
 /// member deadline, the fetch or fill deadline): when it fires, the abandoned
@@ -315,9 +336,9 @@ pub async fn within_own_deadline<F: std::future::Future>(
     match tokio::time::timeout(deadline, fut.as_mut()).await {
         Ok(output) => Ok(output),
         Err(elapsed) => {
-            OWN_DEADLINE_DROP.with(|flag| flag.set(true));
+            let marked = OwnDeadlineDrop::mark();
             drop(fut);
-            OWN_DEADLINE_DROP.with(|flag| flag.set(false));
+            drop(marked);
             Err(elapsed)
         }
     }
@@ -587,7 +608,22 @@ impl UpstreamCircuits {
                 !stale
             });
         }
-        table.states.len() < self.settings.max_tracked
+        let fits = table.states.len() < self.settings.max_tracked;
+        if !fits {
+            let warn = table
+                .last_full_warn
+                .is_none_or(|last| now.saturating_duration_since(last) >= FULL_WARN_INTERVAL);
+            if warn {
+                table.last_full_warn = Some(now);
+                tracing::warn!(
+                    tracked = table.states.len(),
+                    max_tracked = self.settings.max_tracked,
+                    "upstream circuit table is full of failing upstreams: a newly failing \
+                     upstream is not tracked (it behaves as closed) until entries go stale"
+                );
+            }
+        }
+        fits
     }
 
     /// How many upstreams are tracked.
@@ -806,6 +842,35 @@ mod tests {
         // A quick own-deadline drop (under the slow-call threshold) does not
         // count either.
         abandon_by_own_deadline(c.admit(repo, &u).unwrap(), 5).await;
+        assert_eq!(c.tracked(), 0);
+    }
+
+    /// Review of #6339: a `Drop` that panics while our deadline drops the
+    /// abandoned future must not leave the marker set on the thread.
+    #[tokio::test(start_paused = true)]
+    async fn the_own_deadline_marker_is_cleared_after_a_panicking_drop_5013() {
+        struct PanicsOnDrop;
+        impl Drop for PanicsOnDrop {
+            fn drop(&mut self) {
+                panic!("drop");
+            }
+        }
+        let hung = async {
+            let _p = PanicsOnDrop;
+            std::future::pending::<()>().await
+        };
+        let caught = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+            within_own_deadline(Duration::from_secs(1), hung),
+        ))
+        .await;
+        assert!(caught.is_err(), "the drop panicked");
+        assert!(!OWN_DEADLINE_DROP.with(std::cell::Cell::get));
+        // And a later client drop on this thread still does not count.
+        let c = UpstreamCircuits::new(settings(1));
+        let (repo, u) = (Uuid::new_v4(), url("http://up.example/a"));
+        let call = c.admit(repo, &u).unwrap();
+        tokio::time::advance(Duration::from_secs(15)).await;
+        drop(call);
         assert_eq!(c.tracked(), 0);
     }
 
