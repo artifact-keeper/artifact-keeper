@@ -13180,7 +13180,11 @@ async fn await_conclusive_verdict(
             })
             .map(|(row, _, _)| row);
         let live_version = match (&row, state.scanner_service.as_deref()) {
-            (Some(_), Some(scanner)) => scanner.cve_scanner_version().await,
+            (Some(row), Some(scanner)) => {
+                scanner
+                    .cve_scanner_version_for(row.scanner_version.as_deref())
+                    .await
+            }
             _ => None,
         };
         match decide_serve(
@@ -13785,7 +13789,11 @@ async fn decide_proxy_scan_serve(
     // path, never a per-download subprocess). Only probed when a row exists,
     // exactly as the pre-refactor PyPI path did.
     let current_version = match (&row, state.scanner_service.as_deref()) {
-        (Some(_), Some(scanner)) => scanner.cve_scanner_version().await,
+        (Some(row), Some(scanner)) => {
+            scanner
+                .cve_scanner_version_for(row.scanner_version.as_deref())
+                .await
+        }
         _ => None,
     };
 

@@ -490,6 +490,9 @@ pub struct ScanQueue {
     backfill_aging: std::time::Duration,
 }
 
+/// Artifacts per statement when a repository rescan is queued.
+const HOSTED_RESCAN_CHUNK: usize = 5_000;
+
 impl ScanQueue {
     pub fn new(db: PgPool) -> Self {
         Self {
@@ -688,8 +691,10 @@ impl ScanQueue {
 
     /// Queue rescans of hosted artifacts, a `hosted_artifact` job each with no
     /// placeholders, so the worker inserts its rows as an in-process repository
-    /// scan does. A pending job keeps the placeholders another trigger committed,
-    /// a running one is left alone. Returns the jobs added or merged.
+    /// scan does. A pending job keeps the placeholders another trigger committed.
+    /// A running one is left alone, so a rescan asked for while that artifact's
+    /// scan runs is dropped (`bypass_dedup` included) and the running scan's
+    /// result stands. Returns the jobs added or merged.
     pub async fn enqueue_hosted_rescans(
         &self,
         artifact_ids: &[Uuid],
@@ -699,11 +704,12 @@ impl ScanQueue {
         let mut ids = artifact_ids.to_vec();
         ids.sort_unstable();
         ids.dedup();
-        if ids.is_empty() {
-            return Ok(0);
-        }
-        let queued = sqlx::query(
-            r#"
+        let mut queued = 0;
+        // One statement per chunk, so a large repository never binds one
+        // array of every artifact id.
+        for chunk in ids.chunks(HOSTED_RESCAN_CHUNK) {
+            queued += sqlx::query(
+                r#"
             INSERT INTO scan_queue (kind, priority, artifact_id, prepared, bypass_dedup)
             SELECT 'hosted_artifact', $1, id, '{}'::jsonb, $2
             FROM unnest($3::uuid[]) AS id
@@ -715,14 +721,15 @@ impl ScanQueue {
                 updated_at = NOW()
             WHERE scan_queue.state = 'pending'
             "#,
-        )
-        .bind(priority)
-        .bind(bypass_dedup)
-        .bind(&ids)
-        .execute(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .rows_affected();
+            )
+            .bind(priority)
+            .bind(bypass_dedup)
+            .bind(chunk)
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .rows_affected();
+        }
         if queued > 0 {
             enqueue_signal().notify_one();
         }
