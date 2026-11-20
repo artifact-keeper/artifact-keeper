@@ -613,8 +613,9 @@ jobs:
 
       # rust-toolchain.toml pins the compiler (#3551); this installs exactly
       # that version, with the clippy and rustfmt components the file lists.
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
         with:
+          toolchain: 1.98.0
           components: clippy, rustfmt
 
       # The compiler is an input to this job and it used to be an untracked one
@@ -868,8 +869,9 @@ jobs:
 
       # rust-toolchain.toml already lists the target; naming it here as
       # well keeps the job self-describing, as release.yml's leg does.
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
         with:
+          toolchain: 1.98.0
           targets: x86_64-pc-windows-gnu
 
       - name: Assert the pinned Rust toolchain is in force
@@ -1036,8 +1038,9 @@ jobs:
 
       # rust-toolchain.toml pins the compiler; this installs exactly that
       # version plus llvm-tools (llvm-profdata / llvm-cov for cargo-llvm-cov).
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
         with:
+          toolchain: 1.98.0
           components: llvm-tools-preview
 
       - name: Assert the pinned Rust toolchain is in force
@@ -1054,7 +1057,7 @@ jobs:
         run: npm install --global npm@10.9.9
 
       - name: Install cargo-llvm-cov, cargo-nextest and sqlx-cli
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-llvm-cov,cargo-nextest,sqlx-cli
 
@@ -1352,13 +1355,15 @@ jobs:
 
       # rust-toolchain.toml pins the compiler (#3551); this installs exactly
       # that version, and the next step proves it is the one in force.
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
+        with:
+          toolchain: 1.98.0
 
       - name: Assert the pinned Rust toolchain is in force
         run: ./scripts/ci/check-toolchain-pin.sh --active
 
       - name: Install cargo-nextest and sqlx-cli
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-nextest,sqlx-cli
 
@@ -1855,7 +1860,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
+        with:
+          toolchain: 1.98.0
 
       - name: Assert the pinned Rust toolchain is in force
         run: ./scripts/ci/check-toolchain-pin.sh --active
@@ -1864,7 +1871,7 @@ jobs:
         run: python3 scripts/ci/test-shards.py check
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-nextest
 
@@ -2582,6 +2589,12 @@ jobs:
 
       - name: Check the post-release dispatch gate catches what it must
         run: bash scripts/ci/test-check-release-downstream-dispatch.sh
+
+      # Create Release gets a 403 from GITHUB_TOKEN when the commit is not a
+      # branch tip (#6338); the promote pins publish/vX.Y.Z and release.yml
+      # removes it. Stub gh, no network, ~1s.
+      - name: Check the release pin branch script and its wiring
+        run: bash scripts/ci/test-pin-release-branch.sh
 
       # The rule the promotion obeys: a floating tag may only name a version
       # with a published GitHub Release, and only if it is newest in that line.
@@ -3809,10 +3822,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
+        with:
+          toolchain: 1.98.0
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-audit
 

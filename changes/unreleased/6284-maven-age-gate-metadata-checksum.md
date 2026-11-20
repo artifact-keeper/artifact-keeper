@@ -1,0 +1,9 @@
+---
+section: Fixed
+issues: [#6284]
+---
+- **With the Maven age gate on, `maven-metadata.xml` and its `.sha1`, `.md5`, `.sha256` and `.sha512` now describe the same document while the GA is still being dated** (#6284). The metadata filter dates at most 64 undated versions per pass, and the checksum request ran a second pass that dated the next 64, so it hashed a longer document than the one just served: strict-checksum Maven builds (`-C`, `checksumPolicy=fail`) and coursier rejected the metadata, and two downloads in a row listed different versions. A pass that leaves versions undated is now reused for 15 seconds, on a Remote and through a Virtual, and concurrent passes all serve the first one stored; the checksum requests themselves read no POMs, so past that window they still hash the list the last metadata request served. The metadata response also carries its own `X-Checksum-SHA1` and `X-Checksum-MD5`, is served `Cache-Control: no-cache` while versions are still undated, and an age-gate review decision drops the reused document at once.
+
+  Metadata `200` responses now carry `X-Checksum-SHA1` and `X-Checksum-MD5` of the served body.
+
+  The reuse is per backend process. With several replicas, clients that fetch the checksum files as separate requests (coursier, Ivy, strict Maven 3.8) can still see a mismatch while a GA is being dated; use sticky sessions for them. Dating continues at most once per 15 seconds per process, so a GA with about 1,600 versions released inside the gate window is fully listed after about 6 minutes per pod (see `docs/security/maven-age-gate.md`).
