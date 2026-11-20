@@ -205,12 +205,13 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
                     concurrency as f64,
                 );
 
-                // API pods without grype compare stored verdicts against this.
+                // API pods without grype compare stored verdicts against the
+                // versions of the live workers, so this is the heartbeat too.
                 if let Some(scanner) = state.scanner_service.as_deref() {
                     if let Some(version) = scanner.local_cve_scanner_version().await {
                         if let Err(e) =
                             crate::services::scanner_service::publish_cve_scanner_version(
-                                &state.db, &version,
+                                &state.db, &identity, &version,
                             )
                             .await
                         {
