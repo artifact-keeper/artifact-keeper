@@ -234,6 +234,7 @@ static LISTINGS: Lazy<MokaCache<ListingMemoKey, bytes::Bytes>> = Lazy::new(|| {
         .weigher(|_, v: &bytes::Bytes| v.len().min(u32::MAX as usize) as u32)
         .max_capacity(LISTING_MEMO_MAX_BYTES)
         .time_to_live(LISTING_MEMO_TTL)
+        .support_invalidation_closures()
         .build()
 });
 
@@ -244,9 +245,21 @@ pub async fn memo_listing(key: &ListingMemoKey) -> Option<bytes::Bytes> {
 
 /// Keep a filtered listing whose pass left versions undated, so the next
 /// requests for the document and its checksums within [`LISTING_MEMO_TTL`]
-/// get the same bytes.
-pub async fn remember_listing(key: ListingMemoKey, filtered: bytes::Bytes) {
-    LISTINGS.insert(key, filtered).await;
+/// get the same bytes, and return the listing to serve. The first writer
+/// wins: when concurrent passes over one document finish, each serves the
+/// listing stored first, so no client in the window gets a body whose
+/// checksum a later request contradicts.
+pub async fn remember_listing(key: ListingMemoKey, filtered: bytes::Bytes) -> bytes::Bytes {
+    LISTINGS.entry(key).or_insert(filtered).await.into_value()
+}
+
+/// Drop every memoized listing of `repo_id`. Called on each age-gate policy
+/// write and review decision (`invalidate_decision_memos`), so an approval,
+/// rejection or reopen shows on the next request instead of after the
+/// window. Process-local, like the memo.
+pub fn forget_listings_for_repo(repo_id: Uuid) {
+    // Only fails when the cache was built without closure support.
+    let _ = LISTINGS.invalidate_entries_if(move |key, _| key.repo_id == repo_id);
 }
 
 /// Drop one memoized listing (tests that step through successive passes).
@@ -429,6 +442,59 @@ mod tests {
         }
         forget_listing(&base).await;
         assert!(memo_listing(&base).await.is_none());
+    }
+
+    /// Two passes over one document that end with different listings: both
+    /// serve, and the memo keeps, the one stored first (#6284).
+    #[tokio::test]
+    async fn concurrent_passes_serve_the_first_stored_listing_6284() {
+        let key = ListingMemoKey::new(
+            Uuid::new_v4(),
+            "http://up/",
+            "g/a/maven-metadata.xml",
+            7,
+            "upstream_publish_time",
+            b"<metadata/>",
+        );
+        let first = bytes::Bytes::from_static(b"63 versions");
+        let later = bytes::Bytes::from_static(b"127 versions");
+        let (a, b) = tokio::join!(
+            remember_listing(key.clone(), first.clone()),
+            remember_listing(key.clone(), later.clone())
+        );
+        // Whichever finished first is the one both serve.
+        assert_eq!(a, b, "both passes serve one document");
+        assert_eq!(memo_listing(&key).await, Some(a.clone()));
+        // A pass after that, with a longer listing, still serves the stored one.
+        assert_eq!(
+            remember_listing(key.clone(), bytes::Bytes::from_static(b"150")).await,
+            a
+        );
+        forget_listing(&key).await;
+    }
+
+    /// A review decision or policy write drops the memo of that repository
+    /// only (#6284).
+    #[tokio::test]
+    async fn forget_listings_for_repo_drops_only_that_repository_6284() {
+        let (mine, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let key = |repo| {
+            ListingMemoKey::new(
+                repo,
+                "http://up/",
+                "g/a/maven-metadata.xml",
+                7,
+                "upstream_publish_time",
+                b"<metadata/>",
+            )
+        };
+        let doc = bytes::Bytes::from_static(b"listing");
+        remember_listing(key(mine), doc.clone()).await;
+        remember_listing(key(other), doc.clone()).await;
+        forget_listings_for_repo(mine);
+        assert!(memo_listing(&key(mine)).await.is_none());
+        assert_eq!(memo_listing(&key(other)).await, Some(doc));
+        forget_listing(&key(other)).await;
     }
 
     #[test]

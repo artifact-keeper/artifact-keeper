@@ -19,7 +19,7 @@ catalog use) and the version is the path's version directory.
 | Any file in a version directory: `.pom`, `.jar`, `.war`, `.module`, `-sources.jar`, classifier archives | Served when the version is old enough or its review is approved; otherwise `451` with the shared `age_gate_blocked` body (`review_id`, `package`, `version`, `min_age_days`, `requested_age_days`) and a pending review. The `451` carries `Cache-Control: no-store` (RFC 7725 makes a `451` cacheable by default; this hold is lifted by a review or by time). A refused file is neither fetched nor cached; the gate only reads the version's POM, uncached, to date it. |
 | That file's `.sha1`, `.md5`, `.sha256`, `.sha512`, `.asc` | Answers exactly as the file does (the same `451`). |
 | GA-level `g/a/maven-metadata.xml` | Withheld versions are removed from `<versions>`; `<latest>` and `<release>` are re-pointed to the newest remaining version (release: newest non-SNAPSHOT). When nothing is withheld the upstream bytes are served unchanged. |
-| `g/a/maven-metadata.xml.sha1` (and the other digests) | Computed from the served (filtered) metadata, so it matches the body. While the GA is still being dated (below), the body and its digests are served from the same filtered document for 15 seconds instead of a fresh pass each. |
+| `g/a/maven-metadata.xml.sha1` (and the other digests) | Computed from the served (filtered) metadata. While the GA is still being dated (below), the body and its digests come from the same filtered document for 15 seconds instead of a fresh pass each; the body also carries its own `X-Checksum-SHA1` and `X-Checksum-MD5`. |
 | `-SNAPSHOT` versions and their metadata | Not gated, see below. |
 
 There is no last-known-good substitution for Maven: a client asked for one
@@ -76,12 +76,40 @@ the next one. Downloads always decide each version on its own POM.
 
 While versions are still undated, each filter pass lists more versions than
 the one before, so a document filtered that way is reused for 15 seconds
-(#6284): within that window the `maven-metadata.xml` downloads and their
-`.sha1`, `.md5`, `.sha256` and `.sha512` all describe the same bytes, and the
-first request after it runs the next pass. A GA with N undated versions is
-therefore fully listed after about N / 64 passes, at most one per 15 seconds.
-Once every version is dated the document is filtered on every request as
-before.
+(#6284). Within that window the `maven-metadata.xml` downloads and their
+`.sha1`, `.md5`, `.sha256` and `.sha512` describe the same bytes; when two
+passes run at once, both serve the document stored first. The checksum
+sidecars never read POMs themselves: past the window they filter with the
+dates already known, which is the list the last metadata request served. The
+first metadata request after the window runs the next pass. Once every version is dated the document
+is filtered on every request as before, and nothing is reused.
+
+What to expect while a GA is being dated:
+
+- **Checksums.** The metadata response carries `X-Checksum-SHA1` and
+  `X-Checksum-MD5` of its own body, which Maven 3.9's native transport uses
+  instead of fetching the sidecars. Clients that fetch the sidecars as separate
+  requests (coursier, Ivy, Maven 3.8 with strict checksums) get matching
+  checksums only from the same backend process: the reuse is per process, so
+  behind a load balancer two replicas can each serve a different pass. Use
+  sticky sessions for those clients. A sidecar requested right as the 15 s
+  window ends can still describe the next pass.
+- **Caching.** The partially dated document is served with
+  `Cache-Control: no-cache` (and a Virtual does not keep such a merge in its
+  60 s merge cache), so a CDN or proxy in front revalidates instead of keeping
+  a shorter list.
+- **Fill time.** A GA with N undated versions is fully listed after about
+  N / 64 passes, at most one per 15 seconds per backend process: a GA with
+  1,600 versions released inside the gate window takes about 6 minutes per
+  pod. Until then the oldest undated versions are withheld, so a bounded
+  version range that points only at them resolves to "No versions available",
+  and with `updatePolicy=daily` Maven keeps that answer for the day. Pinned
+  versions are not affected (each download decides on its own POM).
+- **Review decisions.** An approval, rejection or reopen drops the reused
+  documents of that repository on the backend that handles it, so the next
+  request there reflects it. Other replicas reflect it within the 15 s window.
+  A public Virtual over the Remote can keep serving its 60 s merge of a fully
+  dated document for up to 60 s after a decision (#6345).
 
 `first_seen` mode dates a version by the first time this server saw it
 from that upstream, as for the other formats: the upstream metadata listing
