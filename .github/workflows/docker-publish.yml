@@ -737,8 +737,13 @@ jobs:
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:buildcache-${{ matrix.cache-tag }}
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:buildcache-${{ matrix.cache-tag }},mode=max,image-manifest=true,oci-mediatypes=true
+          # Its own cache ref, so this export does not replace the runtime
+          # build's `buildcache-<arch>`. Builds of the default (scanner)
+          # target in ci.yml, e2e.yml and scheduled-tests.yml read both.
+          cache-from: |
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:buildcache-${{ matrix.cache-tag }}
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:buildcache-scanner-${{ matrix.cache-tag }}
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:buildcache-scanner-${{ matrix.cache-tag }},mode=max,image-manifest=true,oci-mediatypes=true
           no-cache-filters: grype-bin,grype-db-seed,scanner
           sbom: true
           provenance: mode=max
