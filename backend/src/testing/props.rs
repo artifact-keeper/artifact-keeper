@@ -80,7 +80,13 @@ where
 }
 
 /// Declare a `#[test]` asserting that `$cmp` (a `Fn(&str, &str) -> Ordering`)
-/// is a total order over [`version_triple`].
+/// is a total order over [`version_triple`]. Gated to the shards whose
+/// tests call it (#6329); the router shard has none.
+#[cfg(any(
+    ak_test_shard = "handlers-1",
+    ak_test_shard = "services-1",
+    ak_test_shard = "services-2"
+))]
 macro_rules! total_order_proptest {
     ($name:ident, $cmp:expr) => {
         proptest::proptest! {
@@ -92,4 +98,9 @@ macro_rules! total_order_proptest {
         }
     };
 }
+#[cfg(any(
+    ak_test_shard = "handlers-1",
+    ak_test_shard = "services-1",
+    ak_test_shard = "services-2"
+))]
 pub(crate) use total_order_proptest;

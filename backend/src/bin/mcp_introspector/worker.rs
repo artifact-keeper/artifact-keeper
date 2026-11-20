@@ -48,8 +48,8 @@ impl Backend {
 
     /// A backend reached without the process proxy settings: tests talk to
     /// a local mock, which a `HTTP_PROXY` in the environment must not
-    /// redirect.
-    #[cfg(test)]
+    /// redirect. Only the router shard's tests call it (#6329).
+    #[cfg(all(test, ak_test_shard = "router"))]
     fn direct(base: &str, token: &str) -> Self {
         Self::with_builder(base, token, Self::builder().no_proxy())
     }

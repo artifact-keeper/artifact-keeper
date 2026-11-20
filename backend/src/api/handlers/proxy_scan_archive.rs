@@ -1622,7 +1622,10 @@ pub(crate) mod test_support {
 
     /// The scenarios above as one `#[tokio::test]` each, for one format's
     /// [`CaseFn`]: `archive_scan_suite!(my_case);` inside the format's test
-    /// module.
+    /// module. Gated to the shards whose format modules call it (#6329):
+    /// any other shard's `--lib --tests` build has no caller, and the
+    /// definition would be an `unused_macros` error under `-D warnings`.
+    #[cfg(any(ak_test_shard = "handlers-1", ak_test_shard = "handlers-2"))]
     macro_rules! archive_scan_suite {
         ($case:path) => {
             #[tokio::test]
@@ -1655,6 +1658,7 @@ pub(crate) mod test_support {
             }
         };
     }
+    #[cfg(any(ak_test_shard = "handlers-1", ak_test_shard = "handlers-2"))]
     pub(crate) use archive_scan_suite;
 
     /// A minimal `.rpm` (lead, empty signature header, main header) naming
