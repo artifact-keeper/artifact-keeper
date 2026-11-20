@@ -769,9 +769,11 @@ so a restart or a new replica does not reopen it. As a result, a replica that
 installs the new database more than the window after the first sighting gets
 no grace for it.
 
-A verdict graded against a **newer** build than the live one is reused, under
-every action, while the fleet first saw that build within the longer of the
-two windows (`0` for both turns this off too). This happens when one replica
+A verdict graded against a **newer** build than the live one is reused while
+the fleet first saw that build within the pull's own action window: up to
+`PROXY_SCAN_DB_GRACE_HOURS` for `fail_open` and `record_only`, and up to
+`PROXY_SCAN_DB_GRACE_HOURS_FAIL_CLOSED` for `fail_closed`. At the defaults, a
+`fail_closed` pull therefore re-scans such a verdict exactly as before 1.13.0. This happens when one replica
 updates before another, or during a rolling upgrade. Before, the replica with
 the older build re-scanned it, and the next replica re-scanned it back. The
 trust is bounded so that a build that was rolled back stops counting.
@@ -779,10 +781,13 @@ trust is bounded so that a build that was rolled back stops counting.
 **Rolling back a database build.** If a build grades wrongly (for example it
 misses an advisory and grades a vulnerable package clean) and you roll back
 to the previous build, the replicas on the older build keep trusting the bad
-build's verdicts until its trust window ends, at most the longer of the two
-windows after the fleet first saw it. To stop that at once, and to re-scan
-everything the bad build graded on its next pull, purge its verdicts and its
-record:
+build's verdicts until its trust window ends: the pull's action window after
+the fleet first saw the build (`fail_closed` at its default of `0` never
+trusts it). To stop that at once, and to re-scan everything the bad build
+graded on its next pull, purge its verdicts and its record, **once every
+replica has left the bad build**. A replica still on it re-records the build
+with a new first sighting, which would start a fresh trust window, and keeps
+writing verdicts graded by it:
 
 ```sql
 DELETE FROM proxy_scan_results WHERE scanner_version = 'grype-0.120.1+db-2026-11-20';
