@@ -2210,6 +2210,75 @@ mod tests {
         f.teardown().await;
     }
 
+    // #6062: the chunked completion runs the same NuGet finalizer as the
+    // single generic PUT, so a root .nupkg is indexed as a package there too.
+    #[tokio::test]
+    async fn chunked_root_nupkg_creates_a_nuget_package_6062() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let path = "Qa.Chunked.1.2.3.nupkg";
+        let (status, body) = f
+            .chunked_upload(
+                path,
+                &nupkg("Qa.Chunked", "1.2.3"),
+                serde_json::json!({}),
+                false,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        let (_, name, version, content_type) = row(&f, path).await;
+        assert_eq!(name, "qa.chunked");
+        assert_eq!(version.as_deref(), Some("1.2.3"));
+        assert_eq!(content_type, "application/octet-stream");
+        let (format, document) = metadata_at(&f, path).await.expect("nuget metadata");
+        assert_eq!(format, "nuget");
+        assert_eq!(document["id"], "Qa.Chunked");
+        assert_eq!(document["version"], "1.2.3");
+        assert_eq!(
+            catalog_version(&f, "Qa.Chunked").await.as_deref(),
+            Some("1.2.3")
+        );
+        let (status, search_body) = tdh::send(
+            f.router_with_auth(crate::api::handlers::nuget::router()),
+            tdh::get(format!("/{}/v3/search?q=qa.chunked", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let search: serde_json::Value = serde_json::from_slice(&search_body).unwrap();
+        assert_eq!(search["totalHits"], 1, "{search}");
+
+        f.teardown().await;
+    }
+
+    // #6062: a chunked .nupkg whose .nuspec names another package is refused,
+    // as the other native finalizers refuse a mismatched tarball or wheel.
+    #[tokio::test]
+    async fn chunked_root_nupkg_with_mismatched_nuspec_is_refused_6062() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let path = "Qa.ChunkedMismatch.1.2.3.nupkg";
+        let (status, body) = f
+            .chunked_upload(
+                path,
+                &nupkg("Some.Other.Package", "1.2.3"),
+                serde_json::json!({}),
+                false,
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(artifact_count(&f).await, 0);
+
+        f.teardown().await;
+    }
+
     // #6062: an id may end in a numeric segment. Splitting the filename at
     // its first digit would misread `Qa.Suffix.2` as `Qa` plus `2.1.2.3`.
     #[tokio::test]
