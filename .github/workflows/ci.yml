@@ -1208,7 +1208,7 @@ jobs:
           fi
           if grep -qE '^warning: `artifact-keeper[^`]*` \(.*\) generated [0-9]+ warnings?' <<<"$out"; then
             printf '%s\n' "$out" | grep -vE '^ *(Compiling|Finished|Executable|Blocking|Downloaded|Fresh) '
-            echo "::error title=Compiler warnings in shard ${{ matrix.shard }}::this leg's test build has rustc warnings (above). Gate the item to the shards that use it, e.g. #[cfg(any(ak_test_shard = \"handlers-1\", ...))] (#6329)."
+            echo "::error title=Compiler warnings in shard ${{ matrix.shard }}::this leg's test build has rustc warnings (above). A test helper unused in this shard belongs under lib.rs's shard-subset cfg_attr allow list (#6329); anything else is a real warning to fix."
             exit 1
           fi
           echo "no compiler warnings in the ${{ matrix.shard }} test build"

@@ -48,8 +48,12 @@ impl Backend {
 
     /// A backend reached without the process proxy settings: tests talk to
     /// a local mock, which a `HTTP_PROXY` in the environment must not
-    /// redirect. Only the router shard's tests call it (#6329).
-    #[cfg(all(test, ak_test_shard = "router"))]
+    /// redirect. Only the router shard's tests call it, so another shard's
+    /// `--lib --tests` build sees it unused (#6329). The bin has no
+    /// shard-subset relaxation like lib.rs's, and test-shards.py allows the
+    /// shard cfg only as a test-module gate, hence a plain allow.
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn direct(base: &str, token: &str) -> Self {
         Self::with_builder(base, token, Self::builder().no_proxy())
     }
