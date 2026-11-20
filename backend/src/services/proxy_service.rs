@@ -4702,9 +4702,9 @@ const EGRESS_CLIENT_CACHE_TTL_SECS: u64 = 60;
 /// is a 502, not the 400 the decoder reports
 fn decode_parsed_upstream_body(body: Bytes, coding: Option<&str>, cap: u64) -> Result<Bytes> {
     use crate::util::content_coding::{strip_content_coding_to, Decoded};
-    let decoded = match strip_content_coding_to(&body, coding, cap).map_err(|e| {
-        AppError::BadGateway(format!("upstream body could not be decoded: {e}"))
-    })? {
+    let decoded = match strip_content_coding_to(&body, coding, cap)
+        .map_err(|e| AppError::BadGateway(format!("upstream body could not be decoded: {e}")))?
+    {
         Decoded::Bytes(std::borrow::Cow::Owned(v)) => Some(v),
         Decoded::Bytes(std::borrow::Cow::Borrowed(_)) => None,
         Decoded::Unsupported => {
