@@ -1756,11 +1756,12 @@ impl LifecycleService {
         let swept: std::result::Result<Vec<(String, String)>, sqlx::Error> = sqlx::query_as(
             "SELECT DISTINCT r.key, a.path FROM artifacts a \
              JOIN repositories r ON r.id = a.repository_id \
-             WHERE a.repository_id = $1 AND r.format::text = 'npm' \
+             WHERE a.repository_id = $1 AND r.format::text = ANY($3) \
                AND a.is_deleted = true AND a.deleted_at >= $2",
         )
         .bind(repository_id)
         .bind(deleted_at)
+        .bind(crate::api::handlers::npm::NPM_FAMILY_FORMATS)
         .fetch_all(&self.db)
         .await;
         let swept = match swept {
