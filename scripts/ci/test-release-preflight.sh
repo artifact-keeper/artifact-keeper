@@ -161,6 +161,10 @@ case "$1" in
         cv="FAKE_FAILED_CONCLUSION_$3"; nv="FAKE_NO_JOBS_$3"; xv="FAKE_VIEW_FAIL_$3"
         ov="FAKE_NO_SCAN_JOB_$3"  # =1: the run lists jobs but no Security Scan
         [ "${!xv-0}" = "1" ] && exit 1
+        # FAKE_JOBS_JSON_<id>: the run's whole jobs document, verbatim (an
+        # in-flight run's jobs carry status as well as conclusion, #6166).
+        jv="FAKE_JOBS_JSON_$3"
+        if [ -n "${!jv-}" ]; then printf '%s\n' "${!jv}" | jq -r "$jqx"; exit 0; fi
         if [ "${!nv-0}" = "1" ]; then echo '{"jobs":[]}' | jq -r "$jqx"; exit 0; fi
         if [ "${!ov-0}" = "1" ]; then
           echo '{"jobs":[{"name":"Resolve inputs","conclusion":"success"}]}' | jq -r "$jqx"; exit 0
@@ -377,7 +381,8 @@ FAKE_FAILED_JOB_909="Backend (linux/amd64)" FAKE_FAILED_CONCLUSION_909=cancelled
 FAKE_SECURITY_SCAN_800=success FAKE_MANIFEST_800=success \
   expect "newer rebuild with a cancelled build job -> NOT READY" 1 "run 909: Security Scan=skipped"
 
-# 4t. A run still in flight above a completed build blocks (no verdict yet).
+# 4t. A run still in flight above a completed build blocks (no verdict yet)
+#     while it may still build; one that has skipped every build is 4ab.
 FAKE_RUNS=$'910 in_progress workflow_dispatch\n800 completed push' \
 FAKE_SECURITY_SCAN_800=success FAKE_MANIFEST_800=success \
   expect "in-flight dispatch above a green push run -> NOT READY (wait)" 1 "still 'in_progress'"
@@ -433,6 +438,67 @@ FAKE_RUNS=$'918 completed workflow_dispatch\n800 completed push' \
 FAKE_SECURITY_SCAN_918=skipped FAKE_MANIFEST_918=success FAKE_EXTRA_FAILED_918="Apply Floating Tags" \
 FAKE_SECURITY_SCAN_800=success FAKE_MANIFEST_800=success \
   expect "failed PROMOTE over a green push run -> READY" 0 "run 918 (workflow_dispatch) built nothing"
+
+# 4ab. THE #6166 RACE (candidate 44116177519, preflight 44116420573 at
+#      15:37:15Z). The floating-tag dispatch 44116256357 on e808fdac was
+#      still in_progress: publish-preflight done, every image build job and
+#      Security Scan skipped at 15:36:58, the re-tag manifest jobs running.
+#      It can build nothing, so it must not hide the green push run 44080746556
+#      ("still 'in_progress'" refused the candidate).
+# shellcheck disable=SC2016 # a literal matrix job name, not an expansion
+J_PROMOTE_INFLIGHT='{"jobs":[
+  {"name":"Publish identity preflight","status":"completed","conclusion":"success"},
+  {"name":"Backend (${{ matrix.platform }})","status":"completed","conclusion":"skipped"},
+  {"name":"OpenSCAP (${{ matrix.platform }})","status":"completed","conclusion":"skipped"},
+  {"name":"Scanner Adapter (${{ matrix.platform }})","status":"completed","conclusion":"skipped"},
+  {"name":"Backend Alpine (${{ matrix.platform }})","status":"completed","conclusion":"skipped"},
+  {"name":"Security Scan","status":"completed","conclusion":"skipped"},
+  {"name":"Backend Multi-Arch Manifest","status":"in_progress","conclusion":""},
+  {"name":"OpenSCAP Multi-Arch Manifest","status":"in_progress","conclusion":""}]}'
+FAKE_RUNS=$'920 in_progress workflow_dispatch\n800 completed push' \
+FAKE_JOBS_JSON_920="$J_PROMOTE_INFLIGHT" \
+FAKE_SECURITY_SCAN_800=success FAKE_MANIFEST_800=success \
+  expect "in-flight floating-tag dispatch over a green push run -> READY (#6166)" 0 "run 920 (workflow_dispatch, in_progress) has skipped every image build"
+
+# 4ac. ...and over a RED push run, the red still decides.
+FAKE_RUNS=$'920 in_progress workflow_dispatch\n800 completed push' \
+FAKE_JOBS_JSON_920="$J_PROMOTE_INFLIGHT" \
+FAKE_SECURITY_SCAN_800=failure FAKE_MANIFEST_800=skipped \
+  expect "in-flight floating-tag dispatch over a red push run -> NOT READY" 1 "did NOT cleanly publish"
+
+# 4ad. A dispatch whose publish-preflight is still running lists no build
+#      job yet: it may still build, so it blocks as before.
+FAKE_RUNS=$'921 in_progress workflow_dispatch\n800 completed push' \
+FAKE_JOBS_JSON_921='{"jobs":[{"name":"Publish identity preflight","status":"in_progress","conclusion":""}]}' \
+FAKE_SECURITY_SCAN_800=success FAKE_MANIFEST_800=success \
+  expect "in-flight dispatch, build jobs not listed yet -> NOT READY (wait)" 1 "still 'in_progress' (run 921)"
+
+# 4ae. An in-flight dispatch that IS building (a hand-dispatched rebuild):
+#      its verdict is coming, so it blocks.
+FAKE_RUNS=$'922 in_progress workflow_dispatch\n800 completed push' \
+FAKE_JOBS_JSON_922='{"jobs":[
+  {"name":"Publish identity preflight","status":"completed","conclusion":"success"},
+  {"name":"Backend (linux/arm64)","status":"completed","conclusion":"success"},
+  {"name":"Backend (linux/amd64)","status":"queued","conclusion":""}]}' \
+FAKE_SECURITY_SCAN_800=success FAKE_MANIFEST_800=success \
+  expect "in-flight dispatch with a build job queued -> NOT READY (wait)" 1 "still 'in_progress' (run 922)"
+
+# 4af. Its jobs cannot be read: no guess, it blocks (not INFRA, as before).
+FAKE_RUNS=$'923 in_progress workflow_dispatch\n800 completed push' \
+FAKE_VIEW_FAIL_923=1 \
+FAKE_SECURITY_SCAN_800=success FAKE_MANIFEST_800=success \
+  expect "in-flight dispatch, jobs unreadable -> NOT READY (wait)" 1 "still 'in_progress' (run 923)"
+
+# 4ag. A PUSH run in flight is this commit's build whatever its jobs show.
+FAKE_RUNS=$'924 in_progress push\n800 completed push' \
+FAKE_JOBS_JSON_924="$J_PROMOTE_INFLIGHT" \
+FAKE_SECURITY_SCAN_800=success FAKE_MANIFEST_800=success \
+  expect "in-flight push run -> NOT READY (wait), never passed over" 1 "still 'in_progress' (run 924)"
+
+# 4ah. Only an in-flight floating-tag dispatch and no build: not built.
+FAKE_RUNS='920 in_progress workflow_dispatch' \
+FAKE_JOBS_JSON_920="$J_PROMOTE_INFLIGHT" \
+  expect "only an in-flight floating-tag dispatch -> NOT READY (not built)" 1 "NOT been built"
 
 # 5. The explicit human override reports the red but does not block. Separate
 #    from PREFLIGHT_SKIP_DOCKER_HEALTH on purpose: "I looked, it is red,
