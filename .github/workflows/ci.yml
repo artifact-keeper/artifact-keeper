@@ -3532,8 +3532,27 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The backend crate's CI-profile compile can exceed the hosted runner's RAM.
+      # Give BuildKit swap headroom and reserve RAM for the runner itself (#6334).
+      - name: Add swap
+        run: |
+          if sudo fallocate -l 12G /ak-ci-swapfile \
+             && sudo chmod 600 /ak-ci-swapfile \
+             && sudo mkswap /ak-ci-swapfile >/dev/null \
+             && sudo swapon /ak-ci-swapfile; then
+            echo "added a 12 GiB swapfile"
+          else
+            echo "::warning title=No extra swap::could not add /ak-ci-swapfile; this job runs with the image's default swap only."
+          fi
+          swapon --show
+          free -m
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        with:
+          driver-opts: |
+            memory=12g
+            memory-swap=27g
 
       - name: Build backend image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
@@ -3545,7 +3564,8 @@ jobs:
           load: true
           tags: artifact-keeper-backend:pr-test
           # Read-only registry cache, warmed on main by docker-publish.yml
-          # and by the Warm CI Image Cache job below.
+          # and by the Warm CI Image Cache job below. Fork runs read the
+          # same upstream public cache as runs in the main repository.
           # No cache-to of any kind:
           #   - registry: PR-triggered jobs must not get packages:write (fork
           #     PRs would inherit it — pwn-request risk), and anonymous GHCR
@@ -3564,8 +3584,8 @@ jobs:
           # below); `buildcache-ci-amd64`, warmed on `main` by the Warm CI
           # Image Cache job below, holds the `ci` cook (#6133).
           cache-from: |
-            type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-ci-amd64
-            type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-amd64
+            type=registry,ref=ghcr.io/artifact-keeper/artifact-keeper-backend:buildcache-ci-amd64
+            type=registry,ref=ghcr.io/artifact-keeper/artifact-keeper-backend:buildcache-amd64
           # CARGO_BUILD_JOBS=4: the hosted runner's core count, which is what
           # cargo would use anyway; passed explicitly because the Dockerfile
           # defaults to 8 for the self-hosted pools (see
