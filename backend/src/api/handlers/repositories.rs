@@ -12798,6 +12798,9 @@ async fn stage_generic_native_finalize(
     let staged_native = format_finalize::stage(&repo.format, path, &target, source)
         .await
         .map_err(|reason| AppError::Validation(reason).into_response())?;
+    format_finalize::ensure_unique_nuget(&state.db, repo.id, path, Some(&staged_native))
+        .await
+        .map_err(|e| e.into_response())?;
     drop(local);
     Ok(Some(GenericNativeFinalize {
         target: format_finalize::resolved_target(target, &staged_native),

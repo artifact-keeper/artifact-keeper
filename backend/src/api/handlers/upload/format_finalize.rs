@@ -189,6 +189,44 @@ async fn nuget_catalog_name(db: &sqlx::PgPool, repository_id: Uuid, info: &Nuspe
         .unwrap_or_else(|| info.id.clone())
 }
 
+/// Refuse a generic upload that would leave a second live row for an id and
+/// version a NuGet repository already indexes (#6062). A native push and a
+/// root UI upload of the same package must not coexist: the flat-container
+/// download picks one of them with `LIMIT 1`.
+pub(crate) async fn ensure_unique_nuget(
+    db: &sqlx::PgPool,
+    repository_id: Uuid,
+    artifact_path: &str,
+    staged: Option<&StagedNativeFinalize>,
+) -> std::result::Result<(), crate::error::AppError> {
+    let Some(StagedNativeFinalize::Nuget(nuget)) = staged else {
+        return Ok(());
+    };
+    let duplicate = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM artifacts
+            WHERE repository_id = $1 AND lower(name) = lower($2) AND version = $3
+              AND is_deleted = false AND path <> $4
+        )
+        "#,
+    )
+    .bind(repository_id)
+    .bind(&nuget.info.id)
+    .bind(&nuget.info.version)
+    .bind(artifact_path)
+    .fetch_one(db)
+    .await
+    .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+    if duplicate {
+        return Err(crate::error::AppError::Conflict(format!(
+            "NuGet package {} {} already exists in this repository",
+            nuget.info.id, nuget.info.version
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) struct StagedMaven {
     coords: crate::formats::maven::MavenCoordinates,
     metadata: serde_json::Value,
@@ -2145,6 +2183,30 @@ mod tests {
         let search: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(search["totalHits"], 1, "{search}");
         assert_eq!(search["data"][0]["version"], "1.2.3", "{search}");
+
+        f.teardown().await;
+    }
+
+    // #6062: a root UI upload must not open a second live row beside the one a
+    // native push already indexed, because the flat-container download picks
+    // either row with LIMIT 1.
+    #[tokio::test]
+    async fn generic_put_root_nupkg_refuses_an_existing_nuget_version_6062() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let pushed = "qa.duplicate/1.2.3/qa.duplicate.1.2.3.nupkg";
+        assert_created(generic_put(&f, pushed, &nupkg("Qa.Duplicate", "1.2.3")).await).await;
+
+        let root = "Qa.Duplicate.1.2.3.nupkg";
+        let (status, body) = generic_put(&f, root, &nupkg("Qa.Duplicate", "1.2.3")).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(artifact_count(&f).await, 1);
 
         f.teardown().await;
     }
