@@ -679,7 +679,7 @@ pub(crate) async fn stage(
             let FinalizeSource::File(file) = source else {
                 return Err("a NuGet package finalize needs the assembled file".to_string());
             };
-            stage_nuget(target, file)
+            stage_nuget(artifact_path, target, file)
                 .await
                 .map(|staged| StagedNativeFinalize::Nuget(Box::new(staged)))
         }
@@ -729,9 +729,13 @@ pub(crate) async fn stage(
     }
 }
 
-/// Parse a staged `.nupkg`'s `.nuspec` and check it against the coordinates
-/// its path declares, as the native push route checks its generated path.
-async fn stage_nuget(target: &NativeTarget, file: &std::path::Path) -> Result<StagedNuget, String> {
+/// Parse a staged `.nupkg`'s `.nuspec` and check it against the uploaded
+/// filename, as the native push route checks its generated path.
+async fn stage_nuget(
+    artifact_path: &str,
+    target: &NativeTarget,
+    file: &std::path::Path,
+) -> Result<StagedNuget, String> {
     let staged_path = file.to_path_buf();
     let info = crate::util::bounded_archive::with_ingest_extraction_async(|| {
         tokio::task::spawn_blocking(move || {
@@ -748,9 +752,28 @@ async fn stage_nuget(target: &NativeTarget, file: &std::path::Path) -> Result<St
     if info.id.trim().is_empty() || info.version.trim().is_empty() {
         return Err("Package ID and version are required in .nuspec".to_string());
     }
-    let declared_version = NugetHandler::normalized_version(&info.version)
-        .unwrap_or_else(|| info.version.to_lowercase());
-    if !target.name.eq_ignore_ascii_case(&info.id) || target.version != declared_version {
+    let normalized_version = NugetHandler::normalized_version(&info.version);
+    let fallback_version = info.version.to_lowercase();
+    let filename = basename(artifact_path);
+    let authored = format!("{}.{}.nupkg", info.id, info.version);
+    let canonical = format!(
+        "{}.{}.nupkg",
+        info.id,
+        normalized_version.as_deref().unwrap_or(&fallback_version)
+    );
+    let filename_matches =
+        filename.eq_ignore_ascii_case(&authored) || filename.eq_ignore_ascii_case(&canonical);
+    // A nested path (the canonical NuGet push layout) also has to agree with
+    // its directory coordinates. A root UI upload has only the filename: a
+    // path parser splitting on the first numeric segment would misread an id
+    // like `Foo.2`, so the whole filename is compared to the .nuspec instead.
+    let path_matches = !artifact_path.contains('/')
+        || (target.name.eq_ignore_ascii_case(&info.id)
+            && (target.version == info.version
+                || normalized_version
+                    .as_ref()
+                    .is_some_and(|version| target.version == *version)));
+    if !filename_matches || !path_matches {
         return Err(format!(
             "The .nupkg declares {} {}, which disagrees with the upload path",
             info.id, info.version
@@ -2183,6 +2206,23 @@ mod tests {
         let search: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(search["totalHits"], 1, "{search}");
         assert_eq!(search["data"][0]["version"], "1.2.3", "{search}");
+
+        f.teardown().await;
+    }
+
+    // #6062: an id may end in a numeric segment. Splitting the filename at
+    // its first digit would misread `Qa.Suffix.2` as `Qa` plus `2.1.2.3`.
+    #[tokio::test]
+    async fn generic_put_root_nupkg_accepts_a_numeric_id_segment_6062() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let path = "Qa.Suffix.2.1.2.3.nupkg";
+        assert_created(generic_put(&f, path, &nupkg("Qa.Suffix.2", "1.2.3")).await).await;
+
+        let (_, name, version, _) = row(&f, path).await;
+        assert_eq!(name, "qa.suffix.2");
+        assert_eq!(version.as_deref(), Some("1.2.3"));
 
         f.teardown().await;
     }
